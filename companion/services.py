@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -28,6 +29,7 @@ from core.llm_utils import LLMService
 from planning.schedule_query import ScheduleQuery
 
 from .affection import AffectionManager
+from .affection_events import record_rule_event
 from .cateye_client import CateyeClient
 from .holiday_service import HolidayService
 from .memory_manager import MemoryManager
@@ -35,6 +37,8 @@ from .message_service import MessageService
 from .patrol import PatrolService
 from .screen_context import ScreenContextStore
 from .sender_identity import SenderCache, SessionKindCache
+
+logger = logging.getLogger(__name__)
 
 
 class CompanionServices:
@@ -53,8 +57,19 @@ class CompanionServices:
         # ---- 复用顶层已有实例（只增不改名；缺失时自建兜底）----
         self.affection: AffectionManager = (
             getattr(plugin, "_affection", None)
-            or AffectionManager(self._data_dir, default_level=int(getattr(cfg.affection, "current_level", 0)))
+            or AffectionManager(
+                self._data_dir,
+                default_level=int(getattr(cfg.affection, "current_level", 0)),
+                config_provider=lambda: plugin.config,
+                decision_logger=getattr(plugin, "_decision_logger", None),
+            )
         )
+        # 好感 v2 档位变化事件需要总线（plugin._bus 在服务束构造前已就绪，可空降级）
+        if self.bus is not None:
+            try:
+                self.affection.set_event_bus(self.bus)
+            except Exception:
+                pass
         self.decision_logger: Optional[DecisionLogger] = getattr(plugin, "_decision_logger", None)
         self.llm_logger: Optional[LLMCallLogger] = getattr(plugin, "_llm_logger", None)
         self.llm: LLMService = (
@@ -139,7 +154,13 @@ class CompanionServices:
         except Exception:
             pass
         try:
-            self.affection.update_level(int(getattr(cfg.affection, "current_level", self.affection.level())))
+            # v2：档位由 score/迟滞驱动，current_level 只作「无档案时的初始档位」（构造时传入）；
+            # 热重载时不再回写，否则每次改配置都会把累积的 score 冲回档位代表分数。
+            # enabled=false（v1 回退模式）时维持旧行为：配置档位直接下发。
+            if not self.affection.is_enabled():
+                self.affection.update_level(
+                    int(getattr(cfg.affection, "current_level", self.affection.level()))
+                )
         except Exception:
             pass
         cateye_cfg = getattr(cfg, "cateye", None)
@@ -160,11 +181,49 @@ class CompanionServices:
     # 事件订阅挂点（M0：登记于此，M3+ 消费者按需 subscribe 并存入 _event_unsubs）
     # ------------------------------------------------------------------
     def _register_event_subscriptions(self) -> None:
-        """订阅注册挂点（start() 调用）。M0 本束无订阅者：
-        唯一的实际订阅（proactive.used → 预算计数器）由 core/event_bus 在装配时安装。
-        M3+ 消费者在此 ``self._event_unsubs.append(self.bus.subscribe(...))``。"""
-        if self.bus is None:
+        """订阅注册挂点（start() 调用）。
+
+        M1：订阅 planning 的约定兑现/违约事件 → affection_events 各记 1 次
+        （``commitment_kept`` +1.0 / ``commitment_broken`` −0.5，每约定 1 次；
+        频控/限幅/档位重估都在规则事件层内完成）。幂等：已注册时直接返回，
+        其余消费者（M2/M3）在此追加 ``self._event_unsubs.append(...)``。
+        """
+        if self.bus is None or self._event_unsubs:
             return
+        try:
+            self._event_unsubs.append(
+                self.bus.subscribe("schedule.commitment_kept", self._on_commitment_kept,
+                                   owner="companion")
+            )
+            self._event_unsubs.append(
+                self.bus.subscribe("schedule.commitment_broken", self._on_commitment_broken,
+                                   owner="companion")
+            )
+        except Exception as exc:
+            logger.warning("companion 约定事件订阅失败（忽略）：%s", exc)
+            self._unregister_event_subscriptions()
+
+    async def _on_commitment_kept(self, payload: Any) -> None:
+        """``schedule.commitment_kept`` 订阅者（planning 约定兑现）。"""
+        self._record_commitment_event("commitment_kept", payload)
+
+    async def _on_commitment_broken(self, payload: Any) -> None:
+        """``schedule.commitment_broken`` 订阅者（planning 约定违约）。"""
+        self._record_commitment_event("commitment_broken", payload)
+
+    def _record_commitment_event(self, kind: str, payload: Any) -> None:
+        """把一条约定事件记为好感规则事件（payload 不可用时静默降级）。
+
+        去重键取 ``commitment``（回退 ``summary``），配合规则表的 ``per_key_once``
+        实现「每约定 1 次」；好感关闭（enabled=false）时规则事件层自行跳过。
+        """
+        data = payload if isinstance(payload, dict) else {}
+        key = str(data.get("commitment") or data.get("summary") or "").strip()
+        desc = str(data.get("summary") or data.get("commitment") or "").strip()
+        try:
+            record_rule_event(self.affection, kind, None, desc, key=key)
+        except Exception as exc:
+            logger.debug("好感约定事件 %s 记录失败（忽略）：%s", kind, exc)
 
     def _unregister_event_subscriptions(self) -> None:
         """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""

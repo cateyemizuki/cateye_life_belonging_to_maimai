@@ -305,19 +305,157 @@ class PatrolSectionConfig(PluginConfigBase):
 
 
 class AffectionSectionConfig(PluginConfigBase):
-    """好感度系统（来源：虚拟恋人插件）。"""
+    """好感度系统（来源：虚拟恋人插件；M1 扩展为 v2 状态层配置，全部带默认值可关闭）。
+
+    `enabled=false` 时整体回退 v1 三档行为（§八.2：新增配置关闭时回退旧行为）；
+    `review_*` 三项为 M2 会话/日结裁判预留（本里程碑只声明字段，不产生 LLM 调用）。
+    """
 
     __ui_label__ = "好感度"
     __ui_icon__ = "favorite"
     __ui_order__ = 4
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
-        "en": {"title": "Affection", "description": "Companion affection tier system."}
+        "en": {"title": "Affection", "description": "Companion affection tier system (v2 score/baseline)."}
     }
 
     current_level: Literal[0, 1, 2] = Field(
         default=0,
         description="好感度档位：0=熟悉（温柔拘谨），1=亲密（活泼热情），2=热恋（撒娇抱抱）",
         json_schema_extra={"label": "好感档位", **_ui_i18n("Affection level")},
+    )
+    enabled: bool = Field(
+        default=True,
+        description="启用好感度 v2：开启后按 score/baseline 连续分运行（规则事件记账 + 日衰减 + 档位迟滞）；"
+                    "关闭则回退 v1 三档行为（档位仅由命令/工具设置，不自动变化）",
+        json_schema_extra={
+            "label": "启用好感度 v2",
+            "hint": "关闭=保留旧三档手感（无日衰减、无事件记账）；文件仍以 v2 格式保存，可随时再开启",
+            **_ui_i18n("Enable affection v2",
+                       "Off = legacy 3-tier behaviour: tier only changes via commands, no decay or rule events."),
+        },
+    )
+    decay_pull: float = Field(
+        default=0.06,
+        ge=0.0,
+        le=1.0,
+        description="日衰减拉回基线的比例：每天日切执行 score += (baseline − score) × 该值（0=不衰减）",
+        json_schema_extra={
+            "label": "日衰减拉回",
+            "step": 0.01,
+            "hint": "越大=一次甜蜜日忘得越快；0.06 约 5~6 天回落大半",
+            **_ui_i18n("Daily decay pull", "0 = no decay. 0.06 pulls most of a +2 day back within about a week."),
+        },
+    )
+    baseline_ema: float = Field(
+        default=0.03,
+        ge=0.0,
+        le=1.0,
+        description="关系基线漂移速度：日切执行 baseline += (score − baseline) × 该值（0=基线永不移动）",
+        json_schema_extra={
+            "label": "基线漂移速度",
+            "step": 0.01,
+            "hint": "基线是「感情底色」：涨得慢、忘得慢；0.03 表示长期相处才会抬升",
+            **_ui_i18n("Baseline EMA", "How fast the long-term baseline follows the recent score. 0 = frozen."),
+        },
+    )
+    daily_positive_cap: float = Field(
+        default=4.0,
+        ge=0.0,
+        le=100.0,
+        description="单日正向好感增量上限（含规则事件与后续裁判）：超出部分记日志丢弃",
+        json_schema_extra={
+            "label": "单日正向上限",
+            "step": 0.5,
+            "hint": "防止一天之内好感暴涨；设为 0 = 当日不再增加好感",
+            **_ui_i18n("Daily positive cap", "Hard daily ceiling for positive affection gains."),
+        },
+    )
+    daily_negative_cap: float = Field(
+        default=3.0,
+        ge=0.0,
+        le=100.0,
+        description="单日负向好感扣减下限（含规则事件与后续裁判）：超出部分记日志丢弃",
+        json_schema_extra={
+            "label": "单日负向下限",
+            "step": 0.5,
+            "hint": "防止一次矛盾把好感打崩；设为 0 = 当日不再扣好感",
+            **_ui_i18n("Daily negative cap", "Hard daily floor for negative affection losses."),
+        },
+    )
+    tier_hysteresis: float = Field(
+        default=3.0,
+        ge=0.0,
+        le=30.0,
+        description="档位迟滞带（分）：升档需 score ≥ 当前档上界 + 该值，降档需 ≤ 下界 − 该值（0=无迟滞）",
+        json_schema_extra={
+            "label": "档位迟滞带",
+            "step": 0.5,
+            "hint": "防止在档位边界反复横跳",
+            **_ui_i18n("Tier hysteresis", "Extra margin required before a tier change; prevents oscillation."),
+        },
+    )
+    tier_min_dwell_hours: float = Field(
+        default=24.0,
+        ge=0.0,
+        le=720.0,
+        description="档位最短停留时长（小时）：距进入当前档位不足该时长则不升/降档（0=不限）",
+        json_schema_extra={
+            "label": "档位最短停留(小时)",
+            "step": 1.0,
+            "hint": "档位变化最多一天一次，避免情绪化跳档",
+            **_ui_i18n("Min tier dwell (h)", "Minimum hours in a tier before it may change again."),
+        },
+    )
+    review_enabled: bool = Field(
+        default=True,
+        description="会话采样 LLM 裁判开关（M2 落地：每 N 轮或每日 ≤2 次抽样评估对话增量）；当前仅声明配置",
+        json_schema_extra={
+            "label": "会话裁判开关",
+            "hint": "M2 起生效；关闭则完全不做会话采样评估（规则事件仍照常记账）",
+            **_ui_i18n("Conversation review", "M2: sample-based LLM review of conversation deltas."),
+        },
+    )
+    review_sample_every_rounds: int = Field(
+        default=20,
+        ge=1,
+        le=1000,
+        description="会话裁判采样频率（轮）：每多少轮对话抽样一次（M2 生效）；结合每日上限取先到者",
+        json_schema_extra={
+            "label": "会话采样轮数",
+            "hint": "越小抽样越勤、LLM 成本越高；M1 阶段无实际调用",
+            **_ui_i18n("Review sample rounds", "M2: one sample review every N conversation rounds."),
+        },
+    )
+    review_max_per_day: int = Field(
+        default=2,
+        ge=0,
+        le=50,
+        description="会话裁判每日上限（次）：0=当天不做采样评估（M2 生效）",
+        json_schema_extra={
+            "label": "会话裁判每日上限",
+            "hint": "控制 LLM 成本；M1 阶段无实际调用",
+            **_ui_i18n("Review daily cap", "M2: max sample reviews per day."),
+        },
+    )
+    review_task_name: str = Field(
+        default="utils",
+        description="好感裁判使用的 LLM 任务名（宿主 model_config 的任务键，默认 utils；M2 生效）",
+        json_schema_extra={
+            "label": "裁判任务名",
+            "hint": "建议指到便宜、非思考型的任务；M1 阶段无实际调用",
+            **_ui_i18n("Review task name", "M2: model task used by the affection referee."),
+        },
+    )
+    emotion_modulation: bool = Field(
+        default=True,
+        description="情绪调制好感增量开关（B2，M3 落地）：delta × clamp(1 + 0.25 × V × sign(delta), 0.6, 1.4)；"
+                    "当前仅声明配置（乘数恒 1）",
+        json_schema_extra={
+            "label": "情绪调制好感",
+            "hint": "M3 起生效：开心时好事加分更多、低落时坏事扣分更狠",
+            **_ui_i18n("Emotion modulation",
+                       "M3: modulate affection deltas by the current mood (multiplier 0.6-1.4)."),
+        },
     )
 
 

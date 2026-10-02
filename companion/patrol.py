@@ -231,6 +231,8 @@ class PatrolService:
         # 1) 日切（保留 last_speak_time：跨午夜间隔约束仍生效）
         if self._affection.today_date() != now.strftime("%Y-%m-%d"):
             self._affection.reset_daily(now.strftime("%Y-%m-%d"))
+            # M1 日衰减（§5.5）：score 向 baseline 回归 + baseline 缓慢漂移，每自然日一次
+            self._affection.apply_daily_decay()
 
         daily_max_speak = int(patrol.daily_max_speak)
         # 为晚安预留 1 个配额：晚安未发时，非晚安触发只能用 daily_max_speak-1

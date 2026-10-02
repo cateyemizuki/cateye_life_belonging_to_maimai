@@ -58,7 +58,11 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._llm_logger = LLMCallLogger(data_dir, enabled=cfg.admin.llm_log_enabled,
                                          retention_days=cfg.admin.log_retention_days)
         self._db = ScheduleDB(data_dir / "schedule.db")
-        self._affection = AffectionManager(data_dir, default_level=cfg.affection.current_level)
+        # 好感度 v2：运行期动态读 [affection] 段（热重载即时生效）+ 决策日志留痕
+        self._affection = AffectionManager(
+            data_dir, default_level=cfg.affection.current_level,
+            config_provider=lambda: self.config, decision_logger=self._decision_logger,
+        )
         # config_provider：judge() 等在调用时动态读顶层配置（[judge] 段热更新即时生效）
         self._llm = LLMService(self.ctx, task_name=cfg.schedule.llm_task_name,
                                call_logger=self._llm_logger, config_provider=lambda: self.config)

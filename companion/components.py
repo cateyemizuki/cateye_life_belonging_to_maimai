@@ -42,7 +42,6 @@ from core.diag import DecisionLogger
 from core.inject import pick_payload_key, project_injection, without_stale_proactive_blocks
 from planning.schedule_query import ScheduleQuery
 
-from .affection import LEVEL_DESCRIPTIONS
 from .screen_context import (
     CHANNEL_PLANNER,
     CHANNEL_REPLYER,
@@ -251,7 +250,15 @@ class CompanionComponentsMixin:
     )
     async def mai_hook_target_private_message(self, message: dict[str, Any] | None = None,
                                               **kwargs: Any) -> None:
-        """记录目标用户的入站私聊；群聊和其他用户不影响巡检调度。"""
+        """记录目标用户的入站私聊；群聊和其他用户不影响巡检调度。
+
+        M1 接线（§5.6）：非通知消息发 ``relation.message_received``
+        （is_target 判定结果 / source=auto / stream_kind；私聊 target 判定复用
+        sender_identity 既有链路；群聊里非 target 的发言不上报，避免群流水刷日志）；
+        target 私聊（会话类型未知时按私聊兜底）再经 affection_events 记一条
+        ``chat_round`` 规则事件（日累计 ≤ +1.0），并刷新 last_user_msg_time
+        （顺带触发 ``user_initiated`` 检测，§5.4）。
+        """
         companion = self._mai_companion()
         if companion is None:
             return
@@ -259,17 +266,39 @@ class CompanionComponentsMixin:
             if not isinstance(message, dict) or message.get("is_notify"):
                 return
             message_info = message.get("message_info")
-            if not isinstance(message_info, dict) or message_info.get("group_info"):
+            if not isinstance(message_info, dict):
                 return
-            user_info = message_info.get("user_info")
-            if not isinstance(user_info, dict):
+            _session_id, is_group = extract_session_info_from_message(message)
+            stream_kind = "group" if is_group is True else ("private" if is_group is False else "")
+            user_id = extract_user_id_from_message(message)
+            target_qq = self._mai_target_qq()
+            is_target = bool(user_id and target_qq and user_id == target_qq)
+            # 群聊里非 target 的发言不上报（群流水会刷爆决策日志）；其余消息带上判定结果
+            if is_group is True and not is_target:
                 return
-            user_id = str(user_info.get("user_id", "")).strip()
-            target_qq = str(self.config.target.target_qq or "").strip()
-            if user_id and target_qq and user_id == target_qq:
+            await self._mai_publish_message_received(companion, is_target=is_target,
+                                                     stream_kind=stream_kind)
+            if is_target and stream_kind != "group":
+                # 会话类型未知时按私聊兜底（与旧实现一致：group_info 缺失视为私聊）
                 companion.affection.update_last_user_msg_time(datetime.now())
+                companion.affection.record_rule_event("chat_round", None, "与 target 一问一答")
         except Exception:
             pass
+
+    async def _mai_publish_message_received(self, companion: Any, *, is_target: bool,
+                                            stream_kind: str) -> None:
+        """发布 ``relation.message_received``（M1 接线；总线缺失时静默降级）。"""
+        bus = getattr(self, "_bus", None) or getattr(companion, "bus", None)
+        if bus is None:
+            return
+        try:
+            await bus.publish("relation.message_received", source="auto",
+                              is_target=bool(is_target), stream_kind=str(stream_kind or ""))
+        except Exception as e:
+            try:
+                self.ctx.logger.debug(f"发布 relation.message_received 失败（忽略）: {e}")
+            except Exception:
+                pass
 
     @HookHandler(
         "maisaka.planner.before_request",
@@ -481,9 +510,15 @@ class CompanionComponentsMixin:
         relation_word = getattr(relation, "word", None) or "恋人"
         target_label = f"QQ {target_qq}" if target_qq else relation_word
         affection = companion.affection
-        level = affection.level()
-        level_desc = (relation.level_description(level) if relation is not None
-                      else LEVEL_DESCRIPTIONS.get(level, LEVEL_DESCRIPTIONS[0]))
+        # M1 注入接线（§5.6.1）：好感后缀改读 v2 5 档档位描述（经 relation profile；
+        # 关系档案缺失时回退 affection 的「恋人」5 档基底文案）。habits 通道不在此处。
+        tier = affection.tier()
+        if relation is not None:
+            tier_label = relation.tier_label(tier)
+            tier_desc = relation.tier_description(tier)
+        else:
+            tier_label = affection.tier_label()
+            tier_desc = affection.tier_description()
 
         # 无日程时不注入日程状态（日切后日程未生成时不出现占位句）
         schedule_query = self._mai_schedule_query()
@@ -498,7 +533,8 @@ class CompanionComponentsMixin:
         if activity_line:
             suffix += f"\n【{name}当前状态】现在 {current_time}，{name}正在{activity_line}。"
 
-        suffix += f"\n【{name}与{relation_word}（{target_label}）的好感度】档位 {level}（{level_desc}）"
+        suffix += (f"\n【{name}与{relation_word}（{target_label}）的好感度】"
+                   f"档位 {tier}·{tier_label}（{tier_desc}）")
         return suffix
 
     def _mai_build_proactive_target_rule(self) -> str:
@@ -610,24 +646,26 @@ class CompanionComponentsMixin:
 
     @Tool(
         "cateye_test_mai_lover_affection",
-        description="调整与关系对象的好感度档位（0/1/2；档位名称随关系类型变化，如恋人=熟悉/亲密/热恋）",
+        description="调整与关系对象的好感度：把 score 移动到 0/1/2 兼容档对应的 v2 5 档区间中值并重估档位"
+                    "（档位名称随关系类型变化，如恋人=熟悉/亲密/热恋）",
         parameters={
             "level": {
                 "type": "integer",
-                "description": "好感度档位，只能填 0、1 或 2",
+                "description": "好感度兼容档位（3 档口径），只能填 0、1 或 2",
                 "required": True,
             },
         },
     )
     async def mai_tool_affection(self, level: int = 0, **kwargs: Any) -> str:
+        """LLM Tool：按 3 档兼容口径移动 score 到对应 v2 档区间（管理员兜底，跳过迟滞）。"""
         companion = self._mai_companion()
         if companion is None:
             return "好感度管理器未初始化。"
         if level not in (0, 1, 2):
             return f"档位只能填 0（熟悉）、1（亲密）或 2（热恋），收到的是 {level}。"
         companion.affection.update_level(int(level))
-        self.ctx.logger.info(f"好感度已通过 Tool 调整为 {level}")
-        return f"好感度已更新: {level} - {LEVEL_DESCRIPTIONS[level]}"
+        self.ctx.logger.info(f"好感度已通过 Tool 调整到兼容档 {level}（score 移至对应 v2 档区间）")
+        return f"好感度已更新：{self._mai_affection_state_line()}"
 
     @Tool(
         "cateye_test_mai_lover_config",
@@ -702,7 +740,7 @@ class CompanionComponentsMixin:
             return False, f"发送失败: {e}", True
 
     @Command(name="/cateye_test_mai_affection", pattern=r"(?<!\S)/cateye_test_mai_affection(?:\s+(?P<mai_level>\S+))?\s*$",
-             description="调整好感度档位。用法: /cateye_test_mai_affection <0|1|2>")
+             description="查看/调整好感度（score/baseline/档位/今日Δ）。用法: /cateye_test_mai_affection [0|1|2]")
     async def mai_cmd_affection(self, **kwargs: Any) -> tuple[bool, str, bool]:
         companion = self._mai_companion()
         if not await self._authorize_command(kwargs):
@@ -722,13 +760,12 @@ class CompanionComponentsMixin:
                 self.ctx.logger.warning(f"mai_cmd_affection 回复发送失败: {e}")
 
         if not level_str:
-            current = companion.affection.level() if companion else "?"
+            # 不带参数 = 查看好感 v2 状态（最近印象属 M2，不输出）
+            current = self._mai_affection_state_line() if companion else "好感度管理器未初始化。"
             await _reply(
-                "用法: /cateye_test_mai_affection <0|1|2>\n"
-                "0 = 熟悉（温柔拘谨）\n"
-                "1 = 亲密（活泼热情）\n"
-                "2 = 热恋（撒娇抱抱）\n"
-                f"当前档位: {current}"
+                "用法: /cateye_test_mai_affection <0|1|2>（不带参数只看状态）\n"
+                "0 = 熟悉档区间 | 1 = 亲密档区间 | 2 = 热恋档区间（3 档兼容口径，实际按 v2 score 运行）\n"
+                f"当前状态: {current}"
             )
             return False, "参数错误", True
         try:
@@ -743,8 +780,8 @@ class CompanionComponentsMixin:
             await _reply("好感度管理器未初始化，无法调整。")
             return False, "管理器未初始化", True
         companion.affection.update_level(level)
-        self.ctx.logger.info(f"好感度已通过命令调整为 {level}")
-        await _reply(f"好感度已更新: {level} - {LEVEL_DESCRIPTIONS[level]}")
+        self.ctx.logger.info(f"好感度已通过命令调整到兼容档 {level}（score 移至对应 v2 档区间）")
+        await _reply(f"好感度已更新：{self._mai_affection_state_line()}")
         return True, "好感度已调整", True
 
     @Command(name="/cateye_test_mai_help", pattern=r"(?<!\S)/cateye_test_mai_help\s*$",
@@ -758,7 +795,7 @@ class CompanionComponentsMixin:
             "🐱 麦麦恋人 可用命令:\n"
             f"/cateye_test_mai_status    — 查看{name}状态（好感度/今日发言/日程摘要）\n"
             "/cateye_test_mai_schedule  — 查看今日完整日程\n"
-            "/cateye_test_mai_affection — 调整好感度档位: /cateye_test_mai_affection <0|1|2>\n"
+            "/cateye_test_mai_affection — 查看/调整好感度: /cateye_test_mai_affection [0|1|2]\n"
             "/cateye_test_mai_config    — 查看当前插件配置摘要\n"
             "/cateye_test_mai_llm_log   — 查看 LLM 调用日志: /cateye_test_mai_llm_log [天数]\n"
             "/cateye_test_mai_diag      — 查看主动行为决策日志（为什么发言/为什么没发言）: /cateye_test_mai_diag [天数]\n"
@@ -873,6 +910,26 @@ class CompanionComponentsMixin:
         return False, "发送返回 False", True
 
     # ---- 命令辅助 ----
+
+    def _mai_affection_state_line(self) -> str:
+        """好感 v2 状态行：score / baseline / 档位（5 档口径）/ 今日 Δ。
+
+        最近印象（impressions）属 M2 日结裁判，本里程碑不输出。
+        """
+        companion = self._mai_companion()
+        if companion is None:
+            return "好感度管理器未初始化。"
+        affection = companion.affection
+        relation = getattr(companion, "relation", None)
+        tier = int(affection.tier())
+        label = relation.tier_label(tier) if relation is not None else affection.tier_label()
+        daily = affection.daily_delta() or {}
+        try:
+            net = float(daily.get("positive") or 0.0) + float(daily.get("negative") or 0.0)
+        except (TypeError, ValueError):
+            net = 0.0
+        return (f"score {affection.score():.1f} / baseline {affection.baseline():.1f} / "
+                f"档位 {tier}·{label} / 今日 Δ {net:+.2f}")
 
     @staticmethod
     def _mai_parse_days(matched_groups: Any) -> Optional[int]:
