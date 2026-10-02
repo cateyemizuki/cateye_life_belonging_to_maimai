@@ -308,7 +308,7 @@ class AffectionSectionConfig(PluginConfigBase):
     """好感度系统（来源：虚拟恋人插件；M1 扩展为 v2 状态层配置，全部带默认值可关闭）。
 
     `enabled=false` 时整体回退 v1 三档行为（§八.2：新增配置关闭时回退旧行为）；
-    `review_*` 三项为 M2 会话/日结裁判预留（本里程碑只声明字段，不产生 LLM 调用）。
+    `review_*` 四项为 M2 好感 LLM 裁判（会话采样 + 关系日结）的开关与频控/任务名。
     """
 
     __ui_label__ = "好感度"
@@ -408,21 +408,22 @@ class AffectionSectionConfig(PluginConfigBase):
     )
     review_enabled: bool = Field(
         default=True,
-        description="会话采样 LLM 裁判开关（M2 落地：每 N 轮或每日 ≤2 次抽样评估对话增量）；当前仅声明配置",
+        description="好感度 LLM 裁判总开关（M2：会话采样评估 + 睡眠时段关系日结）；"
+                    "关闭则完全不做 LLM 评估（规则事件仍照常记账）",
         json_schema_extra={
-            "label": "会话裁判开关",
-            "hint": "M2 起生效；关闭则完全不做会话采样评估（规则事件仍照常记账）",
-            **_ui_i18n("Conversation review", "M2: sample-based LLM review of conversation deltas."),
+            "label": "好感裁判开关",
+            "hint": "关闭=零 LLM 成本：不做会话采样评估，也不做关系日结；规则事件与日衰减照常",
+            **_ui_i18n("Affection review", "M2: sample-based conversation review and nightly relationship review."),
         },
     )
     review_sample_every_rounds: int = Field(
         default=20,
         ge=1,
         le=1000,
-        description="会话裁判采样频率（轮）：每多少轮对话抽样一次（M2 生效）；结合每日上限取先到者",
+        description="会话裁判采样频率（轮）：每多少轮对方私聊消息抽样一次（与每日上限取先到者）",
         json_schema_extra={
             "label": "会话采样轮数",
-            "hint": "越小抽样越勤、LLM 成本越高；M1 阶段无实际调用",
+            "hint": "越小抽样越勤、LLM 成本越高；默认 20 轮一次",
             **_ui_i18n("Review sample rounds", "M2: one sample review every N conversation rounds."),
         },
     )
@@ -430,20 +431,20 @@ class AffectionSectionConfig(PluginConfigBase):
         default=2,
         ge=0,
         le=50,
-        description="会话裁判每日上限（次）：0=当天不做采样评估（M2 生效）",
+        description="会话裁判每日上限（次）：0=当天不做采样评估（不影响睡眠时段的关系日结）",
         json_schema_extra={
             "label": "会话裁判每日上限",
-            "hint": "控制 LLM 成本；M1 阶段无实际调用",
-            **_ui_i18n("Review daily cap", "M2: max sample reviews per day."),
+            "hint": "控制 LLM 成本；日结每天最多 1 次，与采样评估分开计",
+            **_ui_i18n("Review daily cap", "M2: max sample reviews per day. The nightly review is separate."),
         },
     )
     review_task_name: str = Field(
         default="utils",
-        description="好感裁判使用的 LLM 任务名（宿主 model_config 的任务键，默认 utils；M2 生效）",
+        description="好感裁判使用的 LLM 任务名（宿主 model_config 的任务键，默认 utils）",
         json_schema_extra={
             "label": "裁判任务名",
-            "hint": "建议指到便宜、非思考型的任务；M1 阶段无实际调用",
-            **_ui_i18n("Review task name", "M2: model task used by the affection referee."),
+            "hint": "建议指到便宜、非思考型的任务（会话采样与关系日结共用）",
+            **_ui_i18n("Review task name", "M2: model task used by the affection referees."),
         },
     )
     emotion_modulation: bool = Field(

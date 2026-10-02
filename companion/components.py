@@ -96,6 +96,27 @@ _ACTION_SPOKEN = DecisionLogger.ACTION_SPOKEN
 _PLACEHOLDER_QQ = "123456789"
 
 
+def _message_plain_text(message: Any) -> str:
+    """取入站消息纯文本（M2 会话裁判的「对话摘要」来源）。
+
+    ``chat.receive.after_process`` 触发时 ``processed_plain_text`` 已生成（宿主
+    message 结构 §10.2），优先取它；缺失时回退 ``raw_message`` 里的文本段拼接。
+    取不到返回空串（裁判输入侧自行省略该条）。
+    """
+    if not isinstance(message, dict):
+        return ""
+    text = str(message.get("processed_plain_text") or "").strip()
+    if text:
+        return text
+    parts = []
+    raw = message.get("raw_message")
+    if isinstance(raw, list):
+        for segment in raw:
+            if isinstance(segment, dict) and str(segment.get("type") or "") == "text":
+                parts.append(str(segment.get("data") or ""))
+    return " ".join(part for part in parts if part).strip()
+
+
 # ---------------------------------------------------------------------------
 # 纯函数：>8MB 载荷收缩（把图片 part 换成文本占位符后照常注入）
 # ---------------------------------------------------------------------------
@@ -282,8 +303,26 @@ class CompanionComponentsMixin:
                 # 会话类型未知时按私聊兜底（与旧实现一致：group_info 缺失视为私聊）
                 companion.affection.update_last_user_msg_time(datetime.now())
                 companion.affection.record_rule_event("chat_round", None, "与 target 一问一答")
+                self._mai_note_review_round(companion, message)
         except Exception:
             pass
+
+    def _mai_note_review_round(self, companion: Any, message: Any) -> None:
+        """M2 会话采样触发点（§5.4-1，挂在 chat_round 记账点旁）。
+
+        只做滚动缓冲 + 轮次计数 + 双频控；命中采样时由 AffectionReviewer 调度后台
+        LLM 任务并立即返回——本 Hook timeout 只有 1s，绝不内联等待 LLM。
+        """
+        reviewer = getattr(companion, "reviews", None)
+        if reviewer is None:
+            return
+        try:
+            reviewer.note_target_message(_message_plain_text(message), now=datetime.now())
+        except Exception as e:
+            try:
+                self.ctx.logger.debug(f"会话采样触发失败（忽略）: {e}")
+            except Exception:
+                pass
 
     async def _mai_publish_message_received(self, companion: Any, *, is_target: bool,
                                             stream_kind: str) -> None:
@@ -535,7 +574,41 @@ class CompanionComponentsMixin:
 
         suffix += (f"\n【{name}与{relation_word}（{target_label}）的好感度】"
                    f"档位 {tier}·{tier_label}（{tier_desc}）")
+        # M2 注入叠加（§5.6.1）：最近 1~2 条 impressions + 最近一次日结 tone；
+        # 无印象/无 tone 时返回空串，注入内容与 M1 完全一致（降级为现状）。
+        memory_line = self._mai_affection_memory_line(affection)
+        if memory_line:
+            suffix += "\n" + memory_line
         return suffix
+
+    @staticmethod
+    def _mai_affection_memory_line(affection: Any) -> str:
+        """好感记忆行（注入与命令共用）：最近 1~2 条印象 + 最近一次日结关系温度。
+
+        状态层缺失/为空/异常一律返回空串（绝不空指针，也绝不给调用方抛错）。
+        """
+        try:
+            impressions = affection.impressions()[-2:]
+        except Exception:
+            impressions = []
+        lines = []
+        entries = []
+        for item in impressions or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if text:
+                entries.append(f"{str(item.get('date') or '').strip()} {text}".strip())
+        if entries:
+            lines.append("【最近印象】" + "；".join(entries))
+        try:
+            tone = affection.tone()
+        except Exception:
+            tone = None
+        if isinstance(tone, dict) and str(tone.get("text") or "").strip():
+            lines.append(f"【关系温度·{str(tone.get('date') or '').strip()}】"
+                         f"{str(tone.get('text')).strip()}")
+        return "\n".join(lines)
 
     def _mai_build_proactive_target_rule(self) -> str:
         """主动发言回合给 planner 的回复目标约束（软约束，宿主无法强制目标）。"""
@@ -760,7 +833,7 @@ class CompanionComponentsMixin:
                 self.ctx.logger.warning(f"mai_cmd_affection 回复发送失败: {e}")
 
         if not level_str:
-            # 不带参数 = 查看好感 v2 状态（最近印象属 M2，不输出）
+            # 不带参数 = 查看好感 v2 状态（M2：含最近印象与关系温度）
             current = self._mai_affection_state_line() if companion else "好感度管理器未初始化。"
             await _reply(
                 "用法: /cateye_test_mai_affection <0|1|2>（不带参数只看状态）\n"
@@ -912,9 +985,9 @@ class CompanionComponentsMixin:
     # ---- 命令辅助 ----
 
     def _mai_affection_state_line(self) -> str:
-        """好感 v2 状态行：score / baseline / 档位（5 档口径）/ 今日 Δ。
+        """好感 v2 状态行：score / baseline / 档位（5 档口径）/ 今日 Δ + M2 最近印象与 tone。
 
-        最近印象（impressions）属 M2 日结裁判，本里程碑不输出。
+        最近印象（impressions）与关系温度（tone）由 M2 关系日结裁判产出；为空时只输出 M1 状态行。
         """
         companion = self._mai_companion()
         if companion is None:
@@ -928,8 +1001,12 @@ class CompanionComponentsMixin:
             net = float(daily.get("positive") or 0.0) + float(daily.get("negative") or 0.0)
         except (TypeError, ValueError):
             net = 0.0
-        return (f"score {affection.score():.1f} / baseline {affection.baseline():.1f} / "
+        line = (f"score {affection.score():.1f} / baseline {affection.baseline():.1f} / "
                 f"档位 {tier}·{label} / 今日 Δ {net:+.2f}")
+        memory_line = self._mai_affection_memory_line(affection)
+        if memory_line:
+            line += "\n" + memory_line
+        return line
 
     @staticmethod
     def _mai_parse_days(matched_groups: Any) -> Optional[int]:

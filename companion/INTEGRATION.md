@@ -8,9 +8,10 @@
 
 | 文件 | 职责 | 对应源模块 |
 |---|---|---|
-| `config.py` | patrol / affection / cateye / judge 四个配置段（whitelist→顶层 target 段；llm_log/proactive_log→顶层 admin 段；**新增 relation_type/relation_custom 关系配置**——miss 提示词占位 {relation}、消息口吻/后缀/档位名随关系变化，热更新经 sync_from_config；**affection 段 M1 扩为 v2**：enabled/decay_pull/baseline_ema/tier_hysteresis/tier_min_dwell_hours/daily_positive_cap/daily_negative_cap，review_* 属 M2、emotion_modulation 属 M3（均仅声明）） | config.py |
-| `affection.py` | 好感度 v2 状态层：score/baseline/5 档迟滞/日累计/事件日志 + v1→v2 迁移 + v1 字段原地保留（`level()` 保持 0/1/2 兼容口径）+ 档位变化发布 `relation.affection_tier_changed`；1 秒节流写盘 + flush | affection_manager.py（M1 重写） |
-| `affection_events.py` | 好感规则事件层（M1，零 LLM 成本）：`RULE_EVENT_TABLE` + 频控 + 日累计限幅 + `note_user_message`；`emotion_modulation` 乘数恒 1.0（M3） | 新增（MAINTENANCE_PLAN §5.4） |
+| `config.py` | patrol / affection / cateye / judge 四个配置段（whitelist→顶层 target 段；llm_log/proactive_log→顶层 admin 段；**新增 relation_type/relation_custom 关系配置**——miss 提示词占位 {relation}、消息口吻/后缀/档位名随关系变化，热更新经 sync_from_config；**affection 段 M1 扩为 v2**：enabled/decay_pull/baseline_ema/tier_hysteresis/tier_min_dwell_hours/daily_positive_cap/daily_negative_cap，**M2 起 review_enabled/review_sample_every_rounds/review_max_per_day/review_task_name 生效**；emotion_modulation 属 M3（仅声明）） | config.py |
+| `affection.py` | 好感度 v2 状态层：score/baseline/5 档迟滞/日累计/事件日志/滚动印象/关系温度 + v1→v2 迁移 + v1 字段原地保留（`level()` 保持 0/1/2 兼容口径）+ 档位变化发布 `relation.affection_tier_changed`；1 秒节流写盘 + flush | affection_manager.py（M1 重写） |
+| `affection_events.py` | 好感规则事件层（M1 规则表 + M2 裁判 kind，零 LLM 成本）：`RULE_EVENT_TABLE` + 频控 + 日累计限幅 + `note_user_message`；`llm_review`/`daily_review` 由 M2 裁判传入 delta（仅受日累计限幅）；`emotion_modulation` 乘数恒 1.0（M3） | 新增（MAINTENANCE_PLAN §5.4） |
+| `affection_referee.py` | **好感 LLM 裁判（M2）**：会话采样裁判 `evaluate_conversation_delta`（delta ∈ [-2,+2.5] + tag）+ 关系日结 `run_daily_review`（delta ∈ [-2,+2] + 0~3 条印象 + tone + reason）+ `AffectionReviewer` 编排（双频控、后台任务、sleep_started 订阅、印象 10 条/7 天、失败静默）；prompt 不含 score/baseline | 新增（MAINTENANCE_PLAN §5.4） |
 | `relation.py` | **关系系统（简单版）**：relation_type/relation_custom 配置 → RelationProfile（称谓、三档档位名 + **v2 5 档标签/描述**、口吻、后缀池、括号小剧场、档位 miss 系数表），patrol/message_service/components 消费；3 档兼容映射经 `affection.legacy_level_for_tier` 转发 | 关系扩展 |
 | `patrol.py` | 巡检调度器完整判定链：日切→静默(fail-safe)→用户冷却→预算(晚安预留)→早安(S)→晚安(S)→想念(A：随机阈值+概率+LLM 把关+驳回冷却+未来日程避让+豁免开关)→日程节点分享(B)→日常搭话(B)；决策日志每轮恰好一条（SKIP_PRIORITY）；触发经 maisaka.proactive.trigger + 计 0.5 发言数 | scheduler.py |
 | `message_service.py` | 好感度后缀 AFFECTION_SUFFIXES + 档位2 括号小剧场（10%）+ send_to_target | message_service.py |
@@ -43,7 +44,7 @@ await self._companion.stop()
 
 **规则事件层 `companion/affection_events.py`**（零 LLM 成本）
 - 统一入口 `record_rule_event(affection, kind, delta=None, desc="", *, caps=None, key="")`（`AffectionManager.record_rule_event` 同名转发）：频控 → 日累计限幅 → 入账 → 迟滞重估 → event_log/决策日志。
-- M1 表 `RULE_EVENT_TABLE`：`chat_round` +0.05（日 ≤ +1.0）、`user_initiated` +0.15（沉默 ≥1h 后对方先开口，日 ≤ +0.5）、`morning_exchange`/`night_exchange` 各 +0.2（1 次/日）、`commitment_kept` +1.0 / `commitment_broken` −0.5（每约定 1 次，`key` 去重）；日累计 positive ≤ +4.0 / negative ≥ −3.0。未登记 kind 按 `unknown_kind` 丢弃并告警（不静默扩表）。
+- M1 表 `RULE_EVENT_TABLE`：`chat_round` +0.05（日 ≤ +1.0）、`user_initiated` +0.15（沉默 ≥1h 后对方先开口，日 ≤ +0.5）、`morning_exchange`/`night_exchange` 各 +0.2（1 次/日）、`commitment_kept` +1.0 / `commitment_broken` −0.5（每约定 1 次，`key` 去重）；M2 追加 `llm_review` / `daily_review`（delta 由裁判传入并已裁剪，仅受日累计限幅）。日累计 positive ≤ +4.0 / negative ≥ −3.0。未登记 kind 按 `unknown_kind` 丢弃并告警（不静默扩表）。
 - `note_user_message()` 由 `update_last_user_msg_time()` 顺带调用；情绪调制乘数恒 1.0（`emotion_modulation` 仅声明字段，M3 接线）。
 
 **接线挂点**
@@ -54,7 +55,25 @@ await self._companion.stop()
 | 对话事件 | `components.py` `chat.receive.after_process` | target 私聊记 `chat_round` + 刷新 `last_user_msg_time`（触发 `user_initiated` 检测）；同时发 `relation.message_received` |
 | planner 注入 | `components.py` `_mai_build_activity_suffix` | 好感行改读 `tier()` + `relation.tier_label()/tier_description()`（5 档口径） |
 | 约定订阅 | `services.py` `_register_event_subscriptions`（`start()` 注册 / `stop()` 反订阅） | `schedule.commitment_kept` / `schedule.commitment_broken` → `record_rule_event`，去重键取 `commitment`（回退 `summary`） |
-| Tool/命令 | `components.py` | `cateye_test_mai_lover_affection` 与 `/cateye_test_mai_affection` 走 `update_level()`（3 档兼容、跳过迟滞）；状态行输出 score/baseline/5 档档位/今日 Δ |
+| Tool/命令 | `components.py` | `cateye_test_mai_lover_affection` 与 `/cateye_test_mai_affection` 走 `update_level()`（3 档兼容、跳过迟滞）；状态行输出 score/baseline/5 档档位/今日 Δ（M2 追加最近 1~2 条印象 + 关系温度） |
+
+## 好感 LLM 裁判（M2 落地，2026-10-03）
+
+**裁判层 `companion/affection_referee.py`**（镜像 `emotion/referee.py` 结构；LLM 全部经 `core/llm_utils.LLMService.generate`，`event=affection_review` / `affection_daily_review`，任务名取 `[affection] review_task_name`）
+
+- **会话采样裁判** `evaluate_conversation_delta()`：输入 = 最近 ~10 条对方消息 + 双方称呼与人设 + 关系档位描述 + 当前情绪低分辨率描述（`emotion.vad.mood_summary`，无 VAD 数值）；输出 `{"event"≤30字, "delta"[-2,+2.5], "tag"}`（tag ∈ normal/conflict/apology/sweet，未知回退 normal）；失败/垃圾输出返回 None。
+- **关系日结裁判** `run_daily_review()`：输入 = 当日 event_log + 互动统计（轮数/沉默后对方先开口/bot 主动发言/沉默时长/约定；取不到的字段省略）+ 最近印象 + 档位描述 + 人设；输出 `{"delta_score"[-2,+2], "impressions"0~3条, "tone", "reason"}`（reason 要求引用原文；代码层打日期、裁 3 条）。
+- **编排器** `AffectionReviewer`：会话采样双频控（每 `review_sample_every_rounds` 轮 + 每日 ≤ `review_max_per_day`，计数持久化在档案 `review` 段），LLM 请求放后台任务（不阻塞 1s 超时的 chat Hook）；日结订阅 `schedule.sleep_started`，arm 后台任务并等 `overhaul_grace_seconds`(90s) 后执行——因为 `emotion/service.py` 是「先 publish、返回后才跑睡眠大修」，注册顺序无法保证晚于大修，必须延迟；`review_enabled=false` 两个裁判整体关闭。
+- **结果应用**：delta 走 `record_rule_event` 既有入账入口（`llm_review`/`daily_review` kind，独立于 kind 上限、受 §5.5 日累计 +4/−3 限幅）→ 追加 impressions（单次 ≤3、滚动 10 条、7 天过期）→ 写 `tone` → 清空当日 `event_log`；失败时不清 log、不落印象，但记 `daily_reviewed_date`（当日不重试）。
+- **注入叠加（§5.6.1）**：`components.py` 好感后缀行后追加最近 1~2 条印象 + 最近一次日结关系温度；无印象/无 tone（含超 7 天）时输出与 M1 完全一致。
+
+**M2 接线挂点**
+
+| 挂点 | 位置 | 行为 |
+|---|---|---|
+| 会话采样触发 | `components.py` `chat.receive.after_process`（chat_round 记账点旁） | `_mai_note_review_round()` → `reviewer.note_target_message()`（滚动缓冲 + 轮次/每日双频控，命中采样只调度后台任务） |
+| 日结订阅 | `services.py` `_register_event_subscriptions`（`start()` 注册 / `stop()` 反订阅 + `reviews.close()`） | `schedule.sleep_started` → `reviewer.on_sleep_started()`（延迟 ≥90s 后日结，晚于情绪睡眠大修） |
+| 印象/tone 注入 | `components.py` `_mai_build_activity_suffix` / `_mai_affection_state_line` | 好感行后叠加「【最近印象】…；【关系温度·日期】…」，无数据降级现状 |
 
 ## 有意的裁剪 / TODO
 

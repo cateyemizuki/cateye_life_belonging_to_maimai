@@ -30,6 +30,7 @@ from planning.schedule_query import ScheduleQuery
 
 from .affection import AffectionManager
 from .affection_events import record_rule_event
+from .affection_referee import AffectionReviewer
 from .cateye_client import CateyeClient
 from .holiday_service import HolidayService
 from .memory_manager import MemoryManager
@@ -108,6 +109,12 @@ class CompanionServices:
             self.decision_logger, cateye=self.cateye, screen_store=self.screen_store,
         )
         self.patrol.set_relation(self.relation)
+        #: M2 好感 LLM 裁判编排器（会话采样 + 关系日结；总线可空降级）
+        self.reviews = AffectionReviewer(
+            plugin, self.affection, self.llm, bus=self.bus,
+            decision_logger=self.decision_logger,
+            relation_getter=lambda: self.relation,
+        )
 
     def _resolve_relation(self) -> Any:
         """从 patrol 配置段解析关系档案（relation_type / relation_custom）。"""
@@ -185,8 +192,10 @@ class CompanionServices:
 
         M1：订阅 planning 的约定兑现/违约事件 → affection_events 各记 1 次
         （``commitment_kept`` +1.0 / ``commitment_broken`` −0.5，每约定 1 次；
-        频控/限幅/档位重估都在规则事件层内完成）。幂等：已注册时直接返回，
-        其余消费者（M2/M3）在此追加 ``self._event_unsubs.append(...)``。
+        频控/限幅/档位重估都在规则事件层内完成）。
+        M2：追加订阅 ``schedule.sleep_started`` → 关系日结（大周期，§5.4-2）；
+        日结晚于情绪睡眠大修的保证机制见 ``affection_referee.AffectionReviewer.on_sleep_started``。
+        幂等：已注册时直接返回，其余消费者（M3）在此追加 ``self._event_unsubs.append(...)``。
         """
         if self.bus is None or self._event_unsubs:
             return
@@ -199,8 +208,14 @@ class CompanionServices:
                 self.bus.subscribe("schedule.commitment_broken", self._on_commitment_broken,
                                    owner="companion")
             )
+            reviewer = getattr(self, "reviews", None)
+            if reviewer is not None:
+                self._event_unsubs.append(
+                    self.bus.subscribe("schedule.sleep_started", reviewer.on_sleep_started,
+                                       owner="companion")
+                )
         except Exception as exc:
-            logger.warning("companion 约定事件订阅失败（忽略）：%s", exc)
+            logger.warning("companion 事件订阅失败（忽略）：%s", exc)
             self._unregister_event_subscriptions()
 
     async def _on_commitment_kept(self, payload: Any) -> None:
@@ -262,6 +277,12 @@ class CompanionServices:
     async def stop(self) -> None:
         """停止服务束：停巡检、清身份缓存、丢弃待注入旁白、强写好感度。"""
         self._unregister_event_subscriptions()
+        reviewer = getattr(self, "reviews", None)
+        if reviewer is not None:
+            try:
+                reviewer.close()  # 取消未执行的关系日结/采样后台任务（M2）
+            except Exception:
+                pass
         await self.patrol.stop()
         self.senders.clear()
         self.session_kinds.clear()

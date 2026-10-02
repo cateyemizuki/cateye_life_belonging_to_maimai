@@ -16,8 +16,10 @@
     record_rule_event(affection, "chat_round", 0.05, "一问一答")
     affection.record_rule_event("chat_round", 0.05, "一问一答")
 
-M2/M6 的 kind（``silence_day`` / ``conflict`` / ``apology_accepted`` / ``qzone_*``）不在本表，
-传入即按 ``unknown_kind`` 丢弃并告警——不猜测、不静默扩表。
+M2 的好感 LLM 裁判 kind（``llm_review`` / ``daily_review``）已登记：增量由裁判输出并在
+referee 侧二次限幅，本层只做日累计限幅与入账。其余 M3/M6 的 kind（``silence_day`` /
+``conflict`` / ``apology_accepted`` / ``qzone_*``）仍不在本表，传入即按 ``unknown_kind``
+丢弃并告警——不猜测、不静默扩表。
 """
 
 from __future__ import annotations
@@ -68,6 +70,18 @@ RULE_EVENT_TABLE: dict[str, dict[str, Any]] = {
         "per_key_once": True,
         "desc": "约定违约",
         "note": "每约定 1 次",
+    },
+    # ---- M2：LLM 裁判入账 kind（delta 由裁判输出并已在 referee 侧裁剪；仅受日累计限幅，
+    #      无 kind 频控——裁判本身已有每日调用上限，见 affection_referee）----
+    "llm_review": {
+        "delta": 0.0,
+        "desc": "会话采样裁判",
+        "note": "M2：delta ∈ [-2, +2.5] 由裁判传入（缺省 0 表示无事件，会被丢弃）",
+    },
+    "daily_review": {
+        "delta": 0.0,
+        "desc": "关系日结",
+        "note": "M2：delta ∈ [-2, +2] 由裁判传入；独立于 kind 上限、受 §5.5 日累计限幅",
     },
 }
 

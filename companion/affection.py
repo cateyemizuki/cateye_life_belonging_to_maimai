@@ -5,6 +5,8 @@
   （恋人 5 档，含迟滞生效值 ``tier``）+ ``daily_delta``（日累计）+ ``event_log``（当日事件）；
 - 规则事件的记账入口在 ``companion/affection_events.py``（频控 + 日累计限幅 + 档位重估）；
 - 日衰减（小周期）由日切调用：patrol 日切分支挂 ``apply_daily_decay()``（§5.5）；
+- M2 状态：``impressions``（滚动 10 条 / 7 天过期）+ ``tone``（最近一次日结关系温度）
+  + ``review``（会话采样每日次数 / 日结尝试日期），写入方是 ``companion/affection_referee.py``；
 - 档位变化发布 ``relation.affection_tier_changed``（old/new/score，经 M0 事件总线）。
 
 v1 字段原地保留（§5.3）：``habits``（memory_manager 的底层存储）、``last_user_msg_time``、
@@ -98,6 +100,16 @@ DEFAULT_DECAY_PULL = 0.06
 DEFAULT_BASELINE_EMA = 0.03
 DEFAULT_TIER_HYSTERESIS = 3.0
 DEFAULT_TIER_MIN_DWELL_HOURS = 24.0
+
+# ---- M2：滚动印象 / 关系温度（§5.3 v2 schema、§5.4 日结裁判）----
+#: impressions 滚动保留条数（§5.3：保留 10 条）
+IMPRESSION_KEEP_LIMIT = 10
+#: impressions / tone 过期天数（§5.3：7 天过期）
+IMPRESSION_EXPIRE_DAYS = 7
+#: 单条印象 / 关系温度文本上限（LLM 输出兜底裁剪）
+IMPRESSION_TEXT_LIMIT = 80
+#: 单次日结最多追加的印象条数（§5.4：0~3 条；裁判已裁剪，此处二次兜底）
+IMPRESSION_PER_DAY_LIMIT = 3
 
 
 def _to_float(value: Any, default: float) -> float:
@@ -216,6 +228,10 @@ def _build_v2_state(raw: Any, default_level: int = 0,
         "tier_entered_at": str(src.get("tier_entered_at") or now.isoformat()),
         "daily_delta": _normalize_daily_delta(src.get("daily_delta"), today),
         "event_log": _normalize_event_log(src.get("event_log")),
+        # ---- M2 字段（§5.3：impressions 为 v2 schema 既有字段，加载时规整）----
+        "impressions": _normalize_impressions(src.get("impressions")),
+        "tone": _normalize_tone(src.get("tone")),
+        "review": _normalize_review_meta(src.get("review"), today),
         # ---- v1 字段原地保留 ----
         # affection_level 只是给旧读方的回滚镜像：迁移时保留原值，其余时候跟随档位兼容口径
         "affection_level": legacy_level if migrated else legacy_level_for_tier(_clamp_tier(tier)),
@@ -248,6 +264,55 @@ def _normalize_event_log(value: Any) -> list:
         if isinstance(item, dict):
             entries.append(dict(item))
     return entries
+
+
+def _normalize_impressions(value: Any) -> list:
+    """规整 ``impressions``（§5.3 v2 schema）：``[{"date": "YYYY-MM-DD", "text": "..."}]``。"""
+    if not isinstance(value, list):
+        return []
+    entries: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        entries.append({
+            "date": str(item.get("date") or ""),
+            "text": text[:IMPRESSION_TEXT_LIMIT],
+        })
+    return entries
+
+
+def _normalize_tone(value: Any) -> Optional[dict]:
+    """规整 ``tone``（最近一次日结产出的一句话关系温度）：``{"date": ..., "text": ...}``。"""
+    if not isinstance(value, dict):
+        return None
+    text = str(value.get("text") or "").strip()
+    if not text:
+        return None
+    return {"date": str(value.get("date") or ""), "text": text[:IMPRESSION_TEXT_LIMIT]}
+
+
+def _normalize_review_meta(value: Any, today: str) -> dict:
+    """规整 M2 裁判计数段（会话采样当日次数 + 日结尝试日期）。"""
+    data = value if isinstance(value, dict) else {}
+    return {
+        "date": str(data.get("date") or today),
+        "samples": max(0, _to_int(data.get("samples"), 0)),
+        "daily_reviewed_date": str(data.get("daily_reviewed_date") or ""),
+    }
+
+
+def _within_days(date_text: Any, days: int, *, now: Optional[datetime] = None) -> bool:
+    """日期字符串是否落在最近 ``days`` 天内（含今天）；解析失败视为过期。"""
+    try:
+        parsed = datetime.strptime(str(date_text), "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return False
+    today = (now or datetime.now()).date()
+    delta_days = (today - parsed.date()).days
+    return 0 <= delta_days <= max(0, int(days))
 
 
 class AffectionManager:
@@ -383,6 +448,36 @@ class AffectionManager:
     def event_log(self) -> list:
         """当日事件日志（副本；M2 日结裁判的输入）。"""
         return [dict(item) for item in (self._state.get("event_log", []) or []) if isinstance(item, dict)]
+
+    # ---- 读：M2 滚动印象 / 关系温度 / 裁判计数 ----
+    def impressions(self) -> list[dict]:
+        """滚动印象列表（§5.3 v2 schema：``{"date", "text"}``，由关系日结裁判产出）。"""
+        return [dict(item) for item in (self._state.get("impressions", []) or [])
+                if isinstance(item, dict)]
+
+    def tone(self, *, now: Optional[datetime] = None) -> Optional[dict]:
+        """最近一次日结产出的一句话关系温度；无记录或已过 §5.3 的 7 天窗口 → None。"""
+        data = _normalize_tone(self._state.get("tone"))
+        if data is None:
+            return None
+        if not _within_days(data.get("date"), IMPRESSION_EXPIRE_DAYS, now=now):
+            return None
+        return data
+
+    def review_state(self, *, now: Optional[datetime] = None) -> dict:
+        """M2 裁判计数段：``{"date", "samples", "daily_reviewed_date"}``。
+
+        ``date`` 跨天自动滚动并清零 ``samples``（会话采样每日上限）；
+        ``daily_reviewed_date`` 保留最近一次日结尝试日期（跨重启防重复日结）。
+        """
+        today = (now or datetime.now()).strftime("%Y-%m-%d")
+        data = _normalize_review_meta(self._state.get("review"), today)
+        if data["date"] != today:
+            data["date"] = today
+            data["samples"] = 0
+            self._state["review"] = dict(data)
+            self._mark_dirty()
+        return data
 
     # ---- 读：v1 兼容口径 ----
     def level(self) -> int:
@@ -595,6 +690,76 @@ class AffectionManager:
             del log[:overflow]
             logger.warning("好感事件日志超过上限 %d 条，已丢弃最旧 %d 条", self.EVENT_LOG_LIMIT, overflow)
         self._mark_dirty()
+
+    def clear_event_log(self) -> int:
+        """清空当日事件日志（关系日结应用成功后调用，§5.4）。返回清掉的条数。"""
+        removed = len(self._state.get("event_log", []) or [])
+        self._state["event_log"] = []
+        if removed:
+            self._mark_dirty()
+        return removed
+
+    # ---- 写：M2 滚动印象 / 关系温度 / 裁判计数 ----
+    def append_impressions(self, entries: Any, *, date: str = "",
+                           now: Optional[datetime] = None) -> list[dict]:
+        """追加日结印象并按 §5.3 裁剪：单次 ≤3 条、滚动保留 10 条、7 天过期。
+
+        Args:
+            entries: 字符串序列，或 ``{"text", "date"?}`` 序列（缺 date 用 ``date`` 参数）。
+            date: 本次印象归属日期（被日结的那一天），缺省今天。
+        """
+        stamp = str(date or (now or datetime.now()).strftime("%Y-%m-%d"))
+        added: list[dict] = []
+        for item in list(entries or []):
+            if isinstance(item, dict):
+                text = str(item.get("text") or "").strip()
+                entry_date = str(item.get("date") or stamp)
+            else:
+                text = str(item or "").strip()
+                entry_date = stamp
+            if not text:
+                continue
+            added.append({"date": entry_date, "text": text[:IMPRESSION_TEXT_LIMIT]})
+            if len(added) >= IMPRESSION_PER_DAY_LIMIT:
+                break  # 每日结 0~3 条（二次兜底）
+
+        merged = self.impressions() + added
+        kept = [entry for entry in merged
+                if _within_days(entry.get("date"), IMPRESSION_EXPIRE_DAYS, now=now)]
+        kept = kept[-IMPRESSION_KEEP_LIMIT:]  # 滚动保留 10 条
+        self._state["impressions"] = [dict(entry) for entry in kept]
+        if added or kept != merged:
+            self._mark_dirty()
+        return [dict(entry) for entry in kept]
+
+    def set_tone(self, text: Any, *, date: str = "",
+                 now: Optional[datetime] = None) -> Optional[dict]:
+        """记录最近一次日结的关系温度（空文本 = 清空）。"""
+        content = str(text or "").strip()
+        if not content:
+            if self._state.get("tone"):
+                self._state["tone"] = None
+                self._mark_dirty()
+            return None
+        data = {
+            "date": str(date or (now or datetime.now()).strftime("%Y-%m-%d")),
+            "text": content[:IMPRESSION_TEXT_LIMIT],
+        }
+        self._state["tone"] = dict(data)
+        self._mark_dirty()
+        return dict(data)
+
+    def update_review_state(self, *, samples: Optional[int] = None,
+                            daily_reviewed_date: str = "") -> dict:
+        """更新 M2 裁判计数段（会话采样当日次数 / 最近一次日结尝试日期）。"""
+        data = self.review_state()
+        if samples is not None:
+            data["samples"] = max(0, _to_int(samples, data.get("samples", 0)))
+        if daily_reviewed_date:
+            data["daily_reviewed_date"] = str(daily_reviewed_date)
+        self._state["review"] = dict(data)
+        self._mark_dirty()
+        return data
 
     def apply_daily_decay(self) -> dict[str, Any]:
         """日衰减（小周期，§5.5）：score 向 baseline 回归，随后 baseline 缓慢漂移。
