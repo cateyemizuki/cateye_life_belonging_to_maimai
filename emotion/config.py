@@ -1,0 +1,77 @@
+"""情绪系统 — 配置段（每个业务模块一个独立总开关的样板）。"""
+
+from __future__ import annotations
+
+from typing import ClassVar, Dict
+
+from maibot_sdk import Field, PluginConfigBase
+
+
+def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
+    entry: Dict[str, str] = {"label": en_label}
+    if en_hint:
+        entry["hint"] = en_hint
+    return {"i18n": {"en": entry}}
+
+
+class EmotionSectionConfig(PluginConfigBase):
+    """情绪维护系统（VAD 三维模型：日常增量微调 + 睡眠期大修）。"""
+
+    __ui_label__ = "情绪系统"
+    __ui_icon__ = "smile"
+    __ui_order__ = 7
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Emotion", "description": "VAD emotion state machine with sleep overhaul."}
+    }
+
+    # ── 模块独立总开关（新模块样板：每个业务模块的第一个字段）──────
+    enabled: bool = Field(
+        default=True,
+        description="情绪模块总开关：关闭后停止情绪评估/注入/睡眠大修（命令与工具返回未启用提示）",
+        json_schema_extra={
+            "label": "启用情绪模块",
+            "hint": "每个业务模块都有独立总开关；关闭不影响其他模块",
+            **_ui_i18n("Enable emotion module", "Master switch of the emotion module."),
+        },
+    )
+    decay_rate: float = Field(
+        default=0.08,
+        ge=0.01,
+        le=0.3,
+        description="日常指数衰减率（每小时）：情绪向基线回落的速度；对话频繁可调高防无限累积",
+        json_schema_extra={"label": "衰减率", "step": 0.01, **_ui_i18n("Decay rate")},
+    )
+    evaluate_on_reply: bool = Field(
+        default=True,
+        description="每次 bot 回复后用小模型评估该轮对话的情绪增量 ΔVAD（事件→增量映射）",
+        json_schema_extra={"label": "回复后评估增量", **_ui_i18n("Evaluate on reply")},
+    )
+    evaluate_min_interval_seconds: int = Field(
+        default=60,
+        ge=0,
+        le=3600,
+        description="两次增量评估之间的最小间隔（秒），控制评估成本",
+        json_schema_extra={"label": "评估最小间隔(秒)", **_ui_i18n("Min evaluate interval (s)")},
+    )
+    evaluator_task_name: str = Field(
+        default="utils",
+        description="增量评估/睡眠裁判使用的模型任务名（裁判默认见 referee_task_name）",
+        json_schema_extra={"label": "评估任务名", **_ui_i18n("Evaluator LLM task")},
+    )
+    referee_task_name: str = Field(
+        default="replyer",
+        description="睡眠裁判 LLM 的模型任务名（独立请求，不携带对话历史）",
+        json_schema_extra={"label": "睡眠裁判任务名", **_ui_i18n("Sleep referee LLM task")},
+    )
+    injection_enabled: bool = Field(
+        default=True,
+        description="把当前情绪底色（模糊化描述）注入 replyer 提示词，引导语气与情绪一致",
+        json_schema_extra={"label": "情绪底色注入", **_ui_i18n("Mood injection")},
+    )
+    check_interval_minutes: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description="睡眠检测循环间隔（分钟）：进入日程睡眠时段后触发睡眠裁判大修",
+        json_schema_extra={"label": "睡眠检测间隔(分钟)", **_ui_i18n("Sleep check interval (min)")},
+    )

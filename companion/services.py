@@ -1,0 +1,188 @@
+"""companion 服务束：一次性初始化虚拟恋人的全部服务，供 plugin.py 持有。
+
+用法（整合者后续接入 plugin.py）：
+    self._companion = CompanionServices(self)
+    await self._companion.start()
+    ...
+    await self._companion.stop()
+
+设计约定：
+- 服务构造持 plugin 引用，运行时动态读 ``plugin.config.xxx``（配置热重载无需重建）；
+- 数据目录 ``plugin._data_dir``；
+- 顶层已有的实例（好感度/日志/LLM/巡检查询）优先复用，缺失时自建兜底；
+- 「今日日程」一律经 ``plugin._planning`` 的 ScheduleQuery 取
+  （缺省回退 ``plugin._schedule_query``，再缺省为 None → 各处降级文案）；
+- ``set_persona(lover_name, personality)`` 是人设刷新入口（顶层
+  config_reload_subscriptions 的 bot 变更回调里调用）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+from core.diag import DecisionLogger, LLMCallLogger
+from core.llm_utils import LLMService
+from planning.schedule_query import ScheduleQuery
+
+from .affection import AffectionManager
+from .cateye_client import CateyeClient
+from .holiday_service import HolidayService
+from .memory_manager import MemoryManager
+from .message_service import MessageService
+from .patrol import PatrolService
+from .screen_context import ScreenContextStore
+from .sender_identity import SenderCache, SessionKindCache
+
+
+class CompanionServices:
+    """虚拟恋人服务束（好感度 / 巡检 / 消息 / 记忆 / 屏幕感知 / 节假日）。"""
+
+    def __init__(self, plugin: Any) -> None:
+        self.plugin = plugin
+        self.ctx = plugin.ctx
+        self._data_dir = Path(getattr(plugin, "_data_dir", Path(".")))
+
+        cfg = plugin.config
+        # ---- 复用顶层已有实例（只增不改名；缺失时自建兜底）----
+        self.affection: AffectionManager = (
+            getattr(plugin, "_affection", None)
+            or AffectionManager(self._data_dir, default_level=int(getattr(cfg.affection, "current_level", 0)))
+        )
+        self.decision_logger: Optional[DecisionLogger] = getattr(plugin, "_decision_logger", None)
+        self.llm_logger: Optional[LLMCallLogger] = getattr(plugin, "_llm_logger", None)
+        self.llm: LLMService = (
+            getattr(plugin, "_llm", None)
+            or LLMService(self.ctx, task_name=cfg.schedule.llm_task_name, call_logger=self.llm_logger,
+                          config_provider=lambda: plugin.config)
+        )
+        # 日程查询：消费 planning 子模块（顶层 plugin._schedule_query 即 planning.ScheduleQuery）
+        self.schedule_query: Optional[ScheduleQuery] = getattr(plugin, "_schedule_query", None)
+
+        # ---- 纯 companion 服务 ----
+        #: 发送者身份缓存（v2.5.0：上下文条目里只有 msg_id 与显示名，靠反查判定恋人）
+        self.senders = SenderCache()
+        #: 会话 ID → 是否群聊
+        self.session_kinds = SessionKindCache()
+        #: 屏幕旁白「尾随锚点」注入缓存（触发时发布，请求 Hook 消费）
+        cateye_cfg = getattr(cfg, "cateye", None)
+        self.screen_store = ScreenContextStore(
+            ttl_minutes=float(getattr(cateye_cfg, "context_ttl_minutes", 90) or 90)
+        )
+        #: 恋人电脑联动客户端（connect-hub 跨插件 API）
+        self.cateye = CateyeClient(plugin, llm=self.llm, call_logger=self.llm_logger)
+        #: 节假日服务（注入日期行用）
+        self.holiday = HolidayService(self._data_dir)
+        #: 本地记忆库（用户习惯）
+        self.memory = MemoryManager(self.affection)
+        #: 关系档案（对方是 bot 的谁：恋人/挚友/维护者/家人/自定义，随配置热更新）
+        self.relation = self._resolve_relation()
+        #: 消息发送服务（情绪后缀 + 直发）
+        self.message = MessageService(plugin, self.affection, lover_name=self.lover_name)
+        self.message.set_relation(self.relation)
+        self.affection.set_level_labels(self.relation.level_labels)
+        #: 巡检调度器（完整判定链）
+        self.patrol = PatrolService(
+            self.ctx, plugin, self.affection, self.schedule_query, self.llm,
+            self.decision_logger, cateye=self.cateye, screen_store=self.screen_store,
+        )
+        self.patrol.set_relation(self.relation)
+
+    def _resolve_relation(self) -> Any:
+        """从 patrol 配置段解析关系档案（relation_type / relation_custom）。"""
+        from .relation import resolve_relation
+
+        patrol_cfg = getattr(self.plugin.config, "patrol", None)
+        return resolve_relation(
+            getattr(patrol_cfg, "relation_type", "恋人"),
+            getattr(patrol_cfg, "relation_custom", ""),
+        )
+
+    # ------------------------------------------------------------------
+    # 人设与目标
+    # ------------------------------------------------------------------
+    @property
+    def lover_name(self) -> str:
+        return str(getattr(self.plugin, "_lover_name", "") or "麦麦")
+
+    @property
+    def personality(self) -> str:
+        return str(getattr(self.plugin, "_personality", "") or "")
+
+    def set_persona(self, lover_name: str, personality: str = "") -> None:
+        """人设刷新入口（顶层的 bot 配置热重载回调里调用）。"""
+        self.patrol.set_persona(lover_name, personality or self.personality)
+        self.message.set_lover_name(lover_name)
+
+    def set_target(self, target_qq: str, stream_id: str) -> None:
+        """目标会话解析结果透传给巡检器（stream 解析成功/变化时调用）。"""
+        self.patrol.set_target(target_qq, stream_id)
+
+    def sync_from_config(self) -> None:
+        """配置热重载后同步动态项（关系档案 / llm 任务名 / 好感度档位 / 旁白 TTL / 日志开关）。"""
+        cfg = self.plugin.config
+        try:
+            self.relation = self._resolve_relation()
+            self.message.set_relation(self.relation)
+            self.patrol.set_relation(self.relation)
+            self.affection.set_level_labels(self.relation.level_labels)
+        except Exception:
+            pass
+        try:
+            self.llm.update_task(cfg.schedule.llm_task_name)
+        except Exception:
+            pass
+        try:
+            self.affection.update_level(int(getattr(cfg.affection, "current_level", self.affection.level())))
+        except Exception:
+            pass
+        cateye_cfg = getattr(cfg, "cateye", None)
+        try:
+            self.screen_store.ttl_seconds = (
+                max(0.0, float(getattr(cateye_cfg, "context_ttl_minutes", 90) or 0)) * 60.0
+            )
+        except Exception:
+            pass
+        admin = getattr(cfg, "admin", None)
+        if admin is not None:
+            if self.llm_logger is not None:
+                self.llm_logger.update_settings(admin.llm_log_enabled, admin.log_retention_days)
+            if self.decision_logger is not None:
+                self.decision_logger.update_settings(admin.decision_log_enabled, admin.log_retention_days)
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+    async def start(self) -> None:
+        """启动服务束（幂等）：加载时清理过期日志、预热节假日缓存；
+        目标 stream 已解析则启动巡检循环（未解析时由顶层重试循环解析后再调）。"""
+        try:
+            if self.llm_logger is not None:
+                self.llm_logger.cleanup()
+            if self.decision_logger is not None:
+                self.decision_logger.cleanup()
+        except Exception:
+            pass
+        patrol_enabled = bool(getattr(getattr(self.plugin.config, 'patrol', None), 'enabled', True))
+        if patrol_enabled and self.patrol.has_target():
+            self.patrol.start()
+        elif not patrol_enabled:
+            self.plugin.ctx.logger.info('恋人模块已停用（patrol.enabled=false），巡检循环未启动')
+        # 预热当天节假日缓存，避免首次 planner 注入阻塞在 API 调用
+        try:
+            asyncio.ensure_future(self.holiday.get_holiday_info(datetime.now().strftime("%Y-%m-%d")))
+        except Exception:
+            pass
+
+    async def stop(self) -> None:
+        """停止服务束：停巡检、清身份缓存、丢弃待注入旁白、强写好感度。"""
+        await self.patrol.stop()
+        self.senders.clear()
+        self.session_kinds.clear()
+        self.screen_store.discard()
+        try:
+            self.affection.flush()
+        except Exception:
+            pass
