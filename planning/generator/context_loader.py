@@ -11,7 +11,7 @@ from datetime import datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 
 from ..stream_filter import is_stream_allowed
-from ..timezone_manager import TimezoneManager
+from ..time_utils import TimezoneManager
 from ..goal_manager import GoalManager
 
 logger = logging.getLogger(__name__)

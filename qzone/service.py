@@ -37,7 +37,7 @@ from core.llm_utils import LLMService
 from .cgi import QzoneCookieManager, QzoneWebClient
 from planning.schedule_query import ScheduleQuery
 from core.storage import load_json, save_json_atomic
-from core.time_utils import is_in_time_window
+from planning.time_utils import is_in_time_window
 
 # ---- 调用通道（按序尝试，命中后缓存）----
 # 通道1：官方 SnowLuma 适配器的语义化 QZone API（params 包一层）

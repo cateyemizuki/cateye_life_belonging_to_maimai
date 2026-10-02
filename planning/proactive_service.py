@@ -29,8 +29,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .config import PlanningProactiveSectionConfig, ScheduleSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
-from .time_utils import parse_time_window
-from .timezone_manager import TimezoneManager
+from .time_utils import TimezoneManager, parse_time_window
 
 if TYPE_CHECKING:
     from typing import Any as _Plugin

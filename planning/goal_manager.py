@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from core.time_utils import parse_hhmm
 from .schedule_db import ScheduleDB
-from .timezone_manager import TimezoneManager
+from .time_utils import TimezoneManager
 
 logger = logging.getLogger(__name__)
 

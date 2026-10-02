@@ -24,7 +24,7 @@ v4.7.0 改造：
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
-from ..timezone_manager import TimezoneManager
+from ..time_utils import TimezoneManager
 
 logger = logging.getLogger(__name__)
 

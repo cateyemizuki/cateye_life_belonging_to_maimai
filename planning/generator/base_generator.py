@@ -10,7 +10,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
-from ..timezone_manager import TimezoneManager
+from ..time_utils import TimezoneManager
 from ..goal_manager import GoalManager
 from .context_loader import ScheduleContextLoader
 from .prompt_builder import PromptBuilder

@@ -24,8 +24,9 @@ from typing import Any, Optional
 
 from core.diag import DecisionLogger
 from core.llm_utils import LLMService
-from core.time_utils import hours_between, is_in_time_window, parse_hhmm
+from core.time_utils import hours_between, parse_hhmm
 from planning.schedule_query import ScheduleQuery
+from planning.time_utils import is_in_time_window
 
 from .affection import AffectionManager
 from .cateye_client import PEEK_OFFLINE

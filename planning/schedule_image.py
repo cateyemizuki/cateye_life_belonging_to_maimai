@@ -24,7 +24,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .timezone_manager import TimezoneManager
+from .time_utils import TimezoneManager
 
 logger = logging.getLogger(__name__)
 

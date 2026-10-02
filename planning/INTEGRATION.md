@@ -21,7 +21,7 @@
 | `role_judge.py` | 自然语言约定裁判（today/future/reject + 宽松 JSON 解析） | planner/role_judge.py |
 | `tools_service.py` / `command_service.py` | 4 个 Tool 实现体 + /plan 命令（图片+文字合并转发，失败降级） | services/tools_service.py、command_service.py |
 | `schedule_image.py` + `assets/fonts/` | PIL 日程图片渲染（asyncio.to_thread + 超时，失败静默；pillow 可选依赖） | utils/schedule_image_generator.py |
-| `energy_model.py` / `timezone_manager.py` / `stream_filter.py` / `lru_cache.py` / `time_utils.py` / `parameter_validator.py` | 基础工具照搬 | utils/*、cache/ |
+| `time_utils.py`（窗口迁移/时区管理/能量模型，R0-C2 合并） / `stream_filter.py` / `lru_cache.py` / `parameter_validator.py` | 基础工具照搬 | utils/*、cache/ |
 | `components.py` | `PlanningComponentsMixin`：4 Tool + /plan Command + get_current_activity API + 2 HookHandler（方法名 `plan_` 前缀） | plugin.py 组件面 |
 | `services.py` | `PlanningServices` 服务束（初始化/启动/停止全部后台循环；重绑 plugin._schedule_gen 为完整管线） | plugin.py 装配段 |
 

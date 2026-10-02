@@ -26,7 +26,7 @@ cateye_test/
 │   ├── inject/ + inject_service.py   # 意图分类 / 注入优化器 / 上下文缓存 / 状态分析
 │   ├── proactive_service.py / auto_scheduler.py / cleanup_service.py / role_judge.py
 │   ├── tools_service.py / command_service.py / schedule_image.py(+assets/fonts)
-│   └── exceptions.py / energy_model.py / timezone_manager.py / stream_filter.py / lru_cache.py ...
+│   └── exceptions.py / time_utils.py（窗口/时区/能量，R0-C2 合并） / stream_filter.py / lru_cache.py ...
 ├── companion/         # 虚拟恋人复刻（日程除外，详见 companion/INTEGRATION.md）
 │   ├── config.py / services.py / components.py
 │   ├── affection.py / patrol.py / message_service.py / memory_manager.py

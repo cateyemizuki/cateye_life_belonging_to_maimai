@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from .config import InjectSectionConfig, ScheduleSectionConfig, section_or_default
-from .energy_model import describe_energy, get_energy_level
 from .goal_manager import get_goal_manager
 from .inject import (
     ActivityStateAnalyzer,
@@ -41,8 +40,7 @@ from .inject import (
     UserIntent,
 )
 from .lru_cache import LRUCache
-from .time_utils import parse_time_window, strip_tz
-from .timezone_manager import TimezoneManager
+from .time_utils import TimezoneManager, describe_energy, get_energy_level, parse_time_window, strip_tz
 
 if TYPE_CHECKING:
     from typing import Any as _Plugin

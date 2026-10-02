@@ -1,4 +1,8 @@
-"""时间工具：HH:MM 解析、时间窗口判断（支持跨午夜）、分钟换算。"""
+"""时间工具：HH:MM 解析与分钟换算等纯时间函数。
+
+R0-C2：窗口类判定（is_in_time_window）已迁至 planning/time_utils.py，
+本模块只保留纯时间函数；core 不依赖 planning。
+"""
 
 from __future__ import annotations
 
@@ -19,20 +23,6 @@ def parse_hhmm(value: str, default_minutes: int = 0) -> int:
 
 def minutes_of_now(now: datetime | None = None) -> int:
     return (now or datetime.now()).hour * 60 + (now or datetime.now()).minute
-
-
-def is_in_time_window(window_start: str, window_end: str, current: str, *, invalid_result: bool = False) -> bool:
-    """判断 current("HH:MM") 是否落在 [start, end) 窗口内。
-
-    start > end 视为跨午夜区间（如 22:00-06:00）。时间配置非法时返回 invalid_result
-    （静默窗口等 fail-safe 场景传 True：配置坏了宁可当静默处理）。
-    """
-    start, end, cur = parse_hhmm(window_start, -1), parse_hhmm(window_end, -1), parse_hhmm(current, -1)
-    if start < 0 or end < 0 or cur < 0:
-        return invalid_result
-    if start <= end:
-        return start <= cur < end
-    return cur >= start or cur < end  # 跨午夜
 
 
 def next_run_at(now: datetime, hhmm: str) -> datetime:

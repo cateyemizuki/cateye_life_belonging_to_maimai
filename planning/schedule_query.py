@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .schedule_db import ScheduleDB
-from .energy_model import describe_energy, get_energy_level
+from .time_utils import describe_energy, get_energy_level
 from core.time_utils import minutes_of_now
 
 # sleep 类型条目不算「正在做的事」

@@ -19,8 +19,7 @@ from .config import ScheduleSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
 from .schedule_image import ScheduleImageGenerator
 from .stream_filter import is_stream_allowed
-from .time_utils import format_minutes_to_time, get_time_window_from_goal, strip_tz
-from .timezone_manager import TimezoneManager
+from .time_utils import TimezoneManager, format_minutes_to_time, get_time_window_from_goal, strip_tz
 
 if TYPE_CHECKING:
     from typing import Any as _Plugin

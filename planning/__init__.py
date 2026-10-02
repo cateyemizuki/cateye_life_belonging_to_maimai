@@ -16,6 +16,6 @@
 - command_service.py    /plan 命令业务实现（含日程图片合并转发）
 - cleanup_service.py    过期日程 / 旧目标清理循环
 - schedule_image.py     PIL 日程图片渲染（pillow 可选，失败静默降级）
-- exceptions.py / parameter_validator.py / time_utils.py / timezone_manager.py /
-  stream_filter.py / energy_model.py / lru_cache.py   公共设施（照搬源插件）
+- exceptions.py / parameter_validator.py / time_utils.py（含时区管理/能量模型，R0-C2 合并） /
+  stream_filter.py / lru_cache.py   公共设施（照搬源插件）
 """

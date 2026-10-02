@@ -19,7 +19,7 @@ from .goal_manager import GoalManager, GoalPriority, get_goal_manager
 from .parameter_validator import ParameterValidator
 from .role_judge import judge_schedule_request
 from .schedule_generator import ScheduleGenerator
-from .timezone_manager import TimezoneManager
+from .time_utils import TimezoneManager
 
 if TYPE_CHECKING:
     from typing import Any as _Plugin
