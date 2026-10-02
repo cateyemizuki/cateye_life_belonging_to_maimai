@@ -24,6 +24,7 @@ from companion.components import CompanionComponentsMixin
 from companion.services import CompanionServices
 from config import SUPPORTED_CONFIG_VERSION, CateyeSuiteConfig
 from core.diag import DecisionLogger, LLMCallLogger
+from core.event_bus import EventBus, install_proactive_budget
 from core.llm_utils import LLMService
 from emotion.components import EmotionComponentsMixin
 from emotion.services import EmotionServices
@@ -62,6 +63,12 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._llm = LLMService(self.ctx, task_name=cfg.schedule.llm_task_name,
                                call_logger=self._llm_logger, config_provider=lambda: self.config)
         self._schedule_query = ScheduleQuery(self._db, cache_minutes=cfg.schedule.inject_cache_minutes)
+
+        # 进程内事件总线（M0，MAINTENANCE_PLAN §三）：先于服务束构造（各服务束自读 plugin._bus），
+        # 预算计数器在装配时装入（先于服务束启动；M0 实际订阅者仅它）
+        self._bus = EventBus(self._decision_logger)
+        self._proactive_budget = install_proactive_budget(
+            self._bus, config_provider=lambda: self.config, decision_logger=self._decision_logger)
 
         # 服务束（内部动态读 self.config，热重载自动生效）
         self._planning = PlanningServices(self)

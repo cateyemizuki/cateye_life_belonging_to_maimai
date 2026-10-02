@@ -116,6 +116,13 @@ class PatrolService:
         # 非法时间窗口配置的告警节流：配置项 -> 已告警过的原始值
         self._invalid_time_warned: dict[str, str] = {}
 
+    # ---- 事件总线（M0；self._config 可能是 plugin 或配置对象，均可空降级）----
+    def _event_bus(self) -> Any:
+        bus = getattr(self._config, "_bus", None)
+        if bus is None:
+            bus = getattr(getattr(self._config, "config", None), "_bus", None)
+        return bus
+
     # ---- 配置段访问（self._config 可能是 plugin（.config 承载各段）或配置对象本身）----
     def _patrol_cfg(self) -> Any:
         cfg_section = getattr(self._config, "patrol", None)
@@ -485,12 +492,22 @@ class PatrolService:
         return await self._trigger_planner("daily", "日常巡检")
 
     async def _trigger_planner(self, intent: str, reason: str) -> bool:
-        """统一触发 planner：先看一眼恋人电脑（旁白挂入缓存），再 proactive.trigger。
+        """统一触发 planner：全渠道预算查询 → proactive.used → 看电脑 → proactive.trigger。
 
-        入队失败/异常时把刚发布的旁白撤掉，避免它被之后某轮普通对话锚上。
+        M0 预算接线（§六.2 H）：五类触发都走本入口，触发前先查全渠道打扰预算，
+        超额直接放弃；入队失败/异常时把刚发布的旁白撤掉，避免它被之后某轮普通对话锚上。
         """
         if not self._stream_id or not self._patrol_cfg().proactive_trigger_enabled:
             return False
+        bus = self._event_bus()
+        if bus is not None:
+            if not bus.allow_proactive("patrol", str(intent or "")):
+                return False
+            try:
+                await bus.publish("proactive.used", source="companion",
+                                  channel="patrol", intent=str(intent or ""))
+            except Exception:
+                pass
         await self._publish_screen_narration()
         try:
             result = await self._ctx.maisaka.proactive.trigger(

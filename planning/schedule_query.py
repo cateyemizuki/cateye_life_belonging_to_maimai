@@ -9,7 +9,7 @@ from .schedule_db import ScheduleDB
 from .time_utils import describe_energy, get_energy_level
 from core.time_utils import minutes_of_now
 
-# sleep 类型条目不算「正在做的事」
+# sleep 类型条目不算「正在做的事」（仅 include_sleep=True 的调用方可见，如情绪睡眠循环）
 _SKIP_TYPES = {"sleep"}
 
 
@@ -22,24 +22,30 @@ class ScheduleQuery:
     def get_day_schedule(self, date: str) -> List[Dict[str, Any]]:
         return self._db.get_day_schedule(date)
 
-    def find_current_activity(self, date: str, now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
-        """返回当前正在进行的日程条目（sleep 类型跳过）；结果按 N 分钟窗口缓存。"""
+    def find_current_activity(self, date: str, now: Optional[datetime] = None,
+                              include_sleep: bool = False) -> Optional[Dict[str, Any]]:
+        """返回当前正在进行的日程条目（默认跳过 sleep 类型）；结果按 N 分钟窗口缓存。
+
+        include_sleep=True 时 sleep 条目也参与匹配（情绪睡眠循环用）；
+        缓存键区分该开关，避免共享实例上不同调用方互相串用结果。
+        """
         now = now or datetime.now()
         window = minutes_of_now(now) // (self._cache_minutes * 60)
-        cached = self._cache.get(f"cur_{date}")
+        key = f"cur_{date}_{int(bool(include_sleep))}"
+        cached = self._cache.get(key)
         if cached and cached[0] == window:
             return cached[1] or None
         current = None
         cur_min = minutes_of_now(now)
         for item in self._db.get_day_schedule(date):
-            if item.get("goal_type") in _SKIP_TYPES:
+            if not include_sleep and item.get("goal_type") in _SKIP_TYPES:
                 continue
             if int(item.get("start_minute") or 0) <= cur_min < int(item.get("end_minute") or 0):
                 current = item
                 break
         if len(self._cache) > 64:  # 简单防膨胀
             self._cache.clear()
-        self._cache[f"cur_{date}"] = (window, current or "")
+        self._cache[key] = (window, current or "")
         return current
 
     def find_next_activities(self, date: str, limit: int = 3, now: Optional[datetime] = None) -> List[Dict[str, Any]]:

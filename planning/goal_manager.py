@@ -228,7 +228,23 @@ class GoalManager:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = db if db is not None else ScheduleDB(self.data_dir / db_name)
         self.tz_manager = TimezoneManager()
+        #: 进程内事件总线（M0；由 PlanningServices 装配时绑定，未绑定=静默跳过事件）
+        self._bus: Optional[Any] = None
         logger.debug("GoalManager 初始化完成，数据库: %s", self.data_dir / db_name)
+
+    def bind_event_bus(self, bus: Optional[Any]) -> None:
+        """绑定事件总线（M0 装配点；允许 None=不发事件，兼容独立测试）。"""
+        self._bus = bus
+
+    def _publish_soon(self, event: str, **payload: Any) -> None:
+        """同步上下文发布事件（本方法非 async，publish_soon 内部 create_task）。"""
+        bus = self._bus
+        if bus is None:
+            return
+        try:
+            bus.publish_soon(event, source="planning", **payload)
+        except Exception:
+            logger.debug("事件发布失败：%s", event, exc_info=True)
 
     # ============================================================
     # 目标 CRUD（goals 表）
@@ -364,14 +380,40 @@ class GoalManager:
             and (g.parameters or {}).get("commitment_date") == commitment_date
         ]
 
-    def consume_pending_commitments(self, commitment_date: str) -> List[Goal]:
-        """消费指定日期的全部未消费约定（标记 COMPLETED，保留审计）。"""
+    def consume_pending_commitments(self, commitment_date: str,
+                                   *, matched_titles: Optional[Any] = None) -> List[Goal]:
+        """消费指定日期的全部未消费约定（标记 COMPLETED，保留审计）。
+
+        Args:
+            commitment_date: 约定日期（YYYY-MM-DD）。
+            matched_titles: 本次日程生成中已匹配到日程项的约定标题集合（M0 新增，默认 None）。
+                None=未知匹配结果（按兑现上报）；非 None 时未匹配的约定上报为违约。
+                消费事件：``schedule.commitment_kept`` / ``schedule.commitment_broken``（附录 A）。
+        """
         consumed = self.get_pending_commitments(commitment_date)
         for goal in consumed:
             self.db.update_goal(goal.goal_id, status=GoalStatus.COMPLETED.value)
         if consumed:
             logger.info("已消费 %d 条 %s 的未来约定", len(consumed), commitment_date)
+            self._publish_commitments(consumed, matched_titles)
         return consumed
+
+    def _publish_commitments(self, consumed: List[Goal], matched_titles: Optional[Any]) -> None:
+        """按匹配结果逐条上报约定兑现/违约（M0；无总线时静默）。"""
+        known = None if matched_titles is None else {str(t) for t in matched_titles}
+        for goal in consumed:
+            params = goal.parameters or {}
+            title = str(goal.name or "").strip()
+            when = str(params.get("time") or "").strip()
+            notes = str(params.get("notes") or "").strip()
+            kept = True if known is None else title in known
+            self._publish_soon(
+                "schedule.commitment_kept" if kept else "schedule.commitment_broken",
+                summary=f"{title}（{when}）" if when else title,
+                commitment=title, time=when, notes=notes,
+                date=str(params.get("commitment_date") or ""),
+                matched=kept,
+            )
 
     # ============================================================
     # 日程 Goal 合成视图（schedule_items → 带 time_window 的 Goal）

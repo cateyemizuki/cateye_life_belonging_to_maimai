@@ -45,6 +45,10 @@ class PlanningServices:
         self._plugin = plugin
         self._started = False
         self._bg_tasks: List[asyncio.Task] = []
+        #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
+        self.bus = getattr(plugin, "_bus", None)
+        #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
+        self._event_unsubs: List[Any] = []
 
         data_dir = getattr(plugin, "_data_dir", None)
         if data_dir is None:
@@ -52,6 +56,8 @@ class PlanningServices:
 
         # GoalManager 单例（复用 plugin._db 的 SQLite 连接，避免双连接写竞争）
         self.goal_manager = get_goal_manager(str(data_dir), db=plugin._db)
+        # 约定消费事件（commitment_kept/broken）经总线上报（M0；无总线时静默跳过）
+        self.goal_manager.bind_event_bus(self.bus)
 
         # 完整版日程生成器（多轮生成 + 约定匹配 + 上下文增强）。
         # 重绑 plugin._schedule_gen：plugin.py 既有调用点（_ensure_today_schedule /
@@ -74,6 +80,25 @@ class PlanningServices:
         logger.info("PlanningServices 初始化完成（完整管线已接管日程生成）")
 
     # ------------------------------------------------------------
+    # 事件订阅挂点（M0：登记于此，M3+ 消费者按需 subscribe 并存入 _event_unsubs）
+    # ------------------------------------------------------------
+    def _register_event_subscriptions(self) -> None:
+        """订阅注册挂点（start() 调用）。M0 本束无订阅者：
+        唯一的实际订阅（proactive.used → 预算计数器）由 core/event_bus 在装配时安装。
+        M3+ 消费者在此 ``self._event_unsubs.append(self.bus.subscribe(...))``。"""
+        if self.bus is None:
+            return
+
+    def _unregister_event_subscriptions(self) -> None:
+        """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""
+        for unsub in self._event_unsubs:
+            try:
+                unsub()
+            except Exception:
+                logger.warning("planning 反订阅失败", exc_info=True)
+        self._event_unsubs.clear()
+
+    # ------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------
 
@@ -82,6 +107,7 @@ class PlanningServices:
         if self._started:
             return
         self._started = True
+        self._register_event_subscriptions()
         if not bool(getattr(self._plugin.config.schedule, "enabled", True)):
             logger.info("日程规划模块已停用（schedule.enabled=false），后台循环未启动")
             return
@@ -95,6 +121,7 @@ class PlanningServices:
 
     async def stop(self) -> None:
         """停止并取消全部后台任务，释放 GoalManager 单例。"""
+        self._unregister_event_subscriptions()
         try:
             await self.proactive.stop()
         except Exception:

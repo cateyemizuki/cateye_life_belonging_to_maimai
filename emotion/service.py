@@ -43,6 +43,23 @@ class EmotionService:
         self._stop_event: Optional[asyncio.Event] = None
         self._task: Optional[asyncio.Task] = None
         self._bg_tasks: list[asyncio.Task] = []
+        # M0 事件：睡眠进出观测（schedule.sleep_started / woke_up 只在进出沿各发一次）
+        self._in_sleep = False
+        self._sleep_started_at: Optional[datetime] = None
+        self._sleep_planned_hours = 0.0
+
+    # ── 事件总线（M0；无总线时静默跳过）─────────────────────
+    def _bus(self) -> Any:
+        return getattr(self._plugin, "_bus", None)
+
+    async def _publish(self, event: str, **payload: Any) -> None:
+        bus = self._bus()
+        if bus is None:
+            return
+        try:
+            await bus.publish(event, source="emotion", **payload)
+        except Exception:
+            pass
 
     # ── 开关与门控 ──────────────────────────────────────────
     def _enabled(self) -> bool:
@@ -117,6 +134,8 @@ class EmotionService:
         event, delta = result
         self._machine.record_event(event or "日常对话", delta)
         self._save_state()
+        # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
+        await self._publish("emotion.updated", mood=self.mood_text(), trigger="reply_evaluated")
 
     def _llm(self) -> Any:
         llm = getattr(self._plugin, "_llm", None)
@@ -166,8 +185,8 @@ class EmotionService:
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
 
-        # 当前活动必须是睡眠条目，且今天尚未大修过
-        current = query.find_current_activity(today) if query else None
+        # 当前活动必须是睡眠条目，且今天尚未大修过（sleep 需 include_sleep 才可见）
+        current = query.find_current_activity(today, include_sleep=True) if query else None
         if current is None or str(current.get("goal_type") or "") != "sleep":
             return {"ok": False, "reason": "当前无睡眠日程条目"}
         sleep_hours = self._sleep_hours(current)
@@ -190,6 +209,13 @@ class EmotionService:
         applied["reasons"] = reasons
         applied["ok"] = True
         self._save_state()
+        # M0 事件：醒后 VAD + 恢复系数（附录 A ★，consumer=planning/qzone）；
+        # 同步发一次 emotion.updated（低分辨率 VAD），保持「VAD 结算即有事件流」。
+        mood = self.mood_text()
+        await self._publish("emotion.overhauled", mood=mood,
+                            recovery_factor=applied.get("recovery_factor", 0.0),
+                            sleep_hours=applied.get("sleep_hours", 0.0))
+        await self._publish("emotion.updated", mood=mood, trigger="sleep_overhaul")
         return applied
 
     async def _loop(self) -> None:
@@ -212,9 +238,11 @@ class EmotionService:
         if query is None:
             return
         now = datetime.now()
-        current = query.find_current_activity(now.strftime("%Y-%m-%d"), now)
+        current = query.find_current_activity(now.strftime("%Y-%m-%d"), now, include_sleep=True)
         if current is None or str(current.get("goal_type") or "") != "sleep":
+            await self._publish_woke_up_if_needed(now)  # M0：离开睡眠条目 → schedule.woke_up
             return
+        await self._publish_sleep_started_if_needed(current, now)  # M0：进入睡眠 → sleep_started
         state = load_json(self._state_path, {}) or {}
         if state.get("applied_sleep_date") == now.strftime("%Y-%m-%d"):
             return
@@ -229,6 +257,30 @@ class EmotionService:
             )
         else:
             self._ctx.logger.debug("睡眠情绪大修未执行：%s", outcome.get("reason"))
+
+    # ── 睡眠进出事件（M0：只发事件，不做冻结/结算——那是 M5）──
+    async def _publish_sleep_started_if_needed(self, item: Dict[str, Any], now: datetime) -> None:
+        """进入睡眠条目的上升沿 → schedule.sleep_started（payload: sleep_hours）。"""
+        if self._in_sleep:
+            return
+        self._in_sleep = True
+        self._sleep_started_at = now
+        self._sleep_planned_hours = self._sleep_hours(item)
+        await self._publish("schedule.sleep_started",
+                            sleep_hours=round(self._sleep_planned_hours, 2),
+                            date=now.strftime("%Y-%m-%d"))
+
+    async def _publish_woke_up_if_needed(self, now: datetime) -> None:
+        """离开睡眠条目的下降沿 → schedule.woke_up（sleep_hours 醒后补实际观测时长）。"""
+        if not self._in_sleep:
+            return
+        started = self._sleep_started_at
+        self._in_sleep = False
+        self._sleep_started_at = None
+        elapsed = (now - started).total_seconds() / 3600.0 if started else self._sleep_planned_hours
+        await self._publish("schedule.woke_up",
+                            sleep_hours=round(max(0.0, elapsed), 2),
+                            date=now.strftime("%Y-%m-%d"))
 
     # ── 初始化（人设推导）────────────────────────────────────
     async def initialize_from_persona(self) -> str:

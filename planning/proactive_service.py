@@ -126,6 +126,9 @@ class ProactiveService:
         self._current_factor: Dict[str, float] = {}
         # 白名单解析缓存：{raw_entry: (session_id 或 None, expire_at)}
         self._resolved_cache: Dict[str, Tuple[Optional[str], float]] = {}
+        # 活动切换判定（M0 事件）：上一次观测到的活动 (name, goal_type, start_minutes)
+        self._last_activity_key: Optional[Tuple[str, str, int]] = None
+        self._last_activity_info: Optional[Tuple[str, str, int, int, Dict[str, Any]]] = None
 
     # ------------------------------------------------------------
     # 循环骨架
@@ -392,6 +395,8 @@ class ProactiveService:
 
         activity_info = self._find_current_activity()
         first_activity = self._find_first_activity_today()
+        # M0 事件：活动切换判定处 → schedule.activity_ended / activity_started（附录 A ★）
+        await self._publish_activity_transition(activity_info)
 
         # 1. 频率调控（每个 stream 独立，因子不变则跳过）
         if cfg_p.enable_frequency_modulation and activity_info is not None:
@@ -711,6 +716,19 @@ class ProactiveService:
             logger.warning("宿主未提供 maisaka.proactive.trigger 能力，主动发起跳过")
             return False
 
+        # M0 预算接线（§六.2 H）：查询预算 → 发布 proactive.used → 执行触发。
+        # 活动切换主动开口与早间问好共用本调用处，两条通道受同一个全渠道预算约束。
+        bus = self._event_bus()
+        if bus is not None:
+            label = str(reason or intent_prompt or "proactive")
+            if not bus.allow_proactive("planning", label):
+                return False
+            try:
+                await bus.publish("proactive.used", source="planning",
+                                  channel="planning", intent=label)
+            except Exception:
+                logger.debug("proactive.used 发布失败", exc_info=True)
+
         result = None
         if priority and priority != "normal":
             try:
@@ -771,3 +789,82 @@ class ProactiveService:
                 reason=reason,
                 stream_id=stream_id,
             )
+
+    # ------------------------------------------------------------
+    # 事件总线（M0）：活动切换事件（无总线时静默跳过）
+    # ------------------------------------------------------------
+
+    def _event_bus(self) -> Any:
+        return getattr(self._plugin, "_bus", None)
+
+    async def _publish_activity_transition(
+        self,
+        activity_info: Optional[Tuple[str, str, int, int, Dict[str, Any]]],
+    ) -> None:
+        """活动切换判定处：上一个活动结束 + 当前活动开始（附录 A ★）。
+
+        以本循环上次观测到的活动为准（含进程启动后的首次观测）；无切换时静默。
+        payload：activity_started = name/goal_type/time_window/stress；
+        activity_ended = name/goal_type。
+        """
+        bus = self._event_bus()
+        if bus is None:
+            return
+        key: Optional[Tuple[str, str, int]] = None
+        if activity_info is not None:
+            key = (str(activity_info[0]), str(activity_info[1]), int(activity_info[2]))
+        if key == self._last_activity_key:
+            return
+        previous = self._last_activity_info
+        self._last_activity_key = key
+        self._last_activity_info = activity_info
+        try:
+            if previous is not None:
+                await bus.publish("schedule.activity_ended", source="planning",
+                                  name=str(previous[0]), goal_type=str(previous[1]))
+            if activity_info is not None:
+                name, goal_type, start_minutes, end_minutes, _params = activity_info
+                await bus.publish(
+                    "schedule.activity_started", source="planning",
+                    name=str(name), goal_type=str(goal_type),
+                    time_window=[int(start_minutes), int(end_minutes)],
+                    stress=self._activity_stress(str(goal_type), int(start_minutes), int(end_minutes)),
+                )
+        except Exception:
+            logger.debug("活动切换事件发布失败", exc_info=True)
+
+    @staticmethod
+    def _activity_stress(goal_type: str, start_minutes: int, end_minutes: int) -> bool:
+        """高压判定（§6.2 E）：当前为 study/work 且连续同类块 ≥4h。
+
+        连续块 = 时间相邻（间隔 ≤15 分钟）的 study/work 条目合并；取不到日程时
+        按当前条目时长兜底。
+        """
+        if goal_type not in ("study", "work"):
+            return False
+        try:
+            goals = get_goal_manager().get_schedule_goals(chat_id="global")
+        except Exception:
+            goals = []
+        blocks: List[Tuple[int, int]] = []
+        for goal in goals:
+            if str(getattr(goal, "goal_type", "")) not in ("study", "work"):
+                continue
+            start, end = parse_time_window((goal.parameters or {}).get("time_window"))
+            if start is None or end is None or int(end) <= int(start):
+                continue
+            blocks.append((int(start), int(end)))
+        if not blocks:
+            return (end_minutes - start_minutes) >= 240
+        blocks.sort()
+        cur_start, cur_end = blocks[0]
+        for start, end in blocks[1:]:
+            if start - cur_end <= 15:  # 相邻/间隔 ≤15 分钟视为连续
+                cur_end = max(cur_end, end)
+                continue
+            if cur_start <= start_minutes < cur_end:
+                return (cur_end - cur_start) >= 240
+            cur_start, cur_end = start, end
+        if cur_start <= start_minutes < cur_end:
+            return (cur_end - cur_start) >= 240
+        return (end_minutes - start_minutes) >= 240

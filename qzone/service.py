@@ -103,6 +103,10 @@ class QzoneService:
         self._state: Dict[str, Any] = {}
         self._target_stream_id = ""
         self._channel_cache: Dict[str, str] = {}  # 动作 -> 命中的通道描述
+        #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
+        self.bus = getattr(config, "_bus", None)
+        #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
+        self._event_unsubs: list = []
 
     # ---- 状态与目标 ----
     def bind_state_dir(self, data_dir: Path) -> None:
@@ -197,6 +201,9 @@ class QzoneService:
                   reason="发说说成功" if result else f"发说说失败: {err}")
         if result:
             self._count_post()
+            # M0 事件：发帖成功（含 _tick 日程发帖与手动/命令发帖）→ emotion（附录 A ★）
+            await self._publish("qzone.posted", tid=str(result.get("tid") or ""),
+                                summary=str(text).strip()[:40])
         return result
 
     async def list_my_moments(self, num: int = 10, pos: int = 0) -> List[Dict[str, Any]]:
@@ -376,6 +383,12 @@ class QzoneService:
                     continue  # 自己的评论不回
                 if self._is_processed(fid, comment_tid):
                     continue  # 已处理过（无论成败都标记，防重复打扰）
+                # M0 事件：收到新评论（楼中楼路径可读正文）→ emotion（附录 A ★）
+                await self._publish(
+                    "qzone.comment_received", tid=fid,
+                    nickname=str(comment.get("nickname") or "好友"),
+                    summary=str(comment.get("content") or "")[:40], nested=True,
+                )
                 await asyncio.sleep(3 + random.random())  # 拟人间隔
                 reply_text = await self._llm.generate(
                     QZONE_REPLY_PROMPT.format(
@@ -399,6 +412,12 @@ class QzoneService:
                     reply_count += 1
                     self._log("trigger", trigger_type="qzone_reply",
                               reason=f"已回复 {comment.get('nickname')} 的评论：{reply_text[:40]}")
+                    # M0 事件：回评成功 → emotion/companion（附录 A ★）
+                    await self._publish(
+                        "qzone.comment_replied", tid=fid,
+                        nickname=str(comment.get("nickname") or "好友"),
+                        summary=str(reply_text)[:40], nested=True,
+                    )
                 # 无论成败立即标记（Maizone 同策略：防下一轮重复回复同一条评论）
                 self._mark_processed(fid, int(comment_tid))
         return reply_count
@@ -461,6 +480,15 @@ class QzoneService:
             for tid, added in new_comments.items():
                 moment = moments_by_tid.get(tid) or {}
                 excerpt = str(moment.get("content") or "")[:30]
+                # M0 预算接线（§六.2 H）：查询预算 → 发布 proactive.used → 执行触发
+                if self.bus is not None and not self.bus.allow_proactive("qzone", "qzone_comment"):
+                    break  # 全渠道预算已满：本条及其余提醒不再触发
+                if self.bus is not None:
+                    try:
+                        await self.bus.publish("proactive.used", source="qzone",
+                                               channel="qzone", intent="qzone_comment")
+                    except Exception:
+                        pass
                 try:
                     await self._ctx.maisaka.proactive.trigger(
                         stream_id=self._target_stream_id,
@@ -514,13 +542,32 @@ class QzoneService:
                 return [c for c in value if isinstance(c, dict)]
         return []
 
+    # ---- 事件订阅挂点（M0：登记于此，M3+ 消费者按需 subscribe 并存入 _event_unsubs）----
+    def _register_event_subscriptions(self) -> None:
+        """订阅注册挂点（start() 调用）。M0 本束无订阅者：
+        唯一的实际订阅（proactive.used → 预算计数器）由 core/event_bus 在装配时安装。
+        M3+ 消费者在此 ``self._event_unsubs.append(self.bus.subscribe(...))``。"""
+        if self.bus is None:
+            return
+
+    def _unregister_event_subscriptions(self) -> None:
+        """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""
+        for unsub in self._event_unsubs:
+            try:
+                unsub()
+            except Exception:
+                pass
+        self._event_unsubs.clear()
+
     # ---- 循环 ----
     def start(self) -> None:
         if self._task is None or self._task.done():
+            self._register_event_subscriptions()
             self._stop_event.clear()
             self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
+        self._unregister_event_subscriptions()
         self._stop_event.set()
         if self._task is not None:
             self._task.cancel()
@@ -563,6 +610,16 @@ class QzoneService:
     def _log(self, action: str, *, trigger_type: str = "", reason: str = "") -> None:
         if self._decision_logger is not None:
             self._decision_logger.record(action=action, trigger_type=trigger_type, reason=reason)
+
+    # ---- 事件总线（M0；无总线时静默跳过）----
+    async def _publish(self, event: str, **payload: Any) -> None:
+        bus = self.bus
+        if bus is None:
+            return
+        try:
+            await bus.publish(event, source="qzone", **payload)
+        except Exception:
+            pass
 
     def status_text(self) -> str:
         cfg = self._config.qzone

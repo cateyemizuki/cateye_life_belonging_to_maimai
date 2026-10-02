@@ -137,6 +137,19 @@ class PatrolSectionConfig(PluginConfigBase):
         description="每日主动发言预算（次）；未发晚安时为晚安预留 1 次。0=完全静音",
         json_schema_extra={"label": "每日预算", **_ui_i18n("Daily budget")},
     )
+    global_proactive_cap: int = Field(
+        default=0,
+        ge=0,
+        le=200,
+        description="全渠道每日主动打扰上限（次）：私聊主动 + 空间互动提醒共享；0=自动取「每日预算+2」",
+        json_schema_extra={
+            "label": "全渠道打扰上限",
+            "hint": "0=自动取「每日预算 + 2」；大于 0 时直接采用该值（patrol/planning/空间提醒共享同一计数）",
+            **_ui_i18n("Global proactive cap",
+                       "0 = daily budget + 2. Shared daily cap for all proactive interruptions "
+                       "(patrol / planning / qzone reminders)."),
+        },
+    )
     min_trigger_interval_minutes: int = Field(
         default=240,
         ge=0,

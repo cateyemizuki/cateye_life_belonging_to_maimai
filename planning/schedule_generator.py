@@ -213,7 +213,21 @@ class ScheduleGenerator:
         else:
             self._db.replace_day_schedule(date, items)
         logger.info("日程生成完成：%s 共 %d 项", date, len(items))
+        # M0 事件：日程生成成功（自动生成/重生成统一走本方法）→ emotion/qzone（附录 A ★）
+        await self._publish("schedule.generated", date=date, items=len(items))
         return items
+
+    # ============================================================
+    # 事件总线（M0；无总线时静默跳过）
+    # ============================================================
+    async def _publish(self, event: str, **payload: Any) -> None:
+        bus = getattr(self._plugin, "_bus", None)
+        if bus is None:
+            return
+        try:
+            await bus.publish(event, source="planning", **payload)
+        except Exception:
+            logger.debug("事件发布失败：%s", event, exc_info=True)
 
     async def regenerate_today_schedule(
         self,
@@ -276,7 +290,13 @@ class ScheduleGenerator:
 
         if consume_commitments and written:
             try:
-                consumed = self.goal_manager.consume_pending_commitments(date)
+                # 匹配到日程项的约定 = 兑现（kept），未匹配 = 违约（broken）——随消费事件上报（M0）
+                matched_titles = {
+                    str(meta.get("commitment_title") or "")
+                    for meta in commitment_meta.values() if meta.get("commitment_title")
+                }
+                consumed = self.goal_manager.consume_pending_commitments(
+                    date, matched_titles=matched_titles)
                 if consumed:
                     logger.info("已消费 %d 条 %s 的未来约定", len(consumed), date)
             except Exception as exc:

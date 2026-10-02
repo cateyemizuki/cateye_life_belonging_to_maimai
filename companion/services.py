@@ -44,6 +44,10 @@ class CompanionServices:
         self.plugin = plugin
         self.ctx = plugin.ctx
         self._data_dir = Path(getattr(plugin, "_data_dir", Path(".")))
+        #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
+        self.bus = getattr(plugin, "_bus", None)
+        #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
+        self._event_unsubs: list = []
 
         cfg = plugin.config
         # ---- 复用顶层已有实例（只增不改名；缺失时自建兜底）----
@@ -153,11 +157,31 @@ class CompanionServices:
                 self.decision_logger.update_settings(admin.decision_log_enabled, admin.log_retention_days)
 
     # ------------------------------------------------------------------
+    # 事件订阅挂点（M0：登记于此，M3+ 消费者按需 subscribe 并存入 _event_unsubs）
+    # ------------------------------------------------------------------
+    def _register_event_subscriptions(self) -> None:
+        """订阅注册挂点（start() 调用）。M0 本束无订阅者：
+        唯一的实际订阅（proactive.used → 预算计数器）由 core/event_bus 在装配时安装。
+        M3+ 消费者在此 ``self._event_unsubs.append(self.bus.subscribe(...))``。"""
+        if self.bus is None:
+            return
+
+    def _unregister_event_subscriptions(self) -> None:
+        """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""
+        for unsub in self._event_unsubs:
+            try:
+                unsub()
+            except Exception:
+                pass
+        self._event_unsubs.clear()
+
+    # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
     async def start(self) -> None:
         """启动服务束（幂等）：加载时清理过期日志、预热节假日缓存；
         目标 stream 已解析则启动巡检循环（未解析时由顶层重试循环解析后再调）。"""
+        self._register_event_subscriptions()
         try:
             if self.llm_logger is not None:
                 self.llm_logger.cleanup()
@@ -178,6 +202,7 @@ class CompanionServices:
 
     async def stop(self) -> None:
         """停止服务束：停巡检、清身份缓存、丢弃待注入旁白、强写好感度。"""
+        self._unregister_event_subscriptions()
         await self.patrol.stop()
         self.senders.clear()
         self.session_kinds.clear()
