@@ -65,10 +65,12 @@ cateye_test/
 - ✅ /plan 命令（日程图片 PIL 渲染 + 合并转发，失败降级纯文本）与 4 个 LLM 工具
 
 ### companion/ — 恋人生活（复刻 mai-love，日程除外；已扩展为关系系统）
-- ✅ 好感度 3 档 + habits 记忆 + 每日计数/早晚安/想念标记（JSON 节流落盘）
+- ✅ **好感度 v2（M1）**：`score`（0~100 连续分，初始 30）+ `baseline`（慢速 EMA 关系底色）+ 恋人 5 档（生疏/熟悉/亲密/热恋/挚爱）；档位升降迟滞（越界 `tier_hysteresis` 3 分且停留 ≥24h 才动）+ 日切衰减（score 向 baseline 回归、baseline 慢速漂移）+ 规则事件记账（一问一答 ≤+1.0/日、沉默 ≥1h 后对方先开口 ≤+0.5/日、早晚安各 1 次/日、约定兑现 +1.0／违约 −0.5 每约定 1 次；日累计 +4.0/−3.0 限幅；零 LLM 成本）；单用户档案（只服务 `target.target_qq`），v1 档案自动迁移（旧 0/1/2 → 25/55/80）；旧 3 档口径保留（`level()` 0/1/2：0/1→旧0、2/3→旧1、4→旧2），habits 记忆、每日计数/早晚安/想念标记与 JSON 节流落盘不变
+- ✅ **好感 v2 接线（M1）**：巡检日切挂日衰减；目标私聊观察 Hook 记 `chat_round` 并检测 `user_initiated`；planner 注入改读 5 档档位描述；订阅 planning 的 `schedule.commitment_kept/broken` 记账约定事件；档位变化发布 `relation.affection_tier_changed`
+- ✅ **[affection] 配置段（M1 扩展）**：`enabled`（false 回退 v1 三档静态行为）、`decay_pull`(0.06)、`baseline_ema`(0.03)、`tier_hysteresis`(3.0)、`tier_min_dwell_hours`(24)、`daily_positive_cap`(4.0)、`daily_negative_cap`(3.0)；`review_*` 为 M2 会话裁判预留、`emotion_modulation` 为 M3 情绪调制预留（**当前仅声明字段，调制逻辑属 M3、乘数恒 1.0**）
 - ✅ 巡检完整判定链（与源插件对齐）：日切→静默(fail-safe)→用户冷却→预算（晚安预留）→早安/晚安（S）→想念（A：沉默阈值随机采样+概率+LLM 把关+驳回 30 分钟冷却+未来日程避让+豁免开关）→日程节点分享/日常搭话（B）
 - ✅ **全渠道打扰预算（M0）**：私聊主动（patrol / planning）与空间互动提醒共享每日上限 `patrol.global_proactive_cap`（默认 0=自动取 `patrol.daily_max_speak + 2`），达上限触发被拦截并留痕决策日志
-- ✅ **关系系统（简单版）**：`patrol.relation_type` 配置对方是 bot 的谁（恋人/挚友/维护者/家人/自定义称谓），想念提示词、消息生成口吻、好感度档位名、消息后缀与括号小剧场全部随关系变化（`companion/relation.py` 预设，热更新生效）
+- ✅ **关系系统（简单版）**：`patrol.relation_type` 配置对方是 bot 的谁（恋人/挚友/维护者/家人/自定义称谓），想念提示词、消息生成口吻、好感度档位名（**v2 5 档表**，注入走 5 档口径）、消息后缀与括号小剧场（按 3 档兼容映射折算）全部随关系变化（`companion/relation.py` 预设，热更新生效）
 - ✅ 触发统一 `maisaka.proactive.trigger`；好感度后缀 + 括号小剧场；message_service 直发
 - ✅ **LLM 判定板块 `[judge]`**（同步 mai-love 2.6.3）：想念把关等判定类调用的模型 / 最大 token 数 / 温度独立成段可配（默认跟随主任务、512、0.2），可为把关单独指到便宜、非思考型的任务/模型；把关调用走 `LLMService.judge()`，`/cateye_test_mai_llm_log` 记录实际使用的模型
 - ✅ **LLM 失败三态分诊**（同步 mai-love 2.6.2）：「成功但正文为空」（思考型模型把小 max_tokens 预算花在 reasoning 上）不再落进"未知错误"兜底，日志附 reasoning 尾部证据；宿主裸失败与非 dict 结果单独识别

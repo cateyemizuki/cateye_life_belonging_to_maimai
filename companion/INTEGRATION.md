@@ -8,9 +8,10 @@
 
 | 文件 | 职责 | 对应源模块 |
 |---|---|---|
-| `config.py` | patrol / affection / cateye / judge 四个配置段（whitelist→顶层 target 段；llm_log/proactive_log→顶层 admin 段；**新增 relation_type/relation_custom 关系配置**——miss 提示词占位 {relation}、消息口吻/后缀/档位名随关系变化，热更新经 sync_from_config） | config.py |
-| `affection.py` | 好感度管理：3 档 + habits 字典 + 每日计数/标记 + 1 秒节流写盘 + flush | affection_manager.py + memory_manager 的存储部分 |
-| `relation.py` | **关系系统（简单版）**：relation_type/relation_custom 配置 → RelationProfile（称谓、三档档位名、口吻、后缀池、括号小剧场），patrol/message_service/components 消费 | 关系扩展 |
+| `config.py` | patrol / affection / cateye / judge 四个配置段（whitelist→顶层 target 段；llm_log/proactive_log→顶层 admin 段；**新增 relation_type/relation_custom 关系配置**——miss 提示词占位 {relation}、消息口吻/后缀/档位名随关系变化，热更新经 sync_from_config；**affection 段 M1 扩为 v2**：enabled/decay_pull/baseline_ema/tier_hysteresis/tier_min_dwell_hours/daily_positive_cap/daily_negative_cap，review_* 属 M2、emotion_modulation 属 M3（均仅声明）） | config.py |
+| `affection.py` | 好感度 v2 状态层：score/baseline/5 档迟滞/日累计/事件日志 + v1→v2 迁移 + v1 字段原地保留（`level()` 保持 0/1/2 兼容口径）+ 档位变化发布 `relation.affection_tier_changed`；1 秒节流写盘 + flush | affection_manager.py（M1 重写） |
+| `affection_events.py` | 好感规则事件层（M1，零 LLM 成本）：`RULE_EVENT_TABLE` + 频控 + 日累计限幅 + `note_user_message`；`emotion_modulation` 乘数恒 1.0（M3） | 新增（MAINTENANCE_PLAN §5.4） |
+| `relation.py` | **关系系统（简单版）**：relation_type/relation_custom 配置 → RelationProfile（称谓、三档档位名 + **v2 5 档标签/描述**、口吻、后缀池、括号小剧场、档位 miss 系数表），patrol/message_service/components 消费；3 档兼容映射经 `affection.legacy_level_for_tier` 转发 | 关系扩展 |
 | `patrol.py` | 巡检调度器完整判定链：日切→静默(fail-safe)→用户冷却→预算(晚安预留)→早安(S)→晚安(S)→想念(A：随机阈值+概率+LLM 把关+驳回冷却+未来日程避让+豁免开关)→日程节点分享(B)→日常搭话(B)；决策日志每轮恰好一条（SKIP_PRIORITY）；触发经 maisaka.proactive.trigger + 计 0.5 发言数 | scheduler.py |
 | `message_service.py` | 好感度后缀 AFFECTION_SUFFIXES + 档位2 括号小剧场（10%）+ send_to_target | message_service.py |
 | `memory_manager.py` | 用户习惯读写（委托 AffectionManager.habits）+ 个人上下文构建 | memory_manager.py |
@@ -31,6 +32,29 @@ await self._companion.stop()
 # 目标会话解析后：self._companion.set_target(qq, stream_id)
 # bot 配置热重载：self._companion.set_persona(lover_name, personality) / sync_from_config()
 ```
+
+## 好感度 v2（M1 落地，2026-10-03）
+
+**状态层 `companion/affection.py`（`AffectionManager`）**
+- 状态：`score`（0~100，初始 30）/ `baseline`（慢速 EMA 关系底色）/ `tier`（恋人 5 档，含迟滞结果）/ `tier_entered_at` / `daily_delta` / `event_log`（上限 300 条，M2 日结裁判输入）；档案仍为 `affection_memory.json`（写回即 version=2），单用户（只服务 target_qq，多用户扩展已裁撤）。
+- 读 API：`score()` / `baseline()` / `tier()` / `tier_label()` / `tier_description()` / `tier_entered_at()` / `daily_delta()` / `event_log()`；v1 兼容口径 `level()` / `level_label()`（`TIER_TO_LEGACY_LEVEL`：0/1→旧0、2/3→旧1、4→旧2），后缀池/状态报告/`companion_get_affection_level` 零改动沿用旧口径。
+- 写 API：`update_level(0/1/2)`（v1 兼容入口：score 移到 30.0/57.5/94.0、强制重估并跳过迟滞）、`set_tier()`（各档区间中值）、`set_score()`、`reevaluate_tier()`（迟滞：升档需 ≥ 上界+`tier_hysteresis`(3.0)、降档需 ≤ 下界−3.0，且距进入当前档 ≥ `tier_min_dwell_hours`(24h)）、`commit_rule_delta()`、`append_event_entry()`、`apply_daily_decay()`（score += (baseline−score)×`decay_pull`(0.06)，baseline 随后 += (score−baseline)×`baseline_ema`(0.03)）、`sync_daily()`（事件早于巡检到达时的跨天兜底，含一次日衰减）、`reset_daily()`；v1 预算方法（`increment_speak()` 等）语义不变、与好感分无关。
+- 迁移：无 `version` 的非空档案按 v1 迁移（`score = {0:25,1:55,2:80}`、`baseline=score`、`tier=level`）并写回；JSON 损坏按全新档案重建并告警。档位变化发布 `relation.affection_tier_changed`（old/new/score/reason，总线缺失静默降级），关键动作留痕 `decision_logs`。
+
+**规则事件层 `companion/affection_events.py`**（零 LLM 成本）
+- 统一入口 `record_rule_event(affection, kind, delta=None, desc="", *, caps=None, key="")`（`AffectionManager.record_rule_event` 同名转发）：频控 → 日累计限幅 → 入账 → 迟滞重估 → event_log/决策日志。
+- M1 表 `RULE_EVENT_TABLE`：`chat_round` +0.05（日 ≤ +1.0）、`user_initiated` +0.15（沉默 ≥1h 后对方先开口，日 ≤ +0.5）、`morning_exchange`/`night_exchange` 各 +0.2（1 次/日）、`commitment_kept` +1.0 / `commitment_broken` −0.5（每约定 1 次，`key` 去重）；日累计 positive ≤ +4.0 / negative ≥ −3.0。未登记 kind 按 `unknown_kind` 丢弃并告警（不静默扩表）。
+- `note_user_message()` 由 `update_last_user_msg_time()` 顺带调用；情绪调制乘数恒 1.0（`emotion_modulation` 仅声明字段，M3 接线）。
+
+**接线挂点**
+
+| 挂点 | 位置 | 行为 |
+|---|---|---|
+| 日衰减 | `patrol.py` 巡检日切分支（`_tick`） | `reset_daily()` 后调 `apply_daily_decay()`，每自然日恰好一次 |
+| 对话事件 | `components.py` `chat.receive.after_process` | target 私聊记 `chat_round` + 刷新 `last_user_msg_time`（触发 `user_initiated` 检测）；同时发 `relation.message_received` |
+| planner 注入 | `components.py` `_mai_build_activity_suffix` | 好感行改读 `tier()` + `relation.tier_label()/tier_description()`（5 档口径） |
+| 约定订阅 | `services.py` `_register_event_subscriptions`（`start()` 注册 / `stop()` 反订阅） | `schedule.commitment_kept` / `schedule.commitment_broken` → `record_rule_event`，去重键取 `commitment`（回退 `summary`） |
+| Tool/命令 | `components.py` | `cateye_test_mai_lover_affection` 与 `/cateye_test_mai_affection` 走 `update_level()`（3 档兼容、跳过迟滞）；状态行输出 score/baseline/5 档档位/今日 Δ |
 
 ## 有意的裁剪 / TODO
 
