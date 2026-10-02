@@ -1,7 +1,7 @@
 # 命令与工具手册（USAGE.md）
 
-> 猫眼生活套件（github.cateye.cateye-suite）现有 **12 个 LLM 工具**、**10 个聊天指令**、**4 个跨插件 API**。
-> 三个业务子模块各自提供一组：planning（日程规划）/ companion（虚拟恋人）/ qzone（QQ 空间）。
+> 猫眼生活套件（github.cateye.cateye-suite）现有 **13 个 LLM 工具**、**12 个聊天指令**、**4 个跨插件 API**。
+> 四个业务子模块各自提供一组：planning（日程规划）/ companion（虚拟恋人）/ emotion（情绪）/ qzone（QQ 空间）。
 > 本手册给出每个条目的描述原文、参数、行为细节与权限要求；架构与安装说明见 README.md。
 
 ## 0. 通用行为说明（先读）
