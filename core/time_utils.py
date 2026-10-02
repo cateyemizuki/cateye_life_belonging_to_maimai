@@ -47,25 +47,3 @@ def hours_between(later: datetime, earlier: datetime) -> float:
     """两个时刻的小时差（later - earlier，负值返回 0）。"""
     delta = (later - earlier).total_seconds() / 3600.0
     return max(0.0, delta)
-
-
-# 24h 精神能量曲线（来源：自主规划插件 energy_model，骨架版直接内置）。
-_ENERGY_TABLE = (15, 12, 10, 8, 8, 10, 22, 40, 60, 75, 85, 88, 82, 76, 74, 72, 70, 65, 58, 50, 42, 35, 28, 20)
-
-
-def get_energy_level(hour: int) -> int:
-    return _ENERGY_TABLE[max(0, min(23, hour))]
-
-
-def describe_energy(energy: int) -> str:
-    if energy >= 80:
-        return "精神满满"
-    if energy >= 60:
-        return "状态不错"
-    if energy >= 40:
-        return "状态一般"
-    if energy >= 25:
-        return "有点累了"
-    if energy >= 10:
-        return "很困"
-    return "快撑不住了"

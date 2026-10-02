@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .schedule_db import ScheduleDB
-from core.time_utils import describe_energy, get_energy_level, minutes_of_now
+from .energy_model import describe_energy, get_energy_level
+from core.time_utils import minutes_of_now
 
 # sleep 类型条目不算「正在做的事」
 _SKIP_TYPES = {"sleep"}
