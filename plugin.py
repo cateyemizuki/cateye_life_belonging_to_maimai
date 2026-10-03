@@ -99,8 +99,11 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             napcat_http_port=cfg.qzone.napcat_http_port,
             napcat_http_token=cfg.qzone.napcat_http_token,
         )
-        self._qzone = QzoneService(self.ctx, self, self._schedule_query, self._llm,
-                                   self._decision_logger, cookie_manager=self._qzone_cookies)
+        # 第二实参为配置实例（服务读 .qzone 段）；另显式传 plugin：bus/emotion 动态属性与
+        # 热重载配置（plugin.config 每次重取，SDK 热重载会整体替换配置实例）都挂在插件对象上
+        self._qzone = QzoneService(self.ctx, self.config, self._schedule_query, self._llm,
+                                   self._decision_logger, plugin=self,
+                                   cookie_manager=self._qzone_cookies)
         self._qzone.bind_state_dir(data_dir)
         self._emotion = EmotionServices(self)
 

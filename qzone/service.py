@@ -96,12 +96,15 @@ class QzoneService:
         llm: LLMService,
         decision_logger: Optional[DecisionLogger] = None,
         *,
+        plugin: Any = None,
         lover_name: str = "麦麦",
         personality: str = "",
         cookie_manager: Optional[QzoneCookieManager] = None,
     ) -> None:
         self._ctx = ctx
         self._config = config
+        #: 插件对象：bus/emotion 与热重载配置的动态来源（离线只传配置样对象时回退为 config 本身）
+        self._plugin = plugin if plugin is not None else config
         self._schedule = schedule_query
         self._llm = llm
         self._decision_logger = decision_logger
@@ -115,9 +118,22 @@ class QzoneService:
         self._target_stream_id = ""
         self._channel_cache: Dict[str, str] = {}  # 动作 -> 命中的通道描述
         #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
-        self.bus = getattr(config, "_bus", None)
+        self.bus = getattr(self._plugin, "_bus", None)
         #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
         self._event_unsubs: list = []
+
+    # ---- 配置段访问 ----
+    def _qzone_cfg(self) -> Any:
+        """[qzone] 配置段。
+
+        优先经 ``plugin.config`` 动态读取：宿主热重载会整体替换 SDK 的强类型配置实例
+        （``set_plugin_config``），不能用 on_load 期的 ``self.config`` 快照，否则热重载失效；
+        离线 stub 只传配置样对象（含 ``.qzone``）时回退到构造入参。
+        """
+        section = getattr(getattr(self._plugin, "config", None), "qzone", None)
+        if section is not None:
+            return section
+        return getattr(self._config, "qzone", None)
 
     # ---- 状态与目标 ----
     def bind_state_dir(self, data_dir: Path) -> None:
@@ -330,7 +346,7 @@ class QzoneService:
         ``post_rate``（M4，§6.2 D）为 _tick 传入的「配置发帖率 × mood_effect.post_rate」
         乘后概率（上限按概率语义夹到 1.0）；缺省 None 时回退配置原文，兼容既有调用方。
         """
-        cfg = self._config.qzone
+        cfg = self._qzone_cfg()
         activity = self._schedule.find_current_activity(date, now)
         if cfg.require_activity and activity is None:
             self._log("skip", trigger_type="qzone_post", reason="当前无日程活动")
@@ -363,7 +379,7 @@ class QzoneService:
             prompt = f"{prompt}\n{mood_line}"
         text = await self._llm.generate(
             prompt,
-            task_name=self._config.qzone.llm_task_name,
+            task_name=self._qzone_cfg().llm_task_name,
             temperature=0.8,
             max_tokens=200,
             event="qzone_post",
@@ -379,7 +395,7 @@ class QzoneService:
 
         返回回评条数；cookie 不可用返回 -1（调用方应回退到 poll_comments 基线提醒）。
         """
-        cfg = self._config.qzone
+        cfg = self._qzone_cfg()
         if self._cookie_manager is None:
             return -1
         client = await self._cookie_manager.get_client()
@@ -482,7 +498,7 @@ class QzoneService:
         返回 {tid: 新增评论数}。基线持久化（每条说说上轮的 comment_num）；
         首次见到某条说说只记基线不算新增（避免冷启动刷屏）。
         """
-        cfg = self._config.qzone
+        cfg = self._qzone_cfg()
         moments = await self.list_my_moments(num=10)
         baseline: Dict[str, int] = dict(self._state.get("comment_baseline") or {})
         new_comments: Dict[str, int] = {}
@@ -534,7 +550,7 @@ class QzoneService:
         """动作通道返回里带评论列表时的向前兼容回评路径（v1.12.10 不会进入）。
 
         主路径见 reply_comments()（CGI 直连，可读评论正文与楼中楼）。"""
-        cfg = self._config.qzone
+        cfg = self._qzone_cfg()
         comments = self._extract_comments(moment)
         if not comments:
             return
@@ -617,14 +633,14 @@ class QzoneService:
                 await self._tick()
             except Exception:
                 pass
-            interval = max(5, int(self._config.qzone.check_interval_minutes)) * 60
+            interval = max(5, int(self._qzone_cfg().check_interval_minutes)) * 60
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 continue
 
     async def _tick(self) -> None:
-        cfg = self._config.qzone
+        cfg = self._qzone_cfg()
         if not cfg.enabled:
             return
         now = datetime.now()
@@ -657,10 +673,10 @@ class QzoneService:
 
     # ---- 情绪联动（M4；§6.2 D，跨模块 getattr 判空 + 恒等降级，§八.2）----
     def _emotion_service(self) -> Any:
-        """情绪模块服务束（plugin._emotion；self._config 可能是 plugin 或配置对象本身）。"""
-        emotion = getattr(self._config, "_emotion", None)
+        """情绪模块服务束（plugin._emotion；离线 stub 只传配置样对象时同源回退）。"""
+        emotion = getattr(self._plugin, "_emotion", None)
         if emotion is None:
-            emotion = getattr(getattr(self._config, "config", None), "_emotion", None)
+            emotion = getattr(getattr(self._plugin, "config", None), "_emotion", None)
         return emotion
 
     def _mood_effect(self) -> Dict[str, Any]:
@@ -731,7 +747,7 @@ class QzoneService:
             pass
 
     def status_text(self) -> str:
-        cfg = self._config.qzone
+        cfg = self._qzone_cfg()
         channels = "、".join(sorted(set(self._channel_cache.values()))) or "未连通"
         cookie = f"｜{self._cookie_manager.status_text()}" if self._cookie_manager else "｜cookie 管理：未启用"
         return (

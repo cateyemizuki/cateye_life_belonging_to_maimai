@@ -89,6 +89,21 @@ class QzoneSectionConfig(PluginConfigBase):
         description="回退路径：cookie 不可用无法读评论正文时，检测到评论数变化经 maisaka 主动提醒",
         json_schema_extra={"label": "新评论主动提醒", **_ui_i18n("Notify new comments")},
     )
+    llm_task_name: str = Field(
+        default="utils",
+        description="说说文案/回评生成的模型任务名（utils/replyer 等，走宿主任务路由）",
+        json_schema_extra={"label": "生成任务名", **_ui_i18n("LLM task")},
+    )
+    silence_start: str = Field(
+        default="01:00",
+        description="空间静默时段开始（HH:MM）：静默期内巡检不发说说、不监听评论（支持跨午夜；配置非法按静默处理）",
+        json_schema_extra={"label": "空间静默开始", **_ui_i18n("QZone silence start")},
+    )
+    silence_end: str = Field(
+        default="08:00",
+        description="空间静默时段结束（HH:MM）",
+        json_schema_extra={"label": "空间静默结束", **_ui_i18n("QZone silence end")},
+    )
     napcat_http_host: str = Field(
         default="",
         description="备选：NapCat HTTP 服务器地址（cookie 获取降级通道 2，如 127.0.0.1）",
