@@ -21,7 +21,7 @@
 | `cateye_client.py` | 恋人电脑联动：connect-hub 跨插件 API（status/screenshot）+ VLM 描述 + 超时与缓存 | cateye_client.py + llm_service.describe_image |
 | `holiday_service.py` | 节假日多级降级：timor 整年表 → jiejiariapi → timor 按天 → 本地星期几；3 天 TTL 原子落盘 | holiday_service.py |
 | `components.py` | `CompanionComponentsMixin`：5 Hook + 6 Tool + 8 Command + 3 API（方法名 `mai_` 前缀；API 组件名加 `companion_` 前缀避免与 planning 撞名） | plugin.py 组件面 |
-| `services.py` | `CompanionServices` 服务束（复用顶层 _affection/_llm/_loggers；`set_persona`/`set_target`/`sync_from_config` 入口） | plugin.py 装配段 |
+| `services.py` | `CompanionServices` 服务束（复用顶层 _affection/_llm/_loggers；`set_persona`/`set_target`/`sync_from_config` 入口；**M2 构造并持有 `reviews`（`AffectionReviewer`）**） | plugin.py 装配段 |
 
 ## 集成方式（已在 plugin.py 完成）
 
@@ -64,8 +64,9 @@ await self._companion.stop()
 - **会话采样裁判** `evaluate_conversation_delta()`：输入 = 最近 ~10 条对方消息 + 双方称呼与人设 + 关系档位描述 + 当前情绪低分辨率描述（`emotion.vad.mood_summary`，无 VAD 数值）；输出 `{"event"≤30字, "delta"[-2,+2.5], "tag"}`（tag ∈ normal/conflict/apology/sweet，未知回退 normal）；失败/垃圾输出返回 None。
 - **关系日结裁判** `run_daily_review()`：输入 = 当日 event_log + 互动统计（轮数/沉默后对方先开口/bot 主动发言/沉默时长/约定；取不到的字段省略）+ 最近印象 + 档位描述 + 人设；输出 `{"delta_score"[-2,+2], "impressions"0~3条, "tone", "reason"}`（reason 要求引用原文；代码层打日期、裁 3 条）。
 - **编排器** `AffectionReviewer`：会话采样双频控（每 `review_sample_every_rounds` 轮 + 每日 ≤ `review_max_per_day`，计数持久化在档案 `review` 段），LLM 请求放后台任务（不阻塞 1s 超时的 chat Hook）；日结订阅 `schedule.sleep_started`，arm 后台任务并等 `overhaul_grace_seconds`(90s) 后执行——因为 `emotion/service.py` 是「先 publish、返回后才跑睡眠大修」，注册顺序无法保证晚于大修，必须延迟；`review_enabled=false` 两个裁判整体关闭。
-- **结果应用**：delta 走 `record_rule_event` 既有入账入口（`llm_review`/`daily_review` kind，独立于 kind 上限、受 §5.5 日累计 +4/−3 限幅）→ 追加 impressions（单次 ≤3、滚动 10 条、7 天过期）→ 写 `tone` → 清空当日 `event_log`；失败时不清 log、不落印象，但记 `daily_reviewed_date`（当日不重试）。
-- **注入叠加（§5.6.1）**：`components.py` 好感后缀行后追加最近 1~2 条印象 + 最近一次日结关系温度；无印象/无 tone（含超 7 天）时输出与 M1 完全一致。
+- **编排器 API**：`note_target_message(text, now=)` → `{sampled, reason, rounds, samples}`（采样入口；reason ∈ rounds/scheduled/daily_cap/disabled/affection_disabled/no_loop）；`on_sleep_started(payload)`（订阅入口，只 arm 延迟任务）；`perform_daily_review(date=)` → `{ok, delta_score, applied, impressions, tone, reason, event_log_cleared}`（可独立单测的日结执行体）；`close()`（服务束 `stop()` 取消所有未完成后台任务，含采样请求与延迟日结）。
+- **结果应用**：delta 走 `record_rule_event` 既有入账入口（`llm_review`/`daily_review` kind，独立于 kind 上限、受 §5.5 日累计 +4/−3 限幅）→ 追加 impressions（单次 ≤3 条、每条 ≤80 字、日期由代码打上；追加时按 7 天窗口剔除旧条目并滚动保留最新 10 条，落盘在 `affection_memory.json` 的 `impressions` 字段）→ 写 `tone`（读取时按同一 7 天窗口过滤）→ 清空当日 `event_log`；失败时不清 log、不落印象，但记 `daily_reviewed_date`（当日不重试）。
+- **注入叠加（§5.6.1）**：`components.py` 好感后缀行后追加最近 1~2 条印象 + 最近一次日结关系温度（tone 超 7 天不注入）；无印象/无 tone 时输出与 M1 完全一致。
 
 **M2 接线挂点**
 
