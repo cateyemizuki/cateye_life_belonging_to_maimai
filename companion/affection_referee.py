@@ -366,7 +366,7 @@ class AffectionReviewer:
       保证日结晚于情绪睡眠大修执行（机制见方法注释）；
     - :meth:`perform_daily_review`：真正执行日结（可独立单测）——LLM → 入账 delta →
       追加 impressions → 写 tone → 清空当日 event_log；
-    - 裁判计数（采样次数 / 日结尝试日期）持久化在好感档案 ``review`` 字段，跨重启防重复。
+    - 裁判计数（采样次数 / 日结成功日期）持久化在好感档案 ``review`` 字段，跨重启防重复。
     """
 
     #: 日结在 sleep_started 之后的等待秒数（实例属性便于测试/运维调参）
@@ -605,7 +605,7 @@ class AffectionReviewer:
             return
         state = self._affection.review_state()
         if str(state.get("daily_reviewed_date") or "") == date:
-            return  # 当日已尝试过（跨重启防重复 LLM 调用）
+            return  # 当日已成功日结（跨重启防重复 LLM 调用）
         if self._daily_task is not None and not self._daily_task.done():
             return  # 已有待执行日结（幂等；sleep_started 本身只在上升沿发布）
         task = self._spawn(self._deferred_daily_review(date))
@@ -652,8 +652,9 @@ class AffectionReviewer:
                                    now: Optional[datetime] = None) -> Dict[str, Any]:
         """执行一次关系日结：LLM → 入账 delta → 追加 impressions/tone → 清空 event_log。
 
-        失败（请求失败/输出垃圾）静默跳过：不清空 event_log、不追加印象；但记下
-        ``daily_reviewed_date``（当日不重试，避免重试轰炸）。可独立单测。
+        失败（请求失败/输出垃圾）静默跳过：不清空 event_log、不追加印象、不落
+        ``daily_reviewed_date``——下个 sleep 边沿即可重试（同一睡眠周期只有一个上升沿，
+        不会重试轰炸）。可独立单测。
         """
         day = str(date or (now or datetime.now()).strftime("%Y-%m-%d"))
         if not self._review_enabled() or not self._affection_enabled():
@@ -661,7 +662,6 @@ class AffectionReviewer:
         state = self._affection.review_state(now=now)
         if str(state.get("daily_reviewed_date") or "") == day:
             return {"ok": False, "reason": "already_reviewed"}
-        self._affection.update_review_state(daily_reviewed_date=day)  # 先记「当日已尝试」
         llm = self._llm_service()
         if llm is None:
             return {"ok": False, "reason": "no_llm"}
@@ -695,6 +695,9 @@ class AffectionReviewer:
         self._affection.set_tone(parsed["tone"], date=day, now=now)
         # 3) 清空当日 event_log
         removed = self._affection.clear_event_log()
+        # 4) 仅成功（JSON 解析成功并已入账）才落「当日已日结」；失败保持未落，
+        #    以便下个 sleep 边沿重试（宿主验证日实证：失败即落 date 会静默吞掉第二次边沿）
+        self._affection.update_review_state(daily_reviewed_date=day)
         self._log("affection.daily_review", trigger_type="affection",
                   reason=parsed["tone"] or "关系日结", date=day,
                   requested=round(parsed["delta_score"], 4), applied=entry.get("applied"),

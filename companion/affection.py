@@ -499,7 +499,7 @@ class AffectionManager:
         """M2 裁判计数段：``{"date", "samples", "daily_reviewed_date"}``。
 
         ``date`` 跨天自动滚动并清零 ``samples``（会话采样每日上限）；
-        ``daily_reviewed_date`` 保留最近一次日结尝试日期（跨重启防重复日结）。
+        ``daily_reviewed_date`` 保留最近一次日结**成功**日期（失败不落，跨重启防重复日结）。
         """
         today = (now or datetime.now()).strftime("%Y-%m-%d")
         data = _normalize_review_meta(self._state.get("review"), today)

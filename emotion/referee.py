@@ -131,7 +131,8 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
         tomorrow_schedule=tomorrow_schedule or "（没有记录）", long_term_status=long_term_status or "普通时期",
         sleep_hours=max(0.5, float(sleep_hours)), emotion_table=EMOTION_TABLE_SUMMARY,
     )
-    response = await llm.generate(prompt, task_name=task_name, temperature=0.4, max_tokens=600,
+    # 三组 reason 为长文本，600 tokens 会截断 JSON（宿主验证日 8 次尝试零落地实测）
+    response = await llm.generate(prompt, task_name=task_name, temperature=0.4, max_tokens=2000,
                                   event="emotion_sleep_referee")
     data = _parse_json_loose(response)
     if data is None or "delta_vad" not in data:

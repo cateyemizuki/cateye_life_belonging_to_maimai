@@ -65,7 +65,7 @@ await self._companion.stop()
 - **关系日结裁判** `run_daily_review()`：输入 = 当日 event_log + 互动统计（轮数/沉默后对方先开口/bot 主动发言/沉默时长/约定；取不到的字段省略）+ 最近印象 + 档位描述 + 人设；输出 `{"delta_score"[-2,+2], "impressions"0~3条, "tone", "reason"}`（reason 要求引用原文；代码层打日期、裁 3 条）。
 - **编排器** `AffectionReviewer`：会话采样双频控（每 `review_sample_every_rounds` 轮 + 每日 ≤ `review_max_per_day`，计数持久化在档案 `review` 段），LLM 请求放后台任务（不阻塞 1s 超时的 chat Hook）；日结订阅 `schedule.sleep_started`，arm 后台任务并等 `overhaul_grace_seconds`(90s) 后执行——因为 `emotion/service.py` 是「先 publish、返回后才跑睡眠大修」，注册顺序无法保证晚于大修，必须延迟；`review_enabled=false` 两个裁判整体关闭。
 - **编排器 API**：`note_target_message(text, now=)` → `{sampled, reason, rounds, samples}`（采样入口；reason ∈ rounds/scheduled/daily_cap/disabled/affection_disabled/no_loop）；`on_sleep_started(payload)`（订阅入口，只 arm 延迟任务）；`perform_daily_review(date=)` → `{ok, delta_score, applied, impressions, tone, reason, event_log_cleared}`（可独立单测的日结执行体）；`close()`（服务束 `stop()` 取消所有未完成后台任务，含采样请求与延迟日结）。
-- **结果应用**：delta 走 `record_rule_event` 既有入账入口（`llm_review`/`daily_review` kind，独立于 kind 上限、受 §5.5 日累计 +4/−3 限幅）→ 追加 impressions（单次 ≤3 条、每条 ≤80 字、日期由代码打上；追加时按 7 天窗口剔除旧条目并滚动保留最新 10 条，落盘在 `affection_memory.json` 的 `impressions` 字段）→ 写 `tone`（读取时按同一 7 天窗口过滤）→ 清空当日 `event_log`；失败时不清 log、不落印象，但记 `daily_reviewed_date`（当日不重试）。
+- **结果应用**：delta 走 `record_rule_event` 既有入账入口（`llm_review`/`daily_review` kind，独立于 kind 上限、受 §5.5 日累计 +4/−3 限幅）→ 追加 impressions（单次 ≤3 条、每条 ≤80 字、日期由代码打上；追加时按 7 天窗口剔除旧条目并滚动保留最新 10 条，落盘在 `affection_memory.json` 的 `impressions` 字段）→ 写 `tone`（读取时按同一 7 天窗口过滤）→ 清空当日 `event_log`；失败时不清 log、不落印象、不记 `daily_reviewed_date`（下个 sleep 边沿可重试）。
 - **注入叠加（§5.6.1）**：`components.py` 好感后缀行后追加最近 1~2 条印象 + 最近一次日结关系温度（tone 超 7 天不注入）；无印象/无 tone 时输出与 M1 完全一致。
 
 **M2 接线挂点**

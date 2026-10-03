@@ -278,13 +278,14 @@ class CompanionComponentsMixin:
         sender_identity 既有链路；群聊里非 target 的发言不上报，避免群流水刷日志）；
         target 私聊（会话类型未知时按私聊兜底）再经 affection_events 记一条
         ``chat_round`` 规则事件（日累计 ≤ +1.0），并刷新 last_user_msg_time
-        （顺带触发 ``user_initiated`` 检测，§5.4）。
+        （顺带触发 ``user_initiated`` 检测，§5.4）。``is_notify`` 消息只按
+        target 私聊口径刷新 last_user_msg_time，不落入其余链路（TEST_PROCEDURE §二）。
         """
         companion = self._mai_companion()
         if companion is None:
             return
         try:
-            if not isinstance(message, dict) or message.get("is_notify"):
+            if not isinstance(message, dict):
                 return
             message_info = message.get("message_info")
             if not isinstance(message_info, dict):
@@ -294,6 +295,13 @@ class CompanionComponentsMixin:
             user_id = extract_user_id_from_message(message)
             target_qq = self._mai_target_qq()
             is_target = bool(user_id and target_qq and user_id == target_qq)
+            if message.get("is_notify"):
+                # is_notify（撤回/戳一戳等通知，只入库不触发回复）：仅按 target 私聊口径
+                # 低成本刷新 last_user_msg_time（沉默检测/想念与主动冷却），不触发
+                # relation.message_received / chat_round / 会话采样评估 / 主动行为。
+                if is_target and stream_kind != "group":
+                    companion.affection.update_last_user_msg_time(datetime.now())
+                return
             # 群聊里非 target 的发言不上报（群流水会刷爆决策日志）；其余消息带上判定结果
             if is_group is True and not is_target:
                 return

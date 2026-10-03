@@ -62,6 +62,13 @@ class EmotionServices:
     def mood_text(self) -> str:
         return self.service.mood_text()
 
+    def injection_text(self) -> str:
+        """情绪底色注入文本（planner/replyer 注入 Hook 入口；转发 self.service）。
+
+        与 ``mood_text()`` 同源但多带注入要求行；Hook 侧仅消费字符串。
+        """
+        return self.service.injection_text()
+
     def mood_effect(self) -> Dict[str, Any]:
         """情绪→行为结构化系数（M4；跨模块消费入口，附录 C）。
 
@@ -88,6 +95,23 @@ class EmotionServices:
 
     def is_enabled(self) -> bool:
         return self.service._enabled()
+
+    async def evaluate_reply(self, reply_text: str, session_id: str = "") -> None:
+        """回复后 ΔVAD 评估入口（replyer.after_response Hook 的后台任务；转发 self.service）。
+
+        与内层 ``EmotionService.evaluate_reply`` 同签名（含 session_id target 识别链路），
+        节流与静默失败语义全部由内层负责。
+        """
+        await self.service.evaluate_reply(reply_text, session_id=session_id)
+
+    @property
+    def _bg_tasks(self) -> list:
+        """评估后台任务列表（与内层同一份；Hook 侧防堆积裁剪与 stop() 清理共用）。"""
+        return self.service._bg_tasks
+
+    @_bg_tasks.setter
+    def _bg_tasks(self, value: list) -> None:
+        self.service._bg_tasks = value
 
     async def start(self) -> None:
         """启动睡眠检测循环（模块总开关关闭时不启动，热重载由循环内门控兜底）。"""
