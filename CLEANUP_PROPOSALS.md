@@ -49,5 +49,6 @@
 |---|---|---|---|---|
 | 2026-10-03 | C1（能量曲线双实现合并：以 planning 侧为唯一实现、core 骨架副本删除） | `11f8498` | smoke + behavior 全绿（含新增能量输出钉住断言：schedule_query 通道逐值等于 `planning/energy_model.py`，h7/h19/h23 文案锚点） | 本项为 R0 唯一已知行为变化，仅限 schedule_query 通道（对齐上游），其余通道零变化 |
 | 2026-10-03 | C2（时间工具双模块合并：core 只留纯时间函数，窗口+能量归 planning 侧一个模块，timezone_manager 并入） | `17e526b` | smoke + behavior 全绿（含 C1 钉住断言回归通过） | 纯重构行为不变；分层保持：core 不依赖 planning |
+| 2026-10-03 | 随 M4 顺路：删除 `planning/inject/state_analyzer.py`（§4.2 planner 注入融合后无消费点，§三 预告项） | `4a95a72` | smoke + behavior 全绿 | 在 M4 功能提交内顺路删除；`inject/__init__.py` 导出与全部调用点清零 |
 
 > 版本号随收尾阶段统一升至 0.3.0，此处不单独递增。

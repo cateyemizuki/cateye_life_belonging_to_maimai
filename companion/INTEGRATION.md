@@ -13,7 +13,7 @@
 | `affection_events.py` | 好感规则事件层（M1 规则表 + M2 裁判 kind，零 LLM 成本）：`RULE_EVENT_TABLE` + 频控 + 日累计限幅 + `note_user_message`；`llm_review`/`daily_review` 由 M2 裁判传入 delta（仅受日累计限幅）；**M3 情绪调制生效**：入账前 delta × clamp(1+0.25×V×sign(delta), 0.6, 1.4)（开关关/读不到 V → 恒 1.0） | 新增（MAINTENANCE_PLAN §5.4） |
 | `affection_referee.py` | **好感 LLM 裁判（M2）**：会话采样裁判 `evaluate_conversation_delta`（delta ∈ [-2,+2.5] + tag）+ 关系日结 `run_daily_review`（delta ∈ [-2,+2] + 0~3 条印象 + tone + reason）+ `AffectionReviewer` 编排（双频控、后台任务、sleep_started 订阅、印象 10 条/7 天、失败静默）；prompt 不含 score/baseline | 新增（MAINTENANCE_PLAN §5.4） |
 | `relation.py` | **关系系统（简单版）**：relation_type/relation_custom 配置 → RelationProfile（称谓、三档档位名 + **v2 5 档标签/描述**、口吻、后缀池、括号小剧场、档位 miss 系数表），patrol/message_service/components 消费；3 档兼容映射经 `affection.legacy_level_for_tier` 转发 | 关系扩展 |
-| `patrol.py` | 巡检调度器完整判定链：日切→静默(fail-safe)→用户冷却→预算(晚安预留)→早安(S)→晚安(S)→想念(A：随机阈值+概率+LLM 把关+驳回冷却+未来日程避让+豁免开关)→日程节点分享(B)→日常搭话(B)；决策日志每轮恰好一条（SKIP_PRIORITY）；触发经 maisaka.proactive.trigger + 计 0.5 发言数；**M3 在 A 级段发布 `relation.silence_detected`（每日 ≤2/间隔 ≥4h/仅 target，独立于想念判定）** | scheduler.py |
+| `patrol.py` | 巡检调度器完整判定链：日切→静默(fail-safe)→用户冷却→预算(晚安预留)→早安(S)→晚安(S)→想念(A：随机阈值+概率+LLM 把关+驳回冷却+未来日程避让+豁免开关)→日程节点分享(B)→日常搭话(B)；决策日志每轮恰好一条（SKIP_PRIORITY）；触发经 maisaka.proactive.trigger + 计 0.5 发言数；**M3 在 A 级段发布 `relation.silence_detected`（每日 ≤2/间隔 ≥4h/仅 target，独立于想念判定）**；**M4 三处消费 emotion `mood_effect()`：概率乘数 / miss 双系数 / reason 追加 intent_hint（见下）** | scheduler.py |
 | `message_service.py` | 好感度后缀 AFFECTION_SUFFIXES + 档位2 括号小剧场（10%）+ send_to_target | message_service.py |
 | `memory_manager.py` | 用户习惯读写（委托 AffectionManager.habits）+ 个人上下文构建 | memory_manager.py |
 | `sender_identity.py` | SenderCache（msg_id→QQ，TTL 24h）+ SessionKindCache（会话→是否群聊）+ 提取助手 | sender_identity.py |
@@ -95,6 +95,18 @@ await self._companion.stop()
 | 沉默发布 | `patrol.py` `_maybe_publish_silence`（A 级判定段调用） | 频控通过 → 发 `relation.silence_detected`（hours / target_bonus） |
 | 情绪 V 注入 | `services.py` 装配段 | `affection.set_emotion_vad_provider(...)` 惰性读 `plugin._emotion.effective_valence()`；停用返回 None |
 | 调制应用 | `affection_events.py` `record_rule_event` | delta → 乘调制系数 → 频控/限幅 → 入账 + 决策日志 |
+
+## M4 落地（2026-10-03）：情绪 → 巡检行为输出（patrol 三处消费点）
+
+`patrol.py` `_tick` 掷骰前读 `plugin._emotion.mood_effect()`（跨模块 getattr 判空 + 恒等降级，§八.2：emotion 停用/缺失/异常时全部乘数恒 1.0、reason 原样透传）：
+
+| # | 消费点 | 位置 | 行为 |
+|---|---|---|---|
+| 1 | 概率乘数 | `_tick` 概率段（掷骰前） | `activity_trigger_rate`/`default_speak_rate` × `proactive_rate`（clamp [0.7,1.3]）；乘后概率与 `mood_proactive_rate` 落决策日志 |
+| 2 | miss 双系数 | `_sample_miss_threshold(mood_mult, tier_mult)` | 区间随机阈值 × `mood_effect.miss_threshold`（情绪）× `RelationProfile.miss_factor_for_tier(tier)`（档位；恋人档 0~4 = 1.4~0.6）；留痕 `miss_threshold_hours`/`mood_miss_threshold`/`tier_miss_factor`；任一不可得恒 1.0 |
+| 3 | intent_hint | `_trigger_planner` → `_append_intent_hint(reason)` | proactive intent 的 reason 追加低分辨成语义行（如「你今天有点低落，语气可以软一点」）；中性空串时 reason 字节不变，零新 Hook |
+
+三处均不新增 Hook；`NEUTRAL_MOOD_EFFECT` + `_mood_multiplier` 对上游值做防御夹取。
 
 ## 有意的裁剪 / TODO
 

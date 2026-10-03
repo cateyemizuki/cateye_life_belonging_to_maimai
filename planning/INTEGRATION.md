@@ -14,7 +14,7 @@
 | `schedule_generator.py` | 日程生成协调器：多轮生成 + 评分 + 提前达标 + retry 带反馈 + 无睡眠后处理 + 约定匹配落库 + regenerate | planner/schedule_generator.py |
 | `schedule_query.py` | 当前/未来活动查询（N 分钟窗口缓存） | ——（骨架保留） |
 | `generator/` 子包 | prompt_builder（wake/sleep 锚点动态 JSON 示例 + 衔接演算 + 三餐窗口 + 无睡眠模式）/ schema_builder / response_parser（**控制字符清理**）/ validator（语义校验，只警告）/ quality_scorer（0~1 评分）/ context_loader（跨群历史 + 知识库 + 近 N 天摘要）/ config | planner/generator/* |
-| `inject/` 子包 + `inject_service.py` | 意图分类 UserIntent / 注入优化器（冷却+概率+TTL）/ 会话上下文缓存（续注判定）/ 状态分析；planner（items 强 schema 协议）与 replyer（extra_prompt 协作式）两个注入入口 | handlers/inject/* + services/inject_service.py |
+| `inject/` 子包 + `inject_service.py` | 意图分类 UserIntent / 注入优化器（冷却+概率+TTL）/ 会话上下文缓存（续注判定）；planner（items 强 schema 协议）与 replyer（extra_prompt 协作式）两个注入入口；**M4：状态分析器（state_analyzer）删除，精神状态行改读情绪系统 `mood_text()`（见下）** | handlers/inject/* + services/inject_service.py |
 | `proactive_service.py` | 60s 轮询：活动切换主动开口（每 stream×活动×日期去重）、早间问好（含需激活）、约定到期强指令（priority=high）、频率调控、睡眠窗口判定 | services/proactive_service.py |
 | `auto_scheduler.py` | 每日定时自动生成（当天已有则跳过；指数退避） | planner/auto_scheduler.py |
 | `cleanup_service.py` | 过期日程/旧目标/旧日志清理循环 + 守护 auto_scheduler | services/cleanup_service.py |
@@ -33,6 +33,13 @@ self._planning = PlanningServices(self)   # 需要 plugin._data_dir/_db/_llm
 await self._planning.start()              # cleanup + auto_scheduler + inject 预热 + proactive
 await self._planning.stop()
 ```
+
+## M4 落地（2026-10-03）：planner 注入精神状态行融合（state_analyzer 删除）
+
+- `inject_service._render_unified_prompt` 的「精神状态」行改读 `plugin._emotion.mood_text()`（`_emotion_mood_line()`，与 emotion 注入条目同源，避免两套矛盾的「精神状态」）；情绪未装配/停用/异常 → 省略该行，不再回退静态模板（§八.2 可空降级）；
+- replyer 极简 extra_prompt 不再拼活动状态短语；`_compute_activity_aux` 只余剩余分钟一项（`goal_type` 参数保留以兼容调用签名）；
+- `inject/state_analyzer.py`（`ActivityStateAnalyzer`，295 行）随 M4 删除——§4.2 planner 注入融合后无消费点（CLEANUP_PROPOSALS §三 预告项），`inject/__init__.py` 导出同步清理；
+- `[inject] enable_state_analysis` 字段保留但当前不生效（字段描述已注明，仅旧配置兼容）。
 
 ## 有意的裁剪 / TODO
 

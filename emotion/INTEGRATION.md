@@ -12,10 +12,10 @@
 | `vad.py` | VADState/EmotionEvent 数据结构；25 种情绪原型（10 正/3 中/12 负）；加权欧氏距离映射（V1.0/A0.8/D1.2）+ 阈值复合标签 + 低分辨率三档描述 | §一/§四/§七 |
 | `state_machine.py` | 外部状态机：日常指数衰减、事件结算（衰减→增量→裁剪→日志）、静态偏移+乘数（effective_vad，避免偏移每轮累加）、睡眠大修（锚点收敛 × 倒 U 恢复系数 + 裁判增量）、参数生效/恢复默认/序列化 | §二/§五/§九/§十 |
 | `referee.py` | 三个独立 LLM 请求：睡眠裁判（±0.8 限幅 + reason 须引用日程原文）、人设初始化（锚点 ±0.6/偏移 ±0.3/增益 [0.8,1.3]/衰减 [0.6,1.2] 校验裁剪）、回复增量评估（±0.5）；宽松 JSON 解析 | §六/§十 |
-| `service.py` | 状态持久化（emotion_state.json / emotion_config.json）、睡眠检测循环（消费 planning 日程的 sleep 条目，跨午夜时长计算）、前后日日程与长期状态（planning 的 custom_prompt）汇总、初始化指令主体、隐私接口（清空日志）；**M3 增 `record_external_event` 统一外部事件入口 + target 识别/三层加算倍率 + 评估上下文反查（get_by_time_in_chat）** | §五/§六/§十/§十三 |
+| `service.py` | 状态持久化（emotion_state.json / emotion_config.json）、睡眠检测循环（消费 planning 日程的 sleep 条目，跨午夜时长计算）、前后日日程与长期状态（planning 的 custom_prompt）汇总、初始化指令主体、隐私接口（清空日志）；**M3 增 `record_external_event` 统一外部事件入口 + target 识别/三层加算倍率 + 评估上下文反查（get_by_time_in_chat）**；**M4 增 `mood_effect()` 情绪→行为系数（附录 C 映射，纯规则）** | §五/§六/§十/§十三 |
 | `bridge.py` | **M3 新增**：跨模块事件桥——订阅 `relation.*` / `schedule.commitment_*` / `qzone.*` 并翻译为有界情绪增量（模板或 LLM 路径），全部经 `record_external_event` 入账；注册/注销挂 `services.py` | MAINTENANCE_PLAN §4.2 / §6.2 A·E·G |
 | `components.py` | `EmotionComponentsMixin`：2 Command + 2 Tool（**M3 新增 `cateye_test_emotion_report`**）+ 3 HookHandler（方法名 `emo_` 前缀，组件名 `cateye_test_emotion_*`） | —— |
-| `services.py` | `EmotionServices` 服务束（start/stop/set_persona 转发；**M3 起 start/stop 注册与注销 bridge 事件订阅、对外暴露 `effective_valence()` 供 B2 调制**） | —— |
+| `services.py` | `EmotionServices` 服务束（start/stop/set_persona 转发；**M3 起 start/stop 注册与注销 bridge 事件订阅、对外暴露 `effective_valence()` 供 B2 调制**；**M4 增 `mood_effect()` 转发，异常兜底恒等中性值**） | —— |
 
 ## 与其他模块的协作
 
@@ -67,6 +67,22 @@
 | 事件订阅 | `services.py` `_register_event_subscriptions` | `register_bridge(bus, service, plugin)`；`stop()` 执行反订阅闭包 |
 | 档位读取 | `service.affection_tier()` | 跨模块 getattr 判空，读不到返回 None → 不加成 |
 | B2 对外读数 | `services.effective_valence()` | 供 companion 好感调制；模块停用/异常返回 None（消费方乘数恒 1） |
+
+## 情绪 → 行为输出（M4 落地，2026-10-03）
+
+**`service.py` `mood_effect() -> dict`**（纯规则、零 LLM 成本；附录 C 默认映射；四种消费字段）
+
+| 字段 | 映射（V=当前生效效价，A=唤醒度） | 消费方 |
+|---|---|---|
+| `proactive_rate` | V>0.3 且 A>0.2 → 1.2；V<−0.3 → 0.8；否则 1.0 | patrol：`activity_trigger_rate`/`default_speak_rate` 乘数 |
+| `miss_threshold` | V<−0.3 → 0.8；V>0.3 → 1.1；否则 1.0 | patrol：想念随机阈值（再 × affection 档位系数，双系数） |
+| `post_rate` | V<−0.6 → 0；V<−0.3 → 0.8；V>0.3 → 1.2；否则 1.0 | qzone：发帖概率与 `emotion_filter` 门控 |
+| `intent_hint` | V<−0.3 →「你今天有点低落，语气可以软一点」；V>0.3 →「你今天心情不错，语气可以轻快一点」；否则空串 | patrol：proactive intent 的 reason |
+
+- 数值一律 clamp [0.7,1.3]（`MOOD_EFFECT_MIN/MAX`），`post_rate` 允许 0~1.2（`MOOD_POST_RATE_MAX`）；
+- 模块停用（`emotion.enabled=false` / `plugin.enabled=false`）→ 返回恒等中性值 `{1.0, 1.0, 1.0, ""}`，消费方无需另判开关（§八.2 可空降级）；
+- 跨模块读取入口为服务束 `EmotionServices.mood_effect()`（内部 `try/except` → 异常同样返回恒等值；patrol/qzone 经 `plugin._emotion.mood_effect()` 读取）；
+- 下游三处消费点见 `companion/INTEGRATION.md` §M4 与 `qzone`（发帖门控 + 说说/回评文案情绪行）。
 
 ## 有意的裁剪 / TODO
 
