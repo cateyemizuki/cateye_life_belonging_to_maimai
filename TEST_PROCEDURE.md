@@ -110,7 +110,8 @@
 
 | 日期 | 文件 | 位置 | 目的 | 回滚方法 | 状态 |
 |---|---|---|---|---|---|
-| （无） | | | | | |
+| 2026-10-03 | config/bot_config.toml | [debug].enable_console_input | true→false：Git Bash 后台承载下 BotConsole(prompt_toolkit) 因 TERM=xterm-256color 崩溃致宿主退出；自动化验证无需终端输入 | 改回 true | 生效中 |
+| 2026-10-03 | config/adapter_policy.toml | 文件末尾新增 [[adapters]] 块 | harness 注入网关（github.cateye.cateye-harness:harness_inject_gateway）策略放行：私聊 allow、群聊仅 392653174——[defaults] 对未登记网关群/私全 block，导致 /h_inject accepted=False | 删除该 [[adapters]] 块 | 生效中（热读） |
 
 ## 八、测试记录（追加式，最新在上）
 
