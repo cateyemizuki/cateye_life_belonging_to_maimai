@@ -29,6 +29,7 @@
 | 私聊 `123456789` | **主测试私聊** | 同上；测试期间被测插件 `target_qq` 应配置为 `123456789`（想念/早晚安/好感链路的对象） |
 | 群 `530610253` | **只许旁观** | **禁止主动激活 bot 聊天**：不得注入、不得发命令、不得把它设进任何主动白名单；仅当框架自身触发时辅助观察并记录 |
 | 私聊 `2634571198` | **另一台服务器上的 bot（"她俩"之一）** | 高危：本 bot 与她可能互聊死循环烧 token。禁令：①注入消息的 sender **永远不得是** 2634571198；②不得在该私聊注入诱导内容；③如确需观察 bot↔bot，先开启 harness 环路守卫，至多单条触发，**≥2 个来回立即 /h_freeze**；④默认完全不碰 |
+| 宿主进程（maibot 本体） | **用户专属操作权**（2026-10-04 新增红线） | 宿主的启动/停止/重启属用户专属操作权：①宿主必须以前台可见控制台窗口运行（§五.1 形式），禁止无窗口后台承载；②**用户已启动的宿主实例禁止杀**（无论以何种理由）；③agent 需要重启时必须先征得用户确认；④违例一次即停工报告 |
 
 **Token 保护三件套（每次测试会话开始前核对）**：
 1. 被测插件配置收紧：`patrol.daily_max_speak ≤ 3`、`patrol.check_interval_minutes` 临时调小仅用于观察、`[judge]`/评估/裁判任务指向便宜非思考任务（`model_config.toml` 任务清单用 `/h_models` 核对）；
@@ -78,8 +79,8 @@
 
 ## 五、标准测试流程 SOP（每轮照此执行）
 
-1. **启动宿主（前台）**：agent 用 Bash 后台任务承载前台控制台进程并捕获输出：
-   `cd /e/maibot/MaiBot-main && cmd //c run.bat`（run_in_background，输出重定向到 `E:\maibot\MaiBot-main\logs\agent_session_stdout.log`）。等待控制台出现就绪标志；QQ/SnowLuma 侧由用户启动，agent 经 `/h_models`、get_all_plugins 确认 `snowluma_gateway` ready。
+1. **启动宿主（前台可见窗口）**：agent 以可见控制台窗口启动（2026-10-04 修订：禁止无窗口后台承载）：
+   `cmd /c start "MaiBot" /D "E:\maibot\MaiBot-main" cmd /k run.bat`——弹出的 "MaiBot" 控制台窗口保持前台可见（cmd /k 不退出）。agent **不捕获 stdout**；自动日志读取一律走 `logs/app_*.log.jsonl`（宿主本就落盘）。等待日志出现就绪标志；QQ/SnowLuma 侧由用户启动，agent 经 `/h_models`、get_all_plugins 确认 `snowluma_gateway` ready。
 2. **前置检查单**：宿主起 → 适配器 ready → 被测插件已装载（版本/组件数）→ `/h_models` 任务名齐全 → 被测插件测试配置已收紧（§一三件套）→ `target_qq=123456789` → decision_logs 无上轮残留 → 环路守卫已启用。
 3. **L0 先行**：跑两个 scratch 脚本全绿再碰宿主。
 4. **部署**：robocopy 镜像拷贝到 `plugins\`（**排除 `__pycache__`、`scratch/`、`*.md` 可带**）→ `/h_wait_reload <新版本>`。
@@ -117,6 +118,8 @@
 
 | 日期 | 里程碑/场景 | 结果 | 摘要/日志位置 |
 |---|---|---|---|
+| 2026-10-04 | 宿主进程边界违例（通报一） | 违例确认 + 规程修订（§五.1 可见窗口 / §一 宿主进程红线） | 启停史：10-03 16:56 用户启动宿主（崩溃循环 4 次，16:56:34 进程对 37584/45796 残留、后自行退出）；10-03 18:07 agent attempt1（无窗口后台，BotConsole 崩溃退出）；18:15 attempt3（无窗口后台，运行至 10-04 01:55 被 agent 树杀）；10-04 01:47 attempt4（无窗口后台，04:41 无日志硬退出）；04:42 attempt5（无窗口后台，被用户手动清除）。违例说明：agent 以"测试环境清理残留/使配置生效"为由多次启动与终止宿主实例，均未征得用户确认且采用无窗口后台形式——终止对象经复核为 agent 自启实例（30328/32068 树），用户 16:56 实例在 agent 处置前已自行退出；但宿主操作权边界自此事件起明确归用户，agent 此前的一切启停均按违例记录 |
+| 2026-10-04 | L5 事件：attempt4 硬退出 | 记录 | 04:41 退出码 1、无优雅关闭痕迹、崩溃前仅 A_Memorix 400 常规噪音（agent_session_stdout.attempt4-crashed-0441.log 留存）；已按新规程以可见窗口重启续 L5 |
 | 2026-10-04 | 宿主验证日·六场景 L2 批量核对 | bus_check=PASS；affection_basic+v1迁移=PASS；attribution/mood_effect/silence/affection_review=PARTIAL（顺延项见下） | 证据：decision_logs（decisions_10-03/04.jsonl）、宿主 DB mai_messages（bot 出站 15+ 条，"博士"称呼自然对话）、harness results/*.json、maisaka_prompt 快照；独立核对员报告见会话存档。修复 P1-P4（29bf06f）后情绪行注入已实证（02:38 快照含【当前情绪底色】） |
 | 2026-10-04 | L2 实证缺陷 P1-P4（全部修复 29bf06f） | P1 EmotionServices 缺委托→情绪 Hook AttributeError ×44；P2 is_notify 被整体忽略；P3 睡眠裁判 max_tokens=600 截断；P4 日结失败也落 reviewed_date | 各项修复经四套测试门+独立验收；P1 情绪行宿主复验通过；P3 token 提升仍被思考型输出淹没（非思考模型绑定为宿主 model_config 决策，§八.8） |
 | 2026-10-04 | L5 挂机（进行中） | 宿主自 10-03 18:15 起持续运行（中途两次计划内重启），恢复配置生效 | 定期抽查 decision_logs；完成判定待 ≥1 天窗口 |
