@@ -1,6 +1,6 @@
 # 命令与工具手册（USAGE.md）
 
-> 猫眼生活套件（github.cateye.cateye-suite）现有 **13 个 LLM 工具**、**12 个聊天指令**、**4 个跨插件 API**。
+> 猫眼生活套件（github.cateye.cateye-suite）现有 **14 个 LLM 工具**、**12 个聊天指令**、**4 个跨插件 API**。
 > 四个业务子模块各自提供一组：planning（日程规划）/ companion（虚拟恋人）/ emotion（情绪）/ qzone（QQ 空间）。
 > 本手册给出每个条目的描述原文、参数、行为细节与权限要求；架构与安装说明见 README.md。
 
@@ -16,7 +16,7 @@
 
 ---
 
-## 一、LLM 工具（13 个）
+## 一、LLM 工具（14 个）
 
 ### planning — 日程规划（4 个）
 
@@ -94,9 +94,21 @@
 
 ---
 
+### emotion — 情绪系统（2 个）
+
 #### `cateye_test_emotion_mood`
 - **描述**：查询 bot 当前的情绪底色（情绪标签与低分辨率描述）。用户问'你现在什么心情''感觉怎么样'时调用。
 - **行为**：从 VAD 状态机取当前有效值（含偏移/乘数），映射为情绪标签（含混合比例）与"愉悦度/唤醒度/支配感"模糊描述；情绪模块未启用时明确提示。
+
+#### `cateye_test_emotion_report`
+- **描述**：上报一件影响 bot 心情的事件（由 bot 判断是否与最重要的人有关），入账有界情绪增量。
+- **参数**：
+  | 参数 | 类型 | 必填 | 说明 |
+  |---|---|---|---|
+  | event | string | ✔ | 一句话概括这轮交流发生了什么（谁说了什么、结果如何） |
+  | is_target | boolean | | 是否由最重要的人（`target.target_qq`）引发；是=true；缺失/类型不对/胡填一律按非 target 处理，不报错 |
+- **行为**：target 时 `K = 1 + target_bonus_step × (档位+1)`、非 target 时 `K = non_target_multiplier`，再乘 `global_event_multiplier` → 事件文本走小模型有界评估 ΔVAD（±0.5）→ 入账；与其他事件共用评估节流（`evaluate_min_interval_seconds`）与 ±0.5 硬限幅，结果落决策日志（`emotion.external_event`）。
+- **备注**：Tool 默认进 **deferred 工具池**（未设 `core_tool=True`），bot 自发调用不保证——**触发条件已写进 `detailed_description`**（仅群聊里出现重要的人相关/由 TA 引发且影响心情的事件才调用；普通群友闲聊与私聊无需调用，`replyer.after_response` 自动评估始终是主通道），本工具只是群聊场景的补充。
 
 ## 二、聊天指令（12 个）
 

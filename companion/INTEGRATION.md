@@ -8,12 +8,12 @@
 
 | 文件 | 职责 | 对应源模块 |
 |---|---|---|
-| `config.py` | patrol / affection / cateye / judge 四个配置段（whitelist→顶层 target 段；llm_log/proactive_log→顶层 admin 段；**新增 relation_type/relation_custom 关系配置**——miss 提示词占位 {relation}、消息口吻/后缀/档位名随关系变化，热更新经 sync_from_config；**affection 段 M1 扩为 v2**：enabled/decay_pull/baseline_ema/tier_hysteresis/tier_min_dwell_hours/daily_positive_cap/daily_negative_cap，**M2 起 review_enabled/review_sample_every_rounds/review_max_per_day/review_task_name 生效**；emotion_modulation 属 M3（仅声明）） | config.py |
-| `affection.py` | 好感度 v2 状态层：score/baseline/5 档迟滞/日累计/事件日志/滚动印象/关系温度 + v1→v2 迁移 + v1 字段原地保留（`level()` 保持 0/1/2 兼容口径）+ 档位变化发布 `relation.affection_tier_changed`；1 秒节流写盘 + flush | affection_manager.py（M1 重写） |
-| `affection_events.py` | 好感规则事件层（M1 规则表 + M2 裁判 kind，零 LLM 成本）：`RULE_EVENT_TABLE` + 频控 + 日累计限幅 + `note_user_message`；`llm_review`/`daily_review` 由 M2 裁判传入 delta（仅受日累计限幅）；`emotion_modulation` 乘数恒 1.0（M3） | 新增（MAINTENANCE_PLAN §5.4） |
+| `config.py` | patrol / affection / cateye / judge 四个配置段（whitelist→顶层 target 段；llm_log/proactive_log→顶层 admin 段；**新增 relation_type/relation_custom 关系配置**——miss 提示词占位 {relation}、消息口吻/后缀/档位名随关系变化，热更新经 sync_from_config；**affection 段 M1 扩为 v2**：enabled/decay_pull/baseline_ema/tier_hysteresis/tier_min_dwell_hours/daily_positive_cap/daily_negative_cap，**M2 起 review_enabled/review_sample_every_rounds/review_max_per_day/review_task_name 生效**；emotion_modulation 属 M3、**已接线**：好感 delta × clamp(1+0.25×V×sign(delta), 0.6, 1.4)） | config.py |
+| `affection.py` | 好感度 v2 状态层：score/baseline/5 档迟滞/日累计/事件日志/滚动印象/关系温度 + v1→v2 迁移 + v1 字段原地保留（`level()` 保持 0/1/2 兼容口径）+ 档位变化发布 `relation.affection_tier_changed`；1 秒节流写盘 + flush；**M3 增 `emotion_modulation_enabled()` 与 `emotion_valence()`（`set_emotion_vad_provider` 注入，可空降级）** | affection_manager.py（M1 重写） |
+| `affection_events.py` | 好感规则事件层（M1 规则表 + M2 裁判 kind，零 LLM 成本）：`RULE_EVENT_TABLE` + 频控 + 日累计限幅 + `note_user_message`；`llm_review`/`daily_review` 由 M2 裁判传入 delta（仅受日累计限幅）；**M3 情绪调制生效**：入账前 delta × clamp(1+0.25×V×sign(delta), 0.6, 1.4)（开关关/读不到 V → 恒 1.0） | 新增（MAINTENANCE_PLAN §5.4） |
 | `affection_referee.py` | **好感 LLM 裁判（M2）**：会话采样裁判 `evaluate_conversation_delta`（delta ∈ [-2,+2.5] + tag）+ 关系日结 `run_daily_review`（delta ∈ [-2,+2] + 0~3 条印象 + tone + reason）+ `AffectionReviewer` 编排（双频控、后台任务、sleep_started 订阅、印象 10 条/7 天、失败静默）；prompt 不含 score/baseline | 新增（MAINTENANCE_PLAN §5.4） |
 | `relation.py` | **关系系统（简单版）**：relation_type/relation_custom 配置 → RelationProfile（称谓、三档档位名 + **v2 5 档标签/描述**、口吻、后缀池、括号小剧场、档位 miss 系数表），patrol/message_service/components 消费；3 档兼容映射经 `affection.legacy_level_for_tier` 转发 | 关系扩展 |
-| `patrol.py` | 巡检调度器完整判定链：日切→静默(fail-safe)→用户冷却→预算(晚安预留)→早安(S)→晚安(S)→想念(A：随机阈值+概率+LLM 把关+驳回冷却+未来日程避让+豁免开关)→日程节点分享(B)→日常搭话(B)；决策日志每轮恰好一条（SKIP_PRIORITY）；触发经 maisaka.proactive.trigger + 计 0.5 发言数 | scheduler.py |
+| `patrol.py` | 巡检调度器完整判定链：日切→静默(fail-safe)→用户冷却→预算(晚安预留)→早安(S)→晚安(S)→想念(A：随机阈值+概率+LLM 把关+驳回冷却+未来日程避让+豁免开关)→日程节点分享(B)→日常搭话(B)；决策日志每轮恰好一条（SKIP_PRIORITY）；触发经 maisaka.proactive.trigger + 计 0.5 发言数；**M3 在 A 级段发布 `relation.silence_detected`（每日 ≤2/间隔 ≥4h/仅 target，独立于想念判定）** | scheduler.py |
 | `message_service.py` | 好感度后缀 AFFECTION_SUFFIXES + 档位2 括号小剧场（10%）+ send_to_target | message_service.py |
 | `memory_manager.py` | 用户习惯读写（委托 AffectionManager.habits）+ 个人上下文构建 | memory_manager.py |
 | `sender_identity.py` | SenderCache（msg_id→QQ，TTL 24h）+ SessionKindCache（会话→是否群聊）+ 提取助手 | sender_identity.py |
@@ -21,7 +21,7 @@
 | `cateye_client.py` | 恋人电脑联动：connect-hub 跨插件 API（status/screenshot）+ VLM 描述 + 超时与缓存 | cateye_client.py + llm_service.describe_image |
 | `holiday_service.py` | 节假日多级降级：timor 整年表 → jiejiariapi → timor 按天 → 本地星期几；3 天 TTL 原子落盘 | holiday_service.py |
 | `components.py` | `CompanionComponentsMixin`：5 Hook + 6 Tool + 8 Command + 3 API（方法名 `mai_` 前缀；API 组件名加 `companion_` 前缀避免与 planning 撞名） | plugin.py 组件面 |
-| `services.py` | `CompanionServices` 服务束（复用顶层 _affection/_llm/_loggers；`set_persona`/`set_target`/`sync_from_config` 入口；**M2 构造并持有 `reviews`（`AffectionReviewer`）**） | plugin.py 装配段 |
+| `services.py` | `CompanionServices` 服务束（复用顶层 _affection/_llm/_loggers；`set_persona`/`set_target`/`sync_from_config` 入口；**M2 构造并持有 `reviews`（`AffectionReviewer`）**；**M3 装配期注入情绪效价提供者 `set_emotion_vad_provider`（惰性读 `plugin._emotion`，可空降级）**） | plugin.py 装配段 |
 
 ## 集成方式（已在 plugin.py 完成）
 
@@ -45,7 +45,7 @@ await self._companion.stop()
 **规则事件层 `companion/affection_events.py`**（零 LLM 成本）
 - 统一入口 `record_rule_event(affection, kind, delta=None, desc="", *, caps=None, key="")`（`AffectionManager.record_rule_event` 同名转发）：频控 → 日累计限幅 → 入账 → 迟滞重估 → event_log/决策日志。
 - M1 表 `RULE_EVENT_TABLE`：`chat_round` +0.05（日 ≤ +1.0）、`user_initiated` +0.15（沉默 ≥1h 后对方先开口，日 ≤ +0.5）、`morning_exchange`/`night_exchange` 各 +0.2（1 次/日）、`commitment_kept` +1.0 / `commitment_broken` −0.5（每约定 1 次，`key` 去重）；M2 追加 `llm_review` / `daily_review`（delta 由裁判传入并已裁剪，仅受日累计限幅）。日累计 positive ≤ +4.0 / negative ≥ −3.0。未登记 kind 按 `unknown_kind` 丢弃并告警（不静默扩表）。
-- `note_user_message()` 由 `update_last_user_msg_time()` 顺带调用；情绪调制乘数恒 1.0（`emotion_modulation` 仅声明字段，M3 接线）。
+- `note_user_message()` 由 `update_last_user_msg_time()` 顺带调用；情绪调制（M3 接线）：入账前 delta × clamp(1 + 0.25 × V × sign(delta), 0.6, 1.4)，乘数恒 1.0 的降级路径见下节。
 
 **接线挂点**
 
@@ -75,6 +75,26 @@ await self._companion.stop()
 | 会话采样触发 | `components.py` `chat.receive.after_process`（chat_round 记账点旁） | `_mai_note_review_round()` → `reviewer.note_target_message()`（滚动缓冲 + 轮次/每日双频控，命中采样只调度后台任务） |
 | 日结订阅 | `services.py` `_register_event_subscriptions`（`start()` 注册 / `stop()` 反订阅 + `reviews.close()`） | `schedule.sleep_started` → `reviewer.on_sleep_started()`（延迟 ≥90s 后日结，晚于情绪睡眠大修） |
 | 印象/tone 注入 | `components.py` `_mai_build_activity_suffix` / `_mai_affection_state_line` | 好感行后叠加「【最近印象】…；【关系温度·日期】…」，无数据降级现状 |
+
+## M3 落地（2026-10-03）：沉默事件发布 + 情绪调制接线
+
+**沉默事件发布（B1 输入端，`patrol.py`）**
+- `_tick` 的 A 级判定段（想念判定之前）调用 `_maybe_publish_silence(now)`：`last_user_msg_time` 超过 `miss_hours_min` → `bus.publish("relation.silence_detected", hours, target_bonus)`；只发布事件，不参与想念触发判定，异常静默吞掉（绝不影响判定链）；
+- 频控（内存态、跨天清零）：每日 ≤2 次、间隔 ≥4h（`SILENCE_EVENT_MAX_PER_DAY` / `SILENCE_EVENT_MIN_INTERVAL_HOURS`）；**仅 target**——`has_target()` 为假不发布；
+- payload `target_bonus` 仅留痕（= `[emotion].target_bonus_step × (档位+1)`；档位读 affection，任一不可得返回 0 不猜）；emotion 侧桥按同一公式重算 K（单一事实来源仍是档位 + 配置）。
+
+**情绪调制好感（B2，`affection_events.py` + `affection.py` + `services.py`）**
+- 规则事件入账前对 delta 乘 `clamp(1 + 0.25 × V × sign(delta), 0.6, 1.4)`（`_EMOTION_MULTIPLIER` 基准 1.0、k=0.25）；调制在频控 / kind 日上限 / 日累计限幅之前应用，后续限幅按调制后的值计算；`requested_raw`/`multiplier`/`emotion_valence` 落决策日志；
+- V 来源：`AffectionManager.emotion_valence()`（clamp ±1）← 装配期 `set_emotion_vad_provider(lambda: _emotion_valence(plugin))`（`services.py`，惰性解析，因 `plugin._emotion` 在 companion 服务束之后装配）；情绪模块缺失/停用/异常 → None → 乘数 1.0；
+- 开关 `[affection] emotion_modulation`（默认 true，`emotion_modulation_enabled()`）：false、情绪模块停用或读不到 V 时乘数恒 1.0（M1 占位语义的降级路径，§八.2 可空降级）。
+
+**M3 接线挂点**
+
+| 挂点 | 位置 | 行为 |
+|---|---|---|
+| 沉默发布 | `patrol.py` `_maybe_publish_silence`（A 级判定段调用） | 频控通过 → 发 `relation.silence_detected`（hours / target_bonus） |
+| 情绪 V 注入 | `services.py` 装配段 | `affection.set_emotion_vad_provider(...)` 惰性读 `plugin._emotion.effective_valence()`；停用返回 None |
+| 调制应用 | `affection_events.py` `record_rule_event` | delta → 乘调制系数 → 频控/限幅 → 入账 + 决策日志 |
 
 ## 有意的裁剪 / TODO
 
