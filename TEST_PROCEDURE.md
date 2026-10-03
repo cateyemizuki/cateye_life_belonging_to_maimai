@@ -116,13 +116,14 @@
 
 | 日期 | 里程碑/场景 | 结果 | 摘要/日志位置 |
 |---|---|---|---|
+| 2026-10-03 | 宿主验证日 L1 | 首次部署加载失败→修复（宿主加载器证据见附录「L1 实证发现」） | 四套测试全绿（L0：smoke/behavior × cateye_test/cateye_harness） |
 | 2026-10-03 | harness v0.1.1 文件任务通道 | L0 四套全绿 | `tasks/*.json` 四动作白名单（inject/seq/state/freeze\|resume）→ `results/<id>.json` 回执，宿主验证日主控链路就绪 |
 | 2026-10-03 | cateye_harness 0.1.0 实现 | L0 四套全绿（smoke/behavior 各两套） | 代码 D:/deepseek-harness_workspace/maibot-plugins/cateye_harness，staging D:/deepseek-harness_workspace/maibot-plugins/cateye_harness\build_staging\； |
 | 2026-10-03 | 文档建立 | — | 环境事实与红线制定；harness 插件已实现待宿主验证（L0 全绿，staging 就绪） |
 
 ## 附录：全自动模式（宿主验证日 SOP）
 
-> 性质：**计划版本（尚未执行）**；验证日的实证结论与偏差追加记录到 §八。
+> 性质：计划版本；**2026-10-03 宿主验证日已进入执行——L1（部署/热重载）已产出实证结论（见下「L1 实证发现」），全流程其余步骤待执行**；验证日的实证结论与偏差追加记录到 §八。
 
 ### 〇、前提
 
@@ -135,12 +136,26 @@
 0. 两仓库打 tag：`cateye_test` v0.4.0-offline-verified / `cateye_harness` v0.1.1。
 1. agent 前台启动宿主（Bash 后台任务承载 `run.bat`，stdout 捕获到 `logs/agent_session_stdout.log`）；随后轮询宿主日志确认 `snowluma_gateway` ready（**最多等 10 分钟，超时即停并报告**；若用户侧未就绪导致超时，等待后重试一次）。
 2. robocopy 部署两 staging（`cateye_harness\build_staging\cateye_test` → `plugins\cateye_test`；`cateye_harness\build_staging\cateye_harness` → `plugins\cateye_harness`）；热重载确认：轮询宿主日志“插件加载”行 + 组件文件时间戳，**实证拷贝是否自动重载**；若不自动则 touch 插件文件强制重载——把实证结论记入 §八。
+   - **实证结论（2026-10-03）**：宿主 file_watcher 自动热重载**实证成立**——拷贝后 watchfiles 检出变更批次（18:16:51.9）约 1s 即完成重启，宿主日志依次出现 `开始重启插件运行时 Supervisor: file_watcher`（18:16:52）与 `插件运行时 Supervisor 已重启完成: file_watcher`（18:16:53），**全程无需 touch**。（证据：宿主 `logs/app_20261003_181507.log.jsonl`；机制：`src/plugin_runtime/integration.py:1511-1531`（watchfiles 监视插件根目录，debounce 600ms）+ `:602-628`（重启日志））。上文“若不自动则 touch”仅作后备（本次未用）。
 3. 首次加载生成 `config.toml` 后直接写入收紧配置（`patrol.daily_max_speak ≤ 3`、`[judge]`/评估任务指便宜非思考任务、`target_qq=123456789`）+ 强制重载 + 读回验证。
 4. 网关连通性探测（**第一发任务文件**）：先私聊注入（123456789→123456789 私聊流）确认链路与回复（回复确认以宿主日志/decision_logs 为准，真实 QQ 侧由用户目视）；再群聊注入 392653174——若 harness 网关被宿主适配器名单拦截，在 `config/adapter_policy.toml` 增补 harness 条目（测试环境允许，记入 §七 HOST_PATCHES），重试通过。
 5. L2 场景链按序全自动（经 `tasks/*.json` 下发 inject/seq 任务，收 `results/<id>.json` 回执）：`bus_check` → `affection_basic` → `affection_review` → `attribution` → `silence` → `mood_effect`；每场景四通道核对**全部文件化**（decision_logs jsonl / 宿主 app log / 状态 JSON / results 回执），逐场景写核对记录（主会话驱动操作，核对派子代理）。
 6. L4 子项（迟滞 24h、sleep 锚点搬运）：agent 直接改 `config.toml` + 强制重载 + 等待观察；用完搬回并记录（环境一次性，但同日后续场景依赖合理配置）。
 7. 全部通过 → L5 挂机 ≥1 天（宿主保持运行，agent 定期抽查 decision_logs）。
 8. 收尾报告：每场景 PASS/FAIL + 四通道证据文件路径 + HOST_PATCHES + git log。
+
+### L1 实证发现（2026-10-03 宿主验证日）
+
+**宿主扩展插件运行时不把插件目录加入 sys.path**（两插件首载失败的根因）：宿主 Runner 用 `spec_from_file_location` 加载插件 `plugin.py`，只在 `exec_module` 期间临时把「plugins 根目录」与宿主 `src` 加入 sys.path（`src/plugin_runtime/runner/plugin_loader.py:583-584` 两处 `_temporary_sys_path_entry`；`:571` 的 `submodule_search_locations=[plugin_dir]` 只作用于插件模块自身，不等于把插件目录加进 sys.path）。因此插件内的顶层绝对导入（`companion`/`core`/`config` 等）会被宿主 `src/` 下同名模块抢先命中，或直接找不到。
+
+**两插件首次部署加载失败证据**（宿主日志 `logs/app_20261003_181507.log.jsonl`，18:16:53；汇总行 `插件注册失败: ... 已加载=0，失败=2`）：
+- `github.cateye.cateye-harness`（旧版 `plugin.py:49`）：`from config import CateyeHarnessConfig` → `cannot import name 'CateyeHarnessConfig' from 'config' (E:\maibot\MaiBot-main\src\config\__init__.py)`，即 `config` 落到了宿主 `src/config`；
+- `github.cateye.cateye-suite`（旧版 `plugin.py:22`）：`from companion.affection import AffectionManager` → `ModuleNotFoundError: No module named 'companion'`。
+
+**修复（实际方案，已落地于开发目录与 staging）**：
+1. 两插件 `plugin.py` 顶部加 sys.path 引导：自身插件目录先 remove 再 `insert(0)` 到 sys.path 首位（`cateye_test/plugin.py:31-34`、`cateye_harness/plugin.py:56-59`），保证自身顶层模块优先命中；
+2. **模块冲突处理**：配置模块改名，避开通用顶层名 `config`——`config.py` → `suite_config.py`（cateye_test）/ `harness_config.py`（cateye_harness）。原因：同进程多插件共用 `sys.modules`，顶层 `config` 会被宿主 `src/config` 或先加载的兄弟插件占住；
+3. **同运行时多插件顶层模块命名需唯一**：sys.path 顺序只对“首次 import”生效，一旦某名字已进 `sys.modules`，后加载插件就会拿到占用者的模块——新增顶层模块前先全仓搜索同名文件/目录。
 
 ### 分工说明
 
