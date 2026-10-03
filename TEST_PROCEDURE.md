@@ -119,6 +119,8 @@
 
 | 日期 | 里程碑/场景 | 结果 | 摘要/日志位置 |
 |---|---|---|---|
+| 2026-10-04 | qzone 子项复验（status/post/文案情绪行） | PASS | 接线修复 bdf29e6 生效：status 命令端到端可用（修复前同命令 100% AttributeError）；真实发帖 `bus:qzone.posted {tid, summary, source:qzone}`（载荷符附录 A）+ `qzone_state.json posted_today=1`（额度 1/2）；M4 mood_line 融合代码级取证（qzone/service.py:376-380/:442-445）；日程驱动路径 prompt 断言随 L5；cookie/动作通道未连通=环境状态（如实回报，非插件缺陷） |
+| 2026-10-04 | 宿主验证日缺陷 #7（QzoneService config 接线错位） | 已修复 bdf29e6 | qzone 首次启用点亮死路径：8 处 `self._config.qzone` 落空（plugin.py:103 第二实参误传插件对象）；修复=实参改 self.config + service 增 _qzone_cfg() 活取值器（保热重载）+ keyword-only plugin 形参（_bus/emotion 路径）+ qzone/config.py 补 3 字段；宿主实测 status 收到 bot 回复 |
 | 2026-10-04 | 顺延复验（mood_effect / attribution / affection_review） | 三项转 PASS | emotion init 实证（bot 05:16 回执「✅ 情绪系统初始化完成」+参数摘要）；planner 快照情绪行维度随真实 VAD 更新；decision_logs emotion.external_event K=1.4（tier3 加成 0.4，source=replyer，δV+0.14 限幅内）；sleep_started→overhauled→daily_review 全链（tone+impressions×2 落盘，P4 成功才落 date）；四套回归全绿；整合验收 9/10 |
 | 2026-10-04 | 残留清理 | 已清 | 整合验收指出 harness-sleep-rv（日结复验用 sleep 条目）未随首轮清理删除 → 主会话删除并复核归零；L5 观察去污染 |
 | 2026-10-04 | 宿主进程边界违例（通报一） | 违例确认 + 规程修订（§五.1 可见窗口 / §一 宿主进程红线） | 启停史：10-03 16:56 用户启动宿主（崩溃循环 4 次，16:56:34 进程对 37584/45796 残留、后自行退出）；10-03 18:07 agent attempt1（无窗口后台，BotConsole 崩溃退出）；18:15 attempt3（无窗口后台，运行至 10-04 01:55 被 agent 树杀）；10-04 01:47 attempt4（无窗口后台，04:41 无日志硬退出）；04:42 attempt5（无窗口后台，被用户手动清除）。违例说明：agent 以"测试环境清理残留/使配置生效"为由多次启动与终止宿主实例，均未征得用户确认且采用无窗口后台形式——终止对象经复核为 agent 自启实例（30328/32068 树），用户 16:56 实例在 agent 处置前已自行退出；但宿主操作权边界自此事件起明确归用户，agent 此前的一切启停均按违例记录 |
