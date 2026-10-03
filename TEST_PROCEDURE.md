@@ -117,6 +117,9 @@
 
 | 日期 | 里程碑/场景 | 结果 | 摘要/日志位置 |
 |---|---|---|---|
+| 2026-10-04 | 宿主验证日·六场景 L2 批量核对 | bus_check=PASS；affection_basic+v1迁移=PASS；attribution/mood_effect/silence/affection_review=PARTIAL（顺延项见下） | 证据：decision_logs（decisions_10-03/04.jsonl）、宿主 DB mai_messages（bot 出站 15+ 条，"博士"称呼自然对话）、harness results/*.json、maisaka_prompt 快照；独立核对员报告见会话存档。修复 P1-P4（29bf06f）后情绪行注入已实证（02:38 快照含【当前情绪底色】） |
+| 2026-10-04 | L2 实证缺陷 P1-P4（全部修复 29bf06f） | P1 EmotionServices 缺委托→情绪 Hook AttributeError ×44；P2 is_notify 被整体忽略；P3 睡眠裁判 max_tokens=600 截断；P4 日结失败也落 reviewed_date | 各项修复经四套测试门+独立验收；P1 情绪行宿主复验通过；P3 token 提升仍被思考型输出淹没（非思考模型绑定为宿主 model_config 决策，§八.8） |
+| 2026-10-04 | L5 挂机（进行中） | 宿主自 10-03 18:15 起持续运行（中途两次计划内重启），恢复配置生效 | 定期抽查 decision_logs；完成判定待 ≥1 天窗口 |
 | 2026-10-03 | 宿主验证日 L1 | 首次部署加载失败→修复（宿主加载器证据见附录「L1 实证发现」） | 四套测试全绿（L0：smoke/behavior × cateye_test/cateye_harness） |
 | 2026-10-03 | harness v0.1.1 文件任务通道 | L0 四套全绿 | `tasks/*.json` 四动作白名单（inject/seq/state/freeze\|resume）→ `results/<id>.json` 回执，宿主验证日主控链路就绪 |
 | 2026-10-03 | cateye_harness 0.1.0 实现 | L0 四套全绿（smoke/behavior 各两套） | 代码 D:/deepseek-harness_workspace/maibot-plugins/cateye_harness，staging D:/deepseek-harness_workspace/maibot-plugins/cateye_harness\build_staging\； |
