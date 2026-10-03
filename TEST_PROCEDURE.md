@@ -116,4 +116,5 @@
 
 | 日期 | 里程碑/场景 | 结果 | 摘要/日志位置 |
 |---|---|---|---|
-| 2026-10-03 | 文档建立 | — | 环境事实与红线制定；harness 插件待实现 |
+| 2026-10-03 | cateye_harness 0.1.0 实现 | L0 四套全绿（smoke/behavior 各两套） | 代码 D:/deepseek-harness_workspace/maibot-plugins/cateye_harness，staging D:/deepseek-harness_workspace/maibot-plugins/cateye_harness\build_staging\； |
+| 2026-10-03 | 文档建立 | — | 环境事实与红线制定；harness 插件已实现待宿主验证（L0 全绿，staging 就绪） |
