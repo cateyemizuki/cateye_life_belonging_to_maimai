@@ -14,6 +14,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from .service import EmotionService
+from .vad import VADState
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,35 @@ class EmotionServices:
 
     def mood_text(self) -> str:
         return self.service.mood_text()
+
+    # ── Command / Tool 面转发（components.py 组件入口；签名与内层一致）──
+    def params_summary(self) -> str:
+        """``/cateye_test_emotion_config`` 查看文本（转发 self.service）。"""
+        return self.service.params_summary()
+
+    def reset_params(self) -> str:
+        """``/cateye_test_emotion_config reset``：恢复默认参数（转发 self.service）。"""
+        return self.service.reset_params()
+
+    def clear_log(self) -> str:
+        """``/cateye_test_emotion_config clear``：清空当天情绪日志（转发 self.service）。"""
+        return self.service.clear_log()
+
+    async def initialize_from_persona(self) -> str:
+        """``/cateye_test_emotion_init`` 主体：人设 → LLM 推导 → 落盘（转发 self.service）。"""
+        return await self.service.initialize_from_persona()
+
+    def target_multiplier(self, is_target: bool) -> float:
+        """§6.2 A 的 K（target 加成 / 非 target 系数；Tool 上报事件用，转发 self.service）。"""
+        return self.service.target_multiplier(is_target)
+
+    async def record_external_event(self, source: str, description: str,
+                                    delta: Optional[VADState] = None, *,
+                                    use_llm: bool = False,
+                                    multiplier: float = 1.0) -> Dict[str, Any]:
+        """外部事件统一入账入口（Tool 上报路径；签名与内层一致，转发 self.service）。"""
+        return await self.service.record_external_event(
+            source, description, delta, use_llm=use_llm, multiplier=multiplier)
 
     def injection_text(self) -> str:
         """情绪底色注入文本（planner/replyer 注入 Hook 入口；转发 self.service）。
