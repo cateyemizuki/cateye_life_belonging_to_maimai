@@ -30,7 +30,7 @@ class ScheduleQuery:
         缓存键区分该开关，避免共享实例上不同调用方互相串用结果。
         """
         now = now or datetime.now()
-        window = minutes_of_now(now) // (self._cache_minutes * 60)
+        window = minutes_of_now(now) // self._cache_minutes
         key = f"cur_{date}_{int(bool(include_sleep))}"
         cached = self._cache.get(key)
         if cached and cached[0] == window:
