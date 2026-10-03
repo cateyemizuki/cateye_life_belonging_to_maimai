@@ -79,8 +79,9 @@
 
 ## 五、标准测试流程 SOP（每轮照此执行）
 
-1. **启动宿主（前台可见窗口）**：agent 以可见控制台窗口启动（2026-10-04 修订：禁止无窗口后台承载）：
-   `cmd /c start "MaiBot" /D "E:\maibot\MaiBot-main" cmd /k run.bat`——弹出的 "MaiBot" 控制台窗口保持前台可见（cmd /k 不退出）。agent **不捕获 stdout**；自动日志读取一律走 `logs/app_*.log.jsonl`（宿主本就落盘）。等待日志出现就绪标志；QQ/SnowLuma 侧由用户启动，agent 经 `/h_models`、get_all_plugins 确认 `snowluma_gateway` ready。
+1. **启动宿主（前台可见窗口，2026-10-04 二次修订为本机实测配方）**：
+   `powershell Start-Process -FilePath 'cmd.exe' -ArgumentList '/k','run.bat' -WorkingDirectory 'E:\maibot\MaiBot-main' -WindowStyle Normal`
+   ——弹出可见 Windows Terminal 窗口（/k 保证崩溃后窗口留存可看报错）。**关键坑**：①禁止重定向 stdout/stderr（重定向=完全无窗口）；②必须设 WorkingDirectory=E:\maibot\MaiBot-main（uv 从 cwd 找 pyproject.toml，错误 cwd 会静默改用系统 Python）；③本机默认终端是 Windows Terminal，被启动 cmd 的 MainWindowHandle 恒为 0，窗口核验用 EnumWindows 找 `CASCADIA_HOSTING_WINDOW_CLASS` 可见窗口（实测窗口名 "cmd.exe - run.bat"），不要依赖 Process.MainWindowHandle。agent **不捕获 stdout**；自动日志读取一律走 `logs/app_*.log.jsonl`。配方出处：`D:\deepseek-harness_workspace\notes\agent-open-foreground-terminal.md`。等待日志出现就绪标志；QQ/SnowLuma 侧由用户启动，agent 经 `/h_models`、get_all_plugins 确认 `snowluma_gateway` ready。
 2. **前置检查单**：宿主起 → 适配器 ready → 被测插件已装载（版本/组件数）→ `/h_models` 任务名齐全 → 被测插件测试配置已收紧（§一三件套）→ `target_qq=123456789` → decision_logs 无上轮残留 → 环路守卫已启用。
 3. **L0 先行**：跑两个 scratch 脚本全绿再碰宿主。
 4. **部署**：robocopy 镜像拷贝到 `plugins\`（**排除 `__pycache__`、`scratch/`、`*.md` 可带**）→ `/h_wait_reload <新版本>`。
