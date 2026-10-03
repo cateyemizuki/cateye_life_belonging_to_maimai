@@ -22,6 +22,10 @@ USER_MESSAGE_LOOKBACK_MINUTES = 20.0
 USER_MESSAGE_LOOKBACK_LIMIT = 10
 #: 调用方传入的 K 的防御性上限（target K = 1+step×(档+1) ≤ 6，留余量）
 EXTERNAL_K_MAX = 10.0
+#: mood_effect 数值夹取范围（附录 C：全部 clamp [0.7, 1.3]；post_rate 允许 0~1.2）
+MOOD_EFFECT_MIN = 0.7
+MOOD_EFFECT_MAX = 1.3
+MOOD_POST_RATE_MAX = 1.2
 
 
 class EmotionService:
@@ -107,6 +111,70 @@ class EmotionService:
             "要求：语气、措辞、节奏与该情绪保持一致；情绪会随时间自然衰减、随事件变化；"
             "严禁在回复中直接说出情绪标签词汇或任何数值；不要主动提及或解释本提示本身。"
         )
+
+    # ── 情绪 → 行为结构化系数（M4；§4.2 行 5 / §6.2 C/D，附录 C）──────
+    def mood_effect(self) -> Dict[str, Any]:
+        """当前情绪 → 行为系数（纯规则、零 LLM 成本；附录 C 默认映射）。
+
+        四个消费字段（消费方：patrol 概率乘数 / miss 阈值 / qzone 发帖门控与文案）：
+
+        - ``proactive_rate``：patrol 主动概率乘数（× activity_trigger_rate/default_speak_rate）；
+        - ``miss_threshold``：想念随机阈值乘数（再 × affection 档位系数，M4 双系数）；
+        - ``post_rate``：qzone 发帖率乘数（0 = 低落时不硬营业；0~1.2）；
+        - ``intent_hint``：低分辨成语义行（拼进 proactive intent 的 reason）；中性为空串。
+
+        映射（附录 C，逐条）：proactive V>0.3&A>0.2→1.2、V<−0.3→0.8、否则 1.0；
+        miss V<−0.3→0.8、V>0.3→1.1、否则 1.0；post V<−0.6→0、V<−0.3→0.8、V>0.3→1.2、否则 1.0；
+        数值一律 clamp [0.7, 1.3]（post_rate 允许 0~1.2）。模块停用（emotion.enabled=false /
+        plugin.enabled=false）时返回恒等中性值，消费方无需再判开关（§八.2 可空降级）。
+        """
+        if not self._enabled():
+            return {"proactive_rate": 1.0, "miss_threshold": 1.0, "post_rate": 1.0, "intent_hint": ""}
+        eff = self._machine.effective_vad()
+        valence = float(eff.valence)
+        arousal = float(eff.arousal)
+
+        # 主动开口：心情好且精神足 → 更主动；低落 → 收敛
+        if valence > 0.3 and arousal > 0.2:
+            proactive_rate = 1.2
+        elif valence < -0.3:
+            proactive_rate = 0.8
+        else:
+            proactive_rate = 1.0
+
+        # 想念阈值：低落 → 更快想念重要的人；兴奋 → 不急着打扰（阈值放宽）
+        if valence < -0.3:
+            miss_threshold = 0.8
+        elif valence > 0.3:
+            miss_threshold = 1.1
+        else:
+            miss_threshold = 1.0
+
+        # 发帖：很低落 → 不硬营业；低落 → 减少；兴奋 → 分享欲上升
+        if valence < -0.6:
+            post_rate = 0.0
+        elif valence < -0.3:
+            post_rate = 0.8
+        elif valence > 0.3:
+            post_rate = 1.2
+        else:
+            post_rate = 1.0
+
+        # 低分辨成语义行：只给语气方向、不含任何数值；中性为空串
+        # （V<−0.3 的文案为规格给定；V>0.3 为对称补充——中性/正向不再是空白）
+        if valence < -0.3:
+            intent_hint = "你今天有点低落，语气可以软一点"
+        elif valence > 0.3:
+            intent_hint = "你今天心情不错，语气可以轻快一点"
+        else:
+            intent_hint = ""
+
+        return {
+            "proactive_rate": _clip(proactive_rate, MOOD_EFFECT_MIN, MOOD_EFFECT_MAX),
+            "miss_threshold": _clip(miss_threshold, MOOD_EFFECT_MIN, MOOD_EFFECT_MAX),
+            "post_rate": _clip(post_rate, 0.0, MOOD_POST_RATE_MAX),
+            "intent_hint": intent_hint,
+        }
 
     def params_summary(self) -> str:
         """/cateye_test_emotion_config 查看文本。"""

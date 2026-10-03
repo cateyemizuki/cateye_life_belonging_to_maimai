@@ -301,7 +301,7 @@ class InjectSectionConfig(PluginConfigBase):
     )
     enable_state_analysis: bool = Field(
         default=True,
-        description="启用活动状态分析：按活动进度生成情绪化短语（如「学了一会儿了，还算专注」）注入提示词",
+        description="（已停用）活动状态分析短语注入已由情绪系统精神状态行（mood_text）融合取代，此开关当前不生效；字段仅作旧配置兼容保留",
         json_schema_extra={"label": "启用状态分析", **_ui_i18n("State analysis")},
     )
     enable_inject_optimization: bool = Field(

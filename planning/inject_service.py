@@ -2,8 +2,9 @@
 
 Hook 入口：``maisaka.planner.before_request`` / ``maisaka.replyer.before_request``。
 
-业务子模块（IntentClassifier / ActivityStateAnalyzer / InjectOptimizer /
-ConversationContextCache）位于 ``inject/`` 子包。
+业务子模块（IntentClassifier / InjectOptimizer / ConversationContextCache）位于
+``inject/`` 子包；活动状态短语（原 ActivityStateAnalyzer）已删除，精神状态行改读
+情绪系统的 ``mood_text()``（M4，§4.2 行 8，两处「精神状态」同源）。
 
 注入协议（照抄源插件）：
 - 向 items 注入 SystemMessageItem 快照：meta 三件套（item_id=uuid4().hex、
@@ -33,7 +34,6 @@ from uuid import uuid4
 from .config import InjectSectionConfig, ScheduleSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
 from .inject import (
-    ActivityStateAnalyzer,
     ConversationContextCache,
     InjectOptimizer,
     IntentClassifier,
@@ -81,7 +81,6 @@ class InjectService:
         # 智能注入组件（按 inject 段配置；未挂载该段时全部启用默认值）
         inj = section_or_default(plugin, "inject", InjectSectionConfig)
         self._intent_classifier = IntentClassifier() if inj.enable_intent_classification else None
-        self._state_analyzer = ActivityStateAnalyzer() if inj.enable_state_analysis else None
         self._inject_optimizer = (
             InjectOptimizer(
                 cache_ttl=cfg.cache_ttl,
@@ -201,14 +200,13 @@ class InjectService:
                     logger.debug(f"replyer 注入被冷却跳过: {skip_reason}")
                     return {"action": "continue"}
 
-            # 一次查询拿到 剩余分钟 + 状态情绪短语
-            remaining_minutes, state_hint = self._compute_activity_aux(current_activity, activity_type)
+            # 一次查询拿到剩余分钟（状态情绪短语已随 state_analyzer 删除，精神状态归情绪系统）
+            remaining_minutes = self._compute_activity_aux(current_activity, activity_type)
             activity_prompt = self._build_replyer_extra_prompt(
                 current_activity=current_activity,
                 description=current_description or "",
                 future_activities=future_activities,
                 remaining_minutes=remaining_minutes,
-                state_hint=state_hint,
             )
 
             if self._inject_optimizer is not None:
@@ -539,8 +537,8 @@ class InjectService:
             logger.debug(f"注入跳过: intent={detected_intent}")
             return None, False, detected_intent
 
-        # 3. 一次查询拿到剩余分钟 + 活动情绪短语
-        remaining_minutes, state_hint = self._compute_activity_aux(current_activity, activity_type)
+        # 3. 查询活动剩余分钟（M4：精神状态行改读情绪 mood_text，见 _render_unified_prompt）
+        remaining_minutes = self._compute_activity_aux(current_activity, activity_type)
 
         # 4. 主动碎碎念判定：仅 CASUAL_CHAT/UNKNOWN 才考虑
         proactive_hit = False
@@ -563,7 +561,6 @@ class InjectService:
             current_description=current_description,
             future_activities=future_activities,
             remaining_minutes=remaining_minutes,
-            state_hint=state_hint,
             proactive_hit=proactive_hit,
             context_continue_inject=context_continue_inject,
             context_reason=context_reason,
@@ -590,12 +587,16 @@ class InjectService:
         current_description: Optional[str],
         future_activities: List[Tuple[str, str]],
         remaining_minutes: Optional[int],
-        state_hint: Optional[str],
         proactive_hit: bool,
         context_continue_inject: bool,
         context_reason: Optional[str],
     ) -> Optional[str]:
-        """按 intent 路由统一模板（详略与语气随意图变化；TECH/COMMAND 返回 None）。"""
+        """按 intent 路由统一模板（详略与语气随意图变化；TECH/COMMAND 返回 None）。
+
+        M4（§4.2 行 8）：精神状态行读情绪系统 ``mood_text()``（与 emotion 注入条目同源，
+        不得出现两套矛盾的「精神状态」）；情绪不可得时省略该行，不再使用已删除的
+        inject/state_analyzer 静态模板。
+        """
         if intent in (UserIntent.TECH_QUESTION, UserIntent.COMMAND_EXECUTION):
             return None
 
@@ -603,7 +604,7 @@ class InjectService:
         enable_detailed = cfg.enable_detailed_description
         max_show = getattr(cfg, "max_future_activities", 3)
 
-        # 当前活动 + 时间衰减 + 情绪短语
+        # 当前活动 + 时间衰减（活动状态短语已随 state_analyzer 删除）
         remaining_hint = ""
         if remaining_minutes is not None and 0 < remaining_minutes <= 15:
             remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
@@ -612,18 +613,14 @@ class InjectService:
             current_line = f"现在：{current_activity}（{current_description}）{remaining_hint}"
         else:
             current_line = f"现在：{current_activity}{remaining_hint}"
-        if state_hint:
-            current_line += f" —— {state_hint}"
-
-        # 能量基线（按当前小时）
-        now = self._tz_manager.get_now()
-        energy_desc = describe_energy(get_energy_level(now.hour))
 
         lines: List[str] = [
             "【可选上下文 - Bot 的当前日程】",
             current_line,
-            f"精神状态：{energy_desc}",
         ]
+        mood = self._emotion_mood_line()
+        if mood:
+            lines.append(f"精神状态：{mood}")
 
         if intent == UserIntent.QUERY_FUTURE and future_activities and max_show > 0:
             lines.append("接下来的安排:")
@@ -652,9 +649,8 @@ class InjectService:
         description: str,
         future_activities: List[Tuple[str, str]],
         remaining_minutes: Optional[int],
-        state_hint: Optional[str],
     ) -> str:
-        """构建 replyer 极简 extra_prompt（~30 token + 状态/能量）。"""
+        """构建 replyer 极简 extra_prompt（~30 token + 能量基线）。"""
         cfg = self._schedule_cfg()
         enable_detailed = cfg.enable_detailed_description
 
@@ -667,8 +663,6 @@ class InjectService:
         else:
             state_line = f"你现在正在 {current_activity}{remaining_hint}。"
 
-        if state_hint:
-            state_line += f" {state_hint}。"
         now = self._tz_manager.get_now()
         energy_desc = describe_energy(get_energy_level(now.hour))
 
@@ -683,13 +677,17 @@ class InjectService:
         self,
         activity_name: str,
         goal_type: Optional[str],
-    ) -> Tuple[Optional[int], Optional[str]]:
-        """一次查询返回（剩余分钟，状态情绪文本），避免重复查询。"""
+    ) -> Optional[int]:
+        """查询某活动剩余分钟（查不到返回 None）。
+
+        M4：活动状态情绪短语随 inject/state_analyzer 删除，本方法只余剩余时间一项；
+        ``goal_type`` 参数保留以兼容调用点签名（当前不使用）。
+        """
         try:
             goal_manager = get_goal_manager()
             goals = goal_manager.get_active_goals(chat_id="global")
             if not goals:
-                return None, None
+                return None
 
             now = self._tz_manager.get_now()
             current_min = now.hour * 60 + now.minute
@@ -712,26 +710,33 @@ class InjectService:
                     end -= 1440
                 remaining = end - current_min
                 if remaining <= 0:
-                    return None, None
-
-                state_hint: Optional[str] = None
-                if self._state_analyzer is not None and goal_type:
-                    try:
-                        _state, emotion_text = self._state_analyzer.analyze_activity_state(
-                            activity_name=activity_name,
-                            start_minutes=start,
-                            end_minutes=end,
-                            current_minutes=current_min,
-                            activity_type=goal_type,
-                        )
-                        state_hint = emotion_text or None
-                    except Exception as exc:
-                        logger.debug("活动状态分析失败: %s", exc)
-
-                return remaining, state_hint
+                    return None
+                return remaining
         except Exception as exc:
             logger.debug("计算活动辅助信息失败: %s", exc)
-        return None, None
+        return None
+
+    def _emotion_mood_line(self) -> str:
+        """M4（§4.2 行 8）：planner 精神状态行读 emotion.mood_text()（与情绪注入条目同源）。
+
+        跨模块可空降级（§八.2）：emotion 未装配/停用/异常一律返回空串，调用方省略该行；
+        不再回退 inject/state_analyzer 的静态模板（该模块已按 §4.2 删除）。
+        """
+        emotion = getattr(self._plugin, "_emotion", None)
+        enabled = getattr(emotion, "is_enabled", None)
+        if callable(enabled):
+            try:
+                if not enabled():
+                    return ""
+            except Exception:
+                return ""
+        getter = getattr(emotion, "mood_text", None)
+        if not callable(getter):
+            return ""
+        try:
+            return str(getter() or "").strip()
+        except Exception:
+            return ""
 
     # ------------------------------------------------------------
     # 对外公开：当前活动快照（供 @API 转发，跨插件可调）

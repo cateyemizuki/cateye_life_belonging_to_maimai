@@ -50,6 +50,11 @@ class QzoneSectionConfig(PluginConfigBase):
         description="每次空间巡检命中发帖时机时的实际发出概率",
         json_schema_extra={"label": "发帖概率", "step": 0.05, **_ui_i18n("Post rate")},
     )
+    emotion_filter: bool = Field(
+        default=True,
+        description="情绪低落时跳过发帖：当前情绪效价 V<−0.6 时本轮不发说说（低落不硬营业，M4）",
+        json_schema_extra={"label": "低落实时跳过发帖", **_ui_i18n("Emotion filter")},
+    )
     post_by_schedule: bool = Field(
         default=True,
         description="根据日程发说说：优先挑当前活动节点，把活动内容转化成生活动态",

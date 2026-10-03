@@ -10,7 +10,7 @@
 - generator/            生成管线子组件（prompt / schema / context / validator / scorer / parser）
 - role_judge.py         自然语言日程请求的角色裁判
 - auto_scheduler.py     每日定时生成循环
-- inject/ + inject_service.py  智能注入（意图分类 / 优化器 / 状态分析 / 上下文缓存）
+- inject/ + inject_service.py  智能注入（意图分类 / 优化器 / 上下文缓存；精神状态行读情绪 mood_text，M4）
 - proactive_service.py  活动切换主动开口 / 早间问好 / 频率调控（60s 轮询）
 - tools_service.py      4 个 LLM Tool 的业务实现
 - command_service.py    /plan 命令业务实现（含日程图片合并转发）

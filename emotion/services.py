@@ -11,7 +11,7 @@ plugin.py 集成方式（与其他模块同构）::
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from .service import EmotionService
 
@@ -61,6 +61,17 @@ class EmotionServices:
 
     def mood_text(self) -> str:
         return self.service.mood_text()
+
+    def mood_effect(self) -> Dict[str, Any]:
+        """情绪→行为结构化系数（M4；跨模块消费入口，附录 C）。
+
+        与 ``mood_text()`` 同为转发入口：patrol/qzone 经 ``plugin._emotion.mood_effect()``
+        读取；模块停用/异常时返回恒等中性值（可空降级，§八.2）。
+        """
+        try:
+            return self.service.mood_effect()
+        except Exception:
+            return {"proactive_rate": 1.0, "miss_threshold": 1.0, "post_rate": 1.0, "intent_hint": ""}
 
     def effective_valence(self) -> Optional[float]:
         """当前生效 V（供跨模块 B2 调制读取，§6.2 B）。

@@ -46,6 +46,18 @@ MISS_REJECT_COOLDOWN_MINUTES = 30.0
 SILENCE_EVENT_MAX_PER_DAY = 2
 SILENCE_EVENT_MIN_INTERVAL_HOURS = 4.0
 
+#: mood_effect 乘数夹取范围（附录 C：全部 clamp [0.7, 1.3]）
+MOOD_MULTIPLIER_MIN = 0.7
+MOOD_MULTIPLIER_MAX = 1.3
+
+#: 情绪不可得时的恒等 mood_effect（emotion 关闭/缺失 → 乘数恒 1.0，§八.2 可空降级）
+NEUTRAL_MOOD_EFFECT: dict[str, Any] = {
+    "proactive_rate": 1.0,
+    "miss_threshold": 1.0,
+    "post_rate": 1.0,
+    "intent_hint": "",
+}
+
 #: 需要校验格式（HH:MM）的时间窗口配置项（非法时 fail-safe：静默视为在静默、窗口视为不触发）
 TIME_WINDOW_KEYS = (
     "silence_start",
@@ -236,6 +248,19 @@ class PatrolService:
         current_hhmm = f"{now.hour:02d}:{now.minute:02d}"
         self._last_tick_at = now
 
+        # M4（§6.2 C）：概率掷骰前读 mood_effect（emotion 关闭/缺失/异常 → 恒 1.0，可空降级）；
+        # activity_trigger_rate/default_speak_rate × proactive_rate，乘后概率落 decision_logs。
+        mood = self._mood_effect()
+        proactive_rate = self._mood_multiplier(
+            mood.get("proactive_rate"), 1.0, lo=MOOD_MULTIPLIER_MIN, hi=MOOD_MULTIPLIER_MAX)
+        mood_intent_hint = str(mood.get("intent_hint") or "").strip()
+        activity_rate = (
+            self._to_float(getattr(patrol, "activity_trigger_rate", 1.0), 1.0) * proactive_rate
+        )
+        default_rate = (
+            self._to_float(getattr(patrol, "default_speak_rate", 1.0), 1.0) * proactive_rate
+        )
+
         # 1) 日切（保留 last_speak_time：跨午夜间隔约束仍生效）
         if self._affection.today_date() != now.strftime("%Y-%m-%d"):
             self._affection.reset_daily(now.strftime("%Y-%m-%d"))
@@ -281,7 +306,13 @@ class PatrolService:
             "cooldown_minutes": int(patrol.user_cooldown_minutes),
             "budget_used": round(self._affection.today_speak_count(), 2),
             "budget_limit": non_night_budget,
+            # M4（§6.2 C / §6.3-7）：情绪乘数与乘后概率留痕（中性时逐值为 1.0）
+            "mood_proactive_rate": round(proactive_rate, 4),
+            "activity_trigger_rate_effective": round(activity_rate, 4),
+            "default_speak_rate_effective": round(default_rate, 4),
         }
+        if mood_intent_hint:
+            base_fields["mood_intent_hint"] = mood_intent_hint
         if invalid_time_keys:
             base_fields["invalid_time_config"] = ",".join(invalid_time_keys)
 
@@ -379,13 +410,23 @@ class PatrolService:
                 mark_skip("no_user_message", "miss", "还没有用户消息记录，不触发想念")
             else:
                 hours_since_last = hours_between(now, last_msg)
-                miss_threshold = self._sample_miss_threshold()
+                # M4（附录 B/C，§7 M4 行）：阈值 = 区间随机采样 × 情绪系数 × affection 档位系数
+                # （双系数；emotion 关闭/档位不可得 → 各自恒 1.0，可空降级）
+                mood_miss_mult, tier_miss_mult = self._miss_threshold_factors(mood)
+                miss_threshold = self._sample_miss_threshold(
+                    mood_mult=mood_miss_mult, tier_mult=tier_miss_mult)
+                base_fields.update(
+                    miss_threshold_hours=round(miss_threshold, 2),
+                    mood_miss_threshold=round(mood_miss_mult, 4),
+                    tier_miss_factor=round(tier_miss_mult, 4),
+                )
                 if hours_since_last <= miss_threshold:
                     mark_skip(
                         "miss_duration",
                         "miss",
                         f"用户沉默 {hours_since_last:.1f}h ≤ 本轮随机阈值 {miss_threshold:.1f}h"
-                        f"（区间 {patrol.miss_hours_min}~{patrol.miss_hours_max}h）",
+                        f"（区间 {patrol.miss_hours_min}~{patrol.miss_hours_max}h"
+                        f"×情绪 {mood_miss_mult:.2f}×档位 {tier_miss_mult:.2f}）",
                     )
                 elif self._avoid_future_schedule_for_miss(now):
                     mark_skip(
@@ -414,7 +455,8 @@ class PatrolService:
                 ):
                     mark_skip("llm_rejected", "miss", "LLM 把关驳回（30 分钟内不重复判断）")
                 elif await self._trigger_missing(hours_since_last):
-                    mark_trigger("miss", f"想念触发已入队（用户沉默 {hours_since_last:.1f}h）")
+                    mark_trigger("miss", f"想念触发已入队（用户沉默 {hours_since_last:.1f}h"
+                                         f" > 阈值 {miss_threshold:.1f}h）")
                 else:
                     mark_skip("planner_trigger_failed", "miss", "触发未入队（stream_id 缺失或触发开关关闭）")
 
@@ -435,11 +477,12 @@ class PatrolService:
                     "activity",
                     f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}",
                 )
-            elif random.random() >= float(patrol.activity_trigger_rate):
+            elif random.random() >= activity_rate:
                 mark_skip(
                     "dice",
                     "activity",
-                    f"活动分享概率未通过（activity_trigger_rate={patrol.activity_trigger_rate}）",
+                    f"活动分享概率未通过（activity_trigger_rate={patrol.activity_trigger_rate}"
+                    f"×情绪 {proactive_rate:.2f} = {activity_rate:.3f}）",
                 )
             elif await self._trigger_activity(activity):
                 mark_trigger("activity", f"日程节点触发已入队：{activity.get('name', '')}")
@@ -460,11 +503,12 @@ class PatrolService:
                     "daily",
                     f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}",
                 )
-            elif random.random() >= float(patrol.default_speak_rate):
+            elif random.random() >= default_rate:
                 mark_skip(
                     "dice",
                     "daily",
-                    f"日常巡检概率未通过（default_speak_rate={patrol.default_speak_rate}）",
+                    f"日常巡检概率未通过（default_speak_rate={patrol.default_speak_rate}"
+                    f"×情绪 {proactive_rate:.2f} = {default_rate:.3f}）",
                 )
             elif await self._trigger_daily():
                 mark_trigger("daily", "日常巡检触发已入队")
@@ -509,9 +553,13 @@ class PatrolService:
 
         M0 预算接线（§六.2 H）：五类触发都走本入口，触发前先查全渠道打扰预算，
         超额直接放弃；入队失败/异常时把刚发布的旁白撤掉，避免它被之后某轮普通对话锚上。
+
+        M4（§6.2 C）：reason 在此追加情绪 ``intent_hint``（低分辨成语义行，如
+        「你今天有点低落，语气可以软一点」）；零新 Hook，情绪不可得时原样透传。
         """
         if not self._stream_id or not self._patrol_cfg().proactive_trigger_enabled:
             return False
+        reason = self._append_intent_hint(reason)
         bus = self._event_bus()
         if bus is not None:
             if not bus.allow_proactive("patrol", str(intent or "")):
@@ -662,6 +710,88 @@ class PatrolService:
             return cfg_section
         return getattr(getattr(self._config, "config", None), "emotion", None)
 
+    # ---- M4 情绪消费（§6.2 C；跨模块 getattr 判空 + 恒等降级，§八.2）----
+    def _emotion_service(self) -> Any:
+        """情绪模块服务束（plugin._emotion；self._config 可能是 plugin 或配置对象本身）。"""
+        emotion = getattr(self._config, "_emotion", None)
+        if emotion is None:
+            emotion = getattr(getattr(self._config, "config", None), "_emotion", None)
+        return emotion
+
+    def _mood_effect(self) -> dict[str, Any]:
+        """读 ``EmotionService.mood_effect()``（M4；缺失/停用/异常 → 恒等中性值）。
+
+        情绪模块自身在停用时已返回中性值；这里再做一次开关与异常兜底，保证
+        「emotion 关闭 → patrol 乘数恒 1.0」不依赖对方实现细节（§八.2 可空降级）。
+        """
+        emotion = self._emotion_service()
+        getter = getattr(emotion, "mood_effect", None)
+        if not callable(getter):
+            return dict(NEUTRAL_MOOD_EFFECT)
+        enabled = getattr(emotion, "is_enabled", None)
+        if callable(enabled):
+            try:
+                if not enabled():
+                    return dict(NEUTRAL_MOOD_EFFECT)
+            except Exception:
+                return dict(NEUTRAL_MOOD_EFFECT)
+        try:
+            raw = getter()
+        except Exception:
+            return dict(NEUTRAL_MOOD_EFFECT)
+        return raw if isinstance(raw, dict) else dict(NEUTRAL_MOOD_EFFECT)
+
+    @staticmethod
+    def _to_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _mood_multiplier(self, value: Any, default: float, *, lo: float, hi: float) -> float:
+        """mood_effect 系数的防御性夹取（附录 C 范围；非法值取默认）。"""
+        return max(lo, min(hi, self._to_float(value, default)))
+
+    def _append_intent_hint(self, reason: str) -> str:
+        """M4（§6.2 C）：proactive intent 的 reason 追加情绪 ``intent_hint``。
+
+        中性/情绪不可得（intent_hint 为空串）时原样返回，既有 reason 字节不变。
+        """
+        hint = str(self._mood_effect().get("intent_hint") or "").strip()
+        if not hint:
+            return reason
+        base = str(reason or "").strip()
+        return f"{base}。{hint}" if base else hint
+
+    def _affection_tier_miss_factor(self) -> float:
+        """affection 档位 → miss 阈值系数（附录 B；读不到恒 1.0，可空降级）。
+
+        档位读 affection 状态层（``tier()``），系数读当前关系档案
+        （``RelationProfile.miss_factor_for_tier``，M1 已存数据）；任一不可得/异常回退 1.0。
+        """
+        tier_getter = getattr(self._affection, "tier", None)
+        if not callable(tier_getter):
+            return 1.0
+        try:
+            tier = max(0, min(4, int(tier_getter())))
+        except Exception:
+            return 1.0
+        factor_getter = getattr(getattr(self, "_relation", None), "miss_factor_for_tier", None)
+        if not callable(factor_getter):
+            return 1.0
+        try:
+            factor = float(factor_getter(tier))
+        except Exception:
+            return 1.0
+        return factor if factor > 0 else 1.0
+
+    def _miss_threshold_factors(self, mood_effect: Optional[dict[str, Any]] = None) -> tuple[float, float]:
+        """M4 双系数（附录 B/C）：(情绪系数, affection 档位系数)，各自不可得恒 1.0。"""
+        mood = mood_effect if isinstance(mood_effect, dict) else self._mood_effect()
+        mood_mult = self._mood_multiplier(mood.get("miss_threshold"), 1.0,
+                                          lo=MOOD_MULTIPLIER_MIN, hi=MOOD_MULTIPLIER_MAX)
+        return mood_mult, self._affection_tier_miss_factor()
+
     def _miss_hours_min(self) -> float:
         """想念阈值下限（小时）；配置写反时取较小值，非法回退 4.0（与采样同口径）。"""
         patrol = self._patrol_cfg()
@@ -675,8 +805,12 @@ class PatrolService:
             high = 8.0
         return max(0.0, min(low, high))
 
-    def _sample_miss_threshold(self) -> float:
-        """在配置区间内随机取本轮想念阈值（小时）；写反时自动交换。"""
+    def _sample_miss_threshold(self, *, mood_mult: float = 1.0, tier_mult: float = 1.0) -> float:
+        """在配置区间内随机取本轮想念阈值（小时）；写反时自动交换。
+
+        M4（§7 M4 行）：采样值再 × ``mood_effect.miss_threshold`` × affection 档位系数
+        （双系数；调用方缺省 1.0 时退化为旧行为）。
+        """
         patrol = self._patrol_cfg()
         try:
             low = float(patrol.miss_hours_min)
@@ -687,7 +821,7 @@ class PatrolService:
         except (TypeError, ValueError):
             high = 8.0
         low, high = min(low, high), max(low, high)
-        return random.uniform(low, high)
+        return max(0.0, random.uniform(low, high) * float(mood_mult) * float(tier_mult))
 
     def _miss_llm_check_enabled(self) -> bool:
         if self._llm is None:

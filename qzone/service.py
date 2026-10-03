@@ -75,6 +75,17 @@ QZONE_REPLY_PROMPT = (
 _MAX_PROCESSED_FEEDS = 200
 _MAX_PROCESSED_COMMENTS = 200
 
+#: mood_effect.post_rate 的上限（附录 C：post_rate 允许 0~1.2；乘到配置发帖率后按概率语义夹到 1.0）
+MOOD_POST_RATE_MAX = 1.2
+
+#: 情绪不可得时的恒等 mood_effect（emotion 关闭/缺失 → 不门控、不拼文案，§八.2）
+NEUTRAL_MOOD_EFFECT: Dict[str, Any] = {
+    "proactive_rate": 1.0,
+    "miss_threshold": 1.0,
+    "post_rate": 1.0,
+    "intent_hint": "",
+}
+
 
 class QzoneService:
     def __init__(
@@ -312,15 +323,23 @@ class QzoneService:
             return 0
         return int(counter.get("count") or 0)
 
-    async def generate_and_post_by_schedule(self, date: str, now: datetime) -> bool:
-        """按日程生成文案并发表。返回是否发出。"""
+    async def generate_and_post_by_schedule(self, date: str, now: datetime,
+                                            post_rate: Optional[float] = None) -> bool:
+        """按日程生成文案并发表。返回是否发出。
+
+        ``post_rate``（M4，§6.2 D）为 _tick 传入的「配置发帖率 × mood_effect.post_rate」
+        乘后概率（上限按概率语义夹到 1.0）；缺省 None 时回退配置原文，兼容既有调用方。
+        """
         cfg = self._config.qzone
         activity = self._schedule.find_current_activity(date, now)
         if cfg.require_activity and activity is None:
             self._log("skip", trigger_type="qzone_post", reason="当前无日程活动")
             return False
-        if random.random() >= cfg.post_rate:
-            self._log("skip", trigger_type="qzone_post", reason="未命中发帖概率")
+        base_rate = self._clamp_float(getattr(cfg, "post_rate", 1.0), 1.0, 0.0, 1.0)
+        effective_rate = base_rate if post_rate is None else self._clamp_float(post_rate, base_rate, 0.0, 1.0)
+        if random.random() >= effective_rate:
+            self._log("skip", trigger_type="qzone_post",
+                      reason=f"未命中发帖概率（乘后 {effective_rate:.3f}）")
             return False
         text = await self.generate_moment_text(date, now)
         if not text:
@@ -331,14 +350,19 @@ class QzoneService:
     async def generate_moment_text(self, date: str, now: datetime) -> str:
         activity = self._schedule.find_current_activity(date, now)
         activity_desc = self._schedule.format_activity_line(activity, now) if activity else "自由活动"
+        prompt = QZONE_POST_PROMPT.format(
+            lover_name=self._lover_name,
+            personality=self._personality or "（暂无人设）",
+            date=date,
+            time=now.strftime("%H:%M"),
+            activity=activity_desc,
+        )
+        # M4（§6.2 D / B8）：说说随当日情绪定调（拼一行 mood_text；情绪不可得时不拼）
+        mood_line = self._mood_line("请让这条说说的语气与心情保持一致")
+        if mood_line:
+            prompt = f"{prompt}\n{mood_line}"
         text = await self._llm.generate(
-            QZONE_POST_PROMPT.format(
-                lover_name=self._lover_name,
-                personality=self._personality or "（暂无人设）",
-                date=date,
-                time=now.strftime("%H:%M"),
-                activity=activity_desc,
-            ),
+            prompt,
             task_name=self._config.qzone.llm_task_name,
             temperature=0.8,
             max_tokens=200,
@@ -390,16 +414,21 @@ class QzoneService:
                     summary=str(comment.get("content") or "")[:40], nested=True,
                 )
                 await asyncio.sleep(3 + random.random())  # 拟人间隔
+                prompt = QZONE_REPLY_PROMPT.format(
+                    lover_name=self._lover_name,
+                    personality=self._personality or "（暂无人设）",
+                    moment=moment_text[:200],
+                    nickname=comment.get("nickname") or "好友",
+                    comment=str(comment.get("content") or "")[:200],
+                    time=str(comment.get("created_time") or ""),
+                    impression=await self._get_impression(comment_qq),
+                )
+                # M4（§6.2 D / B8）：回评语气随当日情绪定调（拼一行 mood_text；不可得时不拼）
+                mood_line = self._mood_line("请让这条回复的语气与心情保持一致")
+                if mood_line:
+                    prompt = f"{prompt}\n{mood_line}"
                 reply_text = await self._llm.generate(
-                    QZONE_REPLY_PROMPT.format(
-                        lover_name=self._lover_name,
-                        personality=self._personality or "（暂无人设）",
-                        moment=moment_text[:200],
-                        nickname=comment.get("nickname") or "好友",
-                        comment=str(comment.get("content") or "")[:200],
-                        time=str(comment.get("created_time") or ""),
-                        impression=await self._get_impression(comment_qq),
-                    ),
+                    prompt,
                     task_name=cfg.llm_task_name, temperature=0.8, max_tokens=120,
                     event="qzone_reply",
                 )
@@ -520,12 +549,17 @@ class QzoneService:
             comment_text = str(comment.get("content") or "")
             if not comment_id or self._is_processed(tid, int(comment_id) if comment_id.isdigit() else 0):
                 continue
+            prompt = QZONE_REPLY_PROMPT.format(
+                lover_name=self._lover_name, personality=self._personality or "（暂无人设）",
+                moment=content[:200], nickname=commenter, comment=comment_text[:200],
+                time="", impression="",
+            )
+            # M4（§6.2 D / B8）：与主回评路径同口径拼一行情绪底色
+            mood_line = self._mood_line("请让这条回复的语气与心情保持一致")
+            if mood_line:
+                prompt = f"{prompt}\n{mood_line}"
             reply_text = await self._llm.generate(
-                QZONE_REPLY_PROMPT.format(
-                    lover_name=self._lover_name, personality=self._personality or "（暂无人设）",
-                    moment=content[:200], nickname=commenter, comment=comment_text[:200],
-                    time="", impression="",
-                ),
+                prompt,
                 task_name=cfg.llm_task_name, temperature=0.8, max_tokens=120, event="qzone_reply",
             )
             reply_text = reply_text.strip()
@@ -600,7 +634,17 @@ class QzoneService:
             return
         # 按日程发说说
         if cfg.daily_max_posts > 0 and self.posts_today() < cfg.daily_max_posts and cfg.post_by_schedule:
-            await self.generate_and_post_by_schedule(today, now)
+            # M4（§6.2 D）：发帖判定 = post_rate × mood_effect.post_rate；
+            # V<−0.6 且 emotion_filter（默认 true）→ 本轮跳过发帖（低落不硬营业），记 skip 原因。
+            base_post_rate = self._clamp_float(getattr(cfg, "post_rate", 1.0), 1.0, 0.0, 1.0)
+            mood_post_rate = self._clamp_float(
+                self._mood_effect().get("post_rate"), 1.0, 0.0, MOOD_POST_RATE_MAX)
+            if bool(getattr(cfg, "emotion_filter", True)) and mood_post_rate <= 0.0:
+                self._log("skip", trigger_type="qzone_post",
+                          reason="情绪低落（V<−0.6），本轮跳过发帖（emotion_filter 开启）")
+            else:
+                await self.generate_and_post_by_schedule(
+                    today, now, post_rate=base_post_rate * mood_post_rate)
         # 评论监听与自动回评：CGI 直连为主（可读评论正文+楼中楼）；cookie 不可用时回退基线提醒
         if cfg.reply_comments_enabled:
             replied = await self.reply_comments()
@@ -610,6 +654,71 @@ class QzoneService:
     def _log(self, action: str, *, trigger_type: str = "", reason: str = "") -> None:
         if self._decision_logger is not None:
             self._decision_logger.record(action=action, trigger_type=trigger_type, reason=reason)
+
+    # ---- 情绪联动（M4；§6.2 D，跨模块 getattr 判空 + 恒等降级，§八.2）----
+    def _emotion_service(self) -> Any:
+        """情绪模块服务束（plugin._emotion；self._config 可能是 plugin 或配置对象本身）。"""
+        emotion = getattr(self._config, "_emotion", None)
+        if emotion is None:
+            emotion = getattr(getattr(self._config, "config", None), "_emotion", None)
+        return emotion
+
+    def _mood_effect(self) -> Dict[str, Any]:
+        """读 ``EmotionService.mood_effect()``（缺失/停用/异常 → 恒等中性值）。"""
+        emotion = self._emotion_service()
+        getter = getattr(emotion, "mood_effect", None)
+        if not callable(getter):
+            return dict(NEUTRAL_MOOD_EFFECT)
+        enabled = getattr(emotion, "is_enabled", None)
+        if callable(enabled):
+            try:
+                if not enabled():
+                    return dict(NEUTRAL_MOOD_EFFECT)
+            except Exception:
+                return dict(NEUTRAL_MOOD_EFFECT)
+        try:
+            raw = getter()
+        except Exception:
+            return dict(NEUTRAL_MOOD_EFFECT)
+        return raw if isinstance(raw, dict) else dict(NEUTRAL_MOOD_EFFECT)
+
+    @staticmethod
+    def _clamp_float(value: Any, default: float, lo: float, hi: float) -> float:
+        """浮点夹取（非法值取默认；M4 概率/乘数统一防御）。"""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = float(default)
+        return max(lo, min(hi, number))
+
+    def _mood_text(self) -> str:
+        """当前情绪底色（M4/B8；情绪模块停用/缺失/异常 → 空串，故 prompt 与旧行为一致）。"""
+        emotion = self._emotion_service()
+        enabled = getattr(emotion, "is_enabled", None)
+        if callable(enabled):
+            try:
+                if not enabled():
+                    return ""
+            except Exception:
+                return ""
+        getter = getattr(emotion, "mood_text", None)
+        if not callable(getter):
+            return ""
+        try:
+            return str(getter() or "").strip()
+        except Exception:
+            return ""
+
+    def _mood_line(self, purpose: str) -> str:
+        """情绪底色行（M4：generate_moment_text / QZONE_REPLY_PROMPT 各拼一行 mood_text）。
+
+        ``purpose`` 是语气要求短语（说说/回复定调）；情绪不可得时返回空串，
+        prompt 与旧行为完全一致（只在 .format(...) 结果后追加一行，不改字段结构）。
+        """
+        mood = self._mood_text()
+        if not mood:
+            return ""
+        return f"你此刻的心情：{mood}（{purpose}）"
 
     # ---- 事件总线（M0；无总线时静默跳过）----
     async def _publish(self, event: str, **payload: Any) -> None:
