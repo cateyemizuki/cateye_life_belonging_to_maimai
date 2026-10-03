@@ -119,6 +119,8 @@
 
 | 日期 | 里程碑/场景 | 结果 | 摘要/日志位置 |
 |---|---|---|---|
+| 2026-10-04 | 顺延复验（mood_effect / attribution / affection_review） | 三项转 PASS | emotion init 实证（bot 05:16 回执「✅ 情绪系统初始化完成」+参数摘要）；planner 快照情绪行维度随真实 VAD 更新；decision_logs emotion.external_event K=1.4（tier3 加成 0.4，source=replyer，δV+0.14 限幅内）；sleep_started→overhauled→daily_review 全链（tone+impressions×2 落盘，P4 成功才落 date）；四套回归全绿；整合验收 9/10 |
+| 2026-10-04 | 残留清理 | 已清 | 整合验收指出 harness-sleep-rv（日结复验用 sleep 条目）未随首轮清理删除 → 主会话删除并复核归零；L5 观察去污染 |
 | 2026-10-04 | 宿主进程边界违例（通报一） | 违例确认 + 规程修订（§五.1 可见窗口 / §一 宿主进程红线） | 启停史：10-03 16:56 用户启动宿主（崩溃循环 4 次，16:56:34 进程对 37584/45796 残留、后自行退出）；10-03 18:07 agent attempt1（无窗口后台，BotConsole 崩溃退出）；18:15 attempt3（无窗口后台，运行至 10-04 01:55 被 agent 树杀）；10-04 01:47 attempt4（无窗口后台，04:41 无日志硬退出）；04:42 attempt5（无窗口后台，被用户手动清除）。违例说明：agent 以"测试环境清理残留/使配置生效"为由多次启动与终止宿主实例，均未征得用户确认且采用无窗口后台形式——终止对象经复核为 agent 自启实例（30328/32068 树），用户 16:56 实例在 agent 处置前已自行退出；但宿主操作权边界自此事件起明确归用户，agent 此前的一切启停均按违例记录 |
 | 2026-10-04 | L5 事件：attempt4 硬退出 | 记录 | 04:41 退出码 1、无优雅关闭痕迹、崩溃前仅 A_Memorix 400 常规噪音（agent_session_stdout.attempt4-crashed-0441.log 留存）；已按新规程以可见窗口重启续 L5 |
 | 2026-10-04 | 宿主验证日·六场景 L2 批量核对 | bus_check=PASS；affection_basic+v1迁移=PASS；attribution/mood_effect/silence/affection_review=PARTIAL（顺延项见下） | 证据：decision_logs（decisions_10-03/04.jsonl）、宿主 DB mai_messages（bot 出站 15+ 条，"博士"称呼自然对话）、harness results/*.json、maisaka_prompt 快照；独立核对员报告见会话存档。修复 P1-P4（29bf06f）后情绪行注入已实证（02:38 快照含【当前情绪底色】） |
