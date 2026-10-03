@@ -63,6 +63,31 @@ class EmotionSectionConfig(PluginConfigBase):
         description="睡眠裁判 LLM 的模型任务名（独立请求，不携带对话历史）",
         json_schema_extra={"label": "睡眠裁判任务名", **_ui_i18n("Sleep referee LLM task")},
     )
+    # ── M3 事件倍率（§6.2 A，附录 C；一律标量，不用 dict/list——陷阱 #4）──────
+    global_event_multiplier: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=3.0,
+        description="全局情绪事件幅度旋钮：作用于一切外部事件增量（不含日常衰减），运行期调控情绪整体波动大小",
+        json_schema_extra={"label": "全局事件倍率", "step": 0.1,
+                           **_ui_i18n("Global event multiplier")},
+    )
+    non_target_multiplier: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="非 target 事件系数（群聊等非重要他人引发的事件）：默认 1.0 保持自然幅度，调低可淡化群聊影响",
+        json_schema_extra={"label": "非目标事件倍率", "step": 0.05,
+                           **_ui_i18n("Non-target event multiplier")},
+    )
+    target_bonus_step: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="target 每档情绪加成步长（加算）：加成 = step × (档位+1)，档 0~4 对应 +0.1~+0.5",
+        json_schema_extra={"label": "目标加成步长", "step": 0.01,
+                           **_ui_i18n("Target bonus step")},
+    )
     injection_enabled: bool = Field(
         default=True,
         description="把当前情绪底色（模糊化描述）注入 replyer 提示词，引导语气与情绪一致",

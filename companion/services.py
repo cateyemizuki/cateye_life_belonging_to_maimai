@@ -42,6 +42,34 @@ from .sender_identity import SenderCache, SessionKindCache
 logger = logging.getLogger(__name__)
 
 
+def _emotion_valence(plugin: Any) -> Optional[float]:
+    """读取情绪模块当前生效 V（M3 B2，§6.2 B）；缺失/停用/异常一律返回 None。
+
+    跨模块调用可空降级（§八.2）：``getattr(plugin, "_emotion", None)`` 判空 +
+    只用 ``is_enabled`` / ``effective_valence`` 两个公开入口，单模块停用不影响其余。
+    返回 None 时好感调制乘数恒 1.0（M1 占位语义的降级路径）。
+    """
+    emotion = getattr(plugin, "_emotion", None)
+    if emotion is None:
+        return None
+    try:
+        enabled = getattr(emotion, "is_enabled", None)
+        if callable(enabled) and not enabled():
+            return None
+        getter = getattr(emotion, "effective_valence", None)
+        if not callable(getter):
+            return None
+        value = getter()
+    except Exception:
+        return None
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class CompanionServices:
     """虚拟恋人服务束（好感度 / 巡检 / 消息 / 记忆 / 屏幕感知 / 节假日）。"""
 
@@ -71,6 +99,13 @@ class CompanionServices:
                 self.affection.set_event_bus(self.bus)
             except Exception:
                 pass
+        # M3（B2）：注入情绪效价提供者，好感入账按 §6.2 B 做情绪调制。
+        # 提供者是惰性 lambda：plugin._emotion 在本服务束构造之后才装配（plugin.py 顺序），
+        # 调用时才解析；情绪模块停用/缺失 → None → 乘数恒 1.0（可空降级，§八.2）。
+        try:
+            self.affection.set_emotion_vad_provider(lambda: _emotion_valence(plugin))
+        except Exception:
+            pass
         self.decision_logger: Optional[DecisionLogger] = getattr(plugin, "_decision_logger", None)
         self.llm_logger: Optional[LLMCallLogger] = getattr(plugin, "_llm_logger", None)
         self.llm: LLMService = (

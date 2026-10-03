@@ -10,9 +10,12 @@ plugin.py 集成方式（与其他模块同构）::
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Optional
 
 from .service import EmotionService
+
+logger = logging.getLogger(__name__)
 
 
 class EmotionServices:
@@ -23,16 +26,25 @@ class EmotionServices:
         self.service = EmotionService(plugin)
         #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
         self.bus = getattr(plugin, "_bus", None)
-        #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
+        #: 本束的事件反订阅闭包（M0 无订阅者；M3 起由 emotion.bridge 追加）
         self._event_unsubs: list = []
 
-    # 事件订阅挂点（M0：登记于此，M3+ 消费者按需 subscribe 并存入 _event_unsubs）
+    # 事件订阅挂点（start() 调用；stop() 注销）
     def _register_event_subscriptions(self) -> None:
-        """订阅注册挂点（start() 调用）。M0 本束无订阅者：
-        唯一的实际订阅（proactive.used → 预算计数器）由 core/event_bus 在装配时安装。
-        M3+ 消费者在此 ``self._event_unsubs.append(self.bus.subscribe(...))``。"""
-        if self.bus is None:
+        """订阅注册挂点（M3：emotion.bridge 订阅 relation.*/schedule.commitment_*/qzone.*）。
+
+        桥内处理器绝不做绝对状态设置，只经 ``record_external_event`` 入账（§6.3-1）；
+        总线缺失时静默降级（§八.2）；幂等：已注册时直接返回。
+        """
+        if self.bus is None or self._event_unsubs:
             return
+        try:
+            from .bridge import register_bridge
+
+            self._event_unsubs.extend(register_bridge(self.bus, self.service, self._plugin))
+        except Exception as exc:
+            logger.warning("emotion 事件订阅失败（忽略）：%s", exc)
+            self._unregister_event_subscriptions()
 
     def _unregister_event_subscriptions(self) -> None:
         """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""
@@ -49,6 +61,19 @@ class EmotionServices:
 
     def mood_text(self) -> str:
         return self.service.mood_text()
+
+    def effective_valence(self) -> Optional[float]:
+        """当前生效 V（供跨模块 B2 调制读取，§6.2 B）。
+
+        模块停用（emotion.enabled=false / plugin.enabled=false）或读取异常时返回 None，
+        消费方据此把调制乘数定为 1.0——单模块停用不影响其余模块（§八.2）。
+        """
+        if not self.is_enabled():
+            return None
+        try:
+            return float(self.service.effective_valence())
+        except Exception:
+            return None
 
     def is_enabled(self) -> bool:
         return self.service._enabled()

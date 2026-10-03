@@ -42,6 +42,10 @@ from .screen_context import ScreenContextStore, format_narration
 # 想念被 LLM 驳回后，多久之内不再重复发起把关判断（分钟）
 MISS_REJECT_COOLDOWN_MINUTES = 30.0
 
+#: 沉默事件（relation.silence_detected，M3/B1）频控：每日 ≤2 次、间隔 ≥4 小时（§4.2 / §6.2 A）
+SILENCE_EVENT_MAX_PER_DAY = 2
+SILENCE_EVENT_MIN_INTERVAL_HOURS = 4.0
+
 #: 需要校验格式（HH:MM）的时间窗口配置项（非法时 fail-safe：静默视为在静默、窗口视为不触发）
 TIME_WINDOW_KEYS = (
     "silence_start",
@@ -113,6 +117,10 @@ class PatrolService:
         self._miss_last_reject_at: Optional[datetime] = None
         self._miss_threshold_hours: Optional[float] = None  # 本轮随机阈值（沉默越久越易过）
         self._last_tick_at: Optional[datetime] = None
+        # M3 沉默事件频控（内存态，进程重启即清零；§4.2：每日 ≤2 次、间隔 ≥4h、仅 target）
+        self._silence_pub_date = ""
+        self._silence_pub_count = 0
+        self._silence_last_pub_at: Optional[datetime] = None
         # 非法时间窗口配置的告警节流：配置项 -> 已告警过的原始值
         self._invalid_time_warned: dict[str, str] = {}
 
@@ -355,7 +363,10 @@ class PatrolService:
             else:
                 mark_skip("planner_trigger_failed", "night", "触发未入队（stream_id 缺失或触发开关关闭）")
 
-        # ---- A 级：想念 ----
+        # ---- A 级：想念 / 沉默事件 ----
+        # M3（B1）：沉默超过 miss_hours_min 时发布 relation.silence_detected（独立于
+        # 想念触发本身；每日 ≤2 次、间隔 ≥4h 的内存频控在 _maybe_publish_silence 内）。
+        await self._maybe_publish_silence(now)
         miss_speak_rate = float(patrol.miss_speak_rate)
         if not patrol.miss_enabled:
             pass  # 开关关闭：整段跳过（记 no_candidate）
@@ -575,8 +586,95 @@ class PatrolService:
             self._screen_store.discard(self._stream_id)
 
     # ------------------------------------------------------------------
-    # 想念机制辅助
+    # 想念机制辅助 / 沉默事件发布（M3，B1；§4.2 / §6.2 A）
     # ------------------------------------------------------------------
+    async def _maybe_publish_silence(self, now: datetime) -> None:
+        """last_user_msg_time 超过 miss_hours_min → 发布 ``relation.silence_detected``。
+
+        频控（内存态，§4.2）：每日 ≤ :data:`SILENCE_EVENT_MAX_PER_DAY` 次、间隔 ≥
+        :data:`SILENCE_EVENT_MIN_INTERVAL_HOURS` 小时；仅 target——巡检只服务目标私聊流
+        （``has_target()`` 为假时不发布）。payload：``hours``（沉默时长）与
+        ``target_bonus``（档位加算加成，留痕用；emotion 侧桥按同一公式重算 K，
+        单一事实来源仍是 affection 档位 + [emotion].target_bonus_step）。
+
+        本方法只发布事件，不参与想念触发判定；任何异常都静默吞掉，绝不影响巡检判定链。
+        """
+        try:
+            if not self.has_target():
+                return
+            bus = self._event_bus()
+            if bus is None:
+                return
+            last_msg = self._affection.last_user_msg_time()
+            if last_msg is None:
+                return
+            hours = hours_between(now, last_msg)
+            if hours <= self._miss_hours_min():
+                return
+            if not self._silence_rate_ok(now):
+                return
+            await bus.publish("relation.silence_detected", source="companion",
+                              hours=round(hours, 2),
+                              target_bonus=round(self._silence_target_bonus(), 4))
+            self._silence_pub_count += 1
+            self._silence_last_pub_at = now
+        except Exception:
+            pass
+
+    def _silence_rate_ok(self, now: datetime) -> bool:
+        """沉默事件频控检查（按日计数跨天清零 + 最小间隔；满足即放行）。"""
+        today = now.strftime("%Y-%m-%d")
+        if self._silence_pub_date != today:
+            self._silence_pub_date = today
+            self._silence_pub_count = 0
+        if self._silence_pub_count >= SILENCE_EVENT_MAX_PER_DAY:
+            return False
+        if self._silence_last_pub_at is not None:
+            elapsed_hours = (now - self._silence_last_pub_at).total_seconds() / 3600.0
+            if elapsed_hours < SILENCE_EVENT_MIN_INTERVAL_HOURS:
+                return False
+        return True
+
+    def _silence_target_bonus(self) -> float:
+        """当前档位的 target 加算加成 = step × (档位+1)（§5.3 / §6.2 A；读不到按 0）。
+
+        step 读 [emotion].target_bonus_step（跨模块 getattr 判空，热重载即时生效），
+        档位读 affection 状态层；任一不可得时返回 0（不猜档位、不猜配置）。
+        """
+        tier_getter = getattr(self._affection, "tier", None)
+        if not callable(tier_getter):
+            return 0.0
+        try:
+            tier = max(0, min(4, int(tier_getter())))
+        except Exception:
+            return 0.0
+        cfg = self._emotion_cfg()
+        try:
+            step = float(getattr(cfg, "target_bonus_step", 0.1) or 0.1)
+        except (TypeError, ValueError):
+            step = 0.1
+        return max(0.0, min(1.0, step)) * (tier + 1)
+
+    def _emotion_cfg(self) -> Any:
+        """[emotion] 配置段（self._config 可能是 plugin 或配置对象本身；均可空降级）。"""
+        cfg_section = getattr(self._config, "emotion", None)
+        if cfg_section is not None:
+            return cfg_section
+        return getattr(getattr(self._config, "config", None), "emotion", None)
+
+    def _miss_hours_min(self) -> float:
+        """想念阈值下限（小时）；配置写反时取较小值，非法回退 4.0（与采样同口径）。"""
+        patrol = self._patrol_cfg()
+        try:
+            low = float(patrol.miss_hours_min)
+        except (TypeError, ValueError):
+            low = 4.0
+        try:
+            high = float(patrol.miss_hours_max)
+        except (TypeError, ValueError):
+            high = 8.0
+        return max(0.0, min(low, high))
+
     def _sample_miss_threshold(self) -> float:
         """在配置区间内随机取本轮想念阈值（小时）；写反时自动交换。"""
         patrol = self._patrol_cfg()

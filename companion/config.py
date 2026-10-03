@@ -449,13 +449,13 @@ class AffectionSectionConfig(PluginConfigBase):
     )
     emotion_modulation: bool = Field(
         default=True,
-        description="情绪调制好感增量开关（B2，M3 落地）：delta × clamp(1 + 0.25 × V × sign(delta), 0.6, 1.4)；"
-                    "当前仅声明配置（乘数恒 1）",
+        description="情绪调制好感增量开关（B2，M3 已接线）：delta × clamp(1 + 0.25 × V × sign(delta), 0.6, 1.4)；"
+                    "情绪模块停用或读不到当前 V 时乘数恒 1",
         json_schema_extra={
             "label": "情绪调制好感",
-            "hint": "M3 起生效：开心时好事加分更多、低落时坏事扣分更狠",
+            "hint": "开心时好事加分更多、低落时坏事扣分更狠；关闭则所有增量按原值入账",
             **_ui_i18n("Emotion modulation",
-                       "M3: modulate affection deltas by the current mood (multiplier 0.6-1.4)."),
+                       "Modulate affection deltas by the current mood (multiplier 0.6-1.4)."),
         },
     )
 

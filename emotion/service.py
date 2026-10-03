@@ -13,7 +13,15 @@ from planning.schedule_query import ScheduleQuery
 
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
 from .state_machine import EmotionParams, EmotionStateMachine
-from .vad import map_emotions, mood_summary
+from .vad import VADState, _clip, map_emotions, mood_summary
+
+#: 单事件增量硬限幅（§6.3-2：所有增量在代码层硬限幅；§6.2 A「单事件经 ±0.5 限幅」）
+EVENT_DELTA_CLAMP = 0.5
+#: 用户侧最后一条消息的反查窗口（分钟）与拉取条数（§4.2 评估上下文增强）
+USER_MESSAGE_LOOKBACK_MINUTES = 20.0
+USER_MESSAGE_LOOKBACK_LIMIT = 10
+#: 调用方传入的 K 的防御性上限（target K = 1+step×(档+1) ≤ 6，留余量）
+EXTERNAL_K_MAX = 10.0
 
 
 class EmotionService:
@@ -85,6 +93,13 @@ class EmotionService:
         """当前情绪底色一句话（标签 + 低分辨率描述）。"""
         return mood_summary(self._machine.effective_vad())
 
+    def effective_valence(self) -> float:
+        """当前生效 V（含静态偏移/乘数结算；B2 情绪调制好感的输入，§6.2 B）。
+
+        只给内部跨模块读数用，绝不出现在任何 LLM 提示词里（§6.3-6 LLM 隔离）。
+        """
+        return float(self._machine.effective_vad().valence)
+
     def injection_text(self) -> str:
         """情绪底色注入文本（planner/replyer 双通道共用，以系统条目插在第一条系统提示词后）。"""
         return (
@@ -114,28 +129,244 @@ class EmotionService:
         return "\n".join(lines)
 
     # ── 事件增量（reply Hook 调用）───────────────────────────
-    async def evaluate_reply(self, reply_text: str) -> None:
-        """评估一轮回复的情绪增量并记录（节流 + 静默失败）。"""
-        if not self._enabled():
-            return
+    def _llm_interval_ok(self) -> bool:
+        """评估节流（与 evaluate_reply / record_external_event 共用同一时间戳）。
+
+        §4.2 行 1「全程既有节流不变」：LLM 路径一律先过 ``evaluate_min_interval_seconds``；
+        模板事件零 LLM 成本，不走节流（其频控在发布方，如沉默事件的每日 ≤2 次）。
+        """
         cfg = getattr(self._plugin.config, "emotion", None)
         min_interval = int(getattr(cfg, "evaluate_min_interval_seconds", 60) or 0)
         if min_interval and (time.monotonic() - self._last_evaluate_at) < min_interval:
-            return
+            return False
         self._last_evaluate_at = time.monotonic()
+        return True
+
+    async def _last_user_message_text(self, session_id: str) -> str:
+        """反查该聊天流最近一条用户消息文本（§4.2 行 2；拿不到就跳过，绝不阻塞评估）。
+
+        ``ctx.message.get_by_time_in_chat(chat_id, start_time, end_time, filter_mai=True)``
+        返回 list（兼容 dict 形态旧代码，陷阱 #12；SDK 归一化见开发文档 §8.5）；
+        filter_mai=True 已过滤 bot 自身消息，这里只取最后一条有文本的。
+        """
+        sid = str(session_id or "").strip()
+        message_api = getattr(self._ctx, "message", None)
+        getter = getattr(message_api, "get_by_time_in_chat", None)
+        if not sid or not callable(getter):
+            return ""
+        end = time.time()
+        start = end - USER_MESSAGE_LOOKBACK_MINUTES * 60.0
+        try:
+            result = await getter(chat_id=sid, start_time=start, end_time=end,
+                                  limit=USER_MESSAGE_LOOKBACK_LIMIT, filter_mai=True)
+        except Exception:
+            return ""
+        if isinstance(result, dict):  # 兼容 dict 形态旧代码（messages 键）
+            result = result.get("messages") or []
+        if not isinstance(result, list):
+            return ""
+        for item in reversed(result):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("processed_plain_text") or "").strip()
+            if text:
+                return text[:300]
+        return ""
+
+    async def evaluate_reply(self, reply_text: str, session_id: str = "") -> None:
+        """评估一轮回复的情绪增量并记录（节流 + 静默失败）。
+
+        M3（§4.2 行 2 / §7 M3 行）：prompt 追加"用户侧最后一条消息"（经
+        ``ctx.message.get_by_time_in_chat`` 反查该流最近消息，拿不到就跳过）；
+        target 识别走 replyer.after_response 的 ``session_id`` 链路（== 目标私聊
+        stream_id → K=1+档位加成，其余按非 target），加算倍率与 bridge 同口径
+        （§6.2 A：final = delta × global_event_multiplier × K）。
+        """
+        if not self._enabled():
+            return
+        if not self._llm_interval_ok():
+            return
+        cfg = getattr(self._plugin.config, "emotion", None)
         task_name = str(getattr(cfg, "evaluator_task_name", "utils") or "utils")
+        user_message = await self._last_user_message_text(session_id)
         try:
             result = await evaluate_reply_delta(self._llm(), reply_text, self._persona,
-                                                self._lover_name, task_name)
+                                                self._lover_name, task_name,
+                                                user_message=user_message)
         except Exception:
             return
         if not result:
             return
         event, delta = result
-        self._machine.record_event(event or "日常对话", delta)
-        self._save_state()
+        is_target = self.is_target_session(session_id)
+        self._apply_external_delta(event or "日常对话", delta, source="replyer",
+                                   multiplier=self.target_multiplier(is_target),
+                                   is_target=is_target, session_id=session_id, llm=True)
         # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
         await self._publish("emotion.updated", mood=self.mood_text(), trigger="reply_evaluated")
+
+    # ── M3：外部事件入口 + target 加算倍率（§4.2 行 1 / §6.2 A）──────
+    def _emotion_cfg(self, name: str, default: Any) -> Any:
+        """运行期动态读 [emotion] 配置项（热重载即时生效；缺省回退默认值）。"""
+        cfg = getattr(self._plugin.config, "emotion", None)
+        value = getattr(cfg, name, default)
+        return default if value is None else value
+
+    @staticmethod
+    def _to_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def global_event_multiplier(self) -> float:
+        """全局事件幅度旋钮（默认 1.0，夹在 [0.1, 3.0]）。"""
+        value = self._to_float(self._emotion_cfg("global_event_multiplier", 1.0), 1.0)
+        return max(0.1, min(3.0, value))
+
+    def non_target_multiplier(self) -> float:
+        """非 target 事件系数（默认 1.0，夹在 [0, 1]）。"""
+        value = self._to_float(self._emotion_cfg("non_target_multiplier", 1.0), 1.0)
+        return max(0.0, min(1.0, value))
+
+    def target_bonus_step(self) -> float:
+        """target 每档加成步长（默认 0.1，夹在 [0, 1]；附录 C）。"""
+        value = self._to_float(self._emotion_cfg("target_bonus_step", 0.1), 0.1)
+        return max(0.0, min(1.0, value))
+
+    def affection_tier(self) -> Optional[int]:
+        """从 affection 状态层读当前档位（跨模块 getattr 判空；读不到返回 None）。"""
+        affection = getattr(self._plugin, "_affection", None)
+        getter = getattr(affection, "tier", None)
+        if not callable(getter):
+            return None
+        try:
+            return max(0, min(4, int(getter())))
+        except Exception:
+            return None
+
+    def target_bonus(self) -> float:
+        """target 加算加成 = step × (档位+1)（§5.3 表 / §6.2 A；档位不可得时 0）。"""
+        tier = self.affection_tier()
+        if tier is None:
+            return 0.0
+        return self.target_bonus_step() * (tier + 1)
+
+    def target_multiplier(self, is_target: bool) -> float:
+        """§6.2 A 的 K：target = 1+加成（加算非乘算）；非 target = non_target_multiplier。"""
+        if is_target:
+            return 1.0 + self.target_bonus()
+        return self.non_target_multiplier()
+
+    def is_target_session(self, session_id: str) -> bool:
+        """私聊 target 判定（§5.3）：session_id == 目标私聊 stream_id（after_response 链路）。
+
+        stream_id 由顶层 ``_resolve_target_stream`` 从 ``target.target_qq`` 解析并
+        随配置热重载更新（plugin._apply_target）；取不到时按非 target 计。
+        """
+        sid = str(session_id or "").strip()
+        target = str(getattr(self._plugin, "_stream_id", "") or "").strip()
+        return bool(sid and target and sid == target)
+
+    def _log_decision(self, action: str, **fields: Any) -> None:
+        """写一条决策日志（无 logger 时静默；日志故障绝不影响情绪结算）。"""
+        logger_ = getattr(self._plugin, "_decision_logger", None)
+        if logger_ is None:
+            return
+        try:
+            logger_.record(action=action, **fields)
+        except Exception:
+            pass
+
+    def _apply_external_delta(self, event_text: str, delta: VADState, *, source: str,
+                              multiplier: float, llm: bool = False,
+                              is_target: Optional[bool] = None,
+                              session_id: str = "") -> Dict[str, Any]:
+        """倍率 → ±0.5 硬限幅 → 入账 → 决策日志（evaluate_reply 与外部事件共用）。
+
+        三层倍率与裁剪前/后值全部落 decision_logs（§6.3-7）：``k``（调用方 K）/
+        ``global_multiplier`` / ``multiplier``（最终总倍率）+ ``delta_before`` /
+        ``delta_scaled`` / ``delta_applied``。
+        """
+        global_mul = self.global_event_multiplier()
+        factor = float(multiplier) * global_mul
+        scaled = VADState(delta.valence * factor, delta.arousal * factor, delta.dominance * factor)
+        applied = VADState(
+            _clip(scaled.valence, -EVENT_DELTA_CLAMP, EVENT_DELTA_CLAMP),
+            _clip(scaled.arousal, -EVENT_DELTA_CLAMP, EVENT_DELTA_CLAMP),
+            _clip(scaled.dominance, -EVENT_DELTA_CLAMP, EVENT_DELTA_CLAMP),
+        )
+        clipped = any(abs(getattr(scaled, axis)) > EVENT_DELTA_CLAMP + 1e-9
+                      for axis in ("valence", "arousal", "dominance"))
+        self._machine.record_event(event_text or "外部事件", applied)
+        self._save_state()
+        self._log_decision(
+            "emotion.external_event", trigger_type="emotion", reason=str(event_text or "")[:120],
+            source=str(source or ""), session_id=str(session_id or ""),
+            is_target=(bool(is_target) if is_target is not None else None), tier=self.affection_tier(),
+            target_bonus=round(self.target_bonus(), 4),
+            non_target_multiplier=round(self.non_target_multiplier(), 4),
+            k=round(float(multiplier), 4), global_multiplier=round(global_mul, 4),
+            multiplier=round(factor, 4), llm=bool(llm), clipped=bool(clipped),
+            delta_before=delta.to_dict(), delta_scaled=scaled.to_dict(), delta_applied=applied.to_dict(),
+        )
+        return {"ok": True, "reason": "", "event": str(event_text or ""), "delta": applied,
+                "delta_before": delta, "multiplier": round(factor, 4),
+                "k": round(float(multiplier), 4), "global_multiplier": round(global_mul, 4),
+                "clipped": bool(clipped)}
+
+    async def record_external_event(self, source: str, description: str,
+                                    delta: Optional[VADState] = None, *,
+                                    use_llm: bool = False,
+                                    multiplier: float = 1.0) -> Dict[str, Any]:
+        """统一外部事件入口（§4.2 行 1 / §6.2 A）。
+
+        - ``delta`` 给出模板增量 → 直接 ``record_event``（×multiplier）；
+        - ``delta`` 为 None 且 ``use_llm=True`` → 走既有 :func:`evaluate_reply_delta`
+          有界评估（±0.5；裁判/评估看不到绝对 VAD，§6.3-6；与回复评估共用节流）；
+        - ``multiplier`` 是调用方按 §6.2 A 算好的 K（target = 1+档位加成 /
+          非 target = non_target_multiplier）；入口再统一乘 ``global_event_multiplier``，
+          即 ``final_delta = delta × global_event_multiplier × K``；
+        - 最终增量经 ±:data:`EVENT_DELTA_CLAMP` 硬限幅后入账，三层倍率与裁剪前/后
+          值落 decision_logs（§6.3-7）。
+
+        Returns:
+            ``{"ok", "reason", "event", "delta", "delta_before", "multiplier",
+            "k", "global_multiplier", "clipped"}``；未入账时 ok=False 且 reason 说明。
+        """
+        if not self._enabled():
+            return {"ok": False, "reason": "disabled"}
+        event_text = str(description or "").strip()
+        k = max(0.0, min(EXTERNAL_K_MAX, self._to_float(multiplier, 1.0)))
+        delta_before: Optional[VADState] = None
+        llm_used = False
+        if delta is not None:
+            delta_before = VADState(delta.valence, delta.arousal, delta.dominance).clipped()
+        elif use_llm:
+            if not event_text:
+                return {"ok": False, "reason": "empty_event"}
+            if not self._llm_interval_ok():
+                return {"ok": False, "reason": "throttled"}
+            cfg = getattr(self._plugin.config, "emotion", None)
+            task_name = str(getattr(cfg, "evaluator_task_name", "utils") or "utils")
+            try:
+                result = await evaluate_reply_delta(self._llm(), event_text, self._persona,
+                                                    self._lover_name, task_name)
+            except Exception:
+                return {"ok": False, "reason": "llm_error"}
+            if not result:
+                return {"ok": False, "reason": "llm_failed"}
+            llm_event, delta_before = result
+            event_text = str(llm_event or "").strip()[:60] or event_text
+            llm_used = True
+        else:
+            return {"ok": False, "reason": "no_delta"}
+        outcome = self._apply_external_delta(event_text, delta_before, source=source,
+                                             multiplier=k, llm=llm_used)
+        if outcome.get("ok"):
+            # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
+            await self._publish("emotion.updated", mood=self.mood_text(), trigger="external_event")
+        return outcome
 
     def _llm(self) -> Any:
         llm = getattr(self._plugin, "_llm", None)

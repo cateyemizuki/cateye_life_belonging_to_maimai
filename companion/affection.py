@@ -338,6 +338,8 @@ class AffectionManager:
         self._decision_logger = decision_logger
         #: M0 事件总线（可空降级；档位变化时发布 relation.affection_tier_changed）
         self._bus = bus
+        #: M3 B2：情绪效价提供者（返回 float 或 None；未接线/情绪停用时乘数恒 1.0）
+        self._emotion_vad_provider: Any = None
         self._level_labels: dict = {}
 
         loaded, status = _read_json_file(self._path)
@@ -382,6 +384,35 @@ class AffectionManager:
     def is_enabled(self) -> bool:
         """[affection] enabled：false 时回退 v1 三档行为（不做规则记账/日衰减/迟滞重估）。"""
         return self._cfg_bool("enabled", True)
+
+    def emotion_modulation_enabled(self) -> bool:
+        """B2 情绪调制开关（[affection] emotion_modulation，默认开；关时乘数恒 1.0）。"""
+        return self._cfg_bool("emotion_modulation", True)
+
+    def set_emotion_vad_provider(self, provider: Any) -> None:
+        """注入情绪效价提供者（M3 B2；可空降级）。
+
+        provider 为无参可调用对象，返回当前生效 V（float）或 None（情绪未接线/停用/异常）。
+        companion/services.py 装配期注入；未注入时 :meth:`emotion_valence` 恒返回 None，
+        好感入账乘数保持 1.0——单模块停用不影响其余模块（§八.2）。
+        """
+        self._emotion_vad_provider = provider if callable(provider) else None
+
+    def emotion_valence(self) -> Optional[float]:
+        """当前生效 V（调制输入，§6.2 B）；未接线/异常时返回 None。"""
+        provider = self._emotion_vad_provider
+        if not callable(provider):
+            return None
+        try:
+            value = provider()
+        except Exception:
+            return None
+        if value is None:
+            return None
+        try:
+            return max(-1.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return None
 
     def daily_caps(self) -> dict[str, float]:
         """日累计限幅（§5.5）：positive ≤ +4.0、negative ≥ −3.0（[affection] 配置，缺省即默认）。"""

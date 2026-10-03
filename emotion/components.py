@@ -2,10 +2,11 @@
 
 组件清单（组件名带 cateye_test_ 前缀，与其他模块同规则）：
 - Command ×2：/cateye_test_emotion_init（人设初始化）、/cateye_test_emotion_config [reset|clear]（查看/重置）
-- Tool ×1：cateye_test_emotion_mood（当前情绪底色，供"你现在什么心情"类问题）
+- Tool ×2：cateye_test_emotion_mood（当前情绪底色，供"你现在什么心情"类问题）、
+  cateye_test_emotion_report(event, is_target)（上报影响心情的事件；群聊 target 声明，M3）
 - HookHandler ×3：maisaka.planner.before_request（情绪底色注入）、
   maisaka.replyer.before_model_request（情绪底色注入）、
-  maisaka.replyer.after_response（回复后 ΔVAD 增量评估，OBSERVE）
+  maisaka.replyer.after_response（回复后 ΔVAD 增量评估，OBSERVE；session_id 进 target 识别链路）
 
 注入方式（planner 与 replyer 一致）：以 SystemMessageItem 插到**第一条系统提示词之后**
 （items 强 schema 协议，meta 三件套齐全、modified_kwargs 全量回传；messages 旧投影兼容）。
@@ -29,12 +30,13 @@ from core.inject import (
 
 
 class EmotionComponentsMixin:
-    """情绪组件（2 Command + 1 Tool + 2 HookHandler）。"""
+    """情绪组件（2 Command + 2 Tool + 3 HookHandler）。"""
 
     emotion_components_info: ClassVar[Dict[str, str]] = {
         "cateye_test_emotion_init": "Command：由人设自动推导情绪锚点/偏移/乘数（VAD 初始化）",
         "cateye_test_emotion_config": "Command：查看情绪参数；reset 子命令恢复默认",
         "cateye_test_emotion_mood": "Tool：查询当前情绪底色（标签+低分辨率描述）",
+        "cateye_test_emotion_report": "Tool：上报一件影响心情的事件；is_target 声明是否由重要的人引发（M3）",
         "emotion_planner_inject": "HookHandler：maisaka.planner.before_request 情绪底色注入（系统提示词后）",
         "emotion_replyer_model_inject": "HookHandler：maisaka.replyer.before_model_request 情绪底色注入（系统提示词后）",
         "emotion_reply_evaluate": "HookHandler：maisaka.replyer.after_response 增量评估（OBSERVE）",
@@ -102,6 +104,65 @@ class EmotionComponentsMixin:
             return "情绪模块未启用。"
         return f"当前情绪底色：{svc.mood_text()}"
 
+    @Tool(
+        "cateye_test_emotion_report",
+        description="上报一件影响 bot 心情的事件（由 bot 判断是否与最重要的人有关），入账有界情绪增量。",
+        detailed_description=(
+            "上报一件给 bot 的情绪带来波动的事件，由代码侧做有界评估后计入当天情绪。"
+            "触发条件（满足其一才调用）：\n"
+            "1) 在群聊里，最重要的人（配置 target.target_qq 指定的那位，非普通群友）对 bot 说了值得在意的话，"
+            "或做了影响 bot 心情的事（关心、调侃、约定、爽约等）；\n"
+            "2) 群聊里发生了由那位重要的人间接引发、明显影响 bot 心情的事（如 TA 被提及、TA 的事有了结果）。\n"
+            "参数：\n"
+            "- event：string，必填。用一句话概括这轮交流发生了什么（谁说了什么、结果如何）。\n"
+            "- is_target：boolean，可选。这件事是否由最重要的人引发；是就填 true。"
+            "不填或填了别的值一律按「非重要的人」处理，不会报错。\n"
+            "注意：普通群友的日常闲聊不要调用（自动回复评估已覆盖）；私聊里的交流也无需调用；"
+            "同一件事不要重复上报。"
+        ),
+        parameters={
+            "event": {
+                "type": "string",
+                "description": "一句话概括这轮交流发生了什么（谁说了什么、发生了什么）",
+                "required": True,
+            },
+            "is_target": {
+                "type": "boolean",
+                "description": "这件事是否由最重要的人引发（是=true）；缺失/非法值按非 target 处理",
+                "required": False,
+            },
+        },
+    )
+    async def emo_tool_report(self, event: str = "", is_target: Any = None, **kwargs: Any) -> str:
+        """Tool：上报群聊里与 target 相关的情绪事件（§5.3 / §6.2 A）。
+
+        与自动评估路径的关系：replyer.after_response 的回复后评估始终是主通道，
+        本工具只是群聊场景的补充（Tool 默认进 deferred 池，不保证被自发调用）。
+
+        参数安全：``is_target`` 永不拒绝——缺失、类型不对、胡填一律静默按非 target 计
+        （最多 debug 级日志），代码不报错；非 bool 值不做任何真值猜测。
+        """
+        svc = self._emo_service()
+        if svc is None or not self._emo_module_enabled():
+            return "情绪模块未启用。"
+        text = str(event or "").strip()
+        if not text:
+            return "缺少 event 参数：请用一句话说明这轮交流发生了什么。"
+        target_flag = is_target is True
+        if is_target is not None and not isinstance(is_target, bool):
+            try:
+                self.ctx.logger.debug("emotion_report：is_target 非法值 %r，按非 target 处理", is_target)
+            except Exception:
+                pass
+        multiplier = svc.target_multiplier(target_flag)
+        result = await svc.record_external_event(
+            source="tool:emotion_report", description=text[:300], delta=None,
+            use_llm=True, multiplier=multiplier,
+        )
+        if not result.get("ok"):
+            return f"这件事暂未计入情绪（{result.get('reason') or '未知原因'}）。"
+        return "已记下这件事给心情带来的变化。"
+
     # ============================================================
     # Hooks（planner + replyer 双通道：均插到第一条系统提示词之后）
     # ============================================================
@@ -165,8 +226,10 @@ class EmotionComponentsMixin:
         reply_text = str(response or "").strip()
         if not reply_text:
             return
+        # M3：session_id 进 target 识别链路（私聊 stream_id == 目标私聊流 → target 事件）
+        session_id = str(kwargs.get("session_id") or "")
         # 评估带 LLM 往返，不能阻塞 Hook（OBSERVE 后台通道）：fire-and-forget
-        task = asyncio.create_task(svc.evaluate_reply(reply_text[:600]))
+        task = asyncio.create_task(svc.evaluate_reply(reply_text[:600], session_id=session_id))
         svc._bg_tasks.append(task)
         if len(svc._bg_tasks) > 20:  # 防堆积：只留最近的评估任务
             svc._bg_tasks = [t for t in svc._bg_tasks if not t.done()][-10:]

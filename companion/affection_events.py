@@ -7,8 +7,10 @@
   ``commitment_broken`` 每约定 1 次（去重键见 ``key`` 参数）。
 - 日累计限幅（§5.5）：positive ≤ ``daily_positive_cap``(4.0)、negative ≥
   ``-daily_negative_cap``(3.0)，超出部分记日志丢弃。
-- 情绪调制（§六.2 B）本里程碑**不接线**：乘数恒 1.0（仅登记在 decision_logs 里），
-  ``[affection] emotion_modulation`` 目前只声明字段。
+- 情绪调制（§六.2 B，M3 接线）：``delta_affection_final = delta × clamp(1 + 0.25 ×
+  V_current × sign(delta), 0.6, 1.4)``；V_current 由 ``AffectionManager.emotion_valence()``
+  读取（emotion 模块未接线/停用时返回 None → 乘数恒 1.0），开关
+  ``affection.emotion_modulation``。调制系数与裁剪前后值落 decision_logs（§6.3-7）。
 
 调用方式二选一（等价）：
 
@@ -88,8 +90,13 @@ RULE_EVENT_TABLE: dict[str, dict[str, Any]] = {
 DEFAULT_DAILY_POSITIVE_CAP = 4.0
 DEFAULT_DAILY_NEGATIVE_CAP = 3.0
 
-#: 情绪调制乘数占位（M3 才会接 emotion/bridge；本里程碑恒 1.0）
+#: 情绪调制兜底乘数（无情绪上下文/开关关闭时的恒等值；M3 起真实调制见 _emotion_multiplier）
 _EMOTION_MULTIPLIER = 1.0
+
+#: 情绪调制参数（§六.2 B）：1 + 0.25 × V × sign(delta)，乘数 clamp [0.6, 1.4]
+EMOTION_MODULATION_K = 0.25
+EMOTION_MODULATION_MIN = 0.6
+EMOTION_MODULATION_MAX = 1.4
 
 #: 限幅类丢弃的告警节流（内存态，按「manager+kind+原因+日期」只警告一次；
 #: 逐条留痕仍在 decision_logs，日志级别降为 debug）
@@ -112,6 +119,44 @@ def _to_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _emotion_multiplier(affection: Any, delta: float) -> tuple:
+    """情绪调制乘数（§6.2 B，M3）：``1 + 0.25 × V × sign(delta)``，clamp [0.6, 1.4]。
+
+    心理学含义（情绪-一致性偏差）：开心时正事件加分更多、负事件更宽容；低落时
+    正事件打折、负事件扣得更狠；乘数对称保正负同时缩放（不会"心情差所以骂人也不扣分"）。
+
+    Returns:
+        ``(multiplier, valence)``；V 不可得（emotion 模块未接线/停用/异常）或
+        ``affection.emotion_modulation=false`` 时返回 ``(1.0, None)``——乘数恒 1，
+        与 M1 占位行为一致（降级路径）。
+    """
+    if affection is None or not delta:
+        return _EMOTION_MULTIPLIER, None
+    enabled = getattr(affection, "emotion_modulation_enabled", None)
+    if callable(enabled):
+        try:
+            if not enabled():
+                return _EMOTION_MULTIPLIER, None
+        except Exception:
+            return _EMOTION_MULTIPLIER, None
+    get_valence = getattr(affection, "emotion_valence", None)
+    if not callable(get_valence):
+        return _EMOTION_MULTIPLIER, None
+    try:
+        valence = get_valence()
+    except Exception:
+        valence = None
+    if valence is None:
+        return _EMOTION_MULTIPLIER, None
+    try:
+        v = float(valence)
+    except (TypeError, ValueError):
+        return _EMOTION_MULTIPLIER, None
+    sign = 1.0 if delta > 0 else -1.0
+    multiplier = 1.0 + EMOTION_MODULATION_K * v * sign
+    return max(EMOTION_MODULATION_MIN, min(EMOTION_MODULATION_MAX, multiplier)), v
 
 
 def _resolve_caps(affection: Any, caps: Any) -> dict[str, Any]:
@@ -168,7 +213,10 @@ def _drop(affection: Any, result: dict[str, Any], reason: str, detail: str = "",
         try:
             log("affection.rule_event_dropped", trigger_type="affection", reason=reason,
                 kind=str(result.get("kind") or ""), detail=detail,
-                requested=round(requested, 4), multiplier=_EMOTION_MULTIPLIER)
+                requested=round(requested, 4),
+                multiplier=result.get("multiplier", _EMOTION_MULTIPLIER),
+                requested_raw=result.get("requested_raw", round(requested, 4)),
+                emotion_valence=result.get("valence"))
         except Exception:
             pass
     if affection is not None:
@@ -196,8 +244,11 @@ def record_rule_event(affection: Any, kind: str, delta: Optional[float] = None, 
         now: 事件时间（测试/补偿用；缺省当前时间）。
 
     Returns:
-        ``{"kind", "requested", "applied", "dropped", "reason", "score", "tier", "tier_changed"}``
-        （``requested`` = 裁剪前，``applied`` = 实际入账；``tier_changed`` = (old,new) 或 None）。
+        ``{"kind", "requested", "applied", "dropped", "reason", "score", "tier",
+        "tier_changed", "multiplier", "requested_raw", "valence"}``
+        （``requested_raw`` = 情绪调制前，``requested`` = 调制后/限幅前，``applied`` =
+        实际入账，``multiplier`` = 情绪调制系数（未接线时 1.0），``valence`` = 调制
+        所用当前 V（不可得时为 None）；``tier_changed`` = (old,new) 或 None）。
     """
     now = now or datetime.now()
     kind = str(kind or "").strip()
@@ -232,6 +283,18 @@ def record_rule_event(affection: Any, kind: str, delta: Optional[float] = None, 
     requested = _to_float(rule.get("delta"), 0.0) if delta is None else _to_float(delta, 0.0)
     if requested == 0.0:
         return _drop(affection, result, "zero_delta", now=now)
+
+    # ---- 情绪调制（B2，§六.2 B，M3 接线）：delta × clamp(1+0.25×V×sign(delta), 0.6, 1.4) ----
+    # 调制在频控/限幅之前应用，后续 kind 日累计与日累计限幅按调制后的值计算；
+    # 裁剪前后值（requested_raw → requested）与调制系数落决策日志（§6.3-7）。
+    requested_raw = round(requested, 4)
+    modulation, valence = _emotion_multiplier(affection, requested)
+    if modulation != _EMOTION_MULTIPLIER:
+        requested = round(requested * modulation, 4)
+        logger.debug("好感情绪调制：%.4f × %.4f（V=%s）→ %.4f",
+                     requested_raw, modulation, valence, requested)
+    result.update(multiplier=round(modulation, 4), requested_raw=requested_raw,
+                  valence=(round(float(valence), 4) if valence is not None else None))
 
     resolved = _resolve_caps(affection, caps)
     today_events = [e for e in affection.event_log() if e.get("kind") == kind]
@@ -300,7 +363,7 @@ def record_rule_event(affection: Any, kind: str, delta: Optional[float] = None, 
             logger.info("好感日累计限幅：负向 %.3f → %.3f（下限 -%g，今日已记 %.3f）",
                         requested, planned, resolved["daily_negative"], neg_used)
 
-    # ---- 入账（情绪调制乘数恒 1.0；M3 才接 B2）----
+    # ---- 入账（情绪调制已在前面应用；M3 起 multiplier 即 B2 调制系数）----
     applied = affection.commit_rule_delta(planned)
     if applied == 0.0:
         return _drop(affection, result, "score_bound",
@@ -312,8 +375,12 @@ def record_rule_event(affection: Any, kind: str, delta: Optional[float] = None, 
         "desc": str(desc or rule.get("desc") or ""),
         "delta": round(applied, 4),
         "requested": round(requested, 4),
-        "multiplier": _EMOTION_MULTIPLIER,
+        "multiplier": round(float(modulation), 4),
     }
+    if modulation != _EMOTION_MULTIPLIER:
+        entry["requested_raw"] = requested_raw
+    if valence is not None:
+        entry["emotion_valence"] = round(float(valence), 4)
     if dedup:
         entry["key"] = dedup
     if notes:
@@ -332,15 +399,17 @@ def record_rule_event(affection: Any, kind: str, delta: Optional[float] = None, 
             log("affection.rule_event", trigger_type="affection",
                 reason=entry["desc"], kind=kind,
                 requested=round(requested, 4), applied=round(applied, 4),
-                multiplier=_EMOTION_MULTIPLIER,
+                multiplier=round(float(modulation), 4),
+                requested_raw=requested_raw,
+                emotion_valence=(round(float(valence), 4) if valence is not None else None),
                 detail="; ".join(notes) or "入账",
                 daily_positive=_to_float(daily_after.get("positive"), 0.0),
                 daily_negative=_to_float(daily_after.get("negative"), 0.0),
                 score=result["score"], tier=result["tier"])
         except Exception:
             pass
-    logger.debug("好感规则事件入账：kind=%s applied=%.3f（requested=%.3f）score=%.1f tier=%d",
-                 kind, applied, requested, result["score"], result["tier"])
+    logger.debug("好感规则事件入账：kind=%s applied=%.3f（requested=%.3f，调制 ×%.3f）score=%.1f tier=%d",
+                 kind, applied, requested, modulation, result["score"], result["tier"])
     return result
 
 

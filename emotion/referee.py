@@ -3,7 +3,7 @@
 三个独立请求都不携带对话历史：
 - 睡眠裁判：客观数据（当前 VAD、当天情绪日志、前后日日程、睡眠时长）→ ΔVAD_sleep（±0.8）；
 - 人设初始化：纯人设文本 → 锚点/静态偏移/乘数四组参数（带数值约束）；
-- 回复增量评估：该轮回复文本 → 事件摘要 + ΔVAD（±0.5）。
+- 回复增量评估：该轮回复文本（+用户侧最后一条消息上下文，§4.2 行 2）→ 事件摘要 + ΔVAD（±0.5）。
 所有返回都经代码层二次校验与裁剪（LLM 数值感知失真的兜底，§十二.1）。
 """
 
@@ -69,16 +69,19 @@ V 代表愉悦度，范围 -1.0 到 1.0，正值愉悦、负值痛苦；A 代表
   "positive_gain": 1.0, "negative_decay": 1.0,
   "reasons": {{"anchor": "...", "offset": "...", "multiplier": "..."}}}}"""
 
-EVALUATE_PROMPT = """你是 AI 角色「{lover_name}」的情绪增量评估器。你看不到角色当前的绝对情绪数值，只根据下面这段 AI 的回复内容，评估"这件事/这段交流"给角色情绪带来的变化量 ΔVAD。
+EVALUATE_PROMPT = """你是 AI 角色「{lover_name}」的情绪增量评估器。你看不到角色当前的绝对情绪数值，只根据下面这段交流内容，评估"这轮交流/这件事"给角色情绪带来的变化量 ΔVAD。
 
 【角色人设（情绪过滤依据）】
 {persona}
 
-【AI 的回复内容】
+【用户侧最后一条消息（对话上下文；可能为空）】
+{user_context}
+
+【AI 的回复内容 / 待评估的交流内容】
 {reply_text}
 
 【要求】
-1. event 用不超过 30 字概括引发情绪变化的事件；
+1. event 用不超过 30 字概括「这轮交流发生了什么」（谁说了什么、发生了什么、结果如何），不要笼统写"日常对话"；
 2. ΔV/ΔA/ΔD 每一维范围 [-0.5, 0.5]；没有明显情绪波动时全部接近 0；
 3. 只输出 JSON：{{"event": "...", "delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}}}"""
 
@@ -178,10 +181,17 @@ async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str
 
 
 async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_name: str,
-                               task_name: str) -> Optional[Tuple[str, VADState]]:
-    """回复增量评估：返回 (事件摘要, ΔVAD)；失败返回 None。"""
+                               task_name: str, *, user_message: str = "") -> Optional[Tuple[str, VADState]]:
+    """回复/外部事件增量评估：返回 (事件摘要, ΔVAD)；失败返回 None。
+
+    ``user_message`` 是评估上下文增强（§4.2 行 2 / §七 M3 行）：该聊天流最近一条
+    用户消息文本，由调用方反查后传入；拿不到时留空（prompt 里以占位说明），
+    评估仍只输出有界增量（±0.5），模型始终看不到绝对 VAD（§6.3-6）。
+    """
     response = await llm.generate(
         prompt=EVALUATE_PROMPT.format(lover_name=lover_name, persona=(persona or "（暂无人设）")[:800],
+                                      user_context=(str(user_message or "").strip()[:300]
+                                                    or "（未取到用户侧消息，仅按下面内容判断）"),
                                       reply_text=str(reply_text or "")[:600]),
         task_name=task_name, temperature=0.2, max_tokens=150, event="emotion_evaluate",
     )
