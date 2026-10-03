@@ -116,5 +116,33 @@
 
 | 日期 | 里程碑/场景 | 结果 | 摘要/日志位置 |
 |---|---|---|---|
+| 2026-10-03 | harness v0.1.1 文件任务通道 | L0 四套全绿 | `tasks/*.json` 四动作白名单（inject/seq/state/freeze\|resume）→ `results/<id>.json` 回执，宿主验证日主控链路就绪 |
 | 2026-10-03 | cateye_harness 0.1.0 实现 | L0 四套全绿（smoke/behavior 各两套） | 代码 D:/deepseek-harness_workspace/maibot-plugins/cateye_harness，staging D:/deepseek-harness_workspace/maibot-plugins/cateye_harness\build_staging\； |
 | 2026-10-03 | 文档建立 | — | 环境事实与红线制定；harness 插件已实现待宿主验证（L0 全绿，staging 就绪） |
+
+## 附录：全自动模式（宿主验证日 SOP）
+
+> 性质：**计划版本（尚未执行）**；验证日的实证结论与偏差追加记录到 §八。
+
+### 〇、前提
+
+- 用户已启动 QQ + SnowLuma 适配器侧（agent 只确认 ready）。
+- 宿主环境纯测试：**配置无需保全**，任何改动记录在案即可。
+- emotion 模块本次**不初始化**：零锚点即可跑完全部场景；人设锚点推导留待用户在场时执行管理员命令或后续 admin API——**不在自动范围内**。
+
+### 步骤
+
+0. 两仓库打 tag：`cateye_test` v0.4.0-offline-verified / `cateye_harness` v0.1.1。
+1. agent 前台启动宿主（Bash 后台任务承载 `run.bat`，stdout 捕获到 `logs/agent_session_stdout.log`）；随后轮询宿主日志确认 `snowluma_gateway` ready（**最多等 10 分钟，超时即停并报告**；若用户侧未就绪导致超时，等待后重试一次）。
+2. robocopy 部署两 staging（`cateye_harness\build_staging\cateye_test` → `plugins\cateye_test`；`cateye_harness\build_staging\cateye_harness` → `plugins\cateye_harness`）；热重载确认：轮询宿主日志“插件加载”行 + 组件文件时间戳，**实证拷贝是否自动重载**；若不自动则 touch 插件文件强制重载——把实证结论记入 §八。
+3. 首次加载生成 `config.toml` 后直接写入收紧配置（`patrol.daily_max_speak ≤ 3`、`[judge]`/评估任务指便宜非思考任务、`target_qq=123456789`）+ 强制重载 + 读回验证。
+4. 网关连通性探测（**第一发任务文件**）：先私聊注入（123456789→123456789 私聊流）确认链路与回复（回复确认以宿主日志/decision_logs 为准，真实 QQ 侧由用户目视）；再群聊注入 392653174——若 harness 网关被宿主适配器名单拦截，在 `config/adapter_policy.toml` 增补 harness 条目（测试环境允许，记入 §七 HOST_PATCHES），重试通过。
+5. L2 场景链按序全自动（经 `tasks/*.json` 下发 inject/seq 任务，收 `results/<id>.json` 回执）：`bus_check` → `affection_basic` → `affection_review` → `attribution` → `silence` → `mood_effect`；每场景四通道核对**全部文件化**（decision_logs jsonl / 宿主 app log / 状态 JSON / results 回执），逐场景写核对记录（主会话驱动操作，核对派子代理）。
+6. L4 子项（迟滞 24h、sleep 锚点搬运）：agent 直接改 `config.toml` + 强制重载 + 等待观察；用完搬回并记录（环境一次性，但同日后续场景依赖合理配置）。
+7. 全部通过 → L5 挂机 ≥1 天（宿主保持运行，agent 定期抽查 decision_logs）。
+8. 收尾报告：每场景 PASS/FAIL + 四通道证据文件路径 + HOST_PATCHES + git log。
+
+### 分工说明
+
+- 操作驱动（启停/拷贝/写配置/下发任务文件/轮询日志）由**主会话**执行；
+- 每场景四通道证据核对由**独立子代理**执行。
