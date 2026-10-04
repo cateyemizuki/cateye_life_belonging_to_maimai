@@ -34,6 +34,7 @@ from .generator import (
     LLMResponseParser,
     ScheduleGeneratorConfig,
     ScheduleQualityScorer,
+    LOW_MOOD_MIN_DAYS,
     ScheduleSemanticValidator,
     build_emotion_context,
     clip_emotional_tone,
@@ -96,6 +97,11 @@ def _fmt_minutes(minutes: int) -> str:
 
 class ScheduleGenerator:
     """日程生成器（协调器：配置 → 上下文 → 多轮生成 → 校验评分 → 落库）。"""
+
+    #: M5 连续低迷软约束（§6.2 F）：恢复类 goal_type（已有则不再强制插入）
+    RECOVERY_GOAL_TYPES = ("rest", "social_maintenance")
+    #: 无缝日程切分时的优先条目类型（高强度/可压缩；不切 meal/daily_routine）
+    RECOVERY_SPLIT_GOAL_TYPES = ("study", "learn_topic", "custom", "entertainment", "exercise")
 
     def __init__(
         self,
@@ -190,9 +196,10 @@ class ScheduleGenerator:
         validator = ScheduleSemanticValidator()
         scorer = ScheduleQualityScorer(gen_config.to_dict())
 
-        # 上下文加载：近几天摘要 / 今日约定 / 跨会话历史 / 知识库 / 睡醒情绪（全部失败静默）
+        # 上下文加载：近几天摘要 / 今日约定 / 跨会话历史 / 知识库 / 睡醒情绪 / 连续低迷（全部失败静默）
         self._load_sync_contexts(base, gen_config, date)
         self._load_emotion_context(base)
+        self._load_low_mood(base)
         await self._load_async_contexts(base, gen_config, date)
 
         # 多轮 / 单轮生成
@@ -211,6 +218,12 @@ class ScheduleGenerator:
 
         # 归一化为 DB 记录并落库（含约定匹配 + 消费）
         items = self._normalize_items(raw_items, date, wake_time, sleep_time)
+        # M5 连续低迷软约束（§6.2 F）：强制插入一次 rest/social（原本没有恢复类活动时）
+        items, inserted = self._ensure_recovery_item(
+            items, date=date, low_mood=base.low_mood_days >= LOW_MOOD_MIN_DAYS,
+            wake_time=wake_time, sleep_time=sleep_time)
+        if inserted:
+            logger.info("连续低迷软约束：已为 %s 强制插入一次恢复类活动（rest/social）", date)
         if apply:
             self.apply_schedule_items(items, date, consume_commitments=True)
         else:
@@ -424,6 +437,94 @@ class ScheduleGenerator:
         except Exception as exc:
             base.emotion_context = ""
             logger.debug("睡醒情绪上下文装载失败（忽略）: %s", exc)
+
+    def _load_low_mood(self, base: BaseScheduleGenerator) -> None:
+        """M5（§6.2 F）：装载连续低迷天数（优先情绪服务实时状态，回退 planning 的事件缓存）。
+
+        情绪侧 ``low_mood_state()`` 未满门槛/模块缺失 → 0（不触发软约束，可空降级）。
+        """
+        try:
+            state: Dict[str, Any] = {}
+            emotion = getattr(self._plugin, "_emotion", None)
+            getter = getattr(emotion, "low_mood_state", None)
+            if callable(getter):
+                state = getter() or {}
+            if not state:
+                planning = getattr(self._plugin, "_planning", None)
+                getter = getattr(planning, "low_mood_state", None)
+                if callable(getter):
+                    state = getter() or {}
+            base.low_mood_days = int((state or {}).get("days") or 0)
+        except Exception as exc:
+            base.low_mood_days = 0
+            logger.debug("连续低迷状态装载失败（忽略）: %s", exc)
+
+    @classmethod
+    def _ensure_recovery_item(cls, items: List[Dict[str, Any]], *, date: str, low_mood: bool,
+                              wake_time: str = "07:00", sleep_time: str = "23:00",
+                              force_minutes: int = 60) -> tuple:
+        """M5 连续低迷软约束（§6.2 F）：确保日程里至少有一段 rest/social，缺失则强制插入一次。
+
+        插入策略（不重叠、不越作息锚点）：
+        1. 存在 ≥``force_minutes`` 的空档 → 在最大空档起点插入。空档**含首尾**
+           （[wake, 首条目)、条目之间、(末条目, sleep]），避免"活动集中在中间、
+           前后全空"的日程被误判为"无空档"；
+        2. 无缝日程（生产常态）→ 切出最长的高强度条目（study/learn_topic/custom/entertainment/
+           exercise）的尾段作为恢复段；找不到合适条目则放弃（记日志，不破坏日程）。
+
+        Returns:
+            ``(items, inserted)``。
+        """
+        rows = sorted((dict(item) for item in (items or [])),
+                      key=lambda it: int(it.get("start_minute") or 0))
+        if not low_mood or not rows:
+            return rows, False
+        if any(str(it.get("goal_type") or "") in cls.RECOVERY_GOAL_TYPES for it in rows):
+            return rows, False
+        wake_min = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
+        sleep_min = parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES)
+        # 1) 最大空档：**含首尾**——[wake, 首条目)、条目之间、(末条目, sleep]
+        #    （只统计条目之间会漏掉"活动集中在中间、前后全空"的日程）
+        gaps: List[tuple] = []
+        cursor = int(wake_min)
+        for it in rows:
+            start = max(int(it.get("start_minute") or 0), cursor)
+            if start - cursor >= force_minutes:
+                gaps.append((cursor, start - cursor))
+            cursor = max(cursor, int(it.get("end_minute") or 0))
+        if int(sleep_min) - cursor >= force_minutes:
+            gaps.append((cursor, int(sleep_min) - cursor))
+        if gaps:
+            at, span = max(gaps, key=lambda gap: gap[1])
+            rows.append(cls._make_recovery_item(at, min(force_minutes, span), date))
+            return sorted(rows, key=lambda it: int(it.get("start_minute") or 0)), True
+        # 2) 无缝日程：切最长的高强度条目尾段
+        def _duration(it: Dict[str, Any]) -> int:
+            return int(it.get("end_minute") or 0) - int(it.get("start_minute") or 0)
+
+        candidates = [it for it in rows
+                      if str(it.get("goal_type") or "") in cls.RECOVERY_SPLIT_GOAL_TYPES
+                      and _duration(it) >= force_minutes + 15]
+        if not candidates:
+            candidates = [it for it in rows if _duration(it) >= force_minutes + 15
+                          and str(it.get("goal_type") or "") not in ("meal", "daily_routine")]
+        if not candidates:
+            logger.info("连续低迷软约束：无合适条目可切分，跳过强制插入（%s）", date)
+            return rows, False
+        target = max(candidates, key=_duration)
+        cut = int(target.get("end_minute") or 0) - force_minutes
+        target["end_minute"] = cut
+        rows.append(cls._make_recovery_item(cut, force_minutes, date))
+        return sorted(rows, key=lambda it: int(it.get("start_minute") or 0)), True
+
+    @staticmethod
+    def _make_recovery_item(start_minute: int, minutes: int, date: str) -> Dict[str, Any]:
+        """构造一条强制插入的恢复类条目（rest）。"""
+        start = max(0, int(start_minute))
+        return {"name": "放空休息", "description": "留一段恢复时间，缓一缓（最近有点低落）",
+                "goal_type": "rest", "priority": "medium",
+                "start_minute": start, "end_minute": start + int(minutes),
+                "parameters": {}, "schedule_date": date}
 
     async def _load_async_contexts(
         self, base: BaseScheduleGenerator, gen_config: ScheduleGeneratorConfig, date: str

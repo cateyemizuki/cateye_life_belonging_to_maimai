@@ -13,7 +13,8 @@ from core.time_utils import parse_hhmm
 from planning.schedule_query import ScheduleQuery
 
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
-from .state_machine import SCHEDULE_TONE_CLAMP, EmotionParams, EmotionStateMachine
+from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
+                            EmotionParams, EmotionStateMachine)
 from .vad import VADState, _clip, _level, map_emotions, mood_summary
 
 #: 单事件增量硬限幅（§6.3-2：所有增量在代码层硬限幅；§6.2 A「单事件经 ±0.5 限幅」）
@@ -70,6 +71,8 @@ class EmotionService:
         self._pending_overhaul: Optional[Dict[str, Any]] = None
         #: M5 睡眠周期窗口 (start, end)：按作息锚点整夜（条目会被截断，不能作窗口）
         self._sleep_period: Optional[Tuple[datetime, datetime]] = None
+        #: M5 连续低迷达标状态（streak ≥ 门槛时的事件载荷；供 planning 强制插入恢复类活动）
+        self._low_mood_day: Dict[str, Any] = {}
 
     # ── 事件总线（M0；无总线时静默跳过）─────────────────────
     def _bus(self) -> Any:
@@ -707,6 +710,75 @@ class EmotionService:
         )
         return cached
 
+    # ── 连续低迷软约束（M5；§4.2 / §6.2 F）──────────────────────
+    def low_mood_days(self) -> int:
+        """当前连续"日均线 V<−0.5"的天数（未满门槛也返回实数，供观测/命令）。"""
+        return int(getattr(self._machine, "low_mood_streak", 0) or 0)
+
+    def low_mood_state(self) -> Dict[str, Any]:
+        """连续低迷达标状态：满 :data:`LOW_MOOD_MIN_DAYS` 天返回 ``{"days","date","mean_valence"}``，
+        否则 ``{}``（planning 据此强制插入一次恢复类活动，§6.2 F）。重启后可从落盘计数派生。"""
+        days = self.low_mood_days()
+        if days < LOW_MOOD_MIN_DAYS:
+            return {}
+        state = dict(self._low_mood_day or {})
+        if not state:
+            state = {"days": days, "date": str(self._machine.low_mood_last_eval_date or ""),
+                     "mean_valence": self._machine.daily_v_mean(
+                         self._machine.low_mood_last_eval_date)}
+        return state
+
+    def _tick_daily_mood(self, now: datetime) -> Optional[Dict[str, Any]]:
+        """每个检测 tick：采样当天 effective V（**仅清醒时段**）；日期翻页后评估连续低迷。
+
+        「日」口径 = **清醒时段**的 effective V 采样均值（冻结的睡眠期不采样：
+        否则 23:00→07:00 会贡献约 1/3 的重复冻结值，稀释日均线）。
+
+        连续判定按**日历逐日**补评（不是只遍历有采样的日子）：从
+        ``max(已评估日+1, 昨天−(保留天数−1))`` 走到昨天，缺失/无采样的日子
+        ``daily_v_mean`` 为 None → 该日按非低迷处理并**归零**（与状态机语义一致），
+        因此停机多日后不会拿陈旧采样批量拼出假连续，事件 ``date`` 恒为昨天（新鲜）。
+
+        Returns:
+            连续天数达门槛时返回事件载荷（由调用方 ``publish``），否则 None；
+            每日最多评估/发布一次（``low_mood_checked_date`` 幂等）。
+        """
+        today = now.strftime("%Y-%m-%d")
+        if not self.is_frozen():
+            try:
+                self._machine.sample_daily_v(today, float(self._machine.effective_vad().valence))
+            except Exception:
+                pass
+        if self._machine.low_mood_checked_date == today:
+            return None
+        prev = (now - timedelta(days=1)).date()
+        last = None
+        last_text = str(self._machine.low_mood_last_eval_date or "")
+        if last_text:
+            try:
+                last = datetime.strptime(last_text, "%Y-%m-%d").date()
+            except ValueError:
+                last = None
+        start = prev - timedelta(days=max(1, int(DAILY_V_KEEP_DAYS)) - 1)
+        if last is not None and (last + timedelta(days=1)) > start:
+            start = last + timedelta(days=1)
+        cursor = start
+        while cursor <= prev:  # 日历逐日（含无采样日 → 归零）
+            self._machine.update_low_mood_streak(cursor.strftime("%Y-%m-%d"))
+            cursor += timedelta(days=1)
+        self._machine.low_mood_checked_date = today
+        self._save_state()
+        streak = self.low_mood_days()
+        if streak >= LOW_MOOD_MIN_DAYS:
+            mean = self._machine.daily_v_mean(self._machine.low_mood_last_eval_date)
+            self._low_mood_day = {
+                "days": int(streak), "date": str(self._machine.low_mood_last_eval_date or ""),
+                "mean_valence": round(float(mean), 4) if mean is not None else None,
+            }
+            return dict(self._low_mood_day)
+        self._low_mood_day = {}  # 未达标 → 清空（planning 侧不再强制）
+        return None
+
     def _wake_side_inputs(self, ref: datetime,
                           cached: Dict[str, Any]) -> Tuple[VADState, VADState, float]:
         """醒来时重算状态侧三输入（R/E/约定）；日期基准 = 入睡时刻（``computed_at``）。
@@ -838,9 +910,13 @@ class EmotionService:
         非睡眠的清醒活动（文档口径「醒来的第一个活动开始」）。
         """
         query = self._schedule_query()
+        now = datetime.now()
+        # M5 连续低迷日统计（不依赖日程：无 query 也要采样/评估）
+        low_mood_payload = self._tick_daily_mood(now)
+        if low_mood_payload is not None:
+            await self._publish("emotion.low_mood_day", **low_mood_payload)
         if query is None:
             return
-        now = datetime.now()
         current = query.find_current_activity(now.strftime("%Y-%m-%d"), now, include_sleep=True)
         sleep_item = current if self._is_sleep_item(current) else None
         awake_activity = current is not None and sleep_item is None

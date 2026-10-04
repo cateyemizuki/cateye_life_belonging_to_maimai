@@ -17,7 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from .generator import LOW_MOOD_MIN_DAYS
+
+#: 连续低迷事件缓存的新鲜度上限（小时）：超龄一律按未激活处理
+#: （防情绪模块停用/停机后拿陈旧事件强制插入恢复类活动）
+LOW_MOOD_CACHE_MAX_AGE_HOURS = 72.0
 
 from .cleanup_service import CleanupService
 from .command_service import CommandService
@@ -52,6 +59,8 @@ class PlanningServices:
         #: M5（§6.2 F）：最近一次睡醒情绪（emotion.overhauled payload 缓存），供日程生成
         #: 的 emotion_context 槽读取；运行期状态、不落盘（无事件时生成侧退化为实时 mood_text）
         self._wake_emotion: Dict[str, Any] = {}
+        #: M5（§6.2 F）：连续低迷事件缓存（emotion.low_mood_day），供日程生成强制插入恢复类活动
+        self._low_mood_day: Dict[str, Any] = {}
 
         data_dir = getattr(plugin, "_data_dir", None)
         if data_dir is None:
@@ -89,15 +98,17 @@ class PlanningServices:
         """订阅注册挂点（start() 调用）。
 
         M0 唯一的实际订阅（proactive.used → 预算计数器）由 core/event_bus 在装配时安装；
-        M5 本束新增 ``emotion.overhauled`` 订阅：缓存睡醒情绪（低分辨率 VAD + levels），
-        供日程生成的 ``emotion_context`` 槽（§6.2 F）。"""
+        M5 本束新增 ``emotion.overhauled`` / ``emotion.low_mood_day`` 订阅：缓存睡醒情绪
+        （低分辨率 VAD + levels）与连续低迷状态，供日程生成的 ``emotion_context`` 槽与
+        连续低迷软约束（§6.2 F）。"""
         if self.bus is None:
             return
-        try:
-            self._event_unsubs.append(
-                self.bus.subscribe("emotion.overhauled", self._on_emotion_overhauled, owner="planning"))
-        except Exception as exc:
-            logger.warning("planning 订阅 emotion.overhauled 失败（忽略）：%s", exc)
+        for event, handler in (("emotion.overhauled", self._on_emotion_overhauled),
+                               ("emotion.low_mood_day", self._on_low_mood_day)):
+            try:
+                self._event_unsubs.append(self.bus.subscribe(event, handler, owner="planning"))
+            except Exception as exc:
+                logger.warning("planning 订阅 %s 失败（忽略）：%s", event, exc)
 
     async def _on_emotion_overhauled(self, payload: Any) -> None:
         """``emotion.overhauled`` 处理器：只缓存低分辨率情绪，不做任何状态设置（§6.3-1）。"""
@@ -111,9 +122,39 @@ class PlanningServices:
             "ts": str(data.get("ts") or ""),
         }
 
+    async def _on_low_mood_day(self, payload: Any) -> None:
+        """``emotion.low_mood_day`` 处理器：只缓存连续低迷状态，不做任何状态设置（§6.3-1）。"""
+        data = payload if isinstance(payload, dict) else {}
+        try:
+            days = int(data.get("days") or 0)
+        except (TypeError, ValueError):
+            days = 0
+        self._low_mood_day = {"days": days, "date": str(data.get("date") or ""),
+                              "mean_valence": data.get("mean_valence"),
+                              "ts": str(data.get("ts") or "")}
+
     def wake_emotion(self) -> Dict[str, Any]:
         """最近一次睡醒情绪缓存（无 → 空 dict；生成侧据此拼 emotion_context）。"""
         return dict(self._wake_emotion or {})
+
+    def low_mood_state(self) -> Dict[str, Any]:
+        """连续低迷事件缓存（未满门槛 / 事件超龄 → 空 dict；生成侧据此强制插入恢复类活动）。
+
+        新鲜度：事件 ``ts`` 超过 :data:`LOW_MOOD_CACHE_MAX_AGE_HOURS` 视为陈旧
+        （情绪模块停用/停机后不得拿旧事件强制插入），生成侧另有实时 ``low_mood_state()`` 优先。
+        """
+        state = dict(self._low_mood_day or {})
+        if int(state.get("days") or 0) < LOW_MOOD_MIN_DAYS:
+            return {}
+        ts = str(state.get("ts") or "")
+        if ts:
+            try:
+                age_hours = (datetime.now() - datetime.fromisoformat(ts)).total_seconds() / 3600.0
+            except (TypeError, ValueError):
+                age_hours = 0.0
+            if age_hours > LOW_MOOD_CACHE_MAX_AGE_HOURS:
+                return {}
+        return state
 
     def _unregister_event_subscriptions(self) -> None:
         """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""

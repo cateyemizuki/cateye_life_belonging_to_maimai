@@ -39,6 +39,8 @@ class BaseScheduleGenerator:
         self.knowledge_context: str = ""
         #: M5（§6.2 F）睡醒情绪描述 + 引导约束（ScheduleGenerator 按 schedule.emotion_influence 装载；空串=不注入）
         self.emotion_context: str = ""
+        #: M5（§6.2 F）连续低迷天数（ScheduleGenerator 从情绪侧 low_mood_state() 装载；≥3 触发软约束）
+        self.low_mood_days: int = 0
         self.config: Dict[str, Any] = config or {}  # 保存配置
 
         # 初始化时区管理器
@@ -86,6 +88,7 @@ class BaseScheduleGenerator:
             history_context=self.history_context,
             knowledge_context=self.knowledge_context,
             emotion_context=self.emotion_context,
+            low_mood_days=self.low_mood_days,
         )
 
     def build_retry_prompt(
@@ -106,4 +109,5 @@ class BaseScheduleGenerator:
             history_context=self.history_context,
             knowledge_context=self.knowledge_context,
             emotion_context=self.emotion_context,
+            low_mood_days=self.low_mood_days,
         )

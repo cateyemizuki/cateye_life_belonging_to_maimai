@@ -110,6 +110,25 @@ class EmotionServices:
         except Exception:
             return {"proactive_rate": 1.0, "miss_threshold": 1.0, "post_rate": 1.0, "intent_hint": ""}
 
+    def low_mood_days(self) -> int:
+        """连续低迷天数（转发 self.service；观测用）。"""
+        try:
+            return int(self.service.low_mood_days())
+        except Exception:
+            return 0
+
+    def low_mood_state(self) -> Dict[str, Any]:
+        """连续低迷达标状态（转发；M5 §6.2 F，planning 生成日程时强制插入恢复类活动）。
+
+        模块停用/异常 → ``{}``（可空降级，§八.2）。
+        """
+        if not self.is_enabled():
+            return {}
+        try:
+            return dict(self.service.low_mood_state() or {})
+        except Exception:
+            return {}
+
     def effective_valence(self) -> Optional[float]:
         """当前生效 V（供跨模块 B2 调制读取，§6.2 B）。
 

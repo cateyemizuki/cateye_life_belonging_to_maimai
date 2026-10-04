@@ -15,8 +15,10 @@
 > planning 订阅并缓存睡醒情绪（`PlanningServices.wake_emotion()`），日程生成把「睡醒情绪描述 + 引导约束」
 > 按 `schedule.emotion_influence` 拼进 `emotion_context` 槽（`build_emotion_context()`）；
 > 日程条目 `emotional_tone` 经 schema（逐维 ±0.5）+ `clip_emotional_tone` 落 `parameters`。
-> **仍未落地（M5 其余部分）**：连续低迷软约束 `emotion.low_mood_day`（§8 行 5）、A3 `emotion_report` 工具裁决；
-> A6 死字段清理已完成（`8d11f54`）。
+> **M5 连续低迷软约束已落地（2026-10-05，三批）**：每日 effective V 采样 → 日均线（滚动 7 天，落盘）→
+> 连续「日均 V<−0.5」满 3 天 → 发 `emotion.low_mood_day`（payload `days/date/mean_valence`）；
+> planning 消费后强制插入一次 rest/social 并在 prompt 注明「最近有点低落」。
+> **仍未落地（M5 其余部分）**：A3 `emotion_report` 工具裁决；A6 死字段清理已完成（`8d11f54`）。
 
 ---
 
@@ -412,6 +414,7 @@ delta_limit / r_yesterday / e_tomorrow / commitment_net / commitment_delta / log
 | `schedule.woke_up` | 离开睡眠条目的**下降沿**（随后应用缓存大修并解冻） | `sleep_hours`（实际观测时长）、`date` |
 | `emotion.overhauled` | 醒后**应用缓存大修**（一次）后 | `mood`（低分辨率描述文本）、**`levels`**（V/A/D 三档词：很低/偏低/中等/偏高/很高）、`recovery_factor`、`sleep_hours`；消费方：planning（`emotion_context` 槽，M5）、qzone、日志 |
 | `emotion.updated` | 每次 VAD 结算后（回复评估 / 外部事件 / 睡眠大修） | `mood`、`trigger` |
+| `emotion.low_mood_day` | 日切评估时连续「日均 V<−0.5」满 3 天（每日最多一次）；**连续按日历逐日补评**（无采样日 → 当日按非低迷归零，不拼假连续）；`date` 恒为**昨天**（新鲜） | `days`（连续天数）、`date`（最后达标日）、`mean_valence`（该日日均线 V）；消费方：planning（强制插入一次 rest/social + prompt 注明「最近有点低落」；事件缓存超 72h 视为陈旧不消费） |
 
 ### 7.5 情绪 → 好感度（§6.2 B，情绪调制）
 
@@ -439,7 +442,7 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 | 2 | 睡眠大修限幅动态化 | ✅ **已实现**：±(0.4 + 0.4×`schedule.emotion_influence`)，默认 0.6→±0.64（旧固定 ±0.8 仅作缺省调用兼容） | — |
 | 3 | 日程条目 `emotional_tone` → 数值输入 | ✅ **已实现**：schema 增可选字段（逐维 ±0.5）+ `clip_emotional_tone` 裁剪入库 `parameters`；睡眠侧求和为 R_yesterday/E_tomorrow（再夹 ±0.5）进入 v2 公式 | — |
 | 4 | 恢复系数下界 | ✅ **已固定**：`MIN_SLEEP_RECOVERY_FACTOR = 0.3`，各时长档全部 ≥0.3（<5h = 0.30） | — |
-| 5 | 连续低迷软约束 `emotion.low_mood_day` | **未实现**（无日统计、无事件发布） | M5 剩余部分 |
+| 5 | 连续低迷软约束 `emotion.low_mood_day` | ✅ **已实现（2026-10-05）**：日采样/日均线/连续计数（`sample_daily_v`/`daily_v_mean`/`update_low_mood_streak`，同日幂等）→ 满 3 天发事件；planning 缓存并强制插入一次 rest/social + prompt 注明 | — |
 | 6 | `planner` 注入与情绪底色融合 | ✅ 已接线（M4 删 `state_analyzer` 静态模板，改读 `mood_text()`）；**M5** 另把睡醒情绪按 `schedule.emotion_influence` 注入日程生成 prompt 的 `emotion_context` 槽（`build_emotion_context()` + `PlanningServices.wake_emotion()`） | — |
 | 7 | `EVALUATE_PROMPT` 30 字 vs 代码截 60 字 | 规格—实现不一致（§5.3） | 待裁决（可不改） |
 | 8 | 白天事件对**锚点**的回归 | 日常衰减只朝 0，不朝锚点 | 设计如此（锚点只在睡眠大修收敛）；若将来要改，属设计变更 |
@@ -463,6 +466,8 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 | `check_interval_minutes` | 10 | [1, 120] | 睡眠检测循环间隔 |
 
 **代码常量（不可配，改需改代码）**：`VAD_WEIGHTS=(1.0,0.8,1.2)`｜`LABEL_DISTANCE_THRESHOLD=0.55`｜`MAX_COMBINED_LABELS=3`｜`EVENT_DELTA_CLAMP=0.5`｜`EXTERNAL_K_MAX=10.0`｜`MOOD_EFFECT_MIN/MAX=0.7/1.3`｜`MOOD_POST_RATE_MAX=1.2`｜`MAX_LOG=200`｜沉默事件 ΔV/ΔA = −0.12/+0.04｜约定兑现/违约 = +0.20/−0.15｜空间评论 ΔV ∈ [0.05, 0.10]｜好感调制 k=0.25、clamp 0.6~1.4。
+**M5 连续低迷常量**：`LOW_MOOD_THRESHOLD=−0.5`（日均线 V 阈值）｜`LOW_MOOD_MIN_DAYS=3`（连续天数门槛；planning 侧 `prompt_builder.LOW_MOOD_MIN_DAYS` 同值，行为用例断言两侧一致防漂移）｜`DAILY_V_KEEP_DAYS=7`（日采样桶滚动保留，也是逐日补评的窗口上限）｜状态 JSON 新增 `daily_v`/`low_mood_streak`/`low_mood_last_eval_date`/`low_mood_checked_date`（旧文件缺键 → 默认空，向后兼容）。
+**「日」口径（连续低迷）**：日均线 = **清醒时段**的 effective V 采样均值（每次检测 tick 采样一次；**冻结的睡眠期不采样**，避免 23:00→07:00 的整夜冻结值稀释）；判定按**日历逐日**推进——缺失/无采样日按非低迷并归零，因此"连续 N 天"必须是紧邻的 N 个自然日。
 **M5 新增常量**：`MIN_SLEEP_RECOVERY_FACTOR=0.3`（恢复系数下界）｜`SLEEP_RESIDUAL_WEIGHT=0.5` / `SLEEP_EXPECTATION_WEIGHT=0.5`（R/E 数值项权重）｜`SLEEP_COMMITMENT_WEIGHT=0.1` / `SLEEP_COMMITMENT_CLAMP=0.3`（约定净兑现项）｜`SCHEDULE_TONE_CLAMP=0.5`（日程 tone 求和后逐维上限）｜`MAX_PENDING=200`（冻结期队列上限）｜`DEFAULT_SLEEP_DELTA_LIMIT=0.8`（裁判缺省限幅兼容值）。
 **M5 新增配置**：`schedule.emotion_influence`（0~1，默认 0.6，0=关闭）——同时驱动两处：①睡眠大修裁判增量动态限幅 ±(0.4+0.4×值)；②日程生成 `emotion_context` 槽的强度（0=不注入；<0.5 精简为 1 条引导约束，≥0.5 完整）。
 

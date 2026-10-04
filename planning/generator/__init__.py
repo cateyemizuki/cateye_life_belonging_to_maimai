@@ -12,7 +12,7 @@
 """
 
 from .base_generator import BaseScheduleGenerator
-from .prompt_builder import PromptBuilder, build_emotion_context
+from .prompt_builder import LOW_MOOD_MIN_DAYS, PromptBuilder, build_emotion_context
 from .schema_builder import SchemaBuilder
 from .context_loader import ScheduleContextLoader
 from .validator import ScheduleSemanticValidator, clip_emotional_tone
@@ -28,6 +28,7 @@ __all__ = [
     "ScheduleSemanticValidator",
     "clip_emotional_tone",
     "build_emotion_context",
+    "LOW_MOOD_MIN_DAYS",
     "LLMResponseParser",
     "ScheduleQualityScorer",
     "ScheduleGeneratorConfig",

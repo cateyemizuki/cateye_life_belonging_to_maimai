@@ -40,6 +40,15 @@ _DEFAULT_SLEEP_MINUTES = 23 * 60
 #: 情绪五档词中代表"低/高"的两组（与 emotion/vad.py `_level` 的词表一致；§6.2 F 引导约束按此分档）
 _EMOTION_LEVEL_LOW = ("很低", "偏低")
 _EMOTION_LEVEL_HIGH = ("很高", "偏高")
+#: M5 连续低迷软约束的触发门槛（与 emotion/state_machine.LOW_MOOD_MIN_DAYS 同值；prompt 注明用）
+LOW_MOOD_MIN_DAYS = 3
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def build_emotion_context(mood: str, levels: Optional[Dict[str, str]] = None,
@@ -385,6 +394,7 @@ class PromptBuilder:
         history_context: str = "",
         knowledge_context: str = "",
         emotion_context: Optional[str] = None,
+        low_mood_days: int = 0,
     ) -> str:
         """构建日程生成提示词
 
@@ -397,6 +407,7 @@ class PromptBuilder:
             history_context: 最近聊天背景（可选；跨群拼接）
             knowledge_context: 相关记忆参考（可选）
             emotion_context: 睡醒情绪描述 + 引导约束（可选；M5 §6.2 F，空串=不注入）
+            low_mood_days: 连续低迷天数（M5 §6.2 F；≥3 时注明「最近有点低落」并要求安排恢复类活动）
 
         Returns:
             完整的提示词字符串
@@ -507,6 +518,15 @@ class PromptBuilder:
         if emotion_context:
             prompt += f"""
 {emotion_context}
+"""
+
+        # M5（§6.2 F）：连续低迷软约束——prompt 注明，并要求安排一次恢复类活动
+        days = _to_int(low_mood_days, 0)
+        if days >= LOW_MOOD_MIN_DAYS:
+            prompt += f"""
+【最近状态】最近有点低落（已连续 {days} 天情绪偏低）。
+请务必在今天安排一次恢复类活动（goal_type 用 rest 或 social_maintenance，如散步、放空、和朋友聊聊天），
+学习与工作强度相应调低，不要连续堆叠高压条目。
 """
 
         # 根据配置决定描述要求
@@ -694,6 +714,7 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
         history_context: str = "",
         knowledge_context: str = "",
         emotion_context: Optional[str] = None,
+        low_mood_days: int = 0,
     ) -> str:
         """构建第二轮prompt（附带反馈）
 
@@ -707,6 +728,7 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
             history_context: 最近聊天背景（可选）
             knowledge_context: 相关记忆参考（可选）
             emotion_context: 睡醒情绪描述 + 引导约束（可选；M5 §6.2 F，空串=不注入）
+            low_mood_days: 连续低迷天数（M5 §6.2 F；≥3 时注明「最近有点低落」）
 
         Returns:
             改进后的提示词
@@ -717,6 +739,7 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
             history_context=history_context,
             knowledge_context=knowledge_context,
             emotion_context=emotion_context,
+            low_mood_days=low_mood_days,
         )
 
         feedback = "\n\n⚠️ **上一次生成存在以下问题，请改进：**\n\n"
