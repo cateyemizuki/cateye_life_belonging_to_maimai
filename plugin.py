@@ -87,8 +87,10 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         # 进程内事件总线（M0，MAINTENANCE_PLAN §三）：先于服务束构造（各服务束自读 plugin._bus），
         # 预算计数器在装配时装入（先于服务束启动；M0 实际订阅者仅它）
         self._bus = EventBus(self._decision_logger)
+        # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
         self._proactive_budget = install_proactive_budget(
-            self._bus, config_provider=lambda: self.config, decision_logger=self._decision_logger)
+            self._bus, config_provider=lambda: self.config, decision_logger=self._decision_logger,
+            data_dir=data_dir)
 
         # 服务束（内部动态读 self.config，热重载自动生效）
         self._planning = PlanningServices(self)

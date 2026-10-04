@@ -9,8 +9,13 @@
 - 订阅注册/注销挂在各服务束 start()/stop()（M0 实际订阅者仅本文件的预算计数器）。
 
 全渠道打扰预算（§六.2 H，B11）：一切主动行为触发前发 ``proactive.used``，
-按日内存计数；各发布方触发前查询 :func:`ProactiveBudget.allow_proactive`；
+按日计数；各发布方触发前查询 :func:`ProactiveBudget.allow_proactive`；
 上限默认 = ``patrol.daily_max_speak + 2``，``patrol.global_proactive_cap > 0`` 时直接采用其值。
+
+计数持久化（A2，2026-10-25）：传入 ``data_dir`` 时 ``_used/_date`` 落盘
+``proactive_budget.json``（复用 core/storage.py 的 load_json/save_json_atomic）——
+启动装载、计数变化即原子写、日切重置写回，使计数跨 file_watcher 热重载连续
+（§八.8：热重载会清零一切内存态计数）；落盘异常降级内存态，不影响事件分发。
 """
 
 from __future__ import annotations
@@ -19,7 +24,10 @@ import asyncio
 import logging
 from contextvars import ContextVar
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
+from core.storage import load_json, save_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -177,24 +185,92 @@ class EventBus:
 
 
 class ProactiveBudget:
-    """全渠道打扰预算计数器（§六.2 H）：按日内存计数，跨天自动清零。"""
+    """全渠道打扰预算计数器（§六.2 H）：按日计数，跨天自动清零。
 
-    def __init__(self, config_provider: Any = None, decision_logger: Any = None) -> None:
+    A2 持久化：``data_dir`` 非空时计数落盘 ``proactive_budget.json``（启动装载 /
+    计数变化即原子写 / 日切重置写回），使 file_watcher 热重载后计数不回落；
+    落盘异常降级为内存态并告警，不影响事件分发。
+    """
+
+    #: 状态文件名（data_dir 下）
+    STATE_FILENAME = "proactive_budget.json"
+
+    def __init__(self, config_provider: Any = None, decision_logger: Any = None,
+                 data_dir: Any = None) -> None:
         self._config_provider = config_provider
         self._decision_logger = decision_logger
         self._date = ""
         self._used = 0
         self._channels: Dict[str, int] = {}
         self._unsubscribe: Optional[Callable[[], None]] = None
+        #: 持久化落点（None = 纯内存态；既有装配不传 data_dir 时行为不变）
+        self._state_path: Optional[Path] = (
+            Path(data_dir) / self.STATE_FILENAME if data_dir else None
+        )
+        self._persist_warned = False
+        self._load()
+
+    # ---- 持久化（A2） ----
+    def _load(self) -> None:
+        """装载落盘计数：缺失/损坏 → 全新起步并告警；非当日 → 清零并写回。"""
+        path = self._state_path
+        if path is None:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._date = today
+        raw = load_json(path, None)
+        if raw is None and not path.exists():
+            logger.warning("打扰预算状态文件不存在，按全新计数起步：%s", path)
+            self._save()
+            return
+        if not isinstance(raw, dict):
+            logger.warning("打扰预算状态文件损坏，按全新计数起步并重建：%s", path)
+            self._save()
+            return
+        date = raw.get("date")
+        if not isinstance(date, str) or not date:
+            logger.warning("打扰预算状态文件缺 date 字段，按全新计数起步并重建：%s", path)
+            self._save()
+            return
+        if date != today:
+            # 跨日（含停机跨天）：装载即清零并写回
+            self._save()
+            return
+        used = raw.get("used")
+        if not isinstance(used, int) or isinstance(used, bool) or used < 0:
+            logger.warning("打扰预算状态文件 used 字段异常，按 0 起步：%s", path)
+            used = 0
+        self._date = date
+        self._used = used
+        self._channels = {}
+        channels = raw.get("channels")
+        if isinstance(channels, dict):
+            for key, value in channels.items():
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    self._channels[str(key)] = value
+
+    def _save(self) -> None:
+        """计数变化即原子落盘；失败降级内存态（单次告警，不中断事件分发）。"""
+        path = self._state_path
+        if path is None:
+            return
+        state = {"date": self._date, "used": self._used, "channels": dict(self._channels)}
+        if save_json_atomic(path, state):
+            self._persist_warned = False
+            return
+        if not self._persist_warned:
+            self._persist_warned = True
+            logger.warning("打扰预算落盘失败，降级为内存态计数（重启后计数将丢失）：%s", path)
 
     # ---- 计数与查询 ----
     def _roll_date(self) -> None:
-        """日期变化 → 计数清零。"""
+        """日期变化 → 计数清零并落盘。"""
         today = datetime.now().strftime("%Y-%m-%d")
         if today != self._date:
             self._date = today
             self._used = 0
             self._channels = {}
+            self._save()
 
     def _config(self) -> Any:
         """取当前配置（provider 可为「返回配置的可调用对象」或配置对象本身）。"""
@@ -241,11 +317,12 @@ class ProactiveBudget:
         return False
 
     def record_used(self, channel: str = "", intent: str = "") -> None:
-        """记一次主动打扰（proactive.used 订阅入口 / 直接调用）。"""
+        """记一次主动打扰（proactive.used 订阅入口 / 直接调用）；计数变化即落盘。"""
         self._roll_date()
         self._used += 1
         key = str(channel or "unknown")
         self._channels[key] = self._channels.get(key, 0) + 1
+        self._save()
 
     async def on_proactive_used(self, payload: Dict[str, Any]) -> None:
         """``proactive.used`` 订阅者（M0 唯一实际订阅者）。"""
@@ -279,16 +356,20 @@ _installed_budget: Optional[ProactiveBudget] = None
 
 
 def install_proactive_budget(bus: EventBus, config_provider: Any = None,
-                             decision_logger: Any = None) -> ProactiveBudget:
+                             decision_logger: Any = None,
+                             data_dir: Any = None) -> ProactiveBudget:
     """装配期安装全渠道打扰预算：订阅 ``proactive.used`` 并挂到总线上。
 
     Args:
         bus: 事件总线实例（plugin._bus）。
         config_provider: 返回插件配置的可调用对象（运行期动态读 patrol 段，热重载生效）。
         decision_logger: 决策日志（拦截留痕用；None 时只记 python logger）。
+        data_dir: 状态目录（A2；传入时计数落盘 ``proactive_budget.json`` 跨热重载连续，
+            None = 纯内存态）。
     """
     global _installed_budget
-    budget = ProactiveBudget(config_provider=config_provider, decision_logger=decision_logger)
+    budget = ProactiveBudget(config_provider=config_provider, decision_logger=decision_logger,
+                             data_dir=data_dir)
     budget._unsubscribe = bus.subscribe("proactive.used", budget.on_proactive_used,
                                         owner="proactive_budget")
     bus.attach_budget(budget)
