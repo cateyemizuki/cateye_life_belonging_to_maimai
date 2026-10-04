@@ -6,14 +6,15 @@ import asyncio
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from core.storage import load_json, save_json_atomic
+from core.time_utils import parse_hhmm
 from planning.schedule_query import ScheduleQuery
 
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
-from .state_machine import EmotionParams, EmotionStateMachine
-from .vad import VADState, _clip, map_emotions, mood_summary
+from .state_machine import SCHEDULE_TONE_CLAMP, EmotionParams, EmotionStateMachine
+from .vad import VADState, _clip, _level, map_emotions, mood_summary
 
 #: 单事件增量硬限幅（§6.3-2：所有增量在代码层硬限幅；§6.2 A「单事件经 ±0.5 限幅」）
 EVENT_DELTA_CLAMP = 0.5
@@ -26,6 +27,12 @@ EXTERNAL_K_MAX = 10.0
 MOOD_EFFECT_MIN = 0.7
 MOOD_EFFECT_MAX = 1.3
 MOOD_POST_RATE_MAX = 1.2
+#: 睡眠条目名称关键词（M5 修复：日程生成 prompt 让"睡觉"条目用 goal_type=daily_routine，
+#: 仅按 goal_type=="sleep" 会漏判；候选见 prompt_builder「睡觉活动」段与无睡眠模式词表）
+SLEEP_NAME_KEYWORDS = ("睡觉", "睡眠", "安睡", "午休", "午睡", "小憩", "打盹")
+#: 作息锚点缺省（配置缺失时按 23:00 入睡 / 07:00 起床）
+DEFAULT_SLEEP_MINUTES = 23 * 60
+DEFAULT_WAKE_MINUTES = 7 * 60
 
 
 class EmotionService:
@@ -59,6 +66,10 @@ class EmotionService:
         self._in_sleep = False
         self._sleep_started_at: Optional[datetime] = None
         self._sleep_planned_hours = 0.0
+        # M5 睡眠大修缓存（§4.2）：冻结期计算并缓存，醒后一次性应用；运行期状态、不落盘
+        self._pending_overhaul: Optional[Dict[str, Any]] = None
+        #: M5 睡眠周期窗口 (start, end)：按作息锚点整夜（条目会被截断，不能作窗口）
+        self._sleep_period: Optional[Tuple[datetime, datetime]] = None
 
     # ── 事件总线（M0；无总线时静默跳过）─────────────────────
     def _bus(self) -> Any:
@@ -477,18 +488,194 @@ class EmotionService:
             end += 24 * 60
         return max(0.5, (end - start) / 60.0)
 
-    async def run_sleep_overhaul(self) -> Dict[str, Any]:
-        """执行一次睡眠期情绪大修（裁判 LLM → 锚点收敛 → 清空日志）。"""
+    # ── M5 睡眠冻结 / 大修缓存（§4.2 睡眠结算改造）──────────────
+    def is_frozen(self) -> bool:
+        """当前是否处于睡眠冻结态（冻结期：事件只入队、衰减与评估结算暂停）。"""
+        return bool(getattr(self._machine, "frozen", False))
+
+    def sleep_delta_limit(self) -> float:
+        """睡眠裁判增量动态限幅 = 0.4 + 0.4×``schedule.emotion_influence``（§4.2 睡眠大修 v2）。
+
+        替代旧固定 ±0.8；``emotion_influence`` 夹在 [0, 1]（0=下限 ±0.4，1=上限 ±0.8），
+        配置缺失/非法一律回退默认 0.6（→ ±0.64）。
+        """
+        influence = self._to_float(self._schedule_cfg("emotion_influence", 0.6), 0.6)
+        influence = max(0.0, min(1.0, influence))
+        return 0.4 + 0.4 * influence
+
+    def _schedule_cfg(self, name: str, default: Any) -> Any:
+        """运行期动态读 [schedule] 配置项（热重载即时生效；缺省回退默认值）。"""
+        cfg = getattr(self._plugin.config, "schedule", None)
+        value = getattr(cfg, name, default)
+        return default if value is None else value
+
+    @staticmethod
+    def schedule_tone_sum(items: Any) -> VADState:
+        """日程条目 ``emotional_tone`` 逐维求和（前日残差 R_yesterday / 明日预期 E_tomorrow）。
+
+        §6.2 E：条目 tone 入库时已由 planning 侧裁剪 ±0.5，这里求和后再逐维夹
+        ±:data:`SCHEDULE_TONE_CLAMP`（双保险，防多项求和发散）；非数值/缺失按 0 计，
+        拿不到日程就退化为零向量（可空降级，§八.2）。
+        """
+        axes = ("valence", "arousal", "dominance")
+        totals = [0.0, 0.0, 0.0]
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            params = item.get("parameters")
+            tone = params.get("emotional_tone") if isinstance(params, dict) else None
+            if not isinstance(tone, dict):
+                continue
+            for idx, axis in enumerate(axes):
+                try:
+                    totals[idx] += float(tone.get(axis) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+        return VADState(*(_clip(totals[i], -SCHEDULE_TONE_CLAMP, SCHEDULE_TONE_CLAMP)
+                          for i in range(3)))
+
+    def _day_items(self, query: Optional[ScheduleQuery], date: str) -> list:
+        """读取某天日程条目（拿不到返回空列表）。"""
+        if query is None:
+            return []
+        try:
+            return query.get_day_schedule(date) or []
+        except Exception:
+            return []
+
+    def _commitment_net_today(self) -> float:
+        """当日约定净兑现次数（kept − broken）：按桥写入的描述前缀从当天日志统计（§4.2 第三输入）。"""
+        from .bridge import COMMITMENT_BROKEN_PREFIX, COMMITMENT_KEPT_PREFIX
+
+        kept = broken = 0
+        for event in self._machine.emotion_log:
+            desc = str(getattr(event, "event_description", "") or "")
+            if desc.startswith(COMMITMENT_KEPT_PREFIX):
+                kept += 1
+            elif desc.startswith(COMMITMENT_BROKEN_PREFIX):
+                broken += 1
+        return float(kept - broken)
+
+    def _current_sleep_item(self, now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """当前活动若为睡眠条目则返回它（sleep 需 include_sleep 才可见）。"""
+        query = self._schedule_query()
+        now = now or datetime.now()
+        current = query.find_current_activity(now.strftime("%Y-%m-%d"), now, include_sleep=True) \
+            if query else None
+        if not self._is_sleep_item(current):
+            return None
+        return current
+
+    # ── 睡眠时段判定（M5 修复：条目会被 _normalize_items 的作息锚点截断）──
+    @staticmethod
+    def _is_sleep_item(item: Any) -> bool:
+        """是否为睡眠条目（goal_type=="sleep"，或名称含睡觉类关键词）。
+
+        ⚠️ 日程生成 prompt 明确让"睡觉"条目用 ``goal_type: daily_routine``（prompt_builder
+        「睡觉活动」段），仅按 goal_type 判定会漏掉生产条目；模板兜底条目才用 "sleep"。
+        """
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("goal_type") or "") == "sleep":
+            return True
+        name = str(item.get("name") or "")
+        return any(keyword in name for keyword in SLEEP_NAME_KEYWORDS)
+
+    def _sleep_anchors(self) -> Tuple[int, int]:
+        """``(sleep_min, wake_min)`` 作息锚点（[schedule] 配置，缺省 23:00 / 07:00）。"""
+        cfg = getattr(self._plugin.config, "schedule", None)
+        sleep_time = str(getattr(cfg, "sleep_time", "") or "")
+        wake_time = str(getattr(cfg, "wake_time", "") or "")
+        return (parse_hhmm(sleep_time, DEFAULT_SLEEP_MINUTES),
+                parse_hhmm(wake_time, DEFAULT_WAKE_MINUTES))
+
+    @staticmethod
+    def _minute_in_night(minute: int, sleep_min: int, wake_min: int) -> bool:
+        if sleep_min > wake_min:  # 常规作息：当晚 → 次日 wake（跨午夜）
+            return minute >= sleep_min or minute < wake_min
+        return sleep_min <= minute < wake_min  # 夜猫子作息：同日 sleep → 同日 wake
+
+    @staticmethod
+    def _planned_sleep_hours(sleep_min: int, wake_min: int) -> float:
+        """作息锚点推出的整夜计划时长（小时，≥0.5）。"""
+        span = (1440 - sleep_min + wake_min) if sleep_min > wake_min else (wake_min - sleep_min)
+        return max(0.5, span / 60.0)
+
+    @staticmethod
+    def _at_minute(day: datetime, minute: int) -> datetime:
+        return day.replace(hour=(minute // 60) % 24, minute=minute % 60, second=0, microsecond=0)
+
+    def _night_window(self, now: datetime) -> Tuple[datetime, datetime]:
+        """当前所处/最近的作息夜间窗口 ``(start, end)``（按 [schedule] 锚点算整夜）。"""
+        sleep_min, wake_min = self._sleep_anchors()
+        cur = now.hour * 60 + now.minute
+        start_day = now if cur >= sleep_min else now - timedelta(days=1)
+        start = self._at_minute(start_day, sleep_min)
+        end = self._at_minute(start + timedelta(days=1), wake_min) if sleep_min > wake_min \
+            else self._at_minute(start, wake_min)
+        return start, end
+
+    @staticmethod
+    def _cycle_key(period_start: datetime) -> str:
+        """睡眠周期身份 = ``周期起始日@起始分钟``（同一周期只结算一次；旧裸日期值兼容读取）。"""
+        return f"{period_start:%Y-%m-%d}@{period_start.hour * 60 + period_start.minute}"
+
+    def _sleep_entry_period(self, item: Optional[Dict[str, Any]], now: datetime
+                            ) -> Tuple[datetime, datetime, float]:
+        """进入睡眠时的周期窗口与计划时长 ``(start, end, planned_hours)``。
+
+        - 夜间睡眠（处于作息夜间窗口，或条目起点落在窗口内）→ 按**锚点整夜**：
+          条目本身会被 ``_normalize_items`` 截断到入睡锚点（最长为 23:00–23:15），
+          不能作为整夜窗口，否则入睡约 15 分钟即误判"醒来"；
+        - 其它（午休/小睡）→ 按条目自身的 start/end 窗口。
+        """
+        sleep_min, wake_min = self._sleep_anchors()
+        night_start, night_end = self._night_window(now)
+        item_start = int((item or {}).get("start_minute") or sleep_min)
+        if item is None or self._minute_in_night(item_start, sleep_min, wake_min) \
+                or night_start <= now < night_end:
+            return night_start, night_end, self._planned_sleep_hours(sleep_min, wake_min)
+        span = max(15, int((item or {}).get("end_minute") or 0) - item_start)
+        start = self._at_minute(now, item_start)
+        return start, start + timedelta(minutes=span), max(0.5, span / 60.0)
+
+    def _in_sleep_period(self, now: datetime) -> bool:
+        """当前是否处于睡眠周期窗口（冻结中按已建立窗口；否则按夜间锚点窗口）。"""
+        if self._sleep_period is not None:
+            return self._sleep_period[0] <= now < self._sleep_period[1]
+        night_start, night_end = self._night_window(now)
+        return night_start <= now < night_end
+
+    async def compute_sleep_overhaul(self, now: Optional[datetime] = None,
+                                     sleep_hours: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """冻结期计算大修并返回缓存载荷（**不落状态**）；裁判失败返回 None（下一轮重试）。
+
+        输入（§4.2 睡眠大修 v2）：当天日志 + 前日残差 R_yesterday + 明日预期 E_tomorrow
+        （均来自日程条目 ``emotional_tone``）+ 当日约定净兑现 + 动态限幅。
+        ``sleep_hours`` 缺省按条目时长；服务侧传作息锚点整夜时长（见 ``_sleep_entry_period``）。
+
+        E_tomorrow 在入睡时刻按"次日"读取，而次日日程要到 ``auto_generate_time``（默认
+        00:30）才生成——故这里只为裁判提供参考文本，**状态侧数值在醒来时会重算一次**
+        （见 ``_apply_cached_overhaul``），保证"明日预期"在生产时序下确实生效。
+        """
         cfg = getattr(self._plugin.config, "emotion", None)
         query = self._schedule_query()
-        now = datetime.now()
-        today = now.strftime("%Y-%m-%d")
-
-        # 当前活动必须是睡眠条目，且今天尚未大修过（sleep 需 include_sleep 才可见）
-        current = query.find_current_activity(today, include_sleep=True) if query else None
-        if current is None or str(current.get("goal_type") or "") != "sleep":
-            return {"ok": False, "reason": "当前无睡眠日程条目"}
-        sleep_hours = self._sleep_hours(current)
+        now = now or datetime.now()
+        current = self._current_sleep_item(now)
+        # 时长的来源优先级：调用方给的计划时长（作息锚点整夜） > 条目时长 > 锚点整夜兜底
+        # （冻结期重试时可能已无当前条目——条目只有 15 分钟窗口，不能作为必要前提）
+        if sleep_hours is not None:
+            hours = float(sleep_hours)
+        elif current is not None:
+            hours = self._sleep_hours(current)
+        else:
+            hours = self._planned_sleep_hours(*self._sleep_anchors())
+        r_yesterday = self.schedule_tone_sum(
+            self._day_items(query, (now - timedelta(days=1)).strftime("%Y-%m-%d")))
+        e_tomorrow = self.schedule_tone_sum(
+            self._day_items(query, (now + timedelta(days=1)).strftime("%Y-%m-%d")))
+        commitment_net = self._commitment_net_today()
+        delta_limit = self.sleep_delta_limit()
 
         referee_task = str(getattr(cfg, "referee_task_name", "replyer") or "replyer")
         vad = self._machine.effective_vad()  # 裁判接收已应用偏移的值（§九.3）
@@ -499,26 +686,136 @@ class EmotionService:
             yesterday_schedule=self._day_summary(query, (now - timedelta(days=1)).strftime("%Y-%m-%d")),
             tomorrow_schedule=self._day_summary(query, (now + timedelta(days=1)).strftime("%Y-%m-%d")),
             long_term_status=self._long_term_status(),
-            sleep_hours=sleep_hours, task_name=referee_task,
+            sleep_hours=hours, task_name=referee_task,
+            delta_limit=delta_limit, r_yesterday=r_yesterday, e_tomorrow=e_tomorrow,
+            commitment_net=commitment_net,
         )
         if result is None:
-            return {"ok": False, "reason": "睡眠裁判请求/解析失败（下一轮重试）"}
+            return None
         delta, reasons = result
-        applied = self._machine.apply_sleep_overhaul(delta, sleep_hours)
-        applied["reasons"] = reasons
+        cached = {
+            "delta": delta, "reasons": reasons, "sleep_hours": hours,
+            "r_yesterday": r_yesterday, "e_tomorrow": e_tomorrow,
+            "commitment_net": commitment_net, "delta_limit": delta_limit, "computed_at": now,
+        }
+        self._log_decision(
+            "emotion.sleep_overhaul_cached", trigger_type="emotion",
+            reason="冻结期计算并缓存大修（未落状态）",
+            sleep_hours=round(hours, 2), delta_limit=round(delta_limit, 4),
+            delta_requested=delta.to_dict(), r_yesterday=r_yesterday.to_dict(),
+            e_tomorrow=e_tomorrow.to_dict(), commitment_net=commitment_net,
+        )
+        return cached
+
+    def _wake_side_inputs(self, ref: datetime,
+                          cached: Dict[str, Any]) -> Tuple[VADState, VADState, float]:
+        """醒来时重算状态侧三输入（R/E/约定）；日期基准 = 入睡时刻（``computed_at``）。
+
+        读不到/异常时回退缓存值（可空降级，§八.2）。
+        """
+        query = self._schedule_query()
+        try:
+            r_yesterday = self.schedule_tone_sum(
+                self._day_items(query, (ref - timedelta(days=1)).strftime("%Y-%m-%d")))
+            e_tomorrow = self.schedule_tone_sum(
+                self._day_items(query, (ref + timedelta(days=1)).strftime("%Y-%m-%d")))
+            commitment_net = self._commitment_net_today()
+        except Exception as exc:
+            self._ctx.logger.debug("睡眠大修三输入重算失败（回退缓存值）：%s", exc)
+            return (cached.get("r_yesterday") or VADState(),
+                    cached.get("e_tomorrow") or VADState(),
+                    float(cached.get("commitment_net") or 0.0))
+        return r_yesterday, e_tomorrow, commitment_net
+
+    async def _apply_cached_overhaul(self, now: datetime) -> Optional[Dict[str, Any]]:
+        """醒后应用缓存的大修并解冻（一次性）；无缓存时只解冻（裁判失败夜不结算）。
+
+        M5 修复（E_tomorrow 生产时序）：入睡时刻（23 点）读取"次日"日程时，次日日程还没到
+        ``auto_generate_time``（默认 00:30）生成，恒为零向量；醒来时按**入睡日**为基准重算
+        R_yesterday（入睡日前一天）/E_tomorrow（入睡日的次日＝醒来日，此时已生成）与约定净兑现，
+        保证"明日预期"与"当日约定"在状态侧真实生效（裁判文本仍用缓存时刻的输入，仅供判断）。
+
+        Returns:
+            应用结果 dict（含 ``ok``/``recovery_factor``/三输入留痕）；无缓存返回 None。
+        """
+        cached, self._pending_overhaul = self._pending_overhaul, None
+        self._sleep_period = None  # 周期结束（醒沿）：后续 tick 重新按条目/锚点判定
+        if cached is None:
+            if self.is_frozen():
+                self._machine.unfreeze(now)
+                self._save_state()
+            return None
+        ref = cached.get("computed_at") or now  # 入睡时刻（日期基准：R=入睡日-1，E=入睡日+1）
+        query = self._schedule_query()
+        r_yesterday, e_tomorrow, commitment_net = self._wake_side_inputs(ref, cached)
+        applied = self._machine.apply_sleep_overhaul(
+            cached["delta"], cached["sleep_hours"], now=now,
+            r_yesterday=r_yesterday, e_tomorrow=e_tomorrow,
+            commitment_net=commitment_net, delta_limit=cached.get("delta_limit"))
+        applied["reasons"] = cached.get("reasons", {})
         applied["ok"] = True
+        applied["r_yesterday"] = r_yesterday.to_dict()
+        applied["e_tomorrow"] = e_tomorrow.to_dict()
+        applied["commitment_net"] = commitment_net
+        applied["delta_limit"] = cached.get("delta_limit")
+        applied["r_yesterday_cached"] = cached.get("r_yesterday", VADState()).to_dict()
+        applied["e_tomorrow_cached"] = cached.get("e_tomorrow", VADState()).to_dict()
+        self._machine.unfreeze(now)  # 队列并入日志（观测保留，不二次入账）
         self._save_state()
+        state = load_json(self._state_path, {}) or {}
+        state["applied_sleep_date"] = str(cached.get("cycle_key") or now.strftime("%Y-%m-%d"))
+        save_json_atomic(self._state_path, state)
+        self._log_decision(
+            "emotion.sleep_overhaul", trigger_type="emotion",
+            reason="醒后一次性应用缓存大修",
+            recovery_factor=applied.get("recovery_factor", 0.0),
+            sleep_hours=applied.get("sleep_hours", 0.0),
+            delta_limit=applied.get("delta_limit"),
+            delta_requested=applied.get("delta_requested"), delta_applied=applied.get("delta_applied"),
+            r_yesterday=applied.get("r_yesterday"), e_tomorrow=applied.get("e_tomorrow"),
+            commitment_net=applied.get("commitment_net"),
+            r_yesterday_cached=applied.get("r_yesterday_cached"),
+            e_tomorrow_cached=applied.get("e_tomorrow_cached"),
+        )
         # M0 事件：醒后 VAD + 恢复系数（附录 A ★，consumer=planning/qzone）；
-        # 同步发一次 emotion.updated（低分辨率 VAD），保持「VAD 结算即有事件流」。
+        # M5：payload 补低分辨率 VAD 三档词（levels），供 planning 的 emotion_context 槽
+        # 直接消费而无需解析文本（§6.2 F；数值一律不出现在提示词里）。
         mood = self.mood_text()
-        await self._publish("emotion.overhauled", mood=mood,
+        eff = self._machine.effective_vad()
+        levels = {"valence": _level(eff.valence), "arousal": _level(eff.arousal),
+                  "dominance": _level(eff.dominance)}
+        await self._publish("emotion.overhauled", mood=mood, levels=levels,
                             recovery_factor=applied.get("recovery_factor", 0.0),
                             sleep_hours=applied.get("sleep_hours", 0.0))
         await self._publish("emotion.updated", mood=mood, trigger="sleep_overhaul")
+        self._ctx.logger.info(
+            "睡眠情绪大修完成（醒后结算）：恢复系数 %.2f（睡 %.1f 小时），ΔVAD 已应用",
+            applied.get("recovery_factor", 0.0), applied.get("sleep_hours", 0.0),
+        )
         return applied
 
+    async def run_sleep_overhaul(self) -> Dict[str, Any]:
+        """立即执行一次睡眠期情绪大修（兼容入口：计算 + 应用 + 解冻，不等待醒沿）。
+
+        M5 起正常路径走「冻结 → 醒后应用缓存」（``_check_and_overhaul``）；本方法保留
+        给直接调用方，返回语义与旧版一致（``ok`` / ``reason`` / ``recovery_factor`` 等）。
+        """
+        now = datetime.now()
+        item = self._current_sleep_item(now)
+        if item is None:
+            return {"ok": False, "reason": "当前无睡眠日程条目"}
+        period_start, period_end, planned = self._sleep_entry_period(item, now)
+        self._sleep_period = (period_start, period_end)
+        if self._pending_overhaul is None:
+            self._pending_overhaul = await self.compute_sleep_overhaul(now, sleep_hours=planned)
+        if self._pending_overhaul is None:
+            self._sleep_period = None
+            return {"ok": False, "reason": "睡眠裁判请求/解析失败（下一轮重试）"}
+        self._pending_overhaul.setdefault("cycle_key", self._cycle_key(period_start))
+        return await self._apply_cached_overhaul(now) or {"ok": False, "reason": "大修应用失败"}
+
     async def _loop(self) -> None:
-        """睡眠检测循环：进入日程睡眠时段且当天未大修 → 触发裁判大修。"""
+        """睡眠检测循环：进 sleep 条目 → 冻结+缓存大修；离开 → 应用缓存并解冻（M5）。"""
         while self._stop_event is not None and not self._stop_event.is_set():
             try:
                 if self._enabled():
@@ -533,38 +830,73 @@ class EmotionService:
                 continue
 
     async def _check_and_overhaul(self) -> None:
+        """一个检测周期：进睡眠时段 → 冻结并在冻结期计算/缓存大修；醒沿 → 应用缓存 + 解冻。
+
+        睡眠时段判定（M5 修复）：条目本身会被 ``_normalize_items`` 的作息锚点截断
+        （最长为 23:00–23:15，夜间无条目覆盖），故**冻结窗口按 [schedule] 作息锚点整夜**
+        （``_sleep_entry_period``），条目只作入口/小睡；醒沿 = 离开该窗口，或日程出现
+        非睡眠的清醒活动（文档口径「醒来的第一个活动开始」）。
+        """
         query = self._schedule_query()
         if query is None:
             return
         now = datetime.now()
         current = query.find_current_activity(now.strftime("%Y-%m-%d"), now, include_sleep=True)
-        if current is None or str(current.get("goal_type") or "") != "sleep":
-            await self._publish_woke_up_if_needed(now)  # M0：离开睡眠条目 → schedule.woke_up
-            return
-        await self._publish_sleep_started_if_needed(current, now)  # M0：进入睡眠 → sleep_started
-        state = load_json(self._state_path, {}) or {}
-        if state.get("applied_sleep_date") == now.strftime("%Y-%m-%d"):
-            return
-        outcome = await self.run_sleep_overhaul()
-        if outcome.get("ok"):
-            state = load_json(self._state_path, {}) or {}
-            state["applied_sleep_date"] = now.strftime("%Y-%m-%d")
-            save_json_atomic(self._state_path, state)
-            self._ctx.logger.info(
-                "睡眠情绪大修完成：恢复系数 %.2f（睡 %.1f 小时），ΔVAD 已应用",
-                outcome.get("recovery_factor", 0.0), outcome.get("sleep_hours", 0.0),
-            )
-        else:
-            self._ctx.logger.debug("睡眠情绪大修未执行：%s", outcome.get("reason"))
+        sleep_item = current if self._is_sleep_item(current) else None
+        awake_activity = current is not None and sleep_item is None
 
-    # ── 睡眠进出事件（M0：只发事件，不做冻结/结算——那是 M5）──
-    async def _publish_sleep_started_if_needed(self, item: Dict[str, Any], now: datetime) -> None:
-        """进入睡眠条目的上升沿 → schedule.sleep_started（payload: sleep_hours）。"""
+        # 醒沿：日程出现清醒活动，或已离开睡眠窗口（含条目被截断后的深夜/清晨）
+        if awake_activity or (self.is_frozen() and not self._in_sleep_period(now)):
+            await self._publish_woke_up_if_needed(now)   # M0：离开睡眠 → schedule.woke_up
+            await self._apply_cached_overhaul(now)       # M5：应用缓存并解冻
+            return
+
+        if self.is_frozen():
+            if self._pending_overhaul is None:           # 上轮裁判失败 → 冻结期内重试
+                planned = float(getattr(self, "_sleep_planned_hours", 0.0) or 0.0)
+                cached = await self.compute_sleep_overhaul(now, sleep_hours=planned or None)
+                if cached is not None:
+                    period = self._sleep_period or (now, now)
+                    cached["cycle_key"] = self._cycle_key(period[0])
+                    self._pending_overhaul = cached
+                else:
+                    self._ctx.logger.debug("睡眠大修计算失败：保持冻结，下一轮重试")
+            return
+
+        # 未冻结：睡眠入口 = 睡眠条目，或已处于作息夜间窗口（如夜间启动/热重载后无条目）
+        night_start, night_end = self._night_window(now)
+        if sleep_item is None and not (night_start <= now < night_end):
+            return                                        # 白天且无睡眠条目：无事
+        period_start, period_end, planned = self._sleep_entry_period(sleep_item, now)
+        await self._publish_sleep_started_if_needed(sleep_item, now, planned_hours=planned)
+        cycle_key = self._cycle_key(period_start)
+        state = load_json(self._state_path, {}) or {}
+        # 本睡眠周期已结算过 → 跳过（兼容旧值：裸日期；热重载后不重复冻结/不重复请求裁判）
+        if state.get("applied_sleep_date") in (now.strftime("%Y-%m-%d"), cycle_key):
+            return
+        self._sleep_period = (period_start, period_end)
+        self._machine.freeze(now)                        # M5：冻结（事件只入队、暂停衰减/结算）
+        cached = await self.compute_sleep_overhaul(now, sleep_hours=planned)
+        if cached is None:
+            self._ctx.logger.debug("睡眠大修计算失败：保持冻结，下一轮重试")
+            return
+        cached["cycle_key"] = cycle_key
+        self._pending_overhaul = cached
+
+    # ── 睡眠进出事件（M0：只发事件；M5 起与冻结/结算绑定）──
+    async def _publish_sleep_started_if_needed(self, item: Optional[Dict[str, Any]], now: datetime,
+                                               planned_hours: Optional[float] = None) -> None:
+        """进入睡眠的上升沿 → schedule.sleep_started（payload: sleep_hours）。
+
+        ``planned_hours`` 给出时优先（夜间睡眠按作息锚点整夜，而非被截断的条目时长）；
+        缺省仍按条目 start/end（旧行为/小睡/直接调用方）。
+        """
         if self._in_sleep:
             return
         self._in_sleep = True
         self._sleep_started_at = now
-        self._sleep_planned_hours = self._sleep_hours(item)
+        self._sleep_planned_hours = float(planned_hours) if planned_hours is not None \
+            else self._sleep_hours(item or {})
         await self._publish("schedule.sleep_started",
                             sleep_hours=round(self._sleep_planned_hours, 2),
                             date=now.strftime("%Y-%m-%d"))

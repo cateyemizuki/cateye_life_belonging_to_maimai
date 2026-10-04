@@ -10,16 +10,16 @@
 |---|---|---|
 | `config.py` | emotion 配置段（总开关、衰减率、评估开关与节流、裁判/评估任务名、注入开关、睡眠检测间隔；**M3 增三项事件倍率**：global_event_multiplier/non_target_multiplier/target_bonus_step，一律标量） | §十二 |
 | `vad.py` | VADState/EmotionEvent 数据结构；25 种情绪原型（10 正/3 中/12 负）；加权欧氏距离映射（V1.0/A0.8/D1.2）+ 阈值复合标签 + 低分辨率三档描述 | §一/§四/§七 |
-| `state_machine.py` | 外部状态机：日常指数衰减、事件结算（衰减→增量→裁剪→日志）、静态偏移+乘数（effective_vad，避免偏移每轮累加）、睡眠大修（锚点收敛 × 倒 U 恢复系数 + 裁判增量）、参数生效/恢复默认/序列化 | §二/§五/§九/§十 |
-| `referee.py` | 三个独立 LLM 请求：睡眠裁判（±0.8 限幅 + reason 须引用日程原文）、人设初始化（锚点 ±0.6/偏移 ±0.3/增益 [0.8,1.3]/衰减 [0.6,1.2] 校验裁剪）、回复增量评估（±0.5）；宽松 JSON 解析 | §六/§十 |
-| `service.py` | 状态持久化（emotion_state.json / emotion_config.json）、睡眠检测循环（消费 planning 日程的 sleep 条目，跨午夜时长计算）、前后日日程与长期状态（planning 的 custom_prompt）汇总、初始化指令主体、隐私接口（清空日志）；**M3 增 `record_external_event` 统一外部事件入口 + target 识别/三层加算倍率 + 评估上下文反查（get_by_time_in_chat）**；**M4 增 `mood_effect()` 情绪→行为系数（附录 C 映射，纯规则）** | §五/§六/§十/§十三 |
+| `state_machine.py` | 外部状态机：日常指数衰减、事件结算（衰减→增量→裁剪→日志）、静态偏移+乘数（effective_vad，避免偏移每轮累加）、睡眠大修（锚点收敛 × 倒 U 恢复系数[恒 ≥0.3] + 裁判增量 + R_yesterday/E_tomorrow/约定三项数值）、参数生效/恢复默认/序列化；**M5 增冻结/解冻**（`freeze`/`unfreeze`：冻结期事件只入队 `pending_events`、衰减与结算暂停；解冻推进 `last_update`，不补算整夜） | §二/§五/§九/§十 |
+| `referee.py` | 三个独立 LLM 请求：睡眠裁判（**M5 起动态限幅 ±(0.4+0.4×`schedule.emotion_influence`)，缺省兼容 ±0.8** + R/E/约定三组数值输入 + reason 须引用日程原文）、人设初始化（锚点 ±0.6/偏移 ±0.3/增益 [0.8,1.3]/衰减 [0.6,1.2] 校验裁剪）、回复增量评估（±0.5）；宽松 JSON 解析 | §六/§十 |
+| `service.py` | 状态持久化（emotion_state.json / emotion_config.json）、睡眠检测循环（消费 planning 日程的 sleep 条目，跨午夜时长计算）、前后日日程与长期状态（planning 的 custom_prompt）汇总、初始化指令主体、隐私接口（清空日志）；**M3 增 `record_external_event` 统一外部事件入口 + target 识别/三层加算倍率 + 评估上下文反查（get_by_time_in_chat）**；**M4 增 `mood_effect()` 情绪→行为系数（附录 C 映射，纯规则）**；**M5 改睡眠循环为冻结→醒后结算**（入睡冻结 + 冻结期计算并缓存大修 → 醒沿应用一次并解冻；`is_frozen()`/`sleep_delta_limit()`/`schedule_tone_sum()`/`compute_sleep_overhaul()`/`_apply_cached_overhaul()`；`applied_sleep_date` 记睡眠周期键，旧裸日期值兼容读取）；**冻结窗口按 [schedule] 作息锚点整夜**（条目会被 `_normalize_items` 截断为 23:00–23:15，不能作窗口；午休按条目窗口），计划时长取整夜 8h；R/E/约定在醒来时按入睡日基准重算（次日日程 00:30 才生成） | §五/§六/§十/§十三 |
 | `bridge.py` | **M3 新增**：跨模块事件桥——订阅 `relation.*` / `schedule.commitment_*` / `qzone.*` 并翻译为有界情绪增量（模板或 LLM 路径），全部经 `record_external_event` 入账；注册/注销挂 `services.py` | MAINTENANCE_PLAN §4.2 / §6.2 A·E·G |
 | `components.py` | `EmotionComponentsMixin`：2 Command + 2 Tool（**M3 新增 `cateye_test_emotion_report`**）+ 3 HookHandler（方法名 `emo_` 前缀，组件名 `cateye_test_emotion_*`） | —— |
 | `services.py` | `EmotionServices` 服务束（start/stop/set_persona 转发；**M3 起 start/stop 注册与注销 bridge 事件订阅、对外暴露 `effective_valence()` 供 B2 调制**；**M4 增 `mood_effect()` 转发，异常兜底恒等中性值**） | —— |
 
 ## 与其他模块的协作
 
-- **planning/**：日程即"日程 LLM"——睡眠检测消费 `ScheduleQuery.find_current_activity` 的 `goal_type=="sleep"` 条目（时长 = start/end 分钟差，跨午夜自动 +1440）；睡眠裁判的前一日/第二日日程取 `format_day_summary`；长期状态取 `schedule.custom_prompt`；约定兑现/违约经 `schedule.commitment_kept/broken` 事件进桥（M3）；
+- **planning/**：日程即"日程 LLM"——睡眠检测消费 `ScheduleQuery.find_current_activity` 的 `goal_type=="sleep"` 条目（时长 = start/end 分钟差，跨午夜自动 +1440）；睡眠裁判的前一日/第二日日程取 `format_day_summary`；长期状态取 `schedule.custom_prompt`；约定兑现/违约经 `schedule.commitment_kept/broken` 事件进桥（M3）；**M5：日程条目 `parameters.emotional_tone`（裁剪 ±0.5）求和为前日残差/明日预期进入睡眠大修，`schedule.emotion_influence` 同时决定大修动态限幅与日程 `emotion_context` 槽强度**；反向通道已接线——`emotion.overhauled`（`mood` + 三档词 `levels`）由 planning 订阅缓存，在日程生成时拼「睡醒情绪描述 + 引导约束」进 prompt（`build_emotion_context()`）；
 - **宿主配置**：人设（personality.personality / bot.nickname）由顶层 `_refresh_persona` → `set_persona` 透传；
 - **companion/**：Hook 层各自独立（同名 Hook 点多 handler 顺序执行），M3 起加一层事件耦合——沉默事件 `relation.silence_detected` 由 companion 巡检发布、本模块 bridge 消费；target 加算加成读取 companion 的 `AffectionManager.tier()`（可空降级，读不到不加成）；
 - **qzone/**：`qzone.comment_received` 进桥记小幅正事件（ΔV +0.05~+0.1，不建评论者档案）。
@@ -27,8 +27,8 @@
 ## 职责划分（开环控制，设计文档 §二）
 
 - **对话 LLM**：不可视 VAD 绝对值，只提供事件 → 增量（由 replyer.after_response 后的小模型评估请求实现，±0.5 限幅；M3 起同一评估器也服务外部事件桥的 LLM 路径）；
-- **睡眠裁判 LLM**：只接收客观数据（当前 VAD 用已应用偏移的有效值、当天原始事件日志、前后日日程、睡眠时长），输出 ΔVAD_sleep（±0.8）；
-- **Python 状态机**：维护绝对数值、裁剪/衰减/偏移/乘数、睡眠锚点收敛。
+- **睡眠裁判 LLM**：只接收客观数据（当前 VAD 用已应用偏移的有效值、当天原始事件日志、前后日日程、睡眠时长、R_yesterday/E_tomorrow/约定净兑现），输出 ΔVAD_sleep（±(0.4+0.4×`schedule.emotion_influence`)，缺省 ±0.8）；M5 起该请求在冻结期发出并缓存，醒后由状态机一次性应用；
+- **Python 状态机**：维护绝对数值、裁剪/衰减/偏移/乘数、睡眠冻结/解冻与锚点收敛。
 
 ## 事件桥、target 识别与倍率（M3 落地，2026-10-03）
 

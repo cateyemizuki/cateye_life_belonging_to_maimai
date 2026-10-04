@@ -36,9 +36,9 @@ cateye_test/
 ├── emotion/           # 情绪维护系统（新增）
 │   ├── config.py / services.py / components.py
 │   ├── vad.py             # 25 种情绪原型 + 加权距离映射 + 低分辨率描述
-│   ├── state_machine.py   # VAD 状态机（指数衰减/增量结算/偏移乘数/睡眠大修）
-│   ├── referee.py         # 睡眠裁判 / 人设初始化 / 回复增量评估（独立 LLM 请求）
-│   └── service.py         # 状态持久化 / 睡眠检测循环 / 初始化指令主体
+│   ├── state_machine.py   # VAD 状态机（指数衰减/增量结算/偏移乘数/睡眠冻结+大修 v2）
+│   ├── referee.py         # 睡眠裁判（动态限幅）/ 人设初始化 / 回复增量评估（独立 LLM 请求）
+│   └── service.py         # 状态持久化 / 睡眠循环（冻结/缓存/醒后结算）/ 初始化指令主体
 ├── qzone/             # QQ 空间（新增）
 │   ├── config.py / components.py
 │   ├── service.py     # 动作层(SnowLuma) + Web CGI 双通道；自动回评 / 评论基线提醒
@@ -98,7 +98,8 @@ cateye_test/
 - ✅ **外部事件桥（M3）**：`emotion/bridge.py` 订阅 `relation.silence_detected`（沉默：ΔV=−0.12、ΔA=+0.04）、`schedule.commitment_kept/broken`（约定兑现 +0.2／违约 −0.15）、`qzone.comment_received`（ΔV +0.05~+0.1）；统一入口 `record_external_event`（模板增量直记，或小模型有界评估 ±0.5）
 - ✅ **target 识别 + 三层加算倍率（M3，§6.2 A）**：私聊按 `session_id == 目标私聊 stream_id` 自动判定；群聊由 Tool `cateye_test_emotion_report(event, is_target)` 传参声明（参数永不拒绝，缺失/非法值静默按非 target）；`final = delta × global_event_multiplier × K`，target K = `1 + target_bonus_step × (档位+1)`（+0.1~+0.5），非 target K = `non_target_multiplier`
 - ✅ **沉默事件（M3，B1）**：巡检发现 `last_user_msg_time` 超过 `miss_hours_min` → 发布 `relation.silence_detected`（仅 target；每日 ≤2 次、间隔 ≥4h）；emotion 侧按模板乘 K 记账（零 LLM 成本）
-- ✅ 睡眠期情绪大修：进入日程睡眠时段（消费 planning 日程的 sleep 条目）→ 睡眠裁判 LLM 独立请求（当前 VAD+当天日志+前后日日程+长期状态+睡眠时长，reason 必须引用日程原文）→ ΔVAD_sleep ±0.8 限幅 → 向锚点收敛（睡眠时长倒 U 型恢复系数）→ 清空日志
+- ✅ **睡眠结算改造 + 睡眠大修 v2（M5，B12）**：进入**作息夜间窗口**（`[schedule].sleep_time → 次日 wake_time`，如 23:00→07:00；睡眠条目被 `_normalize_items` 截断为 23:00–23:15，故窗口按锚点而非条目，午休按条目窗口）→ **冻结整夜**（事件只入队、衰减与评估结算暂停）+ 睡眠裁判 LLM 独立请求（当前 VAD+当天日志+前后日日程+长期状态+睡眠时长+**前日残差 R_yesterday / 明日预期 E_tomorrow（条目 `emotional_tone`）/ 当日约定净兑现**，reason 必须引用日程原文）→ 计算并缓存 → **醒沿（离开窗口或日程出现清醒活动）应用一次并解冻**；R/E/约定在醒来时按入睡日基准重算（次日日程 00:30 才生成，否则"明日预期"生产不生效）；计划时长取整夜（8h→恢复系数 0.85）；ΔVAD_sleep 动态限幅 **±(0.4+0.4×`schedule.emotion_influence`，默认 0.6→±0.64)**；向锚点收敛（倒 U 型恢复系数，**恒 ≥0.3**）；应用后清空日志（冻结期队列并入当天日志作观测）
+- ✅ **睡醒情绪 → 次日日程（M5，B6 前半）**：`emotion.overhauled`（含低分辨率 `mood` + 三档词 `levels`）由 planning 订阅缓存（`PlanningServices.wake_emotion()`）；日程生成把「睡醒情绪描述 + 引导约束」按 `schedule.emotion_influence`（0~1，默认 0.6，**0=关闭**）拼进 `emotion_context` 槽（低落→多休整/娱乐/社交、兴奋→运动社交、支配感低→留 relaxation）；当天已有日程时自动生成跳过，**只在重生成时生效**；日程条目可选 `emotional_tone`（逐维 ±0.5 校验裁剪落 `parameters`）供睡眠大修的前日残差/明日预期
 - ✅ 人设初始化：/cateye_test_emotion_init 由宿主人设推导锚点/偏移/乘数（数值约束校验裁剪，落盘重启生效）；/cateye_test_emotion_config 查看/reset/clear
 - ✅ 情绪底色注入 replyer（模糊化描述 + 严禁直说情绪标签词汇）；Tool 查询心情 / 群聊事件上报（M3）
 - ✅ **[emotion] M3 事件倍率配置**：`global_event_multiplier`(1.0，0.1~3.0，一切外部事件总幅度)、`non_target_multiplier`(1.0，0~1，非 target 事件系数)、`target_bonus_step`(0.1，0~1，每档加算步长)

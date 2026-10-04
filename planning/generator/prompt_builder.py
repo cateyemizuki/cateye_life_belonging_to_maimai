@@ -37,6 +37,55 @@ _DEFAULT_WAKE_MINUTES = 7 * 60
 _DEFAULT_SLEEP_MINUTES = 23 * 60
 
 
+#: 情绪五档词中代表"低/高"的两组（与 emotion/vad.py `_level` 的词表一致；§6.2 F 引导约束按此分档）
+_EMOTION_LEVEL_LOW = ("很低", "偏低")
+_EMOTION_LEVEL_HIGH = ("很高", "偏高")
+
+
+def build_emotion_context(mood: str, levels: Optional[Dict[str, str]] = None,
+                          influence: float = 0.6) -> str:
+    """拼「睡醒情绪描述 + 引导约束」上下文（M5；§6.2 F / SYNERGY §3.2）。
+
+    - ``influence <= 0`` 或 ``mood`` 为空 → 返回空串（不注入，等价关闭）；
+    - ``influence < 0.5`` → 精简模式：只保留 1 条引导约束；``>= 0.5`` → 按三轴命中输出全部约束；
+    - ``levels`` 为情绪低分辨率三档词（emotion.overhauled payload 的 ``levels``：
+      valence/arousal/dominance → 很低/偏低/中等/偏高/很高）；缺失时退化为通用引导；
+    - 只使用低分辨率词与行为约束，**不含任何 VAD 数值**（§6.3-6 LLM 隔离）。
+    """
+    text = str(mood or "").strip()
+    if not text:
+        return ""
+    try:
+        strength = float(influence)
+    except (TypeError, ValueError):
+        strength = 0.6
+    if strength <= 0:
+        return ""
+    axis = levels if isinstance(levels, dict) else {}
+    constraints: List[str] = []
+    valence = str(axis.get("valence") or "")
+    arousal = str(axis.get("arousal") or "")
+    dominance = str(axis.get("dominance") or "")
+    if valence in _EMOTION_LEVEL_LOW:
+        constraints.append("安排更多 rest / entertainment / social_maintenance 类活动，学习与工作强度调低")
+    elif valence in _EMOTION_LEVEL_HIGH:
+        constraints.append("可适当增加 entertainment / social_maintenance 类活动，保持轻快节奏")
+    if arousal in _EMOTION_LEVEL_HIGH:
+        constraints.append("可安排运动或社交把精力用出去，避免整天闷在家里")
+    elif arousal in _EMOTION_LEVEL_LOW:
+        constraints.append("避免连续高强度条目，给上午留一段缓冲")
+    if dominance in _EMOTION_LEVEL_LOW:
+        constraints.append("保留一段 relaxation / free_time，避免连续高压条目")
+    if not constraints:
+        constraints.append("按上述情绪基调调整活动安排（低落时多安排恢复类活动、兴奋时多安排运动与社交）")
+    if strength < 0.5:
+        constraints = constraints[:1]
+    body = "；".join(f"{idx}) {line}" for idx, line in enumerate(constraints, 1))
+    return (f"【睡醒情绪底色】\n昨晚睡醒时的情绪：{text}\n"
+            f"引导约束：{body}\n"
+            "要求：情绪只影响活动类型与强度的微调，不得改变作息锚点、三餐窗口与无缝衔接要求。")
+
+
 def _parse_hhmm(value: Any, default_minutes: int) -> int:
     """把 HH:MM 解析为当天分钟数；非法/留空回退默认值。"""
     try:
@@ -335,6 +384,7 @@ class PromptBuilder:
         pending_commitments: Optional[List[Dict[str, Any]]] = None,
         history_context: str = "",
         knowledge_context: str = "",
+        emotion_context: Optional[str] = None,
     ) -> str:
         """构建日程生成提示词
 
@@ -346,6 +396,7 @@ class PromptBuilder:
             pending_commitments: 今日需要纳入的约定列表（可选）
             history_context: 最近聊天背景（可选；跨群拼接）
             knowledge_context: 相关记忆参考（可选）
+            emotion_context: 睡醒情绪描述 + 引导约束（可选；M5 §6.2 F，空串=不注入）
 
         Returns:
             完整的提示词字符串
@@ -449,6 +500,13 @@ class PromptBuilder:
             prompt += f"""
 【当前生活阶段与今日重点】
 {custom_prompt}
+"""
+
+        # M5（§6.2 F）：睡醒情绪描述 + 引导约束（由 schedule_generator 按
+        # schedule.emotion_influence 拼好传入；空串=关闭/无情绪，不出现该块）
+        if emotion_context:
+            prompt += f"""
+{emotion_context}
 """
 
         # 根据配置决定描述要求
@@ -635,6 +693,7 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
         pending_commitments: Optional[List[Dict[str, Any]]] = None,
         history_context: str = "",
         knowledge_context: str = "",
+        emotion_context: Optional[str] = None,
     ) -> str:
         """构建第二轮prompt（附带反馈）
 
@@ -647,6 +706,7 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
             pending_commitments: 今日约定（可选）
             history_context: 最近聊天背景（可选）
             knowledge_context: 相关记忆参考（可选）
+            emotion_context: 睡醒情绪描述 + 引导约束（可选；M5 §6.2 F，空串=不注入）
 
         Returns:
             改进后的提示词
@@ -656,6 +716,7 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
             pending_commitments=pending_commitments,
             history_context=history_context,
             knowledge_context=knowledge_context,
+            emotion_context=emotion_context,
         )
 
         feedback = "\n\n⚠️ **上一次生成存在以下问题，请改进：**\n\n"

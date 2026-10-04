@@ -39,15 +39,28 @@ V: {v:+.2f}, A: {a:+.2f}, D: {d:+.2f}
 【情绪原型参考表】（V 效价 / A 唤醒 / D 支配）
 {emotion_table}
 
+【前一日日程情感残差 R_yesterday】（已按释怀/反刍加权求和，代码层数值项；正=释怀、负=反刍残留）
+V: {r_v:+.2f}, A: {r_a:+.2f}, D: {r_d:+.2f}
+
+【次日日程情感预期 E_tomorrow】（明日条目情感基调求和；考试/挑战 → V↓A↑D↓）
+V: {e_v:+.2f}, A: {e_a:+.2f}, D: {e_d:+.2f}
+
+【当日约定兑现情况】净兑现 {commitment_net:+.0f} 次（正=兑现多于违约，负=违约多于兑现）
+
 【评分规则】
 1. 越靠近睡前的情绪事件，权重略微增加（近因效应）；强度大的事件影响更大。
 2. 睡眠时长影响恢复效果：<5 小时恢复极差（V 负向、A 升高）；6-9 小时恢复最佳（V 回升）；>10 小时睡懵（A 大幅降低）。
 3. 日程预期：评估前一日日程是"释怀"还是"反刍"，第二日日程是"期待"还是"焦虑"（第二天有考试/挑战 → A 升高、D 降低）。
 4. 必须结合人设性格做情绪过滤（如高神经质 → 焦虑更容易留存）。
-5. 给出最终的 ΔVAD（增量，非绝对值），每一维范围必须在 [-0.8, 0.8] 之间。
-6. reason 中必须直接引用上面日程/情绪日志的原文片段作为依据，禁止脑补不存在的事件。
+5. R_yesterday / E_tomorrow / 约定情况是代码层已计算的参考数值，最终增量仍需你综合人设与日志判断。
+6. 给出最终的 ΔVAD（增量，非绝对值），每一维范围必须在 [-{limit:.2f}, {limit:.2f}] 之间。
+7. reason 中必须直接引用上面日程/情绪日志的原文片段作为依据，禁止脑补不存在的事件。
 
 只输出 JSON：{{"delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}, "reason_valence": "...", "reason_arousal": "...", "reason_dominance": "..."}}"""
+
+#: 睡眠裁判 ΔVAD 的兼容默认限幅（旧调用不传 delta_limit 时保持 ±0.8；
+#: M5 服务侧一律传动态限幅 0.4+0.4×schedule.emotion_influence）
+DEFAULT_SLEEP_DELTA_LIMIT = 0.8
 
 INIT_SYSTEM_PROMPT = """你是一位情绪心理学专家，负责为 AI 角色建立 VAD（效价、唤醒度、支配感）三维情绪模型。
 V 代表愉悦度，范围 -1.0 到 1.0，正值愉悦、负值痛苦；A 代表唤醒度，-1.0 到 1.0，正值兴奋紧张、负值平静困倦；D 代表支配感，-1.0 到 1.0，正值掌控自信、负值无力顺从。
@@ -123,13 +136,37 @@ def _delta_from(data: Any, limit: float) -> VADState:
 
 async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_log_text: str,
                             yesterday_schedule: str, tomorrow_schedule: str, long_term_status: str,
-                            sleep_hours: float, task_name: str) -> Optional[Tuple[VADState, Dict[str, str]]]:
-    """睡眠裁判：返回 (ΔVAD_sleep, 理由)；请求失败/解析失败返回 None。"""
+                            sleep_hours: float, task_name: str,
+                            delta_limit: float = DEFAULT_SLEEP_DELTA_LIMIT,
+                            r_yesterday: Optional[VADState] = None,
+                            e_tomorrow: Optional[VADState] = None,
+                            commitment_net: float = 0.0) -> Optional[Tuple[VADState, Dict[str, str]]]:
+    """睡眠裁判：返回 (ΔVAD_sleep, 理由)；请求失败/解析失败返回 None。
+
+    M5（§4.2 睡眠大修 v2）：``delta_limit`` 为动态限幅（服务侧传
+    0.4+0.4×``schedule.emotion_influence``，缺省仍为兼容值 ±0.8）；
+    ``r_yesterday`` / ``e_tomorrow`` / ``commitment_net`` 为三组新增输入的数值项，
+    作为裁判参考写进提示词（并已在状态机侧进入结算公式）。
+    """
+    try:
+        limit = abs(float(delta_limit))
+    except (TypeError, ValueError):
+        limit = DEFAULT_SLEEP_DELTA_LIMIT
+    limit = max(0.05, min(1.0, limit))
+    residual = r_yesterday or VADState()
+    expectation = e_tomorrow or VADState()
+    try:
+        net = float(commitment_net or 0.0)
+    except (TypeError, ValueError):
+        net = 0.0
     prompt = SLEEP_REFEREE_PROMPT.format(
         persona=persona or "（暂无人设）", v=vad.valence, a=vad.arousal, d=vad.dominance,
         emotion_log=emotion_log_text, yesterday_schedule=yesterday_schedule or "（没有记录）",
         tomorrow_schedule=tomorrow_schedule or "（没有记录）", long_term_status=long_term_status or "普通时期",
         sleep_hours=max(0.5, float(sleep_hours)), emotion_table=EMOTION_TABLE_SUMMARY,
+        r_v=residual.valence, r_a=residual.arousal, r_d=residual.dominance,
+        e_v=expectation.valence, e_a=expectation.arousal, e_d=expectation.dominance,
+        commitment_net=net, limit=limit,
     )
     # 三组 reason 为长文本，600 tokens 会截断 JSON（宿主验证日 8 次尝试零落地实测）
     response = await llm.generate(prompt, task_name=task_name, temperature=0.4, max_tokens=2000,
@@ -142,7 +179,7 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
         "arousal": str(data.get("reason_arousal") or "")[:300],
         "dominance": str(data.get("reason_dominance") or "")[:300],
     }
-    return _delta_from(data, 0.8), reasons
+    return _delta_from(data, limit), reasons
 
 
 async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str) -> Optional[EmotionParams]:

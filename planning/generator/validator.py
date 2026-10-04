@@ -3,11 +3,42 @@
 This module provides semantic validation for schedule items.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 
 
 logger = logging.getLogger(__name__)
+
+#: 日程条目 emotional_tone 的逐维裁剪界（MAINTENANCE_PLAN §6.2 E：裁剪 ±0.5）
+EMOTIONAL_TONE_CLAMP = 0.5
+#: emotional_tone 的三个维度（V 效价 / A 唤醒 / D 支配）
+EMOTIONAL_TONE_AXES = ("valence", "arousal", "dominance")
+
+
+def clip_emotional_tone(raw: Any, limit: float = EMOTIONAL_TONE_CLAMP) -> Dict[str, float]:
+    """校验并裁剪日程条目 ``emotional_tone``（M5；§6.2 E：入库 parameters，裁剪 ±0.5）。
+
+    - 非 dict / 全维无效 → 返回空 dict（视为"无情绪基调"，睡眠侧按 0 计）；
+    - 单维非数值（字符串/布尔等）一律跳过（不写非法值、不抛异常）；
+    - 数值逐维夹到 ±limit（默认 ±0.5），保证任意 LLM 输出都无法越界。
+    """
+    if not isinstance(raw, dict):
+        return {}
+    try:
+        bound = abs(float(limit))
+    except (TypeError, ValueError):
+        bound = EMOTIONAL_TONE_CLAMP
+    clipped: Dict[str, float] = {}
+    for axis in EMOTIONAL_TONE_AXES:
+        value = raw.get(axis)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        clipped[axis] = max(-bound, min(bound, number))
+    return clipped
 
 
 class ScheduleSemanticValidator:

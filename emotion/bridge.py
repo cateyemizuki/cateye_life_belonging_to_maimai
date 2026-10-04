@@ -38,6 +38,9 @@ SILENCE_DELTA = VADState(-0.12, 0.04, 0.0)
 #: 约定兑现 / 违约模板（§6.2 E）
 COMMITMENT_KEPT_DELTA = VADState(0.2, 0.0, 0.0)
 COMMITMENT_BROKEN_DELTA = VADState(-0.15, 0.0, 0.0)
+#: 约定事件的描述前缀（M5 睡眠大修 v2 的「当日约定兑现情况」按此前缀从当天日志统计）
+COMMITMENT_KEPT_PREFIX = "约定兑现"
+COMMITMENT_BROKEN_PREFIX = "约定落空"
 #: 空间评论正事件 ΔV 区间（§6.2 G：+0.05~+0.1，「被在乎的感觉」）
 QZONE_COMMENT_V_MIN = 0.05
 QZONE_COMMENT_V_MAX = 0.1
@@ -123,7 +126,7 @@ class EmotionBridge:
     async def _record_commitment(self, kind: str, payload: Dict[str, Any], delta: VADState) -> None:
         data = payload if isinstance(payload, dict) else {}
         summary = str(data.get("summary") or data.get("commitment") or "约定").strip()[:60]
-        prefix = "约定兑现" if kind == "kept" else "约定落空"
+        prefix = COMMITMENT_KEPT_PREFIX if kind == "kept" else COMMITMENT_BROKEN_PREFIX
         result = await self._record(
             source=f"bridge:commitment_{kind}",
             description=f"{prefix}：{summary}",

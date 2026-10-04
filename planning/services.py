@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .cleanup_service import CleanupService
 from .command_service import CommandService
@@ -49,6 +49,9 @@ class PlanningServices:
         self.bus = getattr(plugin, "_bus", None)
         #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
         self._event_unsubs: List[Any] = []
+        #: M5（§6.2 F）：最近一次睡醒情绪（emotion.overhauled payload 缓存），供日程生成
+        #: 的 emotion_context 槽读取；运行期状态、不落盘（无事件时生成侧退化为实时 mood_text）
+        self._wake_emotion: Dict[str, Any] = {}
 
         data_dir = getattr(plugin, "_data_dir", None)
         if data_dir is None:
@@ -83,11 +86,34 @@ class PlanningServices:
     # 事件订阅挂点（M0：登记于此，M3+ 消费者按需 subscribe 并存入 _event_unsubs）
     # ------------------------------------------------------------
     def _register_event_subscriptions(self) -> None:
-        """订阅注册挂点（start() 调用）。M0 本束无订阅者：
-        唯一的实际订阅（proactive.used → 预算计数器）由 core/event_bus 在装配时安装。
-        M3+ 消费者在此 ``self._event_unsubs.append(self.bus.subscribe(...))``。"""
+        """订阅注册挂点（start() 调用）。
+
+        M0 唯一的实际订阅（proactive.used → 预算计数器）由 core/event_bus 在装配时安装；
+        M5 本束新增 ``emotion.overhauled`` 订阅：缓存睡醒情绪（低分辨率 VAD + levels），
+        供日程生成的 ``emotion_context`` 槽（§6.2 F）。"""
         if self.bus is None:
             return
+        try:
+            self._event_unsubs.append(
+                self.bus.subscribe("emotion.overhauled", self._on_emotion_overhauled, owner="planning"))
+        except Exception as exc:
+            logger.warning("planning 订阅 emotion.overhauled 失败（忽略）：%s", exc)
+
+    async def _on_emotion_overhauled(self, payload: Any) -> None:
+        """``emotion.overhauled`` 处理器：只缓存低分辨率情绪，不做任何状态设置（§6.3-1）。"""
+        data = payload if isinstance(payload, dict) else {}
+        levels = data.get("levels") if isinstance(data.get("levels"), dict) else {}
+        self._wake_emotion = {
+            "mood": str(data.get("mood") or "")[:300],
+            "levels": {str(k): str(v) for k, v in levels.items()},
+            "recovery_factor": data.get("recovery_factor", 0.0),
+            "sleep_hours": data.get("sleep_hours", 0.0),
+            "ts": str(data.get("ts") or ""),
+        }
+
+    def wake_emotion(self) -> Dict[str, Any]:
+        """最近一次睡醒情绪缓存（无 → 空 dict；生成侧据此拼 emotion_context）。"""
+        return dict(self._wake_emotion or {})
 
     def _unregister_event_subscriptions(self) -> None:
         """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""

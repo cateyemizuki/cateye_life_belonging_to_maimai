@@ -2,7 +2,10 @@
 
 职责划分（开环控制）：
 - LLM 只做"事件→增量"映射，不持有情绪状态、不可视绝对值；
-- 本状态机维护 VAD 绝对数值：日常指数衰减、增量结算、静态偏移与乘数、睡眠大修。
+- 本状态机维护 VAD 绝对数值：日常指数衰减、增量结算、静态偏移与乘数、睡眠大修；
+- M5 睡眠冻结：进入 sleep 条目后事件只入队（``pending_events``），衰减/结算暂停；
+  醒后解冻并把队列并入日志（只作观测，不二次入账）。``frozen``/``pending_events``
+  是运行期状态、不落盘（热重载后由睡眠循环重新判定，避免复活陈旧冻结态）。
 
 结算顺序（设计文档 §九.3）：
     应用日常衰减 → 加增量 → 应用静态偏移 → 应用乘数 → 裁剪
@@ -22,6 +25,18 @@ from .vad import EmotionEvent, VADState, _clip
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+#: 睡眠恢复系数下界（§4.2 睡眠大修 v2 / §6.3-3：恒 ≥0.3，保证向锚点收敛）
+MIN_SLEEP_RECOVERY_FACTOR = 0.3
+#: 睡眠大修 v2 数值项权重（SYNERGY §3.1：+ R_yesterday×w1 + E_tomorrow×w2；§4.2 输入扩展）
+SLEEP_RESIDUAL_WEIGHT = 0.5
+SLEEP_EXPECTATION_WEIGHT = 0.5
+#: 当日约定净兑现（kept − broken 次数）的情绪项与夹取（§4.2 第三输入）
+SLEEP_COMMITMENT_WEIGHT = 0.1
+SLEEP_COMMITMENT_CLAMP = 0.3
+#: 日程情感残差/预期的逐维上限（与条目 emotional_tone 的 ±0.5 同界，防多项求和发散）
+SCHEDULE_TONE_CLAMP = 0.5
 
 
 @dataclass
@@ -75,10 +90,11 @@ def sleep_recovery_factor(sleep_hours: float) -> float:
     """睡眠恢复系数（倒 U 型曲线，设计文档 §三/§五.3）。
 
     睡得好→向锚点收敛越彻底（因子大）；睡不好→当天残留越多（因子小）。
+    下界恒 ≥ :data:`MIN_SLEEP_RECOVERY_FACTOR`（§4.2「恢复系数恒 ≥0.3 保证收敛」）。
     """
     hours = max(0.0, float(sleep_hours))
     if hours < 5:
-        return 0.30
+        return MIN_SLEEP_RECOVERY_FACTOR
     if hours < 6:
         return 0.60
     if hours <= 9:
@@ -88,10 +104,25 @@ def sleep_recovery_factor(sleep_hours: float) -> float:
     return 0.50
 
 
+def _clamp_state(state: Optional[VADState], limit: float) -> VADState:
+    """把 VAD 逐维夹到 ±limit（None 视为零向量；limit ≤0 时返回零向量）。"""
+    try:
+        bound = abs(float(limit))
+    except (TypeError, ValueError):
+        bound = 0.0
+    state = state or VADState()
+    return VADState(
+        _clip(state.valence, -bound, bound),
+        _clip(state.arousal, -bound, bound),
+        _clip(state.dominance, -bound, bound),
+    )
+
+
 class EmotionStateMachine:
-    """VAD 状态机：日常增量结算 + 睡眠期大修。"""
+    """VAD 状态机：日常增量结算 + 睡眠期冻结/大修。"""
 
     MAX_LOG = 200  # 当天事件日志上限
+    MAX_PENDING = 200  # 睡眠冻结期入队事件上限（超限丢最旧）
 
     def __init__(self, params: Optional[EmotionParams] = None, decay_rate: float = 0.08) -> None:
         self.params = params or EmotionParams.default()
@@ -99,10 +130,47 @@ class EmotionStateMachine:
         self.vad_raw = VADState.from_dict(self.params.anchor.to_dict())  # 初始化=回到锚点
         self.emotion_log: List[EmotionEvent] = []
         self.last_update = datetime.now()
+        # M5 睡眠冻结（运行期状态，不落盘：热重载后由睡眠循环重新判定，避免复活陈旧冻结态）
+        self.frozen = False
+        self.pending_events: List[EmotionEvent] = []
+        self._frozen_at: Optional[datetime] = None
+
+    # ── 睡眠冻结（M5；§4.2 睡眠结算改造）──────────────────────
+    def freeze(self, now: Optional[datetime] = None) -> None:
+        """进入睡眠条目 → 冻结：事件只入队，衰减与评估结算暂停（幂等）。"""
+        if self.frozen:
+            return
+        self.frozen = True
+        self._frozen_at = now or datetime.now()
+
+    def unfreeze(self, now: Optional[datetime] = None, *, drain_to_log: bool = True) -> List[EmotionEvent]:
+        """醒后解冻：推进 ``last_update``（冻结时段不参与衰减），返回并清空冻结期队列。
+
+        ``drain_to_log=True`` 时把队列并入当天日志（只作观测保留，**不再二次入账**）——
+        夜间事件的结算由缓存的大修一次性完成（§4.2「应用缓存并解冻」）。
+        """
+        if not self.frozen:
+            return []
+        self.frozen = False
+        self._frozen_at = None
+        self.last_update = now or datetime.now()
+        drained = list(self.pending_events)
+        self.pending_events = []
+        if drain_to_log and drained:
+            self.emotion_log.extend(drained)
+            if len(self.emotion_log) > self.MAX_LOG:
+                self.emotion_log = self.emotion_log[-self.MAX_LOG:]
+        return drained
 
     # ── 结算 ────────────────────────────────────────────────
     def apply_daily_decay(self, now: Optional[datetime] = None) -> float:
-        """日常小周期指数衰减：VAD = VAD · exp(-decay_rate·Δt)。返回衰减因子。"""
+        """日常小周期指数衰减：VAD = VAD · exp(-decay_rate·Δt)。返回衰减因子。
+
+        冻结期（睡眠中）暂停衰减并恒返回 1.0（``last_update`` 不推进，解冻时统一推进，
+        避免醒后补算整夜衰减）。
+        """
+        if self.frozen:
+            return 1.0
         now = now or datetime.now()
         hours = (now - self.last_update).total_seconds() / 3600.0
         if hours <= 0:
@@ -115,20 +183,29 @@ class EmotionStateMachine:
         return factor
 
     def record_event(self, event_description: str, delta: VADState, *, now: Optional[datetime] = None) -> VADState:
-        """记录一次情绪事件：衰减 → 原始 VAD 加增量（裁剪）→ 写入当天日志。"""
+        """记录一次情绪事件：衰减 → 原始 VAD 加增量（裁剪）→ 写入当天日志。
+
+        冻结期（睡眠中）：事件**只入队** ``pending_events``，不衰减、不结算（§4.2）。
+        """
         now = now or datetime.now()
+        event = EmotionEvent(
+            timestamp=_now_iso(),
+            event_description=str(event_description or "")[:200],
+            delta_vad=delta.clipped(),
+            raw_intensity=delta.intensity(),
+        )
+        if self.frozen:
+            self.pending_events.append(event)
+            if len(self.pending_events) > self.MAX_PENDING:
+                self.pending_events = self.pending_events[-self.MAX_PENDING:]
+            return self.vad_raw
         self.apply_daily_decay(now)
         self.vad_raw = VADState(
             _clip(self.vad_raw.valence + delta.valence),
             _clip(self.vad_raw.arousal + delta.arousal),
             _clip(self.vad_raw.dominance + delta.dominance),
         )
-        self.emotion_log.append(EmotionEvent(
-            timestamp=_now_iso(),
-            event_description=str(event_description or "")[:200],
-            delta_vad=delta.clipped(),
-            raw_intensity=delta.intensity(),
-        ))
+        self.emotion_log.append(event)
         if len(self.emotion_log) > self.MAX_LOG:
             self.emotion_log = self.emotion_log[-self.MAX_LOG:]
         return self.vad_raw
@@ -147,27 +224,62 @@ class EmotionStateMachine:
 
     # ── 睡眠期大修 ──────────────────────────────────────────
     def apply_sleep_overhaul(self, sleep_delta: VADState, sleep_hours: float, *,
-                             now: Optional[datetime] = None) -> Dict[str, Any]:
-        """睡眠大修：向锚点收敛（恢复系数由睡眠时长决定）+ 裁判增量，随后清空日志。
+                             now: Optional[datetime] = None,
+                             r_yesterday: Optional[VADState] = None,
+                             e_tomorrow: Optional[VADState] = None,
+                             commitment_net: float = 0.0,
+                             delta_limit: Optional[float] = None) -> Dict[str, Any]:
+        """睡眠大修 v2：向锚点收敛 + 裁判增量 + 日程残差/预期/约定三输入，随后清空日志。
 
-        公式（设计文档 §十.7）：raw = 锚点 + (原始 - 锚点) × 恢复系数 + ΔVAD_sleep
-        偏移与乘数在 effective_vad() 统一结算（裁判增量只作用原始层）。
+        公式（设计文档 §十.7 + SYNERGY §3.1 / MAINTENANCE_PLAN §4.2）::
+
+            raw = 锚点 + (原始 − 锚点) × 恢复系数(睡眠时长倒U，恒 ≥0.3)
+                  + ΔVAD裁判(±delta_limit，动态限幅)
+                  + R_yesterday × w1 + E_tomorrow × w2 + clamp(约定净兑现 × w3)
+
+        - ``r_yesterday`` / ``e_tomorrow``：前日情感残差与明日情感预期（日程条目
+          ``emotional_tone`` 求和，逐维再夹 ±0.5），缺省零向量（旧调用行为不变）；
+        - ``commitment_net``：当日约定净兑现次数（kept − broken）；
+        - ``delta_limit``：裁判增量动态限幅（服务侧传 0.4+0.4×``schedule.emotion_influence``）；
+          None 表示不做额外夹取（兼容旧调用）。
+        偏移与乘数仍在 effective_vad() 统一结算（三者只作用原始层）。
         """
         now = now or datetime.now()
-        factor = sleep_recovery_factor(sleep_hours)
+        factor = max(MIN_SLEEP_RECOVERY_FACTOR, sleep_recovery_factor(sleep_hours))
+        residual = _clamp_state(r_yesterday, SCHEDULE_TONE_CLAMP)
+        expectation = _clamp_state(e_tomorrow, SCHEDULE_TONE_CLAMP)
+        try:
+            net = float(commitment_net or 0.0)
+        except (TypeError, ValueError):
+            net = 0.0
+        commitment = _clip(net * SLEEP_COMMITMENT_WEIGHT, -SLEEP_COMMITMENT_CLAMP, SLEEP_COMMITMENT_CLAMP)
+        delta = _clamp_state(sleep_delta, delta_limit) if delta_limit is not None \
+            else VADState(sleep_delta.valence, sleep_delta.arousal, sleep_delta.dominance)
         anchor = self.params.anchor
         before = self.vad_raw.to_dict()
         self.vad_raw = VADState(
-            _clip(anchor.valence + (self.vad_raw.valence - anchor.valence) * factor + sleep_delta.valence),
-            _clip(anchor.arousal + (self.vad_raw.arousal - anchor.arousal) * factor + sleep_delta.arousal),
-            _clip(anchor.dominance + (self.vad_raw.dominance - anchor.dominance) * factor + sleep_delta.dominance),
+            _clip(anchor.valence + (self.vad_raw.valence - anchor.valence) * factor
+                  + delta.valence + residual.valence * SLEEP_RESIDUAL_WEIGHT
+                  + expectation.valence * SLEEP_EXPECTATION_WEIGHT + commitment),
+            _clip(anchor.arousal + (self.vad_raw.arousal - anchor.arousal) * factor
+                  + delta.arousal + residual.arousal * SLEEP_RESIDUAL_WEIGHT
+                  + expectation.arousal * SLEEP_EXPECTATION_WEIGHT),
+            _clip(anchor.dominance + (self.vad_raw.dominance - anchor.dominance) * factor
+                  + delta.dominance + residual.dominance * SLEEP_RESIDUAL_WEIGHT
+                  + expectation.dominance * SLEEP_EXPECTATION_WEIGHT),
         )
         result = {
             "recovery_factor": factor,
             "sleep_hours": sleep_hours,
             "before": before,
             "after_raw": self.vad_raw.to_dict(),
-            "delta_applied": sleep_delta.to_dict(),
+            "delta_requested": sleep_delta.to_dict(),
+            "delta_applied": delta.to_dict(),
+            "delta_limit": delta_limit,
+            "r_yesterday": residual.to_dict(),
+            "e_tomorrow": expectation.to_dict(),
+            "commitment_net": net,
+            "commitment_delta": round(commitment, 4),
             "log_cleared": len(self.emotion_log),
         }
         self.emotion_log = []

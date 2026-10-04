@@ -129,6 +129,32 @@ class SchemaBuilder:
                                 "maximum": 12,
                                 "description": "活动持续时长（小时）"
                             },
+                            "emotional_tone": {
+                                "type": "object",
+                                "description": "该活动给角色带来的情绪基调（可选）：valence 效价 / arousal 唤醒 / "
+                                               "dominance 支配感，各维 [-0.5, +0.5]；沉重/紧张取负 V，"
+                                               "期待/轻松取正 V。供睡眠大修的前日残差与明日预期使用",
+                                "properties": {
+                                    "valence": {
+                                        "type": "number",
+                                        "minimum": -0.5,
+                                        "maximum": 0.5,
+                                        "description": "效价：正=愉悦/期待，负=沉重/压力"
+                                    },
+                                    "arousal": {
+                                        "type": "number",
+                                        "minimum": -0.5,
+                                        "maximum": 0.5,
+                                        "description": "唤醒：正=紧张/兴奋，负=平静/放松"
+                                    },
+                                    "dominance": {
+                                        "type": "number",
+                                        "minimum": -0.5,
+                                        "maximum": 0.5,
+                                        "description": "支配感：正=掌控/自信，负=无力/被压"
+                                    }
+                                }
+                            },
                             "parameters": {
                                 "type": "object",
                                 "description": "额外参数"

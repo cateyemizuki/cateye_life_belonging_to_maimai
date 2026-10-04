@@ -37,6 +37,8 @@ class BaseScheduleGenerator:
         self.pending_commitments: Optional[List[Dict[str, Any]]] = None
         self.history_context: str = ""
         self.knowledge_context: str = ""
+        #: M5（§6.2 F）睡醒情绪描述 + 引导约束（ScheduleGenerator 按 schedule.emotion_influence 装载；空串=不注入）
+        self.emotion_context: str = ""
         self.config: Dict[str, Any] = config or {}  # 保存配置
 
         # 初始化时区管理器
@@ -83,6 +85,7 @@ class BaseScheduleGenerator:
             pending_commitments=self.pending_commitments,
             history_context=self.history_context,
             knowledge_context=self.knowledge_context,
+            emotion_context=self.emotion_context,
         )
 
     def build_retry_prompt(
@@ -102,4 +105,5 @@ class BaseScheduleGenerator:
             pending_commitments=self.pending_commitments,
             history_context=self.history_context,
             knowledge_context=self.knowledge_context,
+            emotion_context=self.emotion_context,
         )

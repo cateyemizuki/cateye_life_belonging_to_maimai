@@ -35,6 +35,8 @@ from .generator import (
     ScheduleGeneratorConfig,
     ScheduleQualityScorer,
     ScheduleSemanticValidator,
+    build_emotion_context,
+    clip_emotional_tone,
 )
 from .goal_manager import GoalManager, get_goal_manager
 from .schedule_db import ScheduleDB
@@ -188,8 +190,9 @@ class ScheduleGenerator:
         validator = ScheduleSemanticValidator()
         scorer = ScheduleQualityScorer(gen_config.to_dict())
 
-        # 上下文加载：近几天摘要 / 今日约定 / 跨会话历史 / 知识库（全部失败静默）
+        # 上下文加载：近几天摘要 / 今日约定 / 跨会话历史 / 知识库 / 睡醒情绪（全部失败静默）
         self._load_sync_contexts(base, gen_config, date)
+        self._load_emotion_context(base)
         await self._load_async_contexts(base, gen_config, date)
 
         # 多轮 / 单轮生成
@@ -380,6 +383,47 @@ class ScheduleGenerator:
                 logger.info("今日有 %d 条未来约定将被纳入日程生成", len(pending))
         except Exception as exc:
             logger.debug("今日约定加载失败: %s", exc)
+
+    def _emotion_influence(self) -> float:
+        """``schedule.emotion_influence``（0~1，默认 0.6；0=关闭），运行期活取值。"""
+        cfg = getattr(getattr(self._plugin, "config", None), "schedule", None)
+        value = getattr(cfg, "emotion_influence", 0.6)
+        try:
+            influence = float(value)
+        except (TypeError, ValueError):
+            influence = 0.6
+        return max(0.0, min(1.0, influence))
+
+    def _load_emotion_context(self, base: BaseScheduleGenerator) -> None:
+        """M5（§6.2 F）：按 ``schedule.emotion_influence`` 把「睡醒情绪描述 + 引导约束」装载进槽位。
+
+        睡醒情绪优先取 planning 缓存的 ``emotion.overhauled``（PlanningServices 订阅，含
+        低分辨率三档词 ``levels``）；尚未醒来过（无事件）时退化为实时 ``mood_text()``
+        （仅描述 + 通用引导）。``emotion_influence=0`` / 无情绪 / 模块缺失 → 空串（不注入，
+        等价关闭，与旧 prompt 逐字一致）。全程静默降级（§八.2）。
+        """
+        try:
+            influence = self._emotion_influence()
+            if influence <= 0:
+                base.emotion_context = ""
+                return
+            wake: Dict[str, Any] = {}
+            planning = getattr(self._plugin, "_planning", None)
+            getter = getattr(planning, "wake_emotion", None)
+            if callable(getter):
+                wake = getter() or {}
+            mood = str(wake.get("mood") or "").strip()
+            levels = wake.get("levels") if isinstance(wake.get("levels"), dict) else None
+            if not mood:
+                emotion = getattr(self._plugin, "_emotion", None)
+                mood_getter = getattr(emotion, "mood_text", None)
+                if callable(mood_getter):
+                    mood = str(mood_getter() or "").strip()
+                    levels = None
+            base.emotion_context = build_emotion_context(mood, levels, influence)
+        except Exception as exc:
+            base.emotion_context = ""
+            logger.debug("睡醒情绪上下文装载失败（忽略）: %s", exc)
 
     async def _load_async_contexts(
         self, base: BaseScheduleGenerator, gen_config: ScheduleGeneratorConfig, date: str
@@ -648,10 +692,18 @@ class ScheduleGenerator:
         wake_time: str,
         sleep_time: str,
     ) -> List[Dict[str, Any]]:
-        """把 LLM/模板条目归一化成 DB 记录：time_slot+duration → start/end 分钟，截断到作息锚点内。"""
+        """把 LLM/模板条目归一化成 DB 记录：time_slot+duration → start/end 分钟，截断到作息锚点内。
+
+        M5（§6.2 E）：条目级 ``emotional_tone`` 经 :func:`clip_emotional_tone` 校验/裁剪
+        （±0.5）后落入 ``parameters``（供睡眠大修的前日残差/明日预期读取）；
+        非字典/顶层无效一律不落该键。
+        """
         wake_min, sleep_min = parse_hhmm(wake_time, 420), parse_hhmm(sleep_time, 1380)
         normalized: List[Dict[str, Any]] = []
         for item in items:
+            raw_tone = item.get("emotional_tone")
+            if raw_tone is None and isinstance(item.get("parameters"), dict):
+                raw_tone = (item.get("parameters") or {}).get("emotional_tone")
             try:
                 start = parse_hhmm(str(item.get("time_slot") or "07:00"), wake_min)
                 hours = float(item.get("duration_hours") or 1.0)
@@ -671,6 +723,11 @@ class ScheduleGenerator:
                 "parameters": dict(item.get("parameters") or {}),
                 "schedule_date": date,
             }
+            tone = clip_emotional_tone(raw_tone)
+            if tone:
+                entry["parameters"]["emotional_tone"] = tone
+            else:
+                entry["parameters"].pop("emotional_tone", None)
             entry["end_minute"] = max(entry["start_minute"] + 15, end)
             normalized.append(entry)
         return normalized

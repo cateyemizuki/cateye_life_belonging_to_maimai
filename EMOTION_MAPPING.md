@@ -7,8 +7,16 @@
 > 命令与工具见 [USAGE.md](USAGE.md)；测试规程见 [TEST_PROCEDURE.md](TEST_PROCEDURE.md)。
 > **来源文件**：`emotion/vad.py`｜`emotion/state_machine.py`｜`emotion/referee.py`｜`emotion/service.py`｜`emotion/bridge.py`｜`emotion/config.py`｜`companion/patrol.py`｜`companion/affection_events.py`｜`companion/relation.py`｜`qzone/service.py`
 >
-> **版本冻结提醒**：**M5 会改造本文件的多处映射**（睡眠结算由"入睡瞬时大修"改为"冻结→醒后一次性应用"，大修限幅由固定 ±0.8 改为 ±(0.4+0.4×`schedule.emotion_influence`)，新增日程条目 `emotional_tone` 与恢复系数下界）。
-> M5 落地后必须同步修订 §7.3、§7.4，并在 §8 的未接线清单里勾销对应项。
+> **M5（emotion 侧）已落地（2026-10-05）**：睡眠结算已由"入睡瞬时大修"改为"冻结 → 醒后一次性应用"；
+> 大修限幅由固定 ±0.8 改为动态 ±(0.4+0.4×`schedule.emotion_influence`)；大修公式新增
+> R_yesterday / E_tomorrow / 约定净兑现三项数值输入；日程条目 `emotional_tone`（裁剪 ±0.5）已
+> 落 `parameters`；恢复系数下界 0.3 由常量固定。本文件 §5.3、§6.3、§7.3、§7.4、§8、附录 A 已同步。
+> **M5（planning 侧）已落地（2026-10-05，同批）**：`emotion.overhauled` payload 补低分辨率三档词 `levels`；
+> planning 订阅并缓存睡醒情绪（`PlanningServices.wake_emotion()`），日程生成把「睡醒情绪描述 + 引导约束」
+> 按 `schedule.emotion_influence` 拼进 `emotion_context` 槽（`build_emotion_context()`）；
+> 日程条目 `emotional_tone` 经 schema（逐维 ±0.5）+ `clip_emotional_tone` 落 `parameters`。
+> **仍未落地（M5 其余部分）**：连续低迷软约束 `emotion.low_mood_day`（§8 行 5）、A3 `emotion_report` 工具裁决；
+> A6 死字段清理已完成（`8d11f54`）。
 
 ---
 
@@ -215,7 +223,7 @@ share_i = (1/d_i) / Σ(1/d_j)        # 反距离归一化，Σ share = 100%
 |---|---|---|---|---|
 | 回复后增量 | `evaluate_reply_delta` / `emotion_evaluate` | 看不到绝对 VAD；`event` ≤30 字（**代码截 60**）；无波动则接近 0 | `{"event": "...", "delta_vad": {V,A,D}}` | **±0.5** |
 | 群聊工具上报 | 同上（`record_external_event` 的 LLM 分支） | 同上 | 同上 | ±0.5 |
-| 睡眠大修 | `ask_sleep_referee` / `emotion_sleep_referee` | 见 §7.3（输入含前后日日程、睡眠时长、原型表；reason 必须引用原文） | `{"delta_vad": {…}, "reason_valence/arousal/dominance": "..."}` | **±0.8** |
+| 睡眠大修 | `ask_sleep_referee` / `emotion_sleep_referee` | 见 §7.3（输入含前后日日程、睡眠时长、原型表、R/E/约定数值项；reason 必须引用原文） | `{"delta_vad": {…}, "reason_valence/arousal/dominance": "..."}` | **±(0.4+0.4×`schedule.emotion_influence`)**（服务侧传；缺省兼容 ±0.8） |
 | 人设初始化 | `derive_params_from_persona` / `emotion_init` | 见 §7.1 | `{"anchor": {...}, "offset": {...}, "positive_gain", "negative_decay", "reasons"}` | 各参数区间钳制（§7.1） |
 
 **解析容错**（`_parse_json_loose`）：整段 → ```json 围栏 → 首个 `{...}` 块，三级降级；全部失败按"请求失败"处理（静默跳过、下轮重试）。
@@ -262,7 +270,8 @@ K = non_target_multiplier                  # 非 target 事件
 | 层 | 限幅 | 位置 |
 |---|---|---|
 | 单事件（外部事件入口） | **±0.5** 每维（`EVENT_DELTA_CLAMP`） | `service.py:19 / :362-368` |
-| LLM 输出（解析后） | 回复/工具 **±0.5**；睡眠裁判 **±0.8** | `referee.py:145 / :203` |
+| LLM 输出（解析后） | 回复/工具 **±0.5**；睡眠裁判 **±(0.4+0.4×`schedule.emotion_influence`)**（0.4~0.8，默认 0.6→0.64；缺省调用仍 ±0.8） | `referee.py` `DEFAULT_SLEEP_DELTA_LIMIT` / `_delta_from(data, limit)` |
+| 睡眠大修应用（状态机再夹一道） | `apply_sleep_overhaul(..., delta_limit=…)` 逐维夹 ±delta_limit；R/E 夹 ±0.5、约定项夹 ±0.3 | `state_machine.py`（M5 v2） |
 | 单维状态 | 裁剪到 [-1, 1] | `vad.py:23` `_clip` |
 | 好感日累计（相邻系统，§6.2 B 输出侧） | positive ≤ +4.0 / negative ≥ −3.0 | `companion/affection.py` |
 
@@ -337,39 +346,71 @@ factor = exp(-decay_rate × Δt_小时)      raw.V/A/D 各乘 factor
 
 > 读法：系数 <1 = 阈值缩短 = **更快想念**；越亲密档位系数越小（恋人档 4 = 0.6，最快）。
 
-### 7.3 睡眠大修（当前实现：**入睡瞬时应用**）
+### 7.3 睡眠大修（M5 起：**冻结 → 醒后一次性应用**）
 
-> ⚠️ **M5 将改造此处**（冻结 → 醒后一次性应用；限幅改动态）。以下为 **v0.4.0 现状**。
+**触发与冻结/结算时序**（`emotion/service.py` `_check_and_overhaul`，睡眠检测循环 `[emotion].check_interval_minutes` 默认 10 分钟）：
 
-**触发**：睡眠检测循环（`[emotion].check_interval_minutes` 默认 10 分钟）发现当前活动是 `goal_type == "sleep"` 的日程条目 → 当天未大修过（`emotion_state.json.applied_sleep_date`）→ 执行；成功后写 `applied_sleep_date`（**按自然日一次**）。
+1. **进入睡眠时段** → `schedule.sleep_started` 上升沿 + `machine.freeze(now)`：
+   冻结期**事件只入队**（`pending_events`，上限 200 条）、**衰减与评估结算暂停**
+   （`apply_daily_decay` 恒返回 1.0 且不推进 `last_update`；`record_event` 不入 `vad_raw`）；
+2. **冻结期**同一周期内计算大修（裁判 LLM）并**缓存**（`_pending_overhaul`，不落状态）；
+   裁判失败保持冻结、下一轮重试（重试只需仍在睡眠周期内，不要求条目仍"当前"）；
+3. **醒沿** = 离开睡眠窗口，或日程出现非睡眠的清醒活动（文档口径「醒来的第一个活动」）→
+   `schedule.woke_up` 下降沿 → **应用缓存的大修一次**（`unfreeze(now)` 同时把队列并入当天日志
+   作观测保留，**不二次入账**）→ 写 `applied_sleep_date` = **睡眠周期键** `"周期起始日@起始分钟"`
+   （如 `2030-05-05@1380`；旧裸日期值仍兼容读取；同一周期不重复结算、且不误伤次夜）→
+   发 `emotion.overhauled`。
 
-**公式**（`state_machine.py:149-175`，只作用 `vad_raw`）：
+> ⚠️ **睡眠窗口按作息锚点，不按条目**（M5 验证者修复）：`_normalize_items` 会把入睡条目
+> 截断到入睡锚点（`end=min(sleep_min,…)` 后 `max(start+15,end)`，**最长 23:00–23:15**），
+> 夜间无任何条目覆盖——若按"条目窗口"冻结，入睡约 15 分钟即误判醒来、恢复系数恒落 <5h 档（0.30）。
+> 故：**夜间睡眠**按 `[schedule].sleep_time → 次日 wake_time` 整夜冻结
+> （`_sleep_entry_period` / `_night_window`），计划时长取整夜
+> （默认 23:00→07:00 = 8h → 恢复系数 0.85）；**午休/小睡**（非夜间窗口的睡眠条目）才按条目窗口。
+> 睡眠条目识别同时接受 `goal_type=="sleep"` 与名称含睡觉类关键词（日程生成 prompt 让"睡觉"
+> 条目用 `goal_type: daily_routine`，仅按 goal_type 会漏判）；夜间启动/热重载后即使无条目，
+> 处于锚点夜间窗口也会按周期进入冻结。
+
+**三输入的日期基准与重算**（M5 修复）：入睡时刻（默认 23 点）读"次日"日程时，次日日程还没到
+`auto_generate_time`（默认 00:30）生成 → **状态侧的 R_yesterday / E_tomorrow / 约定净兑现
+在醒来时按入睡日为基准重算一次**（R = 入睡日−1；E = 入睡日的次日 = 醒来日，此时已生成；
+`_wake_side_inputs`），保证"明日预期"在生产时序下真实生效；入睡缓存值只作裁判 prompt 文本参考，
+决策日志同时留痕 `*_cached` 与应用值（`emotion.sleep_overhaul_cached` / `emotion.sleep_overhaul`）。
+
+**公式**（`state_machine.py` `apply_sleep_overhaul`，只作用 `vad_raw`）：
 
 ```
-raw = anchor + (raw − anchor) × recovery_factor + ΔVAD_sleep
+raw = anchor + (raw − anchor) × recovery_factor
+      + ΔVAD_judge(±delta_limit)          # 动态限幅 ±(0.4+0.4×schedule.emotion_influence)
+      + R_yesterday × 0.5                 # 前日情感残差（条目 emotional_tone 求和，逐维夹 ±0.5）
+      + E_tomorrow  × 0.5                 # 明日情感预期（同上）
+      + clamp(约定净兑现 × 0.1, ±0.3)      # 当日 kept − broken 次数（按桥描述前缀从当天日志统计）
 ```
 
-**恢复系数（倒 U 型，`sleep_recovery_factor`）**：
+**恢复系数（倒 U 型，`sleep_recovery_factor`；下界由 `MIN_SLEEP_RECOVERY_FACTOR` 恒 ≥0.3）**：
 
 | 睡眠时长 | 系数 |
 |---|---|
-| < 5 h | **0.30** |
+| < 5 h | **0.30**（= 下界） |
 | 5 ~ <6 h | 0.60 |
 | 6 ~ 9 h（含 9） | **0.85**（最佳恢复） |
 | > 9 ~ 10 h | 0.70 |
 | > 10 h | 0.50 |
 
-**副作用**：大修后**清空当天情绪日志**（`emotion_log = []`），并把 `sleep_hours / recovery_factor / before / after_raw / delta_applied` 写进返回与决策留痕。
-**裁判输入**：人设 + **当前 VAD 绝对值**（唯一给 LLM 看绝对值的场合，因为它是裁判不是对话模型）+ 当天日志 + **前一天日程** + **第二天日程** + 长期状态 + 预计睡眠时长 + 25 原型表；prompt 内嵌评分规则 6 条（近因效应、时长倒 U、日程"释怀/反刍/期待/焦虑"、人设情绪过滤、ΔVAD ∈ [-0.8, 0.8]、reason 必须引用原文）。
+**副作用**：大修后**清空当天情绪日志**（`emotion_log = []`，随后解冻把冻结期队列并入该日志），
+并把 `sleep_hours / recovery_factor / before / after_raw / delta_requested / delta_applied /
+delta_limit / r_yesterday / e_tomorrow / commitment_net / commitment_delta / log_cleared` 写进返回，
+并以 `emotion.sleep_overhaul` 落决策日志（§6.3-7 可观测）。
+**裁判输入**：人设 + **当前 VAD 绝对值**（唯一给 LLM 看绝对值的场合，因为它是裁判不是对话模型）+ 当天日志 + **前一天日程** + **第二天日程** + 长期状态 + 预计睡眠时长 + 25 原型表 + **R_yesterday / E_tomorrow / 约定净兑现三组数值项**（§4.2 输入扩展）；prompt 内嵌评分规则 7 条（近因效应、时长倒 U、日程"释怀/反刍/期待/焦虑"、人设情绪过滤、三输入为参考、ΔVAD ∈ [-limit, limit]、reason 必须引用原文）。
 **已实测的失败模式**：`max_tokens` 给 600 会被三组长 reason 截断（宿主验证日 8 次尝试零落地）→ 现为 **2000**；思考型模型仍可能挤爆预算，裁判任务必须绑真非思考模型（MAINTENANCE_PLAN §八.8）。
 
-### 7.4 睡眠进出事件（M0，只发事件不做冻结）
+### 7.4 睡眠进出事件（M0 发边沿；M5 起与冻结/结算绑定）
 
 | 事件 | 触发 | payload |
 |---|---|---|
-| `schedule.sleep_started` | 进入睡眠条目的**上升沿**（每段睡眠只发一次） | `sleep_hours`（计划时长）、`date` |
-| `schedule.woke_up` | 离开睡眠条目的**下降沿** | `sleep_hours`（实际观测时长）、`date` |
-| `emotion.overhauled` | 大修成功应用后 | `mood`（低分辨率）、`recovery_factor`、`sleep_hours` |
+| `schedule.sleep_started` | 进入睡眠时段的**上升沿**（每段睡眠只发一次；同时进入冻结） | `sleep_hours`（计划时长：**夜间取作息锚点整夜**，如 8.0；小睡/直接调用仍按条目时长）、`date` |
+| `schedule.woke_up` | 离开睡眠条目的**下降沿**（随后应用缓存大修并解冻） | `sleep_hours`（实际观测时长）、`date` |
+| `emotion.overhauled` | 醒后**应用缓存大修**（一次）后 | `mood`（低分辨率描述文本）、**`levels`**（V/A/D 三档词：很低/偏低/中等/偏高/很高）、`recovery_factor`、`sleep_hours`；消费方：planning（`emotion_context` 槽，M5）、qzone、日志 |
 | `emotion.updated` | 每次 VAD 结算后（回复评估 / 外部事件 / 睡眠大修） | `mood`、`trigger` |
 
 ### 7.5 情绪 → 好感度（§6.2 B，情绪调制）
@@ -394,12 +435,12 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 
 | # | 项 | 现状 | 去向 |
 |---|---|---|---|
-| 1 | 睡眠结算（冻结 / 醒后应用） | **未实现**：大修在入睡瞬间应用，深夜事件无处安放 | M5（§4.2 / §七 M5 行） |
-| 2 | 睡眠大修限幅动态化 | 固定 ±0.8 | M5：±(0.4 + 0.4×`schedule.emotion_influence`) |
-| 3 | 日程条目 `emotional_tone` → 数值输入 | 字段未落库、未进入大修公式 | M5（`schema_builder.py` + `validator.py`，裁剪 ±0.5） |
-| 4 | 恢复系数下界 | 当前最低 0.30（<5h 档）；设计另有"恒 ≥0.3"表述 | M5 复核（一档 0.30 已满足 ≥0.3） |
-| 5 | 连续低迷软约束 `emotion.low_mood_day` | **未实现**（无日统计、无事件发布） | M5 |
-| 6 | `planner` 注入与情绪底色融合 | 已完成（M4 删 `state_analyzer` 静态模板，改读 `mood_text()`） | ✅ 已接线 |
+| 1 | 睡眠结算（冻结 / 醒后应用） | ✅ **已实现（2026-10-05）**：进 sleep 条目冻结（事件只入队、暂停衰减/结算）→ 冻结期计算并缓存大修 → 离开 sleep 应用一次并解冻 | — |
+| 2 | 睡眠大修限幅动态化 | ✅ **已实现**：±(0.4 + 0.4×`schedule.emotion_influence`)，默认 0.6→±0.64（旧固定 ±0.8 仅作缺省调用兼容） | — |
+| 3 | 日程条目 `emotional_tone` → 数值输入 | ✅ **已实现**：schema 增可选字段（逐维 ±0.5）+ `clip_emotional_tone` 裁剪入库 `parameters`；睡眠侧求和为 R_yesterday/E_tomorrow（再夹 ±0.5）进入 v2 公式 | — |
+| 4 | 恢复系数下界 | ✅ **已固定**：`MIN_SLEEP_RECOVERY_FACTOR = 0.3`，各时长档全部 ≥0.3（<5h = 0.30） | — |
+| 5 | 连续低迷软约束 `emotion.low_mood_day` | **未实现**（无日统计、无事件发布） | M5 剩余部分 |
+| 6 | `planner` 注入与情绪底色融合 | ✅ 已接线（M4 删 `state_analyzer` 静态模板，改读 `mood_text()`）；**M5** 另把睡醒情绪按 `schedule.emotion_influence` 注入日程生成 prompt 的 `emotion_context` 槽（`build_emotion_context()` + `PlanningServices.wake_emotion()`） | — |
 | 7 | `EVALUATE_PROMPT` 30 字 vs 代码截 60 字 | 规格—实现不一致（§5.3） | 待裁决（可不改） |
 | 8 | 白天事件对**锚点**的回归 | 日常衰减只朝 0，不朝锚点 | 设计如此（锚点只在睡眠大修收敛）；若将来要改，属设计变更 |
 
@@ -422,6 +463,8 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 | `check_interval_minutes` | 10 | [1, 120] | 睡眠检测循环间隔 |
 
 **代码常量（不可配，改需改代码）**：`VAD_WEIGHTS=(1.0,0.8,1.2)`｜`LABEL_DISTANCE_THRESHOLD=0.55`｜`MAX_COMBINED_LABELS=3`｜`EVENT_DELTA_CLAMP=0.5`｜`EXTERNAL_K_MAX=10.0`｜`MOOD_EFFECT_MIN/MAX=0.7/1.3`｜`MOOD_POST_RATE_MAX=1.2`｜`MAX_LOG=200`｜沉默事件 ΔV/ΔA = −0.12/+0.04｜约定兑现/违约 = +0.20/−0.15｜空间评论 ΔV ∈ [0.05, 0.10]｜好感调制 k=0.25、clamp 0.6~1.4。
+**M5 新增常量**：`MIN_SLEEP_RECOVERY_FACTOR=0.3`（恢复系数下界）｜`SLEEP_RESIDUAL_WEIGHT=0.5` / `SLEEP_EXPECTATION_WEIGHT=0.5`（R/E 数值项权重）｜`SLEEP_COMMITMENT_WEIGHT=0.1` / `SLEEP_COMMITMENT_CLAMP=0.3`（约定净兑现项）｜`SCHEDULE_TONE_CLAMP=0.5`（日程 tone 求和后逐维上限）｜`MAX_PENDING=200`（冻结期队列上限）｜`DEFAULT_SLEEP_DELTA_LIMIT=0.8`（裁判缺省限幅兼容值）。
+**M5 新增配置**：`schedule.emotion_influence`（0~1，默认 0.6，0=关闭）——同时驱动两处：①睡眠大修裁判增量动态限幅 ±(0.4+0.4×值)；②日程生成 `emotion_context` 槽的强度（0=不注入；<0.5 精简为 1 条引导约束，≥0.5 完整）。
 
 ---
 

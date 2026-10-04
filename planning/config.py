@@ -283,6 +283,16 @@ class ScheduleSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "时区", "placeholder": "Asia/Shanghai", **_ui_i18n("Timezone")},
     )
 
+    # ── M5 情绪联动（§4.2 / §6.2 F）─────────────────────────
+    emotion_influence: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="情绪对日程的影响强度（0~1，0=关闭）：睡醒情绪描述进日程生成 prompt，"
+                    "同时决定睡眠大修裁判增量的动态限幅 ±(0.4+0.4×本值)",
+        json_schema_extra={"label": "情绪影响强度", "step": 0.05, **_ui_i18n("Emotion influence")},
+    )
+
 
 class InjectSectionConfig(PluginConfigBase):
     """智能注入策略（来源：自主规划插件 [inject] 段；推荐挂载名 ``inject``）。"""
