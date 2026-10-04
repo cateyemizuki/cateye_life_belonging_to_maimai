@@ -212,7 +212,7 @@ class ProactiveBudget:
 
     # ---- 持久化（A2） ----
     def _load(self) -> None:
-        """装载落盘计数：缺失/损坏 → 全新起步并告警；非当日 → 清零并写回。"""
+        """装载落盘计数：缺失/损坏（含 used 字段类型异常）/非当日 → 全新起步、告警并回写。"""
         path = self._state_path
         if path is None:
             return
@@ -238,8 +238,11 @@ class ProactiveBudget:
             return
         used = raw.get("used")
         if not isinstance(used, int) or isinstance(used, bool) or used < 0:
-            logger.warning("打扰预算状态文件 used 字段异常，按 0 起步：%s", path)
-            used = 0
+            # used 是整份状态的计数基准：类型异常即判整份损坏，清空重建并回写，
+            # 不得保留同一文件里已不可信的 channels 明细
+            logger.warning("打扰预算状态文件 used 字段异常，整份状态按损坏处理并重建：%s", path)
+            self._save()
+            return
         self._date = date
         self._used = used
         self._channels = {}
