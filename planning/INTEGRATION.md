@@ -39,7 +39,11 @@ await self._planning.stop()
 - `inject_service._render_unified_prompt` 的「精神状态」行改读 `plugin._emotion.mood_text()`（`_emotion_mood_line()`，与 emotion 注入条目同源，避免两套矛盾的「精神状态」）；情绪未装配/停用/异常 → 省略该行，不再回退静态模板（§八.2 可空降级）；
 - replyer 极简 extra_prompt 不再拼活动状态短语；`_compute_activity_aux` 只余剩余分钟一项（`goal_type` 参数保留以兼容调用签名）；
 - `inject/state_analyzer.py`（`ActivityStateAnalyzer`，295 行）随 M4 删除——§4.2 planner 注入融合后无消费点（CLEANUP_PROPOSALS §三 预告项），`inject/__init__.py` 导出同步清理；
-- `[inject] enable_state_analysis` 字段保留但当前不生效（字段描述已注明，仅旧配置兼容）。
+- `[inject] enable_state_analysis` 死字段已随 A6 删除（全仓无消费点）。宿主配置归一化对未定义键是**宽松**的——
+  `PluginConfigBase` 设 `extra="ignore"`（宿主 venv `maibot_sdk/config.py:51`，Runner 归一化链见
+  `plugin_runtime/runner/runner_main.py:906` / `maibot_sdk/plugin.py:179-181`），旧 `config.toml`
+  残留该键加载不报错、仅被静默丢弃（离线探针 `scratch/_probe_a6_lenient.py` 实证）；宿主部署副本
+  `plugins/cateye_test/config.toml` 的同名键留待 M5 部署时清理（窗口期禁写宿主）。
 
 ## 有意的裁剪 / TODO
 

@@ -299,11 +299,6 @@ class InjectSectionConfig(PluginConfigBase):
         description="启用意图分类（识别用户消息属于问当前 / 问未来 / 闲聊 / 技术问答等，决定注入的详细程度与是否注入）",
         json_schema_extra={"label": "启用意图分类", **_ui_i18n("Intent classification")},
     )
-    enable_state_analysis: bool = Field(
-        default=True,
-        description="（已停用）活动状态分析短语注入已由情绪系统精神状态行（mood_text）融合取代，此开关当前不生效；字段仅作旧配置兼容保留",
-        json_schema_extra={"label": "启用状态分析", **_ui_i18n("State analysis")},
-    )
     enable_inject_optimization: bool = Field(
         default=True,
         description="启用注入优化器（防止重复注入和无效打扰，planner / replyer 共用冷却）",
