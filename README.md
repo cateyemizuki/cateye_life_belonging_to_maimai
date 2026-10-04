@@ -113,6 +113,8 @@ cateye_test/
 > ⚠️ **部署依赖**：若同一 MaiBot 实例装有 `cateye_mai_set_avatar`，必须升级到 **1.0.2+**（或先部署它）——
 > 旧版的 `meta=None` 块条目会让宿主把 `planner.before_request` 链上**所有**插件的修改整体丢弃
 > （含本插件的过期任务块剥离与屏幕旁白注入）。
+>
+> ⚠️ **模型绑定（宿主验证日 P3 教训）**：裁判与日结类任务（情绪睡眠裁判、好感会话采样/关系日结、`[judge]` 段）建议绑定**真非思考型**模型——思考型模型的 reasoning 输出会挤爆小 `max_tokens` 预算，导致正文为空、裁判整体失效（详见 TEST_PROCEDURE.md §八）。
 
 1. 放进 MaiBot 的 `plugins/` 目录重启；WebUI 里配置 `目标 QQ`（占位值时主动私聊/命令鉴权保持关闭）；
 2. `/cateye_test_life status` 总览四模块；`/cateye_test_plan` 看日程（首次会触发生成）；自然聊天问「在干嘛」验证注入与 `mai_lover_current_activity`；

@@ -40,7 +40,7 @@
 
 | 层 | 名称 | 是否需要宿主 | 内容 |
 |---|---|---|---|
-| L0 | 离线单测 | 否 | `scratch/smoke_test_cateye_test.py`（39+ 组件收集、配置模型、能力面核对）+ `scratch/behavior_test_cateye_test.py`（纯算法回归）。**每个里程碑编码前先加用例、编码后必须全绿** |
+| L0 | 离线单测 | 否 | `scratch/smoke_test_cateye_test.py`（40 组件收集、配置模型、能力面核对）+ `scratch/behavior_test_cateye_test.py`（纯算法回归）。**每个里程碑编码前先加用例、编码后必须全绿** |
 | L1 | 装载与热重载 | 是 | 拷贝插件 → 轮询确认重载完成 → 版本/组件数核对 → 宿主日志无加载报错 |
 | L2 | **注入式集成测试** | 是 | 核心手段：经 `snowluma_gateway` 注入合成 MessageDict，走**完整真实入站链**（写库 → chat.receive hooks → maisaka 回复决策）。无需真人发消息，最大程度"模仿实际应用环境"且零宿主改动 |
 | L3 | 真人联动 | 是 | 注入覆盖不到的：真实消息 ID 的引用回复链、表情、图片、用户自己的措辞习惯。由用户在测试群/私聊手打 |
@@ -62,6 +62,8 @@
 ## 四、测试辅助插件 `github.cateye.cateye-harness`（开发目录 `maibot-plugins/cateye_harness/`）
 
 宿主只接受"真实入站消息"驱动，故写一个辅助插件充当测试夹具（test harness）。它同样走热重载安装；自身**不调 LLM、不主动 send.\***（除显式 /h_say），守卫钩子只计数不存内容。
+
+> **实现状态（0.1.1），宿主复验进行中**：下表 11 个组件（9 Command + 1 Hook 环路守卫 + 1 注入网关 `harness_inject_gateway`）均已实现并随宿主验证日投用（`tasks/*.json` → `results/<id>.json` 文件任务通道，L0 四套全绿；见 §八 2026-10-03/10-04 记录）。
 
 | 组件 | 功能 | 备注 |
 |---|---|---|
@@ -119,6 +121,7 @@
 
 | 日期 | 里程碑/场景 | 结果 | 摘要/日志位置 |
 |---|---|---|---|
+| 2026-10-04 | **宿主验证日终态汇总（六场景 + 顺延复验 + qzone 复验 + 7 缺陷）** | 六场景全部 PASS：bus_check（M0）、affection_basic + v1 迁移（M1）、attribution（M3，复验后）、mood_effect（M4，复验后）、silence（M3；≥4h 间隔断言并入 L5）、affection_review（M2，复验后）；qzone 子项=PASS | 累计发现并修复 7 项缺陷：①插件目录不在宿主 sys.path（91251a9/8176d19 引导头）；②schedule_query 缓存窗口 15h→15min（5008cf1）；③P1 EmotionServices 委托缺失（e993e9f 扩展）；④P2 is_notify 被忽略；⑤P3 睡眠裁判 max_tokens 截断；⑥P4 日结失败落 date（③~⑥ 即 P1~P4，29bf06f 修复复验）；⑦QzoneService config 接线错位（bdf29e6）。顺延项与去向：silence ≥4h→L5 判定、qzone 回评→留观或小号配合、工具 is_target→M5 挂账裁决（详见 MAINTENANCE_PLAN.md §2.3/§七）；L5 挂机进行中 |
 | 2026-10-04 | qzone 子项复验（status/post/文案情绪行） | PASS | 接线修复 bdf29e6 生效：status 命令端到端可用（修复前同命令 100% AttributeError）；真实发帖 `bus:qzone.posted {tid, summary, source:qzone}`（载荷符附录 A）+ `qzone_state.json posted_today=1`（额度 1/2）；M4 mood_line 融合代码级取证（qzone/service.py:376-380/:442-445）；日程驱动路径 prompt 断言随 L5；cookie/动作通道未连通=环境状态（如实回报，非插件缺陷） |
 | 2026-10-04 | 宿主验证日缺陷 #7（QzoneService config 接线错位） | 已修复 bdf29e6 | qzone 首次启用点亮死路径：8 处 `self._config.qzone` 落空（plugin.py:103 第二实参误传插件对象）；修复=实参改 self.config + service 增 _qzone_cfg() 活取值器（保热重载）+ keyword-only plugin 形参（_bus/emotion 路径）+ qzone/config.py 补 3 字段；宿主实测 status 收到 bot 回复 |
 | 2026-10-04 | 顺延复验（mood_effect / attribution / affection_review） | 三项转 PASS | emotion init 实证（bot 05:16 回执「✅ 情绪系统初始化完成」+参数摘要）；planner 快照情绪行维度随真实 VAD 更新；decision_logs emotion.external_event K=1.4（tier3 加成 0.4，source=replyer，δV+0.14 限幅内）；sleep_started→overhauled→daily_review 全链（tone+impressions×2 落盘，P4 成功才落 date）；四套回归全绿；整合验收 9/10 |

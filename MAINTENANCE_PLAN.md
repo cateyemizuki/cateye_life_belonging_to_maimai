@@ -14,7 +14,7 @@
 1. **接手时**：先读 §一（要做成什么样）和 §二（现在是什么样），再读本次任务对应的里程碑（§七）。
 2. **实现某里程碑时**：严格按该里程碑指向的 §三~§六 设计节落码；改动文件清单和验收标准以 §七 为准。
 3. **完成一期后**：
-   - 跑 `scratch/smoke_test_cateye_test.py`（39 组件 + 配置模型 + 能力核对）与
+   - 跑 `scratch/smoke_test_cateye_test.py`（40 组件 + 配置模型 + 能力核对）与
      `scratch/behavior_test_cateye_test.py`（核心算法回归），**新增算法必须配新用例**；随后按
      [TEST_PROCEDURE.md](TEST_PROCEDURE.md) 的 SOP 做宿主级验证（L1 热重载 + L2 注入场景）；
    - 在 §七 路线图表格中勾选状态；
@@ -47,7 +47,7 @@
 
 ---
 
-## 二、现状盘点（截至 2026-10-03）
+## 二、现状盘点（截至 2026-10-03；2026-10-04 终态刷新见 §2.3）
 
 ### 2.1 模块与关键挂点索引
 
@@ -75,6 +75,24 @@
 4. **qzone 互动无下游**：评论/点赞不进入情绪与好感记账（qzone 只单向展示 affection 状态，qzone/components.py:129-138）。
 5. **模块互访靠直接引用**，新增联动会持续加深耦合、难以观测因果链。
 6. 情绪评估事件源单一：只有"bot 自己回复后"的评估（evaluate_reply），看不到用户说了什么；沉默等"零消息事件"没有入口。
+
+### 2.3 终态刷新（2026-10-04：版本、组件面与宿主验证结论）
+
+> 本节为 2026-10-04 终局一致性刷新（一次性终态）；§2.1/§2.2 的 10-03 快照原样保留。
+
+- **版本与组件面**：插件版本 **v0.4.0**（M0~M4 全部落地，`_manifest.json version=0.4.0`）。`cateye_test` 组件 **40**（10 HookHandler + 14 Tool + 12 Command + 4 API，smoke test 断言 40）；测试辅助插件 `cateye_harness` **11**（9 Command + 1 Hook 环路守卫 + 1 注入网关）。
+- **宿主验证日（10-03/10-04）六场景 L2 全部执行**：bus_check=PASS（M0）；affection_basic + v1 迁移=PASS（M1）；attribution=PASS（M3，复验后）；mood_effect=PASS（M4，复验后）；silence=PASS（M3；≥4h 间隔断言并入明日 L5）；affection_review=PASS（M2，复验后）。另 **qzone 子项=PASS**（status/post/文案情绪行；接线修复 `bdf29e6` 后实测，双通道完整态见顺延项）。
+- **宿主验证日累计发现并修复 7 项缺陷（一句话 + commit）**：
+  1. 插件目录不在宿主 sys.path（插件顶层导入被宿主 `src/` 抢占或找不到）→ 两插件 `plugin.py` 顶部 sys.path 引导头（`91251a9`/`8176d19`）；
+  2. `schedule_query` 缓存窗口 15h 过长 → 15min（`5008cf1`）；
+  3. P1 EmotionServices 委托缺失（情绪 Hook AttributeError ×44）→ 扩展委托（`e993e9f`；P1~P4 全部修复见 `29bf06f`）；
+  4. P2 `is_notify` 注入被整体忽略 → 修复（`29bf06f`）；
+  5. P3 睡眠裁判 `max_tokens` 截断 → 提升预算（`29bf06f`）；思考型模型仍会挤爆预算致空正文，裁判任务必须绑真非思考模型（§八.8）；
+  6. P4 日结失败也落 date → 改为成功才落 `reviewed_date`（`29bf06f`）；
+  7. QzoneService config 接线错位（8 处 `self._config.qzone` 落空）→ 实参修正 + `_qzone_cfg()` 活取值器（`bdf29e6`）。
+- **仍顺延项与去向**：silence ≥4h 间隔断言 → 明日 L5 判定；qzone 自动回评/评论提醒链路 → 留观或小号配合；工具 `is_target` 子项 → deferred 池发现性裁决（M5 挂账）；qzone 双通道完整态（cookie/动作通道连通）→ 环境就绪后复验。
+- **emotion 已初始化**：bot 回执 + `params.initialized=true`，锚点 V=0.25/A=−0.35/D=−0.15。
+- **一致性门标记**：交接确定性门对 MAINTENANCE_PLAN 的核对标记词「迷迭香」（机器核对用文档指纹，无业务含义）。
 
 ---
 
@@ -396,11 +414,11 @@ flowchart TD
 | 期 | 内容 | 主要落点（新增文件加粗） | 依赖 | 验收标准 | 状态 |
 |---|---|---|---|---|---|
 | R0 | **结构重置**（"重置"的真实语义：精简臃肿，见 §八.6） | 按 [CLEANUP_PROPOSALS.md](CLEANUP_PROPOSALS.md) **无争议项**执行：能量曲线双实现合并、时间工具双模块合并（含 timezone_manager 并入）、affection 死常量（随 M1/M2）；**不改状态文件格式、不改组件名；屏幕感知 / planning 早间问好 / UPLOAD_AGENT.md / 字体资源已裁决保留，不得再提议移除**（裁决记录见 CLEANUP §二） | 无（可与 M0 并行） | smoke/behavior 全绿（已裁决例外：能量输出通道对齐上游，详见 CLEANUP 执行记录）；README 组件数、USAGE、_manifest.json 能力面同步；每项在 CLEANUP 文档勾选 | ✅ 2026-10-03 |
-| M0 | 事件总线 + 全渠道打扰预算 | **core/event_bus.py**；plugin.py 装配 `self._bus`；四服务束 start/stop 挂订阅；proactive_service.py 活动切换处、emotion/service.py 睡眠循环处、qzone/service.py `_tick`/回评处发布首批事件；patrol/planning/qzone 触发点发布 `proactive.used` 并查询预算 | 无 | 跑 1 天：decision_logs 出现完整事件流；同渠道触发不再超过全局上限；smoke test 组件数不变 | ✅ 2026-10-03（代码+离线验证+总审计；「跑 1 天事件流」为宿主级 → 待用户确认清单） |
-| M1 | 好感度 v2 核心：状态层 + 规则事件 + 日衰减 + 迟滞 + v1 迁移 | **重写 companion/affection.py**（保留类名与预算方法签名）；**companion/affection_events.py**（规则表+频控）；patrol.py:223 日切钩日衰减；components.py:281-284 目标私聊观察 chat Hook 发 `relation.message_received`、刷 `last_user_msg_time` 并计 `user_initiated`（触发点即「对方先开口」，判定在状态层 affection_events.note_user_message；不在 patrol 重复补发，避免二次计分）；Tool/命令改读新档；relation.py 扩 5 档标签表 | M0 | behavior test 新增：迁移用例（v1 0/1/2 → 25/55/80）、衰减回归、日累计限幅、迟滞（升档 +3/24h）、刷分无效（100 条消息日上限 +1.0）；Tool 不再能跳出档位区间 | ✅ 2026-10-03 |
-| M2 | 好感度 LLM 裁判：会话采样 + 关系日结（大周期） | **companion/affection_referee.py**；日结订阅 `schedule.sleep_started`；impressions 注入（components.py:457-495）；`[affection]` 配置段扩展 | M1 | 日结 JSON 校验+裁剪生效；impressions 滚动 10 条/7 天；成本：采样裁判 ≤2 次/日、日结 1 次/日（LLM 日志可查）；LLM 挂掉时系统纯规则退化运行 | ✅ 2026-10-03（离线三路径验证；真实 LLM 裁判质量与成本属宿主级 → 待用户确认清单） |
-| M3 | 情绪事件源扩展 + target 识别与加算倍率 + 沉默事件 + 情绪调制好感（v1.1 修订） | **emotion/bridge.py**；emotion/service.py 增 `record_external_event`（入口统一乘 `global_event_multiplier`）与评估上下文增强（`get_by_time_in_chat(filter_mai=True)`）；**新 Tool `cateye_test_emotion_report(event, is_target)`**（非法值静默忽视，触发条件写进 detailed_description）；patrol.py:348 发布 `relation.silence_detected`（频控）；§6.2 A/B 两通道生效 | M0、M1（加成查档位） | 场景 1 数值推演在 decision_logs 复现（±20%）；behavior test：加算倍率（target +0.1~+0.5 / 非 target ×non_target / 全局倍率三层叠加与裁剪）、is_target 容错（缺失/类型错→按非 target）、沉默事件频控、情绪调制乘数（含 sign 逻辑） | ✅ 2026-10-03（离线验证+审计；宿主级 attribution/silence 场景 → 待用户确认清单） |
-| M4 | 情绪→行为输出：patrol 乘数 / qzone 门控与文案 / planner 注入融合 | emotion/service.py 增 `mood_effect()`；patrol.py 概率段消费；qzone/service.py:324-340+380-392+545-561 消费；inject_service.py:617-628 替换静态 state_hint | M3 | 低落日（构造状态）观察：主动开口×0.8、说说跳过（emotion_filter）、想念阈值×0.8；注入文本出现情绪行且不与 emotion 条目矛盾 | ✅ 2026-10-03（离线验证+审计；宿主级 mood_effect 场景 → 待用户确认清单） |
+| M0 | 事件总线 + 全渠道打扰预算 | **core/event_bus.py**；plugin.py 装配 `self._bus`；四服务束 start/stop 挂订阅；proactive_service.py 活动切换处、emotion/service.py 睡眠循环处、qzone/service.py `_tick`/回评处发布首批事件；patrol/planning/qzone 触发点发布 `proactive.used` 并查询预算 | 无 | 跑 1 天：decision_logs 出现完整事件流；同渠道触发不再超过全局上限；smoke test 组件数不变 | ✅ 2026-10-03（代码+离线验证+总审计；「跑 1 天事件流」为宿主级 → 待用户确认清单）；宿主 L2 已验：bus_check=PASS（10-04） |
+| M1 | 好感度 v2 核心：状态层 + 规则事件 + 日衰减 + 迟滞 + v1 迁移 | **重写 companion/affection.py**（保留类名与预算方法签名）；**companion/affection_events.py**（规则表+频控）；patrol.py:223 日切钩日衰减；components.py:281-284 目标私聊观察 chat Hook 发 `relation.message_received`、刷 `last_user_msg_time` 并计 `user_initiated`（触发点即「对方先开口」，判定在状态层 affection_events.note_user_message；不在 patrol 重复补发，避免二次计分）；Tool/命令改读新档；relation.py 扩 5 档标签表 | M0 | behavior test 新增：迁移用例（v1 0/1/2 → 25/55/80）、衰减回归、日累计限幅、迟滞（升档 +3/24h）、刷分无效（100 条消息日上限 +1.0）；Tool 不再能跳出档位区间 | ✅ 2026-10-03；宿主 L2 已验：affection_basic + v1 迁移=PASS（10-04） |
+| M2 | 好感度 LLM 裁判：会话采样 + 关系日结（大周期） | **companion/affection_referee.py**；日结订阅 `schedule.sleep_started`；impressions 注入（components.py:457-495）；`[affection]` 配置段扩展 | M1 | 日结 JSON 校验+裁剪生效；impressions 滚动 10 条/7 天；成本：采样裁判 ≤2 次/日、日结 1 次/日（LLM 日志可查）；LLM 挂掉时系统纯规则退化运行 | ✅ 2026-10-03（离线三路径验证；真实 LLM 裁判质量与成本属宿主级 → 待用户确认清单）；宿主 L2 已验：affection_review=PASS（复验后，10-04） |
+| M3 | 情绪事件源扩展 + target 识别与加算倍率 + 沉默事件 + 情绪调制好感（v1.1 修订） | **emotion/bridge.py**；emotion/service.py 增 `record_external_event`（入口统一乘 `global_event_multiplier`）与评估上下文增强（`get_by_time_in_chat(filter_mai=True)`）；**新 Tool `cateye_test_emotion_report(event, is_target)`**（非法值静默忽视，触发条件写进 detailed_description）；patrol.py:348 发布 `relation.silence_detected`（频控）；§6.2 A/B 两通道生效 | M0、M1（加成查档位） | 场景 1 数值推演在 decision_logs 复现（±20%）；behavior test：加算倍率（target +0.1~+0.5 / 非 target ×non_target / 全局倍率三层叠加与裁剪）、is_target 容错（缺失/类型错→按非 target）、沉默事件频控、情绪调制乘数（含 sign 逻辑） | ✅ 2026-10-03（离线验证+审计；宿主级 attribution/silence 场景 → 待用户确认清单）；宿主 L2 已验：attribution=PASS（复验后）、silence=PASS（10-04；顺延：≥4h 间隔断言并入 L5）；工具 is_target 子项 → 挂账 M5 裁决（deferred 池发现性） |
+| M4 | 情绪→行为输出：patrol 乘数 / qzone 门控与文案 / planner 注入融合 | emotion/service.py 增 `mood_effect()`；patrol.py 概率段消费；qzone/service.py:324-340+380-392+545-561 消费；inject_service.py:617-628 替换静态 state_hint | M3 | 低落日（构造状态）观察：主动开口×0.8、说说跳过（emotion_filter）、想念阈值×0.8；注入文本出现情绪行且不与 emotion 条目矛盾 | ✅ 2026-10-03（离线验证+审计；宿主级 mood_effect 场景 → 待用户确认清单）；宿主 L2 已验：mood_effect=PASS（复验后）、qzone 子项=PASS（status/post/文案情绪行，10-04）；顺延：qzone 自动回评/评论提醒链路 → 留观或小号配合；qzone 双通道完整态（cookie/动作通道连通）→ 环境就绪后复验 |
 | M5 | 睡眠结算改造（冻结/醒后应用）+ 睡眠大修 v2（emotional_tone/动态限幅/约定输入）+ 连续低迷软约束 + emotion_context 槽 | emotion/service.py+state_machine.py；planning/generator/schema_builder.py+validator.py+prompt_builder.py；schedule_generator.py 装载 emotion_context；`schedule.emotion_influence` 配置 | M0、M3 | 跨夜单测：冻结期事件不结算、醒后一次性应用；emotional_tone 越界裁剪 ±0.5；恢复系数恒 ≥0.3；连续低迷触发强制 rest 条目 | ☐ |
 | M6 | 可选增强包（v1.1 修订：原"多用户好感"裁撤 → §九.1） | 周结大事记（companion 关系周结，默认关）；emoji 情绪联动（`emoji.get_by_description`，manifest 增能力声明，默认关）；statistics 成本看板（⚠️ 扩能力面，暂不做） | M2、M3 | 每个子项独立开关默认全关；启用项有 behavior 用例 | ☐ |
 | M7 | **聚合状态指令**：一条命令总览四模块并渲染为图片（2026-10-03 用户新增） | 新 Command `cateye_test_status_all`（/cateye_test_dashboard）：聚合 planning（今日日程要点/当前活动/约定）、companion（好感 score/baseline/档位/最近印象 tone、今日互动计数、巡检状态）、emotion（VAD 低分辨率+标签、当日事件数、锚点/偏移）、qzone（双通道状态、发帖额度、评论基线）→ 复用 `planning/schedule_image.py` 的 **PIL + 内置 NotoSansSC 字体**渲染一张状态图（`send.image`）；渲染失败降级纯文本/合并转发；鉴权沿用 admin 判定 | M2、M3（数据就绪；某模块关闭时对应区块显示"未启用"） | 图片四区块数值与各模块 status/diag 文本一致；离线字体渲染可用；状态聚合函数入 behavior test；README/USAGE 登记 | ☐ |
@@ -413,7 +431,7 @@ flowchart TD
 
 1. **文档同步义务**：改行为必改文档。README.md（功能清单与组件数）、USAGE.md（命令/工具）、SYNERGY.md（联动图，M0 后把"规划文档"改为"现状文档"）、模块 INTEGRATION.md、本计划书（勾选里程碑 + 修订设计节）。文档漂移视为缺陷。
 2. **兼容契约**：对外方法签名新增参数必须带默认值（既有约定，见 README "planning 兼容契约"行）；JSON 状态文件升级必须向后兼容读取 + 一次性迁移；新增配置必须带默认值且关闭时回退旧行为；跨模块调用一律可空降级（`getattr(plugin, "_x", None)` 判空），单模块停用不影响其余模块启动。
-3. **测试纪律**：纯算法（状态机、限幅、迟滞、乘数、迁移）全部落 `scratch/behavior_test_cateye_test.py` 用例（stub SDK，可离线跑）；涉及宿主装配的改动跑 smoke test 确认 39+ 组件与能力面不回退；涉及 LLM prompt 的改动把实际请求记入 LLM 日志人工抽查一次。**宿主级验证（热重载、注入式集成、长周期、安全红线）一律按 [TEST_PROCEDURE.md](TEST_PROCEDURE.md) 执行**——它是自测试唯一规程（含测试辅助插件 cateye_harness 设计与非破坏性宿主编辑规则；测试目标流、token 保护与环路熔断为其最高优先级红线）。
+3. **测试纪律**：纯算法（状态机、限幅、迟滞、乘数、迁移）全部落 `scratch/behavior_test_cateye_test.py` 用例（stub SDK，可离线跑）；涉及宿主装配的改动跑 smoke test 确认 40 组件与能力面不回退；涉及 LLM prompt 的改动把实际请求记入 LLM 日志人工抽查一次。**宿主级验证（热重载、注入式集成、长周期、安全红线）一律按 [TEST_PROCEDURE.md](TEST_PROCEDURE.md) 执行**——它是自测试唯一规程（含测试辅助插件 cateye_harness 设计与非破坏性宿主编辑规则；测试目标流、token 保护与环路熔断为其最高优先级红线）。
 4. **LLM 调用规范**：一切裁判/评估类调用走 `LLMService` 并带 `event=` 标识；判别类（Y/N、分类）用 `judge()` + `[judge]` 段；任何新 LLM 调用必须在 §七 成本预算表登记。
 5. **日志规范**：决策日志 `trigger_type`/`action` 命名沿用 `bus:<event>` 与各模块现有前缀；联动增量记录"裁剪前/后 + multiplier"，保证 §6.3-7 可审计。
 6. **"重置"操作规程 = 代码结构与功能重置**（用户 2026-10-03 明确：重置指对臃肿的代码结构做减法重构，**不是清数据**）：
