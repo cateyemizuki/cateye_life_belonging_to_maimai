@@ -10,7 +10,7 @@
 >
 > 许可提示：planning/ 为 AGPL 插件的机制复刻（重写实现）；若后续大量照搬其源码，发布时整体应按 AGPL-3.0。
 >
-> 📖 **命令与工具的详细功能介绍、参数与权限说明见 [USAGE.md](USAGE.md)**；**模块间联动规划与流程图见 [SYNERGY.md](SYNERGY.md)**（昼夜节律闭环：日程⇄情绪⇄关系⇄空间）；**长期演进/维护总纲见 [MAINTENANCE_PLAN.md](MAINTENANCE_PLAN.md)**（联动事件总线、好感度 v2 重设计、模块相互影响矩阵、v1.3.0 可行性核对与 R0+M0~M7 分期路线图，其路线图取代 SYNERGY §5）；**结构与功能精简清单（"重置"）见 [CLEANUP_PROPOSALS.md](CLEANUP_PROPOSALS.md)**；**宿主自测试规程见 [TEST_PROCEDURE.md](TEST_PROCEDURE.md)**（agent 向：注入式集成测试、测试辅助插件、安全红线）。
+> 📖 **命令与工具的详细功能介绍、参数与权限说明见 [USAGE.md](USAGE.md)**；**模块间联动规划与流程图见 [SYNERGY.md](SYNERGY.md)**（昼夜节律闭环：日程⇄情绪⇄关系⇄空间）；**长期演进/维护总纲见 [MAINTENANCE_PLAN_10.25.md](MAINTENANCE_PLAN_10.25.md)**（联动事件总线、好感度 v2 重设计、模块相互影响矩阵、v1.3.0 可行性核对、R0+M0~M7 分期路线图、完工评估与剩余工作；其路线图取代 SYNERGY §5；**`MAINTENANCE_PLAN.md` 是 v1.2 旧版快照，已废弃、仅供追溯，勿据其执行**）；**结构与功能精简清单（"重置"）见 [CLEANUP_PROPOSALS.md](CLEANUP_PROPOSALS.md)**；**宿主自测试规程见 [TEST_PROCEDURE.md](TEST_PROCEDURE.md)**（agent 向：注入式集成测试、测试辅助插件、安全红线）；**情绪系统的全部映射关系（25 原型 / 标签映射 / 事件增量 / 倍率限幅 / 睡眠大修 / 情绪→行为）见 [EMOTION_MAPPING.md](EMOTION_MAPPING.md)**（现状导出，代码为唯一真源）。
 
 ## 目录结构
 

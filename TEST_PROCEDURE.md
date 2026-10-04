@@ -1,7 +1,10 @@
 # cateye_test 宿主自测试流程（TEST_PROCEDURE.md）
 
-> 版本：v1.0（2026-10-03）｜**读者：执行测试的 agent**。配套：[MAINTENANCE_PLAN.md](MAINTENANCE_PLAN.md)（里程碑验收标准）、[CLEANUP_PROPOSALS.md](CLEANUP_PROPOSALS.md)。
+> 版本：v1.1（2026-10-05 补路径约定与 §一.4 平台坑引用）｜**读者：执行测试的 agent**。配套：[MAINTENANCE_PLAN_10.25.md](MAINTENANCE_PLAN_10.25.md)（里程碑验收标准 + 剩余工作 §九）、[CLEANUP_PROPOSALS.md](CLEANUP_PROPOSALS.md)。
 > 性质：开发/测试文档，**发布时排除**（同 scratch/ 测试脚本，开发文档陷阱 #23）。
+> ⚠️ **离线脚本路径（2026-10-05 实测订正）**：`smoke_test_cateye_test.py` / `behavior_test_cateye_test.py` / `sdk_stub.py`
+> 都在 **`D:\deepseek-harness_workspace\maibot-plugins\scratch\`（`cateye_test` 的同级目录）**；
+> `cateye_test\scratch\` **不存在**（L5 分析员曾按该路径查找脚本白耗一轮）。执行时以该目录为 cwd。
 > 目标：在不破坏宿主、不烧 token、不依赖真人守着电脑的前提下，自动化验证插件功能与 bug 修复。
 
 ---
@@ -40,7 +43,7 @@
 
 | 层 | 名称 | 是否需要宿主 | 内容 |
 |---|---|---|---|
-| L0 | 离线单测 | 否 | `scratch/smoke_test_cateye_test.py`（40 组件收集、配置模型、能力面核对）+ `scratch/behavior_test_cateye_test.py`（纯算法回归）。**每个里程碑编码前先加用例、编码后必须全绿** |
+| L0 | 离线单测 | 否 | `maibot-plugins/scratch/smoke_test_cateye_test.py`（40 组件收集、配置模型、能力面核对）+ `maibot-plugins/scratch/behavior_test_cateye_test.py`（纯算法回归）。**每个里程碑编码前先加用例、编码后必须全绿**（路径见本文件头部的实测订正） |
 | L1 | 装载与热重载 | 是 | 拷贝插件 → 轮询确认重载完成 → 版本/组件数核对 → 宿主日志无加载报错 |
 | L2 | **注入式集成测试** | 是 | 核心手段：经 `snowluma_gateway` 注入合成 MessageDict，走**完整真实入站链**（写库 → chat.receive hooks → maisaka 回复决策）。无需真人发消息，最大程度"模仿实际应用环境"且零宿主改动 |
 | L3 | 真人联动 | 是 | 注入覆盖不到的：真实消息 ID 的引用回复链、表情、图片、用户自己的措辞习惯。由用户在测试群/私聊手打 |
@@ -98,7 +101,7 @@
 
 ## 六、里程碑 ↔ 测试场景映射（随路线图更新）
 
-| 里程碑 | 场景（/h_seq 名） | 关键断言（对应 MAINTENANCE_PLAN 验收列） |
+| 里程碑 | 场景（/h_seq 名） | 关键断言（对应 MAINTENANCE_PLAN_10.25 验收列；A2 为独立先行项，其验收见该文件 §七 A2 行） |
 |---|---|---|
 | R0 清理 | — | smoke+behavior 全绿、组件数与 CLEANUP 勾选一致 |
 | M0 事件总线 | `bus_check` | 注入一问一答 → decision_logs 出现 `bus:relation.*`/`bus:schedule.*`；主动触发写入 `proactive.used`；同日全渠道触发不超全局上限 |
@@ -121,6 +124,8 @@
 
 | 日期 | 里程碑/场景 | 结果 | 摘要/日志位置 |
 |---|---|---|---|
+| 2026-10-05 | **文档一致性修订（无代码改动）** | 完成 | ①L5 挂账落档：A2（预算计数持久化）自 M5 拆出为**独立先行项**，`proactive_budget` 复验的前置改为 A2；②计划书换版：现行版 = `MAINTENANCE_PLAN_10.25.md`（旧 `MAINTENANCE_PLAN.md` 加废弃横幅、只读留档），本文件与 CLEANUP/SYNERGY/README 的链接与 §指针同步改指新版；③平台坑补两条实测教训（`file_watcher` 热重载清零内存态计数、自建注入网关需过 `adapter_policy` 放行）见计划书 §八.8；④L0 脚本路径实测订正见本文件头部；⑤新增工作报告规范（`work_report/`，计划书 §八.12）。证据：`cateye_test/work_report/20261005_*.md` |
+| 2026-10-05 | **L5 判定（九项检查；分析员→独立审计→仲裁三权分立，子代理模型=deepseek-v4.1-flash）** | 7 pass、1 warn（proactive_budget）、1 fail（error_pileup，按检查项字面口径）→ **总体 FAIL 如实保留，M0 闭环待整改后窗口复验后裁决** | 判定窗口 10-03 18:15:07→10-05 01:24（累计 31h09m ≥1 天；宿主 5 代启动与上文违例通报史逐一对账，无未记录崩溃；日志并集最大空洞 63s、07:35:17 后零重启）。**PASS 项**：①silence≥4h 断言（3 条事件：相邻间隔 15.43h/4.000h、≤2/日、自然窗口 2 条真实触发 hours=4.15/8.15 可回溯 last_user_msg_time=10-04 07:36:29）→ **M3 顺延项就此闭环**；②decision_logs 事件流完整性（722 行、非法 JSON=0、bus 六类全踪迹、>6h 空洞=0）；③无重复主动行为（早安/晚安/活动切换 5 个 intent 各 1 次、qzone 2 次=上限）；④LLM 监控（31 条/30.7h、峰值 14/h、规则与沉默事件零 LLM）；⑤状态文件健全（25/25 断言）；⑥smoke 40 组件复跑通过（脚本实际位于 maibot-plugins/scratch/；dev↔部署 72 个共同 .py MD5 一致，部署侧多 1 个旧名 config.py 残留→M5 部署时清理）。**warn**：10-04 全渠道 used=6>上限 5，根因=07:35:16 热重载清零内存态预算计数器（core/event_bus.py:191-197；+1 有界、单进程生命周期内 18 次拦截严格执行；patrol 渠道自身预算 2≤2 达标）→ **真实缺陷「预算计数不跨热重载持久化」挂账随 M5 修复**。**fail**：error_pileup 破阈全部落于 10-03 18:15~10-04 06:54 验证日混乱期——cateye 插件错误 74 条=已修复 P1（29bf06f）与 #7（bdf29e6）的定位期记录、修复后归零；SnowLuma 管道错误（WinError 232）去重 1573 条=重启搅动期适配器侧产物（适配器归用户）；整改后窗口（≥10-04 07:35:17）全类别零破阈。**裁定路径**：字面 FAIL 不掩盖 → 复验窗口起点取 A2（预算计数持久化，MAINTENANCE_PLAN_10.25.md §七 A2 行/§9.1 前置修订）部署后的干净启动，挂机满 24h 后对 error_pileup+proactive_budget 两项独立复验（仍实施/验证分立，产物追加 l5_report_recheck.md，不改写首轮结论）→ 通过则 M0 闭环+tag。证据：D:\deepseek-harness_workspace\zcode\l5_work\l5_report.md（52KB，逐项含仲裁说明）及全部中间产物/复现脚本 |
 | 2026-10-04 | **宿主验证日终态汇总（六场景 + 顺延复验 + qzone 复验 + 7 缺陷）** | 六场景全部 PASS：bus_check（M0）、affection_basic + v1 迁移（M1）、attribution（M3，复验后）、mood_effect（M4，复验后）、silence（M3；≥4h 间隔断言并入 L5）、affection_review（M2，复验后）；qzone 子项=PASS | 累计发现并修复 7 项缺陷：①插件目录不在宿主 sys.path（91251a9/8176d19 引导头）；②schedule_query 缓存窗口 15h→15min（5008cf1）；③P1 EmotionServices 委托缺失（e993e9f 扩展）；④P2 is_notify 被忽略；⑤P3 睡眠裁判 max_tokens 截断；⑥P4 日结失败落 date（③~⑥ 即 P1~P4，29bf06f 修复复验）；⑦QzoneService config 接线错位（bdf29e6）。顺延项与去向：silence ≥4h→L5 判定、qzone 回评→留观或小号配合、工具 is_target→M5 挂账裁决（详见 MAINTENANCE_PLAN.md §2.3/§七）；L5 挂机进行中 |
 | 2026-10-04 | qzone 子项复验（status/post/文案情绪行） | PASS | 接线修复 bdf29e6 生效：status 命令端到端可用（修复前同命令 100% AttributeError）；真实发帖 `bus:qzone.posted {tid, summary, source:qzone}`（载荷符附录 A）+ `qzone_state.json posted_today=1`（额度 1/2）；M4 mood_line 融合代码级取证（qzone/service.py:376-380/:442-445）；日程驱动路径 prompt 断言随 L5；cookie/动作通道未连通=环境状态（如实回报，非插件缺陷） |
 | 2026-10-04 | 宿主验证日缺陷 #7（QzoneService config 接线错位） | 已修复 bdf29e6 | qzone 首次启用点亮死路径：8 处 `self._config.qzone` 落空（plugin.py:103 第二实参误传插件对象）；修复=实参改 self.config + service 增 _qzone_cfg() 活取值器（保热重载）+ keyword-only plugin 形参（_bus/emotion 路径）+ qzone/config.py 补 3 字段；宿主实测 status 收到 bot 回复 |
