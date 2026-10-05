@@ -37,7 +37,7 @@
 - 组件名前缀 `cateye_test_`：改名会丢失用户已配置的组件启停状态；
 - `planning/assets/fonts` + `schedule_image.py`：渲染基础设施（见 §二）。
 
-## 四、执行纪律（重申 MAINTENANCE_PLAN_10.25 §八.6）
+## 四、执行纪律（重申 MAINTENANCE_PLAN_10.05 §八.6）
 
 1. 每项独立提交、独立可回滚；先摘引用再删/合，完成后必须跑 `scratch/smoke_test_cateye_test.py` + `scratch/behavior_test_cateye_test.py`；
 2. **不改状态文件格式、不改组件名、不改 config 字段名**；
