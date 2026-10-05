@@ -754,3 +754,26 @@ class QzoneService:
             f"QQ空间模块：{'启用' if cfg.enabled else '停用'}｜今日说说 {self.posts_today()}/{cfg.daily_max_posts}"
             f"｜评论监听 {'开' if cfg.reply_comments_enabled else '关'}｜动作通道：{channels}{cookie}"
         )
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        """聚合总览用的只读状态快照（M7 /cateye_test_dashboard 消费）。
+
+        只读：不发起任何空间动作、不落盘；数值与 ``status_text()`` 同源
+        （``posts_today`` / 通道缓存 / cookie 文案 / 评论监听开关），
+        ``comment_baseline`` 为基线覆盖的说说 tid 列表（空 = 尚未建立基线）。
+        """
+        cfg = self._qzone_cfg()
+        try:
+            cookie_text = (self._cookie_manager.status_text() if self._cookie_manager
+                           else "cookie 管理：未启用")
+        except Exception:
+            cookie_text = "cookie 管理：读取失败"
+        return {
+            "enabled": bool(getattr(cfg, "enabled", False)),
+            "posts_today": self.posts_today(),
+            "daily_max_posts": int(getattr(cfg, "daily_max_posts", 0) or 0),
+            "reply_comments_enabled": bool(getattr(cfg, "reply_comments_enabled", False)),
+            "channels": sorted(set(self._channel_cache.values())) or [],
+            "cookie_text": str(cookie_text),
+            "comment_baseline": sorted(self._state.get("comment_baseline") or {}),
+        }

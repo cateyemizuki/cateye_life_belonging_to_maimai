@@ -1,6 +1,6 @@
 # 命令与工具手册（USAGE.md）
 
-> 猫眼生活套件（github.cateye.cateye-suite）现有 **14 个 LLM 工具**、**12 个聊天指令**、**4 个跨插件 API**。
+> 猫眼生活套件（github.cateye.cateye-suite）现有 **14 个 LLM 工具**、**13 个聊天指令**、**4 个跨插件 API**。
 > 四个业务子模块各自提供一组：planning（日程规划）/ companion（虚拟恋人）/ emotion（情绪）/ qzone（QQ 空间）。
 > 本手册给出每个条目的描述原文、参数、行为细节与权限要求；架构与安装说明见 README.md。
 
@@ -10,7 +10,8 @@
 - **聊天指令（Command）**：用户文本命中正则即执行，**命中后不再进入 LLM 回复流程**（intercept）。所有正则用负向前瞻 `(?<!\S)` 匹配，兼容「引用回复」场景下命令不在文本开头的情况。
 - **权限模型**（详见 §4）：
   - planning 的 `/cateye_test_plan` 与 qzone 的写操作：`admin.admin_users` 白名单（兼容 `123456` 与 `qq:123456` 两种写法）；**留空 = 默认拒绝**，仅本机控制台（`is_local_operator`）可用；
-  - companion 的全部 `/cateye_test_mai_*`：额外要求触达者 QQ 等于 `target.target_qq`（占位值 123456789 时一律拒绝，避免误发给陌生人）。
+  - companion 的全部 `/cateye_test_mai_*`：额外要求触达者 QQ 等于 `target.target_qq`（占位值 123456789 时一律拒绝，避免误发给陌生人）；
+  - 聚合总览 `/cateye_test_dashboard`（M7）：按 admin 白名单（同 `/cateye_test_plan`），不要求 `target.target_qq`。
 - 工具/指令的执行体都在各子模块的 service 里，组件层只做鉴权与转发；服务实例动态读配置，改 `config.toml` 热重载立即生效。
 - **模块独立总开关**：四个业务模块各有自己的 `enabled`（`schedule.enabled` / `patrol.enabled` / `qzone.enabled` / `emotion.enabled`），关闭后该模块停止后台循环、主动触发与注入，工具与命令返回「模块未启用」提示；互不影响其他模块。新增模块请照此模式实现。
 
@@ -110,7 +111,7 @@
 - **行为**：target 时 `K = 1 + target_bonus_step × (档位+1)`、非 target 时 `K = non_target_multiplier`，再乘 `global_event_multiplier` → 事件文本走小模型有界评估 ΔVAD（±0.5）→ 入账；与其他事件共用评估节流（`evaluate_min_interval_seconds`）与 ±0.5 硬限幅，结果落决策日志（`emotion.external_event`）。
 - **备注**：Tool 默认进 **deferred 工具池**（未设 `core_tool=True`），bot 自发调用不保证——**触发条件已写进 `detailed_description`**（仅群聊里出现重要的人相关/由 TA 引发且影响心情的事件才调用；普通群友闲聊与私聊无需调用，`replyer.after_response` 自动评估始终是主通道），本工具只是群聊场景的补充。
 
-## 二、聊天指令（12 个）
+## 二、聊天指令（13 个）
 
 ### planning — /cateye_test_plan（1 个）
 
@@ -127,9 +128,10 @@
   | `/cateye_test_plan help` | 显示完整帮助（合并转发） |
 - **备注**：日程每天自动生成（默认 00:30），无需手动创建；输出用合并转发防刷屏。
 
-### companion — /cateye_test_mai_*（8 个，全部需要鉴权）
+### companion — /cateye_test_mai_* 与聚合总览（9 个）
 
 > 鉴权规则：触发者 QQ == `target.target_qq`，或本机控制台；目标 QQ 为占位值 123456789 时一律拒绝。无权限时回复「没有权限」并拦截。
+> 例外：`/cateye_test_dashboard`（M7 聚合总览）沿用 **admin** 判定（`admin.admin_users` ∪ 本机控制台；未配置管理员时 QQ 侧默认拒绝），不要求 `target.target_qq`。
 
 | 指令 | 描述 | 行为 |
 |---|---|---|
@@ -141,6 +143,7 @@
 | `/cateye_test_mai_llm_log [天数]` | 查看插件发起的 LLM 调用日志 | JSONL 按天读取，合并转发；未启用时提示配置项 |
 | `/cateye_test_mai_diag [天数]` | 查看主动行为决策日志 | 每轮巡检一条（为什么发言/为什么没发言），合并转发 |
 | `/cateye_test_mai_test` | 发送一条测试消息以验证发送通道 | 目标私聊直发一条测试文本 |
+| `/cateye_test_dashboard` | **M7 聚合总览**：一条命令看四模块（日程规划/伴侣关系/情绪/QQ空间）并渲染状态图（内置 NotoSansSC + PIL，浅色卡片排版） | **管理员 ∪ 本机控制台**（`admin.admin_users`，留空时 QQ 侧默认拒绝并提示「权限不足」，不要求 target_qq）；有图 = 图片 + 文本合并转发；渲染失败/超时（PIL 缺失、字体缺失、10s 超时）静默降级为纯文本直发（不发失败提示）；某模块未启用/未装配 → 该区块显示「（未启用）」|
 
 ### qzone — /cateye_test_life（1 个）
 
@@ -186,6 +189,7 @@
 |---|---|---|
 | `/cateye_test_plan` 全部子命令 | 管理员 ∪ 本机控制台 | `admin.admin_users`（留空 = 仅本机控制台，QQ 侧默认拒绝） |
 | `/cateye_test_mai_*` 全部 | 目标 QQ ∪ 本机控制台 | `target.target_qq`（占位值 123456789 时全拒） |
+| `/cateye_test_dashboard` | 管理员 ∪ 本机控制台 | `admin.admin_users`（留空 = 仅本机控制台，QQ 侧默认拒绝；不要求 `target.target_qq`） |
 | `/cateye_test_life status` / `help` / `qzone moments` / `qzone comments` | 所有人 | —— |
 | `/cateye_test_life diag` / `qzone post` / `qzone reply` / `qzone like` | 管理员 ∪ 本机控制台 | `admin.admin_users` |
 | 全部 LLM 工具 | 模型自主调用（无用户级鉴权；敏感操作如发说说受每日上限/开关约束） | `qzone.daily_max_posts`、`qzone.enabled` 等 |

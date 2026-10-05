@@ -46,13 +46,13 @@ cateye_test/
 └── core/              # 公共基础设施：llm_utils / diag(决策+LLM 日志) / time_utils / storage / inject(注入投影助手)
 ```
 
-## 组件注册面（共 40 个组件）
+## 组件注册面（共 41 个组件）
 
 | 类型 | 组件 |
 |---|---|
 | HookHandler ×10 | planning：`maisaka.planner.before_request`（日程注入，items 强 schema 协议）、`maisaka.replyer.before_request`（extra_prompt 协作式）｜companion：`chat.receive.before_process`（身份缓存）、`chat.receive.after_process`（目标私聊时间）、`maisaka.planner.before_request`（屏幕旁白+好感度后缀）、`maisaka.replyer.before_model_request`（旁白）、`maisaka.replyer.after_response`（补计发言数，OBSERVE）｜emotion：`maisaka.planner.before_request`（情绪底色注入，系统提示词后）、`maisaka.replyer.before_model_request`（情绪底色注入，系统提示词后）、`maisaka.replyer.after_response`（ΔVAD 增量评估，OBSERVE） |
 | Tool ×14 | planning：cateye_test_manage_goal_v4 / cateye_test_get_planning_status_v4 / cateye_test_apply_schedule_v4 / cateye_test_update_schedule_v4（角色裁判）｜companion：cateye_test_mai_lover_current_activity / status / schedule / send_message / affection / config｜qzone：cateye_test_life_post_qzone / cateye_test_life_qzone_moments｜emotion：cateye_test_emotion_mood、cateye_test_emotion_report（群聊 target 上报，M3） |
-| Command ×12 | planning：/cateye_test_plan、/cateye_test_规划（list/regenerate/delete/clear/help，图片+合并转发）｜companion：/cateye_test_mai_status /cateye_test_mai_schedule /cateye_test_mai_affection /cateye_test_mai_help /cateye_test_mai_config /cateye_test_mai_llm_log /cateye_test_mai_diag /cateye_test_mai_test｜qzone：/cateye_test_life（status/qzone[moments/comments/post/reply/like]/diag/help）｜emotion：/cateye_test_emotion_init（人设初始化）、/cateye_test_emotion_config（查看/reset/clear） |
+| Command ×13 | planning：/cateye_test_plan、/cateye_test_规划（list/regenerate/delete/clear/help，图片+合并转发）｜companion：/cateye_test_mai_status /cateye_test_mai_schedule /cateye_test_mai_affection /cateye_test_mai_help /cateye_test_mai_config /cateye_test_mai_llm_log /cateye_test_mai_diag /cateye_test_mai_test /cateye_test_dashboard（M7 聚合总览：四模块状态图 + 纯文本降级，管理员鉴权）｜qzone：/cateye_test_life（status/qzone[moments/comments/post/reply/like]/diag/help）｜emotion：/cateye_test_emotion_init（人设初始化）、/cateye_test_emotion_config（查看/reset/clear） |
 | API ×4 | get_current_activity（planning，兼容原插件返回结构）｜companion_get_current_activity / companion_get_schedule / companion_get_affection_level |
 
 ## 各模块功能清单
@@ -122,7 +122,7 @@ cateye_test/
 2. `/cateye_test_life status` 总览四模块；`/cateye_test_plan` 看日程（首次会触发生成）；自然聊天问「在干嘛」验证注入与 `mai_lover_current_activity`；
 3. 观察决策日志 `data/plugins/github.cateye.cateye-suite/decision_logs/`；`/cateye_test_mai_diag`、`/cateye_test_life diag` 查判定链；
 4. 空间模块：`/cateye_test_life qzone status` 看通道与 cookie；`/cateye_test_life qzone post 测试` 手动发一条；`comments`+`reply` 验证楼中楼；情绪模块：`/cateye_test_emotion_init` 初始化后聊天观察语气变化；
-5. 离线测试：`scratch/smoke_test_cateye_test.py`（stub SDK 收集 40 组件 + 配置模型 + 能力核对）与 `scratch/behavior_test_cateye_test.py`（16 组核心算法回归，含 mai-love 2.6.2/2.6.3 合并回归）。
+5. 离线测试：`scratch/smoke_test_cateye_test.py`（stub SDK 收集 41 组件 + 配置模型 + 能力核对）与 `scratch/behavior_test_cateye_test.py`（16 组核心算法回归，含 mai-love 2.6.2/2.6.3 合并回归）。
 
 ## 骨架占位 / TODO
 

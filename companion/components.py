@@ -18,10 +18,12 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
 - Tools ×6：cateye_test_mai_lover_current_activity / cateye_test_mai_lover_status /
   cateye_test_mai_lover_schedule / cateye_test_mai_lover_send_message /
   cateye_test_mai_lover_affection / cateye_test_mai_lover_config
-- Commands ×8：/cateye_test_mai_status /cateye_test_mai_schedule /cateye_test_mai_affection
+- Commands ×9：/cateye_test_mai_status /cateye_test_mai_schedule /cateye_test_mai_affection
   /cateye_test_mai_help /cateye_test_mai_config /cateye_test_mai_llm_log
   /cateye_test_mai_diag /cateye_test_mai_test（鉴权：target_qq 白名单 + 本机控制台，
-  占位默认值一律拒绝）
+  占位默认值一律拒绝）＋ /cateye_test_dashboard（M7 聚合总览：四模块状态图 + 纯文本降级，
+  鉴权沿用 admin 判定——管理员 ∪ 本机控制台，未配置管理员时 QQ 侧默认拒绝；
+  渲染失败/超时静默降级为纯文本）
 - APIs ×3：companion_get_current_activity / companion_get_schedule /
   companion_get_affection_level（源插件 get_* 与 planning 子模块撞名，故加前缀）
 
@@ -31,10 +33,13 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
+import cateye_dashboard
 from maibot_sdk import API, Command, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
@@ -881,6 +886,7 @@ class CompanionComponentsMixin:
             "/cateye_test_mai_llm_log   — 查看 LLM 调用日志: /cateye_test_mai_llm_log [天数]\n"
             "/cateye_test_mai_diag      — 查看主动行为决策日志（为什么发言/为什么没发言）: /cateye_test_mai_diag [天数]\n"
             "/cateye_test_mai_test      — 发送一条测试消息（验证发送通道）\n"
+            "/cateye_test_dashboard     — 状态总览图（日程/关系/情绪/空间，管理员）\n"
             "/cateye_test_mai_help      — 本帮助"
         )
         try:
@@ -990,7 +996,123 @@ class CompanionComponentsMixin:
             return True, "测试消息发送成功", True
         return False, "发送返回 False", True
 
+    @Command(
+        name="/cateye_test_dashboard",
+        pattern=r"(?<!\S)/cateye_test_dashboard\s*$",
+        description="聚合总览四模块状态（日程/关系/情绪/空间）并渲染状态图，失败自动降级纯文本",
+    )
+    async def mai_cmd_dashboard(self, **kwargs: Any) -> tuple[bool, str, bool]:
+        """M7 聚合状态指令：四模块状态块 → 状态图 + 纯文本。
+
+        发送形态同 planning/command_service.py 的 ``/plan list``：有图 → 合并转发
+        （第一条图片、第二条文字）；转发失败回退 ``send.image`` → ``send.text``；
+        无图（PIL 缺失/绘制异常/超时）直接发纯文本，全程静默降级不发失败提示。
+        """
+        if not self._qz_is_admin(str(kwargs.get("user_id") or ""),
+                                 bool(kwargs.get("is_local_operator", False))):
+            try:
+                await self.ctx.send.text("权限不足：仅管理员可用 /cateye_test_dashboard。",
+                                         str(kwargs.get("stream_id", "") or ""))
+            except Exception:
+                pass
+            return True, "没有权限", True
+
+        stream_id = str(kwargs.get("stream_id", "") or "")
+        blocks = self._mai_dashboard_blocks()
+        text = cateye_dashboard.render_dashboard_text(blocks)
+        image_base64 = await self._mai_draw_dashboard(blocks)
+
+        if not image_base64:
+            try:
+                await self.ctx.send.text(text=text, stream_id=stream_id)
+                return True, "状态总览已发送", True
+            except Exception as e:
+                self.ctx.logger.error(f"mai_cmd_dashboard 发送失败: {e}")
+                return False, f"发送失败: {e}", True
+
+        records: list[dict[str, Any]] = [
+            {"user_id": "0", "nickname": "状态总览",
+             "segments": [{"type": "image", "content": image_base64}]},
+            {"user_id": "0", "nickname": "状态总览",
+             "segments": [{"type": "text", "content": text}]},
+        ]
+        try:
+            await self.ctx.send.forward(records, stream_id)
+            return True, "状态总览已发送", True
+        except Exception as forward_exc:
+            self.ctx.logger.warning(f"状态总览合并转发失败，回退普通发送: {forward_exc}")
+        try:
+            await self.ctx.send.image(image_base64, stream_id)
+        except Exception as img_exc:
+            # 图片只是尽力而为的附加档：它失败也必须继续落到文本档（否则管理员什么都收不到）
+            self.ctx.logger.warning(f"状态总览图片回退发送失败: {img_exc}")
+        try:
+            await self.ctx.send.text(text=text, stream_id=stream_id)
+            return True, "状态总览已发送", True
+        except Exception as e:
+            self.ctx.logger.error(f"mai_cmd_dashboard 回退文本发送失败: {e}")
+            return False, f"发送失败: {e}", True
+
     # ---- 命令辅助 ----
+
+    def _mai_dashboard_blocks(self, now: Optional[datetime] = None) -> dict[str, Any]:
+        """聚合四模块状态块（M7 /cateye_test_dashboard 的数据面）。
+
+        live 判定必须真实走服务束属性链（不是只看束对象是否存在）：属性名与各束实现
+        一致，静态可达性由 behavior 的组件门面审计断言（组件调了不存在的属性会当场红）。
+        任一束缺失 → 该块 enabled=False，展示为「（未启用）」。
+        """
+        planning = getattr(self, "_planning", None)
+        companion = getattr(self, "_companion", None)
+        emotion_svc = getattr(self, "_emotion", None)
+        qzone = getattr(self, "_qzone", None)
+
+        planning_live = planning is not None and planning.goal_manager is not None
+        companion_live = (companion is not None and companion.affection is not None
+                          and companion.patrol is not None)
+        emotion_live = emotion_svc is not None and emotion_svc.service is not None
+        if emotion_live:
+            # 情绪模块总开关只在宿主提供该判定时生效（离线测试宿主可能没有 emotion Mixin）
+            getter = getattr(self, "_emo_module_enabled", None)
+            if callable(getter):
+                emotion_live = bool(getter())
+        try:
+            qzone_live = qzone is not None and bool(self.config.qzone.enabled)
+        except Exception:
+            qzone_live = False
+
+        return {
+            "planning": cateye_dashboard.planning_block(
+                self._mai_schedule_query(),
+                planning.goal_manager if planning_live else None,
+                enabled=planning_live, now=now),
+            "companion": cateye_dashboard.companion_block(
+                companion, self.config, enabled=companion_live, now=now),
+            "emotion": cateye_dashboard.emotion_block(
+                emotion_svc, self.config, enabled=emotion_live, now=now),
+            "qzone": cateye_dashboard.qzone_block(
+                qzone, self.config, enabled=qzone_live, now=now),
+        }
+
+    async def _mai_draw_dashboard(self, blocks: dict[str, Any]) -> Optional[str]:
+        """绘制状态总览图（返回 base64）；PIL 缺失/绘制异常/超时**静默**返回 None。
+
+        PIL 是同步阻塞操作，统一丢给默认线程池；超时上限 10 秒（四区块排版远低于此）。
+        """
+        data_dir = getattr(self, "_data_dir", None)
+        output_dir = Path(data_dir) / "images" if data_dir is not None else None
+        title = f"猫眼生活套件 状态总览 {datetime.now().strftime('%Y-%m-%d')}"
+        try:
+            _img_path, image_base64 = await asyncio.wait_for(
+                asyncio.to_thread(cateye_dashboard.render_dashboard_image, title, blocks,
+                                  output_dir=output_dir),
+                timeout=10.0,
+            )
+            return image_base64
+        except Exception as exc:
+            # 静默降级：不提示失败，仅记录日志供排查
+            self.ctx.logger.info(f"/cateye_test_dashboard 状态图绘制放弃（静默降级为文本）: {exc}")
+            return None
 
     def _mai_affection_state_line(self) -> str:
         """好感 v2 状态行：score / baseline / 档位（5 档口径）/ 今日 Δ + M2 最近印象与 tone。

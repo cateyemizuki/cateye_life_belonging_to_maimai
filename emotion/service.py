@@ -223,6 +223,25 @@ class EmotionService:
                     lines.append(f"推导理由·{key}：{p.reasons[key]}")
         return "\n".join(lines)
 
+    def status_snapshot(self) -> Dict[str, Any]:
+        """聚合总览用的只读状态快照（M7 /cateye_test_dashboard 消费）。
+
+        只读：不落盘、不改状态机任何字段（含冻结标记）；数值口径与 ``params_summary`` /
+        ``mood_text`` 同源（``labels`` 即 map_emotions 的前 3 个标签名，mood_text 取其中前 2 个）。
+        """
+        eff = self._machine.effective_vad()
+        labels, _nearest = map_emotions(eff)
+        params = self._machine.params
+        return {
+            "initialized": bool(params.initialized),
+            "mood_text": self.mood_text(),
+            "labels": [str(name) for name, _share in labels[:3]],
+            "event_count": len(self._machine.emotion_log),
+            "anchor": params.anchor.to_dict(),
+            "offset": params.offset.to_dict(),
+            "frozen": bool(getattr(self._machine, "frozen", False)),
+        }
+
     # ── 事件增量（reply Hook 调用）───────────────────────────
     def _llm_interval_ok(self) -> bool:
         """评估节流（与 evaluate_reply / record_external_event 共用同一时间戳）。
