@@ -3,7 +3,7 @@
 > **性质**：现状导出文档（**只读镜像，不是设计稿**）——把 `emotion/` 里散落在各常量的映射关系集中成一张可核对的表。
 > 代码是唯一真源：本文件与代码不一致时，**以代码为准**，并回头修本文件。
 > **快照时间**：2026-10-05（本机 UTC+8）｜**适用版本**：`_manifest.json version=0.4.0`、`[plugin].config_version=0.2.0`
-> **上游**：设计与联动口径见 [MAINTENANCE_PLAN_10.25.md](MAINTENANCE_PLAN_10.25.md) §四（情绪系统）、§6.2（联动通道）、§6.3（非决定性七原则）、附录 C（默认参数）；
+> **上游**：设计与联动口径见 [MAINTENANCE_PLAN_10.05.md](MAINTENANCE_PLAN_10.05.md) §四（情绪系统）、§6.2（联动通道）、§6.3（非决定性七原则）、附录 C（默认参数）；
 > 命令与工具见 [USAGE.md](USAGE.md)；测试规程见 [TEST_PROCEDURE.md](TEST_PROCEDURE.md)。
 > **来源文件**：`emotion/vad.py`｜`emotion/state_machine.py`｜`emotion/referee.py`｜`emotion/service.py`｜`emotion/bridge.py`｜`emotion/config.py`｜`companion/patrol.py`｜`companion/affection_events.py`｜`companion/relation.py`｜`qzone/service.py`
 >

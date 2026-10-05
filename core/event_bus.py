@@ -12,7 +12,7 @@
 按日计数；各发布方触发前查询 :func:`ProactiveBudget.allow_proactive`；
 上限默认 = ``patrol.daily_max_speak + 2``，``patrol.global_proactive_cap > 0`` 时直接采用其值。
 
-计数持久化（A2，2026-10-25）：传入 ``data_dir`` 时 ``_used/_date`` 落盘
+计数持久化（A2，2026-10-05）：传入 ``data_dir`` 时 ``_used/_date`` 落盘
 ``proactive_budget.json``（复用 core/storage.py 的 load_json/save_json_atomic）——
 启动装载、计数变化即原子写、日切重置写回，使计数跨 file_watcher 热重载连续
 （§八.8：热重载会清零一切内存态计数）；落盘异常降级内存态，不影响事件分发。
