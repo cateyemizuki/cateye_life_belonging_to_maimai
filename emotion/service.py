@@ -24,6 +24,12 @@ USER_MESSAGE_LOOKBACK_MINUTES = 20.0
 USER_MESSAGE_LOOKBACK_LIMIT = 10
 #: 调用方传入的 K 的防御性上限（target K = 1+step×(档+1) ≤ 6，留余量）
 EXTERNAL_K_MAX = 10.0
+#: 跨来源去重（§2.4.6 A3）：自动回复评估通道 ⇄ 群聊工具上报通道，同一聊天流 + 时间窗内只计一次
+CROSS_SOURCE_DEDUP_SOURCES = ("replyer", "tool:emotion_report")
+#: 跨来源去重时间窗缺省（秒；配置 ``emotion.dedup_window_seconds`` 可调，0 = 关闭窗口判定）
+DEDUP_WINDOW_DEFAULT_SECONDS = 180
+#: 去重登记表容量上限（防无界增长；纯内存态，热重载随进程重置——只影响重载后窗口内的判重机会）
+_DEDUP_REGISTRY_MAX = 64
 #: mood_effect 数值夹取范围（附录 C：全部 clamp [0.7, 1.3]；post_rate 允许 0~1.2）
 MOOD_EFFECT_MIN = 0.7
 MOOD_EFFECT_MAX = 1.3
@@ -34,6 +40,11 @@ SLEEP_NAME_KEYWORDS = ("睡觉", "睡眠", "安睡", "午休", "午睡", "小憩
 #: 作息锚点缺省（配置缺失时按 23:00 入睡 / 07:00 起床）
 DEFAULT_SLEEP_MINUTES = 23 * 60
 DEFAULT_WAKE_MINUTES = 7 * 60
+
+
+def _event_fingerprint(text: str) -> str:
+    """事件指纹（审计留痕用）：去空白、小写、截断 80 字；不参与跨来源重复判定（口径见 dedup_policy）。"""
+    return "".join(str(text or "").split()).lower()[:80]
 
 
 class EmotionService:
@@ -60,6 +71,8 @@ class EmotionService:
         self._persona = str(getattr(plugin, "_personality", "") or "")
         self._lover_name = str(getattr(plugin, "_lover_name", "") or "麦麦")
         self._last_evaluate_at = 0.0
+        #: 跨来源去重登记：stream → (最近一次真正入账的 source, monotonic 时间, 事件指纹)（§2.4.6 A3）
+        self._cross_source_last: Dict[str, Tuple[str, float, str]] = {}
         self._stop_event: Optional[asyncio.Event] = None
         self._task: Optional[asyncio.Task] = None
         self._bg_tasks: list[asyncio.Task] = []
@@ -262,9 +275,12 @@ class EmotionService:
         ``ctx.message.get_by_time_in_chat`` 反查该流最近消息，拿不到就跳过）；
         target 识别走 replyer.after_response 的 ``session_id`` 链路（== 目标私聊
         stream_id → K=1+档位加成，其余按非 target），加算倍率与 bridge 同口径
-        （§6.2 A：final = delta × global_event_multiplier × K）。
+        （§6.2 A：final = delta × global_event_multiplier × K）。跨来源去重（§2.4.6 A3）
+        在评估 LLM 之前先判：命中则本次不调 LLM、不入账，仅落一条去重决策日志。
         """
         if not self._enabled():
+            return
+        if self._dedup_skip_result("replyer", session_id, reply_text) is not None:
             return
         if not self._llm_interval_ok():
             return
@@ -360,6 +376,93 @@ class EmotionService:
         except Exception:
             pass
 
+    # ── 跨来源去重（§2.4.6 A3：自动评估 ⇄ 工具上报，同一流+窗口只计一次）──
+    def dedup_policy(self) -> Dict[str, Any]:
+        """跨来源去重口径（写进 record_external_event 返回值；§2.4.6 A3）。
+
+        ``policy=cross_source_stream_window``：仅 ``replyer``（自动回复评估主通道）与
+        ``tool:emotion_report``（群聊工具上报）两条来源互斥；同一聊天流（session_id /
+        stream_id 归一口径，空流归入 ``-``）内、时间窗（``emotion.dedup_window_seconds``，
+        默认 180s）内**先入账者生效**——真实时序上工具上报在回复生成前、自动评估在回复后，
+        因此群聊 target 事件通常由工具侧的 K（含档位加成）计入、自动评估被去重；后到者判
+        ``duplicate_cross_source`` 不入账（不发 emotion.updated、不写 emotion_log）；
+        窗口相对"最近一次真正入账"滚动，被去重的调用不刷新窗口；模板事件（bridge:* 等）
+        与其它来源不参与（频控/语义各异）。事件指纹仅作审计留痕，不参与匹配判定。
+        """
+        return {
+            "policy": "cross_source_stream_window",
+            "sources": list(CROSS_SOURCE_DEDUP_SOURCES),
+            "enabled": self._dedup_enabled(),
+            "window_seconds": round(self._dedup_window(), 3),
+        }
+
+    def _dedup_enabled(self) -> bool:
+        return bool(self._emotion_cfg("dedup_enabled", True))
+
+    def _dedup_window(self) -> float:
+        raw = self._emotion_cfg("dedup_window_seconds", DEDUP_WINDOW_DEFAULT_SECONDS)
+        try:
+            window = float(raw)
+        except (TypeError, ValueError):
+            window = float(DEDUP_WINDOW_DEFAULT_SECONDS)
+        return max(0.0, min(3600.0, window))
+
+    @staticmethod
+    def _dedup_stream_key(session_id: str) -> str:
+        return str(session_id or "").strip() or "-"
+
+    def _dedup_duplicate(self, source: str, session_id: str,
+                         event_text: str) -> Optional[Dict[str, Any]]:
+        """判定本次入账是否与最近一次跨来源入账重复；命中返回去重信息（调用方不入账）。"""
+        normalized = str(source or "").strip()
+        if normalized not in CROSS_SOURCE_DEDUP_SOURCES or not self._dedup_enabled():
+            return None
+        window = self._dedup_window()
+        if window <= 0:
+            return None
+        key = self._dedup_stream_key(session_id)
+        last = self._cross_source_last.get(key)
+        if last is None:
+            return None
+        last_source, last_ts, last_fingerprint = last
+        if last_source == normalized or last_source not in CROSS_SOURCE_DEDUP_SOURCES:
+            return None
+        elapsed = max(0.0, time.monotonic() - last_ts)
+        if elapsed > window:
+            return None
+        return {
+            "duplicate": True,
+            "first_source": last_source,
+            "first_fingerprint": last_fingerprint,
+            "fingerprint": _event_fingerprint(event_text),
+            "stream": key,
+            "elapsed_seconds": round(elapsed, 3),
+            **self.dedup_policy(),
+        }
+
+    def _dedup_note(self, source: str, session_id: str, event_text: str) -> None:
+        """登记一次真正入账的跨来源事件（窗口相对"最近一次真正入账"滚动）。"""
+        normalized = str(source or "").strip()
+        if normalized not in CROSS_SOURCE_DEDUP_SOURCES:
+            return
+        self._cross_source_last[self._dedup_stream_key(session_id)] = (
+            normalized, time.monotonic(), _event_fingerprint(event_text))
+        while len(self._cross_source_last) > _DEDUP_REGISTRY_MAX:
+            self._cross_source_last.pop(next(iter(self._cross_source_last)), None)
+
+    def _dedup_skip_result(self, source: str, session_id: str,
+                           event_text: str) -> Optional[Dict[str, Any]]:
+        """检查跨来源重复：命中则记决策日志并返回"未入账"结果，未命中返回 None。"""
+        duplicate = self._dedup_duplicate(source, session_id, event_text)
+        if duplicate is None:
+            return None
+        self._log_decision(
+            "emotion.external_event_dedup", trigger_type="emotion",
+            reason=f"跨来源重复上报：{duplicate['first_source']} → {str(source or '').strip()}",
+            source=str(source or "").strip(), **duplicate,
+        )
+        return {"ok": False, "reason": "duplicate_cross_source", "dedup": duplicate}
+
     def _apply_external_delta(self, event_text: str, delta: VADState, *, source: str,
                               multiplier: float, llm: bool = False,
                               is_target: Optional[bool] = None,
@@ -369,7 +472,13 @@ class EmotionService:
         三层倍率与裁剪前/后值全部落 decision_logs（§6.3-7）：``k``（调用方 K）/
         ``global_multiplier`` / ``multiplier``（最终总倍率）+ ``delta_before`` /
         ``delta_scaled`` / ``delta_applied``。
+
+        跨来源去重（§2.4.6 A3）在入账前判定：命中返回 ``duplicate_cross_source`` 且不写
+        emotion_log / 不发 emotion.updated（口径见 :meth:`dedup_policy`）。
         """
+        skip = self._dedup_skip_result(source, session_id, event_text)
+        if skip is not None:
+            return skip
         global_mul = self.global_event_multiplier()
         factor = float(multiplier) * global_mul
         scaled = VADState(delta.valence * factor, delta.arousal * factor, delta.dominance * factor)
@@ -392,15 +501,18 @@ class EmotionService:
             multiplier=round(factor, 4), llm=bool(llm), clipped=bool(clipped),
             delta_before=delta.to_dict(), delta_scaled=scaled.to_dict(), delta_applied=applied.to_dict(),
         )
+        self._dedup_note(source, session_id, event_text)   # §2.4.6 A3：登记本次真正入账
         return {"ok": True, "reason": "", "event": str(event_text or ""), "delta": applied,
                 "delta_before": delta, "multiplier": round(factor, 4),
                 "k": round(float(multiplier), 4), "global_multiplier": round(global_mul, 4),
-                "clipped": bool(clipped)}
+                "clipped": bool(clipped),
+                "dedup": {**self.dedup_policy(), "duplicate": False}}
 
     async def record_external_event(self, source: str, description: str,
                                     delta: Optional[VADState] = None, *,
                                     use_llm: bool = False,
-                                    multiplier: float = 1.0) -> Dict[str, Any]:
+                                    multiplier: float = 1.0,
+                                    session_id: str = "") -> Dict[str, Any]:
         """统一外部事件入口（§4.2 行 1 / §6.2 A）。
 
         - ``delta`` 给出模板增量 → 直接 ``record_event``（×multiplier）；
@@ -409,16 +521,26 @@ class EmotionService:
         - ``multiplier`` 是调用方按 §6.2 A 算好的 K（target = 1+档位加成 /
           非 target = non_target_multiplier）；入口再统一乘 ``global_event_multiplier``，
           即 ``final_delta = delta × global_event_multiplier × K``；
+        - ``session_id``（宿主 ToolInvocation 的 stream_id / 聊天流）供跨来源去重
+          （§2.4.6 A3）使用；缺省空串归入同一"未知流"；
+        - 跨来源去重先于 LLM 评估判定：命中返回 ``{"ok": False,
+          "reason": "duplicate_cross_source", "dedup": {...}}``，不调 LLM、不入账；
         - 最终增量经 ±:data:`EVENT_DELTA_CLAMP` 硬限幅后入账，三层倍率与裁剪前/后
           值落 decision_logs（§6.3-7）。
 
         Returns:
             ``{"ok", "reason", "event", "delta", "delta_before", "multiplier",
-            "k", "global_multiplier", "clipped"}``；未入账时 ok=False 且 reason 说明。
+            "k", "global_multiplier", "clipped", "dedup"}``；未入账时 ok=False 且
+            reason 说明（``disabled`` / ``empty_event`` / ``throttled`` / ``llm_error`` /
+            ``llm_failed`` / ``duplicate_cross_source``）；``dedup`` 恒带上口径与
+            ``duplicate`` 标记（口径见 :meth:`dedup_policy`）。
         """
         if not self._enabled():
             return {"ok": False, "reason": "disabled"}
         event_text = str(description or "").strip()
+        skip = self._dedup_skip_result(source, session_id, description)
+        if skip is not None:
+            return skip
         k = max(0.0, min(EXTERNAL_K_MAX, self._to_float(multiplier, 1.0)))
         delta_before: Optional[VADState] = None
         llm_used = False
@@ -444,7 +566,7 @@ class EmotionService:
         else:
             return {"ok": False, "reason": "no_delta"}
         outcome = self._apply_external_delta(event_text, delta_before, source=source,
-                                             multiplier=k, llm=llm_used)
+                                             multiplier=k, llm=llm_used, session_id=session_id)
         if outcome.get("ok"):
             # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
             await self._publish("emotion.updated", mood=self.mood_text(), trigger="external_event")

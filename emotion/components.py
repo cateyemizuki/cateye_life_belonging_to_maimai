@@ -141,6 +141,11 @@ class EmotionComponentsMixin:
 
         参数安全：``is_target`` 永不拒绝——缺失、类型不对、胡填一律静默按非 target 计
         （最多 debug 级日志），代码不报错；非 bool 值不做任何真值猜测。
+
+        跨来源去重（§2.4.6 A3）：``kwargs['stream_id']``（宿主 ToolInvocation 的聊天流）
+        随上报传入 emotion 侧；若同一流在 ``emotion.dedup_window_seconds``（默认 180s）内
+        已由 replyer 自动评估入账过同一事件，本次判重复、返回明确"未重复计入"文本，
+        不产生第二次情绪增量（口径见 ``EmotionService.dedup_policy``）。
         """
         svc = self._emo_service()
         if svc is None or not self._emo_module_enabled():
@@ -155,12 +160,16 @@ class EmotionComponentsMixin:
             except Exception:
                 pass
         multiplier = svc.target_multiplier(target_flag)
+        stream_id = str(kwargs.get("stream_id", "") or "")
         result = await svc.record_external_event(
             source="tool:emotion_report", description=text[:300], delta=None,
-            use_llm=True, multiplier=multiplier,
+            use_llm=True, multiplier=multiplier, session_id=stream_id,
         )
         if not result.get("ok"):
-            return f"这件事暂未计入情绪（{result.get('reason') or '未知原因'}）。"
+            reason = str(result.get("reason") or "")
+            if reason == "duplicate_cross_source":
+                return "这件事刚才已经计入情绪了（与自动评估重复），未重复计入。"
+            return f"这件事暂未计入情绪（{reason or '未知原因'}）。"
         return "已记下这件事给心情带来的变化。"
 
     # ============================================================

@@ -87,10 +87,16 @@ class EmotionServices:
     async def record_external_event(self, source: str, description: str,
                                     delta: Optional[VADState] = None, *,
                                     use_llm: bool = False,
-                                    multiplier: float = 1.0) -> Dict[str, Any]:
-        """外部事件统一入账入口（Tool 上报路径；签名与内层一致，转发 self.service）。"""
+                                    multiplier: float = 1.0,
+                                    session_id: str = "") -> Dict[str, Any]:
+        """外部事件统一入账入口（Tool 上报路径；签名与内层一致，转发 self.service）。
+
+        ``session_id``（宿主 ToolInvocation 的 stream_id / 聊天流）供 §2.4.6 A3
+        跨来源去重使用；缺省空串归入同一"未知流"。
+        """
         return await self.service.record_external_event(
-            source, description, delta, use_llm=use_llm, multiplier=multiplier)
+            source, description, delta, use_llm=use_llm, multiplier=multiplier,
+            session_id=session_id)
 
     def injection_text(self) -> str:
         """情绪底色注入文本（planner/replyer 注入 Hook 入口；转发 self.service）。

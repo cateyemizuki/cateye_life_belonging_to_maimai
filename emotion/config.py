@@ -93,6 +93,19 @@ class EmotionSectionConfig(PluginConfigBase):
         description="把当前情绪底色（模糊化描述）注入 replyer 提示词，引导语气与情绪一致",
         json_schema_extra={"label": "情绪底色注入", **_ui_i18n("Mood injection")},
     )
+    # ── A3 跨来源去重（§2.4.6：自动评估 ⇄ 工具上报，同一流+窗口只计一次）──────
+    dedup_enabled: bool = Field(
+        default=True,
+        description="跨来源去重：自动评估（replyer）与 emotion_report 工具对同一事件的重复入账只计一次（§2.4.6 A3）",
+        json_schema_extra={"label": "跨来源去重", **_ui_i18n("Cross-source dedup")},
+    )
+    dedup_window_seconds: int = Field(
+        default=180,
+        ge=0,
+        le=3600,
+        description="跨来源去重时间窗（秒）：同一聊天流内两条来源先后入账超过该间隔则各自计入；0=关闭窗口判定",
+        json_schema_extra={"label": "去重时间窗(秒)", **_ui_i18n("Dedup window (s)")},
+    )
     check_interval_minutes: int = Field(
         default=10,
         ge=1,
