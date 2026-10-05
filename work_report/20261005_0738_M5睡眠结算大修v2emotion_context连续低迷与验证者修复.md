@@ -11,7 +11,7 @@
 
 | 材料 | 用途 |
 |---|---|
-| `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\MAINTENANCE_PLAN_10.25.md` | §4.2（睡眠结算改造 / 睡眠大修 v2 / 连续低迷软约束）、§6.2 E/F、§6.3 七原则、§七 M5 行、§八.1/2/12、§9.2/9.4 |
+| `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\MAINTENANCE_PLAN_10.05.md` | §4.2（睡眠结算改造 / 睡眠大修 v2 / 连续低迷软约束）、§6.2 E/F、§6.3 七原则、§七 M5 行、§八.1/2/12、§9.2/9.4 |
 | `...\cateye_test\EMOTION_MAPPING.md` | 现状映射镜像（版本冻结提醒要求 M5 落地后同步 §5.3/§6.3/§7.3/§7.4/§8/附录 A） |
 | `...\cateye_test\SYNERGY.md` | §3.1 日程情感标签与睡眠大修公式（R_yesterday/E_tomorrow/w1/w2、动态限幅原式）、§3.2 睡醒后反塑日程 |
 | `...\cateye_test\emotion\{service,state_machine,referee,bridge,services,config,vad}.py` | 现状实现与改动落点 |
@@ -119,7 +119,7 @@
 
 | 章节 | 修订 |
 |---|---|
-| `MAINTENANCE_PLAN_10.25.md` §七 M5 行 状态列 | 由 `☐` 改为 `🔶 部分落地（2026-10-05）`，列出 emotion/planning 已落地项与余项（滚动更新：四批 → 五批复核修复） |
+| `MAINTENANCE_PLAN_10.05.md` §七 M5 行 状态列 | 由 `☐` 改为 `🔶 部分落地（2026-10-05）`，列出 emotion/planning 已落地项与余项（滚动更新：四批 → 五批复核修复） |
 | 同上 §9.2 第 2 条 | 追加进度行：A6 ✅ `8d11f54`；睡眠结算 v2 + tone + emotion_influence ✅；emotion_context + levels ✅；连续低迷 ✅（五批修复口径）；**余：A3 裁决** |
 | `EMOTION_MAPPING.md` | 头部「M5 双侧落地」说明 + §5.3 睡眠裁判限幅行 + §6.3 限幅表（增睡眠大修应用一道）+ §7.3 重写（冻结→醒后应用、锚点整夜窗口、三输入日期基准与醒来侧重算、v2 公式与常量）+ §7.4 事件表（`emotion.overhauled` 增 `levels`；新增 `emotion.low_mood_day` 行）+ §8 待接线清单 1~5 勾销 + 附录 A（M5 常量、日口径、`schedule.emotion_influence` 双用途） |
 | `README.md` | 模块树 3 行 + 3 条 M5 特性行（睡眠结算/大修 v2、睡醒情绪→次日日程、连续低迷软约束） |

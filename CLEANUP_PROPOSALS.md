@@ -1,6 +1,6 @@
 # cateye_test 精简清单（CLEANUP_PROPOSALS.md）
 
-> 版本：v1.1（2026-10-03 按用户裁决收窄）｜配套：执行规程见 [MAINTENANCE_PLAN_10.25.md](MAINTENANCE_PLAN_10.25.md) §八.6，对应其 **R0 结构重置**里程碑（旧 `MAINTENANCE_PLAN.md` 为 v1.2 快照，已废弃）。
+> 版本：v1.1（2026-10-03 按用户裁决收窄）｜配套：执行规程见 [MAINTENANCE_PLAN_10.05.md](MAINTENANCE_PLAN_10.05.md) §八.6，对应其 **R0 结构重置**里程碑（旧 `MAINTENANCE_PLAN.md` 为 v1.2 快照，已废弃）。
 > 性质：**只评估，不动代码**；本清单**只保留无争议项**（v1.0 中的决策项已按用户裁决撤销或归档，见 §二——未来 agent **不得重复提议**）。
 > 标记：🟡 合并/清理（小重构）｜🔵 顺路清理（挂在功能里程碑上）。
 
@@ -23,7 +23,7 @@
 | `UPLOAD_AGENT.md`（插件根，31KB） | **保留** | 未来发布插件时的必要约束文件，不允许删除；执行代码修改时也**不需要阅读**它 |
 | 恋人电脑屏幕感知（`companion/cateye_client.py` + `screen_context.py` + `[cateye]` 配置段 + patrol 旁白钩子） | **保留** | 属于插件联动功能 |
 | planning 早间问好（`planning_proactive.enable_morning_greeting`） | **保留** | 与 patrol 早安**职责不同、并不重叠**：patrol 早安只对目标用户私聊生效，planning 早安面向群聊 |
-| 字体资源（`planning/assets/fonts` NotoSansSC 2.2MB）与 PIL 渲染链（`planning/schedule_image.py`） | **保留** | 将作为聚合状态指令的渲染基础（MAINTENANCE_PLAN_10.25.md 里程碑 M7：一条命令总览四模块状态并渲染为图片）；`ctx.render.html2png` 替代方案撤销，仅作未来可选技术备选 |
+| 字体资源（`planning/assets/fonts` NotoSansSC 2.2MB）与 PIL 渲染链（`planning/schedule_image.py`） | **保留** | 将作为聚合状态指令的渲染基础（MAINTENANCE_PLAN_10.05.md 里程碑 M7：一条命令总览四模块状态并渲染为图片）；`ctx.render.html2png` 替代方案撤销，仅作未来可选技术备选 |
 
 ## 三、永久保留清单（防止未来 agent 误删）
 

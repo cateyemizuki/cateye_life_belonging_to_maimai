@@ -8,7 +8,7 @@
 - **会话性质**：文档修订 + 只读评估（**未改任何插件代码**）
 - **工作目录**：`D:\deepseek-harness_workspace\maibot-plugins`
 - **依据**：`zcode/l5_work/l5_report.md`（L5 判定）、`cateye_test/MAINTENANCE_PLAN.md`（v1.2 原文）、`cateye_test/TEST_PROCEDURE.md`
-- **命名说明**：本文件是本目录第一份报告，命名规则 `<YYYYMMDD_HHmm>_<主题>.md`（时间戳前置以便按名排序），已写入 `MAINTENANCE_PLAN_10.25.md` §八.12 与本目录 `README.md`
+- **命名说明**：本文件是本目录第一份报告，命名规则 `<YYYYMMDD_HHmm>_<主题>.md`（时间戳前置以便按名排序），已写入 `MAINTENANCE_PLAN_10.05.md` §八.12 与本目录 `README.md`
 
 ---
 
@@ -19,14 +19,14 @@
 | 1 | 探索 `cateye_test` 插件 | 完成 | 组件面/配置面/LLM 调用面全量清点（见 §二、§三） |
 | 2 | 评估完工后可清除的 LLM 工具与非测试指令 | 完成 | 写入 10.25 版 §2.4.2 / §2.4.3 / §2.4.4 |
 | 3 | 推导插件完工后完整配置文件布局 | 完成 | 写入 10.25 版 §2.4.5（13 段 + 字段数 + 预留字段 + 文件树） |
-| 4 | 复制原计划书为 `MAINTENANCE_PLAN_10.25.md` 并清退多用户好感度内容 | 完成 | `cateye_test/MAINTENANCE_PLAN_10.25.md`（61 229 → 82 745 B） |
+| 4 | 复制原计划书为 `MAINTENANCE_PLAN_10.05.md` 并清退多用户好感度内容 | 完成 | `cateye_test/MAINTENANCE_PLAN_10.05.md`（61 229 → 82 745 B） |
 | 5 | 把评估结果补进计划书 | 完成 | 新增 §2.4（6 个子节）+ §九（4 个子节）；§七/§八/§2.3 同步 |
 | 6 | 单写下一步推进提示词 | 完成 | `maibot-plugins/下一步推进提示词_1025_M5.md`（9 295 B） |
 | 7 | 建立工作报告目录与命名约定 | 完成 | `cateye_test/work_report/`（本文件 + `README.md` + 计划书 §八.12） |
 
 **产出文件绝对路径**
 
-1. `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\MAINTENANCE_PLAN_10.25.md`（**唯一现行版**）
+1. `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\MAINTENANCE_PLAN_10.05.md`（**唯一现行版**）
 2. `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\MAINTENANCE_PLAN.md`（v1.2 原文，**保持未改动**，实测 mtime = 2026-10-05 00:24:40 / 61 229 B）
 3. `D:\deepseek-harness_workspace\maibot-plugins\下一步推进提示词_1025_M5.md`
 4. `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\work_report\`（本目录，新）
@@ -97,7 +97,7 @@ on_load/on_unload 全装配冒烟 OK（4 服务束构造/启停/交叉接线）
 
 ### 3.2 补入（评估结果）
 
-- **新增 §2.4 完工评估（2026-10-25）**：2.4.1 LLM 调用点全表（10 event + 任务通道 + 频次上限 + 处置）｜2.4.2 Tool 审计（14 个逐条判定）｜2.4.3 Command 审计（12 个逐条判定）｜2.4.4 测试工件清退 T1~T5｜2.4.5 完工后配置终态（13 段表 + 预留字段表 + 文件树）｜2.4.6 挂账 A1~A6。
+- **新增 §2.4 完工评估（2026-10-05）**：2.4.1 LLM 调用点全表（10 event + 任务通道 + 频次上限 + 处置）｜2.4.2 Tool 审计（14 个逐条判定）｜2.4.3 Command 审计（12 个逐条判定）｜2.4.4 测试工件清退 T1~T5｜2.4.5 完工后配置终态（13 段表 + 预留字段表 + 文件树）｜2.4.6 挂账 A1~A6。
 - **新增 §九 剩余工作与验收口径**：9.1 M0 闭环复验口径｜9.2 M5 执行顺序｜9.3 发布前清退门槛｜9.4 文档义务。
 - **§2.3 订正**：版本面改为"M0~M4 已落地；M5~M7 未开始"，并注明 10-05 L5 总体 FAIL。
 - **§七 路线图**：M5 行并入 A2/A3/A6 三项挂账与验收；M7 行并入 A5 指令收敛。
@@ -107,7 +107,7 @@ on_load/on_unload 全装配冒烟 OK（4 服务束构造/启停/交叉接线）
 ### 3.3 本次会话的裁量（如实列出，供用户否决）
 
 1. **"除归档节外"按"保留归档、清退其余"理解**——即 §10.1（原 §九.1）整体保留，其余位置的设计展开全部删除，仅留结论与指针。
-2. **同时保留两份文件**——`MAINTENANCE_PLAN.md` 作 v1.2 快照不动，`MAINTENANCE_PLAN_10.25.md` 为唯一现行版；两份中"M5~M7 未落地"的结论一致，不清退的只有快照。
+2. **同时保留两份文件**——`MAINTENANCE_PLAN.md` 作 v1.2 快照不动，`MAINTENANCE_PLAN_10.05.md` 为唯一现行版；两份中"M5~M7 未落地"的结论一致，不清退的只有快照。
 3. **报告文件命名**取 `<YYYYMMDD_HHmm>_<主题>.md`（时间戳前置、下划线分隔），因计划书未指定日期格式；若用户要求 `<主题>_<时间戳>` 或其他格式，改 `work_report/README.md` 与 §八.12 一处即可。
 
 ---
@@ -131,7 +131,7 @@ on_load/on_unload 全装配冒烟 OK（4 服务束构造/启停/交叉接线）
 
 | # | 动作 | 文件 | 实测结果 |
 |---|---|---|---|
-| 1 | 计划书追加第 12 条「工作报告规范」（目录 + 命名 + 必含字段 + 执行时点） | `cateye_test/MAINTENANCE_PLAN_10.25.md` | 已写入；§八 现为 12 条（第 9/10/11 条为 2026-10-25 新增，第 12 条本次新增） |
+| 1 | 计划书追加第 12 条「工作报告规范」（目录 + 命名 + 必含字段 + 执行时点） | `cateye_test/MAINTENANCE_PLAN_10.05.md` | 已写入；§八 现为 12 条（第 9/10/11 条为 2026-10-05 新增，第 12 条本次新增） |
 | 2 | 新建目录说明 | `cateye_test/work_report/README.md` | 已创建（规范落地版：用途/命名/必含字段/写作要求/现有报告索引） |
 | 3 | 下一步提示词追加"工作报告"交付物 + 必读项 + 页首依据 | `maibot-plugins/下一步推进提示词_1025_M5.md` | 已写入 3 处（页首依据行、§0 必读第 4 项、§4 交付物第 5 项） |
 | 4 | 本报告自身 | `cateye_test/work_report/20261005_0227_MAINTENANCE_PLAN_10.25修订与完工评估.md` | 本文件 |
@@ -139,7 +139,7 @@ on_load/on_unload 全装配冒烟 OK（4 服务束构造/启停/交叉接线）
 **校验结果（实测，非声明）**：
 
 - `MAINTENANCE_PLAN.md`（v1.2 原文）**未改动**：61 229 B / mtime 2026-10-05 00:24:40。
-- `MAINTENANCE_PLAN_10.25.md`：82 528 B（清退+评估后）→ 加入 §八.12 后 **84 199 B**；UTF-8 无 BOM、LF 行尾（与原文一致，实测 CRLF=0、首字节=35）。
+- `MAINTENANCE_PLAN_10.05.md`：82 528 B（清退+评估后）→ 加入 §八.12 后 **84 199 B**；UTF-8 无 BOM、LF 行尾（与原文一致，实测 CRLF=0、首字节=35）。
 - `下一步推进提示词_1025_M5.md`：9 295 B → 追加报告要求后 **9 923 B**。
 - 本报告：UTF-8 无 BOM、LF（实测首字节=35、CRLF=0）。
 
@@ -148,7 +148,7 @@ on_load/on_unload 全装配冒烟 OK（4 服务束构造/启停/交叉接线）
 | 路径 | 字节 |
 |---|---|
 | `cateye_test/MAINTENANCE_PLAN.md` | 61 229（**未改**） |
-| `cateye_test/MAINTENANCE_PLAN_10.25.md` | 84 199 |
+| `cateye_test/MAINTENANCE_PLAN_10.05.md` | 84 199 |
 | `cateye_test/work_report/README.md` | 2 695 |
 | `cateye_test/work_report/20261005_0227_MAINTENANCE_PLAN_10.25修订与完工评估.md` | 本文件 |
 | `maibot-plugins/下一步推进提示词_1025_M5.md` | 9 923 |

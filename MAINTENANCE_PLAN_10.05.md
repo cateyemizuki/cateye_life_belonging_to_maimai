@@ -1,8 +1,8 @@
 # 猫眼生活套件（cateye_test）长期演进计划书（10-25 版）
 
-> 版本：**v1.3（2026-10-25 修订；本文件 = `MAINTENANCE_PLAN_10.25.md`）**。本次修订：
+> 版本：**v1.3（2026-10-05 修订；本文件 = `MAINTENANCE_PLAN_10.25.md`）**。本次修订：
 > ①**清退"多用户好感度"相关设计内容**——除归档节（**§10.1**）外，正文不再保留该设计（原 B9 行、§5.1-4、§5.3 括注、§5.6-4、§6.1/§6.2 D·G、§6.4 场景 4、路线图 M6 行、附录 A 括注、以及本页沿革中相关表述均按既定裁撤结论精简）；
-> ②新增 **§2.4 完工评估（2026-10-25）**：LLM 调用点全表、LLM 工具审计、非测试指令审计、测试专用工件清退清单、完工后完整配置布局；
+> ②新增 **§2.4 完工评估（2026-10-05）**：LLM 调用点全表、LLM 工具审计、非测试指令审计、测试专用工件清退清单、完工后完整配置布局；
 > ③新增 **§九、剩余工作与验收口径**（M0 整改挂账 / M5~M7 / 发布前清退）。
 > 版本沿革：v1.2（2026-10-03 第二次修订：按用户裁决收窄清理清单并新增裁决记录——保留恋人电脑屏幕感知、planning 早间问好（群聊）与 patrol 早安（目标私聊）职责不同并存、UPLOAD_AGENT.md（发布必要约束，改代码无需阅读）、字体资源与 PIL 渲染链；新增聚合状态指令里程碑 M7）。v1.1：①好感度裁撤多用户，改单用户 + 工具传参识别；②关系→情绪敏感度由乘算改加算并新增全局倍率；③新增 v1.3.0 开发文档可行性核对（§6.5）；④"重置"语义修正为**代码结构重置**（§八.6）；⑤不做项归档（§九）｜适用插件版本：v0.4.0+
 > 性质：**活文档**。本文档供后续 agent 会话长期执行"重置 / 更新 / 维护"使用。
@@ -34,7 +34,7 @@
    - `_manifest.json` 的 `version` 按里程碑递增（M0~M2 → 0.3.x，M3~M5 → 0.4.x，M6 → 0.5.0，M7 → 0.6.0）。
 4. **"重置"= 代码结构与功能的重置**（精简臃肿、去冗余），不是清数据：移除/合并候选清单见 [CLEANUP_PROPOSALS.md](CLEANUP_PROPOSALS.md)（用户勾选后执行），执行规程见 §八.6。
 5. 铁律：**任何跨模块影响都不得绕过 §六.3 的非决定性七原则**；发现既有实现违反时，修复优先于新功能。
-6. **完工前必读**：§2.4（完工评估：保留/清退边界，2026-10-25）与 **§九（剩余工作与验收口径，含 M0 整改复验口径 §9.1）**。
+6. **完工前必读**：§2.4（完工评估：保留/清退边界，2026-10-05）与 **§九（剩余工作与验收口径，含 M0 整改复验口径 §9.1）**。
    注意：**§十是"暂不做项归档"，不是待办清单**；M0/M5~M7 的待办与验收一律在 §七（路线图）与 §九（剩余工作）。
    发布包一律排除测试专用工件（`cateye_harness`、`/cateye_test_mai_test`、宿主 `adapter_policy.toml`
    的 harness 放行块），判定口径见 §2.4.4 与 §9.3。
@@ -112,12 +112,12 @@
 
 ---
 
-### 2.4 完工评估（2026-10-25）：LLM 调用面、工具/指令清退边界、配置终态布局
+### 2.4 完工评估（2026-10-05）：LLM 调用面、工具/指令清退边界、配置终态布局
 
 > 性质：**只评估，不动代码**（与 [CLEANUP_PROPOSALS.md](CLEANUP_PROPOSALS.md) 同性质，但对象是
 > "LLM 工具与非测试指令"而非代码结构）。执行时机：**插件完工（M5~M7 落地 + L5 复验通过 + 发布定版）之后**，
 > 作为发布前清退清单使用。评估基线：dev 仓 `D:\deepseek-harness_workspace\maibot-plugins\cateye_test`
-> 与部署副本 `E:\maibot\MaiBot-main\plugins\cateye_test`（2026-10-25 实测；离线 `scratch/smoke_test_cateye_test.py`
+> 与部署副本 `E:\maibot\MaiBot-main\plugins\cateye_test`（2026-10-05 实测；离线 `scratch/smoke_test_cateye_test.py`
 > 复跑 **PASS，40 组件 = 12 Command + 10 Hook + 14 Tool + 4 API**，配置模型 13 段全解析）。
 > 术语：**清除** = 从发布包与代码中删除；**收敛** = 合并/降级为内部能力；**保留** = 发布包内保留。
 
@@ -149,7 +149,7 @@
 | 判定 | 工具 | 位置 | 理由与处置建议 |
 |---|---|---|---|
 | **清除**（测试专用） | — | — | 当前 14 个 Tool **无一是纯测试用**（`cateye_test_emotion_report` 是功能件，见下） |
-| **保留·观察** | `cateye_test_emotion_report` | `emotion/components.py:107-164` | 群聊里"那件事是否由重要的人引发"的唯一声明入口，是 §6.2 A 群聊分支的实现。**保留**，但挂两条生产观察项：①它是 Tool 默认池/deferred 池问题（v1.3.0 陷阱 #22）——L5 全窗口 decision_logs 中**零条 `source=tool:emotion_report`**，即实测未被 bot 自发调用（自动评估路径覆盖了它）；②同一件事若自动评估已计入、工具又调一次，存在**重复入账**风险（代码层无跨来源去重）。**2026-10-25 复核**：部署 decision_logs 全量 `emotion.external_event` 共 14 条，按 `source` 分组 = `replyer` 8 / `bridge:silence` 3 / `emotion` 3，**工具通道仍为 0 条**（结论与 L5 一致）。两者合并为一件事：**M5 挂账裁决**（沿用 §2.3 的 is_target 子项挂账），**两条出口都必须闭合**：若判"不生效"则**清除**该 Tool（组件数 40→39，同步 manifest/README/USAGE/help）；**若判"保留"则必须同时实现跨来源去重**（自动评估路径与工具上报对同一事件的重复入账——代码层当前无任何跨来源去重），去重口径与证据同样要写进 §2.4.6。**裁决落定（2026-10-05）**：判**保留**，跨来源去重已落地（`cross_source_stream_window`：仅 replyer ⇄ tool:emotion_report、按聊天流 + 窗口先入账者生效；两字段默认 true/180s）；可发现性取证结论=**可用**（deferred 提示已浮出且被模型感知，零调用系模型选择而非工具缺席）；口径、证据与用例见 §2.4.6 A3 行。 |
+| **保留·观察** | `cateye_test_emotion_report` | `emotion/components.py:107-164` | 群聊里"那件事是否由重要的人引发"的唯一声明入口，是 §6.2 A 群聊分支的实现。**保留**，但挂两条生产观察项：①它是 Tool 默认池/deferred 池问题（v1.3.0 陷阱 #22）——L5 全窗口 decision_logs 中**零条 `source=tool:emotion_report`**，即实测未被 bot 自发调用（自动评估路径覆盖了它）；②同一件事若自动评估已计入、工具又调一次，存在**重复入账**风险（代码层无跨来源去重）。**2026-10-05 复核**：部署 decision_logs 全量 `emotion.external_event` 共 14 条，按 `source` 分组 = `replyer` 8 / `bridge:silence` 3 / `emotion` 3，**工具通道仍为 0 条**（结论与 L5 一致）。两者合并为一件事：**M5 挂账裁决**（沿用 §2.3 的 is_target 子项挂账），**两条出口都必须闭合**：若判"不生效"则**清除**该 Tool（组件数 40→39，同步 manifest/README/USAGE/help）；**若判"保留"则必须同时实现跨来源去重**（自动评估路径与工具上报对同一事件的重复入账——代码层当前无任何跨来源去重），去重口径与证据同样要写进 §2.4.6。**裁决落定（2026-10-05）**：判**保留**，跨来源去重已落地（`cross_source_stream_window`：仅 replyer ⇄ tool:emotion_report、按聊天流 + 窗口先入账者生效；两字段默认 true/180s）；可发现性取证结论=**可用**（deferred 提示已浮出且被模型感知，零调用系模型选择而非工具缺席）；口径、证据与用例见 §2.4.6 A3 行。 |
 | **保留** | `cateye_test_manage_goal_v4` | `planning/components.py:44` | 日程/目标的自然语言管理面，用户可感知 |
 | **保留** | `cateye_test_get_planning_status_v4` | `planning/components.py:66` | "我今天安排是什么"的核心问答 |
 | **保留** | `cateye_test_apply_schedule_v4` | `planning/components.py:80` | 承接多轮生成结果 → 全局目标的落地口 |
@@ -586,7 +586,7 @@ flowchart TD
 | M2 | 好感度 LLM 裁判：会话采样 + 关系日结（大周期） | **companion/affection_referee.py**；日结订阅 `schedule.sleep_started`；impressions 注入（components.py:457-495）；`[affection]` 配置段扩展 | M1 | 日结 JSON 校验+裁剪生效；impressions 滚动 10 条/7 天；成本：采样裁判 ≤2 次/日、日结 1 次/日（LLM 日志可查）；LLM 挂掉时系统纯规则退化运行 | ✅ 2026-10-03（离线三路径验证；真实 LLM 裁判质量与成本属宿主级 → 待用户确认清单）；宿主 L2 已验：affection_review=PASS（复验后，10-04） |
 | M3 | 情绪事件源扩展 + target 识别与加算倍率 + 沉默事件 + 情绪调制好感（v1.1 修订） | **emotion/bridge.py**；emotion/service.py 增 `record_external_event`（入口统一乘 `global_event_multiplier`）与评估上下文增强（`get_by_time_in_chat(filter_mai=True)`）；**新 Tool `cateye_test_emotion_report(event, is_target)`**（非法值静默忽视，触发条件写进 detailed_description）；patrol.py:348 发布 `relation.silence_detected`（频控）；§6.2 A/B 两通道生效 | M0、M1（加成查档位） | 场景 1 数值推演在 decision_logs 复现（±20%）；behavior test：加算倍率（target +0.1~+0.5 / 非 target ×non_target / 全局倍率三层叠加与裁剪）、is_target 容错（缺失/类型错→按非 target）、沉默事件频控、情绪调制乘数（含 sign 逻辑） | ✅ 2026-10-03（离线验证+审计；宿主级 attribution/silence 场景 → 待用户确认清单）；宿主 L2 已验：attribution=PASS（复验后）、silence=PASS（10-04；顺延：≥4h 间隔断言并入 L5）；工具 is_target 子项 → 挂账 M5 裁决（deferred 池发现性） |
 | M4 | 情绪→行为输出：patrol 乘数 / qzone 门控与文案 / planner 注入融合 | emotion/service.py 增 `mood_effect()`；patrol.py 概率段消费；qzone/service.py:324-340+380-392+545-561 消费；inject_service.py:617-628 替换静态 state_hint | M3 | 低落日（构造状态）观察：主动开口×0.8、说说跳过（emotion_filter）、想念阈值×0.8；注入文本出现情绪行且不与 emotion 条目矛盾 | ✅ 2026-10-03（离线验证+审计；宿主级 mood_effect 场景 → 待用户确认清单）；宿主 L2 已验：mood_effect=PASS（复验后）、qzone 子项=PASS（status/post/文案情绪行，10-04）；顺延：qzone 自动回评/评论提醒链路 → 留观或小号配合；qzone 双通道完整态（cookie/动作通道连通）→ 环境就绪后复验 |
-| **A2** | **先行项（2026-10-25 从 M5 拆出）**：全渠道主动预算计数持久化 —— 按日计数落盘、启动时装载、日切重置，使计数跨 `file_watcher` 热重载连续 | **core/event_bus.py**（`install_proactive_budget` 的计数器：`_used/_date` 由内存态改为 `data_dir` JSON，复用 `core/storage.py` 的 `load_json/save_json_atomic`）；`plugin.py` 装配处传 `data_dir` | 无（可独立于 M0~M4 落地；**必须先于 §9.1 的 L5 复验**） | behavior test 新增：计数写入 → 重建实例 → 计数仍为原值；跨日自动清零；`cap()` 查询在重载前后同值。宿主级：改一次插件文件触发重载，`budget.blocked` 载荷 `used` 不回落（L5 warn → pass 的直接证据） | ☐ |
+| **A2** | **先行项（2026-10-05 从 M5 拆出）**：全渠道主动预算计数持久化 —— 按日计数落盘、启动时装载、日切重置，使计数跨 `file_watcher` 热重载连续 | **core/event_bus.py**（`install_proactive_budget` 的计数器：`_used/_date` 由内存态改为 `data_dir` JSON，复用 `core/storage.py` 的 `load_json/save_json_atomic`）；`plugin.py` 装配处传 `data_dir` | 无（可独立于 M0~M4 落地；**必须先于 §9.1 的 L5 复验**） | behavior test 新增：计数写入 → 重建实例 → 计数仍为原值；跨日自动清零；`cap()` 查询在重载前后同值。宿主级：改一次插件文件触发重载，`budget.blocked` 载荷 `used` 不回落（L5 warn → pass 的直接证据） | ☐ |
 | M5 | 睡眠结算改造（冻结/醒后应用）+ 睡眠大修 v2（emotional_tone/动态限幅/约定输入）+ 连续低迷软约束 + emotion_context 槽；**并入两项挂账**：A3 `emotion_report` 工具裁决（发现性+重复入账）、A6 `[inject].enable_state_analysis` 字段删除与旧配置迁移策略（见 §2.4.6） | emotion/service.py+state_machine.py；planning/generator/schema_builder.py+validator.py+prompt_builder.py；schedule_generator.py 装载 emotion_context；`schedule.emotion_influence` 配置；**emotion/components.py（A3）**；**planning/config.py（A6）** | M0、M3（A2 已拆出，不再是 M5 前置） | 跨夜单测：冻结期事件不结算、醒后一次性应用；emotional_tone 越界裁剪 ±0.5；恢复系数恒 ≥0.3；连续低迷触发强制 rest 条目；**A3**：给出"保留并观测"或"清除"的实证结论，**若保留则必须同时实现跨来源去重**（见 §2.4.2）；**A6**：旧 `config.toml` 含该键时加载不报错 | ✅ **已落地（2026-10-05）**：emotion 侧睡眠结算改造（冻结/缓存/醒后一次性应用）+ 大修 v2（R_yesterday/E_tomorrow/约定三输入、动态限幅 ±(0.4+0.4×`schedule.emotion_influence`)、恢复系数恒 ≥0.3）+ 条目 `emotional_tone`（schema ±0.5 / 入库裁剪 / 睡眠侧求和）+ `[schedule].emotion_influence` 配置已落，behavior 5 组 M5 用例 + smoke 全绿；**A6 已于 `8d11f54` 完成**；**A3 已裁决（2026-10-05）：保留 + 跨来源去重已落地**（口径与取证见 §2.4.6 A3 行）。连续低迷软约束已于 2026-10-05 四批落地、五批按验证者复核修复：日采样口径=清醒时段、连续按日历逐日（无采样日归零，不拼假连续）、事件新鲜度 ≤72h、插入策略空档含首尾）。（2026-10-05 二批：planning 侧 `emotion_context` 槽与装载、`emotion.overhauled` 低分辨率 `levels`、日程 `emotional_tone` 落库校验亦已落地；**三批（验证者 blocker 修复）**：冻结窗口改按作息锚点整夜（条目被 `_normalize_items` 截断为 23:00–23:15，原按条目会在入睡 15 分钟后误醒且恢复系数恒 0.30）、计划时长取整夜 8h→0.85、E_tomorrow/约定在醒来侧重算（次日日程 00:30 才生成）、周期键口径统一；behavior 11 组 M5 用例 + smoke 全绿） |
 | M6 | 可选增强包 | 周结大事记（companion 关系周结，默认关）；emoji 情绪联动（`emoji.get_by_description`，manifest 增能力声明，默认关）；statistics 成本看板（⚠️ 扩能力面，暂不做） | M2、M3 | 每个子项独立开关默认全关；启用项有 behavior 用例 | ☐ |
 | M7 | **聚合状态指令**：一条命令总览四模块并渲染为图片（2026-10-03 用户新增）；**并入 A5 指令收敛**（`/cateye_test_mai_llm_log` + `/cateye_test_mai_diag` + `/cateye_test_life diag` 三件套合一，`mai_config` Tool 并入 dashboard 文本降级路径，见 §2.4.3） | 新 Command `cateye_test_status_all`（/cateye_test_dashboard）：聚合 planning（今日日程要点/当前活动/约定）、companion（好感 score/baseline/档位/最近印象 tone、今日互动计数、巡检状态）、emotion（VAD 低分辨率+标签、当日事件数、锚点/偏移）、qzone（双通道状态、发帖额度、评论基线）→ 复用 `planning/schedule_image.py` 的 **PIL + 内置 NotoSansSC 字体**渲染一张状态图（`send.image`）；渲染失败降级纯文本/合并转发；鉴权沿用 admin 判定 | M2、M3（数据就绪；某模块关闭时对应区块显示"未启用"） | 图片四区块数值与各模块 status/diag 文本一致；离线字体渲染可用；状态聚合函数入 behavior test；README/USAGE 登记；**A5**：收敛后旧命令名要么保留别名、要么在 USAGE 标注废弃 | ☐ |
@@ -597,10 +597,10 @@ flowchart TD
 
 ## 八、长期维护约定
 
-1. **文档同步义务**：改行为必改文档。README.md（功能清单与组件数）、USAGE.md（命令/工具）、SYNERGY.md（联动图，M0 后把"规划文档"改为"现状文档"）、模块 INTEGRATION.md、本计划书（勾选里程碑 + 修订设计节）；**改 `emotion/` 的任何映射常量/阈值/提示词契约，必须同批更新 [EMOTION_MAPPING.md](EMOTION_MAPPING.md)**（情绪映射现状导出文档，2026-10-25 新增；代码为唯一真源，不一致时以代码为准并回头修文档）。文档漂移视为缺陷。
+1. **文档同步义务**：改行为必改文档。README.md（功能清单与组件数）、USAGE.md（命令/工具）、SYNERGY.md（联动图，M0 后把"规划文档"改为"现状文档"）、模块 INTEGRATION.md、本计划书（勾选里程碑 + 修订设计节）；**改 `emotion/` 的任何映射常量/阈值/提示词契约，必须同批更新 [EMOTION_MAPPING.md](EMOTION_MAPPING.md)**（情绪映射现状导出文档，2026-10-05 新增；代码为唯一真源，不一致时以代码为准并回头修文档）。文档漂移视为缺陷。
 2. **兼容契约**：对外方法签名新增参数必须带默认值（既有约定，见 README "planning 兼容契约"行）；JSON 状态文件升级必须向后兼容读取 + 一次性迁移；新增配置必须带默认值且关闭时回退旧行为；跨模块调用一律可空降级（`getattr(plugin, "_x", None)` 判空），单模块停用不影响其余模块启动。
 3. **测试纪律**：纯算法（状态机、限幅、迟滞、乘数、迁移）全部落 `maibot-plugins/scratch/behavior_test_cateye_test.py` 用例（stub SDK，可离线跑）；涉及宿主装配的改动跑 `maibot-plugins/scratch/smoke_test_cateye_test.py` 确认 40 组件与能力面不回退；涉及 LLM prompt 的改动把实际请求记入 LLM 日志人工抽查一次。**宿主级验证（热重载、注入式集成、长周期、安全红线）一律按 [TEST_PROCEDURE.md](TEST_PROCEDURE.md) 执行**——它是自测试唯一规程（含测试辅助插件 cateye_harness 设计与非破坏性宿主编辑规则；测试目标流、token 保护与环路熔断为其最高优先级红线）。
-   ⚠️ **脚本路径约定**（2026-10-25 补）：两个脚本与 `sdk_stub.py` 都在 **`maibot-plugins\scratch\`（本插件的同级目录）**，`cateye_test\scratch\` **不存在**；执行时以 `maibot-plugins\scratch` 为工作目录，脚本内部按硬编码绝对路径回指插件。向子代理/文档转述路径时必须写绝对路径，否则会重演 L5 分析员"路径不存在"的空耗。
+   ⚠️ **脚本路径约定**（2026-10-05 补）：两个脚本与 `sdk_stub.py` 都在 **`maibot-plugins\scratch\`（本插件的同级目录）**，`cateye_test\scratch\` **不存在**；执行时以 `maibot-plugins\scratch` 为工作目录，脚本内部按硬编码绝对路径回指插件。向子代理/文档转述路径时必须写绝对路径，否则会重演 L5 分析员"路径不存在"的空耗。
 4. **LLM 调用规范**：一切裁判/评估类调用走 `LLMService` 并带 `event=` 标识；判别类（Y/N、分类）用 `judge()` + `[judge]` 段；任何新 LLM 调用必须在 §七 成本预算表登记。
 5. **日志规范**：决策日志 `trigger_type`/`action` 命名沿用 `bus:<event>` 与各模块现有前缀；联动增量记录"裁剪前/后 + multiplier"，保证 §6.3-7 可审计。
 6. **"重置"操作规程 = 代码结构与功能重置**（用户 2026-10-03 明确：重置指对臃肿的代码结构做减法重构，**不是清数据**）：
@@ -610,13 +610,13 @@ flowchart TD
    - 约束：结构重置**不得**改状态文件格式（emotion_state/affection_memory 等 JSON 的 schema 演进归入对应功能里程碑，走 §5.3 迁移通道）；**不得改组件名**（保留用户已配置的组件开关状态）；
    - 数据级清理（删档重开）仅作附带速查：情绪 `/cateye_test_emotion_config reset` → 重新 init；日程 `/cateye_test_plan clear`；好感删 `affection_memory.json`（M1 后自动重建）；回放数据 `decision_logs/` 默认 3 天滚动，重置前如需留证先备份；顺序：先 `plugin.enabled=false` 热重载 → 清理 → 恢复启用，避免运行中回写。
 7. **许可**：planning/ 为 AGPL-3.0 插件的机制复刻；好感度 v2 虽为全新实现，发布前仍需整体复核开源义务（README 风险表同步）。
-8. **已知平台坑**（部署/回归时先查）：宿主要求 `cateye_mai_set_avatar ≥1.0.2`，否则 planner Hook 链整体丢弃（README 部署依赖节）；思考型模型 + 小 max_tokens 会导致裁判正文为空（[judge] 段动机）。**2026-10-25 补入两条宿主验证日实测教训**：
+8. **已知平台坑**（部署/回归时先查）：宿主要求 `cateye_mai_set_avatar ≥1.0.2`，否则 planner Hook 链整体丢弃（README 部署依赖节）；思考型模型 + 小 max_tokens 会导致裁判正文为空（[judge] 段动机）。**2026-10-05 补入两条宿主验证日实测教训**：
    - **`file_watcher` 热重载会清零一切内存态计数**：宿主 file_watcher 在插件文件变更后约 1 s 内自动重启插件运行时（实证见 TEST_PROCEDURE 附录），**插件内所有进程内计数/去重状态随之重置**。已实测受影响项：全渠道主动预算计数（→ 10-04 全渠道 used=6 > cap=5，L5 `proactive_budget` warn 的根因）、patrol 每轮 `minutes_since_last_speak`、沉默事件每日计数与上次发布时间。**规则**：任何"按日/按窗口累计"的状态都必须落盘（挂账 A2 即此），否则会被重载规避；回归时把"改文件后重载"当作默认前提，而不是异常。
    - **自建注入网关过 `adapter_policy.toml` 需先增补放行条目**：`[defaults]` 对未登记的网关按会话类型 block，导致 harness `/h_inject` 首次投递 `accepted=False`。修法 = 在 `config/adapter_policy.toml` 末尾新增该网关的 `[[adapters]]` 块（TEST_PROCEDURE §七 HOST_PATCHES 登记项 2，含回滚方法）。**注意**：该文件由宿主热读，改完无需重启；**发布前必须删除该块**（§2.4.4 T2）。
-9. **测试工件不得进发布包**（2026-10-25 新增，详见 §2.4.4）：`cateye_harness`（含其 `build_staging/cateye_test` 副本）、宿主 `adapter_policy.toml` 的 harness 放行块、`/cateye_test_mai_test`、`config.toml.l4_*`、`config_back/`、`__pycache__`/`*.pyc`、部署残留旧名 `config.py`。**执行时机必须在 L5 复验通过之后**（复验仍需要 harness 通道）。
-10. **能力面与组件面双向对齐**（2026-10-25 新增）：任何 Tool/Command/API/Hook 的增删都必须同时改 `_manifest.json` 的 `capabilities`、README 组件表、USAGE 命令表，并复跑 `maibot-plugins\scratch\smoke_test_cateye_test.py`（其断言 40 组件与能力面，是发布前的最后一道门）。组件名一律不改（CLEANUP §三）。
-11. **多用户好感度不得复活**（2026-10-25 新增）：该设计已裁撤并自正文清退（归档理由见 §10.1）；未来 agent 不得在正文重新引入多用户档案/评论者好感/回评分档设计，重启条件见 §10.1。
-12. **工作报告规范**（2026-10-25 用户要求，**强制**）：此后**每一轮工作都必须留一份工作报告**，写在
+9. **测试工件不得进发布包**（2026-10-05 新增，详见 §2.4.4）：`cateye_harness`（含其 `build_staging/cateye_test` 副本）、宿主 `adapter_policy.toml` 的 harness 放行块、`/cateye_test_mai_test`、`config.toml.l4_*`、`config_back/`、`__pycache__`/`*.pyc`、部署残留旧名 `config.py`。**执行时机必须在 L5 复验通过之后**（复验仍需要 harness 通道）。
+10. **能力面与组件面双向对齐**（2026-10-05 新增）：任何 Tool/Command/API/Hook 的增删都必须同时改 `_manifest.json` 的 `capabilities`、README 组件表、USAGE 命令表，并复跑 `maibot-plugins\scratch\smoke_test_cateye_test.py`（其断言 40 组件与能力面，是发布前的最后一道门）。组件名一律不改（CLEANUP §三）。
+11. **多用户好感度不得复活**（2026-10-05 新增）：该设计已裁撤并自正文清退（归档理由见 §10.1）；未来 agent 不得在正文重新引入多用户档案/评论者好感/回评分档设计，重启条件见 §10.1。
+12. **工作报告规范**（2026-10-05 用户要求，**强制**）：此后**每一轮工作都必须留一份工作报告**，写在
     `cateye_test/work_report/` 下（用户指定路径：
     `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\work_report\`）。
     - **命名**：`<YYYYMMDD_HHmm>_<主题>.md`——时间戳前置（取本机 UTC+8 的报告完成时刻）以便按名排序，
@@ -632,7 +632,7 @@ flowchart TD
 
 ---
 
-## 九、剩余工作与验收口径（2026-10-25 刷新）
+## 九、剩余工作与验收口径（2026-10-05 刷新）
 
 > 本节是 §七 路线图的"当前待办视图"，只列**未完成**项与**判定口径**；完成后勾选并回写 §七 状态列。
 
@@ -641,10 +641,10 @@ flowchart TD
 - **背景**：10-05 L5 判定总体 **FAIL**（9 项中 `error_pileup` = fail、`proactive_budget` = warn、其余 7 项 pass）。破阈证据全部落在 10-03 18:15 ~ 10-04 06:54 的宿主验证日/重启混乱期。
 - **复验口径（不改判定规则，只换窗口）**：挂机满 ≥24h、窗口起点取"整改后首次宿主启动"（10-05 之后的干净启动），对 `error_pileup` 与 `proactive_budget` 两项独立复验；仍实施/验证分立（分析员 → 独立审计 → 仲裁）。
 - **通过标准**：`error_pileup` 无任一类别单小时 >20 条且无连续 ≥3h 递增；`proactive_budget` 全渠道日计数 ≤ cap。
-- **⚠ 前置条件（2026-10-25 修订）**：`proactive_budget` 项**必须先完成 A2（预算计数持久化，§七 A2 行）**再启动复验窗口，否则窗口内任一次 `file_watcher` 热重载都会重复清零计数、把该项判成 warn。**A2 已从 M5 拆出为独立先行项**——M0 收口不再需要等整个 M5 落地。
+- **⚠ 前置条件（2026-10-05 修订）**：`proactive_budget` 项**必须先完成 A2（预算计数持久化，§七 A2 行）**再启动复验窗口，否则窗口内任一次 `file_watcher` 热重载都会重复清零计数、把该项判成 warn。**A2 已从 M5 拆出为独立先行项**——M0 收口不再需要等整个 M5 落地。
 - **判定产物**：追加到 `D:\deepseek-harness_workspace\zcode\l5_work\l5_report.md` 或新建 `l5_report_recheck.md`（**不改写首轮结论**，只追加复验节）。
 
-### 9.2 执行顺序（2026-10-25 修订：A2 先行，主线回到 M5）
+### 9.2 执行顺序（2026-10-05 修订：A2 先行，主线回到 M5）
 
 1. **A2 预算计数持久化**（独立先行项，约 20 行改动）——详见 §七 A2 行。做完 → 跑离线测试 → **即可启动 §9.1 复验窗口**（挂机期间不影响后续编码，因为复验只读宿主）。
 2. **M5 主体**：A6 死字段清理 → 睡眠结算改造 v2 → 连续低迷软约束 → A3 工具裁决（A3 若判"保留"必须同时实现跨来源去重，见 §2.4.2）
@@ -667,9 +667,9 @@ README 组件表 / USAGE 命令表 / 相关模块 `INTEGRATION.md` / 本计划�
 
 ## 十、暂不做项（归档：理由 + 备选方案 + 重启条件）
 
-### 10.1 多用户好感度（v1.1 裁撤；正文已于 2026-10-25 清退，本节为唯一归档处）
+### 10.1 多用户好感度（v1.1 裁撤；正文已于 2026-10-05 清退，本节为唯一归档处）
 
-> **§10.1 索引（2026-10-25）**：多用户好感度的裁撤理由、替代方案与重启条件自本文件正文清退后就集中在本节（即 v1.2 原文的 §九.1），正文其余章节不再复述；相关正文引用已改写为"归档项，见 §10.1"。
+> **§10.1 索引（2026-10-05）**：多用户好感度的裁撤理由、替代方案与重启条件自本文件正文清退后就集中在本节（即 v1.2 原文的 §九.1），正文其余章节不再复述；相关正文引用已改写为"归档项，见 §10.1"。
 
 - **裁撤理由（用户定）**：多用户好感在群聊环境难以注入——planner/replyer 上下文无法按"每个群友一份关系档案"展开；也难以可靠识别"这次情绪变化是哪个用户造成的"。
 - **本轮替代方案（已写入 §5.3/§6.2 A）**：单用户档案；私聊按聊天流 QQ 识别，群聊由 bot 调用 `cateye_test_emotion_report(event, is_target)` 传参声明，参数永不拒绝、非法值代码层静默忽视；情绪倍率改加算（target +0.1~+0.5，非 target 默认 1.0，全局倍率可调）。

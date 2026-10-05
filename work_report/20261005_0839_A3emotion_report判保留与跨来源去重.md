@@ -3,7 +3,7 @@
 - **时间戳**：2026-10-05 08:39（本机 UTC+8）
 - **会话性质**：宿主只读取证 + 一次 harness 文件通道注入（A3 可发现性取证）→ 改代码（跨来源去重）→ 改文档（计划书/INTEGRATION/本报告）
 - **依据（读过的上游材料）**：
-  - `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\MAINTENANCE_PLAN_10.25.md`：§2.4.2（`cateye_test_emotion_report` 行）、§2.4.6 A3 行、§6.2 A、§八.1/8.2/8.8/8.10/8.12、§9.2/§9.4；
+  - `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\MAINTENANCE_PLAN_10.05.md`：§2.4.2（`cateye_test_emotion_report` 行）、§2.4.6 A3 行、§6.2 A、§八.1/8.2/8.8/8.10/8.12、§9.2/§9.4；
   - `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\TEST_PROCEDURE.md`（注入非破坏性规则与红线；仅读取，未改动）；
   - `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\emotion\service.py`、`config.py`、`services.py`、`components.py`、`bridge.py`、`state_machine.py`（现状实现）；
   - `D:\deepseek-harness_workspace\maibot-plugins\scratch\behavior_test_cateye_test.py`（既有 M3/M5 用例与 `_m3_emotion_service`/`_M3RecLogger`/`_M3LLMStub` 约定）、`smoke_test_cateye_test.py`（40 组件门）；
@@ -37,7 +37,7 @@
 
 ### 4) 文档
 
-- `MAINTENANCE_PLAN_10.25.md`：§2.4.6 A3 行重写为「已裁决：保留 + 去重」并附口径与证据路径；§2.4.2 `emotion_report` 行尾追加"裁决落定"；§七 M5 行状态与 A3 勾选；§9.2 进度勾销 A3。
+- `MAINTENANCE_PLAN_10.05.md`：§2.4.6 A3 行重写为「已裁决：保留 + 去重」并附口径与证据路径；§2.4.2 `emotion_report` 行尾追加"裁决落定"；§七 M5 行状态与 A3 勾选；§9.2 进度勾销 A3。
 - `emotion\INTEGRATION.md`：模块表 `config.py`/`service.py` 两行补记 + 新增「跨来源去重（A3 落地）」小节。
 - 本报告；`work_report\README.md` 索引补登（含上一份遗漏的 0738 报告）。
 
