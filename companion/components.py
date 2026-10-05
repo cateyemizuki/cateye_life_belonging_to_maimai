@@ -1299,10 +1299,46 @@ class CompanionComponentsMixin:
                 pass
         return ("状态: " + "｜".join(parts)) if parts else ""
 
+    def _mai_config_affection_line(self) -> str:
+        """配置摘要里的好感度段：优先 v2 实时读数（score/baseline/档位），管理器不可用回退静态档。
+
+        档位名规则与 :meth:`_mai_affection_state_line` 一致（优先 ``companion.relation.tier_label``）；
+        读数任一步失败（未初始化/字段缺失/异常）都降级为配置静态值 ``affection.current_level``，
+        绝不向调用方抛异常（配置摘要行不该连带整条状态总览发不出去）。
+        """
+        try:
+            fallback = f"好感度: {self.config.affection.current_level}"
+        except Exception:
+            fallback = "好感度: 未知"
+        companion = self._mai_companion()
+        if companion is None:
+            return fallback
+        try:
+            affection = companion.affection
+            score = float(affection.score())
+            baseline = float(affection.baseline())
+            tier = int(affection.tier())
+            level = int(affection.level())
+        except Exception:
+            return fallback
+        label = ""
+        relation = getattr(companion, "relation", None)
+        if relation is not None:
+            try:
+                label = str(relation.tier_label(tier) or "")
+            except Exception:
+                label = ""
+        if not label:
+            try:
+                label = str(affection.tier_label() or "")
+            except Exception:
+                label = str(tier)
+        return (f"好感度: score {score:.1f}/baseline {baseline:.1f}/"
+                f"档位 {tier}·{label}（v1 兼容档 {level}）")
+
     def _mai_config_summary(self, multiline: bool) -> str:
         """配置摘要（单行紧凑版给状态总览文本降级路径，多行版给 /cateye_test_mai_config）。"""
         patrol = self.config.patrol
-        affection = self.config.affection
         cateye_cfg = getattr(self.config, "cateye", None)
         miss_llm = "开" if getattr(patrol, "miss_llm_check_enabled", False) else "关"
         screen = "开" if getattr(cateye_cfg, "enabled", False) else "关"
@@ -1323,7 +1359,7 @@ class CompanionComponentsMixin:
                 f"概率: 日常 {patrol.default_speak_rate} | "
                 f"想念 {patrol.miss_speak_rate} | "
                 f"日程节点 {patrol.activity_trigger_rate}\n"
-                f"好感度: {affection.current_level} | "
+                f"{self._mai_config_affection_line()} | "
                 f"恋人上下文注入: 仅目标私聊 | "
                 f"屏幕感知: {screen} | "
                 f"日志: {self._mai_patrol_status_line() or '（巡检未初始化）'}"
@@ -1340,7 +1376,7 @@ class CompanionComponentsMixin:
             f"日常概率 {patrol.default_speak_rate} | "
             f"想念概率 {patrol.miss_speak_rate} | "
             f"节点概率 {patrol.activity_trigger_rate} | "
-            f"好感度 {affection.current_level} | "
+            f"{self._mai_config_affection_line()} | "
             f"屏幕感知 {screen}"
         )
 
