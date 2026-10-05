@@ -71,6 +71,7 @@ cateye_test/
 - ✅ **好感 v2 接线（M1/M2）**：巡检日切挂日衰减；目标私聊观察 Hook 记 `chat_round` 并检测 `user_initiated`（同点触发 M2 会话采样）；planner 注入改读 5 档档位描述（M2 叠加最近 1~2 条印象 + 关系温度，无印象时降级现状）；订阅 planning 的 `schedule.commitment_kept/broken` 记账约定事件；档位变化发布 `relation.affection_tier_changed`
 - ✅ **好感 LLM 裁判（M2）**：会话采样裁判（每 `review_sample_every_rounds`(20) 轮采样一次、每日 ≤ `review_max_per_day`(2) 次，输入最近 ~10 条对方消息 + 人设 + 档位描述 + 低分辨率情绪描述 → `event/delta[-2,+2.5]/tag`）+ 关系日结（每日最多 1 次、与采样上限分开计；订阅 `schedule.sleep_started`、延迟到情绪睡眠大修之后，输入当日 event_log + 互动统计 + 最近印象 + 档位描述 → `delta_score[-2,+2]` + 0~3 条印象 + tone）；delta 均走规则入账入口受日累计限幅；impressions 滚动 10 条/7 天过期（tone 同窗口）；prompt 不含 score/baseline；LLM 请求失败或输出垃圾静默跳过（日结当日不重试），规则事件与日衰减照常——纯规则退化
 - ✅ **[affection] 配置段（M1 扩展，M2 生效）**：`enabled`（false 回退 v1 三档静态行为）、`decay_pull`(0.06)、`baseline_ema`(0.03)、`tier_hysteresis`(3.0)、`tier_min_dwell_hours`(24)、`daily_positive_cap`(4.0)、`daily_negative_cap`(3.0)、`review_enabled`(true)/`review_sample_every_rounds`(20)/`review_max_per_day`(2)/`review_task_name`(utils)；`emotion_modulation`(true，**M3 已接线**：好感增量 × clamp(1 + 0.25 × V × sign(delta), 0.6, 1.4)，情绪模块停用或读不到当前 V 时乘数恒 1.0)
+- ✅ **周结大事记（M6，默认关）**：`[affection] weekly_milestones_enabled`（false，热重载生效）——开启后周日的日结会按**纯规则**汇总最近 7 天：关系温度（最近 ≤4 条 tone，用「；」连接）+ 净变化（`{net:+.1f}`），`|net| ≥ 1.0` 时追加 1 条「升温/降温明显」；写入档案 `week_log`（滚动 8 天）与 `milestones`（cap 20 条，同日幂等），注入/命令的「好感记忆行」追加 1 行【本周大事记】；零 LLM 成本，关闭时输出与旧版逐字一致（旧档案缺键兼容）
 - ✅ 巡检完整判定链（与源插件对齐）：日切→静默(fail-safe)→用户冷却→预算（晚安预留）→早安/晚安（S）→想念（A：沉默阈值随机采样+概率+LLM 把关+驳回 30 分钟冷却+未来日程避让+豁免开关）→日程节点分享/日常搭话（B）
 - ✅ **全渠道打扰预算（M0）**：私聊主动（patrol / planning）与空间互动提醒共享每日上限 `patrol.global_proactive_cap`（默认 0=自动取 `patrol.daily_max_speak + 2`），达上限触发被拦截并留痕决策日志
 - ✅ **情绪消费（M4，B4/B7）**：巡检读 `emotion.mood_effect()`（纯规则零 LLM 成本；情绪停用/异常则各项恒 1.0）——① `activity_trigger_rate`/`default_speak_rate` × `proactive_rate`（低落 ×0.8 降主动、心情好且精神足 ×1.2）；② 想念随机阈值 × `miss_threshold`（情绪）× affection 档位系数（双系数，低落 ×0.8 更快想念；档位系数读 `RelationProfile.miss_factor_for_tier`，恋人档 0~4 = 1.4~0.6）；③ proactive intent 的 reason 追加 `intent_hint` 低分辨成语义行；乘数 clamp [0.7,1.3]，乘后概率/阈值与情绪系数落决策日志
@@ -106,9 +107,11 @@ cateye_test/
 - ✅ **[emotion] M3 事件倍率配置**：`global_event_multiplier`(1.0，0.1~3.0，一切外部事件总幅度)、`non_target_multiplier`(1.0，0~1，非 target 事件系数)、`target_bonus_step`(0.1，0~1，每档加算步长)
 - ✅ **情绪→行为输出 `mood_effect()`（M4，§6.2 C/D）**：纯规则零 LLM 成本，输出 `proactive_rate`（patrol 主动概率乘数）/`miss_threshold`（想念阈值乘数，再叠 affection 档位系数）/`post_rate`（qzone 发帖率，0 = 低落不硬营业）/`intent_hint`（低分辨成语义行）；映射：proactive V>0.3&A>0.2→1.2、V<−0.3→0.8；miss V<−0.3→0.8、V>0.3→1.1；post V<−0.6→0、V<−0.3→0.8、V>0.3→1.2；全部 clamp [0.7,1.3]（post 允许 0~1.2），模块停用返回恒等中性值
 
-## manifest 声明（16 能力 + 2 依赖）
+- ✅ **emoji 情绪联动（M6，默认关，宿主级接线）**：`[emotion] emoji_enabled`（false）——开启后 `cateye_test_emotion_mood` Tool 会按当前情绪首个标签名（取不到回退情绪底色文本）经 `ctx.emoji.get_by_description` 取一个表情，并在返回文本后追加「（表情匹配：…）」；manifest 已声明 `emoji.get_by_description` 能力；**关闭时绝不触碰宿主 API**，匹配失败/通道缺失静默降级、输出与旧版逐字一致
 
-`send.text/image/forward`｜`config.get`｜（能力清单同前，情绪模块无新增能力）`llm.generate`｜`chat.get_all_streams/get_stream_by_user_id/get_private_streams/get_stream_by_group_id`｜`message.get_by_time_in_chat`｜`maisaka.proactive.trigger/context.append`｜`frequency.set_adjust`｜`knowledge.search`｜`api.call`｜`database.get`；依赖 `httpx>=0.24`、`Pillow>=9.0`（日程图片，缺失自动降级）。
+## manifest 声明（17 能力 + 2 依赖）
+
+`send.text/image/forward`｜`config.get`｜（能力清单同前，情绪模块无新增能力）`llm.generate`｜`chat.get_all_streams/get_stream_by_user_id/get_private_streams/get_stream_by_group_id`｜`message.get_by_time_in_chat`｜`maisaka.proactive.trigger/context.append`｜`frequency.set_adjust`｜`knowledge.search`｜`api.call`｜`database.get`；**M6 新增** `emoji.get_by_description`（emoji 情绪联动，默认关）；依赖 `httpx>=0.24`、`Pillow>=9.0`（日程图片，缺失自动降级）。
 
 ## 快速测试
 

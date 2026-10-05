@@ -7,6 +7,9 @@
 - 日衰减（小周期）由日切调用：patrol 日切分支挂 ``apply_daily_decay()``（§5.5）；
 - M2 状态：``impressions``（滚动 10 条 / 7 天过期）+ ``tone``（最近一次日结关系温度）
   + ``review``（会话采样每日次数 / 日结尝试日期），写入方是 ``companion/affection_referee.py``；
+- M6 状态：``week_log``（``date → {"tone", "delta"}``，滚动 8 天）+ ``milestones``（周结大事记，
+  cap 20 条），写入方是 :meth:`AffectionManager.record_daily_summary`（周结大事记，
+  ``[affection] weekly_milestones_enabled`` 默认关，纯规则零 LLM 成本）；
 - 档位变化发布 ``relation.affection_tier_changed``（old/new/score，经 M0 事件总线）。
 
 v1 字段原地保留（§5.3）：``habits``（memory_manager 的底层存储）、``last_user_msg_time``、
@@ -30,7 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -110,6 +113,20 @@ IMPRESSION_EXPIRE_DAYS = 7
 IMPRESSION_TEXT_LIMIT = 80
 #: 单次日结最多追加的印象条数（§5.4：0~3 条；裁判已裁剪，此处二次兜底）
 IMPRESSION_PER_DAY_LIMIT = 3
+
+# ---- M6：周结大事记（§5.4-3，默认关、纯规则零 LLM 成本）----
+#: week_log 滚动保留天数（按日期排序丢最旧；§5.3 v2 schema 预留位）
+WEEK_LOG_KEEP_DAYS = 8
+#: milestones 条数上限（超出丢最旧）
+MILESTONE_KEEP_LIMIT = 20
+#: 单条里程碑文本上限（4 条 tone 拼接后的兜底裁剪）
+MILESTONE_TEXT_LIMIT = 200
+#: 周结判定要求的最少记录天数（最近 7 天窗口内 week_log 覆盖天数）
+WEEKLY_MIN_DAYS = 3
+#: 里程碑文案里引用的 tone 条数上限（最近 ≤4 条）
+WEEKLY_TONE_LIMIT = 4
+#: 净变化「明显」门槛：|net| ≥ 该值追加第 2 条里程碑
+WEEKLY_NET_NOTABLE = 1.0
 
 
 def _to_float(value: Any, default: float) -> float:
@@ -232,6 +249,9 @@ def _build_v2_state(raw: Any, default_level: int = 0,
         "impressions": _normalize_impressions(src.get("impressions")),
         "tone": _normalize_tone(src.get("tone")),
         "review": _normalize_review_meta(src.get("review"), today),
+        # ---- M6 字段（§5.3 v2 schema 预留位：旧档案缺键默认空表，绝不因缺键启动失败）----
+        "week_log": _normalize_week_log(src.get("week_log")),
+        "milestones": _normalize_milestones(src.get("milestones")),
         # ---- v1 字段原地保留 ----
         # affection_level 只是给旧读方的回滚镜像：迁移时保留原值，其余时候跟随档位兼容口径
         "affection_level": legacy_level if migrated else legacy_level_for_tier(_clamp_tier(tier)),
@@ -302,6 +322,50 @@ def _normalize_review_meta(value: Any, today: str) -> dict:
         "samples": max(0, _to_int(data.get("samples"), 0)),
         "daily_reviewed_date": str(data.get("daily_reviewed_date") or ""),
     }
+
+
+def _roll_week_log(entries: Any) -> dict[str, dict]:
+    """按日期排序只保留最近 :data:`WEEK_LOG_KEEP_DAYS` 天（日期不可解析的键排在最前，先被丢弃）。"""
+    if not isinstance(entries, dict) or not entries:
+        return {}
+    ordered = sorted(entries.items(), key=lambda kv: str(kv[0]))[-WEEK_LOG_KEEP_DAYS:]
+    return {str(key): dict(item) for key, item in ordered if isinstance(item, dict)}
+
+
+def _normalize_week_log(value: Any) -> dict[str, dict]:
+    """规整 ``week_log``（§5.3 v2 schema 预留位）：``{date: {"tone": str, "delta": float}}``。
+
+    旧档案缺键/类型不对一律按空表处理（**绝不因缺键启动失败**），并滚动保留最近 8 天。
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for key, item in value.items():
+        if not isinstance(item, dict):
+            continue
+        date = str(key or "").strip()
+        if not date:
+            continue
+        out[date] = {
+            "tone": str(item.get("tone") or "").strip()[:IMPRESSION_TEXT_LIMIT],
+            "delta": round(_to_float(item.get("delta"), 0.0), 4),
+        }
+    return _roll_week_log(out)
+
+
+def _normalize_milestones(value: Any) -> list:
+    """规整 ``milestones``：``[{"date", "text"}]``，cap :data:`MILESTONE_KEEP_LIMIT`（缺键默认空表）。"""
+    if not isinstance(value, list):
+        return []
+    entries: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        entries.append({"date": str(item.get("date") or ""), "text": text[:MILESTONE_TEXT_LIMIT]})
+    return entries[-MILESTONE_KEEP_LIMIT:]
 
 
 def _within_days(date_text: Any, days: int, *, now: Optional[datetime] = None) -> bool:
@@ -791,6 +855,98 @@ class AffectionManager:
         self._state["review"] = dict(data)
         self._mark_dirty()
         return data
+
+    # ---- 读：M6 周结大事记 ----
+    def week_log(self) -> dict[str, dict]:
+        """最近 8 天日结摘要（副本；``{date: {"tone", "delta"}}``，周结判定的输入）。"""
+        return {str(key): dict(item)
+                for key, item in (self._state.get("week_log") or {}).items()
+                if isinstance(item, dict)}
+
+    def milestones(self) -> list[dict]:
+        """周结大事记列表（副本；``[{"date", "text"}]``，未启用时恒为空表）。"""
+        return [dict(item) for item in (self._state.get("milestones", []) or [])
+                if isinstance(item, dict)]
+
+    def weekly_milestones_enabled(self) -> bool:
+        """[affection] weekly_milestones_enabled（M6，默认关）。
+
+        config_provider 缺失/抛异常/配置段读不到该键时一律按未启用处理（§八.2 可空降级）。
+        """
+        return self._cfg_bool("weekly_milestones_enabled", False)
+
+    # ---- 写：M6 周结大事记 ----
+    def record_daily_summary(self, *, date: str, tone: str, delta: float,
+                             now: Optional[datetime] = None) -> dict:
+        """记录一天的日结摘要，并按纯规则做周结判定（M6，§5.4-3；零 LLM 成本）。
+
+        - 写入 ``week_log``（``date → {"tone", "delta"}``），按日期排序滚动保留最近 8 天；
+        - 周结判定（以下条件**同时**满足才生成里程碑，任一条不满足即 0 条）：
+          ① ``[affection] weekly_milestones_enabled`` 为真（默认关；配置缺失/异常按未启用）；
+          ② ``date`` 是周日（``weekday() == 6``）；
+          ③ ``milestones`` 里尚无同日条目（幂等，同日重复调用不重复生成）；
+          ④ ``date`` 往前 7 天窗口内 ``week_log`` 覆盖 ≥3 天；
+        - 文案：1 条「本周关系温度：{最近 ≤4 条 tone，用；连接}（净变化 {net:+.1f}）」；
+          ``|net| ≥ 1.0`` 时追加 1 条「本周好感净变化 {net:+.1f}，升温/降温明显」；
+          ``milestones`` 超 20 条丢最旧。
+
+        Args:
+            date: 被日结的日期（``YYYY-MM-DD``；解析失败按不记录处理）。
+            tone: 当日关系温度（日结裁判产出，可为空串）。
+            delta: 当日好感净变化（日结裁判的 ``delta_score``）。
+            now: 调用方时钟（**保留参数**：7 天窗口以 ``date`` 锚定，保证回放/单测可确定性重放）。
+
+        Returns:
+            ``{"recorded": bool, "milestones_generated": int}``。
+        """
+        try:
+            stamp = datetime.strptime(str(date or "").strip(), "%Y-%m-%d")
+        except ValueError:
+            logger.debug("周结记录跳过：日期非法 %r", date)
+            return {"recorded": False, "milestones_generated": 0}
+
+        day = stamp.strftime("%Y-%m-%d")
+        entries = _normalize_week_log(self._state.get("week_log"))
+        entries[day] = {
+            "tone": str(tone or "").strip()[:IMPRESSION_TEXT_LIMIT],
+            "delta": round(_to_float(delta, 0.0), 4),
+        }
+        self._state["week_log"] = _roll_week_log(entries)
+        generated = self._maybe_generate_milestones(stamp)
+        self._mark_dirty()
+        return {"recorded": True, "milestones_generated": generated}
+
+    def _maybe_generate_milestones(self, stamp: datetime) -> int:
+        """周结判定与里程碑生成（纯规则）；返回本次生成的条数（0/1/2）。"""
+        if not self.weekly_milestones_enabled():
+            return 0
+        if stamp.weekday() != 6:
+            return 0  # 只在周日做周结
+        day = stamp.strftime("%Y-%m-%d")
+        if any(str(item.get("date") or "") == day for item in self.milestones()):
+            return 0  # 幂等：同一周日只生成一次
+        entries = self.week_log()
+        window = [(stamp - timedelta(days=offset)).strftime("%Y-%m-%d")
+                  for offset in range(7)]  # 最近 7 天（含当日）
+        recent = [(key, entries[key]) for key in sorted(window) if key in entries]
+        if len(recent) < WEEKLY_MIN_DAYS:
+            return 0
+
+        net = round(sum(_to_float(item.get("delta"), 0.0) for _, item in recent), 4)
+        tones = [str(item.get("tone") or "").strip() for _, item in recent]
+        tones = [text for text in tones if text][-WEEKLY_TONE_LIMIT:]
+        texts: list[str] = []
+        if tones:
+            texts.append(f"本周关系温度：{'；'.join(tones)}（净变化 {net:+.1f}）")
+        if abs(net) >= WEEKLY_NET_NOTABLE:
+            texts.append(f"本周好感净变化 {net:+.1f}，{'升温' if net > 0 else '降温'}明显")
+        if not texts:
+            return 0
+
+        merged = [dict(item) for item in self.milestones()]
+        merged += [{"date": day, "text": text[:MILESTONE_TEXT_LIMIT]} for text in texts]
+        self._state["milestones"] = merged[-MILESTONE_KEEP_LIMIT:]
+        return len(texts)
 
     def apply_daily_decay(self) -> dict[str, Any]:
         """日衰减（小周期，§5.5）：score 向 baseline 回归，随后 baseline 缓慢漂移。

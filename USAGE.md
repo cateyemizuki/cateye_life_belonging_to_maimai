@@ -99,6 +99,7 @@
 #### `cateye_test_emotion_mood`
 - **描述**：查询 bot 当前的情绪底色（情绪标签与低分辨率描述）。用户问'你现在什么心情''感觉怎么样'时调用。
 - **行为**：从 VAD 状态机取当前有效值（含偏移/乘数），映射为情绪标签（含混合比例）与"愉悦度/唤醒度/支配感"模糊描述；情绪模块未启用时明确提示。
+- **M6（默认关）**：`[emotion] emoji_enabled` 为真时，额外经宿主 `emoji.get_by_description` 匹配一个表情并在文本后追加「（表情匹配：…）」；关闭或匹配失败时输出与旧版逐字一致（详见 §五）。
 
 #### `cateye_test_emotion_report`
 - **描述**：上报一件影响 bot 心情的事件（由 bot 判断是否与最重要的人有关），入账有界情绪增量。
@@ -195,3 +196,15 @@
 | 全部 LLM 工具 | 模型自主调用（无用户级鉴权；敏感操作如发说说受每日上限/开关约束） | `qzone.daily_max_posts`、`qzone.enabled` 等 |
 
 > **A5 权限变化提醒**：旧 `/cateye_test_mai_llm_log` 与 `/cateye_test_mai_diag` 原按 `target.target_qq` 白名单放行，收敛进 `/cateye_test_diag` 后改为管理员判定——升级后若只配置了 `target.target_qq` 而未配置 `admin.admin_users`，QQ 侧调用将提示「权限不足」（本机控制台不受限）。
+
+## 五、M6 可选增强开关（默认关）
+
+两个子项都**默认关闭**：不配置（或保持 `false`）时插件行为与本版本之前逐字一致，既有配置无需任何改动。
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `[affection] weekly_milestones_enabled` | `false` | **周结大事记**：开启后周日的**关系日结**（`schedule.sleep_started` 触发、晚于情绪睡眠大修）按纯规则汇总最近 7 天，生成 1 条「本周关系温度：…（净变化 +0.0）」；`\|净变化\| ≥ 1.0` 时再追加 1 条「升温/降温明显」。结果写入好感档案 `week_log`（滚动 8 天）与 `milestones`（cap 20 条；同一周日**幂等**，重复日结不重复生成），并让 planner 注入与 `/cateye_test_mai_affection` 的记忆行多出一行「【本周大事记】日期 文案」（只取最近 1 条）。**零 LLM 成本**；周内日结记录不足 3 天时不生成；日结本身失败不落里程碑；周结步骤异常不影响日结主流程 |
+| `[emotion] emoji_enabled` | `false` | **emoji 情绪联动**：开启后 `cateye_test_emotion_mood` Tool 按当前情绪首个标签名（取不到时回退情绪底色文本）经宿主 `emoji.get_by_description` 取一个表情，在返回文本后追加「（表情匹配：…）」。关闭时**绝不调用宿主 emoji 接口**；宿主无该通道 / 能力不可调用 / 请求异常 → 静默降级为原输出（不报错、不改变既有文本） |
+
+> 说明：`emoji.get_by_description` 已写入 `_manifest.json` 的 `capabilities`（仅声明，默认不使用）；宿主侧对该能力的实际接线由宿主级验证会话负责——离线测试只覆盖插件侧门控与降级路径。`statistics` 成本看板经裁定**不做**（扩大能力面、收益存疑）。
+> 组件面不变（39 = 12 命令 + 10 Hook + 13 Tool + 4 API），两个开关均为**配置项**。

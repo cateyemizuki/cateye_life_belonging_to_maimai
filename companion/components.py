@@ -605,9 +605,10 @@ class CompanionComponentsMixin:
 
     @staticmethod
     def _mai_affection_memory_line(affection: Any) -> str:
-        """好感记忆行（注入与命令共用）：最近 1~2 条印象 + 最近一次日结关系温度。
+        """好感记忆行（注入与命令共用）：最近 1~2 条印象 + 最近一次日结关系温度 + M6 周结大事记。
 
-        状态层缺失/为空/异常一律返回空串（绝不空指针，也绝不给调用方抛错）。
+        状态层缺失/为空/异常一律返回空串（绝不空指针，也绝不给调用方抛错）；
+        周结大事记默认关、只取最近 1 条，未启用时输出与旧版逐字一致。
         """
         try:
             impressions = affection.impressions()[-2:]
@@ -630,6 +631,19 @@ class CompanionComponentsMixin:
         if isinstance(tone, dict) and str(tone.get("text") or "").strip():
             lines.append(f"【关系温度·{str(tone.get('date') or '').strip()}】"
                          f"{str(tone.get('text')).strip()}")
+        # M6：周结大事记（默认关，未启用时恒为空表）——只取最近 1 条；无则不加，输出与旧版一致
+        try:
+            milestones = affection.milestones()[-1:]
+        except Exception:
+            milestones = []
+        for item in milestones or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            stamp = str(item.get("date") or "").strip()
+            lines.append(f"【本周大事记】{stamp} {text}" if stamp else f"【本周大事记】{text}")
         return "\n".join(lines)
 
     def _mai_build_proactive_target_rule(self) -> str:

@@ -139,6 +139,61 @@ class EmotionService:
             "严禁在回复中直接说出情绪标签词汇或任何数值；不要主动提及或解释本提示本身。"
         )
 
+    # ── M6 可选增强：emoji 情绪联动（默认关；未启用时绝不触碰宿主 API）──────
+    def emoji_description(self) -> str:
+        """当前情绪对应的匹配描述词：首个情绪标签名（取不到回退 ``mood_text()``）。
+
+        供 :meth:`emoji_for_mood` 的缺省 ``description`` 使用，不写状态、不落盘。
+        """
+        labels: list = []
+        try:
+            labels, _nearest = map_emotions(self._machine.effective_vad())
+        except Exception:
+            labels = []
+        for item in labels or []:
+            try:
+                name = str(item[0] or "").strip()
+            except (TypeError, IndexError):
+                continue
+            if name:
+                return name
+        try:
+            return str(self.mood_text() or "")
+        except Exception:
+            return ""
+
+    async def emoji_for_mood(self, description: str = "") -> Optional[Dict[str, Any]]:
+        """按当前情绪向宿主匹配一个 emoji（M6，默认关；返回宿主原始结果或 None）。
+
+        门控与降级（§八.2 可空降级）：
+        - ``[emotion] emoji_enabled`` 非真 → 直接 None（**绝不触碰宿主 API**）；
+        - ``ctx.emoji.get_by_description`` 缺失/不可调用 → None；
+        - 请求异常 → debug 日志 + None（绝不上抛，绝不影响调用方输出）；
+        - ``description`` 缺省时取 :meth:`emoji_description`（首个情绪标签名，取不到用 mood_text）。
+        结果非空则原样返回（宿主返回结构不做假设）。
+
+        消费点：``emotion/components.py`` 的 ``cateye_test_emotion_mood`` Tool——启用时在返回文本后
+        追加一行匹配摘要；本方法只做转发，不写状态、不落盘、不发事件。
+        """
+        if not bool(self._emotion_cfg("emoji_enabled", False)):
+            return None
+        emoji_api = getattr(getattr(self._plugin, "ctx", None), "emoji", None)
+        getter = getattr(emoji_api, "get_by_description", None)
+        if not callable(getter):
+            return None
+        desc = str(description or "").strip() or self.emoji_description()
+        if not desc:
+            return None
+        try:
+            result = await getter(description=desc)
+        except Exception as exc:
+            try:
+                self._ctx.logger.debug("emoji 匹配失败（忽略，不影响原输出）：%s", exc)
+            except Exception:
+                pass
+            return None
+        return result if result else None
+
     # ── 情绪 → 行为结构化系数（M4；§4.2 行 5 / §6.2 C/D，附录 C）──────
     def mood_effect(self) -> Dict[str, Any]:
         """当前情绪 → 行为系数（纯规则、零 LLM 成本；附录 C 默认映射）。

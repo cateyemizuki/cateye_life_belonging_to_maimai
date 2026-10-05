@@ -90,6 +90,14 @@
 - 跨模块读取入口为服务束 `EmotionServices.mood_effect()`（内部 `try/except` → 异常同样返回恒等值；patrol/qzone 经 `plugin._emotion.mood_effect()` 读取）；
 - 下游三处消费点见 `companion/INTEGRATION.md` §M4 与 `qzone`（发帖门控 + 说说/回评文案情绪行）。
 
+## M6 落地（2026-10-06）：emoji 情绪联动（默认关）
+
+- 开关 `[emotion] emoji_enabled`（默认 **false**）：false 或配置无该键 → `EmotionService.emoji_for_mood()` 直接返回 None，**绝不触碰宿主 API**；关闭时 `cateye_test_emotion_mood` Tool 输出与旧版逐字一致。
+- 实现：`service.py` `emoji_for_mood(description="")` → 门控 → `ctx.emoji.get_by_description`（缺失/不可调用 → None）→ `await getter(description=desc)`，结果非空原样返回；任何异常 debug 日志 + None（绝不上抛）。`description` 缺省取 `emoji_description()`（`map_emotions(effective_vad())` 首标签名，取不到回退 `mood_text()`）。
+- 消费面（最小闭环，不改宿主主动链路）：`components.py` `emo_tool_mood`（本就 async）在返回文本后追加「（表情匹配：{摘要}）」；摘要取返回 dict 的常见文本字段，取不到则不加后缀。
+- manifest：`_manifest.json` 能力数组新增 `emoji.get_by_description`（仅声明、默认不使用）；宿主侧实际接线由宿主级验证会话负责。
+- 明确不做：`statistics` 成本看板（扩大能力面、收益存疑，计划书已裁定）。
+
 ## 有意的裁剪 / TODO
 
 - 情绪增量评估为"回复后补一次小模型请求"（设计文档要求对话 LLM 直接输出 JSON ΔVAD，宿主 Hook 面拿不到结构化输出，此为等价实现），可关（`evaluate_on_reply`）；

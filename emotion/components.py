@@ -102,7 +102,38 @@ class EmotionComponentsMixin:
         svc = self._emo_service()
         if svc is None or not self._emo_module_enabled():
             return "情绪模块未启用。"
-        return f"当前情绪底色：{svc.mood_text()}"
+        text = f"当前情绪底色：{svc.mood_text()}"
+        # M6：emoji 情绪联动（默认关；门控与降级都在服务层，未启用时直接 None、不触碰宿主 API），
+        # 拿不到摘要就保持原输出——未启用/异常时返回文本与旧版逐字一致。
+        emoji = await self._emo_match_emoji(svc)
+        summary = self._emo_emoji_summary(emoji) if emoji else ""
+        if summary:
+            text += f"（表情匹配：{summary}）"
+        return text
+
+    async def _emo_match_emoji(self, svc: Any) -> Any:
+        """调用服务层 emoji 匹配（服务缺失该方法或抛错一律按无匹配处理）。"""
+        getter = getattr(svc, "emoji_for_mood", None)
+        if not callable(getter):
+            return None
+        try:
+            return await getter()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _emo_emoji_summary(emoji: Any) -> str:
+        """emoji 匹配结果摘要（宿主返回结构未定：取常见文本字段，取不到返回空串=不加后缀）。"""
+        if isinstance(emoji, dict):
+            for key in ("description", "name", "text", "emoji", "title", "id"):
+                value = str(emoji.get(key) or "").strip()
+                if value:
+                    return value[:40]
+            return ""
+        if isinstance(emoji, (list, tuple)):
+            parts = [str(item).strip() for item in emoji if str(item).strip()]
+            return "、".join(parts[:3])[:40]
+        return str(emoji).strip()[:40]
 
     @Tool(
         "cateye_test_emotion_report",

@@ -22,7 +22,8 @@
   服务束 ``start()`` 注册 / ``stop()`` 注销）；日结晚于情绪睡眠大修的保证机制见该方法注释；
 - 结果应用：delta 走 ``affection_events.record_rule_event`` 既有入账入口
   （``llm_review`` / ``daily_review`` kind，独立于 kind 上限、受 §5.5 日累计限幅），
-  随后追加 impressions（≤3 条/次、滚动 10 条、7 天过期）→ 写 tone → 清空当日 event_log。
+  随后追加 impressions（≤3 条/次、滚动 10 条、7 天过期）→ 写 tone →
+  M6 周结大事记（``record_daily_summary``，默认关、纯规则、失败静默）→ 清空当日 event_log。
 """
 
 from __future__ import annotations
@@ -693,6 +694,12 @@ class AffectionReviewer:
         # 2) 追加 impressions（≤3 条/次、滚动 10 条、7 天过期）→ 写 tone
         kept = self._affection.append_impressions(parsed["impressions"], date=day, now=now)
         self._affection.set_tone(parsed["tone"], date=day, now=now)
+        # 2.5) M6 周结大事记（默认关，纯规则零 LLM 成本）：失败只记 debug，绝不影响日结主流程
+        try:
+            self._affection.record_daily_summary(
+                date=day, tone=parsed["tone"], delta=parsed["delta_score"], now=now)
+        except Exception as exc:
+            logger.debug("周结大事记记录失败（忽略）：%s", exc)
         # 3) 清空当日 event_log
         removed = self._affection.clear_event_log()
         # 4) 仅成功（JSON 解析成功并已入账）才落「当日已日结」；失败保持未落，
