@@ -2,7 +2,8 @@
 
 组件清单：
 - Tools ×2：cateye_test_life_post_qzone（发说说，留空自动生成文案）、cateye_test_life_qzone_moments（查最近说说）
-- Command ×1：/cateye_test_life（status | qzone [moments/comments/post/reply/like] | diag | help）
+- Command ×1：/cateye_test_life（status | qzone [moments/comments/post/reply/like] | diag | help；
+  diag 为 /cateye_test_diag life 的旧名别名，行为不变）
 
 约定（与 planning/companion 的 mixin 一致）：
 - 方法名 `qzone_` 前缀（私有助手 `_qz_` 前缀），组件名 `cateye_test_life_*` / `cateye_test_life_suite`；
@@ -24,7 +25,8 @@ class QzoneComponentsMixin:
     qzone_components_info: ClassVar[Dict[str, str]] = {
         "cateye_test_life_post_qzone": "Tool：发说说（留空自动按当前活动生成文案）",
         "cateye_test_life_qzone_moments": "Tool：查最近说说（内容摘要+评论数）",
-        "cateye_test_life_suite": "Command：/cateye_test_life status|qzone|diag|help",
+        "cateye_test_life_suite": "Command：/cateye_test_life status|qzone|diag|help"
+                                 "（diag = /cateye_test_diag life 的旧名别名）",
     }
 
     # ============================================================
@@ -121,7 +123,7 @@ class QzoneComponentsMixin:
             "/cateye_test_life status - 生活状态总览（好感度/巡检/日程/空间）\n"
             "/cateye_test_life qzone - QQ空间状态｜moments 最近说说｜comments 说说评论列表\n"
             "           （管理员：post 文本、reply 说说序号 [评论序号] 内容、like tid [目标QQ]）\n"
-            "/cateye_test_life diag [天数] - 决策日志（管理员）\n"
+            "/cateye_test_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /cateye_test_diag life，行为相同\n"
             "/cateye_test_life help - 本帮助；日程与恋人功能另有 /cateye_test_plan 与 /cateye_test_mai_* 命令"
         )
 

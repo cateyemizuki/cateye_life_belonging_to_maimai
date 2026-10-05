@@ -46,13 +46,13 @@ cateye_test/
 └── core/              # 公共基础设施：llm_utils / diag(决策+LLM 日志) / time_utils / storage / inject(注入投影助手)
 ```
 
-## 组件注册面（共 41 个组件）
+## 组件注册面（共 39 个组件）
 
 | 类型 | 组件 |
 |---|---|
 | HookHandler ×10 | planning：`maisaka.planner.before_request`（日程注入，items 强 schema 协议）、`maisaka.replyer.before_request`（extra_prompt 协作式）｜companion：`chat.receive.before_process`（身份缓存）、`chat.receive.after_process`（目标私聊时间）、`maisaka.planner.before_request`（屏幕旁白+好感度后缀）、`maisaka.replyer.before_model_request`（旁白）、`maisaka.replyer.after_response`（补计发言数，OBSERVE）｜emotion：`maisaka.planner.before_request`（情绪底色注入，系统提示词后）、`maisaka.replyer.before_model_request`（情绪底色注入，系统提示词后）、`maisaka.replyer.after_response`（ΔVAD 增量评估，OBSERVE） |
-| Tool ×14 | planning：cateye_test_manage_goal_v4 / cateye_test_get_planning_status_v4 / cateye_test_apply_schedule_v4 / cateye_test_update_schedule_v4（角色裁判）｜companion：cateye_test_mai_lover_current_activity / status / schedule / send_message / affection / config｜qzone：cateye_test_life_post_qzone / cateye_test_life_qzone_moments｜emotion：cateye_test_emotion_mood、cateye_test_emotion_report（群聊 target 上报，M3） |
-| Command ×13 | planning：/cateye_test_plan、/cateye_test_规划（list/regenerate/delete/clear/help，图片+合并转发）｜companion：/cateye_test_mai_status /cateye_test_mai_schedule /cateye_test_mai_affection /cateye_test_mai_help /cateye_test_mai_config /cateye_test_mai_llm_log /cateye_test_mai_diag /cateye_test_mai_test /cateye_test_dashboard（M7 聚合总览：四模块状态图 + 纯文本降级，管理员鉴权）｜qzone：/cateye_test_life（status/qzone[moments/comments/post/reply/like]/diag/help）｜emotion：/cateye_test_emotion_init（人设初始化）、/cateye_test_emotion_config（查看/reset/clear） |
+| Tool ×13 | planning：cateye_test_manage_goal_v4 / cateye_test_get_planning_status_v4 / cateye_test_apply_schedule_v4 / cateye_test_update_schedule_v4（角色裁判）｜companion：cateye_test_mai_lover_current_activity / status / schedule / send_message / affection｜qzone：cateye_test_life_post_qzone / cateye_test_life_qzone_moments｜emotion：cateye_test_emotion_mood、cateye_test_emotion_report（群聊 target 上报，M3） |
+| Command ×12 | planning：/cateye_test_plan、/cateye_test_规划（list/regenerate/delete/clear/help，图片+合并转发）｜companion：/cateye_test_mai_status /cateye_test_mai_schedule /cateye_test_mai_affection /cateye_test_mai_help /cateye_test_mai_config /cateye_test_mai_test /cateye_test_diag（A5 排障三合一：llm/decision/life 子命令，旧名 mai_llm_log/mai_diag 与 life diag 为别名，管理员鉴权） /cateye_test_dashboard（M7 聚合总览：四模块状态图 + 纯文本降级，文本档末行附配置摘要，管理员鉴权）｜qzone：/cateye_test_life（status/qzone[moments/comments/post/reply/like]/diag[别名可见 /cateye_test_diag life]/help）｜emotion：/cateye_test_emotion_init（人设初始化）、/cateye_test_emotion_config（查看/reset/clear） |
 | API ×4 | get_current_activity（planning，兼容原插件返回结构）｜companion_get_current_activity / companion_get_schedule / companion_get_affection_level |
 
 ## 各模块功能清单
@@ -76,7 +76,7 @@ cateye_test/
 - ✅ **情绪消费（M4，B4/B7）**：巡检读 `emotion.mood_effect()`（纯规则零 LLM 成本；情绪停用/异常则各项恒 1.0）——① `activity_trigger_rate`/`default_speak_rate` × `proactive_rate`（低落 ×0.8 降主动、心情好且精神足 ×1.2）；② 想念随机阈值 × `miss_threshold`（情绪）× affection 档位系数（双系数，低落 ×0.8 更快想念；档位系数读 `RelationProfile.miss_factor_for_tier`，恋人档 0~4 = 1.4~0.6）；③ proactive intent 的 reason 追加 `intent_hint` 低分辨成语义行；乘数 clamp [0.7,1.3]，乘后概率/阈值与情绪系数落决策日志
 - ✅ **关系系统（简单版）**：`patrol.relation_type` 配置对方是 bot 的谁（恋人/挚友/维护者/家人/自定义称谓），想念提示词、消息生成口吻、好感度档位名（**v2 5 档表**，注入走 5 档口径）、消息后缀与括号小剧场（按 3 档兼容映射折算）全部随关系变化（`companion/relation.py` 预设，热更新生效）
 - ✅ 触发统一 `maisaka.proactive.trigger`；好感度后缀 + 括号小剧场；message_service 直发
-- ✅ **LLM 判定板块 `[judge]`**（同步 mai-love 2.6.3）：想念把关等判定类调用的模型 / 最大 token 数 / 温度独立成段可配（默认跟随主任务、512、0.2），可为把关单独指到便宜、非思考型的任务/模型；把关调用走 `LLMService.judge()`，`/cateye_test_mai_llm_log` 记录实际使用的模型
+- ✅ **LLM 判定板块 `[judge]`**（同步 mai-love 2.6.3）：想念把关等判定类调用的模型 / 最大 token 数 / 温度独立成段可配（默认跟随主任务、512、0.2），可为把关单独指到便宜、非思考型的任务/模型；把关调用走 `LLMService.judge()`，`/cateye_test_diag llm`（旧名 `/cateye_test_mai_llm_log`）记录实际使用的模型
 - ✅ **LLM 失败三态分诊**（同步 mai-love 2.6.2）：「成功但正文为空」（思考型模型把小 max_tokens 预算花在 reasoning 上）不再落进"未知错误"兜底，日志附 reasoning 尾部证据；宿主裸失败与非 dict 结果单独识别
 - ✅ **过期宿主主动任务块剥离**（同步 mai-love 2.6.2）：宿主 `enqueue_proactive_task` 的 `<plugin_proactive_task>` 块持久化进聊天历史且从不清理，planner/replyer 请求 Hook 把入队超过 30 分钟的块从本次请求载荷剥离（不回写宿主历史；新块与解析失败条目一律保留）
 - ✅ 屏幕感知「尾随锚点」注入（planner/replyer 双通道，锚点滑出作废）+ 恋人电脑联动（connect-hub 截屏 + VLM 描述）
@@ -120,9 +120,9 @@ cateye_test/
 
 1. 放进 MaiBot 的 `plugins/` 目录重启；WebUI 里配置 `目标 QQ`（占位值时主动私聊/命令鉴权保持关闭）；
 2. `/cateye_test_life status` 总览四模块；`/cateye_test_plan` 看日程（首次会触发生成）；自然聊天问「在干嘛」验证注入与 `mai_lover_current_activity`；
-3. 观察决策日志 `data/plugins/github.cateye.cateye-suite/decision_logs/`；`/cateye_test_mai_diag`、`/cateye_test_life diag` 查判定链；
+3. 观察决策日志 `data/plugins/github.cateye.cateye-suite/decision_logs/`；`/cateye_test_diag decision`、`/cateye_test_diag life` 查判定链（旧名 `/cateye_test_mai_diag`、`/cateye_test_life diag` 仍可用）；
 4. 空间模块：`/cateye_test_life qzone status` 看通道与 cookie；`/cateye_test_life qzone post 测试` 手动发一条；`comments`+`reply` 验证楼中楼；情绪模块：`/cateye_test_emotion_init` 初始化后聊天观察语气变化；
-5. 离线测试：`scratch/smoke_test_cateye_test.py`（stub SDK 收集 41 组件 + 配置模型 + 能力核对）与 `scratch/behavior_test_cateye_test.py`（16 组核心算法回归，含 mai-love 2.6.2/2.6.3 合并回归）。
+5. 离线测试：`scratch/smoke_test_cateye_test.py`（stub SDK 收集 39 组件 + 配置模型 + 能力核对）与 `scratch/behavior_test_cateye_test.py`（16 组核心算法回归，含 mai-love 2.6.2/2.6.3 合并回归）。
 
 ## 骨架占位 / TODO
 

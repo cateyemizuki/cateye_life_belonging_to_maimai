@@ -15,14 +15,15 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   - maisaka.replyer.before_model_request  过期主动任务块剥离 + 仅屏幕旁白注入
                                        （BLOCKING/NORMAL）
   - maisaka.replyer.after_response     90 秒窗口补计 0.5 发言数 + spoken 回执（OBSERVE/LATE）
-- Tools ×6：cateye_test_mai_lover_current_activity / cateye_test_mai_lover_status /
+- Tools ×5：cateye_test_mai_lover_current_activity / cateye_test_mai_lover_status /
   cateye_test_mai_lover_schedule / cateye_test_mai_lover_send_message /
-  cateye_test_mai_lover_affection / cateye_test_mai_lover_config
-- Commands ×9：/cateye_test_mai_status /cateye_test_mai_schedule /cateye_test_mai_affection
-  /cateye_test_mai_help /cateye_test_mai_config /cateye_test_mai_llm_log
-  /cateye_test_mai_diag /cateye_test_mai_test（鉴权：target_qq 白名单 + 本机控制台，
-  占位默认值一律拒绝）＋ /cateye_test_dashboard（M7 聚合总览：四模块状态图 + 纯文本降级，
-  鉴权沿用 admin 判定——管理员 ∪ 本机控制台，未配置管理员时 QQ 侧默认拒绝；
+  cateye_test_mai_lover_affection
+- Commands ×8：/cateye_test_mai_status /cateye_test_mai_schedule /cateye_test_mai_affection
+  /cateye_test_mai_help /cateye_test_mai_config /cateye_test_mai_test（鉴权：target_qq
+  白名单 + 本机控制台，占位默认值一律拒绝）｜/cateye_test_diag（A5 排障三合一：
+  llm|decision|life 子命令，旧名 /cateye_test_mai_llm_log、/cateye_test_mai_diag 与
+  /cateye_test_life diag 保留为别名；鉴权 = admin 判定）｜/cateye_test_dashboard
+  （M7 聚合总览：四模块状态图 + 纯文本降级，文本档末行附配置摘要；鉴权同 admin 判定；
   渲染失败/超时静默降级为纯文本）
 - APIs ×3：companion_get_current_activity / companion_get_schedule /
   companion_get_affection_level（源插件 get_* 与 planning 子模块撞名，故加前缀）
@@ -69,7 +70,7 @@ _PROACTIVE_RULE_WINDOW_SECONDS = 90.0
 #: 省略图片时替换成的文本占位符（不能直接删 part，否则 item 可能没有 part）。
 _IMAGE_OMITTED_PLACEHOLDER = "[图片已省略：为控制上下文体积]"
 
-#: 主动行为决策日志里的跳过原因 → 中文说明（/mai_diag 展示用）。
+#: 主动行为决策日志里的跳过原因 → 中文说明（/cateye_test_diag decision 展示用）。
 _DIAG_REASON_LABELS: dict[str, str] = {
     "no_candidate": "本轮没有满足条件的触发",
     "silence": "处于静默时段",
@@ -89,6 +90,14 @@ _DIAG_REASON_LABELS: dict[str, str] = {
     "reply_confirmed": "planner 已生成并发送回复",
     "tool_send_message": "planner 通过 Tool 主动发消息",
 }
+
+#: /cateye_test_diag 用法帮助（无参数或未知子命令时原样回复；四行，含旧名别名对应关系）。
+_DIAG_USAGE_TEXT = (
+    "用法: /cateye_test_diag <llm|decision|life> [天数]（管理员）\n"
+    "  llm [天数]      — LLM 调用日志，合并转发（1~30 天；旧名 /cateye_test_mai_llm_log）\n"
+    "  decision [天数] — 主动行为决策日志，合并转发（1~30 天；旧名 /cateye_test_mai_diag）\n"
+    "  life [天数]     — 决策日志紧凑文本（1~7 天；旧名 /cateye_test_life diag）"
+)
 
 #: 注入作用域
 _SCOPE_PRIVATE = "private"
@@ -753,13 +762,6 @@ class CompanionComponentsMixin:
         self.ctx.logger.info(f"好感度已通过 Tool 调整到兼容档 {level}（score 移至对应 v2 档区间）")
         return f"好感度已更新：{self._mai_affection_state_line()}"
 
-    @Tool(
-        "cateye_test_mai_lover_config",
-        description="查看麦麦恋人当前插件配置：巡检间隔、时间窗口、概率、今日发言上限、好感度",
-    )
-    async def mai_tool_config(self, **kwargs: Any) -> str:
-        return self._mai_config_summary(multiline=False)
-
     # ==================================================================
     # Commands
     # ==================================================================
@@ -883,8 +885,7 @@ class CompanionComponentsMixin:
             "/cateye_test_mai_schedule  — 查看今日完整日程\n"
             "/cateye_test_mai_affection — 查看/调整好感度: /cateye_test_mai_affection [0|1|2]\n"
             "/cateye_test_mai_config    — 查看当前插件配置摘要\n"
-            "/cateye_test_mai_llm_log   — 查看 LLM 调用日志: /cateye_test_mai_llm_log [天数]\n"
-            "/cateye_test_mai_diag      — 查看主动行为决策日志（为什么发言/为什么没发言）: /cateye_test_mai_diag [天数]\n"
+            "/cateye_test_diag          — 排障诊断 [llm|decision|life] [天数]（管理员；旧名 mai_llm_log/mai_diag 仍可用）\n"
             "/cateye_test_mai_test      — 发送一条测试消息（验证发送通道）\n"
             "/cateye_test_dashboard     — 状态总览图（日程/关系/情绪/空间，管理员）\n"
             "/cateye_test_mai_help      — 本帮助"
@@ -910,73 +911,52 @@ class CompanionComponentsMixin:
             return False, f"发送失败: {e}", True
 
     @Command(
-        name="/cateye_test_mai_llm_log",
-        pattern=r"(?<!\S)/cateye_test_mai_llm_log(?:\s+(?P<mai_days>\S+))?\s*$",
-        description="查看插件发起的 LLM 调用日志（合并转发）。用法: /cateye_test_mai_llm_log [天数]",
-    )
-    async def mai_cmd_llm_log(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        if not await self._authorize_command(kwargs):
-            return True, "没有权限", True
-        stream_id = str(kwargs.get("stream_id", "") or "")
-        companion = self._mai_companion()
-
-        async def _reply(text: str) -> None:
-            try:
-                await self.ctx.send.text(text=text, stream_id=stream_id)
-            except Exception as e:
-                self.ctx.logger.warning(f"mai_cmd_llm_log 回复发送失败: {e}")
-
-        llm_logger = getattr(companion, "llm_logger", None) if companion else None
-        if llm_logger is None or not llm_logger.enabled:
-            await _reply("LLM 调用日志未启用（配置 [admin] llm_log_enabled = true 后开始记录）。")
-            return True, "日志未启用", True
-
-        days = self._mai_parse_days(kwargs.get("matched_groups"))
-        entries = llm_logger.read_entries(days)
-        if not entries:
-            await _reply(f"最近 {days or llm_logger.retention_days} 天没有 LLM 调用日志。")
-            return True, "暂无日志", True
-
-        records = self._mai_build_llm_log_records(entries, llm_logger.retention_days)
-        return await self._mai_send_forward(records, stream_id, "LLM 日志")
-
-    @Command(
-        name="/cateye_test_mai_diag",
-        pattern=r"(?<!\S)/cateye_test_mai_diag(?:\s+(?P<mai_days>\S+))?\s*$",
-        description="查看主动行为决策日志（每轮巡检一条：为什么发言/为什么没发言）。用法: /cateye_test_mai_diag [天数]",
+        name="/cateye_test_diag",
+        pattern=r"(?<!\S)/cateye_test_diag(?:\s+(?P<diag_args>.*?))?\s*$"
+                r"|(?<!\S)(?P<legacy_llm>/cateye_test_mai_llm_log)(?:\s+(?P<llm_days>\S+))?\s*$"
+                r"|(?<!\S)(?P<legacy_decision>/cateye_test_mai_diag)(?:\s+(?P<mai_days>\S+))?\s*$",
+        description="排障诊断合一：/cateye_test_diag [llm|decision|life] [天数]"
+                    "（旧名 mai_llm_log/mai_diag/life diag 保留为别名）",
     )
     async def mai_cmd_diag(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        if not await self._authorize_command(kwargs):
-            return True, "没有权限", True
+        """A5 排障三合一：llm / decision / life 子命令 + 旧命令名别名直达。
+
+        输出与旧三件套完全同构（llm = 旧 /cateye_test_mai_llm_log、decision = 旧
+        /cateye_test_mai_diag、life = 旧 /cateye_test_life diag 紧凑文本）；旧名由
+        pattern 的 ``legacy_llm`` / ``legacy_decision`` 命名捕获进入同一逻辑（同一组件，
+        零组件成本）。鉴权统一收归 admin 判定（旧 mai_diag/llm_log 走 target 白名单、
+        旧 life diag 走 admin，收归后口径见 USAGE）。
+        """
         stream_id = str(kwargs.get("stream_id", "") or "")
-        companion = self._mai_companion()
+        if not self._qz_is_admin(str(kwargs.get("user_id") or ""),
+                                 bool(kwargs.get("is_local_operator", False))):
+            await self._diag_reply(stream_id, "权限不足：仅管理员可用 /cateye_test_diag。")
+            return True, "没有权限", True
 
-        async def _reply(text: str) -> None:
-            try:
-                await self.ctx.send.text(text=text, stream_id=stream_id)
-            except Exception as e:
-                self.ctx.logger.warning(f"mai_cmd_diag 回复发送失败: {e}")
+        groups = kwargs.get("matched_groups")
+        groups = groups if isinstance(groups, dict) else {}
+        if str(groups.get("legacy_llm") or "").strip():
+            return await self._diag_llm_log(
+                stream_id, self._diag_parse_days_arg(groups.get("llm_days")))
+        if str(groups.get("legacy_decision") or "").strip():
+            return await self._diag_decision_log(
+                stream_id, self._diag_parse_days_arg(groups.get("mai_days")))
 
-        decision_logger = getattr(companion, "decision_logger", None) if companion else None
-        if decision_logger is None or not decision_logger.enabled:
-            await _reply("主动行为日志未启用（配置 [admin] decision_log_enabled = true 后开始记录）。")
-            return True, "日志未启用", True
-
-        days = self._mai_parse_days(kwargs.get("matched_groups"))
-        entries = decision_logger.read_entries(days)
-        if not entries:
-            msg = (
-                f"最近 {days or decision_logger.retention_days} 天没有主动行为决策记录。"
-                "（插件刚加载或日志刚开启时属正常）"
-            )
-            status_line = self._mai_patrol_status_line()
-            if status_line:
-                msg += f"\n{status_line}\n（若「巡检=未运行」，说明 stream_id 没解析出来，主动发言整条链路都没跑）"
-            await _reply(msg)
-            return True, "暂无日志", True
-
-        records = self._mai_build_diag_records(entries, decision_logger.retention_days)
-        return await self._mai_send_forward(records, stream_id, "决策日志")
+        parts = str(groups.get("diag_args") or "").split()
+        sub = parts[0].lower() if parts else ""
+        raw_days = parts[1] if len(parts) > 1 else ""
+        if sub == "llm":
+            return await self._diag_llm_log(stream_id, self._diag_parse_days_arg(raw_days))
+        if sub == "decision":
+            return await self._diag_decision_log(stream_id, self._diag_parse_days_arg(raw_days))
+        if sub == "life":
+            # 天数保持旧 /cateye_test_life diag 语义：1~7，缺省/非法一律 1
+            days = self._diag_parse_days_arg(raw_days, lo=1, hi=7) or 1
+            await self._diag_reply(stream_id, self._qz_diag_text(days))
+            return True, "决策日志已发送", True
+        # 无参数与未知子命令同档：只回用法帮助（帮助属正常应答，不算命令失败）
+        await self._diag_reply(stream_id, _DIAG_USAGE_TEXT)
+        return True, ("用法已发送" if not sub else f"未知子命令: {sub}"), True
 
     @Command(name="/cateye_test_mai_test", pattern=r"(?<!\S)/cateye_test_mai_test\s*$",
              description="发送一条测试消息以验证发送通道")
@@ -1007,6 +987,7 @@ class CompanionComponentsMixin:
         发送形态同 planning/command_service.py 的 ``/plan list``：有图 → 合并转发
         （第一条图片、第二条文字）；转发失败回退 ``send.image`` → ``send.text``；
         无图（PIL 缺失/绘制异常/超时）直接发纯文本，全程静默降级不发失败提示。
+        文本档末行追加配置摘要（A5：mai_config Tool 并入此处；读配置异常则跳过该行）。
         """
         if not self._qz_is_admin(str(kwargs.get("user_id") or ""),
                                  bool(kwargs.get("is_local_operator", False))):
@@ -1020,6 +1001,11 @@ class CompanionComponentsMixin:
         stream_id = str(kwargs.get("stream_id", "") or "")
         blocks = self._mai_dashboard_blocks()
         text = cateye_dashboard.render_dashboard_text(blocks)
+        try:
+            text += "\n" + self._mai_config_summary(multiline=False)
+        except Exception as exc:
+            # 配置字段缺失（如宿主裁剪过 config）不该连带整条总览发不出去：只丢这一行
+            self.ctx.logger.info(f"状态总览配置摘要行跳过: {exc}")
         image_base64 = await self._mai_draw_dashboard(blocks)
 
         if not image_base64:
@@ -1139,17 +1125,64 @@ class CompanionComponentsMixin:
         return line
 
     @staticmethod
-    def _mai_parse_days(matched_groups: Any) -> Optional[int]:
-        """解析命令的 [天数] 命名捕获；非法/缺省返回 None（= 整个保留期）。"""
-        if not isinstance(matched_groups, dict):
-            return None
-        raw = str(matched_groups.get("mai_days", "") or "").strip()
-        if not raw:
+    def _diag_parse_days_arg(raw: Any, *, lo: int = 1, hi: int = 30) -> Optional[int]:
+        """解析诊断子命令的 [天数] 参数；缺省/非法返回 None（= 整个保留期，由 read_entries 兜底）。"""
+        text = str(raw or "").strip()
+        if not text:
             return None
         try:
-            return max(1, min(30, int(raw)))
+            return max(lo, min(hi, int(text)))
         except ValueError:
             return None
+
+    async def _diag_reply(self, stream_id: str, text: str) -> None:
+        """诊断命令的纯文本回复（发送失败只记日志，不影响命令返回的成败语义）。"""
+        try:
+            await self.ctx.send.text(text=text, stream_id=stream_id)
+        except Exception as e:
+            self.ctx.logger.warning(f"mai_cmd_diag 回复发送失败: {e}")
+
+    async def _diag_llm_log(self, stream_id: str, days: Optional[int]) -> tuple[bool, str, bool]:
+        """diag llm 子命令 = 旧 /cateye_test_mai_llm_log（llm_logger 调用日志合并转发）。"""
+        companion = self._mai_companion()
+        llm_logger = getattr(companion, "llm_logger", None) if companion else None
+        if llm_logger is None or not llm_logger.enabled:
+            await self._diag_reply(stream_id,
+                                   "LLM 调用日志未启用（配置 [admin] llm_log_enabled = true 后开始记录）。")
+            return True, "日志未启用", True
+
+        entries = llm_logger.read_entries(days)
+        if not entries:
+            await self._diag_reply(stream_id,
+                                   f"最近 {days or llm_logger.retention_days} 天没有 LLM 调用日志。")
+            return True, "暂无日志", True
+
+        records = self._mai_build_llm_log_records(entries, llm_logger.retention_days)
+        return await self._mai_send_forward(records, stream_id, "LLM 日志")
+
+    async def _diag_decision_log(self, stream_id: str, days: Optional[int]) -> tuple[bool, str, bool]:
+        """diag decision 子命令 = 旧 /cateye_test_mai_diag（决策日志合并转发）。"""
+        companion = self._mai_companion()
+        decision_logger = getattr(companion, "decision_logger", None) if companion else None
+        if decision_logger is None or not decision_logger.enabled:
+            await self._diag_reply(stream_id,
+                                   "主动行为日志未启用（配置 [admin] decision_log_enabled = true 后开始记录）。")
+            return True, "日志未启用", True
+
+        entries = decision_logger.read_entries(days)
+        if not entries:
+            msg = (
+                f"最近 {days or decision_logger.retention_days} 天没有主动行为决策记录。"
+                "（插件刚加载或日志刚开启时属正常）"
+            )
+            status_line = self._mai_patrol_status_line()
+            if status_line:
+                msg += f"\n{status_line}\n（若「巡检=未运行」，说明 stream_id 没解析出来，主动发言整条链路都没跑）"
+            await self._diag_reply(stream_id, msg)
+            return True, "暂无日志", True
+
+        records = self._mai_build_diag_records(entries, decision_logger.retention_days)
+        return await self._mai_send_forward(records, stream_id, "决策日志")
 
     async def _mai_send_forward(self, records: list[dict[str, Any]], stream_id: str,
                                 label: str) -> tuple[bool, str, bool]:
@@ -1228,7 +1261,7 @@ class CompanionComponentsMixin:
         return "\n".join(lines)
 
     def _mai_patrol_status_line(self) -> str:
-        """一行巡检运行状态（/mai_diag 汇总与自诊断用）。"""
+        """一行巡检运行状态（/cateye_test_diag decision 汇总与自诊断用）。"""
         companion = self._mai_companion()
         if companion is None:
             return ""
@@ -1253,7 +1286,7 @@ class CompanionComponentsMixin:
         return ("状态: " + "｜".join(parts)) if parts else ""
 
     def _mai_config_summary(self, multiline: bool) -> str:
-        """配置摘要（Tool 用单行紧凑版，命令用多行版）。"""
+        """配置摘要（单行紧凑版给状态总览文本降级路径，多行版给 /cateye_test_mai_config）。"""
         patrol = self.config.patrol
         affection = self.config.affection
         cateye_cfg = getattr(self.config, "cateye", None)
