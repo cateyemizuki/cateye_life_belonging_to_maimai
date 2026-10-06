@@ -186,7 +186,7 @@ class EmotionServices:
             return {}
 
     def night_interrupt_segments(self, cycle_key: Optional[str] = None) -> list:
-        """已闭合打扰段归档（供观测与第 3 段整夜合计消费；转发 self.service）。"""
+        """已闭合打扰段归档（供观测与整夜合计结算消费；转发 self.service。结算会清空本周期条目）。"""
         try:
             return list(self.service.night_interrupt_segments(cycle_key))
         except Exception:

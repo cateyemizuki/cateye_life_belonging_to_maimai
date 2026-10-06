@@ -66,9 +66,88 @@ DRAINED_EVENTS_MAX = 20
 DEFAULT_INTERRUPT_REPLY_THRESHOLD = 3
 DEFAULT_INTERRUPT_WINDOW_MINUTES = 10
 DEFAULT_RESLEEP_MINUTES = 5
-#: 打扰段归档条数上限（纯内存，供观测与第 3 段整夜合计消费；decision_logs 才是权威留痕，
+#: 打扰段归档条数上限（纯内存，供观测与醒沿整夜合计结算消费；decision_logs 才是权威留痕，
 #: 超限丢最旧只防长跑进程无界增长）
 NIGHT_SEGMENTS_MAX = 128
+#: 整夜合计的净正 ΔV 曲线（附录 §2.3 定稿，M8 段 3）：首档 +0.05、每次递减 0.01、下限 0
+#: （第 3 次 > 第 4 次的正向收益；被需要 > 被吵醒）
+SLEEP_INTERRUPT_DELTA_FIRST = 0.05
+SLEEP_INTERRUPT_DELTA_STEP = 0.01
+#: 整夜合计上限 |ΔV| ≤ 0.15（附录 §2.3 表；远小于单事件 ±0.5 硬限幅——
+#: 夜里"决定次日情绪的主语"仍是睡眠大修，打扰的暖意只在其结果之上叠加）
+SLEEP_INTERRUPT_DELTA_CAP = 0.15
+
+
+def sleep_interrupt_delta_v(count: Any) -> float:
+    """整夜合计的净正 ΔV（附录 §2.3 固化为纯函数，便于直测）。
+
+    单次净正 ΔV_i = ``max(0, 0.05 − 0.01×(i−1))``（i 从 1 起；首档 +0.05、每次递减 0.01、
+    下限 0），整夜 ``delta_v = min(Σ ΔV_i, 0.15)``。只作用 V 维（净正），A/D 恒为 0。
+    ``count`` 非数/负数一律按 0（零打扰 → 0.0，调用方据此不入账）。
+    """
+    try:
+        total = max(0, int(count))
+    except (TypeError, ValueError):
+        total = 0
+    delta = 0.0
+    for index in range(total):
+        delta += max(0.0, SLEEP_INTERRUPT_DELTA_FIRST - SLEEP_INTERRUPT_DELTA_STEP * index)
+    return min(delta, SLEEP_INTERRUPT_DELTA_CAP)
+
+
+def summarize_sleep_window(window_start: datetime, window_end: datetime, segments: Any,
+                           resleep_minutes: float = DEFAULT_RESLEEP_MINUTES) -> Dict[str, Any]:
+    """睡眠窗口口径的**纯计算**（附录 §2.4 / 用户裁决 A4；M8 段 3 落地，无副作用、可直接单测）。
+
+    打扰区间_i = ``[首次 reply_i, 最后一次 reply_i + resleep_minutes]``（``resleep`` 缓冲计入
+    被吵醒时长），逐段**封顶到窗口** ``[window_start, window_end]``；多段**取并集**——相邻/重叠
+    只扣一次（"多个打扰段"不等于"多段时长相加"）。
+
+    输入 ``segments`` = 本周期**已确认**（窗口计数达阈值）的打扰段记录（第 2 段的归档形态，
+    取 ``started_ts`` / ``last_reply_ts`` 两个 epoch 秒字段）；缺失/坏值段跳过。
+
+    Returns:
+        ``{"sleep_window_minutes", "interrupted_minutes", "actual_sleep_hours", "interrupt_count"}``；
+        ``∪`` 为空 → ``interrupted_minutes=0``、实际 = 窗口总长（与现状一致）；
+        窗口倒挂（end ≤ start）→ 三个时长字段全 0，绝不出现负值。
+    """
+    try:
+        start_ts = float(window_start.timestamp())
+        end_ts = float(window_end.timestamp())
+    except (AttributeError, TypeError, ValueError, OSError):
+        start_ts = end_ts = 0.0
+    span_minutes = max(0.0, (end_ts - start_ts) / 60.0)
+    try:
+        buffer_seconds = max(0.0, float(resleep_minutes)) * 60.0
+    except (TypeError, ValueError):
+        buffer_seconds = float(DEFAULT_RESLEEP_MINUTES) * 60.0
+    intervals: list = []
+    count = 0
+    for seg in list(segments or []):
+        if not isinstance(seg, dict):
+            continue
+        count += 1
+        try:
+            begin = max(start_ts, float(seg.get("started_ts")))
+            finish = min(end_ts, float(seg.get("last_reply_ts")) + buffer_seconds)
+        except (TypeError, ValueError):
+            continue
+        if finish > begin:
+            intervals.append((begin, finish))
+    intervals.sort()
+    merged: list = []
+    for begin, finish in intervals:
+        if merged and begin <= merged[-1][1]:      # 相邻/重叠 → 合并（重叠只扣一次）
+            merged[-1] = (merged[-1][0], max(merged[-1][1], finish))
+        else:
+            merged.append((begin, finish))
+    interrupted = sum(finish - begin for begin, finish in merged) / 60.0
+    return {
+        "sleep_window_minutes": round(span_minutes, 3),
+        "interrupted_minutes": round(interrupted, 3),
+        "actual_sleep_hours": round(max(0.0, span_minutes - interrupted) / 60.0, 6),
+        "interrupt_count": count,
+    }
 
 
 def _event_fingerprint(text: str) -> str:
@@ -126,7 +205,7 @@ class EmotionService:
         #: 当前打扰段 {"cycle_key","started_at","last_reply_at","reply_count","window_reply_count",
         #: "stream_ids","last_stream_id","awake","confirmed_at","_stamps"}；无段为 None
         self._night_segment: Optional[Dict[str, Any]] = None
-        #: 已闭合的打扰段归档（供第 3 段「整夜合计」消费；含未达阈值的候选段，``awake`` 区分）
+        #: 已闭合的打扰段归档（供醒沿整夜合计结算消费；含未达阈值的候选段，``awake`` 区分）
         self._night_archived: list = []
         #: §4.5 提醒轮豁免占位（第 4 段接线）：赖床提醒轮的截止时刻（epoch 秒）。
         #: 本段只提供登记入口，不实现豁免判定（提醒链路属第 4 段）。
@@ -975,7 +1054,7 @@ class EmotionService:
         )
         self._dedup_note(source, session_id, event_text)   # §2.4.6 A3：登记本次真正入账
         return {"ok": True, "reason": "", "event": str(event_text or ""), "delta": applied,
-                "delta_before": delta, "multiplier": round(factor, 4),
+                "delta_before": delta, "delta_scaled": scaled, "multiplier": round(factor, 4),
                 "k": round(float(multiplier), 4), "global_multiplier": round(global_mul, 4),
                 "clipped": bool(clipped),
                 "dedup": {**self.dedup_policy(), "duplicate": False}}
@@ -1001,8 +1080,10 @@ class EmotionService:
           值落 decision_logs（§6.3-7）。
 
         Returns:
-            ``{"ok", "reason", "event", "delta", "delta_before", "multiplier",
-            "k", "global_multiplier", "clipped", "dedup"}``；未入账时 ok=False 且
+            ``{"ok", "reason", "event", "delta", "delta_before", "delta_scaled", "multiplier",
+            "k", "global_multiplier", "clipped", "dedup"}``（``delta_before``/``delta_scaled``/
+            ``delta`` 即裁剪前/乘倍率后/入账值，供调用方留痕，M8 段 3 的整夜合计结算取用）；
+            未入账时 ok=False 且
             reason 说明（``disabled`` / ``empty_event`` / ``throttled`` / ``llm_error`` /
             ``llm_failed`` / ``duplicate_cross_source``）；``dedup`` 恒带上口径与
             ``duplicate`` 标记（口径见 :meth:`dedup_policy`）。
@@ -1244,7 +1325,8 @@ class EmotionService:
         return night_start <= now < night_end
 
     # ── L1 夜间打扰记账：判定与归属门控（附录 §2.1/§2.2；M8 第 2 段）──────────
-    # 本段只做「判定 + 留痕 + 内存归档」：整夜合计入账、实际睡着时长、赖床提醒分属第 3/4 段。
+    # 判定 + 留痕 + 内存归档（第 2 段）；整夜合计入账与实际睡着时长消费同一份归档
+    # （第 3 段，见下面「L1 整夜合计结算」）；赖床提醒与 §4.5 豁免分属第 4 段。
     def _no_sleep_mode(self) -> bool:
         """``[schedule].no_sleep_mode`` 的**显式**读数（附录 §〇 C1 + §一 F1）。
 
@@ -1388,7 +1470,7 @@ class EmotionService:
         落日志口径（本段实现裁定，§2.6 表 + 附录 §八.4）：**每段至多一条完整记录、只在闭合时落**。
         确认成立时刻不另落一行，而是记进 ``confirmed_at``——与闭合时刻 ``closed_at`` 一起可分辨
         "何时判定成立、何时回到睡眠"；未达阈值的候选段（只触发 planner 的夜里寒暄）不落
-        ``sleep_interrupt``，仅进内存归档（``awake=False``）供观测与第 3 段消费。
+        ``sleep_interrupt``，仅进内存归档（``awake=False``）供观测与醒沿结算消费。
         打扰段/计数只进内存 + decision_logs，**不新增 emotion_state.json 字段**（F5/§八.4；
         热重载丢账可接受，日志留痕在）。
         """
@@ -1422,7 +1504,8 @@ class EmotionService:
         return self._night_segment_record(seg, closed_at=None, close_reason="")
 
     def night_interrupt_segments(self, cycle_key: Optional[str] = None) -> list:
-        """已闭合打扰段的归档副本（可按 ``cycle_key`` 过滤；供观测与第 3 段整夜合计消费）。"""
+        """已闭合打扰段的归档副本（可按 ``cycle_key`` 过滤；供观测与整夜合计结算消费——
+        结算（:meth:`settle_night_interrupts`）会清空本周期条目，故醒沿之后同周期读数为空）。"""
         key = str(cycle_key or "")
         return [dict(seg) for seg in self._night_archived if not key or seg["cycle_key"] == key]
 
@@ -1435,6 +1518,136 @@ class EmotionService:
         """
         stamp = (until or datetime.now()).timestamp()
         self._reminder_round_until = max(float(self._reminder_round_until), float(stamp))
+
+    # ── L1 整夜合计结算（附录 §2.3/§2.4/§2.6；M8 第 3 段）────────────────────
+    def _awake_night_segments(self, cycle_key: str) -> list:
+        """本 ``cycle_key`` 内**已确认**（窗口计数达阈值）的打扰段（第 2 段内存归档的消费口）。
+
+        §2.3 的 ``n`` = "每次达到阈值算 1 次打扰段"：只触发 planner 的夜里寒暄/未达阈值的候选段
+        （``awake=False``）既不算打扰次数、也不扣睡眠时长——它们本来就没"被吵醒"。
+        """
+        key = str(cycle_key or "")
+        if not key:
+            return []
+        return [dict(seg) for seg in self._night_archived
+                if str(seg.get("cycle_key") or "") == key and bool(seg.get("awake"))]
+
+    def _cycle_window(self, now: datetime,
+                      period: Optional[Tuple[datetime, datetime]] = None
+                      ) -> Tuple[datetime, datetime]:
+        """本睡眠周期的窗口 ``(start, end)``：周期在册值优先，缺失回退作息锚点整夜窗口。"""
+        if period and len(period) == 2 and period[0] and period[1]:
+            return period[0], period[1]
+        return self._night_window(now)
+
+    def _sleep_window_summary(self, now: datetime,
+                              period: Optional[Tuple[datetime, datetime]] = None,
+                              cycle_key: str = "") -> Dict[str, Any]:
+        """本周期睡眠窗口的 §2.4 摘要（``sleep_window_minutes``/``interrupted_minutes``/
+        ``actual_sleep_hours``/``interrupt_count``；实际睡着时长替代计划时长进恢复系数）。"""
+        window = self._cycle_window(now, period)
+        key = str(cycle_key or self._cycle_key(window[0]))
+        return summarize_sleep_window(
+            window[0], window[1], self._awake_night_segments(key),
+            self._night_int("resleep_minutes", DEFAULT_RESLEEP_MINUTES))
+
+    async def settle_night_interrupts(self, now: Optional[datetime] = None, *,
+                                      period: Optional[Tuple[datetime, datetime]] = None,
+                                      cycle_key: str = "") -> Optional[Dict[str, Any]]:
+        """睡眠周期结束（醒沿）时的**整夜合计结算**：把该周期打扰的净正暖意一次性入账（§2.3）。
+
+        口径（附录 §2.3 + 用户裁决 C2/C3）：
+
+        - ``n`` = 本 ``cycle_key`` 内已确认的打扰段数；``delta_v = min(Σ ΔV_i, 0.15)``
+          （曲线见 :func:`sleep_interrupt_delta_v`）；
+        - 入账走**既有** ``record_external_event``（§6.2 A 三层倍率同源，不新开路径）：
+          ``multiplier`` 实参 = ``target_multiplier(True)``（被打扰唯一归属 target），
+          ``global_event_multiplier`` 由入口内既有逻辑相乘——调用方**不再重复乘**；
+        - 每 ``cycle_key`` 至多结算 1 次（C3）：结算后**清空本周期归档**，二次调用无段可结
+          → 返回 None（天然幂等，不落任何日志）；
+        - ``n == 0``（含 no_sleep_mode 静默/未被吵醒的夜）→ **不入账、不落 settled 日志**，
+          返回 None；
+        - **零 LLM**（模板直记）：整条路径没有模型调用；
+        - **不破坏落盘护栏**：入账会把 ``emotion_state.json`` 重写（``_save_state`` 只写状态机 +
+          episode），故本方法先留 ``applied_sleep_date`` 原值、入账后补回（F6「同周期不重复结算」
+          的落盘护栏语义不变；不新增任何状态字段）。
+
+        Args:
+            now: 结算时刻（醒沿）。
+            period: 本周期窗口（醒沿调用方在 apply 前留存，apply 会清 ``_sleep_period``）。
+            cycle_key: 本周期键（缺省按窗口起点推导；醒沿调用方传 apply 载荷中的键）。
+
+        Returns:
+            结算载荷（含 ``delta_v`` 曲线值 / ``delta_v_applied`` 实际入账净 V 与 ``record``
+            原始回执）；未结算返回 None。
+        """
+        current = now or datetime.now()
+        window = self._cycle_window(current, period)
+        key = str(cycle_key or self._cycle_key(window[0]))
+        segments = self._awake_night_segments(key)
+        # 周期已结束 → 本周期归档一律清空（含未达阈值的候选段）：归档的消费方只有本次结算，
+        # 留着只会让热重载后的白天 tick 拿到陈旧账；"每周期至多 1 次"由此获得幂等保证。
+        self._night_archived = [seg for seg in self._night_archived
+                                if str(seg.get("cycle_key") or "") != key]
+        count = len(segments)
+        if count <= 0:
+            return None
+        summary = summarize_sleep_window(
+            window[0], window[1], segments,
+            self._night_int("resleep_minutes", DEFAULT_RESLEEP_MINUTES))
+        delta_v = sleep_interrupt_delta_v(count)
+        if delta_v <= 0:
+            return None
+        description = f"夜间被重要的人打扰 {count} 次（净正合计）"
+        # 护栏（F6）：入账经 record_external_event → _apply_external_delta → _save_state，而
+        # `_save_state` 只写状态机 + episode —— 会把醒沿刚写入的 `applied_sleep_date` 冲掉。
+        # 先留一份、入账后原值补回（本函数不改该键的值，只是不让自己的入账把它抹掉；否则同一夜
+        # 会因"本周期已结算"落盘护栏失效而被重新冻结 + 重复跑裁判）。
+        guard = (load_json(self._state_path, {}) or {}).get("applied_sleep_date")
+        # 入账经既有外部事件入口：K 实参 = target 档（被打扰唯一归属 target），全局倍率在
+        # record_external_event/_apply_external_delta 内既有逻辑里乘一次（三层倍率同源）。
+        outcome = await self.record_external_event(
+            source="sleep_interrupt", description=description,
+            delta=VADState(delta_v, 0.0, 0.0), multiplier=self.target_multiplier(True),
+            session_id=str(segments[-1].get("stream_id") or ""))
+        if guard is not None:
+            state = load_json(self._state_path, {}) or {}
+            if state.get("applied_sleep_date") != guard:
+                state["applied_sleep_date"] = guard
+                save_json_atomic(self._state_path, state)
+        before = outcome.get("delta_before")
+        scaled = outcome.get("delta_scaled")
+        applied_delta = outcome.get("delta")
+        net_v = float(applied_delta.valence) if isinstance(applied_delta, VADState) else 0.0
+        self._log_decision(
+            "emotion.sleep_interrupt_settled", trigger_type="emotion",
+            reason=f"睡眠周期结束合并结算：{count} 次夜间打扰（净正合计，零 LLM）",
+            cycle_key=key,
+            interrupt_count=count,
+            sleep_window_minutes=summary["sleep_window_minutes"],
+            interrupted_minutes=summary["interrupted_minutes"],
+            actual_sleep_hours=summary["actual_sleep_hours"],
+            delta_v=round(float(delta_v), 4),          # 曲线合计（乘倍率前）
+            delta_v_applied=round(net_v, 4),           # 实际入账净 V（乘倍率、限幅后）
+            k=outcome.get("k"), global_multiplier=outcome.get("global_multiplier"),
+            multiplier=outcome.get("multiplier"),
+            record_ok=bool(outcome.get("ok")), record_reason=str(outcome.get("reason") or ""),
+            # 与既有 emotion.external_event 日志同语义：裁剪前 / 乘倍率后 / 入账值（dict 三维）
+            delta_before=before.to_dict() if hasattr(before, "to_dict") else None,
+            delta_scaled=scaled.to_dict() if hasattr(scaled, "to_dict") else None,
+            delta_applied=applied_delta.to_dict() if hasattr(applied_delta, "to_dict") else None,
+            stream_id=str(segments[-1].get("stream_id") or ""),
+            reply_count=sum(int(seg.get("reply_count") or 0) for seg in segments),
+        )
+        return {
+            "ok": bool(outcome.get("ok")), "reason": str(outcome.get("reason") or ""),
+            "cycle_key": key, "interrupt_count": count,
+            "sleep_window_minutes": summary["sleep_window_minutes"],
+            "interrupted_minutes": summary["interrupted_minutes"],
+            "actual_sleep_hours": summary["actual_sleep_hours"],
+            "delta_v": round(float(delta_v), 4), "delta_v_applied": round(net_v, 4),
+            "description": description, "record": outcome,
+        }
 
     async def compute_sleep_overhaul(self, now: Optional[datetime] = None,
                                      sleep_hours: Optional[float] = None) -> Optional[Dict[str, Any]]:
@@ -1454,14 +1667,19 @@ class EmotionService:
         current = self._current_sleep_item(now)
         # 时长的来源优先级：调用方给的计划时长（作息锚点整夜） > 条目时长 > 锚点整夜兜底
         # （冻结期重试时可能已无当前条目——条目只有 15 分钟窗口，不能作为必要前提）
-        # TODO(M8-3)：§2.5.4「实际睡着时长」——依赖 §2.4 的扰段区间并集，由 M8 第 3 段以
-        #   实际值替代此处计划时长进 sleep_recovery_factor()；本段（§2.5）保持计划时长口径。
+        # M8 段 3（附录 §2.5.4 / §2.4 / 用户裁决 A4）：本值仍是**计划**整夜时长——它既是裁判
+        # prompt 的"预计睡眠时长"输入，也是缓存载荷的对照值；**恢复系数的输入在醒沿应用时改成
+        # 实际睡着时长**（`_apply_cached_overhaul` 用 `summarize_sleep_window` 现算并传给
+        # apply_sleep_overhaul），故收回执时 `cached["sleep_hours"]` 只表示"计划"。
+        # 本函数另把"此刻窗口内的实际值"快照进 `actual_sleep_hours`（入睡时无扰段 → = 计划；
+        # 裁判失败重试路径可能已有段），供对照与留痕，不参与裁判。
         if sleep_hours is not None:
             hours = float(sleep_hours)
         elif current is not None:
             hours = self._sleep_hours(current)
         else:
             hours = self._planned_sleep_hours(*self._sleep_anchors())
+        window_now = self._sleep_window_summary(now, self._sleep_period)
         r_yesterday = self.schedule_tone_sum(
             self._day_items(query, (now - timedelta(days=1)).strftime("%Y-%m-%d")))
         e_tomorrow = self.schedule_tone_sum(
@@ -1487,6 +1705,13 @@ class EmotionService:
         delta, reasons = result
         cached = {
             "delta": delta, "reasons": reasons, "sleep_hours": hours,
+            # §2.4 摘要快照：`sleep_hours` 是**计划**整夜时长（裁判输入），
+            # `actual_sleep_hours` 是**此刻**窗口内按扰段并集扣减后的实际值（醒沿应用时会重算，
+            # 以届时归档为准——缓存只作对照留痕）。
+            "sleep_window_minutes": window_now["sleep_window_minutes"],
+            "interrupted_minutes": window_now["interrupted_minutes"],
+            "actual_sleep_hours": window_now["actual_sleep_hours"],
+            "interrupt_count": window_now["interrupt_count"],
             "r_yesterday": r_yesterday, "e_tomorrow": e_tomorrow,
             "commitment_net": commitment_net, "delta_limit": delta_limit, "computed_at": now,
         }
@@ -1496,6 +1721,12 @@ class EmotionService:
             sleep_hours=round(hours, 2), delta_limit=round(delta_limit, 4),
             delta_requested=delta.to_dict(), r_yesterday=r_yesterday.to_dict(),
             e_tomorrow=e_tomorrow.to_dict(), commitment_net=commitment_net,
+            # §2.4 留痕（M8 段 3）：入睡时段的窗口/扰段快照（裁判失败重试路径可能已有段；
+            # 恢复系数在醒沿用届时实算值，不取本快照）
+            sleep_window_minutes=window_now["sleep_window_minutes"],
+            interrupted_minutes=window_now["interrupted_minutes"],
+            actual_sleep_hours=window_now["actual_sleep_hours"],
+            interrupt_count=window_now["interrupt_count"],
         )
         return cached
 
@@ -1632,27 +1863,47 @@ class EmotionService:
         （§2.5.3「至少落其一」的落点：这批事件的 ΔVAD **不进结算**——夜里被打扰的情绪后果由
         M8 第 3 段的 sleep_interrupt 整夜合计统一入账，此处入账即双重记账）。
 
+        M8 段 3（附录 §2.5.4/§2.4，用户裁决 A4）恢复系数改用**实际睡着时长**：本周期窗口减去
+        打扰区间并集（第 2 段归档，此刻醒沿已闭段）；计划时长只留作对照
+        （``sleep_hours_planned``）与裁判输入。窗口/扰段三字段一并落 ``emotion.sleep_overhaul``
+        与 ``emotion.overhauled`` 载荷（§2.4 留痕要求）。
+
         Returns:
-            应用结果 dict（含 ``ok``/``recovery_factor``/三输入/夜间事件摘要留痕）；无缓存返回 None。
+            应用结果 dict（含 ``ok``/``recovery_factor``/``sleep_hours``（实际）/
+            ``sleep_window_minutes``/``interrupted_minutes``/``interrupt_count``/三输入/
+            夜间事件摘要留痕）；无缓存返回 None。
         """
         cached, self._pending_overhaul = self._pending_overhaul, None
+        # 本周期窗口在下面即被清（周期结束）：先留一份给"实际睡着时长"与醒沿结算用
+        period = self._sleep_period
         self._sleep_period = None  # 周期结束（醒沿）：后续 tick 重新按条目/锚点判定
         if cached is None:
             if self.is_frozen():
                 self._machine.unfreeze(now)
                 self._save_state()
             return None
+        cycle_key = str(cached.get("cycle_key") or "")
+        # §2.4/A4：恢复系数输入 = 实际睡着时长（窗口总长 − 打扰区间并集），不是缓存里的计划时长
+        window_stats = self._sleep_window_summary(now, period, cycle_key)
+        actual_hours = float(window_stats["actual_sleep_hours"])
         ref = cached.get("computed_at") or now  # 入睡时刻（日期基准：R=入睡日-1，E=入睡日+1）
         query = self._schedule_query()
         r_yesterday, e_tomorrow, commitment_net = self._wake_side_inputs(ref, cached)
         drained = self._machine.unfreeze(now)  # §2.5.2：先解冻（队列并入日志，观测保留）
         night = self._drained_events_summary(drained)  # §2.5.3：解冻即采集，apply 之后日志即清空
         applied = self._machine.apply_sleep_overhaul(
-            cached["delta"], cached["sleep_hours"], now=now,
+            cached["delta"], actual_hours, now=now,
             r_yesterday=r_yesterday, e_tomorrow=e_tomorrow,
             commitment_net=commitment_net, delta_limit=cached.get("delta_limit"))
         applied["reasons"] = cached.get("reasons", {})
         applied["ok"] = True
+        applied["cycle_key"] = cycle_key or self._cycle_key(self._cycle_window(now, period)[0])
+        # `sleep_hours` = 本次结算**实际**用的时长（进恢复系数）；计划值单独留痕供对照
+        applied["sleep_hours"] = round(actual_hours, 3)
+        applied["sleep_hours_planned"] = round(float(cached.get("sleep_hours") or 0.0), 3)
+        applied["sleep_window_minutes"] = window_stats["sleep_window_minutes"]
+        applied["interrupted_minutes"] = window_stats["interrupted_minutes"]
+        applied["interrupt_count"] = window_stats["interrupt_count"]
         applied["r_yesterday"] = r_yesterday.to_dict()
         applied["e_tomorrow"] = e_tomorrow.to_dict()
         applied["commitment_net"] = commitment_net
@@ -1670,6 +1921,11 @@ class EmotionService:
             reason="醒后一次性应用缓存大修",
             recovery_factor=applied.get("recovery_factor", 0.0),
             sleep_hours=applied.get("sleep_hours", 0.0),
+            # §2.4 留痕（M8 段 3）：实际睡着时长口径 + 计划对照
+            sleep_hours_planned=applied.get("sleep_hours_planned"),
+            sleep_window_minutes=applied.get("sleep_window_minutes"),
+            interrupted_minutes=applied.get("interrupted_minutes"),
+            interrupt_count=applied.get("interrupt_count"),
             delta_limit=applied.get("delta_limit"),
             delta_requested=applied.get("delta_requested"), delta_applied=applied.get("delta_applied"),
             r_yesterday=applied.get("r_yesterday"), e_tomorrow=applied.get("e_tomorrow"),
@@ -1743,9 +1999,11 @@ class EmotionService:
         睡眠时段判定（M5 修复）：条目本身会被 ``_normalize_items`` 的作息锚点截断
         （最长为 23:00–23:15，夜间无条目覆盖），故**冻结窗口按 [schedule] 作息锚点整夜**
         （``_sleep_entry_period``），条目只作入口/小睡；醒沿 = 离开该窗口，或日程出现
-        非睡眠的清醒活动（文档口径「醒来的第一个活动开始」）。醒沿顺序（M8 段 1，附录 §2.5）：
-        ``flush_all_episodes("wake")`` → ``publish_woke_up`` → ``_apply_cached_overhaul``
-        （内部先 ``unfreeze`` 并采集夜间事件摘要，再 ``apply_sleep_overhaul``）。
+        非睡眠的清醒活动（文档口径「醒来的第一个活动开始」）。醒沿顺序（M8 段 1 + 段 3，附录
+        §2.5/§2.3）：``close_night_interrupt_segment("wake")`` → ``flush_all_episodes("wake")``
+        → ``publish_woke_up`` → ``_apply_cached_overhaul``（内部先 ``unfreeze`` 并采集夜间事件
+        摘要、按**实际睡着时长**结算大修）→ ``settle_night_interrupts``（整夜合计一次性入账，
+        在**大修之后**：打扰的暖意叠加在大修结果之上，不被向锚点收敛稀释）。
         """
         query = self._schedule_query()
         now = datetime.now()
@@ -1776,7 +2034,21 @@ class EmotionService:
             if self.is_frozen() or self._in_sleep:
                 await self.flush_all_episodes(reason="wake")
             await self._publish_woke_up_if_needed(now)   # M0：离开睡眠 → schedule.woke_up
-            await self._apply_cached_overhaul(now)       # M5：应用缓存并解冻
+            # 醒沿最终顺序（附录 §2.3 + §2.5.4）：flush → unfreeze → 采集摘要 →
+            # apply_sleep_overhaul → **sleep_interrupt 整夜合计结算**。
+            # 本 tick 是否真的是"周期结束"（而非白天任意 tick 命中本分支）：与冲刷判定同源，
+            # 另加"本周期窗口在册"；`_apply_cached_overhaul` 开头会清窗口，故先留一份。
+            ended_cycle = bool(self.is_frozen() or self._in_sleep
+                               or self._sleep_period is not None)
+            period = self._sleep_period
+            applied = await self._apply_cached_overhaul(now)     # M5：应用缓存并解冻
+            # 顺序理由（附录 §2.3 上限注释）：大修是"夜里决定次日情绪的主语"，被打扰的暖意叠加
+            # 在**大修结果之上**；若在大修前入账，会被 (raw − anchor) × recovery_factor 的向锚点
+            # 收敛稀释（且恒被下界 0.3~0.85 的系数打折），与"净正合计整夜入账"的口径不符。
+            # 无打扰周期 → 结算内部返回 None（不入账、不落 settled 日志）。
+            if ended_cycle:
+                settle_key = str(applied.get("cycle_key") or "") if applied else ""
+                await self.settle_night_interrupts(now, period=period, cycle_key=settle_key)
             return
 
         if self.is_frozen():
