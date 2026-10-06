@@ -1,11 +1,16 @@
-# 注册面简化处置清单 v2.1（2026-10-06 · Tool 终态 6 个 + 情绪评估会话片段制）
+# 注册面简化处置清单 v2.2（2026-10-07 · Tool 终态 7 个 = T6 收口 6 + M9 赖床 1）
 
 > v2 增量（吸收四命令/工具合并×2）之上，并入 **2026-10-06 二次自检（用户确认）**：
 > manage_goal / apply_schedule / mai_lover_status / emotion_mood 四工具移除，
 > 情绪评估改会话片段制（成本封顶）。v1 的 Hook/配置/频率判定不变。
 > 执行者：会话 2（T6 注册面收口 + T7 评估片段制）。
+>
+> **v2.2（2026-10-07，执行者：会话 2 / M9 第 4 段）**：按
+> `MAINTENANCE_PLAN_APPENDIX_20261007_0155` §4.4 新增 **1 个 hidden Tool**
+> `cateye_test_nap_lie_in`（赖床；metadata.visibility=hidden）→ Tool 6→7、组件 28→29。
+> 本清单只更组件账目，行为口径见附录 §四与 README/USAGE。
 
-## 一、Tool 终态（6 个）与全量调用链路
+## 一、Tool 终态（7 个）与全量调用链路
 
 1. **`cateye_test_get_schedule_info(view)`**（四视图；吸收 get_planning_status_v4 /
    current_activity / mai_lover_schedule / **manage_goal 只读**）
@@ -33,6 +38,16 @@
    触发：群聊归因声明 → 跨来源去重（replyer⇄tool、同流 180s 先入账生效）→
    `evaluate_reply_delta`（±0.5 clip）→ `record_external_event` ×(global × (1+加成) | non_target)
    → emotion_state.json + 决策落账。
+7. **`cateye_test_nap_lie_in(time)`**（M9 新增；**hidden** = 不进名册、`enabled=False`，F13）
+   触发：夜间被重要的人吵醒 → 打扰段以 `resleep` 闭合 → 赖床提醒轮（emotion 侧发
+   `proactive.trigger(intent="nap_reminder", metadata={"kind":"nap_reminder"})`，纳入全渠道预算）
+   → 提示词点名本工具 → bot 自主决定是否调用。
+   链路：`planning/components.py:plan_tool_nap_lie_in` → `ToolsService.nap_lie_in`
+   （解析容错 → 非睡眠周期拒绝 → `[schedule] lie_in_max_until` 钳制 → 找**入睡日**日程的 sleep
+   条目并推后其 `end_minute` → `ScheduleGenerator.apply_schedule_items(..., consume_commitments=False)`
+   共享底层写回）→ emotion 束回调 `extend_night_sleep_until`（睡眠窗口端点后移 = 醒沿推迟）
+   + `note_nap_lie_in_applied`（本周期「有效提醒次数」+1）。
+   提醒块"不进下一轮"：`core/inject.py:is_consumed_ephemeral_proactive_block`（块龄 >120s 剔）。
 
 **移除（四项）**：`manage_goal_v4`（写路径撤，只读入 view=goals）、`apply_schedule_v4`
 （写语义入 update，过裁判）、`mai_lover_status`（注入全覆盖）、`emotion_mood`（注入全覆盖；
@@ -59,14 +74,16 @@ tok/日，插件最大常驻消费）；产出的 ±0.1 级增量最终只被低
 
 ## 三、最终目标态
 
-| 维度 | T1~T5 后 | T6+T7 后 | §9.3 清退后 |
-|---|---|---|---|
-| Command | 9~10 | **8** | 8 |
-| Tool | 13 | **6** | 6 |
-| Hook | 10 | 10 | 10 |
-| API | 4 | 4 | **1** |
-| 组件总数 | 39 | **28** | **25** |
-| 配置 | 13 段 | +`[emotion]` 3 字段（评估片段制） | 定版 |
+| 维度 | T1~T5 后 | T6+T7 后 | **M9（赖床 Tool）后** | §9.3 清退后 |
+|---|---|---|---|---|
+| Command | 9~10 | **8** | 8 | 8 |
+| Tool | 13 | **6** | **7** | 7 |
+| Hook | 10 | 10 | 10 | 10 |
+| API | 4 | 4 | 4 | **1** |
+| 组件总数 | 39 | **28** | **29** | **26** |
+| 配置 | 13 段 | +`[emotion]` 3 字段（评估片段制） | +`[schedule] lie_in_max_until`、`[planning_proactive]` 2 字段 | 定版 |
 
 执行：T6/T7 均在 ws2/m6m7 分支；每步独立提交 + 四套脚本门（smoke 断言改 28）+
 实施/验证分立；完成后 merge 协议回主仓，部署归会话 1。
+**M9 增量**：同上流程（smoke 断言 28→29、handler 门面审计 24→25、Tool 6→7），
+行为用例见 `scratch/behavior_test_cateye_test.py` 第 108~114 号。

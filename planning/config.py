@@ -293,6 +293,20 @@ class ScheduleSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "情绪影响强度", "step": 0.05, **_ui_i18n("Emotion influence")},
     )
 
+    # ── M9 赖床上限（附录 §4.4/§4.6，用户裁决 C4）───────────
+    lie_in_max_until: str = Field(
+        default="12:00",
+        description="赖床（推迟起床）的硬上限时刻（HH:MM，默认 12:00）。夜间被吵醒后调用赖床工具时，"
+                    "传入的起床时间**超过本值会被钳到本值**（提醒文本给出的也是本值）；"
+                    "格式非法一律按 12:00 处理",
+        json_schema_extra={
+            "label": "赖床上限时刻",
+            "hint": "HH:MM；传入时间超过它会被钳到它（默认 12:00）",
+            "pattern": r"^\d{1,2}:\d{2}$",
+            **_ui_i18n("Lie-in hard limit", "Hard cap for the lie-in tool (HH:MM)."),
+        },
+    )
+
 
 class InjectSectionConfig(PluginConfigBase):
     """智能注入策略（来源：自主规划插件 [inject] 段；推荐挂载名 ``inject``）。"""
@@ -395,6 +409,21 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         default=True,
         description="按当前活动类型动态调节聊天频率（ctx.frequency.set_adjust）：学习/工作时 30%，休息/娱乐时 130%~150%",
         json_schema_extra={"label": "活动频率调控", **_ui_i18n("Frequency modulation")},
+    )
+
+    # ── M9 赖床提醒（附录 §4.1/§4.6，跟随 L1 睡眠打扰）───────
+    nap_reminder_enabled: bool = Field(
+        default=True,
+        description="赖床提醒开关：夜间被吵醒且重新睡着后，向 bot 发一条临时提醒"
+                    "（点名赖床工具；只在当轮有效）。关闭后不提醒，但不阻止 bot 自行改日程",
+        json_schema_extra={"label": "赖床提醒", **_ui_i18n("Nap reminder")},
+    )
+    nap_reminder_max_per_day: int = Field(
+        default=2,
+        ge=1,
+        description="每个睡眠周期（不是自然日）的有效提醒次数上限：提醒发送成功 + 工具成功改日程"
+                    "都各计 1 次；用尽后不再提醒，但仍允许 bot 自行推迟起床",
+        json_schema_extra={"label": "赖床提醒上限", **_ui_i18n("Nap reminder cap")},
     )
 
 

@@ -192,6 +192,38 @@ class EmotionServices:
         except Exception:
             return []
 
+    # ── M9（附录 §4.1–§4.5）：L3 赖床链路转发（planning 赖床工具只问这三个入口；单向依赖）──
+    def in_night_sleep_cycle(self) -> bool:
+        """当前是否处于夜间睡眠周期（赖床工具「非睡眠周期调用 → 拒绝」的门控；转发 service）。
+
+        planning 侧不 import emotion，只按鸭子类型调用本入口；异常一律 False（可空降级，§八.2）。
+        """
+        try:
+            return bool(self.service.in_night_sleep_cycle())
+        except Exception:
+            return False
+
+    def extend_night_sleep_until(self, target: Any = None) -> bool:
+        """赖床成功后把本睡眠周期窗口结束端推到 target（转发 service；§4.4 第 5 条）。
+
+        只有「周期在册 + 新端 > 旧端 + 受 lie_in_max_until 钳制」三者同时成立才改端点，
+        返回是否真的延长（否则醒沿仍按 wake 锚点触发）。
+        """
+        try:
+            return bool(self.service.extend_night_sleep_until(target))
+        except Exception:
+            return False
+
+    def note_nap_lie_in_applied(self) -> int:
+        """赖床工具成功改写日程 → 本周期「有效提醒次数」+1（转发 service；§4.4 计数口径）。
+
+        只计数（不判额度）：额度用尽只停提醒，**不阻止**工具调用。
+        """
+        try:
+            return int(self.service.note_nap_lie_in_applied())
+        except Exception:
+            return 0
+
     @property
     def _bg_tasks(self) -> list:
         """评估后台任务列表（与内层同一份；Hook 侧防堆积裁剪与 stop() 清理共用）。"""

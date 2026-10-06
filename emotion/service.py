@@ -11,6 +11,10 @@ from typing import Any, Dict, Optional, Tuple
 from core.storage import load_json, save_json_atomic
 from core.time_utils import parse_hhmm
 from planning.schedule_query import ScheduleQuery
+# M9（附录 §4.3 用户裁决 A2）：赖床工具名与钳制上限的**唯一定义点**在 planning/tools_service.py；
+# 提醒文本与组件注册同源引用。planning 侧不 import emotion（单向），故无循环依赖。
+from planning.tools_service import (DEFAULT_LIE_IN_MAX_UNTIL, NAP_TOOL_NAME,
+                                    normalize_hhmm, parse_nap_target)
 
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
 from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
@@ -76,6 +80,22 @@ SLEEP_INTERRUPT_DELTA_STEP = 0.01
 #: 整夜合计上限 |ΔV| ≤ 0.15（附录 §2.3 表；远小于单事件 ±0.5 硬限幅——
 #: 夜里"决定次日情绪的主语"仍是睡眠大修，打扰的暖意只在其结果之上叠加）
 SLEEP_INTERRUPT_DELTA_CAP = 0.15
+#: 赖床提醒轮（L3，附录 §4.5）的豁免窗口时长（秒）：提醒发出后的这段时间内，该流若意外
+#: 触发 reply，不刷新 resleep 计时、不重开吵醒态、不额外限制工具调用。
+#: 与 core/inject.py 的 NAP_BLOCK_LINGER_SECONDS 同值（提醒块"已过提醒轮"的口径）——
+#: core 不 import emotion，故两处各留一份常量，同批改动需一起改。
+NAP_REMINDER_ROUND_SECONDS = 120.0
+#: 有效提醒次数上限的缺省（[planning_proactive] nap_reminder_max_per_day，§4.6 默认 2）
+DEFAULT_NAP_REMINDER_MAX_PER_DAY = 2
+#: 赖床提醒文本模板（附录 §4.3 逐字定稿，占位符照抄）：``{nap_tool_name}`` 引用
+#: planning/tools_service.py 的 NAP_TOOL_NAME（A2：工具改名只需动那一处）；
+#: ``{planned_wake_hhmm}`` = 当前睡眠窗口结束 / wake 锚点；``{lie_in_max_until}`` = [schedule] 配置值。
+NAP_REMINDER_TEMPLATE = (
+    "【临时提醒·不进下一轮上下文】你半夜被重要的人吵醒了，现在是 {now_hhmm}；"
+    "你本来打算睡到 {planned_wake_hhmm}。如果还想再睡一会儿，可以调用 {nap_tool_name} "
+    "把起床时间往后推（最晚 {lie_in_max_until}）。这条提醒只在本轮有效，"
+    "不必向任何人提起\"昨晚被吵醒\"。是否调用由你决定。"
+)
 
 
 def sleep_interrupt_delta_v(count: Any) -> float:
@@ -207,9 +227,15 @@ class EmotionService:
         self._night_segment: Optional[Dict[str, Any]] = None
         #: 已闭合的打扰段归档（供醒沿整夜合计结算消费；含未达阈值的候选段，``awake`` 区分）
         self._night_archived: list = []
-        #: §4.5 提醒轮豁免占位（第 4 段接线）：赖床提醒轮的截止时刻（epoch 秒）。
-        #: 本段只提供登记入口，不实现豁免判定（提醒链路属第 4 段）。
+        #: §4.5 提醒轮豁免窗口的截止时刻（epoch 秒）：由 :meth:`note_reminder_round` 登记
+        #: （赖床提醒发送成功后 = now + :data:`NAP_REMINDER_ROUND_SECONDS`）。
         self._reminder_round_until = 0.0
+        # M9（附录 §4.1–§4.5 L3 赖床提醒）：纯内存运行期状态、不落任何状态文件（F5 同口径）
+        #: 「有效提醒次数」按 cycle_key 计数（提醒发送成功 + 工具成功改日程各 +1）；
+        #: 只留最近 4 个周期键（防长跑进程无界增长）
+        self._nap_reminder_counts: Dict[str, int] = {}
+        #: 已提醒过的段标记 ``(cycle_key, closed_at)``：保证"本轮每段至多一次"（额度之外的第二道闸）
+        self._nap_reminded_segments: set = set()
 
     # ── 事件总线（M0；无总线时静默跳过）─────────────────────
     def _bus(self) -> Any:
@@ -1380,8 +1406,14 @@ class EmotionService:
         故闭段留痕不依赖睡眠检测 tick（tick 内另有一处 resleep 扫描，见 ``_check_and_overhaul``）。
         """
         current = now or datetime.now()
-        self._roll_night_segment(current)
+        closed = self._roll_night_segment(current)
+        if closed is not None:
+            self._dispatch_nap_reminder_soon(closed, current)   # L3：resleep 闭合 → 提醒轮
         if self._no_sleep_mode() or not self._enabled() or not self._in_night_sleep_cycle(current):
+            return False
+        # §4.5 提醒轮豁免：提醒轮窗口内的 reply 不刷新 resleep 计时、不重开吵醒态
+        # （只是不入账，reply 本身照常返回 False —— 与"非 target 不计数"同档语义）
+        if self.in_reminder_round(current):
             return False
         stream = str(session_id or "").strip()
         if not self.is_target_session(stream):
@@ -1510,14 +1542,286 @@ class EmotionService:
         return [dict(seg) for seg in self._night_archived if not key or seg["cycle_key"] == key]
 
     def note_reminder_round(self, until: Optional[datetime] = None) -> None:
-        """§4.5 提醒轮豁免的**占位登记入口**（第 4 段接线，本段不实现豁免判定）。
+        """§4.5 提醒轮豁免的登记入口（赖床提醒发送成功后由提醒轮自行调用）。
 
         赖床提醒轮若意外触发 reply，不应刷新 ``resleep_minutes`` 计时、不应重新进入吵醒态。
-        本段只保留时间戳字段与登记入口（提醒链路与豁免判定属第 4 段）：现在调用它不改变
-        任何打扰计数的行为。
+        登记的是**截止时刻**（``until``，提醒轮 = ``now + NAP_REMINDER_ROUND_SECONDS``）；
+        是否落在提醒轮内由 :meth:`in_reminder_round` 判定，豁免判定在 ``note_night_reply`` 内生效。
         """
         stamp = (until or datetime.now()).timestamp()
         self._reminder_round_until = max(float(self._reminder_round_until), float(stamp))
+
+    def in_reminder_round(self, now: Optional[datetime] = None) -> bool:
+        """当前是否处于提醒轮豁免窗口内（§4.5；无提醒轮登记时恒 False）。"""
+        return float((now or datetime.now()).timestamp()) < float(self._reminder_round_until)
+
+    # ── L3 赖床提醒与工具接线（附录 §4.1–§4.5；M9 落地）────────────────────
+    def _nap_cfg(self, name: str, default: Any) -> Any:
+        """运行期动态读 [planning_proactive] 的赖床配置（热重载即时生效；缺省回退默认值）。"""
+        cfg = getattr(self._plugin.config, "planning_proactive", None)
+        value = getattr(cfg, name, default) if cfg is not None else default
+        return default if value is None else value
+
+    def nap_reminder_max_per_day(self) -> int:
+        """每睡眠周期的有效提醒上限（§4.1②/§4.6；``ge=1``，运行期非法值回退缺省 2）。"""
+        try:
+            value = int(self._nap_cfg("nap_reminder_max_per_day", DEFAULT_NAP_REMINDER_MAX_PER_DAY))
+        except (TypeError, ValueError):
+            return DEFAULT_NAP_REMINDER_MAX_PER_DAY
+        return value if value >= 1 else DEFAULT_NAP_REMINDER_MAX_PER_DAY
+
+    def nap_reminder_enabled(self) -> bool:
+        """``[planning_proactive] nap_reminder_enabled``（§4.1④，默认 true）。"""
+        return bool(self._nap_cfg("nap_reminder_enabled", True))
+
+    def lie_in_max_minutes(self) -> int:
+        """``[schedule] lie_in_max_until`` 的分钟数（与工具侧同源；非法回退 12:00）。
+
+        提醒文本里的「最晚 {lie_in_max_until}」与本方法同源，保证提示与实际钳制一致。
+        """
+        raw = self._schedule_cfg("lie_in_max_until", DEFAULT_LIE_IN_MAX_UNTIL)
+        return parse_nap_target(normalize_hhmm(raw, DEFAULT_LIE_IN_MAX_UNTIL)) or 12 * 60
+
+    def nap_reminder_count(self, cycle_key: str = "", now: Optional[datetime] = None) -> int:
+        """本 ``cycle_key`` 内已用的「有效提醒次数」（纯内存；缺省按当前周期键）。"""
+        key = str(cycle_key or self._night_cycle_key(now or datetime.now()))
+        return int(self._nap_reminder_counts.get(key, 0))
+
+    def note_nap_reminder(self, cycle_key: str = "", now: Optional[datetime] = None) -> int:
+        """「有效提醒次数」+1（§4.1②/§4.4 计数口径），返回自增后的值。
+
+        两个入口共用同一计数：①提醒发送成功；②赖床工具成功修改日程（经
+        :meth:`note_nap_lie_in_applied`）。**未调用/失败不计次**；额度用尽只停提醒，
+        不阻止工具调用（本方法不判额度）。
+        """
+        key = str(cycle_key or self._night_cycle_key(now or datetime.now()))
+        count = self.nap_reminder_count(key) + 1
+        self._nap_reminder_counts[key] = count
+        if len(self._nap_reminder_counts) > 4:      # 只留最近 4 个周期键（纯内存观测计数）
+            for stale in sorted(self._nap_reminder_counts)[:-4]:
+                self._nap_reminder_counts.pop(stale, None)
+        return count
+
+    def note_nap_lie_in_applied(self, now: Optional[datetime] = None) -> int:
+        """赖床工具**成功修改日程**后由 planning 侧回调：本周期有效提醒次数 +1（§4.4）。"""
+        current = now or datetime.now()
+        used = self.note_nap_reminder(now=current)
+        self._log_decision(
+            "emotion.nap_lie_in_applied", trigger_type="emotion",
+            reason="赖床工具已改写今日日程：有效提醒次数 +1",
+            cycle_key=self._night_cycle_key(current), count=used,
+            limit=self.nap_reminder_max_per_day())
+        return used
+
+    def in_night_sleep_cycle(self, now: Optional[datetime] = None) -> bool:
+        """当前是否处于**夜间睡眠周期**内（§4.4「非睡眠周期调用 → 拒绝」的门控）。
+
+        周期窗口在册（``_sleep_period``）时按该窗口判定——**含赖床延长后的端点**：工具把
+        窗口推后之后，本工具的"还能赖床"窗口同步延长；无周期上下文时回退与 L1 记账同源的
+        夜间周期判定（:meth:`_in_night_sleep_cycle`，其本身的语义与调用方均不改）。
+        ``no_sleep_mode == true`` 一律 False（§〇 C1：L1/L3 全线静默）。
+        """
+        current = now or datetime.now()
+        if self._no_sleep_mode():
+            return False
+        if self._sleep_period is not None:
+            return bool(self._sleep_period[0] <= current < self._sleep_period[1])
+        return bool(self._in_night_sleep_cycle(current))
+
+    def extend_night_sleep_until(self, target: Any = None, *, now: Optional[datetime] = None) -> bool:
+        """把**当前**睡眠周期窗口的结束端推到 ``target``（§4.4 第 5 条；工具成功后由 planning 回调）。
+
+        三个条件全满足才改端点，否则原样返回 False（不改任何状态）：
+
+        1. 本周期窗口在册（未在睡眠周期内/已醒 → 无事可延）；
+        2. 目标端 **> 旧端**（只往后推，绝不提前起床）；
+        3. 目标时刻受**同一** ``[schedule] lie_in_max_until`` 钳制（与工具侧同源，双保险）。
+
+        端点一变，醒沿判定（``_in_sleep_period``）自然推迟——不必改别处状态（F15：复用既有
+        周期上下文，不新增状态字段）。
+        """
+        if self._sleep_period is None or target is None:
+            return False
+        start, old_end = self._sleep_period
+        try:
+            minute = int(target.hour) * 60 + int(target.minute)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        minute = min(minute, self.lie_in_max_minutes())
+        new_end = old_end.replace(hour=minute // 60, minute=minute % 60, second=0, microsecond=0)
+        if new_end <= old_end:                 # 同日内未后移（或落到当天更早）→ 无需延长
+            return False
+        self._sleep_period = (start, new_end)
+        self._log_decision(
+            "emotion.nap_lie_in_extended", trigger_type="emotion",
+            reason="赖床工具已延长本睡眠周期窗口端点（醒沿推迟）",
+            cycle_key=self._night_cycle_key(now or datetime.now()),
+            old_end=old_end.isoformat(timespec="seconds"),
+            new_end=new_end.isoformat(timespec="seconds"))
+        return True
+
+    def nap_planned_wake(self, now: Optional[datetime] = None) -> datetime:
+        """提醒文本里的「本来打算睡到」= 当前睡眠窗口结束（周期在册值优先，回退 wake 锚点）。"""
+        current = now or datetime.now()
+        if self._sleep_period is not None:
+            return self._sleep_period[1]
+        return self._night_window(current)[1]
+
+    def nap_reminder_text(self, now: Optional[datetime] = None,
+                          planned_wake: Optional[datetime] = None) -> str:
+        """渲染赖床提醒文本（§4.3 模板；占位符全部由本方法填充，工具名引用 NAP_TOOL_NAME）。"""
+        current = now or datetime.now()
+        wake = planned_wake or self.nap_planned_wake(current)
+        return NAP_REMINDER_TEMPLATE.format(
+            now_hhmm=f"{current:%H:%M}",
+            planned_wake_hhmm=f"{wake:%H:%M}",
+            nap_tool_name=NAP_TOOL_NAME,
+            lie_in_max_until=normalize_hhmm(
+                self._schedule_cfg("lie_in_max_until", DEFAULT_LIE_IN_MAX_UNTIL),
+                DEFAULT_LIE_IN_MAX_UNTIL),
+        )
+
+    def _nap_trigger(self) -> Optional[Any]:
+        """宿主主动开口入口（F9/F12）：``ctx.maisaka.proactive.trigger``（含旧形态回退）。
+
+        宿主未提供该能力（离线测试骨架 / 未声明能力）→ None，调用方按"不发送"处理（§八.2）。
+        """
+        ctx = getattr(self, "_ctx", None)
+        maisaka = getattr(ctx, "maisaka", None) if ctx is not None else None
+        if maisaka is None:
+            return None
+        proactive = getattr(maisaka, "proactive", None)
+        trigger = getattr(proactive, "trigger", None) if proactive is not None else None
+        if trigger is None:
+            trigger = getattr(maisaka, "trigger_proactive", None)   # 兼容旧形态
+        return trigger if callable(trigger) else None
+
+    async def maybe_send_nap_reminder(self, segment: Any = None, *,
+                                      now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """赖床提醒轮（附录 §4.1–§4.5）：打扰段以 ``resleep`` 闭合后判定是否发一条提醒。
+
+        判定顺序（§4.1；任一不满足即不发、不计数，并落一条 ``emotion.nap_reminder_blocked``）：
+
+        0. 段有效性：该段**确认成立过**（``awake`` 且 ``confirmed_at`` 在）；每段至多提醒一次；
+        1. 额度：本 ``cycle_key`` 已用次数 < ``nap_reminder_max_per_day``；
+        2. 窗口：当前仍在睡眠窗口内（``_in_sleep_period``，含赖床延长后的端点）；
+        3. ``no_sleep_mode == false``（§〇 C1：L1/L3 全线静默）；
+        4. ``nap_reminder_enabled``（默认 true）。
+
+        发送（F9/F12）：查全渠道预算（``bus.allow_proactive``）→ 发 ``proactive.used`` →
+        ``ctx.maisaka.proactive.trigger(stream_id=段末条 reply 流, intent="nap_reminder",
+        reason=提醒文本, metadata={"kind": "nap_reminder"})``。预算拒绝/触发失败 → 不发送不计数。
+        成功后：有效提醒次数 +1、登记 §4.5 提醒轮豁免窗口、落 ``emotion.nap_reminder_sent``。
+
+        Returns:
+            发送成功返回载荷 dict；未发送返回 None。
+        """
+        current = now or datetime.now()
+        seg = dict(segment) if isinstance(segment, dict) else self.night_interrupt_snapshot()
+        cycle_key = str((seg or {}).get("cycle_key") or self._night_cycle_key(current))
+        used = self.nap_reminder_count(cycle_key, now=current)
+        limit = self.nap_reminder_max_per_day()
+        stream_id = str((seg or {}).get("stream_id") or "")
+
+        def _blocked(reason: str, **extra: Any) -> None:
+            self._log_decision(
+                "emotion.nap_reminder_blocked", trigger_type="emotion",
+                reason=f"赖床提醒未发送（{reason}）", block_reason=str(reason),
+                cycle_key=cycle_key, count=used, limit=limit, stream_id=stream_id, **extra)
+
+        # 0) 段有效性（§4.1⑤）+ 每段至多一次
+        if not seg or not seg.get("awake") or not seg.get("confirmed_at"):
+            _blocked("segment_not_confirmed")
+            return None
+        marker = (cycle_key, str(seg.get("closed_at") or ""))
+        if marker in self._nap_reminded_segments:
+            _blocked("segment_already_reminded")
+            return None
+        # 1) 额度（§4.1②）
+        if used >= limit:
+            _blocked("quota")
+            return None
+        # 2) 仍在睡眠窗口内（§4.1③）
+        if not self._in_sleep_period(current):
+            _blocked("gate_sleep_window")
+            return None
+        # 3) no_sleep_mode == false（§4.1④ + §〇 C1）
+        if self._no_sleep_mode():
+            _blocked("gate_no_sleep_mode")
+            return None
+        # 4) 提醒开关（§4.1 隐含项 / §4.6）
+        if not self.nap_reminder_enabled():
+            _blocked("gate_disabled")
+            return None
+
+        # 发送（F9：先查预算，再记 proactive.used，最后触发；预算拒绝 → 不发送不计数）
+        trigger = self._nap_trigger()
+        if trigger is None:
+            _blocked("trigger_missing")
+            return None
+        bus = self._bus()
+        if bus is not None and not bus.allow_proactive("emotion", "nap_reminder"):
+            _blocked("budget")
+            return None
+        if bus is not None:
+            try:
+                await bus.publish("proactive.used", source="emotion",
+                                  channel="emotion", intent="nap_reminder")
+            except Exception:
+                pass
+        text = self.nap_reminder_text(current)
+        try:
+            result = await trigger(stream_id=stream_id, intent="nap_reminder", reason=text,
+                                   metadata={"kind": "nap_reminder"})
+        except Exception as exc:
+            _blocked("trigger_error", error=str(exc)[:120])
+            return None
+        if isinstance(result, dict) and not result.get("success", False):
+            _blocked("trigger_rejected", error=str(result.get("error") or "")[:120])
+            return None
+
+        # 成功后：计数 +1、登记豁免窗口（§4.5）、留痕
+        used = self.note_nap_reminder(cycle_key, now=current)
+        self._nap_reminded_segments.add(marker)
+        if len(self._nap_reminded_segments) > 64:   # 防无界增长（纯内存标记）
+            self._nap_reminded_segments = set(list(self._nap_reminded_segments)[-32:])
+        self.note_reminder_round(current + timedelta(seconds=NAP_REMINDER_ROUND_SECONDS))
+        self._log_decision(
+            "emotion.nap_reminder_sent", trigger_type="emotion",
+            reason=f"赖床提醒轮已发送（本周期第 {used}/{limit} 次）",
+            cycle_key=cycle_key, count=used, limit=limit, stream_id=stream_id,
+            text=text[:120], kind="nap_reminder")
+        return {"sent": True, "cycle_key": cycle_key, "count": used, "limit": limit,
+                "stream_id": stream_id, "text": text}
+
+    def _dispatch_nap_reminder_soon(self, closed: Any, now: Optional[datetime] = None) -> None:
+        """同步上下文（reply Hook 的懒结算）派发提醒轮：有事件循环就 create_task。
+
+        ``note_night_reply`` 是同步入口，不能 await；提醒链路绝不能影响 reply 记账主路径，
+        故这里只投递任务（失败静默、留 debug）。仅在段以 ``resleep`` 闭合时进入
+        （§4.1：被吵醒且已回到睡眠）。
+        """
+        if str((closed or {}).get("close_reason") or "") != "resleep":
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._ctx.logger.debug("赖床提醒：无运行中的事件循环，跳过本次派发")
+            return
+        try:
+            task = loop.create_task(self.maybe_send_nap_reminder(closed, now=now))
+            self._bg_tasks.append(task)
+            if len(self._bg_tasks) > 20:
+                self._bg_tasks = [t for t in self._bg_tasks if not t.done()][-10:]
+        except Exception as exc:
+            self._ctx.logger.debug("赖床提醒派发失败（忽略）：%s", exc)
+
+    async def _after_night_segment_closed(self, closed: Any, now: Optional[datetime] = None
+                                          ) -> Optional[Dict[str, Any]]:
+        """段闭合后的 L3 接线（§4.1第 1 条）：只在 ``resleep`` 闭合时进入提醒轮判定。"""
+        if str((closed or {}).get("close_reason") or "") != "resleep":
+            return None
+        return await self.maybe_send_nap_reminder(closed, now=now)
 
     # ── L1 整夜合计结算（附录 §2.3/§2.4/§2.6；M8 第 3 段）────────────────────
     def _awake_night_segments(self, cycle_key: str) -> list:
@@ -2054,7 +2358,10 @@ class EmotionService:
         if self.is_frozen():
             # M8 段 2（附录 §2.1）：冻结期（= 睡眠周期内）每个 tick 扫一次 resleep 到期，
             # 让「回到睡眠」的闭段留痕不必等到醒沿或下一条 reply。
-            self._roll_night_segment(now)
+            # M9（附录 §4.1）：同一次扫描闭段后进入赖床提醒轮判定（仅 resleep 闭段）。
+            closed = self._roll_night_segment(now)
+            if closed is not None:
+                await self._after_night_segment_closed(closed, now)
             if self._pending_overhaul is None:           # 上轮裁判失败 → 冻结期内重试
                 planned = float(getattr(self, "_sleep_planned_hours", 0.0) or 0.0)
                 cached = await self.compute_sleep_overhaul(now, sleep_hours=planned or None)

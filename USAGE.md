@@ -1,13 +1,16 @@
 # 命令与工具手册（USAGE.md）
 
-> 猫眼生活套件（github.cateye.cateye-suite）现有 **6 个 LLM 工具**、**8 个聊天指令**、**4 个跨插件 API**
-> （T6 注册面收口终态：**28 组件 = 8 Command + 6 Tool + 10 Hook + 4 API**）。
+> 猫眼生活套件（github.cateye.cateye-suite）现有 **7 个 LLM 工具**（T6 收口 6 + M9 赖床 1）、**8 个聊天指令**、**4 个跨插件 API**
+> （**29 组件 = 8 Command + 7 Tool + 10 Hook + 4 API**；T6 收口 28 → M9 增 1 个 hidden Tool）。
 > 四个业务子模块各自提供一组：planning（日程规划）/ companion（虚拟恋人）/ emotion（情绪）/ qzone（QQ 空间）。
 > 本手册给出每个条目的描述原文、参数、行为细节与权限要求；架构与安装说明见 README.md。
 >
 > **T6 变更（2026-10-06）**：工具与指令均按**直接删除条目**处理（不标注废弃）——被删入口
 > 的信息面/能力已由下表的新入口完整承接（四视图查询、dashboard 文本档、update_schedule
 > 唯一写入口），保留废弃别名只会让模型与用户读到已不存在的入口。
+>
+> **M9 变更（2026-10-07，附录 §四 L3 赖床）**：新增 Tool `cateye_test_nap_lie_in`（**hidden**——
+> 平时不进工具名册）+ 夜间被吵醒后的**单轮赖床提醒**；说明见 §一 planning 第 3 条与 §七。
 
 ## 0. 通用行为说明（先读）
 
@@ -23,9 +26,9 @@
 
 ---
 
-## 一、LLM 工具（6 个）
+## 一、LLM 工具（7 个）
 
-### planning — 日程规划（2 个）
+### planning — 日程规划（3 个）
 
 #### `cateye_test_get_schedule_info`
 - **描述**：查询日程/活动/目标的只读信息（四视图）。
@@ -48,6 +51,26 @@
   - `future` → 校验日期后写入 pending_commitment，到期由主动行为以强指令提醒；
   - `reject` → 裁判认为不合理（如凌晨约会），日程不变并说明理由。
 - **备注**：原 `cateye_test_apply_schedule_v4`（直接落库，无裁判）与 `cateye_test_manage_goal_v4`（目标写路径）两工具已移除：日程写入全部经本工具过裁判，目标写 API 仍保留在底层（生成流水线与约定消费在用）。
+
+#### `cateye_test_nap_lie_in`（M9 · **hidden**）
+
+- **描述原文**：把今天的起床时间往后推（赖床）。传入目标时间，支持 "HH:MM"、"H:MM" 或纯小时数（如 "09:30" / "9:30" / "9" 表示 09:00）。仅在夜间被吵醒、收到赖床提醒时可用；超过 `[schedule] lie_in_max_until`（默认 12:00）会被钳到该时间。
+- **参数**：
+  | 参数 | 类型 | 必填 | 说明 |
+  |---|---|---|---|
+  | time | string | | 目标起床时间，三种写法等价：`"HH:MM"` / `"H:MM"` / **纯小时数**（`"9"` = 09:00）；缺参或非法（`"abc"`、`"25:00"`、`"12:60"`、`"9:"`）→ 返回友好错误 + 格式示例，**不抛异常** |
+- **可见性（hidden，用户裁决 C4）**：注册时声明 `metadata["visibility"] = "hidden"`——宿主 `component_query` 据此置 `enabled=False` 且**不进 ToolSpec 名册**（附录 F13），即"平时不暴露"。
+- **行为**（附录 §4.4）：
+  1. **非睡眠周期调用 → 拒绝**：经 `plugin._emotion` 服务束查询"是否处于夜间睡眠周期"（本周期窗口在册时按该窗口，含赖床延长后的端点；`[schedule] no_sleep_mode=true` 一律拒绝）→ 返回「你现在还不能想要赖床」；
+  2. **上限钳制**：目标 > `[schedule] lie_in_max_until` → 钳到该值（默认 12:00；提醒文本给的也是这个值，提示与判定同源）；
+  3. **只改日程里的睡眠条目**：找**入睡日**日程的 sleep 条目（"今日"按 `[schedule] wake_time` 锚点定义的新一天：凌晨仍读入睡日；主判 `goal_type=sleep`，兜底按名称含"睡觉/睡眠/安睡"——M5 实测生产条目是 `daily_routine` + 名称"睡觉"，午休/午睡/小憩不算），把其 `end_minute` 推到目标时刻，经**共享底层** `ScheduleGenerator.apply_schedule_items(items, today, consume_commitments=False)` 写回（不消费未来约定、不触发重生成）；**无 sleep 条目或写回失败 → 失败文本且不计数**；
+  4. **延长睡眠窗口**：成功后通知 emotion 把本睡眠周期窗口结束端推到目标时刻（只增不减、受同一 `lie_in_max_until` 钳制），**醒沿因此推迟**到新端点；
+  5. **计数**：调用**并成功修改日程** → 本 `cycle_key` 的「有效提醒次数」+1（纯内存）；未调用/失败不计次；**额度用尽只停提醒，不阻止本工具**。
+- **暴露方案取舍（实现者择优，A2/C4）**：
+  - **方案 ①（运行时翻转）**：提醒前 `ctx.component.enable_component(...)` 把本工具提为可见、提醒轮后 `disable_component(...)` 收回。优点：模型在提醒轮内**真正看得到**工具定义（含参数 schema），调用成功率最高。代价：宿主组件启停是**异步、全局**操作，与"单流单轮"语义不完全对齐（翻转期间其它流/轮次也可能看到），且需要额外宿主能力与失败回滚；**当前未采用**。
+  - **方案 ②（hidden + 提示词点名 + tool_search 兜底）**：本工具**保持 hidden**，赖床提醒文本直接**点名工具名**（A2），由模型自行经 `tool_search` 找到它。优点：零运行时状态、零宿主组件面写入，注册期静态生效（F13 的可见性本来就是注册期读取的静态值）。代价：**依赖宿主 `tool_search` 对 hidden 工具的可达性**——若宿主把 hidden 工具排除在检索面之外，点名也只是"提示"，模型可能找不到该工具。
+  - **本实现采用方案 ②**（离线无法实测宿主检索面；方案 ① 留作宿主实测不通过时的升级路径），因此**需要宿主实测确认**（见 §七 末尾清单）。
+- **计数与提醒的关系**：两者共用同一「有效提醒次数」（`[planning_proactive] nap_reminder_max_per_day`，默认 2，按 `cycle_key` 计，纯内存、不落盘）；额度用尽后只停提醒，bot 仍可自行调本工具改日程。
 
 ### companion — 虚拟恋人（2 个）
 
@@ -193,7 +216,7 @@
 | `[emotion] emoji_enabled` | `false` | **emoji 情绪联动**：按当前情绪首个标签名（取不到时回退情绪底色文本）经宿主 `emoji.get_by_description` 取一个表情。**注意（T6）**：其唯一消费入口 `cateye_test_emotion_mood` Tool 已随注册面收口移除，本开关当前**无组件消费点**——服务层实现（`EmotionService.emoji_for_mood`）与测试保留，宿主侧接线与开关默认关行为不变；如需恢复该能力，重新注册一个消费组件即可 |
 
 > 说明：`emoji.get_by_description` 已写入 `_manifest.json` 的 `capabilities`（仅声明，默认不使用）；宿主侧对该能力的实际接线由宿主级验证会话负责——离线测试只覆盖插件侧门控与降级路径。`statistics` 成本看板经裁定**不做**（扩大能力面、收益存疑）。
-> 组件面（T6 终态）：28 = 8 命令 + 10 Hook + 6 Tool + 4 API，两个开关均为**配置项**。
+> 组件面（T6 终态 28 → M9 后 29）：29 = 8 命令 + 10 Hook + 7 Tool + 4 API，两个开关均为**配置项**。
 
 ## 六、情绪评估模式（T7 会话片段制，默认 `episode`）
 
@@ -212,3 +235,34 @@
 - **睡眠入口**：进入睡眠时段时**先冲刷全部未结片段再跑睡眠裁判**，保证大修读到完整日志。
 - **成本**：典型日 20 回复/6 片段 ≈ 旧 20×700 tok → 新 6×1000 tok；封顶后最坏 ≈ 10k tok/日。
 - 说明：`evaluate_mode` 的"是否显式设置"取自宿主配置模型的 `model_fields_set`；离线环境无真实 `maibot_sdk`，该语义由 `scratch/sdk_stub.py` 的 pydantic 模型等价复现，宿主侧最终行为由宿主级验证会话确认。
+
+## 七、赖床提醒（M9 · 附录 §四 L3）
+
+夜间被重要的人吵醒、又回到睡眠之后，bot 会收到**一条只在本轮有效的临时提醒**（不强制、不进下一轮上下文）。
+
+**触发（全部满足才发）**：①该打扰段**确认成立过**（窗口内 ≥ `interrupt_reply_threshold` 次 target 私聊 reply）且以 `resleep` 闭合（`最后一次 reply + resleep_minutes` 内无新 reply）；②本睡眠周期有效提醒次数 < `nap_reminder_max_per_day`；③当前仍在睡眠窗口内；④`[schedule] no_sleep_mode == false`；⑤`[planning_proactive] nap_reminder_enabled`。每段至多提醒一次，被拦时落 `emotion.nap_reminder_blocked`（`block_reason` 区分 quota / budget / gate_* / trigger_*）。
+
+**提醒文本（逐字模板，`{nap_tool_name}` 引用唯一常量 `NAP_TOOL_NAME`）**：
+
+> 【临时提醒·不进下一轮上下文】你半夜被重要的人吵醒了，现在是 {now_hhmm}；你本来打算睡到
+> {planned_wake_hhmm}。如果还想再睡一会儿，可以调用 {nap_tool_name} 把起床时间往后推（最晚
+> {lie_in_max_until}）。这条提醒只在本轮有效，不必向任何人提起"昨晚被吵醒"。是否调用由你决定。
+
+- `{planned_wake_hhmm}` = **当前睡眠窗口结束**（周期在册端点优先，回退 `[schedule] wake_time` 锚点）；
+- 发送走**统一主动链**：`ctx.maisaka.proactive.trigger(stream_id=该段末条 reply 流, intent="nap_reminder", reason=文本, metadata={"kind": "nap_reminder"})`，调用前查全渠道预算（`allow_proactive` → `proactive.used`），**纳入打扰预算**；预算拒绝 → 不发送、不计数；
+- **不进下一轮**：提醒块由宿主写进该流的内存历史（per-stream，不落库），本插件在注入 Hook 的既有剥离点新增 `is_consumed_ephemeral_proactive_block`——块龄 > `NAP_BLOCK_LINGER_SECONDS`（120s）即从请求载荷剔除（下一轮 planner 起不再出现）；入队超 30 分钟的块仍由原有规则兜底剥离，只影响本插件的 `kind=nap_reminder` 块，不误伤其他主动块与真实消息；
+- **提醒轮豁免（§4.5）**：提醒发出后 120s 内该流若意外触发 reply，**不刷新 resleep 计时、不重开吵醒态、不额外限制工具调用**。
+
+| 配置项 | 默认 | 约束 | 说明 |
+|---|---|---|---|
+| `[planning_proactive] nap_reminder_enabled` | `true` | — | 赖床提醒开关；关闭后不提醒，但不阻止 bot 自行改日程 |
+| `[planning_proactive] nap_reminder_max_per_day` | `2` | `ge=1` | 每**睡眠周期**（不是自然日）的有效提醒上限：提醒发送成功 + 工具成功改日程各计 1 次；用尽后只停提醒 |
+| `[schedule] lie_in_max_until` | `12:00` | `HH:MM` | 赖床硬上限时刻：工具传入超过它会被钳到它，提醒文本给出的也是它 |
+
+**宿主实测项清单（离线不可覆盖，归宿主级验证会话）**：
+
+1. `metadata["visibility"]="hidden"` 的实际效果：`component_query` 是否置 `enabled=False` 且**不进 ToolSpec 名册**（F13 已实测过宿主代码，本插件只需确认注册期声明被读取）；
+2. **方案 ② 的关键前提**：宿主 `tool_search`（或等价的工具检索面）**能否检索到 hidden 工具**——能，则提醒轮点名即可调用；不能，则需升级到方案 ①（提醒前 `ctx.component.enable_component` 翻转可见性、提醒轮后收回），并确认翻转的作用域（全局/单流）与失败回滚；
+3. `ctx.maisaka.proactive.trigger` 的 `metadata` 透传与宿主把它**序列化进块文本一行**（F12；块 id 形态 `proactive:{plugin_id}:{epoch_ms}`）——决定 `is_consumed_ephemeral_proactive_block` 的 `plugin_id`/`kind` 匹配是否按预期命中（当前实现：`plugin_id` 段不一致则不动，取不到该段则退回只按 `kind=nap_reminder` 标记判定）；
+4. 提醒块所在流是否确为 per-stream（F10）——确认剥离只需处理"同一流后续轮次"；
+5. 钳制后的睡眠窗口端点能推迟醒沿：宿主侧观察 `schedule.woke_up` / `emotion.sleep_overhaul` 的实际触发时刻是否随 `lie_in_max_until` 后的端点顺延。

@@ -21,14 +21,17 @@ from typing import Any, ClassVar, Dict, List
 from maibot_sdk import API, Command, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
+from planning.tools_service import NAP_TOOL_NAME, DEFAULT_LIE_IN_MAX_UNTIL
+
 
 class PlanningComponentsMixin:
-    """日程规划组件（2 Tool + 1 Command + 1 API + 2 HookHandler）。"""
+    """日程规划组件（3 Tool + 1 Command + 1 API + 2 HookHandler）。"""
 
     # 供 SDK / 调试用的组件清单说明（不影响注册）
     planning_components_info: ClassVar[Dict[str, str]] = {
         "cateye_test_get_schedule_info": "Tool：日程/活动/目标的只读查询（view=status/current/lover_day/goals）",
         "cateye_test_update_schedule_v4": "Tool：自然语言日程变更（唯一日程写入口，角色裁判 today/future/reject）",
+        NAP_TOOL_NAME: "Tool：赖床（把今日 sleep 条目结束时间推到目标时刻；hidden，仅夜间被吵醒且收到提醒时可用）",
         "cateye_test_planning_v4": "Command：/cateye_test_plan 或 /cateye_test_规划（list/regenerate/delete/clear/help）",
         "get_current_activity": "API：当前活动快照（跨插件可调）",
         "schedule_inject_v4": "HookHandler：maisaka.planner.before_request 日程注入",
@@ -36,7 +39,7 @@ class PlanningComponentsMixin:
     }
 
     # ============================================================
-    # Tools（2 个 LLM 工具）
+    # Tools（3 个 LLM 工具）
     # ============================================================
 
     @Tool(
@@ -67,6 +70,35 @@ class PlanningComponentsMixin:
         if svc is None:
             return {"type": "error", "content": "插件未启用"}
         return await svc.tools.update_schedule(**kwargs)
+
+    @Tool(
+        NAP_TOOL_NAME,
+        description=(
+            "把今天的起床时间往后推（赖床）。传入目标时间，支持 \"HH:MM\"、\"H:MM\" 或纯小时数"
+            "（如 \"09:30\" / \"9:30\" / \"9\" 表示 09:00）。仅在夜间被吵醒、收到赖床提醒时可用；"
+            f"超过 [schedule] lie_in_max_until（默认 {DEFAULT_LIE_IN_MAX_UNTIL}）会被钳到该时间。"
+        ),
+        parameters={
+            "time": {"type": "string",
+                     "description": "目标起床时间（\"HH:MM\" / \"H:MM\" / 纯小时数）",
+                     "required": False},
+        },
+        # F13（附录 §4.4 用户裁决 C4）：hidden → 宿主 component_query 置 enabled=False 且不进
+        # ToolSpec 名册；暴露方案见 USAGE.md「赖床工具」段（运行时翻转 / 提示词点名 + tool_search）。
+        metadata={"visibility": "hidden"},
+    )
+    async def plan_tool_nap_lie_in(self, time: str = "", **kwargs: Any) -> Dict[str, Any]:
+        """赖床工具入口（§4.4）：委托 ``ToolsService.nap_lie_in``（plan_ 前缀满足门面审计）。
+
+        判定与钳制全在服务侧：解析容错、非睡眠周期拒绝、``lie_in_max_until`` 钳制、
+        只改今日 sleep 条目（``apply_schedule_items`` 共享底层）、成功后延长 emotion 睡眠
+        窗口并计一次有效提醒。
+        """
+        del kwargs
+        svc = getattr(self, "_planning", None)
+        if svc is None:
+            return {"type": "error", "content": "插件未启用"}
+        return await svc.tools.nap_lie_in(time=time)
 
     # ============================================================
     # Command（/cateye_test_plan 或 /cateye_test_规划）
