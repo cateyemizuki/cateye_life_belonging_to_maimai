@@ -23,14 +23,12 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 
 class PlanningComponentsMixin:
-    """日程规划组件（4 Tool + 1 Command + 1 API + 2 HookHandler）。"""
+    """日程规划组件（2 Tool + 1 Command + 1 API + 2 HookHandler）。"""
 
     # 供 SDK / 调试用的组件清单说明（不影响注册）
     planning_components_info: ClassVar[Dict[str, str]] = {
-        "cateye_test_manage_goal_v4": "Tool：长期目标管理（create/list/get/update/pause/resume/complete/cancel/delete）",
-        "cateye_test_get_planning_status_v4": "Tool：查看今日日程（正在进行/即将到来/已完成）",
-        "cateye_test_apply_schedule_v4": "Tool：应用日程数据为可执行安排",
-        "cateye_test_update_schedule_v4": "Tool：自然语言日程变更（角色裁判 today/future/reject）",
+        "cateye_test_get_schedule_info": "Tool：日程/活动/目标的只读查询（view=status/current/lover_day/goals）",
+        "cateye_test_update_schedule_v4": "Tool：自然语言日程变更（唯一日程写入口，角色裁判 today/future/reject）",
         "cateye_test_planning_v4": "Command：/cateye_test_plan 或 /cateye_test_规划（list/regenerate/delete/clear/help）",
         "get_current_activity": "API：当前活动快照（跨插件可调）",
         "schedule_inject_v4": "HookHandler：maisaka.planner.before_request 日程注入",
@@ -38,62 +36,27 @@ class PlanningComponentsMixin:
     }
 
     # ============================================================
-    # Tools（4 个 LLM 工具）
+    # Tools（2 个 LLM 工具）
     # ============================================================
 
     @Tool(
-        "cateye_test_manage_goal_v4",
-        description="管理长期目标，支持创建、查看、更新、暂停、恢复、完成、取消、删除目标",
+        "cateye_test_get_schedule_info",
+        description="查询日程/活动/目标的只读信息（四视图）",
         parameters={
-            "action": {"type": "string", "description": "操作类型: create / list / get / update / pause / resume / complete / cancel / delete", "required": True},
-            "goal_id": {"type": "string", "description": "目标 ID（除 create 和 list 外都需要）", "required": False},
-            "name": {"type": "string", "description": "目标名称（create 时必需）", "required": False},
-            "description": {"type": "string", "description": "目标描述（create 时必需）", "required": False},
-            "goal_type": {"type": "string", "description": "目标类型: health_check / social_maintenance / learn_topic / custom", "required": False},
-            "priority": {"type": "string", "description": "优先级: high / medium / low", "required": False},
-            "time_window": {"type": "string", "description": "时间窗口，格式 'HH:MM-HH:MM'（如 '09:00-10:30'）", "required": False},
-            "deadline_hours": {"type": "number", "description": "截止时间（从现在开始的小时数）", "required": False},
-            "parameters": {"type": "string", "description": "目标参数（JSON 字符串）", "required": False},
+            "view": {"type": "string", "description": "status=今日日程状态总览（默认）| current=当前活动 | lover_day=今日完整日程 | goals=活动目标列表", "required": False},
         },
     )
-    async def plan_tool_manage_goal(self, **kwargs: Any) -> Dict[str, Any]:
-        """目标管理工具入口。"""
+    async def plan_tool_schedule_info(self, **kwargs: Any) -> Dict[str, Any]:
+        """日程/活动/目标只读查询工具入口（四视图，view 缺省/非法回落 status）。"""
         svc = getattr(self, "_planning", None)
         if svc is None:
             return {"type": "error", "content": "插件未启用"}
-        return await svc.tools.manage_goal(**kwargs)
-
-    @Tool(
-        "cateye_test_get_planning_status_v4",
-        description="查看今日日程安排，按时间顺序显示正在进行和即将到来的活动",
-        parameters={
-            "detailed": {"type": "boolean", "description": "是否显示详细信息", "required": False},
-        },
-    )
-    async def plan_tool_get_planning_status(self, **kwargs: Any) -> Dict[str, Any]:
-        """规划状态查询工具入口。"""
-        svc = getattr(self, "_planning", None)
-        if svc is None:
-            return {"type": "error", "content": "插件未启用"}
-        return await svc.tools.get_planning_status(**kwargs)
-
-    @Tool(
-        "cateye_test_apply_schedule_v4",
-        description="应用之前生成的日程，将日程项转换为全局可执行的目标",
-        parameters={
-            "schedule_data": {"type": "string", "description": "日程数据（JSON 字符串，含 items 列表）", "required": True},
-        },
-    )
-    async def plan_tool_apply_schedule(self, **kwargs: Any) -> Dict[str, Any]:
-        """日程应用工具入口。"""
-        svc = getattr(self, "_planning", None)
-        if svc is None:
-            return {"type": "error", "content": "插件未启用"}
-        return await svc.tools.apply_schedule(**kwargs)
+        return await svc.tools.get_schedule_info(**kwargs)
 
     @Tool(
         "cateye_test_update_schedule_v4",
-        description="根据自然语言请求维护日程：角色裁判决定接受/未来约定/拒绝；接受时调整今日日程，未来约定写入候选清单",
+        description="根据自然语言请求维护日程：角色裁判决定接受/未来约定/拒绝；接受时调整今日日程，"
+                    "未来约定写入候选清单。唯一日程写入口。",
         parameters={
             "description": {"type": "string", "description": "日程变更的自然语言描述（如\"下午两点一起学习\"、\"周末打游戏\"）", "required": True},
         },

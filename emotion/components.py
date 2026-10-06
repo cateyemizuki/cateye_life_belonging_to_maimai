@@ -2,8 +2,9 @@
 
 组件清单（组件名带 cateye_test_ 前缀，与其他模块同规则）：
 - Command ×2：/cateye_test_emotion_init（人设初始化）、/cateye_test_emotion_config [reset|clear]（查看/重置）
-- Tool ×2：cateye_test_emotion_mood（当前情绪底色，供"你现在什么心情"类问题）、
-  cateye_test_emotion_report(event, is_target)（上报影响心情的事件；群聊 target 声明，M3）
+- Tool ×1：cateye_test_emotion_report(event, is_target)（上报影响心情的事件；群聊 target 声明，M3）
+  （原 cateye_test_emotion_mood 已随 T6 注册面收口移除：「你现在什么心情」类问答由情绪
+  底色注入覆盖；injection_enabled=false 的组合不支持心情问答，见 USAGE.md）
 - HookHandler ×3：maisaka.planner.before_request（情绪底色注入）、
   maisaka.replyer.before_model_request（情绪底色注入）、
   maisaka.replyer.after_response（回复后 ΔVAD 增量评估，OBSERVE；session_id 进 target 识别链路）
@@ -30,12 +31,11 @@ from core.inject import (
 
 
 class EmotionComponentsMixin:
-    """情绪组件（2 Command + 2 Tool + 3 HookHandler）。"""
+    """情绪组件（2 Command + 1 Tool + 3 HookHandler）。"""
 
     emotion_components_info: ClassVar[Dict[str, str]] = {
         "cateye_test_emotion_init": "Command：由人设自动推导情绪锚点/偏移/乘数（VAD 初始化）",
         "cateye_test_emotion_config": "Command：查看情绪参数；reset 子命令恢复默认",
-        "cateye_test_emotion_mood": "Tool：查询当前情绪底色（标签+低分辨率描述）",
         "cateye_test_emotion_report": "Tool：上报一件影响心情的事件；is_target 声明是否由重要的人引发（M3）",
         "emotion_planner_inject": "HookHandler：maisaka.planner.before_request 情绪底色注入（系统提示词后）",
         "emotion_replyer_model_inject": "HookHandler：maisaka.replyer.before_model_request 情绪底色注入（系统提示词后）",
@@ -96,45 +96,6 @@ class EmotionComponentsMixin:
     # ============================================================
     # Tools
     # ============================================================
-    @Tool("cateye_test_emotion_mood",
-          description="查询 bot 当前的情绪底色（情绪标签与低分辨率描述）。用户问'你现在什么心情''感觉怎么样'时调用。")
-    async def emo_tool_mood(self, **kwargs: Any) -> str:
-        svc = self._emo_service()
-        if svc is None or not self._emo_module_enabled():
-            return "情绪模块未启用。"
-        text = f"当前情绪底色：{svc.mood_text()}"
-        # M6：emoji 情绪联动（默认关；门控与降级都在服务层，未启用时直接 None、不触碰宿主 API），
-        # 拿不到摘要就保持原输出——未启用/异常时返回文本与旧版逐字一致。
-        emoji = await self._emo_match_emoji(svc)
-        summary = self._emo_emoji_summary(emoji) if emoji else ""
-        if summary:
-            text += f"（表情匹配：{summary}）"
-        return text
-
-    async def _emo_match_emoji(self, svc: Any) -> Any:
-        """调用服务层 emoji 匹配（服务缺失该方法或抛错一律按无匹配处理）。"""
-        getter = getattr(svc, "emoji_for_mood", None)
-        if not callable(getter):
-            return None
-        try:
-            return await getter()
-        except Exception:
-            return None
-
-    @staticmethod
-    def _emo_emoji_summary(emoji: Any) -> str:
-        """emoji 匹配结果摘要（宿主返回结构未定：取常见文本字段，取不到返回空串=不加后缀）。"""
-        if isinstance(emoji, dict):
-            for key in ("description", "name", "text", "emoji", "title", "id"):
-                value = str(emoji.get(key) or "").strip()
-                if value:
-                    return value[:40]
-            return ""
-        if isinstance(emoji, (list, tuple)):
-            parts = [str(item).strip() for item in emoji if str(item).strip()]
-            return "、".join(parts[:3])[:40]
-        return str(emoji).strip()[:40]
-
     @Tool(
         "cateye_test_emotion_report",
         description="上报一件影响 bot 心情的事件（由 bot 判断是否与最重要的人有关），入账有界情绪增量。",

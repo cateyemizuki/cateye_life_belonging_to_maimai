@@ -4,8 +4,9 @@
 - **纯函数模块**（不 import SDK、不持状态）：四类状态块按「形状」从各服务对象取数，
   任一对象缺失或取数抛错一律回退安全值（0 / 空列表 / None），绝不外抛——总览的语义是
   「一个模块坏了（或没启用）不拖垮整张图」，对应区块显示「（未启用）」。
-- ``block_lines`` 是文本与图片的唯一展示来源：``render_dashboard_text`` 与
-  ``render_dashboard_image`` 都只消费它，保证图片四区块数值与文本降级输出完全一致。
+- ``block_lines`` 是**图片**的展示来源；``render_dashboard_text`` 与其共用同一套区块
+  行构造，仅 planning 区块额外展开 ``items_full``（今日全部条目，不截断——被删
+  ``/cateye_test_mai_schedule`` 的信息面），图片档照旧 ≤5 条。
 - PIL 惰性导入（与 planning/schedule_image.py 同口径）：pillow 未安装或找不到可用中文字体
   时抛 RuntimeError，由调用方静默降级为纯文本。
 """
@@ -114,11 +115,11 @@ def _tier_label(companion: Any, affection: Any, tier: int) -> str:
 
 def planning_block(schedule_query: Any, goal_manager: Any, *, enabled: bool,
                    now: Optional[datetime] = None) -> Dict[str, Any]:
-    """日程块：今日条目（≤5）/ 当前活动 / 今日约定（≤3）。"""
+    """日程块：今日条目（≤5）/ 今日全部条目（items_full，文本档用）/ 当前活动 / 今日约定（≤3）。"""
     now = now or datetime.now()
     date = now.strftime("%Y-%m-%d")
     block: Dict[str, Any] = {
-        "enabled": False, "date": date, "item_count": 0, "items": [],
+        "enabled": False, "date": date, "item_count": 0, "items": [], "items_full": [],
         "current": None, "commitment_count": 0, "commitments": [],
     }
     if not enabled:
@@ -130,6 +131,11 @@ def planning_block(schedule_query: Any, goal_manager: Any, *, enabled: bool,
     block["items"] = [
         {"time": _time_range(item), "name": str(item.get("name") or "")}
         for item in items[:5] if isinstance(item, dict)
+    ]
+    # 文本降级档展开完整日程（被删 /cateye_test_mai_schedule 的信息面）：图片档仍只画 items
+    block["items_full"] = [
+        f"{_time_range(item)} {str(item.get('name') or '')}".strip()
+        for item in items if isinstance(item, dict)
     ]
 
     current = _call(schedule_query, "find_current_activity", date, now)
@@ -259,11 +265,17 @@ def _vad_text(state: Dict[str, Any]) -> str:
             f"D={_to_float(state.get('dominance')):+.2f}")
 
 
-def _planning_lines(block: Dict[str, Any]) -> List[str]:
+def _planning_lines(block: Dict[str, Any], *, full: bool = False) -> List[str]:
+    """日程展示行；``full=True``（文本降级档）用 items_full 展开今日全部条目，不截断。"""
     lines = [f"今日日程 {_to_int(block.get('item_count'))} 项"]
-    for item in block.get("items") or []:
-        if isinstance(item, dict):
-            lines.append(f"{str(item.get('time') or '')} {str(item.get('name') or '')}".strip())
+    if full:
+        for entry in block.get("items_full") or []:
+            if str(entry).strip():
+                lines.append(str(entry).strip())
+    else:
+        for item in block.get("items") or []:
+            if isinstance(item, dict):
+                lines.append(f"{str(item.get('time') or '')} {str(item.get('name') or '')}".strip())
     current = block.get("current")
     lines.append(f"当前活动 {current}" if current else "当前活动 无")
     commitments = [str(c) for c in (block.get("commitments") or []) if str(c).strip()]
@@ -338,8 +350,12 @@ _BLOCK_BODY = {
 }
 
 
-def block_lines(blocks: Any) -> List[Tuple[str, List[str]]]:
-    """四区块展示行 ``[(标题, [行文本, ...]), ...]``；未启用的块只输出「（未启用）」一行。"""
+def _block_lines(blocks: Any, *, full_items: bool) -> List[Tuple[str, List[str]]]:
+    """四区块展示行 ``[(标题, [行文本, ...]), ...]``；未启用的块只输出「（未启用）」一行。
+
+    ``full_items=True`` 只影响 planning 区块（展开 items_full 完整日程，文本降级档用）；
+    图片档走 ``block_lines``（full_items=False，条目 ≤5）。
+    """
     blocks = blocks if isinstance(blocks, dict) else {}
     out: List[Tuple[str, List[str]]] = []
     for key, title in _BLOCK_TITLES:
@@ -347,16 +363,28 @@ def block_lines(blocks: Any) -> List[Tuple[str, List[str]]]:
         if not isinstance(block, dict) or not block.get("enabled"):
             out.append((title, [_DISABLED_LINE]))
             continue
+        if key == "planning" and full_items:
+            out.append((title, _planning_lines(block, full=True)))
+            continue
         out.append((title, _BLOCK_BODY[key](block)))
     return out
 
 
+def block_lines(blocks: Any) -> List[Tuple[str, List[str]]]:
+    """图片档的区块展示行（planning 条目 ≤5 截断）；状态图与外部一致性断言面。"""
+    return _block_lines(blocks, full_items=False)
+
+
 def render_dashboard_text(blocks: Any, *, now: Optional[datetime] = None) -> str:
-    """纯文本总览（标题行 + 四区块全部行）：图片渲染失败时的降级输出与一致性断言面。"""
+    """纯文本总览（标题行 + 四区块全部行）：图片渲染失败时的降级输出与一致性断言面。
+
+    planning 区块用 items_full 展开今日完整日程（不截断），并逐行带上「今日日程 N 项 /
+    当前活动 / 今日约定」——被删 /cateye_test_mai_schedule 命令的信息面在文本档保留。
+    """
     now = now or datetime.now()
     weekday = "一二三四五六日"[now.weekday()]
     lines = [f"🐱 猫眼生活套件 状态总览 {now.strftime('%Y-%m-%d')} 周{weekday}"]
-    for title, body in block_lines(blocks):
+    for title, body in _block_lines(blocks, full_items=True):
         lines.append("")
         lines.append(title)
         lines.extend(f"  {line}" for line in body)
