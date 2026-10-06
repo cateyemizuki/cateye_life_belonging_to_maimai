@@ -187,7 +187,7 @@ share_i = (1/d_i) / Σ(1/d_j)        # 反距离归一化，Σ share = 100%
 | 出口 | 位置 | 说明 |
 |---|---|---|
 | `/cateye_test_emotion_config` | `emotion/components.py:74` | 打印 `params_summary()`：初始化态 / 锚点 / 偏移 / 乘数 / **当前 VAD（含偏移，带数值）** / 当天事件数 + 推导理由。**管理员限定**（默认拒绝） |
-| Tool `cateye_test_emotion_mood` | `emotion/components.py:99` | 只回 `当前情绪底色：{mood_text()}`（**不含数值**，可被 bot 自发调用） |
+| ~~Tool `cateye_test_emotion_mood`~~ | ~~`emotion/components.py:99`~~ | **已移除（T6，2026-10-06，REGISTRY_DISPOSITION v2.1 §一）**：心情问答由情绪底色注入覆盖，`injection_enabled=false` 组合不支持心情问答（USAGE §五 已标注）；emoji 情绪联动保留在服务层（`EmotionService.emoji_for_mood`），当前无组件消费点 |
 
 > 注意 `params_summary()` 是**唯一**向对话面暴露绝对 VAD 数值的地方，但它只发给管理员，且不进 LLM 上下文（是命令回复文本）——与 §1 的"LLM 隔离"不冲突。
 
