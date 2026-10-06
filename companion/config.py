@@ -458,6 +458,17 @@ class AffectionSectionConfig(PluginConfigBase):
                        "Modulate affection deltas by the current mood (multiplier 0.6-1.4)."),
         },
     )
+    weekly_milestones_enabled: bool = Field(
+        default=False,
+        description="周结大事记开关（M6，默认关）：周日的日结后按最近 7 天关系温度与净变化汇总出 1~2 条里程碑，"
+                    "写入档案 milestones 并随好感注入展示；纯规则零 LLM 成本",
+        json_schema_extra={
+            "label": "周结大事记",
+            "hint": "默认关；开启后每周日最多生成 1 次（周内须有 ≥3 天日结记录），重复调用不会重复生成",
+            **_ui_i18n("Weekly milestones",
+                       "Off by default. Rule-based weekly summary of the last 7 days' mood and net change."),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,7 @@
 # cateye_test 宿主自测试流程（TEST_PROCEDURE.md）
+> **【会话 2 范围声明 · 2026-10-06】** 本副本（cateye_test_ws2）的会话 2 仅执行 §三 的 L0 离线测试。
+> §四（harness）与 §五（SOP：宿主启停/部署/注入）为会话 1 专属——**只读理解，禁止执行**；
+> 一切 `E:\maibot` 路径的操作不得由会话 2 发起。
 
 > 版本：v1.1（2026-10-05 补路径约定与 §一.4 平台坑引用）｜**读者：执行测试的 agent**。配套：[MAINTENANCE_PLAN_10.05.md](MAINTENANCE_PLAN_10.05.md)（里程碑验收标准 + 剩余工作 §九）、[CLEANUP_PROPOSALS.md](CLEANUP_PROPOSALS.md)。
 > 性质：开发/测试文档，**发布时排除**（同 scratch/ 测试脚本，开发文档陷阱 #23）。

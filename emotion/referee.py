@@ -99,6 +99,28 @@ EVALUATE_PROMPT = """你是 AI 角色「{lover_name}」的情绪增量评估器�
 3. 只输出 JSON：{{"event": "...", "delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}}}"""
 
 
+#: 评估 prompt 里「待评估正文」的默认字符预算（per_reply 旧口径；片段制由调用方放宽）
+REPLY_TEXT_PROMPT_CHARS = 600
+#: 保留最近正文时在头部补的省略标注（让模型知道前面还有更早的往来，不是交流的开头）
+REPLY_TEXT_OMIT_MARK = "…（较早往来已省略）\n"
+
+
+def _clip_prompt_body(text: str, max_chars: int, keep_recent: bool) -> str:
+    """按预算裁剪待评估正文：``keep_recent=False`` 保留头部（旧语义，逐字不变）；
+    ``True`` 保留**最近** ``max_chars`` 字并在头部标注省略（片段制：最新交流必须可见）。"""
+    body = str(text or "")
+    try:
+        limit = int(max_chars)
+    except (TypeError, ValueError):
+        limit = REPLY_TEXT_PROMPT_CHARS
+    limit = max(1, limit)
+    if len(body) <= limit:
+        return body
+    if not keep_recent:
+        return body[:limit]
+    return REPLY_TEXT_OMIT_MARK + body[-limit:]
+
+
 def _parse_json_loose(text: str) -> Optional[Dict[str, Any]]:
     """宽松 JSON 解析：整段 → ```json 围栏 → 首个 {...} 块。"""
     text = (text or "").strip()
@@ -219,18 +241,26 @@ async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str
 
 
 async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_name: str,
-                               task_name: str, *, user_message: str = "") -> Optional[Tuple[str, VADState]]:
+                               task_name: str, *, user_message: str = "",
+                               reply_max_chars: int = REPLY_TEXT_PROMPT_CHARS,
+                               reply_keep_recent: bool = False) -> Optional[Tuple[str, VADState]]:
     """回复/外部事件增量评估：返回 (事件摘要, ΔVAD)；失败返回 None。
 
     ``user_message`` 是评估上下文增强（§4.2 行 2 / §七 M3 行）：该聊天流最近一条
     用户消息文本，由调用方反查后传入；拿不到时留空（prompt 里以占位说明），
     评估仍只输出有界增量（±0.5），模型始终看不到绝对 VAD（§6.3-6）。
+
+    ``reply_max_chars`` / ``reply_keep_recent``：待评估正文的 prompt 预算与裁剪方向。
+    缺省（600 字、保留头部）是 per_reply 旧语义，调用方不改则逐字不变；片段制
+    （episode）传更宽的预算 + ``reply_keep_recent=True``——片段正文超预算时保留**最近**
+    的往来（头部加省略标注），否则模型只看得到片段最旧的一段、最新交流被丢掉。
     """
+    body = _clip_prompt_body(reply_text, reply_max_chars, reply_keep_recent)
     response = await llm.generate(
         prompt=EVALUATE_PROMPT.format(lover_name=lover_name, persona=(persona or "（暂无人设）")[:800],
                                       user_context=(str(user_message or "").strip()[:300]
                                                     or "（未取到用户侧消息，仅按下面内容判断）"),
-                                      reply_text=str(reply_text or "")[:600]),
+                                      reply_text=body),
         task_name=task_name, temperature=0.2, max_tokens=150, event="emotion_evaluate",
     )
     data = _parse_json_loose(response)

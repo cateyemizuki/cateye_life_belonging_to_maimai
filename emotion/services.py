@@ -159,6 +159,15 @@ class EmotionServices:
         """
         await self.service.evaluate_reply(reply_text, session_id=session_id)
 
+    # ── T7 会话片段制转发（组件层只问这两个入口，不自己读模型字段集）──
+    def _evaluate_mode(self) -> str:
+        """当前回复后评估模式（``episode`` / ``per_reply`` / ``off``；转发 self.service）。"""
+        return self.service._evaluate_mode()
+
+    def note_reply_for_episode(self, session_id: str) -> None:
+        """episode 模式的 Hook 记录入口（纯内存、零 LLM；转发 self.service）。"""
+        self.service.note_reply_for_episode(session_id)
+
     @property
     def _bg_tasks(self) -> list:
         """评估后台任务列表（与内层同一份；Hook 侧防堆积裁剪与 stop() 清理共用）。"""

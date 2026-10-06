@@ -12,7 +12,7 @@
 | `vad.py` | VADState/EmotionEvent 数据结构；25 种情绪原型（10 正/3 中/12 负）；加权欧氏距离映射（V1.0/A0.8/D1.2）+ 阈值复合标签 + 低分辨率三档描述 | §一/§四/§七 |
 | `state_machine.py` | 外部状态机：日常指数衰减、事件结算（衰减→增量→裁剪→日志）、静态偏移+乘数（effective_vad，避免偏移每轮累加）、睡眠大修（锚点收敛 × 倒 U 恢复系数[恒 ≥0.3] + 裁判增量 + R_yesterday/E_tomorrow/约定三项数值）、参数生效/恢复默认/序列化；**M5 增冻结/解冻**（`freeze`/`unfreeze`：冻结期事件只入队 `pending_events`、衰减与结算暂停；解冻推进 `last_update`，不补算整夜） | §二/§五/§九/§十 |
 | `referee.py` | 三个独立 LLM 请求：睡眠裁判（**M5 起动态限幅 ±(0.4+0.4×`schedule.emotion_influence`)，缺省兼容 ±0.8** + R/E/约定三组数值输入 + reason 须引用日程原文）、人设初始化（锚点 ±0.6/偏移 ±0.3/增益 [0.8,1.3]/衰减 [0.6,1.2] 校验裁剪）、回复增量评估（±0.5）；宽松 JSON 解析 | §六/§十 |
-| `service.py` | 状态持久化（emotion_state.json / emotion_config.json）、睡眠检测循环（消费 planning 日程的 sleep 条目，跨午夜时长计算）、前后日日程与长期状态（planning 的 custom_prompt）汇总、初始化指令主体、隐私接口（清空日志）；**M3 增 `record_external_event` 统一外部事件入口 + target 识别/三层加算倍率 + 评估上下文反查（get_by_time_in_chat）**；**M4 增 `mood_effect()` 情绪→行为系数（附录 C 映射，纯规则）**；**M5 改睡眠循环为冻结→醒后结算**（入睡冻结 + 冻结期计算并缓存大修 → 醒沿应用一次并解冻；`is_frozen()`/`sleep_delta_limit()`/`schedule_tone_sum()`/`compute_sleep_overhaul()`/`_apply_cached_overhaul()`；`applied_sleep_date` 记睡眠周期键，旧裸日期值兼容读取）；**冻结窗口按 [schedule] 作息锚点整夜**（条目会被 `_normalize_items` 截断为 23:00–23:15，不能作窗口；午休按条目窗口），计划时长取整夜 8h；R/E/约定在醒来时按入睡日基准重算（次日日程 00:30 才生成）；**M5 连续低迷**：每 tick 采样**清醒时段** effective V（冻结期跳过）→ 日均线（滚动 7 天）→ **日历逐日**判定连续「日均 V<−0.5」（无采样日归零）→ 满 3 天发 `emotion.low_mood_day`（`low_mood_days()`/`low_mood_state()`，随状态落盘、旧文件缺键兼容）；**A3 增跨来源去重**（`dedup_policy()`/`_dedup_skip_result()`：replyer ⇄ tool:emotion_report 按流+窗口先入账者生效，内存在线登记、不改状态文件） | §五/§六/§十/§十三 |
+| `service.py` | 状态持久化（emotion_state.json / emotion_config.json）、睡眠检测循环（消费 planning 日程的 sleep 条目，跨午夜时长计算）、前后日日程与长期状态（planning 的 custom_prompt）汇总、初始化指令主体、隐私接口（清空日志）；**M3 增 `record_external_event` 统一外部事件入口 + target 识别/三层加算倍率 + 评估上下文反查（get_by_time_in_chat）**；**M4 增 `mood_effect()` 情绪→行为系数（附录 C 映射，纯规则）**；**M5 改睡眠循环为冻结→醒后结算**（入睡冻结 + 冻结期计算并缓存大修 → 醒沿应用一次并解冻；`is_frozen()`/`sleep_delta_limit()`/`schedule_tone_sum()`/`compute_sleep_overhaul()`/`_apply_cached_overhaul()`；`applied_sleep_date` 记睡眠周期键，旧裸日期值兼容读取）；**冻结窗口按 [schedule] 作息锚点整夜**（条目会被 `_normalize_items` 截断为 23:00–23:15，不能作窗口；午休按条目窗口），计划时长取整夜 8h；R/E/约定在醒来时按入睡日基准重算（次日日程 00:30 才生成）；**M5 连续低迷**：每 tick 采样**清醒时段** effective V（冻结期跳过）→ 日均线（滚动 7 天）→ **日历逐日**判定连续「日均 V<−0.5」（无采样日归零）→ 满 3 天发 `emotion.low_mood_day`（`low_mood_days()`/`low_mood_state()`，随状态落盘、旧文件缺键兼容）；**T7 会话片段制**（`evaluate_mode` 默认 `episode`）：`replyer.after_response` 只调 `note_reply_for_episode` 登记（纯内存零 LLM）；`_loop` 每轮回调 `flush_idle_episodes()` 冲刷闲置超 `episode_idle_minutes` 的流，睡眠入口先 `flush_all_episodes(reason="sleep_entry")` 再冻结/跑裁判；片段经 `get_by_time_in_chat(filter_mai=False, limit=40)` 组装（40 条/3000 字上限，超出保留最近往来并在头部标注），进评估器时正文预算放宽到片段上限且保留最近往来；水位/日计数落 `emotion_state.json` 的 `episode` 键（`last_eval_ts`/`eval_date`/`eval_count`，缺键/坏类型一律空默认），日上限 `evaluate_max_per_day` 两模式共用；**A3 增跨来源去重**（`dedup_policy()`/`_dedup_skip_result()`：replyer ⇄ tool:emotion_report 按流+窗口先入账者生效，内存在线登记、不改状态文件） | §五/§六/§十/§十三 |
 | `bridge.py` | **M3 新增**：跨模块事件桥——订阅 `relation.*` / `schedule.commitment_*` / `qzone.*` 并翻译为有界情绪增量（模板或 LLM 路径），全部经 `record_external_event` 入账；注册/注销挂 `services.py` | MAINTENANCE_PLAN §4.2 / §6.2 A·E·G |
 | `components.py` | `EmotionComponentsMixin`：2 Command + 2 Tool（**M3 新增 `cateye_test_emotion_report`**）+ 3 HookHandler（方法名 `emo_` 前缀，组件名 `cateye_test_emotion_*`） | —— |
 | `services.py` | `EmotionServices` 服务束（start/stop/set_persona 转发；**M3 起 start/stop 注册与注销 bridge 事件订阅、对外暴露 `effective_valence()` 供 B2 调制**；**M4 增 `mood_effect()` 转发，异常兜底恒等中性值**） | —— |
@@ -90,9 +90,17 @@
 - 跨模块读取入口为服务束 `EmotionServices.mood_effect()`（内部 `try/except` → 异常同样返回恒等值；patrol/qzone 经 `plugin._emotion.mood_effect()` 读取）；
 - 下游三处消费点见 `companion/INTEGRATION.md` §M4 与 `qzone`（发帖门控 + 说说/回评文案情绪行）。
 
+## M6 落地（2026-10-06）：emoji 情绪联动（默认关）
+
+- 开关 `[emotion] emoji_enabled`（默认 **false**）：false 或配置无该键 → `EmotionService.emoji_for_mood()` 直接返回 None，**绝不触碰宿主 API**；关闭时 `cateye_test_emotion_mood` Tool 输出与旧版逐字一致。
+- 实现：`service.py` `emoji_for_mood(description="")` → 门控 → `ctx.emoji.get_by_description`（缺失/不可调用 → None）→ `await getter(description=desc)`，结果非空原样返回；任何异常 debug 日志 + None（绝不上抛）。`description` 缺省取 `emoji_description()`（`map_emotions(effective_vad())` 首标签名，取不到回退 `mood_text()`）。
+- 消费面（最小闭环，不改宿主主动链路）：`components.py` `emo_tool_mood`（本就 async）在返回文本后追加「（表情匹配：{摘要}）」；摘要取返回 dict 的常见文本字段，取不到则不加后缀。
+- manifest：`_manifest.json` 能力数组新增 `emoji.get_by_description`（仅声明、默认不使用）；宿主侧实际接线由宿主级验证会话负责。
+- 明确不做：`statistics` 成本看板（扩大能力面、收益存疑，计划书已裁定）。
+
 ## 有意的裁剪 / TODO
 
-- 情绪增量评估为"回复后补一次小模型请求"（设计文档要求对话 LLM 直接输出 JSON ΔVAD，宿主 Hook 面拿不到结构化输出，此为等价实现），可关（`evaluate_on_reply`）；
+- 情绪增量评估为"回复后补一次小模型请求"（设计文档要求对话 LLM 直接输出 JSON ΔVAD，宿主 Hook 面拿不到结构化输出，此为等价实现），可关（T7 起由 `[emotion] evaluate_mode` 选路：`episode`（默认）=会话闲置后整段评估、`per_reply`=旧每回复模式（60s 节流）、`off`=不评估；旧布尔 `evaluate_on_reply` 已废弃，仅在未显式设置 `evaluate_mode` 时用于迁移）；
 - M3 群聊 target 上报 Tool 默认进 **deferred 工具池**（未设 `core_tool=True`），bot 自发调用不保证——replyer.after_response 自动评估是主通道，工具仅作群聊补充（触发条件写进 `detailed_description`）；
 - 中性情绪细分、人设动态偏移映射（§七.2.3）、planner 通道情绪注入、长期日程高压联动偏移调制（§九.4.4）未实现；
 - 多模态情绪来源（语音/面部/生理）不在 MaiBot 插件能力范围，仅文本路径。

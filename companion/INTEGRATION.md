@@ -108,6 +108,14 @@ await self._companion.stop()
 
 三处均不新增 Hook；`NEUTRAL_MOOD_EFFECT` + `_mood_multiplier` 对上游值做防御夹取。
 
+## M6 落地（2026-10-06）：周结大事记（默认关、纯规则）
+
+- 开关 `[affection] weekly_milestones_enabled`（默认 **false**，`AffectionManager.weekly_milestones_enabled()`）：false / `config_provider` 缺失或异常 → 一律不生成（§八.2 可空降级），行为与旧版逐字一致。
+- 状态（§5.3 v2 schema 预留位；旧档案缺键默认空表，**绝不因缺键启动失败**）：`week_log`（`date → {"tone", "delta"}`，按日期排序滚动保留 8 天）+ `milestones`（`[{"date","text"}]`，cap 20 条，超出丢最旧）。
+- 入口 `AffectionManager.record_daily_summary(date=, tone=, delta=, now=)` → `{"recorded", "milestones_generated"}`；生成条件（同时满足）：开关为真 + `date` 是周日 + 同日尚无里程碑（幂等）+ 该日往前 7 天窗口内 `week_log` 覆盖 ≥3 天。文案：1 条「本周关系温度：{最近 ≤4 条 tone，用；连接}（净变化 {net:+.1f}）」；`|net| ≥ 1.0` 时追加 1 条「本周好感净变化 {net:+.1f}，升温/降温明显」。窗口以 `date` 锚定（保证回放/单测可确定性重放），零 LLM 成本。
+- 接线：`affection_referee.py` `perform_daily_review()` 在 `set_tone` 之后、`update_review_state` 之前调用（try/except 包裹，失败只记 debug，**绝不影响日结主流程**）；消费面 `components.py` `_mai_affection_memory_line()` 追加 1 行「【本周大事记】日期 文案」（只取最近 1 条；无则不加）。
+- 明确不做：`statistics` 成本看板（扩大能力面、收益存疑，计划书已裁定）。
+
 ## 有意的裁剪 / TODO
 
 - 源插件的 `schedule_generator.py` / `mai_template.json` / `external_schedule.py`（跨插件读日程 API）不复刻——日程由 planning/ 提供；

@@ -1,8 +1,9 @@
 """QzoneComponentsMixin —— QQ 空间模块的 SDK 组件注册（装饰器方法）。
 
 组件清单：
-- Tools ×2：cateye_test_life_post_qzone（发说说，留空自动生成文案）、cateye_test_life_qzone_moments（查最近说说）
-- Command ×1：/cateye_test_life（status | qzone [moments/comments/post/reply/like] | diag | help）
+- Tools ×1：cateye_test_life_qzone（action=post 发说说，留空自动生成文案；action=moments 查最近说说）
+- Command ×1：/cateye_test_life（status | qzone [moments/comments/post/reply/like] | diag | help；
+  diag 为 /cateye_test_diag life 的旧名别名，行为不变）
 
 约定（与 planning/companion 的 mixin 一致）：
 - 方法名 `qzone_` 前缀（私有助手 `_qz_` 前缀），组件名 `cateye_test_life_*` / `cateye_test_life_suite`；
@@ -19,54 +20,63 @@ from maibot_sdk import Command, Tool
 
 
 class QzoneComponentsMixin:
-    """QQ 空间组件（2 Tool + 1 Command）。"""
+    """QQ 空间组件（1 Tool + 1 Command）。"""
 
     qzone_components_info: ClassVar[Dict[str, str]] = {
-        "cateye_test_life_post_qzone": "Tool：发说说（留空自动按当前活动生成文案）",
-        "cateye_test_life_qzone_moments": "Tool：查最近说说（内容摘要+评论数）",
-        "cateye_test_life_suite": "Command：/cateye_test_life status|qzone|diag|help",
+        "cateye_test_life_qzone": "Tool：空间运营合一（action=post 发说说/留空自动生成文案；action=moments 查最近说说）",
+        "cateye_test_life_suite": "Command：/cateye_test_life status|qzone|diag|help"
+                                 "（diag = /cateye_test_diag life 的旧名别名）",
     }
 
     # ============================================================
     # Tools
     # ============================================================
-    @Tool("cateye_test_life_post_qzone",
-          description="以 bot 的口吻发一条 QQ 空间说说。message 留空则自动按当前活动生成文案。受每日上限限制。",
-          parameters={"message": {"type": "string", "description": "说说正文；留空自动生成", "required": False}})
-    async def qzone_tool_post_moment(self, message: str = "", **kwargs: Any) -> dict[str, Any]:
+    @Tool("cateye_test_life_qzone",
+          description="QQ空间运营：action=post 发说说（message 留空自动按当前活动生成文案，受每日上限限制）| "
+                      "action=moments 查最近发表的说说（内容摘要、评论数、发表时间）。",
+          parameters={
+              "action": {"type": "string", "description": "操作：post=发说说 | moments=查最近说说", "required": True},
+              "message": {"type": "string", "description": "说说正文（action=post 时可选；留空自动生成）", "required": False},
+          })
+    async def qzone_tool_life(self, action: str = "", message: str = "", **kwargs: Any) -> dict[str, Any]:
+        """空间运营工具入口：post 与 moments 读写合一（action 非法/缺省给用法提示，不抛异常）。"""
         qz = getattr(self, "_qzone", None)
         if qz is None:
             return {"success": False, "content": "QQ 空间模块未初始化"}
-        cfg = self.config.qzone
-        if not cfg.enabled:
-            return {"success": False, "content": "QQ 空间模块未启用"}
-        if self._qz_posts_left_today() <= 0:
-            return {"success": False, "content": "今日说说额度已用完"}
-        text = message.strip()
-        if not text:
-            now = datetime.now()
-            text = await qz.generate_moment_text(now.strftime("%Y-%m-%d"), now)
-            if not text:
-                return {"success": False, "content": "文案生成失败，稍后再试"}
-        result = await qz.post_moment(text)
-        if result:
-            return {"success": True, "content": f"已发说说：{text}", "stop_after_execution": True}
-        return {"success": False, "content": "发表失败（检查 SnowLuma 适配器与 QZone 能力）"}
+        act = str(action or "").strip().lower()
 
-    @Tool("cateye_test_life_qzone_moments",
-          description="查看 bot 最近发表的 QQ 空间说说（内容摘要、评论数、发表时间）。用户问空间/说说/动态相关话题时调用。")
-    async def qzone_tool_moments(self, **kwargs: Any) -> str:
-        qz = getattr(self, "_qzone", None)
-        if qz is None or not self.config.qzone.enabled:
-            return "QQ 空间模块未启用"
-        moments = await qz.list_my_moments(num=5)
-        if not moments:
-            return "最近没有说说，或空间接口不可用。"
-        lines = []
-        for idx, m in enumerate(moments, 1):
-            excerpt = str(m.get("content") or "")[:40]
-            lines.append(f"{idx}. [{m.get('time', 0)}] {excerpt}…（评论 {m.get('comment_num', 0)} 条，tid={m.get('tid', '')}）")
-        return "最近说说：\n" + "\n".join(lines)
+        if act == "post":
+            cfg = self.config.qzone
+            if not cfg.enabled:
+                return {"success": False, "content": "QQ 空间模块未启用"}
+            if self._qz_posts_left_today() <= 0:
+                return {"success": False, "content": "今日说说额度已用完"}
+            text = str(message or "").strip()
+            if not text:
+                now = datetime.now()
+                text = await qz.generate_moment_text(now.strftime("%Y-%m-%d"), now)
+                if not text:
+                    return {"success": False, "content": "文案生成失败，稍后再试"}
+            result = await qz.post_moment(text)
+            if result:
+                return {"success": True, "content": f"已发说说：{text}", "stop_after_execution": True}
+            return {"success": False, "content": "发表失败（检查 SnowLuma 适配器与 QZone 能力）"}
+
+        if act == "moments":
+            if not self.config.qzone.enabled:
+                return {"success": False, "content": "QQ 空间模块未启用"}
+            moments = await qz.list_my_moments(num=5)
+            if not moments:
+                return {"success": False, "content": "最近没有说说，或空间接口不可用。"}
+            lines = []
+            for idx, m in enumerate(moments, 1):
+                excerpt = str(m.get("content") or "")[:40]
+                lines.append(f"{idx}. [{m.get('time', 0)}] {excerpt}…"
+                             f"（评论 {m.get('comment_num', 0)} 条，tid={m.get('tid', '')}）")
+            return {"success": True, "content": "最近说说：\n" + "\n".join(lines)}
+
+        return {"success": False,
+                "content": "用法：action=post（发说说，message 留空自动生成）| action=moments（查最近说说）"}
 
     def _qz_posts_left_today(self) -> int:
         qz = getattr(self, "_qzone", None)
@@ -121,7 +131,7 @@ class QzoneComponentsMixin:
             "/cateye_test_life status - 生活状态总览（好感度/巡检/日程/空间）\n"
             "/cateye_test_life qzone - QQ空间状态｜moments 最近说说｜comments 说说评论列表\n"
             "           （管理员：post 文本、reply 说说序号 [评论序号] 内容、like tid [目标QQ]）\n"
-            "/cateye_test_life diag [天数] - 决策日志（管理员）\n"
+            "/cateye_test_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /cateye_test_diag life，行为相同\n"
             "/cateye_test_life help - 本帮助；日程与恋人功能另有 /cateye_test_plan 与 /cateye_test_mai_* 命令"
         )
 
