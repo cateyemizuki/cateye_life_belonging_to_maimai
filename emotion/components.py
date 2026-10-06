@@ -7,8 +7,9 @@
   底色注入覆盖；injection_enabled=false 的组合不支持心情问答，见 USAGE.md）
 - HookHandler ×3：maisaka.planner.before_request（情绪底色注入）、
   maisaka.replyer.before_model_request（情绪底色注入）、
-  maisaka.replyer.after_response（按 [emotion] evaluate_mode：episode 只登记会话片段、
-  per_reply 回复后 ΔVAD 增量评估，OBSERVE；session_id 进 target 识别链路）
+  maisaka.replyer.after_response（先做一次夜间打扰记账 note_night_reply，
+  再按 [emotion] evaluate_mode 处理：episode 只登记会话片段、per_reply 回复后 ΔVAD 增量评估，
+  OBSERVE；session_id 进 target 识别链路）
 
 注入方式（planner 与 replyer 一致）：以 SystemMessageItem 插到**第一条系统提示词之后**
 （items 强 schema 协议，meta 三件套齐全、modified_kwargs 全量回传；messages 旧投影兼容）。
@@ -221,6 +222,8 @@ class EmotionComponentsMixin:
     async def emo_hook_reply_evaluate(self, response: Any = None, **kwargs: Any) -> None:
         """回复后 Hook（T7 两态，REGISTRY §二.1/§二.5；组件层不自己读 model_fields_set）。
 
+        - 三态**先**做一次夜间打扰登记 ``note_night_reply(session_id)``（M8 段 2，附录
+          §2.1/§2.2：记账独立于评估模式，off 态也登记；门控在服务内）；
         - ``evaluate_mode=off`` → 直接返回（零登记、零任务、零 LLM）；
         - ``episode``（默认）→ 只登记"该流存在未结往来"（纯内存、零 LLM、零 task），
           整段评估由情绪侧的闲置扫描 / 睡眠入口冲刷完成；
@@ -232,10 +235,14 @@ class EmotionComponentsMixin:
         svc = self._emo_service()
         if svc is None or not self._emo_module_enabled():
             return
+        # M8 段 2（附录 §2.1/§2.2）：夜间打扰记账**独立于 evaluate_mode**（off 态也要记账），
+        # 故放在模式分发之前：判定与门控（no_sleep_mode / 睡眠周期 / target 私聊）全在服务内做，
+        # 本调用纯内存、零 LLM；只触发 planner（无 reply）的轮次不会走到这个 Hook。
+        session_id = str(kwargs.get("session_id") or "")
+        svc.note_night_reply(session_id)
         mode = str(svc._evaluate_mode() or "episode")
         if mode == "off":
             return
-        session_id = str(kwargs.get("session_id") or "")
         if mode == "episode":
             if not session_id:
                 try:

@@ -138,6 +138,33 @@ class EmotionSectionConfig(PluginConfigBase):
         description="睡眠检测循环间隔（分钟）：进入日程睡眠时段后触发睡眠裁判大修",
         json_schema_extra={"label": "睡眠检测间隔(分钟)", **_ui_i18n("Sleep check interval (min)")},
     )
+    # ── M8 段 2：L1 夜间打扰判定（附录 §2.1；生效条件 = [schedule].no_sleep_mode 为 false）────
+    interrupt_reply_threshold: int = Field(
+        default=3,
+        ge=1,
+        le=100,
+        description="夜间打扰判定：同一时间窗内累计 reply 达到该次数才算「被吵醒」"
+                    "（只触发 planner、没有 reply 不算；生效还要求处于睡眠周期且 reply 来自 target 私聊）",
+        json_schema_extra={
+            "label": "打扰判定回复数(次)",
+            "hint": "窗口内累计 target 私聊 reply ≥ 该值 → 判定被吵醒；只看计数，不逐次入账",
+            **_ui_i18n("Interrupt reply threshold", "Replies within the window needed to count as woken up."),
+        },
+    )
+    interrupt_window_minutes: int = Field(
+        default=10,
+        ge=1,
+        le=1440,
+        description="夜间打扰判定的计数窗口（分钟）：窗口 = [最后一次 reply − 本值, 最后一次 reply]，随 reply 滚动",
+        json_schema_extra={"label": "打扰计数窗(分钟)", **_ui_i18n("Interrupt window (min)")},
+    )
+    resleep_minutes: int = Field(
+        default=5,
+        ge=1,
+        le=1440,
+        description="夜间打扰判定：自最后一次 reply 起该时长内无新 reply 即视为再次睡着（打扰段闭合，回到睡眠态）",
+        json_schema_extra={"label": "重新入睡判定(分钟)", **_ui_i18n("Resleep minutes (min)")},
+    )
     # ── M6 可选增强：emoji 情绪联动（默认关）──────────────────────
     emoji_enabled: bool = Field(
         default=False,

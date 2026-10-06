@@ -168,6 +168,30 @@ class EmotionServices:
         """episode 模式的 Hook 记录入口（纯内存、零 LLM；转发 self.service）。"""
         self.service.note_reply_for_episode(session_id)
 
+    # ── M8 段 2：L1 夜间打扰记账转发（组件层只问这一个入口，门控在内层）──
+    def note_night_reply(self, session_id: str) -> bool:
+        """夜间打扰记账入口（replyer.after_response Hook；转发 self.service）。
+
+        与 ``_evaluate_mode`` 无关（off 态也记账，附录 §〇 C1）；是否计入由内层按
+        ``[schedule].no_sleep_mode`` / 睡眠周期 / target 私聊门控判定（§2.1/§2.2），
+        返回 True 表示本次 reply 已计入打扰计数。
+        """
+        return bool(self.service.note_night_reply(session_id))
+
+    def night_interrupt_snapshot(self) -> Dict[str, Any]:
+        """当前打扰段快照（观测/调试用；转发 self.service，异常时返回 ``{}``）。"""
+        try:
+            return dict(self.service.night_interrupt_snapshot() or {})
+        except Exception:
+            return {}
+
+    def night_interrupt_segments(self, cycle_key: Optional[str] = None) -> list:
+        """已闭合打扰段归档（供观测与第 3 段整夜合计消费；转发 self.service）。"""
+        try:
+            return list(self.service.night_interrupt_segments(cycle_key))
+        except Exception:
+            return []
+
     @property
     def _bg_tasks(self) -> list:
         """评估后台任务列表（与内层同一份；Hook 侧防堆积裁剪与 stop() 清理共用）。"""

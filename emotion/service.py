@@ -62,6 +62,13 @@ NIGHT_INJECTION_HINT = ("（现在是深夜，你本该在睡觉。回复尽量�
 #: ``drained_events_count`` 仍报真实条数——摘要只作可追溯留痕，不参与任何结算）
 DRAINED_SUMMARY_DESC_CHARS = 60
 DRAINED_EVENTS_MAX = 20
+#: L1 夜间打扰记账的配置缺省（附录 §2.1 定稿值：窗口内 3 次 reply / 窗口 10min / 重新入睡 5min）
+DEFAULT_INTERRUPT_REPLY_THRESHOLD = 3
+DEFAULT_INTERRUPT_WINDOW_MINUTES = 10
+DEFAULT_RESLEEP_MINUTES = 5
+#: 打扰段归档条数上限（纯内存，供观测与第 3 段整夜合计消费；decision_logs 才是权威留痕，
+#: 超限丢最旧只防长跑进程无界增长）
+NIGHT_SEGMENTS_MAX = 128
 
 
 def _event_fingerprint(text: str) -> str:
@@ -114,6 +121,16 @@ class EmotionService:
         self._sleep_period: Optional[Tuple[datetime, datetime]] = None
         #: M5 连续低迷达标状态（streak ≥ 门槛时的事件载荷；供 planning 强制插入恢复类活动）
         self._low_mood_day: Dict[str, Any] = {}
+        # M8 段 2 L1 夜间打扰记账（附录 §2.1/§2.2）：纯运行期状态、不落 emotion_state.json（F5，
+        # 热重载丢账可接受——每次段闭合都有 decision_logs 留痕）
+        #: 当前打扰段 {"cycle_key","started_at","last_reply_at","reply_count","window_reply_count",
+        #: "stream_ids","last_stream_id","awake","confirmed_at","_stamps"}；无段为 None
+        self._night_segment: Optional[Dict[str, Any]] = None
+        #: 已闭合的打扰段归档（供第 3 段「整夜合计」消费；含未达阈值的候选段，``awake`` 区分）
+        self._night_archived: list = []
+        #: §4.5 提醒轮豁免占位（第 4 段接线）：赖床提醒轮的截止时刻（epoch 秒）。
+        #: 本段只提供登记入口，不实现豁免判定（提醒链路属第 4 段）。
+        self._reminder_round_until = 0.0
 
     # ── 事件总线（M0；无总线时静默跳过）─────────────────────
     def _bus(self) -> Any:
@@ -1226,6 +1243,199 @@ class EmotionService:
         night_start, night_end = self._night_window(now)
         return night_start <= now < night_end
 
+    # ── L1 夜间打扰记账：判定与归属门控（附录 §2.1/§2.2；M8 第 2 段）──────────
+    # 本段只做「判定 + 留痕 + 内存归档」：整夜合计入账、实际睡着时长、赖床提醒分属第 3/4 段。
+    def _no_sleep_mode(self) -> bool:
+        """``[schedule].no_sleep_mode`` 的**显式**读数（附录 §〇 C1 + §一 F1）。
+
+        F1：该开关现有副作用只在日程后处理（删除/截断睡眠窗口条目、睡眠时段不触发活动切换），
+        情绪层读不到任何"已静默"信号——L1 全线静默必须在新代码里自己判这个字段。
+        """
+        return bool(self._schedule_cfg("no_sleep_mode", False))
+
+    def _in_night_sleep_cycle(self, now: datetime) -> bool:
+        """是否处于**夜间睡眠周期**内（L1 计数前置；F15 既有上下文，不新增状态字段）。
+
+        ``_in_sleep``（睡眠上升沿置位、醒沿清除）或 ``_sleep_period``（本周期窗口）任一在场，
+        **且**时刻落在 [schedule] 锚点推出的整夜窗口内。小睡/午休（§八.7：其分支保持现状）
+        因此天然不计入——与 §〇「午休被打扰本轮不做」一致。
+        """
+        if not (self._in_sleep or self._sleep_period is not None):
+            return False
+        night_start, night_end = self._night_window(now)
+        return night_start <= now < night_end
+
+    def _night_cycle_key(self, now: datetime) -> str:
+        """打扰段归属的睡眠周期键（F6 既有形态 ``周期起始日@起始分钟``）。"""
+        period = self._sleep_period
+        start = period[0] if period else self._night_window(now)[0]
+        return self._cycle_key(start)
+
+    def _night_int(self, name: str, default: int) -> int:
+        """运行期读 [emotion] 的打扰参数（热重载即时生效；非数/越界一律回退缺省，≥1）。"""
+        try:
+            value = int(self._emotion_cfg(name, default))
+        except (TypeError, ValueError):
+            return int(default)
+        return value if value >= 1 else int(default)
+
+    def note_night_reply(self, session_id: str, *, now: Optional[datetime] = None) -> bool:
+        """登记一次「bot 回复了」（replyer.after_response 的夜间通道）；计入打扰计数返回 True。
+
+        判定口径（附录 §2.1，用户裁决 A3）与门控：
+
+        - **只登记真的 reply**：本方法唯一的计数入口（Hook 调用）；只触发 planner、没有 reply
+          的轮次不经过这里 → 天然不算被吵醒（用户裁决原文）；
+        - **归属门控**（§2.2）：仅 **target 私聊** 的 reply 计入（``is_target_session``）；
+          群聊/其他私聊既不计数也不重置计时；计数**跨聊天流**（任一 target 私聊 reply 都计入/刷新）；
+        - **生效门控**（§〇 C1 + F1/F15）：``[schedule].no_sleep_mode == true`` 时整条 L1 静默
+          （显式判该字段，不依赖其日程侧副作用）；模块停用或非夜间睡眠周期内同样不记账；
+        - **窗口滚动**：窗口 = ``[最后一次 reply − interrupt_window_minutes, 最后一次 reply]``，
+          窗内累计 ≥ ``interrupt_reply_threshold`` → 确认"吵醒态"（时刻记 ``confirmed_at``）；
+          此后直到 ``最后一次 reply + resleep_minutes`` 到期无新 reply 才回到睡眠态（§2.1）。
+
+        登记前先懒结算（:meth:`_roll_night_segment`）：已过 resleep 的段就地闭合，
+        故闭段留痕不依赖睡眠检测 tick（tick 内另有一处 resleep 扫描，见 ``_check_and_overhaul``）。
+        """
+        current = now or datetime.now()
+        self._roll_night_segment(current)
+        if self._no_sleep_mode() or not self._enabled() or not self._in_night_sleep_cycle(current):
+            return False
+        stream = str(session_id or "").strip()
+        if not self.is_target_session(stream):
+            return False
+        seg = self._night_segment
+        if seg is None:
+            seg = self._night_segment = {
+                "cycle_key": self._night_cycle_key(current),
+                "started_at": current,
+                "last_reply_at": current,
+                "reply_count": 0,          # 段内累计计入的 reply 次数（跨窗口不清零）
+                "window_reply_count": 0,   # 最后一条 reply 时刻的窗口内计数（阈值判定口径）
+                "stream_ids": [],
+                "last_stream_id": stream,
+                "awake": False,
+                "confirmed_at": None,
+                "_stamps": [],             # 滚动窗时间戳（epoch 秒；窗口按最后一次 reply 回看）
+            }
+        seg["last_reply_at"] = current
+        seg["last_stream_id"] = stream
+        if stream not in seg["stream_ids"]:
+            seg["stream_ids"].append(stream)
+        seg["_stamps"].append(current.timestamp())
+        cutoff = current.timestamp() - self._night_int(
+            "interrupt_window_minutes", DEFAULT_INTERRUPT_WINDOW_MINUTES) * 60.0
+        seg["_stamps"] = [stamp for stamp in seg["_stamps"] if stamp >= cutoff]
+        seg["reply_count"] = int(seg["reply_count"]) + 1
+        seg["window_reply_count"] = len(seg["_stamps"])
+        if not seg["awake"] and seg["window_reply_count"] >= self._night_int(
+                "interrupt_reply_threshold", DEFAULT_INTERRUPT_REPLY_THRESHOLD):
+            seg["awake"] = True
+            seg["confirmed_at"] = current
+        return True
+
+    def _roll_night_segment(self, now: datetime) -> Optional[Dict[str, Any]]:
+        """懒结算：当前段「最后一次 reply + resleep_minutes」已过 → 立即闭合（§2.1 回到睡眠）。"""
+        seg = self._night_segment
+        if seg is None:
+            return None
+        deadline = seg["last_reply_at"] + timedelta(
+            minutes=self._night_int("resleep_minutes", DEFAULT_RESLEEP_MINUTES))
+        if now <= deadline:
+            return None
+        return self.close_night_interrupt_segment("resleep", now=now)
+
+    @staticmethod
+    def _night_ts(value: Any) -> Any:
+        """时间戳 → ISO 秒级字符串（decision_logs 经 ``json.dumps``：datetime 会整条写不进去）。
+
+        用 ``isoformat`` 鸭子类型判定而非 isinstance：测试的注入时钟会把本模块的 ``datetime``
+        名字换成子类，isinstance 对"非该子类的 datetime 实例"会误判为不可序列化。
+        """
+        return value.isoformat(timespec="seconds") if hasattr(value, "isoformat") else None
+
+    def _night_segment_record(self, seg: Dict[str, Any], *, closed_at: Optional[datetime],
+                              close_reason: str) -> Dict[str, Any]:
+        """打扰段 → 对外记录（快照与归档同一形态；内部 ``_stamps`` 不外露）。
+
+        ``is_target`` **恒为真**：归属门控（§2.2）已把群聊/其他私聊挡在计数之外，
+        段内 reply 全部来自 target 私聊——字段保留以满足 §2.6 的留痕口径。
+        ``stream_id`` 取段内**最后一条** reply 的流，``stream_ids`` 给出跨流合并的全集。
+        """
+        return {
+            "cycle_key": str(seg.get("cycle_key") or ""),
+            "started_at": self._night_ts(seg.get("started_at")),
+            "last_reply_at": self._night_ts(seg.get("last_reply_at")),
+            "started_ts": float(seg["started_at"].timestamp()),
+            "last_reply_ts": float(seg["last_reply_at"].timestamp()),
+            "reply_count": int(seg.get("reply_count") or 0),
+            "window_reply_count": int(seg.get("window_reply_count") or 0),
+            "stream_id": str(seg.get("last_stream_id") or ""),
+            "stream_ids": list(seg.get("stream_ids") or []),
+            "is_target": True,
+            "awake": bool(seg.get("awake")),
+            "confirmed_at": self._night_ts(seg.get("confirmed_at")),
+            "closed_at": self._night_ts(closed_at),
+            "close_reason": str(close_reason or ""),
+        }
+
+    def close_night_interrupt_segment(self, reason: str, *,
+                                      now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """闭合当前打扰段并归档；**已确认（窗口计数达阈值）的段落一条** ``emotion.sleep_interrupt``。
+
+        闭合时机（§2.6 → §2.1）：``resleep`` 到期（懒结算/tick 扫描）、睡眠窗口结束、醒沿。
+
+        落日志口径（本段实现裁定，§2.6 表 + 附录 §八.4）：**每段至多一条完整记录、只在闭合时落**。
+        确认成立时刻不另落一行，而是记进 ``confirmed_at``——与闭合时刻 ``closed_at`` 一起可分辨
+        "何时判定成立、何时回到睡眠"；未达阈值的候选段（只触发 planner 的夜里寒暄）不落
+        ``sleep_interrupt``，仅进内存归档（``awake=False``）供观测与第 3 段消费。
+        打扰段/计数只进内存 + decision_logs，**不新增 emotion_state.json 字段**（F5/§八.4；
+        热重载丢账可接受，日志留痕在）。
+        """
+        seg, self._night_segment = self._night_segment, None
+        if seg is None:
+            return None
+        current = now or datetime.now()
+        closed = self._night_segment_record(seg, closed_at=current, close_reason=reason)
+        self._night_archived.append(closed)
+        if len(self._night_archived) > NIGHT_SEGMENTS_MAX:
+            del self._night_archived[:-NIGHT_SEGMENTS_MAX]
+        if closed["awake"]:
+            self._log_decision(
+                "emotion.sleep_interrupt", trigger_type="emotion",
+                reason=f"夜间打扰段闭合（{closed['close_reason']}）："
+                       f"窗口内 {closed['window_reply_count']} 次 target 私聊 reply",
+                cycle_key=closed["cycle_key"], started_at=closed["started_at"],
+                last_reply_at=closed["last_reply_at"], reply_count=closed["reply_count"],
+                is_target=closed["is_target"], stream_id=closed["stream_id"],
+                stream_ids=closed["stream_ids"], window_reply_count=closed["window_reply_count"],
+                confirmed_at=closed["confirmed_at"], closed_at=closed["closed_at"],
+                close_reason=closed["close_reason"],
+            )
+        return closed
+
+    def night_interrupt_snapshot(self) -> Dict[str, Any]:
+        """当前打扰段的只读快照（无段返回 ``{}``）；形态与归档条目一致（``closed_at=None``）。"""
+        seg = self._night_segment
+        if seg is None:
+            return {}
+        return self._night_segment_record(seg, closed_at=None, close_reason="")
+
+    def night_interrupt_segments(self, cycle_key: Optional[str] = None) -> list:
+        """已闭合打扰段的归档副本（可按 ``cycle_key`` 过滤；供观测与第 3 段整夜合计消费）。"""
+        key = str(cycle_key or "")
+        return [dict(seg) for seg in self._night_archived if not key or seg["cycle_key"] == key]
+
+    def note_reminder_round(self, until: Optional[datetime] = None) -> None:
+        """§4.5 提醒轮豁免的**占位登记入口**（第 4 段接线，本段不实现豁免判定）。
+
+        赖床提醒轮若意外触发 reply，不应刷新 ``resleep_minutes`` 计时、不应重新进入吵醒态。
+        本段只保留时间戳字段与登记入口（提醒链路与豁免判定属第 4 段）：现在调用它不改变
+        任何打扰计数的行为。
+        """
+        stamp = (until or datetime.now()).timestamp()
+        self._reminder_round_until = max(float(self._reminder_round_until), float(stamp))
+
     async def compute_sleep_overhaul(self, now: Optional[datetime] = None,
                                      sleep_hours: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """冻结期计算大修并返回缓存载荷（**不落状态**）；裁判失败返回 None（下一轮重试）。
@@ -1551,6 +1761,10 @@ class EmotionService:
 
         # 醒沿：日程出现清醒活动，或已离开睡眠窗口（含条目被截断后的深夜/清晨）
         if awake_activity or (self.is_frozen() and not self._in_sleep_period(now)):
+            # M8 段 2（附录 §2.1/§2.6）：睡眠窗口结束/醒沿 → 闭合夜间打扰段（本周期已结束，
+            # 段不能再延长；已确认的段在此落唯一一条 emotion.sleep_interrupt）。放在最前，
+            # 保证后续冲刷/结算即便抛错也不丢这条留痕。
+            self.close_night_interrupt_segment("wake", now=now)
             # §2.5.1 醒沿先冲刷片段：让「夜里最后一轮对话」当夜被评估，而不是攒到下一夜。
             # ⚠ 只在**睡眠周期真的结束**时冲刷（仍冻结 / 本周期已发过 sleep_started）：
             # 本分支白天每个 tick 都会命中（有清醒活动即进），无条件冲刷会让 episode
@@ -1566,6 +1780,9 @@ class EmotionService:
             return
 
         if self.is_frozen():
+            # M8 段 2（附录 §2.1）：冻结期（= 睡眠周期内）每个 tick 扫一次 resleep 到期，
+            # 让「回到睡眠」的闭段留痕不必等到醒沿或下一条 reply。
+            self._roll_night_segment(now)
             if self._pending_overhaul is None:           # 上轮裁判失败 → 冻结期内重试
                 planned = float(getattr(self, "_sleep_planned_hours", 0.0) or 0.0)
                 cached = await self.compute_sleep_overhaul(now, sleep_hours=planned or None)

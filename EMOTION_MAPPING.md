@@ -22,7 +22,16 @@
 > 「`flush_all_episodes("wake")` → 先解冻（`unfreeze(drain_to_log=True)`）→ 采集夜间事件摘要 →
 > `apply_sleep_overhaul`」，摘要（`drained_events_count` / `drained_events`）随 `emotion.sleep_overhaul`
 > 落 decision_logs；冻结态 `injection_text()` 追加一行深夜引导。本文件 §4.2、§7.3、§八 已同步。
-> **同段未做**：§2.5.4 实际睡着时长（M8 第 3 段）、`sleep_interrupt` 整夜合计与 §5.1 模板事件登记。
+> **M8 段 2 已落地（2026-10-07，附录定稿 §2.1/§2.2：夜间打扰判定与归属门控）**：`replyer.after_response`
+> （三态，含 off）记账入口 `note_night_reply(session_id)`——只计 **target 私聊** reply；窗口 =
+> `[最后一次 reply − emotion.interrupt_window_minutes, 最后一次 reply]` 滚动累计 ≥
+> `emotion.interrupt_reply_threshold`（默认 3 次 / 10min）确认「吵醒态」，末次 reply ＋
+> `emotion.resleep_minutes`（默认 5min）无新 reply 即回到睡眠；`[schedule].no_sleep_mode=true` 时
+> 整条 L1 显式静默，非夜间睡眠周期（含小睡）不计入；每段闭合落一条 `emotion.sleep_interrupt`
+> （§2.6 字段 + `confirmed_at`/`closed_at`/`close_reason`），段与计数只进内存 + decision_logs、
+> 不写 `emotion_state.json`（F5）。本文件 §7.3 已同步。
+> **同段未做**：§2.5.4 实际睡着时长（M8 第 3 段）、`sleep_interrupt` 整夜合计入账与 §5.1 模板事件登记、
+> 赖床提醒与 §4.5 提醒轮豁免（M8 第 4 段）。
 > **仍未落地（M5 其余部分）**：A3 `emotion_report` 工具裁决；A6 死字段清理已完成（`8d11f54`）。
 
 ---
@@ -448,6 +457,20 @@ delta_limit / r_yesterday / e_tomorrow / commitment_net / commitment_delta / log
 > 依据文档：`D:\deepseek-harness_workspace\maibot-plugins\MAINTENANCE_PLAN_APPENDIX_20261007_0155_睡眠打扰与早晚安漂移.md`
 > §2.5（该附件 §一 的 F3/F4；**定稿版**，草稿 `…_0114_ARCHIVED_草稿v0.1_…md` 已归档、非执行依据）。
 > 指针若失效：在 `D:\deepseek-harness_workspace\maibot-plugins\` 下检索 `睡眠打扰与早晚安漂移` 定位。
+
+**夜间打扰判定（M8 段 2 落地，附录 §2.1/§2.2；只判定 + 留痕，入账归第 3 段）**：`replyer.after_response`
+（`episode`/`per_reply`/`off` 三态）在模式分发前调 `EmotionService.note_night_reply(session_id)`
+（`EmotionServices.note_night_reply` 转发）——只登记**真的 reply**，只触发 planner 的轮次不算。
+**归属门控**：仅 `is_target_session()` 命中的 target 私聊计入（群聊/其他私聊不计数、不重置计时）；
+计数**跨聊天流**合并。**生效门控**：`[schedule].no_sleep_mode=true` 时整条 L1 显式静默（附录 F1），
+且仅当处于**夜间睡眠周期**内（`_in_sleep` / `_sleep_period` + 作息锚点整夜窗口；小睡不计入）才计数。
+**口径**（`interrupt_reply_threshold` = 3 / `interrupt_window_minutes` = 10 / `resleep_minutes` = 5）：
+窗口 = `[最后一次 reply − 窗口, 最后一次 reply]` 滚动，窗内累计 ≥ 阈值 → 确认「吵醒态」（`confirmed_at`）；
+末次 reply + `resleep_minutes` 无新 reply → 回到睡眠（闭段）。**留痕**：每次**段闭合**（resleep 到期 /
+睡眠窗口结束 / 醒沿）落一条 `emotion.sleep_interrupt`（`cycle_key` / `started_at` / `last_reply_at` /
+`reply_count` / `is_target` / `stream_id` + `stream_ids` / `window_reply_count` / `confirmed_at` /
+`closed_at` / `close_reason`；每段至多一条）；段与计数**只进内存 + decision_logs**，不写
+`emotion_state.json`（附录 F5/§八.4）。
 
 **裁判输入**：人设 + **当前 VAD 绝对值**（唯一给 LLM 看绝对值的场合，因为它是裁判不是对话模型）+ 当天日志 + **前一天日程** + **第二天日程** + 长期状态 + 预计睡眠时长 + 25 原型表 + **R_yesterday / E_tomorrow / 约定净兑现三组数值项**（§4.2 输入扩展）；prompt 内嵌评分规则 7 条（近因效应、时长倒 U、日程"释怀/反刍/期待/焦虑"、人设情绪过滤、三输入为参考、ΔVAD ∈ [-limit, limit]、reason 必须引用原文）。
 **已实测的失败模式**：`max_tokens` 给 600 会被三组长 reason 截断（宿主验证日 8 次尝试零落地）→ 现为 **2000**；思考型模型仍可能挤爆预算，裁判任务必须绑真非思考模型（MAINTENANCE_PLAN §八.8）。
