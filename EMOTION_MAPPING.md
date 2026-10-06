@@ -455,7 +455,10 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 |---|---|---|---|
 | `enabled` | true | — | 模块总开关（关 → Hook 直接 continue、mood_effect 恒等） |
 | `decay_rate` | 0.08 | [0.01, 0.3] | 每小时指数衰减（半衰期 ≈8.7h） |
-| `evaluate_on_reply` | true | — | 是否每轮回复后 LLM 评估 |
+| `evaluate_mode` | "episode" | episode / per_reply / off | 回复后评估模式：episode=会话闲置后整段评估（默认，成本封顶）｜per_reply=每回复评估（旧模式，60s 节流）｜off=不评估（T7） |
+| `episode_idle_minutes` | 10 | [1, 720] | episode 模式：会话闲置多少分钟后冲刷该流片段（T7；扫描精度=睡眠检测循环间隔） |
+| `evaluate_max_per_day` | 10 | [0, 200] | 每日情绪评估上限（次，episode/per_reply 共用；0=当日不评估；超限片段丢弃不并入次日，落 `daily_cap` 日志）（T7） |
+| `evaluate_on_reply` | true（**已废弃**） | — | 迁移用：未显式设置 `evaluate_mode` 时 true→episode / false→off；显式设置 `evaluate_mode` 后本字段被忽略（T7） |
 | `evaluate_min_interval_seconds` | 60 | [0, 3600] | LLM 评估节流（回复评估与工具上报共用） |
 | `evaluator_task_name` | "utils" | — | 回复评估 / 工具上报 / 人设初始化用的任务 |
 | `referee_task_name` | "replyer"（**类默认**；部署 config 实测为 "utils"） | — | 睡眠裁判任务 |

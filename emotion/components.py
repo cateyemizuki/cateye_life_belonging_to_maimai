@@ -7,7 +7,8 @@
   底色注入覆盖；injection_enabled=false 的组合不支持心情问答，见 USAGE.md）
 - HookHandler ×3：maisaka.planner.before_request（情绪底色注入）、
   maisaka.replyer.before_model_request（情绪底色注入）、
-  maisaka.replyer.after_response（回复后 ΔVAD 增量评估，OBSERVE；session_id 进 target 识别链路）
+  maisaka.replyer.after_response（按 [emotion] evaluate_mode：episode 只登记会话片段、
+  per_reply 回复后 ΔVAD 增量评估，OBSERVE；session_id 进 target 识别链路）
 
 注入方式（planner 与 replyer 一致）：以 SystemMessageItem 插到**第一条系统提示词之后**
 （items 强 schema 协议，meta 三件套齐全、modified_kwargs 全量回传；messages 旧投影兼容）。
@@ -39,7 +40,7 @@ class EmotionComponentsMixin:
         "cateye_test_emotion_report": "Tool：上报一件影响心情的事件；is_target 声明是否由重要的人引发（M3）",
         "emotion_planner_inject": "HookHandler：maisaka.planner.before_request 情绪底色注入（系统提示词后）",
         "emotion_replyer_model_inject": "HookHandler：maisaka.replyer.before_model_request 情绪底色注入（系统提示词后）",
-        "emotion_reply_evaluate": "HookHandler：maisaka.replyer.after_response 增量评估（OBSERVE）",
+        "emotion_reply_evaluate": "HookHandler：maisaka.replyer.after_response 会话片段登记/增量评估（OBSERVE，按 evaluate_mode）",
     }
 
     def _emo_service(self) -> Any:
@@ -214,21 +215,39 @@ class EmotionComponentsMixin:
 
     @HookHandler("maisaka.replyer.after_response",
                  name="emotion_reply_evaluate",
-                 description="回复后评估该轮对话的情绪增量 ΔVAD 并记入当天情绪日志",
+                 description="回复后按 evaluate_mode 处理该轮对话：episode 只登记会话片段（零 LLM），per_reply 评估增量 ΔVAD",
                  mode=HookMode.OBSERVE, order=HookOrder.LATE,
                  timeout_ms=1000, error_policy=ErrorPolicy.SKIP)
     async def emo_hook_reply_evaluate(self, response: Any = None, **kwargs: Any) -> None:
+        """回复后 Hook（T7 两态，REGISTRY §二.1/§二.5；组件层不自己读 model_fields_set）。
+
+        - ``evaluate_mode=off`` → 直接返回（零登记、零任务、零 LLM）；
+        - ``episode``（默认）→ 只登记"该流存在未结往来"（纯内存、零 LLM、零 task），
+          整段评估由情绪侧的闲置扫描 / 睡眠入口冲刷完成；
+        - ``per_reply``（旧模式）→ 原样 fire-and-forget 评估本轮回复（60s 节流在服务侧）。
+
+        M3：``session_id`` 进 target 识别链路（私聊 stream_id == 目标私聊流 → target 事件）；
+        episode 模式下缺 session_id 时无处可登记，记 debug 日志后返回。
+        """
         svc = self._emo_service()
         if svc is None or not self._emo_module_enabled():
             return
-        cfg = getattr(self.config, "emotion", None)
-        if not bool(getattr(cfg, "evaluate_on_reply", True)):
+        mode = str(svc._evaluate_mode() or "episode")
+        if mode == "off":
+            return
+        session_id = str(kwargs.get("session_id") or "")
+        if mode == "episode":
+            if not session_id:
+                try:
+                    self.ctx.logger.debug("emotion episode：after_response 缺 session_id，未登记片段")
+                except Exception:
+                    pass
+                return
+            svc.note_reply_for_episode(session_id)
             return
         reply_text = str(response or "").strip()
         if not reply_text:
             return
-        # M3：session_id 进 target 识别链路（私聊 stream_id == 目标私聊流 → target 事件）
-        session_id = str(kwargs.get("session_id") or "")
         # 评估带 LLM 往返，不能阻塞 Hook（OBSERVE 后台通道）：fire-and-forget
         task = asyncio.create_task(svc.evaluate_reply(reply_text[:600], session_id=session_id))
         svc._bg_tasks.append(task)

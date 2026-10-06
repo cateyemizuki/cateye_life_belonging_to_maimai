@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Dict
+from typing import ClassVar, Dict, Literal
 
 from maibot_sdk import Field, PluginConfigBase
 
@@ -43,8 +43,33 @@ class EmotionSectionConfig(PluginConfigBase):
     )
     evaluate_on_reply: bool = Field(
         default=True,
-        description="每次 bot 回复后用小模型评估该轮对话的情绪增量 ΔVAD（事件→增量映射）",
+        description="每次 bot 回复后用小模型评估该轮对话的情绪增量 ΔVAD（事件→增量映射）"
+                    "（已废弃，迁移为 evaluate_mode；显式设置 evaluate_mode 时本字段被忽略）",
         json_schema_extra={"label": "回复后评估增量", **_ui_i18n("Evaluate on reply")},
+    )
+    evaluate_mode: Literal["episode", "per_reply", "off"] = Field(
+        default="episode",
+        description="回复后情绪评估模式：episode=会话闲置后整段评估（默认，成本封顶）| "
+                    "per_reply=每回复评估（旧模式，60s 节流）| off=不评估",
+        json_schema_extra={
+            "label": "回复后评估模式",
+            "hint": "episode 按会话片段整段评估（成本封顶）；per_reply 为旧每回复模式",
+            **_ui_i18n("Evaluate mode", "episode: evaluate one idle session segment at a time."),
+        },
+    )
+    episode_idle_minutes: int = Field(
+        default=10,
+        ge=1,
+        le=720,
+        description="episode 模式：会话闲置多少分钟后冲刷评估该流片段",
+        json_schema_extra={"label": "片段闲置阈值(分钟)", **_ui_i18n("Episode idle minutes (min)")},
+    )
+    evaluate_max_per_day: int = Field(
+        default=10,
+        ge=0,
+        le=200,
+        description="情绪评估每日上限（次，两种模式共用，硬封顶；0=当日不评估）",
+        json_schema_extra={"label": "评估每日上限(次)", **_ui_i18n("Max evaluations per day")},
     )
     evaluate_min_interval_seconds: int = Field(
         default=60,

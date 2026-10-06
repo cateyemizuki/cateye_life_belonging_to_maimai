@@ -94,7 +94,7 @@ cateye_test/
 ### emotion/ — 情绪维护系统（新增，按设计文档实现）
 - ✅ VAD 外部状态机：LLM 只输出"事件→增量"，状态机维护绝对值；日常指数衰减（decay_rate 可配）→ 加增量 → 静态偏移 → 乘数（V>0 增益/V<0 衰减）→ 裁剪
 - ✅ 25 种情绪原型（10 正/3 中/12 负）加权欧氏距离映射（V1.0/A0.8/D1.2），阈值内复合标签（激活度归一化），低分辨率三档描述（模糊化反馈防漂移）
-- ✅ 回复后增量评估：replyer.after_response 后用小模型把该轮对话转成 ΔVAD（±0.5 限幅+节流），记入当天情绪日志（原始事件流）
+- ✅ 回复后增量评估（T7 起默认 **episode 会话片段制**）：replyer.after_response 只登记会话片段（零 LLM），会话闲置 `episode_idle_minutes`（默认 10min）后把该流自上次评估以来的完整往来整段交给小模型转成 ΔVAD（±0.5 限幅，进评估器的正文保留最近往来、预算放宽到片段上限），记入当天情绪日志（原始事件流）；`evaluate_mode` 可切回 `per_reply`（每回复评估，60s 节流）或 `off`，`evaluate_max_per_day`（默认 10）两模式共用硬封顶
 - ✅ **评估上下文增强（M3）**：评估 prompt 追加"用户侧最后一条消息"（`ctx.message.get_by_time_in_chat(..., filter_mai=True)` 反查该流最近消息，拿不到就跳过），事件描述要求概括"这轮交流发生了什么"
 - ✅ **外部事件桥（M3）**：`emotion/bridge.py` 订阅 `relation.silence_detected`（沉默：ΔV=−0.12、ΔA=+0.04）、`schedule.commitment_kept/broken`（约定兑现 +0.2／违约 −0.15）、`qzone.comment_received`（ΔV +0.05~+0.1）；统一入口 `record_external_event`（模板增量直记，或小模型有界评估 ±0.5）
 - ✅ **target 识别 + 三层加算倍率（M3，§6.2 A）**：私聊按 `session_id == 目标私聊 stream_id` 自动判定；群聊由 Tool `cateye_test_emotion_report(event, is_target)` 传参声明（参数永不拒绝，缺失/非法值静默按非 target）；`final = delta × global_event_multiplier × K`，target K = `1 + target_bonus_step × (档位+1)`（+0.1~+0.5），非 target K = `non_target_multiplier`
