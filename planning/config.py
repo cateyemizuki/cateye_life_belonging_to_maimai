@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Dict, List, Literal
 
+import pydantic
 from maibot_sdk import Field, PluginConfigBase
 
 
@@ -396,14 +397,15 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     enable_morning_greeting: bool = Field(
         default=False,
-        description="早间问好：bot 睡醒后第一个活动开始时，主动向白名单内的会话道早安",
-        json_schema_extra={"label": "早间问好", **_ui_i18n("Morning greeting")},
+        description="早间问候（L2 漂移驱动）：bot 睡醒后按 morning_drift 随机漂移时刻向目标私聊/群聊/其他私聊道早安",
+        json_schema_extra={"label": "早间问候", **_ui_i18n("Morning greeting")},
     )
     morning_greeting_require_activation: bool = Field(
         default=False,
-        description="早间问好是否需要激活。开启后：随机延迟结束并不立即问好——从 bot 睡醒起算观察会话消息，"
-                    "期间有人说话则照常问好；截止第一个活动结束前 10 分钟仍无人说话，放弃该会话的早间问好",
-        json_schema_extra={"label": "早间问好需激活", **_ui_i18n("Require activation")},
+        description="（旧字段，M10/L2 起由 greeting_require_activation 接管）早间问候是否需激活："
+                    "开启后与 greeting_require_activation 取或——非目标私聊从基准点起观察会话消息，"
+                    "有人说话才问好，到期限仍无人则放弃（目标私聊固定生效，不受本项影响）",
+        json_schema_extra={"label": "早间问候需激活（旧）", **_ui_i18n("Require activation (legacy)")},
     )
     enable_frequency_modulation: bool = Field(
         default=True,
@@ -425,6 +427,74 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
                     "都各计 1 次；用尽后不再提醒，但仍允许 bot 自行推迟起床",
         json_schema_extra={"label": "赖床提醒上限", **_ui_i18n("Nap reminder cap")},
     )
+
+    # ── M10 L2 早晚安漂移（附录 §3.1/§3.7，裁决 B1/B3/B5/B6/B7）───────
+    morning_drift: str = Field(
+        default="10-30",
+        description="早安漂移区间（分钟，相对睡眠窗口结束 = [schedule].wake_time 锚点）："
+                    '填 "a-b" 或单数字 N（= 0~N 随机）；触发时刻 = 基准 + randint(a, b)。'
+                    "负数/非法一律回退默认区间 10-30（不收负数）",
+        json_schema_extra={
+            "label": "早安漂移(分钟)",
+            "hint": '例 "10-30" 或 "20"；单数字 = 0~N 随机',
+            "pattern": r"^\d+(-\d+)?$",
+            **_ui_i18n("Morning drift (min)", 'e.g. "10-30" or "20"'),
+        },
+    )
+    night_drift: str = Field(
+        default="10-30",
+        description="晚安漂移区间（分钟，相对当天最后一个非睡眠日程条目结束）："
+                    '填 "a-b" 或单数字 N（= 0~N 随机）；触发时刻 = 基准 − randint(a, b)（向前漂移）。'
+                    "负数/非法一律回退默认区间 10-30（不收负数）",
+        json_schema_extra={
+            "label": "晚安漂移(分钟)",
+            "hint": '例 "10-30" 或 "20"；单数字 = 0~N 随机',
+            "pattern": r"^\d+(-\d+)?$",
+            **_ui_i18n("Night drift (min)", 'e.g. "10-30" or "20"'),
+        },
+    )
+    enable_night_greeting: bool = Field(
+        default=False,
+        description="晚间问候（L2 漂移驱动）：按 night_drift 随机漂移时刻道晚安；群聊晚安还需必要性激活"
+                    "（名单复用 proactive_group_ids）。关闭时晚安全线不发（含群聊）",
+        json_schema_extra={"label": "晚间问候", **_ui_i18n("Night greeting")},
+    )
+    morning_other_private_enabled: bool = Field(
+        default=False,
+        description="其他私聊的早安开关（默认关）：开启后，非目标的其他私聊需前一日该流消息数 ≥ "
+                    "morning_other_private_min_messages 才可能收到早安（防打扰护栏）",
+        json_schema_extra={"label": "其他私聊早安", **_ui_i18n("Morning greeting to other private chats")},
+    )
+    morning_other_private_min_messages: int = Field(
+        default=5,
+        ge=5,
+        description="其他私聊早安的前一日消息数门槛（**不允许低于 5**，配置校验直接拒绝）："
+                    "前一日该流消息数达到该值才成为早安候选；取不到消息计数按 0 处理（不发送）",
+        json_schema_extra={"label": "其他私聊门槛(条)", **_ui_i18n("Other-private threshold (msgs)")},
+    )
+    greeting_require_activation: bool = Field(
+        default=True,
+        description="问候的必要性激活：开启后，群聊/其他私聊到点需先观察到「自基准点起该流有人发过消息」"
+                    "才问候，无人则推迟到下一轮、到期限仍无人则放弃（当天不再补发）；"
+                    "关闭则到点直接问候。目标私聊固定生效，不受本项影响",
+        json_schema_extra={"label": "问候需激活", **_ui_i18n("Greeting requires activation")},
+    )
+
+    @pydantic.field_validator("morning_drift", "night_drift", mode="before")
+    @classmethod
+    def _coerce_drift_to_str(cls, value: Any) -> Any:
+        """漂移字段接受 int（如 20）与 "a-b" 两种配置写法（§3.1）：数字先转字符串。
+
+        区间解析/合法性回退在服务层（``planning.proactive_service._parse_drift``）——
+        配置层只保证"两种写法都能进得来"，不在校验期拒绝用户（B3：非法值回退默认区间）。
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float) and float(value).is_integer():
+            return str(int(value))
+        return value
 
 
 class PlanningCleanupSectionConfig(PluginConfigBase):

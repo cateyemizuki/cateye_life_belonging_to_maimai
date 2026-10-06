@@ -186,22 +186,26 @@ class PatrolSectionConfig(PluginConfigBase):
     )
     morning_start: str = Field(
         default="07:00",
-        description="早安触发窗口开始（HH:MM）",
+        description="早安触发窗口开始（HH:MM）（已废弃，B1 合并：早晚安时刻由 [planning_proactive] 漂移机制决定；"
+                    "字段保留仅作兼容读取）",
         json_schema_extra={"label": "早安开始", **_ui_i18n("Morning window start")},
     )
     morning_end: str = Field(
         default="10:00",
-        description="早安触发窗口结束（HH:MM）",
+        description="早安触发窗口结束（HH:MM）（已废弃，B1 合并：早晚安时刻由 [planning_proactive] 漂移机制决定；"
+                    "字段保留仅作兼容读取）",
         json_schema_extra={"label": "早安结束", **_ui_i18n("Morning window end")},
     )
     night_start: str = Field(
         default="22:00",
-        description="晚安触发窗口开始（HH:MM）",
+        description="晚安触发窗口开始（HH:MM）（已废弃，B1 合并：早晚安时刻由 [planning_proactive] 漂移机制决定；"
+                    "字段保留仅作兼容读取）",
         json_schema_extra={"label": "晚安开始", **_ui_i18n("Night window start")},
     )
     night_end: str = Field(
         default="23:59",
-        description="晚安触发窗口结束（HH:MM）",
+        description="晚安触发窗口结束（HH:MM）（已废弃，B1 合并：早晚安时刻由 [planning_proactive] 漂移机制决定；"
+                    "字段保留仅作兼容读取）",
         json_schema_extra={"label": "晚安结束", **_ui_i18n("Night window end")},
     )
     silence_start: str = Field(

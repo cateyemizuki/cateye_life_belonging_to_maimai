@@ -266,3 +266,45 @@
 3. `ctx.maisaka.proactive.trigger` 的 `metadata` 透传与宿主把它**序列化进块文本一行**（F12；块 id 形态 `proactive:{plugin_id}:{epoch_ms}`）——决定 `is_consumed_ephemeral_proactive_block` 的 `plugin_id`/`kind` 匹配是否按预期命中（当前实现：`plugin_id` 段不一致则不动，取不到该段则退回只按 `kind=nap_reminder` 标记判定）；
 4. 提醒块所在流是否确为 per-stream（F10）——确认剥离只需处理"同一流后续轮次"；
 5. 钳制后的睡眠窗口端点能推迟醒沿：宿主侧观察 `schedule.woke_up` / `emotion.sleep_overhaul` 的实际触发时刻是否随 `lie_in_max_until` 后的端点顺延。
+
+## 八、早晚安漂移（M10 · 附录 §三 L2）
+
+早/晚安**只配漂移区间**：每聊天流每日独立掷点一次，到点按「必要性激活」决定是否真的开口。
+
+**驱动链（一句话）**：`[planning_proactive]` 的漂移机制在 planning 的 60s 循环里掷点 → 到点查该流是否有人说话 → 统一主动链 `ctx.maisaka.proactive.trigger`（`allow_proactive` → `proactive.used`，纳入全渠道预算）。早安/晚安**各只有这一条驱动链**：`[patrol]` 不再自行判时（B1 合并），只按 `affection` 的每日已发标记去重。
+
+| 配置项 | 默认 | 约束 | 说明 |
+|---|---|---|---|
+| `[planning_proactive] enable_morning_greeting`（既有） | `false` | — | 早安总开关 |
+| `[planning_proactive] morning_drift` | `"10-30"` | `^\d+(-\d+)?$` | 早安漂移区间（分钟）：触发时刻 = 睡眠窗口结束（`[schedule] wake_time` 锚点）+ `randint(a,b)`；单数字 `N` = `0~N` 随机；`a>b` 自动交换；**负数/非法回退默认区间**（不收负数） |
+| `[planning_proactive] night_drift` | `"10-30"` | 同上 | 晚安漂移区间（分钟）：触发时刻 = 当天最后一个非睡眠日程条目结束 − `randint(a,b)`（向前漂移）；无日程回退 `[schedule] sleep_time` 锚点 |
+| `[planning_proactive] enable_night_greeting` | `false` | — | 晚间问候开关；关闭时**晚安全线不发（含群聊）** |
+| `[planning_proactive] morning_other_private_enabled` | `false` | — | 其他私聊的早安开关 |
+| `[planning_proactive] morning_other_private_min_messages` | `5` | `ge=5`（**不允许低于 5**，配置校验直接拒绝） | 其他私聊早安门槛：**前一日**该流消息数达到该值才成为候选；取不到计数按 0 处理（不发送） |
+| `[planning_proactive] greeting_require_activation` | `true` | — | 群聊必要性激活：到点需先观察到「自基准点起该流有人发过消息」才问候；无人则推迟到下一轮，到期限仍无人即放弃（当天不再补发） |
+
+**基准与期限**
+
+| 问候 | 基准点 | 触发时刻 | 放弃期限 |
+|---|---|---|---|
+| 早安 | 睡眠窗口结束（`[schedule] wake_time` 锚点） | 基准 + `randint(a,b)` | 睡眠结束后**第一个非睡眠**日程条目的结束；无日程 → 基准 + 120 分钟 |
+| 晚安 | 当天最后一个非睡眠日程条目的结束（无日程 → `sleep_time` 锚点） | 基准 − `randint(a,b)` | `min(睡眠窗口开始 sleep_time, [patrol] silence_start)`，取先到者 |
+
+- **每流每日一次**：`(stream_id, 日期, 早安/晚安)` 只掷一次点，同日重复决策**复用同一结果**；热重载后允许重掷（纯内存、不落盘）。
+- **跨午夜条目**（结束 > 24:00）按绝对时间戳处理。
+- **锚点参照点**：晚安的「入睡锚点 / `silence_start`」按**今天的起床锚点**取"今晚的那一次"——常规作息得到当天时刻，夜猫子作息（`sleep < wake`，日程延续到次日凌晨）自动落到次日凌晨，不会误判成"窗口已过"。
+- **延迟补发**：循环因重启等原因错过触发时刻时，只要未到期限仍会在下一个 tick 补发；已过期限即记放弃（`abandoned`），当天不再评估。
+
+**覆盖范围（B6/B7）**
+
+| 目标 | 规则 |
+|---|---|
+| 虚拟恋人目标私聊（`[target] target_qq`） | 早安/晚安**固定生效**（只要对应开关打开，不要求激活） |
+| 群聊 | 仅当群号出现在 `[planning_proactive] proactive_group_ids`（**复用全局名单，不新增问候群号配置**）→ 必要性激活（`greeting_require_activation`）；晚安另需 `enable_night_greeting`。⚠ 与活动切换主动开口不同：问候**不做**「名单留空 = 所有群」的放大——**留空 = 不含群聊** |
+| 其他私聊 | 早安需 `morning_other_private_enabled` **且**前一日该流消息数 ≥ `morning_other_private_min_messages`；名单复用 `proactive_other_streams`。**晚安本轮不给其他私聊** |
+
+**预算与去重**：问候一律走统一主动链并计入全渠道预算（**不为问候开预算旁路**）；预算拒绝时当轮不发送、掷点状态不变（下一轮继续尝试，到期限自然放弃）。目标私聊触发成功后写 `affection` 的 `morning_sent`/`night_sent` 每日标记，`[patrol]` 见已发即不再触发——同一私聊流同一天早安/晚安**各至多一条**。
+
+**[patrol] 的四个时间窗字段已废弃**：`morning_start` / `morning_end` / `night_start` / `night_end` 保留在配置里**仅作兼容读取**（仍参与 `HH:MM` 格式校验、非法值照旧落 `invalid_time_config` 留痕），**不再参与任何触发判定**；实际时刻由上面的漂移机制决定。`[patrol]` 的静默时段、每日发言上限（含「未发晚安预留 1 个预算位」）与全渠道预算照旧生效；`[patrol] min_interval_exempt_greetings`（早晚安豁免最小间隔）随 patrol 判时下线而**不再有消费点**（字段保留，间隔约束由漂移机制自身的基准/期限承担）。
+
+**宿主实测项（离线不可覆盖，归宿主级验证会话）**：① 漂移触发时刻与 `[schedule] wake_time`、末条日程结束的实际对齐（含跨午夜条目）；② 群聊必要性激活在真实 `message.get_by_time_in_chat` 语义下的命中口径；③ 同一私聊流同一天早安/晚安各至多一条（含 planning 与其他链路的并发窗口）；④ `[patrol]` 时间窗字段废弃后，宿主 UI 保存配置不再写回旧值的行为。

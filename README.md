@@ -69,7 +69,8 @@ cateye_test/
 - ✅ LLM 多轮日程生成：wake/sleep 锚点**动态 JSON 示例 + 衔接演算**（示例永远与正文约束自洽）、三餐窗口硬约束、无睡眠模式（睡眠时段不生成条目 + 禁字）、**控制字符清理**解析、语义校验（只警告）、质量评分（0~1，≥阈值提前达标）、retry 带上轮反馈、生成上下文（近 N 天日程摘要 / 跨群聊天历史 / 知识库 / 自定义生活阶段）
 - ✅ 当天已有日程跳过、模板兜底（骨架继承）、每日定时自动生成、过期清理
 - ✅ planner 注入（意图分类：问当前/问未来/闲聊/技术/命令，注入优化器冷却+概率+TTL，会话续注，能量模型）+ replyer 注入；**M4 精神状态行与情绪注入同源**：`_render_unified_prompt` 的精神状态行改读情绪系统 `mood_text()`，原活动状态分析器（inject/state_analyzer）删除，情绪不可得时省略该行
-- ✅ 主动行为：活动切换主动开口（去重）、早间问好（含"需激活"）、约定到期强指令、频率调控、睡眠窗口
+- ✅ 主动行为：活动切换主动开口（去重）、**L2 早晚安漂移（M10）**、约定到期强指令、频率调控、睡眠窗口
+- ✅ **早晚安漂移（M10 · 附录 §三 L2）**：早/晚安只配漂移区间（`morning_drift`/`night_drift`，默认 `10-30`，单数字 `N` = `0~N`，负数/非法回退默认）——每 `(流, 日, 早安/晚安)` 独立掷点、同日复用同一结果、纯内存不落盘；早安基准 = 睡眠窗口结束（`[schedule] wake_time` 锚点）、期限 = 首个**非睡眠**日程条目结束（无日程 → 基准 + 120 分钟），晚安基准 = 当天最后非睡眠条目结束（无日程 → `sleep_time` 锚点）、期限 = `min(入睡锚点, [patrol] silence_start)`；到点按必要性激活（`greeting_require_activation`：自基准点起该流有人说话才开口，到期限仍无人即放弃）；覆盖 = 目标私聊**固定生效**（B7）+ 群聊必要性激活（名单**复用** `proactive_group_ids`，B6）+ 其他私聊单独开关 `morning_other_private_enabled` + 前一日该流 ≥ `morning_other_private_min_messages`（默认 5，`ge=5` 硬约束）；触发一律走统一主动链纳入全渠道预算（无旁路），目标私聊写 `affection.morning_sent/night_sent` 保证同流同日各至多一条
 - ✅ 自然语言约定（角色裁判 today/future/reject → 今日重排或未来约定）
 - ✅ /plan 命令（日程图片 PIL 渲染 + 合并转发，失败降级纯文本）与 2 个 LLM 工具（`get_schedule_info` 只读四视图 + `update_schedule_v4` 唯一日程写入口；原 manage_goal / get_planning_status / apply_schedule 三工具随 T6 收口移除，目标写 API 与 `apply_schedule_items` 仍在底层保留）
 
@@ -79,7 +80,7 @@ cateye_test/
 - ✅ **好感 LLM 裁判（M2）**：会话采样裁判（每 `review_sample_every_rounds`(20) 轮采样一次、每日 ≤ `review_max_per_day`(2) 次，输入最近 ~10 条对方消息 + 人设 + 档位描述 + 低分辨率情绪描述 → `event/delta[-2,+2.5]/tag`）+ 关系日结（每日最多 1 次、与采样上限分开计；订阅 `schedule.sleep_started`、延迟到情绪睡眠大修之后，输入当日 event_log + 互动统计 + 最近印象 + 档位描述 → `delta_score[-2,+2]` + 0~3 条印象 + tone）；delta 均走规则入账入口受日累计限幅；impressions 滚动 10 条/7 天过期（tone 同窗口）；prompt 不含 score/baseline；LLM 请求失败或输出垃圾静默跳过（日结当日不重试），规则事件与日衰减照常——纯规则退化
 - ✅ **[affection] 配置段（M1 扩展，M2 生效）**：`enabled`（false 回退 v1 三档静态行为）、`decay_pull`(0.06)、`baseline_ema`(0.03)、`tier_hysteresis`(3.0)、`tier_min_dwell_hours`(24)、`daily_positive_cap`(4.0)、`daily_negative_cap`(3.0)、`review_enabled`(true)/`review_sample_every_rounds`(20)/`review_max_per_day`(2)/`review_task_name`(utils)；`emotion_modulation`(true，**M3 已接线**：好感增量 × clamp(1 + 0.25 × V × sign(delta), 0.6, 1.4)，情绪模块停用或读不到当前 V 时乘数恒 1.0)
 - ✅ **周结大事记（M6，默认关）**：`[affection] weekly_milestones_enabled`（false，热重载生效）——开启后周日的日结会按**纯规则**汇总最近 7 天：关系温度（最近 ≤4 条 tone，用「；」连接）+ 净变化（`{net:+.1f}`），`|net| ≥ 1.0` 时追加 1 条「升温/降温明显」；写入档案 `week_log`（滚动 8 天）与 `milestones`（cap 20 条，同日幂等），注入/命令的「好感记忆行」追加 1 行【本周大事记】；零 LLM 成本，关闭时输出与旧版逐字一致（旧档案缺键兼容）
-- ✅ 巡检完整判定链（与源插件对齐）：日切→静默(fail-safe)→用户冷却→预算（晚安预留）→早安/晚安（S）→想念（A：沉默阈值随机采样+概率+LLM 把关+驳回 30 分钟冷却+未来日程避让+豁免开关）→日程节点分享/日常搭话（B）
+- ✅ 巡检完整判定链（与源插件对齐）：日切→静默(fail-safe)→用户冷却→预算（晚安预留）→早晚安**状态检查**（S；**M10 起判时下线**：实际时刻由 planning 早晚安漂移机制决定，patrol 只按 `affection.morning_sent/night_sent` 去重、不再自行按 `[patrol]` 时间窗触发，四个窗口字段已标 deprecated 仅作兼容读取）→想念（A：沉默阈值随机采样+概率+LLM 把关+驳回 30 分钟冷却+未来日程避让+豁免开关）→日程节点分享/日常搭话（B）
 - ✅ **全渠道打扰预算（M0）**：私聊主动（patrol / planning）与空间互动提醒共享每日上限 `patrol.global_proactive_cap`（默认 0=自动取 `patrol.daily_max_speak + 2`），达上限触发被拦截并留痕决策日志
 - ✅ **情绪消费（M4，B4/B7）**：巡检读 `emotion.mood_effect()`（纯规则零 LLM 成本；情绪停用/异常则各项恒 1.0）——① `activity_trigger_rate`/`default_speak_rate` × `proactive_rate`（低落 ×0.8 降主动、心情好且精神足 ×1.2）；② 想念随机阈值 × `miss_threshold`（情绪）× affection 档位系数（双系数，低落 ×0.8 更快想念；档位系数读 `RelationProfile.miss_factor_for_tier`，恋人档 0~4 = 1.4~0.6）；③ proactive intent 的 reason 追加 `intent_hint` 低分辨成语义行；乘数 clamp [0.7,1.3]，乘后概率/阈值与情绪系数落决策日志
 - ✅ **关系系统（简单版）**：`patrol.relation_type` 配置对方是 bot 的谁（恋人/挚友/维护者/家人/自定义称谓），想念提示词、消息生成口吻、好感度档位名（**v2 5 档表**，注入走 5 档口径）、消息后缀与括号小剧场（按 3 档兼容映射折算）全部随关系变化（`companion/relation.py` 预设，热更新生效）
