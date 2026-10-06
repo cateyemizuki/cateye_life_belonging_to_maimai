@@ -403,6 +403,20 @@ raw = anchor + (raw − anchor) × recovery_factor
 并把 `sleep_hours / recovery_factor / before / after_raw / delta_requested / delta_applied /
 delta_limit / r_yesterday / e_tomorrow / commitment_net / commitment_delta / log_cleared` 写进返回，
 并以 `emotion.sleep_overhaul` 落决策日志（§6.3-7 可观测）。
+
+> ⚠️ **已知缺口（2026-10-07 补充，勿误读为"已闭环"）**：上面这条"解冻把冻结期队列并入日志"**发生在结算之后**——
+> 醒沿顺序是 `unfreeze(drain_to_log=True)`（`emotion/service.py:1391`）→ `apply_sleep_overhaul(...)`，
+> 而**清空日志**发生在 `apply_sleep_overhaul` 结尾（`emotion/state_machine.py:298`）。因此：
+> ① 冻结期的夜间事件（含"睡眠时段 bot 回复了消息"这类打扰）**不会进入本次裁判输入**（裁判增量在入睡时刻已缓存，
+> 读的是入睡前的日志）；② 被并入日志的这批事件会在**下一次**大修时连同当时的 ΔVAD 一起被清掉。
+> 结果：**夜间发生的事在情绪上等于没发生**。修复方案（先解冻入列 → 再结算 → 夜间事件纳入裁判输入 →
+> 恢复系数改用**实际睡着时长**）见同级目录外的追加计划书
+> `D:\deepseek-harness_workspace\maibot-plugins\MAINTENANCE_PLAN_APPENDIX_20261007_0114_DRAFT_睡眠打扰与早晚安漂移.md`
+> §2.5（该附件 §一 的 F3/F4）。**指针稳定性**：附件文件名含其落盘/定稿时间戳，定稿后会重命名；
+> 本指针以**附件正文的标识串**为准 —— 在 `D:\deepseek-harness_workspace\maibot-plugins\` 下检索
+> `睡眠打扰与早晚安漂移` 即可定位（同一附件也是 `EMOTION_MAPPING.md` §八 第 9/10 行的去向文档）。
+> **本节描述的是修复前的现状**，修复后须按文末「维护约定」同批改本节与 §7.4。
+
 **裁判输入**：人设 + **当前 VAD 绝对值**（唯一给 LLM 看绝对值的场合，因为它是裁判不是对话模型）+ 当天日志 + **前一天日程** + **第二天日程** + 长期状态 + 预计睡眠时长 + 25 原型表 + **R_yesterday / E_tomorrow / 约定净兑现三组数值项**（§4.2 输入扩展）；prompt 内嵌评分规则 7 条（近因效应、时长倒 U、日程"释怀/反刍/期待/焦虑"、人设情绪过滤、三输入为参考、ΔVAD ∈ [-limit, limit]、reason 必须引用原文）。
 **已实测的失败模式**：`max_tokens` 给 600 会被三组长 reason 截断（宿主验证日 8 次尝试零落地）→ 现为 **2000**；思考型模型仍可能挤爆预算，裁判任务必须绑真非思考模型（MAINTENANCE_PLAN §八.8）。
 
@@ -434,7 +448,7 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 
 ---
 
-## 八、未接线与待定（M5 相关）
+## 八、未接线与待定（M5 项已闭环；9~10 为追加计划书新增项）
 
 | # | 项 | 现状 | 去向 |
 |---|---|---|---|
@@ -446,6 +460,8 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 | 6 | `planner` 注入与情绪底色融合 | ✅ 已接线（M4 删 `state_analyzer` 静态模板，改读 `mood_text()`）；**M5** 另把睡醒情绪按 `schedule.emotion_influence` 注入日程生成 prompt 的 `emotion_context` 槽（`build_emotion_context()` + `PlanningServices.wake_emotion()`） | — |
 | 7 | `EVALUATE_PROMPT` 30 字 vs 代码截 60 字 | 规格—实现不一致（§5.3） | 待裁决（可不改） |
 | 8 | 白天事件对**锚点**的回归 | 日常衰减只朝 0，不朝锚点 | 设计如此（锚点只在睡眠大修收敛）；若将来要改，属设计变更 |
+| 9 | **夜间事件不进结算**（睡眠期事件被"先结算后并入、下次再清空"，见 §7.3 缺口警示） | 现状：夜间打扰在情绪上无痕迹；恢复系数按**计划**整夜时长取 | 追加计划书 §2.5（先解冻再结算 + 夜间事件纳入裁判输入 + 实际睡着时长）；**已裁决方向，待实现** |
+| 10 | **睡眠期注入无深夜措辞**（夜间回复与白天同构） | 现状：`injection_text()` 不区分冻结态 | 追加计划书 §2.5-5（冻结时追加一行中性引导；D-C1 确认 `no_sleep_mode` 下不介入） |
 
 ---
 
