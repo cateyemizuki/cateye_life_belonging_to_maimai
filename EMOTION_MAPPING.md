@@ -53,7 +53,7 @@
 
 ### 1.1 单维五档描述（低分辨率化的唯一标准）
 
-`_level(value)`（`emotion/vad.py:157-167`）——判据是**闭/开区间**，实测边界如下：
+_level(value)`（`emotion/vad.py:157-167`）——判据是**闭/开区间**，实测边界如下：
 
 | 档位文案 | 判据（代码原文） | 实测边界 |
 |---|---|---|
@@ -289,7 +289,7 @@ factor = exp(-decay_rate × Δt_小时)      raw.V/A/D 各乘 factor
 
 ### 6.5 决策日志的映射留痕（可回放）
 
-`emotion.external_event` 一条记录里同时落：`k`（调用方 K）、`global_multiplier`、`multiplier`（= K×global，最终总倍率）、`delta_before` / `delta_scaled` / `delta_applied`（裁剪前后）、`clipped`、`tier`、`target_bonus`、`non_target_multiplier`、`is_target`、`source`、`llm`。
+emotion.external_event` 一条记录里同时落：`k`（调用方 K）、`global_multiplier`、`multiplier`（= K×global，最终总倍率）、`delta_before` / `delta_scaled` / `delta_applied`（裁剪前后）、`clipped`、`tier`、`target_bonus`、`non_target_multiplier`、`is_target`、`source`、`llm`。
 —— 这就是 MAINTENANCE_PLAN §6.3-7「全链可观测」的情绪侧落地形态；调参时按这三个 delta 字段对账。
 
 ---
@@ -317,7 +317,7 @@ factor = exp(-decay_rate × Δt_小时)      raw.V/A/D 各乘 factor
 
 ### 7.2 情绪 → 行为输出 `mood_effect()`（附录 C）
 
-`EmotionService.mood_effect()`（`service.py:116-177`）返回 4 个字段，**纯规则、零 LLM 成本**；模块停用/异常时返回恒等中性值（`{"proactive_rate":1.0,"miss_threshold":1.0,"post_rate":1.0,"intent_hint":""}`）。
+EmotionService.mood_effect()`（`service.py:116-177`）返回 4 个字段，**纯规则、零 LLM 成本**；模块停用/异常时返回恒等中性值（`{"proactive_rate":1.0,"miss_threshold":1.0,"post_rate":1.0,"intent_hint":""}`）。
 
 | 字段 | 判据（用 `effective_vad` 的 V，A 仅用于第一行） | 输出 | 夹取范围 |
 |---|---|---|---|
@@ -374,9 +374,9 @@ factor = exp(-decay_rate × Δt_小时)      raw.V/A/D 各乘 factor
 > 处于锚点夜间窗口也会按周期进入冻结。
 
 **三输入的日期基准与重算**（M5 修复）：入睡时刻（默认 23 点）读"次日"日程时，次日日程还没到
-`auto_generate_time`（默认 00:30）生成 → **状态侧的 R_yesterday / E_tomorrow / 约定净兑现
+auto_generate_time`（默认 00:30）生成 → **状态侧的 R_yesterday / E_tomorrow / 约定净兑现
 在醒来时按入睡日为基准重算一次**（R = 入睡日−1；E = 入睡日的次日 = 醒来日，此时已生成；
-`_wake_side_inputs`），保证"明日预期"在生产时序下真实生效；入睡缓存值只作裁判 prompt 文本参考，
+_wake_side_inputs`），保证"明日预期"在生产时序下真实生效；入睡缓存值只作裁判 prompt 文本参考，
 决策日志同时留痕 `*_cached` 与应用值（`emotion.sleep_overhaul_cached` / `emotion.sleep_overhaul`）。
 
 **公式**（`state_machine.py` `apply_sleep_overhaul`，只作用 `vad_raw`）：

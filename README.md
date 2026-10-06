@@ -108,7 +108,7 @@ cateye_test/
 
 ## manifest 声明（16 能力 + 2 依赖）
 
-`send.text/image/forward`｜`config.get`｜（能力清单同前，情绪模块无新增能力）`llm.generate`｜`chat.get_all_streams/get_stream_by_user_id/get_private_streams/get_stream_by_group_id`｜`message.get_by_time_in_chat`｜`maisaka.proactive.trigger/context.append`｜`frequency.set_adjust`｜`knowledge.search`｜`api.call`｜`database.get`；依赖 `httpx>=0.24`、`Pillow>=9.0`（日程图片，缺失自动降级）。
+send.text/image/forward`｜`config.get`｜（能力清单同前，情绪模块无新增能力）`llm.generate`｜`chat.get_all_streams/get_stream_by_user_id/get_private_streams/get_stream_by_group_id`｜`message.get_by_time_in_chat`｜`maisaka.proactive.trigger/context.append`｜`frequency.set_adjust`｜`knowledge.search`｜`api.call`｜`database.get`；依赖 `httpx>=0.24`、`Pillow>=9.0`（日程图片，缺失自动降级）。
 
 ## 快速测试
 
