@@ -55,6 +55,13 @@ SLEEP_NAME_KEYWORDS = ("睡觉", "睡眠", "安睡", "午休", "午睡", "小憩
 #: 作息锚点缺省（配置缺失时按 23:00 入睡 / 07:00 起床）
 DEFAULT_SLEEP_MINUTES = 23 * 60
 DEFAULT_WAKE_MINUTES = 7 * 60
+#: 冻结态注入的深夜引导行（附录 §2.5.5，逐字定稿）：非冻结态绝不出现，冻结态追加在既有文本后
+NIGHT_INJECTION_HINT = ("（现在是深夜，你本该在睡觉。回复尽量短、慢、软一些；"
+                        "不要主动开启新话题；不要提及本提示。）")
+#: 夜间事件摘要的单条描述截断 / 落 decision_logs 的条数上限（§2.5.3：超限只留最近 N 条，
+#: ``drained_events_count`` 仍报真实条数——摘要只作可追溯留痕，不参与任何结算）
+DRAINED_SUMMARY_DESC_CHARS = 60
+DRAINED_EVENTS_MAX = 20
 
 
 def _event_fingerprint(text: str) -> str:
@@ -185,12 +192,20 @@ class EmotionService:
         return float(self._machine.effective_vad().valence)
 
     def injection_text(self) -> str:
-        """情绪底色注入文本（planner/replyer 双通道共用，以系统条目插在第一条系统提示词后）。"""
-        return (
+        """情绪底色注入文本（planner/replyer 双通道共用，以系统条目插在第一条系统提示词后）。
+
+        冻结态（睡眠窗口内）在既有文本**后追加一行**深夜引导（§2.5.5，零结构改动）：
+        深夜回复该短/慢/软、不主动开新话题；非冻结态输出与本行加入前逐字一致
+        （不得改动既有字节，否则等于改了白天的提示词契约）。
+        """
+        text = (
             f"【当前情绪底色】{self.mood_text()}。\n"
             "要求：语气、措辞、节奏与该情绪保持一致；情绪会随时间自然衰减、随事件变化；"
             "严禁在回复中直接说出情绪标签词汇或任何数值；不要主动提及或解释本提示本身。"
         )
+        if self.is_frozen():
+            text = f"{text}\n{NIGHT_INJECTION_HINT}"
+        return text
 
     # ── M6 可选增强：emoji 情绪联动（默认关；未启用时绝不触碰宿主 API）──────
     def emoji_description(self) -> str:
@@ -693,8 +708,14 @@ class EmotionService:
     async def flush_all_episodes(self, *, reason: str) -> int:
         """串行冲刷全部已登记流（避免 LLM 并发）；无论成败清空登记，返回成功条数。
 
-        挂点：睡眠入口（``_check_and_overhaul``）——先结清未评片段再跑睡眠裁判
-        （REGISTRY §二.4：冲刷的入账发生在冻结前才能进当天日志、被裁判读到）。
+        两个挂点，语义不同（都不改片段制本身的闲置口径）：
+
+        - 睡眠入口（``_check_and_overhaul``，``reason="sleep_entry"``）：先结清未评片段再跑
+          睡眠裁判（REGISTRY §二.4：冲刷的入账发生在冻结前才能进当天日志、被裁判读到）；
+        - **醒沿**（``reason="wake"``，§2.5.1）：离开冻结时先结清"夜里最后一轮对话"，
+          使其当夜被评估而不是攒到下一夜。此刻机器仍冻结 → 评估事件按 ``record_event``
+          语义只入 ``pending_events``（不直接改 VAD），随后被解冻并入日志；夜里被打扰的
+          情绪后果由 sleep_interrupt 整夜合计统一入账，这里入账会双重记账。
         """
         streams = list(self._pending_episodes.keys())
         done = 0
@@ -1223,6 +1244,8 @@ class EmotionService:
         current = self._current_sleep_item(now)
         # 时长的来源优先级：调用方给的计划时长（作息锚点整夜） > 条目时长 > 锚点整夜兜底
         # （冻结期重试时可能已无当前条目——条目只有 15 分钟窗口，不能作为必要前提）
+        # TODO(M8-3)：§2.5.4「实际睡着时长」——依赖 §2.4 的扰段区间并集，由 M8 第 3 段以
+        #   实际值替代此处计划时长进 sleep_recovery_factor()；本段（§2.5）保持计划时长口径。
         if sleep_hours is not None:
             hours = float(sleep_hours)
         elif current is not None:
@@ -1355,6 +1378,35 @@ class EmotionService:
                     float(cached.get("commitment_net") or 0.0))
         return r_yesterday, e_tomorrow, commitment_net
 
+    @staticmethod
+    def _drained_events_summary(events: Any) -> Dict[str, Any]:
+        """把解冻出的夜间事件压成可落 decision_logs 的紧凑摘要（§2.5.3）。
+
+        返回 ``{"count": 条数, "events": ["描述（ΔV=…,ΔA=…,ΔD=…）", …]}``；``count`` 是
+        真实条数，``events`` 超 :data:`DRAINED_EVENTS_MAX` 只保留最近 N 条（防日志膨胀）。
+        条目形态异常一律跳过（留痕尽力而为，绝不影响结算）。
+        """
+        items = list(events or [])
+        summary: list = []
+        for event in items[-DRAINED_EVENTS_MAX:]:
+            raw = event.to_dict() if hasattr(event, "to_dict") else event
+            if not isinstance(raw, dict):
+                continue
+            delta = raw.get("delta_vad")
+            if not isinstance(delta, dict):
+                delta = {}
+            try:
+                line = (
+                    f"{str(raw.get('event_description') or '')[:DRAINED_SUMMARY_DESC_CHARS]}"
+                    f"（ΔV={float(delta.get('valence') or 0.0):+.2f},"
+                    f"ΔA={float(delta.get('arousal') or 0.0):+.2f},"
+                    f"ΔD={float(delta.get('dominance') or 0.0):+.2f}）"
+                )
+            except (TypeError, ValueError):
+                continue
+            summary.append(line)
+        return {"count": len(items), "events": summary}
+
     async def _apply_cached_overhaul(self, now: datetime) -> Optional[Dict[str, Any]]:
         """醒后应用缓存的大修并解冻（一次性）；无缓存时只解冻（裁判失败夜不结算）。
 
@@ -1363,8 +1415,15 @@ class EmotionService:
         R_yesterday（入睡日前一天）/E_tomorrow（入睡日的次日＝醒来日，此时已生成）与约定净兑现，
         保证"明日预期"与"当日约定"在状态侧真实生效（裁判文本仍用缓存时刻的输入，仅供判断）。
 
+        M8 段 1（附录 §2.5.2/§2.5.3）结算顺序 = **先解冻再结算**：
+        `unfreeze(drain_to_log=True)` 必须早于 `apply_sleep_overhaul`，否则 apply 尾部的清日志
+        （M5 语义：大修后 `emotion_log = []`）会把刚并入的夜间事件连同 ΔVAD 一起抹掉（§一 F3）。
+        解冻出的队列在此压成「夜间事件摘要」并随 ``emotion.sleep_overhaul`` 落 decision_logs
+        （§2.5.3「至少落其一」的落点：这批事件的 ΔVAD **不进结算**——夜里被打扰的情绪后果由
+        M8 第 3 段的 sleep_interrupt 整夜合计统一入账，此处入账即双重记账）。
+
         Returns:
-            应用结果 dict（含 ``ok``/``recovery_factor``/三输入留痕）；无缓存返回 None。
+            应用结果 dict（含 ``ok``/``recovery_factor``/三输入/夜间事件摘要留痕）；无缓存返回 None。
         """
         cached, self._pending_overhaul = self._pending_overhaul, None
         self._sleep_period = None  # 周期结束（醒沿）：后续 tick 重新按条目/锚点判定
@@ -1376,6 +1435,8 @@ class EmotionService:
         ref = cached.get("computed_at") or now  # 入睡时刻（日期基准：R=入睡日-1，E=入睡日+1）
         query = self._schedule_query()
         r_yesterday, e_tomorrow, commitment_net = self._wake_side_inputs(ref, cached)
+        drained = self._machine.unfreeze(now)  # §2.5.2：先解冻（队列并入日志，观测保留）
+        night = self._drained_events_summary(drained)  # §2.5.3：解冻即采集，apply 之后日志即清空
         applied = self._machine.apply_sleep_overhaul(
             cached["delta"], cached["sleep_hours"], now=now,
             r_yesterday=r_yesterday, e_tomorrow=e_tomorrow,
@@ -1388,7 +1449,8 @@ class EmotionService:
         applied["delta_limit"] = cached.get("delta_limit")
         applied["r_yesterday_cached"] = cached.get("r_yesterday", VADState()).to_dict()
         applied["e_tomorrow_cached"] = cached.get("e_tomorrow", VADState()).to_dict()
-        self._machine.unfreeze(now)  # 队列并入日志（观测保留，不二次入账）
+        applied["drained_events_count"] = night["count"]
+        applied["drained_events"] = night["events"]
         self._save_state()
         state = load_json(self._state_path, {}) or {}
         state["applied_sleep_date"] = str(cached.get("cycle_key") or now.strftime("%Y-%m-%d"))
@@ -1404,6 +1466,8 @@ class EmotionService:
             commitment_net=applied.get("commitment_net"),
             r_yesterday_cached=applied.get("r_yesterday_cached"),
             e_tomorrow_cached=applied.get("e_tomorrow_cached"),
+            # §2.5.3 夜间事件可追溯（解冻队列摘要；apply 清日志后 decision_logs 是唯一留痕）
+            drained_events_count=night["count"], drained_events=night["events"],
         )
         # M0 事件：醒后 VAD + 恢复系数（附录 A ★，consumer=planning/qzone）；
         # M5：payload 补低分辨率 VAD 三档词（levels），供 planning 的 emotion_context 槽
@@ -1464,12 +1528,14 @@ class EmotionService:
                 continue
 
     async def _check_and_overhaul(self) -> None:
-        """一个检测周期：进睡眠时段 → 冻结并在冻结期计算/缓存大修；醒沿 → 应用缓存 + 解冻。
+        """一个检测周期：进睡眠时段 → 冻结并在冻结期计算/缓存大修；醒沿 → 冲刷片段 + 应用缓存 + 解冻。
 
         睡眠时段判定（M5 修复）：条目本身会被 ``_normalize_items`` 的作息锚点截断
         （最长为 23:00–23:15，夜间无条目覆盖），故**冻结窗口按 [schedule] 作息锚点整夜**
         （``_sleep_entry_period``），条目只作入口/小睡；醒沿 = 离开该窗口，或日程出现
-        非睡眠的清醒活动（文档口径「醒来的第一个活动开始」）。
+        非睡眠的清醒活动（文档口径「醒来的第一个活动开始」）。醒沿顺序（M8 段 1，附录 §2.5）：
+        ``flush_all_episodes("wake")`` → ``publish_woke_up`` → ``_apply_cached_overhaul``
+        （内部先 ``unfreeze`` 并采集夜间事件摘要，再 ``apply_sleep_overhaul``）。
         """
         query = self._schedule_query()
         now = datetime.now()
@@ -1485,6 +1551,16 @@ class EmotionService:
 
         # 醒沿：日程出现清醒活动，或已离开睡眠窗口（含条目被截断后的深夜/清晨）
         if awake_activity or (self.is_frozen() and not self._in_sleep_period(now)):
+            # §2.5.1 醒沿先冲刷片段：让「夜里最后一轮对话」当夜被评估，而不是攒到下一夜。
+            # ⚠ 只在**睡眠周期真的结束**时冲刷（仍冻结 / 本周期已发过 sleep_started）：
+            # 本分支白天每个 tick 都会命中（有清醒活动即进），无条件冲刷会让 episode
+            # 闲置机制失效——每 tick 都评估一次、日上限被瞬间吃光。
+            # 顺序约束：此刻机器仍处于冻结态，冲刷产生的评估事件按 record_event 既有语义
+            # 只入 pending_events（**不直接改 VAD**）；随后解冻并入日志。绝不为"让冲刷增量
+            # 生效"而绕过冻结——夜里被打扰的情绪后果由 M8 第 3 段的 sleep_interrupt 整夜合计
+            # 统一入账（附录 §2.3），这里入账会造成双重记账。
+            if self.is_frozen() or self._in_sleep:
+                await self.flush_all_episodes(reason="wake")
             await self._publish_woke_up_if_needed(now)   # M0：离开睡眠 → schedule.woke_up
             await self._apply_cached_overhaul(now)       # M5：应用缓存并解冻
             return

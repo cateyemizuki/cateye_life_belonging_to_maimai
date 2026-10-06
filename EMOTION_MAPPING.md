@@ -18,6 +18,11 @@
 > **M5 连续低迷软约束已落地（2026-10-05，三批）**：每日 effective V 采样 → 日均线（滚动 7 天，落盘）→
 > 连续「日均 V<−0.5」满 3 天 → 发 `emotion.low_mood_day`（payload `days/date/mean_valence`）；
 > planning 消费后强制插入一次 rest/social 并在 prompt 注明「最近有点低落」。
+> **M8 段 1 已落地（2026-10-07，附录定稿 §2.5 结算链路修复）**：醒沿顺序改为
+> 「`flush_all_episodes("wake")` → 先解冻（`unfreeze(drain_to_log=True)`）→ 采集夜间事件摘要 →
+> `apply_sleep_overhaul`」，摘要（`drained_events_count` / `drained_events`）随 `emotion.sleep_overhaul`
+> 落 decision_logs；冻结态 `injection_text()` 追加一行深夜引导。本文件 §4.2、§7.3、§八 已同步。
+> **同段未做**：§2.5.4 实际睡着时长（M8 第 3 段）、`sleep_interrupt` 整夜合计与 §5.1 模板事件登记。
 > **仍未落地（M5 其余部分）**：A3 `emotion_report` 工具裁决；A6 死字段清理已完成（`8d11f54`）。
 
 ---
@@ -170,14 +175,22 @@ share_i = (1/d_i) / Σ(1/d_j)        # 反距离归一化，Σ share = 100%
 | `mood_summary(vad)` | `{标签1}({占比})、{标签2}({占比})。{低分辨率描述}`；无命中时前缀为 `复杂难名` | `mood_text()` |
 | `EmotionService.injection_text()` | 见下（**唯一进 LLM 提示词的形态**） | planner / replyer 注入 Hook |
 
-### 4.2 注入文本模板（逐字，`emotion/service.py:107-113`）
+### 4.2 注入文本模板（逐字，`emotion/service.py` `injection_text()` / `NIGHT_INJECTION_HINT`）
 
 ```
 【当前情绪底色】{mood_summary}。
 要求：语气、措辞、节奏与该情绪保持一致；情绪会随时间自然衰减、随事件变化；严禁在回复中直接说出情绪标签词汇或任何数值；不要主动提及或解释本提示本身。
 ```
 
+**冻结态追加行（M8 段 1，附录 §2.5.5；逐字）**——`machine.frozen` 为真时在上面两行**之后**追加一行，
+非冻结态输出与追加前**逐字一致**（既有两个模板字节不得改动）：
+
+```
+（现在是深夜，你本该在睡觉。回复尽量短、慢、软一些；不要主动开启新话题；不要提及本提示。）
+```
+
 **三条硬约束（都在模板里明写）**：① 语气随情绪；② **严禁说出情绪标签词汇或任何数值**；③ 不得提及/解释该提示。
+冻结态追加行的意图：夜里被吵醒后的回复应短/慢/软、且不主动开新话题（避免把深夜打扰变成新话题起点）。
 
 注入位点：`maisaka.planner.before_request` 与 `maisaka.replyer.before_model_request` 两条 Hook，**插在第一条系统提示词之后**（`emotion/components.py:186/197`；replyer 侧 `attempt>1` 的重试请求不重复注入）。
 注入开关：`[emotion].injection_enabled`（默认 true）；模块开关 `[emotion].enabled` 关掉后 Hook 直接 `continue`。
@@ -348,20 +361,39 @@ EmotionService.mood_effect()`（`service.py:116-177`）返回 4 个字段，**�
 
 > 读法：系数 <1 = 阈值缩短 = **更快想念**；越亲密档位系数越小（恋人档 4 = 0.6，最快）。
 
-### 7.3 睡眠大修（M5 起：**冻结 → 醒后一次性应用**）
+### 7.3 睡眠大修（M5 起：**冻结 → 醒后一次性应用**；M8 段 1 起：**醒沿先冲刷片段 → 解冻 → 结算**）
 
 **触发与冻结/结算时序**（`emotion/service.py` `_check_and_overhaul`，睡眠检测循环 `[emotion].check_interval_minutes` 默认 10 分钟）：
 
-1. **进入睡眠时段** → `schedule.sleep_started` 上升沿 + `machine.freeze(now)`：
-   冻结期**事件只入队**（`pending_events`，上限 200 条）、**衰减与评估结算暂停**
-   （`apply_daily_decay` 恒返回 1.0 且不推进 `last_update`；`record_event` 不入 `vad_raw`）；
+1. **进入睡眠时段** → `schedule.sleep_started` 上升沿 + `flush_all_episodes(reason="sleep_entry")`
+   → `machine.freeze(now)`：冻结期**事件只入队**（`pending_events`，上限 200 条）、
+   **衰减与评估结算暂停**（`apply_daily_decay` 恒返回 1.0 且不推进 `last_update`；
+   `record_event` 不入 `vad_raw`）；
 2. **冻结期**同一周期内计算大修（裁判 LLM）并**缓存**（`_pending_overhaul`，不落状态）；
    裁判失败保持冻结、下一轮重试（重试只需仍在睡眠周期内，不要求条目仍"当前"）；
-3. **醒沿** = 离开睡眠窗口，或日程出现非睡眠的清醒活动（文档口径「醒来的第一个活动」）→
-   `schedule.woke_up` 下降沿 → **应用缓存的大修一次**（`unfreeze(now)` 同时把队列并入当天日志
-   作观测保留，**不二次入账**）→ 写 `applied_sleep_date` = **睡眠周期键** `"周期起始日@起始分钟"`
-   （如 `2030-05-05@1380`；旧裸日期值仍兼容读取；同一周期不重复结算、且不误伤次夜）→
-   发 `emotion.overhauled`。
+3. **醒沿** = 离开睡眠窗口，或日程出现非睡眠的清醒活动（文档口径「醒来的第一个活动」），
+   **且仅在睡眠周期真的结束的那一次 tick**（冻结中或本周期已发过 `sleep_started`；否则白天每个
+   tick 都命中该分支，会让片段闲置机制失效）。固定顺序（M8 段 1，附录 §2.5.1/§2.5.2/§2.5.3）：
+   1. **`flush_all_episodes(reason="wake")`**（醒沿先冲刷片段）—— 让「夜里最后一轮对话」当夜被评估
+      而不是攒到下一夜。
+      ⚠ 此刻机器**仍冻结**：冲刷产生的评估事件按 `record_event` 语义**只入 `pending_events`**
+      （不直接改 VAD）。夜里被打扰的情绪后果由附录 §2.3 的 `sleep_interrupt` **整夜合计**统一入账，
+      此处若绕过冻结入账会**双重记账**；
+   2. `schedule.woke_up` 下降沿（边沿语义与 M5 相同）；
+   3. **`unfreeze(now, drain_to_log=True)`**（先解冻，早于结算）→ 夜间事件并入当天日志；
+   4. **采集「夜间事件摘要」**（条数 + 每条 `描述（ΔV/ΔA/ΔD）`；`_drained_events_summary`）；
+   5. **应用缓存的大修一次**（`apply_sleep_overhaul`，**尾部照旧清空当天日志** ← M5 语义不变，
+      故上一步的摘要是这批夜间事件在 decision_logs 里的唯一留痕）；
+   6. 写 `applied_sleep_date` = **睡眠周期键** `"周期起始日@起始分钟"`（如 `2030-05-05@1380`；
+      旧裸日期值仍兼容读取；同一周期不重复结算、且不误伤次夜）→ 发 `emotion.overhauled`。
+
+> **M8 段 1 修的是什么**（附录 §一 F3）：修复前顺序是「先应用大修（尾部清日志）→ 再解冻并入日志」，
+> 于是①夜间事件永远不进本次结算视野（裁判增量在入睡时刻就缓存好了，读的是入睡前的日志）；
+> ②被并入的夜间事件要等到**下一次**大修才连 ΔVAD 一起被清掉（夜里发生的事在情绪上等于没发生）。
+> 修复后：冲刷发生在醒沿、解冻早于结算、摘要随 `emotion.sleep_overhaul` 落盘可追溯；
+> **夜间事件的 ΔVAD 仍不进 VAD**（夜间打扰的入账归 §2.3 `sleep_interrupt` 整夜合计，本段不重复入账）。
+> 仍未闭环项：**恢复系数仍取计划整夜时长**（附录 §2.5.4「实际睡着时长」依赖 §2.4 扰段数据，由 M8
+> 第 3 段落地；代码侧 `compute_sleep_overhaul` 已标 `TODO(M8-3)`）。
 
 > ⚠️ **睡眠窗口按作息锚点，不按条目**（M5 验证者修复）：`_normalize_items` 会把入睡条目
 > 截断到入睡锚点（`end=min(sleep_min,…)` 后 `max(start+15,end)`，**最长 23:00–23:15**），
@@ -399,23 +431,23 @@ raw = anchor + (raw − anchor) × recovery_factor
 | > 9 ~ 10 h | 0.70 |
 | > 10 h | 0.50 |
 
-**副作用**：大修后**清空当天情绪日志**（`emotion_log = []`，随后解冻把冻结期队列并入该日志），
+**副作用**：大修后**清空当天情绪日志**（`emotion_log = []`；M8 段 1 起解冻（夜间事件并入）发生在结算**之前**，
+故清空后日志为空——夜间事件只以「摘要」形式留在 decision_logs，不再被带进下一夜的裁判输入），
 并把 `sleep_hours / recovery_factor / before / after_raw / delta_requested / delta_applied /
-delta_limit / r_yesterday / e_tomorrow / commitment_net / commitment_delta / log_cleared` 写进返回，
-并以 `emotion.sleep_overhaul` 落决策日志（§6.3-7 可观测）。
+delta_limit / r_yesterday / e_tomorrow / commitment_net / commitment_delta / log_cleared /
+**drained_events_count / drained_events**` 写进返回，
+并以 `emotion.sleep_overhaul` 落决策日志（§6.3-7 可观测）；`drained_events` 是解冻队列的紧凑摘要
+（`描述（ΔV/ΔA/ΔD）`，条数上限 20，`drained_events_count` 报真实条数）。
 
-> ⚠️ **已知缺口（2026-10-07 补充，勿误读为"已闭环"）**：上面这条"解冻把冻结期队列并入日志"**发生在结算之后**——
-> 醒沿顺序是 `unfreeze(drain_to_log=True)`（`emotion/service.py:1391`）→ `apply_sleep_overhaul(...)`，
-> 而**清空日志**发生在 `apply_sleep_overhaul` 结尾（`emotion/state_machine.py:298`）。因此：
-> ① 冻结期的夜间事件（含"睡眠时段 bot 回复了消息"这类打扰）**不会进入本次裁判输入**（裁判增量在入睡时刻已缓存，
-> 读的是入睡前的日志）；② 被并入日志的这批事件会在**下一次**大修时连同当时的 ΔVAD 一起被清掉。
-> 结果：**夜间发生的事在情绪上等于没发生**。修复方案（先解冻入列 → 再结算 → 夜间事件纳入裁判输入 →
-> 恢复系数改用**实际睡着时长**）见同级目录外的追加计划书
-> `D:\deepseek-harness_workspace\maibot-plugins\MAINTENANCE_PLAN_APPENDIX_20261007_0114_DRAFT_睡眠打扰与早晚安漂移.md`
-> §2.5（该附件 §一 的 F3/F4）。**指针稳定性**：附件文件名含其落盘/定稿时间戳，定稿后会重命名；
-> 本指针以**附件正文的标识串**为准 —— 在 `D:\deepseek-harness_workspace\maibot-plugins\` 下检索
-> `睡眠打扰与早晚安漂移` 即可定位（同一附件也是 `EMOTION_MAPPING.md` §八 第 9/10 行的去向文档）。
-> **本节描述的是修复前的现状**，修复后须按文末「维护约定」同批改本节与 §7.4。
+> ⚠️ **修复状态（2026-10-07，M8 段 1）**：本节描述的「先结算后并入、下次再清空」缺口（附录 §一 F3）**已修**——
+> 醒沿改为 `flush_all_episodes("wake")` → `unfreeze(drain_to_log=True)` → 采集夜间事件摘要 →
+> `apply_sleep_overhaul`（见上面第 3 步的 6 小步），夜间事件不再"等于没发生"：它们在被清空前被压成摘要
+> 随 `emotion.sleep_overhaul` 落 decision_logs（`drained_events_count` / `drained_events`），且醒沿冲刷
+> 使「夜里最后一轮对话」当夜被评估。**仍未做**：恢复系数改用**实际睡着时长**（附录 §2.5.4，依赖 §2.4 扰段
+> 并集，M8 第 3 段）；`sleep_interrupt` 整夜合计入账与 §5.1 模板事件登记同样归 M8 第 3 段。
+> 依据文档：`D:\deepseek-harness_workspace\maibot-plugins\MAINTENANCE_PLAN_APPENDIX_20261007_0155_睡眠打扰与早晚安漂移.md`
+> §2.5（该附件 §一 的 F3/F4；**定稿版**，草稿 `…_0114_ARCHIVED_草稿v0.1_…md` 已归档、非执行依据）。
+> 指针若失效：在 `D:\deepseek-harness_workspace\maibot-plugins\` 下检索 `睡眠打扰与早晚安漂移` 定位。
 
 **裁判输入**：人设 + **当前 VAD 绝对值**（唯一给 LLM 看绝对值的场合，因为它是裁判不是对话模型）+ 当天日志 + **前一天日程** + **第二天日程** + 长期状态 + 预计睡眠时长 + 25 原型表 + **R_yesterday / E_tomorrow / 约定净兑现三组数值项**（§4.2 输入扩展）；prompt 内嵌评分规则 7 条（近因效应、时长倒 U、日程"释怀/反刍/期待/焦虑"、人设情绪过滤、三输入为参考、ΔVAD ∈ [-limit, limit]、reason 必须引用原文）。
 **已实测的失败模式**：`max_tokens` 给 600 会被三组长 reason 截断（宿主验证日 8 次尝试零落地）→ 现为 **2000**；思考型模型仍可能挤爆预算，裁判任务必须绑真非思考模型（MAINTENANCE_PLAN §八.8）。
@@ -460,8 +492,8 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 | 6 | `planner` 注入与情绪底色融合 | ✅ 已接线（M4 删 `state_analyzer` 静态模板，改读 `mood_text()`）；**M5** 另把睡醒情绪按 `schedule.emotion_influence` 注入日程生成 prompt 的 `emotion_context` 槽（`build_emotion_context()` + `PlanningServices.wake_emotion()`） | — |
 | 7 | `EVALUATE_PROMPT` 30 字 vs 代码截 60 字 | 规格—实现不一致（§5.3） | 待裁决（可不改） |
 | 8 | 白天事件对**锚点**的回归 | 日常衰减只朝 0，不朝锚点 | 设计如此（锚点只在睡眠大修收敛）；若将来要改，属设计变更 |
-| 9 | **夜间事件不进结算**（睡眠期事件被"先结算后并入、下次再清空"，见 §7.3 缺口警示） | 现状：夜间打扰在情绪上无痕迹；恢复系数按**计划**整夜时长取 | 追加计划书 §2.5（先解冻再结算 + 夜间事件纳入裁判输入 + 实际睡着时长）；**已裁决方向，待实现** |
-| 10 | **睡眠期注入无深夜措辞**（夜间回复与白天同构） | 现状：`injection_text()` 不区分冻结态 | 追加计划书 §2.5-5（冻结时追加一行中性引导；D-C1 确认 `no_sleep_mode` 下不介入） |
+| 9 | **夜间事件不进结算**（睡眠期事件被"先结算后并入、下次再清空"，见 §7.3 缺口警示） | ⚠️ **部分闭环（2026-10-07，M8 段 1）**：醒沿改「先冲刷片段 → 先解冻再结算 → 采集夜间事件摘要落 `emotion.sleep_overhaul`」（§7.3 第 3 步 / §4.2 追加行）；**未做**：恢复系数仍按**计划**整夜时长取（§2.5.4 实际睡着时长 → M8 第 3 段；代码标 `TODO(M8-3)`），`sleep_interrupt` 整夜合计入账也在第 3 段 | 追加计划书定稿 §2.5（§2.5.1~2.5.3 已落地；§2.5.4 待第 3 段） |
+| 10 | **睡眠期注入无深夜措辞**（夜间回复与白天同构） | ✅ **已实现（2026-10-07，M8 段 1）**：`injection_text()` 在 `machine.frozen` 为真时于既有文本后追加深夜引导一行（逐字见 §4.2）；非冻结态输出与追加前逐字一致 | —（附录 §2.5.5 已落地） |
 
 ---
 
