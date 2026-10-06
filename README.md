@@ -68,6 +68,7 @@ cateye_test/
 - ✅ SQLite 持久化（schedule_items + 长期目标 goals + 未来约定 pending_commitment + metadata；WAL + 损坏自愈）
 - ✅ LLM 多轮日程生成：wake/sleep 锚点**动态 JSON 示例 + 衔接演算**（示例永远与正文约束自洽）、三餐窗口硬约束、无睡眠模式（睡眠时段不生成条目 + 禁字）、**控制字符清理**解析、语义校验（只警告）、质量评分（0~1，≥阈值提前达标）、retry 带上轮反馈、生成上下文（近 N 天日程摘要 / 跨群聊天历史 / 知识库 / 自定义生活阶段）
 - ✅ 当天已有日程跳过、模板兜底（骨架继承）、每日定时自动生成、过期清理
+- ✅ **生成锚点相对化（M10 · 附录 §五 B2）**：新一天日程不再按绝对时刻生成，改为"当天最后一个**非睡眠**日程条目结束后 `auto_generate_after_last_end_minutes`（默认 90）分钟"，无日程回退 `sleep_time` 锚点（B4）；硬约束"不晚于新一天起点（`wake_time` 锚点）前 30 分钟"，超出强制拉回；旧字段 `auto_generate_time` 标 deprecated（兼容读取、同受钳制，两字段同配时新字段优先）；睡眠条目判定与 M9 赖床工具同源（`planning/schedule_items.py`）
 - ✅ planner 注入（意图分类：问当前/问未来/闲聊/技术/命令，注入优化器冷却+概率+TTL，会话续注，能量模型）+ replyer 注入；**M4 精神状态行与情绪注入同源**：`_render_unified_prompt` 的精神状态行改读情绪系统 `mood_text()`，原活动状态分析器（inject/state_analyzer）删除，情绪不可得时省略该行
 - ✅ 主动行为：活动切换主动开口（去重）、**L2 早晚安漂移（M10）**、约定到期强指令、频率调控、睡眠窗口
 - ✅ **早晚安漂移（M10 · 附录 §三 L2）**：早/晚安只配漂移区间（`morning_drift`/`night_drift`，默认 `10-30`，单数字 `N` = `0~N`，负数/非法回退默认）——每 `(流, 日, 早安/晚安)` 独立掷点、同日复用同一结果、纯内存不落盘；早安基准 = 睡眠窗口结束（`[schedule] wake_time` 锚点）、期限 = 首个**非睡眠**日程条目结束（无日程 → 基准 + 120 分钟），晚安基准 = 当天最后非睡眠条目结束（无日程 → `sleep_time` 锚点）、期限 = `min(入睡锚点, [patrol] silence_start)`；到点按必要性激活（`greeting_require_activation`：自基准点起该流有人说话才开口，到期限仍无人即放弃）；覆盖 = 目标私聊**固定生效**（B7）+ 群聊必要性激活（名单**复用** `proactive_group_ids`，B6）+ 其他私聊单独开关 `morning_other_private_enabled` + 前一日该流 ≥ `morning_other_private_min_messages`（默认 5，`ge=5` 硬约束）；触发一律走统一主动链纳入全渠道预算（无旁路），目标私聊写 `affection.morning_sent/night_sent` 保证同流同日各至多一条
@@ -133,7 +134,7 @@ cateye_test/
 2. `/cateye_test_life status` 总览四模块；`/cateye_test_plan` 看日程（首次会触发生成）；自然聊天问「在干嘛」验证注入与 `get_schedule_info`（view=current）；
 3. 观察决策日志 `data/plugins/github.cateye.cateye-suite/decision_logs/`；`/cateye_test_diag decision`、`/cateye_test_diag life` 查判定链（旧名 `/cateye_test_mai_diag`、`/cateye_test_life diag` 仍可用）；
 4. 空间模块：`/cateye_test_life qzone status` 看通道与 cookie；`/cateye_test_life qzone post 测试` 手动发一条；`comments`+`reply` 验证楼中楼；情绪模块：`/cateye_test_emotion_init` 初始化后聊天观察语气变化；
-5. 离线测试：`scratch/smoke_test_cateye_test.py`（stub SDK 收集 29 组件 + 配置模型 + 能力核对）与 `scratch/behavior_test_cateye_test.py`（16 组核心算法回归，含 mai-love 2.6.2/2.6.3 合并回归；M8/M9 睡眠打扰·赖床用例见文件末 92~114 号）。
+5. 离线测试：`scratch/smoke_test_cateye_test.py`（stub SDK 收集 29 组件 + 配置模型 + 能力核对）与 `scratch/behavior_test_cateye_test.py`（16 组核心算法回归，含 mai-love 2.6.2/2.6.3 合并回归；M8/M9 睡眠打扰·赖床用例见文件末 92~114 号，M10 早晚安漂移·赖床·生成锚点见 115~123 号）。
 
 ## 骨架占位 / TODO
 

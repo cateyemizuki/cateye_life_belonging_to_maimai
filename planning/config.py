@@ -85,10 +85,32 @@ class ScheduleSectionConfig(PluginConfigBase):
         description="每天到点自动用 LLM 生成当日日程（当天已有日程则跳过）",
         json_schema_extra={"label": "自动生成", **_ui_i18n("Auto generate")},
     )
+    auto_generate_after_last_end_minutes: int = Field(
+        default=90,
+        ge=0,
+        description="自动生成时刻（相对锚点，M10 §五 / 裁决 B2）：当天最后一个**非睡眠**日程条目结束后 "
+                    "N 分钟生成新一天日程；当天没有日程时以「入睡时间」锚点为基准（B4）。"
+                    "硬约束：生成时刻不晚于「新一天起点 − 30 分钟」（新一天起点 = 「起床时间」锚点），"
+                    "相对延迟算出的时刻更晚时会被强制拉回该阈值。"
+                    "默认 90：缺省入睡锚点 23:00 时到期 00:30，与旧默认「生成时刻 00:30」等价（老配置零感知迁移）。",
+        json_schema_extra={
+            "label": "生成延迟（最后日程结束后）",
+            "hint": "分钟；最后日程结束后多久生成新一天日程（默认 90＝锚点 23:00 时 00:30）",
+            **_ui_i18n("Delay after last activity", "Minutes after the last non-sleep activity ends."),
+        },
+    )
     auto_generate_time: str = Field(
         default="00:30",
-        description="每日自动生成日程的时刻（HH:MM），推荐凌晨低峰期",
-        json_schema_extra={"label": "生成时刻", "placeholder": "00:30", **_ui_i18n("Generate at")},
+        description="【已废弃（M10 §五 / 裁决 B2）】旧的「每日自动生成日程的绝对时刻」（HH:MM）。"
+                    "保留仅作**兼容读取**：仍未改配置的用户按绝对时刻理解，并同样受「新一天起点 − 30 分钟」"
+                    "硬约束钳制；两个字段都被显式配置时以 auto_generate_after_last_end_minutes 为准。"
+                    "新配置请改用 auto_generate_after_last_end_minutes（相对最后日程结束）。",
+        json_schema_extra={
+            "label": "生成时刻（已废弃）",
+            "placeholder": "00:30",
+            "hint": "已废弃（B2）→ 改用「生成延迟」；仍配置时按绝对时刻兼容读取并受 30 分钟硬约束钳制",
+            **_ui_i18n("Generate at (deprecated)", "Absolute time; superseded by the delay field."),
+        },
     )
 
     # ── 生成参数 ─────────────────────────────────────────────

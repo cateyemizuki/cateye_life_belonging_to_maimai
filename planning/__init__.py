@@ -9,7 +9,8 @@
 - schedule_generator.py 多轮生成 + 质量评分 + 约定匹配的日程生成器
 - generator/            生成管线子组件（prompt / schema / context / validator / scorer / parser）
 - role_judge.py         自然语言日程请求的角色裁判
-- auto_scheduler.py     每日定时生成循环
+- auto_scheduler.py     每日定时生成循环（M10 §五 B2：相对锚点 + 新一天起点前 30 分钟硬约束）
+- schedule_items.py     日程条目口径共享（夜晚睡眠条目判定 / 最后非睡眠条目结束；M9 与 B2 同源）
 - inject/ + inject_service.py  智能注入（意图分类 / 优化器 / 上下文缓存；精神状态行读情绪 mood_text，M4）
 - proactive_service.py  活动切换主动开口 / 早间问好 / 频率调控（60s 轮询）
 - tools_service.py      4 个 LLM Tool 的业务实现

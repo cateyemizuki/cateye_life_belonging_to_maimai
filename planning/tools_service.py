@@ -28,6 +28,7 @@ from .config import ScheduleSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
 from .schedule_generator import ScheduleGenerator
+from .schedule_items import find_night_sleep_item
 from .time_utils import TimezoneManager
 
 logger = logging.getLogger(__name__)
@@ -45,10 +46,8 @@ NAP_LIE_IN_DENIED_TEXT = "你现在还不能想要赖床"
 NAP_LIE_IN_BAD_TIME_TEXT = (
     "没听清你想赖到几点。请传入目标时间，例如 \"09:30\"、\"9:30\" 或纯小时数 \"9\"（表示 09:00）。"
 )
-#: 夜晚睡眠条目的名称兜底关键词：与 emotion/service.py:1249 的 `_is_sleep_item` 同一依据
-#: （M5 实测：生产日程 prompt 让"睡觉"条目用 goal_type=daily_routine，仅按 goal_type 会漏判）；
-#: 此处只取**夜间**词，不含午休/午睡/小憩/打盹（§八.7 / C4-补充：午休本轮不动）。
-_NIGHT_SLEEP_NAME_KEYWORDS = ("睡觉", "睡眠", "安睡")
+# 口径说明（M10 第 6 段）：夜晚睡眠条目的判定**唯一真源** = ``planning/schedule_items.py``，
+# 供本模块的 M9 赖床工具与 ``auto_scheduler.py`` 的 B2 生成锚点共用，避免两处口径漂移。
 
 
 def parse_nap_target(value: Any) -> Optional[int]:
@@ -512,20 +511,14 @@ class ToolsService:
     def _find_sleep_item(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """今日日程里的**夜晚睡眠条目**（§4.4「读今日日程找 sleep 条目（goal_type=sleep）」）。
 
+        判定与读数委托**共享口径** ``planning/schedule_items.py``（M10 第 6 段抽出）：
         主判 ``goal_type == "sleep"``（规格口径）；取不到时按名称含夜晚睡眠词兜底——
         依据同 ``emotion/service.py`` 的 ``_is_sleep_item``（M5 实测：生产条目是
         ``goal_type=daily_routine`` + 名称「睡觉」）。两轮判定都只认夜间词，
         午休/午睡/小憩/打盹不算（§八.7 / C4-补充：午休本轮不动）。
         """
-        rows = [item for item in (items or []) if isinstance(item, dict)]
-        for item in rows:
-            if str(item.get("goal_type") or "") == "sleep":
-                return item
-        for item in rows:
-            name = str(item.get("name") or "")
-            if any(keyword in name for keyword in _NIGHT_SLEEP_NAME_KEYWORDS):
-                return item
-        return None
+        rows = [item for item in (items or []) if isinstance(item, dict)]  # 本工具只吃 DB 行
+        return find_night_sleep_item(rows)
 
     @staticmethod
     def _nap_end_datetime(now: datetime, minute: int) -> datetime:

@@ -439,8 +439,8 @@ M8 段 3 起：**恢复系数用实际睡着时长 → 整夜合计结算**）
 > 条目用 `goal_type: daily_routine`，仅按 goal_type 会漏判）；夜间启动/热重载后即使无条目，
 > 处于锚点夜间窗口也会按周期进入冻结。
 
-**三输入的日期基准与重算**（M5 修复）：入睡时刻（默认 23 点）读"次日"日程时，次日日程还没到
-auto_generate_time`（默认 00:30）生成 → **状态侧的 R_yesterday / E_tomorrow / 约定净兑现
+**三输入的日期基准与重算**（M5 修复）：入睡时刻（默认 23 点）读"次日"日程时，次日日程还没到生成时刻
+（M10 起 = 最后日程结束 + `auto_generate_after_last_end_minutes`，缺省锚点等价旧 00:30；`auto_generate_time` 已废弃）→ **状态侧的 R_yesterday / E_tomorrow / 约定净兑现
 在醒来时按入睡日为基准重算一次**（R = 入睡日−1；E = 入睡日的次日 = 醒来日，此时已生成；
 _wake_side_inputs`），保证"明日预期"在生产时序下真实生效；入睡缓存值只作裁判 prompt 文本参考，
 决策日志同时留痕 `*_cached` 与应用值（`emotion.sleep_overhaul_cached` / `emotion.sleep_overhaul`）。

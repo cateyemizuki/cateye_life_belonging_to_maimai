@@ -1961,8 +1961,9 @@ class EmotionService:
         （均来自日程条目 ``emotional_tone``）+ 当日约定净兑现 + 动态限幅。
         ``sleep_hours`` 缺省按条目时长；服务侧传作息锚点整夜时长（见 ``_sleep_entry_period``）。
 
-        E_tomorrow 在入睡时刻按"次日"读取，而次日日程要到 ``auto_generate_time``（默认
-        00:30）才生成——故这里只为裁判提供参考文本，**状态侧数值在醒来时会重算一次**
+        E_tomorrow 在入睡时刻按"次日"读取，而次日日程要到生成时刻（M10 起 = 最后日程
+        结束 + ``auto_generate_after_last_end_minutes``，缺省锚点等价旧 00:30）才生成——
+        故这里只为裁判提供参考文本，**状态侧数值在醒来时会重算一次**
         （见 ``_apply_cached_overhaul``），保证"明日预期"在生产时序下确实生效。
         """
         cfg = getattr(self._plugin.config, "emotion", None)
@@ -2156,7 +2157,7 @@ class EmotionService:
         """醒后应用缓存的大修并解冻（一次性）；无缓存时只解冻（裁判失败夜不结算）。
 
         M5 修复（E_tomorrow 生产时序）：入睡时刻（23 点）读取"次日"日程时，次日日程还没到
-        ``auto_generate_time``（默认 00:30）生成，恒为零向量；醒来时按**入睡日**为基准重算
+        生成时刻（M10 相对锚点，缺省等价旧 00:30）生成，恒为零向量；醒来时按**入睡日**为基准重算
         R_yesterday（入睡日前一天）/E_tomorrow（入睡日的次日＝醒来日，此时已生成）与约定净兑现，
         保证"明日预期"与"当日约定"在状态侧真实生效（裁判文本仍用缓存时刻的输入，仅供判断）。
 
