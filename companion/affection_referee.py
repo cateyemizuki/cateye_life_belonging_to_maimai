@@ -128,8 +128,46 @@ DAILY_REVIEW_PROMPT = """你是 AI 角色「{lover_name}」与{target_label}之�
 # ---------------------------------------------------------------------------
 
 
+def _strip_leading_plus(text: str) -> str:
+    """字符串感知地剥离 JSON 数值的前导 ``+``（镜像 emotion/referee.py 同名函数）。
+
+    只动字符串字面量**之外**、处于数值前导位置（``: , [`` 或其后空白）的 ``+``；
+    字符串内部的 ``+`` 与指数记号（``1e+5``）不受影响。宿主 2026-10-07 夜实弹：
+    睡眠裁判输出 ``+0.04`` 连续两轮解析失败 → 整夜冻结重试，第三轮模型随机去掉 ``+`` 才自愈。
+    """
+    if "+" not in text:
+        return text
+    out = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if (ch == "+" and out and out[-1] in ":,[ \t\r\n"
+                and i + 1 < n and text[i + 1].isdigit()):
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _parse_json_loose(text: Any) -> Optional[Dict[str, Any]]:
-    """宽松 JSON 解析：整段 → ```json 围栏 → 首个 {...} 块。"""
+    """宽松 JSON 解析：整段 → ```json 围栏 → 首个 {...} 块；全失败后剥前导 ``+`` 重试一轮。"""
     raw = str(text or "").strip()
     if not raw:
         return None
@@ -143,6 +181,16 @@ def _parse_json_loose(text: Any) -> Optional[Dict[str, Any]]:
     for candidate in candidates:
         try:
             data = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return data
+    for candidate in candidates:                     # 前导 '+' 兜底（候选优先级不变）
+        normalized = _strip_leading_plus(candidate)
+        if normalized == candidate:
+            continue
+        try:
+            data = json.loads(normalized)
         except (json.JSONDecodeError, ValueError):
             continue
         if isinstance(data, dict):
