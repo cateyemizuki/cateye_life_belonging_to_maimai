@@ -9,8 +9,9 @@
 2. **L2 早晚安漂移（附录 §三，裁决 B1/B3/B5/B6/B7）** —— 早/晚安只配漂移区间
    （``morning_drift`` / ``night_drift``，每流每日独立掷点）：早安基准 = 睡眠窗口结束
    （``[schedule].wake_time`` 锚点），晚安基准 = 当天最后一个非睡眠日程条目结束
-   （无日程回退 ``sleep_time`` 锚点）。到点按「必要性激活」判定触发（自基准点起该流有人
-   发过消息），到期限仍无人则放弃；目标私聊固定生效、群聊复用 ``proactive_group_ids``
+   （无日程回退 ``sleep_time`` 锚点）。到点按「必要性激活」判定触发（早安自基准点起、
+   晚安自 ``fire_at`` 起该流有人发过消息——附录 §六.补 B5-补），到期限仍无人则放弃；
+   目标私聊固定生效、群聊复用 ``proactive_group_ids``
    名单、其他私聊走单独开关 + 前一日消息数门槛。
 
 3. **按 goal_type 调节聊天频率** —— ``ctx.frequency.set_adjust`` 推给 heartflow。
@@ -723,9 +724,11 @@ class ProactiveService:
 
     async def _stream_activated_since_wake(self, stream_id: str, since_ts: float,
                                            until_ts: float) -> bool:
-        """自基准点起该流是否有人发过消息（B5：早安/晚安共用同一形态）。
+        """自 ``since_ts`` 起该流是否有人发过消息（B5：早安/晚安共用同一查询形态）。
 
-        沿用既有调用形态 ``ctx.message.get_by_time_in_chat(stream_id, 基准ts, now, limit=1)``；
+        窗口起点由调用方分派（附录 §六.补 B5-补）：晚安 = ``fire_at``、早安 = ``baseline``
+        （见 :meth:`_evaluate_greeting`）。沿用既有调用形态
+        ``ctx.message.get_by_time_in_chat(stream_id, 起点ts, now, limit=1)``；
         能力不可用/异常 → False（保守：没人说话就不打扰）。
         """
         ctx_obj = getattr(self._plugin, "ctx", None)
@@ -833,7 +836,17 @@ class ProactiveService:
     async def _evaluate_greeting(self, stream_id: str, category: str, kind: str,
                                  now: datetime, now_ts: float, date_str: str,
                                  cfg_p: Any) -> None:
-        """单个候选的到点判定：激活 / 推迟下一 tick / 到期限放弃 / 触发（§3.3）。"""
+        """单个候选的到点判定：激活 / 推迟下一 tick / 到期限放弃 / 触发（§3.3）。
+
+        激活查询窗按 kind 分派（**附录 §六.补 B5-补（2026-10-07 协调裁决）**）：
+
+        - **晚安** ``[fire_at, now]``：``fire_at = baseline − drift < baseline``，而常见日程形态
+          （末条非睡眠条目截断到入睡锚点）下 ``baseline ≈ 期限``——沿用 ``[baseline, now]``
+          会**结构性空窗**、群聊晚安永不触发；改自「该问候成为可能（fire_at）起」。
+        - **早安** ``[baseline, now]`` **一字不动**（B5 字面：「自基准点起该流有人发过消息」）。
+        - 两者都保留 B5「有人说话才跟着问候」语义；放弃语义不变：``[fire_at, 期限]`` 内
+          无人发言 → ``abandoned``（由既有 deadline 分支落 reason）。
+        """
         if category == GREETING_CATEGORY_OTHER:
             if kind == GREETING_NIGHT:
                 return  # 晚安本轮不给其他私聊（§3.4 末行）
@@ -850,8 +863,9 @@ class ProactiveService:
 
         activated = True
         if self._greeting_requires_activation(category, kind, cfg_p):
-            activated = await self._stream_activated_since_wake(
-                stream_id, entry["baseline"], now_ts)
+            # 附录 §六.补 B5-补：晚安自 fire_at 起算（用 baseline 会结构性空窗），早安维持 baseline
+            since_ts = entry["fire_at"] if kind == GREETING_NIGHT else entry["baseline"]
+            activated = await self._stream_activated_since_wake(stream_id, since_ts, now_ts)
         if not activated:
             if now_ts >= entry["deadline"]:
                 self._abandon_greeting(entry, "deadline")

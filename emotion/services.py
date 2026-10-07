@@ -203,6 +203,14 @@ class EmotionServices:
         except Exception:
             return False
 
+    def night_sleep_end_minute(self) -> Optional[int]:
+        """nap 工具写回前的预检（只读转发；未在夜间周期 → None）。"""
+        svc = self.service
+        getter = getattr(svc, "night_sleep_end_minute", None)
+        if not callable(getter):
+            return None
+        return getter()
+
     def extend_night_sleep_until(self, target: Any = None) -> bool:
         """赖床成功后把本睡眠周期窗口结束端推到 target（转发 service；§4.4 第 5 条）。
 

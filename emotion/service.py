@@ -1660,6 +1660,18 @@ class EmotionService:
             new_end=new_end.isoformat(timespec="seconds"))
         return True
 
+    def night_sleep_end_minute(self) -> Optional[int]:
+        """当前夜间睡眠周期窗口结束的「当日分钟」（未在夜间周期 → None）。
+
+        nap 工具写回日程**之前**的预检用（附录 §六.补 C4：目标不晚于当前醒沿时
+        不写日程、不计次——避免"文案说没改、库里已被写坏"）；权威判定仍在
+        ``extend_night_sleep_until``（本访问器只读，不改任何状态）。
+        """
+        if self._sleep_period is None:
+            return None
+        end = self._sleep_period[1]
+        return end.hour * 60 + end.minute
+
     def nap_planned_wake(self, now: Optional[datetime] = None) -> datetime:
         """提醒文本里的「本来打算睡到」= 当前睡眠窗口结束（周期在册值优先，回退 wake 锚点）。"""
         current = now or datetime.now()

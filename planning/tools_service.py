@@ -557,8 +557,12 @@ class ToolsService:
            （:274）写回——不消费未来约定、不触发重生成；无 sleep 条目或写回失败 →
            失败文本且**不计数**；
         5. **通知 emotion 延长本周期窗口结束到目标时刻**（否则醒沿会在 wake 锚点照常触发）；
-        6. **计数**：调用并成功修改日程 → emotion 侧「有效提醒次数」+1（按 ``cycle_key``，
+        6. **计数**：调用**并成功修改日程** → emotion 侧「有效提醒次数」+1（按 ``cycle_key``，
            内存）；未调用/失败不计次；额度用尽只停提醒、**不阻止**本工具（本方法不判额度）。
+           口径澄清（附录 §六.补 C4，执行既有 C4「成功修改日程才计次」）：目标 ≤ 当前醒沿时
+           **先经 ``night_sleep_end_minute`` 预检**（写回前拒绝，避免日程被误写）且
+           ``extend_night_sleep_until`` 返回 False（双保险）→ 均**不计次**，返回友好提示而非
+           成功文案。
 
         Args:
             time: 目标时间（"HH:MM" / "H:MM" / 纯小时数）。
@@ -584,6 +588,13 @@ class ToolsService:
             # 3) 上限钳制
             limit_minute = self._lie_in_max_minutes()
             clamped = min(int(target_minute), int(limit_minute))
+            # 3.5) 预检（附录 §六.补 C4）：目标不晚于当前醒沿 → 不写日程、不计次
+            #      （否则会出现"文案说没改动、库里 sleep 条目已被写坏"）；权威判定仍在
+            #      写回后的 extend_night_sleep_until（双保险）
+            wake_edge = emotion.night_sleep_end_minute()
+            if wake_edge is not None and clamped <= wake_edge:
+                return {"type": "nap_error",
+                        "content": "这个时间不比现在的起床时间晚，起床时间没有改动，就不多睡啦。"}
             # 4) 写回今日日程（共享底层；只动 sleep 条目，其余条目原样保留）
             query = self._schedule_query()
             items = list(query.get_day_schedule(today)) if query is not None else []
@@ -599,7 +610,12 @@ class ToolsService:
             if not written:
                 return {"type": "nap_error", "content": "日程写回失败，起床时间没有改动。"}
             # 5) + 6) 成功才通知 emotion：延长本周期窗口端点（醒沿推迟）并计一次有效提醒
-            emotion.extend_night_sleep_until(self._nap_end_datetime(current, clamped))
+            extended = emotion.extend_night_sleep_until(self._nap_end_datetime(current, clamped))
+            if not extended:
+                # 附录 §六.补 C4 口径澄清（执行既有 C4「成功修改日程才计次」）：目标不比当前醒沿晚
+                # → 窗口端点未变（未实际延长）→ 不计次，返回友好提示
+                return {"type": "nap_error",
+                        "content": "这个时间不比现在的起床时间晚，起床时间没有改动，就不多睡啦。"}
             emotion.note_nap_lie_in_applied()
             hhmm = f"{int(clamped) // 60:02d}:{int(clamped) % 60:02d}"
             note = "" if clamped == target_minute else f"（超过最晚时间，已按 {hhmm} 算）"
