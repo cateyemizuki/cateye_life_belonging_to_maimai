@@ -1,7 +1,8 @@
 """主动巡检调度器（来源：虚拟恋人插件 scheduler.py，判定链完整对齐）。
 
 单条 asyncio 循环（可打断睡眠：wait_for(stop_event.wait(), timeout)），每轮按优先级判定：
-日切 → 静默(fail-safe) → 非夜预算(晚安预留 1) → 早安(S) → 晚安(S) →
+日切 → 静默(fail-safe) → 非夜预算(晚安预留 1) → 早晚安状态检查(B1 合并：不再自行判时，
+驱动链在 planning 漂移机制) →
 想念(A：沉默阈值每轮随机采样 + 概率 + LLM 把关(驳回 30 分钟冷却) + 未来日程避让 +
 豁免开关 + 每日一次) → 日程节点分享(B) → 日常搭话(B)。
 
@@ -59,6 +60,8 @@ NEUTRAL_MOOD_EFFECT: dict[str, Any] = {
 }
 
 #: 需要校验格式（HH:MM）的时间窗口配置项（非法时 fail-safe：静默视为在静默、窗口视为不触发）
+#: —— 早晚安窗口字段（morning_start/end、night_start/end）自 B1 合并起已废弃：仍参与格式校验
+#: （非法值继续记 invalid_time_config 留痕），但不再参与任何触发判定。
 TIME_WINDOW_KEYS = (
     "silence_start",
     "silence_end",
@@ -277,7 +280,6 @@ class PatrolService:
         # 最小间隔 / 豁免开关 / 时间配置校验
         minutes_since_last_speak = self._minutes_since_last_speak(now)
         min_interval = max(0, int(getattr(patrol, "min_trigger_interval_minutes", 0)))
-        exempt_greetings = bool(getattr(patrol, "min_interval_exempt_greetings", False))
         exempt_miss = bool(getattr(patrol, "min_interval_exempt_miss", False))
         interval_blocked = (
             min_interval > 0
@@ -359,40 +361,17 @@ class PatrolService:
             finish()
             return
 
-        # ---- S 级：早安 ----
-        if is_in_time_window(patrol.morning_start, patrol.morning_end, current_hhmm):
-            if self._affection.morning_sent():
-                mark_skip("already_sent_today", "morning", "今天已经发过早安")
-            elif interval_blocked and not exempt_greetings:
-                mark_skip("min_interval", "morning", interval_desc)
-            elif self._affection.today_speak_count() >= non_night_budget:
-                mark_skip(
-                    "budget",
-                    "morning",
-                    f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}"
-                    f"（未发晚安，为晚安预留 1 条）",
-                )
-            elif await self._trigger_morning():
-                mark_trigger("morning", "早安触发已入队，由 planner 决定是否发言")
-            else:
-                mark_skip("planner_trigger_failed", "morning", "触发未入队（stream_id 缺失或触发开关关闭）")
-
-        # ---- S 级：晚安 ----
-        if is_in_time_window(patrol.night_start, patrol.night_end, current_hhmm):
-            if self._affection.night_sent():
-                mark_skip("already_sent_today", "night", "今天已经发过晚安")
-            elif interval_blocked and not exempt_greetings:
-                mark_skip("min_interval", "night", interval_desc)
-            elif self._affection.today_speak_count() >= daily_max_speak:
-                mark_skip(
-                    "budget",
-                    "night",
-                    f"当日预算已用 {self._affection.today_speak_count():.1f}/{daily_max_speak}",
-                )
-            elif await self._trigger_night():
-                mark_trigger("night", "晚安触发已入队，由 planner 决定是否发言")
-            else:
-                mark_skip("planner_trigger_failed", "night", "触发未入队（stream_id 缺失或触发开关关闭）")
+        # ---- S 级：早安 / 晚安（B1 合并：patrol 不再自行判时）----
+        # 附录 §3.6（用户裁决 B1）：早晚安只有一条驱动链——planning 的 L2 漂移机制。
+        # [patrol] morning_start/morning_end/night_start/night_end 已废弃（仅保留读取兼容，
+        # 不再参与任何判定）；这里只保留"发不发"的状态语义：planning 触发成功后写入 affection
+        # 的 morning_sent/night_sent，本分支见已发即不再触发——两模块因此不会各发一条
+        # （同一私聊流同一天早安/晚安各至多一条）。未发时 patrol 不做任何事，
+        # 由 planning 漂移机制在自己的期限内决定发不发。
+        if self._affection.morning_sent():
+            mark_skip("already_sent_today", "morning", "今天已经发过早安（planning 漂移机制已发）")
+        if self._affection.night_sent():
+            mark_skip("already_sent_today", "night", "今天已经发过晚安（planning 漂移机制已发）")
 
         # ---- A 级：想念 / 沉默事件 ----
         # M3（B1）：沉默超过 miss_hours_min 时发布 relation.silence_detected（独立于
@@ -520,18 +499,6 @@ class PatrolService:
     # ------------------------------------------------------------------
     # 各类触发（屏幕感知统一在 _trigger_planner 里先取）
     # ------------------------------------------------------------------
-    async def _trigger_morning(self) -> bool:
-        success = await self._trigger_planner("morning", "早上好，可以说早安")
-        if success:
-            self._affection.set_morning_sent()
-        return success
-
-    async def _trigger_night(self) -> bool:
-        success = await self._trigger_planner("night", "晚上好，可以说晚安")
-        if success:
-            self._affection.set_night_sent()
-        return success
-
     async def _trigger_missing(self, hours_since_last: float) -> bool:
         reason = self._format_miss_reason(hours_since_last)
         success = await self._trigger_planner("missing", reason)

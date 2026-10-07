@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Dict, List, Literal
 
+import pydantic
 from maibot_sdk import Field, PluginConfigBase
 
 
@@ -84,10 +85,32 @@ class ScheduleSectionConfig(PluginConfigBase):
         description="每天到点自动用 LLM 生成当日日程（当天已有日程则跳过）",
         json_schema_extra={"label": "自动生成", **_ui_i18n("Auto generate")},
     )
+    auto_generate_after_last_end_minutes: int = Field(
+        default=90,
+        ge=0,
+        description="自动生成时刻（相对锚点，M10 §五 / 裁决 B2）：当天最后一个**非睡眠**日程条目结束后 "
+                    "N 分钟生成新一天日程；当天没有日程时以「入睡时间」锚点为基准（B4）。"
+                    "硬约束：生成时刻不晚于「新一天起点 − 30 分钟」（新一天起点 = 「起床时间」锚点），"
+                    "相对延迟算出的时刻更晚时会被强制拉回该阈值。"
+                    "默认 90：缺省入睡锚点 23:00 时到期 00:30，与旧默认「生成时刻 00:30」等价（老配置零感知迁移）。",
+        json_schema_extra={
+            "label": "生成延迟（最后日程结束后）",
+            "hint": "分钟；最后日程结束后多久生成新一天日程（默认 90＝锚点 23:00 时 00:30）",
+            **_ui_i18n("Delay after last activity", "Minutes after the last non-sleep activity ends."),
+        },
+    )
     auto_generate_time: str = Field(
         default="00:30",
-        description="每日自动生成日程的时刻（HH:MM），推荐凌晨低峰期",
-        json_schema_extra={"label": "生成时刻", "placeholder": "00:30", **_ui_i18n("Generate at")},
+        description="【已废弃（M10 §五 / 裁决 B2）】旧的「每日自动生成日程的绝对时刻」（HH:MM）。"
+                    "保留仅作**兼容读取**：仍未改配置的用户按绝对时刻理解，并同样受「新一天起点 − 30 分钟」"
+                    "硬约束钳制；两个字段都被显式配置时以 auto_generate_after_last_end_minutes 为准。"
+                    "新配置请改用 auto_generate_after_last_end_minutes（相对最后日程结束）。",
+        json_schema_extra={
+            "label": "生成时刻（已废弃）",
+            "placeholder": "00:30",
+            "hint": "已废弃（B2）→ 改用「生成延迟」；仍配置时按绝对时刻兼容读取并受 30 分钟硬约束钳制",
+            **_ui_i18n("Generate at (deprecated)", "Absolute time; superseded by the delay field."),
+        },
     )
 
     # ── 生成参数 ─────────────────────────────────────────────
@@ -293,6 +316,20 @@ class ScheduleSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "情绪影响强度", "step": 0.05, **_ui_i18n("Emotion influence")},
     )
 
+    # ── M9 赖床上限（附录 §4.4/§4.6，用户裁决 C4）───────────
+    lie_in_max_until: str = Field(
+        default="12:00",
+        description="赖床（推迟起床）的硬上限时刻（HH:MM，默认 12:00）。夜间被吵醒后调用赖床工具时，"
+                    "传入的起床时间**超过本值会被钳到本值**（提醒文本给出的也是本值）；"
+                    "格式非法一律按 12:00 处理",
+        json_schema_extra={
+            "label": "赖床上限时刻",
+            "hint": "HH:MM；传入时间超过它会被钳到它（默认 12:00）",
+            "pattern": r"^\d{1,2}:\d{2}$",
+            **_ui_i18n("Lie-in hard limit", "Hard cap for the lie-in tool (HH:MM)."),
+        },
+    )
+
 
 class InjectSectionConfig(PluginConfigBase):
     """智能注入策略（来源：自主规划插件 [inject] 段；推荐挂载名 ``inject``）。"""
@@ -382,20 +419,104 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     enable_morning_greeting: bool = Field(
         default=False,
-        description="早间问好：bot 睡醒后第一个活动开始时，主动向白名单内的会话道早安",
-        json_schema_extra={"label": "早间问好", **_ui_i18n("Morning greeting")},
+        description="早间问候（L2 漂移驱动）：bot 睡醒后按 morning_drift 随机漂移时刻向目标私聊/群聊/其他私聊道早安",
+        json_schema_extra={"label": "早间问候", **_ui_i18n("Morning greeting")},
     )
     morning_greeting_require_activation: bool = Field(
         default=False,
-        description="早间问好是否需要激活。开启后：随机延迟结束并不立即问好——从 bot 睡醒起算观察会话消息，"
-                    "期间有人说话则照常问好；截止第一个活动结束前 10 分钟仍无人说话，放弃该会话的早间问好",
-        json_schema_extra={"label": "早间问好需激活", **_ui_i18n("Require activation")},
+        description="（旧字段，M10/L2 起由 greeting_require_activation 接管）早间问候是否需激活："
+                    "开启后与 greeting_require_activation 取或——非目标私聊从基准点起观察会话消息，"
+                    "有人说话才问好，到期限仍无人则放弃（目标私聊固定生效，不受本项影响）",
+        json_schema_extra={"label": "早间问候需激活（旧）", **_ui_i18n("Require activation (legacy)")},
     )
     enable_frequency_modulation: bool = Field(
         default=True,
         description="按当前活动类型动态调节聊天频率（ctx.frequency.set_adjust）：学习/工作时 30%，休息/娱乐时 130%~150%",
         json_schema_extra={"label": "活动频率调控", **_ui_i18n("Frequency modulation")},
     )
+
+    # ── M9 赖床提醒（附录 §4.1/§4.6，跟随 L1 睡眠打扰）───────
+    nap_reminder_enabled: bool = Field(
+        default=True,
+        description="赖床提醒开关：夜间被吵醒且重新睡着后，向 bot 发一条临时提醒"
+                    "（点名赖床工具；只在当轮有效）。关闭后不提醒，但不阻止 bot 自行改日程",
+        json_schema_extra={"label": "赖床提醒", **_ui_i18n("Nap reminder")},
+    )
+    nap_reminder_max_per_day: int = Field(
+        default=2,
+        ge=1,
+        description="每个睡眠周期（不是自然日）的有效提醒次数上限：提醒发送成功 + 工具成功改日程"
+                    "都各计 1 次；用尽后不再提醒，但仍允许 bot 自行推迟起床",
+        json_schema_extra={"label": "赖床提醒上限", **_ui_i18n("Nap reminder cap")},
+    )
+
+    # ── M10 L2 早晚安漂移（附录 §3.1/§3.7，裁决 B1/B3/B5/B6/B7）───────
+    morning_drift: str = Field(
+        default="10-30",
+        description="早安漂移区间（分钟，相对睡眠窗口结束 = [schedule].wake_time 锚点）："
+                    '填 "a-b" 或单数字 N（= 0~N 随机）；触发时刻 = 基准 + randint(a, b)。'
+                    "负数/非法一律回退默认区间 10-30（不收负数）",
+        json_schema_extra={
+            "label": "早安漂移(分钟)",
+            "hint": '例 "10-30" 或 "20"；单数字 = 0~N 随机',
+            "pattern": r"^\d+(-\d+)?$",
+            **_ui_i18n("Morning drift (min)", 'e.g. "10-30" or "20"'),
+        },
+    )
+    night_drift: str = Field(
+        default="10-30",
+        description="晚安漂移区间（分钟，相对当天最后一个非睡眠日程条目结束）："
+                    '填 "a-b" 或单数字 N（= 0~N 随机）；触发时刻 = 基准 − randint(a, b)（向前漂移）。'
+                    "负数/非法一律回退默认区间 10-30（不收负数）",
+        json_schema_extra={
+            "label": "晚安漂移(分钟)",
+            "hint": '例 "10-30" 或 "20"；单数字 = 0~N 随机',
+            "pattern": r"^\d+(-\d+)?$",
+            **_ui_i18n("Night drift (min)", 'e.g. "10-30" or "20"'),
+        },
+    )
+    enable_night_greeting: bool = Field(
+        default=False,
+        description="晚间问候（L2 漂移驱动）：按 night_drift 随机漂移时刻道晚安；群聊晚安还需必要性激活"
+                    "（名单复用 proactive_group_ids）。关闭时晚安全线不发（含群聊）",
+        json_schema_extra={"label": "晚间问候", **_ui_i18n("Night greeting")},
+    )
+    morning_other_private_enabled: bool = Field(
+        default=False,
+        description="其他私聊的早安开关（默认关）：开启后，非目标的其他私聊需前一日该流消息数 ≥ "
+                    "morning_other_private_min_messages 才可能收到早安（防打扰护栏）",
+        json_schema_extra={"label": "其他私聊早安", **_ui_i18n("Morning greeting to other private chats")},
+    )
+    morning_other_private_min_messages: int = Field(
+        default=5,
+        ge=5,
+        description="其他私聊早安的前一日消息数门槛（**不允许低于 5**，配置校验直接拒绝）："
+                    "前一日该流消息数达到该值才成为早安候选；取不到消息计数按 0 处理（不发送）",
+        json_schema_extra={"label": "其他私聊门槛(条)", **_ui_i18n("Other-private threshold (msgs)")},
+    )
+    greeting_require_activation: bool = Field(
+        default=True,
+        description="问候的必要性激活：开启后，群聊/其他私聊到点需先观察到「自基准点起该流有人发过消息」"
+                    "才问候，无人则推迟到下一轮、到期限仍无人则放弃（当天不再补发）；"
+                    "关闭则到点直接问候。目标私聊固定生效，不受本项影响",
+        json_schema_extra={"label": "问候需激活", **_ui_i18n("Greeting requires activation")},
+    )
+
+    @pydantic.field_validator("morning_drift", "night_drift", mode="before")
+    @classmethod
+    def _coerce_drift_to_str(cls, value: Any) -> Any:
+        """漂移字段接受 int（如 20）与 "a-b" 两种配置写法（§3.1）：数字先转字符串。
+
+        区间解析/合法性回退在服务层（``planning.proactive_service._parse_drift``）——
+        配置层只保证"两种写法都能进得来"，不在校验期拒绝用户（B3：非法值回退默认区间）。
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float) and float(value).is_integer():
+            return str(int(value))
+        return value
 
 
 class PlanningCleanupSectionConfig(PluginConfigBase):

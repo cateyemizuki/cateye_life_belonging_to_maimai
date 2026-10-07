@@ -168,6 +168,70 @@ class EmotionServices:
         """episode 模式的 Hook 记录入口（纯内存、零 LLM；转发 self.service）。"""
         self.service.note_reply_for_episode(session_id)
 
+    # ── M8 段 2：L1 夜间打扰记账转发（组件层只问这一个入口，门控在内层）──
+    def note_night_reply(self, session_id: str) -> bool:
+        """夜间打扰记账入口（replyer.after_response Hook；转发 self.service）。
+
+        与 ``_evaluate_mode`` 无关（off 态也记账，附录 §〇 C1）；是否计入由内层按
+        ``[schedule].no_sleep_mode`` / 睡眠周期 / target 私聊门控判定（§2.1/§2.2），
+        返回 True 表示本次 reply 已计入打扰计数。
+        """
+        return bool(self.service.note_night_reply(session_id))
+
+    def night_interrupt_snapshot(self) -> Dict[str, Any]:
+        """当前打扰段快照（观测/调试用；转发 self.service，异常时返回 ``{}``）。"""
+        try:
+            return dict(self.service.night_interrupt_snapshot() or {})
+        except Exception:
+            return {}
+
+    def night_interrupt_segments(self, cycle_key: Optional[str] = None) -> list:
+        """已闭合打扰段归档（供观测与整夜合计结算消费；转发 self.service。结算会清空本周期条目）。"""
+        try:
+            return list(self.service.night_interrupt_segments(cycle_key))
+        except Exception:
+            return []
+
+    # ── M9（附录 §4.1–§4.5）：L3 赖床链路转发（planning 赖床工具只问这三个入口；单向依赖）──
+    def in_night_sleep_cycle(self) -> bool:
+        """当前是否处于夜间睡眠周期（赖床工具「非睡眠周期调用 → 拒绝」的门控；转发 service）。
+
+        planning 侧不 import emotion，只按鸭子类型调用本入口；异常一律 False（可空降级，§八.2）。
+        """
+        try:
+            return bool(self.service.in_night_sleep_cycle())
+        except Exception:
+            return False
+
+    def night_sleep_end_minute(self) -> Optional[int]:
+        """nap 工具写回前的预检（只读转发；未在夜间周期 → None）。"""
+        svc = self.service
+        getter = getattr(svc, "night_sleep_end_minute", None)
+        if not callable(getter):
+            return None
+        return getter()
+
+    def extend_night_sleep_until(self, target: Any = None) -> bool:
+        """赖床成功后把本睡眠周期窗口结束端推到 target（转发 service；§4.4 第 5 条）。
+
+        只有「周期在册 + 新端 > 旧端 + 受 lie_in_max_until 钳制」三者同时成立才改端点，
+        返回是否真的延长（否则醒沿仍按 wake 锚点触发）。
+        """
+        try:
+            return bool(self.service.extend_night_sleep_until(target))
+        except Exception:
+            return False
+
+    def note_nap_lie_in_applied(self) -> int:
+        """赖床工具成功改写日程 → 本周期「有效提醒次数」+1（转发 service；§4.4 计数口径）。
+
+        只计数（不判额度）：额度用尽只停提醒，**不阻止**工具调用。
+        """
+        try:
+            return int(self.service.note_nap_lie_in_applied())
+        except Exception:
+            return 0
+
     @property
     def _bg_tasks(self) -> list:
         """评估后台任务列表（与内层同一份；Hook 侧防堆积裁剪与 stop() 清理共用）。"""

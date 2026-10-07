@@ -11,6 +11,10 @@ from typing import Any, Dict, Optional, Tuple
 from core.storage import load_json, save_json_atomic
 from core.time_utils import parse_hhmm
 from planning.schedule_query import ScheduleQuery
+# M9（附录 §4.3 用户裁决 A2）：赖床工具名与钳制上限的**唯一定义点**在 planning/tools_service.py；
+# 提醒文本与组件注册同源引用。planning 侧不 import emotion（单向），故无循环依赖。
+from planning.tools_service import (DEFAULT_LIE_IN_MAX_UNTIL, NAP_TOOL_NAME,
+                                    normalize_hhmm, parse_nap_target)
 
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
 from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
@@ -55,6 +59,115 @@ SLEEP_NAME_KEYWORDS = ("睡觉", "睡眠", "安睡", "午休", "午睡", "小憩
 #: 作息锚点缺省（配置缺失时按 23:00 入睡 / 07:00 起床）
 DEFAULT_SLEEP_MINUTES = 23 * 60
 DEFAULT_WAKE_MINUTES = 7 * 60
+#: 冻结态注入的深夜引导行（附录 §2.5.5，逐字定稿）：非冻结态绝不出现，冻结态追加在既有文本后
+NIGHT_INJECTION_HINT = ("（现在是深夜，你本该在睡觉。回复尽量短、慢、软一些；"
+                        "不要主动开启新话题；不要提及本提示。）")
+#: 夜间事件摘要的单条描述截断 / 落 decision_logs 的条数上限（§2.5.3：超限只留最近 N 条，
+#: ``drained_events_count`` 仍报真实条数——摘要只作可追溯留痕，不参与任何结算）
+DRAINED_SUMMARY_DESC_CHARS = 60
+DRAINED_EVENTS_MAX = 20
+#: L1 夜间打扰记账的配置缺省（附录 §2.1 定稿值：窗口内 3 次 reply / 窗口 10min / 重新入睡 5min）
+DEFAULT_INTERRUPT_REPLY_THRESHOLD = 3
+DEFAULT_INTERRUPT_WINDOW_MINUTES = 10
+DEFAULT_RESLEEP_MINUTES = 5
+#: 打扰段归档条数上限（纯内存，供观测与醒沿整夜合计结算消费；decision_logs 才是权威留痕，
+#: 超限丢最旧只防长跑进程无界增长）
+NIGHT_SEGMENTS_MAX = 128
+#: 整夜合计的净正 ΔV 曲线（附录 §2.3 定稿，M8 段 3）：首档 +0.05、每次递减 0.01、下限 0
+#: （第 3 次 > 第 4 次的正向收益；被需要 > 被吵醒）
+SLEEP_INTERRUPT_DELTA_FIRST = 0.05
+SLEEP_INTERRUPT_DELTA_STEP = 0.01
+#: 整夜合计上限 |ΔV| ≤ 0.15（附录 §2.3 表；远小于单事件 ±0.5 硬限幅——
+#: 夜里"决定次日情绪的主语"仍是睡眠大修，打扰的暖意只在其结果之上叠加）
+SLEEP_INTERRUPT_DELTA_CAP = 0.15
+#: 赖床提醒轮（L3，附录 §4.5）的豁免窗口时长（秒）：提醒发出后的这段时间内，该流若意外
+#: 触发 reply，不刷新 resleep 计时、不重开吵醒态、不额外限制工具调用。
+#: 与 core/inject.py 的 NAP_BLOCK_LINGER_SECONDS 同值（提醒块"已过提醒轮"的口径）——
+#: core 不 import emotion，故两处各留一份常量，同批改动需一起改。
+NAP_REMINDER_ROUND_SECONDS = 120.0
+#: 有效提醒次数上限的缺省（[planning_proactive] nap_reminder_max_per_day，§4.6 默认 2）
+DEFAULT_NAP_REMINDER_MAX_PER_DAY = 2
+#: 赖床提醒文本模板（附录 §4.3 逐字定稿，占位符照抄）：``{nap_tool_name}`` 引用
+#: planning/tools_service.py 的 NAP_TOOL_NAME（A2：工具改名只需动那一处）；
+#: ``{planned_wake_hhmm}`` = 当前睡眠窗口结束 / wake 锚点；``{lie_in_max_until}`` = [schedule] 配置值。
+NAP_REMINDER_TEMPLATE = (
+    "【临时提醒·不进下一轮上下文】你半夜被重要的人吵醒了，现在是 {now_hhmm}；"
+    "你本来打算睡到 {planned_wake_hhmm}。如果还想再睡一会儿，可以调用 {nap_tool_name} "
+    "把起床时间往后推（最晚 {lie_in_max_until}）。这条提醒只在本轮有效，"
+    "不必向任何人提起\"昨晚被吵醒\"。是否调用由你决定。"
+)
+
+
+def sleep_interrupt_delta_v(count: Any) -> float:
+    """整夜合计的净正 ΔV（附录 §2.3 固化为纯函数，便于直测）。
+
+    单次净正 ΔV_i = ``max(0, 0.05 − 0.01×(i−1))``（i 从 1 起；首档 +0.05、每次递减 0.01、
+    下限 0），整夜 ``delta_v = min(Σ ΔV_i, 0.15)``。只作用 V 维（净正），A/D 恒为 0。
+    ``count`` 非数/负数一律按 0（零打扰 → 0.0，调用方据此不入账）。
+    """
+    try:
+        total = max(0, int(count))
+    except (TypeError, ValueError):
+        total = 0
+    delta = 0.0
+    for index in range(total):
+        delta += max(0.0, SLEEP_INTERRUPT_DELTA_FIRST - SLEEP_INTERRUPT_DELTA_STEP * index)
+    return min(delta, SLEEP_INTERRUPT_DELTA_CAP)
+
+
+def summarize_sleep_window(window_start: datetime, window_end: datetime, segments: Any,
+                           resleep_minutes: float = DEFAULT_RESLEEP_MINUTES) -> Dict[str, Any]:
+    """睡眠窗口口径的**纯计算**（附录 §2.4 / 用户裁决 A4；M8 段 3 落地，无副作用、可直接单测）。
+
+    打扰区间_i = ``[首次 reply_i, 最后一次 reply_i + resleep_minutes]``（``resleep`` 缓冲计入
+    被吵醒时长），逐段**封顶到窗口** ``[window_start, window_end]``；多段**取并集**——相邻/重叠
+    只扣一次（"多个打扰段"不等于"多段时长相加"）。
+
+    输入 ``segments`` = 本周期**已确认**（窗口计数达阈值）的打扰段记录（第 2 段的归档形态，
+    取 ``started_ts`` / ``last_reply_ts`` 两个 epoch 秒字段）；缺失/坏值段跳过。
+
+    Returns:
+        ``{"sleep_window_minutes", "interrupted_minutes", "actual_sleep_hours", "interrupt_count"}``；
+        ``∪`` 为空 → ``interrupted_minutes=0``、实际 = 窗口总长（与现状一致）；
+        窗口倒挂（end ≤ start）→ 三个时长字段全 0，绝不出现负值。
+    """
+    try:
+        start_ts = float(window_start.timestamp())
+        end_ts = float(window_end.timestamp())
+    except (AttributeError, TypeError, ValueError, OSError):
+        start_ts = end_ts = 0.0
+    span_minutes = max(0.0, (end_ts - start_ts) / 60.0)
+    try:
+        buffer_seconds = max(0.0, float(resleep_minutes)) * 60.0
+    except (TypeError, ValueError):
+        buffer_seconds = float(DEFAULT_RESLEEP_MINUTES) * 60.0
+    intervals: list = []
+    count = 0
+    for seg in list(segments or []):
+        if not isinstance(seg, dict):
+            continue
+        count += 1
+        try:
+            begin = max(start_ts, float(seg.get("started_ts")))
+            finish = min(end_ts, float(seg.get("last_reply_ts")) + buffer_seconds)
+        except (TypeError, ValueError):
+            continue
+        if finish > begin:
+            intervals.append((begin, finish))
+    intervals.sort()
+    merged: list = []
+    for begin, finish in intervals:
+        if merged and begin <= merged[-1][1]:      # 相邻/重叠 → 合并（重叠只扣一次）
+            merged[-1] = (merged[-1][0], max(merged[-1][1], finish))
+        else:
+            merged.append((begin, finish))
+    interrupted = sum(finish - begin for begin, finish in merged) / 60.0
+    return {
+        "sleep_window_minutes": round(span_minutes, 3),
+        "interrupted_minutes": round(interrupted, 3),
+        "actual_sleep_hours": round(max(0.0, span_minutes - interrupted) / 60.0, 6),
+        "interrupt_count": count,
+    }
 
 
 def _event_fingerprint(text: str) -> str:
@@ -107,6 +220,22 @@ class EmotionService:
         self._sleep_period: Optional[Tuple[datetime, datetime]] = None
         #: M5 连续低迷达标状态（streak ≥ 门槛时的事件载荷；供 planning 强制插入恢复类活动）
         self._low_mood_day: Dict[str, Any] = {}
+        # M8 段 2 L1 夜间打扰记账（附录 §2.1/§2.2）：纯运行期状态、不落 emotion_state.json（F5，
+        # 热重载丢账可接受——每次段闭合都有 decision_logs 留痕）
+        #: 当前打扰段 {"cycle_key","started_at","last_reply_at","reply_count","window_reply_count",
+        #: "stream_ids","last_stream_id","awake","confirmed_at","_stamps"}；无段为 None
+        self._night_segment: Optional[Dict[str, Any]] = None
+        #: 已闭合的打扰段归档（供醒沿整夜合计结算消费；含未达阈值的候选段，``awake`` 区分）
+        self._night_archived: list = []
+        #: §4.5 提醒轮豁免窗口的截止时刻（epoch 秒）：由 :meth:`note_reminder_round` 登记
+        #: （赖床提醒发送成功后 = now + :data:`NAP_REMINDER_ROUND_SECONDS`）。
+        self._reminder_round_until = 0.0
+        # M9（附录 §4.1–§4.5 L3 赖床提醒）：纯内存运行期状态、不落任何状态文件（F5 同口径）
+        #: 「有效提醒次数」按 cycle_key 计数（提醒发送成功 + 工具成功改日程各 +1）；
+        #: 只留最近 4 个周期键（防长跑进程无界增长）
+        self._nap_reminder_counts: Dict[str, int] = {}
+        #: 已提醒过的段标记 ``(cycle_key, closed_at)``：保证"本轮每段至多一次"（额度之外的第二道闸）
+        self._nap_reminded_segments: set = set()
 
     # ── 事件总线（M0；无总线时静默跳过）─────────────────────
     def _bus(self) -> Any:
@@ -185,12 +314,20 @@ class EmotionService:
         return float(self._machine.effective_vad().valence)
 
     def injection_text(self) -> str:
-        """情绪底色注入文本（planner/replyer 双通道共用，以系统条目插在第一条系统提示词后）。"""
-        return (
+        """情绪底色注入文本（planner/replyer 双通道共用，以系统条目插在第一条系统提示词后）。
+
+        冻结态（睡眠窗口内）在既有文本**后追加一行**深夜引导（§2.5.5，零结构改动）：
+        深夜回复该短/慢/软、不主动开新话题；非冻结态输出与本行加入前逐字一致
+        （不得改动既有字节，否则等于改了白天的提示词契约）。
+        """
+        text = (
             f"【当前情绪底色】{self.mood_text()}。\n"
             "要求：语气、措辞、节奏与该情绪保持一致；情绪会随时间自然衰减、随事件变化；"
             "严禁在回复中直接说出情绪标签词汇或任何数值；不要主动提及或解释本提示本身。"
         )
+        if self.is_frozen():
+            text = f"{text}\n{NIGHT_INJECTION_HINT}"
+        return text
 
     # ── M6 可选增强：emoji 情绪联动（默认关；未启用时绝不触碰宿主 API）──────
     def emoji_description(self) -> str:
@@ -693,8 +830,14 @@ class EmotionService:
     async def flush_all_episodes(self, *, reason: str) -> int:
         """串行冲刷全部已登记流（避免 LLM 并发）；无论成败清空登记，返回成功条数。
 
-        挂点：睡眠入口（``_check_and_overhaul``）——先结清未评片段再跑睡眠裁判
-        （REGISTRY §二.4：冲刷的入账发生在冻结前才能进当天日志、被裁判读到）。
+        两个挂点，语义不同（都不改片段制本身的闲置口径）：
+
+        - 睡眠入口（``_check_and_overhaul``，``reason="sleep_entry"``）：先结清未评片段再跑
+          睡眠裁判（REGISTRY §二.4：冲刷的入账发生在冻结前才能进当天日志、被裁判读到）；
+        - **醒沿**（``reason="wake"``，§2.5.1）：离开冻结时先结清"夜里最后一轮对话"，
+          使其当夜被评估而不是攒到下一夜。此刻机器仍冻结 → 评估事件按 ``record_event``
+          语义只入 ``pending_events``（不直接改 VAD），随后被解冻并入日志；夜里被打扰的
+          情绪后果由 sleep_interrupt 整夜合计统一入账，这里入账会双重记账。
         """
         streams = list(self._pending_episodes.keys())
         done = 0
@@ -937,7 +1080,7 @@ class EmotionService:
         )
         self._dedup_note(source, session_id, event_text)   # §2.4.6 A3：登记本次真正入账
         return {"ok": True, "reason": "", "event": str(event_text or ""), "delta": applied,
-                "delta_before": delta, "multiplier": round(factor, 4),
+                "delta_before": delta, "delta_scaled": scaled, "multiplier": round(factor, 4),
                 "k": round(float(multiplier), 4), "global_multiplier": round(global_mul, 4),
                 "clipped": bool(clipped),
                 "dedup": {**self.dedup_policy(), "duplicate": False}}
@@ -963,8 +1106,10 @@ class EmotionService:
           值落 decision_logs（§6.3-7）。
 
         Returns:
-            ``{"ok", "reason", "event", "delta", "delta_before", "multiplier",
-            "k", "global_multiplier", "clipped", "dedup"}``；未入账时 ok=False 且
+            ``{"ok", "reason", "event", "delta", "delta_before", "delta_scaled", "multiplier",
+            "k", "global_multiplier", "clipped", "dedup"}``（``delta_before``/``delta_scaled``/
+            ``delta`` 即裁剪前/乘倍率后/入账值，供调用方留痕，M8 段 3 的整夜合计结算取用）；
+            未入账时 ok=False 且
             reason 说明（``disabled`` / ``empty_event`` / ``throttled`` / ``llm_error`` /
             ``llm_failed`` / ``duplicate_cross_source``）；``dedup`` 恒带上口径与
             ``duplicate`` 标记（口径见 :meth:`dedup_policy`）。
@@ -1205,6 +1350,621 @@ class EmotionService:
         night_start, night_end = self._night_window(now)
         return night_start <= now < night_end
 
+    # ── L1 夜间打扰记账：判定与归属门控（附录 §2.1/§2.2；M8 第 2 段）──────────
+    # 判定 + 留痕 + 内存归档（第 2 段）；整夜合计入账与实际睡着时长消费同一份归档
+    # （第 3 段，见下面「L1 整夜合计结算」）；赖床提醒与 §4.5 豁免分属第 4 段。
+    def _no_sleep_mode(self) -> bool:
+        """``[schedule].no_sleep_mode`` 的**显式**读数（附录 §〇 C1 + §一 F1）。
+
+        F1：该开关现有副作用只在日程后处理（删除/截断睡眠窗口条目、睡眠时段不触发活动切换），
+        情绪层读不到任何"已静默"信号——L1 全线静默必须在新代码里自己判这个字段。
+        """
+        return bool(self._schedule_cfg("no_sleep_mode", False))
+
+    def _in_night_sleep_cycle(self, now: datetime) -> bool:
+        """是否处于**夜间睡眠周期**内（L1 计数前置；F15 既有上下文，不新增状态字段）。
+
+        ``_in_sleep``（睡眠上升沿置位、醒沿清除）或 ``_sleep_period``（本周期窗口）任一在场，
+        **且**时刻落在 [schedule] 锚点推出的整夜窗口内。小睡/午休（§八.7：其分支保持现状）
+        因此天然不计入——与 §〇「午休被打扰本轮不做」一致。
+        """
+        if not (self._in_sleep or self._sleep_period is not None):
+            return False
+        night_start, night_end = self._night_window(now)
+        return night_start <= now < night_end
+
+    def _night_cycle_key(self, now: datetime) -> str:
+        """打扰段归属的睡眠周期键（F6 既有形态 ``周期起始日@起始分钟``）。"""
+        period = self._sleep_period
+        start = period[0] if period else self._night_window(now)[0]
+        return self._cycle_key(start)
+
+    def _night_int(self, name: str, default: int) -> int:
+        """运行期读 [emotion] 的打扰参数（热重载即时生效；非数/越界一律回退缺省，≥1）。"""
+        try:
+            value = int(self._emotion_cfg(name, default))
+        except (TypeError, ValueError):
+            return int(default)
+        return value if value >= 1 else int(default)
+
+    def note_night_reply(self, session_id: str, *, now: Optional[datetime] = None) -> bool:
+        """登记一次「bot 回复了」（replyer.after_response 的夜间通道）；计入打扰计数返回 True。
+
+        判定口径（附录 §2.1，用户裁决 A3）与门控：
+
+        - **只登记真的 reply**：本方法唯一的计数入口（Hook 调用）；只触发 planner、没有 reply
+          的轮次不经过这里 → 天然不算被吵醒（用户裁决原文）；
+        - **归属门控**（§2.2）：仅 **target 私聊** 的 reply 计入（``is_target_session``）；
+          群聊/其他私聊既不计数也不重置计时；计数**跨聊天流**（任一 target 私聊 reply 都计入/刷新）；
+        - **生效门控**（§〇 C1 + F1/F15）：``[schedule].no_sleep_mode == true`` 时整条 L1 静默
+          （显式判该字段，不依赖其日程侧副作用）；模块停用或非夜间睡眠周期内同样不记账；
+        - **窗口滚动**：窗口 = ``[最后一次 reply − interrupt_window_minutes, 最后一次 reply]``，
+          窗内累计 ≥ ``interrupt_reply_threshold`` → 确认"吵醒态"（时刻记 ``confirmed_at``）；
+          此后直到 ``最后一次 reply + resleep_minutes`` 到期无新 reply 才回到睡眠态（§2.1）。
+
+        登记前先懒结算（:meth:`_roll_night_segment`）：已过 resleep 的段就地闭合，
+        故闭段留痕不依赖睡眠检测 tick（tick 内另有一处 resleep 扫描，见 ``_check_and_overhaul``）。
+        """
+        current = now or datetime.now()
+        closed = self._roll_night_segment(current)
+        if closed is not None:
+            self._dispatch_nap_reminder_soon(closed, current)   # L3：resleep 闭合 → 提醒轮
+        if self._no_sleep_mode() or not self._enabled() or not self._in_night_sleep_cycle(current):
+            return False
+        # §4.5 提醒轮豁免：提醒轮窗口内的 reply 不刷新 resleep 计时、不重开吵醒态
+        # （只是不入账，reply 本身照常返回 False —— 与"非 target 不计数"同档语义）
+        if self.in_reminder_round(current):
+            return False
+        stream = str(session_id or "").strip()
+        if not self.is_target_session(stream):
+            return False
+        seg = self._night_segment
+        if seg is None:
+            seg = self._night_segment = {
+                "cycle_key": self._night_cycle_key(current),
+                "started_at": current,
+                "last_reply_at": current,
+                "reply_count": 0,          # 段内累计计入的 reply 次数（跨窗口不清零）
+                "window_reply_count": 0,   # 最后一条 reply 时刻的窗口内计数（阈值判定口径）
+                "stream_ids": [],
+                "last_stream_id": stream,
+                "awake": False,
+                "confirmed_at": None,
+                "_stamps": [],             # 滚动窗时间戳（epoch 秒；窗口按最后一次 reply 回看）
+            }
+        seg["last_reply_at"] = current
+        seg["last_stream_id"] = stream
+        if stream not in seg["stream_ids"]:
+            seg["stream_ids"].append(stream)
+        seg["_stamps"].append(current.timestamp())
+        cutoff = current.timestamp() - self._night_int(
+            "interrupt_window_minutes", DEFAULT_INTERRUPT_WINDOW_MINUTES) * 60.0
+        seg["_stamps"] = [stamp for stamp in seg["_stamps"] if stamp >= cutoff]
+        seg["reply_count"] = int(seg["reply_count"]) + 1
+        seg["window_reply_count"] = len(seg["_stamps"])
+        if not seg["awake"] and seg["window_reply_count"] >= self._night_int(
+                "interrupt_reply_threshold", DEFAULT_INTERRUPT_REPLY_THRESHOLD):
+            seg["awake"] = True
+            seg["confirmed_at"] = current
+        return True
+
+    def _roll_night_segment(self, now: datetime) -> Optional[Dict[str, Any]]:
+        """懒结算：当前段「最后一次 reply + resleep_minutes」已过 → 立即闭合（§2.1 回到睡眠）。"""
+        seg = self._night_segment
+        if seg is None:
+            return None
+        deadline = seg["last_reply_at"] + timedelta(
+            minutes=self._night_int("resleep_minutes", DEFAULT_RESLEEP_MINUTES))
+        if now <= deadline:
+            return None
+        return self.close_night_interrupt_segment("resleep", now=now)
+
+    @staticmethod
+    def _night_ts(value: Any) -> Any:
+        """时间戳 → ISO 秒级字符串（decision_logs 经 ``json.dumps``：datetime 会整条写不进去）。
+
+        用 ``isoformat`` 鸭子类型判定而非 isinstance：测试的注入时钟会把本模块的 ``datetime``
+        名字换成子类，isinstance 对"非该子类的 datetime 实例"会误判为不可序列化。
+        """
+        return value.isoformat(timespec="seconds") if hasattr(value, "isoformat") else None
+
+    def _night_segment_record(self, seg: Dict[str, Any], *, closed_at: Optional[datetime],
+                              close_reason: str) -> Dict[str, Any]:
+        """打扰段 → 对外记录（快照与归档同一形态；内部 ``_stamps`` 不外露）。
+
+        ``is_target`` **恒为真**：归属门控（§2.2）已把群聊/其他私聊挡在计数之外，
+        段内 reply 全部来自 target 私聊——字段保留以满足 §2.6 的留痕口径。
+        ``stream_id`` 取段内**最后一条** reply 的流，``stream_ids`` 给出跨流合并的全集。
+        """
+        return {
+            "cycle_key": str(seg.get("cycle_key") or ""),
+            "started_at": self._night_ts(seg.get("started_at")),
+            "last_reply_at": self._night_ts(seg.get("last_reply_at")),
+            "started_ts": float(seg["started_at"].timestamp()),
+            "last_reply_ts": float(seg["last_reply_at"].timestamp()),
+            "reply_count": int(seg.get("reply_count") or 0),
+            "window_reply_count": int(seg.get("window_reply_count") or 0),
+            "stream_id": str(seg.get("last_stream_id") or ""),
+            "stream_ids": list(seg.get("stream_ids") or []),
+            "is_target": True,
+            "awake": bool(seg.get("awake")),
+            "confirmed_at": self._night_ts(seg.get("confirmed_at")),
+            "closed_at": self._night_ts(closed_at),
+            "close_reason": str(close_reason or ""),
+        }
+
+    def close_night_interrupt_segment(self, reason: str, *,
+                                      now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """闭合当前打扰段并归档；**已确认（窗口计数达阈值）的段落一条** ``emotion.sleep_interrupt``。
+
+        闭合时机（§2.6 → §2.1）：``resleep`` 到期（懒结算/tick 扫描）、睡眠窗口结束、醒沿。
+
+        落日志口径（本段实现裁定，§2.6 表 + 附录 §八.4）：**每段至多一条完整记录、只在闭合时落**。
+        确认成立时刻不另落一行，而是记进 ``confirmed_at``——与闭合时刻 ``closed_at`` 一起可分辨
+        "何时判定成立、何时回到睡眠"；未达阈值的候选段（只触发 planner 的夜里寒暄）不落
+        ``sleep_interrupt``，仅进内存归档（``awake=False``）供观测与醒沿结算消费。
+        打扰段/计数只进内存 + decision_logs，**不新增 emotion_state.json 字段**（F5/§八.4；
+        热重载丢账可接受，日志留痕在）。
+        """
+        seg, self._night_segment = self._night_segment, None
+        if seg is None:
+            return None
+        current = now or datetime.now()
+        closed = self._night_segment_record(seg, closed_at=current, close_reason=reason)
+        self._night_archived.append(closed)
+        if len(self._night_archived) > NIGHT_SEGMENTS_MAX:
+            del self._night_archived[:-NIGHT_SEGMENTS_MAX]
+        if closed["awake"]:
+            self._log_decision(
+                "emotion.sleep_interrupt", trigger_type="emotion",
+                reason=f"夜间打扰段闭合（{closed['close_reason']}）："
+                       f"窗口内 {closed['window_reply_count']} 次 target 私聊 reply",
+                cycle_key=closed["cycle_key"], started_at=closed["started_at"],
+                last_reply_at=closed["last_reply_at"], reply_count=closed["reply_count"],
+                is_target=closed["is_target"], stream_id=closed["stream_id"],
+                stream_ids=closed["stream_ids"], window_reply_count=closed["window_reply_count"],
+                confirmed_at=closed["confirmed_at"], closed_at=closed["closed_at"],
+                close_reason=closed["close_reason"],
+            )
+        return closed
+
+    def night_interrupt_snapshot(self) -> Dict[str, Any]:
+        """当前打扰段的只读快照（无段返回 ``{}``）；形态与归档条目一致（``closed_at=None``）。"""
+        seg = self._night_segment
+        if seg is None:
+            return {}
+        return self._night_segment_record(seg, closed_at=None, close_reason="")
+
+    def night_interrupt_segments(self, cycle_key: Optional[str] = None) -> list:
+        """已闭合打扰段的归档副本（可按 ``cycle_key`` 过滤；供观测与整夜合计结算消费——
+        结算（:meth:`settle_night_interrupts`）会清空本周期条目，故醒沿之后同周期读数为空）。"""
+        key = str(cycle_key or "")
+        return [dict(seg) for seg in self._night_archived if not key or seg["cycle_key"] == key]
+
+    def note_reminder_round(self, until: Optional[datetime] = None) -> None:
+        """§4.5 提醒轮豁免的登记入口（赖床提醒发送成功后由提醒轮自行调用）。
+
+        赖床提醒轮若意外触发 reply，不应刷新 ``resleep_minutes`` 计时、不应重新进入吵醒态。
+        登记的是**截止时刻**（``until``，提醒轮 = ``now + NAP_REMINDER_ROUND_SECONDS``）；
+        是否落在提醒轮内由 :meth:`in_reminder_round` 判定，豁免判定在 ``note_night_reply`` 内生效。
+        """
+        stamp = (until or datetime.now()).timestamp()
+        self._reminder_round_until = max(float(self._reminder_round_until), float(stamp))
+
+    def in_reminder_round(self, now: Optional[datetime] = None) -> bool:
+        """当前是否处于提醒轮豁免窗口内（§4.5；无提醒轮登记时恒 False）。"""
+        return float((now or datetime.now()).timestamp()) < float(self._reminder_round_until)
+
+    # ── L3 赖床提醒与工具接线（附录 §4.1–§4.5；M9 落地）────────────────────
+    def _nap_cfg(self, name: str, default: Any) -> Any:
+        """运行期动态读 [planning_proactive] 的赖床配置（热重载即时生效；缺省回退默认值）。"""
+        cfg = getattr(self._plugin.config, "planning_proactive", None)
+        value = getattr(cfg, name, default) if cfg is not None else default
+        return default if value is None else value
+
+    def nap_reminder_max_per_day(self) -> int:
+        """每睡眠周期的有效提醒上限（§4.1②/§4.6；``ge=1``，运行期非法值回退缺省 2）。"""
+        try:
+            value = int(self._nap_cfg("nap_reminder_max_per_day", DEFAULT_NAP_REMINDER_MAX_PER_DAY))
+        except (TypeError, ValueError):
+            return DEFAULT_NAP_REMINDER_MAX_PER_DAY
+        return value if value >= 1 else DEFAULT_NAP_REMINDER_MAX_PER_DAY
+
+    def nap_reminder_enabled(self) -> bool:
+        """``[planning_proactive] nap_reminder_enabled``（§4.1④，默认 true）。"""
+        return bool(self._nap_cfg("nap_reminder_enabled", True))
+
+    def lie_in_max_minutes(self) -> int:
+        """``[schedule] lie_in_max_until`` 的分钟数（与工具侧同源；非法回退 12:00）。
+
+        提醒文本里的「最晚 {lie_in_max_until}」与本方法同源，保证提示与实际钳制一致。
+        """
+        raw = self._schedule_cfg("lie_in_max_until", DEFAULT_LIE_IN_MAX_UNTIL)
+        return parse_nap_target(normalize_hhmm(raw, DEFAULT_LIE_IN_MAX_UNTIL)) or 12 * 60
+
+    def nap_reminder_count(self, cycle_key: str = "", now: Optional[datetime] = None) -> int:
+        """本 ``cycle_key`` 内已用的「有效提醒次数」（纯内存；缺省按当前周期键）。"""
+        key = str(cycle_key or self._night_cycle_key(now or datetime.now()))
+        return int(self._nap_reminder_counts.get(key, 0))
+
+    def note_nap_reminder(self, cycle_key: str = "", now: Optional[datetime] = None) -> int:
+        """「有效提醒次数」+1（§4.1②/§4.4 计数口径），返回自增后的值。
+
+        两个入口共用同一计数：①提醒发送成功；②赖床工具成功修改日程（经
+        :meth:`note_nap_lie_in_applied`）。**未调用/失败不计次**；额度用尽只停提醒，
+        不阻止工具调用（本方法不判额度）。
+        """
+        key = str(cycle_key or self._night_cycle_key(now or datetime.now()))
+        count = self.nap_reminder_count(key) + 1
+        self._nap_reminder_counts[key] = count
+        if len(self._nap_reminder_counts) > 4:      # 只留最近 4 个周期键（纯内存观测计数）
+            for stale in sorted(self._nap_reminder_counts)[:-4]:
+                self._nap_reminder_counts.pop(stale, None)
+        return count
+
+    def note_nap_lie_in_applied(self, now: Optional[datetime] = None) -> int:
+        """赖床工具**成功修改日程**后由 planning 侧回调：本周期有效提醒次数 +1（§4.4）。"""
+        current = now or datetime.now()
+        used = self.note_nap_reminder(now=current)
+        self._log_decision(
+            "emotion.nap_lie_in_applied", trigger_type="emotion",
+            reason="赖床工具已改写今日日程：有效提醒次数 +1",
+            cycle_key=self._night_cycle_key(current), count=used,
+            limit=self.nap_reminder_max_per_day())
+        return used
+
+    def in_night_sleep_cycle(self, now: Optional[datetime] = None) -> bool:
+        """当前是否处于**夜间睡眠周期**内（§4.4「非睡眠周期调用 → 拒绝」的门控）。
+
+        周期窗口在册（``_sleep_period``）时按该窗口判定——**含赖床延长后的端点**：工具把
+        窗口推后之后，本工具的"还能赖床"窗口同步延长；无周期上下文时回退与 L1 记账同源的
+        夜间周期判定（:meth:`_in_night_sleep_cycle`，其本身的语义与调用方均不改）。
+        ``no_sleep_mode == true`` 一律 False（§〇 C1：L1/L3 全线静默）。
+        """
+        current = now or datetime.now()
+        if self._no_sleep_mode():
+            return False
+        if self._sleep_period is not None:
+            return bool(self._sleep_period[0] <= current < self._sleep_period[1])
+        return bool(self._in_night_sleep_cycle(current))
+
+    def extend_night_sleep_until(self, target: Any = None, *, now: Optional[datetime] = None) -> bool:
+        """把**当前**睡眠周期窗口的结束端推到 ``target``（§4.4 第 5 条；工具成功后由 planning 回调）。
+
+        三个条件全满足才改端点，否则原样返回 False（不改任何状态）：
+
+        1. 本周期窗口在册（未在睡眠周期内/已醒 → 无事可延）；
+        2. 目标端 **> 旧端**（只往后推，绝不提前起床）；
+        3. 目标时刻受**同一** ``[schedule] lie_in_max_until`` 钳制（与工具侧同源，双保险）。
+
+        端点一变，醒沿判定（``_in_sleep_period``）自然推迟——不必改别处状态（F15：复用既有
+        周期上下文，不新增状态字段）。
+        """
+        if self._sleep_period is None or target is None:
+            return False
+        start, old_end = self._sleep_period
+        try:
+            minute = int(target.hour) * 60 + int(target.minute)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        minute = min(minute, self.lie_in_max_minutes())
+        new_end = old_end.replace(hour=minute // 60, minute=minute % 60, second=0, microsecond=0)
+        if new_end <= old_end:                 # 同日内未后移（或落到当天更早）→ 无需延长
+            return False
+        self._sleep_period = (start, new_end)
+        self._log_decision(
+            "emotion.nap_lie_in_extended", trigger_type="emotion",
+            reason="赖床工具已延长本睡眠周期窗口端点（醒沿推迟）",
+            cycle_key=self._night_cycle_key(now or datetime.now()),
+            old_end=old_end.isoformat(timespec="seconds"),
+            new_end=new_end.isoformat(timespec="seconds"))
+        return True
+
+    def night_sleep_end_minute(self) -> Optional[int]:
+        """当前夜间睡眠周期窗口结束的「当日分钟」（未在夜间周期 → None）。
+
+        nap 工具写回日程**之前**的预检用（附录 §六.补 C4：目标不晚于当前醒沿时
+        不写日程、不计次——避免"文案说没改、库里已被写坏"）；权威判定仍在
+        ``extend_night_sleep_until``（本访问器只读，不改任何状态）。
+        """
+        if self._sleep_period is None:
+            return None
+        end = self._sleep_period[1]
+        return end.hour * 60 + end.minute
+
+    def nap_planned_wake(self, now: Optional[datetime] = None) -> datetime:
+        """提醒文本里的「本来打算睡到」= 当前睡眠窗口结束（周期在册值优先，回退 wake 锚点）。"""
+        current = now or datetime.now()
+        if self._sleep_period is not None:
+            return self._sleep_period[1]
+        return self._night_window(current)[1]
+
+    def nap_reminder_text(self, now: Optional[datetime] = None,
+                          planned_wake: Optional[datetime] = None) -> str:
+        """渲染赖床提醒文本（§4.3 模板；占位符全部由本方法填充，工具名引用 NAP_TOOL_NAME）。"""
+        current = now or datetime.now()
+        wake = planned_wake or self.nap_planned_wake(current)
+        return NAP_REMINDER_TEMPLATE.format(
+            now_hhmm=f"{current:%H:%M}",
+            planned_wake_hhmm=f"{wake:%H:%M}",
+            nap_tool_name=NAP_TOOL_NAME,
+            lie_in_max_until=normalize_hhmm(
+                self._schedule_cfg("lie_in_max_until", DEFAULT_LIE_IN_MAX_UNTIL),
+                DEFAULT_LIE_IN_MAX_UNTIL),
+        )
+
+    def _nap_trigger(self) -> Optional[Any]:
+        """宿主主动开口入口（F9/F12）：``ctx.maisaka.proactive.trigger``（含旧形态回退）。
+
+        宿主未提供该能力（离线测试骨架 / 未声明能力）→ None，调用方按"不发送"处理（§八.2）。
+        """
+        ctx = getattr(self, "_ctx", None)
+        maisaka = getattr(ctx, "maisaka", None) if ctx is not None else None
+        if maisaka is None:
+            return None
+        proactive = getattr(maisaka, "proactive", None)
+        trigger = getattr(proactive, "trigger", None) if proactive is not None else None
+        if trigger is None:
+            trigger = getattr(maisaka, "trigger_proactive", None)   # 兼容旧形态
+        return trigger if callable(trigger) else None
+
+    async def maybe_send_nap_reminder(self, segment: Any = None, *,
+                                      now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """赖床提醒轮（附录 §4.1–§4.5）：打扰段以 ``resleep`` 闭合后判定是否发一条提醒。
+
+        判定顺序（§4.1；任一不满足即不发、不计数，并落一条 ``emotion.nap_reminder_blocked``）：
+
+        0. 段有效性：该段**确认成立过**（``awake`` 且 ``confirmed_at`` 在）；每段至多提醒一次；
+        1. 额度：本 ``cycle_key`` 已用次数 < ``nap_reminder_max_per_day``；
+        2. 窗口：当前仍在睡眠窗口内（``_in_sleep_period``，含赖床延长后的端点）；
+        3. ``no_sleep_mode == false``（§〇 C1：L1/L3 全线静默）；
+        4. ``nap_reminder_enabled``（默认 true）。
+
+        发送（F9/F12）：查全渠道预算（``bus.allow_proactive``）→ 发 ``proactive.used`` →
+        ``ctx.maisaka.proactive.trigger(stream_id=段末条 reply 流, intent="nap_reminder",
+        reason=提醒文本, metadata={"kind": "nap_reminder"})``。预算拒绝/触发失败 → 不发送不计数。
+        成功后：有效提醒次数 +1、登记 §4.5 提醒轮豁免窗口、落 ``emotion.nap_reminder_sent``。
+
+        Returns:
+            发送成功返回载荷 dict；未发送返回 None。
+        """
+        current = now or datetime.now()
+        seg = dict(segment) if isinstance(segment, dict) else self.night_interrupt_snapshot()
+        cycle_key = str((seg or {}).get("cycle_key") or self._night_cycle_key(current))
+        used = self.nap_reminder_count(cycle_key, now=current)
+        limit = self.nap_reminder_max_per_day()
+        stream_id = str((seg or {}).get("stream_id") or "")
+
+        def _blocked(reason: str, **extra: Any) -> None:
+            self._log_decision(
+                "emotion.nap_reminder_blocked", trigger_type="emotion",
+                reason=f"赖床提醒未发送（{reason}）", block_reason=str(reason),
+                cycle_key=cycle_key, count=used, limit=limit, stream_id=stream_id, **extra)
+
+        # 0) 段有效性（§4.1⑤）+ 每段至多一次
+        if not seg or not seg.get("awake") or not seg.get("confirmed_at"):
+            _blocked("segment_not_confirmed")
+            return None
+        marker = (cycle_key, str(seg.get("closed_at") or ""))
+        if marker in self._nap_reminded_segments:
+            _blocked("segment_already_reminded")
+            return None
+        # 1) 额度（§4.1②）
+        if used >= limit:
+            _blocked("quota")
+            return None
+        # 2) 仍在睡眠窗口内（§4.1③）
+        if not self._in_sleep_period(current):
+            _blocked("gate_sleep_window")
+            return None
+        # 3) no_sleep_mode == false（§4.1④ + §〇 C1）
+        if self._no_sleep_mode():
+            _blocked("gate_no_sleep_mode")
+            return None
+        # 4) 提醒开关（§4.1 隐含项 / §4.6）
+        if not self.nap_reminder_enabled():
+            _blocked("gate_disabled")
+            return None
+
+        # 发送（F9：先查预算，再记 proactive.used，最后触发；预算拒绝 → 不发送不计数）
+        trigger = self._nap_trigger()
+        if trigger is None:
+            _blocked("trigger_missing")
+            return None
+        bus = self._bus()
+        if bus is not None and not bus.allow_proactive("emotion", "nap_reminder"):
+            _blocked("budget")
+            return None
+        if bus is not None:
+            try:
+                await bus.publish("proactive.used", source="emotion",
+                                  channel="emotion", intent="nap_reminder")
+            except Exception:
+                pass
+        text = self.nap_reminder_text(current)
+        try:
+            result = await trigger(stream_id=stream_id, intent="nap_reminder", reason=text,
+                                   metadata={"kind": "nap_reminder"})
+        except Exception as exc:
+            _blocked("trigger_error", error=str(exc)[:120])
+            return None
+        if isinstance(result, dict) and not result.get("success", False):
+            _blocked("trigger_rejected", error=str(result.get("error") or "")[:120])
+            return None
+
+        # 成功后：计数 +1、登记豁免窗口（§4.5）、留痕
+        used = self.note_nap_reminder(cycle_key, now=current)
+        self._nap_reminded_segments.add(marker)
+        if len(self._nap_reminded_segments) > 64:   # 防无界增长（纯内存标记）
+            self._nap_reminded_segments = set(list(self._nap_reminded_segments)[-32:])
+        self.note_reminder_round(current + timedelta(seconds=NAP_REMINDER_ROUND_SECONDS))
+        self._log_decision(
+            "emotion.nap_reminder_sent", trigger_type="emotion",
+            reason=f"赖床提醒轮已发送（本周期第 {used}/{limit} 次）",
+            cycle_key=cycle_key, count=used, limit=limit, stream_id=stream_id,
+            text=text[:120], kind="nap_reminder")
+        return {"sent": True, "cycle_key": cycle_key, "count": used, "limit": limit,
+                "stream_id": stream_id, "text": text}
+
+    def _dispatch_nap_reminder_soon(self, closed: Any, now: Optional[datetime] = None) -> None:
+        """同步上下文（reply Hook 的懒结算）派发提醒轮：有事件循环就 create_task。
+
+        ``note_night_reply`` 是同步入口，不能 await；提醒链路绝不能影响 reply 记账主路径，
+        故这里只投递任务（失败静默、留 debug）。仅在段以 ``resleep`` 闭合时进入
+        （§4.1：被吵醒且已回到睡眠）。
+        """
+        if str((closed or {}).get("close_reason") or "") != "resleep":
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._ctx.logger.debug("赖床提醒：无运行中的事件循环，跳过本次派发")
+            return
+        try:
+            task = loop.create_task(self.maybe_send_nap_reminder(closed, now=now))
+            self._bg_tasks.append(task)
+            if len(self._bg_tasks) > 20:
+                self._bg_tasks = [t for t in self._bg_tasks if not t.done()][-10:]
+        except Exception as exc:
+            self._ctx.logger.debug("赖床提醒派发失败（忽略）：%s", exc)
+
+    async def _after_night_segment_closed(self, closed: Any, now: Optional[datetime] = None
+                                          ) -> Optional[Dict[str, Any]]:
+        """段闭合后的 L3 接线（§4.1第 1 条）：只在 ``resleep`` 闭合时进入提醒轮判定。"""
+        if str((closed or {}).get("close_reason") or "") != "resleep":
+            return None
+        return await self.maybe_send_nap_reminder(closed, now=now)
+
+    # ── L1 整夜合计结算（附录 §2.3/§2.4/§2.6；M8 第 3 段）────────────────────
+    def _awake_night_segments(self, cycle_key: str) -> list:
+        """本 ``cycle_key`` 内**已确认**（窗口计数达阈值）的打扰段（第 2 段内存归档的消费口）。
+
+        §2.3 的 ``n`` = "每次达到阈值算 1 次打扰段"：只触发 planner 的夜里寒暄/未达阈值的候选段
+        （``awake=False``）既不算打扰次数、也不扣睡眠时长——它们本来就没"被吵醒"。
+        """
+        key = str(cycle_key or "")
+        if not key:
+            return []
+        return [dict(seg) for seg in self._night_archived
+                if str(seg.get("cycle_key") or "") == key and bool(seg.get("awake"))]
+
+    def _cycle_window(self, now: datetime,
+                      period: Optional[Tuple[datetime, datetime]] = None
+                      ) -> Tuple[datetime, datetime]:
+        """本睡眠周期的窗口 ``(start, end)``：周期在册值优先，缺失回退作息锚点整夜窗口。"""
+        if period and len(period) == 2 and period[0] and period[1]:
+            return period[0], period[1]
+        return self._night_window(now)
+
+    def _sleep_window_summary(self, now: datetime,
+                              period: Optional[Tuple[datetime, datetime]] = None,
+                              cycle_key: str = "") -> Dict[str, Any]:
+        """本周期睡眠窗口的 §2.4 摘要（``sleep_window_minutes``/``interrupted_minutes``/
+        ``actual_sleep_hours``/``interrupt_count``；实际睡着时长替代计划时长进恢复系数）。"""
+        window = self._cycle_window(now, period)
+        key = str(cycle_key or self._cycle_key(window[0]))
+        return summarize_sleep_window(
+            window[0], window[1], self._awake_night_segments(key),
+            self._night_int("resleep_minutes", DEFAULT_RESLEEP_MINUTES))
+
+    async def settle_night_interrupts(self, now: Optional[datetime] = None, *,
+                                      period: Optional[Tuple[datetime, datetime]] = None,
+                                      cycle_key: str = "") -> Optional[Dict[str, Any]]:
+        """睡眠周期结束（醒沿）时的**整夜合计结算**：把该周期打扰的净正暖意一次性入账（§2.3）。
+
+        口径（附录 §2.3 + 用户裁决 C2/C3）：
+
+        - ``n`` = 本 ``cycle_key`` 内已确认的打扰段数；``delta_v = min(Σ ΔV_i, 0.15)``
+          （曲线见 :func:`sleep_interrupt_delta_v`）；
+        - 入账走**既有** ``record_external_event``（§6.2 A 三层倍率同源，不新开路径）：
+          ``multiplier`` 实参 = ``target_multiplier(True)``（被打扰唯一归属 target），
+          ``global_event_multiplier`` 由入口内既有逻辑相乘——调用方**不再重复乘**；
+        - 每 ``cycle_key`` 至多结算 1 次（C3）：结算后**清空本周期归档**，二次调用无段可结
+          → 返回 None（天然幂等，不落任何日志）；
+        - ``n == 0``（含 no_sleep_mode 静默/未被吵醒的夜）→ **不入账、不落 settled 日志**，
+          返回 None；
+        - **零 LLM**（模板直记）：整条路径没有模型调用；
+        - **不破坏落盘护栏**：入账会把 ``emotion_state.json`` 重写（``_save_state`` 只写状态机 +
+          episode），故本方法先留 ``applied_sleep_date`` 原值、入账后补回（F6「同周期不重复结算」
+          的落盘护栏语义不变；不新增任何状态字段）。
+
+        Args:
+            now: 结算时刻（醒沿）。
+            period: 本周期窗口（醒沿调用方在 apply 前留存，apply 会清 ``_sleep_period``）。
+            cycle_key: 本周期键（缺省按窗口起点推导；醒沿调用方传 apply 载荷中的键）。
+
+        Returns:
+            结算载荷（含 ``delta_v`` 曲线值 / ``delta_v_applied`` 实际入账净 V 与 ``record``
+            原始回执）；未结算返回 None。
+        """
+        current = now or datetime.now()
+        window = self._cycle_window(current, period)
+        key = str(cycle_key or self._cycle_key(window[0]))
+        segments = self._awake_night_segments(key)
+        # 周期已结束 → 本周期归档一律清空（含未达阈值的候选段）：归档的消费方只有本次结算，
+        # 留着只会让热重载后的白天 tick 拿到陈旧账；"每周期至多 1 次"由此获得幂等保证。
+        self._night_archived = [seg for seg in self._night_archived
+                                if str(seg.get("cycle_key") or "") != key]
+        count = len(segments)
+        if count <= 0:
+            return None
+        summary = summarize_sleep_window(
+            window[0], window[1], segments,
+            self._night_int("resleep_minutes", DEFAULT_RESLEEP_MINUTES))
+        delta_v = sleep_interrupt_delta_v(count)
+        if delta_v <= 0:
+            return None
+        description = f"夜间被重要的人打扰 {count} 次（净正合计）"
+        # 护栏（F6）：入账经 record_external_event → _apply_external_delta → _save_state，而
+        # `_save_state` 只写状态机 + episode —— 会把醒沿刚写入的 `applied_sleep_date` 冲掉。
+        # 先留一份、入账后原值补回（本函数不改该键的值，只是不让自己的入账把它抹掉；否则同一夜
+        # 会因"本周期已结算"落盘护栏失效而被重新冻结 + 重复跑裁判）。
+        guard = (load_json(self._state_path, {}) or {}).get("applied_sleep_date")
+        # 入账经既有外部事件入口：K 实参 = target 档（被打扰唯一归属 target），全局倍率在
+        # record_external_event/_apply_external_delta 内既有逻辑里乘一次（三层倍率同源）。
+        outcome = await self.record_external_event(
+            source="sleep_interrupt", description=description,
+            delta=VADState(delta_v, 0.0, 0.0), multiplier=self.target_multiplier(True),
+            session_id=str(segments[-1].get("stream_id") or ""))
+        if guard is not None:
+            state = load_json(self._state_path, {}) or {}
+            if state.get("applied_sleep_date") != guard:
+                state["applied_sleep_date"] = guard
+                save_json_atomic(self._state_path, state)
+        before = outcome.get("delta_before")
+        scaled = outcome.get("delta_scaled")
+        applied_delta = outcome.get("delta")
+        net_v = float(applied_delta.valence) if isinstance(applied_delta, VADState) else 0.0
+        self._log_decision(
+            "emotion.sleep_interrupt_settled", trigger_type="emotion",
+            reason=f"睡眠周期结束合并结算：{count} 次夜间打扰（净正合计，零 LLM）",
+            cycle_key=key,
+            interrupt_count=count,
+            sleep_window_minutes=summary["sleep_window_minutes"],
+            interrupted_minutes=summary["interrupted_minutes"],
+            actual_sleep_hours=summary["actual_sleep_hours"],
+            delta_v=round(float(delta_v), 4),          # 曲线合计（乘倍率前）
+            delta_v_applied=round(net_v, 4),           # 实际入账净 V（乘倍率、限幅后）
+            k=outcome.get("k"), global_multiplier=outcome.get("global_multiplier"),
+            multiplier=outcome.get("multiplier"),
+            record_ok=bool(outcome.get("ok")), record_reason=str(outcome.get("reason") or ""),
+            # 与既有 emotion.external_event 日志同语义：裁剪前 / 乘倍率后 / 入账值（dict 三维）
+            delta_before=before.to_dict() if hasattr(before, "to_dict") else None,
+            delta_scaled=scaled.to_dict() if hasattr(scaled, "to_dict") else None,
+            delta_applied=applied_delta.to_dict() if hasattr(applied_delta, "to_dict") else None,
+            stream_id=str(segments[-1].get("stream_id") or ""),
+            reply_count=sum(int(seg.get("reply_count") or 0) for seg in segments),
+        )
+        return {
+            "ok": bool(outcome.get("ok")), "reason": str(outcome.get("reason") or ""),
+            "cycle_key": key, "interrupt_count": count,
+            "sleep_window_minutes": summary["sleep_window_minutes"],
+            "interrupted_minutes": summary["interrupted_minutes"],
+            "actual_sleep_hours": summary["actual_sleep_hours"],
+            "delta_v": round(float(delta_v), 4), "delta_v_applied": round(net_v, 4),
+            "description": description, "record": outcome,
+        }
+
     async def compute_sleep_overhaul(self, now: Optional[datetime] = None,
                                      sleep_hours: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """冻结期计算大修并返回缓存载荷（**不落状态**）；裁判失败返回 None（下一轮重试）。
@@ -1213,8 +1973,9 @@ class EmotionService:
         （均来自日程条目 ``emotional_tone``）+ 当日约定净兑现 + 动态限幅。
         ``sleep_hours`` 缺省按条目时长；服务侧传作息锚点整夜时长（见 ``_sleep_entry_period``）。
 
-        E_tomorrow 在入睡时刻按"次日"读取，而次日日程要到 ``auto_generate_time``（默认
-        00:30）才生成——故这里只为裁判提供参考文本，**状态侧数值在醒来时会重算一次**
+        E_tomorrow 在入睡时刻按"次日"读取，而次日日程要到生成时刻（M10 起 = 最后日程
+        结束 + ``auto_generate_after_last_end_minutes``，缺省锚点等价旧 00:30）才生成——
+        故这里只为裁判提供参考文本，**状态侧数值在醒来时会重算一次**
         （见 ``_apply_cached_overhaul``），保证"明日预期"在生产时序下确实生效。
         """
         cfg = getattr(self._plugin.config, "emotion", None)
@@ -1223,12 +1984,19 @@ class EmotionService:
         current = self._current_sleep_item(now)
         # 时长的来源优先级：调用方给的计划时长（作息锚点整夜） > 条目时长 > 锚点整夜兜底
         # （冻结期重试时可能已无当前条目——条目只有 15 分钟窗口，不能作为必要前提）
+        # M8 段 3（附录 §2.5.4 / §2.4 / 用户裁决 A4）：本值仍是**计划**整夜时长——它既是裁判
+        # prompt 的"预计睡眠时长"输入，也是缓存载荷的对照值；**恢复系数的输入在醒沿应用时改成
+        # 实际睡着时长**（`_apply_cached_overhaul` 用 `summarize_sleep_window` 现算并传给
+        # apply_sleep_overhaul），故收回执时 `cached["sleep_hours"]` 只表示"计划"。
+        # 本函数另把"此刻窗口内的实际值"快照进 `actual_sleep_hours`（入睡时无扰段 → = 计划；
+        # 裁判失败重试路径可能已有段），供对照与留痕，不参与裁判。
         if sleep_hours is not None:
             hours = float(sleep_hours)
         elif current is not None:
             hours = self._sleep_hours(current)
         else:
             hours = self._planned_sleep_hours(*self._sleep_anchors())
+        window_now = self._sleep_window_summary(now, self._sleep_period)
         r_yesterday = self.schedule_tone_sum(
             self._day_items(query, (now - timedelta(days=1)).strftime("%Y-%m-%d")))
         e_tomorrow = self.schedule_tone_sum(
@@ -1254,6 +2022,13 @@ class EmotionService:
         delta, reasons = result
         cached = {
             "delta": delta, "reasons": reasons, "sleep_hours": hours,
+            # §2.4 摘要快照：`sleep_hours` 是**计划**整夜时长（裁判输入），
+            # `actual_sleep_hours` 是**此刻**窗口内按扰段并集扣减后的实际值（醒沿应用时会重算，
+            # 以届时归档为准——缓存只作对照留痕）。
+            "sleep_window_minutes": window_now["sleep_window_minutes"],
+            "interrupted_minutes": window_now["interrupted_minutes"],
+            "actual_sleep_hours": window_now["actual_sleep_hours"],
+            "interrupt_count": window_now["interrupt_count"],
             "r_yesterday": r_yesterday, "e_tomorrow": e_tomorrow,
             "commitment_net": commitment_net, "delta_limit": delta_limit, "computed_at": now,
         }
@@ -1263,6 +2038,12 @@ class EmotionService:
             sleep_hours=round(hours, 2), delta_limit=round(delta_limit, 4),
             delta_requested=delta.to_dict(), r_yesterday=r_yesterday.to_dict(),
             e_tomorrow=e_tomorrow.to_dict(), commitment_net=commitment_net,
+            # §2.4 留痕（M8 段 3）：入睡时段的窗口/扰段快照（裁判失败重试路径可能已有段；
+            # 恢复系数在醒沿用届时实算值，不取本快照）
+            sleep_window_minutes=window_now["sleep_window_minutes"],
+            interrupted_minutes=window_now["interrupted_minutes"],
+            actual_sleep_hours=window_now["actual_sleep_hours"],
+            interrupt_count=window_now["interrupt_count"],
         )
         return cached
 
@@ -1355,40 +2136,99 @@ class EmotionService:
                     float(cached.get("commitment_net") or 0.0))
         return r_yesterday, e_tomorrow, commitment_net
 
+    @staticmethod
+    def _drained_events_summary(events: Any) -> Dict[str, Any]:
+        """把解冻出的夜间事件压成可落 decision_logs 的紧凑摘要（§2.5.3）。
+
+        返回 ``{"count": 条数, "events": ["描述（ΔV=…,ΔA=…,ΔD=…）", …]}``；``count`` 是
+        真实条数，``events`` 超 :data:`DRAINED_EVENTS_MAX` 只保留最近 N 条（防日志膨胀）。
+        条目形态异常一律跳过（留痕尽力而为，绝不影响结算）。
+        """
+        items = list(events or [])
+        summary: list = []
+        for event in items[-DRAINED_EVENTS_MAX:]:
+            raw = event.to_dict() if hasattr(event, "to_dict") else event
+            if not isinstance(raw, dict):
+                continue
+            delta = raw.get("delta_vad")
+            if not isinstance(delta, dict):
+                delta = {}
+            try:
+                line = (
+                    f"{str(raw.get('event_description') or '')[:DRAINED_SUMMARY_DESC_CHARS]}"
+                    f"（ΔV={float(delta.get('valence') or 0.0):+.2f},"
+                    f"ΔA={float(delta.get('arousal') or 0.0):+.2f},"
+                    f"ΔD={float(delta.get('dominance') or 0.0):+.2f}）"
+                )
+            except (TypeError, ValueError):
+                continue
+            summary.append(line)
+        return {"count": len(items), "events": summary}
+
     async def _apply_cached_overhaul(self, now: datetime) -> Optional[Dict[str, Any]]:
         """醒后应用缓存的大修并解冻（一次性）；无缓存时只解冻（裁判失败夜不结算）。
 
         M5 修复（E_tomorrow 生产时序）：入睡时刻（23 点）读取"次日"日程时，次日日程还没到
-        ``auto_generate_time``（默认 00:30）生成，恒为零向量；醒来时按**入睡日**为基准重算
+        生成时刻（M10 相对锚点，缺省等价旧 00:30）生成，恒为零向量；醒来时按**入睡日**为基准重算
         R_yesterday（入睡日前一天）/E_tomorrow（入睡日的次日＝醒来日，此时已生成）与约定净兑现，
         保证"明日预期"与"当日约定"在状态侧真实生效（裁判文本仍用缓存时刻的输入，仅供判断）。
 
+        M8 段 1（附录 §2.5.2/§2.5.3）结算顺序 = **先解冻再结算**：
+        `unfreeze(drain_to_log=True)` 必须早于 `apply_sleep_overhaul`，否则 apply 尾部的清日志
+        （M5 语义：大修后 `emotion_log = []`）会把刚并入的夜间事件连同 ΔVAD 一起抹掉（§一 F3）。
+        解冻出的队列在此压成「夜间事件摘要」并随 ``emotion.sleep_overhaul`` 落 decision_logs
+        （§2.5.3「至少落其一」的落点：这批事件的 ΔVAD **不进结算**——夜里被打扰的情绪后果由
+        M8 第 3 段的 sleep_interrupt 整夜合计统一入账，此处入账即双重记账）。
+
+        M8 段 3（附录 §2.5.4/§2.4，用户裁决 A4）恢复系数改用**实际睡着时长**：本周期窗口减去
+        打扰区间并集（第 2 段归档，此刻醒沿已闭段）；计划时长只留作对照
+        （``sleep_hours_planned``）与裁判输入。窗口/扰段三字段一并落 ``emotion.sleep_overhaul``
+        与 ``emotion.overhauled`` 载荷（§2.4 留痕要求）。
+
         Returns:
-            应用结果 dict（含 ``ok``/``recovery_factor``/三输入留痕）；无缓存返回 None。
+            应用结果 dict（含 ``ok``/``recovery_factor``/``sleep_hours``（实际）/
+            ``sleep_window_minutes``/``interrupted_minutes``/``interrupt_count``/三输入/
+            夜间事件摘要留痕）；无缓存返回 None。
         """
         cached, self._pending_overhaul = self._pending_overhaul, None
+        # 本周期窗口在下面即被清（周期结束）：先留一份给"实际睡着时长"与醒沿结算用
+        period = self._sleep_period
         self._sleep_period = None  # 周期结束（醒沿）：后续 tick 重新按条目/锚点判定
         if cached is None:
             if self.is_frozen():
                 self._machine.unfreeze(now)
                 self._save_state()
             return None
+        cycle_key = str(cached.get("cycle_key") or "")
+        # §2.4/A4：恢复系数输入 = 实际睡着时长（窗口总长 − 打扰区间并集），不是缓存里的计划时长
+        window_stats = self._sleep_window_summary(now, period, cycle_key)
+        actual_hours = float(window_stats["actual_sleep_hours"])
         ref = cached.get("computed_at") or now  # 入睡时刻（日期基准：R=入睡日-1，E=入睡日+1）
         query = self._schedule_query()
         r_yesterday, e_tomorrow, commitment_net = self._wake_side_inputs(ref, cached)
+        drained = self._machine.unfreeze(now)  # §2.5.2：先解冻（队列并入日志，观测保留）
+        night = self._drained_events_summary(drained)  # §2.5.3：解冻即采集，apply 之后日志即清空
         applied = self._machine.apply_sleep_overhaul(
-            cached["delta"], cached["sleep_hours"], now=now,
+            cached["delta"], actual_hours, now=now,
             r_yesterday=r_yesterday, e_tomorrow=e_tomorrow,
             commitment_net=commitment_net, delta_limit=cached.get("delta_limit"))
         applied["reasons"] = cached.get("reasons", {})
         applied["ok"] = True
+        applied["cycle_key"] = cycle_key or self._cycle_key(self._cycle_window(now, period)[0])
+        # `sleep_hours` = 本次结算**实际**用的时长（进恢复系数）；计划值单独留痕供对照
+        applied["sleep_hours"] = round(actual_hours, 3)
+        applied["sleep_hours_planned"] = round(float(cached.get("sleep_hours") or 0.0), 3)
+        applied["sleep_window_minutes"] = window_stats["sleep_window_minutes"]
+        applied["interrupted_minutes"] = window_stats["interrupted_minutes"]
+        applied["interrupt_count"] = window_stats["interrupt_count"]
         applied["r_yesterday"] = r_yesterday.to_dict()
         applied["e_tomorrow"] = e_tomorrow.to_dict()
         applied["commitment_net"] = commitment_net
         applied["delta_limit"] = cached.get("delta_limit")
         applied["r_yesterday_cached"] = cached.get("r_yesterday", VADState()).to_dict()
         applied["e_tomorrow_cached"] = cached.get("e_tomorrow", VADState()).to_dict()
-        self._machine.unfreeze(now)  # 队列并入日志（观测保留，不二次入账）
+        applied["drained_events_count"] = night["count"]
+        applied["drained_events"] = night["events"]
         self._save_state()
         state = load_json(self._state_path, {}) or {}
         state["applied_sleep_date"] = str(cached.get("cycle_key") or now.strftime("%Y-%m-%d"))
@@ -1398,12 +2238,19 @@ class EmotionService:
             reason="醒后一次性应用缓存大修",
             recovery_factor=applied.get("recovery_factor", 0.0),
             sleep_hours=applied.get("sleep_hours", 0.0),
+            # §2.4 留痕（M8 段 3）：实际睡着时长口径 + 计划对照
+            sleep_hours_planned=applied.get("sleep_hours_planned"),
+            sleep_window_minutes=applied.get("sleep_window_minutes"),
+            interrupted_minutes=applied.get("interrupted_minutes"),
+            interrupt_count=applied.get("interrupt_count"),
             delta_limit=applied.get("delta_limit"),
             delta_requested=applied.get("delta_requested"), delta_applied=applied.get("delta_applied"),
             r_yesterday=applied.get("r_yesterday"), e_tomorrow=applied.get("e_tomorrow"),
             commitment_net=applied.get("commitment_net"),
             r_yesterday_cached=applied.get("r_yesterday_cached"),
             e_tomorrow_cached=applied.get("e_tomorrow_cached"),
+            # §2.5.3 夜间事件可追溯（解冻队列摘要；apply 清日志后 decision_logs 是唯一留痕）
+            drained_events_count=night["count"], drained_events=night["events"],
         )
         # M0 事件：醒后 VAD + 恢复系数（附录 A ★，consumer=planning/qzone）；
         # M5：payload 补低分辨率 VAD 三档词（levels），供 planning 的 emotion_context 槽
@@ -1464,12 +2311,16 @@ class EmotionService:
                 continue
 
     async def _check_and_overhaul(self) -> None:
-        """一个检测周期：进睡眠时段 → 冻结并在冻结期计算/缓存大修；醒沿 → 应用缓存 + 解冻。
+        """一个检测周期：进睡眠时段 → 冻结并在冻结期计算/缓存大修；醒沿 → 冲刷片段 + 应用缓存 + 解冻。
 
         睡眠时段判定（M5 修复）：条目本身会被 ``_normalize_items`` 的作息锚点截断
         （最长为 23:00–23:15，夜间无条目覆盖），故**冻结窗口按 [schedule] 作息锚点整夜**
         （``_sleep_entry_period``），条目只作入口/小睡；醒沿 = 离开该窗口，或日程出现
-        非睡眠的清醒活动（文档口径「醒来的第一个活动开始」）。
+        非睡眠的清醒活动（文档口径「醒来的第一个活动开始」）。醒沿顺序（M8 段 1 + 段 3，附录
+        §2.5/§2.3）：``close_night_interrupt_segment("wake")`` → ``flush_all_episodes("wake")``
+        → ``publish_woke_up`` → ``_apply_cached_overhaul``（内部先 ``unfreeze`` 并采集夜间事件
+        摘要、按**实际睡着时长**结算大修）→ ``settle_night_interrupts``（整夜合计一次性入账，
+        在**大修之后**：打扰的暖意叠加在大修结果之上，不被向锚点收敛稀释）。
         """
         query = self._schedule_query()
         now = datetime.now()
@@ -1485,11 +2336,45 @@ class EmotionService:
 
         # 醒沿：日程出现清醒活动，或已离开睡眠窗口（含条目被截断后的深夜/清晨）
         if awake_activity or (self.is_frozen() and not self._in_sleep_period(now)):
+            # M8 段 2（附录 §2.1/§2.6）：睡眠窗口结束/醒沿 → 闭合夜间打扰段（本周期已结束，
+            # 段不能再延长；已确认的段在此落唯一一条 emotion.sleep_interrupt）。放在最前，
+            # 保证后续冲刷/结算即便抛错也不丢这条留痕。
+            self.close_night_interrupt_segment("wake", now=now)
+            # §2.5.1 醒沿先冲刷片段：让「夜里最后一轮对话」当夜被评估，而不是攒到下一夜。
+            # ⚠ 只在**睡眠周期真的结束**时冲刷（仍冻结 / 本周期已发过 sleep_started）：
+            # 本分支白天每个 tick 都会命中（有清醒活动即进），无条件冲刷会让 episode
+            # 闲置机制失效——每 tick 都评估一次、日上限被瞬间吃光。
+            # 顺序约束：此刻机器仍处于冻结态，冲刷产生的评估事件按 record_event 既有语义
+            # 只入 pending_events（**不直接改 VAD**）；随后解冻并入日志。绝不为"让冲刷增量
+            # 生效"而绕过冻结——夜里被打扰的情绪后果由 M8 第 3 段的 sleep_interrupt 整夜合计
+            # 统一入账（附录 §2.3），这里入账会造成双重记账。
+            if self.is_frozen() or self._in_sleep:
+                await self.flush_all_episodes(reason="wake")
             await self._publish_woke_up_if_needed(now)   # M0：离开睡眠 → schedule.woke_up
-            await self._apply_cached_overhaul(now)       # M5：应用缓存并解冻
+            # 醒沿最终顺序（附录 §2.3 + §2.5.4）：flush → unfreeze → 采集摘要 →
+            # apply_sleep_overhaul → **sleep_interrupt 整夜合计结算**。
+            # 本 tick 是否真的是"周期结束"（而非白天任意 tick 命中本分支）：与冲刷判定同源，
+            # 另加"本周期窗口在册"；`_apply_cached_overhaul` 开头会清窗口，故先留一份。
+            ended_cycle = bool(self.is_frozen() or self._in_sleep
+                               or self._sleep_period is not None)
+            period = self._sleep_period
+            applied = await self._apply_cached_overhaul(now)     # M5：应用缓存并解冻
+            # 顺序理由（附录 §2.3 上限注释）：大修是"夜里决定次日情绪的主语"，被打扰的暖意叠加
+            # 在**大修结果之上**；若在大修前入账，会被 (raw − anchor) × recovery_factor 的向锚点
+            # 收敛稀释（且恒被下界 0.3~0.85 的系数打折），与"净正合计整夜入账"的口径不符。
+            # 无打扰周期 → 结算内部返回 None（不入账、不落 settled 日志）。
+            if ended_cycle:
+                settle_key = str(applied.get("cycle_key") or "") if applied else ""
+                await self.settle_night_interrupts(now, period=period, cycle_key=settle_key)
             return
 
         if self.is_frozen():
+            # M8 段 2（附录 §2.1）：冻结期（= 睡眠周期内）每个 tick 扫一次 resleep 到期，
+            # 让「回到睡眠」的闭段留痕不必等到醒沿或下一条 reply。
+            # M9（附录 §4.1）：同一次扫描闭段后进入赖床提醒轮判定（仅 resleep 闭段）。
+            closed = self._roll_night_segment(now)
+            if closed is not None:
+                await self._after_night_segment_closed(closed, now)
             if self._pending_overhaul is None:           # 上轮裁判失败 → 冻结期内重试
                 planned = float(getattr(self, "_sleep_planned_hours", 0.0) or 0.0)
                 cached = await self.compute_sleep_overhaul(now, sleep_hours=planned or None)

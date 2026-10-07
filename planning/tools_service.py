@@ -8,25 +8,94 @@ core.llm_utils.LLMService（日程生成）。
 T6 注册面收口后本服务只服务两个 Tool：``get_schedule_info``（只读四视图）与
 ``update_schedule``（唯一日程写入口，role_judge 裁判路径）。目标的写 API 仍在
 GoalManager（生成流水线与约定消费在用），只是不再有 Tool 注册入口。
+
+M9（附录 §4.3/§4.4 赖床提醒，用户裁决 C4/A2）新增第三个 Tool：``nap_lie_in`` ——
+夜间被吵醒后收到提醒才可用（``metadata["visibility"]="hidden"``，注册期不进名册）；
+只把**今日 sleep 条目的结束时间**推到目标时刻（走 ``apply_schedule_items`` 共享底层，
+不消费未来约定、不触发重生成），并通知 emotion 延长本周期窗口 + 计一次"有效提醒次数"。
+工具名常量 :data:`NAP_TOOL_NAME` 是**唯一定义点**，提醒文本与组件注册同源引用。
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+
+from core.time_utils import parse_hhmm
 
 from .config import ScheduleSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
 from .schedule_generator import ScheduleGenerator
+from .schedule_items import find_night_sleep_item
 from .time_utils import TimezoneManager
 
 logger = logging.getLogger(__name__)
 
+# ── L3 赖床工具常量（附录 §4.3/§4.4；用户裁决 A2/C4）────────────────────────
+#: 赖床工具名（**唯一定义点**）：组件注册（planning/components.py）与提醒文本
+#: （emotion/service.py 的 NAP_REMINDER_TEMPLATE）同源引用本常量——A2 明确"工具后续会改名，
+#: 注意同步"，改名只需动这一处。
+NAP_TOOL_NAME = "cateye_test_nap_lie_in"
+#: 钳制上限的缺省值（[schedule] lie_in_max_until；HH:MM），§4.4「传入时间 > 上限 → 钳到上限」
+DEFAULT_LIE_IN_MAX_UNTIL = "12:00"
+#: 非睡眠周期调用的拒绝话术（§4.4 用户裁决原文语义，逐字）
+NAP_LIE_IN_DENIED_TEXT = "你现在还不能想要赖床"
+#: 解析失败/缺参的友好提示（§4.4：返回友好错误与格式示例，**不抛异常**）
+NAP_LIE_IN_BAD_TIME_TEXT = (
+    "没听清你想赖到几点。请传入目标时间，例如 \"09:30\"、\"9:30\" 或纯小时数 \"9\"（表示 09:00）。"
+)
+# 口径说明（M10 第 6 段）：夜晚睡眠条目的判定**唯一真源** = ``planning/schedule_items.py``，
+# 供本模块的 M9 赖床工具与 ``auto_scheduler.py`` 的 B2 生成锚点共用，避免两处口径漂移。
+
+
+def parse_nap_target(value: Any) -> Optional[int]:
+    """赖床时间解析（§4.4「解析兜底」）：容忍 ``HH:MM`` / ``H:MM`` / 纯小时数。
+
+    纯小时数按整点（``"9"`` → 09:00）；全角冒号容错；非法/缺参/越界一律返回 None
+    （调用方据此给友好错误，**绝不抛异常**）。
+    """
+    raw = str(value if value is not None else "").strip().replace("：", ":")
+    if not raw:
+        return None
+    head, sep, tail = raw.partition(":")
+    try:
+        hour = int(head)
+        if not sep:
+            minute = 0                       # 纯小时数 → 整点
+        else:
+            if not tail.strip():
+                return None                  # "9:" 缺分钟
+            minute = int(tail)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return hour * 60 + minute
+    return None
+
+
+def normalize_hhmm(value: Any, default: str = DEFAULT_LIE_IN_MAX_UNTIL) -> str:
+    """规范成 ``"HH:MM"`` 文本（非法一律回退 ``default``）。
+
+    供钳制上限的**展示与判定同源**：提醒文本里的「最晚 {lie_in_max_until}」与工具侧实际
+    钳到的分钟数由同一个函数产出，不会出现"提示 12:00、实际钳到别的值"。
+    """
+    minute = parse_nap_target(value)
+    if minute is None:
+        minute = parse_nap_target(default)
+    if minute is None:                       # default 也被写坏 → 退到规格缺省
+        minute = parse_nap_target(DEFAULT_LIE_IN_MAX_UNTIL) or 12 * 60
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def lie_in_max_minutes(value: Any) -> int:
+    """``lie_in_max_until`` 配置值 → 当天分钟数（非法回退缺省 12:00）。"""
+    return parse_nap_target(normalize_hhmm(value)) or 12 * 60
+
 
 class ToolsService:
-    """承载 2 个 LLM Tool 的业务逻辑（get_schedule_info / update_schedule）。"""
+    """承载 3 个 LLM Tool 的业务逻辑（get_schedule_info / update_schedule / nap_lie_in）。"""
 
     def __init__(self, plugin: Any, generator: Optional[ScheduleGenerator] = None) -> None:
         """
@@ -419,3 +488,139 @@ class ToolsService:
         except Exception as exc:
             logger.error(f"update_schedule 失败: {exc}", exc_info=True)
             return {"type": "error", "content": f"更新日程失败: {exc}"}
+
+    # ------------------------------------------------------------
+    # Tool 3：nap_lie_in（赖床：推迟今日睡眠条目的结束时间；§4.3/§4.4）
+    # ------------------------------------------------------------
+
+    def _emotion_bundle(self) -> Optional[Any]:
+        """emotion 服务束（``plugin._emotion``）。
+
+        ⚠ 单向依赖：planning **不 import** emotion（避免循环依赖），只按鸭子类型取束上用到的
+        三个入口：``in_night_sleep_cycle`` / ``extend_night_sleep_until`` / ``note_nap_lie_in_applied``；
+        取不到（插件未装配 emotion，或单测骨架插件）→ 返回 None，工具按"非睡眠周期"拒绝。
+        """
+        return getattr(self._plugin, "_emotion", None)
+
+    def _lie_in_max_minutes(self) -> int:
+        """[schedule] lie_in_max_until 的分钟数（非法回退 12:00；钳制与提示同源）。"""
+        return lie_in_max_minutes(getattr(self._schedule_cfg(), "lie_in_max_until",
+                                          DEFAULT_LIE_IN_MAX_UNTIL))
+
+    @staticmethod
+    def _find_sleep_item(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """今日日程里的**夜晚睡眠条目**（§4.4「读今日日程找 sleep 条目（goal_type=sleep）」）。
+
+        判定与读数委托**共享口径** ``planning/schedule_items.py``（M10 第 6 段抽出）：
+        主判 ``goal_type == "sleep"``（规格口径）；取不到时按名称含夜晚睡眠词兜底——
+        依据同 ``emotion/service.py`` 的 ``_is_sleep_item``（M5 实测：生产条目是
+        ``goal_type=daily_routine`` + 名称「睡觉」）。两轮判定都只认夜间词，
+        午休/午睡/小憩/打盹不算（§八.7 / C4-补充：午休本轮不动）。
+        """
+        rows = [item for item in (items or []) if isinstance(item, dict)]  # 本工具只吃 DB 行
+        return find_night_sleep_item(rows)
+
+    @staticmethod
+    def _nap_end_datetime(now: datetime, minute: int) -> datetime:
+        """把"当天分钟数"落成 ``now`` 之后最近的时刻（跨午夜自动 +1 天）。"""
+        end = now.replace(hour=(int(minute) // 60) % 24, minute=int(minute) % 60,
+                          second=0, microsecond=0)
+        return end if end > now else end + timedelta(days=1)
+
+    def _nap_schedule_date(self, now: datetime) -> str:
+        """"今日日程"的日期（F16/B4：**新一天起点 = [schedule] wake_time 锚点**）。
+
+        夜间睡眠条目属于**入睡日**（M5 实测：条目 `23:00–23:15` 落在入睡日、被作息锚点截断），
+        故凌晨（早于 wake_time 锚点的跨午夜段）仍读**昨天**那条日程，否则读今天；夜猫子作息
+        （sleep ≤ wake，同日）一律读今天。取不到锚点一律按"今天"（缺省 07:00/23:00）。
+        """
+        sleep_min = parse_hhmm(self._schedule_cfg().sleep_time, 23 * 60)
+        wake_min = parse_hhmm(self._schedule_cfg().wake_time, 7 * 60)
+        cur = now.hour * 60 + now.minute
+        if sleep_min > wake_min and cur < wake_min:
+            return (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        return now.strftime("%Y-%m-%d")
+
+    async def nap_lie_in(self, time: str = "", now: Optional[datetime] = None) -> Dict[str, Any]:
+        """把**今日 sleep 条目**的结束时间推到目标时刻（附录 §4.4，用户裁决 C4；M9 落地）。
+
+        口径（规格原文逐条）：
+
+        1. **解析容错**：``HH:MM`` / ``H:MM`` / 纯小时数（``"9"`` → 09:00）；非法/缺参 →
+           友好错误 + 格式示例，**不抛异常**；
+        2. **非睡眠周期调用 → 拒绝**：经 ``plugin._emotion`` 服务束查询「是否处于夜间睡眠
+           周期」（白天/午休/未装配 emotion 一律拒绝），话术「你现在还不能想要赖床」；
+        3. **上限钳制**：目标 > ``[schedule] lie_in_max_until``（默认 12:00）→ 钳到该值；
+        4. **修改日程**：找**今日日程**的 sleep 条目（"今日"按 [schedule] wake_time 锚点定义的新一天：
+           凌晨仍属入睡日，见 :meth:`_nap_schedule_date`）并把 ``end_minute`` 推到目标，经**共享底层**
+           ``ScheduleGenerator.apply_schedule_items(items, today, consume_commitments=False)``
+           （:274）写回——不消费未来约定、不触发重生成；无 sleep 条目或写回失败 →
+           失败文本且**不计数**；
+        5. **通知 emotion 延长本周期窗口结束到目标时刻**（否则醒沿会在 wake 锚点照常触发）；
+        6. **计数**：调用**并成功修改日程** → emotion 侧「有效提醒次数」+1（按 ``cycle_key``，
+           内存）；未调用/失败不计次；额度用尽只停提醒、**不阻止**本工具（本方法不判额度）。
+           口径澄清（附录 §六.补 C4，执行既有 C4「成功修改日程才计次」）：目标 ≤ 当前醒沿时
+           **先经 ``night_sleep_end_minute`` 预检**（写回前拒绝，避免日程被误写）且
+           ``extend_night_sleep_until`` 返回 False（双保险）→ 均**不计次**，返回友好提示而非
+           成功文案。
+
+        Args:
+            time: 目标时间（"HH:MM" / "H:MM" / 纯小时数）。
+            now: 当前时刻（缺省 ``datetime.now()``；测试注入时钟用）。
+
+        Returns:
+            Tool 返回载荷 ``{"type", "content"}``（宿主按 type 渲染）；任何异常都吞成
+            失败文案，绝不上抛（§八.2 可空降级）。
+        """
+        try:
+            if not self._module_enabled():
+                return {"type": "error", "content": "日程规划模块未启用（配置 [日程系统] enabled）"}
+            # 1) 解析容错（先解析：缺参/非法给格式示例，不惊动任何状态）
+            target_minute = parse_nap_target(time)
+            if target_minute is None:
+                return {"type": "nap_error", "content": NAP_LIE_IN_BAD_TIME_TEXT}
+            # 2) 非睡眠周期调用 → 拒绝（emotion 侧门控；无 emotion 束同样拒绝）
+            emotion = self._emotion_bundle()
+            if emotion is None or not emotion.in_night_sleep_cycle():
+                return {"type": "nap_rejected", "content": NAP_LIE_IN_DENIED_TEXT}
+            current = now or datetime.now()
+            today = self._nap_schedule_date(current)
+            # 3) 上限钳制
+            limit_minute = self._lie_in_max_minutes()
+            clamped = min(int(target_minute), int(limit_minute))
+            # 3.5) 预检（附录 §六.补 C4）：目标不晚于当前醒沿 → 不写日程、不计次
+            #      （否则会出现"文案说没改动、库里 sleep 条目已被写坏"）；权威判定仍在
+            #      写回后的 extend_night_sleep_until（双保险）
+            wake_edge = emotion.night_sleep_end_minute()
+            if wake_edge is not None and clamped <= wake_edge:
+                return {"type": "nap_error",
+                        "content": "这个时间不比现在的起床时间晚，起床时间没有改动，就不多睡啦。"}
+            # 4) 写回今日日程（共享底层；只动 sleep 条目，其余条目原样保留）
+            query = self._schedule_query()
+            items = list(query.get_day_schedule(today)) if query is not None else []
+            item = self._find_sleep_item(items)
+            if item is None:
+                return {"type": "nap_error",
+                        "content": "今天没有找到睡觉日程，暂时没法往后推起床时间。"}
+            item["end_minute"] = int(clamped)
+            generator = self._get_generator()
+            if generator is None:
+                return {"type": "error", "content": "日程生成器不可用（插件未完成初始化）"}
+            written = generator.apply_schedule_items(items, today, consume_commitments=False)
+            if not written:
+                return {"type": "nap_error", "content": "日程写回失败，起床时间没有改动。"}
+            # 5) + 6) 成功才通知 emotion：延长本周期窗口端点（醒沿推迟）并计一次有效提醒
+            extended = emotion.extend_night_sleep_until(self._nap_end_datetime(current, clamped))
+            if not extended:
+                # 附录 §六.补 C4 口径澄清（执行既有 C4「成功修改日程才计次」）：目标不比当前醒沿晚
+                # → 窗口端点未变（未实际延长）→ 不计次，返回友好提示
+                return {"type": "nap_error",
+                        "content": "这个时间不比现在的起床时间晚，起床时间没有改动，就不多睡啦。"}
+            emotion.note_nap_lie_in_applied()
+            hhmm = f"{int(clamped) // 60:02d}:{int(clamped) % 60:02d}"
+            note = "" if clamped == target_minute else f"（超过最晚时间，已按 {hhmm} 算）"
+            return {"type": "nap_lie_in",
+                    "content": f"好，那就再睡一会儿——今天的起床时间已经推到 {hhmm}。{note}"}
+        except Exception as exc:
+            logger.error(f"nap_lie_in 失败: {exc}", exc_info=True)
+            return {"type": "nap_error", "content": f"赖床设置失败: {exc}"}

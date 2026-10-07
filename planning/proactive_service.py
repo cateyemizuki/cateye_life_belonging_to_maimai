@@ -3,13 +3,16 @@
 三个职责合并在一个 60s 轮询的后台循环里：
 
 1. **活动切换主动发起** —— 活动开始后，在触发窗口内让 bot 主动开口
-   （``ctx.maisaka.proactive.trigger``）。不覆盖当天睡醒后的第一个活动
-   （由「早间问好」负责），设定的睡眠时段内不触发；每个
-   ``(stream_id, activity_name, date)`` 组合只触发一次。
+   （``ctx.maisaka.proactive.trigger``）。不覆盖当天睡醒后的第一个活动，设定的睡眠时段内不触发；
+   每个 ``(stream_id, activity_name, date)`` 组合只触发一次。
 
-2. **早间问好** —— bot 睡醒后第一个活动开始时，向白名单会话道早安；
-   可选「需要激活」：``ctx.message.get_by_time_in_chat`` 判定睡醒后有无消息，
-   截止第一个活动结束前 10 分钟仍无人说话则放弃。
+2. **L2 早晚安漂移（附录 §三，裁决 B1/B3/B5/B6/B7）** —— 早/晚安只配漂移区间
+   （``morning_drift`` / ``night_drift``，每流每日独立掷点）：早安基准 = 睡眠窗口结束
+   （``[schedule].wake_time`` 锚点），晚安基准 = 当天最后一个非睡眠日程条目结束
+   （无日程回退 ``sleep_time`` 锚点）。到点按「必要性激活」判定触发（早安自基准点起、
+   晚安自 ``fire_at`` 起该流有人发过消息——附录 §六.补 B5-补），到期限仍无人则放弃；
+   目标私聊固定生效、群聊复用 ``proactive_group_ids``
+   名单、其他私聊走单独开关 + 前一日消息数门槛。
 
 3. **按 goal_type 调节聊天频率** —— ``ctx.frequency.set_adjust`` 推给 heartflow。
 
@@ -24,13 +27,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .config import PlanningProactiveSectionConfig, ScheduleSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
-from .time_utils import TimezoneManager, parse_time_window
-
+from .time_utils import TimezoneManager, is_in_time_window, parse_time_window
 if TYPE_CHECKING:
     from typing import Any as _Plugin
 
@@ -65,10 +69,19 @@ _PROACTIVE_INTENT_TEMPLATES: Dict[str, str] = {
 }
 _DEFAULT_PROACTIVE_INTENT = "Bot 切换到新活动了，可以自然地在群里说一两句近况"
 
-# 早间问好 intent 模板
+# 早间问好 intent 模板（L2：基准 = 睡眠窗口结束，首个非睡眠日程条目名作补充信息）
 _MORNING_GREETING_INTENT = (
     "Bot 刚睡醒，新的一天开始了，请自然地向大家道一声早安；"
     "可以顺口提一句今天的第一个安排（{activity_name}），语气符合人设，简短随意"
+)
+#: 无今日日程时的早安 intent（不带"第一个安排"这句）
+_MORNING_GREETING_INTENT_NO_ACTIVITY = (
+    "Bot 刚睡醒，新的一天开始了，请自然地道一声早安；语气符合人设，简短随意"
+)
+#: 晚安 intent 模板（L2：基准 = 当天最后一个非睡眠日程条目结束，向前漂移）
+_NIGHT_GREETING_INTENT = (
+    "Bot 准备休息了，今天快结束了，请自然地道一声晚安；"
+    "语气符合人设，简短随意、不要追问对方、不要开新话题"
 )
 
 # 约定（pending_commitment）来源的活动用强指令模板，避免陷入工具调用循环
@@ -79,8 +92,82 @@ _COMMITMENT_INTENT_TEMPLATE = (
     "活动名：{activity_name}"
 )
 
-# 早间问好观察截止：第一个活动结束前 N 分钟
-_MORNING_DEADLINE_MARGIN_MINUTES = 10
+# ── L2 早晚安漂移（附录 §三；裁决 B1/B3/B5/B6/B7）──────────────────
+#: 漂移区间的严格形态（§3.1）：单数字 N 或 "a-b"；负数（"-5-10"/"-10"）与其他写法一律非法（B3）
+_DRIFT_PATTERN = re.compile(r"^\d+(-\d+)?$")
+#: 漂移区间默认值（分钟）——非法/负数回退此区间
+DEFAULT_GREETING_DRIFT: Tuple[int, int] = (10, 30)
+#: 问候种类（掷点/记录键的第二维）
+GREETING_MORNING = "morning"
+GREETING_NIGHT = "night"
+#: 覆盖类别（§3.4/B7）：目标私聊（固定生效）/ 群聊（必要性激活）/ 其他私聊（单独开关 + 门槛）
+GREETING_CATEGORY_TARGET = "target"
+GREETING_CATEGORY_GROUP = "group"
+GREETING_CATEGORY_OTHER = "other"
+#: 掷点状态机的状态取值（§3.2/§3.3）
+GREETING_STATUS_PENDING = "pending"
+GREETING_STATUS_FIRED = "fired"
+GREETING_STATUS_ABANDONED = "abandoned"
+#: 早安无「非睡眠日程条目」时的放弃期限兜底：基准 + 120 分钟（§3.2 期限列的实现裁量）
+_MORNING_FALLBACK_DEADLINE_MINUTES = 120
+#: 睡眠条目名称兜底关键词：与 emotion/service.py 的 `_is_sleep_item` 同一依据
+#: （planning 不 import emotion，避免循环依赖；F14 要求早安期限过滤睡眠条目）
+_SLEEP_NAME_KEYWORDS = ("睡觉", "睡眠", "安睡", "午休", "午睡", "小憩", "打盹")
+#: [patrol] 静默时段开始的缺省值（配置不可得时的兜底，与 companion/config.py 默认值一致；
+#: 缺省窗口为 00:00-07:30，晚安期限只用到起点）
+_DEFAULT_SILENCE_START = "00:00"
+_DEFAULT_SILENCE_END = "07:30"
+
+
+def _parse_drift(value: Any, default: Tuple[int, int] = DEFAULT_GREETING_DRIFT) -> Tuple[int, int]:
+    """解析漂移区间配置（§3.1，裁决 B3）：``"10-30"`` / ``20`` → ``(a, b)``。
+
+    - 单数字 ``N`` → ``(0, N)``；``"a-b"`` → ``(min, max)``（``a > b`` 自动交换）；
+    - 严格匹配 ``^\\d+(-\\d+)?$``（int 先转 str）；负数（``"-5-10"`` / ``"-10"``）、空值、
+      其他非法写法一律**回退默认区间**并记 debug 日志——**不收负数**；
+    - 模块级纯函数（无 self/无 IO），便于直测与服务层复用。
+    """
+    raw = "" if value is None else str(value).strip()
+    if _DRIFT_PATTERN.match(raw):
+        if "-" in raw:
+            left, right = raw.split("-", 1)
+            a, b = int(left), int(right)
+            return (a, b) if a <= b else (b, a)  # a > b 自动交换
+        return (0, int(raw))                    # 单数字 N → 0~N 随机
+    logger.debug(f"漂移区间非法（{value!r}）→ 回退默认区间 {default[0]}-{default[1]}")
+    return default
+
+
+def _is_sleep_schedule_item(goal: Any) -> bool:
+    """日程条目是否为睡眠条目（``goal_type == "sleep"`` 或名称含睡觉类关键词）。
+
+    依据同 ``emotion/service.py`` 的 ``_is_sleep_item``（M5 实测：生产日程的"睡觉"条目是
+    ``goal_type=daily_routine`` + 名称「睡觉」，只看 goal_type 会漏判）。
+    """
+    if str(getattr(goal, "goal_type", "") or "") == "sleep":
+        return True
+    name = str(getattr(goal, "name", "") or "")
+    return any(keyword in name for keyword in _SLEEP_NAME_KEYWORDS)
+
+
+def _goal_time_window(goal: Any) -> Tuple[Optional[int], Optional[int]]:
+    """取 goal 的时间窗口并解析为分钟（先 parameters 后 conditions，与既有取数口径一致）。"""
+    tw = None
+    if getattr(goal, "parameters", None) and "time_window" in goal.parameters:
+        tw = goal.parameters.get("time_window")
+    elif getattr(goal, "conditions", None):
+        tw = goal.conditions.get("time_window")
+    if not tw:
+        return None, None
+    return parse_time_window(tw)
+
+
+def _epoch_ts(dt: datetime) -> float:
+    """datetime → epoch 秒（tz-aware 按其时区换算；异常回退当前时间）。"""
+    try:
+        return float(dt.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return time.time()
 
 # 作息解析默认值：07:00 起床 / 23:00 入睡
 _DEFAULT_WAKE_MINUTES = 7 * 60
@@ -118,10 +205,11 @@ class ProactiveService:
         self._proactive_history: Dict[Tuple[str, str, str], float] = {}
         # 待触发的主动发起：{(stream_id, activity_name, date_str): fire_at_epoch}
         self._pending_triggers: Dict[Tuple[str, str, str], float] = {}
-        # 早间问好状态：{(stream_id, date_str): "fired" / "abandoned"}
-        self._morning_history: Dict[Tuple[str, str], str] = {}
-        # 早间问好待触发：{(stream_id, date_str): fire_at_epoch}
-        self._morning_pending: Dict[Tuple[str, str], float] = {}
+        # L2 早晚安漂移掷点（§3.2）：{(stream_id, date_str, kind): 掷点条目}
+        # 纯内存、不落盘——热重载后允许重掷（附录 §3.2 明示口径）
+        self._greeting_rolls: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        # L2 其他私聊早安门槛（§3.4/B7）当日缓存：{(stream_id, date_str): qualified}
+        self._greeting_other_gate: Dict[Tuple[str, str], bool] = {}
         # 已应用的频率因子缓存：{stream_id: factor}（避免重复 set_adjust）
         self._current_factor: Dict[str, float] = {}
         # 白名单解析缓存：{raw_entry: (session_id 或 None, expire_at)}
@@ -377,12 +465,13 @@ class ProactiveService:
     # ------------------------------------------------------------
 
     async def _check_and_act(self) -> None:
-        """读当前活动 → 安排/落实 主动发起、早间问好、频率调控。"""
+        """读当前活动 → 安排/落实 主动发起、L2 早晚安漂移、频率调控。"""
         cfg_p = self._proactive_cfg()
         if not (
             cfg_p.enable_proactive_trigger
             or cfg_p.enable_frequency_modulation
             or cfg_p.enable_morning_greeting
+            or cfg_p.enable_night_greeting
         ):
             return
 
@@ -427,22 +516,11 @@ class ProactiveService:
                             f"延迟 {int(self._pending_triggers[key] - now_ts)}s"
                         )
 
-            # 3. 早间问好：仅当天第一个活动进行中时安排
-            if cfg_p.enable_morning_greeting and activity_info is not None and first_activity is not None:
-                activity_name, _goal_type, start_minutes, _end, _params = activity_info
-                if activity_name == first_activity[0] and start_minutes == first_activity[1]:
-                    for stream_id in streams:
-                        mkey = (stream_id, date_str)
-                        if mkey in self._morning_history or mkey in self._morning_pending:
-                            continue
-                        self._morning_pending[mkey] = now_ts + self._random_delay_seconds()
-                        logger.info(f"安排早间问好: stream={stream_id}")
+            # 3. 活动切换主动发起之外不再排期问候：早/晚安由下面的漂移机制统一驱动（B1 合并）
 
         # 4. 清理跨天的残留排期
         for key in [k for k in self._pending_triggers if k[2] != date_str]:
             self._pending_triggers.pop(key, None)
-        for mkey in [k for k in self._morning_pending if k[1] != date_str]:
-            self._morning_pending.pop(mkey, None)
 
         # 5. 落实到点的主动发起（重新校验：活动未切换、未进入睡眠时段）
         due_keys = [k for k, fire_at in self._pending_triggers.items() if now_ts >= fire_at]
@@ -461,85 +539,204 @@ class ProactiveService:
             await self._trigger_proactive(stream_id, activity_name, current[1], current[4])
             self._proactive_history[key] = time.time()
 
-        # 6. 落实早间问好（含「需要激活」判定）
-        if cfg_p.enable_morning_greeting and first_activity is not None:
-            await self._process_morning_pending(streams, first_activity, date_str, now_ts, in_sleep)
+        # 6. L2 早晚安漂移（§3.2/§3.3）：掷点复用 → 到点激活判定 → 触发/推迟/放弃
+        await self._process_greetings(now, date_str)
 
     # ------------------------------------------------------------
-    # 早间问好
+    # L2 早晚安漂移（附录 §三；裁决 B1/B3/B5/B6/B7）
     # ------------------------------------------------------------
 
-    async def _process_morning_pending(
-        self,
-        streams: List[str],
-        first_activity: Tuple[str, int, int],
-        date_str: str,
-        now_ts: float,
-        in_sleep: bool,
-    ) -> None:
-        """处理早间问好的待触发队列（含「需要激活」的观察与放弃）。"""
-        cfg_p = self._proactive_cfg()
-        deadline_ts = self._morning_deadline_ts(first_activity)
+    def _schedule_anchors(self) -> Tuple[int, int]:
+        """``(wake_min, sleep_min)`` 作息锚点（``[schedule]``，缺省 07:00 / 23:00）。
 
-        for mkey in list(self._morning_pending.keys()):
-            stream_id, key_date = mkey
-            if key_date != date_str:
-                self._morning_pending.pop(mkey, None)  # 跨天残留，清理
-                continue
-            fire_at = self._morning_pending.get(mkey)
-            if fire_at is None or now_ts < fire_at:
-                continue
-            self._morning_pending.pop(mkey, None)
+        F16/B2：这两个锚点定义「新一天」的起止——早安基准取 wake（= 睡眠窗口结束），
+        晚安无日程时回退 sleep 锚点（B4 只做兜底优先级，不强制两者同步）。
+        """
+        cfg = section_or_default(self._plugin, "schedule", ScheduleSectionConfig)
+        wake_min = _parse_hhmm_minutes(getattr(cfg, "wake_time", ""), _DEFAULT_WAKE_MINUTES)
+        sleep_min = _parse_hhmm_minutes(getattr(cfg, "sleep_time", ""), _DEFAULT_SLEEP_MINUTES)
+        return wake_min, sleep_min
 
-            if in_sleep:
-                logger.info(f"早间问好放弃（已进入睡眠时段）: stream={stream_id}")
-                self._morning_history[mkey] = "abandoned"
-                continue
+    def _patrol_time(self, attr: str, default: str) -> str:
+        """读 ``[patrol]`` 时间窗配置（companion 未装配/字段缺失 → 缺省值兜底）。"""
+        patrol = getattr(getattr(self._plugin, "config", None), "patrol", None)
+        return str(getattr(patrol, attr, "") or default)
 
-            if cfg_p.morning_greeting_require_activation:
-                # 需要激活：有人说话 → 问好；截止（第一个活动结束前 10 分钟）仍无人 → 放弃
-                activated = await self._stream_activated_since_wake(stream_id, first_activity)
-                if not activated:
-                    if deadline_ts is None or now_ts >= deadline_ts:
-                        self._morning_history[mkey] = "abandoned"
-                        logger.info(
-                            f"早间问好放弃（截止仍无人说话）: stream={stream_id}, "
-                            f"deadline={'不可用' if deadline_ts is None else '已过'}"
-                        )
-                        continue
-                    # 重新排队：下一个节拍继续观察，直到截止时刻
-                    self._morning_pending[mkey] = now_ts + self.LOOP_INTERVAL_SECONDS
-                    continue
+    @staticmethod
+    def _midnight_ts(now: datetime) -> float:
+        """当天 00:00 的绝对时间戳（把日程分钟数换算成绝对时刻的基准）。"""
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
-            await self._trigger_morning_greeting(stream_id, first_activity[0])
-            self._morning_history[mkey] = "fired"
+    def _find_first_non_sleep_activity_today(self, date_str: str) -> Optional[Tuple[str, int, int]]:
+        """睡眠结束后第一个**非睡眠**日程条目（F14：复用取数口径 + 一条 ``_is_sleep_item`` 过滤）。"""
+        return self._find_first_activity_today(date_str, skip_sleep=True)
 
-    def _morning_deadline_ts(self, first_activity: Tuple[str, int, int]) -> Optional[float]:
-        """计算早间问好的观察截止时间戳（第一个活动结束前 10 分钟）。"""
-        now = self._tz_manager.get_now()
+    def _last_non_sleep_activity_end_today(self, date_str: str) -> Optional[int]:
+        """当天最后一个非睡眠日程条目的结束分钟数（跨午夜条目可能 > 1440）。"""
         try:
-            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            base = midnight.timestamp()
-        except Exception:
+            goals = get_goal_manager().get_schedule_goals(chat_id="global", date_str=date_str)
+        except Exception as exc:
+            logger.debug(f"查找今日日程失败: {exc}")
             return None
-        end_minutes = max(1, first_activity[2] - _MORNING_DEADLINE_MARGIN_MINUTES)
-        return base + end_minutes * 60
+        latest: Optional[int] = None
+        for goal in goals:
+            if _is_sleep_schedule_item(goal):
+                continue
+            _start, end = _goal_time_window(goal)
+            if end is None:
+                continue
+            if latest is None or int(end) > latest:
+                latest = int(end)
+        return latest
 
-    async def _stream_activated_since_wake(
-        self,
-        stream_id: str,
-        first_activity: Tuple[str, int, int],
-    ) -> bool:
-        """检查会话自 bot 睡醒（第一个活动开始）起是否有人发过消息。"""
+    def _greeting_baseline_ts(self, kind: str, now: datetime, date_str: str) -> float:
+        """问候基准点（绝对时间戳，§3.2/B2/B4）。"""
+        midnight = self._midnight_ts(now)
+        wake_min, sleep_min = self._schedule_anchors()
+        if kind == GREETING_MORNING:
+            # 早安：睡眠窗口结束 = [schedule].wake_time 锚点（与「新一天起点」同一概念）
+            return midnight + wake_min * 60
+        # 晚安：当天最后一个非睡眠日程条目结束；无日程 → 回退 sleep_time 锚点（B4）
+        end_min = self._last_non_sleep_activity_end_today(date_str)
+        if end_min is None:
+            return midnight + sleep_min * 60
+        return midnight + end_min * 60
+
+    def _greeting_deadline_ts(self, kind: str, now: datetime, date_str: str,
+                              baseline_ts: float) -> float:
+        """放弃期限（绝对时间戳，§3.2）。"""
+        midnight = self._midnight_ts(now)
+        if kind == GREETING_MORNING:
+            first = self._find_first_non_sleep_activity_today(date_str)
+            if first is None:
+                # 实现裁量（§3.2 未定义此分支）：无非睡眠条目 → 基准 + 120 分钟；
+                # 不给"无日程"留无期限观察，避免早安在任意时刻补发（防打扰）
+                return baseline_ts + _MORNING_FALLBACK_DEADLINE_MINUTES * 60
+            return midnight + int(first[2]) * 60
+        # 晚安：睡眠窗口开始 与 [patrol] silence_start 取先到者
+        _wake_min, sleep_min = self._schedule_anchors()
+        return min(self._next_daily_anchor_ts(now, sleep_min), self._silence_start_ts(now))
+
+    def _next_daily_anchor_ts(self, now: datetime, minute: int) -> float:
+        """把「当天分钟数」锚点落成**今晚**的绝对时刻（§3.2 晚安的基准/期限分量）。
+
+        参照点 = **今天的起床锚点**（``[schedule].wake_time``，F16 的"新一天起点"）：取最近一次
+        不早于参照点的该锚点。常规作息（sleep > wake）得到今天的 ``sleep_time``/``silence_start``；
+        夜猫子作息（sleep < wake，日程延续到次日凌晨）自动落到**次日凌晨**——保证晚安窗口始终是
+        「最后一个日程之后、入睡之前」，不会因为拿今天的凌晨锚点而误判成"窗口已过"。
+        """
+        wake_min, _sleep_min = self._schedule_anchors()
+        midnight = self._midnight_ts(now)
+        ts = midnight + int(minute) * 60
+        if ts < midnight + wake_min * 60:
+            ts += 86400.0
+        return ts
+
+    def _silence_start_ts(self, now: datetime) -> float:
+        """今晚静默时段开始的绝对时刻（``[patrol].silence_start``，§3.2 期限列）。
+
+        同 :meth:`_next_daily_anchor_ts`（以起床锚点为参照）：默认 ``00:00-07:30`` → 次日 00:00
+        （与入睡锚点取 min 后通常由后者先到）；晚间开始的静默窗（如 21:30-07:30）→ 今天 21:30，
+        已过即视为窗口已关（不再发晚安）。
+        """
+        start_min = _parse_hhmm_minutes(
+            self._patrol_time("silence_start", _DEFAULT_SILENCE_START), 0)
+        return self._next_daily_anchor_ts(now, start_min)
+
+    def _in_silence_window(self, now: datetime) -> bool:
+        """当前是否处于 ``[patrol]`` 静默时段（§3.6：合并后静默仍按 silence_* 生效）。
+
+        支持跨午夜窗口（沿用既有 is_in_time_window 语义）；配置非法按不在静默处理
+        （与巡检侧"非法配置 fail-safe"口径一致）——此时问候链不因静默推迟。
+        """
+        return is_in_time_window(
+            self._patrol_time("silence_start", _DEFAULT_SILENCE_START),
+            self._patrol_time("silence_end", _DEFAULT_SILENCE_END),
+            now.strftime("%H:%M"), invalid_result=False)
+
+    def _greeting_drift(self, kind: str) -> Tuple[int, int]:
+        """取该 kind 的漂移区间（非法/负数回退默认区间，§3.1/B3）。"""
+        cfg_p = self._proactive_cfg()
+        attr = "morning_drift" if kind == GREETING_MORNING else "night_drift"
+        return _parse_drift(getattr(cfg_p, attr, None))
+
+    def _roll_greeting(self, stream_id: str, category: str, kind: str, date_str: str,
+                       now: datetime, now_ts: float) -> Dict[str, Any]:
+        """掷点（§3.2）：每 ``(stream_id, date, kind)`` 只掷一次，同流同日重复决策复用同一结果。
+
+        纯内存、不落盘（热重载后允许重掷）；跨午夜条目按绝对时间戳处理。生成时窗口已关
+        （``now ≥ deadline``）→ 直接记 ``abandoned``（当天不再评估该流该 kind）。
+        """
+        key = (stream_id, date_str, kind)
+        entry = self._greeting_rolls.get(key)
+        if entry is not None:
+            return entry
+
+        drift = self._greeting_drift(kind)
+        baseline_ts = self._greeting_baseline_ts(kind, now, date_str)
+        deadline_ts = self._greeting_deadline_ts(kind, now, date_str, baseline_ts)
+        offset = float(random.randint(drift[0], drift[1])) * 60.0   # 漂移区间是分钟 → 秒
+        fire_at = baseline_ts + offset if kind == GREETING_MORNING else baseline_ts - offset
+        entry = {
+            "stream_id": stream_id,
+            "category": category,
+            "kind": kind,
+            "date": date_str,
+            "drift": drift,
+            "rolled": True,
+            "baseline": baseline_ts,
+            "deadline": deadline_ts,
+            "fire_at": fire_at,
+            "status": GREETING_STATUS_PENDING,
+            "reason": "",
+        }
+        if now_ts >= deadline_ts:
+            entry["status"] = GREETING_STATUS_ABANDONED
+            entry["reason"] = "window_closed"
+            logger.debug(
+                f"问候窗口已过（不排期）: stream={stream_id}, kind={kind}, date={date_str}"
+            )
+        else:
+            logger.info(
+                f"问候掷点: stream={stream_id}, kind={kind}, category={category}, "
+                f"drift={drift[0]}-{drift[1]}, fire_at={int(fire_at)}, "
+                f"deadline={int(deadline_ts)}"
+            )
+        self._greeting_rolls[key] = entry
+        return entry
+
+    def _greeting_requires_activation(self, category: str, kind: str, cfg_p: Any) -> bool:
+        """是否需要「必要性激活」（§3.3/B5/B7）：目标私聊固定生效，其余按开关。
+
+        - 目标私聊：固定生效（B7），激活要求不适用；
+        - 群聊：按 ``greeting_require_activation``（早安另兼容旧字段 ``morning_greeting_require_activation``，取或）；
+        - 其他私聊：激活条件 = 前一日消息数门槛（§3.4/B7 的「激活条件 = 前一日该流 ≥ N 条消息」），
+          即由 ``_morning_other_private_qualified`` 承担，不再叠加「自基准点起有人说话」。
+        """
+        if category != GREETING_CATEGORY_GROUP:
+            return False
+        if bool(getattr(cfg_p, "greeting_require_activation", True)):
+            return True
+        if kind == GREETING_MORNING:
+            # 旧字段兼容（取或）：此前显式开启过「早间问好需激活」的用户仍然生效
+            return bool(getattr(cfg_p, "morning_greeting_require_activation", False))
+        return False
+
+    async def _stream_activated_since_wake(self, stream_id: str, since_ts: float,
+                                           until_ts: float) -> bool:
+        """自 ``since_ts`` 起该流是否有人发过消息（B5：早安/晚安共用同一查询形态）。
+
+        窗口起点由调用方分派（附录 §六.补 B5-补）：晚安 = ``fire_at``、早安 = ``baseline``
+        （见 :meth:`_evaluate_greeting`）。沿用既有调用形态
+        ``ctx.message.get_by_time_in_chat(stream_id, 起点ts, now, limit=1)``；
+        能力不可用/异常 → False（保守：没人说话就不打扰）。
+        """
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "message"):
             return False
         try:
-            now = self._tz_manager.get_now()
-            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            wake_ts = midnight.timestamp() + first_activity[1] * 60
             msgs = await ctx_obj.message.get_by_time_in_chat(
-                stream_id, str(wake_ts), str(time.time()), limit=1,
+                stream_id, str(since_ts), str(until_ts), limit=1,
             )
         except Exception as exc:
             logger.debug(f"查询会话消息失败: {exc}")
@@ -548,17 +745,211 @@ class ProactiveService:
             msgs = msgs.get("messages") or msgs.get("data") or []
         return bool(msgs)
 
-    async def _trigger_morning_greeting(self, stream_id: str, activity_name: str) -> None:
-        """对一个会话触发早间问好。"""
-        intent_prompt = _MORNING_GREETING_INTENT.format(activity_name=activity_name)
-        ok = await self._call_proactive_trigger(
+    async def _morning_other_private_qualified(self, stream_id: str, date_str: str,
+                                               now: datetime, cfg_p: Any) -> bool:
+        """其他私聊早安门槛（§3.4/B7）：前一日该流消息数 ≥ ``morning_other_private_min_messages``。
+
+        经 ``get_by_time_in_chat`` 取「昨日 00:00 → 今日 00:00」的消息，``limit=门槛`` 即够判定；
+        能力不可用/异常/返回形态不可解析 → 按 0 处理（**不发送**）。门槛当日内不变 → 当日缓存。
+        """
+        cache_key = (stream_id, date_str)
+        if cache_key in self._greeting_other_gate:
+            return self._greeting_other_gate[cache_key]
+
+        try:
+            need = max(1, int(getattr(cfg_p, "morning_other_private_min_messages", 5)))
+        except (TypeError, ValueError):
+            need = 5
+
+        qualified = False
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        if ctx_obj is not None and hasattr(ctx_obj, "message"):
+            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            yesterday_start = midnight - timedelta(days=1)
+            try:
+                msgs = await ctx_obj.message.get_by_time_in_chat(
+                    stream_id, str(yesterday_start.timestamp()), str(midnight.timestamp()),
+                    limit=need,
+                )
+            except Exception as exc:
+                logger.debug(f"查询前一日消息失败（按 0 处理）: stream={stream_id}, {exc}")
+                msgs = None
+            if isinstance(msgs, dict):
+                msgs = msgs.get("messages") or msgs.get("data") or []
+            if isinstance(msgs, list):
+                qualified = len(msgs) >= need
+
+        self._greeting_other_gate[cache_key] = qualified
+        return qualified
+
+    async def _resolve_greeting_candidates(self, cfg_p: Any) -> List[Tuple[str, str]]:
+        """问候候选（§3.4/B6/B7）：目标私聊（固定）∪ 群聊 ∪ 其他私聊。
+
+        群聊名单**复用全局配置** ``proactive_group_ids``（B6：不新增问候群号配置）；与活动切换
+        主动开口不同，问候不做「留空 = 所有群」的放大——名单为空即不含群聊（默认空 = 不发，
+        防打扰口径）。其他私聊复用 ``proactive_other_streams`` 名单。
+        """
+        candidates: List[Tuple[str, str]] = []
+        seen: set = set()
+
+        target = str(getattr(self._plugin, "_stream_id", "") or "").strip()
+        if target:
+            candidates.append((target, GREETING_CATEGORY_TARGET))
+            seen.add(target)
+
+        group_ids = [str(g).strip() for g in (getattr(cfg_p, "proactive_group_ids", None) or [])
+                     if str(g).strip()]
+        for gid in group_ids:
+            sid = await self._resolve_group_id(gid)
+            if sid and sid not in seen:
+                candidates.append((sid, GREETING_CATEGORY_GROUP))
+                seen.add(sid)
+
+        others = await self._resolve_proactive_streams(
+            list(getattr(cfg_p, "proactive_other_streams", None) or []))
+        for sid in others:
+            if sid and sid not in seen:
+                candidates.append((sid, GREETING_CATEGORY_OTHER))
+                seen.add(sid)
+
+        return candidates
+
+    async def _process_greetings(self, now: datetime, date_str: str) -> None:
+        """L2 每轮：候选枚举 → 掷点/复用 → 到点激活判定 → 触发/推迟/放弃（§3.2/§3.3/§3.5）。"""
+        cfg_p = self._proactive_cfg()
+        if not (cfg_p.enable_morning_greeting or cfg_p.enable_night_greeting):
+            return
+        now_ts = _epoch_ts(now)
+        for stream_id, category in await self._resolve_greeting_candidates(cfg_p):
+            if cfg_p.enable_morning_greeting:
+                await self._evaluate_greeting(stream_id, category, GREETING_MORNING,
+                                              now, now_ts, date_str, cfg_p)
+            if cfg_p.enable_night_greeting:
+                await self._evaluate_greeting(stream_id, category, GREETING_NIGHT,
+                                              now, now_ts, date_str, cfg_p)
+        # 跨天残留清理：只保留当天条目（纯内存状态，热重载后重掷）
+        for key in [k for k in self._greeting_rolls if k[1] != date_str]:
+            self._greeting_rolls.pop(key, None)
+        for gkey in [k for k in self._greeting_other_gate if k[1] != date_str]:
+            self._greeting_other_gate.pop(gkey, None)
+
+    async def _evaluate_greeting(self, stream_id: str, category: str, kind: str,
+                                 now: datetime, now_ts: float, date_str: str,
+                                 cfg_p: Any) -> None:
+        """单个候选的到点判定：激活 / 推迟下一 tick / 到期限放弃 / 触发（§3.3）。
+
+        激活查询窗按 kind 分派（**附录 §六.补 B5-补（2026-10-07 协调裁决）**）：
+
+        - **晚安** ``[fire_at, now]``：``fire_at = baseline − drift < baseline``，而常见日程形态
+          （末条非睡眠条目截断到入睡锚点）下 ``baseline ≈ 期限``——沿用 ``[baseline, now]``
+          会**结构性空窗**、群聊晚安永不触发；改自「该问候成为可能（fire_at）起」。
+        - **早安** ``[baseline, now]`` **一字不动**（B5 字面：「自基准点起该流有人发过消息」）。
+        - 两者都保留 B5「有人说话才跟着问候」语义；放弃语义不变：``[fire_at, 期限]`` 内
+          无人发言 → ``abandoned``（由既有 deadline 分支落 reason）。
+        """
+        if category == GREETING_CATEGORY_OTHER:
+            if kind == GREETING_NIGHT:
+                return  # 晚安本轮不给其他私聊（§3.4 末行）
+            if not bool(getattr(cfg_p, "morning_other_private_enabled", False)):
+                return
+            if not await self._morning_other_private_qualified(stream_id, date_str, now, cfg_p):
+                return
+
+        entry = self._roll_greeting(stream_id, category, kind, date_str, now, now_ts)
+        if entry["status"] in (GREETING_STATUS_FIRED, GREETING_STATUS_ABANDONED):
+            return
+        if now_ts < entry["fire_at"]:
+            return
+
+        activated = True
+        if self._greeting_requires_activation(category, kind, cfg_p):
+            # 附录 §六.补 B5-补：晚安自 fire_at 起算（用 baseline 会结构性空窗），早安维持 baseline
+            since_ts = entry["fire_at"] if kind == GREETING_NIGHT else entry["baseline"]
+            activated = await self._stream_activated_since_wake(stream_id, since_ts, now_ts)
+        if not activated:
+            if now_ts >= entry["deadline"]:
+                self._abandon_greeting(entry, "deadline")
+            return  # 到点无人说话 → 推迟到下一 tick 继续观察
+        if now_ts >= entry["deadline"]:
+            self._abandon_greeting(entry, "deadline")
+            return
+        if self._in_silence_window(now):
+            # §3.6：合并后静默时段仍生效——静默中不开口（推迟下一 tick；
+            # 静默延续到期限的情形由上一判定的 deadline 分支放弃）
+            return
+        await self._fire_greeting(entry, date_str, now_ts)
+
+    def _abandon_greeting(self, entry: Dict[str, Any], reason: str) -> None:
+        """放弃该流该 kind 的当日问候（状态 + 决策日志；当天不再触发）。"""
+        entry["status"] = GREETING_STATUS_ABANDONED
+        entry["reason"] = reason
+        logger.info(
+            f"问候放弃（{reason}）: stream={entry['stream_id']}, kind={entry['kind']}, "
+            f"date={entry['date']}"
+        )
+        self._decision_log(
+            "skip", trigger_type=f"{entry['kind']}_greeting", reason=reason,
+            stream_id=entry["stream_id"], category=entry["category"],
+            fire_at=int(entry["fire_at"]), deadline=int(entry["deadline"]),
+        )
+
+    async def _fire_greeting(self, entry: Dict[str, Any], date_str: str, now_ts: float) -> None:
+        """触发一次问候（§3.5/F9：一律走既有 ``_call_proactive_trigger``，无预算旁路）。"""
+        stream_id, kind = entry["stream_id"], entry["kind"]
+        ok = await self._trigger_greeting(stream_id, kind, date_str)
+        if not ok:
+            # 预算拒绝 / 宿主触发失败：状态不变，下一轮继续尝试（到期限自然放弃）
+            return
+        entry["status"] = GREETING_STATUS_FIRED
+        entry["fired_at"] = now_ts
+        if entry["category"] == GREETING_CATEGORY_TARGET:
+            # §3.6：目标私聊写 affection 每日标记，patrol 见已发即不再各发一条
+            self._mark_greeting_sent_on_affection(kind)
+        self._decision_log(
+            "trigger", trigger_type=f"{kind}_greeting",
+            reason=("planning_v4: 早安问候（L2 漂移）" if kind == GREETING_MORNING
+                    else "planning_v4: 晚安问候（L2 漂移）"),
+            stream_id=stream_id, category=entry["category"],
+            drift=f"{entry['drift'][0]}-{entry['drift'][1]}",
+            fire_at=int(entry["fire_at"]), deadline=int(entry["deadline"]),
+        )
+
+    async def _trigger_greeting(self, stream_id: str, kind: str, date_str: str) -> bool:
+        """走统一主动链触发一次早晚安问候（intent 提示词按 kind 分派）。"""
+        if kind == GREETING_MORNING:
+            first = self._find_first_non_sleep_activity_today(date_str)
+            intent_prompt = (_MORNING_GREETING_INTENT.format(activity_name=first[0])
+                             if first is not None else _MORNING_GREETING_INTENT_NO_ACTIVITY)
+            reason = "planning_v4: 早安问候（L2 漂移）"
+        else:
+            intent_prompt = _NIGHT_GREETING_INTENT
+            reason = "planning_v4: 晚安问候（L2 漂移）"
+        return await self._call_proactive_trigger(
             stream_id=stream_id,
             intent_prompt=intent_prompt,
-            reason="planning_v4: 早间问好",
+            reason=reason,
             priority="normal",
         )
-        if ok:
-            self._decision_log("trigger", trigger_type="morning_greeting", reason=activity_name, stream_id=stream_id)
+
+    def _mark_greeting_sent_on_affection(self, kind: str) -> None:
+        """目标私聊触发成功 → 写 affection 的 ``set_morning_sent`` / ``set_night_sent``。
+
+        companion 未装配（``plugin._affection`` 缺失）→ getattr 判空静默跳过（§八.2 可空降级）。
+        """
+        affection = getattr(self._plugin, "_affection", None)
+        if affection is None:
+            return
+        setter = getattr(
+            affection,
+            "set_morning_sent" if kind == GREETING_MORNING else "set_night_sent",
+            None,
+        )
+        if not callable(setter):
+            return
+        try:
+            setter()
+        except Exception:
+            logger.debug("写 affection 早晚安标记失败", exc_info=True)
 
     # ------------------------------------------------------------
     # 查询辅助
@@ -623,15 +1014,25 @@ class ProactiveService:
             logger.debug(f"查找当前活动失败: {exc}")
         return None
 
-    def _find_first_activity_today(self) -> Optional[Tuple[str, int, int]]:
-        """找今天日程中开始时间最早的活动（即睡醒后的第一个活动）。"""
+    def _find_first_activity_today(self, date_str: Optional[str] = None,
+                                   skip_sleep: bool = False) -> Optional[Tuple[str, int, int]]:
+        """找指定日期日程中开始时间最早的活动（即睡醒后的第一个活动）。
+
+        ``date_str`` 缺省 = GoalManager 的「今天」（保持既有行为）；L2 早晚安漂移传入显式日期
+        （注入时钟下可测）。``skip_sleep=True`` 过滤睡眠条目（F14：早安放弃期限 =
+        睡眠结束后第一个**非睡眠**条目的结束）。
+        """
         try:
-            goals = get_goal_manager().get_schedule_goals(chat_id="global")
+            gm = get_goal_manager()
+            goals = (gm.get_schedule_goals(chat_id="global", date_str=date_str)
+                     if date_str else gm.get_schedule_goals(chat_id="global"))
         except Exception as exc:
             logger.debug(f"查找今日日程失败: {exc}")
             return None
         best: Optional[Tuple[str, int, int]] = None
         for goal in goals:
+            if skip_sleep and _is_sleep_schedule_item(goal):
+                continue
             tw = None
             if goal.parameters and "time_window" in goal.parameters:
                 tw = goal.parameters.get("time_window")
