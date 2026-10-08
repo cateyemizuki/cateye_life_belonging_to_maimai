@@ -271,17 +271,24 @@
 
 早/晚安**只配漂移区间**：每聊天流每日独立掷点一次，到点按「必要性激活」决定是否真的开口。
 
-**驱动链（一句话）**：`[planning_proactive]` 的漂移机制在 planning 的 60s 循环里掷点 → 到点查该流是否有人说话 → 统一主动链 `ctx.maisaka.proactive.trigger`（`allow_proactive` → `proactive.used`，纳入主动打扰预算——仅目标陪伴私聊）。早安/晚安**各只有这一条驱动链**：`[patrol]` 不再自行判时（B1 合并），只按 `affection` 的每日已发标记去重。
+**驱动链（一句话）**：`[planning_proactive]` 的漂移机制在 planning 的 60s 循环里掷点 → 到点查该流是否有人说话 → 统一主动链 `ctx.maisaka.proactive.trigger`。早安/晚安**各只有这一条驱动链**：`[patrol]` 不再自行判时（B1 合并），只按 `affection` 的每日已发标记去重；**例行问候默认免主动打扰预算**（M11 附录 II §2.3：闸门与计数一起跳，不查预算也不计用量），活动切换/想念/日常等非问候主动行为仍照旧计入主动打扰预算（仅目标陪伴私聊）。
 
 | 配置项 | 默认 | 约束 | 说明 |
 |---|---|---|---|
-| `[planning_proactive] enable_morning_greeting`（既有） | `false` | — | 早安总开关 |
+| `[planning_proactive] greeting_target_enabled` | `true` | — | **目标陪伴私聊**早/晚安开关：目标 QQ **不看任何名单，必定触发**（例外：静默时段、当天该流已发过同类问候、本开关关闭） |
+| `[planning_proactive] greeting_group_enabled` | `true` | — | **群聊**早/晚安开关：受下面两张群聊名单与必要性激活限制（`greeting_require_activation`） |
+| `[planning_proactive] greeting_group_blacklist` | 空 | 只收裸群号 | 群聊问候黑名单：命中即不发；**留空 = 全发**（受激活限制）。带前缀/非数字/空串/重复项忽略并记一条汇总告警；**不支持通配** |
+| `[planning_proactive] greeting_group_whitelist` | 空 | 只收裸群号 | 群聊问候白名单：非空时**仅这些群**生效；留空 = 不过滤（全发）；`["*"]` = 显式全发；`*` 与具体号混用 → 全放行 + 告警 |
+| `[planning_proactive] greeting_other_private_enabled` | `false` | — | **非目标私聊**早/晚安开关（早/晚共用）：开启后还需命中名单且前一日该流消息数 ≥ 门槛 |
+| `[planning_proactive] greeting_other_private_whitelist` | 空 | 只收裸 QQ 号 | 非目标私聊问候白名单：**留空 = 全不发**（默认安全的收紧）；`["*"]` = 不过滤（对已知私聊流生效） |
+| `[planning_proactive] greeting_other_private_blacklist` | 空 | 只收裸 QQ 号 | 非目标私聊问候黑名单：命中即不发；不支持通配 |
+| `[planning_proactive] greeting_other_private_min_messages` | `5` | `ge=5`（**不允许低于 5**，配置校验直接拒绝） | 非目标私聊问候门槛（早/晚共用）：**前一日**该流消息数达到该值才成为候选；取不到计数按 0 处理（不发送） |
+| `[planning_proactive] greeting_exempt_budget` | `true` | — | 例行问候免主动打扰预算：开启后早/晚安触发**既不查预算闸门也不计主动打扰用量**（闸门与计数一起跳）；关闭则照旧受预算约束 |
 | `[planning_proactive] morning_drift` | `"10-30"` | `^\d+(-\d+)?$` | 早安漂移区间（分钟）：触发时刻 = 睡眠窗口结束（`[schedule] wake_time` 锚点）+ `randint(a,b)`；单数字 `N` = `0~N` 随机；`a>b` 自动交换；**负数/非法回退默认区间**（不收负数） |
 | `[planning_proactive] night_drift` | `"10-30"` | 同上 | 晚安漂移区间（分钟）：触发时刻 = 当天最后一个非睡眠日程条目结束 − `randint(a,b)`（向前漂移）；无日程回退 `[schedule] sleep_time` 锚点 |
-| `[planning_proactive] enable_night_greeting` | `false` | — | 晚间问候开关；关闭时**晚安全线不发（含群聊）** |
-| `[planning_proactive] morning_other_private_enabled` | `false` | — | 其他私聊的早安开关 |
-| `[planning_proactive] morning_other_private_min_messages` | `5` | `ge=5`（**不允许低于 5**，配置校验直接拒绝） | 其他私聊早安门槛：**前一日**该流消息数达到该值才成为候选；取不到计数按 0 处理（不发送） |
 | `[planning_proactive] greeting_require_activation` | `true` | — | 群聊必要性激活：到点需先观察到「自基准点起该流有人发过消息」才问候；无人则推迟到下一轮，到期限仍无人即放弃（当天不再补发） |
+
+**被取代键（deprecated 兼容读取，M11 附录 II §2.6/§七）**：`enable_night_greeting` **显式 false = 晚安全灭（三类都不发）**、显式 true / 缺省 = 三类新开关接管（晚间问候总开关被 `greeting_target_enabled` + `greeting_group_enabled` 细分取代）；`morning_other_private_enabled` **显式 true** 归并生效为 `greeting_other_private_enabled`（早/晚共用；新键显式时新键优先）；`morning_other_private_min_messages` 显式值沿用为新门槛 `greeting_other_private_min_messages` 的缺省（新键显式优先）。`enable_morning_greeting` 亦已下线为纯兼容字段（早安不再需要总开关）。旧键存在不报错。
 
 **基准与期限**
 
@@ -295,15 +302,17 @@
 - **锚点参照点**：晚安的「入睡锚点 / `silence_start`」按**今天的起床锚点**取"今晚的那一次"——常规作息得到当天时刻，夜猫子作息（`sleep < wake`，日程延续到次日凌晨）自动落到次日凌晨，不会误判成"窗口已过"。
 - **延迟补发**：循环因重启等原因错过触发时刻时，只要未到期限仍会在下一个 tick 补发；已过期限即记放弃（`abandoned`），当天不再评估。
 
-**覆盖范围（B6/B7）**
+**覆盖范围（M11 附录 II §2.2 三类触发矩阵，取代 B6）**
 
-| 目标 | 规则 |
-|---|---|
-| 虚拟恋人目标私聊（`[target] target_qq`） | 早安/晚安**固定生效**（只要对应开关打开，不要求激活） |
-| 群聊 | 仅当群号出现在 `[planning_proactive] proactive_group_ids`（**复用全局名单，不新增问候群号配置**）→ 必要性激活（`greeting_require_activation`）；晚安另需 `enable_night_greeting`。⚠ 与活动切换主动开口不同：问候**不做**「名单留空 = 所有群」的放大——**留空 = 不含群聊** |
-| 其他私聊 | 早安需 `morning_other_private_enabled` **且**前一日该流消息数 ≥ `morning_other_private_min_messages`；名单复用 `proactive_other_streams`。**晚安本轮不给其他私聊** |
+| 会话类型 | 开关 | 名单 | 附加条件 |
+|---|---|---|---|
+| 目标陪伴私聊（`[target] target_qq`） | `greeting_target_enabled`（默认 **true**） | **豁免名单**（不看任何黑白名单） | 无（必定触发） |
+| 群聊 | `greeting_group_enabled`（默认 **true**） | `greeting_group_blacklist`（空 = 全发）+ `greeting_group_whitelist`（非空 = 仅白名单；`["*"]` = 不过滤） | **必要性激活**（`greeting_require_activation`） |
+| 非目标私聊 | `greeting_other_private_enabled`（默认 **false**） | 白名单 `greeting_other_private_whitelist`（**空 = 全不发**）+ 黑名单命中即不发 | 前一日该流消息数 ≥ `greeting_other_private_min_messages` |
 
-**预算与去重**：问候一律走统一主动链并计入主动打扰预算（仅目标陪伴私聊；**不为问候开预算旁路**）；预算拒绝时当轮不发送、掷点状态不变（下一轮继续尝试，到期限自然放弃）。目标私聊触发成功后写 `affection` 的 `morning_sent`/`night_sent` 每日标记，`[patrol]` 见已发即不再触发——同一私聊流同一天早安/晚安**各至多一条**。
+名单**只收裸群号 / 裸 QQ 号**（带前缀、含非数字、空串、重复项一律忽略并记一条汇总告警，落决策日志；同签名每日一次）；黑名单不支持通配；`*` 与具体号混用 → 全放行 + 告警。与活动切换主动开口的 `proactive_group_ids` / `proactive_other_streams`（支持 `session:` / `qq:private:` 前缀）**两套名单不混用**。
+
+**预算与去重**：问候默认**免主动打扰预算**（`greeting_exempt_budget=true`，§2.3：不查闸门、不记用量）；关闭免预算后照旧走预算、预算拒绝时当轮不发送、掷点状态不变（下一轮继续尝试，到期限自然放弃）。目标私聊触发成功后写 `affection` 的 `morning_sent`/`night_sent` 每日标记，`[patrol]` 见已发即不再触发——同一私聊流同一天早安/晚安**各至多一条**。
 
 **[patrol] 的四个时间窗字段已废弃**：`morning_start` / `morning_end` / `night_start` / `night_end` 保留在配置里**仅作兼容读取**（仍参与 `HH:MM` 格式校验、非法值照旧落 `invalid_time_config` 留痕），**不再参与任何触发判定**；实际时刻由上面的漂移机制决定。`[patrol]` 的静默时段、每日发言上限（含「未发晚安预留 1 个预算位」）与主动打扰预算（仅目标陪伴私聊）照旧生效；`[patrol] min_interval_exempt_greetings`（早晚安豁免最小间隔）随 patrol 判时下线而**不再有消费点**（字段保留，间隔约束由漂移机制自身的基准/期限承担）。
 
