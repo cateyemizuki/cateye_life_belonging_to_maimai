@@ -249,7 +249,7 @@
 > {lie_in_max_until}）。这条提醒只在本轮有效，不必向任何人提起"昨晚被吵醒"。是否调用由你决定。
 
 - `{planned_wake_hhmm}` = **当前睡眠窗口结束**（周期在册端点优先，回退 `[schedule] wake_time` 锚点）；
-- 发送走**统一主动链**：`ctx.maisaka.proactive.trigger(stream_id=该段末条 reply 流, intent="nap_reminder", reason=文本, metadata={"kind": "nap_reminder"})`，调用前查全渠道预算（`allow_proactive` → `proactive.used`），**纳入打扰预算**；预算拒绝 → 不发送、不计数；
+- 发送走**统一主动链**：`ctx.maisaka.proactive.trigger(stream_id=该段末条 reply 流, intent="nap_reminder", reason=文本, metadata={"kind": "nap_reminder"})`，调用前查主动打扰预算（仅目标陪伴私聊；`allow_proactive` → `proactive.used`），**纳入打扰预算**；预算拒绝 → 不发送、不计数；
 - **不进下一轮**：提醒块由宿主写进该流的内存历史（per-stream，不落库），本插件在注入 Hook 的既有剥离点新增 `is_consumed_ephemeral_proactive_block`——块龄 > `NAP_BLOCK_LINGER_SECONDS`（120s）即从请求载荷剔除（下一轮 planner 起不再出现）；入队超 30 分钟的块仍由原有规则兜底剥离，只影响本插件的 `kind=nap_reminder` 块，不误伤其他主动块与真实消息；
 - **提醒轮豁免（§4.5）**：提醒发出后 120s 内该流若意外触发 reply，**不刷新 resleep 计时、不重开吵醒态、不额外限制工具调用**。
 
@@ -271,7 +271,7 @@
 
 早/晚安**只配漂移区间**：每聊天流每日独立掷点一次，到点按「必要性激活」决定是否真的开口。
 
-**驱动链（一句话）**：`[planning_proactive]` 的漂移机制在 planning 的 60s 循环里掷点 → 到点查该流是否有人说话 → 统一主动链 `ctx.maisaka.proactive.trigger`（`allow_proactive` → `proactive.used`，纳入全渠道预算）。早安/晚安**各只有这一条驱动链**：`[patrol]` 不再自行判时（B1 合并），只按 `affection` 的每日已发标记去重。
+**驱动链（一句话）**：`[planning_proactive]` 的漂移机制在 planning 的 60s 循环里掷点 → 到点查该流是否有人说话 → 统一主动链 `ctx.maisaka.proactive.trigger`（`allow_proactive` → `proactive.used`，纳入主动打扰预算——仅目标陪伴私聊）。早安/晚安**各只有这一条驱动链**：`[patrol]` 不再自行判时（B1 合并），只按 `affection` 的每日已发标记去重。
 
 | 配置项 | 默认 | 约束 | 说明 |
 |---|---|---|---|
@@ -303,9 +303,9 @@
 | 群聊 | 仅当群号出现在 `[planning_proactive] proactive_group_ids`（**复用全局名单，不新增问候群号配置**）→ 必要性激活（`greeting_require_activation`）；晚安另需 `enable_night_greeting`。⚠ 与活动切换主动开口不同：问候**不做**「名单留空 = 所有群」的放大——**留空 = 不含群聊** |
 | 其他私聊 | 早安需 `morning_other_private_enabled` **且**前一日该流消息数 ≥ `morning_other_private_min_messages`；名单复用 `proactive_other_streams`。**晚安本轮不给其他私聊** |
 
-**预算与去重**：问候一律走统一主动链并计入全渠道预算（**不为问候开预算旁路**）；预算拒绝时当轮不发送、掷点状态不变（下一轮继续尝试，到期限自然放弃）。目标私聊触发成功后写 `affection` 的 `morning_sent`/`night_sent` 每日标记，`[patrol]` 见已发即不再触发——同一私聊流同一天早安/晚安**各至多一条**。
+**预算与去重**：问候一律走统一主动链并计入主动打扰预算（仅目标陪伴私聊；**不为问候开预算旁路**）；预算拒绝时当轮不发送、掷点状态不变（下一轮继续尝试，到期限自然放弃）。目标私聊触发成功后写 `affection` 的 `morning_sent`/`night_sent` 每日标记，`[patrol]` 见已发即不再触发——同一私聊流同一天早安/晚安**各至多一条**。
 
-**[patrol] 的四个时间窗字段已废弃**：`morning_start` / `morning_end` / `night_start` / `night_end` 保留在配置里**仅作兼容读取**（仍参与 `HH:MM` 格式校验、非法值照旧落 `invalid_time_config` 留痕），**不再参与任何触发判定**；实际时刻由上面的漂移机制决定。`[patrol]` 的静默时段、每日发言上限（含「未发晚安预留 1 个预算位」）与全渠道预算照旧生效；`[patrol] min_interval_exempt_greetings`（早晚安豁免最小间隔）随 patrol 判时下线而**不再有消费点**（字段保留，间隔约束由漂移机制自身的基准/期限承担）。
+**[patrol] 的四个时间窗字段已废弃**：`morning_start` / `morning_end` / `night_start` / `night_end` 保留在配置里**仅作兼容读取**（仍参与 `HH:MM` 格式校验、非法值照旧落 `invalid_time_config` 留痕），**不再参与任何触发判定**；实际时刻由上面的漂移机制决定。`[patrol]` 的静默时段、每日发言上限（含「未发晚安预留 1 个预算位」）与主动打扰预算（仅目标陪伴私聊）照旧生效；`[patrol] min_interval_exempt_greetings`（早晚安豁免最小间隔）随 patrol 判时下线而**不再有消费点**（字段保留，间隔约束由漂移机制自身的基准/期限承担）。
 
 **宿主实测项（离线不可覆盖，归宿主级验证会话）**：① 漂移触发时刻与 `[schedule] wake_time`、末条日程结束的实际对齐（含跨午夜条目）；② 群聊必要性激活在真实 `message.get_by_time_in_chat` 语义下的命中口径；③ 同一私聊流同一天早安/晚安各至多一条（含 planning 与其他链路的并发窗口）；④ `[patrol]` 时间窗字段废弃后，宿主 UI 保存配置不再写回旧值的行为。
 

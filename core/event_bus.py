@@ -1,4 +1,4 @@
-"""进程内事件总线 + 全渠道打扰预算（MAINTENANCE_PLAN §三 / §六.2 H，里程碑 M0）。
+"""进程内事件总线 + 主动打扰预算（仅目标陪伴私聊；MAINTENANCE_PLAN §三 / §六.2 H，里程碑 M0）。
 
 设计约定（逐条对应计划书 §3.1）：
 - 事件名 ``模块.事件``（snake_case）；payload 自动补 ``ts``（ISO 时间）与 ``source``；
@@ -8,9 +8,10 @@
 - 同一事件递归 publish 深度 >5 时丢弃该次发布并告警（§3.1 深度保护）；
 - 订阅注册/注销挂在各服务束 start()/stop()（M0 实际订阅者仅本文件的预算计数器）。
 
-全渠道打扰预算（§六.2 H，B11）：一切主动行为触发前发 ``proactive.used``，
+主动打扰预算（仅目标陪伴私聊；§六.2 H，B11）：主动行为触发前发 ``proactive.used``，
 按日计数；各发布方触发前查询 :func:`ProactiveBudget.allow_proactive`；
-上限默认 = ``patrol.daily_max_speak + 2``，``patrol.global_proactive_cap > 0`` 时直接采用其值。
+上限默认 = ``patrol.daily_max_speak + 2``，``patrol.proactive_target_daily_cap > 0`` 时直接采用其值
+（旧键名 ``global_proactive_cap`` 兼容读取回退：既有 config 与热重载前的运行期对象形态照旧生效）。
 
 计数持久化（A2，2026-10-05）：传入 ``data_dir`` 时 ``_used/_date`` 落盘
 ``proactive_budget.json``（复用 core/storage.py 的 load_json/save_json_atomic）——
@@ -154,7 +155,7 @@ class EventBus:
         return self._budget
 
     def allow_proactive(self, channel: str = "", intent: str = "") -> bool:
-        """查询全渠道打扰预算（未安装预算时恒放行）。"""
+        """查询主动打扰预算（仅目标陪伴私聊计数；未安装预算时恒放行）。"""
         if self._budget is None:
             return True
         return self._budget.allow_proactive(channel, intent)
@@ -185,7 +186,7 @@ class EventBus:
 
 
 class ProactiveBudget:
-    """全渠道打扰预算计数器（§六.2 H）：按日计数，跨天自动清零。
+    """主动打扰预算（仅目标陪伴私聊）计数器（§六.2 H）：按日计数，跨天自动清零。
 
     A2 持久化：``data_dir`` 非空时计数落盘 ``proactive_budget.json``（启动装载 /
     计数变化即原子写 / 日切重置写回），使 file_watcher 热重载后计数不回落；
@@ -286,11 +287,16 @@ class ProactiveBudget:
             return None
 
     def cap(self) -> int:
-        """当日全渠道上限：patrol.global_proactive_cap > 0 时采用其值，否则 daily_max_speak + 2。"""
+        """目标陪伴私聊的每日主动打扰上限：``patrol.proactive_target_daily_cap > 0`` 时采用其值
+        （旧键名 ``patrol.global_proactive_cap`` 属性级兼容回退），否则 ``daily_max_speak + 2``。"""
         cfg = self._config()
         patrol = getattr(cfg, "patrol", None)
         daily = getattr(patrol, "daily_max_speak", 5)
-        override = getattr(patrol, "global_proactive_cap", 0)
+        # M11（附录 II §3.4）：字段改名 proactive_target_daily_cap；取不到时回落旧属性名，
+        # 热重载前的运行期对象 / 既有 SimpleNamespace 桩形态（仅带旧键）照旧生效
+        override = getattr(patrol, "proactive_target_daily_cap", None)
+        if override is None:
+            override = getattr(patrol, "global_proactive_cap", 0)
         try:
             daily_int = int(daily if daily is not None else 5)
         except (TypeError, ValueError):
@@ -336,7 +342,7 @@ class ProactiveBudget:
     # ---- 内部 ----
     def _log_blocked(self, channel: str, intent: str, limit: int) -> None:
         logger.warning(
-            "全渠道打扰预算拦截：渠道=%s，当日已用 %d/%d（intent=%s）",
+            "主动打扰预算拦截：渠道=%s，当日已用 %d/%d（intent=%s）",
             channel or "(未署名)", self._used, limit, intent or "-",
         )
         logger_ = self._decision_logger
@@ -346,7 +352,7 @@ class ProactiveBudget:
             logger_.record(
                 action="budget.blocked",
                 trigger_type="proactive_budget",
-                reason=f"当日全渠道主动打扰已用 {self._used}/{limit}，本次触发被拦截",
+                reason=f"当日主动打扰已用 {self._used}/{limit}（仅目标陪伴私聊），本次触发被拦截",
                 channel=str(channel or ""), intent=str(intent or ""),
                 used=self._used, cap=limit, date=self._date,
             )
@@ -361,7 +367,7 @@ _installed_budget: Optional[ProactiveBudget] = None
 def install_proactive_budget(bus: EventBus, config_provider: Any = None,
                              decision_logger: Any = None,
                              data_dir: Any = None) -> ProactiveBudget:
-    """装配期安装全渠道打扰预算：订阅 ``proactive.used`` 并挂到总线上。
+    """装配期安装主动打扰预算（仅目标陪伴私聊）：订阅 ``proactive.used`` 并挂到总线上。
 
     Args:
         bus: 事件总线实例（plugin._bus）。

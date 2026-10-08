@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Dict, Literal
 
+import pydantic
 from maibot_sdk import Field, PluginConfigBase
 
 
@@ -137,17 +138,19 @@ class PatrolSectionConfig(PluginConfigBase):
         description="每日主动发言预算（次）；未发晚安时为晚安预留 1 次。0=完全静音",
         json_schema_extra={"label": "每日预算", **_ui_i18n("Daily budget")},
     )
-    global_proactive_cap: int = Field(
+    proactive_target_daily_cap: int = Field(
         default=0,
         ge=0,
         le=200,
-        description="全渠道每日主动打扰上限（次）：私聊主动 + 空间互动提醒共享；0=自动取「每日预算+2」",
+        description="目标陪伴私聊的每日主动打扰上限（次）：仅统计发往目标陪伴私聊的主动打扰；"
+                    "0=自动取「每日预算+2」（旧键名 global_proactive_cap 兼容读取）",
         json_schema_extra={
-            "label": "全渠道打扰上限",
-            "hint": "0=自动取「每日预算 + 2」；大于 0 时直接采用该值（patrol/planning/空间提醒共享同一计数）",
-            **_ui_i18n("Global proactive cap",
-                       "0 = daily budget + 2. Shared daily cap for all proactive interruptions "
-                       "(patrol / planning / qzone reminders)."),
+            "label": "目标陪伴私聊打扰上限",
+            "hint": "0=自动取「每日预算 + 2」；大于 0 时直接采用该值。仅目标陪伴私聊计入；"
+                    "旧键名 global_proactive_cap 兼容读取（新旧同给时新键优先）",
+            **_ui_i18n("Target companion proactive cap",
+                       "0 = daily budget + 2. Daily cap of proactive interruptions sent to the target "
+                       "companion private chat. Legacy key global_proactive_cap is still read."),
         },
     )
     min_trigger_interval_minutes: int = Field(
@@ -301,6 +304,22 @@ class PatrolSectionConfig(PluginConfigBase):
                        "LLM gate template; must answer Y to proceed. Placeholders: {lover_name}, {personality}, etc."),
         },
     )
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_cap_key(cls, data: object) -> object:
+        """旧键名 ``global_proactive_cap`` → ``proactive_target_daily_cap``（M11 附录 II §3.4）。
+
+        用户既有 config 里的旧键照旧生效：先把旧键从输入字典里取出（pop），再填进新键
+        （``setdefault`` = 新旧同给时**新键优先**）——旧键不留在字典里，字段的 extra 约束
+        与 WebUI schema 都不会再看到它。非字典输入（模型实例/None 等）原样放行。
+        """
+        if not isinstance(data, dict) or "global_proactive_cap" not in data:
+            return data
+        migrated = dict(data)
+        legacy = migrated.pop("global_proactive_cap")
+        migrated.setdefault("proactive_target_daily_cap", legacy)
+        return migrated
 
 
 # ---------------------------------------------------------------------------
