@@ -2,7 +2,7 @@
 
 > 猫眼生活套件（github.cateye.cateye-suite）现有 **7 个 LLM 工具**（T6 收口 6 + M9 赖床 1）、**8 个聊天指令**、**4 个跨插件 API**
 > （**29 组件 = 8 Command + 7 Tool + 10 Hook + 4 API**；T6 收口 28 → M9 增 1 个 hidden Tool）。
-> 四个业务子模块各自提供一组：planning（日程规划）/ companion（虚拟恋人）/ emotion（情绪）/ qzone（QQ 空间）。
+> 四个业务子模块各自提供一组：planning（日程规划）/ companion（虚拟陪伴）/ emotion（情绪）/ qzone（QQ 空间）。
 > 本手册给出每个条目的描述原文、参数、行为细节与权限要求；架构与安装说明见 README.md。
 >
 > **T6 变更（2026-10-06）**：工具与指令均按**直接删除条目**处理（不标注废弃）——被删入口
@@ -72,10 +72,10 @@
   - **本实现采用方案 ②**（离线无法实测宿主检索面；方案 ① 留作宿主实测不通过时的升级路径），因此**需要宿主实测确认**（见 §七 末尾清单）。
 - **计数与提醒的关系**：两者共用同一「有效提醒次数」（`[planning_proactive] nap_reminder_max_per_day`，默认 2，按 `cycle_key` 计，纯内存、不落盘）；额度用尽后只停提醒，bot 仍可自行调本工具改日程。
 
-### companion — 虚拟恋人（2 个）
+### companion — 虚拟陪伴（2 个）
 
 #### `cateye_test_mai_lover_send_message`
-- **描述**：以麦麦恋人的口吻向用户主动发送一条恋人消息。
+- **描述**：以麦麦的口吻向陪伴对象主动发送一条消息（口吻与后缀随关系自动变化）。
 - **参数**：`message`（string，可选）要发送的消息文本，留空则自动生成。
 - **行为**：发送到目标私聊，追加好感度情绪后缀（热恋档 10% 概率附括号小剧场）；成功计 1 次发言数并写决策日志；发送失败有明确错误返回。
 
@@ -84,7 +84,7 @@
 - **参数**：`level`（integer，必填）只能填 0、1 或 2。
 - **行为**：3 档兼容入口——0/1/2 分别落到 v2 档位 1/2/4（score 取 30.0/57.5/94.0），并**强制重估档位（跳过迟滞）**，保证旧 `level()` 输出与输入一致；持久化后 planner 注入按 v2 5 档档位描述表达（后缀/小剧场仍按 3 档折算）。
 
-> T6 说明：原 `cateye_test_mai_lover_current_activity`、`cateye_test_mai_lover_status`、`cateye_test_mai_lover_schedule` 三工具已移除——当前活动/今日完整日程统一走 `cateye_test_get_schedule_info`（view=current / lover_day），恋人状态面由 `/cateye_test_dashboard` 的伴侣区块与纯文本档承载。
+> T6 说明：原 `cateye_test_mai_lover_current_activity`、`cateye_test_mai_lover_status`、`cateye_test_mai_lover_schedule` 三工具已移除——当前活动/今日完整日程统一走 `cateye_test_get_schedule_info`（view=current / lover_day），陪伴状态面由 `/cateye_test_dashboard` 的伴侣区块与纯文本档承载。
 > A5 指令收敛（2026-10-06，随 M7）：原 `cateye_test_mai_lover_config` Tool 已删除，配置摘要并入 `/cateye_test_dashboard` 的**纯文本档末行**（单行紧凑版，图片档不含）。
 
 ### qzone — QQ 空间（1 个）
@@ -150,7 +150,7 @@
 | 指令 | 描述 | 行为 |
 |---|---|---|
 | `/cateye_test_mai_affection [0\|1\|2]` | 查看/调整好感度：不带参数输出 score/baseline/5 档档位/今日 Δ + 最近印象（最多 2 条，「最近印象」行）与关系温度（tone，「关系温度·日期」行）——印象与 tone 为 M2 关系日结产出，为空则不显示（tone 读取时按 7 天过期判断）；带参数按 3 档兼容口径调整 | 0/1/2 → score 移到 v2 档位 1/2/4（取 30.0/57.5/94.0）并强制重估（跳过迟滞）；参数取正则命名捕获组（兼容引用+命令混排）；缺参/非法值提示用法与当前状态 |
-| `/cateye_test_mai_help` | 查看麦麦恋人所有可用命令 | 命令清单直发（含「日程与生活管理见 /cateye_test_plan 与 /cateye_test_life」指路行） |
+| `/cateye_test_mai_help` | 查看麦麦陪伴所有可用命令 | 命令清单直发（含「日程与生活管理见 /cateye_test_plan 与 /cateye_test_life」指路行） |
 | `/cateye_test_diag [llm\|decision\|life] [天数]` | **A5 排障三合一**：`llm` = LLM 调用日志（旧名 `/cateye_test_mai_llm_log`）、`decision` = 主动行为决策日志（旧名 `/cateye_test_mai_diag`）、`life` = 决策日志紧凑文本（旧名 `/cateye_test_life diag`）；无参数/未知子命令回四行用法帮助 | **管理员 ∪ 本机控制台**；`llm`/`decision` JSONL 按天读取（1~30 天，缺省=整个保留期）后合并转发，未启用时提示配置项、空日志时给提示（decision 附巡检状态行）；`life` 紧凑文本（1~7 天，缺省 1）直发 |
 | `/cateye_test_dashboard` | **M7 聚合总览**：一条命令看四模块（日程规划/伴侣关系/情绪/QQ空间）并渲染状态图（内置 NotoSansSC + PIL，浅色卡片排版） | **管理员 ∪ 本机控制台**（`admin.admin_users`，留空时 QQ 侧默认拒绝并提示「权限不足」，不要求 target_qq）；有图 = 图片 + 文本合并转发；渲染失败/超时（PIL 缺失、字体缺失、10s 超时）静默降级为纯文本直发（不发失败提示）；某模块未启用/未装配 → 该区块显示「（未启用）」；**纯文本档**：日程区块展开今日**完整**日程（不截断，原 `/cateye_test_mai_schedule` 的信息面）+ 伴侣区块含好感/今日发言/早安·晚安·想念标记，末行附单行配置摘要（原 `cateye_test_mai_lover_config` Tool 与 `/cateye_test_mai_config` 命令的信息面）；**图片档仍按 ≤5 条截断且不含配置摘要** |
 
@@ -186,9 +186,9 @@
 | API | 提供方 | 返回结构 | 说明 |
 |---|---|---|---|
 | `get_current_activity` | planning | `{"has_activity", "activity": {name/description/goal_type/time_window}, "next_activities": [{"time","name"}], "as_of", "timezone", "error"}` | 当前活动快照，与自主规划插件返回结构兼容（经注入缓存通道） |
-| `companion_get_current_activity` | companion | 活动描述字符串（无活动返回空串） | 恋人视角的当前活动 |
-| `companion_get_schedule` | companion | `[{time, activity}]` | 今日完整日程（兼容虚拟恋人插件返回结构） |
-| `companion_get_affection_level` | companion | `0 / 1 / 2` | 好感度档位（兼容虚拟恋人插件返回结构） |
+| `companion_get_current_activity` | companion | 活动描述字符串（无活动返回空串） | 陪伴对象视角的当前活动 |
+| `companion_get_schedule` | companion | `[{time, activity}]` | 今日完整日程（兼容虚拟陪伴插件返回结构） |
+| `companion_get_affection_level` | companion | `0 / 1 / 2` | 好感度档位（兼容虚拟陪伴插件返回结构） |
 
 > 命名说明：companion 的三个 API 在源插件中叫 `get_*`，因与 planning 的 `get_current_activity` 在同一插件内撞名，统一加了 `companion_` 前缀。
 

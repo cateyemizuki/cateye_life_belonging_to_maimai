@@ -4,7 +4,7 @@
 > 按来源拆为三个子目录（模块化维护），功能尽可能复刻原插件：
 >
 > 1. **自主规划插件**（autonomous_planning_plugin，上游 xuqian13，AGPL-3.0）→ `planning/`
-> 2. **虚拟恋人插件**（maibot-community mai-love，MIT）→ `companion/`
+> 2. **虚拟陪伴插件**（maibot-community mai-love，MIT）→ `companion/`
 > 3. **QQ 空间模块**（新增，接口依据 SnowLuma v1.12.10 动作面 + 麦麦空间 Maizone v3.0.3 实现路线）→ `qzone/`
 > 4. **情绪维护系统**（新增，按《MaiBot情绪维护系统设计文档》实现：VAD 三维模型 + 睡眠期大修）→ `emotion/`
 >
@@ -27,7 +27,7 @@ cateye_test/
 │   ├── proactive_service.py / auto_scheduler.py / cleanup_service.py / role_judge.py
 │   ├── tools_service.py / command_service.py / schedule_image.py(+assets/fonts)
 │   └── exceptions.py / time_utils.py（窗口/时区/能量，R0-C2 合并） / stream_filter.py / lru_cache.py ...
-├── companion/         # 虚拟恋人复刻（日程除外，详见 companion/INTEGRATION.md）
+├── companion/         # 虚拟陪伴复刻（日程除外，详见 companion/INTEGRATION.md）
 │   ├── config.py / services.py / components.py
 │   ├── affection.py / affection_events.py / affection_referee.py
 │   │                      # 好感 v2：状态层（score/baseline/档位/impressions）/ 规则事件 / LLM 裁判（会话采样 + 关系日结，M2）
@@ -75,7 +75,7 @@ cateye_test/
 - ✅ 自然语言约定（角色裁判 today/future/reject → 今日重排或未来约定）
 - ✅ /plan 命令（日程图片 PIL 渲染 + 合并转发，失败降级纯文本）与 2 个 LLM 工具（`get_schedule_info` 只读四视图 + `update_schedule_v4` 唯一日程写入口；原 manage_goal / get_planning_status / apply_schedule 三工具随 T6 收口移除，目标写 API 与 `apply_schedule_items` 仍在底层保留）
 
-### companion/ — 恋人生活（复刻 mai-love，日程除外；已扩展为关系系统）
+### companion/ — 陪伴生活（复刻 mai-love，日程除外；已扩展为关系系统）
 - ✅ **好感度 v2（M1）**：`score`（0~100 连续分，初始 30）+ `baseline`（慢速 EMA 关系底色）+ 恋人 5 档（生疏/熟悉/亲密/热恋/挚爱）；档位升降迟滞（越界 `tier_hysteresis` 3 分且停留 ≥24h 才动）+ 日切衰减（score 向 baseline 回归、baseline 慢速漂移）+ 规则事件记账（一问一答 ≤+1.0/日、沉默 ≥1h 后对方先开口 ≤+0.5/日、早晚安各 1 次/日、约定兑现 +1.0／违约 −0.5 每约定 1 次；日累计 +4.0/−3.0 限幅；零 LLM 成本）；单用户档案（只服务 `target.target_qq`），v1 档案自动迁移（旧 0/1/2 → 25/55/80）；旧 3 档口径保留（`level()` 0/1/2：0/1→旧0、2/3→旧1、4→旧2），habits 记忆、每日计数/早晚安/想念标记与 JSON 节流落盘不变
 - ✅ **好感 v2 接线（M1/M2）**：巡检日切挂日衰减；目标私聊观察 Hook 记 `chat_round` 并检测 `user_initiated`（同点触发 M2 会话采样）；planner 注入改读 5 档档位描述（M2 叠加最近 1~2 条印象 + 关系温度，无印象时降级现状）；订阅 planning 的 `schedule.commitment_kept/broken` 记账约定事件；档位变化发布 `relation.affection_tier_changed`
 - ✅ **好感 LLM 裁判（M2）**：会话采样裁判（每 `review_sample_every_rounds`(20) 轮采样一次、每日 ≤ `review_max_per_day`(2) 次，输入最近 ~10 条对方消息 + 人设 + 档位描述 + 低分辨率情绪描述 → `event/delta[-2,+2.5]/tag`）+ 关系日结（每日最多 1 次、与采样上限分开计；订阅 `schedule.sleep_started`、延迟到情绪睡眠大修之后，输入当日 event_log + 互动统计 + 最近印象 + 档位描述 → `delta_score[-2,+2]` + 0~3 条印象 + tone）；delta 均走规则入账入口受日累计限幅；impressions 滚动 10 条/7 天过期（tone 同窗口）；prompt 不含 score/baseline；LLM 请求失败或输出垃圾静默跳过（日结当日不重试），规则事件与日衰减照常——纯规则退化
@@ -89,7 +89,7 @@ cateye_test/
 - ✅ **LLM 判定板块 `[judge]`**（同步 mai-love 2.6.3）：想念把关等判定类调用的模型 / 最大 token 数 / 温度独立成段可配（默认跟随主任务、512、0.2），可为把关单独指到便宜、非思考型的任务/模型；把关调用走 `LLMService.judge()`，`/cateye_test_diag llm`（旧名 `/cateye_test_mai_llm_log`）记录实际使用的模型
 - ✅ **LLM 失败三态分诊**（同步 mai-love 2.6.2）：「成功但正文为空」（思考型模型把小 max_tokens 预算花在 reasoning 上）不再落进"未知错误"兜底，日志附 reasoning 尾部证据；宿主裸失败与非 dict 结果单独识别
 - ✅ **过期宿主主动任务块剥离**（同步 mai-love 2.6.2）：宿主 `enqueue_proactive_task` 的 `<plugin_proactive_task>` 块持久化进聊天历史且从不清理，planner/replyer 请求 Hook 把入队超过 30 分钟的块从本次请求载荷剥离（不回写宿主历史；新块与解析失败条目一律保留）
-- ✅ 屏幕感知「尾随锚点」注入（planner/replyer 双通道，锚点滑出作废）+ 恋人电脑联动（connect-hub 截屏 + VLM 描述）
+- ✅ 屏幕感知「尾随锚点」注入（planner/replyer 双通道，锚点滑出作废）+ 陪伴对象电脑联动（connect-hub 截屏 + VLM 描述）
 - ✅ 节假日服务（timor/jiejiariapi 多级降级）；决策日志每轮一条；/mai_* 命令组（鉴权 = target_qq 白名单 + 本机控制台，占位值拒绝）
 
 ### qzone/ — QQ 空间（新增）

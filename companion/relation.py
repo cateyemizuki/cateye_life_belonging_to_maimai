@@ -54,7 +54,7 @@ _RELATION_LEVEL_DESCRIPTIONS: Dict[str, Dict[int, str]] = {
 
 # 消息生成 prompt 用口吻词 + 系统提示词身份描述
 _RELATION_STYLE: Dict[str, Dict[str, str]] = {
-    "恋人": {"style": "温柔亲昵的恋人", "self_desc": "一个温柔体贴的虚拟恋人"},
+    "恋人": {"style": "温柔亲昵的陪伴者", "self_desc": "一个温柔体贴的虚拟陪伴者"},
     "挚友": {"style": "轻松真诚的挚友", "self_desc": "一个靠谱又有趣的挚友"},
     "维护者": {"style": "信赖并感激对方照顾的 AI 伙伴", "self_desc": "一个被TA细心维护、值得TA骄傲的 AI 伙伴"},
     "家人": {"style": "亲近随性的家人", "self_desc": "一个陪伴在侧的家人"},
@@ -168,8 +168,8 @@ class RelationProfile:
     tier_labels: Dict[int, str] = field(default_factory=lambda: dict(_RELATION_TIER_LABELS["恋人"]))
     tier_descriptions: Dict[int, str] = field(default_factory=lambda: dict(_RELATION_TIER_DESCRIPTIONS["恋人"]))
     tier_miss_factors: Dict[int, float] = field(default_factory=lambda: dict(_RELATION_TIER_MISS_FACTORS["恋人"]))
-    style_word: str = "温柔亲昵的恋人"
-    self_desc: str = "一个温柔体贴的虚拟恋人"
+    style_word: str = "温柔亲昵的陪伴者"
+    self_desc: str = "一个温柔体贴的虚拟陪伴者"
     suffixes: Dict[int, List[str]] = field(default_factory=lambda: {k: list(v) for k, v in RELATION_SUFFIXES["恋人"].items()})
     theaters: List[str] = field(default_factory=lambda: list(RELATION_THEATERS["恋人"]))
     is_custom: bool = False

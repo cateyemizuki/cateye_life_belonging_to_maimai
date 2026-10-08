@@ -1,4 +1,4 @@
-# companion/ — 虚拟恋人子模块（复刻自 maibot-community_mai-love v2.6.3）
+# companion/ — 虚拟陪伴子模块（复刻自 maibot-community_mai-love v2.6.3）
 
 > 来源：`maibot-community.mai-love`（原作者 octmicy，cateye 维护 fork，MIT）。
 > **日程生成不复刻**：mai-love 的日程系统由 planning/ 子模块提供，本模块只消费
@@ -18,7 +18,7 @@
 | `memory_manager.py` | 用户习惯读写（委托 AffectionManager.habits）+ 个人上下文构建 | memory_manager.py |
 | `sender_identity.py` | SenderCache（msg_id→QQ，TTL 24h）+ SessionKindCache（会话→是否群聊）+ 提取助手 | sender_identity.py |
 | `screen_context.py` | 屏幕旁白「尾随锚点」注入：ScreenContextStore（planner/replyer 双通道、锚点滑出作废、容量淘汰） | screen_context.py |
-| `cateye_client.py` | 恋人电脑联动：connect-hub 跨插件 API（status/screenshot）+ VLM 描述 + 超时与缓存 | cateye_client.py + llm_service.describe_image |
+| `cateye_client.py` | 陪伴对象电脑联动：connect-hub 跨插件 API（status/screenshot）+ VLM 描述 + 超时与缓存 | cateye_client.py + llm_service.describe_image |
 | `holiday_service.py` | 节假日多级降级：timor 整年表 → jiejiariapi → timor 按天 → 本地星期几；3 天 TTL 原子落盘 | holiday_service.py |
 | `components.py` | `CompanionComponentsMixin`：5 Hook + 6 Tool + 8 Command + 3 API（方法名 `mai_` 前缀；API 组件名加 `companion_` 前缀避免与 planning 撞名） | plugin.py 组件面 |
 | `services.py` | `CompanionServices` 服务束（复用顶层 _affection/_llm/_loggers；`set_persona`/`set_target`/`sync_from_config` 入口；**M2 构造并持有 `reviews`（`AffectionReviewer`）**；**M3 装配期注入情绪效价提供者 `set_emotion_vad_provider`（惰性读 `plugin._emotion`，可空降级）**） | plugin.py 装配段 |

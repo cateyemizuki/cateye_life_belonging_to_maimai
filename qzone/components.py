@@ -132,7 +132,7 @@ class QzoneComponentsMixin:
             "/cateye_test_life qzone - QQ空间状态｜moments 最近说说｜comments 说说评论列表\n"
             "           （管理员：post 文本、reply 说说序号 [评论序号] 内容、like tid [目标QQ]）\n"
             "/cateye_test_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /cateye_test_diag life，行为相同\n"
-            "/cateye_test_life help - 本帮助；日程与恋人功能另有 /cateye_test_plan 与 /cateye_test_mai_* 命令"
+            "/cateye_test_life help - 本帮助；日程与陪伴功能另有 /cateye_test_plan 与 /cateye_test_mai_* 命令"
         )
 
     def _qz_status_text(self) -> str:

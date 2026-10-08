@@ -1,9 +1,9 @@
-"""恋人电脑联动客户端（来源：虚拟恋人插件 cateye_client.py）。
+"""陪伴对象电脑联动客户端（来源：虚拟陪伴插件 cateye_client.py）。
 
 读取「cateye 统一连接插件」的电脑状态，经跨插件 API（``ctx.api.call``）：
 
 - 先查 ``cateye.connect-hub.status``：``connected=false``（或 hub 未安装、调用失败）
-  → 状态 ``offline``（「恋人的电脑没开」）；
+  → 状态 ``offline``（「陪伴对象的电脑没开」）；
 - 已连接 → 调 ``cateye.connect-hub.screenshot`` 截屏（可配模糊半径），
   把截图交给视觉模型（vlm 任务）转成一句话描述；
 - 截图失败 / 描述失败 → 状态 ``failed``（「没看清 TA 在干什么」）。
@@ -44,7 +44,7 @@ PEEK_FAILED = "failed"
 
 @dataclass(frozen=True)
 class ScreenPeek:
-    """一次「看恋人电脑」的结果。"""
+    """一次「看陪伴对象电脑」的结果。"""
 
     #: 取值见 PEEK_OK / PEEK_OFFLINE / PEEK_FAILED
     status: str
@@ -130,7 +130,7 @@ async def describe_image(
 
 
 class CateyeClient:
-    """恋人电脑读取器：在线判定 + 截图 + 视觉描述，带降级与超时保护。"""
+    """陪伴对象电脑读取器：在线判定 + 截图 + 视觉描述，带降级与超时保护。"""
 
     def __init__(self, plugin: Any, llm: Any = None, call_logger: Optional[LLMCallLogger] = None) -> None:
         """
@@ -164,7 +164,7 @@ class CateyeClient:
         return bool(getattr(self._cateye_cfg(), "enabled", False))
 
     async def peek_screen(self, now: datetime) -> Optional[ScreenPeek]:
-        """看一眼恋人电脑。
+        """看一眼陪伴对象电脑。
 
         Returns:
             :class:`ScreenPeek`（ok / offline / failed）；
@@ -177,10 +177,10 @@ class CateyeClient:
             timeout = float(getattr(self._cateye_cfg(), "timeout_seconds", 20.0))
             return await asyncio.wait_for(self._peek(now), timeout=max(5.0, timeout))
         except asyncio.TimeoutError:
-            self._ctx.logger.info("查看恋人电脑超时，本轮不注入屏幕感知")
+            self._ctx.logger.info("查看陪伴对象电脑超时，本轮不注入屏幕感知")
             return None
         except Exception as e:  # 绝不阻塞主动触发
-            self._ctx.logger.warning(f"查看恋人电脑异常（忽略）: {e}")
+            self._ctx.logger.warning(f"查看陪伴对象电脑异常（忽略）: {e}")
             return None
 
     # ------------------------------------------------------------
@@ -190,12 +190,12 @@ class CateyeClient:
     async def _peek(self, now: datetime) -> ScreenPeek:
         """实际的状态获取流程（已在功能开关通过后调用）。"""
         if not await self.is_connected():
-            self._ctx.logger.info("恋人电脑未连接（或 cateye 插件不可用），本轮按「电脑没开」处理")
+            self._ctx.logger.info("陪伴对象电脑未连接（或 cateye 插件不可用），本轮按「电脑没开」处理")
             return ScreenPeek(PEEK_OFFLINE)
 
         image_b64 = await self._take_screenshot()
         if not image_b64:
-            self._ctx.logger.info("恋人电脑截图失败，本轮按「没看清」处理")
+            self._ctx.logger.info("陪伴对象电脑截图失败，本轮按「没看清」处理")
             return ScreenPeek(PEEK_FAILED)
 
         description = await self._describe_screenshot(image_b64)
@@ -203,7 +203,7 @@ class CateyeClient:
             self._ctx.logger.info("屏幕截图视觉理解失败（宿主可能不支持图片输入），本轮按「没看清」处理")
             return ScreenPeek(PEEK_FAILED)
 
-        self._ctx.logger.info(f"恋人电脑状态（{now.strftime('%H:%M')}）：{description}")
+        self._ctx.logger.info(f"陪伴对象电脑状态（{now.strftime('%H:%M')}）：{description}")
         return ScreenPeek(PEEK_OK, description)
 
     async def is_connected(self) -> bool:
@@ -230,7 +230,7 @@ class CateyeClient:
         return connected
 
     async def _take_screenshot(self) -> str:
-        """截取恋人电脑屏幕，成功返回 base64 PNG，失败返回空串。"""
+        """截取陪伴对象电脑屏幕，成功返回 base64 PNG，失败返回空串。"""
         blur = int(getattr(self._cateye_cfg(), "screenshot_blur", 0) or 0)
         user_id = self._target_qq()
         try:

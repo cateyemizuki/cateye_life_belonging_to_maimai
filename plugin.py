@@ -3,8 +3,8 @@
 三个业务子模块（各自拥有 config / services / components）：
 - planning/   自主规划复刻：日程生成（多轮+评分）/ SQLite 目标库 / planner+replyer 注入 /
   活动切换主动开口 / /plan 命令 / get_current_activity API
-- companion/  虚拟恋人复刻：好感度 / 巡检主动聊天（早安晚安想念）/ 屏幕感知 /
-  恋人电脑联动 / 节假日 / /mai_* 命令
+- companion/  虚拟陪伴复刻：好感度 / 巡检主动聊天（早安晚安想念）/ 屏幕感知 /
+  陪伴对象电脑联动 / 节假日 / /mai_* 命令
 - qzone/      QQ 空间：按日程发说说（双通道）/ 自动回评（Web CGI 直连，含楼中楼）/ /life 命令
 - emotion/    情绪维护系统：VAD 三维状态机（日常增量+指数衰减）/ 睡眠裁判大修 / 人设初始化 / 情绪底色注入
 

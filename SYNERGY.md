@@ -2,7 +2,7 @@
 
 > 状态：**现状文档**（含流程图；事件总线已于 M0 落地，见 §3.5：`core/event_bus.py` + 全渠道打扰预算；§2~§4 其余联动点仍为规划，按 MAINTENANCE_PLAN 路线图分期落地）。
 > ⚠️ 2026-10-03 起：分路线图已被 **[MAINTENANCE_PLAN_10.05.md](MAINTENANCE_PLAN_10.05.md)** 取代（P1~P5 → M0~M6），并新增好感度 v2 重设计与模块相互影响矩阵；本文 §1~§4 的现状与联动点详设继续有效（旧 `MAINTENANCE_PLAN.md` 为 v1.2 快照，已废弃）。
-> 四个业务模块：planning（日程）/ companion（恋人·将扩展为关系系统）/ qzone（空间）/ emotion（情绪）。
+> 四个业务模块：planning（日程）/ companion（陪伴·将扩展为关系系统）/ qzone（空间）/ emotion（情绪）。
 > 目标：把四个模块从"各自独立运行、少数点对点引用"升级为**昼夜节律闭环**——日程塑造情绪，情绪反塑日程，关系放大波动，空间是情绪的出口。
 
 ---
@@ -11,7 +11,7 @@
 
 | 数据流 | 路径 | 说明 |
 |---|---|---|
-| planning → companion | `ScheduleQuery.find_current_activity / format_day_summary` | 恋人注入与巡检读取当前活动 |
+| planning → companion | `ScheduleQuery.find_current_activity / format_day_summary` | 陪伴注入与巡检读取当前活动 |
 | planning → qzone | `ScheduleQuery.find_current_activity` + 日程文案 | 空间按日程活动发说说（`require_activity` + 概率） |
 | planning → emotion | sleep 条目触发大修；前后日日程、`schedule.custom_prompt` 作裁判输入 | 睡眠大修已消费日程 |
 | emotion → 宿主 | replyer 模型请求系统条目（planner/replyer 双通道） | 情绪底色注入 |
@@ -22,7 +22,7 @@
 ```mermaid
 flowchart LR
     subgraph 现状
-      P[planning 日程] -->|当前活动/日程文本| C[companion 恋人]
+      P[planning 日程] -->|当前活动/日程文本| C[companion 陪伴]
       P -->|sleep条目/前后日日程| E[emotion 情绪]
       P -->|当前活动| Q[qzone 空间]
       E -->|情绪底色注入| H[宿主 planner/replyer]

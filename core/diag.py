@@ -1,4 +1,4 @@
-"""诊断日志（来源：虚拟恋人插件 decision_logger / llm_logger，简化合并版）。
+"""诊断日志（来源：虚拟陪伴插件 decision_logger / llm_logger，简化合并版）。
 
 两个 JSONL 按天分文件：
 - decisions_YYYY-MM-DD.jsonl  巡检/空间决策（trigger/skip/spoken/info）

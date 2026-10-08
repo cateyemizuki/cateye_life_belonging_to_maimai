@@ -1,4 +1,4 @@
-"""主动巡检调度器（来源：虚拟恋人插件 scheduler.py，判定链完整对齐）。
+"""主动巡检调度器（来源：虚拟陪伴插件 scheduler.py，判定链完整对齐）。
 
 单条 asyncio 循环（可打断睡眠：wait_for(stop_event.wait(), timeout)），每轮按优先级判定：
 日切 → 静默(fail-safe) → 非夜预算(晚安预留 1) → 早晚安状态检查(B1 合并：不再自行判时，
@@ -10,7 +10,7 @@
 计 0.5 发言数；replyer 真实回复后由 Hook 补计 0.5（credit_reply_half）。
 
 决策日志每轮恰好一条：SKIP_PRIORITY 决定多原因时保留哪个；
-触发前先看一眼恋人电脑（cateye_client），屏幕旁白发布到 ScreenContextStore
+触发前先看一眼陪伴对象电脑（cateye_client），屏幕旁白发布到 ScreenContextStore
 （尾随锚点注入由 components 的请求 Hook 完成），触发未入队则撤掉旁白。
 
 日程一律消费 planning 子模块：当前活动/未来活动经 planning.schedule_query.ScheduleQuery。
@@ -159,7 +159,7 @@ class PatrolService:
         self._stream_id = stream_id
 
     def set_persona(self, lover_name: str, personality: str = "") -> None:
-        """设置恋人名称与人设（服务束的 set_persona 入口透传到这里）。"""
+        """设置陪伴对象名称与人设（服务束的 set_persona 入口透传到这里）。"""
         if lover_name:
             self._lover_name = lover_name
         self._personality = personality or ""
@@ -170,7 +170,7 @@ class PatrolService:
             self._relation = relation
 
     def set_target_display_name(self, name: str) -> None:
-        """设置目标用户显示名（屏幕旁白文案用；取不到时旁白回退「恋人」）。"""
+        """设置目标用户显示名（屏幕旁白文案用；取不到时旁白回退「陪伴对象」）。"""
         if name:
             self._target_display_name = str(name).strip()
 
@@ -561,7 +561,7 @@ class PatrolService:
     # 屏幕感知（v2.6.0「先看屏幕，再叫醒 planner」）
     # ------------------------------------------------------------------
     async def _publish_screen_narration(self) -> None:
-        """看一眼恋人电脑，把屏幕旁白发布到注入缓存。
+        """看一眼陪伴对象电脑，把屏幕旁白发布到注入缓存。
 
         三种结果对应 [cateye] 的三个模板，模板留空 = 该情况不注入；
         功能关闭 / 整体超时 / 任何异常 → 不注入，绝不阻塞主动触发。

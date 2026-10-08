@@ -1,4 +1,4 @@
-"""恋人电脑屏幕感知的「尾随锚点」上下文注入（来源：虚拟恋人插件 screen_context.py）。
+"""陪伴对象电脑屏幕感知的「尾随锚点」上下文注入（来源：虚拟陪伴插件 screen_context.py）。
 
 **为什么不用 ``ctx.maisaka.context.append`` 一次性追加**：
 
@@ -17,7 +17,7 @@
 
 旁白是**请求级**的：只存在于当次 LLM 请求的载荷里，不写消息库、不真发到平台、
 也不落进宿主的历史。注入作用域由调用方（components.py 的 Hook）保证：只有
-session_id 命中恋人私聊流时才调用本模块，群聊与其他会话一律不注入。
+session_id 命中陪伴对象私聊流时才调用本模块，群聊与其他会话一律不注入。
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def format_narration(
     fields = {
         "date": f"{now.year}年{now.month}月{now.day}日",
         "time": now.strftime("%H:%M"),
-        "user_name": user_name or "恋人",
+        "user_name": user_name or "陪伴对象",
         "description": str(description or "").strip(),
     }
 

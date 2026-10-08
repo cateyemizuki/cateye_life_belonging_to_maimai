@@ -375,7 +375,7 @@ class InjectSectionConfig(PluginConfigBase):
 class PlanningProactiveSectionConfig(PluginConfigBase):
     """日程驱动的主动行为（来源：自主规划插件 [proactive] 段；推荐挂载名 ``planning_proactive``）。
 
-    与 [patrol]（虚拟恋人巡检）互相独立：本段负责「活动切换主动开口 / 早间问好 /
+    与 [patrol]（虚拟陪伴巡检）互相独立：本段负责「活动切换主动开口 / 早间问好 /
     按活动调节聊天频率」，白名单取群聊与其他会话两份名单的并集。
     """
 
