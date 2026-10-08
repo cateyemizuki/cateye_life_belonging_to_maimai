@@ -1727,9 +1727,11 @@ class EmotionService:
         3. ``no_sleep_mode == false``（§〇 C1：L1/L3 全线静默）；
         4. ``nap_reminder_enabled``（默认 true）。
 
-        发送（F9/F12）：查全渠道预算（``bus.allow_proactive``）→ 发 ``proactive.used`` →
+        发送（F9/F12）：查主动打扰预算（仅目标陪伴私聊；按 ``stream_id`` 维度判定）→
+        发预算记账事件（带 ``stream_id``）→
         ``ctx.maisaka.proactive.trigger(stream_id=段末条 reply 流, intent="nap_reminder",
         reason=提醒文本, metadata={"kind": "nap_reminder"})``。预算拒绝/触发失败 → 不发送不计数。
+        （M11 附录 II §3.3：赖床提醒发往目标陪伴私聊 → 计入；非目标流的段不计入、不受限。）
         成功后：有效提醒次数 +1、登记 §4.5 提醒轮豁免窗口、落 ``emotion.nap_reminder_sent``。
 
         Returns:
@@ -1773,19 +1775,22 @@ class EmotionService:
             _blocked("gate_disabled")
             return None
 
-        # 发送（F9：先查预算，再记 proactive.used，最后触发；预算拒绝 → 不发送不计数）
+        # 发送（F9：先查主动打扰预算，再记 proactive.used，最后触发；预算拒绝 → 不发送不计数）
+        # M11（附录 II §3.3）：预算按 stream 维度判定——本提醒发往目标陪伴私聊故计入。
         trigger = self._nap_trigger()
         if trigger is None:
             _blocked("trigger_missing")
             return None
         bus = self._bus()
-        if bus is not None and not bus.allow_proactive("emotion", "nap_reminder"):
+        if bus is not None and not bus.allow_proactive("emotion", "nap_reminder",
+                                                       stream_id=stream_id):
             _blocked("budget")
             return None
         if bus is not None:
             try:
                 await bus.publish("proactive.used", source="emotion",
-                                  channel="emotion", intent="nap_reminder")
+                                  channel="emotion", intent="nap_reminder",
+                                  stream_id=stream_id)
             except Exception:
                 pass
         text = self.nap_reminder_text(current)

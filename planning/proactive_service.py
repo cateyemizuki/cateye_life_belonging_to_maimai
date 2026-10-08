@@ -1402,7 +1402,9 @@ class ProactiveService:
 
         ``exempt_budget=True``（M11 附录 II §2.3：例行问候专用）→ **闸门与计数一起跳**：
         既不查询主动打扰预算，也不发布 ``proactive.used``（只跳闸门会让计数仍被悄悄消耗）。
-        默认 ``False``：非问候主动行为行为不变，照旧「查预算 → 记用量 → 触发」。
+        默认 ``False``：非问候主动行为照旧「查预算 → 记用量 → 触发」，但计数身份按 stream
+        维度判定（M11 §3.3）——**只有发往目标陪伴私聊**的主动打扰才查计数/入账，
+        群聊与其他私聊开口不计入、不受限。
         """
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "maisaka"):
@@ -1416,17 +1418,19 @@ class ProactiveService:
             logger.warning("宿主未提供 maisaka.proactive.trigger 能力，主动发起跳过")
             return False
 
-        # M0 预算接线（§六.2 H）：查询预算 → 发布 proactive.used → 执行触发。
-        # 活动切换主动开口与早间问好共用本调用处，两条通道受同一个全渠道预算约束。
+        # M0 预算接线（§六.2 H）：查询主动打扰预算 → 发布 proactive.used → 执行触发。
+        # 活动切换主动开口与早间问好共用本调用处。
+        # M11（附录 II §3.3）：预算计数身份 = **目标陪伴私聊**——按 stream 维度传参，
+        # 群聊/其他私聊的活动切换开口直接放行且不计入。
         # M11（附录 II §2.3）：例行问候 exempt_budget=True → 闸门与计数一并跳过。
         bus = self._event_bus()
         if bus is not None and not exempt_budget:
             label = str(reason or intent_prompt or "proactive")
-            if not bus.allow_proactive("planning", label):
+            if not bus.allow_proactive("planning", label, stream_id=stream_id):
                 return False
             try:
                 await bus.publish("proactive.used", source="planning",
-                                  channel="planning", intent=label)
+                                  channel="planning", intent=label, stream_id=stream_id)
             except Exception:
                 logger.debug("proactive.used 发布失败", exc_info=True)
 

@@ -88,9 +88,12 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         # 预算计数器在装配时装入（先于服务束启动；M0 实际订阅者仅它）
         self._bus = EventBus(self._decision_logger)
         # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
+        # M11（附录 II §3.3）：预算只统计发往目标陪伴私聊的主动打扰——注入 self._stream_id
+        # 取值回调（G11 权威来源，随 _apply_target/热重载更新；不新增持久化状态）
         self._proactive_budget = install_proactive_budget(
             self._bus, config_provider=lambda: self.config, decision_logger=self._decision_logger,
-            data_dir=data_dir)
+            data_dir=data_dir,
+            target_stream_provider=lambda: getattr(self, "_stream_id", ""))
 
         # 服务束（内部动态读 self.config，热重载自动生效）
         self._planning = PlanningServices(self)

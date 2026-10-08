@@ -525,15 +525,9 @@ class QzoneService:
             for tid, added in new_comments.items():
                 moment = moments_by_tid.get(tid) or {}
                 excerpt = str(moment.get("content") or "")[:30]
-                # M0 预算接线（§六.2 H）：查询预算 → 发布 proactive.used → 执行触发
-                if self.bus is not None and not self.bus.allow_proactive("qzone", "qzone_comment"):
-                    break  # 全渠道预算已满：本条及其余提醒不再触发
-                if self.bus is not None:
-                    try:
-                        await self.bus.publish("proactive.used", source="qzone",
-                                               channel="qzone", intent="qzone_comment")
-                    except Exception:
-                        pass
+                # M11（附录 II §3.3）：空间侧评论提醒**不计入**主动打扰预算——不再查闸门、
+                # 不再发预算记账事件；空间侧约束仍是既有 qzone.daily_max_posts/reply_number，
+                # 预算耗尽也不得拦掉本条提醒。
                 try:
                     await self._ctx.maisaka.proactive.trigger(
                         stream_id=self._target_stream_id,
@@ -594,8 +588,9 @@ class QzoneService:
 
     # ---- 事件订阅挂点（M0：登记于此，M3+ 消费者按需 subscribe 并存入 _event_unsubs）----
     def _register_event_subscriptions(self) -> None:
-        """订阅注册挂点（start() 调用）。M0 本束无订阅者：
-        唯一的实际订阅（proactive.used → 预算计数器）由 core/event_bus 在装配时安装。
+        """订阅注册挂点（start() 调用）。M0 本束无订阅者（M11 附录 II §3.3：空间侧不参与
+        主动打扰预算——评论提醒不查闸门、不记用量；记账事件的唯一订阅者由 core/event_bus
+        在装配时安装）。
         M3+ 消费者在此 ``self._event_unsubs.append(self.bus.subscribe(...))``。"""
         if self.bus is None:
             return

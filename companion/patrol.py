@@ -516,10 +516,13 @@ class PatrolService:
         return await self._trigger_planner("daily", "日常巡检")
 
     async def _trigger_planner(self, intent: str, reason: str) -> bool:
-        """统一触发 planner：全渠道预算查询 → proactive.used → 看电脑 → proactive.trigger。
+        """统一触发 planner：主动打扰预算（仅目标陪伴私聊）查询 → proactive.used → 看电脑 → proactive.trigger。
 
-        M0 预算接线（§六.2 H）：五类触发都走本入口，触发前先查全渠道打扰预算，
+        M0 预算接线（§六.2 H）：五类触发都走本入口，触发前先查主动打扰预算，
         超额直接放弃；入队失败/异常时把刚发布的旁白撤掉，避免它被之后某轮普通对话锚上。
+        M11（附录 II §3.3）：预算只对**发往目标陪伴私聊**的主动打扰计数——本入口的
+        ``self._stream_id``（``plugin._apply_target`` 注入的目标流）按 stream 维度传参，
+        非目标流不查计数、不入账（自身 ``daily_max_speak`` 与 miss/daily 频控不变）。
 
         M4（§6.2 C）：reason 在此追加情绪 ``intent_hint``（低分辨成语义行，如
         「你今天有点低落，语气可以软一点」）；零新 Hook，情绪不可得时原样透传。
@@ -529,11 +532,12 @@ class PatrolService:
         reason = self._append_intent_hint(reason)
         bus = self._event_bus()
         if bus is not None:
-            if not bus.allow_proactive("patrol", str(intent or "")):
+            if not bus.allow_proactive("patrol", str(intent or ""), stream_id=self._stream_id):
                 return False
             try:
                 await bus.publish("proactive.used", source="companion",
-                                  channel="patrol", intent=str(intent or ""))
+                                  channel="patrol", intent=str(intent or ""),
+                                  stream_id=self._stream_id)
             except Exception:
                 pass
         await self._publish_screen_narration()

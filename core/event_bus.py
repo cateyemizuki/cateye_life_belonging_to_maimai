@@ -13,10 +13,18 @@
 上限默认 = ``patrol.daily_max_speak + 2``，``patrol.proactive_target_daily_cap > 0`` 时直接采用其值
 （旧键名 ``global_proactive_cap`` 兼容读取回退：既有 config 与热重载前的运行期对象形态照旧生效）。
 
+计数范围（M11，附录 II §3.2/§3.3）：**只统计「发往目标陪伴私聊」的主动打扰**——各扣费点
+经 ``stream_id`` 维度传参，非目标流（群聊/其他私聊）直接放行且不查计数、不入账（收窄前为
+「所有主动行为合计」）。目标私聊 stream_id 的权威来源是 ``plugin._stream_id``（G11；由
+``target.target_qq`` 解析、随热重载更新），装配期以 ``target_stream_provider`` 回调注入，
+**不新增任何状态**；取不到目标流时（未注入回调 / 尚未解析）沿用旧全量语义，不静默停账。
+
 计数持久化（A2，2026-10-05）：传入 ``data_dir`` 时 ``_used/_date`` 落盘
 ``proactive_budget.json``（复用 core/storage.py 的 load_json/save_json_atomic）——
 启动装载、计数变化即原子写、日切重置写回，使计数跨 file_watcher 热重载连续
 （§八.8：热重载会清零一切内存态计数）；落盘异常降级内存态，不影响事件分发。
+落盘状态带 ``scope``（§八.6）：旧文件（无 scope = 收窄前旧语义的计数）装载时按新语义
+重置当日计数并记一条决策日志，避免把旧语义的计数带进新口径。
 """
 
 from __future__ import annotations
@@ -154,11 +162,16 @@ class EventBus:
     def budget(self) -> Optional["ProactiveBudget"]:
         return self._budget
 
-    def allow_proactive(self, channel: str = "", intent: str = "") -> bool:
-        """查询主动打扰预算（仅目标陪伴私聊计数；未安装预算时恒放行）。"""
+    def allow_proactive(self, channel: str = "", intent: str = "",
+                        stream_id: str = "") -> bool:
+        """查询主动打扰预算（仅目标陪伴私聊计数；未安装预算时恒放行）。
+
+        ``stream_id`` = 本次主动打扰**要发往**的会话流（§3.3-1）：非目标流直接放行，
+        不查计数、不留痕。
+        """
         if self._budget is None:
             return True
-        return self._budget.allow_proactive(channel, intent)
+        return self._budget.allow_proactive(channel, intent, stream_id)
 
     # ------------------------------------------------------------------
     # 内部
@@ -188,6 +201,10 @@ class EventBus:
 class ProactiveBudget:
     """主动打扰预算（仅目标陪伴私聊）计数器（§六.2 H）：按日计数，跨天自动清零。
 
+    M11（附录 II §3.2）：计数身份 = **目标陪伴私聊**——只有发往该流的主动打扰才查计数/入账；
+    非目标流直接放行、不入账。目标流由 ``target_stream_provider``（装配期注入
+    ``plugin._stream_id`` 回调，G11）动态取，热重载改 ``target_qq`` 即时生效，无新状态。
+
     A2 持久化：``data_dir`` 非空时计数落盘 ``proactive_budget.json``（启动装载 /
     计数变化即原子写 / 日切重置写回），使 file_watcher 热重载后计数不回落；
     落盘异常降级为内存态并告警，不影响事件分发。
@@ -196,10 +213,15 @@ class ProactiveBudget:
     #: 状态文件名（data_dir 下）
     STATE_FILENAME = "proactive_budget.json"
 
+    #: 落盘状态的语义标记（§八.6）：旧文件缺该字段 = 收窄前旧语义计数 → 装载即重置
+    STATE_SCOPE = "target_private"
+
     def __init__(self, config_provider: Any = None, decision_logger: Any = None,
-                 data_dir: Any = None) -> None:
+                 data_dir: Any = None, target_stream_provider: Any = None) -> None:
         self._config_provider = config_provider
         self._decision_logger = decision_logger
+        #: 目标陪伴私聊 stream 的取值来源（可调用 → 动态取值；None = 不可得）
+        self._target_stream_provider = target_stream_provider
         self._date = ""
         self._used = 0
         self._channels: Dict[str, int] = {}
@@ -209,11 +231,17 @@ class ProactiveBudget:
             Path(data_dir) / self.STATE_FILENAME if data_dir else None
         )
         self._persist_warned = False
+        self._scope_reset_logged = False
         self._load()
 
     # ---- 持久化（A2） ----
     def _load(self) -> None:
-        """装载落盘计数：缺失/损坏（含 used 字段类型异常）/非当日 → 全新起步、告警并回写。"""
+        """装载落盘计数：缺失/损坏（含 used 字段类型异常）/非当日/scope 不符 → 重建并回写。
+
+        ``scope`` 兼容（§八.6）：当日文件缺 ``scope``（或值不符）＝收窄前旧语义的计数，
+        按新语义重置当日计数并记一条决策日志（``budget.scope_reset``；同签名每日一次——
+        重置后立即回写 scope，后续装载不再触发）。
+        """
         path = self._state_path
         if path is None:
             return
@@ -244,6 +272,15 @@ class ProactiveBudget:
             logger.warning("打扰预算状态文件 used 字段异常，整份状态按损坏处理并重建：%s", path)
             self._save()
             return
+        if raw.get("scope") != self.STATE_SCOPE:
+            # M11（附录 II §八.6）：收窄前旧语义的当日计数不得带入新语义
+            logger.warning(
+                "打扰预算状态文件 scope=%r 非 %s（收窄前旧语义计数），按新语义重置当日计数：%s",
+                raw.get("scope"), self.STATE_SCOPE, path,
+            )
+            self._log_scope_reset(raw.get("scope"), path)
+            self._save()
+            return
         self._date = date
         self._used = used
         self._channels = {}
@@ -258,13 +295,60 @@ class ProactiveBudget:
         path = self._state_path
         if path is None:
             return
-        state = {"date": self._date, "used": self._used, "channels": dict(self._channels)}
+        state = {"date": self._date, "used": self._used, "channels": dict(self._channels),
+                 "scope": self.STATE_SCOPE}
         if save_json_atomic(path, state):
             self._persist_warned = False
             return
         if not self._persist_warned:
             self._persist_warned = True
             logger.warning("打扰预算落盘失败，降级为内存态计数（重启后计数将丢失）：%s", path)
+
+    def _log_scope_reset(self, previous_scope: Any, path: Path) -> None:
+        """旧语义计数被重置的留痕（§八.6：「记一条决策日志」；同签名每日一次）。"""
+        if self._scope_reset_logged:
+            return
+        self._scope_reset_logged = True
+        logger_ = self._decision_logger
+        if logger_ is None:
+            return
+        try:
+            logger_.record(
+                action="budget.scope_reset",
+                trigger_type="proactive_budget",
+                reason=(f"主动打扰预算旧数据无 scope（收窄前旧语义计数），"
+                        f"按新语义（{self.STATE_SCOPE}）重置当日计数"),
+                previous_scope=str(previous_scope or ""), scope=self.STATE_SCOPE,
+                used=0, date=self._date, file=str(path),
+            )
+        except Exception:
+            pass
+
+    # ---- 计数身份（M11 §3.3：仅目标陪伴私聊） ----
+    def _target_stream(self) -> str:
+        """目标陪伴私聊 stream_id（G11：装配期注入的 ``plugin._stream_id`` 取值回调）。"""
+        provider = self._target_stream_provider
+        if provider is None:
+            return ""
+        try:
+            value = provider() if callable(provider) else provider
+        except Exception:
+            return ""
+        return str(value or "").strip()
+
+    def _is_target_stream(self, stream_id: str) -> bool:
+        """该次主动打扰是否发往目标陪伴私聊（收窄的唯一判据）。
+
+        目标流不可得（未注入回调 / 尚未解析出 stream）→ 返回 True（沿用旧全量语义）：
+        此时收窄无从判定，静默停账会让预算彻底失效；装配侧（``plugin.on_load``）恒注入
+        ``plugin._stream_id``，运行期按目标私聊收窄。空 ``stream_id``（调用方未给流身份）
+        在目标流已知时按**非目标**处理——只对「确证发往目标私聊」的主动打扰计数。
+        """
+        target = self._target_stream()
+        if not target:
+            return True
+        sid = str(stream_id or "").strip()
+        return bool(sid) and sid == target
 
     # ---- 计数与查询 ----
     def _roll_date(self) -> None:
@@ -316,8 +400,14 @@ class ProactiveBudget:
         self._roll_date()
         return dict(self._channels)
 
-    def allow_proactive(self, channel: str = "", intent: str = "") -> bool:
-        """预算查询：未达上限放行；达上限拦截并留痕（action="budget.blocked"）。"""
+    def allow_proactive(self, channel: str = "", intent: str = "",
+                        stream_id: str = "") -> bool:
+        """预算查询（仅目标陪伴私聊）：未达上限放行；达上限拦截并留痕（action="budget.blocked"）。
+
+        ``stream_id`` 非目标陪伴私聊 → 直接放行（不查计数、不留痕；§3.3）。
+        """
+        if not self._is_target_stream(stream_id):
+            return True
         self._roll_date()
         limit = self.cap()
         if self._used < limit:
@@ -325,8 +415,14 @@ class ProactiveBudget:
         self._log_blocked(channel, intent, limit)
         return False
 
-    def record_used(self, channel: str = "", intent: str = "") -> None:
-        """记一次主动打扰（proactive.used 订阅入口 / 直接调用）；计数变化即落盘。"""
+    def record_used(self, channel: str = "", intent: str = "",
+                    stream_id: str = "") -> None:
+        """记一次主动打扰（proactive.used 订阅入口 / 直接调用）；计数变化即落盘。
+
+        ``stream_id`` 非目标陪伴私聊 → **不入账**（§3.3：只有发往目标私聊的主动打扰计数）。
+        """
+        if not self._is_target_stream(stream_id):
+            return
         self._roll_date()
         self._used += 1
         key = str(channel or "unknown")
@@ -334,10 +430,11 @@ class ProactiveBudget:
         self._save()
 
     async def on_proactive_used(self, payload: Dict[str, Any]) -> None:
-        """``proactive.used`` 订阅者（M0 唯一实际订阅者）。"""
+        """``proactive.used`` 订阅者（M0 唯一实际订阅者）：按 payload 的 stream 身份入账。"""
         if not isinstance(payload, dict):
             return
-        self.record_used(str(payload.get("channel") or ""), str(payload.get("intent") or ""))
+        self.record_used(str(payload.get("channel") or ""), str(payload.get("intent") or ""),
+                         str(payload.get("stream_id") or ""))
 
     # ---- 内部 ----
     def _log_blocked(self, channel: str, intent: str, limit: int) -> None:
@@ -366,7 +463,8 @@ _installed_budget: Optional[ProactiveBudget] = None
 
 def install_proactive_budget(bus: EventBus, config_provider: Any = None,
                              decision_logger: Any = None,
-                             data_dir: Any = None) -> ProactiveBudget:
+                             data_dir: Any = None,
+                             target_stream_provider: Any = None) -> ProactiveBudget:
     """装配期安装主动打扰预算（仅目标陪伴私聊）：订阅 ``proactive.used`` 并挂到总线上。
 
     Args:
@@ -375,10 +473,13 @@ def install_proactive_budget(bus: EventBus, config_provider: Any = None,
         decision_logger: 决策日志（拦截留痕用；None 时只记 python logger）。
         data_dir: 状态目录（A2；传入时计数落盘 ``proactive_budget.json`` 跨热重载连续，
             None = 纯内存态）。
+        target_stream_provider: 目标陪伴私聊 stream_id 的取值来源（M11 §3.3；建议传
+            ``lambda: plugin._stream_id``——随热重载更新，不新增状态）。None = 不可得，
+            此时沿用旧全量计数语义。
     """
     global _installed_budget
     budget = ProactiveBudget(config_provider=config_provider, decision_logger=decision_logger,
-                             data_dir=data_dir)
+                             data_dir=data_dir, target_stream_provider=target_stream_provider)
     budget._unsubscribe = bus.subscribe("proactive.used", budget.on_proactive_used,
                                         owner="proactive_budget")
     bus.attach_budget(budget)
@@ -386,9 +487,10 @@ def install_proactive_budget(bus: EventBus, config_provider: Any = None,
     return budget
 
 
-def allow_proactive(channel: str = "", intent: str = "") -> bool:
+def allow_proactive(channel: str = "", intent: str = "",
+                    stream_id: str = "") -> bool:
     """模块级预算查询（未安装预算时恒放行；发布方优先用 ``bus.allow_proactive``）。"""
     budget = _installed_budget
     if budget is None:
         return True
-    return budget.allow_proactive(channel, intent)
+    return budget.allow_proactive(channel, intent, stream_id)
