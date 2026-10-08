@@ -38,7 +38,16 @@
 > 留痕 `emotion.sleep_interrupt_settled`（含 `k`/`global_multiplier`/裁剪前·乘后·入账三值）与
 > `emotion.sleep_overhaul` 的 `sleep_window_minutes`/`interrupted_minutes`/`interrupt_count`。
 > 本文件 §5.1、§7.3、§八 已同步。
-> **仍未落地**：赖床提醒与 §4.5 提醒轮豁免（M8 第 4 段，附录 §4.1~§4.6）。
+> **M9 段 4 已落地（2026-10-07，附录定稿 §四：L3 赖床提醒 + §4.5 提醒轮豁免；`27cf1d4`，
+> 组件 28→29）**：打扰段以 `resleep` 闭合后按 §4.1 五条件发一条提醒（段已确认成立过 / 本周期有效
+> 提醒次数 < `nap_reminder_max_per_day`（默认 2）/ 仍在睡眠窗口内（含赖床延长后的端点）/
+> `no_sleep_mode=false` / `nap_reminder_enabled`），触发
+> `proactive.trigger(intent="nap_reminder", metadata={"kind":"nap_reminder"})`、文本按 §4.3 模板
+> 点名隐藏工具 `cateye_test_nap_lie_in`；提醒块过了提醒轮（块龄 >120s）由 `core/inject.py`
+> `is_consumed_ephemeral_proactive_block` 从请求载荷剥离；发送成功后登记 §4.5 提醒轮豁免窗口
+> （`NAP_REMINDER_ROUND_SECONDS`=120.0：窗口内该流意外 reply 不刷新 `resleep_minutes`、不重进吵醒态）。
+> **M11 预算归属（2026-10-08，附录 II §3.3）**：赖床提醒**计入**「主动打扰预算」，且该预算**仅**按
+> 目标陪伴私聊的 `stream_id` 维度计数——非目标流的段不计入、不受限；qzone 评论提醒**不再计入**该预算。
 > **仍未落地（M5 其余部分）**：A3 `emotion_report` 工具裁决；A6 死字段清理已完成（`8d11f54`）。
 
 ---

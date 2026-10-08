@@ -1,4 +1,4 @@
-# 注册面简化处置清单 v2.2（2026-10-07 · Tool 终态 7 个 = T6 收口 6 + M9 赖床 1）
+# 注册面简化处置清单 v2.3（2026-10-08 · Tool 终态 7 个 = T6 收口 6 + M9 赖床 1；M11 组件 29 零增删）
 
 > v2 增量（吸收四命令/工具合并×2）之上，并入 **2026-10-06 二次自检（用户确认）**：
 > manage_goal / apply_schedule / mai_lover_status / emotion_mood 四工具移除，
@@ -9,6 +9,18 @@
 > `MAINTENANCE_PLAN_APPENDIX_20261007_0155` §4.4 新增 **1 个 hidden Tool**
 > `cateye_test_nap_lie_in`（赖床；metadata.visibility=hidden）→ Tool 6→7、组件 28→29。
 > 本清单只更组件账目，行为口径见附录 §四与 README/USAGE。
+>
+> **v2.3（2026-10-08，执行者：会话 2 / M11 三合一）**：例行问候去预算化（三类开关
+> `greeting_target_enabled`/`greeting_group_enabled`/`greeting_other_private_enabled` + 问候专用
+> 黑白名单，名单只收裸号）＋主动打扰预算收窄为**仅目标陪伴私聊**（`[patrol] global_proactive_cap`
+> 改名 **`proactive_target_daily_cap`**、旧名兼容读取；`proactive_budget.json` 加 `scope`；qzone 评论提醒
+> 不再计入、nap 赖床提醒计）＋恋人→陪伴改名 L1（`lover_*` 等代码标识符与宿主机可见标识不动）。
+> **组件 29 零增删、组件名零变化**（8 Command + 10 Hook + 7 Tool + 4 API），本清单账目不变；
+> 仅 §一 第 7 条赖床提醒的预算归属口径同步订正。
+> 依据：`maibot-plugins\MAINTENANCE_PLAN_APPENDIX2_20261008_0209_问候去预算化与陪伴改名.md`（裁决
+> Q1~Q5 + §二/§三/§四）；本副本分支 `ws2/m6m7` 提交链 `7452ebe`（U0 合并 master）→ `fdc08cb`（U1 P4）
+> → `c40cf68`（U2 文案与 cap 改名）→ `38e4e0a`（U3 问候去预算化+三类开关名单）→ `e276f76`（U4 预算收窄 B）
+> → `3243046`（U5 改名 L1）→ U6 文档同批（本文档）。
 
 ## 一、Tool 终态（7 个）与全量调用链路
 
@@ -40,7 +52,8 @@
    → emotion_state.json + 决策落账。
 7. **`cateye_test_nap_lie_in(time)`**（M9 新增；**hidden** = 不进名册、`enabled=False`，F13）
    触发：夜间被重要的人吵醒 → 打扰段以 `resleep` 闭合 → 赖床提醒轮（emotion 侧发
-   `proactive.trigger(intent="nap_reminder", metadata={"kind":"nap_reminder"})`，纳入全渠道预算）
+   `proactive.trigger(intent="nap_reminder", metadata={"kind":"nap_reminder"})`，M11 起计入主动打扰预算
+   ——**仅目标陪伴私聊**（非目标流的段不计入、不受限，附录 II §3.3））
    → 提示词点名本工具 → bot 自主决定是否调用。
    链路：`planning/components.py:plan_tool_nap_lie_in` → `ToolsService.nap_lie_in`
    （解析容错 → 非睡眠周期拒绝 → `[schedule] lie_in_max_until` 钳制 → 找**入睡日**日程的 sleep

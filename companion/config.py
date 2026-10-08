@@ -1,9 +1,9 @@
-"""companion 子模块配置段（来源：虚拟恋人插件 mai-love config.py）。
+"""companion 子模块配置段（来源：虚拟陪伴插件 mai-love config.py）。
 
 只定义 section 类，不定义聚合模型——聚合由顶层 config.py 的 CateyeSuiteConfig 负责：
 - PatrolSectionConfig          挂为顶层 [patrol] 段（演进版，在骨架字段上补齐源插件能力）；
 - AffectionSectionConfig       挂为顶层 [affection] 段（照搬）；
-- CateyeScreenSectionConfig    挂为顶层 [cateye] 段（新增：恋人电脑屏幕感知联动）；
+- CateyeScreenSectionConfig    挂为顶层 [cateye] 段（新增：陪伴对象电脑屏幕感知联动）；
 - JudgeSectionConfig           挂为顶层 [judge] 段（mai-love v2.6.3：判定类 LLM 调用参数）。
 
 不建 [whitelist] 段——鉴权统一读顶层 [target] 段的 target_qq；
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Dict, Literal
 
+import pydantic
 from maibot_sdk import Field, PluginConfigBase
 
 
@@ -53,9 +54,9 @@ MISS_CONFIRM_PROMPT_DEFAULT = (
     "只回复一个大写字母：Y 或 N。"
 )
 
-#: 恋人电脑屏幕截图的视觉理解提示词（随截图发给 vlm 任务）
+#: 陪伴对象电脑屏幕截图的视觉理解提示词（随截图发给 vlm 任务）
 SCREEN_DESCRIBE_PROMPT_DEFAULT = (
-    "这是你的恋人电脑屏幕的截图。请用一句话（不超过 40 字、口语化）描述"
+    "这是你的陪伴对象电脑屏幕的截图。请用一句话（不超过 40 字、口语化）描述"
     "TA现在可能在干什么（比如在打游戏 / 写代码 / 看视频 / 挂机离开）。\n"
     "如果截图上看不出具体内容，就回答：屏幕上看不出具体内容。"
 )
@@ -78,7 +79,7 @@ SCREEN_FAILED_NARRATION_TEMPLATE_DEFAULT = (
 
 
 class PatrolSectionConfig(PluginConfigBase):
-    """主动巡检（来源：虚拟恋人插件）。"""
+    """主动巡检（来源：虚拟陪伴插件）。"""
 
     __ui_label__ = "主动巡检"
     __ui_icon__ = "radar"
@@ -90,9 +91,9 @@ class PatrolSectionConfig(PluginConfigBase):
     # ── 模块独立总开关 ───────────────────────────────────────
     enabled: bool = Field(
         default=True,
-        description="恋人模块总开关：关闭后停止巡检主动聊天与情绪上下文注入（命令与工具返回未启用提示）",
+        description="陪伴模块总开关：关闭后停止巡检主动聊天与情绪上下文注入（命令与工具返回未启用提示）",
         json_schema_extra={
-            "label": "启用恋人模块",
+            "label": "启用陪伴模块",
             "hint": "每个业务模块都有独立总开关；关闭不影响其他模块",
             **_ui_i18n("Enable companion module", "Master switch of the companion module."),
         },
@@ -137,17 +138,19 @@ class PatrolSectionConfig(PluginConfigBase):
         description="每日主动发言预算（次）；未发晚安时为晚安预留 1 次。0=完全静音",
         json_schema_extra={"label": "每日预算", **_ui_i18n("Daily budget")},
     )
-    global_proactive_cap: int = Field(
+    proactive_target_daily_cap: int = Field(
         default=0,
         ge=0,
         le=200,
-        description="全渠道每日主动打扰上限（次）：私聊主动 + 空间互动提醒共享；0=自动取「每日预算+2」",
+        description="目标陪伴私聊的每日主动打扰上限（次）：仅统计发往目标陪伴私聊的主动打扰；"
+                    "0=自动取「每日预算+2」（旧键名 global_proactive_cap 兼容读取）",
         json_schema_extra={
-            "label": "全渠道打扰上限",
-            "hint": "0=自动取「每日预算 + 2」；大于 0 时直接采用该值（patrol/planning/空间提醒共享同一计数）",
-            **_ui_i18n("Global proactive cap",
-                       "0 = daily budget + 2. Shared daily cap for all proactive interruptions "
-                       "(patrol / planning / qzone reminders)."),
+            "label": "目标陪伴私聊打扰上限",
+            "hint": "0=自动取「每日预算 + 2」；大于 0 时直接采用该值。仅目标陪伴私聊计入；"
+                    "旧键名 global_proactive_cap 兼容读取（新旧同给时新键优先）",
+            **_ui_i18n("Target companion proactive cap",
+                       "0 = daily budget + 2. Daily cap of proactive interruptions sent to the target "
+                       "companion private chat. Legacy key global_proactive_cap is still read."),
         },
     )
     min_trigger_interval_minutes: int = Field(
@@ -302,6 +305,22 @@ class PatrolSectionConfig(PluginConfigBase):
         },
     )
 
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_cap_key(cls, data: object) -> object:
+        """旧键名 ``global_proactive_cap`` → ``proactive_target_daily_cap``（M11 附录 II §3.4）。
+
+        用户既有 config 里的旧键照旧生效：先把旧键从输入字典里取出（pop），再填进新键
+        （``setdefault`` = 新旧同给时**新键优先**）——旧键不留在字典里，字段的 extra 约束
+        与 WebUI schema 都不会再看到它。非字典输入（模型实例/None 等）原样放行。
+        """
+        if not isinstance(data, dict) or "global_proactive_cap" not in data:
+            return data
+        migrated = dict(data)
+        legacy = migrated.pop("global_proactive_cap")
+        migrated.setdefault("proactive_target_daily_cap", legacy)
+        return migrated
+
 
 # ---------------------------------------------------------------------------
 # [affection] 好感度（照搬源插件，仅一个字段）
@@ -309,7 +328,7 @@ class PatrolSectionConfig(PluginConfigBase):
 
 
 class AffectionSectionConfig(PluginConfigBase):
-    """好感度系统（来源：虚拟恋人插件；M1 扩展为 v2 状态层配置，全部带默认值可关闭）。
+    """好感度系统（来源：虚拟陪伴插件；M1 扩展为 v2 状态层配置，全部带默认值可关闭）。
 
     `enabled=false` 时整体回退 v1 三档行为（§八.2：新增配置关闭时回退旧行为）；
     `review_*` 四项为 M2 好感 LLM 裁判（会话采样 + 关系日结）的开关与频控/任务名。
@@ -538,18 +557,18 @@ class JudgeSectionConfig(PluginConfigBase):
 
 
 # ---------------------------------------------------------------------------
-# [cateye] 恋人电脑屏幕感知（源插件 [cateye] 段）
+# [cateye] 陪伴对象电脑屏幕感知（源插件 [cateye] 段）
 # ---------------------------------------------------------------------------
 
 
 class CateyeScreenSectionConfig(PluginConfigBase):
-    """恋人电脑屏幕感知（联动「cateye 统一连接插件」cateye.connect-hub）。
+    """陪伴对象电脑屏幕感知（联动「cateye 统一连接插件」cateye.connect-hub）。
 
-    主动触发前看一眼恋人电脑：已连接则截图 + 视觉模型转述，作为「旁白」以
+    主动触发前看一眼陪伴对象电脑：已连接则截图 + 视觉模型转述，作为「旁白」以
     尾随锚点方式写进 planner/replyer 上下文；未连接/看不成有各自的占位文案。
     """
 
-    __ui_label__ = "恋人电脑感知"
+    __ui_label__ = "陪伴对象电脑感知"
     __ui_icon__ = "monitor"
     __ui_order__ = 7
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {

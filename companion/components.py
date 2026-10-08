@@ -1,4 +1,4 @@
-"""companion 组件层（来源：虚拟恋人插件 plugin.py 的组件面）。
+"""companion 组件层（来源：虚拟陪伴插件 plugin.py 的组件面）。
 
 ``CompanionComponentsMixin`` 供 plugin.py 的主类多继承：
 ``class CateyeSuitePlugin(CompanionComponentsMixin, MaiBotPlugin)``。
@@ -189,7 +189,7 @@ def _shrink_payload_for_injection(payload: list[Any]) -> tuple[Optional[list[Any
 
 
 class CompanionComponentsMixin:
-    """虚拟恋人组件面（Hooks/Tools/Commands/APIs），挂在整合插件主类上。"""
+    """虚拟陪伴组件面（Hooks/Tools/Commands/APIs），挂在整合插件主类上。"""
 
     # ==================================================================
     # 内部取用（全部判空降级）
@@ -251,7 +251,7 @@ class CompanionComponentsMixin:
     @HookHandler(
         "chat.receive.before_process",
         name="mai_lover_sender_identity",
-        description="记录入站消息的「消息 ID → 发送者 QQ 号」与「会话 ID → 是否群聊」，供 planner 注入按 QQ 号判定恋人",
+        description="记录入站消息的「消息 ID → 发送者 QQ 号」与「会话 ID → 是否群聊」，供 planner 注入按 QQ 号判定陪伴对象",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         timeout_ms=1000,
@@ -372,7 +372,7 @@ class CompanionComponentsMixin:
         error_policy=ErrorPolicy.SKIP,
     )
     async def mai_hook_planner_inject(self, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
-        """注入恋人上下文（屏幕旁白 + 日期行 + 当前活动 + 好感度 + 主动回合软约束）。
+        """注入陪伴上下文（屏幕旁白 + 日期行 + 当前活动 + 好感度 + 主动回合软约束）。
 
         屏幕旁白与活动注入相互独立，所以先算旁白——保证任何一条早退路径都不会
         把旁白丢掉。items 是强 schema 载荷：新条目 meta 必须完整，modified_kwargs
@@ -504,7 +504,7 @@ class CompanionComponentsMixin:
             return None
         session_id = str(kwargs.get("session_id") or "")
         if self._mai_resolve_injection_scope(session_id, payload) != _SCOPE_PRIVATE:
-            return None  # 屏幕内容绝不漏到非恋人的聊天流
+            return None  # 屏幕内容绝不漏到非陪伴对象的聊天流
         taken = store.take_injection(session_id, channel, payload)
         if taken is None:
             return None
@@ -524,7 +524,7 @@ class CompanionComponentsMixin:
         3. 其余一律 skip。判定只看 QQ 号（昵称可被伪造）；反查不到按 skip。
 
         注：源插件的群聊注入档在整合版裁剪（无 [injection] 配置段，群聊不注入
-        恋人上下文，见 INTEGRATION.md）。
+        陪伴上下文，见 INTEGRATION.md）。
         """
         companion = self._mai_companion()
         if companion is None:
@@ -681,10 +681,10 @@ class CompanionComponentsMixin:
         },
     )
     async def mai_tool_send_message(self, message: str = "", **kwargs: Any) -> str:
-        """LLM Tool: 主动发送恋人消息（带情绪后缀；成功计 1 次发言数并记决策日志）。"""
+        """LLM Tool: 主动向陪伴对象发送消息（带情绪后缀；成功计 1 次发言数并记决策日志）。"""
         companion = self._mai_companion()
         if companion is None:
-            return "恋人服务未初始化。"
+            return "陪伴服务未初始化。"
         stream_id = self._mai_target_stream_id()
         name = self._mai_lover_name()
         if not stream_id:
@@ -693,8 +693,8 @@ class CompanionComponentsMixin:
         if not str(message or "").strip():
             relation = getattr(companion, "relation", None)
             relation_word = getattr(relation, "word", None) or "恋人"
-            style_word = getattr(relation, "style_word", None) or "温柔亲昵的恋人"
-            self_desc = getattr(relation, "self_desc", None) or "一个温柔体贴的虚拟恋人"
+            style_word = getattr(relation, "style_word", None) or "温柔亲昵的陪伴者"
+            self_desc = getattr(relation, "self_desc", None) or "一个温柔体贴的虚拟陪伴者"
             fallback = ("想你了呢~在忙什么呀？" if relation_word == "恋人"
                         else "在忙什么呀？最近怎么样？~")
             message = await companion.llm.generate_or_fallback(
@@ -779,7 +779,7 @@ class CompanionComponentsMixin:
         stream_id = str(kwargs.get("stream_id", "") or "")
         if stream_id:
             try:
-                await self.ctx.send.text("此命令仅限绑定的恋人用户使用哦~", stream_id)
+                await self.ctx.send.text("此命令仅限绑定的陪伴用户使用哦~", stream_id)
             except Exception:
                 pass
         return False
@@ -830,7 +830,7 @@ class CompanionComponentsMixin:
         return True, "好感度已调整", True
 
     @Command(name="/cateye_test_mai_help", pattern=r"(?<!\S)/cateye_test_mai_help\s*$",
-             description="查看麦麦恋人所有可用命令")
+             description="查看麦麦陪伴所有可用命令")
     async def mai_cmd_help(self, **kwargs: Any) -> tuple[bool, str, bool]:
         if not await self._authorize_command(kwargs):
             return True, "没有权限", True
@@ -1201,7 +1201,7 @@ class CompanionComponentsMixin:
         screen = "开" if getattr(cateye_cfg, "enabled", False) else "关"
         if multiline:
             return (
-                "⚙️ 麦麦恋人配置摘要\n"
+                "⚙️ 麦麦陪伴配置摘要\n"
                 f"调度: 巡检间隔 {patrol.check_interval_minutes}min | "
                 f"每日上限 {patrol.daily_max_speak} 条 | "
                 f"最小间隔 {patrol.min_trigger_interval_minutes}min"
@@ -1217,12 +1217,12 @@ class CompanionComponentsMixin:
                 f"想念 {patrol.miss_speak_rate} | "
                 f"日程节点 {patrol.activity_trigger_rate}\n"
                 f"{self._mai_config_affection_line()} | "
-                f"恋人上下文注入: 仅目标私聊 | "
+                f"陪伴上下文注入: 仅目标私聊 | "
                 f"屏幕感知: {screen} | "
                 f"日志: {self._mai_patrol_status_line() or '（巡检未初始化）'}"
             )
         return (
-            f"⚙️ 麦麦恋人配置: 巡检间隔 {patrol.check_interval_minutes}min | "
+            f"⚙️ 麦麦陪伴配置: 巡检间隔 {patrol.check_interval_minutes}min | "
             f"每日上限 {patrol.daily_max_speak} 条 | "
             f"最小间隔 {patrol.min_trigger_interval_minutes}min | "
             f"冷却 {patrol.user_cooldown_minutes}min | "
@@ -1246,7 +1246,7 @@ class CompanionComponentsMixin:
         first_time = str(entries[0].get("time", "?"))
         last_time = str(entries[-1].get("time", "?"))
         header = (
-            "📋 麦麦恋人 LLM 调用日志\n"
+            "📋 麦麦陪伴 LLM 调用日志\n"
             f"时间范围: {first_time} ~ {last_time}\n"
             f"共 {total} 条（展示最近 {len(shown)} 条） | 保留 {retention_days} 天"
         )
@@ -1290,7 +1290,7 @@ class CompanionComponentsMixin:
         top_reasons = sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:6]
 
         header = (
-            "🔍 麦麦恋人 主动行为决策日志\n"
+            "🔍 麦麦陪伴 主动行为决策日志\n"
             f"时间范围: {entries[0].get('time', '?')} ~ {entries[-1].get('time', '?')}\n"
             f"共 {total} 条：发起触发 {triggered} / 确认发言 {spoken} / 跳过 {skipped}"
             + (f" / 信息 {info}" if info else "")
@@ -1334,7 +1334,7 @@ class CompanionComponentsMixin:
     # ==================================================================
 
     @API("companion_get_current_activity",
-         description="获取恋人当前正在做什么（活动描述字符串，无活动返回空串）",
+         description="获取陪伴对象当前正在做什么（活动描述字符串，无活动返回空串）",
          version="1", public=True)
     async def mai_api_get_current_activity(self, **kwargs: Any) -> str:
         schedule_query = self._mai_schedule_query()
@@ -1350,7 +1350,7 @@ class CompanionComponentsMixin:
         return str(current.get("description") or current.get("name") or "")
 
     @API("companion_get_schedule",
-         description="获取今日完整日程。返回节点列表 [{time, activity}]（兼容虚拟恋人插件返回结构）",
+         description="获取今日完整日程。返回节点列表 [{time, activity}]（兼容虚拟陪伴插件返回结构）",
          version="1", public=True)
     async def mai_api_get_schedule(self, **kwargs: Any) -> list[dict[str, Any]]:
         schedule_query = self._mai_schedule_query()
@@ -1366,7 +1366,7 @@ class CompanionComponentsMixin:
                 for i in items]
 
     @API("companion_get_affection_level",
-         description="获取当前好感度档位。返回 0/1/2（兼容虚拟恋人插件返回结构）",
+         description="获取当前好感度档位。返回 0/1/2（兼容虚拟陪伴插件返回结构）",
          version="1", public=True)
     async def mai_api_get_affection_level(self, **kwargs: Any) -> int:
         companion = self._mai_companion()

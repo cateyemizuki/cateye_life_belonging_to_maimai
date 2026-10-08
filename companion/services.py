@@ -1,4 +1,4 @@
-"""companion 服务束：一次性初始化虚拟恋人的全部服务，供 plugin.py 持有。
+"""companion 服务束：一次性初始化虚拟陪伴的全部服务，供 plugin.py 持有。
 
 用法（整合者后续接入 plugin.py）：
     self._companion = CompanionServices(self)
@@ -71,7 +71,7 @@ def _emotion_valence(plugin: Any) -> Optional[float]:
 
 
 class CompanionServices:
-    """虚拟恋人服务束（好感度 / 巡检 / 消息 / 记忆 / 屏幕感知 / 节假日）。"""
+    """虚拟陪伴服务束（好感度 / 巡检 / 消息 / 记忆 / 屏幕感知 / 节假日）。"""
 
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
@@ -117,7 +117,7 @@ class CompanionServices:
         self.schedule_query: Optional[ScheduleQuery] = getattr(plugin, "_schedule_query", None)
 
         # ---- 纯 companion 服务 ----
-        #: 发送者身份缓存（v2.5.0：上下文条目里只有 msg_id 与显示名，靠反查判定恋人）
+        #: 发送者身份缓存（v2.5.0：上下文条目里只有 msg_id 与显示名，靠反查判定陪伴对象）
         self.senders = SenderCache()
         #: 会话 ID → 是否群聊
         self.session_kinds = SessionKindCache()
@@ -126,7 +126,7 @@ class CompanionServices:
         self.screen_store = ScreenContextStore(
             ttl_minutes=float(getattr(cateye_cfg, "context_ttl_minutes", 90) or 90)
         )
-        #: 恋人电脑联动客户端（connect-hub 跨插件 API）
+        #: 陪伴对象电脑联动客户端（connect-hub 跨插件 API）
         self.cateye = CateyeClient(plugin, llm=self.llm, call_logger=self.llm_logger)
         #: 节假日服务（注入日期行用）
         self.holiday = HolidayService(self._data_dir)
@@ -302,7 +302,7 @@ class CompanionServices:
         if patrol_enabled and self.patrol.has_target():
             self.patrol.start()
         elif not patrol_enabled:
-            self.plugin.ctx.logger.info('恋人模块已停用（patrol.enabled=false），巡检循环未启动')
+            self.plugin.ctx.logger.info('陪伴模块已停用（patrol.enabled=false），巡检循环未启动')
         # 预热当天节假日缓存，避免首次 planner 注入阻塞在 API 调用
         try:
             asyncio.ensure_future(self.holiday.get_holiday_info(datetime.now().strftime("%Y-%m-%d")))

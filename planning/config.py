@@ -375,7 +375,7 @@ class InjectSectionConfig(PluginConfigBase):
 class PlanningProactiveSectionConfig(PluginConfigBase):
     """日程驱动的主动行为（来源：自主规划插件 [proactive] 段；推荐挂载名 ``planning_proactive``）。
 
-    与 [patrol]（虚拟恋人巡检）互相独立：本段负责「活动切换主动开口 / 早间问好 /
+    与 [patrol]（虚拟陪伴巡检）互相独立：本段负责「活动切换主动开口 / 早间问好 /
     按活动调节聊天频率」，白名单取群聊与其他会话两份名单的并集。
     """
 
@@ -502,6 +502,82 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "问候需激活", **_ui_i18n("Greeting requires activation")},
     )
 
+    # ── M11 三类问候开关与问候专用名单（附录 II §2.2/§2.6，裁决 Q1/Q2/Q4）───
+    # 语义：早/晚安按会话类型各自独立开关；名单只收裸群号/QQ 号（与活动切换的
+    # proactive_group_ids/proactive_other_streams 两套名单不混用）；例行问候免主动打扰预算。
+    greeting_target_enabled: bool = Field(
+        default=True,
+        description="目标陪伴私聊的早/晚安开关（默认开）：目标 QQ **不看任何名单，必定触发**"
+                    "（例外：处于静默时段、当天该流已发过同类问候、或本开关关闭）",
+        json_schema_extra={"label": "目标私聊问候", **_ui_i18n("Target-chat greetings")},
+    )
+    greeting_group_enabled: bool = Field(
+        default=True,
+        description="群聊早/晚安开关（默认开）：受 greeting_group_blacklist/whitelist 与必要性激活限制。"
+                    "两名单留空 = 所有群聊生效（受激活限制）",
+        json_schema_extra={"label": "群聊问候", **_ui_i18n("Group greetings")},
+    )
+    greeting_group_blacklist: List[str] = Field(
+        default_factory=list,
+        description='群聊问候黑名单（只收**裸群号**，如 ["392653174"]）：命中即不发；留空 = 全发。'
+                    "带前缀、含非数字、空串、重复项会被忽略并记一条汇总告警（落决策日志）；不支持通配",
+        json_schema_extra={
+            "label": "群聊问候黑名单",
+            "hint": '只填裸群号，例 ["392653174"]；留空 = 全发；不支持 *',
+            **_ui_i18n("Group greeting blacklist", 'Bare group IDs; empty = all groups.'),
+        },
+    )
+    greeting_group_whitelist: List[str] = Field(
+        default_factory=list,
+        description='群聊问候白名单（只收**裸群号**）：非空时仅这些群生效；留空 = 不过滤（全发）。'
+                    '["*"] = 显式全发；`*` 与具体号混用时按全放行处理并告警',
+        json_schema_extra={
+            "label": "群聊问候白名单",
+            "hint": '只填裸群号；留空 = 不过滤；["*"] = 显式全发',
+            **_ui_i18n("Group greeting whitelist", 'Bare group IDs; empty = no filtering.'),
+        },
+    )
+    greeting_other_private_enabled: bool = Field(
+        default=False,
+        description="非目标私聊的早/晚安开关（默认关，早/晚共用）：开启后还需命中黑白名单"
+                    "且前一日该流消息数 ≥ greeting_other_private_min_messages 才问候",
+        json_schema_extra={"label": "其他私聊问候", **_ui_i18n("Other-private greetings")},
+    )
+    greeting_other_private_whitelist: List[str] = Field(
+        default_factory=list,
+        description='非目标私聊问候白名单（只收**裸 QQ 号**）：**留空 = 全不发**（默认安全的收紧）；'
+                    '["*"] = 不过滤（对已知私聊流生效）；`*` 与具体号混用按全放行处理并告警',
+        json_schema_extra={
+            "label": "其他私聊问候白名单",
+            "hint": '只填裸 QQ 号；留空 = 全不发；["*"] = 不过滤',
+            **_ui_i18n("Other-private greeting whitelist", 'Bare QQ IDs; empty = none.'),
+        },
+    )
+    greeting_other_private_blacklist: List[str] = Field(
+        default_factory=list,
+        description="非目标私聊问候黑名单（只收**裸 QQ 号**）：命中即不发；不支持通配",
+        json_schema_extra={
+            "label": "其他私聊问候黑名单",
+            "hint": "只填裸 QQ 号；不支持 *",
+            **_ui_i18n("Other-private greeting blacklist", "Bare QQ IDs."),
+        },
+    )
+    greeting_other_private_min_messages: int = Field(
+        default=5,
+        ge=5,
+        description="非目标私聊问候的前一日消息数门槛（**不允许低于 5**，配置校验直接拒绝；早/晚共用）："
+                    "前一日该流消息数达到该值才成为问候候选；取不到消息计数按 0 处理（不发送）",
+        json_schema_extra={"label": "其他私聊问候门槛(条)",
+                           **_ui_i18n("Other-private greeting threshold (msgs)")},
+    )
+    greeting_exempt_budget: bool = Field(
+        default=True,
+        description="例行问候（早/晚安）免主动打扰预算（默认开，用户口径）：开启后问候触发**既不查预算闸门"
+                    "也不计主动打扰用量**（闸门与计数一起跳）；关闭则照旧受主动打扰预算约束。"
+                    "想念/日常/活动切换等非问候主动行为仍照旧受预算约束",
+        json_schema_extra={"label": "问候免预算", **_ui_i18n("Exempt greetings from budget")},
+    )
+
     @pydantic.field_validator("morning_drift", "night_drift", mode="before")
     @classmethod
     def _coerce_drift_to_str(cls, value: Any) -> Any:
@@ -517,6 +593,76 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         if isinstance(value, float) and float(value).is_integer():
             return str(int(value))
         return value
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_greeting_keys(cls, data: object) -> object:
+        """被取代旧键的 deprecated 映射（M11 附录 II §2.6 取代关系 / §七 冲突表）。
+
+        - ``morning_other_private_enabled`` 显式 true → 归并为 ``greeting_other_private_enabled``
+          （早/晚共用；新键显式时**新键优先**）；
+        - ``morning_other_private_min_messages`` 显式 → 作为 ``greeting_other_private_min_messages``
+          的缺省值（新键显式时新键优先）；
+        - ``enable_night_greeting``：显式 false 的"晚安全灭（三类都不发）"语义无法用三个新开关表达
+          （新开关同时管早安），故不在本处改写，由 :meth:`greeting_effective` 在运行期解析
+          （显式 false → 晚安全灭；显式 true / 缺省 → 三类新开关接管）。
+        非字典输入（模型实例 / None 等）原样放行。
+        """
+        if not isinstance(data, dict):
+            return data
+        migrated = dict(data)
+        if migrated.get("morning_other_private_enabled"):
+            migrated.setdefault("greeting_other_private_enabled", True)
+        if "morning_other_private_min_messages" in migrated:
+            migrated.setdefault("greeting_other_private_min_messages",
+                                migrated["morning_other_private_min_messages"])
+        return migrated
+
+    def greeting_effective(self) -> Dict[str, Any]:
+        """M11 三类问候的生效取值（§2.2 矩阵 + §2.6 旧键 deprecated 映射）。
+
+        返回 ``target_enabled`` / ``group_enabled`` / ``other_private_enabled`` /
+        ``other_private_min_messages`` / ``night_allowed``。判定"显式配置"沿用既有
+        ``model_fields_set`` 惯例（构造传参与属性赋值都会记录；非 pydantic 配置对象
+        没有该属性 → 一律按缺省处理）：
+
+        - 其他私聊开关：新键显式 > 旧键 ``morning_other_private_enabled`` 显式 > 新键默认（false）；
+        - 其他私聊门槛：新键显式 > 旧键 ``morning_other_private_min_messages`` 显式 > 新键默认（5）；
+        - ``night_allowed``：旧键 ``enable_night_greeting`` **显式 false** → 晚安全灭（三类都不发）；
+          显式 true / 缺省 → 三类新开关接管（附录 I 的晚间问候总开关被细分取代）。
+        """
+        fields_set = set(getattr(self, "model_fields_set", None) or ())
+        target_enabled = bool(getattr(self, "greeting_target_enabled", True))
+        group_enabled = bool(getattr(self, "greeting_group_enabled", True))
+
+        if "greeting_other_private_enabled" in fields_set:
+            other_enabled = bool(getattr(self, "greeting_other_private_enabled", False))
+        elif "morning_other_private_enabled" in fields_set:
+            other_enabled = bool(getattr(self, "morning_other_private_enabled", False))
+        else:
+            other_enabled = bool(getattr(self, "greeting_other_private_enabled", False))
+
+        if "greeting_other_private_min_messages" in fields_set:
+            raw_threshold = getattr(self, "greeting_other_private_min_messages", 5)
+        elif "morning_other_private_min_messages" in fields_set:
+            raw_threshold = getattr(self, "morning_other_private_min_messages", 5)
+        else:
+            raw_threshold = getattr(self, "greeting_other_private_min_messages", 5)
+        try:
+            threshold = max(5, int(raw_threshold))   # ge=5 硬约束（§2.6）：运行期兜底同样不收 <5
+        except (TypeError, ValueError):
+            threshold = 5
+
+        night_allowed = True
+        if "enable_night_greeting" in fields_set:
+            night_allowed = bool(getattr(self, "enable_night_greeting", False))
+        return {
+            "target_enabled": target_enabled,
+            "group_enabled": group_enabled,
+            "other_private_enabled": other_enabled,
+            "other_private_min_messages": threshold,
+            "night_allowed": night_allowed,
+        }
 
 
 class PlanningCleanupSectionConfig(PluginConfigBase):

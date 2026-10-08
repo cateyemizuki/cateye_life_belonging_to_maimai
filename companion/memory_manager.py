@@ -1,4 +1,4 @@
-"""本地记忆库（来源：虚拟恋人插件 memory_manager.py）。
+"""本地记忆库（来源：虚拟陪伴插件 memory_manager.py）。
 
 记录和读取用户习惯，构造个性化上下文文案；底层委托给
 AffectionManager 的 habits 段（见 companion/affection.py）。

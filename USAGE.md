@@ -2,7 +2,7 @@
 
 > 猫眼生活套件（github.cateye.cateye-suite）现有 **7 个 LLM 工具**（T6 收口 6 + M9 赖床 1）、**8 个聊天指令**、**4 个跨插件 API**
 > （**29 组件 = 8 Command + 7 Tool + 10 Hook + 4 API**；T6 收口 28 → M9 增 1 个 hidden Tool）。
-> 四个业务子模块各自提供一组：planning（日程规划）/ companion（虚拟恋人）/ emotion（情绪）/ qzone（QQ 空间）。
+> 四个业务子模块各自提供一组：planning（日程规划）/ companion（虚拟陪伴）/ emotion（情绪）/ qzone（QQ 空间）。
 > 本手册给出每个条目的描述原文、参数、行为细节与权限要求；架构与安装说明见 README.md。
 >
 > **T6 变更（2026-10-06）**：工具与指令均按**直接删除条目**处理（不标注废弃）——被删入口
@@ -72,10 +72,10 @@
   - **本实现采用方案 ②**（离线无法实测宿主检索面；方案 ① 留作宿主实测不通过时的升级路径），因此**需要宿主实测确认**（见 §七 末尾清单）。
 - **计数与提醒的关系**：两者共用同一「有效提醒次数」（`[planning_proactive] nap_reminder_max_per_day`，默认 2，按 `cycle_key` 计，纯内存、不落盘）；额度用尽后只停提醒，bot 仍可自行调本工具改日程。
 
-### companion — 虚拟恋人（2 个）
+### companion — 虚拟陪伴（2 个）
 
 #### `cateye_test_mai_lover_send_message`
-- **描述**：以麦麦恋人的口吻向用户主动发送一条恋人消息。
+- **描述**：以麦麦的口吻向陪伴对象主动发送一条消息（口吻与后缀随关系自动变化）。
 - **参数**：`message`（string，可选）要发送的消息文本，留空则自动生成。
 - **行为**：发送到目标私聊，追加好感度情绪后缀（热恋档 10% 概率附括号小剧场）；成功计 1 次发言数并写决策日志；发送失败有明确错误返回。
 
@@ -84,7 +84,7 @@
 - **参数**：`level`（integer，必填）只能填 0、1 或 2。
 - **行为**：3 档兼容入口——0/1/2 分别落到 v2 档位 1/2/4（score 取 30.0/57.5/94.0），并**强制重估档位（跳过迟滞）**，保证旧 `level()` 输出与输入一致；持久化后 planner 注入按 v2 5 档档位描述表达（后缀/小剧场仍按 3 档折算）。
 
-> T6 说明：原 `cateye_test_mai_lover_current_activity`、`cateye_test_mai_lover_status`、`cateye_test_mai_lover_schedule` 三工具已移除——当前活动/今日完整日程统一走 `cateye_test_get_schedule_info`（view=current / lover_day），恋人状态面由 `/cateye_test_dashboard` 的伴侣区块与纯文本档承载。
+> T6 说明：原 `cateye_test_mai_lover_current_activity`、`cateye_test_mai_lover_status`、`cateye_test_mai_lover_schedule` 三工具已移除——当前活动/今日完整日程统一走 `cateye_test_get_schedule_info`（view=current / lover_day），陪伴状态面由 `/cateye_test_dashboard` 的伴侣区块与纯文本档承载。
 > A5 指令收敛（2026-10-06，随 M7）：原 `cateye_test_mai_lover_config` Tool 已删除，配置摘要并入 `/cateye_test_dashboard` 的**纯文本档末行**（单行紧凑版，图片档不含）。
 
 ### qzone — QQ 空间（1 个）
@@ -150,7 +150,7 @@
 | 指令 | 描述 | 行为 |
 |---|---|---|
 | `/cateye_test_mai_affection [0\|1\|2]` | 查看/调整好感度：不带参数输出 score/baseline/5 档档位/今日 Δ + 最近印象（最多 2 条，「最近印象」行）与关系温度（tone，「关系温度·日期」行）——印象与 tone 为 M2 关系日结产出，为空则不显示（tone 读取时按 7 天过期判断）；带参数按 3 档兼容口径调整 | 0/1/2 → score 移到 v2 档位 1/2/4（取 30.0/57.5/94.0）并强制重估（跳过迟滞）；参数取正则命名捕获组（兼容引用+命令混排）；缺参/非法值提示用法与当前状态 |
-| `/cateye_test_mai_help` | 查看麦麦恋人所有可用命令 | 命令清单直发（含「日程与生活管理见 /cateye_test_plan 与 /cateye_test_life」指路行） |
+| `/cateye_test_mai_help` | 查看麦麦陪伴所有可用命令 | 命令清单直发（含「日程与生活管理见 /cateye_test_plan 与 /cateye_test_life」指路行） |
 | `/cateye_test_diag [llm\|decision\|life] [天数]` | **A5 排障三合一**：`llm` = LLM 调用日志（旧名 `/cateye_test_mai_llm_log`）、`decision` = 主动行为决策日志（旧名 `/cateye_test_mai_diag`）、`life` = 决策日志紧凑文本（旧名 `/cateye_test_life diag`）；无参数/未知子命令回四行用法帮助 | **管理员 ∪ 本机控制台**；`llm`/`decision` JSONL 按天读取（1~30 天，缺省=整个保留期）后合并转发，未启用时提示配置项、空日志时给提示（decision 附巡检状态行）；`life` 紧凑文本（1~7 天，缺省 1）直发 |
 | `/cateye_test_dashboard` | **M7 聚合总览**：一条命令看四模块（日程规划/伴侣关系/情绪/QQ空间）并渲染状态图（内置 NotoSansSC + PIL，浅色卡片排版） | **管理员 ∪ 本机控制台**（`admin.admin_users`，留空时 QQ 侧默认拒绝并提示「权限不足」，不要求 target_qq）；有图 = 图片 + 文本合并转发；渲染失败/超时（PIL 缺失、字体缺失、10s 超时）静默降级为纯文本直发（不发失败提示）；某模块未启用/未装配 → 该区块显示「（未启用）」；**纯文本档**：日程区块展开今日**完整**日程（不截断，原 `/cateye_test_mai_schedule` 的信息面）+ 伴侣区块含好感/今日发言/早安·晚安·想念标记，末行附单行配置摘要（原 `cateye_test_mai_lover_config` Tool 与 `/cateye_test_mai_config` 命令的信息面）；**图片档仍按 ≤5 条截断且不含配置摘要** |
 
@@ -186,9 +186,9 @@
 | API | 提供方 | 返回结构 | 说明 |
 |---|---|---|---|
 | `get_current_activity` | planning | `{"has_activity", "activity": {name/description/goal_type/time_window}, "next_activities": [{"time","name"}], "as_of", "timezone", "error"}` | 当前活动快照，与自主规划插件返回结构兼容（经注入缓存通道） |
-| `companion_get_current_activity` | companion | 活动描述字符串（无活动返回空串） | 恋人视角的当前活动 |
-| `companion_get_schedule` | companion | `[{time, activity}]` | 今日完整日程（兼容虚拟恋人插件返回结构） |
-| `companion_get_affection_level` | companion | `0 / 1 / 2` | 好感度档位（兼容虚拟恋人插件返回结构） |
+| `companion_get_current_activity` | companion | 活动描述字符串（无活动返回空串） | 陪伴对象视角的当前活动 |
+| `companion_get_schedule` | companion | `[{time, activity}]` | 今日完整日程（兼容虚拟陪伴插件返回结构） |
+| `companion_get_affection_level` | companion | `0 / 1 / 2` | 好感度档位（兼容虚拟陪伴插件返回结构） |
 
 > 命名说明：companion 的三个 API 在源插件中叫 `get_*`，因与 planning 的 `get_current_activity` 在同一插件内撞名，统一加了 `companion_` 前缀。
 
@@ -249,7 +249,7 @@
 > {lie_in_max_until}）。这条提醒只在本轮有效，不必向任何人提起"昨晚被吵醒"。是否调用由你决定。
 
 - `{planned_wake_hhmm}` = **当前睡眠窗口结束**（周期在册端点优先，回退 `[schedule] wake_time` 锚点）；
-- 发送走**统一主动链**：`ctx.maisaka.proactive.trigger(stream_id=该段末条 reply 流, intent="nap_reminder", reason=文本, metadata={"kind": "nap_reminder"})`，调用前查全渠道预算（`allow_proactive` → `proactive.used`），**纳入打扰预算**；预算拒绝 → 不发送、不计数；
+- 发送走**统一主动链**：`ctx.maisaka.proactive.trigger(stream_id=该段末条 reply 流, intent="nap_reminder", reason=文本, metadata={"kind": "nap_reminder"})`，调用前查主动打扰预算（仅目标陪伴私聊；`allow_proactive` → `proactive.used`），**纳入打扰预算**；预算拒绝 → 不发送、不计数；
 - **不进下一轮**：提醒块由宿主写进该流的内存历史（per-stream，不落库），本插件在注入 Hook 的既有剥离点新增 `is_consumed_ephemeral_proactive_block`——块龄 > `NAP_BLOCK_LINGER_SECONDS`（120s）即从请求载荷剔除（下一轮 planner 起不再出现）；入队超 30 分钟的块仍由原有规则兜底剥离，只影响本插件的 `kind=nap_reminder` 块，不误伤其他主动块与真实消息；
 - **提醒轮豁免（§4.5）**：提醒发出后 120s 内该流若意外触发 reply，**不刷新 resleep 计时、不重开吵醒态、不额外限制工具调用**。
 
@@ -271,17 +271,24 @@
 
 早/晚安**只配漂移区间**：每聊天流每日独立掷点一次，到点按「必要性激活」决定是否真的开口。
 
-**驱动链（一句话）**：`[planning_proactive]` 的漂移机制在 planning 的 60s 循环里掷点 → 到点查该流是否有人说话 → 统一主动链 `ctx.maisaka.proactive.trigger`（`allow_proactive` → `proactive.used`，纳入全渠道预算）。早安/晚安**各只有这一条驱动链**：`[patrol]` 不再自行判时（B1 合并），只按 `affection` 的每日已发标记去重。
+**驱动链（一句话）**：`[planning_proactive]` 的漂移机制在 planning 的 60s 循环里掷点 → 到点查该流是否有人说话 → 统一主动链 `ctx.maisaka.proactive.trigger`。早安/晚安**各只有这一条驱动链**：`[patrol]` 不再自行判时（B1 合并），只按 `affection` 的每日已发标记去重；**例行问候默认免主动打扰预算**（M11 附录 II §2.3：闸门与计数一起跳，不查预算也不计用量），活动切换/想念/日常等非问候主动行为仍照旧计入主动打扰预算（仅目标陪伴私聊）。
 
 | 配置项 | 默认 | 约束 | 说明 |
 |---|---|---|---|
-| `[planning_proactive] enable_morning_greeting`（既有） | `false` | — | 早安总开关 |
+| `[planning_proactive] greeting_target_enabled` | `true` | — | **目标陪伴私聊**早/晚安开关：目标 QQ **不看任何名单，必定触发**（例外：静默时段、当天该流已发过同类问候、本开关关闭） |
+| `[planning_proactive] greeting_group_enabled` | `true` | — | **群聊**早/晚安开关：受下面两张群聊名单与必要性激活限制（`greeting_require_activation`） |
+| `[planning_proactive] greeting_group_blacklist` | 空 | 只收裸群号 | 群聊问候黑名单：命中即不发；**留空 = 全发**（受激活限制）。带前缀/非数字/空串/重复项忽略并记一条汇总告警；**不支持通配** |
+| `[planning_proactive] greeting_group_whitelist` | 空 | 只收裸群号 | 群聊问候白名单：非空时**仅这些群**生效；留空 = 不过滤（全发）；`["*"]` = 显式全发；`*` 与具体号混用 → 全放行 + 告警 |
+| `[planning_proactive] greeting_other_private_enabled` | `false` | — | **非目标私聊**早/晚安开关（早/晚共用）：开启后还需命中名单且前一日该流消息数 ≥ 门槛 |
+| `[planning_proactive] greeting_other_private_whitelist` | 空 | 只收裸 QQ 号 | 非目标私聊问候白名单：**留空 = 全不发**（默认安全的收紧）；`["*"]` = 不过滤（对已知私聊流生效） |
+| `[planning_proactive] greeting_other_private_blacklist` | 空 | 只收裸 QQ 号 | 非目标私聊问候黑名单：命中即不发；不支持通配 |
+| `[planning_proactive] greeting_other_private_min_messages` | `5` | `ge=5`（**不允许低于 5**，配置校验直接拒绝） | 非目标私聊问候门槛（早/晚共用）：**前一日**该流消息数达到该值才成为候选；取不到计数按 0 处理（不发送） |
+| `[planning_proactive] greeting_exempt_budget` | `true` | — | 例行问候免主动打扰预算：开启后早/晚安触发**既不查预算闸门也不计主动打扰用量**（闸门与计数一起跳）；关闭则照旧受预算约束 |
 | `[planning_proactive] morning_drift` | `"10-30"` | `^\d+(-\d+)?$` | 早安漂移区间（分钟）：触发时刻 = 睡眠窗口结束（`[schedule] wake_time` 锚点）+ `randint(a,b)`；单数字 `N` = `0~N` 随机；`a>b` 自动交换；**负数/非法回退默认区间**（不收负数） |
 | `[planning_proactive] night_drift` | `"10-30"` | 同上 | 晚安漂移区间（分钟）：触发时刻 = 当天最后一个非睡眠日程条目结束 − `randint(a,b)`（向前漂移）；无日程回退 `[schedule] sleep_time` 锚点 |
-| `[planning_proactive] enable_night_greeting` | `false` | — | 晚间问候开关；关闭时**晚安全线不发（含群聊）** |
-| `[planning_proactive] morning_other_private_enabled` | `false` | — | 其他私聊的早安开关 |
-| `[planning_proactive] morning_other_private_min_messages` | `5` | `ge=5`（**不允许低于 5**，配置校验直接拒绝） | 其他私聊早安门槛：**前一日**该流消息数达到该值才成为候选；取不到计数按 0 处理（不发送） |
 | `[planning_proactive] greeting_require_activation` | `true` | — | 群聊必要性激活：到点需先观察到「自基准点起该流有人发过消息」才问候；无人则推迟到下一轮，到期限仍无人即放弃（当天不再补发） |
+
+**被取代键（deprecated 兼容读取，M11 附录 II §2.6/§七）**：`enable_night_greeting` **显式 false = 晚安全灭（三类都不发）**、显式 true / 缺省 = 三类新开关接管（晚间问候总开关被 `greeting_target_enabled` + `greeting_group_enabled` 细分取代）；`morning_other_private_enabled` **显式 true** 归并生效为 `greeting_other_private_enabled`（早/晚共用；新键显式时新键优先）；`morning_other_private_min_messages` 显式值沿用为新门槛 `greeting_other_private_min_messages` 的缺省（新键显式优先）。`enable_morning_greeting` 亦已下线为纯兼容字段（早安不再需要总开关）。旧键存在不报错。
 
 **基准与期限**
 
@@ -295,17 +302,19 @@
 - **锚点参照点**：晚安的「入睡锚点 / `silence_start`」按**今天的起床锚点**取"今晚的那一次"——常规作息得到当天时刻，夜猫子作息（`sleep < wake`，日程延续到次日凌晨）自动落到次日凌晨，不会误判成"窗口已过"。
 - **延迟补发**：循环因重启等原因错过触发时刻时，只要未到期限仍会在下一个 tick 补发；已过期限即记放弃（`abandoned`），当天不再评估。
 
-**覆盖范围（B6/B7）**
+**覆盖范围（M11 附录 II §2.2 三类触发矩阵，取代 B6）**
 
-| 目标 | 规则 |
-|---|---|
-| 虚拟恋人目标私聊（`[target] target_qq`） | 早安/晚安**固定生效**（只要对应开关打开，不要求激活） |
-| 群聊 | 仅当群号出现在 `[planning_proactive] proactive_group_ids`（**复用全局名单，不新增问候群号配置**）→ 必要性激活（`greeting_require_activation`）；晚安另需 `enable_night_greeting`。⚠ 与活动切换主动开口不同：问候**不做**「名单留空 = 所有群」的放大——**留空 = 不含群聊** |
-| 其他私聊 | 早安需 `morning_other_private_enabled` **且**前一日该流消息数 ≥ `morning_other_private_min_messages`；名单复用 `proactive_other_streams`。**晚安本轮不给其他私聊** |
+| 会话类型 | 开关 | 名单 | 附加条件 |
+|---|---|---|---|
+| 目标陪伴私聊（`[target] target_qq`） | `greeting_target_enabled`（默认 **true**） | **豁免名单**（不看任何黑白名单） | 无（必定触发） |
+| 群聊 | `greeting_group_enabled`（默认 **true**） | `greeting_group_blacklist`（空 = 全发）+ `greeting_group_whitelist`（非空 = 仅白名单；`["*"]` = 不过滤） | **必要性激活**（`greeting_require_activation`） |
+| 非目标私聊 | `greeting_other_private_enabled`（默认 **false**） | 白名单 `greeting_other_private_whitelist`（**空 = 全不发**）+ 黑名单命中即不发 | 前一日该流消息数 ≥ `greeting_other_private_min_messages` |
 
-**预算与去重**：问候一律走统一主动链并计入全渠道预算（**不为问候开预算旁路**）；预算拒绝时当轮不发送、掷点状态不变（下一轮继续尝试，到期限自然放弃）。目标私聊触发成功后写 `affection` 的 `morning_sent`/`night_sent` 每日标记，`[patrol]` 见已发即不再触发——同一私聊流同一天早安/晚安**各至多一条**。
+名单**只收裸群号 / 裸 QQ 号**（带前缀、含非数字、空串、重复项一律忽略并记一条汇总告警，落决策日志；同签名每日一次）；黑名单不支持通配；`*` 与具体号混用 → 全放行 + 告警。与活动切换主动开口的 `proactive_group_ids` / `proactive_other_streams`（支持 `session:` / `qq:private:` 前缀）**两套名单不混用**。
 
-**[patrol] 的四个时间窗字段已废弃**：`morning_start` / `morning_end` / `night_start` / `night_end` 保留在配置里**仅作兼容读取**（仍参与 `HH:MM` 格式校验、非法值照旧落 `invalid_time_config` 留痕），**不再参与任何触发判定**；实际时刻由上面的漂移机制决定。`[patrol]` 的静默时段、每日发言上限（含「未发晚安预留 1 个预算位」）与全渠道预算照旧生效；`[patrol] min_interval_exempt_greetings`（早晚安豁免最小间隔）随 patrol 判时下线而**不再有消费点**（字段保留，间隔约束由漂移机制自身的基准/期限承担）。
+**预算与去重**：问候默认**免主动打扰预算**（`greeting_exempt_budget=true`，§2.3：不查闸门、不记用量）；关闭免预算后照旧走预算、预算拒绝时当轮不发送、掷点状态不变（下一轮继续尝试，到期限自然放弃）。目标私聊触发成功后写 `affection` 的 `morning_sent`/`night_sent` 每日标记，`[patrol]` 见已发即不再触发——同一私聊流同一天早安/晚安**各至多一条**。
+
+**[patrol] 的四个时间窗字段已废弃**：`morning_start` / `morning_end` / `night_start` / `night_end` 保留在配置里**仅作兼容读取**（仍参与 `HH:MM` 格式校验、非法值照旧落 `invalid_time_config` 留痕），**不再参与任何触发判定**；实际时刻由上面的漂移机制决定。`[patrol]` 的静默时段、每日发言上限（含「未发晚安预留 1 个预算位」）与主动打扰预算（仅目标陪伴私聊）照旧生效；`[patrol] min_interval_exempt_greetings`（早晚安豁免最小间隔）随 patrol 判时下线而**不再有消费点**（字段保留，间隔约束由漂移机制自身的基准/期限承担）。
 
 **宿主实测项（离线不可覆盖，归宿主级验证会话）**：① 漂移触发时刻与 `[schedule] wake_time`、末条日程结束的实际对齐（含跨午夜条目）；② 群聊必要性激活在真实 `message.get_by_time_in_chat` 语义下的命中口径；③ 同一私聊流同一天早安/晚安各至多一条（含 planning 与其他链路的并发窗口）；④ `[patrol]` 时间窗字段废弃后，宿主 UI 保存配置不再写回旧值的行为。
 

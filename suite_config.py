@@ -5,7 +5,7 @@
   兄弟插件抢占（L1 实证），故改名并由 plugin.py 顶部引导头接管自身模块解析。
 - 三个业务子模块各自拥有自己的配置 section 类（模块化维护）：
 - planning/config.py   自主规划：schedule / inject / planning_proactive / planning_cleanup
-- companion/config.py  虚拟恋人：patrol / affection / cateye
+- companion/config.py  虚拟陪伴：patrol / affection / cateye
 - qzone/config.py      QQ 空间：qzone
 
 顶层只保留跨模块共享的基础段（plugin / target / admin），并把各子模块 section
@@ -76,7 +76,7 @@ class PluginSectionConfig(PluginConfigBase):
 
 
 class TargetSectionConfig(PluginConfigBase):
-    """目标用户（虚拟恋人的聊天对象）。"""
+    """目标用户（虚拟陪伴的聊天对象）。"""
 
     __ui_label__ = "目标用户"
     __ui_icon__ = "person"
@@ -87,7 +87,7 @@ class TargetSectionConfig(PluginConfigBase):
 
     target_qq: int = Field(
         default=123456789,
-        description="恋人私聊对象的 QQ 号（主动聊天、想念、好感度都只对这个会话生效）",
+        description="陪伴对象私聊的 QQ 号（主动聊天、想念、好感度都只对这个会话生效）",
         json_schema_extra={
             "label": "目标 QQ",
             "hint": "保持默认占位值时插件不会主动私聊任何人",
@@ -151,7 +151,7 @@ class CateyeSuiteConfig(PluginConfigBase):
     inject: InjectSectionConfig = Field(default_factory=InjectSectionConfig)
     planning_proactive: PlanningProactiveSectionConfig = Field(default_factory=PlanningProactiveSectionConfig)
     planning_cleanup: PlanningCleanupSectionConfig = Field(default_factory=PlanningCleanupSectionConfig)
-    # 虚拟恋人（companion/config.py）
+    # 虚拟陪伴（companion/config.py）
     patrol: PatrolSectionConfig = Field(default_factory=PatrolSectionConfig)
     affection: AffectionSectionConfig = Field(default_factory=AffectionSectionConfig)
     cateye: CateyeScreenSectionConfig = Field(default_factory=CateyeScreenSectionConfig)

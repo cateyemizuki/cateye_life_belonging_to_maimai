@@ -3,8 +3,8 @@
 三个业务子模块（各自拥有 config / services / components）：
 - planning/   自主规划复刻：日程生成（多轮+评分）/ SQLite 目标库 / planner+replyer 注入 /
   活动切换主动开口 / /plan 命令 / get_current_activity API
-- companion/  虚拟恋人复刻：好感度 / 巡检主动聊天（早安晚安想念）/ 屏幕感知 /
-  恋人电脑联动 / 节假日 / /mai_* 命令
+- companion/  虚拟陪伴复刻：好感度 / 巡检主动聊天（早安晚安想念）/ 屏幕感知 /
+  陪伴对象电脑联动 / 节假日 / /mai_* 命令
 - qzone/      QQ 空间：按日程发说说（双通道）/ 自动回评（Web CGI 直连，含楼中楼）/ /life 命令
 - emotion/    情绪维护系统：VAD 三维状态机（日常增量+指数衰减）/ 睡眠裁判大修 / 人设初始化 / 情绪底色注入
 
@@ -88,9 +88,12 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         # 预算计数器在装配时装入（先于服务束启动；M0 实际订阅者仅它）
         self._bus = EventBus(self._decision_logger)
         # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
+        # M11（附录 II §3.3）：预算只统计发往目标陪伴私聊的主动打扰——注入 self._stream_id
+        # 取值回调（G11 权威来源，随 _apply_target/热重载更新；不新增持久化状态）
         self._proactive_budget = install_proactive_budget(
             self._bus, config_provider=lambda: self.config, decision_logger=self._decision_logger,
-            data_dir=data_dir)
+            data_dir=data_dir,
+            target_stream_provider=lambda: getattr(self, "_stream_id", ""))
 
         # 服务束（内部动态读 self.config，热重载自动生效）
         self._planning = PlanningServices(self)

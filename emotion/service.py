@@ -286,7 +286,9 @@ class EmotionService:
         """状态机 + episode 水位/日计数写同一份 emotion_state.json。
 
         状态机 ``load_dict`` 只读自己认识的键（未知键忽略），故 ``episode`` 与
-        ``applied_sleep_date`` 可以安全共存于同一文件。
+        ``applied_sleep_date`` 可以安全共存于同一文件；且落盘前**本方法主动保留合并**
+        盘上已有的 ``applied_sleep_date``（醒沿结算的"本周期已结算"标记，状态机
+        ``to_dict`` 不含该键）——否则 episode 冲刷/日切等任意共用出口都会把它抹掉。
         """
         state = self._machine.to_dict()
         state["episode"] = {
@@ -295,6 +297,11 @@ class EmotionService:
             "eval_date": str(self._episode_state["eval_date"]),
             "eval_count": int(self._episode_state["eval_count"]),
         }
+        # P4 落盘护栏（最小 diff）：醒沿把 applied_sleep_date 直接写入文件，而本方法整体重写
+        # 该文件；覆盖式并入盘上原值（状态机不认识该键，load_dict 忽略；不改其值、不新增字段）。
+        previous = load_json(self._state_path, {}) or {}
+        if isinstance(previous, dict) and "applied_sleep_date" in previous:
+            state["applied_sleep_date"] = previous["applied_sleep_date"]
         save_json_atomic(self._state_path, state)
 
     def _save_params(self) -> None:
@@ -1720,9 +1727,11 @@ class EmotionService:
         3. ``no_sleep_mode == false``（§〇 C1：L1/L3 全线静默）；
         4. ``nap_reminder_enabled``（默认 true）。
 
-        发送（F9/F12）：查全渠道预算（``bus.allow_proactive``）→ 发 ``proactive.used`` →
+        发送（F9/F12）：查主动打扰预算（仅目标陪伴私聊；按 ``stream_id`` 维度判定）→
+        发预算记账事件（带 ``stream_id``）→
         ``ctx.maisaka.proactive.trigger(stream_id=段末条 reply 流, intent="nap_reminder",
         reason=提醒文本, metadata={"kind": "nap_reminder"})``。预算拒绝/触发失败 → 不发送不计数。
+        （M11 附录 II §3.3：赖床提醒发往目标陪伴私聊 → 计入；非目标流的段不计入、不受限。）
         成功后：有效提醒次数 +1、登记 §4.5 提醒轮豁免窗口、落 ``emotion.nap_reminder_sent``。
 
         Returns:
@@ -1766,19 +1775,22 @@ class EmotionService:
             _blocked("gate_disabled")
             return None
 
-        # 发送（F9：先查预算，再记 proactive.used，最后触发；预算拒绝 → 不发送不计数）
+        # 发送（F9：先查主动打扰预算，再记 proactive.used，最后触发；预算拒绝 → 不发送不计数）
+        # M11（附录 II §3.3）：预算按 stream 维度判定——本提醒发往目标陪伴私聊故计入。
         trigger = self._nap_trigger()
         if trigger is None:
             _blocked("trigger_missing")
             return None
         bus = self._bus()
-        if bus is not None and not bus.allow_proactive("emotion", "nap_reminder"):
+        if bus is not None and not bus.allow_proactive("emotion", "nap_reminder",
+                                                       stream_id=stream_id):
             _blocked("budget")
             return None
         if bus is not None:
             try:
                 await bus.publish("proactive.used", source="emotion",
-                                  channel="emotion", intent="nap_reminder")
+                                  channel="emotion", intent="nap_reminder",
+                                  stream_id=stream_id)
             except Exception:
                 pass
         text = self.nap_reminder_text(current)

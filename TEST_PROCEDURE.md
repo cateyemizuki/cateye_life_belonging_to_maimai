@@ -51,7 +51,7 @@
 | L2 | **注入式集成测试** | 是 | 核心手段：经 `snowluma_gateway` 注入合成 MessageDict，走**完整真实入站链**（写库 → chat.receive hooks → maisaka 回复决策）。无需真人发消息，最大程度"模仿实际应用环境"且零宿主改动 |
 | L3 | 真人联动 | 是 | 注入覆盖不到的：真实消息 ID 的引用回复链、表情、图片、用户自己的措辞习惯。由用户在测试群/私聊手打 |
 | L4 | 长周期（日切/日程生成/睡眠大修/好感日结/日衰减） | 是 | **不 mock 时钟、不改宿主**：把被测插件配置里的时间参数临时搬到"几分钟后"（`[schedule] auto_generate_time/wake_time/sleep_time`、`[emotion] check_interval_minutes`、`[affection]` 周期参数），插件热重载生效，观察后恢复。禁止改系统时间 |
-| L5 | 稳定性长跑 | 是 | 挂机 ≥1 天：decision_logs 事件流完整性、全渠道预算互斥、无异常堆积、无重复主动行为。**复验口径（2026-10-05 增补，对应 MAINTENANCE_PLAN_10.05.md §9.1）**：窗口起点=整改后首次干净启动（如 A2 部署触发的新代启动）；挂机满 24h 后仅对未过项复验，产物追加/新建 recheck 文件、不改写首轮结论 |
+| L5 | 稳定性长跑 | 是 | 挂机 ≥1 天：decision_logs 事件流完整性、主动打扰预算（M11 起**仅目标陪伴私聊**）互斥、无异常堆积、无重复主动行为。**复验口径（2026-10-05 增补，对应 MAINTENANCE_PLAN_10.05.md §9.1）**：窗口起点=整改后首次干净启动（如 A2 部署触发的新代启动）；挂机满 24h 后仅对未过项复验，产物追加/新建 recheck 文件、不改写首轮结论 |
 
 **注入的重要性质**（务必理解再用）：注入的消息**不会出现在真实 QQ**（只进宿主 DB 与上下文）；但 bot 的**回复**会经 SnowLuma 真实发出到对应群/私聊——所以只在 392653174 / 123456789 注入会触发回复的内容。`is_notify=True` 的注入只入库不触发回复（可用来低成本更新 last_user_msg_time、模拟撤回/戳一戳通知）。
 
@@ -107,7 +107,7 @@
 | 里程碑 | 场景（/h_seq 名） | 关键断言（对应 MAINTENANCE_PLAN_10.05 验收列；A2 为独立先行项，其验收见该文件 §七 A2 行） |
 |---|---|---|
 | R0 清理 | — | smoke+behavior 全绿、组件数与 CLEANUP 勾选一致 |
-| M0 事件总线 | `bus_check` | 注入一问一答 → decision_logs 出现 `bus:relation.*`/`bus:schedule.*`；主动触发写入 `proactive.used`；同日全渠道触发不超全局上限 |
+| M0 事件总线 | `bus_check` | 注入一问一答 → decision_logs 出现 `bus:relation.*`/`bus:schedule.*`；主动触发写入 `proactive.used`；同日主动打扰不超上限（M11 收窄口径：仅目标陪伴私聊计入） |
 | M1 好感 v2 | `affection_basic` | 连续注入 10 轮对话 → score 上涨但 ≤ 日累计上限（刷 100 条也 +1.0 封顶）；v1 迁移（先放旧格式 JSON 再装载）；档位迟滞（升档需越界+3 且满 24h——用 L4 搬运） |
 | M2 裁判/日结 | `affection_review` | L4：sleep 锚点搬到几分钟后 → 会话采样裁判触发（≤2 次/日）、日结 JSON 合法、impressions 滚动；LLM 任务故意配错 → 纯规则退化不崩 |
 | M3 识别/倍率/沉默 | `attribution`、`silence` | 私聊注入 → target 加成生效（decision_logs 记 K=1+加成）；群聊注入 → ×1.0；群聊 + 工具 is_target=true → 加成生效；is_target 传垃圾值 → 静默按 1.0；`silence`：is_notify 注入最后一条消息后静置（miss_hours 临时调小）→ silence_detected 每日 ≤2 次、间隔 ≥4h |
