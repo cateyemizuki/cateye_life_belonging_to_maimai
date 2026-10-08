@@ -5,6 +5,12 @@
   （V 1.0 / A 0.8 / D 1.2，区分"恐惧/愤怒"时 D 权重更高）；
 - 距离阈值内取最近标签，多条命中输出复合描述（激活度=1/距离 归一化）；
 - 全部超阈值 → 低分辨率三档描述兜底（给对话 LLM 模糊反馈，防长期漂移）。
+
+M12（V3 接线）：原型表与五档阈值可被可选 ``<data_dir>/emotion_mapping.json`` 覆盖——模块内
+``EMOTION_PROTOTYPES`` / ``EMOTION_TABLE_SUMMARY`` 保持为**代码默认基线**，运行期生效值在
+``_PROTO_CENTERS`` / ``_LEVEL_THRESHOLDS`` / ``_EMOTION_TABLE_SUMMARY`` 三个生效位（装载时由
+:func:`apply_mapping_tables` 重绑：默认 ⊕ 覆盖）。映射算法（权重/阈值/复合条数/激活占比）
+与 ``_LEVELS`` 档词/比较链**不开放**覆盖。
 """
 
 from __future__ import annotations
@@ -12,6 +18,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+# M12（V3 接线）：生效阈值默认基线取自覆盖层的声明位（`DEFAULT_LEVEL_THRESHOLDS`），
+# 使 `_level` 的切点成为单一真源。本 import 无环：`mapping_override` 顶层只依赖标准库，
+# 它对 vad/bridge 的引用全部延迟到函数体内（见其 `default_tables`）。
+from . import mapping_override as _mapping_override
 
 VAD_WEIGHTS = (1.0, 0.8, 1.2)
 #: 距离阈值：低于它才认为命中某个情绪原型（设计文档 §七.2）
@@ -108,16 +119,64 @@ EMOTION_PROTOTYPES: List[Tuple[str, Tuple[float, float], Tuple[float, float], Tu
     ("怀旧", (0.2, 0.6), (-0.3, 0.2), (-0.2, 0.3)),
 ]
 
-# 原型中心点（区间中点），映射时计算加权欧氏距离
-_PROTO_CENTERS = [
+# 原型中心点（区间中点），映射时计算加权欧氏距离（**代码默认基线**，不随覆盖变化：
+# `mapping_override.default_tables()` 读本处作默认；运行期生效值见 `_PROTO_CENTERS`）
+_DEFAULT_PROTO_CENTERS = [
     (name, ((v[0] + v[1]) / 2, (a[0] + a[1]) / 2, (d[0] + d[1]) / 2))
     for name, v, a, d in EMOTION_PROTOTYPES
 ]
 
-#: 供 LLM 提示词使用的情绪表摘要（标签 + VAD 中心，砍掉区间细节控制 token）
-EMOTION_TABLE_SUMMARY = "\n".join(
-    f"- {name}：V={v:+.1f}，A={a:+.1f}，D={d:+.1f}" for name, (v, a, d) in _PROTO_CENTERS
-)
+
+def _format_table_summary(centers: List[Tuple[str, Tuple[float, float, float]]]) -> str:
+    """情绪表摘要文本（标签 + VAD 中心，砍掉区间细节控制 token）。"""
+    return "\n".join(
+        f"- {name}：V={v:+.1f}，A={a:+.1f}，D={d:+.1f}" for name, (v, a, d) in centers
+    )
+
+
+# ── 生效位（V3 接线：默认 ⊕ 覆盖；由装载方经 apply_mapping_tables 推入）──────────
+# **生效**原型中心：``map_emotions`` 调用期读本全局（装载时重绑）；无覆盖 = 代码默认。
+_PROTO_CENTERS: List[Tuple[str, Tuple[float, float, float]]] = list(_DEFAULT_PROTO_CENTERS)
+# **生效**五档阈值（默认基线 = mapping_override.DEFAULT_LEVEL_THRESHOLDS；见 apply 函数）
+_LEVEL_THRESHOLDS: Tuple[float, ...] = tuple(float(x) for x in
+                                             _mapping_override.DEFAULT_LEVEL_THRESHOLDS)
+# **生效**摘要文本（覆盖后按合并原型重算；运行期读取入口 = emotion_table_summary()）
+_EMOTION_TABLE_SUMMARY: str = _format_table_summary(_PROTO_CENTERS)
+
+#: 情绪表摘要的**默认基线**文本（供 LLM 提示词使用；标签 + VAD 中心，砍掉区间细节控制 token）。
+#: V3 接线（D6）：覆盖生效时本常量不随动——referee 两处 prompt 已改为运行期调用
+#: :func:`emotion_table_summary`，不再 from-import 本常量；本常量保留 = 默认形态快照/对照用。
+EMOTION_TABLE_SUMMARY = _format_table_summary(_DEFAULT_PROTO_CENTERS)
+
+
+def emotion_table_summary() -> str:
+    """当前**生效**的情绪表摘要文本（默认 ⊕ 覆盖；D6：提示词的运行期读取入口）。"""
+    return _EMOTION_TABLE_SUMMARY
+
+
+def apply_mapping_tables(*, prototypes: Optional[List[Dict[str, Any]]] = None,
+                         level_thresholds: Optional[Any] = None) -> None:
+    """把「默认 ⊕ 覆盖」的生效原型表 / 五档阈值推入本模块（V3 接线；装载方调用）。
+
+    - ``prototypes=None`` → 回代码默认（``prototypes_as_dict()``）；否则为
+      ``mapping_override`` 校验输出的区间形状表（中心点按 ``(lo+hi)/2`` 重派生）；
+    - ``level_thresholds`` 长度非 4 / 不可转数值 → 回默认四点（比较链与档词冻结，语义不变）；
+    - 覆盖为空表时不改现状（校验层本不放行空表，此处只防映射被打成无标签）。
+    """
+    global _PROTO_CENTERS, _EMOTION_TABLE_SUMMARY, _LEVEL_THRESHOLDS
+    table = prototypes_as_dict() if prototypes is None else prototypes
+    centers = _mapping_override.prototype_centers(table) or list(_PROTO_CENTERS)
+    _PROTO_CENTERS = centers
+    _EMOTION_TABLE_SUMMARY = _format_table_summary(centers)
+    thresholds: Tuple[float, ...] = ()
+    if level_thresholds is not None:
+        try:
+            thresholds = tuple(float(x) for x in level_thresholds)
+        except (TypeError, ValueError):
+            thresholds = ()
+    if len(thresholds) != _mapping_override.LEVEL_THRESHOLD_COUNT:
+        thresholds = tuple(float(x) for x in _mapping_override.DEFAULT_LEVEL_THRESHOLDS)
+    _LEVEL_THRESHOLDS = thresholds
 
 
 def weighted_distance(vad: VADState, center: Tuple[float, float, float]) -> float:
@@ -155,14 +214,19 @@ _LEVELS = ("很低", "偏低", "中等", "偏高", "很高")
 
 
 def _level(value: float) -> str:
-    """单维五档描述。"""
-    if value <= -0.5:
+    """单维五档描述（切点 = 生效阈值 ``_LEVEL_THRESHOLDS``：V3 接线后可被 JSON 覆盖）。
+
+    比较链与档词**冻结**：``<=c1`` / ``<=c2`` / ``<c3`` / ``<c4`` / 其余 —— 左闭右开的
+    不对称语义原样保留（默认四点 = (-0.5, -0.15, 0.15, 0.5) 时逐值等于接线前行为）。
+    """
+    c1, c2, c3, c4 = _LEVEL_THRESHOLDS
+    if value <= c1:
         return _LEVELS[0]
-    if value <= -0.15:
+    if value <= c2:
         return _LEVELS[1]
-    if value < 0.15:
+    if value < c3:
         return _LEVELS[2]
-    if value < 0.5:
+    if value < c4:
         return _LEVELS[3]
     return _LEVELS[4]
 

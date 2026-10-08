@@ -14,7 +14,9 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 from .state_machine import EmotionParams
-from .vad import EMOTION_TABLE_SUMMARY, VADState, _clip
+# D6（V3 接线）：情绪表摘要**不得 from-import**（导入期绑定会在覆盖生效前定型）——
+# 改调运行期 getter，两处 prompt 随「默认 ⊕ 覆盖」的合并原型表实时取值。
+from .vad import VADState, _clip, emotion_table_summary
 
 SLEEP_REFEREE_PROMPT = """你是一个客观的情绪裁判系统，负责对 AI 角色的睡眠期情绪进行大修。
 你不参与对话，只依据下面的客观数据输出 JSON。
@@ -234,7 +236,7 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
         persona=persona or "（暂无人设）", v=vad.valence, a=vad.arousal, d=vad.dominance,
         emotion_log=emotion_log_text, yesterday_schedule=yesterday_schedule or "（没有记录）",
         tomorrow_schedule=tomorrow_schedule or "（没有记录）", long_term_status=long_term_status or "普通时期",
-        sleep_hours=max(0.5, float(sleep_hours)), emotion_table=EMOTION_TABLE_SUMMARY,
+        sleep_hours=max(0.5, float(sleep_hours)), emotion_table=emotion_table_summary(),
         r_v=residual.valence, r_a=residual.arousal, r_d=residual.dominance,
         e_v=expectation.valence, e_a=expectation.arousal, e_d=expectation.dominance,
         commitment_net=net, limit=limit,
@@ -257,7 +259,7 @@ async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str
     """人设初始化：人设文本 → 四组参数（校验+裁剪到约束区间）。"""
     response = await llm.generate(
         prompt=str(persona_text or "")[:2000],
-        system_prompt=INIT_SYSTEM_PROMPT.format(emotion_table=EMOTION_TABLE_SUMMARY),
+        system_prompt=INIT_SYSTEM_PROMPT.format(emotion_table=emotion_table_summary()),
         task_name=task_name, temperature=0.4, max_tokens=900, event="emotion_init",
     )
     data = _parse_json_loose(response)

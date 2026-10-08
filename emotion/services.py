@@ -84,6 +84,14 @@ class EmotionServices:
         """§6.2 A 的 K（target 加成 / 非 target 系数；Tool 上报事件用，转发 self.service）。"""
         return self.service.target_multiplier(is_target)
 
+    def target_bonus_step(self) -> float:
+        """target 每档加成步长（转发 self.service；D7：跨模块留痕字段取值口）。
+
+        内层已含「JSON 合法覆盖 > config > 默认」三层合并与 [0, 1] 夹取，热重载即时生效；
+        调用方（companion/patrol.py 的沉默事件 target_bonus 留痕）据此与桥内入账同源。
+        """
+        return self.service.target_bonus_step()
+
     async def record_external_event(self, source: str, description: str,
                                     delta: Optional[VADState] = None, *,
                                     use_llm: bool = False,

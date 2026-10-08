@@ -16,10 +16,12 @@ from planning.schedule_query import ScheduleQuery
 from planning.tools_service import (DEFAULT_LIE_IN_MAX_UNTIL, NAP_TOOL_NAME,
                                     normalize_hhmm, parse_nap_target)
 
+from . import mapping_override
+from .bridge import apply_template_events
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
 from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
                             EmotionParams, EmotionStateMachine)
-from .vad import VADState, _clip, _level, map_emotions, mood_summary
+from .vad import VADState, _clip, _level, apply_mapping_tables, map_emotions, mood_summary
 
 #: 单事件增量硬限幅（§6.3-2：所有增量在代码层硬限幅；§6.2 A「单事件经 ±0.5 限幅」）
 EVENT_DELTA_CLAMP = 0.5
@@ -184,6 +186,32 @@ class EmotionService:
         data_dir = Path(getattr(plugin, "_data_dir", Path(".")))
         self._state_path = data_dir / "emotion_state.json"
         self._config_path = data_dir / "emotion_config.json"
+
+        # ── M12（V3 接线）：情绪映射表覆盖层（可选 <data_dir>/emotion_mapping.json）──────
+        # 与 emotion_config.json 同处装载一次 → 「默认 ⊕ 覆盖」合并 → 推入 vad/bridge 生效位
+        # （两 action 在 load 内已落账，含 severity）；热重载 = on_load 重建本服务 → 自动重读
+        # （plugin.py:65-113）。文件不存在 = 纯代码默认（静默、零 action），下游取值与接线前
+        # 逐字一致。结果留服务实例（倍率三层取值的 JSON 侧 + 观测/直测用）。
+        try:
+            self._mapping_result = mapping_override.load(
+                data_dir, getattr(plugin, "_decision_logger", None))
+        except Exception as exc:  # 模块自身缺陷不拖挂情绪子系统（V2 模块 docstring 明文委托）
+            logger.warning("情绪映射覆盖层装载异常（按纯默认处理）：%s", exc)
+            self._mapping_result = None
+        self._mapping_tables = mapping_override.merge_tables(self._mapping_result)
+        apply_mapping_tables(prototypes=self._mapping_tables["prototypes"],
+                             level_thresholds=self._mapping_tables["level_thresholds"])
+        apply_template_events(self._mapping_tables["template_events"])
+        ctx_logger = getattr(self._ctx, "logger", None)
+        if ctx_logger is not None and self._mapping_result is not None:
+            if self._mapping_result.error is not None:
+                ctx_logger.warning("情绪映射覆盖层拒绝（%s @ %s）→ 全量回退代码默认",
+                                   self._mapping_result.error.get("error_kind"),
+                                   self._mapping_result.error.get("error_key"))
+            elif self._mapping_result.applied_keys:
+                ctx_logger.info("情绪映射覆盖层已生效：%s（%s）",
+                                "、".join(self._mapping_result.applied_keys),
+                                self._mapping_result.counts())
 
         cfg = getattr(plugin.config, "emotion", None)
         self._machine = EmotionStateMachine(
@@ -901,19 +929,37 @@ class EmotionService:
         except (TypeError, ValueError):
             return float(default)
 
+    def _merged_multiplier(self, name: str, default: float) -> float:
+        """三层倍率取值：**JSON 合法覆盖 > config（含用户显式值）> 代码默认**。
+
+        V1 裁定 precedence（`emotion/mapping_override.py` §③）。此处不复用
+        ``merge_tables`` 的 multipliers 位：那里的默认基线是 config 的**字段默认值**
+        （不含用户显式值），照搬会把用户配置顶掉；故直接读装载结果（JSON 侧）的 multipliers，
+        缺表/被拒/无文件时回落 :meth:`_emotion_cfg`（用户 config 与字段默认都由它给出）。
+        """
+        result = self._mapping_result
+        if result is not None and result.error is None and result.multipliers \
+                and name in result.multipliers:
+            return float(result.multipliers[name])
+        return self._to_float(self._emotion_cfg(name, default), default)
+
     def global_event_multiplier(self) -> float:
-        """全局事件幅度旋钮（默认 1.0，夹在 [0.1, 3.0]）。"""
-        value = self._to_float(self._emotion_cfg("global_event_multiplier", 1.0), 1.0)
+        """全局事件幅度旋钮（JSON 覆盖 > config > 默认 1.0，夹在 [0.1, 3.0]）。"""
+        value = self._merged_multiplier("global_event_multiplier", 1.0)
         return max(0.1, min(3.0, value))
 
     def non_target_multiplier(self) -> float:
-        """非 target 事件系数（默认 1.0，夹在 [0, 1]）。"""
-        value = self._to_float(self._emotion_cfg("non_target_multiplier", 1.0), 1.0)
+        """非 target 事件系数（JSON 覆盖 > config > 默认 1.0，夹在 [0, 1]）。"""
+        value = self._merged_multiplier("non_target_multiplier", 1.0)
         return max(0.0, min(1.0, value))
 
     def target_bonus_step(self) -> float:
-        """target 每档加成步长（默认 0.1，夹在 [0, 1]；附录 C）。"""
-        value = self._to_float(self._emotion_cfg("target_bonus_step", 0.1), 0.1)
+        """target 每档加成步长（JSON 覆盖 > config > 默认 0.1，夹在 [0, 1]；附录 C）。
+
+        D7：``companion/patrol.py`` 的沉默事件留痕字段经 ``EmotionServices``
+        转发入口读本方法，与桥内实际入账的 K 同源。
+        """
+        value = self._merged_multiplier("target_bonus_step", 0.1)
         return max(0.0, min(1.0, value))
 
     def affection_tier(self) -> Optional[int]:

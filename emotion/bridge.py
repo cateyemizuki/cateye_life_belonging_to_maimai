@@ -16,6 +16,10 @@
   倍率；**不**为评论者建立好感档案，§九.1）；
 - 其余 ``relation.*`` / ``qzone.*`` 事件仅 debug 日志（附录 A 事件表全量登记）。
 
+上面四个模板增量可被可选 ``<data_dir>/emotion_mapping.json`` 覆盖（M12 / V3 接线）：以下模块
+常量保持为**代码默认基线**，处理器一律读生效位（``_SILENCE_DELTA`` 等，装载时由
+:func:`apply_template_events` 按「默认 ⊕ 覆盖」重绑；无覆盖时二者逐字相同）。
+
 倍率口径（§6.2 A，加算非乘算）：``final = delta × global_event_multiplier × K``，
 ``K = 1 + target_bonus_step×(档位+1)``（target）或 ``non_target_multiplier``（非 target）。
 档位从 affection 状态层读取（``getattr(plugin, "_affection", None)`` 可空降级，
@@ -44,6 +48,52 @@ COMMITMENT_BROKEN_PREFIX = "约定落空"
 #: 空间评论正事件 ΔV 区间（§6.2 G：+0.05~+0.1，「被在乎的感觉」）
 QZONE_COMMENT_V_MIN = 0.05
 QZONE_COMMENT_V_MAX = 0.1
+
+# ── 生效位（V3 接线：默认 ⊕ 覆盖；由装载方经 apply_template_events 推入）──────────
+# 上面四个常量是**代码默认基线**（``mapping_override.default_tables()`` 读它们）；
+# 下面是运行期生效值，处理器一律读生效位——无覆盖时与接线前逐字一致。
+_SILENCE_DELTA: VADState = SILENCE_DELTA
+_COMMITMENT_KEPT_DELTA: VADState = COMMITMENT_KEPT_DELTA
+_COMMITMENT_BROKEN_DELTA: VADState = COMMITMENT_BROKEN_DELTA
+_QZONE_COMMENT_V_MIN: float = QZONE_COMMENT_V_MIN
+_QZONE_COMMENT_V_MAX: float = QZONE_COMMENT_V_MAX
+
+
+def _delta_from_table(table: Dict[str, Any], name: str, fallback: VADState) -> VADState:
+    """从模板事件表取三维标量增量；缺键/坏形状 → 回退 ``fallback``（代码默认）。"""
+    entry = table.get(name)
+    if not isinstance(entry, dict):
+        return fallback
+    try:
+        return VADState(float(entry["valence"]), float(entry["arousal"]),
+                        float(entry["dominance"]))
+    except (KeyError, TypeError, ValueError):
+        return fallback
+
+
+def apply_template_events(table: Optional[Dict[str, Any]] = None) -> None:
+    """把「默认 ⊕ 覆盖」的模板事件表推入本模块生效位（V3 接线；装载方调用）。
+
+    ``None`` / 坏形状 → 回代码默认常量（V2 侧已保证：合法覆盖整表替换、非法整文件回退）。
+    整表替换语义由 ``mapping_override`` 负责，本函数只做「取表 → 重绑生效位」。
+    """
+    global _SILENCE_DELTA, _COMMITMENT_KEPT_DELTA, _COMMITMENT_BROKEN_DELTA
+    global _QZONE_COMMENT_V_MIN, _QZONE_COMMENT_V_MAX
+    data: Dict[str, Any] = table if isinstance(table, dict) else {}
+    _SILENCE_DELTA = _delta_from_table(data, "relation.silence_detected", SILENCE_DELTA)
+    _COMMITMENT_KEPT_DELTA = _delta_from_table(data, "schedule.commitment_kept",
+                                               COMMITMENT_KEPT_DELTA)
+    _COMMITMENT_BROKEN_DELTA = _delta_from_table(data, "schedule.commitment_broken",
+                                                 COMMITMENT_BROKEN_DELTA)
+    vmin, vmax = QZONE_COMMENT_V_MIN, QZONE_COMMENT_V_MAX
+    qzone_entry = data.get("qzone.comment_received")
+    if isinstance(qzone_entry, dict):
+        try:
+            vmin, vmax = float(qzone_entry["valence_min"]), float(qzone_entry["valence_max"])
+        except (KeyError, TypeError, ValueError):
+            vmin, vmax = QZONE_COMMENT_V_MIN, QZONE_COMMENT_V_MAX
+    _QZONE_COMMENT_V_MIN, _QZONE_COMMENT_V_MAX = vmin, vmax
+
 
 #: 订阅的「仅 debug 日志」事件（附录 A 里其余 relation.* / qzone.* 事件）
 IGNORED_EVENTS: tuple[str, ...] = (
@@ -109,7 +159,7 @@ class EmotionBridge:
         result = await self._record(
             source="bridge:silence",
             description=f"重要的人已沉默 {hours:.1f} 小时没有消息",
-            delta=SILENCE_DELTA,
+            delta=_SILENCE_DELTA,
             is_target=True,
         )
         logger.debug("emotion bridge：silence_detected hours=%.1f target_bonus=%s → ok=%s",
@@ -117,11 +167,11 @@ class EmotionBridge:
 
     async def _on_commitment_kept(self, payload: Dict[str, Any]) -> None:
         """约定兑现（§6.2 E）：模板 ΔV=+0.2，归属 target 事件。"""
-        await self._record_commitment("kept", payload, COMMITMENT_KEPT_DELTA)
+        await self._record_commitment("kept", payload, _COMMITMENT_KEPT_DELTA)
 
     async def _on_commitment_broken(self, payload: Dict[str, Any]) -> None:
         """约定违约（§6.2 E）：模板 ΔV=−0.15，归属 target 事件。"""
-        await self._record_commitment("broken", payload, COMMITMENT_BROKEN_DELTA)
+        await self._record_commitment("broken", payload, _COMMITMENT_BROKEN_DELTA)
 
     async def _record_commitment(self, kind: str, payload: Dict[str, Any], delta: VADState) -> None:
         data = payload if isinstance(payload, dict) else {}
@@ -145,7 +195,7 @@ class EmotionBridge:
         data = payload if isinstance(payload, dict) else {}
         nickname = str(data.get("nickname") or "好友").strip()[:20] or "好友"
         summary = str(data.get("summary") or "").strip()[:40]
-        value = random.uniform(QZONE_COMMENT_V_MIN, QZONE_COMMENT_V_MAX)
+        value = random.uniform(_QZONE_COMMENT_V_MIN, _QZONE_COMMENT_V_MAX)
         description = f"空间收到 {nickname} 的评论" + (f"：{summary}" if summary else "")
         result = await self._record(source="bridge:qzone_comment", description=description,
                                     delta=VADState(value, 0.0, 0.0), multiplier=1.0)

@@ -614,7 +614,8 @@ class PatrolService:
         :data:`SILENCE_EVENT_MIN_INTERVAL_HOURS` 小时；仅 target——巡检只服务目标私聊流
         （``has_target()`` 为假时不发布）。payload：``hours``（沉默时长）与
         ``target_bonus``（档位加算加成，留痕用；emotion 侧桥按同一公式重算 K，
-        单一事实来源仍是 affection 档位 + [emotion].target_bonus_step）。
+        单一事实来源仍是 affection 档位 + 情绪服务的 ``target_bonus_step()``——M12/D7：
+        该值含「JSON 覆盖 > config > 默认」三层合并，服务不可得时回退 config 直读）。
 
         本方法只发布事件，不参与想念触发判定；任何异常都静默吞掉，绝不影响巡检判定链。
         """
@@ -657,8 +658,10 @@ class PatrolService:
     def _silence_target_bonus(self) -> float:
         """当前档位的 target 加算加成 = step × (档位+1)（§5.3 / §6.2 A；读不到按 0）。
 
-        step 读 [emotion].target_bonus_step（跨模块 getattr 判空，热重载即时生效），
-        档位读 affection 状态层；任一不可得时返回 0（不猜档位、不猜配置）。
+        step 优先取情绪服务（``plugin._emotion.target_bonus_step()``；M12/D7 起该路径已含
+        「JSON 覆盖 > config > 默认」三层合并，与桥内入账的 K 同源），服务不可得（模块停用/
+        热重载窗口/异常）时回退 ``[emotion].target_bonus_step`` 直读。档位读 affection 状态层；
+        任一不可得时返回 0（不猜档位、不猜配置）。
         """
         tier_getter = getattr(self._affection, "tier", None)
         if not callable(tier_getter):
@@ -667,11 +670,20 @@ class PatrolService:
             tier = max(0, min(4, int(tier_getter())))
         except Exception:
             return 0.0
-        cfg = self._emotion_cfg()
-        try:
-            step = float(getattr(cfg, "target_bonus_step", 0.1) or 0.1)
-        except (TypeError, ValueError):
-            step = 0.1
+        step: Optional[float] = None
+        service = self._emotion_service()
+        step_getter = getattr(service, "target_bonus_step", None)
+        if callable(step_getter):
+            try:
+                step = float(step_getter())
+            except Exception:
+                step = None
+        if step is None:
+            cfg = self._emotion_cfg()
+            try:
+                step = float(getattr(cfg, "target_bonus_step", 0.1) or 0.1)
+            except (TypeError, ValueError):
+                step = 0.1
         return max(0.0, min(1.0, step)) * (tier + 1)
 
     def _emotion_cfg(self) -> Any:
