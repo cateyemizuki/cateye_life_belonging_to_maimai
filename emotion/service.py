@@ -286,7 +286,9 @@ class EmotionService:
         """状态机 + episode 水位/日计数写同一份 emotion_state.json。
 
         状态机 ``load_dict`` 只读自己认识的键（未知键忽略），故 ``episode`` 与
-        ``applied_sleep_date`` 可以安全共存于同一文件。
+        ``applied_sleep_date`` 可以安全共存于同一文件；且落盘前**本方法主动保留合并**
+        盘上已有的 ``applied_sleep_date``（醒沿结算的"本周期已结算"标记，状态机
+        ``to_dict`` 不含该键）——否则 episode 冲刷/日切等任意共用出口都会把它抹掉。
         """
         state = self._machine.to_dict()
         state["episode"] = {
@@ -295,6 +297,11 @@ class EmotionService:
             "eval_date": str(self._episode_state["eval_date"]),
             "eval_count": int(self._episode_state["eval_count"]),
         }
+        # P4 落盘护栏（最小 diff）：醒沿把 applied_sleep_date 直接写入文件，而本方法整体重写
+        # 该文件；覆盖式并入盘上原值（状态机不认识该键，load_dict 忽略；不改其值、不新增字段）。
+        previous = load_json(self._state_path, {}) or {}
+        if isinstance(previous, dict) and "applied_sleep_date" in previous:
+            state["applied_sleep_date"] = previous["applied_sleep_date"]
         save_json_atomic(self._state_path, state)
 
     def _save_params(self) -> None:
