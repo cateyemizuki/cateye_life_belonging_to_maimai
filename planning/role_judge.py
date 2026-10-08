@@ -26,24 +26,73 @@ _RELATIVE_DATE_OFFSETS = {
 }
 
 
-def _parse_json_loose(text: str) -> Optional[Dict[str, Any]]:
-    """从 LLM 响应文本中提取首个 JSON 对象。"""
-    text = (text or "").strip()
-    for candidate in (text, *(m.group(1) for m in _JSON_BLOCK_RE.finditer(text))):
-        try:
-            data = json.loads(candidate)
-            if isinstance(data, dict):
-                return data
-        except (json.JSONDecodeError, ValueError):
+def _strip_leading_plus(text: str) -> str:
+    """字符串感知地剥离 JSON 数值的前导 ``+``（镜像 emotion/referee.py 同名函数）。
+
+    只动字符串字面量**之外**、处于数值前导位置（``: , [`` 或其后空白）的 ``+``；
+    字符串内部的 ``+`` 与指数记号（``1e+5``）不受影响。宿主 2026-10-07 夜实弹：
+    睡眠裁判输出 ``+0.04`` 连续两轮解析失败 → 整夜冻结重试，第三轮模型随机去掉 ``+`` 才自愈。
+    """
+    if "+" not in text:
+        return text
+    out = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
             continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if (ch == "+" and out and out[-1] in ":,[ \t\r\n"
+                and i + 1 < n and text[i + 1].isdigit()):
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _loads_dict(candidate: str) -> Optional[Dict[str, Any]]:
+    parsed = None
+    try:
+        data = json.loads(candidate)
+        if isinstance(data, dict):
+            parsed = data
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return parsed
+
+
+def _parse_json_loose(text: str) -> Optional[Dict[str, Any]]:
+    """从 LLM 响应文本中提取首个 JSON 对象；全失败后剥前导 ``+`` 重试一轮（候选次序不变）。"""
+    text = (text or "").strip()
+    candidates = [text, *(m.group(1) for m in _JSON_BLOCK_RE.finditer(text))]
     match = _JSON_OBJECT_RE.search(text)
     if match:
-        try:
-            data = json.loads(match.group(0))
-            if isinstance(data, dict):
-                return data
-        except (json.JSONDecodeError, ValueError):
-            return None
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        parsed = _loads_dict(candidate)
+        if parsed is not None:
+            return parsed
+    for candidate in candidates:                     # 前导 '+' 兜底
+        normalized = _strip_leading_plus(candidate)
+        if normalized == candidate:
+            continue
+        parsed = _loads_dict(normalized)
+        if parsed is not None:
+            return parsed
     return None
 
 
