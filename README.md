@@ -115,6 +115,7 @@ cateye_test/
 - ✅ 情绪底色注入 replyer（模糊化描述 + 严禁直说情绪标签词汇）；群聊事件上报 Tool（M3）。**T6**：原「查询当前心情」Tool 已移除——心情问答由情绪底色注入覆盖（`injection_enabled=false` 组合不支持心情问答，见 USAGE.md）
 - ✅ **[emotion] M3 事件倍率配置**：`global_event_multiplier`(1.0，0.1~3.0，一切外部事件总幅度)、`non_target_multiplier`(1.0，0~1，非 target 事件系数)、`target_bonus_step`(0.1，0~1，每档加算步长)
 - ✅ **情绪→行为输出 `mood_effect()`（M4，§6.2 C/D）**：纯规则零 LLM 成本，输出 `proactive_rate`（patrol 主动概率乘数）/`miss_threshold`（想念阈值乘数，再叠 affection 档位系数）/`post_rate`（qzone 发帖率，0 = 低落不硬营业）/`intent_hint`（低分辨成语义行）；映射：proactive V>0.3&A>0.2→1.2、V<−0.3→0.8；miss V<−0.3→0.8、V>0.3→1.1；post V<−0.6→0、V<−0.3→0.8、V>0.3→1.2；全部 clamp [0.7,1.3]（post 允许 0~1.2），模块停用返回恒等中性值
+- ✅ **映射表 JSON 覆盖层（M12，可选）**：`<data_dir>/emotion_mapping.json`（与 `proactive_budget.json` 同级；不存在 = 纯代码默认）可整表替换四张数据表——25 原型区间表 / 模板事件表 4 事件 / 三层倍率 / 五档四切点；**整文件原子生效**：解析或任一键校验失败即全量回退代码默认并落 `emotion.mapping_override_rejected`（warn），合法落 `emotion.mapping_override_applied`（info）；优先级 **JSON > config（含用户显式值）> 代码默认**（仅倍率有 config 对应项）；改 JSON 后需 touch 插件文件触发热重载或等重启。字段 / 回退 / 差异披露（倍率不收 0、切点左闭右开、`sleep_interrupt` 曲线不可覆盖）与示例见 [EMOTION_MAPPING.md](EMOTION_MAPPING.md) §九
 
 - ✅ **emoji 情绪联动（M6，默认关，宿主级接线；T6 后无组件消费点）**：`[emotion] emoji_enabled`（false）——按当前情绪首个标签名（取不到回退情绪底色文本）经 `ctx.emoji.get_by_description` 取一个表情的实现保留在服务层（`EmotionService.emoji_for_mood`），manifest 已声明 `emoji.get_by_description` 能力；**原消费入口 `cateye_test_emotion_mood` Tool 已随 T6 注册面收口移除**，当前无组件调用它；**关闭时绝不触碰宿主 API**，匹配失败/通道缺失静默降级
 

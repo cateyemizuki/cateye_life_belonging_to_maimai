@@ -181,6 +181,8 @@
 | `/cateye_test_emotion_init` | 由人设自动推导情绪锚点/静态偏移/乘数并生效（VAD 情绪系统初始化） | 拦截指令→提取宿主人设→独立 LLM 请求（不带对话历史）→校验裁剪（锚点 ±0.6、偏移 ±0.3、增益 [0.8,1.3]、衰减 [0.6,1.2]）→落盘 emotion_config.json→当前 VAD 回到锚点、清空情绪残留；回复参数与推导理由。失败时提示重试 |
 | `/cateye_test_emotion_config [reset\|clear]` | 查看情绪系统参数（锚点/偏移/乘数/当前 VAD） | 无参=查看（含当前情绪底色与当天事件数、推导理由）；`reset`=恢复默认（零锚点零偏移中性乘数）；`clear`=清空当天情绪日志（隐私接口） |
 
+> **可选数据文件（M12）**：`<data_dir>/emotion_mapping.json` 是情绪四张映射表（25 原型区间 / 模板事件 4 条 / 三层倍率 / 五档四切点）的**可选 JSON 覆盖层**，缺省不存在 = 纯代码默认；上表两条命令**都不读写它**（`reset` 只重置 `emotion_config.json` 的锚点/偏移/乘数）。注意：若该文件写了 `multipliers`，`reset` 后覆盖仍生效（优先级 **JSON > config > 默认**，此时须删除/改名该 JSON 才能让 config 旋钮回到生效态）；字段/回退语义/差异披露与示例见 [EMOTION_MAPPING.md](EMOTION_MAPPING.md) §九，改完需 touch 插件文件触发热重载或等宿主重启。
+
 ## 三、跨插件 API（4 个，供其他插件 `ctx.api.call` 调用）
 
 | API | 提供方 | 返回结构 | 说明 |

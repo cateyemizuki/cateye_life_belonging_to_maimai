@@ -5,7 +5,7 @@
 > **快照时间**：2026-10-05（本机 UTC+8）｜**适用版本**：`_manifest.json version=0.4.0`、`[plugin].config_version=0.2.0`
 > **上游**：设计与联动口径见 [MAINTENANCE_PLAN_10.05.md](MAINTENANCE_PLAN_10.05.md) §四（情绪系统）、§6.2（联动通道）、§6.3（非决定性七原则）、附录 C（默认参数）；
 > 命令与工具见 [USAGE.md](USAGE.md)；测试规程见 [TEST_PROCEDURE.md](TEST_PROCEDURE.md)。
-> **来源文件**：`emotion/vad.py`｜`emotion/state_machine.py`｜`emotion/referee.py`｜`emotion/service.py`｜`emotion/bridge.py`｜`emotion/config.py`｜`companion/patrol.py`｜`companion/affection_events.py`｜`companion/relation.py`｜`qzone/service.py`
+> **来源文件**：`emotion/vad.py`｜`emotion/state_machine.py`｜`emotion/referee.py`｜`emotion/service.py`｜`emotion/bridge.py`｜`emotion/config.py`｜`companion/patrol.py`｜`companion/affection_events.py`｜`companion/relation.py`｜`qzone/service.py`｜`emotion/mapping_override.py`（M12 覆盖层）
 >
 > **M5（emotion 侧）已落地（2026-10-05）**：睡眠结算已由"入睡瞬时大修"改为"冻结 → 醒后一次性应用"；
 > 大修限幅由固定 ±0.8 改为动态 ±(0.4+0.4×`schedule.emotion_influence`)；大修公式新增
@@ -48,7 +48,15 @@
 > （`NAP_REMINDER_ROUND_SECONDS`=120.0：窗口内该流意外 reply 不刷新 `resleep_minutes`、不重进吵醒态）。
 > **M11 预算归属（2026-10-08，附录 II §3.3）**：赖床提醒**计入**「主动打扰预算」，且该预算**仅**按
 > 目标陪伴私聊的 `stream_id` 维度计数——非目标流的段不计入、不受限；qzone 评论提醒**不再计入**该预算。
-> **仍未落地（M5 其余部分）**：A3 `emotion_report` 工具裁决；A6 死字段清理已完成（`8d11f54`）。
+> **M12 已落地（2026-10-08，情绪映射表 JSON 化）**：新增可选覆盖层 `<data_dir>/emotion_mapping.json`
+> （文件不存在 = 纯代码默认、零行为变化）；四张数据表（①25 原型区间表 ②模板事件表 4 事件 ③三层倍率
+> ④五档四切点）**整表替换**生效，**整文件原子生效**——解析失败或任一键校验失败 → 全量回退代码默认并落
+> `emotion.mapping_override_rejected`（warn），合法 → `emotion.mapping_override_applied`（info）；
+> 优先级 **JSON > config（含用户显式值）> 代码默认**（仅倍率有 config 对应项）；装载 = 插件装载时读一次
+> （改 JSON 后 touch 插件文件触发热重载或等重启）。本文件**新增 §九**（字段/schema/回退/差异/示例）；
+> §1.1、§二、§5.1、§6.2 的默认值不变——覆盖生效时运行期取"默认 ⊕ 覆盖"。
+> **M5 其余两项挂账已闭环（2026-10-05）**：A3 `emotion_report` **已裁决保留** + 跨来源去重已落地
+> （`03f0234`）；A6 死字段清理已完成（`8d11f54`）。
 
 ---
 
@@ -62,6 +70,7 @@
 - [六、累积层：结算顺序 / 倍率 / 限幅 / 衰减](#六累积层结算顺序--倍率--限幅--衰减)
 - [七、参数层：人设推导 / 睡眠大修 / 情绪→行为](#七参数层人设推导--睡眠大修--情绪行为)
 - [八、未接线与待定（M5 相关）](#八未接线与待定m5-相关)
+- [九、JSON 覆盖层（`<data_dir>/emotion_mapping.json`）](#九json-覆盖层data_diremotion_mappingjson)
 - [附录 A：默认参数速查](#附录-a默认参数速查)
 - [附录 B：映射相关的文件位置索引](#附录-b映射相关的文件位置索引)
 
@@ -590,6 +599,162 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 
 ---
 
+## 九、JSON 覆盖层（`<data_dir>/emotion_mapping.json`）
+
+> **已落地（2026-10-08，M12）**：装载/校验/合并 = `emotion/mapping_override.py`；接线 = `EmotionService.__init__`
+> （`emotion/service.py:189-209`：装载一次 → `merge_tables()` → 推入 `vad`/`bridge` 生效位）。
+> **无该文件时 §一~§八 的默认值即运行期实际行为**（逐字不变）；有该文件且合法时按"**整表替换**"生效。
+> 本节是该层的运行时契约（字段/schema/回退/差异/示例）；映射关系本身的默认值仍见 §1.1 / §二 / §5.1 / §6.2。
+
+### 9.1 文件与生效范围
+
+| 项 | 口径 |
+|---|---|
+| 路径 | `<data_dir>/emotion_mapping.json`（宿主插件数据目录；与 `emotion_state.json` / `emotion_config.json` / `proactive_budget.json` 同级），文件名常量 `mapping_override.MAPPING_FILE_NAME` |
+| 可选性 | 文件**不存在 = 纯代码默认**：静默、零 action、`applied_keys=[]`（`load()` 的不存在分支） |
+| 读写 | **只读**——插件不生成模板、不写回该文件（`load()` 全程不写文件） |
+| 部署 | robocopy 部署只覆盖插件代码目录（`plugins\cateye_test`），**不触碰数据目录** → 自定义文件跨部署存续（同 `proactive_budget.json` / `emotion_state.json` 的既有事实，见 TEST_PROCEDURE §八 部署行） |
+| 顶层结构 | `{"version": 1, <四表键任选>}`：`version` **必填** int 且 `== 1`（`true` / `1.0` 不算 int）；顶层键集恰为 `version` + 下面四个表键，多一个即 `unknown_key` |
+
+四张数据表（键名与顺序 = `mapping_override.TABLE_KEYS`；存在即整表替换）：
+
+| # | 顶层键 | 形状与约束（逐字同 schema） | 运行期生效位 / 消费点 |
+|---|---|---|---|
+| ① | `prototypes` | 数组，条数 **10~40**（代码默认 = §二 的 **25 条**）；每条恰为 `label` + `valence` / `arousal` / `dominance`；三轴各为**长度 2 的数值数组** `[lo, hi]`（`lo<=hi`，允许相等；两界 ∈[-1,1]）；`label` strip 后非空且互不重复 | 中心点按 `(lo+hi)/2` 重派生 → `vad._PROTO_CENTERS`（`map_emotions` 的加权欧氏距离）；摘要文本重算 → `vad.emotion_table_summary()`（裁判 prompt 两处调用点，D6） |
+| ② | `template_events` | 对象，**白名单 4 事件全需在场**（整表替换）：`relation.silence_detected` / `schedule.commitment_kept` / `schedule.commitment_broken` 各为 `{valence, arousal, dominance}`，`qzone.comment_received` 为 `{valence_min, valence_max}`（且 `valence_min<=valence_max`）；各数值 **±0.5** 以内（= `service.EVENT_DELTA_CLAMP`） | `bridge._SILENCE_DELTA` / `_COMMITMENT_KEPT_DELTA` / `_COMMITMENT_BROKEN_DELTA` / `_QZONE_COMMENT_V_MIN` / `_QZONE_COMMENT_V_MAX`（处理器调用期读生效位） |
+| ③ | `multipliers` | 对象，**3 键全需在场**，键名逐字同 `[emotion]` 字段名（无别名）：`global_event_multiplier` ∈[0.1,3.0]；`non_target_multiplier` / `target_bonus_step` ∈**(0,1]**（下限开区间） | `service._merged_multiplier()` 三层取值（§9.2）；出口夹取同 §6.2；D7 的 patrol 留痕经服务取值，与入账同源 |
+| ④ | `level_thresholds` | 数组，长度**恰 4**，各项 ∈[-1,1]，**单调不减**（`c1<=c2<=c3<=c4`）；相邻相等**只告警不拒绝**（该档位为空），出现**下降**才拒绝 | `vad._LEVEL_THRESHOLDS`（`_level` 的四切点）；档词与比较算符**冻结**，不可覆盖（§9.7） |
+
+**整表替换的直接后果**：写 `prototypes` 就必须把 10~40 条**全部**写进去（只写 1 条 = `range` 拒绝，
+实测 detail `期望 条目数 10~40，实得 1`）；`template_events` 必须四事件齐、`multipliers` 必须三键齐
+（漏键 = `incomplete_table` 拒绝，**不**静默保留默认）；只有**未写入的顶层表**才用代码默认。
+
+### 9.2 覆盖口径与优先级
+
+**优先级逐字**：**JSON 合法文件 > config（含用户显式值）> 代码默认**。
+
+- 四表中**只有 ③ `multipliers` 在 config 有对应项**（`[emotion]` 的三个倍率字段）——`service._merged_multiplier()`
+  按上述优先级逐个取值；①/②/④ 没有 config 对应项，取值链只有"JSON > 代码默认"两级。
+- **想让 config 旋钮重新生效 = 删除/改名该 JSON**（或删掉其中的 `multipliers` 键）；否则 JSON 一直压过
+  config（含用户显式设置的值）——"JSON 高于用户 config"是本层的刻意设计（JSON = 更明确的自定义）。
+- 未写入的表 = 代码默认；**合并按整表级**（`merge_table(default, override)`：`override is None` → 默认，
+  否则整表替换），不逐键深合并。
+
+### 9.3 回退语义（整文件原子生效）
+
+**整文件原子生效，不做部分应用**：解析失败或**任一键**校验失败 → **全量回退代码默认**（四张表全回默认，
+连合法的那几张表也不生效）。校验顺序固定、只报**首个**出错键：
+`version` → 顶层键集 → `prototypes` → `template_events` → `multipliers` → `level_thresholds`
+（表内按 JSON 文件序、数组按索引序）；`error_key` 为点分路径（如 `prototypes[3].valence`）。
+
+| `error_kind` | 判据（首错即止） |
+|---|---|
+| `parse` | 读取失败 / 非 UTF-8 文本 / JSON 语法错误（`error_key` 为空串，无键可指） |
+| `version_missing` | `version` 键缺失 |
+| `version_unsupported` | `version` 在场但非 int（含 `true`）或 ≠ 1 |
+| `unknown_key` | 出现 schema 之外的键 / 事件名（顶层、原型条目、事件条目、倍率键） |
+| `incomplete_table` | 应有键缺失（原型条目缺轴、`template_events` 四事件不全、`multipliers` 缺键） |
+| `type` | 类型不符（顶层非对象、表非对象/数组、数值位是 bool 或字符串等） |
+| `range` | 数量越界（原型条数 / 阈值个数）与取值约束（轴越界、`NaN`/`Infinity`、切点下降、标签空或重复、`valence_min > valence_max`、倍率触下限） |
+
+- 原型条数越界（<10 或 >40）也是 `range`；`json.loads` 接受的 `NaN` / `Infinity` 字面量一律按 `range` 拒绝。
+- 校验是**纯函数**（`validate_document`，不碰文件系统、不改任何状态）；被拒时 `applied_keys=[]`、四表全 `None`。
+
+### 9.4 留痕（决策日志 + 上下文日志）
+
+| 情形 | action | severity | 字段 |
+|---|---|---|---|
+| 采纳（合法） | `emotion.mapping_override_applied` | `info` | `version`、`keys`（实际覆盖的表名）、`counts`（各表条目数）、有告警时 `warnings` |
+| 回退（非法） | `emotion.mapping_override_rejected` | `warn` | `error_key`、`error_kind`、`detail`（含期望 vs 实得） |
+| 无文件 | （无 action） | — | 静默纯默认、零留痕 |
+
+- 落账走 `DecisionLogger.record`；`decision_logger` 缺失/非 callable → 跳过落账，**返回值不变**
+  （各表取值与 `applied_keys` 仍可从装载结果读到）。
+- 宿主上下文日志另发一条（`emotion/service.py:202-209`）：采纳 → `info`「情绪映射覆盖层已生效：keys（counts）」；
+  回退 → `warning`「情绪映射覆盖层拒绝（kind @ key）→ 全量回退代码默认」。
+- 模块**自身缺陷**（非 schema 判定失败）不吞：`EmotionService.__init__` catch 后按纯默认装配并
+  `logger.warning`「情绪映射覆盖层装载异常」——不拖挂情绪子系统。
+
+### 9.5 加载时机与热重载
+
+- **装载时机**：`EmotionService.__init__` 每次构造读一次（`emotion/service.py:189-201`）——即宿主插件
+  `on_load` / 插件热重载时生效；结果留在服务实例（`_mapping_result` / `_mapping_tables`）。
+- **file_watcher 不监控数据目录**：宿主 `file_watcher` 监视的是**插件根目录**（宿主实证：watchfiles 监视
+  插件根 + debounce，见 TEST_PROCEDURE.md:176）→ 改 `emotion_mapping.json` **不会**自动重载。生效方式二选一：
+  ①**touch 任一插件文件**（如 `plugin.py`）触发热重载；②等宿主重启（或下次插件装载）。
+  （与"`config.toml` 单改不触发 Supervisor、必须 touch 插件文件"同一既有事实。）
+
+### 9.6 编码与文件形态
+
+- **UTF-8 文本**：文件按 `utf-8` 解码读取（`mapping_override._read_document`）；**推荐 UTF-8 无 BOM**。
+- **容忍一个前导 BOM**：首字符若是 U+FEFF 会被剥掉再解析（Windows 记事本另存场景）——实测 `utf-8-sig`
+  写出的文件仍正常采纳（V2 自测 `10_bom` 用例 = `applied`）；第二个 BOM 落在正文里即 JSON 语法错误 → `parse` 回退。
+- 非 UTF-8 字节序列 → `UnicodeDecodeError` → `parse` 回退；读取失败（权限 / 被占用 / 目录不可判定）同样归 `parse`
+  （`path.exists()` 抛错时按"不存在"处理 = 静默纯默认）。
+- 本层**不生成**模板文件：要自定义就从 §9.8 抄一份（或把 §二 / §5.1 / §6.2 的默认值抄全表再改）。
+
+### 9.7 差异披露与"不覆盖"清单
+
+1. **JSON 倍率不收 0**：`non_target_multiplier` / `target_bonus_step` 的 JSON 侧下限为**开区间** ∈(0,1]
+   （实测给 0 → `range` 拒绝，detail `期望 ∈(0.0, 1.0]（下限开区间，不收 0）`）；config 侧 `ge=0.0` 仍可设 0
+   （0 = 把该通道静音，属配置自伤——JSON 覆盖层不收；要静音请改 config）。
+2. **五档切点左闭右开的不对称语义**：比较链冻结为 `<=c1` / `<=c2` / `<c3` / `<c4` / 其余 → 默认四点下
+   **−0.5 归最低档「很低」、+0.5 归最高档「很高」**（低端闭、高端开）。可覆盖的只有四个切点**数值**；
+   档词（`vad._LEVELS` = 很低 / 偏低 / 中等 / 偏高 / 很高）与比较算符**冻结**。
+3. **`sleep_interrupt` 净正曲线不入 JSON**：`ΔV_i = max(0, 0.05−0.01×(i−1))`、整夜 `min(Σ, 0.15)`
+   （`emotion/service.py:78-84`；§5.1 末行）**不在**模板事件白名单内 → 不可覆盖（要改须改代码）。
+4. **其余不放开**（本期冻结）：映射算法（`VAD_WEIGHTS` / `LABEL_DISTANCE_THRESHOLD` / `MAX_COMBINED_LABELS` /
+   激活占比口径）、注入模板文案、四道限幅（§6.3）、衰减（§6.4）、睡眠大修参数（§7.3）、`mood_effect` 映射（§7.2）
+   ——它们在 config 或代码常量里，不在本覆盖层。
+5. **性质澄清**：本层是"数据表替换"，**不是**新配置面——零 config 键、零组件增删；文件坏了最坏结果 = 回默认
+   （不会半生效、不会带病运行）。
+
+### 9.8 最小示例（字段与 schema 逐字一致）
+
+**最小合法文件**（只覆盖一张表，其余三表回落代码默认）：
+
+```json
+{"version": 1, "level_thresholds": [-0.5, -0.15, 0.15, 0.5]}
+```
+
+**四表各改一处**（原型表取条数下限 10 条——整表替换下"覆盖后原型表 = 这 10 条"，其余默认原型不再存在；
+只想改 1 条原型时，请把 §二 全 25 条抄进来再改那 1 条）：
+
+```json
+{
+  "version": 1,
+  "prototypes": [
+    {"label": "狂喜", "valence": [0.2, 0.6], "arousal": [0.1, 0.5], "dominance": [0.0, 0.4]},
+    {"label": "平静", "valence": [0.3, 0.8], "arousal": [-0.8, -0.2], "dominance": [0.2, 0.7]},
+    {"label": "期待", "valence": [0.2, 0.8], "arousal": [0.3, 0.7], "dominance": [-0.2, 0.4]},
+    {"label": "愤怒", "valence": [-0.9, -0.3], "arousal": [0.6, 1.0], "dominance": [0.4, 0.9]},
+    {"label": "恐惧", "valence": [-0.9, -0.4], "arousal": [0.7, 1.0], "dominance": [-0.9, -0.4]},
+    {"label": "悲伤", "valence": [-1.0, -0.5], "arousal": [-0.5, -0.1], "dominance": [-0.8, -0.3]},
+    {"label": "焦虑", "valence": [-0.7, -0.2], "arousal": [0.5, 0.9], "dominance": [-0.7, -0.2]},
+    {"label": "疲惫", "valence": [-0.4, 0.1], "arousal": [-0.9, -0.4], "dominance": [-0.5, 0.0]},
+    {"label": "厌恶", "valence": [-0.9, -0.4], "arousal": [0.2, 0.6], "dominance": [0.3, 0.8]},
+    {"label": "无奈", "valence": [-0.5, -0.1], "arousal": [-0.4, 0.2], "dominance": [-0.9, -0.5]}
+  ],
+  "template_events": {
+    "relation.silence_detected": {"valence": -0.12, "arousal": 0.04, "dominance": 0.0},
+    "schedule.commitment_kept": {"valence": 0.2, "arousal": 0.0, "dominance": 0.0},
+    "schedule.commitment_broken": {"valence": -0.15, "arousal": 0.0, "dominance": 0.0},
+    "qzone.comment_received": {"valence_min": 0.05, "valence_max": 0.1}
+  },
+  "multipliers": {"global_event_multiplier": 1.0, "non_target_multiplier": 0.8, "target_bonus_step": 0.1},
+  "level_thresholds": [-0.5, -0.15, 0.15, 0.5]
+}
+```
+
+逐行对照：① `狂喜` 区间改为 `[0.2,0.6] / [0.1,0.5] / [0.0,0.4]`（中心 0.85/0.8/0.75 → 0.4/0.3/0.2）=
+"覆盖一个原型"——整表替换后只剩 10 条，VAD `(0.9,0.8,0.8)` 的命中从「狂喜 占比 0.76 / 骄傲 占比 0.24」
+变为**无命中**（最近「期待」距离 0.906 > 阈值 0.55）→ 退回 §1.1 的低分辨率描述；② `silence` 增量
+（−0.12/+0.04/0）与另两事件、空间评论区间必须**四事件同写**；③ 只把 `non_target_multiplier` 改 0.8，
+另两键必须同写；④ 写默认四点 = 显式重申默认（值等价，但会出现在 `applied_keys` 里）。
+**注意**：`sleep_interrupt` 曲线不在 ② 的表内（§9.7-3）。
+
+---
+
 ## 附录 A：默认参数速查
 
 | 参数（`[emotion]` 段） | 默认 | 区间 | 作用于 |
@@ -635,6 +800,7 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 | 睡眠循环与进出事件 | `emotion/service.py:490-582` |
 | 模板事件表 | `emotion/bridge.py:36-52` |
 | 配置段字段与 i18n | `emotion/config.py:17-102` |
+| 映射覆盖层（装载/校验/合并/落账；M12） | `emotion/mapping_override.py`（消费口：`emotion/service.py:189-209`、`emotion/vad.py:140-182`、`emotion/bridge.py:52-95`、`emotion/referee.py:239,262`） |
 | mood_effect 消费（patrol） | `companion/patrol.py:49-56, 251-262, 721-793` |
 | mood_effect 消费（qzone） | `qzone/service.py:25-28, 78-83, 653-661` |
 | 档位 → miss 系数 | `companion/relation.py:105-113` |
