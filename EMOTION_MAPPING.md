@@ -3,8 +3,8 @@
 > **性质**：现状导出文档（**只读镜像，不是设计稿**）——把 `emotion/` 里散落在各常量的映射关系集中成一张可核对的表。
 > 代码是唯一真源：本文件与代码不一致时，**以代码为准**，并回头修本文件。
 > **快照时间**：2026-10-05（本机 UTC+8）｜**适用版本**：`_manifest.json version=1.0.0`、`[plugin].config_version=1.0.0`
-> **上游**：设计与联动口径见 [MAINTENANCE_PLAN_10.05.md](MAINTENANCE_PLAN_10.05.md) §四（情绪系统）、§6.2（联动通道）、§6.3（非决定性七原则）、附录 C（默认参数）；
-> 命令与工具见 [USAGE.md](USAGE.md)；测试规程见 [TEST_PROCEDURE.md](TEST_PROCEDURE.md)。
+> **上游**：设计与联动口径出自开发期计划书（§四 情绪系统 / §6.2 联动通道 / §6.3 非决定性七原则 / 附录 C 默认参数），该计划书不属发布内容，已移出本仓库（开发归档：`cateye_dev_archive/MAINTENANCE_PLAN_10.05.md`）；
+> 命令与工具见 [USAGE.md](USAGE.md)。
 > **来源文件**：`emotion/vad.py`｜`emotion/state_machine.py`｜`emotion/referee.py`｜`emotion/service.py`｜`emotion/bridge.py`｜`emotion/config.py`｜`companion/patrol.py`｜`companion/affection_events.py`｜`companion/relation.py`｜`qzone/service.py`｜`emotion/mapping_override.py`（M12 覆盖层）
 >
 > **M5（emotion 侧）已落地（2026-10-05）**：睡眠结算已由"入睡瞬时大修"改为"冻结 → 醒后一次性应用"；
@@ -520,9 +520,7 @@ raw = anchor + (raw − anchor) × recovery_factor
 > 使「夜里最后一轮对话」当夜被评估。段 1 披露的两项未闭环**均已闭环（M8 段 3）**：①恢复系数改用
 > **实际睡着时长**（附录 §2.5.4，取 §2.4 的扰段并集口径，代码侧 `TODO(M8-3)` 已勾销）；②
 > `sleep_interrupt` 整夜合计入账与 §5.1 模板事件登记（见下）。
-> 依据文档：`D:\deepseek-harness_workspace\maibot-plugins\MAINTENANCE_PLAN_APPENDIX_20261007_0155_睡眠打扰与早晚安漂移.md`
-> §2.5（该附件 §一 的 F3/F4；**定稿版**，草稿 `…_0114_ARCHIVED_草稿v0.1_…md` 已归档、非执行依据）。
-> 指针若失效：在 `D:\deepseek-harness_workspace\maibot-plugins\` 下检索 `睡眠打扰与早晚安漂移` 定位。
+> 依据文档：睡眠打扰与早晚安漂移附录 §2.5（该附件 §一 的 F3/F4；**定稿版**，草稿 `…_0114_ARCHIVED_草稿v0.1_…md` 已归档、非执行依据）。
 
 **夜间打扰判定（M8 段 2 落地，附录 §2.1/§2.2）**：`replyer.after_response`
 （`episode`/`per_reply`/`off` 三态）在模式分发前调 `EmotionService.note_night_reply(session_id)`
@@ -680,7 +678,7 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 - **装载时机**：`EmotionService.__init__` 每次构造读一次（`emotion/service.py:189-201`）——即宿主插件
   `on_load` / 插件热重载时生效；结果留在服务实例（`_mapping_result` / `_mapping_tables`）。
 - **file_watcher 不监控数据目录**：宿主 `file_watcher` 监视的是**插件根目录**（宿主实证：watchfiles 监视
-  插件根 + debounce，见 TEST_PROCEDURE.md:176）→ 改 `emotion_mapping.json` **不会**自动重载。生效方式二选一：
+  插件根 + debounce）→ 改 `emotion_mapping.json` **不会**自动重载。生效方式二选一：
   ①**touch 任一插件文件**（如 `plugin.py`）触发热重载；②等宿主重启（或下次插件装载）。
   （与"`config.toml` 单改不触发 Supervisor、必须 touch 插件文件"同一既有事实。）
 
@@ -812,6 +810,6 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 
 1. **本文件是镜像**：改 `emotion/` 的任何映射常量、阈值、提示词契约，**同批**更新本文件对应小节 + 快照时间与版本。
 2. 本文件属开发文档，**发布时排除**（同 `TEST_PROCEDURE.md`、`scratch/`，见开发文档陷阱 #23）。
-3. 新增情绪原型 / 改权重 / 改阈值后，跑 `maibot-plugins\scratch\behavior_test_lbm.py`
-   （映射用例在其中），并用配套导出脚本 `maibot-plugins\scratch\gen_emotion_mapping.py` 重新生成
+3. 新增情绪原型 / 改权重 / 改阈值后，跑离线脚本 `behavior_test_lbm.py`
+   （映射用例在其中），并用配套导出脚本 `gen_emotion_mapping.py` 重新生成
    §二 的中心点表与 §3.3 的实测校准（该脚本用 `assert` 自校验中心点与代码一致，可直接重跑对账）。

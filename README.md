@@ -10,7 +10,7 @@
 >
 > 许可提示：planning/ 为 AGPL 插件的机制复刻（重写实现）；若后续大量照搬其源码，发布时整体应按 AGPL-3.0。
 >
-> 📖 **命令与工具的详细功能介绍、参数与权限说明见 [USAGE.md](USAGE.md)**；**模块间联动规划与流程图见 [SYNERGY.md](SYNERGY.md)**（昼夜节律闭环：日程⇄情绪⇄关系⇄空间）；**长期演进/维护总纲见 [MAINTENANCE_PLAN_10.05.md](MAINTENANCE_PLAN_10.05.md)**（联动事件总线、好感度 v2 重设计、模块相互影响矩阵、v1.3.0 可行性核对、R0+M0~M7 分期路线图、完工评估与剩余工作；其路线图取代 SYNERGY §5；**`MAINTENANCE_PLAN.md` 是 v1.2 旧版快照，已废弃、仅供追溯，勿据其执行**）；**结构与功能精简清单（"重置"）见 [CLEANUP_PROPOSALS.md](CLEANUP_PROPOSALS.md)**；**宿主自测试规程见 [TEST_PROCEDURE.md](TEST_PROCEDURE.md)**（agent 向：注入式集成测试、测试辅助插件、安全红线）；**情绪系统的全部映射关系（25 原型 / 标签映射 / 事件增量 / 倍率限幅 / 睡眠大修 / 情绪→行为）见 [EMOTION_MAPPING.md](EMOTION_MAPPING.md)**（现状导出，代码为唯一真源）。
+> 📖 **命令与工具的详细功能介绍、参数与权限说明见 [USAGE.md](USAGE.md)**；**情绪系统的全部映射关系（25 原型 / 标签映射 / 事件增量 / 倍率限幅 / 睡眠大修 / 情绪→行为）见 [EMOTION_MAPPING.md](EMOTION_MAPPING.md)**（现状导出，代码为唯一真源）。开发期的计划书、测试规程与模块集成说明不属发布内容，已随开发资料移出本仓库（开发归档：`cateye_dev_archive/`）。
 
 ## 目录结构
 
@@ -19,7 +19,7 @@ lbm/
 ├── _manifest.json / plugin.py / config.py
 │   ├── plugin.py  = 纯组合根：生命周期 + 服务束装配；组件注册由三个 Mixin 多继承收集
 │   └── config.py  = 顶层聚合：plugin / target / admin 基础段 + 各子模块 section 扁平挂载
-├── planning/          # 自主规划复刻（详见 planning/INTEGRATION.md）
+├── planning/          # 自主规划复刻
 │   ├── config.py / services.py / components.py
 │   ├── goal_manager.py / schedule_db.py / schedule_generator.py / schedule_query.py
 │   ├── generator/     # prompt_builder(动态示例+衔接演算) / schema / parser(控制字符清理) / validator / scorer / context_loader
@@ -27,7 +27,7 @@ lbm/
 │   ├── proactive_service.py / auto_scheduler.py / cleanup_service.py / role_judge.py
 │   ├── tools_service.py / command_service.py / schedule_image.py(+assets/fonts)
 │   └── exceptions.py / time_utils.py（窗口/时区/能量，R0-C2 合并） / stream_filter.py / lru_cache.py ...
-├── companion/         # 虚拟陪伴复刻（日程除外，详见 companion/INTEGRATION.md）
+├── companion/         # 虚拟陪伴复刻（日程除外）
 │   ├── config.py / services.py / components.py
 │   ├── affection.py / affection_events.py / affection_referee.py
 │   │                      # 好感 v2：状态层（score/baseline/档位/impressions）/ 规则事件 / LLM 裁判（会话采样 + 关系日结，M2）
@@ -133,7 +133,7 @@ lbm/
 > 旧版的 `meta=None` 块条目会让宿主把 `planner.before_request` 链上**所有**插件的修改整体丢弃
 > （含本插件的过期任务块剥离与屏幕旁白注入）。
 >
-> ⚠️ **模型绑定（宿主验证日 P3 教训）**：裁判与日结类任务（情绪睡眠裁判、好感会话采样/关系日结、`[judge]` 段）建议绑定**真非思考型**模型——思考型模型的 reasoning 输出会挤爆小 `max_tokens` 预算，导致正文为空、裁判整体失效（详见 TEST_PROCEDURE.md §八）。
+> ⚠️ **模型绑定（宿主验证日 P3 教训）**：裁判与日结类任务（情绪睡眠裁判、好感会话采样/关系日结、`[judge]` 段）建议绑定**真非思考型**模型——思考型模型的 reasoning 输出会挤爆小 `max_tokens` 预算，导致正文为空、裁判整体失效。
 
 1. 放进 MaiBot 的 `plugins/` 目录重启；WebUI 里配置 `目标 QQ`（占位值时主动私聊/命令鉴权保持关闭）；
 2. `/lbm_life status` 总览四模块；`/lbm_plan` 看日程（首次会触发生成）；自然聊天问「在干嘛」验证注入与 `get_schedule_info`（view=current）；
