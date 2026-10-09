@@ -23,8 +23,8 @@ from typing import Any, ClassVar, Iterable
 # plugin_loader.py:567-585）；本插件又用绝对导入引用自身模块，故必须自行把插件
 # 目录放到 sys.path 首位，否则 companion/core/planning 等会被宿主 src/ 下同名模块
 # 抢先命中（core/config 在宿主 src 下均存在）。配置模块命名为 suite_config 而非
-# config：本插件与 cateye_harness 同进程加载，顶层 'config' 会被宿主 src/config
-# 或先加载的兄弟插件占住 sys.modules。
+# config：同进程可加载多个插件，顶层 'config' 会被宿主 src/config 或先加载的兄弟
+# 插件占住 sys.modules。
 import os as _os
 import sys as _sys
 
