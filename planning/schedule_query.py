@@ -19,6 +19,15 @@ class ScheduleQuery:
         self._cache_minutes = max(1, int(cache_minutes))
         self._cache: Dict[str, Tuple[int, Any]] = {}  # key -> (窗口号, 结果)
 
+    @property
+    def db(self) -> ScheduleDB:
+        """底层日程库（只读访问器）。
+
+        P6 顺延写回用：跨午夜赖床要顺延的是**醒来日**日程（与本查询实例同一份库），
+        不能借入睡日那一次写回携带，故按层访问同一 ``ScheduleDB``。
+        """
+        return self._db
+
     def get_day_schedule(self, date: str) -> List[Dict[str, Any]]:
         return self._db.get_day_schedule(date)
 

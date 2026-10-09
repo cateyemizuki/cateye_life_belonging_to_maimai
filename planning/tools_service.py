@@ -28,7 +28,7 @@ from .config import ScheduleSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
 from .schedule_generator import ScheduleGenerator
-from .schedule_items import find_night_sleep_item
+from .schedule_items import find_night_sleep_item, is_night_sleep_item
 from .time_utils import TimezoneManager
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 NAP_TOOL_NAME = "cateye_test_nap_lie_in"
 #: 钳制上限的缺省值（[schedule] lie_in_max_until；HH:MM），§4.4「传入时间 > 上限 → 钳到上限」
 DEFAULT_LIE_IN_MAX_UNTIL = "12:00"
+#: 一天的分钟数（P6 顺延的当日帧上界：顺延后 ``end`` 封顶 24:00，不产生跨午夜条目）
+DAY_MINUTES = 24 * 60
 #: 非睡眠周期调用的拒绝话术（§4.4 用户裁决原文语义，逐字）
 NAP_LIE_IN_DENIED_TEXT = "你现在还不能想要赖床"
 #: 解析失败/缺参的友好提示（§4.4：返回友好错误与格式示例，**不抛异常**）
@@ -527,6 +529,70 @@ class ToolsService:
                           second=0, microsecond=0)
         return end if end > now else end + timedelta(days=1)
 
+    # ── P6 修复（W2）：赖床延长窗口内的清醒条目顺延 ─────────────────────
+    # 缺陷：lie-in 只把 sleep 条目 end 推后时，与延长窗口重叠的**非睡眠**条目会在下一 tick
+    # 被 ``find_current_activity(include_sleep=True)`` 命中（按 start 升序取首条匹配）→ 醒沿
+    # 判定（emotion/service.py ``_check_and_overhaul``）第一析支 ``awake_activity`` 抢先为真
+    # → woke_up 仍按旧端点触发（emotion 侧 ``_sleep_period`` 延长其实已生效，窗口统计却是
+    # 延长后的值——登记行 11:06:53 woke_up + sleep_hours=1.417 即此形态）。
+    # 修法：写回时把这类条目**顺延**到延长端点之后，只动赖床写回路径（生成/归一化契约不动）。
+
+    @staticmethod
+    def _postpone_items_for_lie_in(items: List[Dict[str, Any]], lo: int, hi: int) -> int:
+        """把赖床延长窗口 ``[lo, hi)`` 内重叠的**非睡眠**条目顺延到 ``hi`` 之后（就地改）。
+
+        红线：
+        - 只动与窗口重叠的条目（``start < hi`` 且 ``end > lo``），其余原样；
+        - 保留时长，``end`` 封顶 :data:`DAY_MINUTES`（24:00）——不产生跨午夜/``start>end`` 倒挂；
+        - 夜晚睡眠条目（共享口径 :func:`find_night_sleep_item`）**不动**：它的 ``end`` 由调用方
+          单独写（M9 as-built 口径不变，倒挂面不扩大）。
+
+        Returns:
+            被顺延的条目数（0 = 无需改动，调用方跳过写回）。
+        """
+        moved = 0
+        for item in items or []:
+            if not isinstance(item, dict) or is_night_sleep_item(item):
+                continue
+            try:
+                start = int(item.get("start_minute") or 0)
+                end = int(item.get("end_minute") or 0)
+            except (TypeError, ValueError):
+                continue
+            if end <= start or start >= hi or end <= lo:
+                continue
+            item["start_minute"] = int(hi)
+            item["end_minute"] = min(DAY_MINUTES, int(hi) + (end - start))
+            moved += 1
+        return moved
+
+    def _postpone_wake_day_schedule(self, query: Optional[Any], day: str, lo: int, hi: int) -> int:
+        """跨午夜赖床（凌晨）：**醒来日**日程的顺延写回（醒沿查询读的正是那一天的日程）。
+
+        入睡日的 sleep 条目属于入睡日（:meth:`_nap_schedule_date`），凌晨醒沿查询却按**日历日**
+        取醒来日日程——与延长窗口重叠的清醒条目在那份日程里，须单独顺延。写回走
+        ``ScheduleQuery.db`` 的 ``replace_day_schedule``（即 ``apply_schedule_items`` 的落库底层；
+        该日条目从库中原样带回元数据，且**不消费**未来约定）。失败静默（不影响本次赖床）。
+        """
+        try:
+            if query is None or not callable(getattr(query, "get_day_schedule", None)):
+                return 0
+            items = [dict(row) for row in (query.get_day_schedule(day) or [])
+                     if isinstance(row, dict)]
+            if not items:
+                return 0
+            moved = self._postpone_items_for_lie_in(items, lo, hi)
+            db = getattr(query, "db", None)
+            if not moved or db is None:
+                return 0
+            db.replace_day_schedule(day, items)
+            logger.info("赖床顺延：%s 的 %d 个日程条目已移到 %02d:%02d 之后",
+                        day, moved, hi // 60, hi % 60)
+            return moved
+        except Exception as exc:
+            logger.warning("赖床顺延失败（不影响本次赖床）: %s", exc, exc_info=True)
+            return 0
+
     def _nap_schedule_date(self, now: datetime) -> str:
         """"今日日程"的日期（F16/B4：**新一天起点 = [schedule] wake_time 锚点**）。
 
@@ -555,7 +621,9 @@ class ToolsService:
            凌晨仍属入睡日，见 :meth:`_nap_schedule_date`）并把 ``end_minute`` 推到目标，经**共享底层**
            ``ScheduleGenerator.apply_schedule_items(items, today, consume_commitments=False)``
            （:274）写回——不消费未来约定、不触发重生成；无 sleep 条目或写回失败 →
-           失败文本且**不计数**；
+           失败文本且**不计数**；**P6（W2）**：与延长窗口重叠的**非睡眠**条目一并**顺延**到延长
+           端点之后（同日 = 同一次写回；跨午夜 = 醒来日日程另写一次），否则下一 tick 的醒沿判定
+           会先命中这些清醒条目（``awake_activity``）→ 醒沿不随端点推迟；
         5. **通知 emotion 延长本周期窗口结束到目标时刻**（否则醒沿会在 wake 锚点照常触发）；
         6. **计数**：调用**并成功修改日程** → emotion 侧「有效提醒次数」+1（按 ``cycle_key``，
            内存）；未调用/失败不计次；额度用尽只停提醒、**不阻止**本工具（本方法不判额度）。
@@ -603,14 +671,24 @@ class ToolsService:
                 return {"type": "nap_error",
                         "content": "今天没有找到睡觉日程，暂时没法往后推起床时间。"}
             item["end_minute"] = int(clamped)
+            # P6：延长窗口内的清醒条目顺延到延长端点之后（否则下一 tick 醒沿被它们抢占）。
+            # 窗口在"醒来日"帧内的起点：同日 → 当前时刻；跨午夜 → 该日 0 点（见 _nap_end_datetime）。
+            end_dt = self._nap_end_datetime(current, clamped)
+            wake_day = end_dt.strftime("%Y-%m-%d")
+            window_lo = current.hour * 60 + current.minute if wake_day == today else 0
+            if wake_day == today:
+                self._postpone_items_for_lie_in(items, window_lo, clamped)
             generator = self._get_generator()
             if generator is None:
                 return {"type": "error", "content": "日程生成器不可用（插件未完成初始化）"}
             written = generator.apply_schedule_items(items, today, consume_commitments=False)
             if not written:
                 return {"type": "nap_error", "content": "日程写回失败，起床时间没有改动。"}
+            if wake_day != today:
+                # 跨午夜（凌晨赖床）：醒来日日程单独顺延（唤醒日 ≠ 入睡日，须另一份写回）
+                self._postpone_wake_day_schedule(query, wake_day, window_lo, clamped)
             # 5) + 6) 成功才通知 emotion：延长本周期窗口端点（醒沿推迟）并计一次有效提醒
-            extended = emotion.extend_night_sleep_until(self._nap_end_datetime(current, clamped))
+            extended = emotion.extend_night_sleep_until(end_dt)
             if not extended:
                 # 附录 §六.补 C4 口径澄清（执行既有 C4「成功修改日程才计次」）：目标不比当前醒沿晚
                 # → 窗口端点未变（未实际延长）→ 不计次，返回友好提示
