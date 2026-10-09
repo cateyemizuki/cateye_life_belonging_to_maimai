@@ -3,7 +3,7 @@
 > **性质**：现状导出文档（**只读镜像，不是设计稿**）——把 `emotion/` 里散落在各常量的映射关系集中成一张可核对的表。
 > 代码是唯一真源：本文件与代码不一致时，**以代码为准**，并回头修本文件。
 > **快照时间**：2026-10-05（本机 UTC+8）｜**适用版本**：`_manifest.json version=1.0.0`、`[plugin].config_version=1.0.0`
-> **上游**：设计与联动口径出自开发期计划书（§四 情绪系统 / §6.2 联动通道 / §6.3 非决定性七原则 / 附录 C 默认参数），该计划书不属发布内容，已移出本仓库（开发归档：`cateye_dev_archive/MAINTENANCE_PLAN_10.05.md`）；
+> **上游**：设计与联动口径出自开发期计划书（§四 情绪系统 / §6.2 联动通道 / §6.3 非决定性七原则 / 附录 C 默认参数），该计划书不属发布内容，已移出本仓库；
 > 命令与工具见 [USAGE.md](USAGE.md)。
 > **来源文件**：`emotion/vad.py`｜`emotion/state_machine.py`｜`emotion/referee.py`｜`emotion/service.py`｜`emotion/bridge.py`｜`emotion/config.py`｜`companion/patrol.py`｜`companion/affection_events.py`｜`companion/relation.py`｜`qzone/service.py`｜`emotion/mapping_override.py`（M12 覆盖层）
 >
@@ -88,7 +88,7 @@
 
 1. **开环控制**：LLM 只做"事件 → 增量"，**永不持有**情绪绝对值；绝对值（`vad_raw`）只由状态机维护。
 2. **裁剪处处存在**：单维越界一律 `_clip` 回 [-1, 1]（`emotion/vad.py:23`）。
-3. **LLM 隔离**：裁判/评估类 prompt 里**不出现**任何绝对 VAD 数值（只有低分辨率描述），防"模型看着数值凑答案"（MAINTENANCE_PLAN §6.3-6）。
+3. **LLM 隔离**：裁判/评估类 prompt 里**不出现**任何绝对 VAD 数值（只有低分辨率描述），防"模型看着数值凑答案"。
 
 ### 1.1 单维五档描述（低分辨率化的唯一标准）
 
@@ -338,7 +338,7 @@ factor = exp(-decay_rate × Δt_小时)      raw.V/A/D 各乘 factor
 ### 6.5 决策日志的映射留痕（可回放）
 
 emotion.external_event` 一条记录里同时落：`k`（调用方 K）、`global_multiplier`、`multiplier`（= K×global，最终总倍率）、`delta_before` / `delta_scaled` / `delta_applied`（裁剪前后）、`clipped`、`tier`、`target_bonus`、`non_target_multiplier`、`is_target`、`source`、`llm`。
-—— 这就是 MAINTENANCE_PLAN §6.3-7「全链可观测」的情绪侧落地形态；调参时按这三个 delta 字段对账。
+—— 这就是「全链可观测」设计口径在情绪侧的落地形态；调参时按这三个 delta 字段对账。
 
 M8 段 3 的 `emotion.sleep_interrupt_settled` 复用同一三值口径（`delta_before` / `delta_scaled` /
 `delta_applied` 直接取自本次 `record_external_event` 的回执，故与 `emotion.external_event` 行逐值一致），
@@ -520,7 +520,7 @@ raw = anchor + (raw − anchor) × recovery_factor
 > 使「夜里最后一轮对话」当夜被评估。段 1 披露的两项未闭环**均已闭环（M8 段 3）**：①恢复系数改用
 > **实际睡着时长**（附录 §2.5.4，取 §2.4 的扰段并集口径，代码侧 `TODO(M8-3)` 已勾销）；②
 > `sleep_interrupt` 整夜合计入账与 §5.1 模板事件登记（见下）。
-> 依据文档：睡眠打扰与早晚安漂移附录 §2.5（该附件 §一 的 F3/F4；**定稿版**，草稿 `…_0114_ARCHIVED_草稿v0.1_…md` 已归档、非执行依据）。
+> 依据文档：睡眠打扰与早晚安漂移附录 §2.5（该附件 §一 的 F3/F4；**定稿版**，v0.1 草稿已归档、非执行依据）。
 
 **夜间打扰判定（M8 段 2 落地，附录 §2.1/§2.2）**：`replyer.after_response`
 （`episode`/`per_reply`/`off` 三态）在模式分发前调 `EmotionService.note_night_reply(session_id)`
@@ -549,7 +549,7 @@ raw = anchor + (raw − anchor) × recovery_factor
 **每 `cycle_key` 至多 1 次**（结算后清空本周期归档；无打扰 → 不入账、不落 settled 日志）。
 
 **裁判输入**：人设 + **当前 VAD 绝对值**（唯一给 LLM 看绝对值的场合，因为它是裁判不是对话模型）+ 当天日志 + **前一天日程** + **第二天日程** + 长期状态 + 预计睡眠时长 + 25 原型表 + **R_yesterday / E_tomorrow / 约定净兑现三组数值项**（§4.2 输入扩展）；prompt 内嵌评分规则 7 条（近因效应、时长倒 U、日程"释怀/反刍/期待/焦虑"、人设情绪过滤、三输入为参考、ΔVAD ∈ [-limit, limit]、reason 必须引用原文）。
-**已实测的失败模式**：`max_tokens` 给 600 会被三组长 reason 截断（宿主验证日 8 次尝试零落地）→ 现为 **2000**；思考型模型仍可能挤爆预算，裁判任务必须绑真非思考模型（MAINTENANCE_PLAN §八.8）。
+**已实测的失败模式**：`max_tokens` 给 600 会被三组长 reason 截断（8 次尝试零落地）→ 现为 **2000**；思考型模型仍可能挤爆预算，裁判任务必须绑真非思考模型。
 
 ### 7.4 睡眠进出事件（M0 发边沿；M5 起与冻结/结算绑定）
 
@@ -611,7 +611,7 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 | 路径 | `<data_dir>/emotion_mapping.json`（宿主插件数据目录；与 `emotion_state.json` / `emotion_config.json` / `proactive_budget.json` 同级），文件名常量 `mapping_override.MAPPING_FILE_NAME` |
 | 可选性 | 文件**不存在 = 纯代码默认**：静默、零 action、`applied_keys=[]`（`load()` 的不存在分支） |
 | 读写 | **只读**——插件不生成模板、不写回该文件（`load()` 全程不写文件） |
-| 部署 | robocopy 部署只覆盖插件代码目录（`plugins\lbm`），**不触碰数据目录** → 自定义文件跨部署存续（同 `proactive_budget.json` / `emotion_state.json` 的既有事实，见 TEST_PROCEDURE §八 部署行） |
+| 部署 | 插件代码目录的部署（如 robocopy 覆盖 `plugins\lbm`）**不触碰数据目录** → 自定义文件跨部署存续（同 `proactive_budget.json` / `emotion_state.json` 的既有事实） |
 | 顶层结构 | `{"version": 1, <四表键任选>}`：`version` **必填** int 且 `== 1`（`true` / `1.0` 不算 int）；顶层键集恰为 `version` + 下面四个表键，多一个即 `unknown_key` |
 
 四张数据表（键名与顺序 = `mapping_override.TABLE_KEYS`；存在即整表替换）：
@@ -686,7 +686,7 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 
 - **UTF-8 文本**：文件按 `utf-8` 解码读取（`mapping_override._read_document`）；**推荐 UTF-8 无 BOM**。
 - **容忍一个前导 BOM**：首字符若是 U+FEFF 会被剥掉再解析（Windows 记事本另存场景）——实测 `utf-8-sig`
-  写出的文件仍正常采纳（V2 自测 `10_bom` 用例 = `applied`）；第二个 BOM 落在正文里即 JSON 语法错误 → `parse` 回退。
+  写出的文件仍正常采纳（首字节带 BOM 也照常 `applied`）；第二个 BOM 落在正文里即 JSON 语法错误 → `parse` 回退。
 - 非 UTF-8 字节序列 → `UnicodeDecodeError` → `parse` 回退；读取失败（权限 / 被占用 / 目录不可判定）同样归 `parse`
   （`path.exists()` 抛错时按"不存在"处理 = 静默纯默认）。
 - 本层**不生成**模板文件：要自定义就从 §9.8 抄一份（或把 §二 / §5.1 / §6.2 的默认值抄全表再改）。
@@ -773,7 +773,7 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 | `check_interval_minutes` | 10 | [1, 120] | 睡眠检测循环间隔 |
 
 **代码常量（不可配，改需改代码）**：`VAD_WEIGHTS=(1.0,0.8,1.2)`｜`LABEL_DISTANCE_THRESHOLD=0.55`｜`MAX_COMBINED_LABELS=3`｜`EVENT_DELTA_CLAMP=0.5`｜`EXTERNAL_K_MAX=10.0`｜`MOOD_EFFECT_MIN/MAX=0.7/1.3`｜`MOOD_POST_RATE_MAX=1.2`｜`MAX_LOG=200`｜沉默事件 ΔV/ΔA = −0.12/+0.04｜约定兑现/违约 = +0.20/−0.15｜空间评论 ΔV ∈ [0.05, 0.10]｜好感调制 k=0.25、clamp 0.6~1.4。
-**M5 连续低迷常量**：`LOW_MOOD_THRESHOLD=−0.5`（日均线 V 阈值）｜`LOW_MOOD_MIN_DAYS=3`（连续天数门槛；planning 侧 `prompt_builder.LOW_MOOD_MIN_DAYS` 同值，行为用例断言两侧一致防漂移）｜`DAILY_V_KEEP_DAYS=7`（日采样桶滚动保留，也是逐日补评的窗口上限）｜状态 JSON 新增 `daily_v`/`low_mood_streak`/`low_mood_last_eval_date`/`low_mood_checked_date`（旧文件缺键 → 默认空，向后兼容）。
+**M5 连续低迷常量**：`LOW_MOOD_THRESHOLD=−0.5`（日均线 V 阈值）｜`LOW_MOOD_MIN_DAYS=3`（连续天数门槛；planning 侧 `prompt_builder.LOW_MOOD_MIN_DAYS` 同值，两侧保持一致以防漂移）｜`DAILY_V_KEEP_DAYS=7`（日采样桶滚动保留，也是逐日补评的窗口上限）｜状态 JSON 新增 `daily_v`/`low_mood_streak`/`low_mood_last_eval_date`/`low_mood_checked_date`（旧文件缺键 → 默认空，向后兼容）。
 **「日」口径（连续低迷）**：日均线 = **清醒时段**的 effective V 采样均值（每次检测 tick 采样一次；**冻结的睡眠期不采样**，避免 23:00→07:00 的整夜冻结值稀释）；判定按**日历逐日**推进——缺失/无采样日按非低迷并归零，因此"连续 N 天"必须是紧邻的 N 个自然日。
 **M5 新增常量**：`MIN_SLEEP_RECOVERY_FACTOR=0.3`（恢复系数下界）｜`SLEEP_RESIDUAL_WEIGHT=0.5` / `SLEEP_EXPECTATION_WEIGHT=0.5`（R/E 数值项权重）｜`SLEEP_COMMITMENT_WEIGHT=0.1` / `SLEEP_COMMITMENT_CLAMP=0.3`（约定净兑现项）｜`SCHEDULE_TONE_CLAMP=0.5`（日程 tone 求和后逐维上限）｜`MAX_PENDING=200`（冻结期队列上限）｜`DEFAULT_SLEEP_DELTA_LIMIT=0.8`（裁判缺省限幅兼容值）。
 **M5 新增配置**：`schedule.emotion_influence`（0~1，默认 0.6，0=关闭）——同时驱动两处：①睡眠大修裁判增量动态限幅 ±(0.4+0.4×值)；②日程生成 `emotion_context` 槽的强度（0=不注入；<0.5 精简为 1 条引导约束，≥0.5 完整）。
@@ -809,7 +809,6 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 ## 维护约定
 
 1. **本文件是镜像**：改 `emotion/` 的任何映射常量、阈值、提示词契约，**同批**更新本文件对应小节 + 快照时间与版本。
-2. 本文件属开发文档，**发布时排除**（同 `TEST_PROCEDURE.md`、`scratch/`，见开发文档陷阱 #23）。
-3. 新增情绪原型 / 改权重 / 改阈值后，跑离线脚本 `behavior_test_lbm.py`
-   （映射用例在其中），并用配套导出脚本 `gen_emotion_mapping.py` 重新生成
-   §二 的中心点表与 §3.3 的实测校准（该脚本用 `assert` 自校验中心点与代码一致，可直接重跑对账）。
+2. 本文件**随插件发布**，作为情绪映射关系的现状导出与参考；**代码为唯一真源**——本文件与代码不一致时以代码为准，并回头修本文件。
+3. 新增情绪原型 / 改权重 / 改阈值后，需同批重新导出 §二 的中心点表与 §3.3 的实测校准
+   （配套导出工具会自校验中心点与代码一致，可直接重跑对账）。
