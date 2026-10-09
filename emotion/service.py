@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,6 +24,8 @@ from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_rep
 from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
                             EmotionParams, EmotionStateMachine)
 from .vad import VADState, _clip, _level, apply_mapping_tables, map_emotions, mood_summary
+
+logger = logging.getLogger(__name__)
 
 #: 单事件增量硬限幅（§6.3-2：所有增量在代码层硬限幅；§6.2 A「单事件经 ±0.5 限幅」）
 EVENT_DELTA_CLAMP = 0.5
@@ -183,7 +187,12 @@ class EmotionService:
     def __init__(self, plugin: Any) -> None:
         self._plugin = plugin
         self._ctx = plugin.ctx
-        data_dir = Path(getattr(plugin, "_data_dir", Path(".")))
+        # 数据目录只在插件数据目录内（宿主隔离）；未接线场景绝不落宿主工作目录（插件中心评审阻断项）
+        _raw_data_dir = getattr(plugin, "_data_dir", None)
+        if not _raw_data_dir:
+            _raw_data_dir = tempfile.gettempdir()
+            logger.warning("EmotionService 未收到 plugin._data_dir，回退系统临时目录：%s", _raw_data_dir)
+        data_dir = Path(_raw_data_dir)
         self._state_path = data_dir / "emotion_state.json"
         self._config_path = data_dir / "emotion_config.json"
 

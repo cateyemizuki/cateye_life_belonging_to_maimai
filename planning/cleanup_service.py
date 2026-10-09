@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .auto_scheduler import ScheduleAutoScheduler
 from .config import PlanningCleanupSectionConfig, section_or_default

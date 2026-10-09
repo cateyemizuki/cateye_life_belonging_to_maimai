@@ -14,6 +14,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
+
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n\s*```", re.DOTALL)
 _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}")
 

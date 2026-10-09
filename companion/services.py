@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -76,7 +77,12 @@ class CompanionServices:
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
         self.ctx = plugin.ctx
-        self._data_dir = Path(getattr(plugin, "_data_dir", Path(".")))
+        # 数据目录只在插件数据目录内（宿主隔离）；未接线场景绝不落宿主工作目录（插件中心评审阻断项）
+        _raw_data_dir = getattr(plugin, "_data_dir", None)
+        if not _raw_data_dir:
+            _raw_data_dir = tempfile.gettempdir()
+            logger.warning("CompanionServices 未收到 plugin._data_dir，回退系统临时目录：%s", _raw_data_dir)
+        self._data_dir = Path(_raw_data_dir)
         #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
         self.bus = getattr(plugin, "_bus", None)
         #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）

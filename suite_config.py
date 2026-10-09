@@ -2,7 +2,7 @@
 
 - 文件名刻意不叫 ``config.py``：宿主 Runner 加载插件时 sys.path 含宿主 ``src``，
   且同一进程可能加载多个插件，顶层 ``config`` 会被宿主 ``src/config`` 或兄弟插件
-  抢占（L1 实证），故改名并由 plugin.py 顶部引导头接管自身模块解析。
+  抢占（实测），故改名并由 plugin.py 顶部引导头接管自身模块解析。
 - 三个业务子模块各自拥有自己的配置 section 类（模块化维护）：
 - planning/config.py   自主规划：schedule / inject / planning_proactive / planning_cleanup
 - companion/config.py  虚拟陪伴：patrol / affection / cateye

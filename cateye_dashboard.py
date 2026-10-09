@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import io
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -416,6 +417,9 @@ def render_dashboard_image(title: str, blocks: Any, *, output_dir: Optional[Path
     系统字体回退），逐行绘制 ``block_lines`` 的展示行（超宽截断）。高度按行数动态计算，
     上限 4096——超出部分不绘制（宁可少画不裁半行）。
 
+    Args:
+        output_dir: 图片输出目录（宿主隔离数据目录；None=系统临时目录，绝不写插件目录）。
+
     Raises:
         RuntimeError: pillow/字体/渲染任一步失败（调用方静默降级为纯文本）。
     """
@@ -500,7 +504,9 @@ def render_dashboard_image(title: str, blocks: Any, *, output_dir: Optional[Path
         _SIG._draw_text(draw, ((width - sig_w) // 2, height - footer_h + int(14 * s)),
                         signature, (159, 176, 198), fonts["footer"])
 
-        save_dir = Path(output_dir) if output_dir else Path(__file__).resolve().parent
+        # output_dir 缺省 = 系统临时目录（与同族渲染器同一契约）：
+        # 绝不回退到插件目录/代码目录（宿主隔离数据目录由调用方传入）。
+        save_dir = Path(output_dir) if output_dir else Path(tempfile.gettempdir())
         save_dir.mkdir(parents=True, exist_ok=True)
         image_path = save_dir / "dashboard_today.jpg"
         img.save(str(image_path), format="JPEG", quality=90, optimize=True)

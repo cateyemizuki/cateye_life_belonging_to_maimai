@@ -424,9 +424,10 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     morning_greeting_require_activation: bool = Field(
         default=False,
-        description="（旧字段，M10/L2 起由 greeting_require_activation 接管）早间问候是否需激活："
-                    "开启后与 greeting_require_activation 取或——非目标私聊从基准点起观察会话消息，"
-                    "有人说话才问好，到期限仍无人则放弃（目标私聊固定生效，不受本项影响）",
+        description="（旧字段，已由 greeting_require_activation 接管）群聊早间问候是否需激活："
+                    "开启后与 greeting_require_activation **取或**——群聊早安同样要求「自基准点起"
+                    "该流有人发过消息」才问好，到期限仍无人则放弃（目标私聊不受本项影响；"
+                    "非目标私聊由消息数门槛承担）",
         json_schema_extra={"label": "早间问候需激活（旧）", **_ui_i18n("Require activation (legacy)")},
     )
     enable_frequency_modulation: bool = Field(
@@ -496,9 +497,10 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     greeting_require_activation: bool = Field(
         default=True,
-        description="问候的必要性激活：开启后，群聊/其他私聊到点需先观察到「自基准点起该流有人发过消息」"
+        description="问候的必要性激活（**只作用于群聊**）：开启后，群聊到点需先观察到「自基准点起该流有人发过消息」"
                     "才问候，无人则推迟到下一轮、到期限仍无人则放弃（当天不再补发）；"
-                    "关闭则到点直接问候。目标私聊固定生效，不受本项影响",
+                    "关闭则到点直接问候。目标私聊不受本项影响；非目标私聊由消息数门槛"
+                    "（greeting_other_private_min_messages）承担",
         json_schema_extra={"label": "问候需激活", **_ui_i18n("Greeting requires activation")},
     )
 

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 import uuid
 from datetime import datetime, timedelta
 from enum import Enum
@@ -223,7 +224,10 @@ class GoalManager:
         db: Optional[ScheduleDB] = None,
     ):
         if data_dir is None:
-            data_dir = Path(__file__).parent
+            # 未接线场景（独立测试/单例先于服务束创建）绝不写插件代码目录：
+            # 宿主隔离数据目录由 PlanningServices 必传（services.py 已做 None 前置校验）。
+            data_dir = Path(tempfile.gettempdir())
+            logger.warning("GoalManager 未收到 data_dir，回退系统临时目录：%s", data_dir)
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = db if db is not None else ScheduleDB(self.data_dir / db_name)

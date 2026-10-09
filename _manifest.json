@@ -3,7 +3,7 @@
   "id": "cateye.life_belonging_to_maimai",
   "version": "1.0.0",
   "name": "属于麦麦的生活",
-  "description": "「属于麦麦的生活」是一个三合一的整合插件：① 自主规划日程——按人设由大模型生成每日作息日程（带质量评分与语义校验），把当前活动注入对话，并在活动切换或约定到期时主动开口（指令族 /lbm_plan）；② 虚拟陪伴——好感度养成与定时主动聊天（早安/晚安/想念/节点分享，带概率、预算与静默时段），支持陪伴对象电脑的屏幕感知旁白（指令族 /lbm_mai_*）；③ QQ 空间——按日程自动发说说、自动回复评论（含楼中楼）与点赞（指令族 /lbm_life）。另有 /lbm_dashboard 聚合总览与 /lbm_diag 排障诊断。",
+  "description": "「属于麦麦的生活」是一个四合一的整合插件：① 自主规划日程——按人设由大模型生成每日作息日程（带质量评分与语义校验），把当前活动注入对话，并在活动切换或约定到期时主动开口（指令族 /lbm_plan）；② 虚拟陪伴——好感度养成与定时主动聊天（早安/晚安/想念/节点分享，带概率、预算与静默时段），支持陪伴对象电脑的屏幕感知旁白（指令族 /lbm_mai_*）；③ QQ 空间——按日程自动发说说、自动回复评论（含楼中楼）与点赞（指令族 /lbm_life）；④ 情绪维护——按人设推导情绪基线，在对话中保持连贯的心情底色，并按重要之人的言行与睡眠、告别等事件自动累积或平复心情（指令 /lbm_emotion_init 初始化、/lbm_emotion_config 查看与重置）。另有 /lbm_dashboard 聚合总览与 /lbm_diag 排障诊断。",
   "author": {
     "name": "cateye",
     "url": "https://github.com/cateyemizuki"
@@ -35,7 +35,7 @@
       "version_spec": ">=9.0.0"
     }
   ],
-  "plugin_type": "tool",
+  "plugin_type": "integration",
   "display": {
     "icon": {
       "type": "lucide",
@@ -68,5 +68,6 @@
       "zh-CN",
       "en-US"
     ]
-  }
+  },
+  "changelog": "CHANGELOG.md"
 }
