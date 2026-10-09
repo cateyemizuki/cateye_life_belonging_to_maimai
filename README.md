@@ -61,6 +61,10 @@ cateye_test/
 > `tool_search` 兜底发现；**方案 ①**（提醒前 `ctx.component.enable_component` 翻转可见性、提醒轮后
 > 收回）留作升级路径。取舍理由与**宿主实测项清单**见 USAGE.md §一（赖床工具条目）与 §七 末尾——
 > 关键待确认点：宿主的 `tool_search` 是否对 hidden 工具可达（不可达则须走方案 ①）。
+>
+> **P6 修复（W2，2026-10-09）**：赖床写回同时把与延长窗口重叠的当日**非睡眠**条目顺延到延长端点之后
+> （跨午夜则醒来日日程另写一次）——否则醒沿判定会被这些清醒条目抢占、不随延长端点推迟；生成/归一化契约不动。
+> 计次口径 = **钳制后成功延长即计次**（详见 USAGE.md §一 赖床工具 / §七）。
 
 ## 各模块功能清单
 
@@ -71,7 +75,7 @@ cateye_test/
 - ✅ **生成锚点相对化（M10 · 附录 §五 B2）**：新一天日程不再按绝对时刻生成，改为"当天最后一个**非睡眠**日程条目结束后 `auto_generate_after_last_end_minutes`（默认 90）分钟"，无日程回退 `sleep_time` 锚点（B4）；硬约束"不晚于新一天起点（`wake_time` 锚点）前 30 分钟"，超出强制拉回；旧字段 `auto_generate_time` 标 deprecated（兼容读取、同受钳制，两字段同配时新字段优先）；睡眠条目判定与 M9 赖床工具同源（`planning/schedule_items.py`）
 - ✅ planner 注入（意图分类：问当前/问未来/闲聊/技术/命令，注入优化器冷却+概率+TTL，会话续注，能量模型）+ replyer 注入；**M4 精神状态行与情绪注入同源**：`_render_unified_prompt` 的精神状态行改读情绪系统 `mood_text()`，原活动状态分析器（inject/state_analyzer）删除，情绪不可得时省略该行
 - ✅ 主动行为：活动切换主动开口（去重）、**L2 早晚安漂移（M10）**、约定到期强指令、频率调控、睡眠窗口
-- ✅ **早晚安漂移（M10 · 附录 §三 L2；M11 附录 II §二 三类开关与免预算）**：早/晚安只配漂移区间（`morning_drift`/`night_drift`，默认 `10-30`，单数字 `N` = `0~N`，负数/非法回退默认）——每 `(流, 日, 早安/晚安)` 独立掷点、同日复用同一结果、纯内存不落盘；早安基准 = 睡眠窗口结束（`[schedule] wake_time` 锚点）、期限 = 首个**非睡眠**日程条目结束（无日程 → 基准 + 120 分钟），晚安基准 = 当天最后非睡眠条目结束（无日程 → `sleep_time` 锚点）、期限 = `min(入睡锚点, [patrol] silence_start)`；到点按必要性激活（`greeting_require_activation`：自基准点起该流有人说话才开口，到期限仍无人即放弃）；覆盖 = 三类独立开关（`greeting_target_enabled` 目标私聊**必定触发/豁免名单**、`greeting_group_enabled` 群聊 + 问候专用黑白名单 `greeting_group_*` 空=全发 + 必要性激活、`greeting_other_private_enabled` 非目标私聊默认关 + 白名单留空=全不发 + 前一日该流 ≥ `greeting_other_private_min_messages`（默认 5，`ge=5` 硬约束）），名单只收裸群号/QQ 号（非法元素忽略并记一条汇总告警）；**例行问候默认免主动打扰预算**（`greeting_exempt_budget`：闸门与计数一起跳），活动切换等非问候主动行为仍照旧计入预算（仅目标陪伴私聊）；旧键 `enable_night_greeting`/`morning_other_private_*` 走 deprecated 映射（`enable_night_greeting` 显式 false = 晚安全灭），目标私聊写 `affection.morning_sent/night_sent` 保证同流同日各至多一条
+- ✅ **早晚安漂移（M10 · 附录 §三 L2；M11 附录 II §二 三类开关与免预算）**：早/晚安只配漂移区间（`morning_drift`/`night_drift`，默认 `10-30`，单数字 `N` = `0~N`，负数/非法回退默认）——每 `(流, 日, 早安/晚安)` 独立掷点、同日复用同一结果、纯内存不落盘；早安基准 = 睡眠窗口结束（`[schedule] wake_time` 锚点）、期限 = 首个**非睡眠**日程条目结束（无日程 → 基准 + 120 分钟），晚安基准 = 当天最后非睡眠条目结束（无日程 → `sleep_time` 锚点）、期限 = `min(入睡锚点, [patrol] silence_start)`；到点按必要性激活（`greeting_require_activation`：自基准点起该流有人说话才开口，到期限仍无人即放弃）；覆盖 = 三类独立开关（`greeting_target_enabled` 目标私聊**必定触发/豁免名单**、`greeting_group_enabled` 群聊 + 问候专用黑白名单 `greeting_group_*` 空=全发 + 必要性激活、`greeting_other_private_enabled` 非目标私聊默认关 + 白名单留空=全不发 + 前一日该流 ≥ `greeting_other_private_min_messages`（默认 5，`ge=5` 硬约束）），名单只收裸群号/QQ 号（非法元素忽略并记一条汇总告警）；**例行问候默认免主动打扰预算**（`greeting_exempt_budget`：闸门与计数一起跳），活动切换等非问候主动行为仍照旧计入预算（仅目标陪伴私聊）；旧键 `enable_night_greeting`/`morning_other_private_*` 走 deprecated 映射（`enable_night_greeting` 显式 false = 晚安全灭），目标私聊写 `affection.morning_sent/night_sent`，**planning 发送闸同查该标记（P5/W1，2026-10-09）**——同一**目标**私聊流同日早安/晚安各至多一条（**含热重载/重启后**）；非目标类不写该标记，跨热重载去重登记待议（口径见 USAGE.md §八）
 - ✅ 自然语言约定（角色裁判 today/future/reject → 今日重排或未来约定）
 - ✅ /plan 命令（日程图片 PIL 渲染 + 合并转发，失败降级纯文本）与 2 个 LLM 工具（`get_schedule_info` 只读四视图 + `update_schedule_v4` 唯一日程写入口；原 manage_goal / get_planning_status / apply_schedule 三工具随 T6 收口移除，目标写 API 与 `apply_schedule_items` 仍在底层保留）
 
