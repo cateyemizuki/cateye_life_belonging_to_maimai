@@ -1163,7 +1163,46 @@ class ProactiveService:
             # §3.6：合并后静默时段仍生效——静默中不开口（推迟下一 tick；
             # 静默延续到期限的情形由上一判定的 deadline 分支放弃）
             return
+        if self._greeting_deduped_by_persisted_marker(category, kind):
+            # P5（2026-10-09 登记）：热重载/重启后内存掷点清零，但 affection 的按天标记仍在——
+            # 目标私聊该 kind 今天已发过 → 视为已触发（与自然触发同形态）+ 落去重行，不再重发。
+            # 内存 status 已 FIRED 的在上方短路，不会走到这里（不重复落去重行）。
+            entry["status"] = GREETING_STATUS_FIRED
+            self._decision_log(
+                "skip", trigger_type=f"{kind}_greeting",
+                reason="持久化标记命中，热重载去重",
+                stream_id=entry["stream_id"], category=entry["category"],
+                fire_at=int(entry["fire_at"]), deadline=int(entry["deadline"]),
+            )
+            return
         await self._fire_greeting(entry, date_str, now_ts)
+
+    def _greeting_deduped_by_persisted_marker(self, category: str, kind: str) -> bool:
+        """TARGET 类问候的跨重载去重：查 affection 的按天标记（``morning_sent``/``night_sent``）。
+
+        P5（2026-10-09 登记）：标记的语义域 =「目标私聊该 kind 今日已发」（**按天全局布尔**，
+        非按流；日切清零见 affection），故只对 TARGET 类别查——群聊/其他私聊查全局标记会把
+        「目标已发」误判为「该流已发」，直接压制三类矩阵的多群全发语义（既有 128 号用例）。
+        companion 未装配（``_affection`` 缺失）或标记接口不可调 → 返回 False（可空降级，同
+        :meth:`_mark_greeting_sent_on_affection`）。
+        """
+        if category != GREETING_CATEGORY_TARGET:
+            return False
+        affection = getattr(self._plugin, "_affection", None)
+        if affection is None:
+            return False
+        getter = getattr(
+            affection,
+            "morning_sent" if kind == GREETING_MORNING else "night_sent",
+            None,
+        )
+        if not callable(getter):
+            return False
+        try:
+            return bool(getter())
+        except Exception:
+            logger.debug("读 affection 早晚安标记失败", exc_info=True)
+            return False
 
     def _abandon_greeting(self, entry: Dict[str, Any], reason: str) -> None:
         """放弃该流该 kind 的当日问候（状态 + 决策日志；当天不再触发）。"""
