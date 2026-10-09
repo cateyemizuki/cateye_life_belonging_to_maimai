@@ -10,10 +10,10 @@
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/cateyemizuki/cateye_test",
-    "homepage": "https://github.com/cateyemizuki/cateye_test",
-    "documentation": "https://github.com/cateyemizuki/cateye_test/blob/main/README.md",
-    "issues": "https://github.com/cateyemizuki/cateye_test/issues"
+    "repository": "https://github.com/cateyemizuki/cateye_life_belonging_to_maimai",
+    "homepage": "https://github.com/cateyemizuki/cateye_life_belonging_to_maimai",
+    "documentation": "https://github.com/cateyemizuki/cateye_life_belonging_to_maimai/blob/main/README.md",
+    "issues": "https://github.com/cateyemizuki/cateye_life_belonging_to_maimai/issues"
   },
   "host_application": {
     "min_version": "1.0.0",
