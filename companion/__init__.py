@@ -9,7 +9,6 @@
 - sender_identity   发送者身份缓存（消息 ID → QQ 号；会话 ID → 是否群聊）
 - screen_context    屏幕旁白「尾随锚点」注入缓存（planner/replyer 双通道）
 - cateye_client     陪伴对象电脑联动（connect-hub 截图 + VLM 转述）
-- holiday_service   节假日/调休查询（多级降级 + 3 天 TTL 磁盘缓存）
 - components        CompanionComponentsMixin（5 Hook + 6 Tool + 8 Command + 3 API）
 - services          CompanionServices 服务束（plugin.py: self._companion = CompanionServices(self)）
 """

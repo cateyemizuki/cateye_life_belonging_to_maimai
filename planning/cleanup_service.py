@@ -12,7 +12,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 from .auto_scheduler import ScheduleAutoScheduler
-from .config import PlanningCleanupSectionConfig, section_or_default
+from .config import ScheduleAdvancedSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
 
 if TYPE_CHECKING:
@@ -50,7 +50,7 @@ class CleanupService:
                 except Exception as exc:
                     logger.error(f"清理目标异常: {exc}", exc_info=True)
 
-                cleanup_cfg = section_or_default(self._plugin, "planning_cleanup", PlanningCleanupSectionConfig)
+                cleanup_cfg = section_or_default(self._plugin, "planning_cleanup", ScheduleAdvancedSectionConfig)
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=float(cleanup_cfg.cleanup_interval))
                     break
@@ -72,7 +72,7 @@ class CleanupService:
             logger.info(f"清理了 {expired_schedules} 个过期日程（3 天前）")
 
         # 2. 清理已完成 / 已取消的旧目标（保留 cleanup_old_goals_days 天）
-        cleanup_cfg = section_or_default(self._plugin, "planning_cleanup", PlanningCleanupSectionConfig)
+        cleanup_cfg = section_or_default(self._plugin, "planning_cleanup", ScheduleAdvancedSectionConfig)
         cleaned_count = goal_manager.cleanup_old_goals(days=cleanup_cfg.cleanup_old_goals_days)
         if cleaned_count > 0:
             logger.info(f"清理了 {cleaned_count} 个旧目标（{cleanup_cfg.cleanup_old_goals_days} 天前）")

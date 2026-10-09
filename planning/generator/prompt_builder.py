@@ -24,6 +24,15 @@ v4.7.0 改造：
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
+from suite_prompts import (
+    SCHEDULE_EMOTION_CONTEXT_DEFAULT,
+    SCHEDULE_GENERATION_EXTRA_DEFAULT,
+    SCHEDULE_LOW_MOOD_NOTE_DEFAULT,
+    SCHEDULE_RETRY_FEEDBACK_DEFAULT,
+    prompt as prompt_of,
+    render,
+)
+
 from ..time_utils import TimezoneManager
 
 logger = logging.getLogger(__name__)
@@ -52,7 +61,7 @@ def _to_int(value: Any, default: int) -> int:
 
 
 def build_emotion_context(mood: str, levels: Optional[Dict[str, str]] = None,
-                          influence: float = 0.6) -> str:
+                          influence: float = 0.6, plugin: Any = None) -> str:
     """拼「睡醒情绪描述 + 引导约束」上下文（M5；§6.2 F / SYNERGY §3.2）。
 
     - ``influence <= 0`` 或 ``mood`` 为空 → 返回空串（不注入，等价关闭）；
@@ -60,6 +69,7 @@ def build_emotion_context(mood: str, levels: Optional[Dict[str, str]] = None,
     - ``levels`` 为情绪低分辨率三档词（emotion.overhauled payload 的 ``levels``：
       valence/arousal/dominance → 很低/偏低/中等/偏高/很高）；缺失时退化为通用引导；
     - 只使用低分辨率词与行为约束，**不含任何 VAD 数值**（§6.3-6 LLM 隔离）。
+    - ``plugin`` 提供 ``[prompts].schedule_emotion_context`` 覆盖（模板写坏自动回退出厂文案）。
     """
     text = str(mood or "").strip()
     if not text:
@@ -90,9 +100,12 @@ def build_emotion_context(mood: str, levels: Optional[Dict[str, str]] = None,
     if strength < 0.5:
         constraints = constraints[:1]
     body = "；".join(f"{idx}) {line}" for idx, line in enumerate(constraints, 1))
-    return (f"【睡醒情绪底色】\n昨晚睡醒时的情绪：{text}\n"
-            f"引导约束：{body}\n"
-            "要求：情绪只影响活动类型与强度的微调，不得改变作息锚点、三餐窗口与无缝衔接要求。")
+    return render(
+        prompt_of(plugin, "schedule_emotion_context"),
+        fallback=SCHEDULE_EMOTION_CONTEXT_DEFAULT,
+        mood=text,
+        constraints=body,
+    )
 
 
 def _parse_hhmm(value: Any, default_minutes: int) -> int:
@@ -136,6 +149,14 @@ class PromptBuilder:
         """
         self.config = config
         self.tz_manager = tz_manager
+
+    def _plugin_ref(self) -> Any:
+        """取 plugin 引用（生成配置字典里的 ``plugin`` 键；None = 提示词全走默认）。
+
+        2026-10-10：日程生成提示词可经 ``[prompts]`` 段定制（追加指令 / 情绪块 /
+        低迷软约束 / 重试反馈），本方法提供读配置所需的 plugin 引用。
+        """
+        return self.config.get("plugin") if isinstance(self.config, dict) else None
 
     def _get_cached_config(self) -> tuple[str, str, str, str]:
         """读取由插件层注入的 bot 配置（无 IO，纯字典访问）。
@@ -395,6 +416,7 @@ class PromptBuilder:
         knowledge_context: str = "",
         emotion_context: Optional[str] = None,
         low_mood_days: int = 0,
+        holiday_context: Optional[str] = None,
     ) -> str:
         """构建日程生成提示词
 
@@ -408,6 +430,7 @@ class PromptBuilder:
             knowledge_context: 相关记忆参考（可选）
             emotion_context: 睡醒情绪描述 + 引导约束（可选；M5 §6.2 F，空串=不注入）
             low_mood_days: 连续低迷天数（M5 §6.2 F；≥3 时注明「最近有点低落」并要求安排恢复类活动）
+            holiday_context: 节假日上下文（可选；2026-10-10，空串=不注入）
 
         Returns:
             完整的提示词字符串
@@ -520,14 +543,19 @@ class PromptBuilder:
 {emotion_context}
 """
 
+        # 节假日上下文（2026-10-10）：仅当 [schedule] holiday_affects_schedule 开启时装载
+        if holiday_context:
+            prompt += "\n" + str(holiday_context).strip() + "\n"
+
         # M5（§6.2 F）：连续低迷软约束——prompt 注明，并要求安排一次恢复类活动
         days = _to_int(low_mood_days, 0)
         if days >= LOW_MOOD_MIN_DAYS:
-            prompt += f"""
-【最近状态】最近有点低落（已连续 {days} 天情绪偏低）。
-请务必在今天安排一次恢复类活动（goal_type 用 rest 或 social_maintenance，如散步、放空、和朋友聊聊天），
-学习与工作强度相应调低，不要连续堆叠高压条目。
-"""
+            note = render(
+                prompt_of(self._plugin_ref(), "schedule_low_mood_note"),
+                fallback=SCHEDULE_LOW_MOOD_NOTE_DEFAULT,
+                days=days,
+            )
+            prompt += "\n" + note + "\n"
 
         # 根据配置决定描述要求
         if enable_detailed_description:
@@ -687,6 +715,11 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 """ + ("- description填空字符串\"\"即可\n" if not enable_detailed_description else f"- description简洁，{min_desc_len}-{max_desc_len}字\n") + f"""- 体现{weekday}特色（{"周末睡懒觉" if is_weekend else "工作日早起"}）
 """
 
+        # [prompts].schedule_generation_extra：用户的自由追加指令（留空不追加）
+        extra = prompt_of(self._plugin_ref(), "schedule_generation_extra")
+        if extra.strip() and extra.strip() != SCHEDULE_GENERATION_EXTRA_DEFAULT.strip():
+            prompt += "\n" + extra.strip() + "\n"
+
         # 添加Schema约束（精简版）
         if schema:
             import json
@@ -715,6 +748,7 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
         knowledge_context: str = "",
         emotion_context: Optional[str] = None,
         low_mood_days: int = 0,
+        holiday_context: Optional[str] = None,
     ) -> str:
         """构建第二轮prompt（附带反馈）
 
@@ -740,12 +774,15 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
             knowledge_context=knowledge_context,
             emotion_context=emotion_context,
             low_mood_days=low_mood_days,
+            holiday_context=holiday_context,
         )
 
-        feedback = "\n\n⚠️ **上一次生成存在以下问题，请改进：**\n\n"
-        for idx, issue in enumerate(previous_issues[:5], 1):  # 只列出前5个
-            feedback += f"{idx}. {issue}\n"
-
-        feedback += "\n**请重新生成一个更合理的日程，特别注意以上问题！**\n"
-
+        issues_text = "".join(
+            f"{idx}. {issue}\n" for idx, issue in enumerate(previous_issues[:5], 1)  # 只列出前5个
+        )
+        feedback = render(
+            prompt_of(self._plugin_ref(), "schedule_retry_feedback"),
+            fallback=SCHEDULE_RETRY_FEEDBACK_DEFAULT,
+            issues=issues_text,
+        )
         return base_prompt + feedback

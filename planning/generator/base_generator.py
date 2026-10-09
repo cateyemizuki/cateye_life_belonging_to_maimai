@@ -41,6 +41,9 @@ class BaseScheduleGenerator:
         self.emotion_context: str = ""
         #: M5（§6.2 F）连续低迷天数（ScheduleGenerator 从情绪侧 low_mood_state() 装载；≥3 触发软约束）
         self.low_mood_days: int = 0
+        #: 节假日上下文（2026-10-10：只有 [schedule] holiday_affects_schedule 开启时由
+        #: ScheduleGenerator 装载；空串=不注入，行为与旧版逐字一致）
+        self.holiday_context: str = ""
         self.config: Dict[str, Any] = config or {}  # 保存配置
 
         # 初始化时区管理器
@@ -89,6 +92,7 @@ class BaseScheduleGenerator:
             knowledge_context=self.knowledge_context,
             emotion_context=self.emotion_context,
             low_mood_days=self.low_mood_days,
+            holiday_context=self.holiday_context,
         )
 
     def build_retry_prompt(
@@ -110,4 +114,5 @@ class BaseScheduleGenerator:
             knowledge_context=self.knowledge_context,
             emotion_context=self.emotion_context,
             low_mood_days=self.low_mood_days,
+            holiday_context=self.holiday_context,
         )

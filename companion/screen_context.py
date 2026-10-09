@@ -28,7 +28,7 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional, Tuple
 from uuid import uuid4
 
-from .config import SCREEN_NARRATION_TEMPLATE_DEFAULT
+from suite_prompts import SCREEN_NARRATION_DEFAULT as SCREEN_NARRATION_TEMPLATE_DEFAULT
 from .sender_identity import first_text_part, message_id_from_item
 
 #: 通道名：planner 与 replyer 的上下文分开识别（两者条目不一定相同）

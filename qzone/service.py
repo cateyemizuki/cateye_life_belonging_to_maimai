@@ -33,7 +33,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.diag import DecisionLogger
-from core.llm_utils import LLMService
+from core.llm_utils import LLMService, purpose_task
+from suite_prompts import (
+    QZONE_COMMENT_REMINDER_DEFAULT,
+    prompt as prompt_of,
+    render,
+)
 from .cgi import QzoneCookieManager, QzoneWebClient
 from planning.schedule_query import ScheduleQuery
 from core.storage import load_json, save_json_atomic
@@ -366,7 +371,9 @@ class QzoneService:
     async def generate_moment_text(self, date: str, now: datetime) -> str:
         activity = self._schedule.find_current_activity(date, now)
         activity_desc = self._schedule.format_activity_line(activity, now) if activity else "自由活动"
-        prompt = QZONE_POST_PROMPT.format(
+        prompt = render(
+            prompt_of(self._plugin, "qzone_post"),
+            fallback=QZONE_POST_PROMPT,
             lover_name=self._lover_name,
             personality=self._personality or "（暂无人设）",
             date=date,
@@ -379,7 +386,7 @@ class QzoneService:
             prompt = f"{prompt}\n{mood_line}"
         text = await self._llm.generate(
             prompt,
-            task_name=self._qzone_cfg().llm_task_name,
+            task_name=purpose_task(self._plugin, "qzone", default="utils"),
             temperature=0.8,
             max_tokens=200,
             event="qzone_post",
@@ -430,7 +437,9 @@ class QzoneService:
                     summary=str(comment.get("content") or "")[:40], nested=True,
                 )
                 await asyncio.sleep(3 + random.random())  # 拟人间隔
-                prompt = QZONE_REPLY_PROMPT.format(
+                prompt = render(
+                    prompt_of(self._plugin, "qzone_reply"),
+                    fallback=QZONE_REPLY_PROMPT,
                     lover_name=self._lover_name,
                     personality=self._personality or "（暂无人设）",
                     moment=moment_text[:200],
@@ -445,7 +454,8 @@ class QzoneService:
                     prompt = f"{prompt}\n{mood_line}"
                 reply_text = await self._llm.generate(
                     prompt,
-                    task_name=cfg.llm_task_name, temperature=0.8, max_tokens=120,
+                    task_name=purpose_task(self._plugin, "qzone", default="utils"),
+                    temperature=0.8, max_tokens=120,
                     event="qzone_reply",
                 )
                 reply_text = reply_text.strip()
@@ -532,7 +542,11 @@ class QzoneService:
                     await self._ctx.maisaka.proactive.trigger(
                         stream_id=self._target_stream_id,
                         intent="qzone_comment",
-                        reason=f"你刚发的说说「{excerpt}」收到了 {added} 条新评论，可以在聊天里自然地提到这件事",
+                        reason=render(
+                            prompt_of(self._plugin, "qzone_comment_reminder"),
+                            fallback=QZONE_COMMENT_REMINDER_DEFAULT,
+                            excerpt=excerpt, added=added,
+                        ),
                     )
                 except Exception:
                     pass
@@ -559,7 +573,9 @@ class QzoneService:
             comment_text = str(comment.get("content") or "")
             if not comment_id or self._is_processed(tid, int(comment_id) if comment_id.isdigit() else 0):
                 continue
-            prompt = QZONE_REPLY_PROMPT.format(
+            prompt = render(
+                prompt_of(self._plugin, "qzone_reply"),
+                fallback=QZONE_REPLY_PROMPT,
                 lover_name=self._lover_name, personality=self._personality or "（暂无人设）",
                 moment=content[:200], nickname=commenter, comment=comment_text[:200],
                 time="", impression="",
@@ -570,7 +586,8 @@ class QzoneService:
                 prompt = f"{prompt}\n{mood_line}"
             reply_text = await self._llm.generate(
                 prompt,
-                task_name=cfg.llm_task_name, temperature=0.8, max_tokens=120, event="qzone_reply",
+                task_name=purpose_task(self._plugin, "qzone", default="utils"),
+                temperature=0.8, max_tokens=120, event="qzone_reply",
             )
             reply_text = reply_text.strip()
             if reply_text and await self.comment_moment(tid, reply_text):

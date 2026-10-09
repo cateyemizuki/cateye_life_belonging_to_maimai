@@ -19,7 +19,8 @@ class EmotionSectionConfig(PluginConfigBase):
 
     __ui_label__ = "情绪系统"
     __ui_icon__ = "smile"
-    __ui_order__ = 7
+    __ui_order__ = 11
+    # 2026-10-10：模型任务名（evaluator/referee）已迁入 [llm] 段统一管理。
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Emotion", "description": "VAD emotion state machine with sleep overhaul."}
     }
@@ -77,16 +78,6 @@ class EmotionSectionConfig(PluginConfigBase):
         le=3600,
         description="两次增量评估之间的最小间隔（秒），控制评估成本",
         json_schema_extra={"label": "评估最小间隔(秒)", **_ui_i18n("Min evaluate interval (s)")},
-    )
-    evaluator_task_name: str = Field(
-        default="utils",
-        description="增量评估/睡眠裁判使用的模型任务名（裁判默认见 referee_task_name）",
-        json_schema_extra={"label": "评估任务名", **_ui_i18n("Evaluator LLM task")},
-    )
-    referee_task_name: str = Field(
-        default="replyer",
-        description="睡眠裁判 LLM 的模型任务名（独立请求，不携带对话历史）",
-        json_schema_extra={"label": "睡眠裁判任务名", **_ui_i18n("Sleep referee LLM task")},
     )
     # ── M3 事件倍率（§6.2 A，附录 C；一律标量，不用 dict/list——陷阱 #4）──────
     global_event_multiplier: float = Field(

@@ -90,6 +90,8 @@ class ScheduleGeneratorConfig:
         self.bot_profile = dict(config_dict.get('bot_profile', {}) or {})
         # 时区（由 plugin 注入；旧版默认 Asia/Shanghai）
         self.timezone = config_dict.get('timezone', 'Asia/Shanghai')
+        # 2026-10-10：plugin 引用（提示词读 [prompts] 段；None = 全部回退出厂默认）
+        self.plugin = config_dict.get('plugin')
 
         # 保存原始配置字典（用于传递给子组件）
         self._raw_config = config_dict
@@ -219,6 +221,7 @@ class ScheduleGeneratorConfig:
             'llm_task_name': self.llm_task_name,
             'bot_profile': self.bot_profile,
             'timezone': self.timezone,
+            'plugin': self.plugin,
         }
 
     def __repr__(self) -> str:

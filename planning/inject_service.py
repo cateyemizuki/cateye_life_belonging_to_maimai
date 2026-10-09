@@ -16,8 +16,11 @@ Hook 入口：``maisaka.planner.before_request`` / ``maisaka.replyer.before_requ
 
 对整合契约的适配：
 - ``inject_schedule`` 配置名对齐为 ``inject_into_planner``；
-- 白名单用 ``schedule.inject_scope``（target_private=仅目标私聊 / all）；
-  admin 段若挂载了 allowed_streams 则叠加为额外限制；
+- 白名单用 ``schedule.inject_scope``（**默认 all**：所有会话都注入日程；
+  ``target_private`` = 只给目标陪伴私聊注入）；admin 段若挂载了 allowed_streams 则叠加为额外限制；
+- **日期/节假日头部**（2026-10-10 由陪伴模块迁入）：``schedule.holiday_inject_enabled`` 开启时，
+  日程块头部先注一行「今天是 X（星期Y），节假日状态」，模板见 ``[prompts].inject_date_header``；
+- 注入文案（首行/当前行/未来行/引导行/replyer 状态块）全部读 ``[prompts]`` 段（suite_prompts）；
 - 数据查询经 GoalManager 合成视图（schedule_items 单一数据源）。
 """
 
@@ -31,7 +34,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from .config import InjectSectionConfig, ScheduleSectionConfig, section_or_default
+from .config import ScheduleAdvancedSectionConfig, ScheduleSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
 from .inject import (
     ConversationContextCache,
@@ -41,6 +44,17 @@ from .inject import (
 )
 from .lru_cache import LRUCache
 from .time_utils import TimezoneManager, describe_energy, get_energy_level, parse_time_window, strip_tz
+from suite_prompts import (
+    INJECT_DATE_HEADER_DEFAULT,
+    INJECT_HINT_CONTINUE_DEFAULT,
+    INJECT_REPLYER_NEXT_LINE_DEFAULT,
+    INJECT_REPLYER_STATE_LINE_DEFAULT,
+    INJECT_REPLYER_STATUS_DEFAULT,
+    INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
+    INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
+    prompt,
+    render,
+)
 
 if TYPE_CHECKING:
     from typing import Any as _Plugin
@@ -63,40 +77,38 @@ class InjectService:
     # ``<message msg_id="..." time="..." user="...">\n真实文本`` 前缀。
     _PLANNER_PREFIX_PATTERN: re.Pattern = re.compile(r"^<message\s+[^>]*>\s*\n?")
 
-    def __init__(self, plugin: Any) -> None:
+    def __init__(self, plugin: Any, holiday_service: Any = None) -> None:
         """初始化 InjectService，加载智能注入组件、缓存、配置。
 
         Args:
             plugin: 当前插件实例（动态读 plugin.config，热重载自动生效）
+            holiday_service: 节假日服务（planning.HolidayService；None = 不注入日期头部）
         """
         self._plugin = plugin
-        cfg = section_or_default(plugin, "schedule", ScheduleSectionConfig)
+        self._holiday = holiday_service
 
-        # 缓存：把 TTL 直接传给 LRUCache，由它统一管理过期
-        self._schedule_cache: LRUCache = LRUCache(max_size=cfg.cache_max_size, ttl=cfg.cache_ttl)
+        # 缓存 / 时区 / 注入调优（2026-10-10 起全部在 [schedule_advanced] 段）
+        adv = section_or_default(plugin, "schedule_advanced", ScheduleAdvancedSectionConfig)
+        self._schedule_cache: LRUCache = LRUCache(max_size=adv.cache_max_size, ttl=adv.cache_ttl)
+        self._tz_manager: TimezoneManager = TimezoneManager(adv.timezone)
 
-        # 时区管理器
-        self._tz_manager: TimezoneManager = TimezoneManager(cfg.timezone)
-
-        # 智能注入组件（按 inject 段配置；未挂载该段时全部启用默认值）
-        inj = section_or_default(plugin, "inject", InjectSectionConfig)
-        self._intent_classifier = IntentClassifier() if inj.enable_intent_classification else None
+        self._intent_classifier = IntentClassifier() if adv.enable_intent_classification else None
         self._inject_optimizer = (
             InjectOptimizer(
-                cache_ttl=cfg.cache_ttl,
-                casual_inject_probability=inj.casual_chat_inject_probability,
+                cache_ttl=adv.cache_ttl,
+                casual_inject_probability=adv.casual_chat_inject_probability,
             )
-            if inj.enable_inject_optimization
+            if adv.enable_inject_optimization
             else None
         )
         self._context_cache = ConversationContextCache(
-            max_turns=inj.context_max_turns,
-            ttl=inj.context_ttl,
+            max_turns=adv.context_max_turns,
+            ttl=adv.context_ttl,
         )
         logger.debug(
             "InjectService 初始化完成（cache_max=%d, cache_ttl=%d, intent=%s, optimizer=%s）",
-            cfg.cache_max_size, cfg.cache_ttl,
-            inj.enable_intent_classification, inj.enable_inject_optimization,
+            adv.cache_max_size, adv.cache_ttl,
+            adv.enable_intent_classification, adv.enable_inject_optimization,
         )
 
     # ------------------------------------------------------------
@@ -119,14 +131,9 @@ class InjectService:
             return False
         cfg = self._schedule_cfg()
         if getattr(cfg, "inject_scope", "all") != "all":
-            # 只注入目标私聊（与 plugin.py 的 _injection_allowed 同口径）
-            patrol = getattr(self._plugin, "_patrol", None)
-            target_stream = ""
-            if patrol is not None:
-                try:
-                    target_stream = str(patrol.patrol_status().get("stream_id") or "")
-                except Exception:
-                    target_stream = ""
+            # 只注入目标陪伴私聊：目标流 = plugin._stream_id（plugin 解析 target_qq 得到，
+            # 随热重载更新；2026-10-10 修正——此前误读不存在的 plugin._patrol）
+            target_stream = str(getattr(self._plugin, "_stream_id", "") or "")
             if not target_stream or session_id != target_stream:
                 return False
         # admin 段若挂载了 allowed_streams 则叠加限制（留空 = 不限制）
@@ -137,6 +144,34 @@ class InjectService:
             if not is_stream_allowed(session_id, allowed):
                 return False
         return True
+
+    async def _date_header(self) -> str:
+        """日期/节假日头部（2026-10-10 由陪伴模块迁入日程注入）。
+
+        只在 ``[schedule].holiday_inject_enabled`` 开启时输出；查不到节假日信息时按
+        「工作日/周末」兜底（HolidayService 内部已有本地判断，这里再兜一层异常）。
+        模板可经 ``[prompts].inject_date_header`` 定制。
+        """
+        cfg = self._schedule_cfg()
+        if not bool(getattr(cfg, "holiday_inject_enabled", True)):
+            return ""
+        now = self._tz_manager.get_now()
+        date_str = now.strftime("%Y-%m-%d")
+        weekday = "一二三四五六日"[now.weekday()]
+        holiday_info = "周末" if now.weekday() >= 5 else "工作日"
+        if self._holiday is not None:
+            try:
+                holiday_info = await self._holiday.get_holiday_info(date_str)
+            except Exception as exc:
+                logger.debug("查询节假日失败（按星期兜底）：%s", exc)
+        template = prompt(self._plugin, "inject_date_header")
+        return render(
+            template,
+            fallback=INJECT_DATE_HEADER_DEFAULT,
+            date=date_str,
+            weekday=weekday,
+            holiday=holiday_info,
+        )
 
     # ------------------------------------------------------------
     # 后台缓存预热
@@ -328,6 +363,12 @@ class InjectService:
 
             if not inject_content:
                 return {"action": "continue"}
+
+            # 日期/节假日头部（2026-10-10：由陪伴模块迁入——只在日程块头部注一行，
+            # 开关 [schedule].holiday_inject_enabled；失败/关闭时不出现）
+            header = await self._date_header()
+            if header:
+                inject_content = header + "\n" + inject_content
 
             # 把注入文本作为 system 条目插入消息列表
             modified_payload = self._inject_system_message(payload, inject_content)
@@ -602,20 +643,33 @@ class InjectService:
 
         cfg = self._schedule_cfg()
         enable_detailed = cfg.enable_detailed_description
-        max_show = getattr(cfg, "max_future_activities", 3)
+        max_show = getattr(section_or_default(
+            self._plugin, "schedule_advanced", ScheduleAdvancedSectionConfig),
+            "max_future_activities", 3)
 
-        # 当前活动 + 时间衰减（活动状态短语已随 state_analyzer 删除）
+        # 当前活动 + 时间衰减
         remaining_hint = ""
         if remaining_minutes is not None and 0 < remaining_minutes <= 15:
             remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
 
         if enable_detailed and current_description:
-            current_line = f"现在：{current_activity}（{current_description}）{remaining_hint}"
+            current_line = render(
+                prompt(self._plugin, "inject_schedule_current_line"),
+                fallback=INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
+                activity=current_activity, description=current_description,
+                remaining_hint=remaining_hint,
+            )
         else:
-            current_line = f"现在：{current_activity}{remaining_hint}"
+            # 无描述：同一模板渲染后把空的「（…）」括注收干净（自定义模板里没有括注时无副作用）
+            current_line = render(
+                prompt(self._plugin, "inject_schedule_current_line"),
+                fallback=INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
+                activity=current_activity, description="", remaining_hint=remaining_hint,
+            )
+            current_line = current_line.replace("（）", "").replace("()", "").strip()
 
         lines: List[str] = [
-            "【可选上下文 - Bot 的当前日程】",
+            prompt(self._plugin, "inject_schedule_header"),
             current_line,
         ]
         mood = self._emotion_mood_line()
@@ -623,22 +677,35 @@ class InjectService:
             lines.append(f"精神状态：{mood}")
 
         if intent == UserIntent.QUERY_FUTURE and future_activities and max_show > 0:
-            lines.append("接下来的安排:")
+            lines.append(prompt(self._plugin, "inject_schedule_future_title"))
             for time_str, name in future_activities[:max_show]:
-                lines.append(f"  {time_str} - {name}")
-            lines.extend(["", "💡 用户询问未来计划，请自然地介绍后续安排。"])
+                lines.append(render(
+                    prompt(self._plugin, "inject_schedule_future_line"),
+                    fallback=INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
+                    time=time_str, name=name,
+                ))
+            lines.extend(["", prompt(self._plugin, "inject_hint_future")])
         elif intent == UserIntent.QUERY_CURRENT:
             if future_activities and max_show > 0:
                 time_str, name = future_activities[0]
-                lines.append(f"接下来：{time_str} - {name}")
-            lines.extend(["", "💡 用户直接询问当前状态，请如实告知，并自然带出此刻的精神状态。"])
+                line = render(
+                    prompt(self._plugin, "inject_schedule_future_line"),
+                    fallback=INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
+                    time=time_str, name=name,
+                ).strip()
+                lines.append(f"接下来：{line}")
+            lines.extend(["", prompt(self._plugin, "inject_hint_current")])
         else:
             if context_continue_inject:
-                lines.extend(["", f"💡 对话延续中（{context_reason}），可自然带过当前活动。"])
+                lines.extend(["", render(
+                    prompt(self._plugin, "inject_hint_continue"),
+                    fallback=INJECT_HINT_CONTINUE_DEFAULT,
+                    reason=context_reason or "",
+                )])
             elif proactive_hit:
-                lines.extend(["", "💡 可以在回答中自然带出此刻你正在做的事（一两句即可，不要刻意转移话题）。"])
+                lines.extend(["", prompt(self._plugin, "inject_hint_proactive")])
             else:
-                lines.extend(["", "💡 仅供参考；不相关请完全忽略，不要刻意提及。"])
+                lines.extend(["", prompt(self._plugin, "inject_hint_idle")])
 
         lines.extend(["", "---", ""])
         return "\n".join(lines)
@@ -650,7 +717,7 @@ class InjectService:
         future_activities: List[Tuple[str, str]],
         remaining_minutes: Optional[int],
     ) -> str:
-        """构建 replyer 极简 extra_prompt（~30 token + 能量基线）。"""
+        """构建 replyer 极简 extra_prompt（~30 token + 能量基线；模板可在 [prompts] 段定制）。"""
         cfg = self._schedule_cfg()
         enable_detailed = cfg.enable_detailed_description
 
@@ -658,20 +725,32 @@ class InjectService:
         if remaining_minutes is not None and 0 < remaining_minutes <= 15:
             remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
 
-        if enable_detailed and description:
-            state_line = f"你现在正在 {current_activity}（{description}）{remaining_hint}。"
-        else:
-            state_line = f"你现在正在 {current_activity}{remaining_hint}。"
+        state_line = render(
+            prompt(self._plugin, "inject_replyer_state_line"),
+            fallback=INJECT_REPLYER_STATE_LINE_DEFAULT,
+            activity=current_activity,
+            description=description if (enable_detailed and description) else "",
+            remaining_hint=remaining_hint,
+        )
+        if not (enable_detailed and description):
+            state_line = state_line.replace("（）", "").replace("()", "").strip()
 
         now = self._tz_manager.get_now()
         energy_desc = describe_energy(get_energy_level(now.hour))
 
-        lines: List[str] = ["【角色当前状态】", state_line, f"精神：{energy_desc}。"]
+        next_line = ""
         if future_activities:
             time_str, name = future_activities[0]
-            lines.append(f"接下来 {time_str} 要 {name}。")
-        lines.append("⚠️ 不要主动提及；仅在用户问到 / 强相关时自然带过。")
-        return "\n".join(lines)
+            next_line = render(
+                prompt(self._plugin, "inject_replyer_next_line"),
+                fallback=INJECT_REPLYER_NEXT_LINE_DEFAULT,
+                time=time_str, name=name,
+            )
+        return render(
+            prompt(self._plugin, "inject_replyer_status"),
+            fallback=INJECT_REPLYER_STATUS_DEFAULT,
+            state_line=state_line, energy=energy_desc, next_line=next_line,
+        )
 
     def _compute_activity_aux(
         self,
@@ -837,7 +916,8 @@ class InjectService:
                 return cached_result
 
             goal_manager = get_goal_manager()
-            cross_day_enabled = bool(self._schedule_cfg().cross_day_activity)
+            cross_day_enabled = bool(section_or_default(
+                self._plugin, "schedule_advanced", ScheduleAdvancedSectionConfig).cross_day_activity)
             goals = goal_manager.get_active_goals(chat_id="global")
             if not goals and chat_id and chat_id != "global":
                 goals = goal_manager.get_active_goals(chat_id=chat_id)

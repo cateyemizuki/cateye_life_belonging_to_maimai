@@ -29,6 +29,7 @@ LOW_MOOD_CACHE_MAX_AGE_HOURS = 72.0
 from .cleanup_service import CleanupService
 from .command_service import CommandService
 from .goal_manager import close_goal_manager, get_goal_manager
+from .holiday_service import HolidayService
 from .inject_service import InjectService
 from .proactive_service import ProactiveService
 from .schedule_generator import ScheduleGenerator
@@ -86,7 +87,9 @@ class PlanningServices:
         # 组件依赖的服务
         self.tools = ToolsService(plugin, generator=self.generator)
         self.commands = CommandService(plugin, tools_service=self.tools)
-        self.inject = InjectService(plugin)
+        #: 节假日服务（2026-10-10 由 companion 迁入 planning：日期/节假日只随日程块注入）
+        self.holiday = HolidayService(data_dir)
+        self.inject = InjectService(plugin, holiday_service=self.holiday)
         self.proactive = ProactiveService(plugin)
         self.cleanup = CleanupService(plugin, generator_factory=lambda: self.generator)
         logger.info("PlanningServices 初始化完成（完整管线已接管日程生成）")
@@ -183,8 +186,16 @@ class PlanningServices:
             asyncio.create_task(self.cleanup.run_scheduler_loop()),
             asyncio.create_task(self.inject.preheat_cache()),
             asyncio.create_task(self.proactive.run_loop()),
+            asyncio.create_task(self._preheat_holiday()),
         ]
         logger.info("PlanningServices 后台任务已启动（%d 个循环）", len(self._bg_tasks))
+
+    async def _preheat_holiday(self) -> None:
+        """预热当天节假日缓存（避免首次注入阻塞在联网查询；失败静默）。"""
+        try:
+            await self.holiday.get_holiday_info(datetime.now().strftime("%Y-%m-%d"))
+        except Exception as exc:
+            logger.debug("节假日缓存预热失败（忽略）：%s", exc)
 
     async def stop(self) -> None:
         """停止并取消全部后台任务，释放 GoalManager 单例。"""

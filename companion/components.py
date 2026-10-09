@@ -8,8 +8,8 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
 - Hooks ×5：
   - chat.receive.before_process        发送者身份缓存（BLOCKING/EARLY，只记录不拦截）
   - chat.receive.after_process         目标用户私聊时间（OBSERVE/LATE）
-  - maisaka.planner.before_request     过期主动任务块剥离 + 屏幕旁白 + 活动后缀 +
-                                       好感度 + 主动回合软约束（BLOCKING/NORMAL；
+  - maisaka.planner.before_request     过期主动任务块剥离 + 屏幕旁白 + 好感度 +
+                                       主动回合软约束（BLOCKING/NORMAL；
                                        items 强 schema 协议 + messages 双投影 +
                                        modified_kwargs 全量回传 + >8MB 载荷收缩）
   - maisaka.replyer.before_model_request  过期主动任务块剥离 + 仅屏幕旁白注入
@@ -45,9 +45,17 @@ import cateye_dashboard
 from maibot_sdk import API, Command, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
+from companion.config import target_qq_of
 from core.diag import DecisionLogger
 from core.inject import pick_payload_key, project_injection, without_stale_proactive_blocks
 from planning.schedule_query import ScheduleQuery
+from suite_prompts import (
+    INJECT_AFFECTION_BLOCK_DEFAULT,
+    TOOL_SEND_MESSAGE_DEFAULT,
+    TOOL_SEND_MESSAGE_SYSTEM_DEFAULT,
+    prompt,
+    render,
+)
 
 from .screen_context import (
     CHANNEL_PLANNER,
@@ -83,7 +91,9 @@ _DIAG_REASON_LABELS: dict[str, str] = {
     "already_sent_today": "今天已经发过（每天一次）",
     "no_user_message": "还没有用户消息记录",
     "miss_duration": "想念时长条件未满足",
-    "future_schedule": "未来窗口内有日程节点",
+    "activity_disabled": "日程巡检开关已关闭",
+    "greeting_list_parse": "名单存在非法元素（已忽略）",
+    "proactive_list_parse": "名单存在非法元素（已忽略）",
     "llm_rejected": "想念把关被 LLM 驳回",
     "planner_trigger_failed": "触发未入队（stream_id 缺失或开关关闭）",
     "disabled": "主动触发开关已关闭",
@@ -100,9 +110,13 @@ _DIAG_USAGE_TEXT = (
     "  life [天数]     — 决策日志紧凑文本（1~7 天；旧名 /cateye_test_life diag）"
 )
 
-#: 注入作用域
+#: 注入作用域（2026-10-10 注入矩阵：目标私聊 / 含陪伴用户的群聊 / 跳过）
 _SCOPE_PRIVATE = "private"
+_SCOPE_GROUP = "group"
 _SCOPE_SKIP = "skip"
+
+#: 群聊「上下文是否包含陪伴用户」的回看条数（按 msg_id 反查发送者 QQ 的窗口）
+_GROUP_TARGET_WINDOW = 20
 
 #: 决策日志动作值（core.diag.DecisionLogger 的类属性别名，源插件为模块常量 ACTION_SPOKEN）
 _ACTION_SPOKEN = DecisionLogger.ACTION_SPOKEN
@@ -212,9 +226,13 @@ class CompanionComponentsMixin:
         return str(getattr(self, "_lover_name", "") or "麦麦")
 
     def _mai_target_qq(self) -> str:
-        """目标 QQ（占位默认值/空值返回空串，用于身份判定）。"""
+        """目标 QQ（占位默认值/空值返回空串，用于身份判定）。
+
+        读取位置：``[patrol].target_qq``（2026-10-10 由 [target] 段迁入；
+        兼容 helper 仍会在旧段存在时兜底，热重载窗口不丢目标）。
+        """
         try:
-            raw = str(self.config.target.target_qq or "").strip()
+            raw = target_qq_of(self.config)
         except Exception:
             return ""
         return "" if raw in ("", "0", _PLACEHOLDER_QQ) else raw
@@ -372,9 +390,14 @@ class CompanionComponentsMixin:
         error_policy=ErrorPolicy.SKIP,
     )
     async def mai_hook_planner_inject(self, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
-        """注入陪伴上下文（屏幕旁白 + 日期行 + 当前活动 + 好感度 + 主动回合软约束）。
+        """注入陪伴上下文（屏幕旁白 + 好感度 + 主动回合软约束；2026-10-10 注入矩阵）。
 
-        屏幕旁白与活动注入相互独立，所以先算旁白——保证任何一条早退路径都不会
+        日期行与当前活动**不再由本 Hook 注入**：日期/节假日行归日程模块
+        （planning.inject_service._date_header），当前活动归日程块本身。
+        本 Hook 只负责：①屏幕旁白（仅目标私聊）；②好感度块（目标私聊恒定 /
+        含陪伴用户的群聊受 `[patrol] inject_affection_in_group` 控制）；③主动发言回合的回复目标约束（仅目标私聊）。
+
+        屏幕旁白与好感度注入相互独立，所以先算旁白——保证任何一条早退路径都不会
         把旁白丢掉。items 是强 schema 载荷：新条目 meta 必须完整，modified_kwargs
         必须全量回传（core.inject 负责构造合法快照）。
         """
@@ -416,8 +439,8 @@ class CompanionComponentsMixin:
             except Exception:
                 pass
 
-        suffix = await self._mai_build_activity_suffix(scope)
-        if scope != _SCOPE_SKIP:
+        suffix = self._mai_build_affection_suffix(scope)
+        if scope == _SCOPE_PRIVATE:
             suffix += self._mai_build_proactive_target_rule()
         if not suffix.strip():
             # 没有可注入文本：不回传收缩后的载荷（避免白丢图片）
@@ -516,15 +539,17 @@ class CompanionComponentsMixin:
         return {**kwargs, payload_key: new_payload}
 
     def _mai_resolve_injection_scope(self, session_id: str, payload: list[Any]) -> str:
-        """判断本次请求该注入哪一档上下文：``private`` / ``skip``。
+        """判断本次请求该注入哪一档陪伴上下文：``private`` / ``group`` / ``skip``。
 
-        1. session_id 等于已解析的目标私聊 stream_id → private；
-        2. 已知是私聊（会话类型 False）且最近一条用户消息的发送者 QQ 就是目标
-           用户 → private（宿主重建会话导致 stream_id 变化时的兜底）；
-        3. 其余一律 skip。判定只看 QQ 号（昵称可被伪造）；反查不到按 skip。
+        2026-10-10 注入矩阵（用户口径）：
 
-        注：源插件的群聊注入档在整合版裁剪（无 [injection] 配置段，群聊不注入
-        陪伴上下文，见 INTEGRATION.md）。
+        1. **目标陪伴私聊** → ``private``：**始终**注入好感度（陪伴模块启用时）；
+        2. **群聊且群内上下文包含陪伴用户** → ``group``：注入好感度
+           （受 ``[patrol].inject_affection_in_group`` 开关控制，默认开）；
+        3. **非陪伴用户的私聊** → ``skip``：**始终不**注入好感度；
+        4. 其余（看不到陪伴用户的群聊等）→ ``skip``。
+
+        判定只看 QQ 号（昵称可被伪造）；反查不到发送者按 skip（宁可漏注入，绝不按名字兜底）。
         """
         companion = self._mai_companion()
         if companion is None:
@@ -535,44 +560,51 @@ class CompanionComponentsMixin:
         if target_stream and sid and sid == target_stream:
             return _SCOPE_PRIVATE
 
-        # 私聊兜底：stream_id 变了（宿主重建会话）但对方确实是目标用户
         is_group = companion.session_kinds.is_group(sid)
+        # 私聊兜底：stream_id 变了（宿主重建会话）但对方确实是目标用户
         if (
             is_group is False
             and target_qq
             and sender_ids_in_window(payload, companion.senders, 1)[-1:] == [target_qq]
         ):
             return _SCOPE_PRIVATE
+        # 群聊：上下文里出现过陪伴用户（最近若干条消息的发送者含目标 QQ）
+        if (
+            is_group is True
+            and target_qq
+            and target_qq in sender_ids_in_window(payload, companion.senders, _GROUP_TARGET_WINDOW)
+        ):
+            return _SCOPE_GROUP
         return _SCOPE_SKIP
 
-    async def _mai_build_activity_suffix(self, scope: str) -> str:
-        """构造注入文本：skip 档只注入中性的日期行；private 档加状态与好感度。"""
+    def _mai_inject_affection_in_group(self) -> bool:
+        """群聊好感度注入开关（``[patrol].inject_affection_in_group``，取不到按开）。"""
+        section = getattr(getattr(self, "config", None), "patrol", None)
+        return bool(getattr(section, "inject_affection_in_group", True))
+
+    def _mai_build_affection_suffix(self, scope: str) -> str:
+        """构造好感度注入块（不含日期行——日期/节假日已归日程模块）。
+
+        - ``private``（目标私聊）：好感度块 + 关系记忆行（最近印象/关系温度/本周大事记）；
+        - ``group``（群内含陪伴用户）：只注入好感度档位块——**不带**关系记忆行，
+          避免把私聊里的相处细节带进群聊（隐私护栏）；
+        - 其余 scope 返回空串。
+        """
+        if scope == _SCOPE_SKIP:
+            return ""
+        if scope == _SCOPE_GROUP and not self._mai_inject_affection_in_group():
+            return ""
         companion = self._mai_companion()
         if companion is None:
             return ""
-        now = datetime.now()
-        current_date = now.strftime("%Y-%m-%d")
-        weekday = "一二三四五六日"[now.weekday()]
-        holiday_info = "工作日"
-        holiday_svc = getattr(companion, "holiday", None)
-        if holiday_svc is not None:
-            try:
-                holiday_info = await holiday_svc.get_holiday_info(current_date)
-            except Exception:
-                holiday_info = "工作日"
 
-        suffix = f"\n【当前日期】今天是 {current_date}（星期{weekday}），{holiday_info}。"
-        if scope == _SCOPE_SKIP:
-            return suffix
-
-        current_time = now.strftime("%H:%M")
         name = self._mai_lover_name()
         target_qq = self._mai_target_qq()
         relation = getattr(companion, "relation", None)
         relation_word = getattr(relation, "word", None) or "恋人"
         target_label = f"QQ {target_qq}" if target_qq else relation_word
         affection = companion.affection
-        # M1 注入接线（§5.6.1）：好感后缀改读 v2 5 档档位描述（经 relation profile；
+        # M1 注入接线：好感后缀改读 v2 5 档档位描述（经 relation profile；
         # 关系档案缺失时回退 affection 的「恋人」5 档基底文案）。habits 通道不在此处。
         tier = affection.tier()
         if relation is not None:
@@ -582,27 +614,20 @@ class CompanionComponentsMixin:
             tier_label = affection.tier_label()
             tier_desc = affection.tier_description()
 
-        # 无日程时不注入日程状态（日切后日程未生成时不出现占位句）
-        schedule_query = self._mai_schedule_query()
-        activity_line = ""
-        if schedule_query is not None:
-            try:
-                current = schedule_query.find_current_activity(current_date, now)
-                if current is not None:
-                    activity_line = schedule_query.format_activity_line(current, now)
-            except Exception:
-                activity_line = ""
-        if activity_line:
-            suffix += f"\n【{name}当前状态】现在 {current_time}，{name}正在{activity_line}。"
-
-        suffix += (f"\n【{name}与{relation_word}（{target_label}）的好感度】"
-                   f"档位 {tier}·{tier_label}（{tier_desc}）")
-        # M2 注入叠加（§5.6.1）：最近 1~2 条 impressions + 最近一次日结 tone；
+        block = render(
+            prompt(self.config, "inject_affection_block"),
+            fallback=INJECT_AFFECTION_BLOCK_DEFAULT,
+            name=name, relation_word=relation_word, target_label=target_label,
+            tier=tier, tier_label=tier_label, tier_desc=tier_desc,
+        )
+        if scope == _SCOPE_GROUP:
+            return block
+        # M2 注入叠加：最近 1~2 条 impressions + 最近一次日结 tone；
         # 无印象/无 tone 时返回空串，注入内容与 M1 完全一致（降级为现状）。
         memory_line = self._mai_affection_memory_line(affection)
         if memory_line:
-            suffix += "\n" + memory_line
-        return suffix
+            block += "\n" + memory_line
+        return block
 
     @staticmethod
     def _mai_affection_memory_line(affection: Any) -> str:
@@ -657,13 +682,7 @@ class CompanionComponentsMixin:
             return ""
         if (datetime.now() - last_trigger).total_seconds() > _PROACTIVE_RULE_WINDOW_SECONDS:
             return ""
-        return (
-            "\n【本轮是主动发言】现在是你在主动找对方说话（不是对方来找你）："
-            "\n- 不要回复你自己发送的消息，也不要在发言里引用你自己的消息；"
-            "\n- 优先回应对方最后一条发言；如果最后一条发言是你自己的（对方还没回你），"
-            "就当作对方还没回，直接说新内容或起一个新话题；"
-            "\n- reply 的 msg_id 只能选对方发送的消息。"
-        )
+        return prompt(self.config, "inject_proactive_turn_rule")
 
     # ==================================================================
     # Tools
@@ -698,9 +717,17 @@ class CompanionComponentsMixin:
             fallback = ("想你了呢~在忙什么呀？" if relation_word == "恋人"
                         else "在忙什么呀？最近怎么样？~")
             message = await companion.llm.generate_or_fallback(
-                prompt=f"请用{style_word}的口吻，对你的{relation_word}说一句问候或分享一件小事（20-40字）。",
+                prompt=render(
+                    prompt(self.config, "tool_send_message"),
+                    fallback=TOOL_SEND_MESSAGE_DEFAULT,
+                    style_word=style_word, relation_word=relation_word,
+                ),
                 fallback=fallback,
-                system_prompt=f"你是「{name}」（{self_desc}），此刻正主动找你的{relation_word}说话。",
+                system_prompt=render(
+                    prompt(self.config, "tool_send_message_system"),
+                    fallback=TOOL_SEND_MESSAGE_SYSTEM_DEFAULT,
+                    name=name, self_desc=self_desc, relation_word=relation_word,
+                ),
                 temperature=0.8,
                 event="tool_send_message",
             )
@@ -759,7 +786,7 @@ class CompanionComponentsMixin:
         if is_local_operator:
             return True
         try:
-            target_qq = str(self.config.target.target_qq or "").strip()
+            target_qq = target_qq_of(self.config)
         except Exception:
             return False
         if not target_qq or target_qq in ("0", _PLACEHOLDER_QQ):
@@ -1196,43 +1223,38 @@ class CompanionComponentsMixin:
         /cateye_test_dashboard 的纯文本档末行消费，多行版仅供离线测试与后续入口复用。
         """
         patrol = self.config.patrol
-        cateye_cfg = getattr(self.config, "cateye", None)
         miss_llm = "开" if getattr(patrol, "miss_llm_check_enabled", False) else "关"
-        screen = "开" if getattr(cateye_cfg, "enabled", False) else "关"
+        screen = "开" if getattr(patrol, "screen_enabled", False) else "关"
+        patrol_activity = "开" if getattr(patrol, "patrol_activity_enabled", True) else "关"
+        group_inject = "开" if getattr(patrol, "inject_affection_in_group", True) else "关"
         if multiline:
             return (
                 "⚙️ 麦麦陪伴配置摘要\n"
                 f"调度: 巡检间隔 {patrol.check_interval_minutes}min | "
-                f"每日上限 {patrol.daily_max_speak} 条 | "
-                f"最小间隔 {patrol.min_trigger_interval_minutes}min"
-                f"（早晚安{'豁免' if getattr(patrol, 'min_interval_exempt_greetings', False) else '不豁免'}"
-                f" / 想念{'豁免' if getattr(patrol, 'min_interval_exempt_miss', False) else '不豁免'}） | "
+                f"每日预算 {patrol.daily_max_speak} 条（只计巡检与想念，早晚安免预算） | "
+                f"最小间隔 {patrol.min_trigger_interval_minutes}min（早/晚安始终豁免） | "
                 f"冷却 {patrol.user_cooldown_minutes}min | "
                 f"触发开关 {'开启' if patrol.proactive_trigger_enabled else '关闭'}\n"
-                f"时间窗口: 早安 {patrol.morning_start}~{patrol.morning_end} | "
-                f"晚安 {patrol.night_start}~{patrol.night_end} | "
-                f"静默 {patrol.silence_start}~{patrol.silence_end} | "
-                f"想念 {patrol.miss_hours_min}~{patrol.miss_hours_max}h（LLM把关{miss_llm}）\n"
+                f"时间: 静默 {patrol.silence_start}~{patrol.silence_end}（早/晚安时刻由日程模块漂移驱动） | "
+                f"想念阈值 {getattr(patrol, 'miss_silence_hours', '4-8')}h（LLM把关{miss_llm}）\n"
                 f"概率: 日常 {patrol.default_speak_rate} | "
                 f"想念 {patrol.miss_speak_rate} | "
-                f"日程节点 {patrol.activity_trigger_rate}\n"
+                f"日程巡检 {patrol.activity_trigger_rate}（开关{patrol_activity}）\n"
                 f"{self._mai_config_affection_line()} | "
-                f"陪伴上下文注入: 仅目标私聊 | "
+                f"好感度注入: 目标私聊恒定 / 群聊{group_inject} | "
                 f"屏幕感知: {screen} | "
                 f"日志: {self._mai_patrol_status_line() or '（巡检未初始化）'}"
             )
         return (
             f"⚙️ 麦麦陪伴配置: 巡检间隔 {patrol.check_interval_minutes}min | "
-            f"每日上限 {patrol.daily_max_speak} 条 | "
+            f"每日预算 {patrol.daily_max_speak} 条 | "
             f"最小间隔 {patrol.min_trigger_interval_minutes}min | "
             f"冷却 {patrol.user_cooldown_minutes}min | "
             f"触发开关 {'开' if patrol.proactive_trigger_enabled else '关'} | "
-            f"早安 {patrol.morning_start}~{patrol.morning_end} | "
-            f"晚安 {patrol.night_start}~{patrol.night_end} | "
-            f"想念 {patrol.miss_hours_min}~{patrol.miss_hours_max}h（LLM把关{miss_llm}） | "
+            f"想念 {getattr(patrol, 'miss_silence_hours', '4-8')}h（LLM把关{miss_llm}） | "
             f"日常概率 {patrol.default_speak_rate} | "
             f"想念概率 {patrol.miss_speak_rate} | "
-            f"节点概率 {patrol.activity_trigger_rate} | "
+            f"巡检概率 {patrol.activity_trigger_rate} | "
             f"{self._mai_config_affection_line()} | "
             f"屏幕感知 {screen}"
         )

@@ -10,7 +10,9 @@ M10 第 6 段（附录 §五，裁决 B2/B4）：**到期时刻从「绝对时�
   ``[schedule] sleep_time`` 锚点（B4："有日程用日程、无日程用锚点"）。
 - 硬约束（B2）：**生成时刻 ≤ 新一天起点 − 30 分钟**（新一天起点 = ``[schedule] wake_time``
   锚点，与 L2 早安基准同一概念）；相对延迟算出的时刻更晚 → **强制拉回**该阈值。
-- 旧字段 ``auto_generate_time``（绝对时刻）**deprecated、兼容读取**，且同样受 30 分钟硬约束钳制；
+- 旧字段 ``auto_generate_time``（绝对时刻）**deprecated、兼容读取**（2026-10-10 起住在
+  ``[schedule_advanced]`` 隐藏位，判定经 :class:`TimingConfigView` 两段合并读取），
+  且同样受 30 分钟硬约束钳制；
   两字段都被**显式配置**时新字段优先（判定见 :func:`resolve_generate_timing`，与 T7
   ``evaluate_mode``/``evaluate_on_reply`` 迁移同一 ``model_fields_set`` 惯例）。
 - "非睡眠条目"的判定与读数**不在本模块另立口径**：走 ``planning/schedule_items.py``
@@ -32,9 +34,14 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.llm_utils import llm_task_name_of
 from core.time_utils import parse_hhmm
 
-from .config import section_or_default, ScheduleSectionConfig
+from .config import (
+    ScheduleAdvancedSectionConfig,
+    ScheduleSectionConfig,
+    section_or_default,
+)
 from .schedule_items import last_non_sleep_end_minute
 
 logger = logging.getLogger(__name__)
@@ -48,6 +55,8 @@ _DEFAULT_WAKE_MINUTES = 7 * 60
 _DEFAULT_SLEEP_MINUTES = 23 * 60
 #: 旧字段（绝对时刻）的兜底值：与字段默认值同源（非法输入回退它）
 _DEFAULT_ABSOLUTE_TIME = "00:30"
+#: 相对延迟的出厂值（resolve_generate_timing 的值判断口径）
+_DEFAULT_DELAY_MINUTES = 90
 #: 同上，分钟形态（``parse_hhmm`` 的兜底）
 _DEFAULT_ABSOLUTE_MINUTES = 30
 #: 生成时刻口径（``resolve_generate_timing`` 的返回值）
@@ -115,28 +124,45 @@ def baseline_minutes(items: Optional[List[Dict[str, Any]]], *,
     return in_frame_minutes(end, wake_minutes)
 
 
+class TimingConfigView:
+    """生成时刻判定视图：``[schedule]`` 的延迟字段 + ``[schedule_advanced]`` 的旧绝对时刻字段。
+
+    2026-10-10 段拆分后 ``auto_generate_time`` 住在 ``[schedule_advanced]``（隐藏兼容位），
+    而 ``auto_generate_after_last_end_minutes`` 仍在 ``[schedule]``——判定需要同时看到两段，
+    故用本视图按"先基础段、后高级段"的属性查找合并（找不到的属性照旧抛 AttributeError）。
+    """
+
+    def __init__(self, schedule_cfg: Any, advanced_cfg: Any) -> None:
+        object.__setattr__(self, "_sections", (schedule_cfg, advanced_cfg))
+
+    def __getattr__(self, name: str) -> Any:
+        for section in object.__getattribute__(self, "_sections"):
+            if section is not None and hasattr(section, name):
+                return getattr(section, name)
+        raise AttributeError(name)
+
+
 def resolve_generate_timing(cfg: Any) -> Tuple[str, Any]:
     """裁定生效的生成时刻口径（B2 + 旧字段兼容读取 + 优先级）。
 
-    - 新字段 ``auto_generate_after_last_end_minutes`` 被**显式配置** → ``(TIMING_RELATIVE, 分钟数)``
-      （**优先**：两字段同时配置时以它为准）；
-    - 否则旧字段 ``auto_generate_time`` 被显式配置 → ``(TIMING_ABSOLUTE, "HH:MM")``
+    - 新字段 ``auto_generate_after_last_end_minutes`` 偏离缺省（90） → ``(TIMING_RELATIVE, 分钟数)``
+      （**优先**：两字段都像"配过"时以新字段为准）；
+    - 否则旧字段 ``auto_generate_time`` 偏离出厂值（00:30） → ``(TIMING_ABSOLUTE, "HH:MM")``
       （deprecated 兼容路径，按绝对时刻理解）；
-    - 两者都没显式配置 → ``(TIMING_RELATIVE, 新字段当前值/缺省)``。
+    - 两者都是出厂值 → ``(TIMING_RELATIVE, 缺省 90)``。
 
-    "显式配置"沿用 T7 迁移（``evaluate_mode`` / ``evaluate_on_reply``）的 ``model_fields_set``
-    惯例：非 pydantic 配置对象（骨架/测试桩）没有该属性 → 一律走相对路径。
+    口径说明（2026-10-10）：宿主会把缺失键用默认值补齐后再交给插件，``model_fields_set``
+    因此**不再能**区分"用户配过/没配过"；改为**值判断**——偏离出厂值即视为用户配置过。
+    旧字段已隐藏进 ``[schedule_advanced]``（不占界面），只为兼容既有配置保留——
+    因此生产调用点传的是 :class:`TimingConfigView`（两段合并视图），直调 ``[schedule]`` 单段时
+    旧字段自然取不到（无兼容路径生效，行为 = 相对延迟）。
     """
     delay = _as_minutes(getattr(cfg, "auto_generate_after_last_end_minutes", None), 90)
-    fields_set = getattr(cfg, "model_fields_set", None)
-    if fields_set is None:
+    if delay != _DEFAULT_DELAY_MINUTES:
         return TIMING_RELATIVE, delay
-    if "auto_generate_after_last_end_minutes" in fields_set:
-        return TIMING_RELATIVE, delay
-    if "auto_generate_time" in fields_set:
-        absolute = _normalize_time_str(str(getattr(cfg, "auto_generate_time", "") or ""),
-                                       _DEFAULT_ABSOLUTE_TIME)
-        return TIMING_ABSOLUTE, absolute
+    legacy_raw = str(getattr(cfg, "auto_generate_time", "") or "").strip()
+    if legacy_raw and legacy_raw != _DEFAULT_ABSOLUTE_TIME:
+        return TIMING_ABSOLUTE, _normalize_time_str(legacy_raw, _DEFAULT_ABSOLUTE_TIME)
     return TIMING_RELATIVE, delay
 
 
@@ -186,7 +212,7 @@ class ScheduleAutoScheduler:
             return
         self.is_running = True
         self.task = asyncio.create_task(self._schedule_loop())
-        logger.info("日程定时生成已启动 - %s", self._describe_timing(cfg))
+        logger.info("日程定时生成已启动 - %s", self._describe_timing(self._timing_view()))
 
     async def stop(self) -> None:
         """停止定时任务并等待退出。"""
@@ -205,6 +231,13 @@ class ScheduleAutoScheduler:
     # ------------------------------------------------------------
     # 到期时刻（B2：按日期 + 相对锚点；全部可注入时钟直测）
     # ------------------------------------------------------------
+
+    def _timing_view(self) -> TimingConfigView:
+        """两段合并的生成时刻视图（延迟在 [schedule]、旧绝对时刻在 [schedule_advanced]）。"""
+        return TimingConfigView(
+            section_or_default(self.plugin, "schedule", ScheduleSectionConfig),
+            section_or_default(self.plugin, "schedule_advanced", ScheduleAdvancedSectionConfig),
+        )
 
     def _describe_timing(self, cfg: Any) -> str:
         """启动日志用的口径描述（不参与判定）。"""
@@ -284,7 +317,7 @@ class ScheduleAutoScheduler:
         while self.is_running:
             try:
                 now = datetime.now()
-                cfg = section_or_default(self.plugin, "schedule", ScheduleSectionConfig)
+                cfg = self._timing_view()
                 target_date, due_at = self._pending_generation(now, cfg)
 
                 if self._is_time_due(now, target_date, due_at):
@@ -336,6 +369,7 @@ class ScheduleAutoScheduler:
                 return
 
             cfg = section_or_default(self.plugin, "schedule", ScheduleSectionConfig)
+            adv = section_or_default(self.plugin, "schedule_advanced", ScheduleAdvancedSectionConfig)
             personality = str(getattr(self.plugin, "_personality", "") or "")
             lover_name = str(getattr(self.plugin, "_lover_name", "") or "麦麦")
 
@@ -347,22 +381,22 @@ class ScheduleAutoScheduler:
                 sleep_time=cfg.sleep_time,
                 min_activities=cfg.min_activities,
                 max_activities=cfg.max_activities,
-                timeout_seconds=cfg.generation_timeout,
-                use_multi_round=cfg.use_multi_round,
-                max_rounds=cfg.max_rounds,
-                quality_threshold=cfg.quality_threshold,
+                timeout_seconds=adv.generation_timeout,
+                use_multi_round=adv.use_multi_round,
+                max_rounds=adv.max_rounds,
+                quality_threshold=adv.quality_threshold,
                 enable_detailed_description=cfg.enable_detailed_description,
-                min_description_length=cfg.min_description_length,
-                max_description_length=cfg.max_description_length,
-                max_tokens=cfg.max_tokens,
+                min_description_length=adv.min_description_length,
+                max_description_length=adv.max_description_length,
+                max_tokens=adv.max_tokens,
                 custom_prompt=cfg.custom_prompt,
-                recent_schedule_days=cfg.recent_schedule_days,
-                history_message_limit=cfg.history_message_limit,
-                knowledge_search_limit=cfg.knowledge_search_limit,
-                cross_day_activity=cfg.cross_day_activity,
+                recent_schedule_days=adv.recent_schedule_days,
+                history_message_limit=adv.history_message_limit,
+                knowledge_search_limit=adv.knowledge_search_limit,
+                cross_day_activity=adv.cross_day_activity,
                 no_sleep_mode=cfg.no_sleep_mode,
-                timezone=cfg.timezone,
-                llm_task_name=cfg.llm_task_name,
+                timezone=adv.timezone,
+                llm_task_name=llm_task_name_of(self.plugin),
             )
             logger.info("自动生成日程成功: %s - 共 %d 个活动", target, len(items))
 

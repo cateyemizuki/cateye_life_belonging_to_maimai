@@ -15,7 +15,11 @@ import logging
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from .config import ScheduleSectionConfig, section_or_default
+from .config import (
+    ScheduleAdvancedSectionConfig,
+    ScheduleSectionConfig,
+    section_or_default,
+)
 from .goal_manager import get_goal_manager
 from .schedule_image import ScheduleImageGenerator
 from .stream_filter import is_stream_allowed
@@ -65,11 +69,15 @@ class CommandService:
     def _enable_detailed_description(self) -> bool:
         return section_or_default(self._plugin, "schedule", ScheduleSectionConfig).enable_detailed_description
 
+    def _advanced_cfg(self) -> ScheduleAdvancedSectionConfig:
+        """日程高级段（`[schedule_advanced]`：绘图开关 / 时区等）。"""
+        return section_or_default(self._plugin, "schedule_advanced", ScheduleAdvancedSectionConfig)
+
     def _schedule_cfg(self) -> ScheduleSectionConfig:
         return section_or_default(self._plugin, "schedule", ScheduleSectionConfig)
 
     def _make_tz_manager(self) -> TimezoneManager:
-        return TimezoneManager(self._schedule_cfg().timezone)
+        return TimezoneManager(self._advanced_cfg().timezone)
 
     def _tools_svc(self) -> Optional[Any]:
         return self._tools_service or getattr(self._plugin, "_planning_tools", None)
@@ -224,7 +232,7 @@ class CommandService:
         超时由 ``image_timeout_seconds`` 配置控制；PIL 是同步阻塞操作，
         统一丢给默认线程池执行，避免阻塞事件循环。
         """
-        cfg = self._schedule_cfg()
+        cfg = self._advanced_cfg()
         if not cfg.list_draw_image:
             return None
 

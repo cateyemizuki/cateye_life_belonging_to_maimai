@@ -29,6 +29,8 @@
    - 跑离线测试（**脚本在相邻仓库目录，不在本插件内**）：
      `D:\deepseek-harness_workspace\maibot-plugins\scratch\smoke_test_cateye_test.py`（40 组件 + 配置模型 + 能力核对）与
      `...\scratch\behavior_test_cateye_test.py`（核心算法回归，需同目录 `sdk_stub.py` 配合），
+     以及 `...\scratch\_config_round_checks.py`（2026-10-10 配置整理轮新增：统一名单系统 / 问候候选矩阵 /
+     陪伴注入矩阵 / 配置迁移幂等 / 提示词模板可渲染 / 日期头部——**改动配置模型、名单、提示词或注入时必跑**），
      以 `cd maibot-plugins\scratch` 为工作目录执行（脚本内硬编码插件路径，可从该目录回指插件）；
      **新增算法必须配新用例**；随后按
      [TEST_PROCEDURE.md](TEST_PROCEDURE.md) 的 SOP 做宿主级验证（L1 热重载 + L2 注入场景）；
@@ -712,6 +714,37 @@ README 组件表 / USAGE 命令表 / 相关模块 `INTEGRATION.md` / 本计划�
   - **待裁三点**：①重入口径（锚点整夜 vs 截到重入时刻 vs 混合）；②`sleep_started` 宣告守卫；③`ended_cycle` 取值时序（与 ① 同批裁——单独改会破坏附录 §2.3「每 `cycle_key` 结算 1 次」）。
   - **生成侧护栏缺口（同批登记）**：日程条目时间只做下界约束、validator 语义校验保留为告警不拦截（`planning/generator/validator.py:97-127`）→ 生成端可产出夜窗内清醒条目。
 - **P5 余项：非目标类问候跨热重载去重（2026-10-09 登记）**：`morning_sent`/`night_sent` 标记按天全局且**仅目标类写入**，非目标类（群聊 / 非目标私聊）查全局会误杀多群全发 → 跨热重载去重需另立按流持久化口径，待议（W1 未实现；见 §9.5）。
+
+---
+
+## 十一、2026-10-10 配置整理轮（用户直派；非里程碑）
+
+> 性质：用户直接下达的配置面整理任务（"内部逻辑规整 + 配置项更新"），不占 §七 路线图编号；
+> 实施与验收口径见本轮工作报告 `work_report/20261010_0700_配置整理轮_陪伴注入矩阵与配置重排.md`。
+
+**目标（用户原话归纳）**：①内部逻辑规整——陪伴与日程的早/晚安不重复触发、注入矩阵定稿；
+②配置项按"一眼能懂 + 深度可定制"重排；③提示词与 LLM 调用双集中。
+
+**落地要点**
+
+1. **段布局**：11 段（plugin / patrol / affection / schedule / schedule_advanced / planning_proactive /
+   llm / prompts / admin / qzone / emotion）。`[target]`→`[patrol]`、`[cateye]`→`[patrol].screen_*`、
+   `[judge]`→`[llm]`、`[inject]`+`[planning_cleanup]`→`[schedule_advanced]`、提示词→`[prompts]`。
+   **`config_version` 有意不递增**：宿主在版本变化时会先按新骨架重建（丢弃跨段旧键），
+   迁移必须在插件侧执行（见 `suite_config.py` 模块 docstring）。
+2. **注入矩阵**：目标私聊始终好感度；其他私聊只有日程；群聊仅在上下文含陪伴用户且开关开启时给档位块；
+   日期/节假日由 planning 注入日程块头部（`holiday_inject_enabled` / `holiday_affects_schedule`）。
+3. **早/晚安**：唯一驱动链（planning 漂移）+ 两个总开关 + 统一名单（群/私聊 + 模式，目标 QQ 恒为私聊黑名单）；
+   陪伴侧不触发、只去重；问候**始终免预算**，预算只统计"日程巡检 + 想念"（上限 = `daily_max_speak`）。
+4. **移除**：想念避让未来日程、两处最小间隔豁免开关、目标私聊打扰上限、旧问候四名单/前缀名单、
+   想念阈值两字段（并 `miss_silence_hours`）、`auto_generate_time`（降级隐藏兼容位）。
+5. **双集中**：`suite_prompts.py`（提示词唯一真源 + `[prompts]` 段）与 `core/llm_utils.py`
+   （唯一模型出口；`role_judge` 与屏幕 VLM 两处绕行收编，`emotion` 恒复用主实例）。
+6. **验证**：离线门 `smoke_test_cateye_test.py`（含旧配置迁移用例）与 `behavior_test_cateye_test.py` 全绿；
+   **宿主级验证（L1 热重载 + 真机迁移落盘 + WebUI 渲染）仍待宿主级会话执行**（回归清单见 USAGE §十 末尾）。
+
+**遗留（登记）**：① 非目标类问候跨热重载去重（§10.3 既有待议项，未在本轮动）；
+② `[prompts]` 61 字段在 WebUI 的编辑体验需真机确认；③ 发布身份 `release/lbm-1.0.0` 是否随本轮同步（待用户裁定）。
 
 ---
 

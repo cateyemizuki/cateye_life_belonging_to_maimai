@@ -1,5 +1,12 @@
 # planning/ — 自主规划子模块（复刻自 autonomous_planning_plugin v4.9.1）
 
+> **2026-10-10 配置整理轮（模块侧变更）**：配置段 = `[schedule]`（基础）/ `[schedule_advanced]`（高级，
+> 收纳原 `[inject]` 与 `[planning_cleanup]` 全部字段）/ `[planning_proactive]`（主动行为）；任务名迁顶层 `[llm]`，
+> 提示词迁顶层 `[prompts]`（`suite_prompts.py`）。名单系统合并为群聊/私聊两份 + 模式开关（目标陪伴 QQ 始终按私聊黑名单）；
+> 新增早/晚安两个总开关；`holiday_service.py` 由 companion 迁入本模块，日期/节假日行由 `inject_service._date_header()`
+> 注入日程块头部（开关 `[schedule] holiday_inject_enabled`，可另开 `holiday_affects_schedule` 让生成考虑节假日）；
+> 角色裁判改走 `LLMService`（提示词 `[prompts].schedule_role_judge`）；`auto_generate_time` 降级为高级段隐藏兼容位（值判断口径）。
+
 > 来源：`xuqian13.autonomous-planning-plugin-v4`（上游 xuqian13，cateye 维护 fork，AGPL-3.0）。
 > 许可提示：本子模块为机制复刻（重写实现），若后续大量照搬源码，发布时整体应按 AGPL-3.0。
 

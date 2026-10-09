@@ -13,7 +13,7 @@
 任何异常都不外抛——电脑状态属于锦上添花，绝不能阻塞主动消息触发。
 
 另含 :func:`describe_image`：多模态消息列表形式的 VLM 调用
-（源插件放 LLMService.describe_image；本整合插件的 LLMService 在 core/llm_utils
+（2026-10-10 起 describe_image 收编到 core/llm_utils.LLMService；旧注释保留见下
 是共享文件不允许扩展，故落在本模块）。
 """
 
@@ -25,7 +25,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+from companion.config import target_qq_of
 from core.diag import LLMCallLogger
+from core.llm_utils import LLMService, purpose_task
+from suite_prompts import prompt as prompt_of
 
 # cateye 统一连接插件（cateye.connect-hub）公共 API 全名
 HUB_API_STATUS = "cateye.connect-hub.status"
@@ -57,76 +60,12 @@ class ScreenPeek:
         return self.status == PEEK_OK and bool(self.description)
 
 
-async def describe_image(
-    ctx: Any,
-    vlm_task: str,
-    image_b64: str,
-    prompt: str,
-    *,
-    call_logger: Optional[LLMCallLogger] = None,
-    event: str = "cateye_screen_describe",
-) -> str:
-    """用视觉模型解读一张图片，返回一句话描述；失败返回空字符串。
-
-    图片以多模态 content 段（Data URL 形式）传入；任务名走 ``task_name``
-    路由（与 core/llm_utils 同一约定）。max_tokens 512：一句话描述用不完，
-    但思考型模型在更小预算下会把 token 全花在思考上、正文为空。
-
-    Args:
-        ctx: PluginContext（ctx.llm.generate / ctx.logger）。
-        vlm_task: 视觉模型任务名（宿主 model_config 的任务键）。
-        image_b64: 图片 base64（PNG）。
-        prompt: 视觉理解提示词。
-        call_logger: LLM 调用日志记录器（可选）。
-        event: 事件来源标注（写入调用日志）。
-    """
-    message: list[dict[str, Any]] = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
-                },
-            ],
-        }
-    ]
-
-    def _log(success: bool, response: str = "", error: str = "") -> None:
-        if call_logger is None:
-            return
-        try:
-            call_logger.record(event=event, task=vlm_task, success=success,
-                               response=response, error=error)
-        except Exception:
-            pass
-
-    try:
-        result: Any = await ctx.llm.generate(
-            prompt=message, task_name=vlm_task or "vlm", temperature=0.3, max_tokens=512
-        )
-    except Exception as e:
-        ctx.logger.error(f"视觉模型调用异常: {e}")
-        _log(False, "", str(e))
-        return ""
-    if isinstance(result, dict) and result.get("success"):
-        response = str(result.get("response", "") or "").strip()
-        if response:
-            _log(True, response)
-            return response
-        # 成功但空回复单独识别：reasoning 通常是思考型模型把 token 花在思考上的直接证据
-        detail = "模型返回空内容（可能被 max_tokens 截断，或截图无内容可描述）"
-        reasoning = str(result.get("reasoning", "") or "").strip()
-        if reasoning:
-            detail += f"；思考尾部: {reasoning[-160:]}"
-        ctx.logger.warning(f"视觉模型生成失败: {detail}")
-        _log(False, "", detail)
-        return ""
-    error = str((result or {}).get("error") or "宿主返回失败但未携带 error 信息")
-    ctx.logger.warning(f"视觉模型生成失败: {error}")
-    _log(False, "", error)
-    return ""
+def _fallback_llm(plugin: Any) -> Any:
+    """兜底 LLM 实例（服务束未注入时用 plugin._llm；两者都缺则 None）。"""
+    existing = getattr(plugin, "_llm", None)
+    if isinstance(existing, LLMService):
+        return existing
+    return None
 
 
 class CateyeClient:
@@ -135,9 +74,9 @@ class CateyeClient:
     def __init__(self, plugin: Any, llm: Any = None, call_logger: Optional[LLMCallLogger] = None) -> None:
         """
         Args:
-            plugin: 整合插件实例（读 plugin.config.cateye / plugin.config.target）。
-            llm: 未直接使用（保留参数位以便未来复用 core LLMService）。
-            call_logger: LLM 调用日志记录器（VLM 调用记录用）。
+            plugin: 整合插件实例（读 plugin.config.patrol 的 screen_* / [llm] / [prompts]）。
+            llm: 统一 LLMService（2026-10-10 起 VLM 调用经它发出）。
+            call_logger: 保留参数（调用留痕已由 LLMService 的 call_logger 承担）。
         """
         self._plugin = plugin
         self._ctx = plugin.ctx
@@ -149,11 +88,13 @@ class CateyeClient:
     # ------------------------------------------------------------
     # 配置（运行时动态读，热重载即时生效）
     # ------------------------------------------------------------
-    def _cateye_cfg(self) -> Any:
-        return getattr(self._plugin.config, "cateye", None)
+    def _screen_cfg(self) -> Any:
+        """屏幕感知配置（2026-10-10 起在 [patrol] 段，字段前缀 screen_*）。"""
+        section = getattr(self._plugin.config, "patrol", None) or getattr(self._plugin.config, "cateye", None)
+        return section
 
     def _target_qq(self) -> str:
-        return str(getattr(self._plugin.config.target, "target_qq", "") or "")
+        return target_qq_of(self._plugin.config)
 
     # ------------------------------------------------------------
     # 对外入口
@@ -161,7 +102,11 @@ class CateyeClient:
 
     def is_enabled(self) -> bool:
         """功能开关（配置段缺失时安全回退 False）。"""
-        return bool(getattr(self._cateye_cfg(), "enabled", False))
+        cfg = self._screen_cfg()
+        value = getattr(cfg, "screen_enabled", None)
+        if value is None:
+            value = getattr(cfg, "enabled", False)   # 旧 [cateye].enabled 兜底
+        return bool(value)
 
     async def peek_screen(self, now: datetime) -> Optional[ScreenPeek]:
         """看一眼陪伴对象电脑。
@@ -174,7 +119,9 @@ class CateyeClient:
         if not self.is_enabled():
             return None
         try:
-            timeout = float(getattr(self._cateye_cfg(), "timeout_seconds", 20.0))
+            cfg = self._screen_cfg()
+            timeout = float(getattr(cfg, "screen_timeout_seconds", None)
+                            or getattr(cfg, "timeout_seconds", 20.0))
             return await asyncio.wait_for(self._peek(now), timeout=max(5.0, timeout))
         except asyncio.TimeoutError:
             self._ctx.logger.info("查看陪伴对象电脑超时，本轮不注入屏幕感知")
@@ -231,7 +178,10 @@ class CateyeClient:
 
     async def _take_screenshot(self) -> str:
         """截取陪伴对象电脑屏幕，成功返回 base64 PNG，失败返回空串。"""
-        blur = int(getattr(self._cateye_cfg(), "screenshot_blur", 0) or 0)
+        cfg = self._screen_cfg()
+        blur = int(getattr(cfg, "screen_blur", None)
+                   if getattr(cfg, "screen_blur", None) is not None
+                   else (getattr(cfg, "screenshot_blur", 0) or 0))
         user_id = self._target_qq()
         try:
             resp = await self._ctx.api.call(HUB_API_SCREENSHOT, user_id=user_id, blur=blur)
@@ -245,11 +195,19 @@ class CateyeClient:
         return str(resp.get("image_base64", "") or "")
 
     async def _describe_screenshot(self, image_b64: str) -> str:
-        """用视觉模型把截图转成一句话描述，失败返回空串。"""
-        cfg = self._cateye_cfg()
-        prompt = str(getattr(cfg, "describe_prompt", "") or "")
-        vlm_task = str(getattr(cfg, "vlm_task", "vlm") or "vlm")
-        return await describe_image(
-            self._ctx, vlm_task, image_b64, prompt,
-            call_logger=self._call_logger, event="cateye_screen_describe",
+        """用视觉模型把截图转成一句话描述，失败返回空串。
+
+        调用统一走 ``core.llm_utils.LLMService.describe_image``（2026-10-10 收编：
+        所有 LLM 调用只从这一个模块发出）；提示词与任务名分别来自
+        ``[prompts].screen_describe`` 与 ``[llm].vlm_task``。
+        """
+        llm = self._llm or _fallback_llm(self._plugin)
+        if llm is None:
+            return ""
+        describe_prompt = prompt_of(self._plugin, "screen_describe")
+        vlm_task = purpose_task(self._plugin, "vlm", default="vlm")
+        return await llm.describe_image(
+            image_b64, describe_prompt,
+            task_name=vlm_task, temperature=0.3, max_tokens=512,
+            event="cateye_screen_describe",
         )

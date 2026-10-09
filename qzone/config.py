@@ -19,7 +19,7 @@ class QzoneSectionConfig(PluginConfigBase):
 
     __ui_label__ = "QQ 空间"
     __ui_icon__ = "cloud"
-    __ui_order__ = 5
+    __ui_order__ = 10
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "QQ Zone", "description": "Post moments by schedule, auto reply to comments."}
     }
@@ -41,7 +41,11 @@ class QzoneSectionConfig(PluginConfigBase):
         ge=0,
         le=20,
         description="每日最多发几条说说；0=不发",
-        json_schema_extra={"label": "每日说说上限", **_ui_i18n("Daily post limit")},
+        json_schema_extra={
+            "label": "每日说说上限",
+            "hint": "0 = 当天不发说说",
+            **_ui_i18n("Daily post limit"),
+        },
     )
     post_rate: float = Field(
         default=0.5,
@@ -75,7 +79,11 @@ class QzoneSectionConfig(PluginConfigBase):
         ge=1,
         le=20,
         description="自动回评检查自己最近多少条说说下的评论",
-        json_schema_extra={"label": "回评检查条数", **_ui_i18n("Reply window (feeds)")},
+        json_schema_extra={
+            "label": "回评检查条数",
+            "hint": "越大越不会漏回评论，检查量与模型成本也越大",
+            **_ui_i18n("Reply window (feeds)"),
+        },
     )
     reply_probability: float = Field(
         default=1.0,
@@ -89,11 +97,6 @@ class QzoneSectionConfig(PluginConfigBase):
         description="回退路径：cookie 不可用无法读评论正文时，检测到评论数变化经 maisaka 主动提醒",
         json_schema_extra={"label": "新评论主动提醒", **_ui_i18n("Notify new comments")},
     )
-    llm_task_name: str = Field(
-        default="utils",
-        description="说说文案/回评生成的模型任务名（utils/replyer 等，走宿主任务路由）",
-        json_schema_extra={"label": "生成任务名", **_ui_i18n("LLM task")},
-    )
     silence_start: str = Field(
         default="01:00",
         description="空间静默时段开始（HH:MM）：静默期内巡检不发说说、不监听评论（支持跨午夜；配置非法按静默处理）",
@@ -102,7 +105,11 @@ class QzoneSectionConfig(PluginConfigBase):
     silence_end: str = Field(
         default="08:00",
         description="空间静默时段结束（HH:MM）",
-        json_schema_extra={"label": "空间静默结束", **_ui_i18n("QZone silence end")},
+        json_schema_extra={
+            "label": "空间静默结束",
+            "hint": "HH:MM；静默期内不发说说、不回评",
+            **_ui_i18n("QZone silence end"),
+        },
     )
     napcat_http_host: str = Field(
         default="",

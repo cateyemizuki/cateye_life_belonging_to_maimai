@@ -24,6 +24,11 @@ from typing import Any, Dict, List, Optional
 
 from core.llm_utils import LLMService
 from core.time_utils import parse_hhmm
+from suite_prompts import (
+    SCHEDULE_HOLIDAY_CONTEXT_DEFAULT,
+    prompt as prompt_of,
+    render,
+)
 from .exceptions import (
     LLMError,
     LLMInvalidResponseError,
@@ -200,6 +205,7 @@ class ScheduleGenerator:
         self._load_sync_contexts(base, gen_config, date)
         self._load_emotion_context(base)
         self._load_low_mood(base)
+        await self._load_holiday_context(base, date)
         await self._load_async_contexts(base, gen_config, date)
 
         # 多轮 / 单轮生成
@@ -357,6 +363,8 @@ class ScheduleGenerator:
             if value is not None and value != "":
                 cfg[dst_key] = value
         cfg["bot_profile"] = profile
+        # 2026-10-10：把 plugin 引用带进生成配置字典（提示词读 [prompts] 段用；to_dict 会透传）
+        cfg["plugin"] = self._plugin
         task_name = str(kwargs.get("llm_task_name") or "").strip()
         if task_name:
             cfg["llm_task_name"] = task_name
@@ -398,8 +406,9 @@ class ScheduleGenerator:
             logger.debug("今日约定加载失败: %s", exc)
 
     def _emotion_influence(self) -> float:
-        """``schedule.emotion_influence``（0~1，默认 0.6；0=关闭），运行期活取值。"""
-        cfg = getattr(getattr(self._plugin, "config", None), "schedule", None)
+        """``[schedule_advanced].emotion_influence``（0~1，默认 0.6；0=关闭），运行期活取值。"""
+        cfg = (getattr(getattr(self._plugin, "config", None), "schedule_advanced", None)
+               or getattr(getattr(self._plugin, "config", None), "schedule", None))
         value = getattr(cfg, "emotion_influence", 0.6)
         try:
             influence = float(value)
@@ -433,10 +442,45 @@ class ScheduleGenerator:
                 if callable(mood_getter):
                     mood = str(mood_getter() or "").strip()
                     levels = None
-            base.emotion_context = build_emotion_context(mood, levels, influence)
+            base.emotion_context = build_emotion_context(mood, levels, influence,
+                                                         plugin=self._plugin)
         except Exception as exc:
             base.emotion_context = ""
             logger.debug("睡醒情绪上下文装载失败（忽略）: %s", exc)
+
+    async def _load_holiday_context(self, base: BaseScheduleGenerator, date: str) -> None:
+        """节假日上下文（2026-10-10）：``[schedule] holiday_affects_schedule`` 开启时装载。
+
+        取数走 planning 自己的 ``HolidayService``（``plugin._planning.holiday``；多级降级 +
+        3 天 TTL 磁盘缓存），命中节假日/补班时把「今天是 X（星期Y）：节假日状态」写进生成
+        提示词；开关关闭 / 服务不可得 / 查询失败一律空串（**行为与旧版逐字一致**）。
+        """
+        base.holiday_context = ""
+        try:
+            cfg = (getattr(getattr(self._plugin, "config", None), "schedule", None)
+                   if self._plugin is not None else None)
+            if not bool(getattr(cfg, "holiday_affects_schedule", False)):
+                return
+            planning = getattr(self._plugin, "_planning", None)
+            holiday_svc = getattr(planning, "holiday", None)
+            if holiday_svc is None:
+                return
+            info = await holiday_svc.get_holiday_info(str(date or ""))
+            info = str(info or "").strip()
+            if not info:
+                return
+            try:
+                weekday = "一二三四五六日"[datetime.strptime(str(date), "%Y-%m-%d").weekday()]
+            except Exception:
+                weekday = "?"
+            base.holiday_context = render(
+                prompt_of(self._plugin, "schedule_holiday_context"),
+                fallback=SCHEDULE_HOLIDAY_CONTEXT_DEFAULT,
+                date=str(date), weekday=weekday, holiday=info,
+            )
+        except Exception as exc:
+            base.holiday_context = ""
+            logger.debug("节假日上下文装载失败（忽略）: %s", exc)
 
     def _load_low_mood(self, base: BaseScheduleGenerator) -> None:
         """M5（§6.2 F）：装载连续低迷天数（优先情绪服务实时状态，回退 planning 的事件缓存）。

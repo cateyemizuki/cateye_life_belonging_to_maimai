@@ -1,5 +1,15 @@
 # companion/ — 虚拟陪伴子模块（复刻自 maibot-community_mai-love v2.6.3）
 
+> **2026-10-10 配置整理轮（模块侧变更）**：配置段合并为 **`[patrol]`（陪伴模块 = 目标用户 + 巡检 + 屏幕感知）**
+> 与 `[affection]` 两段——原 `[target]`（target_qq）与 `[cateye]`（屏幕感知，字段前缀改 `screen_*`）并入 `[patrol]`；
+> 原 `[judge]` 与新任务名字段统一迁入顶层 `[llm]`；全部提示词迁入顶层 `[prompts]`（`suite_prompts.py` 为唯一真源，
+> 业务侧一律 `prompt(plugin, "字段名")` 读取）。其余变更：想念阈值合并为 `miss_silence_hours`（"4-8"/单数字 N=0~N）、
+> 删除想念避让未来日程与两处最小间隔豁免开关（早/晚安**始终**豁免、想念不豁免）、删除目标私聊打扰上限
+> （预算上限 = `daily_max_speak`）、新增 `patrol_activity_enabled`（日程巡检开关）与 `inject_affection_in_group`（群聊好感注入）；
+> **注入矩阵**：`_mai_resolve_injection_scope` 返回 private/group/skip，`_mai_build_activity_suffix` 已被
+> `_mai_build_affection_suffix` 取代（日期/节假日行改由 planning 注入）；`patrol.py` 不再触发问候（只做去重观察）。
+> VLM 调用收编进 `core/llm_utils.LLMService.describe_image`。
+
 > 来源：`maibot-community.mai-love`（原作者 octmicy，cateye 维护 fork，MIT）。
 > **日程生成不复刻**：mai-love 的日程系统由 planning/ 子模块提供，本模块只消费
 > `planning.schedule_query.ScheduleQuery`（当前活动 / 未来活动 / 全天摘要）。

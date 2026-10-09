@@ -1,4 +1,4 @@
-"""LLM 调用封装。
+"""LLM 调用封装（**插件内所有模型调用的唯一出口**）。
 
 统一走宿主 ctx.llm.generate，按开发文档 §8.3 的推荐写法：
 - 显式传 task_name（模型任务名路由，享受任务级 model_list 自动兜底）；
@@ -7,18 +7,78 @@
 
 带 system prompt 时必须用消息列表传 prompt（宿主对 str prompt 不处理 system 字段）。
 
+2026-10-10 配置整理轮：本模块成为「所有 LLM 调用集中模块」——
+- 任务名/判定参数统一读顶层 ``[llm]`` 段（:func:`llm_task_name_of` / :func:`purpose_task`
+  与 :meth:`LLMService.judge`；旧 ``[judge]`` / 各模块段落仅在自身仍存在时兜底）；
+- 原绕过本模块的两处调用收编：角色裁判（planning/role_judge.py 改走 LLMService）与
+  屏幕截图理解（:meth:`LLMService.describe_image`，原 companion/cateye_client.py 内联）。
+
 合并自 mai-love v2.6.2 / v2.6.3：
 - generate 失败三态分诊（v2.6.2）——"成功但正文为空"不再落进 result.get("error",
   "未知错误") 兜底误导排查；宿主裸失败（无 error 字段）与非 dict 结果单独识别；
 - generate 增加可选 model 覆盖参数（v2.6.3）——只传 model 不传 task_name，
   宿主按「先任务名、未命中按具体模型名（任务回落 utils）」双解析；
-- judge()（v2.6.3）——判定类调用（想念把关等）专用入口，模型 / 最大 token 数 /
-  温度全部读顶层 [judge] 配置板块（经 config_provider 动态取，热更新即时生效）。
+- judge()（v2.6.3）——判定类调用（想念把关等）专用入口。
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
+
+
+def _llm_section(config_or_plugin: Any) -> Any:
+    """取 ``[llm]`` 段（接受 plugin 实例或配置对象；取不到返回 None）。"""
+    section = getattr(config_or_plugin, "llm", None)
+    if section is not None:
+        return section
+    return getattr(getattr(config_or_plugin, "config", None), "llm", None)
+
+
+def llm_task_name_of(config_or_plugin: Any) -> str:
+    """主模型任务名（``[llm].task_name``；旧 ``[schedule].llm_task_name`` 兜底，最后 replyer）。"""
+    section = _llm_section(config_or_plugin)
+    value = getattr(section, "task_name", None)
+    if value is None:
+        schedule = getattr(config_or_plugin, "schedule", None)
+        if schedule is None:
+            schedule = getattr(getattr(config_or_plugin, "config", None), "schedule", None)
+        value = getattr(schedule, "llm_task_name", None)
+    return str(value or "replyer")
+
+
+def purpose_task(config_or_plugin: Any, purpose: str, default: str = "utils") -> str:
+    """按用途取任务名（``[llm]`` 段的专用字段；缺失时回退到同模块旧字段，最后 default）。
+
+    purpose ∈ {``review`` 好感裁判, ``emotion_referee`` 情绪睡眠裁判,
+    ``emotion_evaluator`` 情绪增量评估, ``qzone`` 空间, ``vlm`` 视觉}。
+    """
+    section = _llm_section(config_or_plugin)
+    config = getattr(config_or_plugin, "config", None) or config_or_plugin
+    legacy_section_map: Dict[str, str] = {
+        "review": "affection",
+        "emotion_referee": "emotion",
+        "emotion_evaluator": "emotion",
+        "qzone": "qzone",
+        "vlm": "cateye",
+    }
+    legacy_attr_map: Dict[str, str] = {
+        "review": "review_task_name",
+        "emotion_referee": "referee_task_name",
+        "emotion_evaluator": "evaluator_task_name",
+        "qzone": "llm_task_name",
+        "vlm": "vlm_task",
+    }
+    if section is not None:
+        value = getattr(section, f"{purpose}_task_name", None)
+        if value is None and purpose == "vlm":
+            value = getattr(section, "vlm_task", None)
+        if value:
+            return str(value)
+    legacy = getattr(config, legacy_section_map.get(purpose, ""), None)
+    value = getattr(legacy, legacy_attr_map.get(purpose, ""), None)
+    if value:
+        return str(value)
+    return default
 
 
 class LLMService:
@@ -148,28 +208,39 @@ class LLMService:
         return ""
 
     async def judge(self, prompt: str, *, event: str = "judge") -> str:
-        """判定类调用（想念把关等）：模型与参数全部来自顶层 [judge] 配置板块。
+        """判定类调用（想念把关、角色裁判等）：模型与参数来自顶层 ``[llm]`` 段。
 
         与 :meth:`generate` 的区别：调用方只给提示词拿结论；用哪个模型、最大
-        token 数、温度集中在 [judge] 配置里（config_provider 动态读，热更新
-        即时生效）——判定要的是稳定结论，与生成类调用的参数策略解耦。
+        token 数、温度集中在配置里（config_provider 动态读，热更新即时生效）——
+        判定要的是稳定结论，与生成类调用的参数策略解耦。
+        旧 ``[judge]`` 段（model/max_tokens/temperature）在 ``[llm]`` 段对应字段缺省时兜底。
 
         Returns:
             判定文本，失败返回空字符串（调用方按 fail-closed 处理）。
         """
-        judge_cfg = None
+        cfg = None
         if self._config_provider is not None:
             try:
-                judge_cfg = getattr(self._config_provider(), "judge", None)
+                cfg = self._config_provider()
             except Exception:
-                judge_cfg = None
-        model = str(getattr(judge_cfg, "model", "") or "").strip()
+                cfg = None
+        section = _llm_section(cfg) if cfg is not None else None
+        legacy = getattr(cfg, "judge", None) if cfg is not None else None
+
+        model = str(
+            getattr(section, "judge_model", None)
+            or getattr(legacy, "model", "")
+            or ""
+        ).strip()
         try:
-            max_tokens = int(getattr(judge_cfg, "max_tokens", 512))
+            max_tokens = int(getattr(section, "judge_max_tokens", None)
+                             or getattr(legacy, "max_tokens", 512))
         except (TypeError, ValueError):
             max_tokens = 512
         try:
-            temperature = float(getattr(judge_cfg, "temperature", 0.2))
+            temperature = float(getattr(section, "judge_temperature", None)
+                                if getattr(section, "judge_temperature", None) is not None
+                                else getattr(legacy, "temperature", 0.2))
         except (TypeError, ValueError):
             temperature = 0.2
         return await self.generate(
@@ -179,6 +250,46 @@ class LLMService:
             event=event,
             model=model,
         )
+
+    async def describe_image(
+        self,
+        image_base64: str,
+        prompt: str,
+        *,
+        task_name: str = "",
+        temperature: float = 0.3,
+        max_tokens: int = 512,
+        event: str = "describe_image",
+    ) -> str:
+        """视觉理解：把一张 base64 图片 + 提示词交给视觉模型，返回一句话描述。
+
+        2026-10-10 由 companion/cateye_client.py 收编进本模块（所有 LLM 调用的唯一出口）。
+        **消息形态与原实现逐字一致**（Data URL 的 ``image_url`` 段），避免宿主多模态解析口径漂移；
+        失败返回空串由调用方降级。
+        """
+        content = [
+            {"type": "text", "text": str(prompt or "")},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{image_base64}"},
+            },
+        ]
+        kwargs: dict[str, Any] = {
+            "prompt": [{"role": "user", "content": content}],
+            "task_name": task_name or self._task_name,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        try:
+            result = await self._ctx.llm.generate(**kwargs)
+        except Exception as e:
+            self._log(event, str(task_name or self._task_name), False, "", str(e))
+            try:
+                self._ctx.logger.warning(f"视觉理解调用异常: {e}")
+            except Exception:
+                pass
+            return ""
+        return self._interpret(result, event, str(task_name or self._task_name))
 
     def _log(self, event: str, task: str, success: bool, response: str = "", error: str = "") -> None:
         if self._call_logger is not None:

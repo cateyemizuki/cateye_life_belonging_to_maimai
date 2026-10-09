@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -253,7 +254,8 @@ class ScheduleImageGenerator:
 
     @classmethod
     def _draw_header(cls, img: Any, draw: Any, title: str, stats_text: str,
-                     logo: Any, s: float, fonts: Dict[str, Any], ImageDraw: Any) -> None:
+                     logo: Any, s: float, fonts: Dict[str, Any], ImageDraw: Any,
+                     Image: Any) -> None:
         """绘制头部：圆形头像 + 标题 + 统计副标题。"""
         margin_x = int(48 * s)
 
@@ -453,7 +455,7 @@ class ScheduleImageGenerator:
         # 5. 头部
         logo = cls._load_logo(Image)
         stats = cls._build_stats_text(rows)
-        cls._draw_header(img, draw, title, stats, logo, s, fonts, ImageDraw)
+        cls._draw_header(img, draw, title, stats, logo, s, fonts, ImageDraw, Image)
 
         # 6. 日程卡片（全部条目）
         y = header_h + body_padding_top
@@ -472,7 +474,10 @@ class ScheduleImageGenerator:
         )
 
         # 8. 保存并编码
-        save_dir = Path(output_dir) if output_dir else Path(cls.BUNDLED_FONT_PATH).parent.parent.parent
+        # output_dir 缺省 = 系统临时目录（与 generate_schedule_image 的 docstring 契约一致）：
+        # 绝不回退到插件代码目录（宿主隔离数据目录由调用方传入）。
+        # 传承：release/lbm-1.0.0 R6（2026-10-09）已修正的同名缺陷，2026-10-10 回灌主线。
+        save_dir = Path(output_dir) if output_dir else Path(tempfile.gettempdir())
         save_dir.mkdir(parents=True, exist_ok=True)
         image_path = save_dir / "schedule_today.jpg"
         img.save(str(image_path), format="JPEG", quality=90, optimize=True)

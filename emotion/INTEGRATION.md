@@ -1,5 +1,11 @@
 # emotion/ — 情绪维护系统子模块（按《MaiBot情绪维护系统设计文档.md》实现）
 
+> **2026-10-10 配置整理轮（模块侧变更）**：模型任务名（原 `evaluator_task_name` / `referee_task_name`）迁顶层 `[llm]`
+> （`emotion_evaluator_task_name` / `emotion_referee_task_name`，业务侧经 `core.llm_utils.purpose_task` 读取）；
+> 三条裁判/评估提示词与情绪底色注入文本、深夜引导行、赖床提醒模板全部迁顶层 `[prompts]`（`suite_prompts.py` 为唯一真源；
+> `referee.py` 三个入口新增可选 `plugin=` 参数供读配置）；`[schedule_advanced].emotion_influence` 取代原
+> `[schedule].emotion_influence`（`_schedule_cfg` 已改为先查高级段再回退基础段）。
+
 > 来源：`D:\deepseek-harness_workspace\maibot-plugins\MaiBot情绪维护系统设计文档.md`
 >（VAD 三维情绪模型 + 日常增量微调 + 睡眠期大修 Overhaul + 人设初始化）。
 > 与其他两个复刻模块同构：独立总开关（`emotion.enabled`）、服务束、组件 Mixin、cateye_test 前缀组件名。

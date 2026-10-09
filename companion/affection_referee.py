@@ -35,6 +35,9 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from core.llm_utils import purpose_task
+from suite_prompts import prompt as prompt_of, render
+
 from .affection_events import record_rule_event
 
 logger = logging.getLogger(__name__)
@@ -300,6 +303,7 @@ async def evaluate_conversation_delta(
     tier_desc: str = "",
     mood_text: str = "",
     task_name: str = "utils",
+    plugin: Any = None,
 ) -> Optional[Tuple[str, float, str]]:
     """会话采样裁判：返回 ``(event ≤30 字, delta ∈ [-2, +2.5], tag)``；失败/垃圾输出返回 None。
 
@@ -307,7 +311,9 @@ async def evaluate_conversation_delta(
     """
     if llm is None:
         return None
-    prompt = CONVERSATION_REVIEW_PROMPT.format(
+    prompt = render(
+        prompt_of(plugin, "affection_conversation_review"),
+        fallback=CONVERSATION_REVIEW_PROMPT,
         lover_name=str(lover_name or "麦麦"),
         target_label=str(target_label or "重要的人"),
         persona=str(persona or "（暂无人设）")[:800],
@@ -351,6 +357,7 @@ async def run_daily_review(
     tier_label: str = "",
     tier_desc: str = "",
     task_name: str = "utils",
+    plugin: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """关系日结裁判：返回 ``{"delta_score", "impressions", "tone", "reason"}``；失败返回 None。
 
@@ -361,7 +368,9 @@ async def run_daily_review(
     if llm is None:
         return None
     day = str(date or datetime.now().strftime("%Y-%m-%d"))
-    prompt = DAILY_REVIEW_PROMPT.format(
+    prompt = render(
+        prompt_of(plugin, "affection_daily_review"),
+        fallback=DAILY_REVIEW_PROMPT,
         lover_name=str(lover_name or "麦麦"),
         target_label=str(target_label or "重要的人"),
         date=day,
@@ -450,7 +459,11 @@ class AffectionReviewer:
         return bool(self._cfg("review_enabled", True))
 
     def _task_name(self) -> str:
-        return str(self._cfg("review_task_name", "utils") or "utils")
+        """好感裁判任务名：统一读 ``[llm].review_task_name``（旧 [affection] 段兜底）。"""
+        try:
+            return purpose_task(self._plugin, "review", default="utils")
+        except Exception:
+            return str(self._cfg("review_task_name", "utils") or "utils")
 
     def _max_per_day(self) -> int:
         return max(0, _to_int(self._cfg("review_max_per_day", 2), 2))
@@ -614,6 +627,7 @@ class AffectionReviewer:
                 lover_name=self._lover_name(), target_label=self._target_label(),
                 persona=self._persona(), tier_label=tier_label, tier_desc=tier_desc,
                 mood_text=self._mood_text(), task_name=self._task_name(),
+                plugin=self._plugin,
             )
             if parsed is None:
                 self._log("affection.review_skipped", trigger_type="affection",
@@ -725,6 +739,7 @@ class AffectionReviewer:
                 date=day, lover_name=self._lover_name(), target_label=self._target_label(),
                 persona=self._persona(), tier_label=tier_label, tier_desc=tier_desc,
                 task_name=self._task_name(),
+                plugin=self._plugin,
             )
         except asyncio.CancelledError:
             raise

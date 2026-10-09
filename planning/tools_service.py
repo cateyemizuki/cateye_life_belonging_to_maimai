@@ -24,7 +24,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.time_utils import parse_hhmm
 
-from .config import ScheduleSectionConfig, section_or_default
+from core.llm_utils import llm_task_name_of
+from suite_prompts import (
+    NAP_TOOL_BAD_TIME_DEFAULT,
+    NAP_TOOL_DENIED_DEFAULT,
+    prompt as prompt_of,
+)
+
+from .config import (
+    ScheduleAdvancedSectionConfig,
+    ScheduleSectionConfig,
+    section_or_default,
+)
 from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
 from .schedule_generator import ScheduleGenerator
@@ -42,12 +53,11 @@ NAP_TOOL_NAME = "cateye_test_nap_lie_in"
 DEFAULT_LIE_IN_MAX_UNTIL = "12:00"
 #: 一天的分钟数（P6 顺延的当日帧上界：顺延后 ``end`` 封顶 24:00，不产生跨午夜条目）
 DAY_MINUTES = 24 * 60
-#: 非睡眠周期调用的拒绝话术（§4.4 用户裁决原文语义，逐字）
-NAP_LIE_IN_DENIED_TEXT = "你现在还不能想要赖床"
-#: 解析失败/缺参的友好提示（§4.4：返回友好错误与格式示例，**不抛异常**）
-NAP_LIE_IN_BAD_TIME_TEXT = (
-    "没听清你想赖到几点。请传入目标时间，例如 \"09:30\"、\"9:30\" 或纯小时数 \"9\"（表示 09:00）。"
-)
+#: 非睡眠周期调用的拒绝话术（出厂文案见 suite_prompts.NAP_TOOL_DENIED_DEFAULT，
+#: 2026-10-10 起可在 [prompts].nap_tool_denied 覆盖）
+NAP_LIE_IN_DENIED_TEXT = NAP_TOOL_DENIED_DEFAULT
+#: 解析失败/缺参的友好提示（可在 [prompts].nap_tool_bad_time 覆盖）
+NAP_LIE_IN_BAD_TIME_TEXT = NAP_TOOL_BAD_TIME_DEFAULT
 # 口径说明（M10 第 6 段）：夜晚睡眠条目的判定**唯一真源** = ``planning/schedule_items.py``，
 # 供本模块的 M9 赖床工具与 ``auto_scheduler.py`` 的 B2 生成锚点共用，避免两处口径漂移。
 
@@ -114,11 +124,16 @@ class ToolsService:
     # ------------------------------------------------------------
 
     def _schedule_cfg(self) -> ScheduleSectionConfig:
+        """日程基础段（`[schedule]`：作息 / 活动数量 / 注入范围 / 节假日开关）。"""
         return section_or_default(self._plugin, "schedule", ScheduleSectionConfig)
 
+    def _advanced_cfg(self) -> ScheduleAdvancedSectionConfig:
+        """日程高级段（`[schedule_advanced]`：多轮生成 / 裁判 / 缓存 / 赖床 / 时区等）。"""
+        return section_or_default(self._plugin, "schedule_advanced", ScheduleAdvancedSectionConfig)
+
     def _make_tz_manager(self) -> TimezoneManager:
-        """根据配置创建 TimezoneManager。"""
-        return TimezoneManager(self._schedule_cfg().timezone)
+        """根据配置创建 TimezoneManager（时区在高级段）。"""
+        return TimezoneManager(self._advanced_cfg().timezone)
 
     def _get_generator(self) -> Optional[ScheduleGenerator]:
         generator = self._generator or getattr(self._plugin, "_schedule_gen", None)
@@ -137,8 +152,9 @@ class ToolsService:
         return query
 
     def _generate_kwargs(self) -> Dict[str, Any]:
-        """从 schedule 配置段产出 generate_daily_schedule 的完整关键字参数。"""
+        """从 [schedule] + [schedule_advanced] 两段产出 generate_daily_schedule 的完整关键字参数。"""
         cfg = self._schedule_cfg()
+        adv = self._advanced_cfg()
         return {
             "personality": str(getattr(self._plugin, "_personality", "") or ""),
             "lover_name": str(getattr(self._plugin, "_lover_name", "") or "麦麦"),
@@ -146,22 +162,22 @@ class ToolsService:
             "sleep_time": cfg.sleep_time,
             "min_activities": cfg.min_activities,
             "max_activities": cfg.max_activities,
-            "timeout_seconds": cfg.generation_timeout,
-            "use_multi_round": cfg.use_multi_round,
-            "max_rounds": cfg.max_rounds,
-            "quality_threshold": cfg.quality_threshold,
+            "timeout_seconds": adv.generation_timeout,
+            "use_multi_round": adv.use_multi_round,
+            "max_rounds": adv.max_rounds,
+            "quality_threshold": adv.quality_threshold,
             "enable_detailed_description": cfg.enable_detailed_description,
-            "min_description_length": cfg.min_description_length,
-            "max_description_length": cfg.max_description_length,
-            "max_tokens": cfg.max_tokens,
+            "min_description_length": adv.min_description_length,
+            "max_description_length": adv.max_description_length,
+            "max_tokens": adv.max_tokens,
             "custom_prompt": cfg.custom_prompt,
-            "recent_schedule_days": cfg.recent_schedule_days,
-            "history_message_limit": cfg.history_message_limit,
-            "knowledge_search_limit": cfg.knowledge_search_limit,
-            "cross_day_activity": cfg.cross_day_activity,
+            "recent_schedule_days": adv.recent_schedule_days,
+            "history_message_limit": adv.history_message_limit,
+            "knowledge_search_limit": adv.knowledge_search_limit,
+            "cross_day_activity": adv.cross_day_activity,
             "no_sleep_mode": cfg.no_sleep_mode,
-            "timezone": cfg.timezone,
-            "llm_task_name": cfg.llm_task_name,
+            "timezone": adv.timezone,
+            "llm_task_name": llm_task_name_of(self._plugin),
         }
 
     # ------------------------------------------------------------
@@ -382,7 +398,7 @@ class ToolsService:
             if not description:
                 return {"type": "error", "content": "请提供日程变更描述"}
 
-            cfg = self._schedule_cfg()
+            cfg = self._advanced_cfg()   # 裁判开关/温度/超时/最大 token 均在高级段
             goal_manager = get_goal_manager()
             tz_manager = self._make_tz_manager()
             today = tz_manager.get_now()
@@ -419,7 +435,7 @@ class ToolsService:
                 persona=persona,
                 today_str=today_str,
                 weekday=weekday,
-                task_name=cfg.llm_task_name,
+                task_name=llm_task_name_of(self._plugin),
                 temperature=cfg.role_judge_temperature,
                 max_tokens=cfg.max_tokens,
                 # 角色裁判同样受 generation_timeout 约束
@@ -506,7 +522,7 @@ class ToolsService:
 
     def _lie_in_max_minutes(self) -> int:
         """[schedule] lie_in_max_until 的分钟数（非法回退 12:00；钳制与提示同源）。"""
-        return lie_in_max_minutes(getattr(self._schedule_cfg(), "lie_in_max_until",
+        return lie_in_max_minutes(getattr(self._advanced_cfg(), "lie_in_max_until",
                                           DEFAULT_LIE_IN_MAX_UNTIL))
 
     @staticmethod
@@ -646,11 +662,13 @@ class ToolsService:
             # 1) 解析容错（先解析：缺参/非法给格式示例，不惊动任何状态）
             target_minute = parse_nap_target(time)
             if target_minute is None:
-                return {"type": "nap_error", "content": NAP_LIE_IN_BAD_TIME_TEXT}
+                return {"type": "nap_error",
+                        "content": prompt_of(self._plugin, "nap_tool_bad_time")}
             # 2) 非睡眠周期调用 → 拒绝（emotion 侧门控；无 emotion 束同样拒绝）
             emotion = self._emotion_bundle()
             if emotion is None or not emotion.in_night_sleep_cycle():
-                return {"type": "nap_rejected", "content": NAP_LIE_IN_DENIED_TEXT}
+                return {"type": "nap_rejected",
+                        "content": prompt_of(self._plugin, "nap_tool_denied")}
             current = now or datetime.now()
             today = self._nap_schedule_date(current)
             # 3) 上限钳制
