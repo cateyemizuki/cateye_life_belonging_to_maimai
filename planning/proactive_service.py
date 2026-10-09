@@ -6,23 +6,24 @@
    （``ctx.maisaka.proactive.trigger``）。不覆盖当天睡醒后的第一个活动，设定的睡眠时段内不触发；
    每个 ``(stream_id, activity_name, date)`` 组合只触发一次。
 
-2. **L2 早晚安漂移（附录 §三，裁决 B1/B3/B5/B6/B7；M11 附录 II §二 三类开关与名单）** ——
+2. **L2 早晚安漂移（M11 三类开关 → 2026-10-10 两开关 + 统一名单）** ——
    早/晚安只配漂移区间（``morning_drift`` / ``night_drift``，每流每日独立掷点）：早安基准 =
    睡眠窗口结束（``[schedule].wake_time`` 锚点），晚安基准 = 当天最后一个非睡眠日程条目结束
    （无日程回退 ``sleep_time`` 锚点）。到点按「必要性激活」判定触发（早安自基准点起、
-   晚安自 ``fire_at`` 起该流有人发过消息——附录 §六.补 B5-补），到期限仍无人则放弃；
-   触发矩阵（附录 II §2.2）：目标私聊**必定触发**（``greeting_target_enabled``，不看名单）、
-   群聊走问候专用黑白名单 + 必要性激活（``greeting_group_*``）、其他私聊走独立开关 +
-   前一日消息数门槛（``greeting_other_private_*``，白名单留空 = 全不发）。
-   **例行问候免预算**（§2.3）：默认 ``greeting_exempt_budget=true``，早/晚安触发既不查预算
-   闸门也不计主动打扰用量；想念/日常/活动切换仍照旧受预算约束。
+   晚安自 ``fire_at`` 起该流有人发过消息），到期限仍无人则放弃。
+   候选矩阵：目标陪伴私聊（``[patrol].enabled`` 时固定生效，不看名单）；群聊与其他私聊
+   走**统一名单系统**（``proactive_group_ids`` / ``proactive_private_ids`` + 各自模式开关），
+   其他私聊另有「前一日消息数 ≥ 门槛」护栏。开/关由 ``greeting_morning_enabled`` /
+   ``greeting_night_enabled`` 两个开关统一控制。
+   **例行问候始终免预算**：早/晚安触发既不查预算闸门也不计主动打扰用量；
+   预算只服务 [patrol] 的巡检与想念（[patrol].daily_max_speak）。
 
 3. **按 goal_type 调节聊天频率** —— ``ctx.frequency.set_adjust`` 推给 heartflow。
 
 对整合契约的适配：
 - 触发走 ``ctx.maisaka.proactive.trigger``（目标插件声明的能力名）；
-- 群/会话白名单解析失败时跳过该条目（宿主能力缺失不炸循环）；
-- 决策写入 plugin._decision_logger（core/diag）。
+- 名单只收**裸号**（群聊填群号、私聊填 QQ 号），非法元素汇总级告警（不逐条刷屏）；
+- 决策写入 plugin._decision_logger（core/diag）；提示词一律读 suite_prompts。
 """
 
 from __future__ import annotations
@@ -35,7 +36,33 @@ import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from .config import PlanningProactiveSectionConfig, ScheduleSectionConfig, section_or_default
+from suite_prompts import (
+    PROACTIVE_INTENT_DEFAULT,
+    PROACTIVE_INTENT_COMMITMENT_DEFAULT,
+    PROACTIVE_INTENT_DAILY_ROUTINE_DEFAULT,
+    PROACTIVE_INTENT_ENTERTAINMENT_DEFAULT,
+    PROACTIVE_INTENT_EXERCISE_DEFAULT,
+    PROACTIVE_INTENT_LEARN_TOPIC_DEFAULT,
+    PROACTIVE_INTENT_MEAL_DEFAULT,
+    PROACTIVE_INTENT_MORNING_DEFAULT,
+    PROACTIVE_INTENT_REST_DEFAULT,
+    PROACTIVE_INTENT_SOCIAL_DEFAULT,
+    PROACTIVE_INTENT_STUDY_DEFAULT,
+    PROACTIVE_INTENT_WORK_DEFAULT,
+    PROACTIVE_REASON_ACTIVITY_DEFAULT,
+    PROACTIVE_REASON_COMMITMENT_DEFAULT,
+    prompt,
+    render,
+)
+
+from .config import (
+    LIST_MODE_BLACKLIST,
+    LIST_MODE_WHITELIST,
+    PlanningProactiveSectionConfig,
+    ScheduleAdvancedSectionConfig,
+    ScheduleSectionConfig,
+    section_or_default,
+)
 from .goal_manager import get_goal_manager
 from .time_utils import TimezoneManager, is_in_time_window, parse_time_window
 if TYPE_CHECKING:
@@ -58,42 +85,31 @@ _FREQUENCY_FACTOR_BY_GOAL_TYPE: Dict[str, float] = {
     "social_maintenance": 1.5,  # 社交：最高
 }
 
-# 主动发起的 intent 模板：按 goal_type 提供给 maisaka 当作主动开口的提示
-_PROACTIVE_INTENT_TEMPLATES: Dict[str, str] = {
-    "study": "Bot 刚开始学习/写代码，可以自然地在群里说一两句开始投入工作的话",
-    "work": "Bot 刚开始工作，可以自然地说一两句进入状态的话",
-    "meal": "Bot 刚开始吃饭，可以自然地在群里说一两句关于这顿饭的话",
-    "rest": "Bot 刚开始休息，可以自然地说一两句放松/闲下来的话",
-    "exercise": "Bot 刚开始运动，可以自然地在群里吼一两句锻炼的话",
-    "entertainment": "Bot 刚开始娱乐/看剧/打游戏，可以自然地说一两句兴奋/期待的话",
-    "social_maintenance": "Bot 现在心情比较social，可以主动找群友聊聊天",
-    "daily_routine": "Bot 刚切换到日常活动，可以自然地说一句近况",
-    "learn_topic": "Bot 开始钻研感兴趣的话题，可以自然地分享一点新发现",
+# 主动发起的 intent 模板：按 goal_type 取用（2026-10-10 起默认文案在 suite_prompts，
+# 可经 [prompts] 段逐类型覆盖；键 = goal_type）
+_PROACTIVE_INTENT_PROMPT_KEYS: Dict[str, str] = {
+    "study": "proactive_intent_study",
+    "work": "proactive_intent_work",
+    "meal": "proactive_intent_meal",
+    "rest": "proactive_intent_rest",
+    "exercise": "proactive_intent_exercise",
+    "entertainment": "proactive_intent_entertainment",
+    "social_maintenance": "proactive_intent_social",
+    "daily_routine": "proactive_intent_daily_routine",
+    "learn_topic": "proactive_intent_learn_topic",
 }
-_DEFAULT_PROACTIVE_INTENT = "Bot 切换到新活动了，可以自然地在群里说一两句近况"
-
-# 早间问好 intent 模板（L2：基准 = 睡眠窗口结束，首个非睡眠日程条目名作补充信息）
-_MORNING_GREETING_INTENT = (
-    "Bot 刚睡醒，新的一天开始了，请自然地向大家道一声早安；"
-    "可以顺口提一句今天的第一个安排（{activity_name}），语气符合人设，简短随意"
-)
-#: 无今日日程时的早安 intent（不带"第一个安排"这句）
-_MORNING_GREETING_INTENT_NO_ACTIVITY = (
-    "Bot 刚睡醒，新的一天开始了，请自然地道一声早安；语气符合人设，简短随意"
-)
-#: 晚安 intent 模板（L2：基准 = 当天最后一个非睡眠日程条目结束，向前漂移）
-_NIGHT_GREETING_INTENT = (
-    "Bot 准备休息了，今天快结束了，请自然地道一声晚安；"
-    "语气符合人设，简短随意、不要追问对方、不要开新话题"
-)
-
-# 约定（pending_commitment）来源的活动用强指令模板，避免陷入工具调用循环
-_COMMITMENT_INTENT_TEMPLATE = (
-    "你之前答应过对方今天{time_hint}要在私聊里{title}（约定备注：{notes_hint}）。\n"
-    "现在到点了，请用符合人设的语气**立即在私聊里发出**这条消息（例如叫醒、问候、"
-    "提醒等），不要询问对方、不要等用户先开口、不要陷入工具调用循环。\n"
-    "活动名：{activity_name}"
-)
+#: 各 goal_type 的出厂文案回退（[prompts] 段取不到时用）
+_PROACTIVE_INTENT_FALLBACKS: Dict[str, str] = {
+    "study": PROACTIVE_INTENT_STUDY_DEFAULT,
+    "work": PROACTIVE_INTENT_WORK_DEFAULT,
+    "meal": PROACTIVE_INTENT_MEAL_DEFAULT,
+    "rest": PROACTIVE_INTENT_REST_DEFAULT,
+    "exercise": PROACTIVE_INTENT_EXERCISE_DEFAULT,
+    "entertainment": PROACTIVE_INTENT_ENTERTAINMENT_DEFAULT,
+    "social_maintenance": PROACTIVE_INTENT_SOCIAL_DEFAULT,
+    "daily_routine": PROACTIVE_INTENT_DAILY_ROUTINE_DEFAULT,
+    "learn_topic": PROACTIVE_INTENT_LEARN_TOPIC_DEFAULT,
+}
 
 # ── L2 早晚安漂移（附录 §三；裁决 B1/B3/B5/B6/B7）──────────────────
 #: 漂移区间的严格形态（§3.1）：单数字 N 或 "a-b"；负数（"-5-10"/"-10"）与其他写法一律非法（B3）
@@ -201,8 +217,9 @@ class ProactiveService:
     def __init__(self, plugin: Any) -> None:
         self._plugin = plugin
         self._stop_event: asyncio.Event = asyncio.Event()
+        # 时区在 [schedule_advanced]（2026-10-10 段拆分）
         self._tz_manager: TimezoneManager = TimezoneManager(
-            section_or_default(plugin, "schedule", ScheduleSectionConfig).timezone
+            section_or_default(plugin, "schedule_advanced", ScheduleAdvancedSectionConfig).timezone
         )
         # 已触发的主动发起记录：{(stream_id, activity_name, date_str): trigger_time}
         self._proactive_history: Dict[Tuple[str, str, str], float] = {}
@@ -279,38 +296,133 @@ class ProactiveService:
                 pass
 
     # ------------------------------------------------------------
-    # 白名单解析（群聊 + 其他会话，取并集）
+    # 统一名单系统（2026-10-10 合并：群聊名单 + 私聊名单，各带模式开关）
     # ------------------------------------------------------------
 
-    async def _resolve_target_streams(self) -> List[str]:
-        """解析主动行为生效的会话列表（群聊白名单 ∪ 其他会话白名单）。
+    @staticmethod
+    def _clean_id_list(raw: Any) -> Tuple[List[str], List[str]]:
+        """清洗一份名单：只收**裸号**（纯数字）；返回 ``(合法号列表, 问题清单)``。
 
-        - 群聊：``proactive_group_ids`` 直接填群号；**留空 = 所有群聊生效**；
-        - 其他会话：``proactive_other_streams`` 支持 ``session:<id>`` / ``qq:private:<uid>``。
+        带前缀（``qq:private:`` / ``session:`` 等）、含非数字、空串、重复项、通配 ``*``
+        一律记为问题（调用方汇总成一条告警，不逐条刷屏）；通配在新语义下没有意义
+        （黑名单留空即全放行、白名单留空即全不发），故按非法元素处理。
+        """
+        values: List[str] = []
+        problems: List[str] = []
+        seen: set = set()
+        for item in list(raw or []):
+            text = str(item).strip()
+            if not text:
+                problems.append(f"空串（{item!r}）")
+                continue
+            if not text.isdigit():
+                problems.append(f"{text}（非法：只收裸号，不带前缀、不含非数字字符）")
+                continue
+            if text in seen:
+                problems.append(f"{text}（重复项）")
+                continue
+            seen.add(text)
+            values.append(text)
+        return values, problems
+
+    def _target_qq(self) -> str:
+        """目标陪伴对象 QQ（空/占位返回空串）。"""
+        section = getattr(getattr(self._plugin, "config", None), "patrol", None)
+        raw = str(getattr(section, "target_qq", "") or "").strip()
+        return "" if raw in ("", "0", "123456789") else raw
+
+    def _companion_enabled(self) -> bool:
+        """陪伴模块是否启用（目标私聊的早/晚安由陪伴模块开关兜底；读不到按启用）。"""
+        section = getattr(getattr(self._plugin, "config", None), "patrol", None)
+        return bool(getattr(section, "enabled", True))
+
+    def _note_list_problem(self, signature: Tuple[str, ...], problems: List[str]) -> None:
+        """名单非法元素的**汇总**告警：一条 logger.warning + 一条决策日志；同签名每日一次。"""
+        day = self._tz_manager.get_now().strftime("%Y-%m-%d")
+        key = (day, signature)
+        if key in self._greeting_list_warned:
+            return
+        # 跨天清理：只保留当天签名（避免内存无界增长）
+        self._greeting_list_warned = {k: True for k in self._greeting_list_warned if k[0] == day}
+        self._greeting_list_warned[key] = True
+        detail = "；".join(problems)
+        logger.warning(f"主动行为名单存在非法/重复元素（已忽略，不逐条刷屏）：{detail}")
+        self._decision_log(
+            "skip", trigger_type="proactive_list_parse",
+            reason=f"名单存在非法元素（已忽略）：{detail}",
+        )
+
+    async def _resolve_group_streams(self) -> List[str]:
+        """群聊生效会话：按「群聊名单 + 名单模式」解析。
+
+        - 模式 = 黑名单（默认）：名单内的群**不**生效；留空 = 所有群生效；
+        - 模式 = 白名单：只有名单内的群生效；留空 = 都不生效。
         """
         cfg = self._proactive_cfg()
+        ids, problems = self._clean_id_list(getattr(cfg, "proactive_group_ids", None))
+        mode = str(getattr(cfg, "proactive_group_list_mode", LIST_MODE_BLACKLIST) or LIST_MODE_BLACKLIST)
+        if problems:
+            self._note_list_problem(tuple(["group"] + ids + problems), [f"群聊名单：{p}" for p in problems])
+
+        if mode == LIST_MODE_WHITELIST:
+            if not ids:
+                return []
+            candidates: List[Tuple[str, Optional[str]]] = [
+                (gid, await self._resolve_group_id(gid)) for gid in ids
+            ]
+        else:
+            excluded = set(ids)
+            candidates = [
+                (gid, sid) for gid, sid in await self._enumerate_group_pairs()
+                if gid not in excluded
+            ]
+        return [sid for _gid, sid in candidates if sid]
+
+    async def _resolve_private_streams(self) -> List[str]:
+        """私聊生效会话：按「私聊名单 + 名单模式」解析。
+
+        - 模式 = 白名单（默认）：只有名单内的 QQ 生效；留空 = 都不生效；
+        - 模式 = 黑名单：名单内的 QQ 不生效；留空 = 全部生效。
+
+        **目标陪伴对象始终按黑名单处理**（无论模式如何都剔除）：陪伴对象的私聊时段留给
+        陪伴模块的巡检与早/晚安，日程侧的活动切换不进去抢话。
+        """
+        cfg = self._proactive_cfg()
+        ids, problems = self._clean_id_list(getattr(cfg, "proactive_private_ids", None))
+        mode = str(getattr(cfg, "proactive_private_list_mode", LIST_MODE_WHITELIST) or LIST_MODE_WHITELIST)
+        if problems:
+            self._note_list_problem(tuple(["private"] + ids + problems),
+                                    [f"私聊名单：{p}" for p in problems])
+        target_qq = self._target_qq()
+
+        if mode == LIST_MODE_WHITELIST:
+            if not ids:
+                return []
+            pairs: List[Tuple[str, Optional[str]]] = [
+                (uid, await self._resolve_private_id(uid)) for uid in ids
+            ]
+        else:
+            excluded = set(ids)
+            pairs = [(uid, sid) for uid, sid in await self._enumerate_private_pairs()
+                     if uid not in excluded]
+
+        result: List[str] = []
+        for uid, sid in pairs:
+            if not sid:
+                continue
+            if target_qq and uid == target_qq:
+                continue  # 陪伴对象始终按私聊黑名单处理
+            result.append(sid)
+        return result
+
+    async def _resolve_target_streams(self) -> List[str]:
+        """主动行为生效的会话列表（活动切换用）：群聊生效集 ∪ 私聊生效集。"""
         streams: List[str] = []
         seen: set = set()
-
-        group_ids = [str(g).strip() for g in (cfg.proactive_group_ids or []) if str(g).strip()]
-        if group_ids:
-            for gid in group_ids:
-                sid = await self._resolve_group_id(gid)
-                if sid and sid not in seen:
-                    streams.append(sid)
-                    seen.add(sid)
-        else:
-            # 留空 = 所有群聊生效
-            for sid in await self._enumerate_group_streams():
-                if sid not in seen:
-                    streams.append(sid)
-                    seen.add(sid)
-
-        for sid in await self._resolve_proactive_streams(list(cfg.proactive_other_streams or [])):
-            if sid not in seen:
+        for sid in (await self._resolve_group_streams()) + (await self._resolve_private_streams()):
+            if sid and sid not in seen:
                 streams.append(sid)
                 seen.add(sid)
-
         return streams
 
     async def _resolve_group_id(self, group_id: str) -> Optional[str]:
@@ -390,81 +502,6 @@ class ProactiveService:
         logger.warning(f"解析 {entry} 失败：返回无 session_id 字段")
         return None
 
-    async def _resolve_proactive_streams(self, raw_entries: List[str]) -> List[str]:
-        """解析其他会话白名单（session:<id> / qq:private:<uid> / 裸 id）。"""
-        resolved: List[str] = []
-        seen: set = set()
-        now = time.time()
-        ctx_obj = getattr(self._plugin, "ctx", None)
-
-        for raw in raw_entries:
-            entry = str(raw).strip()
-            if not entry:
-                continue
-
-            cached = self._resolved_cache.get(entry)
-            if cached is not None and now < cached[1]:
-                resolved_sid = cached[0]
-                if resolved_sid and resolved_sid not in seen:
-                    resolved.append(resolved_sid)
-                    seen.add(resolved_sid)
-                continue
-
-            session_id: Optional[str] = None
-            if entry.startswith("session:"):
-                session_id = entry[len("session:"):].strip() or None
-            elif ":group:" in entry:
-                session_id = await self._resolve_via_chat_capability(entry, kind="group", ctx_obj=ctx_obj)
-            elif ":private:" in entry:
-                session_id = await self._resolve_via_chat_capability(entry, kind="private", ctx_obj=ctx_obj)
-            else:
-                session_id = entry
-
-            ttl = self.RESOLVE_CACHE_TTL_SUCCESS if session_id else self.RESOLVE_CACHE_TTL_FAILURE
-            self._resolved_cache[entry] = (session_id, now + ttl)
-
-            if session_id and session_id not in seen:
-                resolved.append(session_id)
-                seen.add(session_id)
-
-        return resolved
-
-    async def _resolve_via_chat_capability(
-        self,
-        entry: str,
-        kind: str,
-        ctx_obj: Any,
-    ) -> Optional[str]:
-        """通过 ``ctx.chat`` 把 ``qq:group:<gid>`` / ``qq:private:<uid>`` 解析为 session_id。"""
-        if ctx_obj is None or not hasattr(ctx_obj, "chat"):
-            logger.warning(f"无法解析 {entry}：ctx.chat 能力不可用")
-            return None
-
-        parts = entry.split(":", 2)
-        if len(parts) != 3:
-            logger.warning(f"配置条目格式错误：{entry}（应为 <platform>:{kind}:<id>）")
-            return None
-        platform, _, target_id = parts
-        platform = platform.strip() or "qq"
-        target_id = target_id.strip()
-        if not target_id:
-            logger.warning(f"配置条目缺失 ID：{entry}")
-            return None
-
-        try:
-            if kind == "group":
-                result = await ctx_obj.chat.get_stream_by_group_id(target_id, platform)
-            else:
-                result = await ctx_obj.chat.get_stream_by_user_id(target_id)
-        except Exception as exc:
-            logger.warning(f"解析 {entry} 异常: {exc}")
-            return None
-
-        session_id = self._extract_session_id(entry, result)
-        if session_id:
-            logger.info(f"解析成功 {entry} → session_id={session_id}")
-        return session_id
-
     # ------------------------------------------------------------
     # 主循环逻辑
     # ------------------------------------------------------------
@@ -472,16 +509,11 @@ class ProactiveService:
     async def _check_and_act(self) -> None:
         """读当前活动 → 安排/落实 主动发起、L2 早晚安漂移、频率调控。"""
         cfg_p = self._proactive_cfg()
-        greeting_flags = self._greeting_flags(cfg_p)
         if not (
             cfg_p.enable_proactive_trigger
             or cfg_p.enable_frequency_modulation
-            or cfg_p.enable_morning_greeting
-            or cfg_p.enable_night_greeting
-            # M11（附录 II §二）：三类问候开关任一开启（默认目标/群聊为开）即需进入本轮
-            or greeting_flags["target_enabled"]
-            or greeting_flags["group_enabled"]
-            or greeting_flags["other_private_enabled"]
+            or self._greeting_kind_enabled(GREETING_MORNING)
+            or self._greeting_kind_enabled(GREETING_NIGHT)
         ):
             return
 
@@ -715,53 +747,25 @@ class ProactiveService:
         self._greeting_rolls[key] = entry
         return entry
 
-    def _greeting_requires_activation(self, category: str, kind: str, cfg_p: Any) -> bool:
-        """是否需要「必要性激活」（§3.3/B5/B7）：目标私聊固定生效，其余按开关。
+    def _greeting_kind_enabled(self, kind: str) -> bool:
+        """早/晚安总开关（2026-10-10 起由两个开关统一控制，取代原三类会话开关矩阵）。"""
+        attr = "greeting_morning_enabled" if kind == GREETING_MORNING else "greeting_night_enabled"
+        return bool(getattr(self._proactive_cfg(), attr, True))
 
-        - 目标私聊：固定生效（B7），激活要求不适用；
-        - 群聊：按 ``greeting_require_activation``（早安另兼容旧字段 ``morning_greeting_require_activation``，取或）；
-        - 其他私聊：激活条件 = 前一日消息数门槛（§3.4/B7 的「激活条件 = 前一日该流 ≥ N 条消息」），
-          即由 ``_morning_other_private_qualified`` 承担，不再叠加「自基准点起有人说话」。
+    def _greeting_requires_activation(self, category: str, kind: str, cfg_p: Any) -> bool:
+        """是否需要「必要性激活」：只有群聊需要（有人说话才跟着问候）。
+
+        目标私聊固定生效（不看激活）；其他私聊的门槛 = 前一日消息数
+        （``greeting_other_private_min_messages``），由 :meth:`_other_private_qualified` 承担。
         """
         if category != GREETING_CATEGORY_GROUP:
             return False
-        if bool(getattr(cfg_p, "greeting_require_activation", True)):
-            return True
-        if kind == GREETING_MORNING:
-            # 旧字段兼容（取或）：此前显式开启过「早间问好需激活」的用户仍然生效
-            return bool(getattr(cfg_p, "morning_greeting_require_activation", False))
-        return False
+        return bool(getattr(cfg_p, "greeting_require_activation", True))
 
-    async def _stream_activated_since_wake(self, stream_id: str, since_ts: float,
-                                           until_ts: float) -> bool:
-        """自 ``since_ts`` 起该流是否有人发过消息（B5：早安/晚安共用同一查询形态）。
+    async def _other_private_qualified(self, stream_id: str, date_str: str,
+                                      now: datetime, cfg_p: Any) -> bool:
+        """其他私聊问候门槛：前一日该流消息数 ≥ ``greeting_other_private_min_messages``。
 
-        窗口起点由调用方分派（附录 §六.补 B5-补）：晚安 = ``fire_at``、早安 = ``baseline``
-        （见 :meth:`_evaluate_greeting`）。沿用既有调用形态
-        ``ctx.message.get_by_time_in_chat(stream_id, 起点ts, now, limit=1)``；
-        能力不可用/异常 → False（保守：没人说话就不打扰）。
-        """
-        ctx_obj = getattr(self._plugin, "ctx", None)
-        if ctx_obj is None or not hasattr(ctx_obj, "message"):
-            return False
-        try:
-            msgs = await ctx_obj.message.get_by_time_in_chat(
-                stream_id, str(since_ts), str(until_ts), limit=1,
-            )
-        except Exception as exc:
-            logger.debug(f"查询会话消息失败: {exc}")
-            return False
-        if isinstance(msgs, dict):
-            msgs = msgs.get("messages") or msgs.get("data") or []
-        return bool(msgs)
-
-    async def _morning_other_private_qualified(self, stream_id: str, date_str: str,
-                                               now: datetime, cfg_p: Any) -> bool:
-        """其他私聊问候门槛（§3.4/B7；M11 §2.2 早/晚共用）：前一日该流消息数 ≥ 门槛。
-
-        门槛取 ``greeting_other_private_min_messages``（``ge=5`` 硬约束；被取代键
-        ``morning_other_private_min_messages`` 的 deprecated 映射在配置层完成——
-        显式旧键沿用为新门槛的缺省，新键显式优先）。
         经 ``get_by_time_in_chat`` 取「昨日 00:00 → 今日 00:00」的消息，``limit=门槛`` 即够判定；
         能力不可用/异常/返回形态不可解析 → 按 0 处理（**不发送**）。门槛当日内不变 → 当日缓存。
         """
@@ -770,7 +774,7 @@ class ProactiveService:
             return self._greeting_other_gate[cache_key]
 
         try:
-            need = max(1, int(self._greeting_flags(cfg_p)["other_private_min_messages"]))
+            need = max(5, int(getattr(cfg_p, "greeting_other_private_min_messages", 5) or 5))
         except (TypeError, ValueError):
             need = 5
 
@@ -795,157 +799,28 @@ class ProactiveService:
         self._greeting_other_gate[cache_key] = qualified
         return qualified
 
-    @staticmethod
-    def _greeting_flags(cfg_p: Any) -> Dict[str, Any]:
-        """三类问候的生效取值（M11 附录 II §2.2/§2.6）。
+    async def _stream_activated_since_wake(self, stream_id: str, since_ts: float,
+                                           until_ts: float) -> bool:
+        """自 ``since_ts`` 起该流是否有人发过消息（早安/晚安共用同一查询形态）。
 
-        配置层（``PlanningProactiveSectionConfig.greeting_effective``）统一解析
-        「新键显式 > 旧键显式 > 新键默认」与被取代旧键（``enable_night_greeting`` 显式 false =
-        晚安全灭）的 deprecated 映射；非 pydantic 配置对象（骨架/测试桩）没有该解析方法 →
-        退化为直接读键（新键缺失时旧键归并生效），保证服务可独立运行。
+        窗口起点由调用方分派：晚安 = ``fire_at``、早安 = ``baseline``
+        （见 :meth:`_evaluate_greeting`）。沿用既有调用形态
+        ``ctx.message.get_by_time_in_chat(stream_id, 起点ts, now, limit=1)``；
+        能力不可用/异常 → False（保守：没人说话就不打扰）。
         """
-        resolver = getattr(cfg_p, "greeting_effective", None)
-        if callable(resolver):
-            try:
-                return dict(resolver())
-            except Exception:
-                logger.debug("greeting_effective 解析失败，回落直接读键", exc_info=True)
-
-        other = getattr(cfg_p, "greeting_other_private_enabled", None)
-        if other is None:
-            other = getattr(cfg_p, "morning_other_private_enabled", False)
-        raw_threshold = getattr(cfg_p, "greeting_other_private_min_messages", None)
-        if raw_threshold is None:
-            raw_threshold = getattr(cfg_p, "morning_other_private_min_messages", 5)
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        if ctx_obj is None or not hasattr(ctx_obj, "message"):
+            return False
         try:
-            threshold = max(5, int(raw_threshold))
-        except (TypeError, ValueError):
-            threshold = 5
-        return {
-            "target_enabled": bool(getattr(cfg_p, "greeting_target_enabled", True)),
-            "group_enabled": bool(getattr(cfg_p, "greeting_group_enabled", True)),
-            "other_private_enabled": bool(other),
-            "other_private_min_messages": threshold,
-            "night_allowed": True,
-        }
-
-    @staticmethod
-    def _parse_greeting_list(raw: Any, *, wildcard_allowed: bool) -> Tuple[List[str], bool, List[str]]:
-        """解析一份问候专用名单（M11 §2.4，Q2/Q4）：**只收裸群号/QQ 号**（纯数字）。
-
-        返回 ``(合法号列表, 是否通配, 问题清单)``：
-
-        - 带前缀、含非数字、空串、重复项 → 忽略该元素并计入问题清单（调用方汇总一条告警）；
-        - 白名单 ``"*"`` → 通配（不过滤）；``*`` 与具体号混用 → 按全放行处理并计入问题；
-        - 黑名单不支持通配（``"*"`` 按非法元素处理）。
-        """
-        values: List[str] = []
-        problems: List[str] = []
-        wildcard = False
-        seen: set = set()
-        for item in list(raw or []):
-            text = str(item).strip()
-            if not text:
-                problems.append(f"空串（{item!r}）")
-                continue
-            if text == "*":
-                if wildcard_allowed:
-                    wildcard = True
-                else:
-                    problems.append("黑名单不支持通配 *（按非法元素忽略）")
-                continue
-            if not text.isdigit():
-                problems.append(f"{text}（非法：只收裸号，带前缀或含非数字字符）")
-                continue
-            if text in seen:
-                problems.append(f"{text}（重复项）")
-                continue
-            seen.add(text)
-            values.append(text)
-        if wildcard and values:
-            problems.append("通配 * 与具体号混用 → 按全放行处理")
-        return values, wildcard, problems
-
-    def _note_greeting_list_problem(self, signature: Tuple[str, ...], problems: List[str]) -> None:
-        """名单非法元素的**汇总**告警（§2.4）：一条 ``logger.warning`` + 一条决策日志。
-
-        同签名每日一次（不逐条刷屏、也不每轮刷屏）；配置错误在 decision_logs 可见。
-        """
-        day = self._tz_manager.get_now().strftime("%Y-%m-%d")
-        key = (day, signature)
-        if key in self._greeting_list_warned:
-            return
-        # 跨天清理：只保留当天签名（避免内存无界增长）
-        self._greeting_list_warned = {k: True for k in self._greeting_list_warned if k[0] == day}
-        self._greeting_list_warned[key] = True
-        detail = "；".join(problems)
-        logger.warning(f"问候名单存在非法/重复元素（已忽略，不逐条刷屏）：{detail}")
-        self._decision_log(
-            "skip", trigger_type="greeting_list_parse",
-            reason=f"问候名单存在非法元素（已忽略）：{detail}",
-        )
-
-    def _greeting_lists(self, cfg_p: Any) -> Dict[str, Any]:
-        """解析问候专用黑白名单（群聊 + 其他私聊），非法元素汇总告警落决策日志（§2.4）。
-
-        返回 ``group_whitelist`` / ``group_wildcard`` / ``group_blacklist`` /
-        ``other_private_whitelist`` / ``other_private_wildcard`` / ``other_private_blacklist``。
-        与活动切换的 ``proactive_group_ids`` / ``proactive_other_streams``（支持前缀）**不混用**：
-        此处只认裸群号 / 裸 QQ 号。
-        """
-        raw_group_whitelist = list(getattr(cfg_p, "greeting_group_whitelist", None) or [])
-        raw_group_blacklist = list(getattr(cfg_p, "greeting_group_blacklist", None) or [])
-        raw_other_whitelist = list(getattr(cfg_p, "greeting_other_private_whitelist", None) or [])
-        raw_other_blacklist = list(getattr(cfg_p, "greeting_other_private_blacklist", None) or [])
-
-        group_whitelist, group_wildcard, gw_problems = self._parse_greeting_list(
-            raw_group_whitelist, wildcard_allowed=True)
-        group_blacklist, _gb_wildcard, gb_problems = self._parse_greeting_list(
-            raw_group_blacklist, wildcard_allowed=False)
-        other_whitelist, other_wildcard, ow_problems = self._parse_greeting_list(
-            raw_other_whitelist, wildcard_allowed=True)
-        other_blacklist, _ob_wildcard, ob_problems = self._parse_greeting_list(
-            raw_other_blacklist, wildcard_allowed=False)
-
-        problems: List[str] = []
-        for label, items in (("群聊白名单", gw_problems), ("群聊黑名单", gb_problems),
-                             ("其他私聊白名单", ow_problems), ("其他私聊黑名单", ob_problems)):
-            if items:
-                problems.append(f"{label}[{len(items)}]：" + "、".join(items))
-        if problems:
-            signature = tuple(str(x) for x in (raw_group_whitelist + raw_group_blacklist
-                                               + raw_other_whitelist + raw_other_blacklist))
-            self._note_greeting_list_problem(signature, problems)
-
-        return {
-            "group_whitelist": group_whitelist,
-            "group_wildcard": group_wildcard,
-            "group_blacklist": group_blacklist,
-            "other_private_whitelist": other_whitelist,
-            "other_private_wildcard": other_wildcard,
-            "other_private_blacklist": other_blacklist,
-        }
-
-    async def _resolve_greeting_group_streams(self, lists: Dict[str, Any]) -> List[str]:
-        """群聊问候候选（§2.2/§2.4）：黑名单命中即剔除；白名单非空（且非通配）时仅白名单。
-
-        名单为空 / 通配 ``["*"]`` → 枚举所有已知群聊（受必要性激活限制）。
-        """
-        whitelist = list(lists["group_whitelist"])
-        blacklist = set(lists["group_blacklist"])
-        pairs: List[Tuple[str, Optional[str]]] = []
-        if whitelist and not lists["group_wildcard"]:
-            for gid in whitelist:
-                pairs.append((gid, await self._resolve_group_id(gid)))
-        else:
-            pairs = await self._enumerate_group_pairs()
-
-        result: List[str] = []
-        for gid, sid in pairs:
-            if not sid or str(gid) in blacklist:
-                continue
-            result.append(sid)
-        return result
+            msgs = await ctx_obj.message.get_by_time_in_chat(
+                stream_id, str(since_ts), str(until_ts), limit=1,
+            )
+        except Exception as exc:
+            logger.debug(f"查询会话消息失败: {exc}")
+            return False
+        if isinstance(msgs, dict):
+            msgs = msgs.get("messages") or msgs.get("data") or []
+        return bool(msgs)
 
     async def _enumerate_group_pairs(self) -> List[Tuple[str, str]]:
         """枚举所有群聊的 ``(群号, session_id)``（问候黑名单需要群号维度；活动切换沿用既有枚举）。"""
@@ -1025,58 +900,35 @@ class ProactiveService:
                 result.append((user_id, session_id))
         return result
 
-    async def _resolve_greeting_other_streams(self, lists: Dict[str, Any]) -> List[str]:
-        """其他私聊问候候选（§2.2/§2.4，Q4）：白名单**留空 = 全不发**；黑名单命中即剔除。
-
-        白名单非空时仅白名单内的裸 QQ 号参与；通配 ``["*"]`` → 枚举已知私聊流（不过滤）。
-        门槛（前一日消息数 ≥ ``greeting_other_private_min_messages``）在到点判定处统一承担。
-        """
-        whitelist = list(lists["other_private_whitelist"])
-        blacklist = set(lists["other_private_blacklist"])
-        pairs: List[Tuple[str, Optional[str]]] = []
-        if lists["other_private_wildcard"]:
-            pairs = await self._enumerate_private_pairs()
-        elif whitelist:
-            for uid in whitelist:
-                pairs.append((uid, await self._resolve_private_id(uid)))
-        else:
-            return []   # 白名单留空 = 全不发（默认安全的收紧）
-
-        result: List[str] = []
-        for uid, sid in pairs:
-            if not sid or str(uid) in blacklist:
-                continue
-            result.append(sid)
-        return result
-
     async def _resolve_greeting_candidates(self, cfg_p: Any) -> List[Tuple[str, str]]:
-        """问候候选（M11 §2.2 矩阵）：目标私聊（开关） ∪ 群聊（名单 + 激活） ∪ 其他私聊（开关 + 门槛）。
+        """问候候选：目标私聊（陪伴模块启用时固定生效）∪ 群聊（名单）∪ 其他私聊（名单 + 门槛）。
 
-        - 目标私聊：``greeting_target_enabled``（默认开）——**豁免名单**，不看任何黑白名单；
-        - 群聊：``greeting_group_enabled``（默认开）+ 问候专用黑白名单（空 = 全发）；
-        - 其他私聊：``greeting_other_private_enabled``（默认关）+ 白名单（空 = 全不发）+ 黑名单。
-        与活动切换主动开口的两套旧名单（``proactive_group_ids`` / ``proactive_other_streams``）
-        **不混用**（附录 II §2.4/§八.2）。
+        2026-10-10 口径：
+
+        - **目标陪伴私聊**：陪伴模块（``[patrol].enabled``）启用时**不看任何名单**照发；
+          陪伴模块整体关闭时目标私聊也不再问候（问候是陪伴体验的一部分）；
+        - **群聊**：走统一群聊名单（``proactive_group_ids`` + 模式；默认黑名单 + 留空 = 全群）；
+          受 ``greeting_group_enabled``（隐藏兼容位，默认开）与「问候需激活」限制；
+        - **其他私聊**：走统一私聊名单（``proactive_private_ids`` + 模式；默认白名单 + 留空 = 全不发）；
+          另需 ``greeting_other_private_enabled``（隐藏兼容位，默认关）与前一日消息数门槛。
         """
         candidates: List[Tuple[str, str]] = []
         seen: set = set()
-        flags = self._greeting_flags(cfg_p)
 
         target = str(getattr(self._plugin, "_stream_id", "") or "").strip()
-        if target and flags["target_enabled"]:
+        if (target and self._companion_enabled()
+                and bool(getattr(cfg_p, "greeting_target_enabled", True))):
             candidates.append((target, GREETING_CATEGORY_TARGET))
             seen.add(target)
 
-        lists = (self._greeting_lists(cfg_p)
-                 if (flags["group_enabled"] or flags["other_private_enabled"]) else None)
-        if flags["group_enabled"] and lists is not None:
-            for sid in await self._resolve_greeting_group_streams(lists):
+        if bool(getattr(cfg_p, "greeting_group_enabled", True)):
+            for sid in await self._resolve_group_streams():
                 if sid and sid not in seen:
                     candidates.append((sid, GREETING_CATEGORY_GROUP))
                     seen.add(sid)
 
-        if flags["other_private_enabled"] and lists is not None:
-            for sid in await self._resolve_greeting_other_streams(lists):
+        if bool(getattr(cfg_p, "greeting_other_private_enabled", False)):
+            for sid in await self._resolve_private_streams():
                 if sid and sid not in seen:
                     candidates.append((sid, GREETING_CATEGORY_OTHER))
                     seen.add(sid)
@@ -1084,23 +936,22 @@ class ProactiveService:
         return candidates
 
     async def _process_greetings(self, now: datetime, date_str: str) -> None:
-        """L2 每轮：候选枚举 → 掷点/复用 → 到点激活判定 → 触发/推迟/放弃（§3.2/§3.3/§3.5）。
+        """L2 每轮：候选枚举 → 掷点/复用 → 到点激活判定 → 触发/推迟/放弃。
 
-        M11（附录 II §二）：早/晚安不再由 ``enable_morning_greeting`` / ``enable_night_greeting``
-        总开关决定，而由三类会话各自的开关与名单决定；被取代的 ``enable_night_greeting``
-        仅保留"显式 false = 晚安全灭"的 deprecated 语义（见
-        :meth:`PlanningProactiveSectionConfig.greeting_effective`）。
+        早/晚安由两个总开关（``greeting_morning_enabled`` / ``greeting_night_enabled``）控制，
+        候选名单见 :meth:`_resolve_greeting_candidates`；两类开关全关时本方法直接返回。
         """
         cfg_p = self._proactive_cfg()
-        flags = self._greeting_flags(cfg_p)
-        if not (flags["target_enabled"] or flags["group_enabled"] or flags["other_private_enabled"]):
+        if not (self._greeting_kind_enabled(GREETING_MORNING)
+                or self._greeting_kind_enabled(GREETING_NIGHT)):
             return
         now_ts = _epoch_ts(now)
         for stream_id, category in await self._resolve_greeting_candidates(cfg_p):
-            await self._evaluate_greeting(stream_id, category, GREETING_MORNING,
-                                          now, now_ts, date_str, cfg_p)
-            await self._evaluate_greeting(stream_id, category, GREETING_NIGHT,
-                                          now, now_ts, date_str, cfg_p)
+            for kind in (GREETING_MORNING, GREETING_NIGHT):
+                if not self._greeting_kind_enabled(kind):
+                    continue
+                await self._evaluate_greeting(stream_id, category, kind,
+                                              now, now_ts, date_str, cfg_p)
         # 跨天残留清理：只保留当天条目（纯内存状态，热重载后重掷）
         for key in [k for k in self._greeting_rolls if k[1] != date_str]:
             self._greeting_rolls.pop(key, None)
@@ -1110,35 +961,30 @@ class ProactiveService:
     async def _evaluate_greeting(self, stream_id: str, category: str, kind: str,
                                  now: datetime, now_ts: float, date_str: str,
                                  cfg_p: Any) -> None:
-        """单个候选的到点判定：激活 / 推迟下一 tick / 到期限放弃 / 触发（§3.3）。
+        """单个候选的到点判定：激活 / 推迟下一 tick / 到期限放弃 / 触发。
 
-        激活查询窗按 kind 分派（**附录 §六.补 B5-补（2026-10-07 协调裁决）**）：
+        激活查询窗按 kind 分派（附录 §六.补 B5-补）：
 
         - **晚安** ``[fire_at, now]``：``fire_at = baseline − drift < baseline``，而常见日程形态
           （末条非睡眠条目截断到入睡锚点）下 ``baseline ≈ 期限``——沿用 ``[baseline, now]``
           会**结构性空窗**、群聊晚安永不触发；改自「该问候成为可能（fire_at）起」。
-        - **早安** ``[baseline, now]`` **一字不动**（B5 字面：「自基准点起该流有人发过消息」）。
-        - 两者都保留 B5「有人说话才跟着问候」语义；放弃语义不变：``[fire_at, 期限]`` 内
-          无人发言 → ``abandoned``（由既有 deadline 分支落 reason）。
+        - **早安** ``[baseline, now]``（「自基准点起该流有人发过消息」）。
 
-        M11（附录 II §2.2）：三类开关在此兜底判定（候选枚举已按开关过滤，本处再判一次保证
-        直调路径同样生效）；其他私聊早/晚共用 ``greeting_other_private_enabled`` + 前一日
-        消息数门槛（旧键 ``morning_other_private_*`` 由配置层 deprecated 映射归并）。
+        目标私聊不看激活与名单；群聊看激活开关；其他私聊看前一日消息数门槛。
         """
-        flags = self._greeting_flags(cfg_p)
-        if kind == GREETING_NIGHT and not flags["night_allowed"]:
-            # 被取代键 enable_night_greeting 显式 false → 晚安全灭（三类都不发；§2.6/§七）
-            return
+        if not self._greeting_kind_enabled(kind):
+            return  # 总开关（候选枚举已按开关过滤，这里再判一次保证直调路径同样生效）
         if category == GREETING_CATEGORY_TARGET:
-            if not flags["target_enabled"]:
+            if not (self._companion_enabled()
+                    and bool(getattr(cfg_p, "greeting_target_enabled", True))):
                 return
         elif category == GREETING_CATEGORY_GROUP:
-            if not flags["group_enabled"]:
+            if not bool(getattr(cfg_p, "greeting_group_enabled", True)):
                 return
         else:
-            if not flags["other_private_enabled"]:
+            if not bool(getattr(cfg_p, "greeting_other_private_enabled", False)):
                 return
-            if not await self._morning_other_private_qualified(stream_id, date_str, now, cfg_p):
+            if not await self._other_private_qualified(stream_id, date_str, now, cfg_p):
                 return
 
         entry = self._roll_greeting(stream_id, category, kind, date_str, now, now_ts)
@@ -1219,48 +1065,57 @@ class ProactiveService:
         )
 
     async def _fire_greeting(self, entry: Dict[str, Any], date_str: str, now_ts: float) -> None:
-        """触发一次问候（§3.5/F9：一律走同一条主动链；M11 §2.3 例行问候默认免预算）。"""
+        """触发一次问候（一律走同一条主动链；例行问候始终免预算）。"""
         stream_id, kind = entry["stream_id"], entry["kind"]
         ok = await self._trigger_greeting(stream_id, kind, date_str)
         if not ok:
-            # 预算拒绝 / 宿主触发失败：状态不变，下一轮继续尝试（到期限自然放弃）
+            # 宿主触发失败：状态不变，下一轮继续尝试（到期限自然放弃）
             return
         entry["status"] = GREETING_STATUS_FIRED
         entry["fired_at"] = now_ts
         if entry["category"] == GREETING_CATEGORY_TARGET:
-            # §3.6：目标私聊写 affection 每日标记，patrol 见已发即不再各发一条
+            # 目标私聊写 affection 每日标记，patrol 见已发即不再各发一条
             self._mark_greeting_sent_on_affection(kind)
         self._decision_log(
             "trigger", trigger_type=f"{kind}_greeting",
-            reason=("planning_v4: 早安问候（L2 漂移）" if kind == GREETING_MORNING
-                    else "planning_v4: 晚安问候（L2 漂移）"),
+            reason=self._greeting_reason(kind),
             stream_id=stream_id, category=entry["category"],
             drift=f"{entry['drift'][0]}-{entry['drift'][1]}",
             fire_at=int(entry["fire_at"]), deadline=int(entry["deadline"]),
         )
 
+    def _greeting_reason(self, kind: str) -> str:
+        """问候的触发标注（进主动任务块，标明为什么开口；可在 [prompts] 段改文案）。"""
+        if kind == GREETING_MORNING:
+            return prompt(self._plugin, "proactive_reason_morning")
+        return prompt(self._plugin, "proactive_reason_night")
+
     async def _trigger_greeting(self, stream_id: str, kind: str, date_str: str) -> bool:
         """走统一主动链触发一次早晚安问候（intent 提示词按 kind 分派）。
 
-        M11（附录 II §2.3）：例行问候默认免主动打扰预算（``greeting_exempt_budget=true``）——
-        传 ``exempt_budget=True`` 时闸门与计数一起跳；关闭免预算则照旧走预算。
+        **例行问候始终免预算**（2026-10-10：原 ``greeting_exempt_budget`` 开关删除、恒为免预算）——
+        闸门与计数一起跳；陪伴侧的巡检/想念才走预算。
         """
-        cfg_p = self._proactive_cfg()
-        exempt_budget = bool(getattr(cfg_p, "greeting_exempt_budget", True))
         if kind == GREETING_MORNING:
             first = self._find_first_non_sleep_activity_today(date_str)
-            intent_prompt = (_MORNING_GREETING_INTENT.format(activity_name=first[0])
-                             if first is not None else _MORNING_GREETING_INTENT_NO_ACTIVITY)
-            reason = "planning_v4: 早安问候（L2 漂移）"
+            if first is not None:
+                intent_prompt = render(
+                    prompt(self._plugin, "proactive_intent_morning"),
+                    fallback=PROACTIVE_INTENT_MORNING_DEFAULT,
+                    activity_name=first[0],
+                )
+            else:
+                intent_prompt = prompt(self._plugin, "proactive_intent_morning_no_activity")
+            reason = self._greeting_reason(GREETING_MORNING)
         else:
-            intent_prompt = _NIGHT_GREETING_INTENT
-            reason = "planning_v4: 晚安问候（L2 漂移）"
+            intent_prompt = prompt(self._plugin, "proactive_intent_night")
+            reason = self._greeting_reason(GREETING_NIGHT)
         return await self._call_proactive_trigger(
             stream_id=stream_id,
             intent_prompt=intent_prompt,
             reason=reason,
             priority="normal",
-            exempt_budget=exempt_budget,
+            exempt_budget=True,
         )
 
     def _mark_greeting_sent_on_affection(self, kind: str) -> None:
@@ -1504,17 +1359,29 @@ class ProactiveService:
             commit_title = str(activity_params.get("commitment_title") or activity_name).strip()
             commit_time = str(activity_params.get("commitment_time") or "").strip()
             commit_notes = str(activity_params.get("commitment_notes") or "").strip()
-            intent_prompt = _COMMITMENT_INTENT_TEMPLATE.format(
+            intent_prompt = render(
+                prompt(self._plugin, "proactive_intent_commitment"),
+                fallback=PROACTIVE_INTENT_COMMITMENT_DEFAULT,
                 time_hint=f"{commit_time} " if commit_time else "",
                 title=commit_title,
                 notes_hint=commit_notes or "无",
                 activity_name=activity_name,
             )
-            reason = f"planning_v4: 约定到期 → {commit_title}"
+            reason = render(
+                prompt(self._plugin, "proactive_reason_commitment"),
+                fallback=PROACTIVE_REASON_COMMITMENT_DEFAULT,
+                title=commit_title,
+            )
         else:
-            template = _PROACTIVE_INTENT_TEMPLATES.get(goal_type, _DEFAULT_PROACTIVE_INTENT)
-            intent_prompt = f"{template}（活动名：{activity_name}）"
-            reason = f"planning_v4: 活动切换 → {activity_name}"
+            key = _PROACTIVE_INTENT_PROMPT_KEYS.get(goal_type, "")
+            template = prompt(self._plugin, key) if key else prompt(self._plugin, "proactive_intent_default")
+            fallback = _PROACTIVE_INTENT_FALLBACKS.get(goal_type, PROACTIVE_INTENT_DEFAULT)
+            intent_prompt = render(template, fallback=fallback, activity_name=activity_name)
+            reason = render(
+                prompt(self._plugin, "proactive_reason_activity"),
+                fallback=PROACTIVE_REASON_ACTIVITY_DEFAULT,
+                activity_name=activity_name,
+            )
 
         ok = await self._call_proactive_trigger(
             stream_id=stream_id,

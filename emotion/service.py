@@ -10,11 +10,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from core.llm_utils import purpose_task
 from core.storage import load_json, save_json_atomic
 from core.time_utils import parse_hhmm
 from planning.schedule_query import ScheduleQuery
 # M9（附录 §4.3 用户裁决 A2）：赖床工具名与钳制上限的**唯一定义点**在 planning/tools_service.py；
 # 提醒文本与组件注册同源引用。planning 侧不 import emotion（单向），故无循环依赖。
+from suite_prompts import (
+    EMOTION_INJECTION_DEFAULT,
+    prompt as prompt_of,
+    render,
+)
+
 from planning.tools_service import (DEFAULT_LIE_IN_MAX_UNTIL, NAP_TOOL_NAME,
                                     normalize_hhmm, parse_nap_target)
 
@@ -364,13 +371,13 @@ class EmotionService:
         深夜回复该短/慢/软、不主动开新话题；非冻结态输出与本行加入前逐字一致
         （不得改动既有字节，否则等于改了白天的提示词契约）。
         """
-        text = (
-            f"【当前情绪底色】{self.mood_text()}。\n"
-            "要求：语气、措辞、节奏与该情绪保持一致；情绪会随时间自然衰减、随事件变化；"
-            "严禁在回复中直接说出情绪标签词汇或任何数值；不要主动提及或解释本提示本身。"
+        text = render(
+            prompt_of(self._plugin, "emotion_injection"),
+            fallback=EMOTION_INJECTION_DEFAULT,
+            mood=self.mood_text(),
         )
         if self.is_frozen():
-            text = f"{text}\n{NIGHT_INJECTION_HINT}"
+            text = f"{text}\n{prompt_of(self._plugin, 'emotion_night_hint')}"
         return text
 
     # ── M6 可选增强：emoji 情绪联动（默认关；未启用时绝不触碰宿主 API）──────
@@ -651,13 +658,13 @@ class EmotionService:
             return
         if not self._daily_quota_ok(datetime.now(), label=f"per_reply:{str(session_id or '-')}"):
             return
-        cfg = getattr(self._plugin.config, "emotion", None)
-        task_name = str(getattr(cfg, "evaluator_task_name", "utils") or "utils")
+        task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
         user_message = await self._last_user_message_text(session_id)
         try:
             result = await evaluate_reply_delta(self._llm(), reply_text, self._persona,
                                                 self._lover_name, task_name,
-                                                user_message=user_message)
+                                                user_message=user_message,
+                                                plugin=self._plugin)
         except Exception:
             return
         if not result:
@@ -833,13 +840,13 @@ class EmotionService:
                                stream=stream, flush_reason=flush_reason,
                                pending_seconds=pending_seconds)
             return False
-        cfg = getattr(self._plugin.config, "emotion", None)
-        task_name = str(getattr(cfg, "evaluator_task_name", "utils") or "utils")
+        task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
         try:
             result = await evaluate_reply_delta(self._llm(), segment, self._persona,
                                                 self._lover_name, task_name, user_message="",
                                                 reply_max_chars=EPISODE_PROMPT_BUDGET_CHARS,
-                                                reply_keep_recent=True)
+                                                reply_keep_recent=True,
+                                                plugin=self._plugin)
         except Exception:
             return False          # 水位不推进：下轮重试（费用已花，不重复取同一段）
         if not result:
@@ -1192,11 +1199,11 @@ class EmotionService:
                 return {"ok": False, "reason": "empty_event"}
             if not self._llm_interval_ok():
                 return {"ok": False, "reason": "throttled"}
-            cfg = getattr(self._plugin.config, "emotion", None)
-            task_name = str(getattr(cfg, "evaluator_task_name", "utils") or "utils")
+            task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
             try:
                 result = await evaluate_reply_delta(self._llm(), event_text, self._persona,
-                                                    self._lover_name, task_name)
+                                                    self._lover_name, task_name,
+                                                    plugin=self._plugin)
             except Exception:
                 return {"ok": False, "reason": "llm_error"}
             if not result:
@@ -1260,7 +1267,7 @@ class EmotionService:
         return bool(getattr(self._machine, "frozen", False))
 
     def sleep_delta_limit(self) -> float:
-        """睡眠裁判增量动态限幅 = 0.4 + 0.4×``schedule.emotion_influence``（§4.2 睡眠大修 v2）。
+        """睡眠裁判增量动态限幅 = 0.4 + 0.4×``[schedule_advanced].emotion_influence``（§4.2 睡眠大修 v2）。
 
         替代旧固定 ±0.8；``emotion_influence`` 夹在 [0, 1]（0=下限 ±0.4，1=上限 ±0.8），
         配置缺失/非法一律回退默认 0.6（→ ±0.64）。
@@ -1270,8 +1277,13 @@ class EmotionService:
         return 0.4 + 0.4 * influence
 
     def _schedule_cfg(self, name: str, default: Any) -> Any:
-        """运行期动态读 [schedule] 配置项（热重载即时生效；缺省回退默认值）。"""
-        cfg = getattr(self._plugin.config, "schedule", None)
+        """运行期动态读日程配置项（热重载即时生效；缺省回退默认值）。
+
+        2026-10-10：`emotion_influence` 等深水项在 ``[schedule_advanced]``，先查高级段再回退基础段。
+        """
+        cfg = getattr(self._plugin.config, "schedule_advanced", None)
+        if cfg is None or getattr(cfg, name, None) is None:
+            cfg = getattr(self._plugin.config, "schedule", None)
         value = getattr(cfg, name, default)
         return default if value is None else value
 
@@ -1746,7 +1758,9 @@ class EmotionService:
         """渲染赖床提醒文本（§4.3 模板；占位符全部由本方法填充，工具名引用 NAP_TOOL_NAME）。"""
         current = now or datetime.now()
         wake = planned_wake or self.nap_planned_wake(current)
-        return NAP_REMINDER_TEMPLATE.format(
+        return render(
+            prompt_of(self._plugin, "nap_reminder"),
+            fallback=NAP_REMINDER_TEMPLATE,
             now_hhmm=f"{current:%H:%M}",
             planned_wake_hhmm=f"{wake:%H:%M}",
             nap_tool_name=NAP_TOOL_NAME,
@@ -2071,7 +2085,7 @@ class EmotionService:
         commitment_net = self._commitment_net_today()
         delta_limit = self.sleep_delta_limit()
 
-        referee_task = str(getattr(cfg, "referee_task_name", "replyer") or "replyer")
+        referee_task = purpose_task(self._plugin, "emotion_referee", default="replyer")
         vad = self._machine.effective_vad()  # 裁判接收已应用偏移的值（§九.3）
         result = await ask_sleep_referee(
             self._llm(),
@@ -2083,6 +2097,7 @@ class EmotionService:
             sleep_hours=hours, task_name=referee_task,
             delta_limit=delta_limit, r_yesterday=r_yesterday, e_tomorrow=e_tomorrow,
             commitment_net=commitment_net,
+            plugin=self._plugin,
         )
         if result is None:
             return None
@@ -2509,9 +2524,9 @@ class EmotionService:
     # ── 初始化（人设推导）────────────────────────────────────
     async def initialize_from_persona(self) -> str:
         """/lbm_emotion_init 主体：人设 → LLM 推导 → 校验落盘 → 生效。"""
-        cfg = getattr(self._plugin.config, "emotion", None)
-        task_name = str(getattr(cfg, "evaluator_task_name", "utils") or "utils")
-        params = await derive_params_from_persona(self._llm(), self._persona_text(), task_name)
+        task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
+        params = await derive_params_from_persona(self._llm(), self._persona_text(), task_name,
+                                                  plugin=self._plugin)
         if params is None:
             return "情绪初始化失败：模型未返回有效 JSON。请重试一次；若持续失败请检查模型配置。"
         self._machine.apply_params(params)

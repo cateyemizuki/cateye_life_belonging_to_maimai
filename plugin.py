@@ -37,11 +37,12 @@ from maibot_sdk import MaiBotPlugin
 
 from companion.affection import AffectionManager
 from companion.components import CompanionComponentsMixin
+from companion.config import target_qq_of
 from companion.services import CompanionServices
 from suite_config import SUPPORTED_CONFIG_VERSION, CateyeSuiteConfig
 from core.diag import DecisionLogger, LLMCallLogger
 from core.event_bus import EventBus, install_proactive_budget
-from core.llm_utils import LLMService
+from core.llm_utils import LLMService, llm_task_name_of
 from emotion.components import EmotionComponentsMixin
 from emotion.services import EmotionServices
 from planning.components import PlanningComponentsMixin
@@ -80,9 +81,12 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             config_provider=lambda: self.config, decision_logger=self._decision_logger,
         )
         # config_provider：judge() 等在调用时动态读顶层配置（[judge] 段热更新即时生效）
-        self._llm = LLMService(self.ctx, task_name=cfg.schedule.llm_task_name,
+        # 任务名统一读 [llm].task_name（2026-10-10 起 LLM 调用参数集中在 [llm] 段）
+        self._llm = LLMService(self.ctx, task_name=llm_task_name_of(cfg),
                                call_logger=self._llm_logger, config_provider=lambda: self.config)
-        self._schedule_query = ScheduleQuery(self._db, cache_minutes=cfg.schedule.inject_cache_minutes)
+        # 缓存窗口在 [schedule_advanced]（2026-10-10 段拆分）
+        self._schedule_query = ScheduleQuery(
+            self._db, cache_minutes=cfg.schedule_advanced.inject_cache_minutes)
 
         # 进程内事件总线（M0，MAINTENANCE_PLAN §三）：先于服务束构造（各服务束自读 plugin._bus），
         # 预算计数器在装配时装入（先于服务束启动；M0 实际订阅者仅它）
@@ -124,10 +128,11 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
 
         # 目标私聊 stream 解析（失败则后台重试）
         self._stream_id = await self._resolve_target_stream()
-        self._apply_target(str(cfg.target.target_qq), self._stream_id)
+        self._apply_target(target_qq_of(cfg), self._stream_id)
         await self._start_bg()
         self.ctx.logger.info("属于麦麦的生活已加载 v%s（目标=%s，stream=%s）",
-                             SUPPORTED_CONFIG_VERSION, cfg.target.target_qq, self._stream_id or "待解析")
+                             SUPPORTED_CONFIG_VERSION, target_qq_of(cfg) or "未配置",
+                             self._stream_id or "待解析")
 
     async def on_unload(self) -> None:
         await self._qzone.stop()
@@ -164,7 +169,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         if scope != "self":
             return
         cfg = self.config
-        self._llm.update_task(cfg.schedule.llm_task_name)
+        self._llm.update_task(llm_task_name_of(cfg))
         self._companion.sync_from_config()
         if not cfg.plugin.enabled:
             await self._qzone.stop()
@@ -174,7 +179,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             return
         # 目标 QQ 变化 → 重新解析 stream
         self._stream_id = await self._resolve_target_stream()
-        self._apply_target(str(cfg.target.target_qq), self._stream_id)
+        self._apply_target(target_qq_of(cfg), self._stream_id)
         await self._start_bg()
         if self._stream_id:
             self._companion.patrol.start()
@@ -217,7 +222,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
     # ------------------------------------------------------------------
     async def _resolve_target_stream(self) -> str:
         """解析目标 QQ 的私聊 stream_id；失败返回空串（后台重试循环接管）。"""
-        target_qq = str(self.config.target.target_qq)
+        target_qq = target_qq_of(self.config)
         if not target_qq or target_qq == "123456789":
             return ""  # 占位号不解析
         try:
@@ -247,7 +252,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             stream_id = await self._resolve_target_stream()
             if stream_id:
                 self._stream_id = stream_id
-                self._apply_target(str(self.config.target.target_qq), stream_id)
+                self._apply_target(target_qq_of(self.config), stream_id)
                 self._companion.patrol.start()
                 self.ctx.logger.info("目标 stream 解析成功：%s", stream_id)
                 return

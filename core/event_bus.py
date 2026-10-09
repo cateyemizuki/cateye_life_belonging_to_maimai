@@ -10,10 +10,11 @@
 
 主动打扰预算（仅目标陪伴私聊；§六.2 H，B11）：主动行为触发前发 ``proactive.used``，
 按日计数；各发布方触发前查询 :func:`ProactiveBudget.allow_proactive`；
-上限默认 = ``patrol.daily_max_speak + 2``，``patrol.proactive_target_daily_cap > 0`` 时直接采用其值
-（旧键名 ``global_proactive_cap`` 兼容读取回退：既有 config 与热重载前的运行期对象形态照旧生效）。
+**上限 = ``patrol.daily_max_speak``（每日预算即上限；2026-10-10 配置整理轮移除独立的
+``proactive_target_daily_cap`` / 旧键 ``global_proactive_cap``，不再叠加 +2 余量）**，
+只统计陪伴侧的「日程巡检 + 想念」；早/晚安免预算（planning 侧闸门与计数一起跳）。
 
-计数范围（M11，附录 II §3.2/§3.3）：**只统计「发往目标陪伴私聊」的主动打扰**——各扣费点
+计数范围（M11，附录 II §3.2/§3.3；2026-10-10 口径复核）：**只统计「发往目标陪伴私聊」的主动打扰**——各扣费点
 经 ``stream_id`` 维度传参，非目标流（群聊/其他私聊）直接放行且不查计数、不入账（收窄前为
 「所有主动行为合计」）。目标私聊 stream_id 的权威来源是 ``plugin._stream_id``（G11；由
 ``target.target_qq`` 解析、随热重载更新），装配期以 ``target_stream_provider`` 回调注入，
@@ -371,25 +372,21 @@ class ProactiveBudget:
             return None
 
     def cap(self) -> int:
-        """目标陪伴私聊的每日主动打扰上限：``patrol.proactive_target_daily_cap > 0`` 时采用其值
-        （旧键名 ``patrol.global_proactive_cap`` 属性级兼容回退），否则 ``daily_max_speak + 2``。"""
+        """目标陪伴私聊的每日主动打扰上限 = ``[patrol].daily_max_speak``（每日预算即上限）。
+
+        2026-10-10 配置整理轮：独立上限字段（旧 ``proactive_target_daily_cap`` /
+        ``global_proactive_cap``）已删除——预算只统计陪伴侧的日程巡检与想念
+        （早/晚安不占预算，见 planning/proactive_service 的免预算口径），
+        因此「每日预算」本身就是上限，不再叠加 +2 余量；取不到配置时回退 5。
+        """
         cfg = self._config()
         patrol = getattr(cfg, "patrol", None)
         daily = getattr(patrol, "daily_max_speak", 5)
-        # M11（附录 II §3.4）：字段改名 proactive_target_daily_cap；取不到时回落旧属性名，
-        # 热重载前的运行期对象 / 既有 SimpleNamespace 桩形态（仅带旧键）照旧生效
-        override = getattr(patrol, "proactive_target_daily_cap", None)
-        if override is None:
-            override = getattr(patrol, "global_proactive_cap", 0)
         try:
             daily_int = int(daily if daily is not None else 5)
         except (TypeError, ValueError):
             daily_int = 5
-        try:
-            override_int = int(override if override is not None else 0)
-        except (TypeError, ValueError):
-            override_int = 0
-        return override_int if override_int > 0 else daily_int + 2
+        return max(0, daily_int)
 
     def used_today(self) -> int:
         self._roll_date()

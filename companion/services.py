@@ -18,22 +18,18 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import tempfile
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from core.diag import DecisionLogger, LLMCallLogger
-from core.llm_utils import LLMService
+from core.llm_utils import LLMService, llm_task_name_of
 from planning.schedule_query import ScheduleQuery
 
 from .affection import AffectionManager
 from .affection_events import record_rule_event
 from .affection_referee import AffectionReviewer
 from .cateye_client import CateyeClient
-from .holiday_service import HolidayService
 from .memory_manager import MemoryManager
 from .message_service import MessageService
 from .patrol import PatrolService
@@ -116,7 +112,7 @@ class CompanionServices:
         self.llm_logger: Optional[LLMCallLogger] = getattr(plugin, "_llm_logger", None)
         self.llm: LLMService = (
             getattr(plugin, "_llm", None)
-            or LLMService(self.ctx, task_name=cfg.schedule.llm_task_name, call_logger=self.llm_logger,
+            or LLMService(self.ctx, task_name=llm_task_name_of(cfg), call_logger=self.llm_logger,
                           config_provider=lambda: plugin.config)
         )
         # 日程查询：消费 planning 子模块（顶层 plugin._schedule_query 即 planning.ScheduleQuery）
@@ -128,14 +124,12 @@ class CompanionServices:
         #: 会话 ID → 是否群聊
         self.session_kinds = SessionKindCache()
         #: 屏幕旁白「尾随锚点」注入缓存（触发时发布，请求 Hook 消费）
-        cateye_cfg = getattr(cfg, "cateye", None)
+        # 2026-10-10：[cateye] 段并入 [patrol]（陪伴模块），字段前缀 screen_*
         self.screen_store = ScreenContextStore(
-            ttl_minutes=float(getattr(cateye_cfg, "context_ttl_minutes", 90) or 90)
+            ttl_minutes=float(getattr(cfg.patrol, "screen_context_ttl_minutes", 90) or 90)
         )
         #: 陪伴对象电脑联动客户端（connect-hub 跨插件 API）
         self.cateye = CateyeClient(plugin, llm=self.llm, call_logger=self.llm_logger)
-        #: 节假日服务（注入日期行用）
-        self.holiday = HolidayService(self._data_dir)
         #: 本地记忆库（用户习惯）
         self.memory = MemoryManager(self.affection)
         #: 关系档案（对方是 bot 的谁：恋人/挚友/维护者/家人/自定义，随配置热更新）
@@ -198,7 +192,7 @@ class CompanionServices:
         except Exception:
             pass
         try:
-            self.llm.update_task(cfg.schedule.llm_task_name)
+            self.llm.update_task(llm_task_name_of(cfg))
         except Exception:
             pass
         try:
@@ -309,11 +303,6 @@ class CompanionServices:
             self.patrol.start()
         elif not patrol_enabled:
             self.plugin.ctx.logger.info('陪伴模块已停用（patrol.enabled=false），巡检循环未启动')
-        # 预热当天节假日缓存，避免首次 planner 注入阻塞在 API 调用
-        try:
-            asyncio.ensure_future(self.holiday.get_holiday_info(datetime.now().strftime("%Y-%m-%d")))
-        except Exception:
-            pass
 
     async def stop(self) -> None:
         """停止服务束：停巡检、清身份缓存、丢弃待注入旁白、强写好感度。"""

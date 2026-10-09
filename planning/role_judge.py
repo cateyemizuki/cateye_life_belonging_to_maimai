@@ -3,7 +3,7 @@
 供 ``tools_service.update_schedule_v4`` 使用：把当前日程 + 人设 + 用户描述
 扔给 LLM，让它返回 ``{"decision": "today/future/reject", ...}``，调用方
 据此决定是重生成当日日程、记录未来约定，还是拒绝不变。
-LLM 调用走宿主 ``ctx.llm.generate``（task_name 路由）。
+LLM 调用走统一出口 ``core.llm_utils.LLMService``（2026-10-10 收编；task_name 路由）。
 """
 
 from __future__ import annotations
@@ -13,6 +13,14 @@ import logging
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+
+from suite_prompts import (
+    SCHEDULE_ROLE_JUDGE_DEFAULT,
+    SCHEDULE_ROLE_JUDGE_NO_ACTIVITY_DEFAULT,
+    SCHEDULE_ROLE_JUDGE_NO_PERSONA_DEFAULT,
+    prompt as prompt_of,
+    render,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,13 +120,14 @@ def _infer_future_date(raw_date: str, today_str: str) -> str:
 
 def _build_judge_prompt(
     *,
+    plugin: Any = None,
     persona: str,
     today_str: str,
     weekday: str,
     current_activities: List[Dict[str, Any]],
     description: str,
 ) -> str:
-    """构造角色裁判 prompt。"""
+    """构造角色裁判 prompt（模板读 ``[prompts].schedule_role_judge``，可深度定制）。"""
     if current_activities:
         lines = []
         for act in current_activities:
@@ -127,25 +136,19 @@ def _build_judge_prompt(
             lines.append(f"- {time_str} {name}")
         current_text = "\n".join(lines)
     else:
-        current_text = "暂无可靠日程"
+        current_text = prompt_of(plugin, "schedule_role_judge_no_activity") or \
+            SCHEDULE_ROLE_JUDGE_NO_ACTIVITY_DEFAULT
 
-    return (
-        f"【角色人设】\n{persona or '未提供'}\n\n"
-        f"【日期信息】\n今天是 {today_str}（{weekday}）\n\n"
-        f"【当前日程】\n{current_text}\n\n"
-        f"【用户请求】\n{description}\n\n"
-        "请扮演该角色，判断是否会接受这个日程相关请求。\n"
-        "不要机械接受用户安排；如果不符合人设、时间冲突太强、语气像玩笑或没有明确计划，可以拒绝或不改日程。\n"
-        "decision 只能是以下值之一：\n"
-        "- today: 角色接受或调整今天的安排，需要修改今天日程\n"
-        "- future: 角色接受未来某天的预约，只记录预约，不修改今天日程\n"
-        "- reject: 角色没有接受，日程不变\n\n"
-        "以 JSON 格式返回：\n"
-        '{"decision": "today/future/reject", "date": "YYYY-MM-DD 或空", '
-        '"time": "HH:MM 或空", "title": "简短标题", "notes": "备注", '
-        '"reason": "角色判断理由", "raw_date": "用户原文中的日期描述"}\n'
-        "日期必须根据【日期信息】中的真实日期推断。\n"
-        "只输出 JSON，不要其他文字。"
+    persona_text = persona or (
+        prompt_of(plugin, "schedule_role_judge_no_persona") or SCHEDULE_ROLE_JUDGE_NO_PERSONA_DEFAULT)
+    return render(
+        prompt_of(plugin, "schedule_role_judge"),
+        fallback=SCHEDULE_ROLE_JUDGE_DEFAULT,
+        persona=persona_text,
+        today_str=today_str,
+        weekday=weekday,
+        current_text=current_text,
+        description=description,
     )
 
 
@@ -161,11 +164,12 @@ async def judge_schedule_request(
     temperature: float = 0.3,
     max_tokens: int = 2000,
     timeout_ms: Optional[int] = None,
+    llm_service: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """让 LLM 判断用户日程请求该如何处理。
 
     Args:
-        plugin: 当前插件实例（用于 ``ctx.llm.generate``）。
+        plugin: 当前插件实例（取 ``plugin._llm`` 兜底；配置读取也走它）。
         description: 用户的日程相关请求文本。
         current_activities: 今日日程活动列表（每项含 ``time`` / ``name``）。
         persona: 角色人设文本。
@@ -174,13 +178,15 @@ async def judge_schedule_request(
         task_name: 模型任务名（走宿主任务路由）。
         temperature: LLM 温度。
         max_tokens: LLM 最大 tokens。
-        timeout_ms: LLM 调用 RPC 超时（毫秒）。``None`` 使用宿主默认。
+        timeout_ms: LLM 调用超时（毫秒）。``None`` 使用宿主默认。
+        llm_service: 统一 LLMService 实例（缺省取 ``plugin._llm``）。
 
     Returns:
         解析后的判断 dict（含 ``decision`` 等字段）；LLM 失败时返回 None，
         调用方应降级到「日程不变」。
     """
     prompt = _build_judge_prompt(
+        plugin=plugin,
         persona=persona,
         today_str=today_str,
         weekday=weekday,
@@ -188,27 +194,21 @@ async def judge_schedule_request(
         description=description,
     )
 
-    llm_kwargs: Dict[str, Any] = {
-        "prompt": prompt,
-        "task_name": task_name,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if timeout_ms is not None and timeout_ms > 0:
-        llm_kwargs["timeout_ms"] = int(timeout_ms)
-
-    try:
-        result = await plugin.ctx.llm.generate(**llm_kwargs)
-    except Exception as exc:
-        logger.warning(f"角色裁判 LLM 调用失败: {exc}")
+    # 2026-10-10：角色裁判改走统一出口 LLMService（原先直接 ctx.llm.generate，
+    # 绕过调用日志与失败三态分诊）；实例缺省时回退 plugin._llm，都拿不到按失败处理。
+    llm = llm_service or getattr(plugin, "_llm", None)
+    if llm is None:
+        logger.warning("角色裁判缺少 LLMService 实例，按判定失败处理（日程不变）")
         return None
-
-    response_text = ""
-    if isinstance(result, dict):
-        response_text = str(result.get("response", "") or "").strip()
-    success = bool(result.get("success", False)) if isinstance(result, dict) else False
-
-    if not success or not response_text:
+    response_text = await llm.generate(
+        prompt,
+        task_name=task_name,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout_ms=int(timeout_ms) if (timeout_ms is not None and timeout_ms > 0) else None,
+        event="role_judge",
+    )
+    if not response_text:
         return None
 
     parsed = _parse_json_loose(response_text)

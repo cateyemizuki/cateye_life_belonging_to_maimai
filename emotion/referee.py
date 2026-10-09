@@ -13,6 +13,8 @@ import json
 import re
 from typing import Any, Dict, Optional, Tuple
 
+from suite_prompts import prompt as prompt_of, render
+
 from .state_machine import EmotionParams
 # D6（V3 接线）：情绪表摘要**不得 from-import**（导入期绑定会在覆盖生效前定型）——
 # 改调运行期 getter，两处 prompt 随「默认 ⊕ 覆盖」的合并原型表实时取值。
@@ -213,7 +215,8 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
                             delta_limit: float = DEFAULT_SLEEP_DELTA_LIMIT,
                             r_yesterday: Optional[VADState] = None,
                             e_tomorrow: Optional[VADState] = None,
-                            commitment_net: float = 0.0) -> Optional[Tuple[VADState, Dict[str, str]]]:
+                            commitment_net: float = 0.0,
+                            plugin: Any = None) -> Optional[Tuple[VADState, Dict[str, str]]]:
     """睡眠裁判：返回 (ΔVAD_sleep, 理由)；请求失败/解析失败返回 None。
 
     M5（§4.2 睡眠大修 v2）：``delta_limit`` 为动态限幅（服务侧传
@@ -232,7 +235,9 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
         net = float(commitment_net or 0.0)
     except (TypeError, ValueError):
         net = 0.0
-    prompt = SLEEP_REFEREE_PROMPT.format(
+    prompt = render(
+        prompt_of(plugin, "emotion_sleep_referee"),
+        fallback=SLEEP_REFEREE_PROMPT,
         persona=persona or "（暂无人设）", v=vad.valence, a=vad.arousal, d=vad.dominance,
         emotion_log=emotion_log_text, yesterday_schedule=yesterday_schedule or "（没有记录）",
         tomorrow_schedule=tomorrow_schedule or "（没有记录）", long_term_status=long_term_status or "普通时期",
@@ -255,11 +260,16 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
     return _delta_from(data, limit), reasons
 
 
-async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str) -> Optional[EmotionParams]:
+async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str,
+                                     plugin: Any = None) -> Optional[EmotionParams]:
     """人设初始化：人设文本 → 四组参数（校验+裁剪到约束区间）。"""
     response = await llm.generate(
         prompt=str(persona_text or "")[:2000],
-        system_prompt=INIT_SYSTEM_PROMPT.format(emotion_table=emotion_table_summary()),
+        system_prompt=render(
+            prompt_of(plugin, "emotion_init_system"),
+            fallback=INIT_SYSTEM_PROMPT,
+            emotion_table=emotion_table_summary(),
+        ),
         task_name=task_name, temperature=0.4, max_tokens=900, event="emotion_init",
     )
     data = _parse_json_loose(response)
@@ -294,7 +304,8 @@ async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str
 async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_name: str,
                                task_name: str, *, user_message: str = "",
                                reply_max_chars: int = REPLY_TEXT_PROMPT_CHARS,
-                               reply_keep_recent: bool = False) -> Optional[Tuple[str, VADState]]:
+                               reply_keep_recent: bool = False,
+                               plugin: Any = None) -> Optional[Tuple[str, VADState]]:
     """回复/外部事件增量评估：返回 (事件摘要, ΔVAD)；失败返回 None。
 
     ``user_message`` 是评估上下文增强（§4.2 行 2 / §七 M3 行）：该聊天流最近一条
@@ -308,7 +319,10 @@ async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_na
     """
     body = _clip_prompt_body(reply_text, reply_max_chars, reply_keep_recent)
     response = await llm.generate(
-        prompt=EVALUATE_PROMPT.format(lover_name=lover_name, persona=(persona or "（暂无人设）")[:800],
+        prompt=render(
+            prompt_of(plugin, "emotion_evaluate"),
+            fallback=EVALUATE_PROMPT,
+            lover_name=lover_name, persona=(persona or "（暂无人设）")[:800],
                                       user_context=(str(user_message or "").strip()[:300]
                                                     or "（未取到用户侧消息，仅按下面内容判断）"),
                                       reply_text=body),
