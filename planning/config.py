@@ -225,7 +225,7 @@ class ScheduleSectionConfig(PluginConfigBase):
     # ── 角色裁判 ────────────────────────────────────────────
     role_judge_enabled: bool = Field(
         default=True,
-        description="角色裁判模式：用户通过 cateye_test_update_schedule_v4 提出自然语言日程请求时，LLM 扮演 bot 判断接不接——"
+        description="角色裁判模式：用户通过 lbm_update_schedule_v4 提出自然语言日程请求时，LLM 扮演 bot 判断接不接——"
                     "today=接受并调整今天日程；future=接受未来预约（写入候选清单，到点主动兑现）；"
                     "reject=拒绝（日程不变）。判定失败安全降级为日程不变。关闭后所有请求一律记为未来约定",
         json_schema_extra={
@@ -289,13 +289,13 @@ class ScheduleSectionConfig(PluginConfigBase):
     # ── 命令展示 ────────────────────────────────────────────
     list_draw_image: bool = Field(
         default=True,
-        description="/cateye_test_plan list 是否绘制日程图片。关闭后只返回文字长文本",
+        description="/lbm_plan list 是否绘制日程图片。关闭后只返回文字长文本",
         json_schema_extra={"label": "list 绘制图片", **_ui_i18n("Draw list image")},
     )
     image_timeout_seconds: float = Field(
         default=15.0,
         ge=1.0,
-        description="日程图片绘制超时（秒）。超时静默放弃图片，/cateye_test_plan list 自动降级为纯文字（不会提示绘制失败）",
+        description="日程图片绘制超时（秒）。超时静默放弃图片，/lbm_plan list 自动降级为纯文字（不会提示绘制失败）",
         json_schema_extra={"label": "绘制超时", **_ui_i18n("Image timeout (s)")},
     )
 

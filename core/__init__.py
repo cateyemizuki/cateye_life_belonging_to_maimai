@@ -1,4 +1,4 @@
-"""猫眼生活套件 — 公共基础设施（跨模块共享；各业务模块在 planning/ companion/ qzone/）。"""
+"""属于麦麦的生活 — 公共基础设施（跨模块共享；各业务模块在 planning/ companion/ qzone/）。"""
 
 from .diag import DecisionLogger, LLMCallLogger
 from .llm_utils import LLMService

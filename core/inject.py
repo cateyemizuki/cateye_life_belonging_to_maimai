@@ -37,7 +37,7 @@ PROACTIVE_BLOCK_STALE_MS = 30 * 60 * 1000
 #: 主动任务块 id 的形态标记：``id="proactive:{plugin_id}:{epoch_ms}"``（附录 §一 F10）。
 _PROACTIVE_ID_MARKER = 'id="proactive:'
 #: 本插件在宿主侧的标识（_manifest.json 的 id）：块 id 里的 plugin_id 段据此比对。
-CATEYE_PLUGIN_ID = "github.cateye.cateye-suite"
+CATEYE_PLUGIN_ID = "cateye.life_belonging_to_maimai"
 #: 赖床提醒块的身份标记（附录 §4.2）：``proactive.trigger(..., metadata={"kind": "nap_reminder"})``
 #: 被宿主**序列化进块文本一行**（F12），且 intent 同名，故块文本里必然出现该串；该标记只有本
 #: 插件的赖床提醒会带 → 不会误伤其他主动块与真实消息。

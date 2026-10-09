@@ -15,13 +15,13 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   - maisaka.replyer.before_model_request  过期主动任务块剥离 + 仅屏幕旁白注入
                                        （BLOCKING/NORMAL）
   - maisaka.replyer.after_response     90 秒窗口补计 0.5 发言数 + spoken 回执（OBSERVE/LATE）
-- Tools ×2：cateye_test_mai_lover_send_message / cateye_test_mai_lover_affection
+- Tools ×2：lbm_mai_lover_send_message / lbm_mai_lover_affection
   （原 current_activity / status / schedule 三工具已随 T6 注册面收口移除：
-  当前活动与日程查询见 cateye_test_get_schedule_info，状态总览见 /cateye_test_dashboard）
-- Commands ×4：/cateye_test_mai_affection（鉴权：target_qq 白名单 + 本机控制台，
-  占位默认值一律拒绝）｜/cateye_test_mai_help｜/cateye_test_diag（A5 排障三合一：
-  llm|decision|life 子命令，旧名 /cateye_test_mai_llm_log、/cateye_test_mai_diag 与
-  /cateye_test_life diag 保留为别名；鉴权 = admin 判定）｜/cateye_test_dashboard
+  当前活动与日程查询见 lbm_get_schedule_info，状态总览见 /lbm_dashboard）
+- Commands ×4：/lbm_mai_affection（鉴权：target_qq 白名单 + 本机控制台，
+  占位默认值一律拒绝）｜/lbm_mai_help｜/lbm_diag（A5 排障三合一：
+  llm|decision|life 子命令，旧名 /lbm_mai_llm_log、/lbm_mai_diag 与
+  /lbm_life diag 保留为别名；鉴权 = admin 判定）｜/lbm_dashboard
   （M7 聚合总览：四模块状态图 + 纯文本降级，文本档展开完整日程并附配置摘要；
   鉴权同 admin 判定；渲染失败/超时静默降级为纯文本）
   （原 /mai_status、/mai_schedule、/mai_config、/mai_test 四条命令已移除：状态/日程
@@ -71,7 +71,7 @@ _PROACTIVE_RULE_WINDOW_SECONDS = 90.0
 #: 省略图片时替换成的文本占位符（不能直接删 part，否则 item 可能没有 part）。
 _IMAGE_OMITTED_PLACEHOLDER = "[图片已省略：为控制上下文体积]"
 
-#: 主动行为决策日志里的跳过原因 → 中文说明（/cateye_test_diag decision 展示用）。
+#: 主动行为决策日志里的跳过原因 → 中文说明（/lbm_diag decision 展示用）。
 _DIAG_REASON_LABELS: dict[str, str] = {
     "no_candidate": "本轮没有满足条件的触发",
     "silence": "处于静默时段",
@@ -92,12 +92,12 @@ _DIAG_REASON_LABELS: dict[str, str] = {
     "tool_send_message": "planner 通过 Tool 主动发消息",
 }
 
-#: /cateye_test_diag 用法帮助（无参数或未知子命令时原样回复；四行，含旧名别名对应关系）。
+#: /lbm_diag 用法帮助（无参数或未知子命令时原样回复；四行，含旧名别名对应关系）。
 _DIAG_USAGE_TEXT = (
-    "用法: /cateye_test_diag <llm|decision|life> [天数]（管理员）\n"
-    "  llm [天数]      — LLM 调用日志，合并转发（1~30 天；旧名 /cateye_test_mai_llm_log）\n"
-    "  decision [天数] — 主动行为决策日志，合并转发（1~30 天；旧名 /cateye_test_mai_diag）\n"
-    "  life [天数]     — 决策日志紧凑文本（1~7 天；旧名 /cateye_test_life diag）"
+    "用法: /lbm_diag <llm|decision|life> [天数]（管理员）\n"
+    "  llm [天数]      — LLM 调用日志，合并转发（1~30 天；旧名 /lbm_mai_llm_log）\n"
+    "  decision [天数] — 主动行为决策日志，合并转发（1~30 天；旧名 /lbm_mai_diag）\n"
+    "  life [天数]     — 决策日志紧凑文本（1~7 天；旧名 /lbm_life diag）"
 )
 
 #: 注入作用域
@@ -670,7 +670,7 @@ class CompanionComponentsMixin:
     # ==================================================================
 
     @Tool(
-        "cateye_test_mai_lover_send_message",
+        "lbm_mai_lover_send_message",
         description="以 bot 的口吻向关系对象主动发送一条消息（关系类型见配置 relation_type：恋人/挚友/维护者/家人），口吻与后缀随关系自动变化",
         parameters={
             "message": {
@@ -709,7 +709,7 @@ class CompanionComponentsMixin:
         try:
             result = await self.ctx.send.text(text=final_text, stream_id=stream_id)
         except Exception as e:
-            self.ctx.logger.error(f"[cateye_test_mai_lover_send_message] 发送异常: {e}")
+            self.ctx.logger.error(f"[lbm_mai_lover_send_message] 发送异常: {e}")
             return f"消息发送异常: {e}"
         if result:
             companion.affection.increment_speak()
@@ -723,7 +723,7 @@ class CompanionComponentsMixin:
         return "消息发送失败: 发送返回 False"
 
     @Tool(
-        "cateye_test_mai_lover_affection",
+        "lbm_mai_lover_affection",
         description="调整与关系对象的好感度：把 score 移动到 0/1/2 兼容档对应的 v2 5 档区间中值并重估档位"
                     "（档位名称随关系类型变化，如恋人=熟悉/亲密/热恋）",
         parameters={
@@ -750,7 +750,7 @@ class CompanionComponentsMixin:
     # ==================================================================
 
     def _is_authorized_command_user(self, user_id: str, is_local_operator: bool = False) -> bool:
-        """校验命令触发者是否有权使用 /cateye_test_mai_* 命令。
+        """校验命令触发者是否有权使用 /lbm_mai_* 命令。
 
         规则：本机控制台操作员天然放行；其余仅白名单 target_qq 本人可用
         （兼容 ``qq:123456`` 平台前缀写法）。target_qq 为占位默认值/无效值时
@@ -784,8 +784,8 @@ class CompanionComponentsMixin:
                 pass
         return False
 
-    @Command(name="/cateye_test_mai_affection", pattern=r"(?<!\S)/cateye_test_mai_affection(?:\s+(?P<mai_level>\S+))?\s*$",
-             description="查看/调整好感度（score/baseline/档位/今日Δ）。用法: /cateye_test_mai_affection [0|1|2]")
+    @Command(name="/lbm_mai_affection", pattern=r"(?<!\S)/lbm_mai_affection(?:\s+(?P<mai_level>\S+))?\s*$",
+             description="查看/调整好感度（score/baseline/档位/今日Δ）。用法: /lbm_mai_affection [0|1|2]")
     async def mai_cmd_affection(self, **kwargs: Any) -> tuple[bool, str, bool]:
         companion = self._mai_companion()
         if not await self._authorize_command(kwargs):
@@ -808,7 +808,7 @@ class CompanionComponentsMixin:
             # 不带参数 = 查看好感 v2 状态（M2：含最近印象与关系温度）
             current = self._mai_affection_state_line() if companion else "好感度管理器未初始化。"
             await _reply(
-                "用法: /cateye_test_mai_affection <0|1|2>（不带参数只看状态）\n"
+                "用法: /lbm_mai_affection <0|1|2>（不带参数只看状态）\n"
                 "0 = 熟悉档区间 | 1 = 亲密档区间 | 2 = 热恋档区间（3 档兼容口径，实际按 v2 score 运行）\n"
                 f"当前状态: {current}"
             )
@@ -829,7 +829,7 @@ class CompanionComponentsMixin:
         await _reply(f"好感度已更新：{self._mai_affection_state_line()}")
         return True, "好感度已调整", True
 
-    @Command(name="/cateye_test_mai_help", pattern=r"(?<!\S)/cateye_test_mai_help\s*$",
+    @Command(name="/lbm_mai_help", pattern=r"(?<!\S)/lbm_mai_help\s*$",
              description="查看麦麦陪伴所有可用命令")
     async def mai_cmd_help(self, **kwargs: Any) -> tuple[bool, str, bool]:
         if not await self._authorize_command(kwargs):
@@ -838,11 +838,11 @@ class CompanionComponentsMixin:
         name = self._mai_lover_name()
         help_text = (
             f"🐱 {name} 可用命令:\n"
-            "/cateye_test_mai_affection — 查看/调整好感度: /cateye_test_mai_affection [0|1|2]\n"
-            "/cateye_test_diag          — 排障诊断 [llm|decision|life] [天数]（管理员；旧名 mai_llm_log/mai_diag 仍可用）\n"
-            "/cateye_test_dashboard     — 状态总览图（日程/关系/情绪/空间，管理员）\n"
-            "日程与生活管理见 /cateye_test_plan 与 /cateye_test_life\n"
-            "/cateye_test_mai_help      — 本帮助"
+            "/lbm_mai_affection — 查看/调整好感度: /lbm_mai_affection [0|1|2]\n"
+            "/lbm_diag          — 排障诊断 [llm|decision|life] [天数]（管理员；旧名 mai_llm_log/mai_diag 仍可用）\n"
+            "/lbm_dashboard     — 状态总览图（日程/关系/情绪/空间，管理员）\n"
+            "日程与生活管理见 /lbm_plan 与 /lbm_life\n"
+            "/lbm_mai_help      — 本帮助"
         )
         try:
             await self.ctx.send.text(text=help_text, stream_id=stream_id)
@@ -852,18 +852,18 @@ class CompanionComponentsMixin:
             return False, f"发送失败: {e}", True
 
     @Command(
-        name="/cateye_test_diag",
-        pattern=r"(?<!\S)/cateye_test_diag(?:\s+(?P<diag_args>.*?))?\s*$"
-                r"|(?<!\S)(?P<legacy_llm>/cateye_test_mai_llm_log)(?:\s+(?P<llm_days>\S+))?\s*$"
-                r"|(?<!\S)(?P<legacy_decision>/cateye_test_mai_diag)(?:\s+(?P<mai_days>\S+))?\s*$",
-        description="排障诊断合一：/cateye_test_diag [llm|decision|life] [天数]"
+        name="/lbm_diag",
+        pattern=r"(?<!\S)/lbm_diag(?:\s+(?P<diag_args>.*?))?\s*$"
+                r"|(?<!\S)(?P<legacy_llm>/lbm_mai_llm_log)(?:\s+(?P<llm_days>\S+))?\s*$"
+                r"|(?<!\S)(?P<legacy_decision>/lbm_mai_diag)(?:\s+(?P<mai_days>\S+))?\s*$",
+        description="排障诊断合一：/lbm_diag [llm|decision|life] [天数]"
                     "（旧名 mai_llm_log/mai_diag/life diag 保留为别名）",
     )
     async def mai_cmd_diag(self, **kwargs: Any) -> tuple[bool, str, bool]:
         """A5 排障三合一：llm / decision / life 子命令 + 旧命令名别名直达。
 
-        输出与旧三件套完全同构（llm = 旧 /cateye_test_mai_llm_log、decision = 旧
-        /cateye_test_mai_diag、life = 旧 /cateye_test_life diag 紧凑文本）；旧名由
+        输出与旧三件套完全同构（llm = 旧 /lbm_mai_llm_log、decision = 旧
+        /lbm_mai_diag、life = 旧 /lbm_life diag 紧凑文本）；旧名由
         pattern 的 ``legacy_llm`` / ``legacy_decision`` 命名捕获进入同一逻辑（同一组件，
         零组件成本）。鉴权统一收归 admin 判定（旧 mai_diag/llm_log 走 target 白名单、
         旧 life diag 走 admin，收归后口径见 USAGE）。
@@ -871,7 +871,7 @@ class CompanionComponentsMixin:
         stream_id = str(kwargs.get("stream_id", "") or "")
         if not self._qz_is_admin(str(kwargs.get("user_id") or ""),
                                  bool(kwargs.get("is_local_operator", False))):
-            await self._diag_reply(stream_id, "权限不足：仅管理员可用 /cateye_test_diag。")
+            await self._diag_reply(stream_id, "权限不足：仅管理员可用 /lbm_diag。")
             return True, "没有权限", True
 
         groups = kwargs.get("matched_groups")
@@ -891,7 +891,7 @@ class CompanionComponentsMixin:
         if sub == "decision":
             return await self._diag_decision_log(stream_id, self._diag_parse_days_arg(raw_days))
         if sub == "life":
-            # 天数保持旧 /cateye_test_life diag 语义：1~7，缺省/非法一律 1
+            # 天数保持旧 /lbm_life diag 语义：1~7，缺省/非法一律 1
             days = self._diag_parse_days_arg(raw_days, lo=1, hi=7) or 1
             await self._diag_reply(stream_id, self._qz_diag_text(days))
             return True, "决策日志已发送", True
@@ -900,8 +900,8 @@ class CompanionComponentsMixin:
         return True, ("用法已发送" if not sub else f"未知子命令: {sub}"), True
 
     @Command(
-        name="/cateye_test_dashboard",
-        pattern=r"(?<!\S)/cateye_test_dashboard\s*$",
+        name="/lbm_dashboard",
+        pattern=r"(?<!\S)/lbm_dashboard\s*$",
         description="聚合总览四模块状态（日程/关系/情绪/空间）并渲染状态图，失败自动降级纯文本",
     )
     async def mai_cmd_dashboard(self, **kwargs: Any) -> tuple[bool, str, bool]:
@@ -915,7 +915,7 @@ class CompanionComponentsMixin:
         if not self._qz_is_admin(str(kwargs.get("user_id") or ""),
                                  bool(kwargs.get("is_local_operator", False))):
             try:
-                await self.ctx.send.text("权限不足：仅管理员可用 /cateye_test_dashboard。",
+                await self.ctx.send.text("权限不足：仅管理员可用 /lbm_dashboard。",
                                          str(kwargs.get("stream_id", "") or ""))
             except Exception:
                 pass
@@ -965,7 +965,7 @@ class CompanionComponentsMixin:
     # ---- 命令辅助 ----
 
     def _mai_dashboard_blocks(self, now: Optional[datetime] = None) -> dict[str, Any]:
-        """聚合四模块状态块（M7 /cateye_test_dashboard 的数据面）。
+        """聚合四模块状态块（M7 /lbm_dashboard 的数据面）。
 
         live 判定必须真实走服务束属性链（不是只看束对象是否存在）：属性名与各束实现
         一致，静态可达性由 behavior 的组件门面审计断言（组件调了不存在的属性会当场红）。
@@ -1010,7 +1010,7 @@ class CompanionComponentsMixin:
         """
         data_dir = getattr(self, "_data_dir", None)
         output_dir = Path(data_dir) / "images" if data_dir is not None else None
-        title = f"猫眼生活套件 状态总览 {datetime.now().strftime('%Y-%m-%d')}"
+        title = f"属于麦麦的生活 状态总览 {datetime.now().strftime('%Y-%m-%d')}"
         try:
             _img_path, image_base64 = await asyncio.wait_for(
                 asyncio.to_thread(cateye_dashboard.render_dashboard_image, title, blocks,
@@ -1020,7 +1020,7 @@ class CompanionComponentsMixin:
             return image_base64
         except Exception as exc:
             # 静默降级：不提示失败，仅记录日志供排查
-            self.ctx.logger.info(f"/cateye_test_dashboard 状态图绘制放弃（静默降级为文本）: {exc}")
+            self.ctx.logger.info(f"/lbm_dashboard 状态图绘制放弃（静默降级为文本）: {exc}")
             return None
 
     def _mai_affection_state_line(self) -> str:
@@ -1066,7 +1066,7 @@ class CompanionComponentsMixin:
             self.ctx.logger.warning(f"mai_cmd_diag 回复发送失败: {e}")
 
     async def _diag_llm_log(self, stream_id: str, days: Optional[int]) -> tuple[bool, str, bool]:
-        """diag llm 子命令 = 旧 /cateye_test_mai_llm_log（llm_logger 调用日志合并转发）。"""
+        """diag llm 子命令 = 旧 /lbm_mai_llm_log（llm_logger 调用日志合并转发）。"""
         companion = self._mai_companion()
         llm_logger = getattr(companion, "llm_logger", None) if companion else None
         if llm_logger is None or not llm_logger.enabled:
@@ -1084,7 +1084,7 @@ class CompanionComponentsMixin:
         return await self._mai_send_forward(records, stream_id, "LLM 日志")
 
     async def _diag_decision_log(self, stream_id: str, days: Optional[int]) -> tuple[bool, str, bool]:
-        """diag decision 子命令 = 旧 /cateye_test_mai_diag（决策日志合并转发）。"""
+        """diag decision 子命令 = 旧 /lbm_mai_diag（决策日志合并转发）。"""
         companion = self._mai_companion()
         decision_logger = getattr(companion, "decision_logger", None) if companion else None
         if decision_logger is None or not decision_logger.enabled:
@@ -1128,7 +1128,7 @@ class CompanionComponentsMixin:
     # ==================================================================
 
     def _mai_patrol_status_line(self) -> str:
-        """一行巡检运行状态（/cateye_test_diag decision 汇总与自诊断用）。"""
+        """一行巡检运行状态（/lbm_diag decision 汇总与自诊断用）。"""
         companion = self._mai_companion()
         if companion is None:
             return ""
@@ -1192,8 +1192,8 @@ class CompanionComponentsMixin:
     def _mai_config_summary(self, multiline: bool) -> str:
         """配置摘要（单行紧凑版给状态总览文本降级路径；多行版保留完整排版，当前无命令入口）。
 
-        T6 注册面收口后 /cateye_test_mai_config 命令已移除：单行版仍由
-        /cateye_test_dashboard 的纯文本档末行消费，多行版仅供离线测试与后续入口复用。
+        T6 注册面收口后 /lbm_mai_config 命令已移除：单行版仍由
+        /lbm_dashboard 的纯文本档末行消费，多行版仅供离线测试与后续入口复用。
         """
         patrol = self.config.patrol
         cateye_cfg = getattr(self.config, "cateye", None)

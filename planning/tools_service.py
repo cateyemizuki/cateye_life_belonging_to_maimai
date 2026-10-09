@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 #: 赖床工具名（**唯一定义点**）：组件注册（planning/components.py）与提醒文本
 #: （emotion/service.py 的 NAP_REMINDER_TEMPLATE）同源引用本常量——A2 明确"工具后续会改名，
 #: 注意同步"，改名只需动这一处。
-NAP_TOOL_NAME = "cateye_test_nap_lie_in"
+NAP_TOOL_NAME = "lbm_nap_lie_in"
 #: 钳制上限的缺省值（[schedule] lie_in_max_until；HH:MM），§4.4「传入时间 > 上限 → 钳到上限」
 DEFAULT_LIE_IN_MAX_UNTIL = "12:00"
 #: 一天的分钟数（P6 顺延的当日帧上界：顺延后 ``end`` 封顶 24:00，不产生跨午夜条目）

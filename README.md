@@ -1,4 +1,4 @@
-# 猫眼生活套件（cateye_test）— 整合插件 v0.4.0
+# 属于麦麦的生活（lbm）— 整合插件 v1.0.0
 
 > 状态：**三模块整合版（可加载、核心链路可运行）**。把三个来源的功能整合进一个插件，
 > 按来源拆为三个子目录（模块化维护），功能尽可能复刻原插件：
@@ -15,7 +15,7 @@
 ## 目录结构
 
 ```
-cateye_test/
+lbm/
 ├── _manifest.json / plugin.py / config.py
 │   ├── plugin.py  = 纯组合根：生命周期 + 服务束装配；组件注册由三个 Mixin 多继承收集
 │   └── config.py  = 顶层聚合：plugin / target / admin 基础段 + 各子模块 section 扁平挂载
@@ -51,11 +51,11 @@ cateye_test/
 | 类型 | 组件 |
 |---|---|
 | HookHandler ×10 | planning：`maisaka.planner.before_request`（日程注入，items 强 schema 协议）、`maisaka.replyer.before_request`（extra_prompt 协作式）｜companion：`chat.receive.before_process`（身份缓存）、`chat.receive.after_process`（目标私聊时间）、`maisaka.planner.before_request`（屏幕旁白+好感度后缀）、`maisaka.replyer.before_model_request`（旁白）、`maisaka.replyer.after_response`（补计发言数，OBSERVE）｜emotion：`maisaka.planner.before_request`（情绪底色注入，系统提示词后）、`maisaka.replyer.before_model_request`（情绪底色注入，系统提示词后）、`maisaka.replyer.after_response`（ΔVAD 增量评估，OBSERVE；M8 起兼夜间打扰记账） |
-| Tool ×7 | planning：cateye_test_get_schedule_info（只读四视图 status/current/lover_day/goals）/ cateye_test_update_schedule_v4（**唯一日程写入口**，角色裁判）/ **cateye_test_nap_lie_in（M9 赖床：把今日 sleep 条目结束时间推到目标时刻，`metadata.visibility=hidden`——平时不进名册，只在赖床提醒轮由提示词点名，见 USAGE「赖床工具」）**｜companion：cateye_test_mai_lover_send_message / cateye_test_mai_lover_affection｜qzone：cateye_test_life_qzone（action=post 发说说 / moments 查说说）｜emotion：cateye_test_emotion_report（群聊 target 上报，M3） |
-| Command ×8 | planning：/cateye_test_plan、/cateye_test_规划（list/regenerate/delete/clear/help，图片+合并转发）｜companion：/cateye_test_mai_affection /cateye_test_mai_help /cateye_test_diag（A5 排障三合一：llm/decision/life 子命令，旧名 mai_llm_log/mai_diag 与 life diag 为别名，管理员鉴权） /cateye_test_dashboard（M7 聚合总览：四模块状态图 + 纯文本降级，文本档展开完整日程并附配置摘要，管理员鉴权）｜qzone：/cateye_test_life（status/qzone[moments/comments/post/reply/like]/diag[别名可见 /cateye_test_diag life]/help）｜emotion：/cateye_test_emotion_init（人设初始化）、/cateye_test_emotion_config（查看/reset/clear） |
+| Tool ×7 | planning：lbm_get_schedule_info（只读四视图 status/current/lover_day/goals）/ lbm_update_schedule_v4（**唯一日程写入口**，角色裁判）/ **lbm_nap_lie_in（M9 赖床：把今日 sleep 条目结束时间推到目标时刻，`metadata.visibility=hidden`——平时不进名册，只在赖床提醒轮由提示词点名，见 USAGE「赖床工具」）**｜companion：lbm_mai_lover_send_message / lbm_mai_lover_affection｜qzone：lbm_life_qzone（action=post 发说说 / moments 查说说）｜emotion：lbm_emotion_report（群聊 target 上报，M3） |
+| Command ×8 | planning：/lbm_plan、/lbm_规划（list/regenerate/delete/clear/help，图片+合并转发）｜companion：/lbm_mai_affection /lbm_mai_help /lbm_diag（A5 排障三合一：llm/decision/life 子命令，旧名 mai_llm_log/mai_diag 与 life diag 为别名，管理员鉴权） /lbm_dashboard（M7 聚合总览：四模块状态图 + 纯文本降级，文本档展开完整日程并附配置摘要，管理员鉴权）｜qzone：/lbm_life（status/qzone[moments/comments/post/reply/like]/diag[别名可见 /lbm_diag life]/help）｜emotion：/lbm_emotion_init（人设初始化）、/lbm_emotion_config（查看/reset/clear） |
 | API ×4 | get_current_activity（planning，兼容原插件返回结构）｜companion_get_current_activity / companion_get_schedule / companion_get_affection_level |
 
-> **M9 赖床工具的实现说明（附录 §4.4，用户裁决 C4；隐藏与暴露方案取舍）**：`cateye_test_nap_lie_in`
+> **M9 赖床工具的实现说明（附录 §4.4，用户裁决 C4；隐藏与暴露方案取舍）**：`lbm_nap_lie_in`
 > 以 `metadata["visibility"]="hidden"` 注册（宿主据此 `enabled=False` 且不进 ToolSpec 名册，F13）。
 > 暴露方式二选一，本实现取 **方案 ②**：保持 hidden + 赖床提醒文本直接点名工具（A2），由模型经宿主
 > `tool_search` 兜底发现；**方案 ①**（提醒前 `ctx.component.enable_component` 翻转可见性、提醒轮后
@@ -90,7 +90,7 @@ cateye_test/
 - ✅ **情绪消费（M4，B4/B7）**：巡检读 `emotion.mood_effect()`（纯规则零 LLM 成本；情绪停用/异常则各项恒 1.0）——① `activity_trigger_rate`/`default_speak_rate` × `proactive_rate`（低落 ×0.8 降主动、心情好且精神足 ×1.2）；② 想念随机阈值 × `miss_threshold`（情绪）× affection 档位系数（双系数，低落 ×0.8 更快想念；档位系数读 `RelationProfile.miss_factor_for_tier`，恋人档 0~4 = 1.4~0.6）；③ proactive intent 的 reason 追加 `intent_hint` 低分辨成语义行；乘数 clamp [0.7,1.3]，乘后概率/阈值与情绪系数落决策日志
 - ✅ **关系系统（简单版）**：`patrol.relation_type` 配置对方是 bot 的谁（恋人/挚友/维护者/家人/自定义称谓），想念提示词、消息生成口吻、好感度档位名（**v2 5 档表**，注入走 5 档口径）、消息后缀与括号小剧场（按 3 档兼容映射折算）全部随关系变化（`companion/relation.py` 预设，热更新生效）
 - ✅ 触发统一 `maisaka.proactive.trigger`；好感度后缀 + 括号小剧场；message_service 直发
-- ✅ **LLM 判定板块 `[judge]`**（同步 mai-love 2.6.3）：想念把关等判定类调用的模型 / 最大 token 数 / 温度独立成段可配（默认跟随主任务、512、0.2），可为把关单独指到便宜、非思考型的任务/模型；把关调用走 `LLMService.judge()`，`/cateye_test_diag llm`（旧名 `/cateye_test_mai_llm_log`）记录实际使用的模型
+- ✅ **LLM 判定板块 `[judge]`**（同步 mai-love 2.6.3）：想念把关等判定类调用的模型 / 最大 token 数 / 温度独立成段可配（默认跟随主任务、512、0.2），可为把关单独指到便宜、非思考型的任务/模型；把关调用走 `LLMService.judge()`，`/lbm_diag llm`（旧名 `/lbm_mai_llm_log`）记录实际使用的模型
 - ✅ **LLM 失败三态分诊**（同步 mai-love 2.6.2）：「成功但正文为空」（思考型模型把小 max_tokens 预算花在 reasoning 上）不再落进"未知错误"兜底，日志附 reasoning 尾部证据；宿主裸失败与非 dict 结果单独识别
 - ✅ **过期宿主主动任务块剥离**（同步 mai-love 2.6.2）：宿主 `enqueue_proactive_task` 的 `<plugin_proactive_task>` 块持久化进聊天历史且从不清理，planner/replyer 请求 Hook 把入队超过 30 分钟的块从本次请求载荷剥离（不回写宿主历史；新块与解析失败条目一律保留）
 - ✅ 屏幕感知「尾随锚点」注入（planner/replyer 双通道，锚点滑出作废）+ 陪伴对象电脑联动（connect-hub 截屏 + VLM 描述）
@@ -110,18 +110,18 @@ cateye_test/
 - ✅ 回复后增量评估（T7 起默认 **episode 会话片段制**）：replyer.after_response 只登记会话片段（零 LLM），会话闲置 `episode_idle_minutes`（默认 10min）后把该流自上次评估以来的完整往来整段交给小模型转成 ΔVAD（±0.5 限幅，进评估器的正文保留最近往来、预算放宽到片段上限），记入当天情绪日志（原始事件流）；`evaluate_mode` 可切回 `per_reply`（每回复评估，60s 节流）或 `off`，`evaluate_max_per_day`（默认 10）两模式共用硬封顶
 - ✅ **评估上下文增强（M3）**：评估 prompt 追加"用户侧最后一条消息"（`ctx.message.get_by_time_in_chat(..., filter_mai=True)` 反查该流最近消息，拿不到就跳过），事件描述要求概括"这轮交流发生了什么"
 - ✅ **外部事件桥（M3）**：`emotion/bridge.py` 订阅 `relation.silence_detected`（沉默：ΔV=−0.12、ΔA=+0.04）、`schedule.commitment_kept/broken`（约定兑现 +0.2／违约 −0.15）、`qzone.comment_received`（ΔV +0.05~+0.1）；统一入口 `record_external_event`（模板增量直记，或小模型有界评估 ±0.5）
-- ✅ **target 识别 + 三层加算倍率（M3，§6.2 A）**：私聊按 `session_id == 目标私聊 stream_id` 自动判定；群聊由 Tool `cateye_test_emotion_report(event, is_target)` 传参声明（参数永不拒绝，缺失/非法值静默按非 target）；`final = delta × global_event_multiplier × K`，target K = `1 + target_bonus_step × (档位+1)`（+0.1~+0.5），非 target K = `non_target_multiplier`
+- ✅ **target 识别 + 三层加算倍率（M3，§6.2 A）**：私聊按 `session_id == 目标私聊 stream_id` 自动判定；群聊由 Tool `lbm_emotion_report(event, is_target)` 传参声明（参数永不拒绝，缺失/非法值静默按非 target）；`final = delta × global_event_multiplier × K`，target K = `1 + target_bonus_step × (档位+1)`（+0.1~+0.5），非 target K = `non_target_multiplier`
 - ✅ **沉默事件（M3，B1）**：巡检发现 `last_user_msg_time` 超过 `miss_hours_min` → 发布 `relation.silence_detected`（仅 target；每日 ≤2 次、间隔 ≥4h）；emotion 侧按模板乘 K 记账（零 LLM 成本）
 - ✅ **睡眠结算改造 + 睡眠大修 v2（M5，B12）**：进入**作息夜间窗口**（`[schedule].sleep_time → 次日 wake_time`，如 23:00→07:00；睡眠条目被 `_normalize_items` 截断为 23:00–23:15，故窗口按锚点而非条目，午休按条目窗口）→ **冻结整夜**（事件只入队、衰减与评估结算暂停）+ 睡眠裁判 LLM 独立请求（当前 VAD+当天日志+前后日日程+长期状态+睡眠时长+**前日残差 R_yesterday / 明日预期 E_tomorrow（条目 `emotional_tone`）/ 当日约定净兑现**，reason 必须引用日程原文）→ 计算并缓存 → **醒沿（离开窗口或日程出现清醒活动）应用一次并解冻**；R/E/约定在醒来时按入睡日基准重算（次日日程 00:30 才生成，否则"明日预期"生产不生效）；计划时长取整夜（8h→恢复系数 0.85）；ΔVAD_sleep 动态限幅 **±(0.4+0.4×`schedule.emotion_influence`，默认 0.6→±0.64)**；向锚点收敛（倒 U 型恢复系数，**恒 ≥0.3**）；应用后清空日志（冻结期队列并入当天日志作观测）
 - ✅ **睡醒情绪 → 次日日程（M5，B6 前半）**：`emotion.overhauled`（含低分辨率 `mood` + 三档词 `levels`）由 planning 订阅缓存（`PlanningServices.wake_emotion()`）；日程生成把「睡醒情绪描述 + 引导约束」按 `schedule.emotion_influence`（0~1，默认 0.6，**0=关闭**）拼进 `emotion_context` 槽（低落→多休整/娱乐/社交、兴奋→运动社交、支配感低→留 relaxation）；当天已有日程时自动生成跳过，**只在重生成时生效**；日程条目可选 `emotional_tone`（逐维 ±0.5 校验裁剪落 `parameters`）供睡眠大修的前日残差/明日预期
 - ✅ **连续低迷软约束（M5，B6 后半）**：每个检测周期采样当日 **清醒时段** effective V（冻结的睡眠期不采样）→ 日均线（滚动 7 天，随状态落盘、旧文件缺键兼容读取）→ 按**日历逐日**判定连续「日均 V<−0.5」（无采样日按非低迷归零，不拼假连续），满 3 天发 `emotion.low_mood_day`（payload `days/date/mean_valence`，`date` 恒为昨天；每日最多一次）；planning 缓存（超 72h 视为陈旧）后在日程生成里**强制插入一次 rest/social 活动**（条目间/首尾空档均可插入，无缝日程切最长高强度条目尾段）并在 prompt 注明「最近有点低落」，防连续高压把情绪压垮
-- ✅ 人设初始化：/cateye_test_emotion_init 由宿主人设推导锚点/偏移/乘数（数值约束校验裁剪，落盘重启生效）；/cateye_test_emotion_config 查看/reset/clear
+- ✅ 人设初始化：/lbm_emotion_init 由宿主人设推导锚点/偏移/乘数（数值约束校验裁剪，落盘重启生效）；/lbm_emotion_config 查看/reset/clear
 - ✅ 情绪底色注入 replyer（模糊化描述 + 严禁直说情绪标签词汇）；群聊事件上报 Tool（M3）。**T6**：原「查询当前心情」Tool 已移除——心情问答由情绪底色注入覆盖（`injection_enabled=false` 组合不支持心情问答，见 USAGE.md）
 - ✅ **[emotion] M3 事件倍率配置**：`global_event_multiplier`(1.0，0.1~3.0，一切外部事件总幅度)、`non_target_multiplier`(1.0，0~1，非 target 事件系数)、`target_bonus_step`(0.1，0~1，每档加算步长)
 - ✅ **情绪→行为输出 `mood_effect()`（M4，§6.2 C/D）**：纯规则零 LLM 成本，输出 `proactive_rate`（patrol 主动概率乘数）/`miss_threshold`（想念阈值乘数，再叠 affection 档位系数）/`post_rate`（qzone 发帖率，0 = 低落不硬营业）/`intent_hint`（低分辨成语义行）；映射：proactive V>0.3&A>0.2→1.2、V<−0.3→0.8；miss V<−0.3→0.8、V>0.3→1.1；post V<−0.6→0、V<−0.3→0.8、V>0.3→1.2；全部 clamp [0.7,1.3]（post 允许 0~1.2），模块停用返回恒等中性值
 - ✅ **映射表 JSON 覆盖层（M12，可选）**：`<data_dir>/emotion_mapping.json`（与 `proactive_budget.json` 同级；不存在 = 纯代码默认）可整表替换四张数据表——25 原型区间表 / 模板事件表 4 事件 / 三层倍率 / 五档四切点；**整文件原子生效**：解析或任一键校验失败即全量回退代码默认并落 `emotion.mapping_override_rejected`（warn），合法落 `emotion.mapping_override_applied`（info）；优先级 **JSON > config（含用户显式值）> 代码默认**（仅倍率有 config 对应项）；改 JSON 后需 touch 插件文件触发热重载或等重启。字段 / 回退 / 差异披露（倍率不收 0、切点左闭右开、`sleep_interrupt` 曲线不可覆盖）与示例见 [EMOTION_MAPPING.md](EMOTION_MAPPING.md) §九
 
-- ✅ **emoji 情绪联动（M6，默认关，宿主级接线；T6 后无组件消费点）**：`[emotion] emoji_enabled`（false）——按当前情绪首个标签名（取不到回退情绪底色文本）经 `ctx.emoji.get_by_description` 取一个表情的实现保留在服务层（`EmotionService.emoji_for_mood`），manifest 已声明 `emoji.get_by_description` 能力；**原消费入口 `cateye_test_emotion_mood` Tool 已随 T6 注册面收口移除**，当前无组件调用它；**关闭时绝不触碰宿主 API**，匹配失败/通道缺失静默降级
+- ✅ **emoji 情绪联动（M6，默认关，宿主级接线；T6 后无组件消费点）**：`[emotion] emoji_enabled`（false）——按当前情绪首个标签名（取不到回退情绪底色文本）经 `ctx.emoji.get_by_description` 取一个表情的实现保留在服务层（`EmotionService.emoji_for_mood`），manifest 已声明 `emoji.get_by_description` 能力；**原消费入口 `lbm_emotion_mood` Tool 已随 T6 注册面收口移除**，当前无组件调用它；**关闭时绝不触碰宿主 API**，匹配失败/通道缺失静默降级
 
 ## manifest 声明（17 能力 + 2 依赖）
 
@@ -136,10 +136,10 @@ cateye_test/
 > ⚠️ **模型绑定（宿主验证日 P3 教训）**：裁判与日结类任务（情绪睡眠裁判、好感会话采样/关系日结、`[judge]` 段）建议绑定**真非思考型**模型——思考型模型的 reasoning 输出会挤爆小 `max_tokens` 预算，导致正文为空、裁判整体失效（详见 TEST_PROCEDURE.md §八）。
 
 1. 放进 MaiBot 的 `plugins/` 目录重启；WebUI 里配置 `目标 QQ`（占位值时主动私聊/命令鉴权保持关闭）；
-2. `/cateye_test_life status` 总览四模块；`/cateye_test_plan` 看日程（首次会触发生成）；自然聊天问「在干嘛」验证注入与 `get_schedule_info`（view=current）；
-3. 观察决策日志 `data/plugins/github.cateye.cateye-suite/decision_logs/`；`/cateye_test_diag decision`、`/cateye_test_diag life` 查判定链（旧名 `/cateye_test_mai_diag`、`/cateye_test_life diag` 仍可用）；
-4. 空间模块：`/cateye_test_life qzone status` 看通道与 cookie；`/cateye_test_life qzone post 测试` 手动发一条；`comments`+`reply` 验证楼中楼；情绪模块：`/cateye_test_emotion_init` 初始化后聊天观察语气变化；
-5. 离线测试：`scratch/smoke_test_cateye_test.py`（stub SDK 收集 29 组件 + 配置模型 + 能力核对）与 `scratch/behavior_test_cateye_test.py`（16 组核心算法回归，含 mai-love 2.6.2/2.6.3 合并回归；M8/M9 睡眠打扰·赖床用例见文件末 92~114 号，M10 早晚安漂移·赖床·生成锚点见 115~123 号）。
+2. `/lbm_life status` 总览四模块；`/lbm_plan` 看日程（首次会触发生成）；自然聊天问「在干嘛」验证注入与 `get_schedule_info`（view=current）；
+3. 观察决策日志 `data/plugins/cateye.life_belonging_to_maimai/decision_logs/`；`/lbm_diag decision`、`/lbm_diag life` 查判定链（旧名 `/lbm_mai_diag`、`/lbm_life diag` 仍可用）；
+4. 空间模块：`/lbm_life qzone status` 看通道与 cookie；`/lbm_life qzone post 测试` 手动发一条；`comments`+`reply` 验证楼中楼；情绪模块：`/lbm_emotion_init` 初始化后聊天观察语气变化；
+5. 离线测试：`scratch/smoke_test_lbm.py`（stub SDK 收集 29 组件 + 配置模型 + 能力核对）与 `scratch/behavior_test_lbm.py`（16 组核心算法回归，含 mai-love 2.6.2/2.6.3 合并回归；M8/M9 睡眠打扰·赖床用例见文件末 92~114 号，M10 早晚安漂移·赖床·生成锚点见 115~123 号）。
 
 ## 骨架占位 / TODO
 

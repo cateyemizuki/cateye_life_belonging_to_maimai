@@ -397,7 +397,7 @@ class EmotionService:
         - ``description`` 缺省时取 :meth:`emoji_description`（首个情绪标签名，取不到用 mood_text）。
         结果非空则原样返回（宿主返回结构不做假设）。
 
-        消费点：``emotion/components.py`` 的 ``cateye_test_emotion_mood`` Tool——启用时在返回文本后
+        消费点：``emotion/components.py`` 的 ``lbm_emotion_mood`` Tool——启用时在返回文本后
         追加一行匹配摘要；本方法只做转发，不写状态、不落盘、不发事件。
         """
         if not bool(self._emotion_cfg("emoji_enabled", False)):
@@ -484,7 +484,7 @@ class EmotionService:
         }
 
     def params_summary(self) -> str:
-        """/cateye_test_emotion_config 查看文本。"""
+        """/lbm_emotion_config 查看文本。"""
         p = self._machine.params
         eff = self._machine.effective_vad()
         labels, _ = map_emotions(eff)
@@ -504,7 +504,7 @@ class EmotionService:
         return "\n".join(lines)
 
     def status_snapshot(self) -> Dict[str, Any]:
-        """聚合总览用的只读状态快照（M7 /cateye_test_dashboard 消费）。
+        """聚合总览用的只读状态快照（M7 /lbm_dashboard 消费）。
 
         只读：不落盘、不改状态机任何字段（含冻结标记）；数值口径与 ``params_summary`` /
         ``mood_text`` 同源（``labels`` 即 map_emotions 的前 3 个标签名，mood_text 取其中前 2 个）。
@@ -2499,7 +2499,7 @@ class EmotionService:
 
     # ── 初始化（人设推导）────────────────────────────────────
     async def initialize_from_persona(self) -> str:
-        """/cateye_test_emotion_init 主体：人设 → LLM 推导 → 校验落盘 → 生效。"""
+        """/lbm_emotion_init 主体：人设 → LLM 推导 → 校验落盘 → 生效。"""
         cfg = getattr(self._plugin.config, "emotion", None)
         task_name = str(getattr(cfg, "evaluator_task_name", "utils") or "utils")
         params = await derive_params_from_persona(self._llm(), self._persona_text(), task_name)

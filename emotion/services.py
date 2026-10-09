@@ -65,19 +65,19 @@ class EmotionServices:
 
     # ── Command / Tool 面转发（components.py 组件入口；签名与内层一致）──
     def params_summary(self) -> str:
-        """``/cateye_test_emotion_config`` 查看文本（转发 self.service）。"""
+        """``/lbm_emotion_config`` 查看文本（转发 self.service）。"""
         return self.service.params_summary()
 
     def reset_params(self) -> str:
-        """``/cateye_test_emotion_config reset``：恢复默认参数（转发 self.service）。"""
+        """``/lbm_emotion_config reset``：恢复默认参数（转发 self.service）。"""
         return self.service.reset_params()
 
     def clear_log(self) -> str:
-        """``/cateye_test_emotion_config clear``：清空当天情绪日志（转发 self.service）。"""
+        """``/lbm_emotion_config clear``：清空当天情绪日志（转发 self.service）。"""
         return self.service.clear_log()
 
     async def initialize_from_persona(self) -> str:
-        """``/cateye_test_emotion_init`` 主体：人设 → LLM 推导 → 落盘（转发 self.service）。"""
+        """``/lbm_emotion_init`` 主体：人设 → LLM 推导 → 落盘（转发 self.service）。"""
         return await self.service.initialize_from_persona()
 
     def target_multiplier(self, is_target: bool) -> float:

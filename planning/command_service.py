@@ -1,4 +1,4 @@
-"""``/cateye_test_plan`` 命令的业务实现（来源：自主规划插件 services/command_service.py，移植版）。
+"""``/lbm_plan`` 命令的业务实现（来源：自主规划插件 services/command_service.py，移植版）。
 
 通过 ``self._plugin.ctx.send.text(...) / ctx.send.forward(...)`` 发送消息。
 
@@ -113,7 +113,7 @@ class CommandService:
                 await self._send(
                     stream_id,
                     "🚫 尚未配置管理员：请在插件配置 [管理与日志] 的 admin_users 中"
-                    "添加你的用户 ID 后再使用 /cateye_test_plan（本机控制台不受限）",
+                    "添加你的用户 ID 后再使用 /lbm_plan（本机控制台不受限）",
                 )
             else:
                 await self._send(stream_id, "🚫 你不是管理员哦~只有管理员才能查看和管理日程呢")
@@ -143,7 +143,7 @@ class CommandService:
         elif subcommand == "help":
             await self._show_help(stream_id)
         else:
-            await self._send(stream_id, f"未知命令: {subcommand}\n使用 /cateye_test_plan help 查看帮助")
+            await self._send(stream_id, f"未知命令: {subcommand}\n使用 /lbm_plan help 查看帮助")
 
         return True, "命令执行完成", True
 
@@ -261,7 +261,7 @@ class CommandService:
             return img_base64
         except Exception as exc:
             # 静默降级：不提示失败、不发图片，仅记录日志供排查
-            logger.info(f"/cateye_test_plan list 图片绘制放弃（静默降级为文本）: {exc}")
+            logger.info(f"/lbm_plan list 图片绘制放弃（静默降级为文本）: {exc}")
             return None
 
     def _image_output_dir(self):
@@ -277,7 +277,7 @@ class CommandService:
     # ------------------------------------------------------------
 
     async def _handle_list(self, stream_id: str) -> None:
-        """``/cateye_test_plan list``：今日日程（图片 + 详细文字，合并转发）。
+        """``/lbm_plan list``：今日日程（图片 + 详细文字，合并转发）。
 
         流程：先检查今日是否有日程 → 无则代码层触发生成后再发送；
         发送形态：合并转发两条记录（第一条图片（若绘制成功），第二条详细文字）；
@@ -298,12 +298,12 @@ class CommandService:
             try:
                 await tools_svc.regenerate_today_schedule_now()
             except Exception as exc:
-                logger.error(f"/cateye_test_plan list 触发生成日程失败: {exc}", exc_info=True)
+                logger.error(f"/lbm_plan list 触发生成日程失败: {exc}", exc_info=True)
                 await self._send(stream_id, f"❌ 日程生成失败: {exc}")
                 return
             schedule_goals = self._get_today_schedule_goals(goal_manager)
             if not schedule_goals:
-                await self._send(stream_id, "⚠️ 日程生成完成但没有产生有效活动，请稍后用 /cateye_test_plan list 重试")
+                await self._send(stream_id, "⚠️ 日程生成完成但没有产生有效活动，请稍后用 /lbm_plan list 重试")
                 return
 
         text = self._build_status_text(schedule_goals)
@@ -325,7 +325,7 @@ class CommandService:
 
         try:
             await self._plugin.ctx.send.forward(records, stream_id)
-            logger.info("✅ /cateye_test_plan list 已合并转发（图片=%s，文字 %s 字符）", "有" if image_base64 else "无", len(text))
+            logger.info("✅ /lbm_plan list 已合并转发（图片=%s，文字 %s 字符）", "有" if image_base64 else "无", len(text))
         except Exception as exc:
             # 合并转发失败（能力未声明 / 平台不支持）→ 回退普通发送
             logger.warning(f"合并转发失败，回退为普通发送: {exc}")
@@ -337,7 +337,7 @@ class CommandService:
             await self._send(stream_id, text)
 
     async def _handle_regenerate(self, stream_id: str, parts: List[str]) -> None:
-        """``/cateye_test_plan regenerate [额外要求...]``：立即重新生成今日日程。"""
+        """``/lbm_plan regenerate [额外要求...]``：立即重新生成今日日程。"""
         tools_svc = self._tools_svc()
         if tools_svc is None:
             await self._send(stream_id, "❌ 插件未完成初始化，无法重新生成日程")
@@ -358,17 +358,17 @@ class CommandService:
             await self._send(stream_id, f"❌ 重新生成失败: {exc}")
             return
 
-        msg = f"✅ 已重新生成今日日程，共 {len(items)} 项活动\n\n💡 使用 /cateye_test_plan list 查看（图片+文字详情）"
+        msg = f"✅ 已重新生成今日日程，共 {len(items)} 项活动\n\n💡 使用 /lbm_plan list 查看（图片+文字详情）"
         await self._send(stream_id, msg)
 
     async def _handle_delete(self, stream_id: str, parts: List[str]) -> Tuple[bool, str, bool]:
-        """``/cateye_test_plan delete <id|序号>``：删除目标（含合成视图的日程条目）。"""
+        """``/lbm_plan delete <id|序号>``：删除目标（含合成视图的日程条目）。"""
         goal_manager = get_goal_manager()
 
         if len(parts) < 3:
             await self._send(
                 stream_id,
-                "❌ 请提供要删除的目标 ID 或序号\n\n用法: /cateye_test_plan delete <goal_id或序号>\n\n使用 /cateye_test_plan list 查看所有目标",
+                "❌ 请提供要删除的目标 ID 或序号\n\n用法: /lbm_plan delete <goal_id或序号>\n\n使用 /lbm_plan list 查看所有目标",
             )
             return True, "缺少参数", True
 
@@ -383,7 +383,7 @@ class CommandService:
                 goal_id = goal.goal_id
                 goal_name = goal.name
             else:
-                await self._send(stream_id, f"❌ 序号 {identifier} 超出范围\n使用 /cateye_test_plan list 查看所有目标")
+                await self._send(stream_id, f"❌ 序号 {identifier} 超出范围\n使用 /lbm_plan list 查看所有目标")
                 return True, "序号无效", True
         else:
             # 作为 goal_id 处理
@@ -402,7 +402,7 @@ class CommandService:
         return True, "命令执行完成", True
 
     async def _handle_clear(self, stream_id: str, parts: List[str]) -> None:
-        """``/cateye_test_plan clear [days]``：清理旧日程（days=0 表示仅保留今天）。"""
+        """``/lbm_plan clear [days]``：清理旧日程（days=0 表示仅保留今天）。"""
         goal_manager = get_goal_manager()
 
         days_to_keep = 0
@@ -457,24 +457,24 @@ class CommandService:
         help_text = """🤖 日程规划系统
 
 📋 命令列表:
-/cateye_test_plan list - 查看今日日程（图片+详细文字合并转发；无日程时自动先生成）
-/cateye_test_plan regenerate [额外要求] - 重新生成今日日程（先删今天再重生，可附加临时要求）
-/cateye_test_plan delete <goal_id或序号> - 删除指定目标
-/cateye_test_plan clear - 清理昨天及更早的旧日程
-/cateye_test_plan help - 显示此帮助
+/lbm_plan list - 查看今日日程（图片+详细文字合并转发；无日程时自动先生成）
+/lbm_plan regenerate [额外要求] - 重新生成今日日程（先删今天再重生，可附加临时要求）
+/lbm_plan delete <goal_id或序号> - 删除指定目标
+/lbm_plan clear - 清理昨天及更早的旧日程
+/lbm_plan help - 显示此帮助
 
 💡 使用方式:
-1. 对我说 "帮我生成今天的日程" / 直接 /cateye_test_plan list，没有日程时会自动创建
+1. 对我说 "帮我生成今天的日程" / 直接 /lbm_plan list，没有日程时会自动创建
 2. 使用 regenerate 在不满意当前日程时立即重新生成
 3. 使用 clear 清理旧日程，保持目标列表整洁
 
 ♻️ 重新生成示例:
-/cateye_test_plan regenerate                # 直接重新生成今日日程
-/cateye_test_plan regenerate 加入下午跑步     # 重新生成并临时叠加要求
+/lbm_plan regenerate                # 直接重新生成今日日程
+/lbm_plan regenerate 加入下午跑步     # 重新生成并临时叠加要求
 
 📌 注意:
 - 日程每天自动生成，无需手动创建
-- /cateye_test_plan list 在今日无日程时会先自动生成再展示
+- /lbm_plan list 在今日无日程时会先自动生成再展示
 - regenerate 会丢弃今天已有日程并重新生成，操作不可逆
 - clear 命令会自动保留今天的日程
 """

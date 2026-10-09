@@ -29,10 +29,10 @@ class PlanningComponentsMixin:
 
     # 供 SDK / 调试用的组件清单说明（不影响注册）
     planning_components_info: ClassVar[Dict[str, str]] = {
-        "cateye_test_get_schedule_info": "Tool：日程/活动/目标的只读查询（view=status/current/lover_day/goals）",
-        "cateye_test_update_schedule_v4": "Tool：自然语言日程变更（唯一日程写入口，角色裁判 today/future/reject）",
+        "lbm_get_schedule_info": "Tool：日程/活动/目标的只读查询（view=status/current/lover_day/goals）",
+        "lbm_update_schedule_v4": "Tool：自然语言日程变更（唯一日程写入口，角色裁判 today/future/reject）",
         NAP_TOOL_NAME: "Tool：赖床（把今日 sleep 条目结束时间推到目标时刻；hidden，仅夜间被吵醒且收到提醒时可用）",
-        "cateye_test_planning_v4": "Command：/cateye_test_plan 或 /cateye_test_规划（list/regenerate/delete/clear/help）",
+        "lbm_planning_v4": "Command：/lbm_plan 或 /lbm_规划（list/regenerate/delete/clear/help）",
         "get_current_activity": "API：当前活动快照（跨插件可调）",
         "schedule_inject_v4": "HookHandler：maisaka.planner.before_request 日程注入",
         "schedule_inject_replyer_v4": "HookHandler：maisaka.replyer.before_request 活动提醒注入",
@@ -43,7 +43,7 @@ class PlanningComponentsMixin:
     # ============================================================
 
     @Tool(
-        "cateye_test_get_schedule_info",
+        "lbm_get_schedule_info",
         description="查询日程/活动/目标的只读信息（四视图）",
         parameters={
             "view": {"type": "string", "description": "status=今日日程状态总览（默认）| current=当前活动 | lover_day=今日完整日程 | goals=活动目标列表", "required": False},
@@ -57,7 +57,7 @@ class PlanningComponentsMixin:
         return await svc.tools.get_schedule_info(**kwargs)
 
     @Tool(
-        "cateye_test_update_schedule_v4",
+        "lbm_update_schedule_v4",
         description="根据自然语言请求维护日程：角色裁判决定接受/未来约定/拒绝；接受时调整今日日程，"
                     "未来约定写入候选清单。唯一日程写入口。",
         parameters={
@@ -101,15 +101,15 @@ class PlanningComponentsMixin:
         return await svc.tools.nap_lie_in(time=time)
 
     # ============================================================
-    # Command（/cateye_test_plan 或 /cateye_test_规划）
+    # Command（/lbm_plan 或 /lbm_规划）
     # ============================================================
 
     @Command(
-        "cateye_test_planning_v4",
-        description="日程规划系统管理命令（支持 /cateye_test_plan 与 /cateye_test_规划）",
+        "lbm_planning_v4",
+        description="日程规划系统管理命令（支持 /lbm_plan 与 /lbm_规划）",
         # 用负向前瞻代替 ^ 锚点——回复引用场景下命令不在文本开头；
         # (?<!\S) 同时避免命中行中片段（照抄源插件 pattern）
-        pattern=r"(?P<planning_cmd>(?<!\S)/cateye_test_(?:plan|规划)(?:\s.*)?)$",
+        pattern=r"(?P<planning_cmd>(?<!\S)/lbm_(?:plan|规划)(?:\s.*)?)$",
     )
     async def plan_command_planning(
         self,
@@ -122,7 +122,7 @@ class PlanningComponentsMixin:
         is_local_operator: bool = False,
         **kwargs: Any,
     ) -> tuple:
-        """``/cateye_test_plan`` 命令入口，转发给 CommandService。"""
+        """``/lbm_plan`` 命令入口，转发给 CommandService。"""
         del kwargs
         svc = getattr(self, "_planning", None)
         if svc is None:

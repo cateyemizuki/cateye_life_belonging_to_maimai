@@ -1,4 +1,4 @@
-"""猫眼生活套件（cateye_test）— 整合插件组合根。
+"""属于麦麦的生活（lbm）— 整合插件组合根。
 
 三个业务子模块（各自拥有 config / services / components）：
 - planning/   自主规划复刻：日程生成（多轮+评分）/ SQLite 目标库 / planner+replyer 注入 /
@@ -126,7 +126,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._stream_id = await self._resolve_target_stream()
         self._apply_target(str(cfg.target.target_qq), self._stream_id)
         await self._start_bg()
-        self.ctx.logger.info("猫眼生活套件已加载 v%s（目标=%s，stream=%s）",
+        self.ctx.logger.info("属于麦麦的生活已加载 v%s（目标=%s，stream=%s）",
                              SUPPORTED_CONFIG_VERSION, cfg.target.target_qq, self._stream_id or "待解析")
 
     async def on_unload(self) -> None:
@@ -155,7 +155,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._bg_started = False
         self._affection.flush()
         self._db.close()
-        self.ctx.logger.info("猫眼生活套件已卸载")
+        self.ctx.logger.info("属于麦麦的生活已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope == "bot":

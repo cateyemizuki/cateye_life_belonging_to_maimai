@@ -6,7 +6,7 @@
   「一个模块坏了（或没启用）不拖垮整张图」，对应区块显示「（未启用）」。
 - ``block_lines`` 是**图片**的展示来源；``render_dashboard_text`` 与其共用同一套区块
   行构造，仅 planning 区块额外展开 ``items_full``（今日全部条目，不截断——被删
-  ``/cateye_test_mai_schedule`` 的信息面），图片档照旧 ≤5 条。
+  ``/lbm_mai_schedule`` 的信息面），图片档照旧 ≤5 条。
 - PIL 惰性导入（与 planning/schedule_image.py 同口径）：pillow 未安装或找不到可用中文字体
   时抛 RuntimeError，由调用方静默降级为纯文本。
 """
@@ -132,7 +132,7 @@ def planning_block(schedule_query: Any, goal_manager: Any, *, enabled: bool,
         {"time": _time_range(item), "name": str(item.get("name") or "")}
         for item in items[:5] if isinstance(item, dict)
     ]
-    # 文本降级档展开完整日程（被删 /cateye_test_mai_schedule 的信息面）：图片档仍只画 items
+    # 文本降级档展开完整日程（被删 /lbm_mai_schedule 的信息面）：图片档仍只画 items
     block["items_full"] = [
         f"{_time_range(item)} {str(item.get('name') or '')}".strip()
         for item in items if isinstance(item, dict)
@@ -379,11 +379,11 @@ def render_dashboard_text(blocks: Any, *, now: Optional[datetime] = None) -> str
     """纯文本总览（标题行 + 四区块全部行）：图片渲染失败时的降级输出与一致性断言面。
 
     planning 区块用 items_full 展开今日完整日程（不截断），并逐行带上「今日日程 N 项 /
-    当前活动 / 今日约定」——被删 /cateye_test_mai_schedule 命令的信息面在文本档保留。
+    当前活动 / 今日约定」——被删 /lbm_mai_schedule 命令的信息面在文本档保留。
     """
     now = now or datetime.now()
     weekday = "一二三四五六日"[now.weekday()]
-    lines = [f"🐱 猫眼生活套件 状态总览 {now.strftime('%Y-%m-%d')} 周{weekday}"]
+    lines = [f"🐱 属于麦麦的生活 状态总览 {now.strftime('%Y-%m-%d')} 周{weekday}"]
     for title, body in _block_lines(blocks, full_items=True):
         lines.append("")
         lines.append(title)

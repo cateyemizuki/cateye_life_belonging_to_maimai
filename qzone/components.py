@@ -1,14 +1,14 @@
 """QzoneComponentsMixin —— QQ 空间模块的 SDK 组件注册（装饰器方法）。
 
 组件清单：
-- Tools ×1：cateye_test_life_qzone（action=post 发说说，留空自动生成文案；action=moments 查最近说说）
-- Command ×1：/cateye_test_life（status | qzone [moments/comments/post/reply/like] | diag | help；
-  diag 为 /cateye_test_diag life 的旧名别名，行为不变）
+- Tools ×1：lbm_life_qzone（action=post 发说说，留空自动生成文案；action=moments 查最近说说）
+- Command ×1：/lbm_life（status | qzone [moments/comments/post/reply/like] | diag | help；
+  diag 为 /lbm_diag life 的旧名别名，行为不变）
 
 约定（与 planning/companion 的 mixin 一致）：
-- 方法名 `qzone_` 前缀（私有助手 `_qz_` 前缀），组件名 `cateye_test_life_*` / `cateye_test_life_suite`；
+- 方法名 `qzone_` 前缀（私有助手 `_qz_` 前缀），组件名 `lbm_life_*` / `lbm_life_suite`；
 - 方法开头判空 ``getattr(self, "_qzone", None)``（服务束未挂上时降级）；
-- 状态聚合（/cateye_test_life status）同时展示 companion / planning / qzone 三个子模块。
+- 状态聚合（/lbm_life status）同时展示 companion / planning / qzone 三个子模块。
 """
 
 from __future__ import annotations
@@ -23,15 +23,15 @@ class QzoneComponentsMixin:
     """QQ 空间组件（1 Tool + 1 Command）。"""
 
     qzone_components_info: ClassVar[Dict[str, str]] = {
-        "cateye_test_life_qzone": "Tool：空间运营合一（action=post 发说说/留空自动生成文案；action=moments 查最近说说）",
-        "cateye_test_life_suite": "Command：/cateye_test_life status|qzone|diag|help"
-                                 "（diag = /cateye_test_diag life 的旧名别名）",
+        "lbm_life_qzone": "Tool：空间运营合一（action=post 发说说/留空自动生成文案；action=moments 查最近说说）",
+        "lbm_life_suite": "Command：/lbm_life status|qzone|diag|help"
+                                 "（diag = /lbm_diag life 的旧名别名）",
     }
 
     # ============================================================
     # Tools
     # ============================================================
-    @Tool("cateye_test_life_qzone",
+    @Tool("lbm_life_qzone",
           description="QQ空间运营：action=post 发说说（message 留空自动按当前活动生成文案，受每日上限限制）| "
                       "action=moments 查最近发表的说说（内容摘要、评论数、发表时间）。",
           parameters={
@@ -85,11 +85,11 @@ class QzoneComponentsMixin:
         return max(0, self.config.qzone.daily_max_posts - qz.posts_today())
 
     # ============================================================
-    # Command：/cateye_test_life
+    # Command：/lbm_life
     # ============================================================
-    @Command("cateye_test_life_suite",
-             description="猫眼生活套件管理命令（/cateye_test_life status|qzone|diag|help）",
-             pattern=r"(?P<life_cmd>(?<!\S)/cateye_test_life(?:\s+(?P<life_args>.*))?)\s*$")
+    @Command("lbm_life_suite",
+             description="属于麦麦的生活管理命令（/lbm_life status|qzone|diag|help）",
+             pattern=r"(?P<life_cmd>(?<!\S)/lbm_life(?:\s+(?P<life_args>.*))?)\s*$")
     async def qzone_cmd_life(self, text: str = "", stream_id: str = "", user_id: str = "",
                              is_local_operator: bool = False, **kwargs: Any) -> tuple[bool, str, bool]:
         args = str((kwargs.get("matched_groups") or {}).get("life_args") or "").strip()
@@ -103,7 +103,7 @@ class QzoneComponentsMixin:
             reply = await self._qz_handle_qzone(rest[0].strip() if rest else "", admin)
         elif sub == "diag":
             if not admin:
-                reply = "权限不足：仅管理员可用 /cateye_test_life diag。"
+                reply = "权限不足：仅管理员可用 /lbm_life diag。"
             else:
                 try:
                     days = max(1, min(7, int((rest[0].strip() or "1") if rest else 1)))
@@ -127,12 +127,12 @@ class QzoneComponentsMixin:
 
     def _qz_help_text(self) -> str:
         return (
-            "猫眼生活套件命令：\n"
-            "/cateye_test_life status - 生活状态总览（好感度/巡检/日程/空间）\n"
-            "/cateye_test_life qzone - QQ空间状态｜moments 最近说说｜comments 说说评论列表\n"
+            "属于麦麦的生活命令：\n"
+            "/lbm_life status - 生活状态总览（好感度/巡检/日程/空间）\n"
+            "/lbm_life qzone - QQ空间状态｜moments 最近说说｜comments 说说评论列表\n"
             "           （管理员：post 文本、reply 说说序号 [评论序号] 内容、like tid [目标QQ]）\n"
-            "/cateye_test_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /cateye_test_diag life，行为相同\n"
-            "/cateye_test_life help - 本帮助；日程与陪伴功能另有 /cateye_test_plan 与 /cateye_test_mai_* 命令"
+            "/lbm_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /lbm_diag life，行为相同\n"
+            "/lbm_life help - 本帮助；日程与陪伴功能另有 /lbm_plan 与 /lbm_mai_* 命令"
         )
 
     def _qz_status_text(self) -> str:
@@ -177,7 +177,7 @@ class QzoneComponentsMixin:
         if action == "moments":
             moments = await qz.list_my_moments(num=10)
             if not moments:
-                return "最近没有说说，或空间接口不可用（查看 /cateye_test_life qzone status 的通道状态）。"
+                return "最近没有说说，或空间接口不可用（查看 /lbm_life qzone status 的通道状态）。"
             lines = []
             for idx, m in enumerate(moments, 1):
                 excerpt = str(m.get("content") or "")[:40] or "（无文字）"
@@ -187,7 +187,7 @@ class QzoneComponentsMixin:
             # Web CGI 读自己说说及其评论（含楼中楼），供 reply 定位
             feeds = await qz.list_own_feeds_with_comments(num=10)
             if not feeds:
-                return "读不到说说评论（cookie 未就绪或接口失败，见 /cateye_test_life qzone status）。"
+                return "读不到说说评论（cookie 未就绪或接口失败，见 /lbm_life qzone status）。"
             self_uin = self._qz_cookie_uin()
             lines = []
             for idx, feed in enumerate(feeds, 1):
@@ -196,13 +196,13 @@ class QzoneComponentsMixin:
                 for c_idx, c in enumerate(feed.get("comments") or [], 1):
                     owner = "（自己）" if str(c.get("qq_account")) == self_uin else ""
                     lines.append(f"   {idx}.{c_idx} {c.get('nickname', '?')}{owner}：{str(c.get('content'))[:36]}")
-            return "说说评论（序号用于 /cateye_test_life qzone reply 楼中楼回复）：\n" + "\n".join(lines[:40])
+            return "说说评论（序号用于 /lbm_life qzone reply 楼中楼回复）：\n" + "\n".join(lines[:40])
         if not admin:
             return "权限不足：需要管理员权限。"
         if action == "post":
             text = (rest[0].strip() if rest else "")
             if not text:
-                return "用法：/cateye_test_life qzone post <说说内容>"
+                return "用法：/lbm_life qzone post <说说内容>"
             result = await qz.post_moment(text)
             return f"已发表（tid={result.get('tid', '')}）。" if result else "发表失败（检查 SnowLuma 适配器与 QZone 能力）。"
         if action == "reply":
@@ -210,7 +210,7 @@ class QzoneComponentsMixin:
             #   只给说说序号 = 普通评论；给「说说.评论」序号（或两个数字）= 楼中楼回复该评论
             parts = (rest[0].strip() if rest else "").split(maxsplit=2)
             if len(parts) < 2 or not parts[-1].strip():
-                return "用法：/cateye_test_life qzone reply <说说序号> [评论序号] <内容>（序号见 /cateye_test_life qzone comments）"
+                return "用法：/lbm_life qzone reply <说说序号> [评论序号] <内容>（序号见 /lbm_life qzone comments）"
             nums = parts[0].replace(".", " ").split()
             try:
                 feed_idx = int(nums[0]) - 1
@@ -220,7 +220,7 @@ class QzoneComponentsMixin:
             content = parts[-1].strip()
             feeds = await qz.list_own_feeds_with_comments(num=10)
             if not (0 <= feed_idx < len(feeds)):
-                return "说说序号超出范围，先 /cateye_test_life qzone comments 查看。"
+                return "说说序号超出范围，先 /lbm_life qzone comments 查看。"
             feed = feeds[feed_idx]
             fid = str(feed.get("tid") or "")
             if comment_idx is None:
@@ -228,7 +228,7 @@ class QzoneComponentsMixin:
                 return "已评论。" if comment_id is not None else "评论失败。"
             comments = feed.get("comments") or []
             if not (0 <= comment_idx < len(comments)):
-                return "评论序号超出范围，先 /cateye_test_life qzone comments 查看。"
+                return "评论序号超出范围，先 /lbm_life qzone comments 查看。"
             c = comments[comment_idx]
             if str(c.get("qq_account")) == self._qz_cookie_uin():
                 return "这是自己发的评论，不需要回复。"
@@ -239,11 +239,11 @@ class QzoneComponentsMixin:
             # 用法：/life qzone like <tid> [目标QQ]（自己的说说省略目标QQ；好友说说传对方QQ号）
             parts = (rest[0].strip() if rest else "").split()
             if not parts:
-                return "用法：/cateye_test_life qzone like <说说tid> [目标QQ]"
+                return "用法：/lbm_life qzone like <说说tid> [目标QQ]"
             target_qq = parts[1] if len(parts) > 1 else ""
             ok = await qz.like_moment(parts[0], target_uin=target_qq)
             return "已点赞。" if ok else "点赞失败。"
-        return "未知空间子命令，用 /cateye_test_life help 查看。"
+        return "未知空间子命令，用 /lbm_life help 查看。"
 
     def _qz_cookie_uin(self) -> str:
         """当前空间 cookie 对应的 bot QQ 号（用于标注自己的评论；取不到返回空串）。"""

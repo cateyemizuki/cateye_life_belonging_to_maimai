@@ -168,7 +168,7 @@ class EmotionSectionConfig(PluginConfigBase):
     # ── M6 可选增强：emoji 情绪联动（默认关）──────────────────────
     emoji_enabled: bool = Field(
         default=False,
-        description="emoji 情绪联动开关（M6，默认关）：启用后 cateye_test_emotion_mood 会按当前情绪标签"
+        description="emoji 情绪联动开关（M6，默认关）：启用后 lbm_emotion_mood 会按当前情绪标签"
                     "向宿主 emoji.get_by_description 匹配一个表情并附在返回文本后；关闭时输出与旧版逐字一致",
         json_schema_extra={
             "label": "emoji 情绪联动",

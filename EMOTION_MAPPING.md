@@ -2,7 +2,7 @@
 
 > **性质**：现状导出文档（**只读镜像，不是设计稿**）——把 `emotion/` 里散落在各常量的映射关系集中成一张可核对的表。
 > 代码是唯一真源：本文件与代码不一致时，**以代码为准**，并回头修本文件。
-> **快照时间**：2026-10-05（本机 UTC+8）｜**适用版本**：`_manifest.json version=0.4.0`、`[plugin].config_version=0.2.0`
+> **快照时间**：2026-10-05（本机 UTC+8）｜**适用版本**：`_manifest.json version=1.0.0`、`[plugin].config_version=1.0.0`
 > **上游**：设计与联动口径见 [MAINTENANCE_PLAN_10.05.md](MAINTENANCE_PLAN_10.05.md) §四（情绪系统）、§6.2（联动通道）、§6.3（非决定性七原则）、附录 C（默认参数）；
 > 命令与工具见 [USAGE.md](USAGE.md)；测试规程见 [TEST_PROCEDURE.md](TEST_PROCEDURE.md)。
 > **来源文件**：`emotion/vad.py`｜`emotion/state_machine.py`｜`emotion/referee.py`｜`emotion/service.py`｜`emotion/bridge.py`｜`emotion/config.py`｜`companion/patrol.py`｜`companion/affection_events.py`｜`companion/relation.py`｜`qzone/service.py`｜`emotion/mapping_override.py`（M12 覆盖层）
@@ -43,7 +43,7 @@
 > 提醒次数 < `nap_reminder_max_per_day`（默认 2）/ 仍在睡眠窗口内（含赖床延长后的端点）/
 > `no_sleep_mode=false` / `nap_reminder_enabled`），触发
 > `proactive.trigger(intent="nap_reminder", metadata={"kind":"nap_reminder"})`、文本按 §4.3 模板
-> 点名隐藏工具 `cateye_test_nap_lie_in`；提醒块过了提醒轮（块龄 >120s）由 `core/inject.py`
+> 点名隐藏工具 `lbm_nap_lie_in`；提醒块过了提醒轮（块龄 >120s）由 `core/inject.py`
 > `is_consumed_ephemeral_proactive_block` 从请求载荷剥离；发送成功后登记 §4.5 提醒轮豁免窗口
 > （`NAP_REMINDER_ROUND_SECONDS`=120.0：窗口内该流意外 reply 不刷新 `resleep_minutes`、不重进吵醒态）。
 > **M11 预算归属（2026-10-08，附录 II §3.3）**：赖床提醒**计入**「主动打扰预算」，且该预算**仅**按
@@ -233,8 +233,8 @@ share_i = (1/d_i) / Σ(1/d_j)        # 反距离归一化，Σ share = 100%
 
 | 出口 | 位置 | 说明 |
 |---|---|---|
-| `/cateye_test_emotion_config` | `emotion/components.py:74` | 打印 `params_summary()`：初始化态 / 锚点 / 偏移 / 乘数 / **当前 VAD（含偏移，带数值）** / 当天事件数 + 推导理由。**管理员限定**（默认拒绝） |
-| ~~Tool `cateye_test_emotion_mood`~~ | ~~`emotion/components.py:99`~~ | **已移除（T6，2026-10-06，REGISTRY_DISPOSITION v2.1 §一）**：心情问答由情绪底色注入覆盖，`injection_enabled=false` 组合不支持心情问答（USAGE §五 已标注）；emoji 情绪联动保留在服务层（`EmotionService.emoji_for_mood`），当前无组件消费点 |
+| `/lbm_emotion_config` | `emotion/components.py:74` | 打印 `params_summary()`：初始化态 / 锚点 / 偏移 / 乘数 / **当前 VAD（含偏移，带数值）** / 当天事件数 + 推导理由。**管理员限定**（默认拒绝） |
+| ~~Tool `lbm_emotion_mood`~~ | ~~`emotion/components.py:99`~~ | **已移除（T6，2026-10-06，REGISTRY_DISPOSITION v2.1 §一）**：心情问答由情绪底色注入覆盖，`injection_enabled=false` 组合不支持心情问答（USAGE §五 已标注）；emoji 情绪联动保留在服务层（`EmotionService.emoji_for_mood`），当前无组件消费点 |
 
 > 注意 `params_summary()` 是**唯一**向对话面暴露绝对 VAD 数值的地方，但它只发给管理员，且不进 LLM 上下文（是命令回复文本）——与 §1 的"LLM 隔离"不冲突。
 
@@ -253,7 +253,7 @@ share_i = (1/d_i) / Σ(1/d_j)        # 反距离归一化，Σ share = 100%
 | `bridge:commitment_broken` | `schedule.commitment_broken` | **ΔV=−0.15** | target | 每约定 1 次 | ✅ |
 | `bridge:qzone_comment` | `qzone.comment_received` | **ΔV ∈ [+0.05, +0.10] 随机取值** | **K≡1**（只乘全局倍率，不加成也不淡化） | qzone 回评轮次 | ✅ |
 | `replyer` | `maisaka.replyer.after_response`（每轮回复后） | LLM 评估輸出（±0.5） | target / 非 target（按 session_id 判定） | `evaluate_min_interval_seconds`（默认 60s） | ❌ |
-| `tool:emotion_report` | Tool `cateye_test_emotion_report(event, is_target)` | LLM 评估輸出（±0.5） | target / 非 target（按 `is_target` 参数） | 与回复评估共用同一 60s 节流 | ❌ |
+| `tool:emotion_report` | Tool `lbm_emotion_report(event, is_target)` | LLM 评估輸出（±0.5） | target / 非 target（按 `is_target` 参数） | 与回复评估共用同一 60s 节流 | ❌ |
 | `sleep_interrupt` | **睡眠周期结束（醒沿，大修之后）** | **整夜合计净正**：单段 `ΔV_i = max(0, 0.05−0.01×(i−1))`，整夜 `min(Σ ΔV_i, 0.15)`（只作用 **V**，A/D 恒 0；`i` = 已确认打扰段序号，下限 0） | target（K=1+加成；被打扰**唯一归属** target 私聊） | **每 `cycle_key` 1 次**（结算即清空本周期归档；无打扰不入账、不落日志） | ✅ |
 
 **只订阅不结算的事件**（仅 debug 日志，`IGNORED_EVENTS`，`emotion/bridge.py:46-52`）：`relation.interaction_event`、`relation.affection_tier_changed`、`relation.daily_reviewed`、`qzone.posted`、`qzone.comment_replied`。
@@ -351,7 +351,7 @@ M8 段 3 的 `emotion.sleep_interrupt_settled` 复用同一三值口径（`delta
 
 ### 7.1 人设初始化参数（锚点 / 偏移 / 乘数）
 
-由 `/cateye_test_emotion_init` 触发（管理员命令）→ `derive_params_from_persona` → 落 `emotion_config.json`。
+由 `/lbm_emotion_init` 触发（管理员命令）→ `derive_params_from_persona` → 落 `emotion_config.json`。
 
 | 参数 | 含义 | LLM 要求区间 | **代码钳制区间** | 默认/中性值 |
 |---|---|---|---|---|
@@ -364,7 +364,7 @@ M8 段 3 的 `emotion.sleep_interrupt_settled` 复用同一三值口径（`delta
 | `initialized` | 是否已初始化 | — | bool | false |
 
 - 初始化后 `apply_params()`：**当前 VAD 直接设为锚点**、清空情绪日志（`state_machine.py:178-183`）。
-- `/cateye_test_emotion_config reset` → `reset_params()`：零锚点 / 零偏移 / 中性乘数、VAD 归零。
+- `/lbm_emotion_config reset` → `reset_params()`：零锚点 / 零偏移 / 中性乘数、VAD 归零。
 - 落盘：`emotion_config.json`（参数）+ `emotion_state.json`（运行时）；启动时**以 config 文件为准**（防 state 里的旧参数覆盖初始化结果，`service.py:46-50`）。
 - 未初始化时的实测后果：参数全中性 → `effective_vad = (0,0,0)` → `mood_text()` = **"怀旧(100%)。愉悦度：中等；…"**（见 §3.3 观察 ①）。
 
@@ -613,7 +613,7 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 | 路径 | `<data_dir>/emotion_mapping.json`（宿主插件数据目录；与 `emotion_state.json` / `emotion_config.json` / `proactive_budget.json` 同级），文件名常量 `mapping_override.MAPPING_FILE_NAME` |
 | 可选性 | 文件**不存在 = 纯代码默认**：静默、零 action、`applied_keys=[]`（`load()` 的不存在分支） |
 | 读写 | **只读**——插件不生成模板、不写回该文件（`load()` 全程不写文件） |
-| 部署 | robocopy 部署只覆盖插件代码目录（`plugins\cateye_test`），**不触碰数据目录** → 自定义文件跨部署存续（同 `proactive_budget.json` / `emotion_state.json` 的既有事实，见 TEST_PROCEDURE §八 部署行） |
+| 部署 | robocopy 部署只覆盖插件代码目录（`plugins\lbm`），**不触碰数据目录** → 自定义文件跨部署存续（同 `proactive_budget.json` / `emotion_state.json` 的既有事实，见 TEST_PROCEDURE §八 部署行） |
 | 顶层结构 | `{"version": 1, <四表键任选>}`：`version` **必填** int 且 `== 1`（`true` / `1.0` 不算 int）；顶层键集恰为 `version` + 下面四个表键，多一个即 `unknown_key` |
 
 四张数据表（键名与顺序 = `mapping_override.TABLE_KEYS`；存在即整表替换）：
@@ -812,6 +812,6 @@ delta_affection_final = delta × clamp(1 + 0.25 × V_current × sign(delta), 0.6
 
 1. **本文件是镜像**：改 `emotion/` 的任何映射常量、阈值、提示词契约，**同批**更新本文件对应小节 + 快照时间与版本。
 2. 本文件属开发文档，**发布时排除**（同 `TEST_PROCEDURE.md`、`scratch/`，见开发文档陷阱 #23）。
-3. 新增情绪原型 / 改权重 / 改阈值后，跑 `maibot-plugins\scratch\behavior_test_cateye_test.py`
+3. 新增情绪原型 / 改权重 / 改阈值后，跑 `maibot-plugins\scratch\behavior_test_lbm.py`
    （映射用例在其中），并用配套导出脚本 `maibot-plugins\scratch\gen_emotion_mapping.py` 重新生成
    §二 的中心点表与 §3.3 的实测校准（该脚本用 `assert` 自校验中心点与代码一致，可直接重跑对账）。

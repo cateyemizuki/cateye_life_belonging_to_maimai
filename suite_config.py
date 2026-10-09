@@ -1,4 +1,4 @@
-"""猫眼生活套件（cateye_test）插件 — 顶层配置聚合。
+"""属于麦麦的生活（lbm）插件 — 顶层配置聚合。
 
 - 文件名刻意不叫 ``config.py``：宿主 Runner 加载插件时 sys.path 含宿主 ``src``，
   且 cateye_harness 与本插件同进程加载，顶层 ``config`` 会被宿主 ``src/config`` 或
@@ -34,7 +34,7 @@ from planning.config import (
 from qzone.config import QzoneSectionConfig
 
 # 与 _manifest.json 的 version 保持同步。
-SUPPORTED_CONFIG_VERSION = "0.2.0"
+SUPPORTED_CONFIG_VERSION = "1.0.0"
 
 
 def _ui_i18n(en_label: str, en_hint: str = "") -> dict:

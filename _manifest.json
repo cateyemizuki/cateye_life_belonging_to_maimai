@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "id": "github.cateye.cateye-suite",
-  "version": "0.4.0",
-  "name": "猫眼生活套件（骨架版）",
+  "id": "cateye.life_belonging_to_maimai",
+  "version": "1.0.0",
+  "name": "属于麦麦的生活",
   "description": "整合插件：① 自主规划——LLM 按人设多轮生成每日作息日程（SQLite + 质量评分 + 语义校验），当前活动注入 planner/replyer，活动切换/约定到期主动开口，/plan 命令与日程图片；② 虚拟陪伴——好感度 + 巡检主动聊天（早安/晚安/想念/节点分享，概率+预算+静默时段），屏幕感知旁白注入，陪伴对象电脑联动；③ QQ 空间——按日程发说说（动作层+Web CGI 双通道）、自动回复评论（含楼中楼）、点赞。/plan、/mai_*、/life 三组命令。",
   "author": {
     "name": "cateye",

@@ -1,9 +1,9 @@
 """EmotionComponentsMixin —— 情绪系统的 SDK 组件注册（装饰器方法）。
 
-组件清单（组件名带 cateye_test_ 前缀，与其他模块同规则）：
-- Command ×2：/cateye_test_emotion_init（人设初始化）、/cateye_test_emotion_config [reset|clear]（查看/重置）
-- Tool ×1：cateye_test_emotion_report(event, is_target)（上报影响心情的事件；群聊 target 声明，M3）
-  （原 cateye_test_emotion_mood 已随 T6 注册面收口移除：「你现在什么心情」类问答由情绪
+组件清单（组件名带 lbm_ 前缀，与其他模块同规则）：
+- Command ×2：/lbm_emotion_init（人设初始化）、/lbm_emotion_config [reset|clear]（查看/重置）
+- Tool ×1：lbm_emotion_report(event, is_target)（上报影响心情的事件；群聊 target 声明，M3）
+  （原 lbm_emotion_mood 已随 T6 注册面收口移除：「你现在什么心情」类问答由情绪
   底色注入覆盖；injection_enabled=false 的组合不支持心情问答，见 USAGE.md）
 - HookHandler ×3：maisaka.planner.before_request（情绪底色注入）、
   maisaka.replyer.before_model_request（情绪底色注入）、
@@ -36,9 +36,9 @@ class EmotionComponentsMixin:
     """情绪组件（2 Command + 1 Tool + 3 HookHandler）。"""
 
     emotion_components_info: ClassVar[Dict[str, str]] = {
-        "cateye_test_emotion_init": "Command：由人设自动推导情绪锚点/偏移/乘数（VAD 初始化）",
-        "cateye_test_emotion_config": "Command：查看情绪参数；reset 子命令恢复默认",
-        "cateye_test_emotion_report": "Tool：上报一件影响心情的事件；is_target 声明是否由重要的人引发（M3）",
+        "lbm_emotion_init": "Command：由人设自动推导情绪锚点/偏移/乘数（VAD 初始化）",
+        "lbm_emotion_config": "Command：查看情绪参数；reset 子命令恢复默认",
+        "lbm_emotion_report": "Tool：上报一件影响心情的事件；is_target 声明是否由重要的人引发（M3）",
         "emotion_planner_inject": "HookHandler：maisaka.planner.before_request 情绪底色注入（系统提示词后）",
         "emotion_replyer_model_inject": "HookHandler：maisaka.replyer.before_model_request 情绪底色注入（系统提示词后）",
         "emotion_reply_evaluate": "HookHandler：maisaka.replyer.after_response 会话片段登记/增量评估（OBSERVE，按 evaluate_mode）",
@@ -56,9 +56,9 @@ class EmotionComponentsMixin:
     # ============================================================
     # Commands
     # ============================================================
-    @Command("cateye_test_emotion_init",
+    @Command("lbm_emotion_init",
              description="由人设自动推导情绪锚点/静态偏移/乘数并生效（VAD 情绪系统初始化）",
-             pattern=r"(?<!\S)/cateye_test_emotion_init\s*$")
+             pattern=r"(?<!\S)/lbm_emotion_init\s*$")
     async def emo_cmd_init(self, **kwargs: Any) -> tuple[bool, str, bool]:
         svc = self._emo_service()
         stream_id = str(kwargs.get("stream_id", "") or "")
@@ -73,9 +73,9 @@ class EmotionComponentsMixin:
         await self.ctx.send.text(reply, stream_id)
         return True, "emotion init done", True
 
-    @Command("cateye_test_emotion_config",
+    @Command("lbm_emotion_config",
              description="查看情绪系统参数（锚点/偏移/乘数/当前VAD）；reset 子命令恢复默认",
-             pattern=r"(?<!\S)/cateye_test_emotion_config(?:\s+(?P<emo_args>\S+))?\s*$")
+             pattern=r"(?<!\S)/lbm_emotion_config(?:\s+(?P<emo_args>\S+))?\s*$")
     async def emo_cmd_config(self, **kwargs: Any) -> tuple[bool, str, bool]:
         svc = self._emo_service()
         stream_id = str(kwargs.get("stream_id", "") or "")
@@ -99,7 +99,7 @@ class EmotionComponentsMixin:
     # Tools
     # ============================================================
     @Tool(
-        "cateye_test_emotion_report",
+        "lbm_emotion_report",
         description="上报一件影响 bot 心情的事件（由 bot 判断是否与最重要的人有关），入账有界情绪增量。",
         detailed_description=(
             "上报一件给 bot 的情绪带来波动的事件，由代码侧做有界评估后计入当天情绪。"
