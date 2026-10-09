@@ -1,4 +1,10 @@
-# cateye_test 宿主自测试流程（TEST_PROCEDURE.md）
+# 属于麦麦的生活（lbm）宿主自测试流程（TEST_PROCEDURE.md）
+
+> **维护基线（2026-10-10 起）**：被测/维护树 = `D:\deepseek-harness_workspace\maibot-plugins\cateye_life_belonging_to_maimai`
+> （`release/lbm-1.0.0`）；`cateye_test` 与 `cateye_test_ws2` 已冻结为只读档案（见计划书 §〇 与 §十二）。
+> 本文的宿主级流程（L1~L5）与红线**不变**；文中出现的 `cateye_test` 路径/组件名多为历史记录，
+> **现行组件名前缀为 `lbm_`**（`/lbm_*` 命令同理）。离线脚本支持 `CATEYE_TEST_DIR` 指向被测树
+> （未设置时默认 `..\cateye_test`）。
 > **【会话 2 范围声明 · 2026-10-06】** 本副本（cateye_test_ws2）的会话 2 仅执行 §三 的 L0 离线测试。
 > §四（harness）与 §五（SOP：宿主启停/部署/注入）为会话 1 专属——**只读理解，禁止执行**；
 > 一切 `E:\maibot` 路径的操作不得由会话 2 发起。
@@ -46,7 +52,7 @@
 
 | 层 | 名称 | 是否需要宿主 | 内容 |
 |---|---|---|---|
-| L0 | 离线单测 | 否 | `maibot-plugins/scratch/smoke_test_cateye_test.py`（40 组件收集、配置模型、能力面核对）+ `maibot-plugins/scratch/behavior_test_cateye_test.py`（纯算法回归）。**每个里程碑编码前先加用例、编码后必须全绿**（路径见本文件头部的实测订正） |
+| L0 | 离线单测 | 否 | `maibot-plugins/scratch/` 三件套：`smoke_test_cateye_test.py`（组件收集、配置模型与迁移、能力面核对）+ `behavior_test_cateye_test.py`（纯算法回归）+ `_config_round_checks.py`（名单/注入矩阵/迁移幂等/提示词模板，2026-10-10 新增）。**每个里程碑编码前先加用例、编码后必须全绿**；跑维护树时设 `CATEYE_TEST_DIR`（见文件头基线块） |
 | L1 | 装载与热重载 | 是 | 拷贝插件 → 轮询确认重载完成 → 版本/组件数核对 → 宿主日志无加载报错 |
 | L2 | **注入式集成测试** | 是 | 核心手段：经 `snowluma_gateway` 注入合成 MessageDict，走**完整真实入站链**（写库 → chat.receive hooks → maisaka 回复决策）。无需真人发消息，最大程度"模仿实际应用环境"且零宿主改动 |
 | L3 | 真人联动 | 是 | 注入覆盖不到的：真实消息 ID 的引用回复链、表情、图片、用户自己的措辞习惯。由用户在测试群/私聊手打 |

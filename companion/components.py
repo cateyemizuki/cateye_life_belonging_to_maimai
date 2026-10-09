@@ -934,7 +934,7 @@ class CompanionComponentsMixin:
     async def mai_cmd_dashboard(self, **kwargs: Any) -> tuple[bool, str, bool]:
         """M7 聚合状态指令：四模块状态块 → 状态图 + 纯文本。
 
-        发送形态同 planning/command_service.py 的 ``/plan list``：有图 → 合并转发
+        发送形态同 planning/command_service.py 的 ``/lbm_plan list``：有图 → 合并转发
         （第一条图片、第二条文字）；转发失败回退 ``send.image`` → ``send.text``；
         无图（PIL 缺失/绘制异常/超时）直接发纯文本，全程静默降级不发失败提示。
         文本档末行追加配置摘要（A5：mai_config Tool 并入此处；读配置异常则跳过该行）。

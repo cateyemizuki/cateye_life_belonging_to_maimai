@@ -64,7 +64,9 @@ from planning.config import (
 from qzone.config import QzoneSectionConfig
 from suite_prompts import PromptsSectionConfig
 
-# 与 _manifest.json 的 version 保持同步。
+# 配置版本（**与插件版本 `_manifest.json` 的 version 解耦**，两者不等是预期状态）：
+# 插件版本表达"功能发布代次"（本版 = 1.1.0）；配置版本表达"配置文件结构代次"，
+# 它决定宿主是否按新骨架重建设置文件——重建会丢弃跨段旧键，使插件侧迁移器失效。
 # 注意（2026-10-10 配置整理轮）：**不要**因为配置结构调整而递增本值——宿主在版本号变化时
 # 会先按新骨架重建设置文件（丢弃跨段旧键），本模块的迁移器将看不到旧值。递增时机 =
 # 既有用户的 config.toml 已按新布局落盘之后（建议随下一次发布处理）。

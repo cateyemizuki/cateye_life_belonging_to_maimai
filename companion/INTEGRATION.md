@@ -65,7 +65,7 @@ await self._companion.stop()
 | 对话事件 | `components.py` `chat.receive.after_process` | target 私聊记 `chat_round` + 刷新 `last_user_msg_time`（触发 `user_initiated` 检测）；同时发 `relation.message_received` |
 | planner 注入 | `components.py` `_mai_build_activity_suffix` | 好感行改读 `tier()` + `relation.tier_label()/tier_description()`（5 档口径） |
 | 约定订阅 | `services.py` `_register_event_subscriptions`（`start()` 注册 / `stop()` 反订阅） | `schedule.commitment_kept` / `schedule.commitment_broken` → `record_rule_event`，去重键取 `commitment`（回退 `summary`） |
-| Tool/命令 | `components.py` | `cateye_test_mai_lover_affection` 与 `/cateye_test_mai_affection` 走 `update_level()`（3 档兼容、跳过迟滞）；状态行输出 score/baseline/5 档档位/今日 Δ（M2 追加最近 1~2 条印象 + 关系温度） |
+| Tool/命令 | `components.py` | `lbm_mai_lover_affection` 与 `/lbm_mai_affection` 走 `update_level()`（3 档兼容、跳过迟滞）；状态行输出 score/baseline/5 档档位/今日 Δ（M2 追加最近 1~2 条印象 + 关系温度） |
 
 ## 好感 LLM 裁判（M2 落地，2026-10-03）
 

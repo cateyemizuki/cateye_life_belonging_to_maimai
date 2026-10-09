@@ -8,7 +8,7 @@
 
 > 来源：`D:\deepseek-harness_workspace\maibot-plugins\MaiBot情绪维护系统设计文档.md`
 >（VAD 三维情绪模型 + 日常增量微调 + 睡眠期大修 Overhaul + 人设初始化）。
-> 与其他两个复刻模块同构：独立总开关（`emotion.enabled`）、服务束、组件 Mixin、cateye_test 前缀组件名。
+> 与其他两个复刻模块同构：独立总开关（`emotion.enabled`）、服务束、组件 Mixin、`lbm_` 前缀组件名。
 
 ## 模块地图
 
@@ -20,7 +20,7 @@
 | `referee.py` | 三个独立 LLM 请求：睡眠裁判（**M5 起动态限幅 ±(0.4+0.4×`schedule.emotion_influence`)，缺省兼容 ±0.8** + R/E/约定三组数值输入 + reason 须引用日程原文）、人设初始化（锚点 ±0.6/偏移 ±0.3/增益 [0.8,1.3]/衰减 [0.6,1.2] 校验裁剪）、回复增量评估（±0.5）；宽松 JSON 解析 | §六/§十 |
 | `service.py` | 状态持久化（emotion_state.json / emotion_config.json）、睡眠检测循环（消费 planning 日程的 sleep 条目，跨午夜时长计算）、前后日日程与长期状态（planning 的 custom_prompt）汇总、初始化指令主体、隐私接口（清空日志）；**M3 增 `record_external_event` 统一外部事件入口 + target 识别/三层加算倍率 + 评估上下文反查（get_by_time_in_chat）**；**M4 增 `mood_effect()` 情绪→行为系数（附录 C 映射，纯规则）**；**M5 改睡眠循环为冻结→醒后结算**（入睡冻结 + 冻结期计算并缓存大修 → 醒沿应用一次并解冻；`is_frozen()`/`sleep_delta_limit()`/`schedule_tone_sum()`/`compute_sleep_overhaul()`/`_apply_cached_overhaul()`；`applied_sleep_date` 记睡眠周期键，旧裸日期值兼容读取）；**冻结窗口按 [schedule] 作息锚点整夜**（条目会被 `_normalize_items` 截断为 23:00–23:15，不能作窗口；午休按条目窗口），计划时长取整夜 8h；R/E/约定在醒来时按入睡日基准重算（次日日程 00:30 才生成）；**M5 连续低迷**：每 tick 采样**清醒时段** effective V（冻结期跳过）→ 日均线（滚动 7 天）→ **日历逐日**判定连续「日均 V<−0.5」（无采样日归零）→ 满 3 天发 `emotion.low_mood_day`（`low_mood_days()`/`low_mood_state()`，随状态落盘、旧文件缺键兼容）；**T7 会话片段制**（`evaluate_mode` 默认 `episode`）：`replyer.after_response` 只调 `note_reply_for_episode` 登记（纯内存零 LLM）；`_loop` 每轮回调 `flush_idle_episodes()` 冲刷闲置超 `episode_idle_minutes` 的流，睡眠入口先 `flush_all_episodes(reason="sleep_entry")` 再冻结/跑裁判；片段经 `get_by_time_in_chat(filter_mai=False, limit=40)` 组装（40 条/3000 字上限，超出保留最近往来并在头部标注），进评估器时正文预算放宽到片段上限且保留最近往来；水位/日计数落 `emotion_state.json` 的 `episode` 键（`last_eval_ts`/`eval_date`/`eval_count`，缺键/坏类型一律空默认），日上限 `evaluate_max_per_day` 两模式共用；**A3 增跨来源去重**（`dedup_policy()`/`_dedup_skip_result()`：replyer ⇄ tool:emotion_report 按流+窗口先入账者生效，内存在线登记、不改状态文件） | §五/§六/§十/§十三 |
 | `bridge.py` | **M3 新增**：跨模块事件桥——订阅 `relation.*` / `schedule.commitment_*` / `qzone.*` 并翻译为有界情绪增量（模板或 LLM 路径），全部经 `record_external_event` 入账；注册/注销挂 `services.py` | MAINTENANCE_PLAN §4.2 / §6.2 A·E·G |
-| `components.py` | `EmotionComponentsMixin`：2 Command + 2 Tool（**M3 新增 `cateye_test_emotion_report`**）+ 3 HookHandler（方法名 `emo_` 前缀，组件名 `cateye_test_emotion_*`） | —— |
+| `components.py` | `EmotionComponentsMixin`：2 Command + 2 Tool（**M3 新增 `lbm_emotion_report`**）+ 3 HookHandler（方法名 `emo_` 前缀，组件名 `lbm_emotion_*`） | —— |
 | `services.py` | `EmotionServices` 服务束（start/stop/set_persona 转发；**M3 起 start/stop 注册与注销 bridge 事件订阅、对外暴露 `effective_valence()` 供 B2 调制**；**M4 增 `mood_effect()` 转发，异常兜底恒等中性值**） | —— |
 
 ## 与其他模块的协作
@@ -46,7 +46,7 @@
 
 **target 识别 + 三层加算倍率（MAINTENANCE_PLAN §6.2 A）**
 - 私聊：`is_target_session(session_id)` 比对目标私聊 stream_id（`plugin._stream_id`，随 target 配置解析/热重载）；replyer.after_response 链路把 session_id 传入 `evaluate_reply`；
-- 群聊：Tool `cateye_test_emotion_report(event, is_target)` 传参声明——参数永不拒绝，缺失/非 bool/胡填一律静默按非 target（最多 debug 日志），代码不报错；
+- 群聊：Tool `lbm_emotion_report(event, is_target)` 传参声明——参数永不拒绝，缺失/非 bool/胡填一律静默按非 target（最多 debug 日志），代码不报错；
 - K：target = `1 + target_bonus_step × (档位+1)`（档 0~4 → +0.1~+0.5；档位经 `plugin._affection.tier()` 读取，可空降级、读不到不加成）；非 target = `non_target_multiplier`；调用方 K 有 `EXTERNAL_K_MAX=10` 防御上限。
 
 **事件桥 `emotion/bridge.py`**（注册/注销挂 `EmotionServices.start()/stop()`；总线缺失静默跳过，处理器绝不抛异常）
@@ -67,7 +67,7 @@
 **跨来源去重（A3 落地，2026-10-05；MAINTENANCE_PLAN §2.4.6 A3）**
 - 口径 `policy=cross_source_stream_window`：仅 `replyer`（replyer.after_response 自动评估主通道）与 `tool:emotion_report`（群聊工具上报）两条来源互斥；按聊天流（`session_id`/`stream_id`，空流归 `-`）+ 时间窗 `emotion.dedup_window_seconds`（默认 180s）判定——窗口内**先入账者生效**，后到者返回 `{"ok": false, "reason": "duplicate_cross_source", "dedup": {...}}`，不入 `emotion_log`、不发 `emotion.updated`，并落一条 `emotion.external_event_dedup` 决策日志；窗口相对"最近一次真正入账"滚动，模板事件（bridge:* 等）与其它来源不参与；
 - 判定发生在评估 LLM 之前：命中即跳过（不消耗 `evaluate_min_interval_seconds` 节流、不产生 LLM 成本）；`record_external_event` 返回值恒带 `dedup` 口径描述（`dedup_policy()`）；
-- Tool 侧：`cateye_test_emotion_report` 从宿主 kwargs 取 `stream_id` 随上报传入；命中重复时回文本「这件事刚才已经计入情绪了（与自动评估重复），未重复计入。」；
+- Tool 侧：`lbm_emotion_report` 从宿主 kwargs 取 `stream_id` 随上报传入；命中重复时回文本「这件事刚才已经计入情绪了（与自动评估重复），未重复计入。」；
 - 兼容：新增两字段均有默认值（`dedup_enabled=True`/`dedup_window_seconds=180`），关闭/置 0 即回退旧行为；去重为内存态，不改 `emotion_state.json` 任何字段（旧状态文件缺键/未知键照常读取）。
 
 **接线挂点**

@@ -1,6 +1,11 @@
-# 猫眼生活套件（cateye_test）长期演进计划书（10-05 版）
+# 属于麦麦的生活（lbm）长期演进计划书（10-05 版；2026-10-10 起随发布身份维护）
 
-> 版本：**v1.6（2026-10-08 附录 II 注册）**。本次修订：⑦**追加计划书 II 注册**——例行问候去预算化 +
+> 版本：**v1.7（2026-10-10 维护基线切换 + 配置整理轮登记）**。本次修订：⑧**维护基线切换**——
+> 唯一维护树改为本目录（`cateye_life_belonging_to_maimai`，`release/lbm-1.0.0`），
+> `cateye_test` / `cateye_test_ws2` 冻结为只读档案；维护文档随迁（§八.13 发布前剥离义务）；
+> 新增 **§十一**（配置整理轮：11 段配置 / 注入矩阵 / 问候去重 / `[prompts]`+`[llm]` 双集中）与
+> **§十二**（迁移执行记录：合并 `2f76c41`、身份保持、`config_version` 保持 1.0.0 的迁移口径、
+> `_manifest` → 1.1.0）。v1.6（2026-10-08 附录 II 注册）。本次修订：⑦**追加计划书 II 注册**——例行问候去预算化 +
 > 主动打扰预算收窄（"全渠道"→仅目标陪伴私聊）+ 恋人→陪伴改名（L1 全改/L3 宿主机标识不改），新增里程碑
 > **M11**（§七）；裁决 Q1~Q5 闭合（Q1 仅早/晚安免预算；Q3=B 真收窄+全部文案修正；Q4 三类开关+问候专用
 > 黑白名单——**取代附录 I 的 B6**；Q5 目录与 `relation_type` 枚举值不动），详细设计见
@@ -23,6 +28,13 @@
 
 ## 〇、如何使用本文档（给未来 agent 的操作规程）
 
+> **维护基线（2026-10-10 起，用户裁定）**：**唯一维护的代码树 = 本文件所在目录**
+> `D:\deepseek-harness_workspace\maibot-plugins\cateye_life_belonging_to_maimai`
+> （发布身份「属于麦麦的生活」，git 分支 `release/lbm-1.0.0`）。
+> `maibot-plugins\cateye_test`（`master`，开发身份）与 `maibot-plugins\cateye_test_ws2`（`ws2/m6m7`）
+> 自本轮起**冻结为档案**：只读、不再接受任何代码或文档改动（历史提交与报告仍在，供追溯）。
+> 计划书 / TEST_PROCEDURE / work_report 等维护文档已随维护树回归本目录（见 §八.13）。
+
 1. **接手时**：先读 §一（要做成什么样）和 §二（现在是什么样），再读本次任务对应的里程碑（§七）。
 2. **实现某里程碑时**：严格按该里程碑指向的 §三~§六 设计节落码；改动文件清单和验收标准以 §七 为准。
 3. **完成一期后**：
@@ -31,7 +43,10 @@
      `...\scratch\behavior_test_cateye_test.py`（核心算法回归，需同目录 `sdk_stub.py` 配合），
      以及 `...\scratch\_config_round_checks.py`（2026-10-10 配置整理轮新增：统一名单系统 / 问候候选矩阵 /
      陪伴注入矩阵 / 配置迁移幂等 / 提示词模板可渲染 / 日期头部——**改动配置模型、名单、提示词或注入时必跑**），
-     以 `cd maibot-plugins\scratch` 为工作目录执行（脚本内硬编码插件路径，可从该目录回指插件）；
+     以 `cd maibot-plugins\scratch` 为工作目录执行；脚本支持 `CATEYE_TEST_DIR` 环境变量指向被测树
+     （未设置时默认 `..\cateye_test`）。**维护树（lbm）的验证命令**：
+     `CATEYE_TEST_DIR=D:/deepseek-harness_workspace/maibot-plugins/cateye_life_belonging_to_maimai python smoke_test_cateye_test.py`
+     （三份脚本同理；组件/命令名的身份前缀由脚本自动探测，"cateye_test_ / lbm_" 两树通用）；
      **新增算法必须配新用例**；随后按
      [TEST_PROCEDURE.md](TEST_PROCEDURE.md) 的 SOP 做宿主级验证（L1 热重载 + L2 注入场景）；
      ⚠️ 路径陷阱：`cateye_test/scratch/` **不存在**（L5 分析员曾按该路径找脚本白耗一轮）；写文档/派子代理时
@@ -625,9 +640,17 @@ flowchart TD
 9. **测试工件不得进发布包**（2026-10-05 新增，详见 §2.4.4）：`cateye_harness`（含其 `build_staging/cateye_test` 副本）、宿主 `adapter_policy.toml` 的 harness 放行块、`/cateye_test_mai_test`、`config.toml.l4_*`、`config_back/`、`__pycache__`/`*.pyc`、部署残留旧名 `config.py`。**执行时机必须在 L5 复验通过之后**（复验仍需要 harness 通道）。
 10. **能力面与组件面双向对齐**（2026-10-05 新增）：任何 Tool/Command/API/Hook 的增删都必须同时改 `_manifest.json` 的 `capabilities`、README 组件表、USAGE 命令表，并复跑 `maibot-plugins\scratch\smoke_test_cateye_test.py`（其断言 40 组件与能力面，是发布前的最后一道门）。组件名一律不改（CLEANUP §三）。
 11. **多用户好感度不得复活**（2026-10-05 新增）：该设计已裁撤并自正文清退（归档理由见 §10.1）；未来 agent 不得在正文重新引入多用户档案/评论者好感/回评分档设计，重启条件见 §10.1。
+13. **维护文档与发布包的关系（2026-10-10 新增；随维护基线切换）**：维护文档
+    （`MAINTENANCE_PLAN_10.05.md` / `TEST_PROCEDURE.md` / `work_report/` / `CLEANUP_PROPOSALS.md` /
+    `REGISTRY_DISPOSITION.md` / `SYNERGY.md` / 三份模块 `INTEGRATION.md`）自本轮起**随维护树提交**
+    （否则"单一维护树"会在文档面上分叉）。**发布前必须剥离**：这些文件与 §2.4.4 T1~T5 的测试工件
+    一并列入定版清退清单（§9.3 顺序不变：复验 → 清退 → 复跑 smoke → 版本递增）；
+    清退判定新增一条——发布包内不得出现上述任一维护文档。
+
 12. **工作报告规范**（2026-10-05 用户要求，**强制**）：此后**每一轮工作都必须留一份工作报告**，写在
-    `cateye_test/work_report/` 下（用户指定路径：
-    `D:\deepseek-harness_workspace\maibot-plugins\cateye_test\work_report\`）。
+    **维护树的 `work_report/`** 下（2026-10-10 起路径随维护基线切换：
+    `D:\deepseek-harness_workspace\maibot-plugins\cateye_life_belonging_to_maimai\work_report\`；
+    2026-10-10 之前的报告已随迁移一并保留在该目录，文件名时间戳连续可排序）。
     - **命名**：`<YYYYMMDD_HHmm>_<主题>.md`——时间戳前置（取本机 UTC+8 的报告完成时刻）以便按名排序，
       下划线分隔，主题用中文短语（例：`20261005_0227_MAINTENANCE_PLAN_10.25修订与完工评估.md`）。
       同一分钟多份时在主题后加 `_2`、`_3`。
@@ -745,6 +768,28 @@ README 组件表 / USAGE 命令表 / 相关模块 `INTEGRATION.md` / 本计划�
 
 **遗留（登记）**：① 非目标类问候跨热重载去重（§10.3 既有待议项，未在本轮动）；
 ② `[prompts]` 61 字段在 WebUI 的编辑体验需真机确认；③ 发布身份 `release/lbm-1.0.0` 是否随本轮同步（待用户裁定）。
+
+---
+
+## 十二、维护基线切换：开发身份 → 发布身份（2026-10-10，用户裁定）
+
+> 用户指令（2026-10-10 晨）："改进计划书，加迁移到 `cateye_life_belonging_to_maimai`；
+> 往后直接维护该树，不再维护 ws2 与 cateye_test。"
+
+**执行记录**
+
+| 项 | 内容 |
+|---|---|
+| 源 | `cateye_test`（master）配置整理轮提交 `f9f3f23` |
+| 目标 | 本树（`release/lbm-1.0.0`），合并提交 `2f76c41` |
+| 冲突解析 | 9 处内容冲突 + 6 处 modify/delete。原则：**采用源树的结构改动，保留目标树的发布身份**——`planning/config.py`、`suite_config.py` 取源树版本后再回填发布侧身份串（`lbm_` 组件/命令名、`/lbm_plan`、插件 id）；`plugin.py`/`emotion/service.py` 取源树逻辑并回填显示名与命令名；`planning/schedule_image.py` 两侧同修（R6 回灌），取发布侧；README/USAGE 取发布侧产品化版本，随后按本轮内容同步（见 §十二.2） |
+| 身份清扫 | 合并后全树 grep `cateye_test` / `猫眼生活套件` / `cateye-suite` 清零；顺带把节假日服务 UA 串从遗留的 `cateye-suite/0.1` 改为 `life-belonging-to-maimai/1.0` |
+| `config_version` | **保持 `1.0.0`**：本轮的旧配置迁移依赖"版本号不变 + 插件侧一次性迁移"（宿主会在版本变化时先按新骨架重建、丢弃跨段旧键）。**递增时机 = 既有用户 config.toml 已按新布局落盘之后**（建议随下一次发布处理；届时迁移器已无需工作） |
+| `_manifest.json` | 版本递增 **1.0.0 → 1.1.0**（发布身份的产品版本；与 config_version 解耦） |
+| 文档位置 | 维护文档（计划书 / TEST_PROCEDURE / work_report / CLEANUP / REGISTRY / SYNERGY / 三份 INTEGRATION）随维护树回归本目录；**发布前剥离义务**见 §八.13 |
+| 门禁 | 三份离线脚本改为身份无关（`CATEYE_TEST_DIR` + 前缀自动探测），开发树与维护树**同批全绿**（证据见本轮 work_report） |
+| 冻结登记 | `cateye_test`（master @ `f9f3f23`）与 `cateye_test_ws2`（`ws2/m6m7` @ `32e4f64`）转为**只读档案**；后续任何改动只落本树（分支 `release/lbm-1.0.0`）。历史报告/台账保留在两树与 `cateye_dev_archive\` |
+| 遗留 | ①宿主级验证（L1 热重载 / 真机旧配置迁移落盘 / WebUI 11 段渲染 / 屏幕感知与角色裁判收编后的实弹）仍待宿主级会话；②版本发布（1.1.0）与发布包剥离执行时机由用户裁定 |
 
 ---
 

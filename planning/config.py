@@ -353,7 +353,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     # ── 角色裁判 ─────────────────────────────────────────────
     role_judge_enabled: bool = Field(
         default=True,
-        description="角色裁判模式：你（用户）用自然语言要求改日程时，让 bot 以角色身份先做判断——"
+        description="角色裁判模式：你（用户）通过 lbm_update_schedule_v4 用自然语言要求改日程时，让 bot 以角色身份先做判断——"
                     "接受并改今天（today）/ 接受为未来预约（future）/ 拒绝不改（reject）。"
                     "判定失败时安全回退为「日程不变」",
         json_schema_extra={
@@ -380,7 +380,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     # ── 命令展示 ────────────────────────────────────────────
     list_draw_image: bool = Field(
         default=True,
-        description="/plan list 是否绘制日程图片（内置字体渲染后合并转发）；关闭后只返回文字长文本",
+        description="/lbm_plan list 是否绘制日程图片（内置字体渲染后合并转发）；关闭后只返回文字长文本",
         json_schema_extra={
             "label": "list 绘制图片",
             "hint": "关 = 纯文字，省渲染开销；渲染失败时会自动降级为纯文字",
@@ -390,7 +390,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     image_timeout_seconds: float = Field(
         default=15.0,
         ge=1.0,
-        description="日程图片绘制超时（秒）；超时静默降级为纯文字（不提示失败）",
+        description="日程图片绘制超时（秒）；超时 /lbm_plan list 静默降级为纯文字（不提示失败）",
         json_schema_extra={
             "label": "绘制超时(秒)",
             **_ui_i18n("Image timeout (s)"),
@@ -659,7 +659,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     # ── 早晚安 ──────────────────────────────────────────────
     greeting_morning_enabled: bool = Field(
         default=True,
-        description="启用早安：睡醒时刻（[schedule] 起床时间）+ 早安稳态漂移后，向候选举行的会话道早安",
+        description="启用早安：睡醒时刻（[schedule] 起床时间）+ 早安漂移后，向候选会话道早安",
         json_schema_extra={
             "label": "启用早安",
             "hint": "关 = 完全不发早安（含目标私聊与群聊）",
@@ -668,7 +668,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     greeting_night_enabled: bool = Field(
         default=True,
-        description="启用晚安：当天最后一个非睡眠日程结束时刻 − 漂移后，向候选举行的会话道晚安",
+        description="启用晚安：当天最后一个非睡眠日程结束时刻 − 漂移后，向候选会话道晚安",
         json_schema_extra={
             "label": "启用晚安",
             "hint": "关 = 完全不发晚安（含目标私聊与群聊）",

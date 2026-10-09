@@ -2,6 +2,40 @@
 
 本文件记录「属于麦麦的生活」（lbm）**面向使用者**的版本变更：新增能力、口径变化、缺陷修复与已知问题。
 
+## [1.1.0] - 2026-10-10
+
+配置大整理版：把配置从 13 段重排为 **11 段**，集中了提示词与模型调用，并修好两处既有缺陷。**功能行为不变**；旧配置在首次启动时由插件自动迁移，无需手改（迁移幂等，可反复重启）。宿主显示的**插件版本为 1.1.0**，而配置版本 `[plugin] config_version` **仍是 1.0.0**——这是有意保留的，请勿修改（详见「升级须知」）。
+
+### 新增
+
+- **`[llm]` LLM 调用段（9 键）**：集中插件全部模型调用——主任务名 `task_name`、判定类模型与参数（`judge_model` / `judge_max_tokens` / `judge_temperature`）、以及各用途任务名（好感裁判 / 情绪睡眠裁判 / 情绪评估 / 空间 / 视觉）。原先散落在 `[judge]`、`[schedule] llm_task_name`、`[affection] review_task_name`、`[emotion] evaluator_task_name / referee_task_name`、`[qzone] llm_task_name`、`[cateye] vlm_task` 六处的模型路由统一收拢于此。
+- **`[prompts]` 提示词段（64 键，高级）**：插件发给模型的全部原文集中暴露（陪伴 / 日程 / 情绪 / 空间 / 工具五组），带占位符说明。不改 = 与出厂文案逐字一致，改了立即生效；占位符写坏只会回退出厂文案并记一条告警，**不会中断业务**。
+- **`[schedule_advanced]` 日程系统·高级设置段（30 键）**：原 `[inject]`（注入调优）、`[planning_cleanup]`（后台清理）两段，以及原 `[schedule]` 的一批深水项（时区、生成 token/超时/回看、角色裁判、绘图、缓存、赖床上限、情绪影响强度等）全部并入。
+- **`[patrol]` 统一名单系统**：群聊名单 `proactive_group_ids` + `proactive_group_list_mode`（默认黑名单，留空 = 全群生效）与私聊名单 `proactive_private_ids` + `proactive_private_list_mode`（默认白名单，留空 = 全不发）；一份名单同时服务「活动切换主动开口」与「早/晚安问候」。
+- **`[patrol] inject_affection_in_group`**（默认开）：群聊上下文出现陪伴对象时注入好感度档位块。
+- **`[schedule] holiday_inject_enabled` / `holiday_affects_schedule`**（默认开 / 默认关）：真实节假日注入日程块头部 / 影响日程生成。
+
+### 变更
+
+- **配置段 13 → 11**：`[target]`、`[cateye]` 并入 **`[patrol]`（陪伴模块）**；`[judge]` 并入 **`[llm]`**；`[inject]`、`[planning_cleanup]` 并入 **`[schedule_advanced]`**；提示词集中到 **`[prompts]`**。新段序（WebUI）：`plugin → patrol → affection → schedule → schedule_advanced → planning_proactive → llm → prompts → admin → qzone → emotion`。
+- **早/晚安简化**：三类会话开关（`greeting_target_enabled` / `greeting_group_enabled` / `greeting_other_private_enabled`）与问候专用黑白名单收拢为**两个总开关** `greeting_morning_enabled` / `greeting_night_enabled`（默认都开）＋统一名单；问候**恒免主动打扰预算**；目标陪伴私聊**不看名单、恒生效**，其他私聊**默认不发**（私聊白名单留空）。
+- **每日预算即上限**：删除独立的目标私聊打扰上限字段（`proactive_target_daily_cap` / 旧名 `global_proactive_cap`）；`[patrol] daily_max_speak` 即陪伴侧主动打扰上限，只统计**日程巡检与想念**两类（早/晚安不占预算）。
+- **想念阈值合并**：`miss_hours_min` + `miss_hours_max` 合并为一个 `[patrol] miss_silence_hours`（如 `"4-8"`，或单数字 `8` = `0~8`）；想念「避开未来日程」功能整体移除。
+- **注入矩阵定稿**：目标陪伴私聊**始终**注入好感度；其他私聊**始终只注入日程**；群聊仅在上下文出现陪伴对象且 `inject_affection_in_group=true`（默认开）时注入好感度档位块（不带关系记忆行）。日期/节假日行改由日程模块注入（`[schedule] holiday_inject_enabled`）；日程注入范围 `inject_scope` 默认 `all`（所有会话）。
+- **移除的配置项**（新界面不再提供；旧值会被自动迁移或忽略）：`[patrol] morning_start / morning_end / night_start / night_end`（问候时间窗）、`min_interval_exempt_greetings`（问候恒豁免最小间隔）、`min_interval_exempt_miss`（想念不豁免）、`proactive_target_daily_cap` / `global_proactive_cap`、`miss_avoid_future_schedule` / `miss_future_schedule_hours`；`[planning_proactive]` 的 `enable_morning_greeting` / `enable_night_greeting`、旧问候黑白名单、`morning_other_private_*`、`greeting_exempt_budget`；`[schedule] auto_generate_time`（降级为 `[schedule_advanced]` 隐藏兼容位）。
+
+### 修复
+
+- **`[affection] current_level` 传字符串不再导致整份配置校验失败**：WebUI 表单或 `config.toml` 以字符串 `"0"` / `"1"` / `"2"` 提交时，先归一为整数再校验；`"3"`、`"x"` 等非法值照旧拒绝。
+- **日程图片出图修复**：日程渲染的表头绘制引用了未定义的图像符号名（内部异常被静默降级为纯文字），已修正，`/lbm_plan list` 与 `/lbm_dashboard` 可正常出图。
+- **图片输出目录（数据目录）修复**：图片文件不再回退写入插件代码目录，改用系统临时目录（宿主隔离数据目录由调用方传入）。
+
+### 升级须知
+
+- **旧配置首启动自动迁移（幂等）**：插件启动时把旧布局的值搬进新家并落盘——`[target] target_qq → [patrol] target_qq`、`[cateye] * → [patrol] screen_* / [llm] vlm_task / [prompts] screen_*`、`[judge] * → [llm] judge_*`、`[inject] * / [planning_cleanup] * → [schedule_advanced] *`、各模块任务名与一批 `[schedule]` 深水项按映射搬家、`miss_hours_min + miss_hours_max → miss_silence_hours`、旧问候名单 → 统一名单。迁移只在首轮发生（以 `[plugin] layout_version` 标记），反复重启不会二次改写；段名不变的键原样保留。
+- **`[plugin] config_version` 保持 1.0.0，请勿修改**：迁移依赖「配置版本号不变 + 插件侧一次性迁移」——一旦递增，宿主会在插件看到旧值之前按新骨架重建设置文件，跨段搬迁的旧值将被丢弃。因此**宿主显示的插件版本是 1.1.0，而配置版本会保持 1.0.0，二者不同步是预期的**。
+- **数据目录与 1.0.0 相同**（`data/plugins/cateye.life_belonging_to_maimai/`），本版无需搬运数据；升级 1.0.0 → 1.1.0 只需重启/重载插件。
+
 ## [1.0.0] - 2026-10-09
 
 首个正式发布版：自 `0.4.0`（「猫眼生活套件（骨架版）」）完成发布化整改——插件身份、工具与指令前缀、版本号整体更换，四个模块（日程规划 / 虚拟陪伴 / QQ 空间 / 情绪维护）的能力面从早期骨架版到 1.0.0 全部落地。**升级前请先读「变更」节的数据目录注意事项。**
@@ -64,18 +98,18 @@
 
 | 对象 | 0.4.0 | 1.0.0 |
 |---|---|---|
-| 插件注册 id | `github.cateye.cateye-suite` | `cateye.life_belonging_to_maimai` |
+| 插件注册 id | 旧的 `github.cateye.*` 命名空间 | `cateye.life_belonging_to_maimai` |
 | 插件显示名 | 猫眼生活套件（骨架版） | **属于麦麦的生活** |
-| 工具名前缀 | `cateye_test_` | `lbm_` |
-| 指令名前缀 | `/cateye_test_` | `/lbm_` |
+| 工具名前缀 | 旧前缀 | `lbm_` |
+| 指令名前缀 | 旧前缀 | `/lbm_` |
 | 版本 / 配置版本 | 0.4.0 / 0.2.0 | **1.0.0 / 1.0.0** |
 
-- **旧前缀不再是别名**：`/cateye_test_*` 与 `cateye_test_*` 名称在本版已全部不存在，请按上表把前缀替换为 `/lbm_*` 与 `lbm_*`（本版保留的别名是**新前缀下的旧短名**，如 `/lbm_mai_llm_log`、`/lbm_mai_diag`、`/lbm_life diag`、`/lbm_规划`）。
-- **仓库与文档链接指向新地址**：`_manifest.json` 的仓库、主页、文档与问题反馈链接已改为 `https://github.com/cateyemizuki/cateye_life_belonging_to_maimai`（原先指向已不存在的旧仓库 `cateye_test`）。
+- **旧前缀不再是别名**：旧的工具名与指令名前缀在本版已全部不存在，请按上表把前缀替换为 `/lbm_*` 与 `lbm_*`（本版保留的别名是**新前缀下的旧短名**，如 `/lbm_mai_llm_log`、`/lbm_mai_diag`、`/lbm_life diag`、`/lbm_规划`）。
+- **仓库与文档链接指向新地址**：`_manifest.json` 的仓库、主页、文档与问题反馈链接已改为 `https://github.com/cateyemizuki/cateye_life_belonging_to_maimai`（原先指向已不存在的旧仓库）。
 
 **2. ⚠️ 数据目录随插件 id 变更（升级注意）**
 
-- 旧：`data/plugins/github.cateye.cateye-suite/`
+- 旧：`data/plugins/` 下按 1.0.0 之前的旧插件 id 命名的目录
 - 新：`data/plugins/cateye.life_belonging_to_maimai/`
 - **旧目录不会自动迁移**：宿主按新 id 新建的是一个全新空目录，本版不代迁任何历史数据。
 - 如需保留历史**决策日志、情绪状态、好感档案、空间状态/去重文件**，请在**停机状态**下把旧目录内容手动复制到新目录，再启动插件；运行中复制可能拿到写入一半的文件。

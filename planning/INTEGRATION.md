@@ -23,7 +23,7 @@
 | `generator/` 子包 | prompt_builder（wake/sleep 锚点动态 JSON 示例 + 衔接演算 + 三餐窗口 + 无睡眠模式；**M5 增 `emotion_context` 槽 + `build_emotion_context()`**）/ schema_builder（**M5 增可选 `emotional_tone` 字段，逐维 ±0.5**）/ prompt_builder 的 `emotion_context` 与 `low_mood_days` 槽（**M5 增，连续低迷注明「最近有点低落」**）/ response_parser（**控制字符清理**）/ validator（语义校验，只警告；**M5 增 `clip_emotional_tone`**）/ quality_scorer（0~1 评分）/ context_loader（跨群历史 + 知识库 + 近 N 天摘要）/ config；base_generator 持 `emotion_context` 动态上下文字段并透传两个 prompt 构建器 | planner/generator/* |
 | `inject/` 子包 + `inject_service.py` | 意图分类 UserIntent / 注入优化器（冷却+概率+TTL）/ 会话上下文缓存（续注判定）；planner（items 强 schema 协议）与 replyer（extra_prompt 协作式）两个注入入口；**M4：状态分析器（state_analyzer）删除，精神状态行改读情绪系统 `mood_text()`（见下）** | handlers/inject/* + services/inject_service.py |
 | `proactive_service.py` | 60s 轮询：活动切换主动开口（每 stream×活动×日期去重）、早间问好（含需激活）、约定到期强指令（priority=high）、频率调控、睡眠窗口判定 | services/proactive_service.py |
-| `auto_scheduler.py` | 每日定时自动生成（当天已有则跳过；指数退避）；**M5 语义：当天已有日程 → 睡醒情绪上下文不生效，只在重生成（`/cateye_test_plan regenerate` / 次日生成）时注入** | planner/auto_scheduler.py |
+| `auto_scheduler.py` | 每日定时自动生成（当天已有则跳过；指数退避）；**M5 语义：当天已有日程 → 睡醒情绪上下文不生效，只在重生成（`/lbm_plan regenerate` / 次日生成）时注入** | planner/auto_scheduler.py |
 | `cleanup_service.py` | 过期日程/旧目标/旧日志清理循环 + 守护 auto_scheduler | services/cleanup_service.py |
 | `role_judge.py` | 自然语言约定裁判（today/future/reject + 宽松 JSON 解析） | planner/role_judge.py |
 | `tools_service.py` / `command_service.py` | 4 个 Tool 实现体 + /plan 命令（图片+文字合并转发，失败降级） | services/tools_service.py、command_service.py |
