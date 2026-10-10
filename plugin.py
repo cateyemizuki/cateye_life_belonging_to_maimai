@@ -101,7 +101,12 @@ def _type_compatible(value: object, reference: object) -> bool:
         return True
     if isinstance(reference, bool):
         return isinstance(value, bool)
-    if isinstance(reference, (int, float)):
+    if isinstance(reference, int):
+        # 与宿主 _is_plugin_config_value_type_compatible 逐字对齐：int 字段只收 int
+        # （放行 float 会在落盘校验期抛 ValidationError，而宿主激活路径 suppress_errors=False
+        #  → 整个插件激活失败，比"丢一个用户值"严重得多；T3 审计 #12）
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(reference, float):
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     if isinstance(reference, str):
         return isinstance(value, str)

@@ -839,7 +839,6 @@ class ProactiveService:
         ``greeting_require_activation=false`` → 不看激活，到点即发。
         """
         return bool(getattr(cfg_p, "greeting_require_activation", True))
-        return bool(getattr(cfg_p, "greeting_require_activation", True))
 
     async def _other_private_qualified(self, stream_id: str, date_str: str,
                                       now: datetime, cfg_p: Any) -> bool:
