@@ -23,7 +23,7 @@ from .config import (
 from .goal_manager import get_goal_manager
 from .schedule_image import ScheduleImageGenerator
 from .stream_filter import is_stream_allowed
-from .time_utils import TimezoneManager, format_minutes_to_time, get_time_window_from_goal, strip_tz
+from .time_utils import TimezoneManager, format_day_minute, get_time_window_from_goal, strip_tz
 
 if TYPE_CHECKING:
     from typing import Any as _Plugin
@@ -215,8 +215,9 @@ class CommandService:
 
         for idx, goal in enumerate(schedule_goals, 1):
             start_minutes, end_minutes = get_time_window_from_goal(goal)
-            start_time = format_minutes_to_time(start_minutes)
-            end_time = format_minutes_to_time(end_minutes if end_minutes < 1440 else end_minutes - 1440)
+            # 跨午夜条目（end>1440）标「次日」，不再丢标记渲染成 23:00-01:00
+            start_time = format_day_minute(start_minutes)
+            end_time = format_day_minute(end_minutes)
             type_label = _GOAL_TYPE_LABEL.get(goal.goal_type, "其他")
 
             lines.append(f"{idx}. {start_time}-{end_time}  [{type_label}] {goal.name}")
@@ -240,8 +241,7 @@ class CommandService:
         schedule_items: List[Dict[str, Any]] = []
         for goal in schedule_goals:
             start_minutes, end_minutes = get_time_window_from_goal(goal)
-            end_norm = end_minutes if end_minutes < 1440 else end_minutes - 1440
-            time_str = f"{format_minutes_to_time(start_minutes)}-{format_minutes_to_time(end_norm)}"
+            time_str = f"{format_day_minute(start_minutes)}-{format_day_minute(end_minutes)}"
             schedule_items.append({
                 "time": time_str,
                 "name": goal.name,

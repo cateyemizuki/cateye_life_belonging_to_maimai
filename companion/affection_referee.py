@@ -8,7 +8,7 @@
   + 人设 → ``delta_score ∈ [-2, +2] + 0~3 条印象 + tone + reason``；
 - 解析一律宽松（整段 → ```json 围栏 → 首个 {...} 块），代码层二次限幅（LLM 数值失真兜底）；
 - LLM 全部经 ``core/llm_utils.LLMService.generate`` 并带 ``event=`` 标识
-  （``affection_review`` / ``affection_daily_review``），任务名用 ``[affection] review_task_name``；
+  （``affection_review`` / ``affection_daily_review``），任务名用 ``[llm].review_task_name``；
 - **失败哲学**：请求失败或输出垃圾 → 返回 None，调用方静默跳过本轮（不崩溃、不阻塞、不重试轰炸）。
 
 **LLM 隔离铁律（§6.3-6）**：两个 prompt 都只见关系档位描述（名称 + 文案）与低分辨率情绪
@@ -506,7 +506,7 @@ class AffectionReviewer:
         return str(getattr(self._plugin, "_personality", "") or "")
 
     def _target_label(self) -> str:
-        """对方称呼（供裁判理解「对方是谁」）：关系名 + QQ；关系档案不可用时退回 QQ 或中性称谓。"""
+        """对方称呼（供裁判理解「对方是谁」）：只给关系词或中性称谓；[target] 段已删，cfg.target 不存在，QQ 不再包含。"""
         cfg = getattr(self._plugin, "config", None)
         target = getattr(cfg, "target", None)
         qq = str(getattr(target, "target_qq", "") or "").strip()

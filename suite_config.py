@@ -227,11 +227,15 @@ class LlmSectionConfig(PluginConfigBase):
     judge_model: str = Field(
         default="",
         description="判断用模型：填宿主任务名或具体模型名；留空 = 跟随「主任务名」。"
-                    "判定类调用只需要明确结论（如 Y/N）",
+                    "仅判定类 ``judge()`` 调用（当前唯一调用点 = 想念把关）使用；"
+                    "角色裁判 / 睡眠裁判不读它（各走自己的任务名）",
         json_schema_extra={
             "label": "判断用模型",
-            "hint": "建议指到便宜、非思考型模型；用思考型模型时请把「判断最大 token」保持 512 以上",
-            **_ui_i18n("Judge model", "Empty = follow the main task."),
+            "hint": "建议指到便宜、非思考型模型；用思考型模型时请把「判断最大 token」保持 512 以上。"
+                    "只影响想念把关这类 judge() 判定，角色裁判/睡眠裁判不受影响",
+            **_ui_i18n("Judge model", "Empty = follow the main task. "
+                                      "Only used by judge()-style verdict calls (miss referee); "
+                                      "the role judge and sleep referee use their own task names."),
         },
     )
     judge_max_tokens: int = Field(

@@ -3,7 +3,8 @@
 统一入口 :func:`record_rule_event` —— 频控 → 日累计限幅 → 入账 → 档位重估 → 事件日志：
 
 - 频控（§5.4）：``chat_round`` 日累计 ≤ +1.0；``user_initiated`` 日 ≤ +0.5；
-  ``morning_exchange`` / ``night_exchange`` 各 1 次/日；``commitment_kept`` /
+  ``morning_exchange`` / ``night_exchange`` 各 1 次/日（**暂无触发点**：未接线，
+  问候成功只写 planning 侧已发标记，不经本层入账）；``commitment_kept`` /
   ``commitment_broken`` 每约定 1 次（去重键见 ``key`` 参数）。
 - 日累计限幅（§5.5）：positive ≤ ``daily_positive_cap``(4.0)、negative ≥
   ``-daily_negative_cap``(3.0)，超出部分记日志丢弃。
@@ -53,13 +54,13 @@ RULE_EVENT_TABLE: dict[str, dict[str, Any]] = {
         "delta": 0.2,
         "once_per_day": True,
         "desc": "互道早安",
-        "note": "各 1 次/日",
+        "note": "各 1 次/日；暂无触发点（未接线；问候成功只写 planning 侧已发标记）",
     },
     "night_exchange": {
         "delta": 0.2,
         "once_per_day": True,
         "desc": "互道晚安",
-        "note": "各 1 次/日",
+        "note": "各 1 次/日；暂无触发点（未接线；问候成功只写 planning 侧已发标记）",
     },
     "commitment_kept": {
         "delta": 1.0,

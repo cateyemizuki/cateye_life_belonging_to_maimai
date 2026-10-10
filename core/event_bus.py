@@ -8,11 +8,13 @@
 - 同一事件递归 publish 深度 >5 时丢弃该次发布并告警（§3.1 深度保护）；
 - 订阅注册/注销挂在各服务束 start()/stop()（M0 实际订阅者仅本文件的预算计数器）。
 
-主动打扰预算（仅目标陪伴私聊；§六.2 H，B11）：主动行为触发前发 ``proactive.used``，
+主动打扰预算（目标陪伴私聊导向；§六.2 H，B11）：主动行为触发前发 ``proactive.used``，
 按日计数；各发布方触发前查询 :func:`ProactiveBudget.allow_proactive`；
 **上限 = ``patrol.daily_max_speak``（每日预算即上限；2026-10-10 配置整理轮移除独立的
-``proactive_target_daily_cap`` / 旧键 ``global_proactive_cap``，不再叠加 +2 余量）**，
-只统计陪伴侧的「日程巡检 + 想念」；早/晚安免预算（planning 侧闸门与计数一起跳）。
+``proactive_target_daily_cap`` / 旧键 ``global_proactive_cap``，不再叠加 +2 余量）**。
+计数口径 = **按发送流身份计数**：发往目标陪伴私聊的主动打扰都计入（发布方不限——
+陪伴侧巡检/想念、日程侧非问候主动行为、emotion 赖床提醒都发 ``proactive.used``）；
+早/晚安免预算（planning 侧闸门与计数一起跳），活动切换开口在目标流已解析时不占。
 
 计数范围（M11，附录 II §3.2/§3.3；2026-10-10 口径复核）：**只统计「发往目标陪伴私聊」的主动打扰**——各扣费点
 经 ``stream_id`` 维度传参，非目标流（群聊/其他私聊）直接放行且不查计数、不入账（收窄前为
@@ -375,9 +377,10 @@ class ProactiveBudget:
         """目标陪伴私聊的每日主动打扰上限 = ``[patrol].daily_max_speak``（每日预算即上限）。
 
         2026-10-10 配置整理轮：独立上限字段（旧 ``proactive_target_daily_cap`` /
-        ``global_proactive_cap``）已删除——预算只统计陪伴侧的日程巡检与想念
-        （早/晚安不占预算，见 planning/proactive_service 的免预算口径），
-        因此「每日预算」本身就是上限，不再叠加 +2 余量；取不到配置时回退 5。
+        ``global_proactive_cap``）已删除——预算按发送流身份计数：发往目标陪伴私聊的
+        主动打扰都计入（发布方不限，含赖床提醒；早/晚安免预算，见 planning/proactive_service
+        的免预算口径；活动切换开口在目标流已解析时不占），因此「每日预算」本身就是上限，
+        不再叠加 +2 余量；取不到配置时回退 5。
         """
         cfg = self._config()
         patrol = getattr(cfg, "patrol", None)

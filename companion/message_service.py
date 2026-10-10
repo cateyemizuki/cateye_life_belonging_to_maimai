@@ -5,8 +5,9 @@
 2. 调用 ctx.send.text 发送文本消息；
 3. 主动发言时更新发言计数与冷却基准。
 
-主动聊天主链路走 maisaka.proactive.trigger（patrol.py），本服务主要供
-mai_lover_send_message Tool 直发消息使用。
+当前仅 append_affection_suffix（第 1 项）在用——Tool 直发走 components 的
+「append_affection_suffix + ctx.send.text」，不经过本服务发送；
+send_to_target（第 2/3 项的发送与计数路径）为预留、无调用点。
 """
 
 from __future__ import annotations

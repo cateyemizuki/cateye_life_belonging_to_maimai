@@ -102,7 +102,7 @@ NAP_REMINDER_ROUND_SECONDS = 120.0
 DEFAULT_NAP_REMINDER_MAX_PER_DAY = 2
 #: 赖床提醒文本模板（附录 §4.3 逐字定稿，占位符照抄）：``{nap_tool_name}`` 引用
 #: planning/tools_service.py 的 NAP_TOOL_NAME（A2：工具改名只需动那一处）；
-#: ``{planned_wake_hhmm}`` = 当前睡眠窗口结束 / wake 锚点；``{lie_in_max_until}`` = [schedule] 配置值。
+#: ``{planned_wake_hhmm}`` = 当前睡眠窗口结束 / wake 锚点；``{lie_in_max_until}`` = [schedule_advanced] 配置值。
 NAP_REMINDER_TEMPLATE = (
     "【临时提醒·不进下一轮上下文】你半夜被重要的人吵醒了，现在是 {now_hhmm}；"
     "你本来打算睡到 {planned_wake_hhmm}。如果还想再睡一会儿，可以调用 {nap_tool_name} "
@@ -413,8 +413,8 @@ class EmotionService:
         - ``description`` 缺省时取 :meth:`emoji_description`（首个情绪标签名，取不到用 mood_text）。
         结果非空则原样返回（宿主返回结构不做假设）。
 
-        消费点：``emotion/components.py`` 的 ``lbm_emotion_mood`` Tool——启用时在返回文本后
-        追加一行匹配摘要；本方法只做转发，不写状态、不落盘、不发事件。
+        无消费点（原 ``lbm_emotion_mood`` Tool 已随 T6 注册面收口移除），能力保留备用；
+        本方法只做转发，不写状态、不落盘、不发事件。
         """
         if not bool(self._emotion_cfg("emoji_enabled", False)):
             return None
@@ -1651,7 +1651,7 @@ class EmotionService:
         return bool(self._nap_cfg("nap_reminder_enabled", True))
 
     def lie_in_max_minutes(self) -> int:
-        """``[schedule] lie_in_max_until`` 的分钟数（与工具侧同源；非法回退 12:00）。
+        """``[schedule_advanced] lie_in_max_until`` 的分钟数（与工具侧同源；非法回退 12:00）。
 
         提醒文本里的「最晚 {lie_in_max_until}」与本方法同源，保证提示与实际钳制一致。
         """
@@ -1711,7 +1711,7 @@ class EmotionService:
 
         1. 本周期窗口在册（未在睡眠周期内/已醒 → 无事可延）；
         2. 目标端 **> 旧端**（只往后推，绝不提前起床）；
-        3. 目标时刻受**同一** ``[schedule] lie_in_max_until`` 钳制（与工具侧同源，双保险）。
+        3. 目标时刻受**同一** ``[schedule_advanced] lie_in_max_until`` 钳制（与工具侧同源，双保险）。
 
         端点一变，醒沿判定（``_in_sleep_period``）自然推迟——不必改别处状态（F15：复用既有
         周期上下文，不新增状态字段）。

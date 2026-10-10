@@ -1,10 +1,16 @@
 """planner / replyer 状态注入。
 
-遵循开发文档 §9.7.1 强校验协议：向 items 注入新条目必须
+items 注入遵循**宿主的真实校验**（MaiBot ``ContextItemMeta`` 与
+``validate_context_items``，payload_content/context_item.py、context_protocol.py）：
 - item_type ∈ 受支持集合（这里用 SystemMessageItem）；
-- meta 完整（item_id 唯一 hex、logical_turn_id=None、timestamp 可解析 ISO）；
+- meta：item_id **非空**且全局唯一（重复 item_id 宿主抛错；无「纯 hex」要求——
+  本插件旁白条目用 ``companion-screen-`` 前缀 hex 是有意设计，便于识别与排查，
+  见 companion/screen_context.build_narration_item）；timestamp 需可解析；
+  logical_turn_id 可空（仅工具条目必须有，普通条目可沿用锚点值或置 None）；
 - modified_kwargs 完整替换（**kwargs 展开），item_schema_version 原样带回。
-不满足 → 宿主静默丢弃整份修改（表现就是"注入不生效"），这段协议照文档抄。
+不满足 → 宿主丢弃整份修改（表现就是"注入不生效"）。
+（原注释自称遵循「开发文档 §9.7.1 强校验协议」，该文档原文已找不到；
+以上按宿主源码逐条核对改写。）
 
 兼容两条投影：1.2.x+ 的 items（ContextItem 快照）与旧 messages（role/content）。
 

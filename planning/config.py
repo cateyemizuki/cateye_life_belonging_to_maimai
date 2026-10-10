@@ -74,8 +74,8 @@ class ScheduleSectionConfig(PluginConfigBase):
     )
     sleep_time: str = Field(
         default="23:00",
-        description="入睡时间锚点（HH:MM）：这一刻之后进入睡眠时段；晚安问候以当天最后一个日程为准、"
-                    "无日程时回退本时刻",
+        description="入睡时间锚点（HH:MM）：这一刻之后进入睡眠时段；晚安漂移锚在睡前界 "
+                    "min(本时刻, 生效静默起点)（最后一段日程的结束只用作观测窗下界）",
         json_schema_extra={
             "label": "入睡时间",
             "hint": "HH:MM；睡眠时段整体不生成日程（无睡眠模式）且不主动开口",
@@ -173,7 +173,9 @@ class ScheduleSectionConfig(PluginConfigBase):
     )
     inject_into_replyer: bool = Field(
         default=True,
-        description="在 replyer 生成回复前把当前日程作为额外提示注入；与 planner 注入共享冷却，不会两阶段连刷",
+        description="在 replyer 生成回复前把当前日程作为额外提示注入；冷却与 planner 侧按通道分开记账"
+                    "（各自只有「同活动+同意图」才跳过，闲聊意图另有概率掷骰）——"
+                    "planner 本轮注入过不拦截 replyer，同一轮不保证绝不双份",
         json_schema_extra={
             "label": "注入 replyer",
             "hint": "关 = 只有 planner 侧注入；两处都关等于完全不注入日程",
@@ -358,10 +360,12 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
                     "判定失败时安全回退为「日程不变」",
         json_schema_extra={
             "label": "角色裁判模式",
-            "hint": "开 = 请求先经角色人格判断（可能被拒绝，更像真人）；关 = 一律记为未来预约",
+            "hint": "开 = 请求先经角色人格判断（可能被拒绝，更像真人）；"
+                    "关 = 记录为今天的候选约定，仅当天重新生成日程时才会纳入",
             **_ui_i18n("Role judge",
                        "On: the bot decides in character (today / future / reject). "
-                       "Off: every request is recorded as a future appointment."),
+                       "Off: the request is recorded as a candidate commitment dated today; "
+                       "it is only picked up if today's schedule is regenerated."),
         },
     )
     role_judge_temperature: float = Field(
@@ -559,16 +563,21 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     """日程主动行为：活动切换主动开口 + 早晚安问候 + 名单系统 + 赖床提醒。
 
     与 [patrol]（陪伴巡检）分工：
-    - 本段负责**群聊与其他私聊**的活动切换开口与早/晚安问候，以及名单过滤；
+    - 本段负责活动切换主动开口（候选**恒剔除**目标陪伴私聊）与早/晚安问候
+      （问候候选**含**目标私聊，是否放行由 ``_target_greeting_allowed`` 按名单过滤），
+      以及名单过滤；
     - 目标陪伴私聊的日常巡检/想念归 [patrol]；早/晚安由本段的漂移机制统一驱动
       （发过之后写标记，陪伴侧巡检见标记即不再重复开口——两模块因此不会各发一条）。
 
     名单系统（2026-10-10 合并）：原「活动切换白名单（支持前缀）+ 问候专用四名单」统一为
-    群聊名单 / 私聊名单两份（**只填裸号**：群聊填群号、私聊填 QQ 号），各配一个模式开关：
+    群聊名单 / 私聊名单两份（**裸号或带前缀**：群聊填群号、私聊填 QQ 号，也接受
+    group:/qq:group:（群）与 private:/qq:private:/qq:（私聊）前缀写法，自动取号），
+    各配一个模式开关：
     - 模式 = 黑名单（默认·群聊）：名单里的人**不**生效，留空 = 全部生效；
     - 模式 = 白名单（默认·私聊）：只有名单里的人生效，留空 = 全部不生效。
-    目标陪伴对象**始终视为在私聊黑名单中**（防止日程主动开口与陪伴的早/晚安撞车），
-    但早/晚安问候对目标私聊仍然照发（问候走单独通道，不看名单过滤）。
+    目标陪伴对象在**活动切换通道**始终视为在私聊黑名单中（防止日程主动开口与陪伴的
+    早/晚安撞车）；问候通道由 ``_target_greeting_allowed`` 过滤——白名单模式下目标
+    恒视为在名单内（照常问候），黑名单模式下命中其 QQ 即不问候。
     """
 
     __ui_label__ = "日程主动行为"
@@ -615,13 +624,17 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     # ── 名单系统（群聊 / 私聊）───────────────────────────────
     proactive_group_ids: List[str] = Field(
         default_factory=list,
-        description='群聊名单（只填**裸群号**，如 ["123456"]，不需要任何前缀）：'
+        description='群聊名单（填**裸群号**如 ["123456"]，也接受 group:/qq:group:（群）'
+                    "前缀写法及 qq:group_/group_ 变体，自动取号）："
                     "名单模式=黑名单时这些群不生效、留空则所有群生效；"
                     "名单模式=白名单时只有这些群生效、留空则所有群都不生效。不支持通配 *",
         json_schema_extra={
             "label": "群聊名单",
-            "hint": '只填群号，例 ["123456"]；默认黑名单 + 留空 = 所有群聊都生效',
-            **_ui_i18n("Group list", 'Bare group IDs; default mode = blacklist with empty list = all groups.'),
+            "hint": '填群号（裸号或 group:/qq:group: 前缀），例 ["123456"]；'
+                    "默认黑名单 + 留空 = 所有群聊都生效",
+            **_ui_i18n("Group list",
+                       'Group IDs, bare or prefixed (group:/qq:group:); '
+                       'default mode = blacklist with empty list = all groups.'),
         },
     )
     proactive_group_list_mode: Literal["blacklist", "whitelist"] = Field(
@@ -636,13 +649,17 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     proactive_private_ids: List[str] = Field(
         default_factory=list,
-        description='私聊名单（只填**裸 QQ 号**，如 ["789"]，不需要任何前缀）：'
+        description='私聊名单（填**裸 QQ 号**如 ["789"]，也接受 private:/qq:private:/qq:（私聊）'
+                    "前缀写法及 user: 变体，自动取号）："
                     "名单模式=白名单时只有这些私聊生效、留空则所有私聊都不生效；"
-                    "名单模式=黑名单时这些私聊不生效。目标陪伴对象始终按黑名单处理",
+                    "名单模式=黑名单时这些私聊不生效。目标陪伴对象在活动切换通道始终按黑名单处理",
         json_schema_extra={
             "label": "私聊名单",
-            "hint": '只填 QQ 号；默认白名单 + 留空 = 其他私聊一概不主动，只有陪伴对象私聊照常',
-            **_ui_i18n("Private list", 'Bare QQ IDs; default mode = whitelist with empty list = no other privates.'),
+            "hint": '填 QQ 号（裸号或 private:/qq:private:/qq: 前缀）；'
+                    "默认白名单 + 留空 = 其他私聊一概不主动，只有陪伴对象私聊照常",
+            **_ui_i18n("Private list",
+                       'QQ IDs, bare or prefixed (private:/qq:private:/qq:); '
+                       'default mode = whitelist with empty list = no other privates.'),
         },
     )
     proactive_private_list_mode: Literal["blacklist", "whitelist"] = Field(
@@ -668,7 +685,8 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     greeting_night_enabled: bool = Field(
         default=True,
-        description="启用晚安：当天最后一个非睡眠日程结束时刻 + 漂移后，向候选会话道晚安",
+        description="启用晚安：睡前界（= min([schedule] sleep_time, [patrol] silence_start；"
+                    "silence_start 留空跟随 sleep_time））向前随机漂移后，向候选会话道晚安",
         json_schema_extra={
             "label": "启用晚安",
             "hint": "关 = 完全不发晚安（含目标私聊与群聊）",
@@ -688,11 +706,13 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     night_drift: str = Field(
         default="10-30",
-        description="晚安漂移区间（分钟，相对最后一条日程结束）：填 \"a-b\" 或单数字 N（= 0~N 随机）；"
-                    "触发时刻 = 最后日程结束 + 随机漂移（睡前的随机点）。非法值回退 10-30",
+        description="晚安漂移区间（分钟，相对睡前界向前）：填 \"a-b\" 或单数字 N（= 0~N 随机）；"
+                    "睡前界 = min([schedule] sleep_time, [patrol] silence_start（留空跟随 sleep_time）），"
+                    "触发时刻 = 睡前界 − 随机漂移（睡前的随机点）。非法值回退 10-30",
         json_schema_extra={
             "label": "晚安漂移(分钟)",
-            "hint": '例 "10-30" 或 "20"；在最后一段日程结束后 10~30 分钟内随机开口',
+            "hint": '例 "10-30" 或 "20"；在睡前界前 10~30 分钟内随机开口'
+                    "（睡前界 = min([schedule] sleep_time, [patrol] silence_start，留空跟随 sleep_time））",
             "pattern": r"^\d+(-\d+)?$",
             **_ui_i18n("Night drift (min)", 'e.g. "10-30" or "20"'),
         },

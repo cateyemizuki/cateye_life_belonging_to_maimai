@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from planning.time_utils import format_day_minute
+
 #: 区块标题（键 → 固定标题；顺序即展示顺序）
 _BLOCK_TITLES: Tuple[Tuple[str, str], ...] = (
     ("planning", "日程规划"),
@@ -91,10 +93,10 @@ def _to_int(value: Any, default: int = 0) -> int:
 
 
 def _time_range(item: Any) -> str:
-    """条目 → ``HH:MM-HH:MM``（分钟字段缺失/异常按 00:00 兜底）。"""
+    """条目 → ``HH:MM-HH:MM``（跨午夜经 :func:`format_day_minute` 标「次日」；分钟字段缺失/异常按 00:00 兜底）。"""
     start = _to_int(item.get("start_minute"), 0) if isinstance(item, dict) else 0
     end = _to_int(item.get("end_minute"), 0) if isinstance(item, dict) else 0
-    return f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}"
+    return f"{format_day_minute(start)}-{format_day_minute(end)}"
 
 
 def _tier_label(companion: Any, affection: Any, tier: int) -> str:

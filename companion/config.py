@@ -250,12 +250,13 @@ class PatrolSectionConfig(PluginConfigBase):
     )
     silence_start: str = Field(
         default="",
-        description="静默时段开始（HH:MM）：留空 = 跟随日程作息：入睡时间~起床时间；非空 = 自定义静默窗"
-                    "（支持跨午夜）。静默期内巡检不触发；问候不受静默拦截（由激活观测把关）；"
-                    "配置非法按静默处理（宁可不发）",
+        description="静默时段开始（HH:MM）：非空 = 自定义静默窗（支持跨午夜）。"
+                    "静默期内巡检不触发；早/晚安不受静默拦截（静默起点仅作为晚安期限的上界；"
+                    "留空 = 跟随 [schedule] sleep_time/wake_time）；配置非法按静默处理（宁可不发）",
         json_schema_extra={
             "label": "静默开始",
-            "hint": "留空 = 跟随日程作息（[日程系统] 入睡~起床）；非空 = 自定义静默窗起点（HH:MM）",
+            "hint": "静默期内巡检不触发；早/晚安不受静默拦截（起点仅作晚安期限上界）；"
+                    "留空 = 跟随 [schedule] sleep_time/wake_time；非空 = 自定义静默窗起点（HH:MM）",
             **_ui_i18n("Silence start", "Empty = follow [schedule] sleep~wake; HH:MM = override."),
         },
     )
@@ -265,7 +266,8 @@ class PatrolSectionConfig(PluginConfigBase):
                     "（跨午夜窗的终点可早于起点；配置非法按静默处理，宁可不发）",
         json_schema_extra={
             "label": "静默结束",
-            "hint": "留空 = 跟随日程作息（[日程系统] 入睡~起床）；非空 = 自定义静默窗终点（HH:MM）",
+            "hint": "静默期内巡检不触发、静默结束后恢复；早/晚安不受静默拦截；"
+                    "留空 = 跟随 [schedule] sleep_time/wake_time；非空 = 自定义静默窗终点（HH:MM）",
             **_ui_i18n("Silence end", "Empty = follow [schedule] sleep~wake; HH:MM = override."),
         },
     )
@@ -273,13 +275,16 @@ class PatrolSectionConfig(PluginConfigBase):
     # ── 好感度注入 ───────────────────────────────────────────
     inject_affection_in_group: bool = Field(
         default=True,
-        description="群聊好感度注入：开启后，群里最近有人提到/包含陪伴对象时，给 bot 注入一点好感度上下文；"
+        description="群聊好感度注入：开启后，群里最近的消息中有陪伴用户本人发言时（按发送者判定，"
+                    "不识别昵称/代称提及），给 bot 注入一点好感度上下文；"
                     "目标私聊始终注入好感度，其他私聊始终不注入",
         json_schema_extra={
             "label": "群聊注入好感度",
-            "hint": "开 = 群聊里出现陪伴对象才注入（不影响其他会话）；关 = 群里永不注入好感度",
+            "hint": "开 = 群里最近的消息中有陪伴用户本人发言时才注入（按发送者判定，"
+                    "不识别昵称/代称提及；不影响其他会话）；关 = 群里永不注入好感度",
             **_ui_i18n("Inject affection in group chats",
-                       "Only when the companion user appears in the group context."),
+                       "Only when the companion user spoke in the group recently "
+                       "(sender-based; no nickname/mention matching)."),
         },
     )
 
@@ -539,7 +544,7 @@ def migrate_legacy_patrol(data: dict, legacy_target: object = None) -> dict:
     - ``legacy_target``（旧 [target] 段的字典）里的 ``target_qq`` → 本段的 ``target_qq``
       （段合并的一部分；新段已有显式值时不动）；
     - ``miss_hours_min`` / ``miss_hours_max`` → ``miss_silence_hours``（``"min-max"``；
-      只有一个值时按 "0-N" 处理，与新区间语义一致）；
+      单值口径：min-only → ``"N-N"``、max-only → ``"0-N"``，不复现旧有效区间）；
     - ``proactive_target_daily_cap`` / ``global_proactive_cap`` → 丢弃（每日预算即上限）；
     - 其余已删键 → 丢弃（早/晚安窗口、两处豁免开关、想念避让窗口全部不再需要）。
 
@@ -561,7 +566,8 @@ def migrate_legacy_patrol(data: dict, legacy_target: object = None) -> dict:
             low_v, high_v = 4.0, 8.0
         if low_v > high_v:
             low_v, high_v = high_v, low_v
-        # 只有一个值时按 0~N 处理（与单数字写法的解析口径一致）
+        # 单值口径：min-only → "N-N"、max-only → "0-N"（不复现旧有效区间；
+        # 注意与单数字写法 "N" = 0~N 的解析口径不同，见 patrol.parse_hours_range）
         if low is None:
             low_v = 0.0
         if high is None:

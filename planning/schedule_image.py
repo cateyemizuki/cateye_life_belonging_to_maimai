@@ -164,8 +164,9 @@ class ScheduleImageGenerator:
     def _parse_time_str(time_str: str) -> Tuple[int, int]:
         """解析 ``HH:MM-HH:MM``，返回 (开始分钟, 结束分钟)。
 
-        兼容两种跨午夜写法：累计分钟（``23:00-31:00``）与回绕写法（``23:00-07:00``）。
-        解析失败返回 (0, 0)。
+        兼容三种跨午夜写法：累计分钟（``23:00-31:00``）、回绕写法（``23:00-07:00``）与
+        :func:`time_utils.format_day_minute` 前缀（``23:00-次日 07:00``，读取侧统一渲染后的
+        现行形态）。解析失败返回 (0, 0)。
         """
         try:
             parts = str(time_str).split("-")
@@ -173,20 +174,26 @@ class ScheduleImageGenerator:
                 return (0, 0)
 
             def _to_minutes(seg: str) -> Optional[int]:
-                seg = seg.strip().split(":")[0:2]
-                if len(seg) != 2:
+                text = seg.strip()
+                offset = 0
+                if text.startswith("次日"):        # format_day_minute 的跨午夜前缀：1440+钟点
+                    offset, text = 24 * 60, text[2:].strip()
+                elif text.startswith("前日"):      # 防御性（正常链路不产生负分钟条目）
+                    offset, text = -24 * 60, text[2:].strip()
+                parts = text.split(":")[0:2]
+                if len(parts) != 2:
                     return None
-                hour, minute = int(seg[0]), int(seg[1])
+                hour, minute = int(parts[0]), int(parts[1])
                 if minute < 0 or minute > 59 or hour < 0:
                     return None
-                return hour * 60 + minute
+                return hour * 60 + minute + offset
 
             start = _to_minutes(parts[0])
             end = _to_minutes(parts[1])
             if start is None or end is None:
                 return (0, 0)
             if 0 < end <= start:
-                end += 24 * 60  # 回绕写法的跨午夜活动
+                end += 24 * 60  # 回绕写法的跨午夜活动（带「次日」前缀时已≥start，不会进这分支）
             return (start, end)
         except (ValueError, IndexError, AttributeError):
             return (0, 0)

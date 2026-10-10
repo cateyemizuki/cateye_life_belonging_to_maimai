@@ -1,7 +1,8 @@
 """LLM 请求封装：睡眠裁判 / 人设初始化 / 回复增量评估（设计文档 §六/§十）。
 
 三个独立请求都不携带对话历史：
-- 睡眠裁判：客观数据（当前 VAD、当天情绪日志、前后日日程、睡眠时长）→ ΔVAD_sleep（±0.8）；
+- 睡眠裁判：客观数据（当前 VAD、当天情绪日志、前后日日程、睡眠时长）→
+  ΔVAD_sleep = ±(0.4+0.4×[schedule_advanced].emotion_influence)，缺省调用兼容 ±0.8；
 - 人设初始化：纯人设文本 → 锚点/静态偏移/乘数四组参数（带数值约束）；
 - 回复增量评估：该轮回复文本（+用户侧最后一条消息上下文，§4.2 行 2）→ 事件摘要 + ΔVAD（±0.5）。
 所有返回都经代码层二次校验与裁剪（LLM 数值感知失真的兜底，§十二.1）。
@@ -63,7 +64,7 @@ V: {e_v:+.2f}, A: {e_a:+.2f}, D: {e_d:+.2f}
 只输出 JSON：{{"delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}, "reason_valence": "...", "reason_arousal": "...", "reason_dominance": "..."}}"""
 
 #: 睡眠裁判 ΔVAD 的兼容默认限幅（旧调用不传 delta_limit 时保持 ±0.8；
-#: M5 服务侧一律传动态限幅 0.4+0.4×schedule.emotion_influence）
+#: M5 服务侧一律传动态限幅 0.4+0.4×[schedule_advanced].emotion_influence）
 DEFAULT_SLEEP_DELTA_LIMIT = 0.8
 
 INIT_SYSTEM_PROMPT = """你是一位情绪心理学专家，负责为 AI 角色建立 VAD（效价、唤醒度、支配感）三维情绪模型。

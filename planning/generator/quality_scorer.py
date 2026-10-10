@@ -17,6 +17,7 @@ import logging
 
 from core.time_utils import parse_hhmm
 
+from ..time_utils import DAY_MINUTES
 from .validator import is_gap_warning, item_time_block
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,6 @@ GAP_WARNING_PENALTY = 0.25
 #: 评分兜底作息锚点（配置缺 ``wake_time`` / ``sleep_time`` 时用）
 _DEFAULT_WAKE_MINUTES = 7 * 60
 _DEFAULT_SLEEP_MINUTES = 23 * 60
-_DAY_MINUTES = 24 * 60
 
 
 class ScheduleQualityScorer:
@@ -269,7 +269,7 @@ class ScheduleQualityScorer:
 
         wake_min = parse_hhmm(str(self.config.get('wake_time') or ''), _DEFAULT_WAKE_MINUTES)
         sleep_min = parse_hhmm(str(self.config.get('sleep_time') or ''), _DEFAULT_SLEEP_MINUTES)
-        awake_end = sleep_min + (_DAY_MINUTES if sleep_min <= wake_min else 0)
+        awake_end = sleep_min + (DAY_MINUTES if sleep_min <= wake_min else 0)
         awake_len = awake_end - wake_min
         if awake_len <= 0:
             return 0.0
@@ -282,7 +282,7 @@ class ScheduleQualityScorer:
             start, end = block[1], block[2]
             if end <= start:
                 continue
-            for shift in (-_DAY_MINUTES, 0, _DAY_MINUTES):
+            for shift in (-DAY_MINUTES, 0, DAY_MINUTES):
                 lo = max(start + shift, wake_min)
                 hi = min(end + shift, awake_end)
                 if hi > lo:

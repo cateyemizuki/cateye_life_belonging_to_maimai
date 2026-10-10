@@ -208,7 +208,8 @@ class LLMService:
         return ""
 
     async def judge(self, prompt: str, *, event: str = "judge") -> str:
-        """判定类调用（想念把关、角色裁判等）：模型与参数来自顶层 ``[llm]`` 段。
+        """判定类调用（当前唯一调用点 = 想念把关；角色裁判/睡眠裁判走各自任务名，不读本入口）：
+        模型与参数来自顶层 ``[llm]`` 段。
 
         与 :meth:`generate` 的区别：调用方只给提示词拿结论；用哪个模型、最大
         token 数、温度集中在配置里（config_provider 动态读，热更新即时生效）——

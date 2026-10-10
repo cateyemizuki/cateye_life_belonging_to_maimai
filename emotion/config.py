@@ -39,7 +39,8 @@ class EmotionSectionConfig(PluginConfigBase):
         default=0.08,
         ge=0.01,
         le=0.3,
-        description="日常指数衰减率（每小时）：情绪向基线回落的速度；对话频繁可调高防无限累积",
+        description="日常指数衰减率（每小时）：情绪向 0（中性）回落的速度；向人设锚点收敛只在睡眠大修发生；"
+                    "对话频繁可调高防无限累积",
         json_schema_extra={"label": "衰减率", "step": 0.01, **_ui_i18n("Decay rate")},
     )
     evaluate_on_reply: bool = Field(

@@ -6,7 +6,7 @@ This module provides semantic validation for schedule items.
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
-from ..time_utils import normalize_day_minutes
+from ..time_utils import format_day_minute
 
 
 logger = logging.getLogger(__name__)
@@ -301,9 +301,10 @@ class ScheduleSemanticValidator:
                       allowed_gap: Optional[Tuple[int, int]] = None) -> List[str]:
         """相邻条目空档检查（``blocks`` = ``(名称, 起始, 结束)``，按起始排序后逐对比较）。
 
-        ``end`` 可 >1440（跨午夜写法）；展示用钟点统一经 :func:`normalize_day_minutes` 归一
-        （1500 → 01:00），避免出现 "25:00" 这类帧外钟点。``allowed_gap`` 内的间隙不算空档
-        （跨午夜作息下缺睡觉条目时，睡眠环本身就是留空段）。
+        ``end`` 可 >1440（跨午夜写法）；展示端点统一经 :func:`format_day_minute` 渲染
+        （1500 → ``次日 01:00``），避免出现 "25:00" 这类帧外钟点、跨午夜端点也不再丢
+        「次日」标记。``allowed_gap`` 内的间隙不算空档（跨午夜作息下缺睡觉条目时，
+        睡眠环本身就是留空段）。
         """
         if not blocks:
             return []
@@ -318,8 +319,8 @@ class ScheduleSemanticValidator:
                 continue
             if allowed_gap and allowed_gap[0] <= current_end and next_start <= allowed_gap[1]:
                 continue
-            current_end_time = f"{normalize_day_minutes(current_end) // 60:02d}:{normalize_day_minutes(current_end) % 60:02d}"
-            next_start_time = f"{normalize_day_minutes(next_start) // 60:02d}:{normalize_day_minutes(next_start) % 60:02d}"
+            current_end_time = format_day_minute(current_end)
+            next_start_time = format_day_minute(next_start)
             warnings.append(
                 f"注意：时间空档：{current_end_time}-{next_start_time} "
                 f"({gap_minutes / 60.0:.1f}小时无安排)"

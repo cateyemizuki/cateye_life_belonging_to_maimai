@@ -987,7 +987,9 @@ class ProactiveService:
         return session_id
 
     async def _enumerate_private_pairs(self) -> List[Tuple[str, str]]:
-        """枚举已知私聊流的 ``(QQ 号, session_id)``（其他私聊白名单通配 ``["*"]`` 时使用）。"""
+        """枚举已知私聊流的 ``(QQ 号, session_id)``（私聊名单为**黑名单模式**时使用：
+        全量枚举后剔除名单号，见 :meth:`_resolve_greeting_candidates`；白名单模式按名单
+        逐号解析，不走本枚举）。"""
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "chat"):
             return []
@@ -1429,9 +1431,10 @@ class ProactiveService:
 
         ``exempt_budget=True``（M11 附录 II §2.3：例行问候专用）→ **闸门与计数一起跳**：
         既不查询主动打扰预算，也不发布 ``proactive.used``（只跳闸门会让计数仍被悄悄消耗）。
-        默认 ``False``：非问候主动行为照旧「查预算 → 记用量 → 触发」，但计数身份按 stream
-        维度判定（M11 §3.3）——**只有发往目标陪伴私聊**的主动打扰才查计数/入账，
-        群聊与其他私聊开口不计入、不受限。
+        默认 ``False``：非问候主动行为照旧「查预算 → 记用量 → 触发」，计数身份按 stream
+        维度判定（M11 §3.3）——目标流已解析时只有发往目标陪伴私聊的主动打扰才查计数/入账，
+        群聊与其他私聊开口不计入、不受限；**目标流不可得/未解析时**预算退回全量口径：
+        任何流的开口都会查计数与被拦截（沿用旧语义，判据见 ``core/event_bus._is_target_stream``）。
         """
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "maisaka"):
@@ -1447,8 +1450,10 @@ class ProactiveService:
 
         # M0 预算接线（§六.2 H）：查询主动打扰预算 → 发布 proactive.used → 执行触发。
         # 活动切换主动开口与早间问好共用本调用处。
-        # M11（附录 II §3.3）：预算计数身份 = **目标陪伴私聊**——按 stream 维度传参，
-        # 群聊/其他私聊的活动切换开口直接放行且不计入。
+        # M11（附录 II §3.3）：预算计数身份 = **目标陪伴私聊**——按 stream 维度传参。
+        # 注意（#26 口径）：目标流不可得/未解析时预算按**全量口径**计数与拦截（沿用旧语义，
+        # 见 core/event_bus._is_target_stream 的回退分支），此时群聊/其他私聊的活动切换开口
+        # 同样会被计数；目标流已解析后群聊/其他私聊开口才不计入。
         # M11（附录 II §2.3）：例行问候 exempt_budget=True → 闸门与计数一并跳过。
         bus = self._event_bus()
         if bus is not None and not exempt_budget:

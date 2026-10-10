@@ -12,8 +12,10 @@
 
 **与早晚安的关系（2026-10-10 配置整理轮口径）**：早安/晚安只有一条驱动链——
 planning 的 L2 漂移机制（[planning_proactive]）。本巡检器**从不**触发问候，
-只读取 affection 的按天标记（planning 触发成功后写入）：标记已置位即记一条
-``already_sent_today`` 跳过原因，两模块因此不会各发一条。patrol 自身可发的只有
+只读取 affection 的按天标记（planning 触发成功后写入）做**记录性观察**：标记已置位
+仅记一条 ``already_sent_today`` 观察日志，**不构成去重闸门**（patrol 本就没有问候
+触发路径，标记置位与否不改变本侧行为）——两模块不会各发一条，靠的是 planning
+自查 + affection 已发标记闭环。patrol 自身可发的只有
 想念 / 日程分享 / 日常搭话三类；早/晚安/问候一律不占陪伴侧预算。
 
 **预算口径**：``[patrol].daily_max_speak`` 即上限（不再有独立上限字段），
@@ -490,12 +492,14 @@ class PatrolService:
             finish()
             return
 
-        # ---- 早安 / 晚安的状态检查（patrol 从不触发问候，只做去重观察）----
+        # ---- 早安 / 晚安的状态检查（patrol 从不触发问候；已发标记仅记录观察）----
         # 唯一驱动链 = planning 的 L2 漂移机制（[planning_proactive] 的漂移区间 + 开关）。
         # 旧的 [patrol] morning_start/end、night_start/end 四个窗口字段已于 2026-10-10
         # 配置整理轮**删除**（问候时刻一律用 [schedule].wake_time/sleep_time + 漂移）。
-        # planning 触发成功后写入 affection 的 morning_sent/night_sent；这里见已发即记一条
-        # 跳过原因——同一会话同一天早安/晚安各至多一条，两模块不会各发一条。
+        # planning 触发成功后写入 affection 的 morning_sent/night_sent；这里见已发只记一条
+        # already_sent_today 观察日志，**不构成去重闸门**（patrol 本就没有问候触发路径，
+        # 标记置位与否不改变本侧行为）——两模块不会各发一条，靠的是 planning 自查
+        # + affection 已发标记闭环。
         if self._affection.morning_sent():
             mark_skip("already_sent_today", "morning", "今天已经发过早安（planning 漂移机制已发）")
         if self._affection.night_sent():

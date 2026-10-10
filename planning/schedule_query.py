@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .schedule_db import ScheduleDB
 from .time_utils import (describe_energy, format_day_minute, get_energy_level,
-                         is_upcoming_day_minute, ring_minutes_ahead)
+                         is_in_day_frame, is_upcoming_day_minute, ring_minutes_ahead)
 from core.time_utils import minutes_of_now
 
 # sleep 类型条目不算「正在做的事」（仅 include_sleep=True 的调用方可见，如情绪睡眠循环）
@@ -38,6 +38,8 @@ class ScheduleQuery:
 
         include_sleep=True 时 sleep 条目也参与匹配（情绪睡眠循环用）；
         缓存键区分该开关，避免共享实例上不同调用方互相串用结果。
+        覆盖判定走 :func:`time_utils.is_in_day_frame`（同一个 24h 环）——凌晨 00:30
+        也能命中「23:00 → 次日 07:00」的跨午夜睡觉条目（朴素 ``start<=cur<end`` 会漏）。
         """
         now = now or datetime.now()
         window = minutes_of_now(now) // self._cache_minutes
@@ -50,7 +52,7 @@ class ScheduleQuery:
         for item in self._db.get_day_schedule(date):
             if not include_sleep and item.get("goal_type") in _SKIP_TYPES:
                 continue
-            if int(item.get("start_minute") or 0) <= cur_min < int(item.get("end_minute") or 0):
+            if is_in_day_frame(item.get("start_minute") or 0, item.get("end_minute") or 0, cur_min):
                 current = item
                 break
         if len(self._cache) > 64:  # 简单防膨胀
@@ -88,7 +90,9 @@ class ScheduleQuery:
         now = now or datetime.now()
         start = int(item.get("start_minute") or 0)
         end = int(item.get("end_minute") or 0)
-        remain = end - minutes_of_now(now)
+        # 剩余时间按同一个 24h 环归一：跨午夜条目（end>1440）在次日凌晨（如 06:50）也能
+        # 得到真实的「约还剩 N 分钟」，不再是 1830 这类帧外大数（裸 end - cur 的旧缺陷）
+        remain = ring_minutes_ahead(end, minutes_of_now(now))
         line = f"{item.get('name', '???')}"
         if item.get("description"):
             line += f"（{item['description']}）"

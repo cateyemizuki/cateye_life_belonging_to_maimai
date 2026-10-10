@@ -43,13 +43,12 @@ from .config import (
     section_or_default,
 )
 from .schedule_items import last_non_sleep_end_minute
+from .time_utils import DAY_MINUTES
 
 logger = logging.getLogger(__name__)
 
 #: 硬约束（B2）：生成时刻距**新一天起点**的最小提前量（分钟）——"至少新一天开始前 30 分钟生成"
 GENERATE_LEAD_MINUTES = 30
-#: 一天的分钟数（当日帧相对分钟的回绕长度）
-_DAY_MINUTES = 24 * 60
 #: 缺省作息锚点（配置缺失/非法时兜底）：07:00 起床 / 23:00 入睡
 _DEFAULT_WAKE_MINUTES = 7 * 60
 _DEFAULT_SLEEP_MINUTES = 23 * 60
@@ -92,7 +91,7 @@ def in_frame_minutes(clock_minutes: int, wake_minutes: int) -> int:
     条目落在凌晨的那一段（如 23:00 入睡 + 8h ⇒ 1380→1860，次日 00:00–07:00 段）都落在
     帧尾（2026-10-10 N2/N4 起条目跨午夜保留原时长，不再被截断到入睡锚点）。
     """
-    return (int(clock_minutes) - int(wake_minutes)) % _DAY_MINUTES
+    return (int(clock_minutes) - int(wake_minutes)) % DAY_MINUTES
 
 
 def anchor_in_frame_minutes(anchor_minutes: int, wake_minutes: int) -> int:
@@ -104,12 +103,12 @@ def anchor_in_frame_minutes(anchor_minutes: int, wake_minutes: int) -> int:
     30 分钟硬约束拉回，不会在"新一天开始的那一刻"才生成。
     """
     rel = int(anchor_minutes) - int(wake_minutes)
-    return rel if rel > 0 else rel + _DAY_MINUTES
+    return rel if rel > 0 else rel + DAY_MINUTES
 
 
 def clamp_due_minutes(due_minutes: int) -> int:
     """硬约束（B2）：帧内到期分钟数 ≤ ``1440 − 30``（= 新一天起点前 30 分钟）；超出强制拉回。"""
-    return min(int(due_minutes), _DAY_MINUTES - GENERATE_LEAD_MINUTES)
+    return min(int(due_minutes), DAY_MINUTES - GENERATE_LEAD_MINUTES)
 
 
 def baseline_minutes(items: Optional[List[Dict[str, Any]]], *,

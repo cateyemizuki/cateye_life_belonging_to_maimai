@@ -76,7 +76,7 @@ class PlanningComponentsMixin:
         description=(
             "把今天的起床时间往后推（赖床）。传入目标时间，支持 \"HH:MM\"、\"H:MM\" 或纯小时数"
             "（如 \"09:30\" / \"9:30\" / \"9\" 表示 09:00）。仅在夜间被吵醒、收到赖床提醒时可用；"
-            f"超过 [schedule] lie_in_max_until（默认 {DEFAULT_LIE_IN_MAX_UNTIL}）会被钳到该时间。"
+            f"超过 [schedule_advanced] lie_in_max_until（默认 {DEFAULT_LIE_IN_MAX_UNTIL}）会被钳到该时间。"
         ),
         parameters={
             "time": {"type": "string",

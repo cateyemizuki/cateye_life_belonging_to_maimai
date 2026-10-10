@@ -125,8 +125,10 @@ class CompanionServices:
         self.session_kinds = SessionKindCache()
         #: 屏幕旁白「尾随锚点」注入缓存（触发时发布，请求 Hook 消费）
         # 2026-10-10：[cateye] 段并入 [patrol]（陪伴模块），字段前缀 screen_*
+        # T3 #5 收尾（第四轮）：构造期与热重载同源——`or 0` 让显式 0（不限时）在首次加载即生效
+        # （旧 `or 90` 把 0 折成 90，只有保存一次配置后才恢复）；缺失属性仍回退缺省 90
         self.screen_store = ScreenContextStore(
-            ttl_minutes=float(getattr(cfg.patrol, "screen_context_ttl_minutes", 90) or 90)
+            ttl_minutes=float(getattr(cfg.patrol, "screen_context_ttl_minutes", 90) or 0)
         )
         #: 陪伴对象电脑联动客户端（connect-hub 跨插件 API）
         self.cateye = CateyeClient(plugin, llm=self.llm, call_logger=self.llm_logger)

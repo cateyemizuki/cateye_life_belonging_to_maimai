@@ -43,7 +43,9 @@ from .inject import (
     UserIntent,
 )
 from .lru_cache import LRUCache
-from .time_utils import TimezoneManager, describe_energy, get_energy_level, parse_time_window, strip_tz
+from .time_utils import (TimezoneManager, describe_energy, format_day_minute,
+                         get_energy_level, is_in_day_frame, normalize_day_minutes,
+                         parse_time_window, strip_tz)
 from suite_prompts import (
     INJECT_DATE_HEADER_DEFAULT,
     INJECT_HINT_CONTINUE_DEFAULT,
@@ -987,7 +989,7 @@ class InjectService:
         }
 
     def _lookup_time_window(self, activity_name: str, chat_id: str) -> Optional[str]:
-        """根据活动名反查时间窗口字符串（HH:MM-HH:MM）。"""
+        """根据活动名反查时间窗口字符串（``format_day_minute`` 形态，跨午夜端点标「次日」）。"""
         try:
             goal_manager = get_goal_manager()
             goals = goal_manager.get_active_goals(chat_id="global")
@@ -1007,10 +1009,7 @@ class InjectService:
                 start_minutes, end_minutes = parse_time_window(tw)
                 if start_minutes is None or end_minutes is None:
                     continue
-                start_str = f"{start_minutes // 60:02d}:{start_minutes % 60:02d}"
-                end_minutes_norm = end_minutes if end_minutes < 1440 else end_minutes - 1440
-                end_str = f"{end_minutes_norm // 60:02d}:{end_minutes_norm % 60:02d}"
-                return f"{start_str}-{end_str}"
+                return f"{format_day_minute(start_minutes)}-{format_day_minute(end_minutes)}"
         except Exception as exc:
             logger.debug("反查时间窗口失败: %s", exc)
         return None
@@ -1116,14 +1115,13 @@ class InjectService:
                 is_cross_day = end_minutes > 1440
 
                 if is_today:
-                    if is_cross_day:
-                        is_in_window = (start_minutes <= current_time_minutes < 1440) or (
-                            0 <= current_time_minutes < (end_minutes - 1440)
-                        )
-                    else:
-                        is_in_window = start_minutes <= current_time_minutes < end_minutes
+                    # 跨午夜 = 同一个 24h 环，统一走 time_utils.is_in_day_frame
+                    # （与原手写「start<=cur<1440 or cur<end-1440」逐分支等价）
+                    is_in_window = is_in_day_frame(start_minutes, end_minutes, current_time_minutes)
                 elif is_yesterday and is_cross_day:
-                    is_in_window = 0 <= current_time_minutes < (end_minutes - 1440)
+                    # 昨天创建的条目只可能以「今日钟点的尾段」[0, end−1440) 延续：
+                    # 不能整环判——其傍晚段属昨日钟点，此刻必然已过
+                    is_in_window = 0 <= current_time_minutes < normalize_day_minutes(end_minutes)
                 else:
                     continue
 

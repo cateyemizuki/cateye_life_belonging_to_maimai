@@ -40,7 +40,7 @@ from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
 from .schedule_generator import ScheduleGenerator
 from .schedule_items import find_night_sleep_item, is_night_sleep_item
-from .time_utils import TimezoneManager
+from .time_utils import DAY_MINUTES, TimezoneManager, format_day_minute, is_in_day_frame
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +49,8 @@ logger = logging.getLogger(__name__)
 #: （emotion/service.py 的 NAP_REMINDER_TEMPLATE）同源引用本常量——A2 明确"工具后续会改名，
 #: 注意同步"，改名只需动这一处。
 NAP_TOOL_NAME = "lbm_nap_lie_in"
-#: 钳制上限的缺省值（[schedule] lie_in_max_until；HH:MM），§4.4「传入时间 > 上限 → 钳到上限」
+#: 钳制上限的缺省值（[schedule_advanced] lie_in_max_until；HH:MM），§4.4「传入时间 > 上限 → 钳到上限」
 DEFAULT_LIE_IN_MAX_UNTIL = "12:00"
-#: 一天的分钟数（P6 顺延的当日帧上界：顺延后 ``end`` 封顶 24:00，不产生跨午夜条目）
-DAY_MINUTES = 24 * 60
 #: 非睡眠周期调用的拒绝话术（出厂文案见 suite_prompts.NAP_TOOL_DENIED_DEFAULT，
 #: 2026-10-10 起可在 [prompts].nap_tool_denied 覆盖）
 NAP_LIE_IN_DENIED_TEXT = NAP_TOOL_DENIED_DEFAULT
@@ -271,26 +269,24 @@ class ToolsService:
 
         schedule_with_time.sort(key=lambda x: x[1][0])
 
-        # 分类：正在进行 / 即将到来 / 已完成
+        # 分类：正在进行 / 即将到来 / 已完成（「正在进行」跨午夜 = 同一个 24h 环：
+        # 凌晨 00:30 的「23:00 → 次日 07:00」条目归「正在进行」而非「即将到来」；
+        # upcoming/completed 保持帧内单调比较——帧首条目的环上双关语义见 time_utils.is_upcoming_day_minute）
         ongoing: List[Tuple[Any, List[int]]] = []
         upcoming: List[Tuple[Any, List[int]]] = []
         completed: List[Tuple[Any, List[int]]] = []
         for goal, tw in schedule_with_time:
             start_min, end_min = tw
-            if start_min <= current_minutes <= end_min:
+            if is_in_day_frame(start_min, end_min, current_minutes):
                 ongoing.append((goal, tw))
             elif current_minutes < start_min:
                 upcoming.append((goal, tw))
             else:
                 completed.append((goal, tw))
 
-        def _fmt_time(minutes: int) -> str:
-            h, m = minutes // 60, minutes % 60
-            return f"{h:02d}:{m:02d}"
-
         def _fmt_item(goal: Any, tw: List[int], prefix: str = "") -> str:
-            start_time = _fmt_time(tw[0])
-            end_time = _fmt_time(tw[1] if tw[1] < 1440 else tw[1] - 1440)
+            start_time = format_day_minute(tw[0])
+            end_time = format_day_minute(tw[1])
             desc = ""
             if enable_detailed_description and goal.description:
                 desc = goal.description
@@ -353,7 +349,8 @@ class ToolsService:
         for item in items:
             start = int(item.get("start_minute") or 0)
             end = int(item.get("end_minute") or 0)
-            lines.append(f"  [{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}] "
+            # 跨午夜条目（end>1440）标「次日」，不再渲染成 31:00 这类帧外钟点
+            lines.append(f"  [{format_day_minute(start)}-{format_day_minute(end)}] "
                          f"{item.get('name', '未知')}")
         return {"type": "schedule_day", "content": "\n".join(lines)}
 
@@ -378,7 +375,7 @@ class ToolsService:
             tw = (getattr(goal, "parameters", None) or {}).get("time_window")
             window = ""
             if isinstance(tw, list) and len(tw) == 2:
-                window = f"{int(tw[0]) // 60:02d}:{int(tw[0]) % 60:02d}-{int(tw[1]) // 60:02d}:{int(tw[1]) % 60:02d} "
+                window = f"{format_day_minute(tw[0])}-{format_day_minute(tw[1])} "
             lines.append(f"- {window}{getattr(goal, 'name', '')}（进度 {getattr(goal, 'progress', 0)}%）")
         return {"type": "schedule_goals", "content": "\n".join(lines)}
 
@@ -414,7 +411,7 @@ class ToolsService:
                 )
                 return {
                     "type": "schedule_updated",
-                    "content": "已记录到日程候选清单（裁判模式关闭，下次生成日程时纳入）",
+                    "content": "已记录为今天的候选约定（裁判模式关闭，仅当天重新生成日程时才会纳入）",
                 }
 
             # 准备当前活动摘要 + 人设
@@ -521,7 +518,7 @@ class ToolsService:
         return getattr(self._plugin, "_emotion", None)
 
     def _lie_in_max_minutes(self) -> int:
-        """[schedule] lie_in_max_until 的分钟数（非法回退 12:00；钳制与提示同源）。"""
+        """[schedule_advanced] lie_in_max_until 的分钟数（非法回退 12:00；钳制与提示同源）。"""
         return lie_in_max_minutes(getattr(self._advanced_cfg(), "lie_in_max_until",
                                           DEFAULT_LIE_IN_MAX_UNTIL))
 
@@ -633,7 +630,7 @@ class ToolsService:
            友好错误 + 格式示例，**不抛异常**；
         2. **非睡眠周期调用 → 拒绝**：经 ``plugin._emotion`` 服务束查询「是否处于夜间睡眠
            周期」（白天/午休/未装配 emotion 一律拒绝），话术「你现在还不能想要赖床」；
-        3. **上限钳制**：目标 > ``[schedule] lie_in_max_until``（默认 12:00）→ 钳到该值；
+        3. **上限钳制**：目标 > ``[schedule_advanced] lie_in_max_until``（默认 12:00）→ 钳到该值；
         4. **修改日程**：找**今日日程**的 sleep 条目（"今日"按 [schedule] wake_time 锚点定义的新一天：
            凌晨仍属入睡日，见 :meth:`_nap_schedule_date`）并把 ``end_minute`` 推到目标，经**共享底层**
            ``ScheduleGenerator.apply_schedule_items(items, today, consume_commitments=False)``
