@@ -9,7 +9,7 @@
 - **QQ 空间**：按日程自动发说说、自动回复评论（含楼中楼）与点赞；cookie 取不到时自动降级成「有新评论」的提醒。
 - **情绪维护系统**：VAD 三维情绪状态机 + 25 种情绪原型映射；日常衰减、事件增量、睡眠期「大修」结算；情绪反过来影响主动频率、想念阈值、发帖意愿与回复语气。
 
-📖 每个工具/指令的参数、权限与**11 段配置总览、完整配置键总表**见 **[USAGE.md](USAGE.md)**；情绪系统的映射关系现状导出见 **[EMOTION_MAPPING.md](EMOTION_MAPPING.md)**（代码为唯一真源）；版本变更与本版已知问题见 **[CHANGELOG.md](CHANGELOG.md)**。
+📖 版本变更与本版已知问题见 **[CHANGELOG.md](CHANGELOG.md)**；每个工具/指令的参数、权限、11 段配置总览与完整配置键总表见维护手册 `USAGE.md`，情绪映射现状导出见 `EMOTION_MAPPING.md`——两份维护文档在插件目录旁的开发文档目录 `..\cateye_life_belonging_to_maimai开发文档\`（**不随插件包发布**）。
 
 ## 2026-10-10 配置大整理（1.1.0）
 
@@ -24,7 +24,7 @@
 - **两处修复**：`[affection] current_level` 以字符串 `"1"` 提交时不再导致整份配置校验失败；日程图片出图与图片输出目录两处修正。
 - **版本说明**：宿主显示的**插件版本为 1.1.0**，而 `[plugin] config_version` **保持 1.0.0**——这是有意保留的（旧配置迁移依赖「版本号不变」），**请勿修改**。
 
-详细迁移映射与新段总览见 **[USAGE.md](USAGE.md)** 的「十、配置总览」，完整变更见 **[CHANGELOG.md](CHANGELOG.md)**。
+详细迁移映射与新段总览见维护手册 `USAGE.md` 的「十、配置总览」（位于 `..\cateye_life_belonging_to_maimai开发文档\`），完整变更见 **[CHANGELOG.md](CHANGELOG.md)**。
 
 
 ## 安装
@@ -36,7 +36,7 @@
 
 **依赖**：`httpx>=0.24`、`Pillow>=9.0`。Pillow 只用于日程图／状态图渲染，**缺失或渲染失败时自动降级为纯文本**，不影响其他功能。
 
-**可选开关**（默认全关，开了才生效）：屏幕感知（`[patrol] screen_enabled`）、QQ 空间（`[qzone] enabled`）、周结大事记（`[affection] weekly_milestones_enabled`）、emoji 情绪联动（`[emotion] emoji_enabled`，当前无组件消费，开启暂不生效——详见 USAGE.md §五）。
+**可选开关**（默认全关，开了才生效）：屏幕感知（`[patrol] screen_enabled`）、QQ 空间（`[qzone] enabled`）、周结大事记（`[affection] weekly_milestones_enabled`）、emoji 情绪联动（`[emotion] emoji_enabled`，当前无组件消费，开启暂不生效）。
 
 **声明能力**：`_manifest.json` 共声明 17 项宿主能力与 2 项 Python 依赖（发文本／图片／合并转发、配置读取、LLM 生成、会话查询、消息回查、主动触发、上下文追加、频率调节、知识库检索、跨插件 API、数据库只读、emoji 按描述匹配）。
 
@@ -122,28 +122,26 @@
 | `[schedule_advanced] emotion_influence` | `0.6` | 情绪对日程的影响强度（`0` = 关闭） |
 | `[llm] task_name` / `judge_model` | `replyer` / `""` | 主任务名／判定用模型（留空跟随主任务）；插件全部模型调用集中于此段 |
 
-> 全部 **11 个配置段、208 个可见配置项**的**键名｜类型｜默认值｜说明**总表、旧配置迁移映射、已移除项清单、注入矩阵与预算口径，见 [USAGE.md](USAGE.md) 的「十、配置总览」。
+> 全部 **11 个配置段、208 个可见配置项**的**键名｜类型｜默认值｜说明**总表、旧配置迁移映射、已移除项清单、注入矩阵与预算口径，见维护手册 `USAGE.md` 的「十、配置总览」（位于 `..\cateye_life_belonging_to_maimai开发文档\`）。
 
 ## FAQ
 
-- **配了目标 QQ 还是没人私聊我？** 先确认 `[patrol] target_qq` 已改成真实 QQ（占位值不解析）；插件需要能在宿主里查到该 QQ 的**私聊流**，查不到时每 60 秒重试一次——和目标 QQ 先互发一条消息通常就能解析到。详见 [USAGE.md](USAGE.md) 的 FAQ。
+- **配了目标 QQ 还是没人私聊我？** 先确认 `[patrol] target_qq` 已改成真实 QQ（占位值不解析）；插件需要能在宿主里查到该 QQ 的**私聊流**，查不到时每 60 秒重试一次——和目标 QQ 先互发一条消息通常就能解析到。详见维护手册 `USAGE.md` 的 FAQ（位于 `..\cateye_life_belonging_to_maimai开发文档\`）。
 - **命令没反应？** 管理员指令要求 `admin.admin_users` 里有你（留空时只有本机控制台能用）；另外若配置了 `admin.allowed_streams`，不在名单内的会话会被静默拒绝。
 - **日程图／状态图只有文字没有图？** 这是预期的静默降级：Pillow 或字体不可用、渲染超时（状态图 10 秒／日程图 15 秒）时改发纯文本，功能不受影响。
 - **早安／晚安没来、或来了两条？** 看两个总开关 `greeting_morning_enabled` / `greeting_night_enabled` 与统一名单；目标私聊恒生效、其他私聊默认不发（私聊白名单留空）。例行问候**始终免预算**，所以「预算用完」不是原因。目标私聊同日同类型至多一条（热重载后也生效），群聊／非目标私聊跨热重载去重尚未实现。
 - **QQ 空间发不出去／评论不回复？** 用 `/lbm_life qzone status` 看通道与 cookie：cookie 不可用时会降级成「有新评论」的提醒而不回评；`qzone.enabled=false`、静默时段、每日上限、`emotion_filter` 都会拦住发帖。（另：图片说说只有动作通道支持，CGI 回退通道的图片上传尚未接通。）
 - **裁判类任务输出为空？** 建议把 `[llm] judge_model` 与情绪裁判（`[llm] emotion_referee_task_name`）、好感裁判（`[llm] review_task_name`）的任务绑到**真正的非思考型模型**——思考型模型会把小 `max_tokens` 预算花在推理上，导致正文为空。
 - **怎么临时关掉某个模块？** `[qzone] enabled=false`、`[affection] enabled=false`、`[emotion] enabled=false` 分别关闭对应模块；`[plugin] enabled=false` 则只注册组件、不跑任何循环。
-- **升级后配置和数据会怎样？** **配置**：旧键在首次启动时自动迁移到新段（幂等），无需手改，见 USAGE.md 的「配置总览」；`[plugin] config_version` 保持 `1.0.0`，请勿修改。**数据**：数据目录沿用 1.0.0 的 `data/plugins/cateye.life_belonging_to_maimai/`，本版无需搬运；若从更早的 1.0.0 之前版本升级，见下节。
+- **升级后配置和数据会怎样？** **配置**：旧键在首次启动时自动迁移到新段（幂等，反复重启不二次改写），无需手改；`[plugin] config_version` 保持 `1.0.0`，请勿修改。**数据**：数据目录 `data/plugins/cateye.life_belonging_to_maimai/` 与 1.0.0 相同，本版无需搬运数据。
 
-## 升级注意：数据目录变更（自 1.0.0 起）
-
-`_manifest.json` 的 `id` 在 1.0.0 改为 `cateye.life_belonging_to_maimai`，数据目录为：
+## 数据目录
 
 ```
 data/plugins/cateye.life_belonging_to_maimai/
 ```
 
-**1.0.0 之前的旧目录（`data/plugins/` 下按旧插件 id 命名）不会自动迁移。** 若你从更早版本升级，请把旧目录下的 `schedule.db`、`emotion_state.json`、`emotion_config.json`、`affection` 档案、决策／LLM 日志等，手动复制到新目录再重启，历史日程与好感／情绪才能延续。1.0.0 及以后版本之间升级无需搬运数据。
+日程库、情绪状态、好感档案、空间状态与各类日志都在这里；插件只在宿主给定的数据目录内读写。
 
 ## 已知问题
 
