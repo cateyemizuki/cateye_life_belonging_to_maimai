@@ -458,6 +458,15 @@ class AffectionReviewer:
         """``[affection] review_enabled``：false 时 M2 两个裁判整体关闭（零 LLM 调用）。"""
         return bool(self._cfg("review_enabled", True))
 
+    def _patrol_enabled(self) -> bool:
+        """``[patrol].enabled``：false 时好感裁判整体关闭（T3 #4 用户裁决②）。
+
+        陪伴模块停用后不应再产生模型调用；文档承诺「关 = 不巡检、不注入好感度」，
+        会话采样与关系日结属陪伴模块的成本面，一并在总开关下停掉（零 LLM）。
+        """
+        section = getattr(getattr(self._plugin, "config", None), "patrol", None)
+        return bool(getattr(section, "enabled", True))
+
     def _task_name(self) -> str:
         """好感裁判任务名：统一读 ``[llm].review_task_name``（旧 [affection] 段兜底）。"""
         try:
@@ -592,7 +601,7 @@ class AffectionReviewer:
         samples = _to_int(state.get("samples"), 0)
         result: Dict[str, Any] = {"sampled": False, "reason": "rounds",
                                   "rounds": self._rounds_today, "samples": samples}
-        if not self._review_enabled():
+        if not self._review_enabled() or not self._patrol_enabled():
             result["reason"] = "disabled"
             return result
         if not self._affection_enabled():
@@ -615,7 +624,8 @@ class AffectionReviewer:
     async def _run_sample_review(self, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         """执行一次会话采样裁判并走既有入账入口（后台任务体；异常一律吞掉）。"""
         try:
-            if not self._review_enabled() or not self._affection_enabled():
+            if (not self._review_enabled() or not self._affection_enabled()
+                or not self._patrol_enabled()):
                 return {"ok": False, "reason": "disabled"}
             llm = self._llm_service()
             if llm is None:
@@ -662,7 +672,8 @@ class AffectionReviewer:
         """
         data = payload if isinstance(payload, dict) else {}
         date = str(data.get("date") or datetime.now().strftime("%Y-%m-%d"))
-        if not self._review_enabled() or not self._affection_enabled():
+        if (not self._review_enabled() or not self._affection_enabled()
+                or not self._patrol_enabled()):
             self._log("affection.daily_review_skipped", trigger_type="affection",
                       reason="disabled", date=date)
             return
@@ -720,7 +731,8 @@ class AffectionReviewer:
         不会重试轰炸）。可独立单测。
         """
         day = str(date or (now or datetime.now()).strftime("%Y-%m-%d"))
-        if not self._review_enabled() or not self._affection_enabled():
+        if (not self._review_enabled() or not self._affection_enabled()
+                or not self._patrol_enabled()):
             return {"ok": False, "reason": "disabled"}
         state = self._affection.review_state(now=now)
         if str(state.get("daily_reviewed_date") or "") == day:

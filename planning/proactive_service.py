@@ -1027,9 +1027,14 @@ class ProactiveService:
                     continue
                 await self._evaluate_greeting(stream_id, category, kind,
                                               now, now_ts, date_str, cfg_p)
-        # 跨天残留清理：只保留当天条目（纯内存状态，热重载后重掷）
-        for key in [k for k in self._greeting_rolls if k[1] != date_str]:
-            self._greeting_rolls.pop(key, None)
+        # 跨天残留清理：当天条目保留；跨天条目只在「已终结（fired/abandoned）或观测窗已整段过去」
+        # 时清掉——夜猫子作息的晚安漂移点落在次日凌晨，条目必须活到那一刻（T3 问题表 #1）。
+        for key, entry in list(self._greeting_rolls.items()):
+            if key[1] == date_str:
+                continue
+            terminated = entry.get("status") in (GREETING_STATUS_FIRED, GREETING_STATUS_ABANDONED)
+            if terminated or now_ts > float(entry.get("observe_until", 0) or 0):
+                self._greeting_rolls.pop(key, None)
         for gkey in [k for k in self._greeting_other_gate if k[1] != date_str]:
             self._greeting_other_gate.pop(gkey, None)
 
@@ -1060,13 +1065,30 @@ class ProactiveService:
             if not await self._other_private_qualified(stream_id, date_str, now, cfg_p):
                 return
 
+        # 跨夜存活的历史条目先推进：条目按「掷点日」key 化，夜猫子作息（sleep < wake）的晚安
+        # 漂移点落在次日凌晨，今天重掷不会替它走完流程（T3 问题表 #1：旧版跨天清理把它直接丢掉，
+        # 表现为晚安永不发送）。
+        for key, prev in list(self._greeting_rolls.items()):
+            if key[0] == stream_id and key[2] == kind and key[1] != date_str:
+                await self._advance_greeting(prev, now_ts, date_str, cfg_p)
+
         entry = self._roll_greeting(stream_id, category, kind, date_str, now, now_ts)
+        await self._advance_greeting(entry, now_ts, date_str, cfg_p)
+
+    async def _advance_greeting(self, entry: Dict[str, Any], now_ts: float,
+                                date_str: str, cfg_p: Any) -> None:
+        """推进一条掷点条目：已终结 → 跳过；未激活 → 等待/窗关放弃；激活后到点（或已过点）→ 发。
+
+        投递同一条目的调用点有两处（见 :meth:`_evaluate_greeting`）：今天新掷的条目，
+        以及**跨夜存活的历史条目**（夜猫子作息 sleep < wake 时晚安漂移点落在次日凌晨，
+        条目按掷点日 key 化，今天再掷不会替它走完流程——T3 问题表 #1）。
+        """
         if entry["status"] in (GREETING_STATUS_FIRED, GREETING_STATUS_ABANDONED):
             return
         observe_until = entry.get("observe_until", entry["deadline"])
         if self._greeting_requires_activation(cfg_p):
             activated = await self._stream_activated_since_wake(
-                stream_id, entry.get("observe_from", entry["baseline"]), now_ts)
+                entry["stream_id"], entry.get("observe_from", entry["baseline"]), now_ts)
             if not activated:
                 if now_ts > observe_until:
                     self._abandon_greeting(entry, "deadline")
@@ -1080,13 +1102,13 @@ class ProactiveService:
                 # 不看激活时，观测窗就是"补发窗口"：整段错过（如重启）→ 不深夜补发
                 self._abandon_greeting(entry, "window_closed")
                 return
-        if self._greeting_deduped_by_persisted_marker(category, kind):
+        if self._greeting_deduped_by_persisted_marker(entry["category"], entry["kind"]):
             # P5（2026-10-09 登记）：热重载/重启后内存掷点清零，但 affection 的按天标记仍在——
             # 目标私聊该 kind 今天已发过 → 视为已触发（与自然触发同形态）+ 落去重行，不再重发。
             # 内存 status 已 FIRED 的在上方短路，不会走到这里（不重复落去重行）。
             entry["status"] = GREETING_STATUS_FIRED
             self._decision_log(
-                "skip", trigger_type=f"{kind}_greeting",
+                "skip", trigger_type=f"{entry['kind']}_greeting",
                 reason="持久化标记命中，热重载去重",
                 stream_id=entry["stream_id"], category=entry["category"],
                 fire_at=int(entry["fire_at"]), deadline=int(entry["deadline"]),

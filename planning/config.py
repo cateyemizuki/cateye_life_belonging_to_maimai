@@ -753,13 +753,15 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     def _migrate_legacy_lists(cls, data: object) -> object:
         """旧名单/开关 → 新统一名单系统（2026-10-10 合并；**只在首轮迁移生效**）。
 
-        **只读旧键、不再声明旧字段**（2026-10-10 第二轮）：下文出现的
+        **只读旧键、不再声明旧字段**（2026-10-10 第二轮）：下面出现的旧键都已从模型删除。
+        **真正被读取**（旧值搬进统一名单/门槛，随后被 pop 或随落盘消失）的是：
         ``greeting_group_blacklist`` / ``greeting_group_whitelist`` /
         ``greeting_other_private_whitelist`` / ``greeting_other_private_blacklist`` /
         ``greeting_other_private_enabled`` / ``morning_other_private_enabled`` /
-        ``morning_other_private_min_messages`` / ``greeting_target_enabled`` /
-        ``greeting_group_enabled`` 都是**已从模型删除的旧键**，只从旧配置的原始字典里读一次
-        （读的是用户真正的旧值），随后被 pop 或随落盘消失。
+        ``morning_other_private_min_messages`` / ``proactive_other_streams``。
+        **``greeting_target_enabled`` / ``greeting_group_enabled`` 不读也不搬**（T3 问题表 #2，
+        用户裁决 A）：旧的显式 ``false`` **不保留**，升级后按新默认（开）生效——要停掉某类问候
+        请改统一名单与两个总开关。
 
         触发条件：聚合校验器判定"尚未迁移"（``[plugin] layout_version`` 不是本轮标记）时，
         会在本段字典里放一枚哨兵 ``_layout_migrated=False``；已迁移形态（哨兵为 True）直接放行——

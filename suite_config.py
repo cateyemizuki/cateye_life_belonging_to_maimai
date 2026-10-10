@@ -73,7 +73,11 @@ from planning.config import (
     ScheduleSectionConfig,
 )
 from qzone.config import QzoneSectionConfig
-from suite_prompts import PromptsSectionConfig
+from suite_prompts import (
+    COMPANION_MISS_CONFIRM_DEFAULT,
+    COMPANION_MISS_REASON_DEFAULT,
+    PromptsSectionConfig,
+)
 
 # 配置版本（**必须与插件版本 `_manifest.json` 的 version 同步**，红线 R6）：
 # 插件版本表达"功能发布代次"；配置版本表达"配置文件结构代次"，宿主在它变化时会按新骨架
@@ -88,6 +92,13 @@ CURRENT_LAYOUT_VERSION = "2026-10-10"
 #: 2026-10-10 配置整理轮删除的 5 个旧段（迁移器整段搬运；plugin.py 的磁盘抢救也整段带回）。
 #: 保持单一真源：迁移器与抢救逻辑都读这里，别再各写一份字面量元组。
 LEGACY_SECTIONS = ("target", "cateye", "judge", "inject", "planning_cleanup")
+
+#: 1.0.0（配置整理轮之前）[patrol] 「想念触发说明」的出厂文案——仅用于迁移时判断「用户改过没有」。
+#: 为什么不拿新默认当参照：配置整理轮把该文案重写过（新版带【触发原因·想念】前缀），
+#: 拿新默认比较会把老用户的出厂值误判成「用户自定义」并搬进 [prompts]（等于把文案回退成旧版）。
+_LEGACY_MISS_REASON_PROMPT_DEFAULT = (
+    "你已经有 {hours} 个小时没收到{relation}的消息了，你有点想TA了。可以主动开口问问近况、表达一下想念；但不必强行找话题，如果觉得此刻开口不自然，平淡地打个招呼也可以。"
+)
 
 #: 2026-10-10 段拆分：从 [schedule] 迁往 [schedule_advanced] 的字段（键名不变，仅换段）
 _SCHEDULE_TO_ADVANCED_KEYS = (
@@ -474,6 +485,20 @@ class CateyeSuiteConfig(PluginConfigBase):
             llm_data.setdefault("qzone_task_name", qzone_data.pop("llm_task_name"))
         else:
             qzone_data.pop("llm_task_name", None)
+
+        # 3b) [patrol] 的两个可编提示词（1.0.0 的 miss_reason_prompt / miss_confirm_prompt）
+        #     → [prompts] companion_miss_reason / companion_miss_confirm（**仅非出厂值才搬**，
+        #     与 [cateye] 提示词同口径；T3 问题表 #3 用户裁决 A：不搬会静默回退出厂文案）
+        for old_key, new_key, factory_texts in (
+            ("miss_reason_prompt", "companion_miss_reason",
+             (_LEGACY_MISS_REASON_PROMPT_DEFAULT, COMPANION_MISS_REASON_DEFAULT)),
+            ("miss_confirm_prompt", "companion_miss_confirm",
+             (COMPANION_MISS_CONFIRM_DEFAULT,)),
+        ):
+            legacy_text = patrol_data.pop(old_key, None)
+            if (isinstance(legacy_text, str) and legacy_text.strip()
+                    and legacy_text not in factory_texts):
+                prompts_data.setdefault(new_key, legacy_text)
 
         # 5) [schedule] 深水字段 → [schedule_advanced]（键名不变；2026-10-10 段拆分）
         advanced_data = dict(migrated.get("schedule_advanced") or {})

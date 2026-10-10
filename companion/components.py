@@ -212,6 +212,15 @@ class CompanionComponentsMixin:
     def _mai_companion(self) -> Any:
         return getattr(self, "_companion", None)
 
+    def _mai_patrol_enabled(self) -> bool:
+        """陪伴模块总开关（``[patrol].enabled``）。
+
+        T3 问题表 #4（用户裁决 ②）：此前 enabled=false 只停巡检，文档承诺的
+        「不注入好感度 / 命令与工具返回未启用提示」不成立——现按文档逐入口补齐。
+        """
+        section = getattr(getattr(self, "config", None), "patrol", None)
+        return bool(getattr(section, "enabled", True))
+
     def _mai_schedule_query(self) -> Optional[ScheduleQuery]:
         companion = self._mai_companion()
         if companion is not None:
@@ -592,6 +601,9 @@ class CompanionComponentsMixin:
         """
         if scope == _SCOPE_SKIP:
             return ""
+        if not self._mai_patrol_enabled():
+            # [patrol].enabled=false：不注入好感度（T3 #4；与字段 description/hint 的承诺对齐）
+            return ""
         if scope == _SCOPE_GROUP and not self._mai_inject_affection_in_group():
             return ""
         companion = self._mai_companion()
@@ -701,6 +713,8 @@ class CompanionComponentsMixin:
     )
     async def mai_tool_send_message(self, message: str = "", **kwargs: Any) -> str:
         """LLM Tool: 主动向陪伴对象发送消息（带情绪后缀；成功计 1 次发言数并记决策日志）。"""
+        if not self._mai_patrol_enabled():
+            return "陪伴模块未启用（[patrol].enabled=false）。"   # T3 #4：工具按文档返回未启用提示
         companion = self._mai_companion()
         if companion is None:
             return "陪伴服务未初始化。"
@@ -817,6 +831,9 @@ class CompanionComponentsMixin:
         companion = self._mai_companion()
         if not await self._authorize_command(kwargs):
             return True, "没有权限", True
+        if not self._mai_patrol_enabled():
+            # T3 #4：指令按文档返回未启用提示（此前静默照跑）
+            return True, "陪伴模块未启用（[patrol].enabled=false）。", True
         stream_id = str(kwargs.get("stream_id", "") or "")
 
         # 参数优先取正则命名捕获（兼容"引用+命令"场景下 text 前缀混入其他内容）

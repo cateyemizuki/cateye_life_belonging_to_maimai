@@ -205,10 +205,12 @@ class CompanionServices:
                 )
         except Exception:
             pass
-        cateye_cfg = getattr(cfg, "cateye", None)
+        # T3 问题表 #5：旧实现在热重载路径读已删除的 [cateye].context_ttl_minutes
+        # （getattr 恒落默认 90）→ 用户设 0/30/1440 后只要保存任意一次配置就被静默重置。
+        # 现与构造期同源：读 [patrol].screen_context_ttl_minutes。
         try:
             self.screen_store.ttl_seconds = (
-                max(0.0, float(getattr(cateye_cfg, "context_ttl_minutes", 90) or 0)) * 60.0
+                max(0.0, float(getattr(cfg.patrol, "screen_context_ttl_minutes", 90) or 0)) * 60.0
             )
         except Exception:
             pass

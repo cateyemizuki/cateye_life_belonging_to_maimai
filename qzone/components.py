@@ -246,10 +246,15 @@ class QzoneComponentsMixin:
         return "未知空间子命令，用 /lbm_life help 查看。"
 
     def _qz_cookie_uin(self) -> str:
-        """当前空间 cookie 对应的 bot QQ 号（用于标注自己的评论；取不到返回空串）。"""
+        """当前空间 cookie 对应的 bot QQ 号（用于标注自己的评论；取不到返回空串）。
+
+        T3 问题表 #6：旧实现写成 ``str(cookies).get("uin")``——cookies 正常是 dict，
+        先 ``str()`` 再 ``.get()`` 必然抛 AttributeError（comments/reply 命令在 cookie
+        就绪时无回复）。改与 ``qzone/cgi.py`` 的 ``uin`` 读取同口径：直接取 dict 的键。
+        """
         qz = getattr(self, "_qzone", None)
         mgr = getattr(qz, "_cookie_manager", None)
         cookies = getattr(mgr, "_cached", None)
-        if not cookies:
+        if not isinstance(cookies, dict):
             return ""
-        return str(cookies).get("uin", "").lstrip("o0") if isinstance(cookies, dict) else ""
+        return str(cookies.get("uin") or "").lstrip("o0")
