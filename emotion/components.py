@@ -169,8 +169,13 @@ class EmotionComponentsMixin:
     # ============================================================
     # Hooks（planner + replyer 双通道：均插到第一条系统提示词之后）
     # ============================================================
-    def _emo_inject(self, kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _emo_inject(self, kwargs: Dict[str, Any], **writeback: Any) -> Optional[Dict[str, Any]]:
         """按 payload 形态把情绪底色系统条目插到第一条系统提示词之后。
+
+        ``writeback``：随 ``modified_kwargs`` 一并**原样回传**的键。宿主对 blocking
+        处理器返回的 modified_kwargs 做整份替换，被具名参数接住的键（session_id /
+        attempt）若不显式写回，链上后续处理器就再也看不到它们（2026-10-10 N6：
+        planner 链 session_id 被吞 → 好感度块恒 skip、日程注入退化为 unknown 单桶）。
 
         Returns:
             Hook 返回 dict；payload 无法识别时返回 None（调用方回 continue）。
@@ -184,17 +189,33 @@ class EmotionComponentsMixin:
             modified = inject_into_items_after_system(payload, text)
         else:
             modified = inject_into_messages(payload, text)
-        return {"action": "continue", "modified_kwargs": {**kwargs, payload_key: modified}}
+        return {"action": "continue", "modified_kwargs": {**kwargs, **writeback, payload_key: modified}}
 
     @HookHandler("maisaka.planner.before_request",
                  name="emotion_planner_inject",
                  description="把当前情绪底色（模糊化）以系统条目插入 planner 上下文的第一条系统提示词之后",
                  mode=HookMode.BLOCKING, order=HookOrder.NORMAL,
                  timeout_ms=2000, error_policy=ErrorPolicy.SKIP)
-    async def emo_hook_planner_inject(self, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
+    async def emo_hook_planner_inject(self, **kwargs: Any) -> dict[str, Any]:
+        """planner 通道情绪底色注入（本 Hook 是 planner 链上排序最靠前的一个，见 N6 审计）。
+
+        ``session_id``（replyer 通道路径另含 ``attempt``）一律走 ``**kwargs`` 并在
+        回传里原样写回：本 Hook 一旦返回 modified_kwargs，宿主会整份替换请求参数，
+        具名参数接住的键会在链上消失（emotion 因此曾被判为「第一个剥者」）。
+        """
         if not self._emo_module_enabled() or not self._injection_enabled():
             return {"action": "continue"}
-        result = self._emo_inject(kwargs)
+        session_id = str(kwargs.get("session_id") or "")
+        if not session_id:
+            # 失效路径不再静默（N6-4）：空 session_id 会连带影响下游日程注入的桶键
+            try:
+                self.ctx.logger.warning(
+                    "planner 情绪注入未拿到 session_id（宿主未传或上游 Hook 未写回）："
+                    "下游日程注入与好感度块的作用域/缓存键将退化为 unknown"
+                )
+            except Exception:
+                pass
+        result = self._emo_inject(kwargs, session_id=session_id)
         return result or {"action": "continue"}
 
     @HookHandler("maisaka.replyer.before_model_request",
@@ -202,12 +223,15 @@ class EmotionComponentsMixin:
                  description="把当前情绪底色（模糊化）以系统条目插入 replyer 模型请求的第一条系统提示词之后",
                  mode=HookMode.BLOCKING, order=HookOrder.NORMAL,
                  timeout_ms=2000, error_policy=ErrorPolicy.SKIP)
-    async def emo_hook_replyer_model_inject(self, attempt: int = 1, **kwargs: Any) -> dict[str, Any]:
+    async def emo_hook_replyer_model_inject(self, **kwargs: Any) -> dict[str, Any]:
+        """replyer 模型请求通道情绪底色注入（``attempt``/``session_id`` 读取后原样写回）。"""
+        attempt = kwargs.get("attempt", 1)
         if attempt and int(attempt) > 1:  # 重试请求不重复加压
             return {"action": "continue"}
         if not self._emo_module_enabled() or not self._injection_enabled():
             return {"action": "continue"}
-        result = self._emo_inject(kwargs)
+        session_id = str(kwargs.get("session_id") or "")
+        result = self._emo_inject(kwargs, session_id=session_id, attempt=attempt)
         return result or {"action": "continue"}
 
     def _injection_enabled(self) -> bool:

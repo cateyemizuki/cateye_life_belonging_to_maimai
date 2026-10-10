@@ -6,6 +6,8 @@ This module provides semantic validation for schedule items.
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
+from ..time_utils import normalize_day_minutes
+
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +15,43 @@ logger = logging.getLogger(__name__)
 EMOTIONAL_TONE_CLAMP = 0.5
 #: emotional_tone 的三个维度（V 效价 / A 唤醒 / D 支配）
 EMOTIONAL_TONE_AXES = ("valence", "arousal", "dominance")
+
+#: 空档类警告的识别标记（N2/N1：quality_scorer 据此单独重罚，空档必须能压到重试线下）
+GAP_WARNING_MARKER = "时间空档"
+
+
+def is_gap_warning(warning: Any) -> bool:
+    """警告是否属于「时间空档」类（N2/N1：空档类警告单独重罚，能触发重试）。"""
+    return GAP_WARNING_MARKER in str(warning or "")
+
+
+def item_time_block(item: Any) -> Optional[Tuple[str, int, int]]:
+    """取日程条目 ``(名称, 起始分钟, 结束分钟)``；取不到 → ``None``。
+
+    两形态通吃（N2：空档检查 / 覆盖率评分在归一化前、后都能跑，取数口径唯一）：
+
+    - **归一化条目**（DB 形态）：``start_minute`` / ``end_minute``（跨午夜 ``end`` 可 >1440）；
+    - **原始条目**（LLM 形态）：``time_slot`` + ``duration_hours``；缺 ``duration_hours``
+      时取不到结束时间 → ``None``（与旧实现口径一致，不臆造时长）。
+    """
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("name") or "未命名")
+    start, end = item.get("start_minute"), item.get("end_minute")
+    if start is not None and end is not None:
+        try:
+            return name, int(start), int(end)
+        except (TypeError, ValueError):
+            return None
+    time_slot = str(item.get("time_slot") or "")
+    duration_hours = item.get("duration_hours")
+    if not time_slot or duration_hours is None:
+        return None
+    try:
+        start_minutes = ScheduleSemanticValidator._parse_time_to_minutes(time_slot)
+        return name, start_minutes, start_minutes + int(float(duration_hours) * 60)
+    except (TypeError, ValueError):
+        return None
 
 
 def clip_emotional_tone(raw: Any, limit: float = EMOTIONAL_TONE_CLAMP) -> Dict[str, float]:
@@ -50,6 +89,9 @@ class ScheduleSemanticValidator:
     - 活动持续时间
     - 优先级匹配
     """
+
+    #: 空档判定阈值（分钟）：相邻条目间隙 ≥ 此值计为「时间空档」（N2 原口径不变）
+    GAP_MINUTES = 30
 
     # 合理时间范围（小时）- 基于常识的时间安排
     REASONABLE_TIME_RANGES = {
@@ -248,58 +290,71 @@ class ScheduleSemanticValidator:
         except (ValueError, IndexError, AttributeError):
             return 0
 
+    @staticmethod
+    def _item_time_block(item: Any) -> Optional[Tuple[str, int, int]]:
+        """取条目 ``(名称, 起始分钟, 结束分钟)``；取不到 → ``None``（委托模块级 :func:`item_time_block`）。"""
+        return item_time_block(item)
+
+    @classmethod
+    def _gap_warnings(cls, blocks: List[Tuple[str, int, int]], *,
+                      min_gap_minutes: int = GAP_MINUTES,
+                      allowed_gap: Optional[Tuple[int, int]] = None) -> List[str]:
+        """相邻条目空档检查（``blocks`` = ``(名称, 起始, 结束)``，按起始排序后逐对比较）。
+
+        ``end`` 可 >1440（跨午夜写法）；展示用钟点统一经 :func:`normalize_day_minutes` 归一
+        （1500 → 01:00），避免出现 "25:00" 这类帧外钟点。``allowed_gap`` 内的间隙不算空档
+        （跨午夜作息下缺睡觉条目时，睡眠环本身就是留空段）。
+        """
+        if not blocks:
+            return []
+        ordered = sorted(blocks, key=lambda block: block[1])
+        warnings: List[str] = []
+        for current, nxt in zip(ordered, ordered[1:]):
+            current_end, next_start = current[2], nxt[1]
+            if next_start <= current_end:
+                continue
+            gap_minutes = next_start - current_end
+            if gap_minutes < min_gap_minutes:
+                continue
+            if allowed_gap and allowed_gap[0] <= current_end and next_start <= allowed_gap[1]:
+                continue
+            current_end_time = f"{normalize_day_minutes(current_end) // 60:02d}:{normalize_day_minutes(current_end) % 60:02d}"
+            next_start_time = f"{normalize_day_minutes(next_start) // 60:02d}:{normalize_day_minutes(next_start) % 60:02d}"
+            warnings.append(
+                f"注意：时间空档：{current_end_time}-{next_start_time} "
+                f"({gap_minutes / 60.0:.1f}小时无安排)"
+            )
+        return warnings
+
     def _check_time_continuity(self, items: List[Dict]) -> List[str]:
         """检查时间连续性，检测活动之间的空档
 
         Args:
-            items: 日程项列表
+            items: 日程项列表（原始 LLM 形态；归一化条目同样可判）
 
         Returns:
             警告列表
         """
-        warnings = []
+        blocks = [block for block in (self._item_time_block(item) for item in (items or [])) if block]
+        return self._gap_warnings(blocks)
 
-        # 1. 提取并解析所有活动的时间信息
-        time_blocks = []
-        for item in items:
-            time_slot = item.get("time_slot", "")
-            duration_hours = item.get("duration_hours")
+    def check_normalized_gaps(
+        self,
+        items: List[Dict],
+        *,
+        min_gap_minutes: int = GAP_MINUTES,
+        wake_min: Optional[int] = None,
+        sleep_min: Optional[int] = None,
+    ) -> List[str]:
+        """对**归一化之后**的条目复查空档（N2/N1：归一化制造的空档只有此时才看得见）。
 
-            if not time_slot or not duration_hours:
-                continue
-
-            start_minutes = self._parse_time_to_minutes(time_slot)
-            end_minutes = start_minutes + int(duration_hours * 60)
-
-            time_blocks.append({
-                "name": item.get("name", "未命名"),
-                "start": start_minutes,
-                "end": end_minutes
-            })
-
-        if not time_blocks:
-            return warnings
-
-        # 2. 按开始时间排序
-        time_blocks.sort(key=lambda x: x["start"])
-
-        # 3. 检查相邻活动之间的空档
-        for i in range(len(time_blocks) - 1):
-            current_end = time_blocks[i]["end"]
-            next_start = time_blocks[i + 1]["start"]
-
-            if next_start > current_end:
-                gap_minutes = next_start - current_end
-                gap_hours = gap_minutes / 60.0
-
-                # 超过30分钟的空档视为问题
-                if gap_minutes >= 30:
-                    current_end_time = f"{current_end // 60:02d}:{current_end % 60:02d}"
-                    next_start_time = f"{next_start // 60:02d}:{next_start % 60:02d}"
-
-                    warnings.append(
-                        f"⚠️ 时间空档：{current_end_time}-{next_start_time} "
-                        f"({gap_hours:.1f}小时无安排)"
-                    )
-
-        return warnings
+        入参取 ``start_minute`` / ``end_minute``（DB 形态）；跨午夜条目 ``end`` 可 >1440，
+        展示钟点按日帧归一。跨午夜作息（``sleep_min <= wake_min``，如 01:00 入睡 / 07:00 起床）
+        且睡觉条目缺失时，睡眠环 ``[sleep_min, wake_min)`` 本身会表现为一段空档——该段不算空档
+        （睡眠时段本就留空），其余间隙按 :attr:`GAP_MINUTES` 判定。
+        """
+        blocks = [block for block in (self._item_time_block(item) for item in (items or [])) if block]
+        allowed_gap: Optional[Tuple[int, int]] = None
+        if wake_min is not None and sleep_min is not None and int(sleep_min) <= int(wake_min):
+            allowed_gap = (int(sleep_min), int(wake_min))
+        return self._gap_warnings(blocks, min_gap_minutes=min_gap_minutes, allowed_gap=allowed_gap)

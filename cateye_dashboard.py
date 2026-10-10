@@ -22,10 +22,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 #: 区块标题（键 → 固定标题；顺序即展示顺序）
 _BLOCK_TITLES: Tuple[Tuple[str, str], ...] = (
-    ("planning", "📅 日程规划"),
-    ("companion", "❤️ 伴侣关系"),
-    ("emotion", "🎭 情绪"),
-    ("qzone", "🌐 QQ空间"),
+    ("planning", "日程规划"),
+    ("companion", "伴侣关系"),
+    ("emotion", "情绪"),
+    ("qzone", "QQ空间"),
 )
 
 #: 未启用区块的唯一一行
@@ -294,9 +294,9 @@ def _companion_lines(block: Dict[str, Any]) -> List[str]:
         f"档位 {_to_int(block.get('tier'))}·{str(block.get('tier_label') or '')}",
         f"今日主动发言 {_to_float(block.get('speak_count')):g}/{_to_int(block.get('daily_max'))}"
         f"｜今日Δ {_to_float(block.get('daily_net')):+.2f}",
-        f"早安 {'✅' if block.get('morning_sent') else '❌'}"
-        f"｜晚安 {'✅' if block.get('night_sent') else '❌'}"
-        f"｜想念 {'✅' if block.get('miss_sent') else '❌'}",
+        f"早安 {'是' if block.get('morning_sent') else '否'}"
+        f"｜晚安 {'是' if block.get('night_sent') else '否'}"
+        f"｜想念 {'是' if block.get('miss_sent') else '否'}",
         f"巡检 {'运行中' if patrol.get('running') else '未运行'}"
         f"｜上次巡检 {str(patrol.get('last_tick_at') or '无')}"
         f"｜间隔 {_to_int(patrol.get('interval_minutes'))}min"
@@ -384,7 +384,7 @@ def render_dashboard_text(blocks: Any, *, now: Optional[datetime] = None) -> str
     """
     now = now or datetime.now()
     weekday = "一二三四五六日"[now.weekday()]
-    lines = [f"🐱 属于麦麦的生活 状态总览 {now.strftime('%Y-%m-%d')} 周{weekday}"]
+    lines = [f"属于麦麦的生活 状态总览 {now.strftime('%Y-%m-%d')} 周{weekday}"]
     for title, body in _block_lines(blocks, full_items=True):
         lines.append("")
         lines.append(title)

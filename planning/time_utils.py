@@ -155,6 +155,144 @@ def format_minutes_to_time(minutes: int) -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
+# ==================== 日帧分钟 / 睡眠环（跨午夜统一口径；N2/N4）====================
+# 约定（日程生成链与展示/读取侧共用，唯一真源）：
+#     条目 start_minute 取当天帧 [0, 1440) 的钟点分钟；
+#     end_minute 允许 > 1440 表达"跨午夜"（如 23:00 入睡 + 8h ⇒ 1380→1860）；
+#     展示侧一律经 :func:`format_day_minute` 渲染（>1440 ⇒ "次日 HH:MM"）；
+#     读取侧的"是否在进行中 / 是否接下来"一律经 :func:`is_in_day_frame` /
+#     :func:`is_upcoming_day_minute`（同一个 24h 环），不得各自手写 ``//60`` 或一次性 −1440。
+DAY_MINUTES = 24 * 60
+#: 模块内短名（历史沿用；对外请用 :data:`DAY_MINUTES`）
+_DAY_MINUTES = DAY_MINUTES
+
+
+def normalize_day_minutes(minutes: Any) -> int:
+    """日帧分钟归一：任意分钟数 → ``[0, 1440)``（跨午夜条目 ``end>1440`` 归一后即次日钟点）。
+
+    N2/N4：日程归一化按「跨午夜 = 同一个 24h 环」处理，条目的 ``end_minute`` 允许大于 1440
+    （如 23:00 入睡 + 8h ⇒ 1380→1860）；展示/读取侧需先经本函数归一，再按 ``HH:MM`` 渲染，
+    避免手写 ``//60/%60`` 或一次性 ``−1440`` 各自漂移。非法输入 → 0（不抛异常，可空降级）。
+    """
+    try:
+        value = int(minutes)
+    except (TypeError, ValueError):
+        return 0
+    return value % _DAY_MINUTES
+
+
+def _day_offset_minutes(minutes: Any) -> Tuple[int, int]:
+    """日帧分钟 → ``(日偏移, 帧内钟点分钟)``（跨午夜分解的唯一实现）。
+
+    - ``[0, 1440)`` → ``(0, 原值)``；
+    - ``>= 1440``（跨午夜写法，如 1860 = 次日 07:00）→ ``(1, 原值 − 1440)``；
+    - 负值（防御性；正常链路不产生）→ ``(-1, 原值 + 1440)``。
+
+    非法输入按 ``0`` 处理（不抛异常，可空降级）。
+    """
+    try:
+        value = int(minutes)
+    except (TypeError, ValueError):
+        return 0, 0
+    offset = value // _DAY_MINUTES          # 向下取整：负值也得到负偏移
+    return offset, value - offset * _DAY_MINUTES
+
+
+def format_day_minute(minutes: Any) -> str:
+    """日帧分钟 → 展示文本（**唯一实现**：禁止展示面各自手写 ``//60/%60``）。
+
+    口径（与 :func:`normalize_day_minutes` 同一个 24h 环）：
+
+    - ``[0, 1440)`` → ``HH:MM``（570 → ``09:30``）；
+    - ``>= 1440`` → ``次日 HH:MM``（1860 → ``次日 07:00``；旧写法裸做 ``//60`` 会渲染成
+      ``31:00``，即读取侧跨午夜渲染缺陷）；
+    - 负值 → ``前日 HH:MM``（防御性）。
+
+    偏移超过 1 天不在现有生成链内（条目时长 ≤ 12h + 跨午夜 ⇒ 偏移恒为 ±1）；此处同向偏移
+    统一标「次日 / 前日」，不做多日标号。
+    """
+    offset, clock = _day_offset_minutes(minutes)
+    text = f"{clock // 60:02d}:{clock % 60:02d}"
+    if offset > 0:
+        return f"次日 {text}"
+    if offset < 0:
+        return f"前日 {text}"
+    return text
+
+
+def is_in_day_frame(start_minute: Any, end_minute: Any, cur_minute: Any) -> bool:
+    """条目 ``[start, end)`` 是否覆盖 ``cur``（跨午夜按**同一个 24h 环**判定，唯一实现）。
+
+    ``end`` 可 >1440（跨午夜写法，如 23:00 入睡 + 8h ⇒ ``1380 → 1860``）：把 ``cur`` 与
+    ``cur + 1440`` 两个等价环位一起试——``cur=30``（凌晨 00:30）⇒ ``1470`` 落在
+    ``[1380, 1860)`` → 命中（"现在正在进行"）；``cur=600``（10:00）⇒ 两个环位都不落在窗口内
+    → 未命中。``end <= start``（倒挂/无时长）视为非法条目 → ``False``。
+    """
+    try:
+        start = int(start_minute)
+        end = int(end_minute)
+        cur = int(cur_minute)
+    except (TypeError, ValueError):
+        return False
+    if end <= start:
+        return False
+    cur = normalize_day_minutes(cur)
+    return start <= cur < end or start <= cur + _DAY_MINUTES < end
+
+
+def is_upcoming_day_minute(start_minute: Any, cur_minute: Any, end_minute: Any = None) -> bool:
+    """``start`` 是否在 ``cur`` 之后（**同一个 24h 环**，日帧 ``[0, 1440)``；唯一实现）。
+
+    - ``start > cur``：同帧内稍后（14:00 > 12:30）→ ``True``；
+    - ``start == cur``：正好开始（"正在进行"由 ``find_current_activity`` 负责）→ ``False``；
+    - ``start == 0 < cur``：帧首分钟在环上同时是**帧尾**（= 1440，即"今晚 24:00"）→ ``True``
+      ——这就是「23:35 的下一步是 00:00 的尾段条目」；白天查询时这类帧尾条目同样会列出
+      （它表示"今晚 24:00"的下一段，同一环口径的自然结果），排序恒排最后；但给出
+      ``end_minute`` 且 ``cur`` 仍落在该窗口内时（如 00:30 的 ``(0, 60)`` 尾段）它是
+      "正在进行"而非"接下来" → ``False``；
+    - 其余 ``start < cur``：帧内已过 → ``False``（**不**回绕成"明天同一时刻"，否则列表会
+      把整天条目都当作"接下来"）。
+    """
+    start = normalize_day_minutes(start_minute)
+    cur = normalize_day_minutes(cur_minute)
+    if start > cur:
+        return True
+    if start != 0 or cur == 0:
+        return False
+    if end_minute is not None and is_in_day_frame(start, end_minute, cur):
+        return False
+    return True
+
+
+def ring_minutes_ahead(start_minute: Any, cur_minute: Any) -> int:
+    """``start`` 相对 ``cur`` 在 24h 环上"还在前面"的分钟数（``0`` = 同一分钟）。
+
+    排序用（值越小越近）：帧尾（``start == 0 < cur``）得 ``1440 − cur``，自然排在最后；
+    与 :func:`is_upcoming_day_minute` 同一环口径。
+    """
+    return (normalize_day_minutes(start_minute) - normalize_day_minutes(cur_minute)) % _DAY_MINUTES
+
+
+def is_in_sleep_ring(start_minute: Any, wake_min: Any, sleep_min: Any) -> bool:
+    """判断某钟点分钟是否落在**睡眠环**内（跨午夜按同一个 24h 环处理）。
+
+    - ``sleep_min <= wake_min``（跨午夜作息，如 01:00 入睡 / 07:00 起床）：
+      睡眠环 = ``[sleep_min, wake_min)``，清醒时段绕午夜延续（``[wake, 1440) ∪ [0, sleep)``）；
+    - 否则（常规作息，如 23:00 入睡 / 07:00 起床）：
+      睡眠环 = ``[sleep_min, 1440) ∪ [0, wake_min)``。
+
+    睡眠环内的条目（睡觉 / 跨午夜条目）保留 ``start + 时长`` 的跨午夜写法（``end`` 可 >1440）；
+    环外（清醒）条目的 ``end`` 才夹到入睡锚点（跨午夜作息下即 ``sleep_min + 1440``）。
+    入参均为 HH:MM 解析出的钟点分钟；非法输入按 0 归一（可空降级）。
+    """
+    start = normalize_day_minutes(start_minute)
+    wake = normalize_day_minutes(wake_min)
+    sleep = normalize_day_minutes(sleep_min)
+    if sleep <= wake:
+        return sleep <= start < wake
+    return start >= sleep or start < wake
+
+
 def get_time_window_from_goal(goal: Any) -> Tuple[int, int]:
     """从目标对象中提取时间窗口（优先 parameters，其次 conditions；默认 (0, 60)）。"""
     time_window = None

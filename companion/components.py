@@ -46,6 +46,7 @@ from maibot_sdk import API, Command, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from companion.config import target_qq_of
+from companion.patrol import resolve_silence_window
 from core.diag import DecisionLogger
 from core.inject import pick_payload_key, project_injection, without_stale_proactive_blocks
 from planning.schedule_query import ScheduleQuery
@@ -398,7 +399,7 @@ class CompanionComponentsMixin:
         timeout_ms=3000,
         error_policy=ErrorPolicy.SKIP,
     )
-    async def mai_hook_planner_inject(self, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
+    async def mai_hook_planner_inject(self, **kwargs: Any) -> dict[str, Any]:
         """注入陪伴上下文（屏幕旁白 + 好感度 + 主动回合软约束；2026-10-10 注入矩阵）。
 
         日期行与当前活动**不再由本 Hook 注入**：日期/节假日行归日程模块
@@ -409,7 +410,25 @@ class CompanionComponentsMixin:
         屏幕旁白与好感度注入相互独立，所以先算旁白——保证任何一条早退路径都不会
         把旁白丢掉。items 是强 schema 载荷：新条目 meta 必须完整，modified_kwargs
         必须全量回传（core.inject 负责构造合法快照）。
+
+        session_id 写回（2026-10-10 N6 注入链修复）：宿主对 blocking 处理器返回的
+        ``modified_kwargs`` 做整份替换，被 ``**kwargs`` 之外具名参数接住的键不会
+        再出现在回传里。故本 Hook 不声明 ``session_id`` 具名参数，改为从 kwargs
+        读取，并在**每条带 modified_kwargs 的返回分支**原样写回——否则链上后续
+        处理器（schedule_inject_v4）只会拿到空 session_id，好感度块恒 skip、
+        日程注入按 ``user=unknown`` 单桶冷却。
         """
+        session_id = str(kwargs.get("session_id") or "")
+        if not session_id:
+            # 失效路径不再静默：上游没写回/宿主没传时留一条线索
+            try:
+                self.ctx.logger.warning(
+                    "planner 注入未拿到 session_id（上游 Hook 未写回或宿主未传）："
+                    "好感度块作用域将退化为 skip，日程注入缓存键退化为 unknown"
+                )
+            except Exception:
+                pass
+
         # mai-love v2.6.2：先剥离过期的宿主主动任务块（与后续注入相互独立，
         # 放在最前，保证下面任何早退路径都不受影响）。
         stripped = without_stale_proactive_blocks(kwargs)
@@ -428,9 +447,9 @@ class CompanionComponentsMixin:
         # 2) 活动注入（日程服务不可用 → 只保留旁白结果）
         payload_key, payload = pick_payload_key(kwargs)
         if not payload_key:
-            return {"action": "continue", "modified_kwargs": kwargs}
+            return {"action": "continue", "modified_kwargs": {**kwargs, "session_id": session_id}}
 
-        scope = self._mai_resolve_injection_scope(str(session_id or ""), payload)
+        scope = self._mai_resolve_injection_scope(session_id, payload)
 
         # 3) 超限不再整体跳过：先把最大的图片 part 换成文本占位符再注入
         shrunk, omitted = _shrink_payload_for_injection(payload)
@@ -441,7 +460,7 @@ class CompanionComponentsMixin:
                 )
             except Exception:
                 pass
-            return {"action": "continue", "modified_kwargs": kwargs}
+            return {"action": "continue", "modified_kwargs": {**kwargs, "session_id": session_id}}
         if omitted:
             try:
                 self.ctx.logger.info(f"planner payload 过大，已省略 {omitted} 张图片以完成活动注入")
@@ -453,10 +472,13 @@ class CompanionComponentsMixin:
             suffix += self._mai_build_proactive_target_rule()
         if not suffix.strip():
             # 没有可注入文本：不回传收缩后的载荷（避免白丢图片）
-            return {"action": "continue", "modified_kwargs": kwargs}
+            return {"action": "continue", "modified_kwargs": {**kwargs, "session_id": session_id}}
 
         modified_payload = project_injection(payload_key, shrunk, suffix)
-        return {"action": "continue", "modified_kwargs": {**kwargs, payload_key: modified_payload}}
+        return {
+            "action": "continue",
+            "modified_kwargs": {**kwargs, "session_id": session_id, payload_key: modified_payload},
+        }
 
     @HookHandler(
         "maisaka.replyer.before_model_request",
@@ -881,7 +903,7 @@ class CompanionComponentsMixin:
         stream_id = str(kwargs.get("stream_id", "") or "")
         name = self._mai_lover_name()
         help_text = (
-            f"🐱 {name} 可用命令:\n"
+            f"{name} 可用命令:\n"
             "/lbm_mai_affection — 查看/调整好感度: /lbm_mai_affection [0|1|2]\n"
             "/lbm_diag          — 排障诊断 [llm|decision|life] [天数]（管理员；旧名 mai_llm_log/mai_diag 仍可用）\n"
             "/lbm_dashboard     — 状态总览图（日程/关系/情绪/空间，管理员）\n"
@@ -1238,21 +1260,26 @@ class CompanionComponentsMixin:
 
         T6 注册面收口后 /lbm_mai_config 命令已移除：单行版仍由
         /lbm_dashboard 的纯文本档末行消费，多行版仅供离线测试与后续入口复用。
+
+        静默行显示**生效值 + 来源**（N5：``[patrol].silence_*`` 留空 = 跟随 ``[schedule]``
+        作息锚点）——与巡检静默闸 / 晚安期限共用 ``resolve_silence_window``（唯一真源），
+        不再回显原始配置（留空会显示成「静默 ~」）。
         """
         patrol = self.config.patrol
+        silence = resolve_silence_window(self.config)
         miss_llm = "开" if getattr(patrol, "miss_llm_check_enabled", False) else "关"
         screen = "开" if getattr(patrol, "screen_enabled", False) else "关"
         patrol_activity = "开" if getattr(patrol, "patrol_activity_enabled", True) else "关"
         group_inject = "开" if getattr(patrol, "inject_affection_in_group", True) else "关"
         if multiline:
             return (
-                "⚙️ 麦麦陪伴配置摘要\n"
+                "麦麦陪伴配置摘要\n"
                 f"调度: 巡检间隔 {patrol.check_interval_minutes}min | "
                 f"每日预算 {patrol.daily_max_speak} 条（只计巡检与想念，早晚安免预算） | "
                 f"最小间隔 {patrol.min_trigger_interval_minutes}min（早/晚安始终豁免） | "
                 f"冷却 {patrol.user_cooldown_minutes}min | "
                 f"触发开关 {'开启' if patrol.proactive_trigger_enabled else '关闭'}\n"
-                f"时间: 静默 {patrol.silence_start}~{patrol.silence_end}（早/晚安时刻由日程模块漂移驱动） | "
+                f"时间: 静默 {silence.describe()}（早/晚安时刻由日程模块漂移驱动） | "
                 f"想念阈值 {getattr(patrol, 'miss_silence_hours', '4-8')}h（LLM把关{miss_llm}）\n"
                 f"概率: 日常 {patrol.default_speak_rate} | "
                 f"想念 {patrol.miss_speak_rate} | "
@@ -1263,7 +1290,7 @@ class CompanionComponentsMixin:
                 f"日志: {self._mai_patrol_status_line() or '（巡检未初始化）'}"
             )
         return (
-            f"⚙️ 麦麦陪伴配置: 巡检间隔 {patrol.check_interval_minutes}min | "
+            f"麦麦陪伴配置: 巡检间隔 {patrol.check_interval_minutes}min | "
             f"每日预算 {patrol.daily_max_speak} 条 | "
             f"最小间隔 {patrol.min_trigger_interval_minutes}min | "
             f"冷却 {patrol.user_cooldown_minutes}min | "
@@ -1285,7 +1312,7 @@ class CompanionComponentsMixin:
         first_time = str(entries[0].get("time", "?"))
         last_time = str(entries[-1].get("time", "?"))
         header = (
-            "📋 麦麦陪伴 LLM 调用日志\n"
+            "麦麦陪伴 LLM 调用日志\n"
             f"时间范围: {first_time} ~ {last_time}\n"
             f"共 {total} 条（展示最近 {len(shown)} 条） | 保留 {retention_days} 天"
         )
@@ -1294,7 +1321,7 @@ class CompanionComponentsMixin:
              "segments": [{"type": "text", "content": header}]}
         ]
         for entry in shown:
-            status = "✅" if entry.get("success") else "❌"
+            status = "成功" if entry.get("success") else "失败"
             body = str(entry.get("response") or "")
             error = str(entry.get("error") or "")
             if error:
@@ -1329,7 +1356,7 @@ class CompanionComponentsMixin:
         top_reasons = sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)[:6]
 
         header = (
-            "🔍 麦麦陪伴 主动行为决策日志\n"
+            "麦麦陪伴 主动行为决策日志\n"
             f"时间范围: {entries[0].get('time', '?')} ~ {entries[-1].get('time', '?')}\n"
             f"共 {total} 条：发起触发 {triggered} / 确认发言 {spoken} / 跳过 {skipped}"
             + (f" / 信息 {info}" if info else "")
@@ -1346,14 +1373,14 @@ class CompanionComponentsMixin:
             trigger_type = str(entry.get("trigger_type") or "")
             reason = str(entry.get("reason") or "unknown")
             if action == "trigger":
-                line = f"[{entry.get('time', '?')}] ✅ 发起触发 · {trigger_type or '?'}\n{entry.get('detail') or ''}"
+                line = f"[{entry.get('time', '?')}] 发起触发 · {trigger_type or '?'}\n{entry.get('detail') or ''}"
             elif action == "spoken":
-                line = f"[{entry.get('time', '?')}] 🗣️ 确认发言 · {trigger_type or '?'}\n{entry.get('detail') or ''}"
+                line = f"[{entry.get('time', '?')}] 确认发言 · {trigger_type or '?'}\n{entry.get('detail') or ''}"
             elif action == "info":
-                line = f"[{entry.get('time', '?')}] ℹ️ {reason}\n{entry.get('detail') or ''}"
+                line = f"[{entry.get('time', '?')}] 信息 · {reason}\n{entry.get('detail') or ''}"
             else:
                 label = _DIAG_REASON_LABELS.get(reason, reason)
-                line = f"[{entry.get('time', '?')}] ⏭️ 跳过 · {reason}（{label}）\n{entry.get('detail') or ''}"
+                line = f"[{entry.get('time', '?')}] 跳过 · {reason}（{label}）\n{entry.get('detail') or ''}"
             extras: list[str] = []
             minutes_since = entry.get("minutes_since_last_speak")
             if minutes_since is not None:

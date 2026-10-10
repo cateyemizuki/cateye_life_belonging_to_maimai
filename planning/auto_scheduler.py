@@ -88,8 +88,9 @@ def _as_minutes(value: Any, default: int) -> int:
 def in_frame_minutes(clock_minutes: int, wake_minutes: int) -> int:
     """钟点分钟数 → **当日帧相对分钟**：``(clock − wake) mod 1440``（帧起点 = 当日 wake 锚点）。
 
-    早于帧起点的钟点回绕到**帧尾**——夜猫子作息（sleep ≤ wake）的入睡锚点、以及被
-    ``_normalize_items`` 截断在入睡锚点之后/凌晨的条目都落在这里。
+    早于帧起点的钟点回绕到**帧尾**——夜猫子作息（sleep ≤ wake）的入睡锚点、以及跨午夜
+    条目落在凌晨的那一段（如 23:00 入睡 + 8h ⇒ 1380→1860，次日 00:00–07:00 段）都落在
+    帧尾（2026-10-10 N2/N4 起条目跨午夜保留原时长，不再被截断到入睡锚点）。
     """
     return (int(clock_minutes) - int(wake_minutes)) % _DAY_MINUTES
 

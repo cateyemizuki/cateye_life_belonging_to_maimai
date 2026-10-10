@@ -15,9 +15,20 @@ Example:
 from typing import Any, Dict, List
 import logging
 
-from ..time_utils import time_slot_to_minutes
+from core.time_utils import parse_hhmm
+
+from .validator import is_gap_warning, item_time_block
 
 logger = logging.getLogger(__name__)
+
+#: 普通警告单项罚分（旧值；保持向后兼容）
+WARNING_PENALTY_PER_ITEM = 0.05
+#: 空档类警告单项罚分（N2/N1：≥0.25 —— 单项即可把满分压到 0.75 < 0.85 重试线）
+GAP_WARNING_PENALTY = 0.25
+#: 评分兜底作息锚点（配置缺 ``wake_time`` / ``sleep_time`` 时用）
+_DEFAULT_WAKE_MINUTES = 7 * 60
+_DEFAULT_SLEEP_MINUTES = 23 * 60
+_DAY_MINUTES = 24 * 60
 
 
 class ScheduleQualityScorer:
@@ -86,12 +97,18 @@ class ScheduleQualityScorer:
               + (活动数量合理 ? activity_count_weight : 0)
               + (描述长度充分 ? description_length_weight : 0)
               + (时间覆盖率 * time_coverage_weight)
-              - min(警告数 * 0.05, warnings_weight)
+              - min(普通警告数 * 0.05, warnings_weight)
+              - min(空档警告数 * GAP_WARNING_PENALTY, 1.0)
         ```
+
+        空档类警告（``validator.GAP_WARNING_MARKER``）单独重罚 ≥0.25/条（N2/N1：旧口径 0.05/条
+        时 0.95 分照样放行；现单项空档即可把满分压到 0.75 < 质量阈值，触发下一轮重试）。
+        条目可为**归一化形态**（``start_minute``/``end_minute``）或**原始形态**
+        （``time_slot``/``duration_hours``），取数口径见 ``validator.item_time_block``。
 
         Args:
             items: 日程项列表
-            warnings: 警告列表
+            warnings: 警告列表（validator 产出）
 
         Returns:
             质量分数（0.0-1.0之间）
@@ -145,8 +162,12 @@ class ScheduleQualityScorer:
         coverage_score = self._score_time_coverage(items)
         score += coverage_score * self.weights['time_coverage']
 
-        # 4. 警告惩罚
-        warning_penalty = min(len(warnings) * 0.05, self.weights['warnings'])
+        # 4. 警告惩罚：普通警告按旧口径，空档类单独重罚（N2/N1：空档必须能触发重试）
+        gap_count = sum(1 for warning in (warnings or []) if is_gap_warning(warning))
+        other_count = max(0, len(warnings or []) - gap_count)
+        ordinary_penalty = min(other_count * WARNING_PENALTY_PER_ITEM, self.weights['warnings'])
+        gap_penalty = min(gap_count * GAP_WARNING_PENALTY, 1.0)
+        warning_penalty = ordinary_penalty + gap_penalty
         score -= warning_penalty
 
         # 确保分数在[0, 1]范围内
@@ -157,7 +178,7 @@ class ScheduleQualityScorer:
             f"(活动数:{activity_count_score:.2f}, "
             f"描述:{description_score:.2f}, "
             f"覆盖:{coverage_score:.2f}, "
-            f"警告:-{warning_penalty:.2f})"
+            f"警告:-{ordinary_penalty:.2f}, 空档:-{gap_penalty:.2f})"
         )
 
         return final_score
@@ -216,9 +237,15 @@ class ScheduleQualityScorer:
             return 0.0  # 不达标
 
     def _score_time_coverage(self, items: List[Dict[str, Any]]) -> float:
-        """评估时间覆盖率
+        """评估**清醒时段**的时间覆盖率（分钟级）：Σ(条目在清醒环内占用的分钟) / 清醒时长。
 
-        期望覆盖全天的主要时段（7:00-23:00，共16小时）
+        清醒环 = ``[wake_min, sleep_min + 1440)``（跨午夜作息 ``sleep_min <= wake_min`` 时绕午夜；
+        否则 ``[wake_min, sleep_min)``）；锚点取配置 ``wake_time`` / ``sleep_time``（缺省 07:00/23:00）。
+        条目可为归一化形态或原始形态（``validator.item_time_block``）；跨午夜条目 ``end`` 可 >1440，
+        按 ``k∈{-1,0,1}`` 平移与清醒环求交，不重复计数。
+
+        N2：旧口径只数"不同起始小时数 / 16"——条目被压成 15 分钟时覆盖率几乎不降
+        （真机 0.69 照旧放行）；分钟级口径下塌缩/空档会直接压低覆盖率。
 
         Args:
             items: 日程项列表
@@ -240,24 +267,25 @@ class ScheduleQualityScorer:
         if not items:
             return 0.0
 
-        # 统计覆盖的小时数
-        covered_hours = set()
+        wake_min = parse_hhmm(str(self.config.get('wake_time') or ''), _DEFAULT_WAKE_MINUTES)
+        sleep_min = parse_hhmm(str(self.config.get('sleep_time') or ''), _DEFAULT_SLEEP_MINUTES)
+        awake_end = sleep_min + (_DAY_MINUTES if sleep_min <= wake_min else 0)
+        awake_len = awake_end - wake_min
+        if awake_len <= 0:
+            return 0.0
 
+        covered = 0
         for item in items:
-            time_slot = item.get('time_slot')
-            if not time_slot:
+            block = item_time_block(item)
+            if block is None:
                 continue
-
-            # 解析时间
-            minutes = time_slot_to_minutes(time_slot)
-            if minutes is None:
+            start, end = block[1], block[2]
+            if end <= start:
                 continue
+            for shift in (-_DAY_MINUTES, 0, _DAY_MINUTES):
+                lo = max(start + shift, wake_min)
+                hi = min(end + shift, awake_end)
+                if hi > lo:
+                    covered += hi - lo
 
-            hour = minutes // 60
-            covered_hours.add(hour)
-
-        # 期望覆盖16小时（7:00-23:00）
-        expected_hours = 16
-        coverage_ratio = len(covered_hours) / expected_hours
-
-        return min(1.0, coverage_ratio)
+        return min(1.0, covered / float(awake_len))

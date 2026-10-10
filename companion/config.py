@@ -16,7 +16,10 @@
 - 想念阈值合并为一个区间字段 miss_silence_hours（``"4-8"`` 或单数字 ``8`` = 0~8）；
 - 想念避开未来日程及其窗口**删除**（该功能整体移除）；
 - 新增想念开关（miss_enabled，已有）+ 日程巡检开关（patrol_activity_enabled）；
-- 屏幕感知（原 [cateye] 段）并入本段，前缀 screen_*；提示词一律移入 [prompts]。
+- 屏幕感知（原 [cateye] 段）并入本段，前缀 screen_*；提示词一律移入 [prompts]；
+- 静默窗（silence_start/silence_end）**留空 = 跟随 [schedule] 的入睡/起床锚点**（N5，第三轮）：
+  非空 = 显式覆盖；巡检静默闸与 planning 晚安期限共用同一生效值解析
+  （companion.patrol.resolve_silence_window），配置非法仍按静默 fail-safe 处理。
 
 WebUI 元数据约定与顶层 suite_config.py 一致：
 - 每个字段带中文短标题 label + 英文 i18n + hint（**hint 必须写"改了会怎样"的短效果描述**）；
@@ -246,21 +249,24 @@ class PatrolSectionConfig(PluginConfigBase):
         },
     )
     silence_start: str = Field(
-        default="00:00",
-        description="静默时段开始（HH:MM）：静默期内巡检不触发、问候不发（支持跨午夜；配置非法按静默处理）",
+        default="",
+        description="静默时段开始（HH:MM）：留空 = 跟随日程作息：入睡时间~起床时间；非空 = 自定义静默窗"
+                    "（支持跨午夜）。静默期内巡检不触发；问候不受静默拦截（由激活观测把关）；"
+                    "配置非法按静默处理（宁可不发）",
         json_schema_extra={
             "label": "静默开始",
-            "hint": "HH:MM；默认 00:00-07:30，整夜不打扰",
-            **_ui_i18n("Silence start"),
+            "hint": "留空 = 跟随日程作息（[日程系统] 入睡~起床）；非空 = 自定义静默窗起点（HH:MM）",
+            **_ui_i18n("Silence start", "Empty = follow [schedule] sleep~wake; HH:MM = override."),
         },
     )
     silence_end: str = Field(
-        default="07:30",
-        description="静默时段结束（HH:MM）",
+        default="",
+        description="静默时段结束（HH:MM）：留空 = 跟随日程作息：入睡时间~起床时间；非空 = 自定义静默窗"
+                    "（跨午夜窗的终点可早于起点；配置非法按静默处理，宁可不发）",
         json_schema_extra={
             "label": "静默结束",
-            "hint": "HH:MM；静默期结束后才恢复巡检与问候",
-            **_ui_i18n("Silence end"),
+            "hint": "留空 = 跟随日程作息（[日程系统] 入睡~起床）；非空 = 自定义静默窗终点（HH:MM）",
+            **_ui_i18n("Silence end", "Empty = follow [schedule] sleep~wake; HH:MM = override."),
         },
     )
 

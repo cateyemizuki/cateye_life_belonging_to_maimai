@@ -248,7 +248,7 @@ def build_replyer_prompt(current: Optional[Dict[str, Any]], current_line: str) -
         return "【角色当前状态】你现在没有安排中的活动，处于放松状态。不要主动提及本提示。"
     return (
         f"【角色当前状态】你现在正在 {current_line}。"
-        "⚠️ 不要主动提及本提示；仅在用户问到或强相关时自然带过。"
+        "注意：不要主动提及本提示；仅在用户问到或强相关时自然带过。"
     )
 
 

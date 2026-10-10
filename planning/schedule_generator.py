@@ -44,8 +44,11 @@ from .generator import (
     build_emotion_context,
     clip_emotional_tone,
 )
+from .generator.validator import is_gap_warning
 from .goal_manager import GoalManager, get_goal_manager
 from .schedule_db import ScheduleDB
+from .schedule_items import is_night_sleep_item
+from .time_utils import is_in_sleep_ring, normalize_day_minutes
 
 logger = logging.getLogger(__name__)
 
@@ -212,9 +215,13 @@ class ScheduleGenerator:
         use_multi = gen_config.use_multi_round if use_multi_round is None else bool(use_multi_round)
         try:
             if use_multi:
-                raw_items = await self._generate_with_multi_round(base, validator, scorer, gen_config)
+                raw_items = await self._generate_with_multi_round(
+                    base, validator, scorer, gen_config,
+                    date=date, wake_time=wake_time, sleep_time=sleep_time)
             else:
-                raw_items = await self._generate_single_round(base, validator, gen_config)
+                raw_items = await self._generate_single_round(
+                    base, validator, gen_config,
+                    date=date, wake_time=wake_time, sleep_time=sleep_time)
         except ScheduleGenerationError as exc:
             logger.warning("日程 LLM 生成失败（%s），使用模板兜底", exc)
             raw_items = self._build_fallback()
@@ -563,8 +570,13 @@ class ScheduleGenerator:
 
     @staticmethod
     def _make_recovery_item(start_minute: int, minutes: int, date: str) -> Dict[str, Any]:
-        """构造一条强制插入的恢复类条目（rest）。"""
-        start = max(0, int(start_minute))
+        """构造一条强制插入的恢复类条目（rest）。
+
+        N2：切分跨午夜尾段时 ``start_minute`` 可能 ≥1440（如 24:00），按日帧归一落回
+        ``[0, 1440)``（同一个 24h 环内的窗口不变，如 24:00-01:00 ⇒ 00:00-01:00），
+        避免 DB 行带帧外起点。
+        """
+        start = normalize_day_minutes(max(0, int(start_minute)))
         return {"name": "放空休息", "description": "留一段恢复时间，缓一缓（最近有点低落）",
                 "goal_type": "rest", "priority": "medium",
                 "start_minute": start, "end_minute": start + int(minutes),
@@ -603,10 +615,24 @@ class ScheduleGenerator:
         validator: ScheduleSemanticValidator,
         scorer: ScheduleQualityScorer,
         gen_config: ScheduleGeneratorConfig,
+        *,
+        date: str = "",
+        wake_time: str = "07:00",
+        sleep_time: str = "23:00",
     ) -> List[Dict[str, Any]]:
-        """多轮生成：首轮质量不达标时按反馈重试，保留得分最高的一轮。"""
+        """多轮生成：首轮质量不达标时按反馈重试，保留得分最高的一轮。
+
+        N2/N1：每轮在 ``_normalize_items`` **之后**再跑一次空档检查——归一化制造的空档
+        （旧实现把条目压成 15 分钟）只有此时才看得见；空档警告随 ``validation_warnings``
+        进入下一轮反馈，并在评分里单独重罚，能压到质量阈值以下触发重试。
+        ``validator.validate`` 在**原始形态**上报的空档类警告会被丢弃（它按钟点排序、无跨午夜
+        环概念，跨午夜作息下会把睡眠时段误报成空档，且与归一化复查重复）；空档的唯一真源 =
+        归一化之后的复查结果。
+        """
         max_rounds = gen_config.max_rounds
         quality_threshold = gen_config.quality_threshold
+        wake_min = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
+        sleep_min = parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES)
 
         best_schedule: Optional[List[Dict[str, Any]]] = None
         best_score = 0.0
@@ -626,13 +652,21 @@ class ScheduleGenerator:
                 validated_items, warnings = validator.validate(raw_items)
                 validated_items, sleep_warnings = self._apply_no_sleep_postprocess(validated_items, gen_config)
                 warnings.extend(sleep_warnings)
-                score = scorer.calculate_score(validated_items, warnings)
+                # 归一化后复查：空档只有归一化之后才可见（N2/N1），评分同样看归一化结果
+                normalized = self._normalize_items(validated_items, date, wake_time, sleep_time)
+                gap_warnings = validator.check_normalized_gaps(
+                    normalized, wake_min=wake_min, sleep_min=sleep_min)
+                # 空档以**归一化后的复查**为准（写库形态的真源）：原始形态按钟点排序，跨午夜作息下
+                # 会把睡眠时段误报成空档，且同一条空档会被两种形态各报一次 → 原始形态的空档类警告丢弃。
+                # 空档排在最前：重试反馈只列前 5 条（build_retry_prompt），结构性问题优先
+                round_warnings = gap_warnings + [w for w in warnings if not is_gap_warning(w)]
+                score = scorer.calculate_score(normalized, round_warnings)
 
                 logger.debug("第 %d 轮质量分数: %.2f", round_num, score)
                 if score > best_score:
                     best_schedule = validated_items
                     best_score = score
-                    validation_warnings = warnings
+                    validation_warnings = round_warnings
                 if score >= quality_threshold:
                     logger.debug("质量达标（%.2f >= %.2f），提前结束", score, quality_threshold)
                     break
@@ -655,14 +689,25 @@ class ScheduleGenerator:
         base: BaseScheduleGenerator,
         validator: ScheduleSemanticValidator,
         gen_config: ScheduleGeneratorConfig,
+        *,
+        date: str = "",
+        wake_time: str = "07:00",
+        sleep_time: str = "23:00",
     ) -> List[Dict[str, Any]]:
-        """单轮生成。"""
+        """单轮生成（无重试轮次；归一化后的空档只记日志，N2）。"""
         schema = base.build_json_schema()
         prompt = base.build_schedule_prompt("daily", {}, schema)
         raw_items = await self._call_llm(prompt, gen_config)
         validated_items, warnings = validator.validate(raw_items)
         validated_items, sleep_warnings = self._apply_no_sleep_postprocess(validated_items, gen_config)
         warnings.extend(sleep_warnings)
+        # 归一化后复查：空档只有归一化之后才可见（N2/N1）；原始形态的空档类警告丢弃（跨午夜误报）
+        normalized = self._normalize_items(validated_items, date, wake_time, sleep_time)
+        warnings = validator.check_normalized_gaps(
+            normalized,
+            wake_min=parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES),
+            sleep_min=parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES),
+        ) + [w for w in warnings if not is_gap_warning(w)]
         if warnings:
             logger.warning("语义验证发现 %d 个问题", len(warnings))
             for warning in warnings[:3]:
@@ -837,13 +882,30 @@ class ScheduleGenerator:
         wake_time: str,
         sleep_time: str,
     ) -> List[Dict[str, Any]]:
-        """把 LLM/模板条目归一化成 DB 记录：time_slot+duration → start/end 分钟，截断到作息锚点内。
+        """把 LLM/模板条目归一化成 DB 记录：time_slot+duration → start/end 分钟（跨午夜 = 同一个 24h 环）。
+
+        口径（N2/N4，与 ``prompt_builder`` 「跨午夜用时长表达、不要硬切成两条」的提示词要求对齐）：
+
+        - ``cross = sleep_min <= wake_min``（入睡锚点早于起床锚点 = 跨午夜作息，
+          如 01:00 入睡 / 07:00 起床）；
+        - **睡眠环内**的条目（:func:`is_in_sleep_ring`）与**夜晚睡眠条目**
+          （:func:`is_night_sleep_item`：``goal_type=="sleep"`` 或夜间名）保留 ``start + 时长``，
+          ``end`` 允许 >1440（如 23:00 入睡 + 8h ⇒ 1380→1860），交由展示层同环归一；
+          不再被起床锚点上钳、不再被 +15 分钟地板压成 15 分钟；
+        - **非睡眠**条目的 ``end`` 才夹到入睡锚点：
+          ``min(start+时长, sleep_min + (1440 if cross else 0))``。
+
+        这样 ``sleep_min`` 早于条目起点时不会再触发「``end<=start`` → ``start+15``」的连锁塌缩
+        （旧实现把全天条目压成 15 分钟、制造 45–225 分钟级空档）。
 
         M5（§6.2 E）：条目级 ``emotional_tone`` 经 :func:`clip_emotional_tone` 校验/裁剪
         （±0.5）后落入 ``parameters``（供睡眠大修的前日残差/明日预期读取）；
         非字典/顶层无效一律不落该键。
         """
         wake_min, sleep_min = parse_hhmm(wake_time, 420), parse_hhmm(sleep_time, 1380)
+        cross = sleep_min <= wake_min
+        #: 非睡眠条目的 end 上限 = 下一个入睡时刻（跨午夜作息下落次日，故 +1440）
+        awake_end_bound = sleep_min + (1440 if cross else 0)
         normalized: List[Dict[str, Any]] = []
         for item in items:
             raw_tone = item.get("emotional_tone")
@@ -855,16 +917,19 @@ class ScheduleGenerator:
             except (TypeError, ValueError):
                 start, hours = wake_min, 1.0
             hours = max(0.25, min(12.0, hours))
-            end = min(sleep_min, start + int(hours * 60))
-            if end <= start:
-                end = min(sleep_min, start + 30)
+            duration = int(hours * 60)
+            if is_night_sleep_item(item) or is_in_sleep_ring(start, wake_min, sleep_min):
+                # 睡觉 / 睡眠环内条目：保留原时长与跨午夜写法（end 可 >1440）
+                end = start + duration
+            else:
+                end = min(start + duration, awake_end_bound)
             entry = {
                 "name": str(item.get("name") or "未命名活动"),
                 "description": str(item.get("description") or ""),
                 "goal_type": str(item.get("goal_type") or "daily_routine"),
                 "priority": str(item.get("priority") or "medium"),
-                "start_minute": max(wake_min, start),
-                "end_minute": 0,
+                "start_minute": start,
+                "end_minute": end,
                 "parameters": dict(item.get("parameters") or {}),
                 "schedule_date": date,
             }
@@ -873,7 +938,6 @@ class ScheduleGenerator:
                 entry["parameters"]["emotional_tone"] = tone
             else:
                 entry["parameters"].pop("emotional_tone", None)
-            entry["end_minute"] = max(entry["start_minute"] + 15, end)
             normalized.append(entry)
         return normalized
 

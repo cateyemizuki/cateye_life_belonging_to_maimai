@@ -61,16 +61,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: 无当前活动兜底文案（2026-10-10 N1-2：空档期不再静默早退）。
+#: 首选 ``[prompts].inject_no_activity``（suite_prompts 侧新增键）；键未落地/取不到时
+#: 用本默认——保证「无活动也给一句兜底」在任何配置版本下都成立。
+#: 语义与 ``core/inject.py`` 的同类实现一致（build_activity_prompt / build_replyer_prompt）。
+_INJECT_NO_ACTIVITY_DEFAULT = "现在没有安排中的活动（可能在休息）。"
+
+#: replyer 复用本轮 planner 意图的最大年龄（秒，N6-1）。
+#: planner → replyer 同一轮内相隔仅数秒；超过该年龄说明不是同一轮，回落旧口径（闲聊）。
+_REPLYER_INTENT_REUSE_SECONDS = 180
+
 
 class InjectService:
     """日程注入服务。"""
 
     # 主程序 maisaka 会在 messages 末尾追加多条独立 user 消息作为元数据上下文，
     # 这些消息**不是真实用户问题**，不应进入 IntentClassifier，否则会污染意图判定。
+    # 2026-10-10 N6-3 增补：宿主尾部指令（planner 的「时间：…」「你需要输出对…的分析」、
+    # replyer 的「当前时间：…」「请简短的回复…」）与内部参考块同样要跳过，否则分类
+    # 永远落在最后一条指令上（真机 12/12 判 casual_chat/0.40）。
     _METADATA_USER_MESSAGE_PATTERNS: List[re.Pattern] = [
-        re.compile(r"^当前时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*$"),
+        # replyer 通道的合成尾消息（``当前时间：…`` 开头，其后再挂目标消息/篇幅要求）
+        re.compile(r"^当前时间[：:]\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"),
+        # planner 通道尾部追加的「时间：2026-10-10 16:18:48」（整条即时间戳）
+        re.compile(r"^时间[：:]\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*$"),
         re.compile(r"^【人物画像-内部参考】"),
+        re.compile(r"^【启发式记忆-内部参考】"),
         re.compile(r"^<system-reminder>"),
+        # replyer 篇幅要求（宿主原文：请简短的回复，允许句子残缺…）
+        re.compile(r"^请简短的回复[，,]"),
+        # planner 尾部的最终提醒（宿主模板：你需要输出对{bot_name}发言的分析…）
+        re.compile(r"^你需要输出对\S*发言的分析"),
     ]
 
     # 主程序 build_planner_prefix 会给 chat history 里每条 user 消息加
@@ -201,7 +222,10 @@ class InjectService:
         """``maisaka.replyer.before_request`` Hook 入口。
 
         把当前活动作为 extra_prompt 协作式注入（保留上游内容，自身追加在后方），
-        与 planner 注入共用 InjectOptimizer 冷却（同会话 + 同活动短时间不重复）。
+        走 InjectOptimizer 冷却——**本通道独立桶键**（``{session_id}:replyer``）：
+        修复前与 planner 共桶 + 意图写死 CASUAL_CHAT，replyer 每次注入都给自己
+        盖上 300 秒「同活动同意图」冷却章（真机 2/8 命中），见 2026-10-10 N6。
+        无当前活动时走「空活动变体」兜底文案，不再静默早退（N1-2）。
         """
         cfg = self._schedule_cfg()
         if not self._plugin_enabled() or not cfg.inject_into_replyer:
@@ -222,43 +246,58 @@ class InjectService:
             current_activity, current_description, future_activities, activity_type = (
                 await self._get_current_schedule(chat_id)
             )
-            if not current_activity:
-                return {"action": "continue"}
 
-            # 复用 InjectOptimizer 冷却（与 planner 共享）
+            # N6-1：不再写死闲聊意图——优先复用本轮 planner 已判定的真实意图
+            # （拿不到时才回落 CASUAL_CHAT/0.5，与修复前逐字一致）。
+            intent, confidence = self._resolve_replyer_intent(user_id, kwargs)
+
+            # N6-2：optimizer 记录键按通道命名空间化，replyer 与 planner 互不占冷却。
+            # 无当前活动统一用 ""（而不是 None）参与冷却比较，保证空活动轮次也能自节流。
+            scope_key = f"{user_id}:replyer"
+            activity_key = current_activity or ""
+
+            # 复用 InjectOptimizer 冷却（本通道独立桶）
             if self._inject_optimizer is not None:
-                neutral_intent = UserIntent.CASUAL_CHAT
                 should_inject, skip_reason = self._inject_optimizer.should_inject(
-                    user_id, neutral_intent, current_activity, confidence=0.5,
+                    scope_key, intent, activity_key, confidence=confidence,
                 )
                 if not should_inject:
                     logger.debug(f"replyer 注入被冷却跳过: {skip_reason}")
                     return {"action": "continue"}
 
-            # 一次查询拿到剩余分钟（状态情绪短语已随 state_analyzer 删除，精神状态归情绪系统）
-            remaining_minutes = self._compute_activity_aux(current_activity, activity_type)
-            activity_prompt = self._build_replyer_extra_prompt(
-                current_activity=current_activity,
-                description=current_description or "",
-                future_activities=future_activities,
-                remaining_minutes=remaining_minutes,
-            )
+            if current_activity:
+                # 一次查询拿到剩余分钟（状态情绪短语已随 state_analyzer 删除，精神状态归情绪系统）
+                remaining_minutes = self._compute_activity_aux(current_activity, activity_type)
+                activity_prompt = self._build_replyer_extra_prompt(
+                    current_activity=current_activity,
+                    description=current_description or "",
+                    future_activities=future_activities,
+                    remaining_minutes=remaining_minutes,
+                )
+                logger.info(f"replyer 注入: {current_activity}")
+            else:
+                # N1-2：无当前活动不静默早退——空活动变体（兜底文案见 [prompts].inject_no_activity）
+                activity_prompt = self._build_replyer_no_activity_prompt(future_activities)
+                if not activity_prompt:
+                    # 文案被显式关空（旧行为：无活动即不注入）
+                    return {"action": "continue"}
+                logger.info("replyer 注入: 无当前活动（空活动变体）")
 
             if self._inject_optimizer is not None:
                 self._inject_optimizer.record_injection(
-                    user_id, current_activity, activity_prompt, UserIntent.CASUAL_CHAT,
+                    scope_key, activity_key, activity_prompt, intent,
                 )
 
             # 协作式追加——保留上游 extra_prompt，自身文本追加在后方
             upstream_prompt = str(extra_prompt or "").strip()
             merged_prompt = f"{upstream_prompt}\n\n{activity_prompt}" if upstream_prompt else activity_prompt
 
-            logger.info(f"replyer 注入: {current_activity}")
             return {
                 "action": "continue",
                 "modified_kwargs": {
                     **kwargs,
                     "session_id": session_id,
+                    "attempt": attempt,
                     "extra_prompt": merged_prompt,
                 },
             }
@@ -307,6 +346,11 @@ class InjectService:
             # 提取最后一条 user 消息用于意图分析
             user_message = self._extract_last_user_text(payload)
             user_id = session_id or "unknown"
+            if not session_id:
+                logger.debug(
+                    "planner 注入未拿到 session_id：冷却/上下文缓存键退化为 %s（钩子链应已写回 session_id）",
+                    user_id,
+                )
 
             # 检查对话上下文：判断是否在连续讨论日程话题
             context_continue_inject = False
@@ -327,19 +371,10 @@ class InjectService:
                     user_id, current_activity,
                 )
 
-            # 无当前活动：仅记录上下文，不注入
-            if not current_activity:
-                if self._context_cache is not None:
-                    self._context_cache.add_turn(
-                        user_id=user_id,
-                        user_message=user_message,
-                        intent=None,
-                        injected=False,
-                        activity=None,
-                    )
-                return {"action": "continue"}
-
-            # 统一注入管道：分类 → 决策 → 模板路由
+            # 无当前活动不再静默早退（N1-2）：照常走「分类 → 决策 → 模板路由」，
+            # 模板侧自动切到空活动变体（兜底文案见 [prompts].inject_no_activity）。
+            # 决策仍由 optimizer 把关——空活动时它只放行「问当前/问未来/上下文延续」，
+            # 闲聊继续按概率与冷却节流，不会变成空档期刷屏。
             inject_content, injected, detected_intent = self._build_inject_text(
                 user_message=user_message,
                 current_activity=current_activity,
@@ -536,7 +571,7 @@ class InjectService:
     def _build_inject_text(
         self,
         user_message: str,
-        current_activity: str,
+        current_activity: Optional[str],
         current_description: Optional[str],
         future_activities: List[Tuple[str, str]],
         activity_type: Optional[str],
@@ -545,6 +580,10 @@ class InjectService:
         user_id: str,
     ) -> Tuple[Optional[str], bool, Optional[str]]:
         """分类 → 决策 → 模板路由。user_id 实际是会话维度 scope ID（session_id）。
+
+        ``current_activity`` 允许为空（2026-10-10 N1-2）：空活动不再是「静默早退」，
+        而是走同一决策管道 + 空活动文案变体；决策权仍交给 optimizer/上下文延续
+        （空活动时 optimizer 只放行问当前/问未来，闲聊维持节流）。
 
         Returns:
             (inject_content, injected, detected_intent)。``inject_content`` 为 None
@@ -578,8 +617,12 @@ class InjectService:
             logger.debug(f"注入跳过: intent={detected_intent}")
             return None, False, detected_intent
 
-        # 3. 查询活动剩余分钟（M4：精神状态行改读情绪 mood_text，见 _render_unified_prompt）
-        remaining_minutes = self._compute_activity_aux(current_activity, activity_type)
+        # 3. 查询活动剩余分钟（无当前活动时无意义，直接跳过；M4：精神状态行改读
+        #    情绪 mood_text，见 _render_unified_prompt）
+        remaining_minutes = (
+            self._compute_activity_aux(current_activity, activity_type)
+            if current_activity else None
+        )
 
         # 4. 主动碎碎念判定：仅 CASUAL_CHAT/UNKNOWN 才考虑
         proactive_hit = False
@@ -624,7 +667,7 @@ class InjectService:
     def _render_unified_prompt(
         self,
         intent: "UserIntent",
-        current_activity: str,
+        current_activity: Optional[str],
         current_description: Optional[str],
         future_activities: List[Tuple[str, str]],
         remaining_minutes: Optional[int],
@@ -637,6 +680,11 @@ class InjectService:
         M4（§4.2 行 8）：精神状态行读情绪系统 ``mood_text()``（与 emotion 注入条目同源，
         不得出现两套矛盾的「精神状态」）；情绪不可得时省略该行，不再使用已删除的
         inject/state_analyzer 静态模板。
+
+        ``current_activity`` 为空（2026-10-10 N1-2）：当前行换成
+        ``[prompts].inject_no_activity`` 兜底文案（默认「现在没有安排中的活动（可能在
+        休息）。」，与 core/inject.py 同类实现同口径）；文案被显式关空时返回 None
+        （回退旧行为：空活动不注入）。
         """
         if intent in (UserIntent.TECH_QUESTION, UserIntent.COMMAND_EXECUTION):
             return None
@@ -652,7 +700,12 @@ class InjectService:
         if remaining_minutes is not None and 0 < remaining_minutes <= 15:
             remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
 
-        if enable_detailed and current_description:
+        if not current_activity:
+            # 空活动变体：兜底文案（空串 = 显式关闭 → 维持旧行为：本轮不注入）
+            current_line = self._no_activity_text()
+            if not current_line:
+                return None
+        elif enable_detailed and current_description:
             current_line = render(
                 prompt(self._plugin, "inject_schedule_current_line"),
                 fallback=INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
@@ -710,6 +763,20 @@ class InjectService:
         lines.extend(["", "---", ""])
         return "\n".join(lines)
 
+    def _no_activity_text(self) -> str:
+        """无当前活动兜底文案（``[prompts].inject_no_activity``；2026-10-10 N1-2）。
+
+        - 键已落地且非空 → 用配置值（``render`` 占位符写坏时回退出厂默认）；
+        - 键已落地但显式为空串 → 返回空串，调用方回退旧行为（空活动不注入）；
+        - 键未落地（suite_prompts 尚未加字段，取不到属性）→ 用本文件默认文案，
+          保证「无活动也给一句兜底」在任何配置版本下都成立。
+        """
+        section = getattr(getattr(self._plugin, "config", None), "prompts", None)
+        raw = getattr(section, "inject_no_activity", None) if section is not None else None
+        if isinstance(raw, str):
+            return render(raw, fallback=_INJECT_NO_ACTIVITY_DEFAULT).strip()
+        return _INJECT_NO_ACTIVITY_DEFAULT
+
     def _build_replyer_extra_prompt(
         self,
         current_activity: str,
@@ -734,7 +801,26 @@ class InjectService:
         )
         if not (enable_detailed and description):
             state_line = state_line.replace("（）", "").replace("()", "").strip()
+        return self._render_replyer_status_block(state_line, future_activities)
 
+    def _build_replyer_no_activity_prompt(self, future_activities: List[Tuple[str, str]]) -> str:
+        """replyer extra_prompt 的空活动变体（2026-10-10 N1-2；参考 core/inject.py）。
+
+        与有活动版本共用 ``[prompts]`` 模板：``state_line`` 换成「无当前活动」兜底行
+        （``inject_no_activity``），能量行 / 下一条活动行 / 不主动提及提示照常。
+        文案被显式关空时返回空串（调用方维持旧行为：不注入）。
+        """
+        state_line = self._no_activity_text()
+        if not state_line:
+            return ""
+        return self._render_replyer_status_block(state_line, future_activities)
+
+    def _render_replyer_status_block(
+        self,
+        state_line: str,
+        future_activities: List[Tuple[str, str]],
+    ) -> str:
+        """按 ``inject_replyer_status`` 模板拼 replyer 状态块（能量 + 下一条活动）。"""
         now = self._tz_manager.get_now()
         energy_desc = describe_energy(get_energy_level(now.hour))
 
@@ -751,6 +837,47 @@ class InjectService:
             fallback=INJECT_REPLYER_STATUS_DEFAULT,
             state_line=state_line, energy=energy_desc, next_line=next_line,
         )
+
+    def _resolve_replyer_intent(
+        self,
+        session_id: str,
+        kwargs: Dict[str, Any],
+    ) -> Tuple["UserIntent", float]:
+        """replyer 通道的「真实意图」（2026-10-10 N6-1：不再写死闲聊）。
+
+        取数顺序（全程可空降级，取不到就回到修复前口径 ``CASUAL_CHAT``/0.5）：
+
+        1. 请求载荷里若带 ``items``/``messages``（部分宿主版本会传），就地跑既有
+           ``IntentClassifier``；
+        2. 否则复用本轮 planner 在该会话记下的意图（``ConversationContextCache``；
+           同一轮 planner 请求先于 replyer，键与 planner 的 ``user_id`` 一致），
+           只接受 ``_REPLYER_INTENT_REUSE_SECONDS`` 内的记录，避免隔轮误用；
+        3. 都没有 → ``(CASUAL_CHAT, 0.5)``（与修复前逐字一致）。
+
+        效果：用户明确问当前/未来状态时不再被 50% 硬币挡掉；冷却只对「同活动 +
+        同意图」生效，replyer 不再被自己写死的同一种意图反复盖冷却章。
+        """
+        if self._intent_classifier is not None:
+            payload = kwargs.get("items")
+            if not isinstance(payload, list):
+                payload = kwargs.get("messages")
+            if isinstance(payload, list) and payload:
+                text = self._extract_last_user_text(payload)
+                if text:
+                    return self._intent_classifier.classify(text)
+        if self._context_cache is not None:
+            try:
+                turns = self._context_cache.get_recent_turns(session_id or "unknown", count=1)
+            except Exception:
+                turns = []
+            if turns:
+                last = turns[-1]
+                if last.intent and (time.time() - float(last.timestamp or 0)) <= _REPLYER_INTENT_REUSE_SECONDS:
+                    try:
+                        return UserIntent(str(last.intent)), 0.5
+                    except ValueError:
+                        pass
+        return UserIntent.CASUAL_CHAT, 0.5
 
     def _compute_activity_aux(
         self,

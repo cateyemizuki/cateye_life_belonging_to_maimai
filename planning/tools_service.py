@@ -251,7 +251,7 @@ class ToolsService:
         # 统一获取今日日程目标（合成视图，含日期过滤）
         schedule_goals = goal_manager.get_schedule_goals(chat_id="global")
         if not schedule_goals:
-            return {"type": "schedule_info", "content": "📅 今天还没有日程"}
+            return {"type": "schedule_info", "content": "今天还没有日程"}
 
         tz_manager = self._make_tz_manager()
         now = tz_manager.get_now()
@@ -288,7 +288,7 @@ class ToolsService:
             h, m = minutes // 60, minutes % 60
             return f"{h:02d}:{m:02d}"
 
-        def _fmt_item(goal: Any, tw: List[int], emoji: str = "") -> str:
+        def _fmt_item(goal: Any, tw: List[int], prefix: str = "") -> str:
             start_time = _fmt_time(tw[0])
             end_time = _fmt_time(tw[1] if tw[1] < 1440 else tw[1] - 1440)
             desc = ""
@@ -297,33 +297,33 @@ class ToolsService:
                 if len(desc) > 30:
                     desc = desc[:27] + "..."
             if desc:
-                return f"{emoji}{start_time}-{end_time} {goal.name}\n   💭 {desc}"
-            return f"{emoji}{start_time}-{end_time} {goal.name}"
+                return f"{prefix}{start_time}-{end_time} {goal.name}\n   描述：{desc}"
+            return f"{prefix}{start_time}-{end_time} {goal.name}"
 
         date_str = now.strftime("%Y-%m-%d")
         weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
         weekday = weekday_names[now.weekday()]
 
-        content = f"📅 今日日程 {date_str} {weekday}\n"
+        content = f"今日日程 {date_str} {weekday}\n"
 
         if ongoing:
-            content += "\n🔵 正在进行:\n"
+            content += "\n正在进行:\n"
             for goal, tw in ongoing:
-                content += _fmt_item(goal, tw, "▶️ ") + "\n"
+                content += _fmt_item(goal, tw, "当前：") + "\n"
 
         if upcoming:
-            content += "\n⏰ 即将到来:\n"
+            content += "\n即将到来:\n"
             for goal, tw in upcoming[:5]:
                 content += _fmt_item(goal, tw) + "\n"
             if len(upcoming) > 5:
                 content += f"   ...还有 {len(upcoming) - 5} 个活动\n"
 
         if completed:
-            content += "\n✅ 已完成:\n"
+            content += "\n已完成:\n"
             for goal, tw in completed[-3:]:
                 content += _fmt_item(goal, tw) + "\n"
 
-        content += f"\n📊 共 {len(schedule_goals)} 个活动"
+        content += f"\n共 {len(schedule_goals)} 个活动"
         return {"type": "schedule_info", "content": content}
 
     def _view_current(self) -> Dict[str, Any]:
@@ -348,13 +348,13 @@ class ToolsService:
             return {"type": "schedule_day", "content": "日程服务未就绪（planning 子模块不可用）。"}
         items = query.get_day_schedule(today)
         if not items:
-            return {"type": "schedule_day", "content": f"📅 今日 ({today}) 暂无日程。"}
-        lines = [f"📅 今日完整日程 ({today})"]
+            return {"type": "schedule_day", "content": f"今日 ({today}) 暂无日程。"}
+        lines = [f"今日完整日程 ({today})"]
         for item in items:
             start = int(item.get("start_minute") or 0)
             end = int(item.get("end_minute") or 0)
             lines.append(f"  [{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}] "
-                         f"🐱 {item.get('name', '未知')}")
+                         f"{item.get('name', '未知')}")
         return {"type": "schedule_day", "content": "\n".join(lines)}
 
     def _view_goals(self) -> Dict[str, Any]:
@@ -362,7 +362,7 @@ class ToolsService:
         goals = get_goal_manager().get_active_goals(chat_id="global")
         if not goals:
             return {"type": "schedule_goals", "content": "当前没有进行中的目标"}
-        lines = [f"🎯 进行中的目标（{len(goals)} 个）"]
+        lines = [f"进行中的目标（{len(goals)} 个）"]
         for goal in goals:
             summary = ""
             getter = getattr(goal, "get_summary", None)
@@ -414,7 +414,7 @@ class ToolsService:
                 )
                 return {
                     "type": "schedule_updated",
-                    "content": "📌 已记录到日程候选清单（裁判模式关闭，下次生成日程时纳入）",
+                    "content": "已记录到日程候选清单（裁判模式关闭，下次生成日程时纳入）",
                 }
 
             # 准备当前活动摘要 + 人设
@@ -443,13 +443,13 @@ class ToolsService:
             )
 
             if parsed is None:
-                return {"type": "schedule_unchanged", "content": "🤔 没听清你的请求，日程保持不变"}
+                return {"type": "schedule_unchanged", "content": "没听清你的请求，日程保持不变"}
 
             decision = parsed["decision"]
             reason = str(parsed.get("reason") or "").strip()
 
             if decision == "reject":
-                msg = "😶 我没接受这个请求，日程保持不变"
+                msg = "我没接受这个请求，日程保持不变"
                 if reason:
                     msg += f"\n理由：{reason}"
                 return {"type": "schedule_unchanged", "content": msg}
@@ -459,7 +459,7 @@ class ToolsService:
                 if target_date <= today_str:
                     return {
                         "type": "schedule_unchanged",
-                        "content": f"⚠️ 未来约定日期 {target_date} 无效，日程不变",
+                        "content": f"注意：未来约定日期 {target_date} 无效，日程不变",
                     }
                 goal_manager.add_pending_commitment(
                     commitment_date=target_date,
@@ -471,7 +471,7 @@ class ToolsService:
                 return {
                     "type": "schedule_committed",
                     "content": (
-                        f"📅 已记录 {target_date} 的约定：{parsed.get('title')}\n"
+                        f"已记录 {target_date} 的约定：{parsed.get('title')}\n"
                         f"{('备注：' + parsed.get('notes')) if parsed.get('notes') else ''}\n"
                         f"{('理由：' + reason) if reason else ''}"
                     ).strip(),
@@ -498,7 +498,7 @@ class ToolsService:
             return {
                 "type": "schedule_regenerated",
                 "content": (
-                    f"✅ 已根据请求调整今日日程，共 {len(items)} 个活动\n"
+                    f"已根据请求调整今日日程，共 {len(items)} 个活动\n"
                     f"{('理由：' + reason) if reason else ''}"
                 ).strip(),
             }
@@ -612,7 +612,8 @@ class ToolsService:
     def _nap_schedule_date(self, now: datetime) -> str:
         """"今日日程"的日期（F16/B4：**新一天起点 = [schedule] wake_time 锚点**）。
 
-        夜间睡眠条目属于**入睡日**（M5 实测：条目 `23:00–23:15` 落在入睡日、被作息锚点截断），
+        夜间睡眠条目属于**入睡日**（跨午夜条目保留原时长，如 23:00 入睡 + 8h ⇒
+        ``23:00–次日 07:00``——2026-10-10 N2/N4 起不再被作息锚点截断成 ``23:00–23:15``），
         故凌晨（早于 wake_time 锚点的跨午夜段）仍读**昨天**那条日程，否则读今天；夜猫子作息
         （sleep ≤ wake，同日）一律读今天。取不到锚点一律按"今天"（缺省 07:00/23:00）。
         """

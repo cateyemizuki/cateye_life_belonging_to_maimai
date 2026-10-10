@@ -13,17 +13,19 @@
    - **基准点**：早安 = 睡眠窗口结束（``[schedule].wake_time`` 锚点）；晚安 = 当天最后一个
      非睡眠日程条目结束（无日程回退 ``sleep_time`` 锚点）。
    - **漂移点（fire_at）**：早安 = 基准 + randint(a,b)（醒来后随机点）；晚安 = 期限 − randint(a,b)
-     （睡前随机点；期限 = ``min(入睡锚点, [patrol] silence_start)``）——两个方向都保证点落在
+     （睡前随机点；期限 = ``min(入睡锚点, 生效静默起点)``）——两个方向都保证点落在
      「当天的清醒区间」内，不会跨过入睡界。
    - **激活观测窗** = ``[min(基准, 漂移点), max(期限, 漂移点)]``（两种问候同一公式）：
      早安期限 = 第一段非睡眠日程结束（无日程 → 起床 + 120 分钟）；
-     晚安期限 = ``min(入睡锚点, [patrol] silence_start)``。
+     晚安期限 = ``min(入睡锚点, 生效静默起点)``（生效静默起点 = ``[patrol].silence_start``，
+     **留空即跟随 ``[schedule].sleep_time``**，N5 第三轮；见 :meth:`_silence_start_ts`）。
    - **判定**：窗内**该流有人发过消息** → 已激活；激活后未到点 → 等待，到点即发；观察到时
      **已过点** → 立即发；观测窗结束仍无人 → 当天不再评估（放弃）。
    - ``greeting_require_activation=false`` → 不看激活，到点即发；错过观测窗（如重启跨过整窗）不补发。
    - **静默时段不再拦截问候**（2026-10-10 第二轮）：默认静默窗 00:00-07:30 与起床锚点 07:00
      重叠，会把漂移整段吞掉（每天固定在 07:30 开口 = 漂移失效），而问候本身已由"必要性激活"
-     把关（没人说话就不发）；``[patrol] silence_*`` 仍约束陪伴巡检。
+     把关（没人说话就不发）；``[patrol] silence_*`` 仍约束陪伴巡检（巡检与晚安期限共用同一
+     生效值解析：留空 = 跟随日程作息锚点，见 companion/patrol.py 的 resolve_silence_window）。
    - 候选矩阵：目标陪伴私聊（``[patrol].enabled`` 且**未被私聊黑名单排除**时生效）；
      群聊与其他私聊走**统一名单系统**（``proactive_group_ids`` / ``proactive_private_ids`` +
      各自模式开关），其他私聊另有「前一日消息数 ≥ 门槛」护栏。
@@ -79,7 +81,7 @@ from .config import (
     section_or_default,
 )
 from .goal_manager import get_goal_manager
-from .time_utils import TimezoneManager, parse_time_window
+from .time_utils import TimezoneManager, is_in_day_frame, parse_time_window
 if TYPE_CHECKING:
     from typing import Any as _Plugin
 
@@ -147,9 +149,10 @@ _MORNING_FALLBACK_DEADLINE_MINUTES = 120
 #: 睡眠条目名称兜底关键词：与 emotion/service.py 的 `_is_sleep_item` 同一依据
 #: （planning 不 import emotion，避免循环依赖；F14 要求早安期限过滤睡眠条目）
 _SLEEP_NAME_KEYWORDS = ("睡觉", "睡眠", "安睡", "午休", "午睡", "小憩", "打盹")
-#: [patrol] 静默时段开始的缺省值（配置不可得时的兜底，与 companion/config.py 默认值一致；
-#: 晚安期限只用到起点，故只需起点常量——终点已随"静默不拦截问候"一并删除）
-_DEFAULT_SILENCE_START = "00:00"
+#: [patrol] 静默起点的生效口径（N5，2026-10-10 第三轮）：留空 = 跟随 [schedule].sleep_time。
+#: 生效值解析的真源在 companion.patrol.resolve_silence_window（巡检静默闸同源）；
+#: 解析不可用时的本地降级见 :meth:`ProactiveService._effective_silence_start`。
+#: 注：晚安期限只用到起点，终点不在本模块使用。
 
 
 def _parse_drift(value: Any, default: Tuple[int, int] = DEFAULT_GREETING_DRIFT) -> Tuple[int, int]:
@@ -705,8 +708,9 @@ class ProactiveService:
 
         - **早安** = 睡眠结束后**第一个非睡眠日程条目的结束**（"第一段日程结束前有人说话"）；
           无日程 → 基准 + 120 分钟（实现裁量：不给无日程留无期限观察）；
-        - **晚安** = ``min(入睡锚点, [patrol] silence_start)``：既是激活观测上界，
-          也是漂移点的硬界（不得在界后道晚安）。
+        - **晚安** = ``min(入睡锚点, 生效静默起点)``（生效起点见 :meth:`_silence_start_ts`；
+          ``[patrol].silence_start`` 留空即跟随 ``[schedule].sleep_time``，此时 min 恒等于入睡锚点）：
+          既是激活观测上界，也是漂移点的硬界（不得在界后道晚安）。
 
         观测窗下界统一取 ``max(期限, 漂移点)``（见 :meth:`_roll_greeting`）——期限本身
         不再用于"到点前放弃"（旧版把它当放弃线，与静默窗叠加后会把问候整段吞掉）。
@@ -719,7 +723,8 @@ class ProactiveService:
                 # 不给"无日程"留无期限观察，避免早安在任意时刻补发（防打扰）
                 return baseline_ts + _MORNING_FALLBACK_DEADLINE_MINUTES * 60
             return midnight + int(first[2]) * 60
-        # 晚安：睡眠窗口开始 与 [patrol] silence_start 取先到者
+        # 晚安：睡眠窗口开始 与 生效静默起点 取先到者（N5：静默起点留空即跟随 sleep_time 锚点，
+        # 此时 min 恒等于睡锚点；显式覆盖仍照旧被睡锚点封顶，兼容既有配置）
         _wake_min, sleep_min = self._schedule_anchors()
         return min(self._next_daily_anchor_ts(now, sleep_min), self._silence_start_ts(now))
 
@@ -727,7 +732,7 @@ class ProactiveService:
         """把「当天分钟数」锚点落成**今晚**的绝对时刻（§3.2 晚安的基准/期限分量）。
 
         参照点 = **今天的起床锚点**（``[schedule].wake_time``，F16 的"新一天起点"）：取最近一次
-        不早于参照点的该锚点。常规作息（sleep > wake）得到今天的 ``sleep_time``/``silence_start``；
+        不早于参照点的该锚点。常规作息（sleep > wake）得到今天的 ``sleep_time``/生效静默起点；
         夜猫子作息（sleep < wake，日程延续到次日凌晨）自动落到**次日凌晨**——保证晚安窗口始终是
         「最后一个日程之后、入睡之前」，不会因为拿今天的凌晨锚点而误判成"窗口已过"。
         """
@@ -739,15 +744,47 @@ class ProactiveService:
         return ts
 
     def _silence_start_ts(self, now: datetime) -> float:
-        """今晚静默时段开始的绝对时刻（``[patrol].silence_start``，§3.2 期限列）。
+        """今晚静默时段开始的绝对时刻（**生效**静默起点，§3.2 期限列）。
 
-        同 :meth:`_next_daily_anchor_ts`（以起床锚点为参照）：默认 ``00:00-07:30`` → 次日 00:00
-        （与入睡锚点取 min 后通常由后者先到）；晚间开始的静默窗（如 21:30-07:30）→ 今天 21:30，
-        已过即视为窗口已关（不再发晚安）。
+        N5（2026-10-10 第三轮）：生效起点 = ``[patrol].silence_start``，**留空则跟随
+        ``[schedule].sleep_time``**（与 companion/patrol.py 的巡检静默闸共用同一解析，见
+        :meth:`_effective_silence_start`）。
+
+        同 :meth:`_next_daily_anchor_ts`（以起床锚点为参照）：默认（跟随作息、如 23:00~07:00）
+        → 今天 23:00；晚间开始的静默窗（如 21:30）→ 今天 21:30，已过即视为窗口已关
+        （不再发晚安）。fail-safe：生效起点不可解析（显式值非法，或留空且
+        ``[schedule].sleep_time`` 非法）→ 返回 0（观测窗直接关闭，宁可不发），
+        **不**回退成"可打扰"的边界猜测。
         """
-        start_min = _parse_hhmm_minutes(
-            self._patrol_time("silence_start", _DEFAULT_SILENCE_START), 0)
+        start_text, _start_key = self._effective_silence_start()
+        start_min = _parse_hhmm_minutes(start_text, -1)
+        if start_min < 0:
+            logger.warning(
+                f"静默起点 {start_text!r} 不是 HH:MM 格式；今晚晚安观测窗关闭（fail-safe，宁可不发）"
+            )
+            return 0.0
         return self._next_daily_anchor_ts(now, start_min)
+
+    def _effective_silence_start(self) -> Tuple[str, str]:
+        """生效静默起点 ``(HH:MM 原文, 来源配置键)``（N5 单一真源 + 本地降级）。
+
+        主路径 = ``companion.patrol.resolve_silence_window``（留空 → ``[schedule].sleep_time``；
+        非空 → 原值）。companion 未装配（裁剪部署/桩环境）→ 本地按同一口径解析：显式值优先，
+        留空读 ``[schedule].sleep_time``。两条路径都**不**把非法值改写成缺省时刻——非法由
+        :meth:`_silence_start_ts` 按 fail-safe 关闭观测窗。
+        """
+        try:
+            from companion.patrol import resolve_silence_window
+
+            window = resolve_silence_window(self._plugin)
+            return window.start, window.start_key
+        except Exception as exc:  # pragma: no cover - companion 未装配时的降级路径
+            logger.debug(f"静默窗生效值解析不可用（{exc}），按本地口径降级解析")
+        raw_start = str(self._patrol_time("silence_start", "") or "").strip()
+        if raw_start:
+            return raw_start, "silence_start"
+        cfg = section_or_default(self._plugin, "schedule", ScheduleSectionConfig)
+        return str(getattr(cfg, "sleep_time", "") or ""), "schedule.sleep_time"
 
     # 注（2026-10-10 第二轮）：原 ``_in_silence_window`` 已删除——问候不再被静默时段拦截。
     # 原因：默认静默窗 00:00-07:30 与起床锚点 07:00 重叠，会把早安漂移整段吞掉（表现为
@@ -768,7 +805,7 @@ class ProactiveService:
         **漂移点**（2026-10-10 第二轮回正）：
 
         - 早安 = ``基准 + randint(a,b)``（醒来后 0~N 分钟；基准 = wake 锚点）；
-        - 晚安 = ``期限 − randint(a,b)``（睡前 0~N 分钟；期限 = ``min(入睡锚点, 静默起点)``）。
+        - 晚安 = ``期限 − randint(a,b)``（睡前 0~N 分钟；期限 = ``min(入睡锚点, 生效静默起点)``）。
           旧版晚安拿"最后一段日程结束"当参考做减法，最后一段恰好结束在入睡锚点时点会落在
           日程中段 = 提前发；锚在期限上则恒为"睡前随机点"，且永不超过入睡界。
         - **观测窗 = ``[min(基准, 漂移点), max(期限, 漂移点)]``**（两种问候同一公式）：窗内
@@ -788,7 +825,7 @@ class ProactiveService:
         deadline_ts = self._greeting_deadline_ts(kind, now, date_str, baseline_ts)
         offset = float(random.randint(drift[0], drift[1])) * 60.0   # 漂移区间是分钟 → 秒
         # 漂移点：早安 = 基准 + offset（醒来后 0~N 分钟）；晚安 = 期限 − offset
-        # （睡前 0~N 分钟；期限 = min(入睡锚点, 静默起点)）。两个方向都保证"点"落在
+        # （睡前 0~N 分钟；期限 = min(入睡锚点, 生效静默起点)）。两个方向都保证"点"落在
         # 「白天锚点之间」，不会跨过入睡界（旧版拿最后一段日程结束当参考，最后一段恰好
         # 结束在入睡锚点时点会落在日程中间 = 提前发；锚在期限上则恒为睡前随机点）。
         fire_at = baseline_ts + offset if kind == GREETING_MORNING else deadline_ts - offset
@@ -1254,6 +1291,12 @@ class ProactiveService:
     def _find_current_activity(self) -> Optional[Tuple[str, str, int, int, Dict[str, Any]]]:
         """从 GoalManager 找当前正在进行的活动。
 
+        N1 读取侧（2026-10-10）：跨午夜窗口统一走 ``time_utils.is_in_day_frame``（同一个 24h
+        环，唯一实现）——``end > 1440`` 的条目（如 23:00 入睡 + 8h ⇒ 1380→1860）在凌晨
+        00:00-11:59 也能被查到"正在进行"；不再各自做 ``if end > 1440 and current_min < 720:
+        end -= 1440``（该写法在 00:30 会把窗口错误地折成 [1380, 420) → 恒不命中）。
+        返回的 ``end`` 原样保留 >1440（与 ``schedule_items.item_end_minute`` 同一口径）。
+
         Returns:
             ``(name, goal_type, start_minutes, end_minutes, parameters)``；没找到时为 None。
         """
@@ -1279,10 +1322,7 @@ class ProactiveService:
                 start, end = parse_time_window(tw)
                 if start is None or end is None:
                     continue
-                # 跨夜归一化
-                if end > 1440 and current_min < 720:
-                    end -= 1440
-                if start <= current_min < end:
+                if is_in_day_frame(start, end, current_min):
                     return (
                         goal.name,
                         goal.goal_type or "daily_routine",

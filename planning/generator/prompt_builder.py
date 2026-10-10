@@ -174,12 +174,12 @@ class PromptBuilder:
 
         if not personality:
             logger.error(
-                "❌ bot_profile.personality 未配置或为空 —— 生成的日程将无法贴合角色人设。"
+                "错误：bot_profile.personality 未配置或为空 —— 生成的日程将无法贴合角色人设。"
                 "请在主程序 bot 配置中填写 personality.personality 字段。"
             )
         if not bot_name:
             logger.error(
-                "❌ bot_profile.bot_name 未配置或为空 —— prompt 中将不出现角色名。"
+                "错误：bot_profile.bot_name 未配置或为空 —— prompt 中将不出现角色名。"
                 "请在主程序 bot 配置中填写 bot.nickname 字段。"
             )
         return personality, reply_style, interest, bot_name
@@ -365,9 +365,9 @@ class PromptBuilder:
         lines.append(f"（根据实际情况生成{min_activities}-{max_activities}个活动，以上仅为衔接方式示例）")
         lines.append("")
         if no_sleep:
-            lines.append("⚠️ 重要：上面示例展示了清醒时段无缝衔接的正确方式！（睡眠时段不生成条目）")
+            lines.append("重要：上面示例展示了清醒时段无缝衔接的正确方式！（睡眠时段不生成条目）")
         else:
-            lines.append("⚠️ 重要：上面示例展示了全天无缝衔接的正确方式！")
+            lines.append("重要：上面示例展示了全天无缝衔接的正确方式！")
         # 取前三个活动做衔接演算
         for i in range(min(3, len(items) - 1)):
             cur, nxt = items[i], items[i + 1]
@@ -376,7 +376,7 @@ class PromptBuilder:
             next_label = f"次日 {nxt['time_slot']}" if nxt_m <= cur_m else nxt['time_slot']
             lines.append(
                 f"- {cur['time_slot']} {cur['name']} + {cur['duration_hours']}h = {next_label} "
-                f"→ {nxt['name']} ✅ 无缝"
+                f"→ {nxt['name']}（无缝）"
             )
         last = items[-1]
         if no_sleep:
@@ -385,20 +385,20 @@ class PromptBuilder:
             wake_text_ex = _fmt_minutes(wake_min)
             lines.append(
                 f"- {last['time_slot']} {last['name']} + {last['duration_hours']}h = {sleep_text_ex} "
-                f"✅ 恰好到入睡时刻收尾"
+                f"（恰好到入睡时刻收尾）"
             )
             lines.append(
                 f"- 睡眠时段（{sleep_text_ex} → 次日 {wake_text_ex}）不生成任何日程条目，"
-                f"次日 {wake_text_ex} 直接开始新一天 ✅ 完整闭环"
+                f"次日 {wake_text_ex} 直接开始新一天（完整闭环）"
             )
         else:
             first_sleep = items[0]
             lines.append(
                 f"- {last['time_slot']} {last['name']} + {last['duration_hours']}h = "
-                f"次日 {first_sleep['time_slot']} ✅ 回到 {first_sleep['name']}，完整闭环"
+                f"次日 {first_sleep['time_slot']}（回到 {first_sleep['name']}，完整闭环）"
             )
         lines.append("")
-        lines.append("⚠️ duration_hours 是活动持续时长（小时），不是重复间隔！")
+        lines.append("注意：duration_hours 是活动持续时长（小时），不是重复间隔！")
         return "\n".join(lines)
 
     # ------------------------------------------------------------
@@ -504,7 +504,7 @@ class PromptBuilder:
 以下是 bot 近期在聊天中观察到的事，可作为日程灵感（不要直接复述）：
 {history_context}
 
-💡 若上面提到了**特殊事件**（节日、约会、考试、截止、心情转变等），优先把它反映到今日日程中。
+提示：若上面提到了**特殊事件**（节日、约会、考试、截止、心情转变等），优先把它反映到今日日程中。
 """
 
         # 知识库参考（动态上下文）
@@ -599,7 +599,7 @@ class PromptBuilder:
                 f"（入睡时刻 = 前一个活动的结束时间，起床时刻 = 后一个活动的开始时间）"
             )
         time_range_requirement = f"""
-🔴 【作息时间】本角色 {sleep_text} 上床入睡，{wake_text} 睡醒起床（作息锚点，不可移动）！
+硬性要求：【作息时间】本角色 {sleep_text} 上床入睡，{wake_text} 睡醒起床（作息锚点，不可移动）！
    {awake_rule}
    {routine_rule}
    {seam_rule}
@@ -609,7 +609,7 @@ class PromptBuilder:
         no_sleep_requirement = ""
         if no_sleep_mode:
             no_sleep_requirement = f"""
-🔴 【无睡眠模式】本角色**不需要睡觉**！
+硬性要求：【无睡眠模式】本角色**不需要睡觉**！
    - 睡眠时段（{sleep_text} 到次日 {wake_text}）**不生成任何日程条目**——该时段整体留空
    - 日程只覆盖清醒时段（{wake_text} 到 {sleep_text}），时段内部保持无缝衔接、无空档
    - 全天任何活动的 name 都不得包含"睡 / 眠 / 憩"字样（睡觉、睡眠、午休、午睡、小憩、打盹、赖床等一律禁止）
@@ -637,15 +637,15 @@ class PromptBuilder:
 
         # ── 覆盖口径（随模式自适应）：正常模式要求全天闭环，无睡眠模式只要求清醒时段 ──
         if no_sleep_mode:
-            coverage_core = "🔴 核心要求：清醒时段内日程必须无缝衔接，不允许任何时间空档！（睡眠时段整体留空，不计入）"
+            coverage_core = "硬性要求：清醒时段内日程必须无缝衔接，不允许任何时间空档！（睡眠时段整体留空，不计入）"
             coverage_rule = f"1. {min_activities}-{max_activities}个活动，完整覆盖清醒时段（无缝衔接；睡眠时段不生成条目）"
             coverage_seam = "1. 无缝覆盖清醒时段：每个活动结束时间 = 下个活动开始时间（睡眠时段留空，不算空档）"
-            coverage_final = "🔴 核心要求：必须无缝覆盖清醒时段（睡眠时段不生成条目，不算空档）！"
+            coverage_final = "硬性要求：必须无缝覆盖清醒时段（睡眠时段不生成条目，不算空档）！"
         else:
-            coverage_core = "🔴 核心要求：日程必须全天无缝衔接，不允许任何时间空档！"
+            coverage_core = "硬性要求：日程必须全天无缝衔接，不允许任何时间空档！"
             coverage_rule = f"1. {min_activities}-{max_activities}个活动，完整覆盖全天（绕时钟闭环，无缝衔接）"
             coverage_seam = "1. 无缝覆盖全天：每个活动结束时间 = 下个活动开始时间（不允许任何空档）"
-            coverage_final = "🔴 核心要求：必须无缝覆盖全天，不能有任何时间空档！"
+            coverage_final = "硬性要求：必须无缝覆盖全天，不能有任何时间空档！"
 
         prompt += f"""
 【任务】生成今天的详细日程JSON：
@@ -656,8 +656,8 @@ class PromptBuilder:
 - 作息框架（睡眠时段 / 三餐 / 起床 / 入睡）每天稳定，是基础保留项 —— 不动这个框架
 - 真实的人 ≠ 日程机器：同一作息框架下，每天的"做什么"与"心情"应有微变化
 - 例：早餐时段不变，但今天可能粥配油条，明天面包黄油；上午时段不变，但今天审稿子，明天写专栏
-- ⚠️ 不要为了"特色"突破常识作息（凌晨跑清醒活动、跳过晚餐、午餐推到 16 点都不可以）
-- ⚠️ 不要为了"和昨天不同"而把作息打乱（睡眠时段、三餐时段必须正常）
+- 注意：不要为了"特色"突破常识作息（凌晨跑清醒活动、跳过晚餐、午餐推到 16 点都不可以）
+- 注意：不要为了"和昨天不同"而把作息打乱（睡眠时段、三餐时段必须正常）
 
 {coverage_rule}
 {desc_requirement}
@@ -665,30 +665,30 @@ class PromptBuilder:
 4. 兴趣偏好：{interest if interest else "日常生活"}
 5. description 字段的语气贴合开头的表达风格（reply_style）；活动 name 保持简短中性
 6. **今日特色（在作息框架内做微变化）**：至少 2 个活动名/描述体现今天独有的细节
-   - ✅ 把"上午活动"具化成今天具体在做什么（例：审稿、回邮件、写专栏、整理藏书）
-   - ✅ 与【最近聊天背景】呼应（例：朋友提到的事 → 反映到 description 或 name 中）
-   - ✅ description 写出今天的小心情 / 小插曲（不夸张，像日记一笔带过）
-   - ❌ 不要每天叫"上午学习""下午学习""夜聊"这种通用名
-   - ❌ 不要为求新意突破作息（清醒时段越过入睡时刻、跳过用餐都不允许）
-   - ❌ "今日特色"≠ 改变作息时段，是同一时段填不同的具体内容{(
+   - 推荐：把"上午活动"具化成今天具体在做什么（例：审稿、回邮件、写专栏、整理藏书）
+   - 推荐：与【最近聊天背景】呼应（例：朋友提到的事 → 反映到 description 或 name 中）
+   - 推荐：description 写出今天的小心情 / 小插曲（不夸张，像日记一笔带过）
+   - 禁止：不要每天叫"上午学习""下午学习""夜聊"这种通用名
+   - 禁止：不要为求新意突破作息（清醒时段越过入睡时刻、跳过用餐都不允许）
+   - 禁止："今日特色"≠ 改变作息时段，是同一时段填不同的具体内容{(
     f'''
 7. **避免与最近几天重复**：今天的活动 name 至少 30% 不要与【最近几天日程参考】里的相同
    - 防止"周一审稿 / 周二写专栏 / 周三又审稿"这种交替式循环
    - 看到最近几天反复出现的活动，今天换个具体内容或换措辞
-   - ⚠️ 不是换作息时段：早餐还是早餐时段，但内容可以不同'''
+   - 注意：不是换作息时段：早餐还是早餐时段，但内容可以不同'''
     if has_real_yesterday else ""
 )}
 """
 
         # 如果有自定义prompt，强调一下
         if custom_prompt:
-            prompt += f"6. ⚠️ 优先延续上述【当前生活阶段与今日重点】的内容\n"
+            prompt += f"6. 注意：优先延续上述【当前生活阶段与今日重点】的内容\n"
 
         prompt += f"""
 【活动类型】
 daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_maintenance(社交)|exercise(运动)|learn_topic(兴趣)|rest(休息/放空)|free_time(自由)|custom(其他)
 
-⚠️ **重要：meal类型活动命名规范**
+**重要：meal类型活动命名规范**
 - 活动名称必须直接使用：早餐、午餐、晚餐
 - 禁止使用：准备xx、零食时间、下午茶等变体
 - 时间要求：早餐06:00-09:00，午餐11:00-14:00，晚餐17:00-20:00
@@ -698,12 +698,12 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 
         prompt += f"""
 【时间合理性要求 - 重要！】
-⚠️ 必须同时满足以下两点：
+注意：必须同时满足以下两点：
 {coverage_seam}
 2. 遵守常识性时间安排，参考以下框架（已按本角色作息锚点适配）：
 {routine_rows}
 
-⚠️ 注意：下午和晚间的大时段应该细分成多个活动，不要一个活动占据5小时以上！
+注意：下午和晚间的大时段应该细分成多个活动，不要一个活动占据5小时以上！
 
 【要求】
 - 严格JSON格式，无注释
@@ -711,7 +711,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 - {coverage_final}
   * 每个活动结束时间 = 下个活动开始时间
   * 计算方式：结束时间 = time_slot + duration_hours
-- ⚠️ 关键活动时间必须合理：早餐6-9点、午餐11-14点、晚餐17-20点
+- 注意：关键活动时间必须合理：早餐6-9点、午餐11-14点、晚餐17-20点
 """ + ("- description填空字符串\"\"即可\n" if not enable_detailed_description else f"- description简洁，{min_desc_len}-{max_desc_len}字\n") + f"""- 体现{weekday}特色（{"周末睡懒觉" if is_weekend else "工作日早起"}）
 """
 

@@ -175,19 +175,22 @@ INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT = "接下来的安排:"
 #: 未来安排条目模板（占位符：{time} / {name}）
 INJECT_SCHEDULE_FUTURE_LINE_DEFAULT = "  {time} - {name}"
 #: 询问未来时的引导行（占位符：无）
-INJECT_HINT_FUTURE_DEFAULT = "💡 用户询问未来计划，请自然地介绍后续安排。"
+INJECT_HINT_FUTURE_DEFAULT = "提示：用户询问未来计划，请自然地介绍后续安排。"
 #: 询问当前时的引导行（占位符：无）
-INJECT_HINT_CURRENT_DEFAULT = "💡 用户直接询问当前状态，请如实告知，并自然带出此刻的精神状态。"
+INJECT_HINT_CURRENT_DEFAULT = "提示：用户直接询问当前状态，请如实告知，并自然带出此刻的精神状态。"
 #: 对话延续时的引导行（占位符：{reason}）
-INJECT_HINT_CONTINUE_DEFAULT = "💡 对话延续中（{reason}），可自然带过当前活动。"
+INJECT_HINT_CONTINUE_DEFAULT = "提示：对话延续中（{reason}），可自然带过当前活动。"
 #: 主动碎碎念时的引导行（占位符：无）
-INJECT_HINT_PROACTIVE_DEFAULT = "💡 可以在回答中自然带出此刻你正在做的事（一两句即可，不要刻意转移话题）。"
+INJECT_HINT_PROACTIVE_DEFAULT = "提示：可以在回答中自然带出此刻你正在做的事（一两句即可，不要刻意转移话题）。"
 #: 闲聊时的引导行（占位符：无）
-INJECT_HINT_IDLE_DEFAULT = "💡 仅供参考；不相关请完全忽略，不要刻意提及。"
+INJECT_HINT_IDLE_DEFAULT = "提示：仅供参考；不相关请完全忽略，不要刻意提及。"
+#: 无当前活动时的兜底文案（占位符：无；2026-10-10 N1-2：
+#: 日程空档期不静默早退，改注入这一句；留空 = 不注入无活动兜底）
+INJECT_NO_ACTIVITY_DEFAULT = "现在没有安排中的活动（可能在休息）。"
 #: replyer 状态注入模板（占位符：{state_line} / {energy} / {next_line}；{next_line} 为空时整行省略）
 INJECT_REPLYER_STATUS_DEFAULT = (
     "【角色当前状态】\n{state_line}\n精神：{energy}。\n{next_line}"
-    "⚠️ 不要主动提及；仅在用户问到 / 强相关时自然带过。"
+    "注意：不要主动提及；仅在用户问到 / 强相关时自然带过。"
 )
 #: replyer 状态行模板（占位符：{activity} / {description} / {remaining_hint}）
 INJECT_REPLYER_STATE_LINE_DEFAULT = "你现在正在 {activity}（{description}）{remaining_hint}。"
@@ -220,7 +223,7 @@ SCHEDULE_HOLIDAY_CONTEXT_DEFAULT = (
 SCHEDULE_GENERATION_EXTRA_DEFAULT = ""
 #: 多轮生成的重试反馈模板（占位符：{issues}）
 SCHEDULE_RETRY_FEEDBACK_DEFAULT = (
-    "\n\n⚠️ **上一次生成存在以下问题，请改进：**\n\n{issues}"
+    "\n\n注意：**上一次生成存在以下问题，请改进：**\n\n{issues}"
     "\n**请重新生成一个更合理的日程，特别注意以上问题！**\n"
 )
 #: 角色裁判提示词（占位符：{persona} / {today_str} / {weekday} / {current_text} / {description}）
@@ -586,6 +589,12 @@ class PromptsSectionConfig(PluginConfigBase):
         default=INJECT_HINT_IDLE_DEFAULT,
         description="闲聊时的引导行（无占位符）",
         json_schema_extra={"label": "注入·引导·闲聊", **_ui_i18n("Hint: idle")},
+    )
+    inject_no_activity: str = Field(
+        default=INJECT_NO_ACTIVITY_DEFAULT,
+        description="无当前活动时的兜底文案（无占位符；留空 = 不注入无活动兜底）",
+        json_schema_extra={"label": "注入·无活动兜底", "rows": 2,
+                           **_ui_i18n("No-activity fallback text")},
     )
     inject_replyer_status: str = Field(
         default=INJECT_REPLYER_STATUS_DEFAULT,

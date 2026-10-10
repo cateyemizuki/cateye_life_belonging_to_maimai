@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .schedule_db import ScheduleDB
-from .time_utils import describe_energy, get_energy_level
+from .time_utils import (describe_energy, format_day_minute, get_energy_level,
+                         is_upcoming_day_minute, ring_minutes_ahead)
 from core.time_utils import minutes_of_now
 
 # sleep 类型条目不算「正在做的事」（仅 include_sleep=True 的调用方可见，如情绪睡眠循环）
@@ -58,20 +59,32 @@ class ScheduleQuery:
         return current
 
     def find_next_activities(self, date: str, limit: int = 3, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """今天**还没开始**的活动（前 ``limit`` 条），跨午夜按同一个 24h 环判定。
+
+        ``N1 读取侧``：起点比较统一走 ``time_utils.is_upcoming_day_minute``（唯一口径）——
+        23:35 时帧首（``0`` 分钟）条目按环上的**帧尾**（今晚 24:00）算作"接下来"，
+        不再被 ``start > cur`` 的单调比较漏掉；列表按环上距离排序（同帧内按 start 升序，
+        帧尾条目自然排在最后）。正在进行中的尾段（如 00:30 的 ``(0, 60)``）不算"接下来"。
+        """
         now = now or datetime.now()
-        cur_min = now.hour * 60 + now.minute
-        upcoming = []
+        cur_min = minutes_of_now(now)
+        upcoming: List[Tuple[int, Dict[str, Any]]] = []
         for item in self._db.get_day_schedule(date):
             if item.get("goal_type") in _SKIP_TYPES:
                 continue
-            if int(item.get("start_minute") or 0) > cur_min:
-                upcoming.append(item)
-                if len(upcoming) >= limit:
-                    break
-        return upcoming
+            raw_start = item.get("start_minute")
+            if not is_upcoming_day_minute(raw_start, cur_min, item.get("end_minute")):
+                continue
+            upcoming.append((ring_minutes_ahead(raw_start, cur_min), item))
+        upcoming.sort(key=lambda pair: pair[0])
+        return [item for _ahead, item in upcoming[:max(0, int(limit))]]
 
     def format_activity_line(self, item: Dict[str, Any], now: Optional[datetime] = None) -> str:
-        """当前活动的一行描述（含剩余时间与情绪/能量提示），注入与 Tool 共用。"""
+        """当前活动的一行描述（含剩余时间与情绪/能量提示），注入与 Tool 共用。
+
+        时间窗一律经 ``time_utils.format_day_minute`` 渲染：跨午夜条目 ``end>1440``
+        显示为「23:00-次日 07:00」（不再是裸 ``//60`` 的 31:00）。
+        """
         now = now or datetime.now()
         start = int(item.get("start_minute") or 0)
         end = int(item.get("end_minute") or 0)
@@ -79,20 +92,21 @@ class ScheduleQuery:
         line = f"{item.get('name', '???')}"
         if item.get("description"):
             line += f"（{item['description']}）"
-        line += f" [{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}]"
+        line += f" [{format_day_minute(start)}-{format_day_minute(end)}]"
         if 0 < remain <= 15:
             line += f"，约还剩 {remain} 分钟"
         energy = describe_energy(get_energy_level(now.hour))
         return f"{line}｜精神状态：{energy}"
 
     def format_day_summary(self, date: str) -> str:
+        """全天日程逐条摘要（时间窗同样经 ``format_day_minute`` 渲染，跨午夜标「次日」）。"""
         items = self._db.get_day_schedule(date)
         if not items:
             return f"{date}：今天还没有安排日程"
         lines = [f"{date} 的日程（共 {len(items)} 项）："]
         for idx, item in enumerate(items, 1):
             start, end = int(item.get("start_minute") or 0), int(item.get("end_minute") or 0)
-            lines.append(f"{idx}. [{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}] "
+            lines.append(f"{idx}. [{format_day_minute(start)}-{format_day_minute(end)}] "
                          f"{item.get('name', '???')}｜{item.get('goal_type', '')}")
             if item.get("description"):
                 lines.append(f"   └ {item['description']}")
@@ -108,5 +122,5 @@ class ScheduleQuery:
             if items:
                 first = items[0]
                 start = int(first.get("start_minute") or 0)
-                result.append((d, f"{start // 60:02d}:{start % 60:02d} {first.get('name', '')}"))
+                result.append((d, f"{format_day_minute(start)} {first.get('name', '')}"))
         return result

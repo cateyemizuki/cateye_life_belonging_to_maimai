@@ -1403,8 +1403,10 @@ class EmotionService:
         """进入睡眠时的周期窗口与计划时长 ``(start, end, planned_hours)``。
 
         - 夜间睡眠（处于作息夜间窗口，或条目起点落在窗口内）→ 按**锚点整夜**：
-          条目本身会被 ``_normalize_items`` 截断到入睡锚点（最长为 23:00–23:15），
-          不能作为整夜窗口，否则入睡约 15 分钟即误判"醒来"；
+          条目本身跨午夜保留原时长（如 23:00 入睡 + 8h ⇒ ``23:00–次日 07:00``，2026-10-10
+          N2/N4 起不再被截断到入睡锚点），但整夜窗口仍以 [schedule] 入睡/起床锚点为唯一
+          真源（赖床延长、锚点漂移都会让条目端点与整夜不等），不能拿条目端点当窗口，
+          否则会提前误判"醒来"；
         - 其它（午休/小睡）→ 按条目自身的 start/end 窗口。
         """
         sleep_min, wake_min = self._sleep_anchors()
@@ -2395,9 +2397,10 @@ class EmotionService:
     async def _check_and_overhaul(self) -> None:
         """一个检测周期：进睡眠时段 → 冻结并在冻结期计算/缓存大修；醒沿 → 冲刷片段 + 应用缓存 + 解冻。
 
-        睡眠时段判定（M5 修复）：条目本身会被 ``_normalize_items`` 的作息锚点截断
-        （最长为 23:00–23:15，夜间无条目覆盖），故**冻结窗口按 [schedule] 作息锚点整夜**
-        （``_sleep_entry_period``），条目只作入口/小睡；醒沿 = 离开该窗口，或日程出现
+        睡眠时段判定（M5 修复）：夜间睡眠条目跨午夜保留原时长（如 23:00 入睡 + 8h ⇒
+        ``23:00–次日 07:00``，2026-10-10 N2/N4 起不再被截断到入睡锚点），但**冻结窗口仍按
+        [schedule] 作息锚点整夜**（``_sleep_entry_period``，条目端点不作窗口），条目只作
+        入口/小睡；醒沿 = 离开该窗口，或日程出现
         非睡眠的清醒活动（文档口径「醒来的第一个活动开始」）。醒沿顺序（M8 段 1 + 段 3，附录
         §2.5/§2.3）：``close_night_interrupt_segment("wake")`` → ``flush_all_episodes("wake")``
         → ``publish_woke_up`` → ``_apply_cached_overhaul``（内部先 ``unfreeze`` 并采集夜间事件
@@ -2533,7 +2536,7 @@ class EmotionService:
         self._save_params()
         self._save_state()
         lines = [
-            "✅ 情绪系统初始化完成（参数已落盘，重启后依然生效）：",
+            "情绪系统初始化完成（参数已落盘，重启后依然生效）：",
             self.params_summary(),
         ]
         if params.reasons.get("anchor"):
@@ -2545,13 +2548,13 @@ class EmotionService:
         self._machine.reset_params()
         self._save_params()
         self._save_state()
-        return "✅ 已恢复默认情绪参数（零锚点、零偏移、中性乘数），当前 VAD 归零。"
+        return "已恢复默认情绪参数（零锚点、零偏移、中性乘数），当前 VAD 归零。"
 
     def clear_log(self) -> str:
         """清空当天情绪日志（隐私接口，设计文档 §十三）。"""
         self._machine.emotion_log = []
         self._save_state()
-        return "✅ 已清空当天情绪日志。"
+        return "已清空当天情绪日志。"
 
     # ── 生命周期 ────────────────────────────────────────────
     def start(self) -> None:

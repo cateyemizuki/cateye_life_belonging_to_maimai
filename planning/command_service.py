@@ -31,17 +31,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# 目标类型 → emoji 映射
-_GOAL_TYPE_EMOJI: Dict[str, str] = {
-    "meal": "🍽️",
-    "study": "📚",
-    "entertainment": "🎮",
-    "daily_routine": "🏠",
-    "social_maintenance": "💬",
-    "learn_topic": "📖",
-    "exercise": "🏃",
-    "rest": "💤",
-    "free_time": "🌟",
+# 目标类型 → 中文标签映射（曾为 emoji；2026-10-10 N7 清洗）
+_GOAL_TYPE_LABEL: Dict[str, str] = {
+    "meal": "用餐",
+    "study": "学习",
+    "entertainment": "娱乐",
+    "daily_routine": "日常",
+    "social_maintenance": "社交",
+    "learn_topic": "兴趣",
+    "exercise": "运动",
+    "rest": "休息",
+    "free_time": "自由时间",
 }
 
 _WEEKDAY_NAMES: Dict[int, str] = {
@@ -112,7 +112,7 @@ class CommandService:
         # 模块独立总开关：停用期间命令不可用（提示配置位置）
         schedule_cfg = getattr(self._plugin.config, "schedule", None)
         if not bool(getattr(schedule_cfg, "enabled", True)):
-            await self._send(stream_id, "🚫 日程规划模块已停用（配置 [日程系统] enabled = false）")
+            await self._send(stream_id, "日程规划模块已停用（配置 [日程系统] enabled = false）")
             return True, "模块未启用", True
 
         # 权限检查：默认拒绝——admin_users 未配置时仅本机控制台可用
@@ -120,18 +120,18 @@ class CommandService:
             if not (self._admin_cfg() and self._admin_cfg().admin_users):
                 await self._send(
                     stream_id,
-                    "🚫 尚未配置管理员：请在插件配置 [管理与日志] 的 admin_users 中"
+                    "尚未配置管理员：请在插件配置 [管理与日志] 的 admin_users 中"
                     "添加你的用户 ID 后再使用 /lbm_plan（本机控制台不受限）",
                 )
             else:
-                await self._send(stream_id, "🚫 你不是管理员哦~只有管理员才能查看和管理日程呢")
+                await self._send(stream_id, "你不是管理员哦~只有管理员才能查看和管理日程呢")
             return True, "没有权限", True
 
         # 白名单过滤（留空 = 全部允许）
         admin = self._admin_cfg()
         allowed_streams = list(getattr(admin, "allowed_streams", None) or []) if admin else []
         if not is_stream_allowed(stream_id, allowed_streams):
-            await self._send(stream_id, "💤 当前会话未启用日程功能")
+            await self._send(stream_id, "当前会话未启用日程功能")
             return True, "会话未启用", True
 
         if len(parts) == 1:
@@ -211,17 +211,17 @@ class CommandService:
         today = now.strftime("%Y-%m-%d")
         weekday = _WEEKDAY_NAMES[now.weekday()]
 
-        lines: List[str] = [f"📅 今日日程 {today} {weekday}", f"共 {len(schedule_goals)} 项活动", ""]
+        lines: List[str] = [f"今日日程 {today} {weekday}", f"共 {len(schedule_goals)} 项活动", ""]
 
         for idx, goal in enumerate(schedule_goals, 1):
             start_minutes, end_minutes = get_time_window_from_goal(goal)
             start_time = format_minutes_to_time(start_minutes)
             end_time = format_minutes_to_time(end_minutes if end_minutes < 1440 else end_minutes - 1440)
-            type_emoji = _GOAL_TYPE_EMOJI.get(goal.goal_type, "📌")
+            type_label = _GOAL_TYPE_LABEL.get(goal.goal_type, "其他")
 
-            lines.append(f"{idx}. ⏰ {start_time}-{end_time}  {type_emoji} {goal.name}")
+            lines.append(f"{idx}. {start_time}-{end_time}  [{type_label}] {goal.name}")
             if self._enable_detailed_description and goal.description:
-                lines.append(f"   📝 {goal.description}")
+                lines.append(f"   说明：{goal.description}")
             lines.append("")  # 空行分隔
 
         return "\n".join(lines).rstrip()
@@ -297,21 +297,21 @@ class CommandService:
         if not schedule_goals:
             tools_svc = self._tools_svc()
             if tools_svc is None:
-                await self._send(stream_id, "❌ 插件未完成初始化，无法生成日程")
+                await self._send(stream_id, "插件未完成初始化，无法生成日程")
                 return
             await self._send(
                 stream_id,
-                "📋 今天还没有日程，正在为你生成（约 30s ~ 2min），完成后会自动发送…",
+                "今天还没有日程，正在为你生成（约 30s ~ 2min），完成后会自动发送…",
             )
             try:
                 await tools_svc.regenerate_today_schedule_now()
             except Exception as exc:
                 logger.error(f"/lbm_plan list 触发生成日程失败: {exc}", exc_info=True)
-                await self._send(stream_id, f"❌ 日程生成失败: {exc}")
+                await self._send(stream_id, f"日程生成失败: {exc}")
                 return
             schedule_goals = self._get_today_schedule_goals(goal_manager)
             if not schedule_goals:
-                await self._send(stream_id, "⚠️ 日程生成完成但没有产生有效活动，请稍后用 /lbm_plan list 重试")
+                await self._send(stream_id, "注意：日程生成完成但没有产生有效活动，请稍后用 /lbm_plan list 重试")
                 return
 
         text = self._build_status_text(schedule_goals)
@@ -348,25 +348,25 @@ class CommandService:
         """``/lbm_plan regenerate [额外要求...]``：立即重新生成今日日程。"""
         tools_svc = self._tools_svc()
         if tools_svc is None:
-            await self._send(stream_id, "❌ 插件未完成初始化，无法重新生成日程")
+            await self._send(stream_id, "插件未完成初始化，无法重新生成日程")
             return
 
         # 剩余参数拼为 extra_prompt（允许带空格的自然描述）
         extra_prompt = " ".join(parts[2:]).strip()
 
-        hint = "♻️ 正在重新生成今日日程，请稍候（约 30s ~ 2min）..."
+        hint = "正在重新生成今日日程，请稍候（约 30s ~ 2min）..."
         if extra_prompt:
-            hint += f"\n📝 额外要求：{extra_prompt}"
+            hint += f"\n额外要求：{extra_prompt}"
         await self._send(stream_id, hint)
 
         try:
             items = await tools_svc.regenerate_today_schedule_now(extra_prompt=extra_prompt)
         except Exception as exc:
             logger.error(f"重新生成日程失败: {exc}", exc_info=True)
-            await self._send(stream_id, f"❌ 重新生成失败: {exc}")
+            await self._send(stream_id, f"重新生成失败: {exc}")
             return
 
-        msg = f"✅ 已重新生成今日日程，共 {len(items)} 项活动\n\n💡 使用 /lbm_plan list 查看（图片+文字详情）"
+        msg = f"已重新生成今日日程，共 {len(items)} 项活动\n\n提示：使用 /lbm_plan list 查看（图片+文字详情）"
         await self._send(stream_id, msg)
 
     async def _handle_delete(self, stream_id: str, parts: List[str]) -> Tuple[bool, str, bool]:
@@ -376,7 +376,7 @@ class CommandService:
         if len(parts) < 3:
             await self._send(
                 stream_id,
-                "❌ 请提供要删除的目标 ID 或序号\n\n用法: /lbm_plan delete <goal_id或序号>\n\n使用 /lbm_plan list 查看所有目标",
+                "请提供要删除的目标 ID 或序号\n\n用法: /lbm_plan delete <goal_id或序号>\n\n使用 /lbm_plan list 查看所有目标",
             )
             return True, "缺少参数", True
 
@@ -391,22 +391,22 @@ class CommandService:
                 goal_id = goal.goal_id
                 goal_name = goal.name
             else:
-                await self._send(stream_id, f"❌ 序号 {identifier} 超出范围\n使用 /lbm_plan list 查看所有目标")
+                await self._send(stream_id, f"序号 {identifier} 超出范围\n使用 /lbm_plan list 查看所有目标")
                 return True, "序号无效", True
         else:
             # 作为 goal_id 处理
             goal_id = identifier
             goal = goal_manager.get_goal(goal_id)
             if not goal:
-                await self._send(stream_id, f"❌ 目标不存在: {goal_id}")
+                await self._send(stream_id, f"目标不存在: {goal_id}")
                 return True, "目标不存在", True
             goal_name = goal.name
 
         success = goal_manager.delete_goal(goal_id)
         if success:
-            await self._send(stream_id, f"🗑️ 已删除目标: {goal_name}\n\nID: {goal_id}")
+            await self._send(stream_id, f"已删除目标: {goal_name}\n\nID: {goal_id}")
         else:
-            await self._send(stream_id, "❌ 删除失败")
+            await self._send(stream_id, "删除失败")
         return True, "命令执行完成", True
 
     async def _handle_clear(self, stream_id: str, parts: List[str]) -> None:
@@ -443,7 +443,7 @@ class CommandService:
                 continue
 
         if not to_delete:
-            await self._send(stream_id, "✨ 没有需要清理的旧日程")
+            await self._send(stream_id, "没有需要清理的旧日程")
             return
 
         deleted_count = 0
@@ -455,32 +455,32 @@ class CommandService:
             today_schedule_count = len(self._get_today_schedule_goals(goal_manager))
             await self._send(
                 stream_id,
-                f"🧹 已清理 {deleted_count} 个旧日程目标\n\n保留了今天的 {today_schedule_count} 个日程",
+                f"已清理 {deleted_count} 个旧日程目标\n\n保留了今天的 {today_schedule_count} 个日程",
             )
         else:
-            await self._send(stream_id, "❌ 清理失败")
+            await self._send(stream_id, "清理失败")
 
     async def _show_help(self, stream_id: str) -> None:
         """显示帮助（完整帮助文本作为单条消息合并转发）。"""
-        help_text = """🤖 日程规划系统
+        help_text = """日程规划系统
 
-📋 命令列表:
+命令列表:
 /lbm_plan list - 查看今日日程（图片+详细文字合并转发；无日程时自动先生成）
 /lbm_plan regenerate [额外要求] - 重新生成今日日程（先删今天再重生，可附加临时要求）
 /lbm_plan delete <goal_id或序号> - 删除指定目标
 /lbm_plan clear - 清理昨天及更早的旧日程
 /lbm_plan help - 显示此帮助
 
-💡 使用方式:
+使用方式:
 1. 对我说 "帮我生成今天的日程" / 直接 /lbm_plan list，没有日程时会自动创建
 2. 使用 regenerate 在不满意当前日程时立即重新生成
 3. 使用 clear 清理旧日程，保持目标列表整洁
 
-♻️ 重新生成示例:
+重新生成示例:
 /lbm_plan regenerate                # 直接重新生成今日日程
 /lbm_plan regenerate 加入下午跑步     # 重新生成并临时叠加要求
 
-📌 注意:
+注意:
 - 日程每天自动生成，无需手动创建
 - /lbm_plan list 在今日无日程时会先自动生成再展示
 - regenerate 会丢弃今天已有日程并重新生成，操作不可逆
