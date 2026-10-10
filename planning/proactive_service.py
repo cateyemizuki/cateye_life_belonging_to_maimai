@@ -6,15 +6,28 @@
    （``ctx.maisaka.proactive.trigger``）。不覆盖当天睡醒后的第一个活动，设定的睡眠时段内不触发；
    每个 ``(stream_id, activity_name, date)`` 组合只触发一次。
 
-2. **L2 早晚安漂移（M11 三类开关 → 2026-10-10 两开关 + 统一名单）** ——
-   早/晚安只配漂移区间（``morning_drift`` / ``night_drift``，每流每日独立掷点）：早安基准 =
-   睡眠窗口结束（``[schedule].wake_time`` 锚点），晚安基准 = 当天最后一个非睡眠日程条目结束
-   （无日程回退 ``sleep_time`` 锚点）。到点按「必要性激活」判定触发（早安自基准点起、
-   晚安自 ``fire_at`` 起该流有人发过消息），到期限仍无人则放弃。
-   候选矩阵：目标陪伴私聊（``[patrol].enabled`` 时固定生效，不看名单）；群聊与其他私聊
-   走**统一名单系统**（``proactive_group_ids`` / ``proactive_private_ids`` + 各自模式开关），
-   其他私聊另有「前一日消息数 ≥ 门槛」护栏。开/关由 ``greeting_morning_enabled`` /
-   ``greeting_night_enabled`` 两个开关统一控制。
+2. **L2 早晚安漂移（M11 三类开关 → 2026-10-10 两开关 + 统一名单；第二轮重做状态机）** ——
+   早/晚安只配漂移区间（``morning_drift`` / ``night_drift``，每流每日独立掷点），执行顺序固定为
+   **掷点 → 激活观测 → 到点（或已过点则立即）发**：
+
+   - **基准点**：早安 = 睡眠窗口结束（``[schedule].wake_time`` 锚点）；晚安 = 当天最后一个
+     非睡眠日程条目结束（无日程回退 ``sleep_time`` 锚点）。
+   - **漂移点（fire_at）**：早安 = 基准 + randint(a,b)（醒来后随机点）；晚安 = 期限 − randint(a,b)
+     （睡前随机点；期限 = ``min(入睡锚点, [patrol] silence_start)``）——两个方向都保证点落在
+     「当天的清醒区间」内，不会跨过入睡界。
+   - **激活观测窗** = ``[min(基准, 漂移点), max(期限, 漂移点)]``（两种问候同一公式）：
+     早安期限 = 第一段非睡眠日程结束（无日程 → 起床 + 120 分钟）；
+     晚安期限 = ``min(入睡锚点, [patrol] silence_start)``。
+   - **判定**：窗内**该流有人发过消息** → 已激活；激活后未到点 → 等待，到点即发；观察到时
+     **已过点** → 立即发；观测窗结束仍无人 → 当天不再评估（放弃）。
+   - ``greeting_require_activation=false`` → 不看激活，到点即发；错过观测窗（如重启跨过整窗）不补发。
+   - **静默时段不再拦截问候**（2026-10-10 第二轮）：默认静默窗 00:00-07:30 与起床锚点 07:00
+     重叠，会把漂移整段吞掉（每天固定在 07:30 开口 = 漂移失效），而问候本身已由"必要性激活"
+     把关（没人说话就不发）；``[patrol] silence_*`` 仍约束陪伴巡检。
+   - 候选矩阵：目标陪伴私聊（``[patrol].enabled`` 且**未被私聊黑名单排除**时生效）；
+     群聊与其他私聊走**统一名单系统**（``proactive_group_ids`` / ``proactive_private_ids`` +
+     各自模式开关），其他私聊另有「前一日消息数 ≥ 门槛」护栏。
+     开/关由 ``greeting_morning_enabled`` / ``greeting_night_enabled`` 两个开关统一控制。
    **例行问候始终免预算**：早/晚安触发既不查预算闸门也不计主动打扰用量；
    预算只服务 [patrol] 的巡检与想念（[patrol].daily_max_speak）。
 
@@ -22,7 +35,9 @@
 
 对整合契约的适配：
 - 触发走 ``ctx.maisaka.proactive.trigger``（目标插件声明的能力名）；
-- 名单只收**裸号**（群聊填群号、私聊填 QQ 号），非法元素汇总级告警（不逐条刷屏）；
+- 名单接受**裸号**（群聊填群号、私聊填 QQ 号）以及带 ``qq:group:`` / ``qq:private:`` /
+  ``group:`` / ``private:`` / ``qq:`` 前缀的写法（自动剥前缀取号，B2 轮补：此前前缀写法会被
+  当作非法元素静默忽略，黑名单因此"看起来没生效"）；非法元素汇总级告警（不逐条刷屏）；
 - 决策写入 plugin._decision_logger（core/diag）；提示词一律读 suite_prompts。
 """
 
@@ -64,7 +79,7 @@ from .config import (
     section_or_default,
 )
 from .goal_manager import get_goal_manager
-from .time_utils import TimezoneManager, is_in_time_window, parse_time_window
+from .time_utils import TimezoneManager, parse_time_window
 if TYPE_CHECKING:
     from typing import Any as _Plugin
 
@@ -133,9 +148,8 @@ _MORNING_FALLBACK_DEADLINE_MINUTES = 120
 #: （planning 不 import emotion，避免循环依赖；F14 要求早安期限过滤睡眠条目）
 _SLEEP_NAME_KEYWORDS = ("睡觉", "睡眠", "安睡", "午休", "午睡", "小憩", "打盹")
 #: [patrol] 静默时段开始的缺省值（配置不可得时的兜底，与 companion/config.py 默认值一致；
-#: 缺省窗口为 00:00-07:30，晚安期限只用到起点）
+#: 晚安期限只用到起点，故只需起点常量——终点已随"静默不拦截问候"一并删除）
 _DEFAULT_SILENCE_START = "00:00"
-_DEFAULT_SILENCE_END = "07:30"
 
 
 def _parse_drift(value: Any, default: Tuple[int, int] = DEFAULT_GREETING_DRIFT) -> Tuple[int, int]:
@@ -299,14 +313,27 @@ class ProactiveService:
     # 统一名单系统（2026-10-10 合并：群聊名单 + 私聊名单，各带模式开关）
     # ------------------------------------------------------------
 
-    @staticmethod
-    def _clean_id_list(raw: Any) -> Tuple[List[str], List[str]]:
+    #: 名单元素可接受的前缀写法（剥前缀取号；B2 轮补：此前一律按非法忽略）
+    _GROUP_ID_PREFIXES = ("qq:group:", "group:", "qq:group_", "group_")
+    _PRIVATE_ID_PREFIXES = ("qq:private:", "private:", "qq:", "user:")
+
+    @classmethod
+    def _clean_id_list(cls, raw: Any, kind: str = "") -> Tuple[List[str], List[str]]:
         """清洗一份名单：只收**裸号**（纯数字）；返回 ``(合法号列表, 问题清单)``。
 
-        带前缀（``qq:private:`` / ``session:`` 等）、含非数字、空串、重复项、通配 ``*``
-        一律记为问题（调用方汇总成一条告警，不逐条刷屏）；通配在新语义下没有意义
-        （黑名单留空即全放行、白名单留空即全不发），故按非法元素处理。
+        前缀写法（``qq:group:123`` / ``group:123`` / ``qq:private:789`` / ``qq:789``）会**剥掉
+        前缀取号**（``kind`` 决定认哪一组前缀：``"group"`` / ``"private"``）——B2 轮补：
+        此前这些写法被当作非法元素**静默忽略**，用户填了黑名单却"看起来没生效"（黑名单变空 =
+        全部放行）。跨类前缀（群号写进私聊名单等）仍按非法处理并告警。
+
+        空串、含非数字、重复项、通配 ``*`` 按非法元素处理（调用方汇总成一条告警，不逐条刷屏）；
+        通配在新语义下没有意义（黑名单留空即全放行、白名单留空即全不发）。
         """
+        prefixes: Tuple[str, ...] = ()
+        if kind == "group":
+            prefixes = cls._GROUP_ID_PREFIXES
+        elif kind == "private":
+            prefixes = cls._PRIVATE_ID_PREFIXES
         values: List[str] = []
         problems: List[str] = []
         seen: set = set()
@@ -315,14 +342,20 @@ class ProactiveService:
             if not text:
                 problems.append(f"空串（{item!r}）")
                 continue
-            if not text.isdigit():
-                problems.append(f"{text}（非法：只收裸号，不带前缀、不含非数字字符）")
+            number = text
+            for prefix in prefixes:
+                if text.lower().startswith(prefix):
+                    number = text[len(prefix):].strip()
+                    break
+            if not number.isdigit():
+                problems.append(f"{text}（非法：只收裸号或带 qq:group:/qq:private: 前缀的号，"
+                                f"不含非数字字符）")
                 continue
-            if text in seen:
+            if number in seen:
                 problems.append(f"{text}（重复项）")
                 continue
-            seen.add(text)
-            values.append(text)
+            seen.add(number)
+            values.append(number)
         return values, problems
 
     def _target_qq(self) -> str:
@@ -359,7 +392,7 @@ class ProactiveService:
         - 模式 = 白名单：只有名单内的群生效；留空 = 都不生效。
         """
         cfg = self._proactive_cfg()
-        ids, problems = self._clean_id_list(getattr(cfg, "proactive_group_ids", None))
+        ids, problems = self._clean_id_list(getattr(cfg, "proactive_group_ids", None), "group")
         mode = str(getattr(cfg, "proactive_group_list_mode", LIST_MODE_BLACKLIST) or LIST_MODE_BLACKLIST)
         if problems:
             self._note_list_problem(tuple(["group"] + ids + problems), [f"群聊名单：{p}" for p in problems])
@@ -388,7 +421,7 @@ class ProactiveService:
         陪伴模块的巡检与早/晚安，日程侧的活动切换不进去抢话。
         """
         cfg = self._proactive_cfg()
-        ids, problems = self._clean_id_list(getattr(cfg, "proactive_private_ids", None))
+        ids, problems = self._clean_id_list(getattr(cfg, "proactive_private_ids", None), "private")
         mode = str(getattr(cfg, "proactive_private_list_mode", LIST_MODE_WHITELIST) or LIST_MODE_WHITELIST)
         if problems:
             self._note_list_problem(tuple(["private"] + ids + problems),
@@ -424,6 +457,28 @@ class ProactiveService:
                 streams.append(sid)
                 seen.add(sid)
         return streams
+
+    def _target_greeting_allowed(self) -> bool:
+        """目标陪伴私聊是否允许问候（B2：严格遵循统一名单）。
+
+        规则（与"活动切换恒剔除目标"相反——问候恰恰主要服务目标私聊）：
+
+        - 私聊名单模式 = **白名单**（默认）：目标私聊**视为恒在名单内**（名单留空 = 其他私聊
+          一概不主动，但目标照常问候，保住默认体验）；
+        - 私聊名单模式 = **黑名单**：目标 QQ 写进名单即被排除（"配置为黑名单的聊天流仍触发
+          早安"由此修复）。
+        """
+        cfg = self._proactive_cfg()
+        ids, problems = self._clean_id_list(getattr(cfg, "proactive_private_ids", None), "private")
+        if problems:
+            self._note_list_problem(tuple(["private"] + ids + problems),
+                                    [f"私聊名单：{p}" for p in problems])
+        mode = str(getattr(cfg, "proactive_private_list_mode", LIST_MODE_WHITELIST)
+                   or LIST_MODE_WHITELIST)
+        target = self._target_qq()
+        if mode == LIST_MODE_BLACKLIST and target and target in set(ids):
+            return False
+        return True
 
     async def _resolve_group_id(self, group_id: str) -> Optional[str]:
         """把群号解析为 session_id（带解析缓存）。"""
@@ -646,7 +701,16 @@ class ProactiveService:
 
     def _greeting_deadline_ts(self, kind: str, now: datetime, date_str: str,
                               baseline_ts: float) -> float:
-        """放弃期限（绝对时间戳，§3.2）。"""
+        """观测窗期限（绝对时间戳，§3.2；2026-10-10 第二轮重定义为"激活观测上界"）。
+
+        - **早安** = 睡眠结束后**第一个非睡眠日程条目的结束**（"第一段日程结束前有人说话"）；
+          无日程 → 基准 + 120 分钟（实现裁量：不给无日程留无期限观察）；
+        - **晚安** = ``min(入睡锚点, [patrol] silence_start)``：既是激活观测上界，
+          也是漂移点的硬界（不得在界后道晚安）。
+
+        观测窗下界统一取 ``max(期限, 漂移点)``（见 :meth:`_roll_greeting`）——期限本身
+        不再用于"到点前放弃"（旧版把它当放弃线，与静默窗叠加后会把问候整段吞掉）。
+        """
         midnight = self._midnight_ts(now)
         if kind == GREETING_MORNING:
             first = self._find_first_non_sleep_activity_today(date_str)
@@ -685,16 +749,11 @@ class ProactiveService:
             self._patrol_time("silence_start", _DEFAULT_SILENCE_START), 0)
         return self._next_daily_anchor_ts(now, start_min)
 
-    def _in_silence_window(self, now: datetime) -> bool:
-        """当前是否处于 ``[patrol]`` 静默时段（§3.6：合并后静默仍按 silence_* 生效）。
-
-        支持跨午夜窗口（沿用既有 is_in_time_window 语义）；配置非法按不在静默处理
-        （与巡检侧"非法配置 fail-safe"口径一致）——此时问候链不因静默推迟。
-        """
-        return is_in_time_window(
-            self._patrol_time("silence_start", _DEFAULT_SILENCE_START),
-            self._patrol_time("silence_end", _DEFAULT_SILENCE_END),
-            now.strftime("%H:%M"), invalid_result=False)
+    # 注（2026-10-10 第二轮）：原 ``_in_silence_window`` 已删除——问候不再被静默时段拦截。
+    # 原因：默认静默窗 00:00-07:30 与起床锚点 07:00 重叠，会把早安漂移整段吞掉（表现为
+    # "每天固定在 07:30 开口、漂移失效"甚至"第一段日程结束在静默内 → 直接放弃不发"）。
+    # 问候的必要性由"激活观测"（有人在该流说过话）把关，静默语义继续约束 [patrol] 巡检
+    # （companion/patrol.py 的 is_in_time_window）。不要在这里重新引入静默拦截。
 
     def _greeting_drift(self, kind: str) -> Tuple[int, int]:
         """取该 kind 的漂移区间（非法/负数回退默认区间，§3.1/B3）。"""
@@ -706,8 +765,18 @@ class ProactiveService:
                        now: datetime, now_ts: float) -> Dict[str, Any]:
         """掷点（§3.2）：每 ``(stream_id, date, kind)`` 只掷一次，同流同日重复决策复用同一结果。
 
-        纯内存、不落盘（热重载后允许重掷）；跨午夜条目按绝对时间戳处理。生成时窗口已关
-        （``now ≥ deadline``）→ 直接记 ``abandoned``（当天不再评估该流该 kind）。
+        **漂移点**（2026-10-10 第二轮回正）：
+
+        - 早安 = ``基准 + randint(a,b)``（醒来后 0~N 分钟；基准 = wake 锚点）；
+        - 晚安 = ``期限 − randint(a,b)``（睡前 0~N 分钟；期限 = ``min(入睡锚点, 静默起点)``）。
+          旧版晚安拿"最后一段日程结束"当参考做减法，最后一段恰好结束在入睡锚点时点会落在
+          日程中段 = 提前发；锚在期限上则恒为"睡前随机点"，且永不超过入睡界。
+        - **观测窗 = ``[min(基准, 漂移点), max(期限, 漂移点)]``**（两种问候同一公式）：窗内
+          该流有人说话即"已激活"；窗下界保证漂移点永远落在窗内（旧版窗口比漂移点还早时
+          结构性发不出）。
+
+        纯内存、不落盘（热重载后允许重掷）；跨午夜条目按绝对时间戳处理。掷点时观测窗
+        已整段关掉（``now ≥ 观测窗上界``）→ 直接记 ``abandoned``（当天不再评估该流该 kind）。
         """
         key = (stream_id, date_str, kind)
         entry = self._greeting_rolls.get(key)
@@ -718,7 +787,15 @@ class ProactiveService:
         baseline_ts = self._greeting_baseline_ts(kind, now, date_str)
         deadline_ts = self._greeting_deadline_ts(kind, now, date_str, baseline_ts)
         offset = float(random.randint(drift[0], drift[1])) * 60.0   # 漂移区间是分钟 → 秒
-        fire_at = baseline_ts + offset if kind == GREETING_MORNING else baseline_ts - offset
+        # 漂移点：早安 = 基准 + offset（醒来后 0~N 分钟）；晚安 = 期限 − offset
+        # （睡前 0~N 分钟；期限 = min(入睡锚点, 静默起点)）。两个方向都保证"点"落在
+        # 「白天锚点之间」，不会跨过入睡界（旧版拿最后一段日程结束当参考，最后一段恰好
+        # 结束在入睡锚点时点会落在日程中间 = 提前发；锚在期限上则恒为睡前随机点）。
+        fire_at = baseline_ts + offset if kind == GREETING_MORNING else deadline_ts - offset
+        # 观测窗：[min(基准, 漂移点), max(期限, 漂移点)]——两种问候同一公式，且保证漂移点
+        # 永远落在窗内（否则会出现"窗口比漂移点还早、结构性发不出"）
+        observe_from = min(baseline_ts, fire_at)
+        observe_until = max(deadline_ts, fire_at)
         entry = {
             "stream_id": stream_id,
             "category": category,
@@ -728,11 +805,13 @@ class ProactiveService:
             "rolled": True,
             "baseline": baseline_ts,
             "deadline": deadline_ts,
+            "observe_from": observe_from,
+            "observe_until": observe_until,
             "fire_at": fire_at,
             "status": GREETING_STATUS_PENDING,
             "reason": "",
         }
-        if now_ts >= deadline_ts:
+        if now_ts > observe_until:
             entry["status"] = GREETING_STATUS_ABANDONED
             entry["reason"] = "window_closed"
             logger.debug(
@@ -742,7 +821,7 @@ class ProactiveService:
             logger.info(
                 f"问候掷点: stream={stream_id}, kind={kind}, category={category}, "
                 f"drift={drift[0]}-{drift[1]}, fire_at={int(fire_at)}, "
-                f"deadline={int(deadline_ts)}"
+                f"observe_until={int(observe_until)}"
             )
         self._greeting_rolls[key] = entry
         return entry
@@ -752,14 +831,14 @@ class ProactiveService:
         attr = "greeting_morning_enabled" if kind == GREETING_MORNING else "greeting_night_enabled"
         return bool(getattr(self._proactive_cfg(), attr, True))
 
-    def _greeting_requires_activation(self, category: str, kind: str, cfg_p: Any) -> bool:
-        """是否需要「必要性激活」：只有群聊需要（有人说话才跟着问候）。
+    def _greeting_requires_activation(self, cfg_p: Any) -> bool:
+        """是否需要「必要性激活」：所有会话一视同仁（含目标私聊）。
 
-        目标私聊固定生效（不看激活）；其他私聊的门槛 = 前一日消息数
-        （``greeting_other_private_min_messages``），由 :meth:`_other_private_qualified` 承担。
+        2026-10-10 第二轮回正：此前只有群聊需要激活、目标私聊"固定生效"，与用户期望的
+        「有人在当前聊天流发过消息才算激活」不符（B1/B2 的共同成因之一）；
+        ``greeting_require_activation=false`` → 不看激活，到点即发。
         """
-        if category != GREETING_CATEGORY_GROUP:
-            return False
+        return bool(getattr(cfg_p, "greeting_require_activation", True))
         return bool(getattr(cfg_p, "greeting_require_activation", True))
 
     async def _other_private_qualified(self, stream_id: str, date_str: str,
@@ -801,10 +880,10 @@ class ProactiveService:
 
     async def _stream_activated_since_wake(self, stream_id: str, since_ts: float,
                                            until_ts: float) -> bool:
-        """自 ``since_ts`` 起该流是否有人发过消息（早安/晚安共用同一查询形态）。
+        """自 ``since_ts`` 起该流是否有人发过消息（早/晚安统一口径：起点 = 基准点）。
 
-        窗口起点由调用方分派：晚安 = ``fire_at``、早安 = ``baseline``
-        （见 :meth:`_evaluate_greeting`）。沿用既有调用形态
+        2026-10-10 第二轮统一：早/晚安都用 ``[基准点, now]``（旧版晚安起点是 ``fire_at``，
+        与「漂移点之前就说话算不算激活」的语义不一致）。查询形态沿用
         ``ctx.message.get_by_time_in_chat(stream_id, 起点ts, now, limit=1)``；
         能力不可用/异常 → False（保守：没人说话就不打扰）。
         """
@@ -901,37 +980,34 @@ class ProactiveService:
         return result
 
     async def _resolve_greeting_candidates(self, cfg_p: Any) -> List[Tuple[str, str]]:
-        """问候候选：目标私聊（陪伴模块启用时固定生效）∪ 群聊（名单）∪ 其他私聊（名单 + 门槛）。
+        """问候候选：目标私聊 ∪ 群聊（名单）∪ 其他私聊（名单 + 门槛）。
 
-        2026-10-10 口径：
+        2026-10-10 第二轮回正（B2）：**严格遵循统一名单**，不再有任何"隐藏兼容位"开关：
 
-        - **目标陪伴私聊**：陪伴模块（``[patrol].enabled``）启用时**不看任何名单**照发；
-          陪伴模块整体关闭时目标私聊也不再问候（问候是陪伴体验的一部分）；
+        - **目标陪伴私聊**：陪伴模块（``[patrol].enabled``）启用、目标会话已解析、
+          且**未被私聊黑名单排除**（白名单模式下视为恒在名单内；黑名单模式下把目标 QQ
+          写进 ``proactive_private_ids`` 即可停掉它的问候）时生效；
         - **群聊**：走统一群聊名单（``proactive_group_ids`` + 模式；默认黑名单 + 留空 = 全群）；
-          受 ``greeting_group_enabled``（隐藏兼容位，默认开）与「问候需激活」限制；
-        - **其他私聊**：走统一私聊名单（``proactive_private_ids`` + 模式；默认白名单 + 留空 = 全不发）；
-          另需 ``greeting_other_private_enabled``（隐藏兼容位，默认关）与前一日消息数门槛。
+        - **其他私聊**：走统一私聊名单（``proactive_private_ids`` + 模式；默认白名单 + 留空 = 全不发），
+          另需前一日消息数门槛（``greeting_other_private_min_messages``）。
         """
         candidates: List[Tuple[str, str]] = []
         seen: set = set()
 
         target = str(getattr(self._plugin, "_stream_id", "") or "").strip()
-        if (target and self._companion_enabled()
-                and bool(getattr(cfg_p, "greeting_target_enabled", True))):
+        if target and self._companion_enabled() and self._target_greeting_allowed():
             candidates.append((target, GREETING_CATEGORY_TARGET))
             seen.add(target)
 
-        if bool(getattr(cfg_p, "greeting_group_enabled", True)):
-            for sid in await self._resolve_group_streams():
-                if sid and sid not in seen:
-                    candidates.append((sid, GREETING_CATEGORY_GROUP))
-                    seen.add(sid)
+        for sid in await self._resolve_group_streams():
+            if sid and sid not in seen:
+                candidates.append((sid, GREETING_CATEGORY_GROUP))
+                seen.add(sid)
 
-        if bool(getattr(cfg_p, "greeting_other_private_enabled", False)):
-            for sid in await self._resolve_private_streams():
-                if sid and sid not in seen:
-                    candidates.append((sid, GREETING_CATEGORY_OTHER))
-                    seen.add(sid)
+        for sid in await self._resolve_private_streams():
+            if sid and sid not in seen:
+                candidates.append((sid, GREETING_CATEGORY_OTHER))
+                seen.add(sid)
 
         return candidates
 
@@ -961,54 +1037,50 @@ class ProactiveService:
     async def _evaluate_greeting(self, stream_id: str, category: str, kind: str,
                                  now: datetime, now_ts: float, date_str: str,
                                  cfg_p: Any) -> None:
-        """单个候选的到点判定：激活 / 推迟下一 tick / 到期限放弃 / 触发。
+        """单个候选的状态机：**掷点 → 激活观测 → 到点（或已过点立即）发 / 窗关放弃**。
 
-        激活查询窗按 kind 分派（附录 §六.补 B5-补）：
+        2026-10-10 第二轮（用户口径重做）：
 
-        - **晚安** ``[fire_at, now]``：``fire_at = baseline − drift < baseline``，而常见日程形态
-          （末条非睡眠条目截断到入睡锚点）下 ``baseline ≈ 期限``——沿用 ``[baseline, now]``
-          会**结构性空窗**、群聊晚安永不触发；改自「该问候成为可能（fire_at）起」。
-        - **早安** ``[baseline, now]``（「自基准点起该流有人发过消息」）。
+        - 激活观测窗 = ``[baseline, observe_until]``（``observe_until`` 见 :meth:`_roll_greeting`），
+          窗口内该流有人发过消息即「已激活」——**不再分会话类型**（目标私聊同样要看激活）；
+        - 已激活后：未到 ``fire_at`` → 等待下一 tick；到点（或观察到时已过点）→ **立即发**，
+          不再因"超过期限/落在静默时段"二次拦截（满载漂移语义：点就是点）；
+        - 观测窗整段结束仍无人说话 → 放弃当天该流该 kind（记 ``deadline``）；
+        - ``greeting_require_activation=false`` → 不看激活，到点即发；若此刻观测窗已整段错过
+          （如重启跨过整窗）→ 放弃，不深夜补发。
 
-        目标私聊不看激活与名单；群聊看激活开关；其他私聊看前一日消息数门槛。
+        其他私聊另有前一日消息数门槛（``greeting_other_private_min_messages``）；
+        目标私聊的准入在候选枚举里按统一名单判定（:meth:`_target_greeting_allowed`）。
         """
         if not self._greeting_kind_enabled(kind):
             return  # 总开关（候选枚举已按开关过滤，这里再判一次保证直调路径同样生效）
         if category == GREETING_CATEGORY_TARGET:
-            if not (self._companion_enabled()
-                    and bool(getattr(cfg_p, "greeting_target_enabled", True))):
+            if not self._companion_enabled():
                 return
-        elif category == GREETING_CATEGORY_GROUP:
-            if not bool(getattr(cfg_p, "greeting_group_enabled", True)):
-                return
-        else:
-            if not bool(getattr(cfg_p, "greeting_other_private_enabled", False)):
-                return
+        elif category != GREETING_CATEGORY_GROUP:
             if not await self._other_private_qualified(stream_id, date_str, now, cfg_p):
                 return
 
         entry = self._roll_greeting(stream_id, category, kind, date_str, now, now_ts)
         if entry["status"] in (GREETING_STATUS_FIRED, GREETING_STATUS_ABANDONED):
             return
-        if now_ts < entry["fire_at"]:
-            return
-
-        activated = True
-        if self._greeting_requires_activation(category, kind, cfg_p):
-            # 附录 §六.补 B5-补：晚安自 fire_at 起算（用 baseline 会结构性空窗），早安维持 baseline
-            since_ts = entry["fire_at"] if kind == GREETING_NIGHT else entry["baseline"]
-            activated = await self._stream_activated_since_wake(stream_id, since_ts, now_ts)
-        if not activated:
-            if now_ts >= entry["deadline"]:
-                self._abandon_greeting(entry, "deadline")
-            return  # 到点无人说话 → 推迟到下一 tick 继续观察
-        if now_ts >= entry["deadline"]:
-            self._abandon_greeting(entry, "deadline")
-            return
-        if self._in_silence_window(now):
-            # §3.6：合并后静默时段仍生效——静默中不开口（推迟下一 tick；
-            # 静默延续到期限的情形由上一判定的 deadline 分支放弃）
-            return
+        observe_until = entry.get("observe_until", entry["deadline"])
+        if self._greeting_requires_activation(cfg_p):
+            activated = await self._stream_activated_since_wake(
+                stream_id, entry.get("observe_from", entry["baseline"]), now_ts)
+            if not activated:
+                if now_ts > observe_until:
+                    self._abandon_greeting(entry, "deadline")
+                return  # 窗内暂时无人说话 → 推迟到下一 tick 继续观察
+            if now_ts < entry["fire_at"]:
+                return  # 已激活但未到点 → 等待漂移点
+        else:
+            if now_ts < entry["fire_at"]:
+                return
+            if now_ts > observe_until:
+                # 不看激活时，观测窗就是"补发窗口"：整段错过（如重启）→ 不深夜补发
+                self._abandon_greeting(entry, "window_closed")
+                return
         if self._greeting_deduped_by_persisted_marker(category, kind):
             # P5（2026-10-09 登记）：热重载/重启后内存掷点清零，但 affection 的按天标记仍在——
             # 目标私聊该 kind 今天已发过 → 视为已触发（与自然触发同形态）+ 落去重行，不再重发。

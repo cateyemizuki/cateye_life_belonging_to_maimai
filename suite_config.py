@@ -19,12 +19,23 @@
 提示词集中进新增 [prompts]。段名保持不变的段（plugin/patrol/affection/schedule/
 planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
-**为什么不递增 config_version**（重要，别乱改）：宿主 Runner 在「配置版本号变化」时会
+**config_version 与迁移保障（2026-10-10 第二版，已订正）**：
+开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `1.1.0`；
+迁移保障改由 **plugin.py 的「磁盘旧文件抢救」**（`CateyeSuitePlugin.normalize_plugin_config` 先读尚未被
+宿主覆写的磁盘 `config.toml`，把用户值并回输入）＋ 下面的 `mode="before"` 一次性迁移器共同承担。
+**旧口径（已作废）如下，仅留作教训**：宿主 Runner 在「配置版本号变化」时会
 **先**用最新默认结构重建设置文件（只保留新旧同名的键），之后才把结果交给插件模型校验——
 一旦递增，跨段搬迁（如 target_qq → patrol.target_qq）与所有改名键的用户值都会在插件
 看到它们之前被丢弃。因此本轮的旧键迁移放在 :class:`CateyeSuiteConfig` 的
 ``mode="before"`` 校验器里（版本号不变 → 宿主把原始配置交给插件 → 插件搬迁 → 落盘时
 旧键自然消失），:data:`SUPPORTED_CONFIG_VERSION` 保持不变是有意为之。
+
+**迁移哨兵的历史缺陷（2026-10-10 第二轮修复，别再犯）**：``[plugin] layout_version`` 曾被
+无条件写进 ``mode="before"`` 校验器——而 Pydantic 在**无参构造 / 空输入**时也会跑该校验器，
+于是「出厂默认配置」本身就带上了布局标记。宿主与 SDK 的归一化都会**先 merge 出厂默认**，
+``already_migrated`` 因此恒为 True、**迁移器在真实宿主路径下从不执行**（跨段旧键全丢；
+离线用例直接 ``model_validate(旧字典)``、不经 merge，所以当时没抓到）。
+现在只在**输入非空**（真拿到了配置数据）时才写标记；抢救逻辑见 plugin.py。
 
 **迁移映射**（旧 → 新，全部在 :meth:`CateyeSuiteConfig._migrate_legacy_sections`）：
 - ``[target].target_qq`` → ``[patrol].target_qq``；
@@ -44,7 +55,7 @@ planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
 from __future__ import annotations
 
-from typing import ClassVar, Dict, List
+from typing import Any, ClassVar, Dict, List
 
 import pydantic
 from maibot_sdk import Field, PluginConfigBase
@@ -64,16 +75,19 @@ from planning.config import (
 from qzone.config import QzoneSectionConfig
 from suite_prompts import PromptsSectionConfig
 
-# 配置版本（**与插件版本 `_manifest.json` 的 version 解耦**，两者不等是预期状态）：
-# 插件版本表达"功能发布代次"（本版 = 1.1.0）；配置版本表达"配置文件结构代次"，
-# 它决定宿主是否按新骨架重建设置文件——重建会丢弃跨段旧键，使插件侧迁移器失效。
-# 注意（2026-10-10 配置整理轮）：**不要**因为配置结构调整而递增本值——宿主在版本号变化时
-# 会先按新骨架重建设置文件（丢弃跨段旧键），本模块的迁移器将看不到旧值。递增时机 =
-# 既有用户的 config.toml 已按新布局落盘之后（建议随下一次发布处理）。
-SUPPORTED_CONFIG_VERSION = "1.0.0"
+# 配置版本（**必须与插件版本 `_manifest.json` 的 version 同步**，红线 R6）：
+# 插件版本表达"功能发布代次"；配置版本表达"配置文件结构代次"，宿主在它变化时会按新骨架
+# 重建设置文件（丢弃跨段旧键）。因此递增本值必须同时具备"磁盘旧文件抢救"（plugin.py 的
+# normalize_plugin_config：把尚未被覆写的磁盘 config.toml 里的用户值并回输入），
+# 否则跨段/改名键的用户值会在插件看到它们之前被丢弃 —— 见模块 docstring 的教训段。
+SUPPORTED_CONFIG_VERSION = "1.1.0"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
+
+#: 2026-10-10 配置整理轮删除的 5 个旧段（迁移器整段搬运；plugin.py 的磁盘抢救也整段带回）。
+#: 保持单一真源：迁移器与抢救逻辑都读这里，别再各写一份字面量元组。
+LEGACY_SECTIONS = ("target", "cateye", "judge", "inject", "planning_cleanup")
 
 #: 2026-10-10 段拆分：从 [schedule] 迁往 [schedule_advanced] 的字段（键名不变，仅换段）
 _SCHEDULE_TO_ADVANCED_KEYS = (
@@ -92,6 +106,46 @@ def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
     if en_hint:
         entry["hint"] = en_hint
     return {"i18n": {"en": entry}}
+
+
+#: 出厂默认配置缓存（``CateyeSuiteConfig()`` 的 model_dump；无参构造不会递归——空输入在
+#: 聚合校验器里被早退放行）。取不到时退回 ``{}``（搬运逻辑退化为老行为，不阻塞校验）。
+_FACTORY_DEFAULTS: Dict[str, Any] = {}
+
+
+def factory_defaults() -> Dict[str, Any]:
+    """出厂默认配置字典（带缓存；供迁移器比较"用户是否显式配过"）。"""
+    if not _FACTORY_DEFAULTS:
+        try:
+            _FACTORY_DEFAULTS.update(CateyeSuiteConfig().model_dump(mode="python"))
+        except Exception:  # pragma: no cover - 理论不可达（模型恒可构造）
+            return {}
+    return _FACTORY_DEFAULTS
+
+
+def _strip_factory_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
+    """剔除「仍等于出厂默认」的段内键，还原出「用户显式配置过」的视图。
+
+    **为什么必须这样做**（2026-10-10 实证）：宿主 Runner 与 SDK 归一化都会**先把出厂默认
+    merge 进输入**，于是旧键搬运用的 ``setdefault``/`键缺失` 判断永远命中不到缺失分支——
+    跨段旧值（target_qq / timezone / miss_silence_hours 等）会被静默丢弃，用户升级后配置
+    看似"迁移成功"实则全回默认。剔除等于默认的值后再搬运，`setdefault` 语义即恢复正确；
+    被剔掉的键由随后的 pydantic 校验按默认值补回，无需手工回填。
+
+    ``[plugin]`` 段不参与剔除（它的 ``config_version``/``layout_version`` 由迁移器显式管理）。
+    非 dict 段原样保留。
+    """
+    defaults = factory_defaults()
+    if not defaults:
+        return data
+    out: Dict[str, Any] = {}
+    for section, value in data.items():
+        dflt = defaults.get(section)
+        if section == "plugin" or not isinstance(value, dict) or not isinstance(dflt, dict):
+            out[section] = value
+            continue
+        out[section] = {k: v for k, v in value.items() if k not in dflt or v != dflt[k]}
+    return out
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -329,27 +383,46 @@ class CateyeSuiteConfig(PluginConfigBase):
         ``[planning_proactive]`` 放一枚 ``_layout_migrated`` 哨兵，通知段级校验器是否跳过
         它自己的旧名单映射（见 PlanningProactiveSectionConfig._migrate_legacy_lists）。
 
+        **标记只在输入非空时写入**（2026-10-10 第二轮修复）：Pydantic 在无参构造（出厂默认）
+        时也会调用本校验器，若此时写字面标记，出厂默认本身就会带标记 → 宿主/SDK 归一化
+        merge 默认后 ``already_migrated`` 恒为 True → 迁移器在真实宿主路径下永不执行。
+        故 ``if not data: return data``（空输入原样返回，标记留空）。
+
         缺陷史（2026-10-10 离线自检抓到）：无标记版迁移在"落盘 → 再读回"时会把新白名单
         当成旧白名单再映射一遍（群聊名单在黑名单模式下被误转白名单）→ 非幂等，故加标记。
         非 dict 输入（模型实例 / None）原样放行。
         """
         if not isinstance(data, dict):
             return data
+        if not data:
+            # 出厂默认路径（无参构造 / 空输入）：不写布局标记，也不放哨兵
+            return data
         migrated = dict(data)
         plugin_section = dict(migrated.get("plugin") or {})
         already_migrated = str(plugin_section.get("layout_version") or "") == CURRENT_LAYOUT_VERSION
-
-        # [planning_proactive] 哨兵：True = 已迁移形态（段级校验器跳过旧名单映射）
-        proactive_data = dict(migrated.get("planning_proactive") or {})
-        proactive_data["_layout_migrated"] = already_migrated
-        migrated["planning_proactive"] = proactive_data
+        # 结构版本以插件当前值为准（宿主已按"版本变化"决定升级；旧值不参与落盘）。
+        # 若把旧版本号原样落回去，下一次加载会再次触发重建 + 抢救（且磁盘已带标记 → 抢救跳过），
+        # 跨段旧值会在这条路径上被丢掉——必须强制归位。
+        plugin_section["config_version"] = SUPPORTED_CONFIG_VERSION
 
         if already_migrated:
             # 已迁移：只清掉理论上不该再出现的旧段（用户手工加回时忽略不炸），不做任何值搬运
-            for stale in ("target", "cateye", "judge", "inject", "planning_cleanup"):
+            proactive_data = dict(migrated.get("planning_proactive") or {})
+            proactive_data["_layout_migrated"] = True
+            migrated["planning_proactive"] = proactive_data
+            for stale in LEGACY_SECTIONS:
                 migrated.pop(stale, None)
             migrated["plugin"] = plugin_section
             return migrated
+
+        # 值搬运前先剔除"仍等于出厂默认"的键（把 merge 了默认的输入还原成用户显式值视图；
+        # 否则下面的 setdefault 永远命中不到缺失分支，旧值被静默丢弃——见 _strip_factory_defaults）
+        migrated = _strip_factory_defaults(migrated)
+
+        # [planning_proactive] 哨兵：True = 已迁移形态（段级校验器跳过旧名单映射）
+        proactive_data = dict(migrated.get("planning_proactive") or {})
+        proactive_data["_layout_migrated"] = False
+        migrated["planning_proactive"] = proactive_data
 
         # 1) [target] → [patrol].target_qq（其余旧键丢弃）
         legacy_target = migrated.pop("target", None)

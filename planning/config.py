@@ -668,7 +668,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     greeting_night_enabled: bool = Field(
         default=True,
-        description="启用晚安：当天最后一个非睡眠日程结束时刻 − 漂移后，向候选会话道晚安",
+        description="启用晚安：当天最后一个非睡眠日程结束时刻 + 漂移后，向候选会话道晚安",
         json_schema_extra={
             "label": "启用晚安",
             "hint": "关 = 完全不发晚安（含目标私聊与群聊）",
@@ -689,21 +689,23 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     night_drift: str = Field(
         default="10-30",
         description="晚安漂移区间（分钟，相对最后一条日程结束）：填 \"a-b\" 或单数字 N（= 0~N 随机）；"
-                    "触发时刻 = 最后日程结束 − 随机漂移。非法值回退 10-30",
+                    "触发时刻 = 最后日程结束 + 随机漂移（睡前的随机点）。非法值回退 10-30",
         json_schema_extra={
             "label": "晚安漂移(分钟)",
-            "hint": '例 "10-30" 或 "20"；向前漂移（比日程结束更早开口）',
+            "hint": '例 "10-30" 或 "20"；在最后一段日程结束后 10~30 分钟内随机开口',
             "pattern": r"^\d+(-\d+)?$",
             **_ui_i18n("Night drift (min)", 'e.g. "10-30" or "20"'),
         },
     )
     greeting_require_activation: bool = Field(
         default=True,
-        description="问候需激活（群聊与其他私聊）：到点后需先观察到该会话自基准点起有人发过消息才问候，"
-                    "无人则推迟、到期限放弃（当天不补发）。目标私聊不受此项影响",
+        description="问候需激活（所有会话，含目标私聊）：先在观察窗内看该会话有没有人说过话，"
+                    "有人 → 到漂移点就问候（若观察到时已过点则立即问候）；到观察窗结束仍无人 → 当天不发。"
+                    "观察窗：早安 = 起床锚点→当天第一段非睡眠日程结束；晚安 = 最后一段日程结束→"
+                    "（睡点与静默起点取先到者）。关 = 不看激活，到点即发",
         json_schema_extra={
             "label": "问候需激活",
-            "hint": "开 = 群里没人说话就不进去打招呼（推荐）；关 = 到点就发",
+            "hint": "开 = 有人说话才问早/晚安（推荐，避免对着空会话自说自话）；关 = 到点就发",
             **_ui_i18n("Greeting requires activation"),
         },
     )
@@ -740,70 +742,24 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         },
     )
 
-    # ── 兼容字段（隐藏，不占界面；保留旧值语义）───────────────
-    greeting_target_enabled: bool = Field(
-        default=True,
-        description="（兼容旧配置）目标陪伴私聊的问候开关；新界面不再提供，默认开",
-        json_schema_extra={"label": "目标私聊问候（旧）", "hidden": True,
-                           **_ui_i18n("Target-chat greetings (legacy)")},
-    )
-    greeting_group_enabled: bool = Field(
-        default=True,
-        description="（兼容旧配置）群聊问候开关；新界面不再提供，默认开",
-        json_schema_extra={"label": "群聊问候（旧）", "hidden": True,
-                           **_ui_i18n("Group greetings (legacy)")},
-    )
-    greeting_other_private_enabled: bool = Field(
-        default=True,
-        description="非目标私聊问候总开关（2026-10-10 起默认开）：真正的「发不发」由私聊名单表达——"
-                    "私聊名单留空（默认白名单）时本就无人候选，故默认开不会打扰任何人；"
-                    "只有旧配置显式 false 时才整体关闭其他私聊问候",
-        json_schema_extra={"label": "其他私聊问候（旧）", "hidden": True,
-                           **_ui_i18n("Other-private greetings (legacy)")},
-    )
-    greeting_group_blacklist: List[str] = Field(
-        default_factory=list,
-        description="（兼容旧配置）群聊问候黑名单；已并入「群聊名单」",
-        json_schema_extra={"label": "群聊问候黑名单（旧）", "hidden": True,
-                           **_ui_i18n("Group greeting blacklist (legacy)")},
-    )
-    greeting_group_whitelist: List[str] = Field(
-        default_factory=list,
-        description="（兼容旧配置）群聊问候白名单；已并入「群聊名单」",
-        json_schema_extra={"label": "群聊问候白名单（旧）", "hidden": True,
-                           **_ui_i18n("Group greeting whitelist (legacy)")},
-    )
-    greeting_other_private_whitelist: List[str] = Field(
-        default_factory=list,
-        description="（兼容旧配置）非目标私聊问候白名单；已并入「私聊名单」",
-        json_schema_extra={"label": "其他私聊问候白名单（旧）", "hidden": True,
-                           **_ui_i18n("Other-private greeting whitelist (legacy)")},
-    )
-    greeting_other_private_blacklist: List[str] = Field(
-        default_factory=list,
-        description="（兼容旧配置）非目标私聊问候黑名单；已并入「私聊名单」",
-        json_schema_extra={"label": "其他私聊问候黑名单（旧）", "hidden": True,
-                           **_ui_i18n("Other-private greeting blacklist (legacy)")},
-    )
-    morning_other_private_enabled: bool = Field(
-        default=False,
-        description="（兼容旧配置）旧「其他私聊早安」开关；并入 greeting_other_private_enabled",
-        json_schema_extra={"label": "其他私聊早安（旧）", "hidden": True,
-                           **_ui_i18n("Morning to other privates (legacy)")},
-    )
-    morning_other_private_min_messages: int = Field(
-        default=5,
-        ge=5,
-        description="（兼容旧配置）旧「其他私聊早安门槛」；并入 greeting_other_private_min_messages",
-        json_schema_extra={"label": "其他私聊门槛（旧）", "hidden": True,
-                           **_ui_i18n("Other-private threshold (legacy)")},
-    )
-
+    # ── 兼容位（旧问候开关/四名单）已彻底移除（2026-10-10 第二轮，用户要求）──
+    # 移除理由：隐藏兼容位运行期早已不再参与判定（问候走两个总开关 + 统一名单），但用户
+    # 在 WebUI/配置文件里看到/填了它们会"看起来配了黑名单却没生效"（B2 的成因之一）。
+    # 旧值仍在**首轮迁移**里被读取并并入统一名单（见 _migrate_legacy_lists：它直接读原始
+    # 输入字典，不依赖本段有没有声明这些字段），迁移后这些键在落盘结果中自然消失。
     # ── 旧键迁移（段级；在聚合校验器里与其它段一起被调用）──────
     @pydantic.model_validator(mode="before")
     @classmethod
     def _migrate_legacy_lists(cls, data: object) -> object:
         """旧名单/开关 → 新统一名单系统（2026-10-10 合并；**只在首轮迁移生效**）。
+
+        **只读旧键、不再声明旧字段**（2026-10-10 第二轮）：下文出现的
+        ``greeting_group_blacklist`` / ``greeting_group_whitelist`` /
+        ``greeting_other_private_whitelist`` / ``greeting_other_private_blacklist`` /
+        ``greeting_other_private_enabled`` / ``morning_other_private_enabled`` /
+        ``morning_other_private_min_messages`` / ``greeting_target_enabled`` /
+        ``greeting_group_enabled`` 都是**已从模型删除的旧键**，只从旧配置的原始字典里读一次
+        （读的是用户真正的旧值），随后被 pop 或随落盘消失。
 
         触发条件：聚合校验器判定"尚未迁移"（``[plugin] layout_version`` 不是本轮标记）时，
         会在本段字典里放一枚哨兵 ``_layout_migrated=False``；已迁移形态（哨兵为 True）直接放行——

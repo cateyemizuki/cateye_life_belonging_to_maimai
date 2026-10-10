@@ -4,7 +4,7 @@
 
 ## [1.1.0] - 2026-10-10
 
-配置大整理版：把配置从 13 段重排为 **11 段**，集中了提示词与模型调用，并修好两处既有缺陷。**功能行为不变**；旧配置在首次启动时由插件自动迁移，无需手改（迁移幂等，可反复重启）。宿主显示的**插件版本为 1.1.0**，而配置版本 `[plugin] config_version` **仍是 1.0.0**——这是有意保留的，请勿修改（详见「升级须知」）。
+配置大整理版：把配置从 13 段重排为 **11 段**，集中了提示词与模型调用，修好既有缺陷，并重做了早/晚安链。**旧配置在首次启动时自动迁移，无需手改**（幂等，可反复重启）；升级时插件会先读回磁盘上的旧配置再搬运，**跨段/改名键的用户值不会丢**。插件版本与配置版本均为 **1.1.0**（同步）。
 
 ### 新增
 
@@ -18,21 +18,33 @@
 ### 变更
 
 - **配置段 13 → 11**：`[target]`、`[cateye]` 并入 **`[patrol]`（陪伴模块）**；`[judge]` 并入 **`[llm]`**；`[inject]`、`[planning_cleanup]` 并入 **`[schedule_advanced]`**；提示词集中到 **`[prompts]`**。新段序（WebUI）：`plugin → patrol → affection → schedule → schedule_advanced → planning_proactive → llm → prompts → admin → qzone → emotion`。
-- **早/晚安简化**：三类会话开关（`greeting_target_enabled` / `greeting_group_enabled` / `greeting_other_private_enabled`）与问候专用黑白名单收拢为**两个总开关** `greeting_morning_enabled` / `greeting_night_enabled`（默认都开）＋统一名单；问候**恒免主动打扰预算**；目标陪伴私聊**不看名单、恒生效**，其他私聊**默认不发**（私聊白名单留空）。
+- **早/晚安简化**：三类会话开关（`greeting_target_enabled` / `greeting_group_enabled` / `greeting_other_private_enabled`）与问候专用黑白名单收拢为**两个总开关** `greeting_morning_enabled` / `greeting_night_enabled`（默认都开）＋统一名单；问候**恒免主动打扰预算**。
+- **早/晚安链重做（2026-10-10 第二轮，用户口径）**——固定顺序「**掷点 → 激活观测 → 到点（或已过点则立即）发**」：
+  - **激活观测对所有会话一视同仁（含目标陪伴私聊）**：`greeting_require_activation=true`（默认）时，只有观察窗内**该会话有人发过消息**才问候；窗内无人 → 当天不发。观察窗：早安 = `[schedule] wake_time` → 当天第一段非睡眠日程结束（无日程 = 起床 + 120 分钟）；晚安 = 最后一段非睡眠日程结束 → `min(入睡时间, 静默起点)`。
+  - **漂移点**：早安 = 起床锚点 + `randint(a,b)`；晚安 = **睡前界（`min(入睡时间, 静默起点)`）− `randint(a,b)`**（睡前随机点，不再在最后一段日程还没结束时开口）。
+  - **静默时段不再拦截问候**：默认静默窗 00:00-07:30 与起床锚点 07:00 重叠，此前会把早安漂移整段吞掉甚至直接放弃；问候的必要性由"激活观测"把关。`[patrol] silence_*` 继续约束巡检。
+- **统一名单严格生效（B2）**：私聊名单为**黑名单**模式时，把某个 QQ（**包括目标陪伴对象自己的 QQ**）写进名单即不再问候它；白名单模式下目标私聊视为恒在名单内（留空不影响默认问候体验）。名单元素现在也接受 `group:` / `qq:group:` / `private:` / `qq:private:` / `qq:` 前缀写法（自动取号），此前这些写法会被当作非法元素**静默忽略**（黑名单因此"看起来没生效"）。
 - **每日预算即上限**：删除独立的目标私聊打扰上限字段（`proactive_target_daily_cap` / 旧名 `global_proactive_cap`）；`[patrol] daily_max_speak` 即陪伴侧主动打扰上限，只统计**日程巡检与想念**两类（早/晚安不占预算）。
 - **想念阈值合并**：`miss_hours_min` + `miss_hours_max` 合并为一个 `[patrol] miss_silence_hours`（如 `"4-8"`，或单数字 `8` = `0~8`）；想念「避开未来日程」功能整体移除。
 - **注入矩阵定稿**：目标陪伴私聊**始终**注入好感度；其他私聊**始终只注入日程**；群聊仅在上下文出现陪伴对象且 `inject_affection_in_group=true`（默认开）时注入好感度档位块（不带关系记忆行）。日期/节假日行改由日程模块注入（`[schedule] holiday_inject_enabled`）；日程注入范围 `inject_scope` 默认 `all`（所有会话）。
-- **移除的配置项**（新界面不再提供；旧值会被自动迁移或忽略）：`[patrol] morning_start / morning_end / night_start / night_end`（问候时间窗）、`min_interval_exempt_greetings`（问候恒豁免最小间隔）、`min_interval_exempt_miss`（想念不豁免）、`proactive_target_daily_cap` / `global_proactive_cap`、`miss_avoid_future_schedule` / `miss_future_schedule_hours`；`[planning_proactive]` 的 `enable_morning_greeting` / `enable_night_greeting`、旧问候黑白名单、`morning_other_private_*`、`greeting_exempt_budget`；`[schedule] auto_generate_time`（降级为 `[schedule_advanced]` 隐藏兼容位）。
+- **移除的配置项**（新界面不再提供；旧值会被自动迁移或忽略）：`[patrol] morning_start / morning_end / night_start / night_end`（问候时间窗）、`min_interval_exempt_greetings`（问候恒豁免最小间隔）、`min_interval_exempt_miss`（想念不豁免）、`proactive_target_daily_cap` / `global_proactive_cap`、`miss_avoid_future_schedule` / `miss_future_schedule_hours`；`[planning_proactive]` 的 `enable_morning_greeting` / `enable_night_greeting`、`greeting_exempt_budget`、`[schedule] auto_generate_time`（降级为 `[schedule_advanced]` 隐藏兼容位）；**以及 9 个隐藏兼容字段**——`greeting_target_enabled` / `greeting_group_enabled` / `greeting_other_private_enabled` / `greeting_group_blacklist` / `greeting_group_whitelist` / `greeting_other_private_whitelist` / `greeting_other_private_blacklist` / `morning_other_private_enabled` / `morning_other_private_min_messages`（**旧命名一律清除**：这些字段运行期已不参与判定，留着只会让用户以为"配了黑名单却没生效"；其旧值仍在首轮迁移里并入统一名单与门槛）。
 
 ### 修复
 
 - **`[affection] current_level` 传字符串不再导致整份配置校验失败**：WebUI 表单或 `config.toml` 以字符串 `"0"` / `"1"` / `"2"` 提交时，先归一为整数再校验；`"3"`、`"x"` 等非法值照旧拒绝。
+- **早安漂移延迟失效（B1，真机观察）**：默认静默窗（00:00-07:30）与起床锚点（07:00）重叠，早安漂移点（07:10~07:30）整段落在静默里 → 要么被推迟到 07:30（看起来"没有漂移、每天固定时刻"），要么因第一段日程结束在静默内而直接放弃（"干脆不发"）；晚安则以"最后一段日程结束"为参考做减法，最后一段恰好结束在入睡时间时会在日程中段提前开口。现已按上面的新链重做（静默不拦截、晚安锚定睡前界）。
+- **配置为黑名单的聊天流仍触发早安（B2，真机观察）**：两处成因——① 旧的隐藏问候黑白名单字段看起来"配了黑名单"但运行期不读；② 统一名单只认裸号，带前缀/非数字写法被静默忽略（黑名单变空 = 全部放行）。现已彻底移除旧字段、名单支持前缀写法，并让黑名单对**目标私聊**同样生效。
+- **升级时旧配置的跨段/改名值被静默丢弃（迁移链两处缺陷）**：
+  ① 迁移幂等标记（`[plugin] layout_version`）曾被写进出厂默认配置，而宿主与 SDK 归一化都会先 merge 出厂默认 → 迁移器在真实宿主路径下**从不执行**；
+  ② 迁移搬运用"目标键缺失才搬"的判断，但 merge 过默认的输入里所有键都存在 → 跨段旧值（`target_qq`、`timezone`、`miss_silence_hours`、旧名单等）全部回默认。
+  现改为「出厂默认不带标记 + 搬运前剔除等于默认的值」，并新增**磁盘旧文件抢救**（`normalize_plugin_config` 在宿主覆写磁盘前读回旧配置），升级不再丢配置。
 - 说明：本版未重复登记 1.0.0 已含的出图与输出目录修复。
 
 ### 升级须知
 
-- **旧配置首启动自动迁移（幂等）**：插件启动时把旧布局的值搬进新家并落盘——`[target] target_qq → [patrol] target_qq`、`[cateye] * → [patrol] screen_* / [llm] vlm_task / [prompts] screen_*`、`[judge] * → [llm] judge_*`、`[inject] * / [planning_cleanup] * → [schedule_advanced] *`、各模块任务名与一批 `[schedule]` 深水项按映射搬家、`miss_hours_min + miss_hours_max → miss_silence_hours`、旧问候名单 → 统一名单。迁移只在首轮发生（以 `[plugin] layout_version` 标记），反复重启不会二次改写；段名不变的键原样保留。
-- **`[plugin] config_version` 保持 1.0.0，请勿修改**：迁移依赖「配置版本号不变 + 插件侧一次性迁移」——一旦递增，宿主会在插件看到旧值之前按新骨架重建设置文件，跨段搬迁的旧值将被丢弃。因此**宿主显示的插件版本是 1.1.0，而配置版本会保持 1.0.0，二者不同步是预期的**。
+- **旧配置首启动自动迁移（幂等）**：插件启动时把旧布局的值搬进新家并落盘——`[target] target_qq → [patrol] target_qq`、`[cateye] * → [patrol] screen_* / [llm] vlm_task / [prompts] screen_*`、`[judge] * → [llm] judge_*`、`[inject] * / [planning_cleanup] * → [schedule_advanced] *`、各模块任务名与一批 `[schedule]` 深水项按映射搬家、`miss_hours_min + miss_hours_max → miss_silence_hours`、旧问候名单/开关 → 统一名单与门槛。迁移只在首轮发生（以 `[plugin] layout_version` 标记），反复重启不会二次改写；段名不变的键原样保留。
+- **升级不丢配置（「磁盘旧文件抢救」）**：宿主在配置版本变化时会**先**按新骨架重建设置文件（跨段旧键在插件看到之前就被丢掉）。本版起，插件在归一化入口先读**尚未被覆写**的磁盘 `config.toml`（旧段整段带回、存活段的用户值并回输入），再走一次性迁移器；抢救失败（文件缺失/损坏/无权限）绝不阻塞启动。
+- **`[plugin] config_version` = 1.1.0，与插件版本同步**（红线 R6：两者必须一致；改版本号时请同步递增，别只动一个）。
 - **数据目录与 1.0.0 相同**（`data/plugins/cateye.life_belonging_to_maimai/`），本版无需搬运数据；升级 1.0.0 → 1.1.0 只需重启/重载插件。
 
 ## [1.0.0] - 2026-10-09
