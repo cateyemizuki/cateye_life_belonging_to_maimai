@@ -616,7 +616,7 @@ def render_dashboard_image(title: str, blocks: Any, *, output_dir: Optional[Path
         # 底部签名（2px 墨线 + 左右签名）
         foot_y = height - int(58 * s)
         draw.line([(M, foot_y), (width - M, foot_y)], fill=INK, width=2)
-        draw.text((M, foot_y + int(14 * s)), _spaced("属于麦麦的生活 v1.1.0"), font=f_foot, fill=MUTED)
+        draw.text((M, foot_y + int(14 * s)), _spaced("属于麦麦的生活 v2.0.0"), font=f_foot, fill=MUTED)
         sig = "Powered by Mai-Bot"
         draw.text((width - M - _tw(sig, f_foot), foot_y + int(14 * s)), sig, font=f_foot, fill=MUTED)
 

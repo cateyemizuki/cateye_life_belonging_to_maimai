@@ -20,7 +20,7 @@
 planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
 **config_version 与迁移保障（2026-10-10 第二版，已订正）**：
-开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `1.1.0`；
+开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `2.0.0`（2026-10-12 起；1.1.0 未单独发布，随 2.0.0 一并发布）；
 迁移保障改由 **plugin.py 的「磁盘旧文件抢救」**（`CateyeSuitePlugin.normalize_plugin_config` 先读尚未被
 宿主覆写的磁盘 `config.toml`，把用户值并回输入）＋ 下面的 `mode="before"` 一次性迁移器共同承担。
 **旧口径（已作废）如下，仅留作教训**：宿主 Runner 在「配置版本号变化」时会
@@ -84,7 +84,7 @@ from suite_prompts import (
 # 重建设置文件（丢弃跨段旧键）。因此递增本值必须同时具备"磁盘旧文件抢救"（plugin.py 的
 # normalize_plugin_config：把尚未被覆写的磁盘 config.toml 里的用户值并回输入），
 # 否则跨段/改名键的用户值会在插件看到它们之前被丢弃 —— 见模块 docstring 的教训段。
-SUPPORTED_CONFIG_VERSION = "1.1.0"
+SUPPORTED_CONFIG_VERSION = "2.0.0"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

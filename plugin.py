@@ -196,7 +196,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
     config_reload_subscriptions: ClassVar[Iterable[str]] = ("bot",)
 
     # ------------------------------------------------------------------
-    # 配置归一化（含「磁盘旧文件抢救」——升级到 1.1.0 的迁移保障，T1）
+    # 配置归一化（含「磁盘旧文件抢救」——版本升级迁移保障，T1 自 1.1.0 起建立）
     # ------------------------------------------------------------------
     def normalize_plugin_config(self, config_data: Any) -> tuple[dict[str, Any], bool]:
         """宿主 Runner 的配置归一化入口（SDK 基类同名方法的包装）。
