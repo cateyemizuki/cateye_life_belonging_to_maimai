@@ -396,6 +396,10 @@ class EmotionService:
             pass
         return desc
 
+    def emotion_description_body(self) -> str:
+        """当前主导情绪的详细描述正文（F5；面板展示用，无人称前缀）。"""
+        return self._primary_emotion_description()
+
     def emotion_description_text(self, channel: str = "planner") -> str:
         """F5 双人称渲染：planner 第三人称（bot 名）、replyer 第二人称。
 

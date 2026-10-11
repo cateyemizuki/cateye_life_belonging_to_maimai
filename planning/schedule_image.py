@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import base64
+import re
+from datetime import datetime
 import io
 import logging
 import tempfile
@@ -405,99 +407,176 @@ class ScheduleImageGenerator:
         tz_name: Optional[str],
         output_dir: Optional[Path],
     ) -> Tuple[str, str]:
+        """瑞士极简 · S1 时刻表（2026-10-11 用户选型）。
+
+        版式：纸底/墨字/单红强调；巨型日期「MM.DD」+ 红色星期 + 统计；
+        编号行（时间/活动名真粗体/右侧状态），进行中行 = 红左边线 + 红字；
+        底部跨午夜口径说明与命令指路。高度按条目数动态计算（上限 4096）。
+        """
         Image, ImageDraw, ImageFont = cls._require_pil()
+        try:
+            width = min(int(width or 1080), 1920)
+            s = width / 1080
+            M = int(64 * s)
+            PAPER, INK, RED = (242, 241, 237), (17, 17, 17), (232, 64, 42)
+            MUTED, HAIR = (107, 107, 107), (205, 203, 196)
 
-        # 1. 画布尺寸：宽度可配，高度按条目数动态计算
-        width = min(width or cls.DEFAULT_WIDTH, cls.MAX_WIDTH)
-        s = width / 1080
+            def _font(size, bold=False):
+                return cls._get_font(ImageFont, int(size * s), bold=bold)
 
-        # 2. 当前时刻与状态
-        tz_manager = TimezoneManager(tz_name) if tz_name else TimezoneManager()
-        now = tz_manager.get_now()
-        now_minutes = now.hour * 60 + now.minute
+            f_giant, f_wd = _font(96, True), _font(44, True)
+            f_stat, f_head = _font(22), _font(20, True)
+            f_num, f_time = _font(19, True), _font(24)
+            f_time_b, f_name = _font(24, True), _font(26, True)
+            f_status, f_note, f_foot = _font(20), _font(17), _font(17)
 
-        # 3. 字体与度量
-        fonts = {
-            "title": cls._get_font(ImageFont, int(34 * s)),
-            "stats": cls._get_font(ImageFont, int(20 * s)),
-            "time": cls._get_font(ImageFont, int(24 * s)),
-            "name": cls._get_font(ImageFont, int(27 * s)),
-            "desc": cls._get_font(ImageFont, int(21 * s)),
-            "pill": cls._get_font(ImageFont, int(19 * s)),
-            "footer": cls._get_font(ImageFont, int(17 * s)),
-        }
+            try:
+                now = TimezoneManager(tz_name).get_now() if tz_name else datetime.now()
+            except Exception:
+                now = datetime.now()
+            now_minutes = now.hour * 60 + now.minute
 
-        margin_x = int(48 * s)
-        card_w = width - margin_x * 2
-        pill_reserve = int(92 * s) + int(40 * s)   # 状态胶囊 + 右边距
-        name_x_offset = int(190 * s)               # 时间列宽
-        max_text_width = card_w - pill_reserve - name_x_offset - int(20 * s)
+            rows = []
+            for item in schedule_items or []:
+                time_str = str(item.get("time", ""))
+                status = cls._activity_status(time_str, now_minutes)
+                rows.append({
+                    "time": time_str,
+                    "name": cls._ellipsis(ImageDraw.Draw(Image.new("RGB", (8, 8))),
+                                          str(item.get("name", "") or ""), _font(26, True),
+                                          int(560 * s)),
+                    "desc": str(item.get("description", "") or ""),
+                    "status": status,
+                })
+            total = len(rows)
+            done = sum(1 for r in rows if r["status"] == "completed")
+            current = sum(1 for r in rows if r["status"] == "current")
 
-        # 预渲染一行用于测量（截断需要 draw 对象）
-        measure_img = Image.new("RGB", (8, 8))
-        measure_draw = ImageDraw.Draw(measure_img)
-        rows = cls._build_rows(measure_draw, schedule_items or [], now_minutes, s, fonts, max_text_width)
+            m_title = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(title or ""))
+            if m_title:
+                giant = f"{m_title.group(1)[-2:]}.{m_title.group(2)}" if False else \
+                    f"{m_title.group(2)}.{m_title.group(3)}"
+                try:
+                    weekday = "一二三四五六日"[datetime(
+                        int(m_title.group(1)), int(m_title.group(2)),
+                        int(m_title.group(3))).weekday()]
+                except ValueError:
+                    weekday = ""
+            else:
+                giant, weekday = "今日", ""
 
-        # 行高：有描述的两行，无描述的单行
-        card_h_with_desc = int(88 * s)
-        card_h_plain = int(58 * s)
-        card_gap = int(12 * s)
-        header_h = int(148 * s)
-        footer_h = int(56 * s)
-        body_padding_top = int(4 * s)
+            row_h, head_h, foot_h = int(62 * s), int(240 * s), int(110 * s)
+            height = head_h + total * row_h + int(90 * s) + foot_h
 
-        cards_height = sum(
-            card_h_with_desc if r["has_desc"] else card_h_plain for r in rows
-        ) + max(0, len(rows) - 1) * card_gap
-        height = int(header_h + body_padding_top + cards_height + (card_gap if rows else 0) + footer_h)
-        height = min(height, cls.MAX_HEIGHT)
+            img = Image.new("RGB", (width, height), PAPER)
+            draw = ImageDraw.Draw(img)
+            M2 = int(64 * s)
+            inner = width - 2 * M2
 
-        # 4. 画布：浅色纵向渐变
-        img = Image.new("RGB", (width, height), (246, 248, 252))
-        draw = ImageDraw.Draw(img, "RGBA")
-        top_color, bottom_color = (247, 249, 253), (235, 240, 248)
-        for y in range(height):
-            ratio = y / max(1, height - 1)
-            color = tuple(
-                int(top_color[i] + (bottom_color[i] - top_color[i]) * ratio)
-                for i in range(3)
-            )
-            draw.line([(0, y), (width, y)], fill=(*color, 255))
+            # 头部：红点 + 标记 | 右侧标记 + 2px 墨线
+            draw.ellipse([M2, int(30 * s) + 2, M2 + 18, int(30 * s) + 20], fill=RED)
+            draw.text((M2 + 30, int(30 * s)), " ".join(list("MAI · STATE")),
+                      font=_font(20, True), fill=INK)
+            draw.text((width - M2 - int(200 * s), int(30 * s)), " ".join(list("MAI · SCHEDULE")),
+                      font=_font(20, True), fill=INK)
+            draw.line([(M2, int(74 * s)), (width - M2, int(74 * s))], fill=INK, width=2)
 
-        # 5. 头部
-        logo = cls._load_logo(Image)
-        stats = cls._build_stats_text(rows)
-        cls._draw_header(img, draw, title, stats, logo, s, fonts, ImageDraw, Image)
+            # 巨型日期 + 红色星期 + 统计
+            draw.text((M2, int(110 * s)), giant, font=f_giant, fill=INK)
+            if weekday:
+                draw.text((M2 + int(300 * s), int(126 * s)), weekday, font=f_wd, fill=RED)
+            stats = f"{total} 项 · 完成 {done} · 进行中 {current}"
+            draw.text((M2 + int(300 * s) + (int(120 * s) if weekday else 0), int(150 * s)),
+                      stats, font=f_stat, fill=MUTED)
+            draw.line([(M2, head_h - int(6 * s)), (width - M2, head_h - int(6 * s))],
+                      fill=HAIR, width=1)
 
-        # 6. 日程卡片（全部条目）
-        y = header_h + body_padding_top
-        for row in rows:
-            row_h = card_h_with_desc if row["has_desc"] else card_h_plain
-            cls._draw_row_card(draw, row, margin_x, y, card_w, row_h, s, fonts)
-            y += row_h + card_gap
+            # 编号行
+            y = head_h
+            for i, row in enumerate(rows, 1):
+                is_current = row["status"] == "current"
+                if is_current:
+                    draw.rectangle([M2 - int(14 * s), y + int(6 * s),
+                                    M2 - int(6 * s), y + row_h - int(14 * s)], fill=RED)
+                draw.text((M2, y), f"{i:02d}", font=f_num, fill=RED)
+                draw.text((M2 + int(46 * s), y), row["time"],
+                          font=f_time_b if is_current else f_time,
+                          fill=INK if is_current else MUTED)
+                name_x = M2 + int(380 * s)
+                draw.text((name_x, y - int(2 * s)), row["name"], font=f_name, fill=INK)
+                status_text = {"completed": "已完成", "current": "进行中", "upcoming": "未开始"}[
+                    row["status"]]
+                _sw = inner - (name_x - M2)
+                _sx = name_x + _sw - draw.textlength(status_text, font=f_status)
+                draw.text((_sx, y + int(4 * s)), status_text,
+                          font=_font(20, is_current), fill=RED if is_current else MUTED)
+                draw.line([(M2, y + row_h - int(16 * s)), (width - M2, y + row_h - int(16 * s))],
+                          fill=HAIR, width=1)
+                y += row_h
 
-        # 7. 底部签名
-        signature = "Powered by Mai-Bot"
-        sig_w = cls._text_width(draw, signature, fonts["footer"])
-        cls._draw_text(
-            draw,
-            ((width - sig_w) // 2, height - footer_h + int(14 * s)),
-            signature, (159, 176, 198), fonts["footer"],
-        )
+            # 底注：跨午夜口径 + 命令指路
+            y += int(16 * s)
+            draw.text((M2, y), "跨午夜条目按 24h 环标注「次日」；晨间 00:30 起以昨日帧合并判定",
+                      font=f_note, fill=MUTED)
+            hint = "完整日程 /lbm_plan list · 重新生成 /lbm_plan regenerate · 今日更新 /lbm_mai_diag decision 1"
+            _hx = width - M2 - draw.textlength(hint, font=_font(18))
+            draw.text((_hx, y + int(30 * s)), hint, font=_font(18), fill=RED)
 
-        # 8. 保存并编码
-        # output_dir 缺省 = 系统临时目录（与 generate_schedule_image 的 docstring 契约一致）：
-        # 绝不回退到插件代码目录（宿主隔离数据目录由调用方传入）。
-        save_dir = Path(output_dir) if output_dir else Path(tempfile.gettempdir())
-        save_dir.mkdir(parents=True, exist_ok=True)
-        image_path = save_dir / "schedule_today.jpg"
-        img.save(str(image_path), format="JPEG", quality=90, optimize=True)
+            # 底部签名
+            foot_y = height - int(52 * s)
+            draw.line([(M2, foot_y), (width - M2, foot_y)], fill=INK, width=2)
+            draw.text((M2, foot_y + int(12 * s)), " ".join(list("属于麦麦的生活 v1.1.0")),
+                      font=f_foot, fill=MUTED)
+            sig = "Powered by Mai-Bot"
+            draw.text((width - M2 - draw.textlength(sig, font=f_foot), foot_y + int(12 * s)),
+                      sig, font=f_foot, fill=MUTED)
 
-        img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format="JPEG", quality=90, optimize=True)
-        img_base64 = base64.b64encode(img_byte_arr.getvalue()).decode("utf-8")
+            # output_dir 缺省 = 系统临时目录（与同族渲染器同一契约）：
+            # 绝不回退到插件目录/代码目录（宿主隔离数据目录由调用方传入）。
+            save_dir = Path(output_dir) if output_dir else Path(tempfile.gettempdir())
+            save_dir.mkdir(parents=True, exist_ok=True)
+            image_path = save_dir / "schedule_today.jpg"
+            img.save(str(image_path), format="JPEG", quality=90, optimize=True)
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format="JPEG", quality=90, optimize=True)
+            return str(image_path), base64.b64encode(img_byte_arr.getvalue()).decode("utf-8")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"日程图片渲染失败: {exc}") from exc
 
-        return str(image_path), img_base64
+    # ------------------------------------------------------------
+
+    @classmethod
+    def generate_schedule_image(
+        cls,
+        title: str,
+        schedule_items: List[Dict[str, Any]],
+        width: Optional[int] = None,
+        tz_name: Optional[str] = None,
+        output_dir: Optional[Path] = None,
+    ) -> Tuple[str, str]:
+        """生成日程图片（v2：动态高度清单排版，展示全部条目）。
+
+        Args:
+            title: 标题文字（如 "今日日程 2026-09-19 周六"）
+            schedule_items: 日程项列表，每项
+                ``{"time": "HH:MM-HH:MM", "name", "description", "goal_type"}``
+            width: 图片宽度（None=默认 1080）
+            tz_name: 用于判定「进行中/已完成」的时区（IANA 名；None=默认）
+            output_dir: 图片输出目录（宿主隔离数据目录；None=系统临时目录）
+
+        Returns:
+            (图片路径, base64编码字符串)
+
+        Raises:
+            RuntimeError: pillow 未安装或找不到可用字体（调用方静默降级为文本）。
+        """
+        cls._generation_semaphore.acquire()
+        try:
+            return cls._generate(title, schedule_items, width, tz_name, output_dir)
+        finally:
+            cls._generation_semaphore.release()
 
     @classmethod
     def _build_stats_text(cls, rows: List[Dict[str, Any]]) -> str:

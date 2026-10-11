@@ -63,6 +63,14 @@ class EmotionServices:
     def mood_text(self) -> str:
         return self.service.mood_text()
 
+    def emotion_description_body(self) -> str:
+        """F5 情绪描述正文（面板展示用；转发 self.service）。"""
+        return self.service.emotion_description_body()
+
+    def evaluate_mode(self) -> str:
+        """回复后评估模式（episode/per_reply/off；面板展示用）。"""
+        return self.service._evaluate_mode()
+
     # ── Command / Tool 面转发（components.py 组件入口；签名与内层一致）──
     def params_summary(self) -> str:
         """``/lbm_emotion_config`` 查看文本（转发 self.service）。"""

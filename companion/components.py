@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -1006,12 +1006,18 @@ class CompanionComponentsMixin:
                 self.ctx.logger.error(f"mai_cmd_dashboard 发送失败: {e}")
                 return False, f"发送失败: {e}", True
 
-        # F2（2026-10-11）：重绘后面板自足（配置摘要等文字面归 WebUI/文本降级档），
-        # 合并转发只发图——不再「图片+文字」混发
+        # F2（2026-10-11）+ 用户续批：面板图在前，其后跟随「日程与情绪变动」日志文字档
+        #（最多 98 条；无记录时不发文字档）。合并转发上限 99 条，图片占 1 条。
         records: list[dict[str, Any]] = [
             {"user_id": "0", "nickname": "状态总览",
              "segments": [{"type": "image", "content": image_base64}]},
         ]
+        change_log = self._mai_change_log_text(hours=24, cap=98)
+        if change_log:
+            records.append({
+                "user_id": "0", "nickname": "日程与情绪变动",
+                "segments": [{"type": "text", "content": change_log}]},
+            )
         try:
             await self.ctx.send.forward(records, stream_id)
             return True, "状态总览已发送", True
@@ -1022,6 +1028,12 @@ class CompanionComponentsMixin:
         except Exception as img_exc:
             # 图片只是尽力而为的附加档：它失败也必须继续落到文本档（否则管理员什么都收不到）
             self.ctx.logger.warning(f"状态总览图片回退发送失败: {img_exc}")
+        if change_log:
+            try:
+                await self.ctx.send.text(text=change_log, stream_id=stream_id)
+                return True, "状态总览已发送", True
+            except Exception as log_exc:
+                self.ctx.logger.error(f"状态总览变动日志回退发送失败: {log_exc}")
         try:
             await self.ctx.send.text(text=text, stream_id=stream_id)
             return True, "状态总览已发送", True
@@ -1057,6 +1069,28 @@ class CompanionComponentsMixin:
         except Exception:
             qzone_live = False
 
+        emotion_extra = {}
+        described = getattr(emotion_svc, "emotion_description_body", None)
+        if callable(described):
+            try:
+                emotion_extra["description"] = str(described() or "")
+            except Exception:
+                emotion_extra["description"] = ""
+        mode_getter = getattr(emotion_svc, "evaluate_mode", None)
+        if callable(mode_getter):
+            try:
+                emotion_extra["mode"] = str(mode_getter() or "")
+            except Exception:
+                emotion_extra["mode"] = ""
+
+        usage_summary = None
+        llm = getattr(self, "_llm", None)
+        if llm is not None and callable(getattr(llm, "usage_summary", None)):
+            try:
+                usage_summary = llm.usage_summary(24)
+            except Exception:
+                usage_summary = None
+
         return {
             "planning": cateye_dashboard.planning_block(
                 self._mai_schedule_query(),
@@ -1065,11 +1099,77 @@ class CompanionComponentsMixin:
             "companion": cateye_dashboard.companion_block(
                 companion, self.config, enabled=companion_live, now=now),
             "emotion": cateye_dashboard.emotion_block(
-                emotion_svc, self.config, enabled=emotion_live, now=now),
+                emotion_svc, self.config, enabled=emotion_live, now=now) | emotion_extra,
             "qzone": cateye_dashboard.qzone_block(
                 qzone, self.config, enabled=qzone_live, now=now),
-            "usage": {"enabled": True, "lines": self._mai_usage_lines()},
+            "usage": {"enabled": True, "lines": self._mai_usage_lines(),
+                      "tokens": int((usage_summary or {}).get("tokens") or 0),
+                      "calls": int((usage_summary or {}).get("calls") or 0),
+                      "models": (usage_summary or {}).get("models") or {},
+                      "modules": (usage_summary or {}).get("modules") or {}},
         }
+
+    #: 随图日志的事件中文名（bus:<event> 前缀已剥；未登记事件回退原名）
+    _CHANGE_LOG_LABELS = {
+        "schedule.generated": "日程已生成",
+        "schedule.activity_started": "活动开始",
+        "schedule.activity_ended": "活动结束",
+        "schedule.sleep_started": "入睡",
+        "schedule.woke_up": "醒来",
+        "schedule.commitment_kept": "约定兑现",
+        "schedule.commitment_broken": "约定违约",
+        "emotion.updated": "情绪更新",
+        "emotion.overhauled": "睡眠大修完成",
+        "emotion.low_mood_day": "连续低迷",
+    }
+
+    def _mai_change_log_text(self, *, hours: int = 24, cap: int = 98) -> str:
+        """总命令随图文字（2026-10-11 用户口径）：日程变动 + 情绪变化日志，合并一条。
+
+        数据源 = 决策账本里的总线事件（EventBus 自动落账 ``bus:<event>``）：
+        日程 = ``bus:schedule.*``，情绪 = ``bus:emotion.*``。合并按时间升序、只取最近
+        ``hours`` 小时、最多 ``cap`` 条（超出保最新并在尾注省略数）。日志开关关闭/
+        无记录 → 空串（该次转发不发文字档）。
+        """
+        companion = self._mai_companion()
+        logger_ = getattr(companion, "decision_logger", None) if companion else None
+        if logger_ is None or not getattr(logger_, "enabled", False):
+            return ""
+        try:
+            entries = logger_.read_entries(2)  # 24h 窗口最多跨两天
+        except Exception:
+            return ""
+        cutoff = datetime.now() - timedelta(hours=max(1, int(hours)))
+        picked = []
+        for entry in entries or []:
+            action = str((entry or {}).get("action") or "")
+            if not (action.startswith("bus:schedule.") or action.startswith("bus:emotion.")):
+                continue
+            try:
+                when = datetime.fromisoformat(str((entry or {}).get("time") or ""))
+            except ValueError:
+                continue
+            if when < cutoff:
+                continue
+            picked.append((when, action, entry or {}))
+        picked.sort(key=lambda item: item[0])
+        dropped = max(0, len(picked) - max(1, int(cap)))
+        if dropped:
+            picked = picked[len(picked) - cap:]
+        if not picked:
+            return ""
+        lines = [f"日程与情绪变动 · 最近 {hours} 小时 · 共 {len(picked) + dropped} 条"
+                 + (f"（已省略较早 {dropped} 条）" if dropped else "")]
+        for when, action, entry in picked:
+            event = action[4:] if action.startswith("bus:") else action
+            label = self._CHANGE_LOG_LABELS.get(event, event)
+            clock = when.strftime("%m-%d %H:%M")
+            detail = str(entry.get("reason") or "").strip()
+            if not detail:
+                mood = str(entry.get("mood") or "").strip()
+                detail = f"情绪基调 {mood}" if mood else ""
+            lines.append(f"[{clock}] {label}" + (f"：{detail}" if detail else ""))
+        return chr(10).join(lines)
 
     def _mai_usage_lines(self) -> List[str]:
         """模型消耗块（F3 2026-10-11）：最近 24 小时按模型/按模块的 token 消耗。

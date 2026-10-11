@@ -432,14 +432,18 @@ COLOR_GRADIENT_BOTTOM = (235, 240, 248)
 
 def render_dashboard_image(title: str, blocks: Any, *, output_dir: Optional[Path] = None,
                            width: int = _DEFAULT_WIDTH) -> Tuple[str, str]:
-    """渲染聚合状态图并保存 ``output_dir/dashboard_today.jpg``，返回 (路径, base64)。
+    """渲染聚合状态图（瑞士极简 · V2 双栏网格）并保存 ``dashboard_today.jpg``。
 
-    字体与文字度量复用 planning.schedule_image.ScheduleImageGenerator（打包 NotoSansSC +
-    系统字体回退），逐行绘制 ``block_lines`` 的展示行（超宽截断）。高度按行数动态计算，
-    上限 4096——超出部分不绘制（宁可少画不裁半行）。
+    版式（2026-10-11 用户选型）：纸底/墨字/单红强调，细线分节；
+    左栏三个巨型读数（好感 / 情绪 / 24h tokens），右栏 01~05 编号节
+    （日程/陪伴/情绪/空间/消耗），每节右上红色命令指路；情绪节注入
+    F5 详细情绪描述（换行排印）。行高与字号较旧卡片版增大。
 
     Args:
         output_dir: 图片输出目录（宿主隔离数据目录；None=系统临时目录，绝不写插件目录）。
+
+    Returns:
+        (图片路径, base64)。
 
     Raises:
         RuntimeError: pillow/字体/渲染任一步失败（调用方静默降级为纯文本）。
@@ -455,86 +459,151 @@ def render_dashboard_image(title: str, blocks: Any, *, output_dir: Optional[Path
     try:
         width = min(int(width or _DEFAULT_WIDTH), _MAX_WIDTH)
         s = width / _DEFAULT_WIDTH
+        M = int(64 * s)
+        inner = width - 2 * M
+        PAPER, INK, RED = (242, 241, 237), (17, 17, 17), (232, 64, 42)
+        MUTED, HAIR = (107, 107, 107), (205, 203, 196)
 
-        fonts = {
-            "title": _SIG._get_font(ImageFont, int(34 * s)),
-            "subtitle": _SIG._get_font(ImageFont, int(20 * s)),
-            "block": _SIG._get_font(ImageFont, int(25 * s)),
-            "body": _SIG._get_font(ImageFont, int(21 * s)),
-            "footer": _SIG._get_font(ImageFont, int(17 * s)),
-        }
+        def _font(size, bold=False):
+            return _SIG._get_font(ImageFont, int(size * s), bold=bold)
 
-        margin_x = int(48 * s)
-        card_w = width - margin_x * 2
-        padding = int(24 * s)
-        text_max_w = card_w - padding * 2
-        block_title_h = int(48 * s)
-        body_line_h = int(34 * s)
-        card_gap = int(16 * s)
-        header_h = int(152 * s)
-        footer_h = int(56 * s)
+        f_label, f_big = _font(22, True), _font(84, True)
+        f_mid, f_sub = _font(56, True), _font(20)
+        f_sec, f_cmd = _font(22, True), _font(18)
+        f_row, f_foot = _font(22), _font(17)
 
-        # 四区块卡片（标题行 + 展示行）
-        layout: List[Tuple[str, List[str], int]] = []
-        for block_title, body in block_lines(blocks):
-            layout.append((block_title, body, block_title_h + len(body) * body_line_h + padding))
-        height = header_h + sum(h for _, _, h in layout) + card_gap * max(0, len(layout) - 1) + footer_h
-        height = min(max(int(height), int(240 * s)), _MAX_HEIGHT)
+        data = blocks if isinstance(blocks, dict) else {}
+        planning = data.get("planning") if isinstance(data.get("planning"), dict) else {}
+        companion = data.get("companion") if isinstance(data.get("companion"), dict) else {}
+        emotion = data.get("emotion") if isinstance(data.get("emotion"), dict) else {}
+        qzone = data.get("qzone") if isinstance(data.get("qzone"), dict) else {}
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
 
-        img = Image.new("RGB", (width, height), (246, 248, 252))
-        draw = ImageDraw.Draw(img, "RGBA")
+        def _spaced(text):
+            return " ".join(list(str(text)))
 
-        # 浅色纵向渐变画布
-        top_color, bottom_color = COLOR_GRADIENT_TOP, COLOR_GRADIENT_BOTTOM
-        for y in range(height):
-            ratio = y / max(1, height - 1)
-            color = tuple(int(top_color[i] + (bottom_color[i] - top_color[i]) * ratio) for i in range(3))
-            draw.line([(0, y), (width, y)], fill=(*color, 255))
+        def _tw(text, font):
+            return font.getlength(text)
 
-        # 头部：标题 + 生成时间副标题
-        _SIG._draw_text(draw, (margin_x, int(46 * s)), str(title or ""),
-                        COLOR_TEXT_PRIMARY, fonts["title"], bold=True)
-        _SIG._draw_text(
-            draw, (margin_x, int(46 * s) + int(54 * s)),
-            f"生成于 {datetime.now().strftime('%Y-%m-%d %H:%M')}｜四模块聚合（空白区块表示该模块未启用）",
-            COLOR_TEXT_SECONDARY, fonts["subtitle"],
-        )
-        # 头部分隔线（F2：标题区与卡片区之间的视觉切分）
-        draw.line([(margin_x, header_h - int(10 * s)), (margin_x + card_w, header_h - int(10 * s))],
-                  fill=COLOR_CARD_BORDER, width=1)
+        def _right(x, y, text, font, fill, max_w):
+            text = str(text)
+            while text and _tw(text, font) > max_w:
+                text = text[:-1]
+            draw.text((x + max_w - _tw(text, font), y), text, font=font, fill=fill)
 
-        # 逐块卡片：block_lines 的行原样画，超宽截断；左侧模块色强调条（F2 重排）
-        accent_by_title = {title: _MODULE_ACCENT.get(key, _MODULE_ACCENT["usage"])
-                           for key, title in _BLOCK_TITLES}
-        y = header_h
-        for block_title, body, block_h in layout:
-            draw.rounded_rectangle(
-                [margin_x, y, margin_x + card_w, y + block_h],
-                radius=int(18 * s), fill=COLOR_CARD, outline=COLOR_CARD_BORDER, width=1,
-            )
-            accent = accent_by_title.get(block_title, _MODULE_ACCENT["usage"])
-            bar_w = int(4 * s)
-            draw.rounded_rectangle(
-                [margin_x, y + int(14 * s), margin_x + bar_w, y + block_h - int(14 * s)],
-                radius=int(2 * s), fill=(*accent, 255),
-            )
-            _SIG._draw_text(draw, (margin_x + padding + bar_w + int(8 * s), y + int(14 * s)),
-                            block_title, COLOR_TEXT_PRIMARY, fonts["block"], bold=True)
-            line_y = y + block_title_h
-            for line in body:
-                if line_y + body_line_h > height - footer_h:
-                    break  # 触到画布上限：剩余行不画（不裁半行）
-                text = _SIG._ellipsis(draw, str(line), fonts["body"], text_max_w)
-                _SIG._draw_text(draw, (margin_x + padding, line_y), text,
-                                COLOR_TEXT_SECONDARY, fonts["body"])
-                line_y += body_line_h
-            y += block_h + card_gap
+        def _ellip(text, font, max_w):
+            text = str(text)
+            while text and _tw(text, font) > max_w:
+                text = text[:-1]
+            return text + ("…" if text != str(text) else "")
 
-        # 底部签名
-        signature = "Powered by Mai-Bot"
-        sig_w = _SIG._text_width(draw, signature, fonts["footer"])
-        _SIG._draw_text(draw, ((width - sig_w) // 2, height - footer_h + int(14 * s)),
-                        signature, (159, 176, 198), fonts["footer"])
+        def _wrap(text, font, max_w):
+            text = str(text or "").strip()
+            lines = []
+            current = ""
+            for ch in text:
+                if _tw(current + ch, font) > max_w:
+                    lines.append(current)
+                    current = ch
+                else:
+                    current += ch
+            if current:
+                lines.append(current)
+            return lines or [""]
+
+        def _enabled(key):
+            block = data.get(key)
+            return isinstance(block, dict) and bool(block.get("enabled"))
+
+        score = _to_float(companion.get("score"), 0.0)
+        tier_label = str(companion.get("tier_label") or "")
+        baseline = _to_float(companion.get("baseline"), 0.0)
+        labels = [str(x) for x in (emotion.get("labels") or []) if str(x)]
+        emo_word = labels[0] if labels else "—"
+        emo_sub = str(emotion.get("mood_text") or "")
+        desc = str(emotion.get("description") or "")
+        mode = str(emotion.get("mode") or "")
+        tokens = _to_int(usage.get("tokens"), 0)
+        calls = _to_int(usage.get("calls"), 0)
+        tokens_big = f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
+        current = str(planning.get("current") or "").strip()
+
+        left_w = int(inner * 0.34)
+        right_x = M + left_w + int(48 * s)
+        right_w = width - M - right_x
+        row_h, sec_head = int(52 * s), int(46 * s)
+
+        sections = [
+            ("01", _spaced("日程"), f"{_to_int(planning.get('item_count'), 0)} 项在列",
+             _BLOCK_BODY["planning"](planning), "/lbm_plan list · /lbm_plan regenerate"),
+            ("02", _spaced("陪伴"), tier_label,
+             _BLOCK_BODY["companion"](companion), "/lbm_mai_affection"),
+            ("03", _spaced("情绪"), mode,
+             _BLOCK_BODY["emotion"](emotion) + (_wrap(desc, f_row, right_w) if desc else []),
+             "/lbm_emotion_config"),
+            ("04", _spaced("空间"), "",
+             _BLOCK_BODY["qzone"](qzone), "/lbm_life qzone comments"),
+            ("05", _spaced("消耗"), "24h",
+             [str(line) for line in (usage.get("lines") or [])] or ["最近 24 小时：无 LLM 调用"],
+             "/lbm_mai_diag llm 1"),
+        ]
+        right_h = sum(sec_head + len(lines) * row_h + int(30 * s)
+                      for _, _, _, lines, _ in sections)
+        left_h = int(640 * s)
+        body_h = max(right_h, left_h)
+        height = int(120 * s) + body_h + int(96 * s)
+
+        img = Image.new("RGB", (width, height), PAPER)
+        draw = ImageDraw.Draw(img)
+
+        # 头部：红点 + 标记 | 标题（含日期）+ 2px 墨线
+        draw.ellipse([M, M + 2, M + 18, M + 20], fill=RED)
+        draw.text((M + 30, M), _spaced("MAI · STATE"), font=_font(20, True), fill=INK)
+        _right(M, M, str(title or ""), _font(20, True), INK, inner - 30)
+        draw.line([(M, M + int(44 * s)), (width - M, M + int(44 * s))], fill=INK, width=2)
+
+        y = int(120 * s)
+        # 左栏：三个巨型读数
+        lx = M
+        draw.text((lx, y), "好感", font=f_label, fill=RED)
+        draw.text((lx, y + int(34 * s)), f"{score:g}", font=f_big, fill=INK)
+        draw.text((lx, y + int(150 * s)),
+                  f"{tier_label} · 基线 {baseline:g}".strip(" ·"), font=f_sub, fill=MUTED)
+        y2 = y + int(212 * s)
+        draw.text((lx, y2), "情绪", font=f_label, fill=RED)
+        draw.text((lx, y2 + int(34 * s)), emo_word, font=f_mid, fill=INK)
+        draw.text((lx, y2 + int(112 * s)), emo_sub, font=f_sub, fill=MUTED)
+        y3 = y2 + int(170 * s)
+        draw.text((lx, y3), "24h 消耗", font=f_label, fill=RED)
+        draw.text((lx, y3 + int(34 * s)), tokens_big, font=f_mid, fill=INK)
+        draw.text((lx, y3 + int(112 * s)), f"tokens · {calls} 次调用", font=f_sub, fill=MUTED)
+
+        # 分隔细线（长度随右栏内容）
+        draw.line([(right_x - int(24 * s), y), (right_x - int(24 * s), y + body_h - int(30 * s))],
+                  fill=HAIR, width=1)
+
+        # 右栏：编号节（行 = 区块展示行，细线分隔；节尾红色命令指路）
+        ry = y
+        for num, label, sub, lines, cmd in sections:
+            draw.text((right_x, ry), num, font=f_label, fill=RED)
+            draw.text((right_x + int(46 * s), ry), label, font=f_sec, fill=INK)
+            if sub:
+                _right(right_x, ry + int(4 * s), sub, f_sub, MUTED, right_w - int(46 * s))
+            ry += int(40 * s)
+            for line in lines:
+                text = _ellip(line, f_row, right_w - int(46 * s))
+                draw.text((right_x + int(46 * s), ry), text, font=f_row,
+                          fill=MUTED if str(line) == "（未启用）" else INK)
+                ry += row_h
+            _right(right_x, ry - int(10 * s), cmd, f_cmd, RED, right_w)
+            ry += int(30 * s)
+
+        # 底部签名（2px 墨线 + 左右签名）
+        foot_y = height - int(58 * s)
+        draw.line([(M, foot_y), (width - M, foot_y)], fill=INK, width=2)
+        draw.text((M, foot_y + int(14 * s)), _spaced("属于麦麦的生活 v1.1.0"), font=f_foot, fill=MUTED)
+        sig = "Powered by Mai-Bot"
+        draw.text((width - M - _tw(sig, f_foot), foot_y + int(14 * s)), sig, font=f_foot, fill=MUTED)
 
         # output_dir 缺省 = 系统临时目录（与同族渲染器同一契约）：
         # 绝不回退到插件目录/代码目录（宿主隔离数据目录由调用方传入）。
