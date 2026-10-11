@@ -1006,11 +1006,11 @@ class CompanionComponentsMixin:
                 self.ctx.logger.error(f"mai_cmd_dashboard 发送失败: {e}")
                 return False, f"发送失败: {e}", True
 
+        # F2（2026-10-11）：重绘后面板自足（配置摘要等文字面归 WebUI/文本降级档），
+        # 合并转发只发图——不再「图片+文字」混发
         records: list[dict[str, Any]] = [
             {"user_id": "0", "nickname": "状态总览",
              "segments": [{"type": "image", "content": image_base64}]},
-            {"user_id": "0", "nickname": "状态总览",
-             "segments": [{"type": "text", "content": text}]},
         ]
         try:
             await self.ctx.send.forward(records, stream_id)
@@ -1068,7 +1068,7 @@ class CompanionComponentsMixin:
                 emotion_svc, self.config, enabled=emotion_live, now=now),
             "qzone": cateye_dashboard.qzone_block(
                 qzone, self.config, enabled=qzone_live, now=now),
-            "usage": self._mai_usage_lines(),
+            "usage": {"enabled": True, "lines": self._mai_usage_lines()},
         }
 
     def _mai_usage_lines(self) -> List[str]:

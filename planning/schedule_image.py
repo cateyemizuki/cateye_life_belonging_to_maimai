@@ -92,6 +92,9 @@ class ScheduleImageGenerator:
         """加载标题头像；目标插件暂无 logo 资源，使用主题色圆形占位。"""
         return Image.new("RGBA", (100, 100), (74, 144, 226, 255))
 
+    BUNDLED_FONT_BOLD_PATH = (
+        Path(__file__).resolve().parent / "assets" / "fonts" / "NotoSansSC-Bold.otf")
+
     @classmethod
     def _get_font(cls, ImageFont: Any, size: int, bold: bool = False):
         """获取字体（带缓存）；优先打包字体，失败回退系统常见中文字体。"""
@@ -100,6 +103,10 @@ class ScheduleImageGenerator:
             return cls._cached_fonts[key]
 
         candidates = []
+        # F2（2026-10-11）：bold 优先用打包的真粗体字重（NotoSansSC-Bold，OFL 随包分发）；
+        # 缺失时回退 Regular（bold 降级为同字重，不再依赖描边模拟）
+        if bold and cls.BUNDLED_FONT_BOLD_PATH.exists():
+            candidates.append(str(cls.BUNDLED_FONT_BOLD_PATH))
         if cls.BUNDLED_FONT_PATH.exists():
             candidates.append(str(cls.BUNDLED_FONT_PATH))
         candidates += [
@@ -111,6 +118,7 @@ class ScheduleImageGenerator:
             "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         ]
 
+        bundled = {str(cls.BUNDLED_FONT_PATH), str(cls.BUNDLED_FONT_BOLD_PATH)}
         for path in candidates:
             try:
                 font = ImageFont.truetype(path, size)
@@ -118,7 +126,7 @@ class ScheduleImageGenerator:
                 bbox = font.getbbox("日程09:30")
                 if bbox[2] - bbox[0] > 0:
                     cls._cached_fonts[key] = font
-                    if path != str(cls.BUNDLED_FONT_PATH):
+                    if path not in bundled:
                         logger.info(f"打包字体不可用，回退系统字体: {path} (size={size})")
                     return font
             except Exception:
@@ -129,11 +137,8 @@ class ScheduleImageGenerator:
     @classmethod
     def _draw_text(cls, draw: Any, xy: Tuple[int, int], text: str, fill: Tuple[int, ...],
                    font: Any, bold: bool = False) -> None:
-        """绘制文字；bold 用同色 1px 描边模拟（打包字体为单一字重）。"""
-        if bold:
-            draw.text(xy, text, fill=fill, font=font, stroke_width=1, stroke_fill=fill)
-        else:
-            draw.text(xy, text, fill=fill, font=font)
+        """绘制文字；bold 由 :meth:`_get_font` 装载的真粗体字重承担（F2：不再描边模拟）。"""
+        draw.text(xy, text, fill=fill, font=font)
 
     @classmethod
     def _text_width(cls, draw: Any, text: str, font: Any) -> int:
@@ -332,7 +337,7 @@ class ScheduleImageGenerator:
         # 第一行：时间 + 活动名
         cls._draw_text(draw, (content_x, line1_y), row["time"], time_color, fonts["time"], bold=is_current)
         name_x = content_x + int(190 * s)
-        cls._draw_text(draw, (name_x, line1_y - int(3 * s)), row["name"], text_color, fonts["name"], bold=is_current)
+        cls._draw_text(draw, (name_x, line1_y - int(3 * s)), row["name"], text_color, fonts["name"], bold=True)
 
         # 第二行：描述（有才画）
         if row["has_desc"]:

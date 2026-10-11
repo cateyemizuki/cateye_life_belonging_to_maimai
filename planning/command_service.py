@@ -317,7 +317,7 @@ class CommandService:
         text = self._build_status_text(schedule_goals)
         image_base64 = await self._draw_schedule_image(schedule_goals)
 
-        # 合并转发：第一条为图片（若绘制成功），第二条为文字
+        # 合并转发：F2（2026-10-11）重绘后面板自足，只发图（绘制失败时才有纯文本档）
         records: List[Dict[str, Any]] = []
         if image_base64:
             records.append({
@@ -325,15 +325,16 @@ class CommandService:
                 "nickname": "日程规划",
                 "segments": [{"type": "image", "content": image_base64}],
             })
-        records.append({
-            "user_id": "0",
-            "nickname": "日程规划",
-            "segments": [{"type": "text", "content": text}],
-        })
+        else:
+            records.append({
+                "user_id": "0",
+                "nickname": "日程规划",
+                "segments": [{"type": "text", "content": text}],
+            })
 
         try:
             await self._plugin.ctx.send.forward(records, stream_id)
-            logger.info("✅ /lbm_plan list 已合并转发（图片=%s，文字 %s 字符）", "有" if image_base64 else "无", len(text))
+            logger.info("/lbm_plan list 已合并转发（图片=%s）", "有" if image_base64 else "无（文字档）")
         except Exception as exc:
             # 合并转发失败（能力未声明 / 平台不支持）→ 回退普通发送
             logger.warning(f"合并转发失败，回退为普通发送: {exc}")

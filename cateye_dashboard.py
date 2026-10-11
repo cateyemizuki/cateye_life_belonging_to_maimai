@@ -34,6 +34,15 @@ _BLOCK_TITLES: Tuple[Tuple[str, str], ...] = (
 #: 未启用区块的唯一一行
 _DISABLED_LINE = "（未启用）"
 
+#: 模块强调条配色（F2 重排；键与 _BLOCK_TITLES 对齐）
+_MODULE_ACCENT: Dict[str, Tuple[int, int, int]] = {
+    "planning": (91, 124, 250),
+    "companion": (235, 106, 140),
+    "emotion": (245, 166, 75),
+    "qzone": (90, 190, 140),
+    "usage": (130, 120, 220),
+}
+
 # ---------------------------------------------------------------------------
 # 取数助手（全部防御式：缺失/异常/None → 安全值）
 # ---------------------------------------------------------------------------
@@ -346,11 +355,20 @@ def _qzone_lines(block: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _usage_lines(block: Any) -> List[str]:
+    """模型消耗块（F3/F2）：行由 companion 侧 ``_mai_usage_lines`` 生成，这里只做展示投影。"""
+    lines = block.get("lines") if isinstance(block, dict) else None
+    if isinstance(lines, list) and lines:
+        return [str(line) for line in lines]
+    return ["最近 24 小时：无 LLM 调用"]
+
+
 _BLOCK_BODY = {
     "planning": _planning_lines,
     "companion": _companion_lines,
     "emotion": _emotion_lines,
     "qzone": _qzone_lines,
+    "usage": _usage_lines,
 }
 
 
@@ -481,16 +499,27 @@ def render_dashboard_image(title: str, blocks: Any, *, output_dir: Optional[Path
             f"生成于 {datetime.now().strftime('%Y-%m-%d %H:%M')}｜四模块聚合（空白区块表示该模块未启用）",
             COLOR_TEXT_SECONDARY, fonts["subtitle"],
         )
+        # 头部分隔线（F2：标题区与卡片区之间的视觉切分）
+        draw.line([(margin_x, header_h - int(10 * s)), (margin_x + card_w, header_h - int(10 * s))],
+                  fill=COLOR_CARD_BORDER, width=1)
 
-        # 逐块卡片：block_lines 的行原样画，超宽截断
+        # 逐块卡片：block_lines 的行原样画，超宽截断；左侧模块色强调条（F2 重排）
+        accent_by_title = {title: _MODULE_ACCENT.get(key, _MODULE_ACCENT["usage"])
+                           for key, title in _BLOCK_TITLES}
         y = header_h
         for block_title, body, block_h in layout:
             draw.rounded_rectangle(
                 [margin_x, y, margin_x + card_w, y + block_h],
                 radius=int(18 * s), fill=COLOR_CARD, outline=COLOR_CARD_BORDER, width=1,
             )
-            _SIG._draw_text(draw, (margin_x + padding, y + int(14 * s)), block_title,
-                            COLOR_TEXT_PRIMARY, fonts["block"], bold=True)
+            accent = accent_by_title.get(block_title, _MODULE_ACCENT["usage"])
+            bar_w = int(4 * s)
+            draw.rounded_rectangle(
+                [margin_x, y + int(14 * s), margin_x + bar_w, y + block_h - int(14 * s)],
+                radius=int(2 * s), fill=(*accent, 255),
+            )
+            _SIG._draw_text(draw, (margin_x + padding + bar_w + int(8 * s), y + int(14 * s)),
+                            block_title, COLOR_TEXT_PRIMARY, fonts["block"], bold=True)
             line_y = y + block_title_h
             for line in body:
                 if line_y + body_line_h > height - footer_h:
