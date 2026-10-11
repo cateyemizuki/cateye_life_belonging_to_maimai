@@ -106,12 +106,13 @@ class EmotionServices:
             source, description, delta, use_llm=use_llm, multiplier=multiplier,
             session_id=session_id)
 
-    def injection_text(self) -> str:
+    def injection_text(self, channel: str = "replyer") -> str:
         """情绪底色注入文本（planner/replyer 注入 Hook 入口；转发 self.service）。
 
+        F5（2026-10-11）：``channel`` 决定情绪描述的人称（planner 第三人称 / replyer 第二人称）。
         与 ``mood_text()`` 同源但多带注入要求行；Hook 侧仅消费字符串。
         """
-        return self.service.injection_text()
+        return self.service.injection_text(channel)
 
     def mood_effect(self) -> Dict[str, Any]:
         """情绪→行为结构化系数（M4；跨模块消费入口，附录 C）。

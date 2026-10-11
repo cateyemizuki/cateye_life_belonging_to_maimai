@@ -925,10 +925,11 @@ class InjectService:
         return None
 
     def _emotion_mood_line(self) -> str:
-        """M4（§4.2 行 8）：planner 精神状态行读 emotion.mood_text()（与情绪注入条目同源）。
+        """M4（§4.2 行 8）：planner 精神状态行读 emotion 的情绪描述（F5 双人称·第三人称）。
 
-        跨模块可空降级（§八.2）：emotion 未装配/停用/异常一律返回空串，调用方省略该行；
-        不再回退 inject/state_analyzer 的静态模板（该模块已按 §4.2 删除）。
+        2026-10-11 起（F5 用户口径）：该行由「标签(百分比)+三维约值」改为**详细文字描述**，
+        与情绪注入条目同源（emotion.emotion_description_text("planner")）；emotion 未提供
+        描述方法（旧形态/桩）→ 回退 mood_text，保持可空降级。
         """
         emotion = getattr(self._plugin, "_emotion", None)
         enabled = getattr(emotion, "is_enabled", None)
@@ -938,6 +939,12 @@ class InjectService:
                     return ""
             except Exception:
                 return ""
+        described = getattr(emotion, "emotion_description_text", None)
+        if callable(described):
+            try:
+                return str(described("planner") or "").strip()
+            except Exception:
+                pass
         getter = getattr(emotion, "mood_text", None)
         if not callable(getter):
             return ""

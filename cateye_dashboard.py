@@ -28,6 +28,7 @@ _BLOCK_TITLES: Tuple[Tuple[str, str], ...] = (
     ("companion", "伴侣关系"),
     ("emotion", "情绪"),
     ("qzone", "QQ空间"),
+    ("usage", "模型消耗"),
 )
 
 #: 未启用区块的唯一一行

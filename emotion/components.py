@@ -169,7 +169,8 @@ class EmotionComponentsMixin:
     # ============================================================
     # Hooks（planner + replyer 双通道：均插到第一条系统提示词之后）
     # ============================================================
-    def _emo_inject(self, kwargs: Dict[str, Any], **writeback: Any) -> Optional[Dict[str, Any]]:
+    def _emo_inject(self, kwargs: Dict[str, Any], channel: str = "replyer",
+                    **writeback: Any) -> Optional[Dict[str, Any]]:
         """按 payload 形态把情绪底色系统条目插到第一条系统提示词之后。
 
         ``writeback``：随 ``modified_kwargs`` 一并**原样回传**的键。宿主对 blocking
@@ -184,7 +185,7 @@ class EmotionComponentsMixin:
         payload_key, payload = pick_payload_key(kwargs)
         if payload_key is None or svc is None:
             return None
-        text = svc.injection_text()
+        text = svc.injection_text(channel)
         if payload_key == "items":
             modified = inject_into_items_after_system(payload, text)
         else:
@@ -215,7 +216,7 @@ class EmotionComponentsMixin:
                 )
             except Exception:
                 pass
-        result = self._emo_inject(kwargs, session_id=session_id)
+        result = self._emo_inject(kwargs, channel="planner", session_id=session_id)
         return result or {"action": "continue"}
 
     @HookHandler("maisaka.replyer.before_model_request",
@@ -231,7 +232,7 @@ class EmotionComponentsMixin:
         if not self._emo_module_enabled() or not self._injection_enabled():
             return {"action": "continue"}
         session_id = str(kwargs.get("session_id") or "")
-        result = self._emo_inject(kwargs, session_id=session_id, attempt=attempt)
+        result = self._emo_inject(kwargs, channel="replyer", session_id=session_id, attempt=attempt)
         return result or {"action": "continue"}
 
     def _injection_enabled(self) -> bool:

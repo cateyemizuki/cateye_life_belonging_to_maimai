@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional
 
+from core.llm_usage import LLMUsageTracker
+
 
 def _llm_section(config_or_plugin: Any) -> Any:
     """取 ``[llm]`` 段（接受 plugin 实例或配置对象；取不到返回 None）。"""
@@ -97,6 +99,14 @@ class LLMService:
         self._call_logger = call_logger  # LLMCallLogger（可选）
         #: 返回插件实时配置的回调（judge() 读 [judge] 段用；None = 全部走内置默认）
         self._config_provider = config_provider
+        # F3（2026-10-11）：LLM 消耗账本（无配置项；data_dir 不可得 → None = 统计降级不可用）
+        self._usage_tracker: Optional[LLMUsageTracker] = None
+        try:
+            data_dir = getattr(getattr(self._ctx, "paths", None), "data_dir", None)
+            if data_dir:
+                self._usage_tracker = LLMUsageTracker(data_dir)
+        except Exception:
+            self._usage_tracker = None
 
     def update_task(self, task_name: str, model_name: str = "") -> None:
         self._task_name = task_name or "utils"
@@ -176,6 +186,7 @@ class LLMService:
         - 宿主裸失败（无 error 字段）→ 不再冒充"未知错误"；
         - 非 dict 结果 → 防御性按失败处理，不抛异常。
         """
+        self._record_usage(event, task, result)
         if not isinstance(result, dict):
             detail = "宿主返回非字典结果"
             try:
@@ -206,6 +217,39 @@ class LLMService:
             pass
         self._log(event, task, False, "", error)
         return ""
+
+    def _record_usage(self, event: str, task: str, result: Any) -> None:
+        """F3：把宿主能力载荷里的用量字段记入消耗账本（_interpret 唯一出口处调用）。
+
+        宿主 LLM 能力返回自带 ``model_name / prompt_tokens / completion_tokens /
+        total_tokens``（旧宿主/测试桩没有 → 记 0 tokens、只计调用次数，面板据此
+        区分"无调用"与"有调用但宿主未返回用量"）。任何异常都不打断业务链路。
+        """
+        tracker = self._usage_tracker
+        if tracker is None or not isinstance(result, dict):
+            return
+        try:
+            total = result.get("total_tokens")
+            if total is None:
+                total = (result.get("prompt_tokens") or 0) + (result.get("completion_tokens") or 0)
+            tracker.record(event=event, model=result.get("model_name"),
+                           prompt_tokens=result.get("prompt_tokens"),
+                           completion_tokens=result.get("completion_tokens"),
+                           total_tokens=total)
+        except Exception:
+            try:
+                self._ctx.logger.debug("LLM 消耗记账失败（忽略）", exc_info=True)
+            except Exception:
+                pass
+
+    def usage_summary(self, hours: int = 24) -> Dict[str, Any]:
+        """最近 ``hours`` 小时的消耗聚合（面板指令渲染用；账本缺失 → 空账本）。"""
+        if self._usage_tracker is None:
+            return {"calls": 0, "tokens": 0, "models": {}, "modules": {}, "has_usage": False}
+        try:
+            return self._usage_tracker.summary(hours)
+        except Exception:
+            return {"calls": 0, "tokens": 0, "models": {}, "modules": {}, "has_usage": False}
 
     async def judge(self, prompt: str, *, event: str = "judge") -> str:
         """判定类调用（当前唯一调用点 = 想念把关；角色裁判/睡眠裁判走各自任务名，不读本入口）：

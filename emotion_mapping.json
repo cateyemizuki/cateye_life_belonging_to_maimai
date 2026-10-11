@@ -1,0 +1,412 @@
+{
+  "version": 1,
+  "prototypes": [
+    {
+      "label": "狂喜",
+      "valence": [
+        0.7,
+        1.0
+      ],
+      "arousal": [
+        0.6,
+        1.0
+      ],
+      "dominance": [
+        0.5,
+        1.0
+      ]
+    },
+    {
+      "label": "平静",
+      "valence": [
+        0.3,
+        0.8
+      ],
+      "arousal": [
+        -0.8,
+        -0.2
+      ],
+      "dominance": [
+        0.2,
+        0.7
+      ]
+    },
+    {
+      "label": "期待",
+      "valence": [
+        0.2,
+        0.8
+      ],
+      "arousal": [
+        0.3,
+        0.7
+      ],
+      "dominance": [
+        -0.2,
+        0.4
+      ]
+    },
+    {
+      "label": "愤怒",
+      "valence": [
+        -0.9,
+        -0.3
+      ],
+      "arousal": [
+        0.6,
+        1.0
+      ],
+      "dominance": [
+        0.4,
+        0.9
+      ]
+    },
+    {
+      "label": "恐惧",
+      "valence": [
+        -0.9,
+        -0.4
+      ],
+      "arousal": [
+        0.7,
+        1.0
+      ],
+      "dominance": [
+        -0.9,
+        -0.4
+      ]
+    },
+    {
+      "label": "悲伤",
+      "valence": [
+        -1.0,
+        -0.5
+      ],
+      "arousal": [
+        -0.5,
+        -0.1
+      ],
+      "dominance": [
+        -0.8,
+        -0.3
+      ]
+    },
+    {
+      "label": "焦虑",
+      "valence": [
+        -0.7,
+        -0.2
+      ],
+      "arousal": [
+        0.5,
+        0.9
+      ],
+      "dominance": [
+        -0.7,
+        -0.2
+      ]
+    },
+    {
+      "label": "疲惫",
+      "valence": [
+        -0.4,
+        0.1
+      ],
+      "arousal": [
+        -0.9,
+        -0.4
+      ],
+      "dominance": [
+        -0.5,
+        0.0
+      ]
+    },
+    {
+      "label": "厌恶",
+      "valence": [
+        -0.9,
+        -0.4
+      ],
+      "arousal": [
+        0.2,
+        0.6
+      ],
+      "dominance": [
+        0.3,
+        0.8
+      ]
+    },
+    {
+      "label": "无奈",
+      "valence": [
+        -0.5,
+        -0.1
+      ],
+      "arousal": [
+        -0.4,
+        0.2
+      ],
+      "dominance": [
+        -0.9,
+        -0.5
+      ]
+    },
+    {
+      "label": "骄傲",
+      "valence": [
+        0.6,
+        0.9
+      ],
+      "arousal": [
+        0.4,
+        0.8
+      ],
+      "dominance": [
+        0.6,
+        1.0
+      ]
+    },
+    {
+      "label": "嫉妒",
+      "valence": [
+        -0.7,
+        -0.3
+      ],
+      "arousal": [
+        0.4,
+        0.7
+      ],
+      "dominance": [
+        -0.6,
+        -0.2
+      ]
+    },
+    {
+      "label": "羞耻",
+      "valence": [
+        -0.8,
+        -0.4
+      ],
+      "arousal": [
+        0.3,
+        0.6
+      ],
+      "dominance": [
+        -0.9,
+        -0.6
+      ]
+    },
+    {
+      "label": "无聊",
+      "valence": [
+        -0.3,
+        0.1
+      ],
+      "arousal": [
+        -0.8,
+        -0.5
+      ],
+      "dominance": [
+        0.0,
+        0.4
+      ]
+    },
+    {
+      "label": "好奇",
+      "valence": [
+        0.3,
+        0.7
+      ],
+      "arousal": [
+        0.4,
+        0.7
+      ],
+      "dominance": [
+        -0.1,
+        0.4
+      ]
+    },
+    {
+      "label": "感激",
+      "valence": [
+        0.7,
+        1.0
+      ],
+      "arousal": [
+        0.2,
+        0.6
+      ],
+      "dominance": [
+        -0.2,
+        0.3
+      ]
+    },
+    {
+      "label": "挫败",
+      "valence": [
+        -0.6,
+        -0.2
+      ],
+      "arousal": [
+        0.5,
+        0.8
+      ],
+      "dominance": [
+        -0.5,
+        -0.1
+      ]
+    },
+    {
+      "label": "释然",
+      "valence": [
+        0.4,
+        0.8
+      ],
+      "arousal": [
+        -0.6,
+        -0.2
+      ],
+      "dominance": [
+        0.3,
+        0.7
+      ]
+    },
+    {
+      "label": "轻蔑",
+      "valence": [
+        -0.6,
+        -0.2
+      ],
+      "arousal": [
+        0.2,
+        0.5
+      ],
+      "dominance": [
+        0.6,
+        0.9
+      ]
+    },
+    {
+      "label": "忧郁",
+      "valence": [
+        -0.6,
+        -0.2
+      ],
+      "arousal": [
+        -0.7,
+        -0.3
+      ],
+      "dominance": [
+        -0.6,
+        -0.2
+      ]
+    },
+    {
+      "label": "敬畏",
+      "valence": [
+        0.5,
+        0.9
+      ],
+      "arousal": [
+        0.6,
+        0.9
+      ],
+      "dominance": [
+        -0.7,
+        -0.3
+      ]
+    },
+    {
+      "label": "惊喜",
+      "valence": [
+        0.4,
+        0.8
+      ],
+      "arousal": [
+        0.7,
+        1.0
+      ],
+      "dominance": [
+        -0.4,
+        0.2
+      ]
+    },
+    {
+      "label": "内疚",
+      "valence": [
+        -0.8,
+        -0.4
+      ],
+      "arousal": [
+        0.3,
+        0.7
+      ],
+      "dominance": [
+        -0.7,
+        -0.3
+      ]
+    },
+    {
+      "label": "冷漠",
+      "valence": [
+        -0.4,
+        0.0
+      ],
+      "arousal": [
+        -0.9,
+        -0.6
+      ],
+      "dominance": [
+        0.3,
+        0.7
+      ]
+    },
+    {
+      "label": "怀旧",
+      "valence": [
+        0.2,
+        0.6
+      ],
+      "arousal": [
+        -0.3,
+        0.2
+      ],
+      "dominance": [
+        -0.2,
+        0.3
+      ]
+    }
+  ],
+  "template_events": {
+    "relation.silence_detected": {
+      "valence": -0.12,
+      "arousal": 0.04,
+      "dominance": 0.0
+    },
+    "schedule.commitment_kept": {
+      "valence": 0.2,
+      "arousal": 0.0,
+      "dominance": 0.0
+    },
+    "schedule.commitment_broken": {
+      "valence": -0.15,
+      "arousal": 0.0,
+      "dominance": 0.0
+    },
+    "qzone.comment_received": {
+      "valence_min": 0.05,
+      "valence_max": 0.1
+    }
+  },
+  "multipliers": {
+    "global_event_multiplier": 1.0,
+    "non_target_multiplier": 1.0,
+    "target_bonus_step": 0.1
+  },
+  "level_thresholds": [
+    -0.5,
+    -0.15,
+    0.15,
+    0.5
+  ]
+}

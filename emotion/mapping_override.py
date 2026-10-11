@@ -646,6 +646,57 @@ def _record_outcome(result: MappingOverrideResult, decision_logger: Any) -> None
         logger.debug("emotion mapping override：落账 %s 异常（忽略）", action, exc_info=True)
 
 
+ROOT_MAPPING_FILE_NAME = "emotion_mapping.json"
+#: 插件根目录默认映射表文件（F4 2026-10-11）：缺失时由内置四表生成，用户可编辑
+
+
+def load_effective(data_dir: Union[str, Path], decision_logger: Any = None,
+                   *, root_dir: Any = None) -> MappingOverrideResult:
+    """F4（裁决 2026-10-11）：插件根目录映射表优先 → data_dir 覆盖层（M12）→ 内置默认。
+
+    - 根文件存在 → 校验：合法即生效（**不再叠加** data_dir 覆盖层——根文件是唯一
+      用户编辑位）；非法 → 告警并回退**内置默认**（用户口径「格式有误时回退为
+      使用默认的映射表」，不落入 data_dir 以免双重覆盖）；
+    - 根文件缺失 → best-effort 生成内置默认文件（供用户编辑），并继续走
+      data_dir 覆盖层（M12 兼容）→ 内置默认；
+    - ``root_dir=None``（测试桩/无插件根信息的调用方）→ **跳过根层**，纯走
+      data_dir 覆盖层（M12 行为逐字不变；根层仅由真实插件实例启用）；
+    - 结果落账与 :func:`load` 同口径。
+    """
+    if root_dir is None:
+        return load(data_dir, decision_logger)
+    root = Path(root_dir)
+    root_path = root / ROOT_MAPPING_FILE_NAME
+    try:
+        present = root_path.exists()
+    except OSError:
+        present = False
+    if not present:
+        _generate_default_root(root_path)
+        return load(data_dir, decision_logger)
+    try:
+        raw = _read_document(root_path)
+    except _Rejected as exc:
+        logger.warning("插件根目录映射表非法（%s：%s）→ 回退内置默认（不叠加 data_dir 覆盖层）",
+                       exc.error_kind, exc.detail)
+        result = _rejected(exc.error_key, exc.error_kind, exc.detail)
+        _record_outcome(result, decision_logger)
+        return result
+    result = validate_document(raw)
+    _record_outcome(result, decision_logger)
+    return result
+
+
+def _generate_default_root(path: Path) -> None:
+    """生成插件根目录默认映射表（内置四表；best-effort，失败仅告警）。"""
+    try:
+        doc = {"version": 1, **default_tables()}
+        path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        logger.info("已生成默认情绪映射表：%s（可自行编辑，格式错误将回退内置默认）", path)
+    except Exception as exc:
+        logger.warning("生成默认情绪映射表失败（忽略）：%s", exc)
+
+
 def load(data_dir: Union[str, Path], decision_logger: Any = None,
          *, file_name: str = MAPPING_FILE_NAME) -> MappingOverrideResult:
     """装载 ``<data_dir>/<file_name>`` 并校验（**只读**，不写任何文件）。

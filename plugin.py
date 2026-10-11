@@ -233,6 +233,8 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         data_dir = self.ctx.paths.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
         self._data_dir = data_dir
+        # F4（2026-10-11）：插件根目录（映射表/情绪描述根文件所在；测试桩无此属性 → 走 M12 原路径）
+        self._plugin_root = _PLUGIN_DIR
 
         cfg = self.config
         # 公共基础设施（三个服务束共享的实例，缺省时它们会自建兜底）

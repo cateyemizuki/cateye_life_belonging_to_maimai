@@ -25,7 +25,7 @@ from suite_prompts import (
 from planning.tools_service import (DEFAULT_LIE_IN_MAX_UNTIL, NAP_TOOL_NAME,
                                     normalize_hhmm, parse_nap_target)
 
-from . import mapping_override
+from . import descriptions, mapping_override
 from .bridge import apply_template_events
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
 from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
@@ -209,8 +209,9 @@ class EmotionService:
         # （plugin.py:65-113）。文件不存在 = 纯代码默认（静默、零 action），下游取值与接线前
         # 逐字一致。结果留服务实例（倍率三层取值的 JSON 侧 + 观测/直测用）。
         try:
-            self._mapping_result = mapping_override.load(
-                data_dir, getattr(plugin, "_decision_logger", None))
+            self._mapping_result = mapping_override.load_effective(
+                data_dir, getattr(plugin, "_decision_logger", None),
+                root_dir=getattr(plugin, "_plugin_root", None))
         except Exception as exc:  # 模块自身缺陷不拖挂情绪子系统（V2 模块 docstring 明文委托）
             logger.warning("情绪映射覆盖层装载异常（按纯默认处理）：%s", exc)
             self._mapping_result = None
@@ -218,6 +219,17 @@ class EmotionService:
         apply_mapping_tables(prototypes=self._mapping_tables["prototypes"],
                              level_thresholds=self._mapping_tables["level_thresholds"])
         apply_template_events(self._mapping_tables["template_events"])
+        # F5（2026-10-11）：情绪描述表（插件根目录 json 可编辑；只在加载/重载时读一遍）
+        try:
+            _proto_labels = [str(p.get("label") or "").strip()
+                             for p in (self._mapping_tables.get("prototypes") or [])]
+            self._emotion_descriptions = descriptions.load_descriptions(
+                known_labels=[label for label in _proto_labels if label],
+                decision_logger=getattr(plugin, "_decision_logger", None),
+                root_dir=getattr(plugin, "_plugin_root", None))
+        except Exception as exc:  # 描述表故障不拖挂情绪子系统（同覆盖层口径）
+            logger.warning("情绪描述表装载异常（按内置默认处理）：%s", exc)
+            self._emotion_descriptions = dict(descriptions.DEFAULT_EMOTION_DESCRIPTIONS)
         ctx_logger = getattr(self._ctx, "logger", None)
         if ctx_logger is not None and self._mapping_result is not None:
             if self._mapping_result.error is not None:
@@ -364,7 +376,39 @@ class EmotionService:
         """
         return float(self._machine.effective_vad().valence)
 
-    def injection_text(self) -> str:
+    def _primary_emotion_description(self) -> str:
+        """当前主导情绪的详细文字描述（F5；映射表外/无命中 → 通用固定描述）。"""
+        try:
+            labels, _nearest = map_emotions(self._machine.effective_vad())
+        except Exception:
+            labels = []
+        descriptions_map = getattr(self, "_emotion_descriptions", None) or {}
+        if not labels:
+            return descriptions_map.get(descriptions.GENERIC_LABEL) or                 descriptions.generic_description(descriptions.GENERIC_LABEL)
+        primary, _share = labels[0]
+        desc = descriptions_map.get(str(primary))
+        if not desc:
+            desc = descriptions.generic_description(str(primary))
+        try:
+            if len(labels) > 1 and float(labels[1][1]) >= 0.25:
+                desc = f"{desc}同时夹杂着一点「{labels[1][0]}」的成分。"
+        except (TypeError, ValueError):
+            pass
+        return desc
+
+    def emotion_description_text(self, channel: str = "planner") -> str:
+        """F5 双人称渲染：planner 第三人称（bot 名）、replyer 第二人称。
+
+        返回值作为情绪注入模板的 ``mood`` 槽 / planner 日程块的精神状态行——
+        详细文字描述替代「百分比 + 三维约值」（用户口径：数值渲染不得再进 LLM 面向文本）。
+        """
+        body = self._primary_emotion_description()
+        if channel == "replyer":
+            return f"你此刻的情绪：{body}"
+        name = str(getattr(self, "_lover_name", "") or "麦麦")
+        return f"{name}此刻的情绪：{body}"
+
+    def injection_text(self, channel: str = "replyer") -> str:
         """情绪底色注入文本（planner/replyer 双通道共用，以系统条目插在第一条系统提示词后）。
 
         冻结态（睡眠窗口内）在既有文本**后追加一行**深夜引导（§2.5.5，零结构改动）：
@@ -374,7 +418,7 @@ class EmotionService:
         text = render(
             prompt_of(self._plugin, "emotion_injection"),
             fallback=EMOTION_INJECTION_DEFAULT,
-            mood=self.mood_text(),
+            mood=self.emotion_description_text(channel),
         )
         if self.is_frozen():
             text = f"{text}\n{prompt_of(self._plugin, 'emotion_night_hint')}"

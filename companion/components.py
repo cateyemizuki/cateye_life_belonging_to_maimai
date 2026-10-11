@@ -39,7 +39,7 @@ import asyncio
 import json as _json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import cateye_dashboard
 from maibot_sdk import API, Command, HookHandler, Tool
@@ -1068,7 +1068,37 @@ class CompanionComponentsMixin:
                 emotion_svc, self.config, enabled=emotion_live, now=now),
             "qzone": cateye_dashboard.qzone_block(
                 qzone, self.config, enabled=qzone_live, now=now),
+            "usage": self._mai_usage_lines(),
         }
+
+    def _mai_usage_lines(self) -> List[str]:
+        """模型消耗块（F3 2026-10-11）：最近 24 小时按模型/按模块的 token 消耗。
+
+        数据源 = ``plugin._llm`` 的消耗账本（``core/llm_usage.py``，无配置项）；
+        服务缺失（降级形态）→ 单行提示。
+        """
+        from core.llm_usage import MODULE_ORDER
+
+        llm = getattr(self, "_llm", None)
+        summary = llm.usage_summary(24) if llm is not None and callable(
+            getattr(llm, "usage_summary", None)) else None
+        if not summary:
+            return ["消耗统计不可用（LLM 服务未就绪）"]
+        calls = int(summary.get("calls") or 0)
+        tokens = int(summary.get("tokens") or 0)
+        if calls == 0:
+            return ["最近 24 小时：无 LLM 调用"]
+        lines = [f"最近 24 小时：{tokens} tokens / {calls} 次调用"]
+        if not summary.get("has_usage"):
+            lines.append("（宿主未返回 token 用量，仅计调用次数）")
+        models = summary.get("models") or {}
+        for model, count in sorted(models.items(), key=lambda kv: kv[1], reverse=True)[:5]:
+            lines.append(f"模型 {model or '未知'}：{count} tokens")
+        modules = summary.get("modules") or {}
+        for module in MODULE_ORDER:
+            if module in modules:
+                lines.append(f"模块 {module}：{modules[module]} tokens")
+        return lines
 
     async def _mai_draw_dashboard(self, blocks: dict[str, Any]) -> Optional[str]:
         """绘制状态总览图（返回 base64）；PIL 缺失/绘制异常/超时**静默**返回 None。
