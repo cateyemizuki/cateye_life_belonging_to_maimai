@@ -18,7 +18,7 @@ import logging
 from core.time_utils import parse_hhmm
 
 from ..time_utils import DAY_MINUTES
-from .validator import is_gap_warning, item_time_block
+from .validator import is_gap_warning, is_reasonableness_warning, item_time_block
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 WARNING_PENALTY_PER_ITEM = 0.05
 #: 空档类警告单项罚分（N2/N1：≥0.25 —— 单项即可把满分压到 0.75 < 0.85 重试线）
 GAP_WARNING_PENALTY = 0.25
+#: 常识窗判定界（裁决⑤ 2026-10-11）：起床锚点 ∈ [05:00, 10:00] 且入睡锚点 ∈ [21:00~次日 06:00]
+#: 视为「常规作息」；否则视为作息偏离常识时间窗——常识窗类警告（如「早餐 6-9 点」）只告警不罚分，
+#: 避免 wake=11:00 一类作息被无辜罚进重试。
+_COMMONSENSE_WAKE_RANGE = (5 * 60, 10 * 60)
+_COMMONSENSE_SLEEP_EARLIEST = 21 * 60   # 21:00 及之后入睡
+_COMMONSENSE_SLEEP_LATEST = 6 * 60      # 或次日 06:00 前入睡（跨午夜环）
 #: 评分兜底作息锚点（配置缺 ``wake_time`` / ``sleep_time`` 时用）
 _DEFAULT_WAKE_MINUTES = 7 * 60
 _DEFAULT_SLEEP_MINUTES = 23 * 60
@@ -162,9 +168,15 @@ class ScheduleQualityScorer:
         coverage_score = self._score_time_coverage(items)
         score += coverage_score * self.weights['time_coverage']
 
-        # 4. 警告惩罚：普通警告按旧口径，空档类单独重罚（N2/N1：空档必须能触发重试）
+        # 4. 警告惩罚：普通警告按旧口径，空档类单独重罚（N2/N1：空档必须能触发重试）；
+        #    常识时间窗类（裁决⑤）：作息锚点偏离常识窗时只告警不罚分
         gap_count = sum(1 for warning in (warnings or []) if is_gap_warning(warning))
-        other_count = max(0, len(warnings or []) - gap_count)
+        reasonableness_count = 0
+        if self._anchors_deviate_from_common_sense():
+            reasonableness_count = sum(
+                1 for warning in (warnings or [])
+                if is_reasonableness_warning(warning) and not is_gap_warning(warning))
+        other_count = max(0, len(warnings or []) - gap_count - reasonableness_count)
         ordinary_penalty = min(other_count * WARNING_PENALTY_PER_ITEM, self.weights['warnings'])
         gap_penalty = min(gap_count * GAP_WARNING_PENALTY, 1.0)
         warning_penalty = ordinary_penalty + gap_penalty
@@ -182,6 +194,22 @@ class ScheduleQualityScorer:
         )
 
         return final_score
+
+    def _anchors_deviate_from_common_sense(self) -> bool:
+        """作息锚点是否偏离常识时间窗（裁决⑤ 2026-10-11；配置缺省 07:00/23:00 视为常规）。
+
+        缺省锚点恰在常识窗内 → 不偏离（旧行为逐字一致）；用户把作息调成
+        wake=11:00 / sleep=01:00 一类时 → 偏离，常识窗类警告豁免罚分。
+        """
+        try:
+            wake_min = parse_hhmm(str(self.config.get('wake_time') or ''), _DEFAULT_WAKE_MINUTES)
+            sleep_min = parse_hhmm(str(self.config.get('sleep_time') or ''), _DEFAULT_SLEEP_MINUTES)
+        except Exception:
+            return False
+        wake_ok = _COMMONSENSE_WAKE_RANGE[0] <= wake_min <= _COMMONSENSE_WAKE_RANGE[1]
+        sleep_ok = (sleep_min >= _COMMONSENSE_SLEEP_EARLIEST
+                    or sleep_min < _COMMONSENSE_SLEEP_LATEST)
+        return not (wake_ok and sleep_ok)
 
     def _score_activity_count(
         self,

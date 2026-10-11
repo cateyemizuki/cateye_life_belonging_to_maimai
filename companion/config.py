@@ -271,6 +271,18 @@ class PatrolSectionConfig(PluginConfigBase):
             **_ui_i18n("Silence end", "Empty = follow [schedule] sleep~wake; HH:MM = override."),
         },
     )
+    nap_quiet_enabled: bool = Field(
+        default=False,
+        description="午休静默（2026-10-11 裁决⑦，默认关）：开启后，陪伴对象的日程正处于"
+                    "午休/小睡条目（名称含 午休/午睡/小憩/打盹，或目标类型为休息）时，"
+                    "巡检本轮不主动开口（想念/日程分享/日常搭话都跳过）",
+        json_schema_extra={
+            "label": "午休静默",
+            "hint": "默认关（午休照常巡检）；开启 = 午休条目进行中整轮跳过主动开口",
+            **_ui_i18n("Nap quiet", "Skip proactive turns while a nap schedule item is active."),
+        },
+    )
+
 
     # ── 好感度注入 ───────────────────────────────────────────
     inject_affection_in_group: bool = Field(

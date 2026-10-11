@@ -380,62 +380,10 @@ class EmotionService:
             text = f"{text}\n{prompt_of(self._plugin, 'emotion_night_hint')}"
         return text
 
-    # ── M6 可选增强：emoji 情绪联动（默认关；未启用时绝不触碰宿主 API）──────
-    def emoji_description(self) -> str:
-        """当前情绪对应的匹配描述词：首个情绪标签名（取不到回退 ``mood_text()``）。
-
-        供 :meth:`emoji_for_mood` 的缺省 ``description`` 使用，不写状态、不落盘。
-        """
-        labels: list = []
-        try:
-            labels, _nearest = map_emotions(self._machine.effective_vad())
-        except Exception:
-            labels = []
-        for item in labels or []:
-            try:
-                name = str(item[0] or "").strip()
-            except (TypeError, IndexError):
-                continue
-            if name:
-                return name
-        try:
-            return str(self.mood_text() or "")
-        except Exception:
-            return ""
-
-    async def emoji_for_mood(self, description: str = "") -> Optional[Dict[str, Any]]:
-        """按当前情绪向宿主匹配一个 emoji（M6，默认关；返回宿主原始结果或 None）。
-
-        门控与降级（§八.2 可空降级）：
-        - ``[emotion] emoji_enabled`` 非真 → 直接 None（**绝不触碰宿主 API**）；
-        - ``ctx.emoji.get_by_description`` 缺失/不可调用 → None；
-        - 请求异常 → debug 日志 + None（绝不上抛，绝不影响调用方输出）；
-        - ``description`` 缺省时取 :meth:`emoji_description`（首个情绪标签名，取不到用 mood_text）。
-        结果非空则原样返回（宿主返回结构不做假设）。
-
-        无消费点（原 ``lbm_emotion_mood`` Tool 已随 T6 注册面收口移除），能力保留备用；
-        本方法只做转发，不写状态、不落盘、不发事件。
-        """
-        if not bool(self._emotion_cfg("emoji_enabled", False)):
-            return None
-        emoji_api = getattr(getattr(self._plugin, "ctx", None), "emoji", None)
-        getter = getattr(emoji_api, "get_by_description", None)
-        if not callable(getter):
-            return None
-        desc = str(description or "").strip() or self.emoji_description()
-        if not desc:
-            return None
-        try:
-            result = await getter(description=desc)
-        except Exception as exc:
-            try:
-                self._ctx.logger.debug("emoji 匹配失败（忽略，不影响原输出）：%s", exc)
-            except Exception:
-                pass
-            return None
-        return result if result else None
-
     # ── 情绪 → 行为结构化系数（M4；§4.2 行 5 / §6.2 C/D，附录 C）──────
+    # 注：M6 emoji 情绪联动（emoji_enabled / emoji_for_mood / emoji_description 与
+    # manifest 的 emoji.get_by_description 能力声明）已于 2026-10-11 按用户裁决移除——
+    # 该能力自 T6 注册面收口后始终无消费组件（DEV_GUIDE 附录 A-7）。
     def mood_effect(self) -> Dict[str, Any]:
         """当前情绪 → 行为系数（纯规则、零 LLM 成本；附录 C 默认映射）。
 
@@ -587,15 +535,21 @@ class EmotionService:
     def _evaluate_mode(self) -> str:
         """当前回复后评估模式：``episode``（默认）/ ``per_reply`` / ``off``。
 
-        显式设置 ``evaluate_mode`` 时以其值为准（非法值回落 episode，防手改配置写坏）；
-        未显式设置时按旧布尔 ``evaluate_on_reply`` 迁移（true→episode / false→off）。
-        组件层只问本方法，不自己读 ``model_fields_set``。
+        ``evaluate_mode`` 的值**≠出厂默认**时以其为准（非法值回落 episode，防手改配置写坏）；
+        保持出厂值（或没写）时按旧布尔 ``evaluate_on_reply`` 迁移（true→episode / false→off）。
+        2026-10-11 裁决（DEV_GUIDE 6.5-H）：弃 ``model_fields_set`` 信任——宿主把出厂默认
+        merge 进配置后 fields_set 不能区分"配过/没配过"（与 auto_scheduler 的"值≠默认"口径
+        统一）；代价是显式写回默认值时会退回旧布尔迁移，属已登记的口径取舍。
         """
         cfg = getattr(self._plugin.config, "emotion", None)
-        fields_set = getattr(cfg, "model_fields_set", None)
-        if fields_set is not None and "evaluate_mode" in fields_set:
-            mode = str(getattr(cfg, "evaluate_mode", "") or "").strip().lower()
-            return mode if mode in EVALUATE_MODES else "episode"
+        configured = str(getattr(cfg, "evaluate_mode", "") or "").strip().lower()
+        factory_default = "episode"
+        fields = getattr(type(cfg), "model_fields", None) if cfg is not None else None
+        field = fields.get("evaluate_mode") if isinstance(fields, dict) else None
+        if field is not None:
+            factory_default = str(getattr(field, "default", "") or "episode").strip().lower() or "episode"
+        if configured and configured != factory_default:
+            return configured if configured in EVALUATE_MODES else "episode"
         legacy = self._emotion_cfg("evaluate_on_reply", True)
         return "episode" if bool(legacy) else "off"
 

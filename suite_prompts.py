@@ -19,9 +19,23 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Dict
+import logging
+from typing import Any, ClassVar, Dict, Set
 
 from maibot_sdk import Field, PluginConfigBase
+
+logger = logging.getLogger(__name__)
+
+#: 已告警过"回退默认"的提示词键（进程内去重：回退告警每键至多一条，防刷日志）
+_FALLBACK_WARNED: Set[str] = set()
+
+
+def _warn_fallback_once(name: str, reason: str) -> None:
+    """提示词回退默认时记一条 warning（每键进程内至多一次；6.5-G：docstring 承诺落地）。"""
+    if name in _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED.add(name)
+    logger.warning("提示词 %s 回退出厂默认模板（%s）；请检查 [prompts] 配置", name, reason)
 
 
 def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
@@ -856,12 +870,17 @@ def prompt(plugin: Any, name: str) -> str:
     if section is None:
         section = getattr(getattr(plugin, "config", None), "prompts", None)
     if section is None:
+        _warn_fallback_once(name, "配置段不可用（骨架/热重载窗口/测试桩）")
         return default
     value = getattr(section, name, None)
     if value is None:
+        _warn_fallback_once(name, "配置键缺失")
         return default
     text = str(value)
-    return text if text.strip() else default
+    if not text.strip():
+        _warn_fallback_once(name, "配置值为空白")
+        return default
+    return text
 
 
 def render(template: str, *, fallback: str, **values: Any) -> str:

@@ -18,11 +18,18 @@ EMOTIONAL_TONE_AXES = ("valence", "arousal", "dominance")
 
 #: 空档类警告的识别标记（N2/N1：quality_scorer 据此单独重罚，空档必须能压到重试线下）
 GAP_WARNING_MARKER = "时间空档"
+#: 常识时间窗类警告的识别标记（裁决⑤ 2026-10-11：作息锚点偏离常识窗时只告警不罚分）
+REASONABLENESS_MARKER = "时间不合理"
 
 
 def is_gap_warning(warning: Any) -> bool:
     """警告是否属于「时间空档」类（N2/N1：空档类警告单独重罚，能触发重试）。"""
     return GAP_WARNING_MARKER in str(warning or "")
+
+
+def is_reasonableness_warning(warning: Any) -> bool:
+    """警告是否属于「常识时间窗」类（裁决⑤：作息偏离常识窗时豁免罚分，只告警）。"""
+    return REASONABLENESS_MARKER in str(warning or "")
 
 
 def item_time_block(item: Any) -> Optional[Tuple[str, int, int]]:

@@ -157,18 +157,7 @@ class EmotionSectionConfig(PluginConfigBase):
         description="夜间打扰判定：自最后一次 reply 起该时长内无新 reply 即视为再次睡着（打扰段闭合，回到睡眠态）",
         json_schema_extra={"label": "重新入睡判定(分钟)", **_ui_i18n("Resleep minutes (min)")},
     )
-    # ── 可选增强：emoji 情绪联动（默认关）──────────────────────
-    emoji_enabled: bool = Field(
-        default=False,
-        description="emoji 情绪联动开关（默认关）：启用后服务层会按当前情绪标签向宿主 "
-                    "emoji.get_by_description 匹配一个表情。注意：当前没有任何组件消费这个能力"
-                    "（原消费入口已移除），实现保留备用；关闭时输出与旧版逐字一致",
-        json_schema_extra={
-            "label": "emoji 情绪联动",
-            "hint": "默认关；需宿主提供 emoji.get_by_description 能力（manifest 已声明）；"
-                    "当前无组件消费，匹配失败静默、不影响原输出",
-            **_ui_i18n("Emoji mood linkage",
-                       "Off by default. Service-layer emoji matching is retained but currently "
-                       "has no consuming component."),
-        },
-    )
+    # 注：M6 的 emoji 情绪联动键已于 2026-10-11 按用户裁决随实现一并移除
+    # （自 T6 起无消费组件；DEV_GUIDE 附录 A-7）。旧配置里的该键由宿主 extra=ignore 静默丢弃。
+
+

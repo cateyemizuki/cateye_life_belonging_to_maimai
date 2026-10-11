@@ -13,7 +13,8 @@
 **与早晚安的关系（2026-10-10 配置整理轮口径）**：早安/晚安只有一条驱动链——
 planning 的 L2 漂移机制（[planning_proactive]）。本巡检器**从不**触发问候，
 只读取 affection 的按天标记（planning 触发成功后写入）做**记录性观察**：标记已置位
-仅记一条 ``already_sent_today`` 观察日志，**不构成去重闸门**（patrol 本就没有问候
+写进决策行的独立字段 ``greeting_observation``（2026-10-11 裁决 A-17：不占
+SKIP_PRIORITY、不盖掉真实归因），**不构成去重闸门**（patrol 本就没有问候
 触发路径，标记置位与否不改变本侧行为）——两模块不会各发一条，靠的是 planning
 自查 + affection 已发标记闭环。patrol 自身可发的只有
 想念 / 日程分享 / 日常搭话三类；早/晚安/问候一律不占陪伴侧预算。
@@ -207,12 +208,16 @@ def resolve_silence_window(config: Any) -> SilenceWindow:
 
 #: 跳过原因优先级：一轮巡检里若多个候选触发都被挡，只保留优先级最高的那个原因。
 #: 数值越大越"值得报告"；同优先级时保留先出现的（即更高等级的触发）。
+#: 注：``already_sent_today``（早/晚安已发观察）已按 2026-10-11 裁决（A-17）移出本表——
+#: 它是纯观察、不构成归因，现记在决策行的独立字段 ``greeting_observation``（见 _tick）。
 SKIP_PRIORITY: dict[str, int] = {
     "invalid_time_config": 100,
     "disabled": 96,
     "daily_max_zero": 96,
-    "activity_disabled": 94,
     "silence": 95,
+    "activity_disabled": 94,
+    #: 午休静默（裁决⑦ 2026-10-11）：午休条目进行中整轮跳过主动开口（默认关）
+    "nap_quiet": 93,
     "planner_trigger_failed": 85,
     "min_interval": 80,
     "cooldown": 70,
@@ -220,7 +225,9 @@ SKIP_PRIORITY: dict[str, int] = {
     "llm_rejected": 50,
     "dice": 40,
     "miss_duration": 25,
-    "already_sent_today": 10,
+    #: 想念当日已发（真闸门：挡住想念候选本身；2026-10-11 起与早/晚安的纯观察
+    #: ``greeting_observation`` 字段区分开，不再共用 already_sent_today 词汇）
+    "miss_already_sent": 20,
     "no_user_message": 10,
     "no_candidate": 0,
 }
@@ -492,18 +499,26 @@ class PatrolService:
             finish()
             return
 
+        # ---- 午休静默（裁决⑦ 2026-10-11：[patrol].nap_quiet_enabled，默认关 = 现状）----
+        if self._nap_quiet_enabled() and self._nap_in_progress(now):
+            mark_skip("nap_quiet", detail="陪伴对象午休/小睡中（[patrol] nap_quiet_enabled）")
+            finish()
+            return
+
         # ---- 早安 / 晚安的状态检查（patrol 从不触发问候；已发标记仅记录观察）----
         # 唯一驱动链 = planning 的 L2 漂移机制（[planning_proactive] 的漂移区间 + 开关）。
         # 旧的 [patrol] morning_start/end、night_start/end 四个窗口字段已于 2026-10-10
         # 配置整理轮**删除**（问候时刻一律用 [schedule].wake_time/sleep_time + 漂移）。
-        # planning 触发成功后写入 affection 的 morning_sent/night_sent；这里见已发只记一条
-        # already_sent_today 观察日志，**不构成去重闸门**（patrol 本就没有问候触发路径，
-        # 标记置位与否不改变本侧行为）——两模块不会各发一条，靠的是 planning 自查
-        # + affection 已发标记闭环。
+        # planning 触发成功后写入 affection 的 morning_sent/night_sent；这里见已发只写一条
+        # **独立观察字段** ``greeting_observation``（2026-10-11 裁决 A-17：不再占用
+        # SKIP_PRIORITY 归因，避免盖掉本轮真实的 no_user_message/no_candidate 归因）——
+        # 两模块不会各发一条，靠的是 planning 自查 + affection 已发标记闭环。
         if self._affection.morning_sent():
-            mark_skip("already_sent_today", "morning", "今天已经发过早安（planning 漂移机制已发）")
+            base_fields["greeting_observation"] = "already_sent_today(morning)"
         if self._affection.night_sent():
-            mark_skip("already_sent_today", "night", "今天已经发过晚安（planning 漂移机制已发）")
+            prev = base_fields.get("greeting_observation")
+            base_fields["greeting_observation"] = (
+                f"{prev},already_sent_today(night)" if prev else "already_sent_today(night)")
 
         # ---- A 级：想念 / 沉默事件 ----
         # M3（B1）：沉默超过 miss_hours_min 时发布 relation.silence_detected（独立于
@@ -513,7 +528,7 @@ class PatrolService:
         if not patrol.miss_enabled:
             pass  # 开关关闭：整段跳过（记 no_candidate）
         elif self._affection.miss_sent_today():
-            mark_skip("already_sent_today", "miss", "今天已经发过想念")
+            mark_skip("miss_already_sent", "miss", "今天已经发过想念")
         else:
             last_msg = self._affection.last_user_msg_time()
             if last_msg is None:
@@ -1060,6 +1075,33 @@ class PatrolService:
         单一真源 = :func:`resolve_silence_window`；格式非法的值原样带出（由调用方 fail-safe）。
         """
         return resolve_silence_window(self._config)
+
+    #: 午休/小睡条目的名称词表（与 proactive_service._SLEEP_NAME_KEYWORDS 的午休类同源口径）
+    _NAP_NAME_KEYWORDS = ("午休", "午睡", "小憩", "打盹")
+
+    def _nap_quiet_enabled(self) -> bool:
+        """午休静默开关（``[patrol].nap_quiet_enabled``，缺省 False = 现状：午休照常巡检）。"""
+        section = getattr(self._config, "patrol", None) if self._config is not None else None
+        return bool(getattr(section, "nap_quiet_enabled", False))
+
+    def _nap_in_progress(self, now: datetime) -> bool:
+        """当前是否处于午休/小睡条目中（读日程查询；查询不可用/异常 → False 可空降级）。
+
+        识别口径：当前条目名称含 午休/午睡/小憩/打盹，或 ``goal_type == "rest"``（休息类）。
+        """
+        query = self._schedule
+        if query is None:
+            return False
+        try:
+            item = query.find_current_activity(now=now, include_sleep=True)
+        except Exception:
+            return False
+        if not item:
+            return False
+        name = str(item.get("name") or "")
+        if any(keyword in name for keyword in self._NAP_NAME_KEYWORDS):
+            return True
+        return str(item.get("goal_type") or "") == "rest"
 
     def _collect_invalid_time_keys(self, window: Optional[SilenceWindow] = None) -> list[str]:
         """收集**生效**静默窗里格式非法的（HH:MM）来源配置项，并对每个非法值告警一次。
