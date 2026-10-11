@@ -39,6 +39,8 @@
 - **注入链不再吞 session_id（N6）**：陪伴/情绪两个 planner 钩子改为整份回写 `modified_kwargs`（含 `session_id`），好感度块与会话维度缓存键恢复；replyer 改用真实意图 + 独立冷却桶，且不再把宿主追加的尾部指令当用户消息。
 - **用户可见文案去掉 emoji（N7）**：命令/工具返回、注入提示词与状态图标题改中文词（`提示：` / `注意：` / `是·否` 等）；日志与注释不清洗。
 - **跨午夜读取侧统一口径（第四轮收尾）**：日程查询、`lbm_schedule_info` 工具、`/lbm_plan` 文字版与状态图、注入反查窗口全部改走 `planning/time_utils` 日帧助手——`23:00–07:00` 的睡觉条目不再显示成 `23:00–31:00`（标「次日 07:00」），凌晨 00:30 能正确命中进行中的睡觉条目并在 06:50 显示「约还剩 10 分钟」。
+- **状态图/面板重绘 + 消耗统计（第四轮续批）**：面板换真粗体字重并新增模块色强调条；`/lbm_dashboard` 新增「模型消耗」块（最近 24 小时按模型/按模块的 token 消耗，无配置项）；情绪注入改详细文字描述（planner 第三人称 / replyer 第二人称，用户可编辑插件根目录 `emotion_descriptions.json`）；`/lbm_dashboard` 与 `/lbm_plan list` 只发图不再图文混发。
+- **配置面变化（第四轮续批）**：移除 `[emotion] emoji_enabled`（无消费组件的 emoji 情绪联动整体下线，manifest 能力 17→16）；新增 `[patrol] nap_quiet_enabled`（默认关，午休静默）；日程写入带日期帧标记（跨午夜条目判定更精确）。
 
 
 ## 安装
@@ -50,9 +52,9 @@
 
 **依赖**：`httpx>=0.24`、`Pillow>=9.0`。Pillow 只用于日程图／状态图渲染，**缺失或渲染失败时自动降级为纯文本**，不影响其他功能。
 
-**可选开关**（默认全关，开了才生效）：屏幕感知（`[patrol] screen_enabled`）、QQ 空间（`[qzone] enabled`）、周结大事记（`[affection] weekly_milestones_enabled`）、emoji 情绪联动（`[emotion] emoji_enabled`，当前无组件消费，开启暂不生效）。
+**可选开关**（默认全关，开了才生效）：屏幕感知（`[patrol] screen_enabled`）、QQ 空间（`[qzone] enabled`）、周结大事记（`[affection] weekly_milestones_enabled`）、午休静默（`[patrol] nap_quiet_enabled`）。
 
-**声明能力**：`_manifest.json` 共声明 17 项宿主能力与 2 项 Python 依赖（发文本／图片／合并转发、配置读取、LLM 生成、会话查询、消息回查、主动触发、上下文追加、频率调节、知识库检索、跨插件 API、数据库只读、emoji 按描述匹配）。
+**声明能力**：`_manifest.json` 共声明 16 项宿主能力与 2 项 Python 依赖（发文本／图片／合并转发、配置读取、LLM 生成、会话查询、消息回查、主动触发、上下文追加、频率调节、知识库检索、跨插件 API、数据库只读）。
 
 ## 快速上手
 
