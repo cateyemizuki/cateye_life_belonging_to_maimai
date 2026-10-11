@@ -485,29 +485,42 @@ def render_dashboard_image(title: str, blocks: Any, *, output_dir: Optional[Path
         def _tw(text, font):
             return font.getlength(text)
 
+        def _cap(text, font, max_w):
+            """先把超长输入按平均字宽预截到量级内，再交给精细截断（防 O(n²) 与超大串）。"""
+            text = str(text)[:2000]
+            if _tw(text, font) <= max_w:
+                return text
+            avg = _tw(text, font) / max(1, len(text))
+            return text[:max(1, int(max_w / max(avg, 1.0)) + 2)]
+
         def _right(x, y, text, font, fill, max_w):
-            text = str(text)
+            text = _cap(text, font, max_w)
             while text and _tw(text, font) > max_w:
                 text = text[:-1]
             draw.text((x + max_w - _tw(text, font), y), text, font=font, fill=fill)
 
         def _ellip(text, font, max_w):
-            text = str(text)
+            text = _cap(text, font, max_w)
             while text and _tw(text, font) > max_w:
                 text = text[:-1]
-            return text + ("…" if text != str(text) else "")
+            return text + ("…" if text and text != str(text) else "")
 
-        def _wrap(text, font, max_w):
-            text = str(text or "").strip()
-            lines = []
-            current = ""
+        def _wrap(text, font, max_w, *, max_lines=12):
+            """情绪描述换行（有界版）：输入预截 400 字、输出 ≤ max_lines 行、
+            逐字符累计宽度（O(n)，不再每字符重扫全串）。"""
+            text = str(text or "").strip()[:400]
+            lines, current, width_acc = [], "", 0.0
             for ch in text:
-                if _tw(current + ch, font) > max_w:
+                ch_w = font.getlength(ch)
+                if current and width_acc + ch_w > max_w:
                     lines.append(current)
-                    current = ch
+                    current, width_acc = ch, ch_w
+                    if len(lines) >= max_lines:
+                        break
                 else:
                     current += ch
-            if current:
+                    width_acc += ch_w
+            if current and len(lines) < max_lines:
                 lines.append(current)
             return lines or [""]
 
@@ -535,23 +548,25 @@ def render_dashboard_image(title: str, blocks: Any, *, output_dir: Optional[Path
 
         sections = [
             ("01", _spaced("日程"), f"{_to_int(planning.get('item_count'), 0)} 项在列",
-             _BLOCK_BODY["planning"](planning), "/lbm_plan list · /lbm_plan regenerate"),
+             _BLOCK_BODY["planning"](planning)[:40], "/lbm_plan list · /lbm_plan regenerate"),
             ("02", _spaced("陪伴"), tier_label,
-             _BLOCK_BODY["companion"](companion), "/lbm_mai_affection"),
+             _BLOCK_BODY["companion"](companion)[:40], "/lbm_mai_affection"),
             ("03", _spaced("情绪"), mode,
-             _BLOCK_BODY["emotion"](emotion) + (_wrap(desc, f_row, right_w) if desc else []),
+             (_BLOCK_BODY["emotion"](emotion) + (_wrap(desc, f_row, right_w) if desc else []))[:40],
              "/lbm_emotion_config"),
             ("04", _spaced("空间"), "",
-             _BLOCK_BODY["qzone"](qzone), "/lbm_life qzone comments"),
+             _BLOCK_BODY["qzone"](qzone)[:40], "/lbm_life qzone comments"),
             ("05", _spaced("消耗"), "24h",
-             [str(line) for line in (usage.get("lines") or [])] or ["最近 24 小时：无 LLM 调用"],
+             ([str(line) for line in (usage.get("lines") or [])] or ["最近 24 小时：无 LLM 调用"])[:12],
              "/lbm_mai_diag llm 1"),
         ]
         right_h = sum(sec_head + len(lines) * row_h + int(30 * s)
                       for _, _, _, lines, _ in sections)
         left_h = int(640 * s)
         body_h = max(right_h, left_h)
-        height = int(120 * s) + body_h + int(96 * s)
+        # 热修（2026-10-11 服务器死机）：高度必须钳制在 _MAX_HEIGHT——旧行数爆炸
+        # （如超长情绪描述/异常块）曾让 Image.new 申请 GB 级位图直接 OOM
+        height = min(int(120 * s) + body_h + int(96 * s), _MAX_HEIGHT)
 
         img = Image.new("RGB", (width, height), PAPER)
         draw = ImageDraw.Draw(img)

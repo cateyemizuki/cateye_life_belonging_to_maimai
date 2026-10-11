@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+from collections import deque as _deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, List, Optional
@@ -1135,32 +1136,65 @@ class CompanionComponentsMixin:
         logger_ = getattr(companion, "decision_logger", None) if companion else None
         if logger_ is None or not getattr(logger_, "enabled", False):
             return ""
-        try:
-            entries = logger_.read_entries(2)  # 24h 窗口最多跨两天
-        except Exception:
-            return ""
         cutoff = datetime.now() - timedelta(hours=max(1, int(hours)))
-        picked = []
-        for entry in entries or []:
-            action = str((entry or {}).get("action") or "")
-            if not (action.startswith("bus:schedule.") or action.startswith("bus:emotion.")):
-                continue
+        max_cap = max(1, int(cap))
+        picked: "_json.deque" = _deque(maxlen=max_cap)  # noqa: 有界（账本热修）
+        total_matched = 0
+        log_dir = getattr(logger_, "_dir", None)   # DecisionLogger 的账本目录（有界直读）
+        if log_dir is not None:
+            # 热修（2026-10-11）：不再 read_entries 整文件解析——子串预过滤 + deque 封顶，
+            # 内存/耗时与账本体量解耦（账本可含全部总线事件，量大）
+            for offset in (0, 1):
+                day = datetime.now() - timedelta(days=offset)
+                path = Path(log_dir) / f"decisions_{day.strftime('%Y-%m-%d')}.jsonl"
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if "bus:schedule." not in line and "bus:emotion." not in line:
+                                continue
+                            try:
+                                entry = _json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            action = str((entry or {}).get("action") or "")
+                            if not (action.startswith("bus:schedule.")
+                                    or action.startswith("bus:emotion.")):
+                                continue
+                            try:
+                                when = datetime.fromisoformat(str((entry or {}).get("time") or ""))
+                            except ValueError:
+                                continue
+                            if when < cutoff:
+                                continue
+                            total_matched += 1
+                            picked.append((when, action, entry or {}))
+                except OSError:
+                    continue
+        else:
+            # 桩/无 _dir 的兜底：走 read_entries（测试与降级形态）
             try:
-                when = datetime.fromisoformat(str((entry or {}).get("time") or ""))
-            except ValueError:
-                continue
-            if when < cutoff:
-                continue
-            picked.append((when, action, entry or {}))
-        picked.sort(key=lambda item: item[0])
-        dropped = max(0, len(picked) - max(1, int(cap)))
-        if dropped:
-            picked = picked[len(picked) - cap:]
-        if not picked:
+                entries = logger_.read_entries(2)
+            except Exception:
+                return ""
+            for entry in entries or []:
+                action = str((entry or {}).get("action") or "")
+                if not (action.startswith("bus:schedule.") or action.startswith("bus:emotion.")):
+                    continue
+                try:
+                    when = datetime.fromisoformat(str((entry or {}).get("time") or ""))
+                except ValueError:
+                    continue
+                if when < cutoff:
+                    continue
+                total_matched += 1
+                picked.append((when, action, entry or {}))
+        dropped = max(0, total_matched - len(picked))
+        ordered = sorted(picked, key=lambda item: item[0])
+        if not ordered:
             return ""
-        lines = [f"日程与情绪变动 · 最近 {hours} 小时 · 共 {len(picked) + dropped} 条"
+        lines = [f"日程与情绪变动 · 最近 {hours} 小时 · 共 {len(ordered) + dropped} 条"
                  + (f"（已省略较早 {dropped} 条）" if dropped else "")]
-        for when, action, entry in picked:
+        for when, action, entry in ordered:
             event = action[4:] if action.startswith("bus:") else action
             label = self._CHANGE_LOG_LABELS.get(event, event)
             clock = when.strftime("%m-%d %H:%M")

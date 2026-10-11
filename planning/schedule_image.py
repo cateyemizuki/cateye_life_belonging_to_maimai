@@ -442,13 +442,16 @@ class ScheduleImageGenerator:
                 status = cls._activity_status(time_str, now_minutes)
                 rows.append({
                     "time": time_str,
-                    "name": cls._ellipsis(ImageDraw.Draw(Image.new("RGB", (8, 8))),
-                                          str(item.get("name", "") or ""), _font(26, True),
-                                          int(560 * s)),
-                    "desc": str(item.get("description", "") or ""),
+                    "name": str(item.get("name", "") or "")[:200],   # 热修：预截（防超大串 O(n²) 截断）
+                    "desc": str(item.get("description", "") or "")[:200],
                     "status": status,
                 })
             total = len(rows)
+            # 热修（2026-10-11 服务器死机）：高度钳制 4096（旧版有、S1 重写时丢失）——
+            # 行数超限时只画能放下的部分并在底注注明
+            max_rows = max(1, int((4096 - int(240 * s) - int(90 * s) - int(110 * s)) // max(1, int(62 * s))))
+            omitted = max(0, total - max_rows)
+            rows = rows[:max_rows]
             done = sum(1 for r in rows if r["status"] == "completed")
             current = sum(1 for r in rows if r["status"] == "current")
 
@@ -466,7 +469,7 @@ class ScheduleImageGenerator:
                 giant, weekday = "今日", ""
 
             row_h, head_h, foot_h = int(62 * s), int(240 * s), int(110 * s)
-            height = head_h + total * row_h + int(90 * s) + foot_h
+            height = min(head_h + len(rows) * row_h + int(90 * s) + foot_h, 4096)
 
             img = Image.new("RGB", (width, height), PAPER)
             draw = ImageDraw.Draw(img)
@@ -514,10 +517,12 @@ class ScheduleImageGenerator:
                           fill=HAIR, width=1)
                 y += row_h
 
-            # 底注：跨午夜口径 + 命令指路
+            # 底注：跨午夜口径 + 命令指路（行数超限时注明省略数）
             y += int(16 * s)
-            draw.text((M2, y), "跨午夜条目按 24h 环标注「次日」；晨间 00:30 起以昨日帧合并判定",
-                      font=f_note, fill=MUTED)
+            note = "跨午夜条目按 24h 环标注「次日」；晨间 00:30 起以昨日帧合并判定"
+            if omitted:
+                note += f"（条目过多，已省略较早 {omitted} 条）"
+            draw.text((M2, y), note, font=f_note, fill=MUTED)
             hint = "完整日程 /lbm_plan list · 重新生成 /lbm_plan regenerate · 今日更新 /lbm_mai_diag decision 1"
             _hx = width - M2 - draw.textlength(hint, font=_font(18))
             draw.text((_hx, y + int(30 * s)), hint, font=_font(18), fill=RED)
