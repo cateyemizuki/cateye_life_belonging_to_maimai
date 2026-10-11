@@ -576,11 +576,14 @@ class ScheduleGenerator:
         ``[0, 1440)``（同一个 24h 环内的窗口不变，如 24:00-01:00 ⇒ 00:00-01:00），
         避免 DB 行带帧外起点。
         """
-        start = normalize_day_minutes(max(0, int(start_minute)))
+        raw_start = max(0, int(start_minute))
+        # A-16：起点 ≥1440（跨午夜尾段切分产物，如 24:00）折回当日钟点时同步标 day_offset=1
+        day_offset = 1 if raw_start >= 1440 else 0
+        start = raw_start - (1440 if raw_start >= 1440 else 0)
         return {"name": "放空休息", "description": "留一段恢复时间，缓一缓（最近有点低落）",
                 "goal_type": "rest", "priority": "medium",
                 "start_minute": start, "end_minute": start + int(minutes),
-                "parameters": {}, "schedule_date": date}
+                "day_offset": day_offset, "parameters": {}, "schedule_date": date}
 
     async def _load_async_contexts(
         self, base: BaseScheduleGenerator, gen_config: ScheduleGeneratorConfig, date: str
@@ -918,11 +921,16 @@ class ScheduleGenerator:
                 start, hours = wake_min, 1.0
             hours = max(0.25, min(12.0, hours))
             duration = int(hours * 60)
-            if is_night_sleep_item(item) or is_in_sleep_ring(start, wake_min, sleep_min):
+            sleep_like = bool(is_night_sleep_item(item) or is_in_sleep_ring(start, wake_min, sleep_min))
+            if sleep_like:
                 # 睡觉 / 睡眠环内条目：保留原时长与跨午夜写法（end 可 >1440）
                 end = start + duration
             else:
                 end = min(start + duration, awake_end_bound)
+            # A-16 日期帧标记（裁决① 2026-10-11）：夜猫子作息（sleep<=wake）下 start 落在
+            # [0, sleep_min) 的清醒条目属于「今晚午夜之后」（下一个午夜），显式标 day_offset=1；
+            # 其余条目标 0（当天钟点）。读取侧据此消解帧首双关；旧行缺省 NULL = 旧环口径。
+            day_offset = 1 if (cross and not sleep_like and start < sleep_min) else 0
             entry = {
                 "name": str(item.get("name") or "未命名活动"),
                 "description": str(item.get("description") or ""),
@@ -930,6 +938,7 @@ class ScheduleGenerator:
                 "priority": str(item.get("priority") or "medium"),
                 "start_minute": start,
                 "end_minute": end,
+                "day_offset": day_offset,
                 "parameters": dict(item.get("parameters") or {}),
                 "schedule_date": date,
             }

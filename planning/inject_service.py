@@ -1113,15 +1113,34 @@ class InjectService:
                     continue
 
                 is_cross_day = end_minutes > 1440
+                # A-16 日期帧标记（裁决①）：合成 Goal 的 parameters 里有生成链写入的 day_offset
+                goal_offset = None
+                goal_params = getattr(goal, "parameters", None)
+                if isinstance(goal_params, dict) and goal_params.get("day_offset") is not None:
+                    try:
+                        goal_offset = int(goal_params["day_offset"])
+                    except (TypeError, ValueError):
+                        goal_offset = None
 
                 if is_today:
-                    # 跨午夜 = 同一个 24h 环，统一走 time_utils.is_in_day_frame
-                    # （与原手写「start<=cur<1440 or cur<end-1440」逐分支等价）
-                    is_in_window = is_in_day_frame(start_minutes, end_minutes, current_time_minutes)
-                elif is_yesterday and is_cross_day:
-                    # 昨天创建的条目只可能以「今日钟点的尾段」[0, end−1440) 延续：
-                    # 不能整环判——其傍晚段属昨日钟点，此刻必然已过
-                    is_in_window = 0 <= current_time_minutes < normalize_day_minutes(end_minutes)
+                    if goal_offset == 1:
+                        # 标记为「今晚午夜段」：在自身日期帧内不会进行中（属于下一个午夜）
+                        is_in_window = False
+                    else:
+                        # 跨午夜 = 同一个 24h 环，统一走 time_utils.is_in_day_frame
+                        # （与原手写「start<=cur<1440 or cur<end-1440」逐分支等价）
+                        is_in_window = is_in_day_frame(start_minutes, end_minutes, current_time_minutes)
+                elif is_yesterday:
+                    if goal_offset == 1:
+                        # 昨日行标记的「今晚午夜段」：今天就发生在 start..end（钟点）区间
+                        end_clock = end_minutes if end_minutes < 1440 else end_minutes - 1440
+                        is_in_window = start_minutes <= current_time_minutes < end_clock
+                    elif is_cross_day:
+                        # 昨天创建的条目只可能以「今日钟点的尾段」[0, end−1440) 延续：
+                        # 不能整环判——其傍晚段属昨日钟点，此刻必然已过
+                        is_in_window = 0 <= current_time_minutes < normalize_day_minutes(end_minutes)
+                    else:
+                        continue
                 else:
                     continue
 

@@ -40,7 +40,8 @@ from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
 from .schedule_generator import ScheduleGenerator
 from .schedule_items import find_night_sleep_item, is_night_sleep_item
-from .time_utils import DAY_MINUTES, TimezoneManager, format_day_minute, is_in_day_frame
+from .time_utils import (DAY_MINUTES, TimezoneManager, format_day_minute,
+                         is_in_day_frame_marked, is_upcoming_day_minute_marked)
 
 logger = logging.getLogger(__name__)
 
@@ -277,9 +278,17 @@ class ToolsService:
         completed: List[Tuple[Any, List[int]]] = []
         for goal, tw in schedule_with_time:
             start_min, end_min = tw
-            if is_in_day_frame(start_min, end_min, current_minutes):
+            # A-16 日期帧标记（裁决①）：合成 Goal 参数里带生成链写入的 day_offset（旧行/旧档 = None）
+            goal_params = getattr(goal, "parameters", None)
+            goal_offset = None
+            if isinstance(goal_params, dict) and goal_params.get("day_offset") is not None:
+                try:
+                    goal_offset = int(goal_params["day_offset"])
+                except (TypeError, ValueError):
+                    goal_offset = None
+            if is_in_day_frame_marked(start_min, end_min, current_minutes, goal_offset):
                 ongoing.append((goal, tw))
-            elif current_minutes < start_min:
+            elif is_upcoming_day_minute_marked(start_min, current_minutes, end_min, goal_offset):
                 upcoming.append((goal, tw))
             else:
                 completed.append((goal, tw))

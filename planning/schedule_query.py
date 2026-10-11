@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .schedule_db import ScheduleDB
 from .time_utils import (describe_energy, format_day_minute, get_energy_level,
-                         is_in_day_frame, is_upcoming_day_minute, ring_minutes_ahead)
+                         is_in_day_frame, is_in_day_frame_marked,
+                         is_upcoming_day_minute, is_upcoming_day_minute_marked,
+                         ring_minutes_ahead)
 from core.time_utils import minutes_of_now
 
 # sleep 类型条目不算「正在做的事」（仅 include_sleep=True 的调用方可见，如情绪睡眠循环）
@@ -38,8 +40,10 @@ class ScheduleQuery:
 
         include_sleep=True 时 sleep 条目也参与匹配（情绪睡眠循环用）；
         缓存键区分该开关，避免共享实例上不同调用方互相串用结果。
-        覆盖判定走 :func:`time_utils.is_in_day_frame`（同一个 24h 环）——凌晨 00:30
-        也能命中「23:00 → 次日 07:00」的跨午夜睡觉条目（朴素 ``start<=cur<end`` 会漏）。
+        覆盖判定走 :func:`time_utils.is_in_day_frame_marked`（同一个 24h 环 + A-16
+        日期帧标记）——凌晨 00:30 也能命中「23:00 → 次日 07:00」的跨午夜睡觉条目；
+        并合并**前一日期帧**的行：``day_offset=1``（今晚午夜段）与 ``end>1440``
+        （跨午夜延续）的昨日条目在今天凌晨仍可命中。
         """
         now = now or datetime.now()
         window = minutes_of_now(now) // self._cache_minutes
@@ -52,9 +56,29 @@ class ScheduleQuery:
         for item in self._db.get_day_schedule(date):
             if not include_sleep and item.get("goal_type") in _SKIP_TYPES:
                 continue
-            if is_in_day_frame(item.get("start_minute") or 0, item.get("end_minute") or 0, cur_min):
+            if is_in_day_frame_marked(item.get("start_minute") or 0, item.get("end_minute") or 0,
+                                      cur_min, item.get("day_offset")):
                 current = item
                 break
+        if current is None:
+            prev_date = self._previous_date(date)
+            if prev_date:
+                for item in self._db.get_day_schedule(prev_date):
+                    if not include_sleep and item.get("goal_type") in _SKIP_TYPES:
+                        continue
+                    end = int(item.get("end_minute") or 0)
+                    offset = item.get("day_offset")
+                    if offset == 1:
+                        # 昨日标记的"今晚午夜段"：今天就发生在 start..end（钟点）区间
+                        start = int(item.get("start_minute") or 0)
+                        end_clock = end if end < 1440 else end - 1440
+                        if start <= cur_min < end_clock:
+                            current = item
+                            break
+                    elif end > 1440 and is_in_day_frame(
+                            item.get("start_minute") or 0, end, cur_min):
+                        current = item
+                        break
         if len(self._cache) > 64:  # 简单防膨胀
             self._cache.clear()
         self._cache[key] = (window, current or "")
@@ -75,11 +99,29 @@ class ScheduleQuery:
             if item.get("goal_type") in _SKIP_TYPES:
                 continue
             raw_start = item.get("start_minute")
-            if not is_upcoming_day_minute(raw_start, cur_min, item.get("end_minute")):
+            if not is_upcoming_day_minute_marked(raw_start, cur_min, item.get("end_minute"),
+                                                 item.get("day_offset")):
                 continue
             upcoming.append((ring_minutes_ahead(raw_start, cur_min), item))
+        # 前一日期帧的 day_offset=1 行（昨晚标记的"今晚午夜段"）在今天尚未开始的也算"接下来"
+        prev_date = self._previous_date(date)
+        if prev_date:
+            for item in self._db.get_day_schedule(prev_date):
+                if item.get("goal_type") in _SKIP_TYPES or item.get("day_offset") != 1:
+                    continue
+                start = int(item.get("start_minute") or 0)
+                if start > cur_min:
+                    upcoming.append((start - cur_min, item))
         upcoming.sort(key=lambda pair: pair[0])
         return [item for _ahead, item in upcoming[:max(0, int(limit))]]
+
+    @staticmethod
+    def _previous_date(date: str) -> Optional[str]:
+        """``YYYY-MM-DD`` → 前一天（解析失败返回 None，调用方跳过跨日合并）。"""
+        try:
+            return (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            return None
 
     def format_activity_line(self, item: Dict[str, Any], now: Optional[datetime] = None) -> str:
         """当前活动的一行描述（含剩余时间与情绪/能量提示），注入与 Tool 共用。

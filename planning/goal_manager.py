@@ -438,6 +438,9 @@ class GoalManager:
         end = int(item.get("end_minute") or 60)
         parameters = dict(item.get("parameters") or {})
         parameters.setdefault("time_window", [start, end])
+        if item.get("day_offset") is not None:
+            # A-16 日期帧标记透传（裁决①）：注入/视图侧据此消解帧首双关
+            parameters["day_offset"] = int(item.get("day_offset") or 0)
         return Goal(
             goal_id=str(item.get("item_id") or ""),
             name=str(item.get("name") or ""),

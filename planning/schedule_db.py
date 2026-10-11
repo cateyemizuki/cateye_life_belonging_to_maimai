@@ -34,6 +34,7 @@ class ScheduleDB:
         priority TEXT NOT NULL DEFAULT 'medium',
         start_minute INTEGER NOT NULL DEFAULT 0,
         end_minute INTEGER NOT NULL DEFAULT 60,
+        day_offset INTEGER,
         parameters TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT
@@ -93,8 +94,9 @@ class ScheduleDB:
             with self._lock:
                 self._conn = self._connect()
                 self._conn.executescript(self.SCHEMA)
+                self._migrate_schema_v3()
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', '2')"
+                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', '3')"
                 )
                 self._conn.commit()
         except sqlite3.DatabaseError as e:
@@ -105,6 +107,16 @@ class ScheduleDB:
                 self._conn = self._connect()
                 self._conn.executescript(self.SCHEMA)
                 self._conn.commit()
+
+    def _migrate_schema_v3(self) -> None:
+        """v2→v3 增列迁移（A-16 裁决① 2026-10-11）：schedule_items 加 ``day_offset``。
+
+        只对旧库补列（CREATE TABLE IF NOT EXISTS 对已存在的表不会加列）；缺省 NULL =
+        旧行为（读取侧按未标记的环口径判定），不回填不迁移行数据——向后兼容。
+        """
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(schedule_items)")}
+        if "day_offset" not in columns:
+            self._conn.execute("ALTER TABLE schedule_items ADD COLUMN day_offset INTEGER")
 
     def _quarantine_corrupt_files(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -147,8 +159,8 @@ class ScheduleDB:
             for item in items:
                 self._conn.execute(
                     "INSERT INTO schedule_items(item_id, schedule_date, name, description, goal_type,"
-                    " priority, start_minute, end_minute, parameters, created_at, updated_at)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    " priority, start_minute, end_minute, day_offset, parameters, created_at, updated_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         str(item.get("item_id") or uuid.uuid4().hex),
                         schedule_date,
@@ -158,6 +170,7 @@ class ScheduleDB:
                         str(item.get("priority") or "medium"),
                         int(item.get("start_minute") or 0),
                         int(item.get("end_minute") or 60),
+                        (None if item.get("day_offset") is None else int(item.get("day_offset") or 0)),
                         json.dumps(item.get("parameters") or {}, ensure_ascii=False),
                         now,
                         now,

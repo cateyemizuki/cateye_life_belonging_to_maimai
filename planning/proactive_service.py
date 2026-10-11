@@ -51,6 +51,7 @@ import random
 import re
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from suite_prompts import (
@@ -80,6 +81,8 @@ from .config import (
     ScheduleSectionConfig,
     section_or_default,
 )
+from core.storage import load_json, save_json_atomic
+
 from .goal_manager import get_goal_manager
 from .time_utils import TimezoneManager, is_in_day_frame, parse_time_window
 if TYPE_CHECKING:
@@ -233,6 +236,9 @@ class ProactiveService:
 
     def __init__(self, plugin: Any) -> None:
         self._plugin = plugin
+        #: P5 余项（裁决⑩ 2026-10-11）：非目标类问候的按流持久化去重标记
+        # （延迟加载；热重载后新实例重新读盘，即"重载后不再重发"）
+        self._stream_greeting_marks: Optional[Dict[str, Any]] = None
         self._stop_event: asyncio.Event = asyncio.Event()
         # 时区在 [schedule_advanced]（2026-10-10 段拆分）
         self._tz_manager: TimezoneManager = TimezoneManager(
@@ -1141,9 +1147,12 @@ class ProactiveService:
                 # 不看激活时，观测窗就是"补发窗口"：整段错过（如重启）→ 不深夜补发
                 self._abandon_greeting(entry, "window_closed")
                 return
-        if self._greeting_deduped_by_persisted_marker(entry["category"], entry["kind"]):
+        if (self._greeting_deduped_by_persisted_marker(entry["category"], entry["kind"])
+                or self._stream_greeting_marked(entry["stream_id"], entry["kind"], entry["date"])):
             # P5（2026-10-09 登记）：热重载/重启后内存掷点清零，但 affection 的按天标记仍在——
             # 目标私聊该 kind 今天已发过 → 视为已触发（与自然触发同形态）+ 落去重行，不再重发。
+            # P5 余项（裁决⑩ 2026-10-11）：非目标类（群聊/其他私聊）同样按流落盘去重——
+            # 内存掷点被热重载清零后不再向同一群/私聊重发同一天的同 kind 问候。
             # 内存 status 已 FIRED 的在上方短路，不会走到这里（不重复落去重行）。
             entry["status"] = GREETING_STATUS_FIRED
             self._decision_log(
@@ -1154,6 +1163,59 @@ class ProactiveService:
             )
             return
         await self._fire_greeting(entry, date_str, now_ts)
+
+    #: 按流问候去重标记的落盘文件名（P5 余项/裁决⑩）
+    _GREETING_MARKS_FILE = "greeting_stream_marks.json"
+
+    def _stream_marks_path(self) -> Optional[Path]:
+        """去重标记文件路径（data_dir 不可得 → None，调用方降级为纯内存）。"""
+        data_dir = getattr(self._plugin, "_data_dir", None)
+        return Path(data_dir) / self._GREETING_MARKS_FILE if data_dir else None
+
+    def _load_stream_marks(self) -> Dict[str, Any]:
+        """按流去重标记（实例内缓存一次；热重载后新实例重新读盘）。"""
+        if self._stream_greeting_marks is None:
+            path = self._stream_marks_path()
+            data = load_json(path, {}) if path else {}
+            marks = data.get("marks") if isinstance(data, dict) else None
+            self._stream_greeting_marks = marks if isinstance(marks, dict) else {}
+        return self._stream_greeting_marks
+
+    def _stream_greeting_marked(self, stream_id: str, kind: str, date_str: str) -> bool:
+        """该流该 kind 在该掷点日是否已发过（持久化标记；文件不可用 → False 可空降级）。"""
+        marks = self._load_stream_marks()
+        try:
+            return bool(marks.get(str(stream_id), {}).get(str(date_str), {}).get(kind))
+        except Exception:
+            return False
+
+    def _mark_stream_greeting(self, stream_id: str, kind: str, date_str: str) -> None:
+        """写按流去重标记并落盘（保留最近 3 个掷点日，防无限增长；失败仅告警不打断）。"""
+        marks = self._load_stream_marks()
+        try:
+            per_stream = marks.setdefault(str(stream_id), {})
+            per_day = per_stream.setdefault(str(date_str), {})
+            per_day[kind] = True
+            try:
+                cutoff = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d")
+            except (TypeError, ValueError):
+                cutoff = None
+            if cutoff:
+                for stream_key in list(marks):
+                    per_stream_marks = marks[stream_key]
+                    for stale_day in [d for d in list(per_stream_marks) if d < cutoff]:
+                        per_stream_marks.pop(stale_day, None)
+                    if not per_stream_marks:
+                        marks.pop(stream_key, None)
+        except Exception:
+            logger.debug("写按流问候标记失败（忽略）", exc_info=True)
+            return
+        path = self._stream_marks_path()
+        if path is not None:
+            try:
+                save_json_atomic(path, {"version": 1, "marks": marks})
+            except Exception:
+                logger.debug("落盘按流问候标记失败（忽略）", exc_info=True)
 
     def _greeting_deduped_by_persisted_marker(self, category: str, kind: str) -> bool:
         """TARGET 类问候的跨重载去重：查 affection 的按天标记（``morning_sent``/``night_sent``）。
@@ -1205,6 +1267,8 @@ class ProactiveService:
             return
         entry["status"] = GREETING_STATUS_FIRED
         entry["fired_at"] = now_ts
+        # P5 余项（裁决⑩ 2026-10-11）：所有类别按流落盘去重标记（重载后不重发）
+        self._mark_stream_greeting(stream_id, kind, entry.get("date", date_str))
         if entry["category"] == GREETING_CATEGORY_TARGET:
             # 目标私聊写 affection 每日标记，patrol 见已发即不再各发一条
             self._mark_greeting_sent_on_affection(kind)

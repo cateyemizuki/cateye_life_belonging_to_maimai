@@ -2430,13 +2430,10 @@ class EmotionService:
         if sleep_item is None and not (night_start <= now < night_end):
             return                                        # 白天且无睡眠条目：无事
         period_start, period_end, planned = self._sleep_entry_period(sleep_item, now)
-        await self._publish_sleep_started_if_needed(sleep_item, now, planned_hours=planned)
-        cycle_key = self._cycle_key(period_start)
-        state = load_json(self._state_path, {}) or {}
-        # 本睡眠周期已结算过 → 跳过（兼容旧值：裸日期；热重载后不重复冻结/不重复请求裁判）
-        if state.get("applied_sleep_date") in (now.strftime("%Y-%m-%d"), cycle_key):
+        if await self._sleep_entry_settled_gate(sleep_item, now, period_start, planned):
             return
         self._sleep_period = (period_start, period_end)
+        cycle_key = self._cycle_key(period_start)
         # 顺序约束（REGISTRY §二.4）：先冲刷全部未结片段，再冻结/跑睡眠裁判——冲刷的入账
         # 发生在冻结前才会进当天 emotion_log（冻结期事件只入队），裁判的日志输入才完整
         await self.flush_all_episodes(reason="sleep_entry")
@@ -2447,6 +2444,26 @@ class EmotionService:
             return
         cached["cycle_key"] = cycle_key
         self._pending_overhaul = cached
+
+    async def _sleep_entry_settled_gate(self, sleep_item: Optional[Dict[str, Any]], now: datetime,
+                                        period_start: datetime, planned: Optional[float]) -> bool:
+        """睡眠入口闸门：已结算周期 → 跳过重冻结/重裁判，且**不重发** sleep_started。
+
+        R1 裁决（2026-10-11，锚点整夜口径维持）：宣告守卫**前置**——原实现先发布
+        ``schedule.sleep_started`` 再查 ``applied_sleep_date`` 结算标记，热重载清零
+        ``_in_sleep`` 内存态后，已结算周期的重入必然重发一次宣告。现在先查落盘的
+        结算标记：已结算 → 直接跳过（不宣告、不冻结、不重跑裁判）；未结算 → 照常
+        宣告（订阅方同样因重载丢了状态，需要重新宣告）。``ended_cycle`` 维持内存态
+        口径不变——重入路径在此提前返回，不会触发第二次结算（每 cycle_key 结算 1 次）。
+        放行后调用方需自行重取 ``cycle_key``（本方法只做结算判定与宣告）。
+        """
+        cycle_key = self._cycle_key(period_start)
+        state = load_json(self._state_path, {}) or {}
+        # 本睡眠周期已结算过 → 跳过（兼容旧值：裸日期；热重载后不重复冻结/不重复请求裁判）
+        if state.get("applied_sleep_date") in (now.strftime("%Y-%m-%d"), cycle_key):
+            return True
+        await self._publish_sleep_started_if_needed(sleep_item, now, planned_hours=planned)
+        return False
 
     # ── 睡眠进出事件（M0：只发事件；M5 起与冻结/结算绑定）──
     async def _publish_sleep_started_if_needed(self, item: Optional[Dict[str, Any]], now: datetime,

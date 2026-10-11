@@ -264,6 +264,39 @@ def is_upcoming_day_minute(start_minute: Any, cur_minute: Any, end_minute: Any =
     return True
 
 
+def is_in_day_frame_marked(start_minute: Any, end_minute: Any, cur_minute: Any,
+                           day_offset: Any = None) -> bool:
+    """带日期帧标记的"正在进行"判定（A-16 裁决① 2026-10-11）。
+
+    - ``day_offset=None``（旧行，未标记）→ 与 :func:`is_in_day_frame` 完全一致
+      （帧首双关维持旧行为，不因升级改变判定）；
+    - ``0``（生成链显式标记"当天钟点"）→ 同 :func:`is_in_day_frame`
+      （``cur+1440`` 环位仅服务 ``end>1440`` 的跨午夜延续）；
+    - ``1``（生成链显式标记"下一个午夜段"）→ 在**自身**日期帧内恒不进行中
+      （它属于下一个午夜；跨日命中由调用方合并前一日期帧行完成）。
+    """
+    if day_offset == 1:
+        return False
+    return is_in_day_frame(start_minute, end_minute, cur_minute)
+
+
+def is_upcoming_day_minute_marked(start_minute: Any, cur_minute: Any,
+                                  end_minute: Any = None, day_offset: Any = None) -> bool:
+    """带日期帧标记的"接下来"判定（A-16 裁决① 2026-10-11）。
+
+    - ``None`` → 旧行为（帧首按环上帧尾列出，排序恒最后）；
+    - ``0`` → 严格帧内单调（``start==0`` 且 ``cur>start`` 视为当天凌晨已过，不再当
+      "今晚 24:00"——标记消解帧首双关的读法 A 侧）；
+    - ``1`` → 恒为"接下来"（环距 = ``(start − cur) mod 1440``，与
+      :func:`ring_minutes_ahead` 同口径，自然排到当天列表末尾）。
+    """
+    if day_offset == 1:
+        return True
+    if day_offset == 0:
+        return normalize_day_minutes(start_minute) > normalize_day_minutes(cur_minute)
+    return is_upcoming_day_minute(start_minute, cur_minute, end_minute)
+
+
 def ring_minutes_ahead(start_minute: Any, cur_minute: Any) -> int:
     """``start`` 相对 ``cur`` 在 24h 环上"还在前面"的分钟数（``0`` = 同一分钟）。
 
