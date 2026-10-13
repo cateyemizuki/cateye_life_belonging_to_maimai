@@ -2,7 +2,7 @@
 
 组件清单：
 - Tools ×1：lbm_life_qzone（action=post 发说说，留空自动生成文案；action=moments 查最近说说）
-- Command ×1：/lbm_life（status | qzone [moments/comments/post/reply/like] | diag | help；
+- Command ×1：/lbm_life（status | qzone [moments/comments/post/reply/like/decisions] | diag | help；
   diag 为 /lbm_diag life 的旧名别名，行为不变）
 
 约定（与 planning/companion 的 mixin 一致）：
@@ -130,7 +130,8 @@ class QzoneComponentsMixin:
             "属于麦麦的生活命令：\n"
             "/lbm_life status - 生活状态总览（好感度/巡检/日程/空间）\n"
             "/lbm_life qzone - QQ空间状态｜moments 最近说说｜comments 说说评论列表\n"
-            "           （管理员：post 文本、reply 说说序号 [评论序号] 内容、like tid [目标QQ]）\n"
+            "           （管理员：post 文本、reply 说说序号 [评论序号] 内容、like tid [目标QQ]、"
+            "decisions [条数] 发帖判定历史）\n"
             "/lbm_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /lbm_diag life，行为相同\n"
             "/lbm_life help - 本帮助；日程与陪伴功能另有 /lbm_plan 与 /lbm_mai_* 命令"
         )
@@ -243,6 +244,14 @@ class QzoneComponentsMixin:
             target_qq = parts[1] if len(parts) > 1 else ""
             ok = await qz.like_moment(parts[0], target_uin=target_qq)
             return "已点赞。" if ok else "点赞失败。"
+        if action == "decisions":
+            # §18.4 调试命令：发帖判定链历史（为什么没发可查；进程内 deque，重启清零）
+            try:
+                limit = max(1, min(20, int((rest[0].strip() or "10") if rest else 10)))
+            except ValueError:
+                limit = 10
+            text = qz.decision_history_text(limit=limit)
+            return f"发帖判定历史（最近 {limit} 条，最新在前；重启后清零）：\n{text}"
         return "未知空间子命令，用 /lbm_life help 查看。"
 
     def _qz_cookie_uin(self) -> str:

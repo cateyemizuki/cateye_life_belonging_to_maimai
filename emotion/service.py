@@ -429,9 +429,10 @@ class EmotionService:
         return text
 
     # ── 情绪 → 行为结构化系数（M4；§4.2 行 5 / §6.2 C/D，附录 C）──────
-    # 注：M6 emoji 情绪联动（emoji_enabled / emoji_for_mood / emoji_description 与
-    # manifest 的 emoji.get_by_description 能力声明）已于 2026-10-11 按用户裁决移除——
-    # 该能力自 T6 注册面收口后始终无消费组件（DEV_GUIDE 附录 A-7）。
+    # 注：M6 emoji 情绪联动（emoji_enabled / emoji_for_mood / emoji_description）已于
+    # 2026-10-11 按用户裁决移除（自 T6 起无消费组件；DEV_GUIDE 附录 A-7）；manifest 的
+    # emoji.get_by_description 能力声明随后于 2026-10-12 恢复（§18.2 空间表情包配图成为
+    # 新消费点——[emotion] emoji_enabled 配置键维持移除不变）。
     def mood_effect(self) -> Dict[str, Any]:
         """当前情绪 → 行为系数（纯规则、零 LLM 成本；附录 C 默认映射）。
 

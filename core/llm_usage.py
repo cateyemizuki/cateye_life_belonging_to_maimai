@@ -33,6 +33,7 @@ EVENT_MODULE_MAP: Dict[str, str] = {
     "emotion_evaluate": "emotion",
     "qzone_post": "qzone",
     "qzone_reply": "qzone",
+    "qzone_post_gate": "qzone",
 }
 #: 模块展示顺序（面板按此排序；映射外的事件归「其他」）
 MODULE_ORDER = ("planning", "companion", "emotion", "qzone", "其他")

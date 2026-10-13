@@ -6,7 +6,7 @@
 
 - **自主规划日程**：按人设由大模型生成每天的生活（睡眠、三餐、工作、娱乐），把「麦麦现在在做什么」注入对话；活动切换、约定到期时主动开口；`/lbm_plan` 随时查看，还能渲染日程图片。
 - **虚拟陪伴**：好感度养成（连续分＋恋人五档＋日衰减）、早晚安问候、想念、日程节点分享、陪伴对象电脑的屏幕感知旁白——都跑在概率、每日预算与静默时段的约束下。
-- **QQ 空间**：按日程自动发说说、自动回复评论（含楼中楼）与点赞；cookie 取不到时自动降级成「有新评论」的提醒。
+- **QQ 空间**：按日程自动发说说（可配图：宿主表情包 / 本地图库随机），自动回复评论（含楼中楼）与点赞；发帖前走「归类 → 睡眠硬跳 → 冷却 → 活动黑名单 → LLM 严判」判定链（拿不准就不发）；cookie 取不到时自动降级成「有新评论」的提醒。
 - **情绪维护系统**：VAD 三维情绪状态机 + 25 种情绪原型映射；日常衰减、事件增量、睡眠期「大修」结算；情绪反过来影响主动频率、想念阈值、发帖意愿与回复语气。
 
 📖 版本变更与本版已知问题见 **[CHANGELOG.md](CHANGELOG.md)**；每个工具/指令的参数、权限、11 段配置总览与完整配置键总表见维护手册 `USAGE.md`，情绪映射现状导出见 `EMOTION_MAPPING.md`——两份维护文档在插件目录旁的开发文档目录 `..\cateye_life_belonging_to_maimai开发文档\`（**不随插件包发布**）。
@@ -54,7 +54,7 @@
 
 **可选开关**（默认全关，开了才生效）：屏幕感知（`[patrol] screen_enabled`）、QQ 空间（`[qzone] enabled`）、周结大事记（`[affection] weekly_milestones_enabled`）、午休静默（`[patrol] nap_quiet_enabled`）。
 
-**声明能力**：`_manifest.json` 共声明 16 项宿主能力与 2 项 Python 依赖（发文本／图片／合并转发、配置读取、LLM 生成、会话查询、消息回查、主动触发、上下文追加、频率调节、知识库检索、跨插件 API、数据库只读）。
+**声明能力**：`_manifest.json` 共声明 17 项宿主能力与 2 项 Python 依赖（发文本／图片／合并转发、配置读取、LLM 生成、会话查询、消息回查、主动触发、上下文追加、频率调节、知识库检索、跨插件 API、数据库只读、表情包按描述取图）。
 
 ## 快速上手
 
@@ -93,10 +93,11 @@
 
 ### QQ 空间（qzone）
 
-- 按日程发说说：静默时段 → 当前活动 → 概率 → 每日上限 → LLM 文案；发布走双通道（SnowLuma 动作层优先，失败回退 Web CGI 直连）。
+- 按日程发说说：静默时段 → 当前活动 → 概率 → 每日上限 → **发帖判定链**（活动归类 → 睡眠硬跳 → 冷却 → 活动黑名单 → LLM 严判「此刻发是否自然」→ 可选掷骰）→ LLM 文案 → 可选配图 → 发布；发布走双通道（SnowLuma 动作层优先，失败回退 Web CGI 直连，**图片上传已接通 CGI 回退**）。
+- 配图（默认关，`[qzone] image_mode`）：`emoji` = 宿主表情包库按说说正文语义匹配；`library` = 本地图库目录随机取图；`random` = 两者各半掷骰。图统一走 `cgi_upload_image` 上传（动作通道用 `base64://` 透传）；**任何一张取不到就跳过，全部取不到发纯文本**。
 - 自动回评：cookie 多级降级获取（适配器 → NapCat HTTP → 本地文件）→ CGI 读评论（含楼中楼）→ 过滤自己与已处理 → LLM 回复 → 楼中楼回评；**cookie 不可用时降级为「评论数基线 + 提醒」**。
 - 情绪联动：当前情绪效价过低时本轮不发说说；说说文案与回评各拼一行情绪底色。
-- 手动命令：`/lbm_life qzone comments|reply|like` 分别用于列评论、回复（含楼中楼）、点赞。
+- 手动命令：`/lbm_life qzone comments|reply|like` 分别用于列评论、回复（含楼中楼）、点赞；`decisions` 查看「为什么没发」的判定历史（管理员）。
 
 ### 情绪维护（emotion）
 
@@ -114,7 +115,7 @@
 |---|---|
 | Hook ×10 | planning：`maisaka.planner.before_request`（注入当前日程，items 快照协议）、`maisaka.replyer.before_request`（把当前活动作为额外提示注入）｜companion：`chat.receive.before_process`（缓存发送者身份）、`chat.receive.after_process`（记录目标私聊发言时间）、`maisaka.planner.before_request`（屏幕旁白 + 好感度后缀）、`maisaka.replyer.before_model_request`（屏幕旁白）、`maisaka.replyer.after_response`（补计发言数，只观察）｜emotion：`maisaka.planner.before_request`、`maisaka.replyer.before_model_request`（情绪底色注入）、`maisaka.replyer.after_response`（情绪增量评估，只观察；夜间兼作打扰记账） |
 | Tool ×7 | planning：`lbm_get_schedule_info`（只读四视图 status/current/lover_day/goals）、`lbm_update_schedule_v4`（**唯一日程写入口**，角色裁判）、`lbm_nap_lie_in`（赖床：把今日睡眠条目的结束时间推到指定时刻；平时不进工具名册，只在赖床提醒轮被点名）｜companion：`lbm_mai_lover_send_message`、`lbm_mai_lover_affection`｜qzone：`lbm_life_qzone`（action=post 发说说 / moments 查说说）｜emotion：`lbm_emotion_report`（群聊事件上报） |
-| Command ×8 | planning：`/lbm_plan`、`/lbm_规划`（list/regenerate/delete/clear/help，图片 + 合并转发）｜companion：`/lbm_mai_affection`、`/lbm_mai_help`、`/lbm_diag`（llm/decision/life 三合一排障；别名 `/lbm_mai_llm_log`、`/lbm_mai_diag`、`/lbm_life diag`，管理员）、`/lbm_dashboard`（聚合总览，管理员）｜qzone：`/lbm_life`（status / qzone[moments/comments/post/reply/like] / diag / help）｜emotion：`/lbm_emotion_init`、`/lbm_emotion_config`（查看/reset/clear） |
+| Command ×8 | planning：`/lbm_plan`、`/lbm_规划`（list/regenerate/delete/clear/help，图片 + 合并转发）｜companion：`/lbm_mai_affection`、`/lbm_mai_help`、`/lbm_diag`（llm/decision/life 三合一排障；别名 `/lbm_mai_llm_log`、`/lbm_mai_diag`、`/lbm_life diag`，管理员）、`/lbm_dashboard`（聚合总览，管理员）｜qzone：`/lbm_life`（status / qzone[moments/comments/post/reply/like/decisions] / diag / help）｜emotion：`/lbm_emotion_init`、`/lbm_emotion_config`（查看/reset/clear） |
 | API ×4 | `get_current_activity`（planning，兼容原插件返回结构）｜`companion_get_current_activity` / `companion_get_schedule` / `companion_get_affection_level`（companion） |
 
 ## 常用配置速查
@@ -136,12 +137,15 @@
 | `[patrol] miss_silence_hours` | `"4-8"` | 想念阈值区间（小时） |
 | `[patrol] inject_affection_in_group` | `true` | 群聊出现陪伴对象时注入好感度档位块 |
 | `[qzone] enabled` | `false` | QQ 空间模块总开关 |
+| `[qzone] image_mode` / `image_library_dir` / `image_number` | `off` / `""` / `1` | 说说配图来源（`off`/`emoji`/`library`/`random`）／本地图库目录（绝对路径）／单条配图张数（1~4） |
+| `[qzone] post_cooldown_minutes` / `post_blocked_activities` | `120` / `[sleeping,working,studying,eating,exercising]` | 两条说说最短间隔（0=不冷却）／活动黑名单（命中不发） |
+| `[qzone] post_llm_gate_enabled` / `post_max_chance` | `true` / `1.0` | 发帖前 LLM 严判开关（只认回复首字符 是/否，异常按否）／严判通过后的掷骰上限 |
 | `[affection] enabled` | `true` | 好感度 v2；关掉回退旧的静态三档行为 |
 | `[emotion] enabled` / `evaluate_mode` / `injection_enabled` | `true` / `episode` / `true` | 情绪模块总开关／评估模式／情绪底色注入 |
 | `[schedule_advanced] emotion_influence` | `0.6` | 情绪对日程的影响强度（`0` = 关闭） |
 | `[llm] task_name` / `judge_model` | `replyer` / `""` | 主任务名／判定用模型（留空跟随主任务）；插件全部模型调用集中于此段 |
 
-> 全部 **11 个配置段、209 个可见配置项**的**键名｜类型｜默认值｜说明**总表、旧配置迁移映射、已移除项清单、注入矩阵与预算口径，见维护手册 `USAGE.md` 的「十、配置总览」（位于 `..\cateye_life_belonging_to_maimai开发文档\`）。
+> 全部 **11 个配置段、217 个可见配置项**的**键名｜类型｜默认值｜说明**总表、旧配置迁移映射、已移除项清单、注入矩阵与预算口径，见维护手册 `USAGE.md` 的「十、配置总览」（位于 `..\cateye_life_belonging_to_maimai开发文档\`）。
 
 ## FAQ
 
@@ -149,7 +153,7 @@
 - **命令没反应？** 管理员指令要求 `admin.admin_users` 里有你（留空时只有本机控制台能用）；另外若配置了 `admin.allowed_streams`，不在名单内的会话会被静默拒绝。
 - **日程图／状态图只有文字没有图？** 这是预期的静默降级：Pillow 或字体不可用、渲染超时（状态图 10 秒／日程图 15 秒）时改发纯文本，功能不受影响。
 - **早安／晚安没来、或来了两条？** 看两个总开关 `greeting_morning_enabled` / `greeting_night_enabled` 与统一名单。**问候要"有人说话"才发**（`greeting_require_activation`，默认开，所有会话一视同仁）：早安的观察窗 = 起床锚点 → 当天第一段日程结束，晚安的观察窗 = 最后一段日程结束 → 睡前界（`min(入睡时间, 生效静默起点)`）；窗内没人说话就不发。漂移点：早安 = 起床 + 10~30 分钟；晚安 = 睡前界 − 10~30 分钟（都在各自区间里随机，**不再被静默时段吞掉**）。例行问候**始终免预算**，所以「预算用完」不是原因。目标私聊同日同类型至多一条（热重载后也生效），群聊／非目标私聊跨热重载去重尚未实现。
-- **QQ 空间发不出去／评论不回复？** 用 `/lbm_life qzone status` 看通道与 cookie：cookie 不可用时会降级成「有新评论」的提醒而不回评；`qzone.enabled=false`、静默时段、每日上限、`emotion_filter` 都会拦住发帖。（另：图片说说只有动作通道支持，CGI 回退通道的图片上传尚未接通。）
+- **QQ 空间发不出去／评论不回复？** 用 `/lbm_life qzone status` 看通道与 cookie：cookie 不可用时会降级成「有新评论」的提醒而不回评；`qzone.enabled=false`、静默时段、每日上限、`emotion_filter`、发帖冷却与活动黑名单都会拦住发帖；LLM 严判说「否」也不发——用 `/lbm_life qzone decisions` 看最近每轮判定卡在哪道闸。
 - **裁判类任务输出为空？** 建议把 `[llm] judge_model` 与情绪裁判（`[llm] emotion_referee_task_name`）、好感裁判（`[llm] review_task_name`）的任务绑到**真正的非思考型模型**——思考型模型会把小 `max_tokens` 预算花在推理上，导致正文为空。
 - **怎么临时关掉某个模块？** `[qzone] enabled=false`、`[affection] enabled=false`、`[emotion] enabled=false` 分别关闭对应模块；`[plugin] enabled=false` 则只注册组件、不跑任何循环。
 - **升级后配置和数据会怎样？** **配置**：旧键在首次启动时自动迁移到新段（幂等，反复重启不二次改写），无需手改；本版（2.0.0，含 1.1.0 未发布的全部变更）升级时会额外做一次「磁盘旧文件抢救」——宿主在配置版本变化时会先按新骨架重建设置文件，插件在此之前读回磁盘上的旧值并搬运，因此**跨段/改名键的用户值不会丢**。`[plugin] config_version` = **2.0.0**（与插件版本同步，不要手改）。**数据**：数据目录 `data/plugins/cateye.life_belonging_to_maimai/` 与 1.0.0 相同，本版无需搬运数据。

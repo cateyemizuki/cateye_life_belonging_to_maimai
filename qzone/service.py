@@ -27,19 +27,30 @@ mapMsgList 映射时丢弃，动作面没有任何动作能返回评论正文，
 from __future__ import annotations
 
 import asyncio
+import base64
+import math
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.diag import DecisionLogger
 from core.llm_utils import LLMService, purpose_task
 from suite_prompts import (
     QZONE_COMMENT_REMINDER_DEFAULT,
+    QZONE_POST_GATE_DEFAULT,
     prompt as prompt_of,
     render,
 )
 from .cgi import QzoneCookieManager, QzoneWebClient
+from .decision import (
+    ActivityType,
+    DecisionHistory,
+    classify_activity,
+    normalize_blocked_activities,
+    parse_llm_decision,
+)
+from .image_sources import collect_images
 from planning.schedule_query import ScheduleQuery
 from core.storage import load_json, save_json_atomic
 from planning.time_utils import is_in_time_window
@@ -122,6 +133,8 @@ class QzoneService:
         self._state: Dict[str, Any] = {}
         self._target_stream_id = ""
         self._channel_cache: Dict[str, str] = {}  # 动作 -> 命中的通道描述
+        #: §18.4 发帖判定历史（deque，最多 20 条，最新在前；进程内、热重载清零——调试用途）
+        self._decision_history = DecisionHistory(20)
         #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
         self.bus = getattr(self._plugin, "_bus", None)
         #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
@@ -148,6 +161,8 @@ class QzoneService:
         self._state.setdefault("comment_baseline", {})
         self._state.setdefault("replied_comment_ids", [])
         self._state.setdefault("processed_list", {})  # {fid: [已回评的 comment_tid, ...]}
+        #: §18.4 冷却锚点（**只在发送成功后更新**，落盘跨热重载；ISO 字符串）
+        self._state.setdefault("last_post_at", "")
 
     def set_target(self, stream_id: str) -> None:
         """目标私聊 stream（新评论主动提醒用）。"""
@@ -210,27 +225,36 @@ class QzoneService:
         return False, None, last_error or "所有调用通道均不可用（检查 SnowLuma 适配器）"
 
     # ---- 说说读写 ----
-    async def post_moment(self, text: str, *, images: Optional[List[str]] = None, ugc_right: int = 1) -> Optional[Dict[str, Any]]:
-        """发表说说。优先 SnowLuma 动作通道（客户端持续维护），失败回退 Web CGI 直连。
+    async def post_moment(self, text: str, *, images: Optional[List[bytes]] = None,
+                          ugc_right: int = 1) -> Optional[Dict[str, Any]]:
+        """发表说说（可带图）。优先 SnowLuma 动作通道（客户端持续维护），失败回退 Web CGI 直连。
+
+        ``images`` 为收集层产出的 ``list[bytes]``（§18.1 契约：收集层只产出 bytes，与发布层解耦）：
+        - 动作通道把 bytes 编成 ``base64://`` 形态（SnowLuma ``send_qzone_msg`` 既有能力）；
+        - CGI 回退通道直传 bytes（``QzoneWebClient.publish`` 内逐张上传 + 拼 pic_bo/richval）。
+        配图失败（含超限跳过）**永不阻断发布**——单张失败跳过，全部失败发纯文本。
 
         成功返回 {tid, time}（CGI 通道 time 为空串）。"""
         if not text.strip():
             return None
+        image_list = [bytes(img) for img in (images or [])[:4]
+                      if isinstance(img, (bytes, bytearray)) and img]
         params: Dict[str, Any] = {"content": text.strip(), "ugc_right": int(ugc_right) if ugc_right in (1, 4, 16, 64, 128) else 1}
-        if images:
-            params["images"] = [str(i) for i in images]
+        if image_list:
+            params["images"] = [f"base64://{base64.b64encode(img).decode('ascii')}" for img in image_list]
         ok, data, err = await self.call_action("send", params)
         result = data if ok and isinstance(data, dict) and data.get("tid") else None
         if result is None and self._cookie_manager is not None:
             # 动作通道失败 → Web CGI 直连（发布端点相同，cookie/g_tk 与 SnowLuma 同源）
             client = await self._cookie_manager.get_client()
             if client is not None:
-                tid = await client.publish(text.strip())
+                tid = await client.publish(text.strip(), images=image_list or None)
                 result = {"tid": tid, "time": ""} if tid else None
                 if result is None:
                     err = f"{err}; CGI 直连也失败"
         self._log("trigger" if result else "skip", trigger_type="qzone_post",
-                  reason="发说说成功" if result else f"发说说失败: {err}")
+                  reason=("发说说成功（含 %d 张配图）" % len(image_list)) if result and image_list
+                  else ("发说说成功" if result else f"发说说失败: {err}"))
         if result:
             self._count_post()
             # M0 事件：发帖成功（含 _tick 日程发帖与手动/命令发帖）→ emotion（附录 A ★）
@@ -336,6 +360,8 @@ class QzoneService:
         if counter.get("date") != today:
             counter.update({"date": today, "count": 0})
         counter["count"] = int(counter.get("count") or 0) + 1
+        # §18.4 冷却锚点：**只在发送成功后更新**（失败不重置，防失败风暴）；落盘跨热重载
+        self._state["last_post_at"] = datetime.now().isoformat(timespec="seconds")
         self._save_state()
 
     def posts_today(self) -> int:
@@ -346,10 +372,14 @@ class QzoneService:
 
     async def generate_and_post_by_schedule(self, date: str, now: datetime,
                                             post_rate: Optional[float] = None) -> bool:
-        """按日程生成文案并发表。返回是否发出。
+        """按日程生成文案并发表（自动发帖路径）。返回是否发出。
 
         ``post_rate``（M4，§6.2 D）为 _tick 传入的「配置发帖率 × mood_effect.post_rate」
         乘后概率（上限按概率语义夹到 1.0）；缺省 None 时回退配置原文，兼容既有调用方。
+
+        链路（§18.4 融合）：``require_activity``（既有前置）→ ``post_rate`` 概率层（既有）
+        → **判定链**（归类 → 无活动 → 睡眠硬跳 → 冷却 → 静默复检 + 活动黑名单 → LLM 严判
+        → 掷骰；MaiTrace v3.1 移植）→ 生成文案 → 收集配图 → 发表。
         """
         cfg = self._qzone_cfg()
         activity = self._schedule.find_current_activity(date, now)
@@ -362,11 +392,169 @@ class QzoneService:
             self._log("skip", trigger_type="qzone_post",
                       reason=f"未命中发帖概率（乘后 {effective_rate:.3f}）")
             return False
+        # ── §18.4 判定链（成本从低到高：规则闸在前、LLM 在后；每道闸的拒绝都写决策历史）──
+        if not await self._post_gate_chain(date, now):
+            return False
         text = await self.generate_moment_text(date, now)
         if not text:
-            self._log("skip", trigger_type="qzone_post", reason="文案生成失败")
+            self._record_decision("skip", gate="generate", reason="文案生成失败")
             return False
-        return bool(await self.post_moment(text))
+        images = await self.collect_moment_images(text)
+        result = bool(await self.post_moment(text, images=images))
+        self._decision_history.add(
+            action="send" if result else "skip", gate="post",
+            reason=f"发表{'成功' if result else '失败'}（配图 {len(images)} 张）",
+            result="ok" if result else "fail")
+        return result
+
+    # ---- §18.4 发帖判定链（MaiTrace v3.1 移植；融合既有 require_activity/post_rate 前置层）----
+    async def _post_gate_chain(self, date: str, now: datetime) -> bool:
+        """判定链主入口：全部闸通过返回 True；任一闸拒绝 → 记历史并返回 False。
+
+        闸序（成本从低到高）：静默时段复检 → 无活动（含睡眠）→ 睡眠硬跳 → 冷却 →
+        活动黑名单 → LLM 严判（可关）→ 掷骰上限（可关）。规则只认枚举，
+        自由文本先经 :func:`classify_activity` 归类，归类失败落 ``other`` 由 LLM 闸兜底。
+        """
+        cfg = self._qzone_cfg()
+        # 闸 0：静默时段（复用跨午夜判定；_tick 外层已有同口径早退，此处保证链自足可单测）
+        if is_in_time_window(cfg.silence_start, cfg.silence_end,
+                             now.strftime("%H:%M"), invalid_result=True):
+            self._record_decision("skip", gate="silence", reason="空间静默时段")
+            return False
+        # 闸 1：无活动 → 不发（最保守兜底；含睡眠条目，睡眠在下一闸单独识别）
+        activity = self._schedule.find_current_activity(date, now, include_sleep=True)
+        if activity is None:
+            self._record_decision("skip", gate="no_activity", reason="当前无日程活动（含睡眠）")
+            return False
+        activity_type = classify_activity(
+            activity.get("goal_type"),
+            f"{activity.get('name') or ''} {activity.get('description') or ''}",
+        )
+        # 闸 2：睡眠类硬跳过（连 LLM 都不问）
+        if activity_type is ActivityType.SLEEPING:
+            self._record_decision("skip", activity_type=activity_type.value, gate="sleeping",
+                                  reason="睡眠中（硬跳过，不花 LLM）")
+            return False
+        activity_name = str(activity.get("name") or activity.get("description") or "活动")
+        # 闸 3：冷却（锚点只在发送成功后更新；失败不重置）
+        remain_minutes = self._cooldown_remain_minutes(now)
+        if remain_minutes > 0:
+            self._record_decision("skip", activity_type=activity_type.value, gate="cooldown",
+                                  reason=f"冷却中（剩余约 {remain_minutes} 分钟）")
+            return False
+        # 闸 4：活动黑名单（枚举比对；黑名单配置经归一化，非法项忽略）
+        blocked = normalize_blocked_activities(getattr(cfg, "post_blocked_activities", None))
+        if activity_type.value in blocked:
+            self._record_decision("skip", activity_type=activity_type.value, gate="blacklist",
+                                  reason=f"活动黑名单（{activity_type.value}：{activity_name}）")
+            return False
+        # 闸 5：LLM 严判（可关；只认回复首字符「是/否」，格式异常一律按否）
+        if bool(getattr(cfg, "post_llm_gate_enabled", True)):
+            allowed, reason, answer = await self._llm_post_gate(activity, now)
+            if not allowed:
+                self._record_decision("skip", activity_type=activity_type.value, gate="llm",
+                                      reason=f"LLM 严判不发（{reason or '未说明'}）",
+                                      llm_answer=answer)
+                return False
+            self._record_decision("pass", activity_type=activity_type.value, gate="llm",
+                                  reason=f"LLM 严判通过（{reason or '未说明'}）", llm_answer=answer)
+        # 闸 6：可选掷骰（LLM 通过后的概率上限，防误判刷屏；1.0 = 不掷骰）
+        max_chance = self._clamp_float(getattr(cfg, "post_max_chance", 1.0), 1.0, 0.0, 1.0)
+        if max_chance < 1.0 and random.random() > max_chance:
+            self._record_decision("skip", activity_type=activity_type.value, gate="chance",
+                                  reason=f"掷骰未过（上限 {max_chance:.2f}）")
+            return False
+        self._record_decision("allow", activity_type=activity_type.value, gate="chain",
+                              reason=f"判定链通过（{activity_name}）")
+        return True
+
+    async def _llm_post_gate(self, activity: Dict[str, Any], now: datetime) -> Tuple[bool, str, str]:
+        """闸 5：LLM 严判「此刻发一条说说是否自然」。返回 ``(放行, 理由, 原文)``。
+
+        提示词从 ``[prompts].qzone_post_gate`` 渲染（写坏占位符时 render 回退默认模板）；
+        判定解析走最严口径（:func:`parse_llm_decision`）；调用异常按不通过处理（保守）。
+        """
+        activity_desc = self._schedule.format_activity_line(activity, now) if activity else "自由活动"
+        prompt = render(
+            prompt_of(self._plugin, "qzone_post_gate"),
+            fallback=QZONE_POST_GATE_DEFAULT,
+            lover_name=self._lover_name,
+            personality=self._personality or "（暂无人设）",
+            current_time=now.strftime("%H:%M"),
+            activity=activity_desc,
+        )
+        try:
+            answer = await self._llm.generate(
+                prompt,
+                task_name=purpose_task(self._plugin, "qzone", default="utils"),
+                temperature=0.2,
+                max_tokens=60,
+                event="qzone_post_gate",
+            )
+        except Exception:
+            return False, "严判调用异常（保守按不发）", ""
+        allowed, reason = parse_llm_decision(answer)
+        return allowed, reason, str(answer or "")[:80]
+
+    def _cooldown_remain_minutes(self, now: datetime) -> int:
+        """距冷却结束还有几分钟（0 = 可发）。锚点 = ``last_post_at``（成功发送才更新）。
+
+        锚点缺失/损坏 → 不冷却（fail-open，交 LLM 闸兜底；不让坏状态永久锁死发帖）；
+        时钟回拨（锚点在将来）→ 视为冷却中（保守）。
+        """
+        minutes = int(self._clamp_float(
+            getattr(self._qzone_cfg(), "post_cooldown_minutes", 0), 0.0, 0.0, 1440.0))
+        if minutes <= 0:
+            return 0
+        anchor = str(self._state.get("last_post_at") or "")
+        if not anchor:
+            return 0
+        try:
+            last = datetime.fromisoformat(anchor)
+        except ValueError:
+            return 0
+        elapsed = (now - last).total_seconds() / 60.0
+        if elapsed < 0:
+            return minutes
+        remaining = minutes - elapsed
+        return int(math.ceil(remaining)) if remaining > 0 else 0
+
+    def _record_decision(self, action: str, *, activity_type: str = "", gate: str = "",
+                         reason: str = "", llm_answer: str = "", result: str = "") -> None:
+        """写一条判定历史（deque 20）并同步既有决策日志（skip 归 qzone_post 触发类型）。"""
+        self._decision_history.add(action=action, activity_type=activity_type, gate=gate,
+                                   reason=reason, llm_answer=llm_answer, result=result)
+        if action == "skip":
+            self._log("skip", trigger_type="qzone_post", reason=f"[{gate}] {reason}")
+
+    def decision_history_text(self, limit: int = 10) -> str:
+        """发帖判定历史文本（/lbm_life qzone decisions 用；进程内 deque，重启清零）。"""
+        return self._decision_history.format_text(limit=limit)
+
+    async def collect_moment_images(self, text: str) -> List[bytes]:
+        """按 ``[qzone].image_mode`` 收集本条说说的配图（收集层只产出 bytes）。
+
+        铁律（§18.2/§18.3）：任何来源失败都静默降级——单张失败跳过、全部失败发纯文本，
+        配图永不阻断发布。``off``（默认）直接返回空列表（老行为逐字一致）。
+        """
+        cfg = self._qzone_cfg()
+        mode = str(getattr(cfg, "image_mode", "off") or "off")
+        if mode.strip().lower() not in ("emoji", "library", "random"):
+            return []
+        images = await collect_images(
+            mode=mode,
+            count=int(getattr(cfg, "image_number", 1) or 1),
+            description=str(text or ""),
+            emoji_api=getattr(self._ctx, "emoji", None),
+            library_dir=str(getattr(cfg, "image_library_dir", "") or ""),
+        )
+        if images:
+            self._log("trigger", trigger_type="qzone_post",
+                      reason=f"配图收集 {len(images)} 张（{mode.strip().lower()}）")
+        else:
+            self._log("skip", trigger_type="qzone_post",
+                      reason=f"配图收集为空（{mode.strip().lower()}），发纯文本")
+        return images
 
     async def generate_moment_text(self, date: str, now: datetime) -> str:
         activity = self._schedule.find_current_activity(date, now)
@@ -762,9 +950,11 @@ class QzoneService:
         cfg = self._qzone_cfg()
         channels = "、".join(sorted(set(self._channel_cache.values()))) or "未连通"
         cookie = f"｜{self._cookie_manager.status_text()}" if self._cookie_manager else "｜cookie 管理：未启用"
+        image_mode = str(getattr(cfg, "image_mode", "off") or "off").strip().lower()
         return (
             f"QQ空间模块：{'启用' if cfg.enabled else '停用'}｜今日说说 {self.posts_today()}/{cfg.daily_max_posts}"
-            f"｜评论监听 {'开' if cfg.reply_comments_enabled else '关'}｜动作通道：{channels}{cookie}"
+            f"｜配图 {image_mode}｜评论监听 {'开' if cfg.reply_comments_enabled else '关'}"
+            f"｜动作通道：{channels}{cookie}"
         )
 
     def status_snapshot(self) -> Dict[str, Any]:
@@ -772,7 +962,9 @@ class QzoneService:
 
         只读：不发起任何空间动作、不落盘；数值与 ``status_text()`` 同源
         （``posts_today`` / 通道缓存 / cookie 文案 / 评论监听开关），
-        ``comment_baseline`` 为基线覆盖的说说 tid 列表（空 = 尚未建立基线）。
+        ``comment_baseline`` 为基线覆盖的说说 tid 列表（空 = 尚未建立基线）；
+        §18.4 追加 ``image_mode`` / ``cooldown_minutes`` / ``last_post_at`` / ``last_decision``
+        （判定历史最近一条，热重载后为空 dict）。
         """
         cfg = self._qzone_cfg()
         try:
@@ -788,4 +980,8 @@ class QzoneService:
             "channels": sorted(set(self._channel_cache.values())) or [],
             "cookie_text": str(cookie_text),
             "comment_baseline": sorted(self._state.get("comment_baseline") or {}),
+            "image_mode": str(getattr(cfg, "image_mode", "off") or "off").strip().lower(),
+            "cooldown_minutes": int(getattr(cfg, "post_cooldown_minutes", 0) or 0),
+            "last_post_at": str(self._state.get("last_post_at") or ""),
+            "last_decision": dict(self._decision_history.last() or {}),
         }

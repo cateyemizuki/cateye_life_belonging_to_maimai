@@ -432,6 +432,30 @@ QZONE_REPLY_DEFAULT = (
 )
 #: 评论提醒主动 intent（占位符：{excerpt} / {added}）
 QZONE_COMMENT_REMINDER_DEFAULT = "你刚发的说说「{excerpt}」收到了 {added} 条新评论，可以在聊天里自然地提到这件事"
+#: 发帖前 LLM 严判提示词（占位符：{lover_name} / {personality} / {current_time} / {activity}；
+#: 2026-10-14 §18.4 判定链移植自 MaiTrace v3.1：正反例 + 强烈压制「是」+ 首字符应答格式）
+QZONE_POST_GATE_DEFAULT = (
+    "你是「{lover_name}」，人设：{personality}。\n"
+    "现在是 {current_time}，你正在：{activity}。\n\n"
+    "请判断你现在是否会自然地发一条 QQ 空间说说。\n\n"
+    "【基本不会的情况】\n"
+    "- 正在专注做事（工作 / 学习 / 会议 / 写代码 / 审阅）\n"
+    "- 正在用餐、洗澡、运动、化妆等不方便看手机的活动\n"
+    "- 正在睡觉，或刚睡醒还没清醒\n"
+    "- 时间太深夜（22:00 后到次日 8:00）\n"
+    "- 当前活动与「低头看手机、打字发消息」明显冲突\n"
+    "- 最近刚做过同类的事（哪怕没明确告诉你）\n\n"
+    "【才可以的情况】\n"
+    "- 当前是放松 / 休息 / 闲逛 / 通勤 / 闲聊等碎片时间\n"
+    "- 时间是白天或晚上 8-10 点等正常社交活跃时段\n"
+    "- 你确实有想分享的内容，或被好奇心驱动\n\n"
+    "绝大多数情况下应该回答「否」——能回答「否」就回答「否」。\n\n"
+    "请严格按如下格式回答：\n"
+    "  是|<不超过 20 字的简短理由>\n"
+    "  或\n"
+    "  否|<不超过 20 字的简短理由>\n"
+    "第一个字符必须是「是」或「否」。"
+)
 
 
 # ===========================================================================
@@ -828,6 +852,13 @@ class PromptsSectionConfig(PluginConfigBase):
         description="新评论提醒的主动 intent（占位符：{excerpt} {added}）",
         json_schema_extra={"label": "空间·评论提醒", "rows": 2,
                            **_ui_i18n("Qzone comment reminder")},
+    )
+    qzone_post_gate: str = Field(
+        default=QZONE_POST_GATE_DEFAULT,
+        description="发帖前 LLM 严判提示词（占位符：{lover_name} {personality} {current_time} {activity}；"
+                    "只认回复首字符的 是/否，格式异常一律按否）",
+        json_schema_extra={"label": "空间·发帖严判", "rows": 10,
+                           **_ui_i18n("Qzone post gate prompt")},
     )
 
     # ── 工具文案 ─────────────────────────────────────────────

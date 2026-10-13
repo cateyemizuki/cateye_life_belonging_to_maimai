@@ -250,7 +250,7 @@ def qzone_block(qzone: Any, config: Any, *, enabled: bool,
     block: Dict[str, Any] = {
         "enabled": False, "posts_today": 0, "daily_max_posts": 0,
         "reply_comments_enabled": False, "channels": [], "cookie_text": "",
-        "comment_baseline": [],
+        "comment_baseline": [], "image_mode": "off",
     }
     if not enabled or qzone is None:
         return block
@@ -263,6 +263,8 @@ def qzone_block(qzone: Any, config: Any, *, enabled: bool,
         "channels": [str(c) for c in (snapshot.get("channels") or [])],
         "cookie_text": str(snapshot.get("cookie_text") or ""),
         "comment_baseline": list(snapshot.get("comment_baseline") or []),
+        # §18.3（2026-10-12）：配图来源（缺键/旧快照 → off）——面板行为照常、多一个读数
+        "image_mode": str(snapshot.get("image_mode") or "off").strip().lower() or "off",
     })
     return block
 
@@ -342,9 +344,10 @@ def _emotion_lines(block: Dict[str, Any]) -> List[str]:
 def _qzone_lines(block: Dict[str, Any]) -> List[str]:
     channels = [str(c) for c in (block.get("channels") or [])]
     baseline = list(block.get("comment_baseline") or [])
+    image_mode = str(block.get("image_mode") or "off").strip().lower() or "off"
     lines = [
         f"今日说说 {_to_int(block.get('posts_today'))}/{_to_int(block.get('daily_max_posts'))}",
-        f"评论监听 {'开' if block.get('reply_comments_enabled') else '关'}",
+        f"评论监听 {'开' if block.get('reply_comments_enabled') else '关'}｜配图 {image_mode}",
         f"动作通道 {'、'.join(channels) if channels else '未连通'}",
         f"cookie {str(block.get('cookie_text') or '未知')}",
     ]

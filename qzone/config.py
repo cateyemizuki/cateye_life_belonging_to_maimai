@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Dict
+from typing import ClassVar, Dict, List
 
 from maibot_sdk import Field, PluginConfigBase
 
@@ -68,6 +68,72 @@ class QzoneSectionConfig(PluginConfigBase):
         default=True,
         description="只在没有静默/睡眠且日程里有当前活动时才发说说",
         json_schema_extra={"label": "仅活动时发帖", **_ui_i18n("Only post during activity")},
+    )
+    # ── 配图（2026-10-14 §18.1~§18.3；默认 off = 老行为逐字一致）──────────────
+    image_mode: str = Field(
+        default="off",
+        description="说说配图来源：off=不配图｜emoji=宿主表情包（按说说正文语义匹配）｜"
+                    "library=本地随机图库｜random=两者各半掷骰。"
+                    "任何一步取图失败都只跳过该图，全部失败发纯文本（配图失败永不阻断发布）",
+        json_schema_extra={
+            "label": "配图来源",
+            "hint": "off/emoji/library/random；emoji 与 library 都失败时自动退回纯文本",
+            **_ui_i18n("Image source", "off / emoji / library / random"),
+        },
+    )
+    image_library_dir: str = Field(
+        default="",
+        description="本地随机图库目录（填**绝对路径**；image_mode=library/random 时生效）："
+                    "目录不存在、为空或读不出图 → 静默退回纯文本",
+        json_schema_extra={
+            "label": "图库目录",
+            "placeholder": "D:/pictures/qzone",
+            **_ui_i18n("Image library folder", "Absolute path; empty or missing folder falls back to text-only."),
+        },
+    )
+    image_number: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description="单条说说最多配几张图（1~4；表情包/图库随机取图共用该上限）",
+        json_schema_extra={"label": "配图张数", **_ui_i18n("Images per post")},
+    )
+    # ── 发帖判定链（2026-10-14 §18.4；MaiTrace 判定链移植）────────────────────
+    post_cooldown_minutes: int = Field(
+        default=120,
+        ge=0,
+        le=1440,
+        description="两条说说之间的最短间隔（分钟；0=不冷却）。锚点只在**发送成功后**更新，"
+                    "失败不重置（防失败风暴）",
+        json_schema_extra={
+            "label": "发帖冷却(分钟)",
+            "hint": "0 = 不冷却；冷却锚点成功发送后才前移",
+            **_ui_i18n("Post cooldown (min)"),
+        },
+    )
+    post_blocked_activities: List[str] = Field(
+        default_factory=lambda: ["sleeping", "working", "studying", "eating", "exercising"],
+        description="活动黑名单：当前活动归类命中这些类型时本轮不发（枚举值：sleeping/waking_up/eating/"
+                    "working/studying/exercising/relaxing/socializing/commuting/hobby/self_care/other）；"
+                    "空列表=不拦",
+        json_schema_extra={
+            "label": "活动黑名单",
+            "hint": "留空 = 不按活动类型拦截",
+            **_ui_i18n("Blocked activities"),
+        },
+    )
+    post_llm_gate_enabled: bool = Field(
+        default=True,
+        description="发帖前让模型严格判断「此刻发一条是否自然」（正反例 + 强烈压制「是」，"
+                    "只认回复首字符的 是/否，格式异常一律按否）；关 = 只跑规则闸不花模型钱",
+        json_schema_extra={"label": "发帖 LLM 严判", **_ui_i18n("LLM post gate")},
+    )
+    post_max_chance: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="LLM 严判通过后的掷骰上限（1.0=不掷骰；设 0.3 = 通过后仅 30% 真发，防模型误判刷屏）",
+        json_schema_extra={"label": "严判后掷骰上限", "step": 0.05, **_ui_i18n("Post chance cap")},
     )
     reply_comments_enabled: bool = Field(
         default=True,

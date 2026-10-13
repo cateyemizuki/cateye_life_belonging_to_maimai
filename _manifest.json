@@ -59,7 +59,8 @@
     "frequency.set_adjust",
     "knowledge.search",
     "api.call",
-    "database.get"
+    "database.get",
+    "emoji.get_by_description"
   ],
   "i18n": {
     "default_locale": "zh-CN",

@@ -20,7 +20,8 @@ from typing import Any, ClassVar, Iterable
 # ── 宿主运行时导入引导（勿删）──────────────────────────────────────────
 # 宿主 Runner 用 spec_from_file_location 加载本文件，只把「plugins 根目录」和宿主
 # 「src」临时放进 sys.path，从不加入本插件目录（src/plugin_runtime/runner/
-# plugin_loader.py:567-585）；本插件又用绝对导入引用自身模块，故必须自行把插件
+# plugin_loader.py:568-584，2026-10-14 对照 MaiBot-main 宿主源码复核订正）；
+# 本插件又用绝对导入引用自身模块，故必须自行把插件
 # 目录放到 sys.path 首位，否则 companion/core/planning 等会被宿主 src/ 下同名模块
 # 抢先命中（core/config 在宿主 src 下均存在）。配置模块命名为 suite_config 而非
 # config：同进程可加载多个插件，顶层 'config' 会被宿主 src/config 或先加载的兄弟

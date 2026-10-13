@@ -158,6 +158,8 @@ class EmotionSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "重新入睡判定(分钟)", **_ui_i18n("Resleep minutes (min)")},
     )
     # 注：M6 的 emoji 情绪联动键已于 2026-10-11 按用户裁决随实现一并移除
-    # （自 T6 起无消费组件；DEV_GUIDE 附录 A-7）。旧配置里的该键由宿主 extra=ignore 静默丢弃。
+    # （自 T6 起无消费组件；DEV_GUIDE 附录 A-7）。**维持移除不变**——2026-10-14 §18.2
+    # 恢复的是 manifest 能力声明与空间侧表情包配图（消费点在 qzone），与本键无关。
+    # 旧配置里的该键由宿主 extra=ignore 静默丢弃。
 
 
