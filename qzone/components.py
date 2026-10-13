@@ -1,7 +1,8 @@
 """QzoneComponentsMixin —— QQ 空间模块的 SDK 组件注册（装饰器方法）。
 
 组件清单：
-- Tools ×1：lbm_life_qzone（action=post 发说说，留空自动生成文案；action=moments 查最近说说）
+- Tools ×1：lbm_life_qzone（action=post 发说说，留空自动生成文案，按 [qzone].image_mode 自动配图；
+  action=moments 查最近说说）
 - Command ×1：/lbm_life（status | qzone [moments/comments/post/reply/like/decisions] | diag | help；
   diag 为 /lbm_diag life 的旧名别名，行为不变）
 
@@ -32,7 +33,8 @@ class QzoneComponentsMixin:
     # Tools
     # ============================================================
     @Tool("lbm_life_qzone",
-          description="QQ空间运营：action=post 发说说（message 留空自动按当前活动生成文案，受每日上限限制）| "
+          description="QQ空间运营：action=post 发说说（message 留空自动按当前活动生成文案，受每日上限限制；"
+                      "按配置自动配图/表情包）| "
                       "action=moments 查最近发表的说说（内容摘要、评论数、发表时间）。",
           parameters={
               "action": {"type": "string", "description": "操作：post=发说说 | moments=查最近说说", "required": True},
@@ -57,9 +59,14 @@ class QzoneComponentsMixin:
                 text = await qz.generate_moment_text(now.strftime("%Y-%m-%d"), now)
                 if not text:
                     return {"success": False, "content": "文案生成失败，稍后再试"}
-            result = await qz.post_moment(text)
+            # 2026-10-14 用户指示：手动路径同样按 [qzone].image_mode 配图（跟随 Maizone 行为；
+            # off/取图失败 → 纯文本，配图永不阻断发布）
+            images = await qz.collect_moment_images(text)
+            result = await qz.post_moment(text, images=images)
             if result:
-                return {"success": True, "content": f"已发说说：{text}", "stop_after_execution": True}
+                suffix = f"（配图 {len(images)} 张）" if images else ""
+                return {"success": True, "content": f"已发说说：{text}{suffix}",
+                        "stop_after_execution": True}
             return {"success": False, "content": "发表失败（检查 SnowLuma 适配器与 QZone 能力）"}
 
         if act == "moments":
@@ -204,8 +211,14 @@ class QzoneComponentsMixin:
             text = (rest[0].strip() if rest else "")
             if not text:
                 return "用法：/lbm_life qzone post <说说内容>"
-            result = await qz.post_moment(text)
-            return f"已发表（tid={result.get('tid', '')}）。" if result else "发表失败（检查 SnowLuma 适配器与 QZone 能力）。"
+            # 2026-10-14 用户指示：手动路径同样按 [qzone].image_mode 配图（跟随 Maizone 行为；
+            # off/取图失败 → 纯文本，配图永不阻断发布）
+            images = await qz.collect_moment_images(text)
+            result = await qz.post_moment(text, images=images)
+            if result:
+                suffix = f"，配图 {len(images)} 张" if images else ""
+                return f"已发表（tid={result.get('tid', '')}{suffix}）。"
+            return "发表失败（检查 SnowLuma 适配器与 QZone 能力）。"
         if action == "reply":
             # 用法：/life qzone reply <说说序号> [评论序号] <内容>
             #   只给说说序号 = 普通评论；给「说说.评论」序号（或两个数字）= 楼中楼回复该评论

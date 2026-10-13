@@ -23,6 +23,7 @@
   （连 LLM 都不问）** → 冷却（`post_cooldown_minutes`，**锚点只在发送成功后前移**、失败不重置）→ 静默复检 +
   活动黑名单（`post_blocked_activities`）→ LLM 严判（`post_llm_gate_enabled`，正反例 + 强烈压制「是」，
   只认回复首字符「是/否」，格式异常一律按否）→ 可选掷骰（`post_max_chance`）→ 发完进入冷却。
+- **配图三路同口径（2026-10-14 用户指示）**：自动巡检、手动 `/lbm_life qzone post` 与 `lbm_life_qzone` 工具发帖都按 `[qzone] image_mode` 取随机图库/表情包（跟随 Maizone 行为）；`off` 或取图失败 → 纯文本，配图永不阻断发布。
 - **可观测性**：每轮判定（无论卡在哪道闸）写入带上限 20 的判定历史；`/lbm_life qzone decisions [条数]`
   （管理员）查看「为什么没发」；`/lbm_life qzone status` 增加配图模式。
 - **配置面**：`[qzone]` 新增 7 键（`image_mode` / `image_library_dir` / `image_number` /
