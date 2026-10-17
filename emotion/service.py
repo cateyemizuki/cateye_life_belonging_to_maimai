@@ -982,22 +982,38 @@ class EmotionService:
         return max(0.0, min(1.0, value))
 
     def affection_tier(self) -> Optional[int]:
-        """从 affection 状态层读当前档位（跨模块 getattr 判空；读不到返回 None）。"""
+        """从 affection 状态层读当前档位（跨模块 getattr 判空；读不到返回 None）。
+
+        档位数随生效预设（1~5 档，2026-10-17 §19）——tier() 在状态层已按预设钳制，
+        此处仅防负数。
+        """
         affection = getattr(self._plugin, "_affection", None)
         getter = getattr(affection, "tier", None)
         if not callable(getter):
             return None
         try:
-            return max(0, min(4, int(getter())))
+            return max(0, int(getter()))
         except Exception:
             return None
 
     def target_bonus(self) -> float:
-        """target 加算加成 = step × (档位+1)（§5.3 表 / §6.2 A；档位不可得时 0）。"""
+        """target 加算加成 = step × (档位相对位置 × 4 + 1)（§6.2 A）。
+
+        2026-10-17 §19.4：档位数可变（1~5）后按 ratio×4 连续化——5 档时与旧
+        ``step × (tier+1)`` 逐档一致（ratio=tier/4 → ×4+1 恒等）；档位不可得时 0。
+        """
         tier = self.affection_tier()
         if tier is None:
             return 0.0
-        return self.target_bonus_step() * (tier + 1)
+        size = getattr(getattr(self._plugin, "_affection", None), "preset", None)
+        try:
+            preset = size() if callable(size) else None
+            count = int(getattr(preset, "size", 5)) if preset is not None else 5
+        except Exception:
+            count = 5
+        count = max(1, count)
+        ratio = 0.0 if count <= 1 else min(1.0, tier / (count - 1))
+        return self.target_bonus_step() * (ratio * 4.0 + 1.0)
 
     def target_multiplier(self, is_target: bool) -> float:
         """§6.2 A 的 K：target = 1+加成（加算非乘算）；非 target = non_target_multiplier。"""

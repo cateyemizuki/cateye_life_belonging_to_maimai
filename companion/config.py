@@ -28,9 +28,8 @@ WebUI 元数据约定与顶层 suite_config.py 一致：
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Dict, Literal
+from typing import Any, ClassVar, Dict, Literal, Tuple
 
-import pydantic
 from maibot_sdk import Field, PluginConfigBase
 
 
@@ -40,6 +39,28 @@ def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
     if en_hint:
         entry["hint"] = en_hint
     return {"i18n": {"en": entry}}
+
+
+def _relation_type_choices() -> Tuple[str, ...]:
+    """[patrol].relation_type 的下拉名单：内置五预设 ∪ ``mappings/affection_presets.json``
+    里的合法预设名（2026-10-17 用户指示：下拉选项可随每次启动动态注册）。
+
+    宿主每次 schema 请求现场重算、热重载清 ``sys.modules`` 重导入插件模块，而本函数在
+    **配置模型类体构造时**（= 模块导入期）求值一次 → json 变更后每次启动（含热重载）
+    下拉选项即变更（宿主侦察结论 dwfrun-b11fe5a6：唯一机制 = pydantic Literal，无缓存层）。
+    导入期只读不写（不生成默认文件、不落账）；读取失败/非法 → 静默回退内置名单。
+    内置名恒在名单内 → 出厂默认值「恋人」永不因 json 内容而非法。
+    """
+    try:
+        from .affection_presets import available_preset_names
+
+        return available_preset_names()
+    except Exception:  # 导入期绝不抛（配置模型构造失败会拖挂整个插件装载）
+        return ("恋人", "挚友", "维护者", "家人", "自定义")
+
+
+#: 动态下拉类型（导入期冻结一次；``Literal[tuple]`` 与多参数形式等价）
+RelationType = Literal[_relation_type_choices()]  # type: ignore[valid-type]
 
 
 def target_qq_of(config: Any) -> str:
@@ -97,12 +118,14 @@ class PatrolSectionConfig(PluginConfigBase):
             **_ui_i18n("Target QQ", "Proactive chat stays off while the placeholder is kept."),
         },
     )
-    relation_type: Literal["恋人", "挚友", "维护者", "家人", "自定义"] = Field(
+    relation_type: RelationType = Field(
         default="恋人",
-        description="目标用户是 bot 的谁：影响想念提示词、消息口吻、好感度档位名称与消息后缀",
+        description="目标用户是 bot 的谁：影响想念提示词、消息口吻、好感度档位名称与消息后缀；"
+                    "选项含 mappings/affection_presets.json 中的自定义预设（改 json 后重启/热重载生效）",
         json_schema_extra={
             "label": "关系类型",
-            "hint": "恋人=甜蜜亲昵；挚友=轻松直来直去；维护者=信赖依赖；家人=随性亲近；自定义=用下方称谓",
+            "hint": "恋人=甜蜜亲昵；挚友=轻松直来直去；维护者=信赖依赖；家人=随性亲近；自定义=用下方称谓；"
+                    "其余选项来自好感度预设表（mappings/affection_presets.json）",
             **_ui_i18n("Relation type", "Who the target user is to the bot."),
         },
     )
@@ -351,58 +374,31 @@ class PatrolSectionConfig(PluginConfigBase):
 
 
 class AffectionSectionConfig(PluginConfigBase):
-    """好感度系统（来源：虚拟陪伴插件；M1 扩展为 v2 状态层配置，全部带默认值可关闭）。
+    """好感度系统（M1 v2 状态层配置，全部带默认值可关闭；2026-10-17 §19 起分数 0~200）。
 
-    `enabled=false` 时整体回退 v1 三档行为（§八.2：新增配置关闭时回退旧行为）；
-    `review_*` 三项为 M2 好感 LLM 裁判（会话采样 + 关系日结）的开关与频控。
-    裁判任务名统一移到 [llm] 段的 review_task_name。
+    `enabled=false` 时好感系统停用（不记账/不衰减/不重估；v1 三档回退语义已随
+    §19.4 移除）；`review_*` 三项为 M2 好感 LLM 裁判（会话采样 + 关系日结）的开关
+    与频控。裁判任务名统一移到 [llm] 段的 review_task_name。
+    档位区间/标签来自外置预设表 ``mappings/affection_presets.json``（1~5 档自由构造，
+    内置兜底）——本段不再含档位/区间配置。
     """
 
     __ui_label__ = "好感度"
     __ui_icon__ = "favorite"
     __ui_order__ = 2
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
-        "en": {"title": "Affection", "description": "Companion affection tier system (v2 score/baseline)."}
+        "en": {"title": "Affection", "description": "Companion affection system (score 0-200, JSON presets)."}
     }
-
-    current_level: Literal[0, 1, 2] = Field(
-        default=0,
-        description="好感度档位：0=熟悉（温柔拘谨），1=亲密（活泼热情），2=热恋（撒娇抱抱）",
-        json_schema_extra={
-            "label": "好感档位",
-            "hint": "只作首次建立档案时的初始档位；已有档案时以累积分数为准",
-            **_ui_i18n("Affection level"),
-        },
-    )
-
-    @pydantic.field_validator("current_level", mode="before")
-    @classmethod
-    def _coerce_current_level(cls, value: Any) -> Any:
-        """P7 修复（2026-10-10，退休报告 §7.2 推荐方案 A）：WebUI/TOML 传来的数字字符串归一为 int。
-
-        宿主传输形态是字符串（WebUI 表单控件提交 ``"1"``，或 config.toml 手写
-        ``current_level = "1"``），而 ``Literal[0, 1, 2]`` 按「值 + 类型」精确匹配 →
-        ``"1" ≠ 1`` → literal_error → 整个 CateyeSuiteConfig 校验失败（宿主回 E_BAD_PAYLOAD）。
-        Pydantic 的「数字字符串宽松转 int」只对 int 字段生效、对 Literal 成员不生效，故在此前置归一。
-
-        只放行 strip 后恰为 ``"0"``/``"1"``/``"2"`` 的字符串；``"3"``/``"x"``/浮点等
-        一律原样交给 Literal 拒绝（保持原有报错语义）。
-        """
-        if isinstance(value, str):
-            text = value.strip()
-            if text in ("0", "1", "2"):
-                return int(text)
-        return value
 
     enabled: bool = Field(
         default=True,
-        description="启用好感度 v2：开启后按 score/baseline 连续分运行（规则事件记账 + 日衰减 + 档位迟滞）；"
-                    "关闭则回退 v1 三档行为（档位仅由命令/工具设置，不自动变化）",
+        description="启用好感度系统：开启后按 score/baseline 连续分（0~200）运行"
+                    "（规则事件记账 + 日衰减 + 档位迟滞）；关闭则好感度完全停用（不记账、不变化）",
         json_schema_extra={
-            "label": "启用好感度 v2",
-            "hint": "关 = 保留旧三档手感（无日衰减、无事件记账）；文件仍以 v2 格式保存，可随时再开",
-            **_ui_i18n("Enable affection v2",
-                       "Off = legacy 3-tier behaviour: tier only changes via commands, no decay or rule events."),
+            "label": "启用好感度",
+            "hint": "关 = 好感度停用（分数/档位不再变化）；文件保留，可随时再开",
+            **_ui_i18n("Enable affection",
+                       "Off = affection frozen: no decay, no rule events, no tier changes."),
         },
     )
     decay_pull: float = Field(
@@ -430,9 +426,9 @@ class AffectionSectionConfig(PluginConfigBase):
         },
     )
     daily_positive_cap: float = Field(
-        default=4.0,
+        default=8.0,
         ge=0.0,
-        le=100.0,
+        le=200.0,
         description="单日正向好感增量上限（含规则事件与后续裁判）：超出部分记日志丢弃",
         json_schema_extra={
             "label": "单日正向上限",
@@ -442,9 +438,9 @@ class AffectionSectionConfig(PluginConfigBase):
         },
     )
     daily_negative_cap: float = Field(
-        default=3.0,
+        default=6.0,
         ge=0.0,
-        le=100.0,
+        le=200.0,
         description="单日负向好感扣减下限（含规则事件与后续裁判）：超出部分记日志丢弃",
         json_schema_extra={
             "label": "单日负向下限",
@@ -454,9 +450,9 @@ class AffectionSectionConfig(PluginConfigBase):
         },
     )
     tier_hysteresis: float = Field(
-        default=3.0,
+        default=6.0,
         ge=0.0,
-        le=30.0,
+        le=60.0,
         description="档位迟滞带（分）：升档需 score ≥ 当前档上界 + 该值，降档需 ≤ 下界 − 该值（0=无迟滞）",
         json_schema_extra={
             "label": "档位迟滞带",

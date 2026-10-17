@@ -39,6 +39,34 @@ from .sender_identity import SenderCache, SessionKindCache
 logger = logging.getLogger(__name__)
 
 
+def _load_affection_tables(plugin: Any) -> None:
+    """装载好感度预设表与档位描述表并重绑生效位（2026-10-17 §19；**只在加载/重载调用**）。
+
+    顺序：预设表先装载（``apply_presets`` 重绑区间/标签生效位）→ 描述表后装载
+    （已知预设/档位集合来自生效预设）。``root_dir`` 取 ``plugin._plugin_root``（缺失 =
+    测试桩 → 跳过根层纯内置）。任何失败只告警不抛——装载故障绝不拖挂陪伴服务束
+    （内置默认恒可用）。
+    """
+    from . import affection_presets, affection_tier_descriptions
+
+    root_dir = getattr(plugin, "_plugin_root", None)
+    decision_logger = getattr(plugin, "_decision_logger", None)
+    try:
+        result = affection_presets.load_and_apply(root_dir=root_dir,
+                                                  decision_logger=decision_logger)
+        if result.rejected:
+            logger.warning("好感度预设表有 %d 个预设被排除：%s",
+                           len(result.rejected), "；".join(n for n, _ in result.rejected))
+    except Exception as exc:
+        logger.warning("好感度预设表装载失败（使用内置默认）：%s", exc)
+    try:
+        affection_tier_descriptions.load_and_apply(
+            root_dir=root_dir, presets=affection_presets.active_presets(),
+            decision_logger=decision_logger)
+    except Exception as exc:
+        logger.warning("好感度档位描述表装载失败（使用内置默认）：%s", exc)
+
+
 def _emotion_valence(plugin: Any) -> Optional[float]:
     """读取情绪模块当前生效 V（M3 B2，§6.2 B）；缺失/停用/异常一律返回 None。
 
@@ -85,12 +113,15 @@ class CompanionServices:
         self._event_unsubs: list = []
 
         cfg = plugin.config
+        # ---- 预设表与档位描述表装载（2026-10-17 §19：mappings/ 只在加载/重载读一遍）----
+        # 顺序敏感：先 apply 预设（区间/标签生效位）→ 再解析 relation（取预设标签）→
+        # 再装载描述表（已知预设/档位集合来自生效预设）。失败全部可空降级（内置默认兜底）。
+        _load_affection_tables(plugin)
         # ---- 复用顶层已有实例（只增不改名；缺失时自建兜底）----
         self.affection: AffectionManager = (
             getattr(plugin, "_affection", None)
             or AffectionManager(
                 self._data_dir,
-                default_level=int(getattr(cfg.affection, "current_level", 0)),
                 config_provider=lambda: plugin.config,
                 decision_logger=getattr(plugin, "_decision_logger", None),
             )
@@ -134,12 +165,12 @@ class CompanionServices:
         self.cateye = CateyeClient(plugin, llm=self.llm, call_logger=self.llm_logger)
         #: 本地记忆库（用户习惯）
         self.memory = MemoryManager(self.affection)
-        #: 关系档案（对方是 bot 的谁：恋人/挚友/维护者/家人/自定义，随配置热更新）
+        #: 关系档案（对方是 bot 的谁：内置五预设 ∪ 好感度预设表自定义预设，随配置热更新）
         self.relation = self._resolve_relation()
         #: 消息发送服务（情绪后缀 + 直发）
         self.message = MessageService(plugin, self.affection, lover_name=self.lover_name)
         self.message.set_relation(self.relation)
-        self.affection.set_level_labels(self.relation.level_labels)
+        self.affection.set_preset_name(self.relation.preset_name)
         #: 巡检调度器（完整判定链）
         self.patrol = PatrolService(
             self.ctx, plugin, self.affection, self.schedule_query, self.llm,
@@ -184,27 +215,19 @@ class CompanionServices:
         self.patrol.set_target(target_qq, stream_id)
 
     def sync_from_config(self) -> None:
-        """配置热重载后同步动态项（关系档案 / llm 任务名 / 好感度档位 / 旁白 TTL / 日志开关）。"""
+        """配置热重载后同步动态项（预设表 / 关系档案 / llm 任务名 / 旁白 TTL / 日志开关）。"""
         cfg = self.plugin.config
         try:
+            # 预设表/描述表只在加载/重载读一遍（热重载即重读）；失败可空降级（内置默认兜底）
+            _load_affection_tables(self.plugin)
             self.relation = self._resolve_relation()
             self.message.set_relation(self.relation)
             self.patrol.set_relation(self.relation)
-            self.affection.set_level_labels(self.relation.level_labels)
+            self.affection.set_preset_name(self.relation.preset_name)
         except Exception:
             pass
         try:
             self.llm.update_task(llm_task_name_of(cfg))
-        except Exception:
-            pass
-        try:
-            # v2：档位由 score/迟滞驱动，current_level 只作「无档案时的初始档位」（构造时传入）；
-            # 热重载时不再回写，否则每次改配置都会把累积的 score 冲回档位代表分数。
-            # enabled=false（v1 回退模式）时维持旧行为：配置档位直接下发。
-            if not self.affection.is_enabled():
-                self.affection.update_level(
-                    int(getattr(cfg.affection, "current_level", self.affection.level()))
-                )
         except Exception:
             pass
         # T3 问题表 #5：旧实现在热重载路径读已删除的 [cateye].context_ttl_minutes

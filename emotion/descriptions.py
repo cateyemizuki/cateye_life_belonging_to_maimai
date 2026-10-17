@@ -1,6 +1,7 @@
 """情绪描述表（F5，2026-10-11）：引导 LLM 的详细文字描述，替代「百分比 + 三维约值」渲染。
 
-- **插件根目录 json**（``emotion_descriptions.json``）允许用户自行编辑：
+- **插件根 ``mappings/`` 子文件夹 json**（2026-10-17 起读取位 = ``<root>/mappings/emotion_descriptions.json``；
+  F4/F5 期的旧根文件在新位置缺失时自动复制进来，旧文件保留不删）允许用户自行编辑：
   - 文件缺失 → 由内置默认（本模块常量）生成一份并返回默认；
   - **格式错误**（非 dict / 值非字符串）→ 整体回退内置默认（告警日志）；
   - **格式正确但出现不在映射表中的情绪键** → 丢弃那些键（用户口径），其余生效；
@@ -18,8 +19,12 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+from core.mapping_dir import mappings_path, migrate_legacy_root_file
+
 logger = logging.getLogger(__name__)
 
+#: 描述表文件名（实际读取位 = ``<root>/mappings/``；路径拼接唯一真源 =
+#: ``core/mapping_dir.mappings_path``——2026-10-17 §19.4 / 复核 findings#9：仅补注释，常量名不变）
 ROOT_DESCRIPTIONS_FILE_NAME = "emotion_descriptions.json"
 #: 通用兜底键：映射表里存在、但描述表（内置或用户）未覆盖的情绪渲染时使用
 GENERIC_LABEL = "复杂难名"
@@ -94,9 +99,21 @@ def _plugin_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _descriptions_path(root: Path) -> Path:
+    """描述表路径（``<root>/mappings/emotion_descriptions.json``；旧根文件自动复制进来）。"""
+    path = mappings_path(root, ROOT_DESCRIPTIONS_FILE_NAME)
+    try:
+        present = path.exists()
+    except OSError:
+        present = False
+    if not present:
+        migrate_legacy_root_file(root, ROOT_DESCRIPTIONS_FILE_NAME)
+    return path
+
+
 def load_descriptions(*, root_dir: Any = None, known_labels: Optional[Iterable[str]] = None,
                       decision_logger: Any = None) -> Dict[str, str]:
-    """装载插件根目录的情绪描述 json（F5；**只在加载/重载时调用一次**）。
+    """装载插件根 ``mappings/`` 的情绪描述 json（F5；**只在加载/重载时调用一次**）。
 
     流程（用户口径）：
     - 文件缺失 → 生成内置默认文件（best-effort，失败不阻断）并返回内置默认；
@@ -107,7 +124,7 @@ def load_descriptions(*, root_dir: Any = None, known_labels: Optional[Iterable[s
     known = {str(label).strip() for label in (known_labels or ()) if str(label).strip()}
     known.add(GENERIC_LABEL)
     root = Path(root_dir) if root_dir else _plugin_root()
-    path = root / ROOT_DESCRIPTIONS_FILE_NAME
+    path = _descriptions_path(root)
 
     if not path.exists():
         _generate_default(path)
@@ -149,6 +166,7 @@ def load_descriptions(*, root_dir: Any = None, known_labels: Optional[Iterable[s
 def _generate_default(path: Path) -> None:
     """生成内置默认描述文件（best-effort：目录只读/失败仅告警，不阻断装载）。"""
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(DEFAULT_EMOTION_DESCRIPTIONS, ensure_ascii=False, indent=2) + "\n",
                         encoding="utf-8")
         logger.info("已生成默认情绪描述文件：%s（可自行编辑，格式错误将回退内置默认）", path)

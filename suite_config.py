@@ -93,6 +93,12 @@ CURRENT_LAYOUT_VERSION = "2026-10-10"
 #: 保持单一真源：迁移器与抢救逻辑都读这里，别再各写一份字面量元组。
 LEGACY_SECTIONS = ("target", "cateye", "judge", "inject", "planning_cleanup")
 
+#: [affection] 段内已删键（2026-10-17 §19.4 好感度 0~200 重构）：v1 三档口径的**初始档位键**
+#: ``current_level``。登记于此供迁移器入口显式 pop（见 :meth:`CateyeSuiteConfig._migrate_legacy_sections`）：
+#: v1 的 0/1/2 静态档位无法映射到 0~200 连续标度、也无可回填的等价键（§9.7 教训：不猜、
+#: 不静默换标度），故只清旧键、**不做任何值搬运**（无 setdefault、无键缺失判断）。
+LEGACY_AFFECTION_KEYS = ("current_level",)
+
 #: 1.0.0（配置整理轮之前）[patrol] 「想念触发说明」的出厂文案——仅用于迁移时判断「用户改过没有」。
 #: 为什么不拿新默认当参照：配置整理轮把该文案重写过（新版带【触发原因·想念】前缀），
 #: 拿新默认比较会把老用户的出厂值误判成「用户自定义」并搬进 [prompts]（等于把文案回退成旧版）。
@@ -390,7 +396,9 @@ class CateyeSuiteConfig(PluginConfigBase):
         1. [target] / [cateye] / [judge] / [inject] / [planning_cleanup] 五个已删段的
            字段搬进新家（搬完即从字典里 pop，落盘/校验都不再看到它们）；
         2. 各段内部改名键的搬运（llm_task_name→[llm].task_name 等）；
-        3. [patrol] 段内部已删键的清理与阈值合并（companion.config.migrate_legacy_patrol）。
+        3. [patrol] 段内部已删键的清理与阈值合并（companion.config.migrate_legacy_patrol）；
+        4. [affection] 段内部已删键的清理（:data:`LEGACY_AFFECTION_KEYS`；2026-10-17 §19.4
+           加：v1 三档的 ``current_level`` 在入口显式 pop，两个分支都经过）。
 
         **幂等**：迁移完成时在 ``[plugin] layout_version`` 写下本轮布局标记；下一次校验
         （迁移结果被宿主落盘后再读回）看到该标记即跳过全部值搬运——新旧同名的键
@@ -413,6 +421,16 @@ class CateyeSuiteConfig(PluginConfigBase):
             # 出厂默认路径（无参构造 / 空输入）：不写布局标记，也不放哨兵
             return data
         migrated = dict(data)
+        # 0) 段内已删键清理——放在两个分支**都经过**的入口处（清旧键性质，与 already_migrated
+        #    分支只清旧段同精神：不搬运、不回填）。2026-10-17 §19.4 / 复核 findings#4：
+        #    v1 三档口径的 [affection].current_level 无法映射 0~200 新标度（§9.7 教训），
+        #    无条件 pop 丢弃（显式 pop，不用 setdefault、不做键缺失判断——§9.5）。
+        legacy_affection = migrated.get("affection")
+        if isinstance(legacy_affection, dict):
+            legacy_affection = dict(legacy_affection)
+            for stale_key in LEGACY_AFFECTION_KEYS:
+                legacy_affection.pop(stale_key, None)
+            migrated["affection"] = legacy_affection
         plugin_section = dict(migrated.get("plugin") or {})
         already_migrated = str(plugin_section.get("layout_version") or "") == CURRENT_LAYOUT_VERSION
         # 结构版本以插件当前值为准（宿主已按"版本变化"决定升级；旧值不参与落盘）。

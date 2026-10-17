@@ -3,9 +3,9 @@
 结构镜像 ``emotion/referee.py``：
 
 - **会话采样裁判** :func:`evaluate_conversation_delta`：最近 ~10 条对话摘要 + 双方称呼与人设
-  + 关系档位描述 + 当前情绪低分辨率描述 → ``(event, delta ∈ [-2, +2.5], tag)``；
+  + 关系档位描述 + 当前情绪低分辨率描述 → ``(event, delta ∈ [-4, +5], tag)``；
 - **关系日结裁判** :func:`run_daily_review`：当日事件日志 + 互动统计 + 最近印象 + 档位描述
-  + 人设 → ``delta_score ∈ [-2, +2] + 0~3 条印象 + tone + reason``；
+  + 人设 → ``delta_score ∈ [-4, +4] + 0~3 条印象 + tone + reason``；
 - 解析一律宽松（整段 → ```json 围栏 → 首个 {...} 块），代码层二次限幅（LLM 数值失真兜底）；
 - LLM 全部经 ``core/llm_utils.LLMService.generate`` 并带 ``event=`` 标识
   （``affection_review`` / ``affection_daily_review``），任务名用 ``[llm].review_task_name``；
@@ -46,12 +46,12 @@ logger = logging.getLogger(__name__)
 # 数值边界（代码层二次限幅；§6.3-2）
 # ---------------------------------------------------------------------------
 
-#: 会话采样裁判 delta 区间（§5.4 非对称：[-2, +2.5]）
-REVIEW_DELTA_MIN = -2.0
-REVIEW_DELTA_MAX = 2.5
-#: 关系日结 delta 区间（§5.4：[-2, +2]）
-DAILY_DELTA_MIN = -2.0
-DAILY_DELTA_MAX = 2.0
+#: 会话采样裁判 delta 区间（§5.4 非对称；2026-10-17 §19.1 起 0~200 标度等比 ×2）
+REVIEW_DELTA_MIN = -4.0
+REVIEW_DELTA_MAX = 5.0
+#: 关系日结 delta 区间（§5.4；0~200 标度等比 ×2）
+DAILY_DELTA_MIN = -4.0
+DAILY_DELTA_MAX = 4.0
 #: tag 白名单（§5.4）
 REVIEW_TAGS = ("normal", "conflict", "apology", "sweet")
 #: 会话采样裁判可见的最近消息条数（§5.4：最近 ~10 条对话摘要）
@@ -86,7 +86,7 @@ CONVERSATION_REVIEW_PROMPT = """你是 AI 角色「{lover_name}」与{target_lab
 
 【判定标准】
 1. event：用不超过 30 字概括这段相处里最值得记住的一件事；没有就写「日常闲聊」；
-2. delta：好感度增量，范围 [-2, +2.5]——
+2. delta：好感度增量，范围 [-4, +5]——
    - 阿谀奉承、无意义刷屏、单方面索取：不给正分（0 或负）；
    - 真诚的关心、共同完成一件事、化解了一次矛盾：才给正分；
    - 明显的争吵、冒犯、被冷落：给负分；
@@ -114,7 +114,7 @@ DAILY_REVIEW_PROMPT = """你是 AI 角色「{lover_name}」与{target_label}之�
 {impressions}
 
 【判定标准】
-1. delta_score：这一天对关系的影响，范围 [-2, +2]——
+1. delta_score：这一天对关系的影响，范围 [-4, +4]——
    - 真诚的关心、共同完成一件事、化解矛盾：正分；
    - 阿谀奉承、无意义刷屏：不给正分；
    - 争吵、冒犯、被冷落、整天没有互动：负分；

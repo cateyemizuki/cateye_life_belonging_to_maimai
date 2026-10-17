@@ -74,21 +74,28 @@ class MessageService:
             return False
 
     def append_affection_suffix(self, text: str) -> str:
-        """根据好感度档位追加情绪锚点后缀；档位 2 有 10% 概率追加括号小剧场。
+        """根据好感度档位追加情绪锚点后缀；最高档桶有 10% 概率追加括号小剧场。
 
-        后缀池与小剧场来自关系档案（RelationProfile）——恋人/挚友/维护者/家人各有各的说法。
+        后缀池与小剧场来自关系档案（RelationProfile）——恋人/挚友/维护者/家人各有各的说法；
+        档位数 ≠ 3 的预设由 ``relation.suffix_for_tier`` 按档位相对位置折算 3 档桶
+        （2026-10-17 §19.4：v1 ``level()`` 口径已移除，改读 ``tier()``）。
         """
-        level = self._affection.level()
+        tier = self._affection.tier()
         relation = self._relation
         if relation is not None:
-            suffixes = relation.suffix_for(level)
+            suffixes = relation.suffix_for_tier(tier)
             theaters = relation.theaters
-        else:  # 未注入关系档案时回退「恋人」预设
-            suffixes = AFFECTION_SUFFIXES.get(level, AFFECTION_SUFFIXES[0])
+            theater_bucket = relation.tier_uses_theater(tier)
+        else:  # 未注入关系档案时按档位相对位置折算回退「恋人」池
+            from .relation import ratio_bucket_index
+
+            bucket = ratio_bucket_index(tier, self._affection.preset().size, 3)
+            suffixes = AFFECTION_SUFFIXES.get(bucket, AFFECTION_SUFFIXES[0])
             theaters = BRACKET_THEATERS
+            theater_bucket = bucket == 2
         suffix = self._random_suffix(suffixes)
         result = text + suffix
-        if level == 2 and theaters and random.random() < 0.1:
+        if theater_bucket and theaters and random.random() < 0.1:
             theater = self._random_suffix(theaters)
             try:
                 theater = theater.format(name=self._lover_name)

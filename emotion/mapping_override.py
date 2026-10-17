@@ -82,6 +82,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from core.mapping_dir import mappings_path, migrate_legacy_root_file
+
 logger = logging.getLogger(__name__)
 
 # ── 文件与版本 ────────────────────────────────────────────────────────────
@@ -648,12 +650,18 @@ def _record_outcome(result: MappingOverrideResult, decision_logger: Any) -> None
 
 ROOT_MAPPING_FILE_NAME = "emotion_mapping.json"
 #: 插件根目录默认映射表文件（F4 2026-10-11）：缺失时由内置四表生成，用户可编辑
+#: （2026-10-17 起实际读取位 = ``<root>/mappings/``，见 :func:`load_effective`；
+#: 路径拼接唯一真源 = ``core/mapping_dir.mappings_path``——§19.4 / 复核 findings#9
+#: 仅补注释，常量名不变）
 
 
 def load_effective(data_dir: Union[str, Path], decision_logger: Any = None,
                    *, root_dir: Any = None) -> MappingOverrideResult:
-    """F4（裁决 2026-10-11）：插件根目录映射表优先 → data_dir 覆盖层（M12）→ 内置默认。
+    """F4（裁决 2026-10-11）：插件根映射表优先 → data_dir 覆盖层（M12）→ 内置默认。
 
+    2026-10-17 起根表读取位 = ``<root>/mappings/emotion_mapping.json``（映射表集中子文件夹）：
+    - 新位置缺失而旧根文件 ``<root>/emotion_mapping.json`` 存在 → 先复制进 ``mappings/``
+      （只复制不删除，``core/mapping_dir``），随后按新位置读取；
     - 根文件存在 → 校验：合法即生效（**不再叠加** data_dir 覆盖层——根文件是唯一
       用户编辑位）；非法 → 告警并回退**内置默认**（用户口径「格式有误时回退为
       使用默认的映射表」，不落入 data_dir 以免双重覆盖）；
@@ -666,11 +674,17 @@ def load_effective(data_dir: Union[str, Path], decision_logger: Any = None,
     if root_dir is None:
         return load(data_dir, decision_logger)
     root = Path(root_dir)
-    root_path = root / ROOT_MAPPING_FILE_NAME
+    root_path = mappings_path(root, ROOT_MAPPING_FILE_NAME)
     try:
         present = root_path.exists()
     except OSError:
         present = False
+    if not present:
+        migrate_legacy_root_file(root, ROOT_MAPPING_FILE_NAME)
+        try:
+            present = root_path.exists()
+        except OSError:
+            present = False
     if not present:
         _generate_default_root(root_path)
         return load(data_dir, decision_logger)
@@ -690,6 +704,7 @@ def load_effective(data_dir: Union[str, Path], decision_logger: Any = None,
 def _generate_default_root(path: Path) -> None:
     """生成插件根目录默认映射表（内置四表；best-effort，失败仅告警）。"""
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         doc = {"version": 1, **default_tables()}
         path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         logger.info("已生成默认情绪映射表：%s（可自行编辑，格式错误将回退内置默认）", path)

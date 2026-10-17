@@ -1,56 +1,29 @@
 """关系预设（简单版关系系统：配置「对方是 bot 的谁」，措辞随关系变化）。
 
 设计：`companion/config.py` 的 PatrolSectionConfig 暴露 relation_type / relation_custom
-两个配置项；本模块把它们解析成 RelationProfile（称谓、三档好感度名 + v2 五档名、口吻提示、
-消息后缀池、括号小剧场），供 patrol（miss 提示词）、message_service（后缀）、
-components（消息生成 prompt 与注入文案）消费。
+两个配置项；本模块把它们解析成 RelationProfile（称谓、档位标签、口吻提示、消息后缀池、
+括号小剧场），供 patrol（miss 提示词）、message_service（后缀）、components（消息生成
+prompt 与注入文案）消费。
 
-兼容约定： affection.py 的 LEVEL_LABELS / LEVEL_DESCRIPTIONS 保留为「恋人」预设
-的原始出处；运行时一律走这里的 profile。好感 v2 的 5 档名（tier 0~4）与档位→miss
-阈值系数见 `_RELATION_TIER_LABELS` / `_RELATION_TIER_MISS_FACTORS`（MAINTENANCE_PLAN
-附录 B）；档位→旧 3 档的兼容映射单一事实来源在 `companion/affection.py`
-（TIER_TO_LEGACY_LEVEL，§5.3），本模块 `tier_to_legacy_level()` 只是转发，后缀池/
-小剧场过渡期按 3 档折算（0/1→旧0，2/3→旧1，4→旧2）。
+2026-10-17 §19（用户指示，R7 依据）：
+- **v1 三档体系移除**——`_RELATION_LEVEL_LABELS/_RELATION_LEVEL_DESCRIPTIONS`、
+  ``tier_to_legacy_level`` 固定映射删除；后缀池/小剧场改按**档位相对位置（ratio）折算**
+  到旧 3 档桶（5 档时与旧映射逐档一致）；
+- **档位标签/区间的单一真源 = 生效预设表**（``companion/affection_presets``：外置
+  ``mappings/affection_presets.json``，1~5 档自由构造，内置五预设兜底）；
+  本模块不再自持 5 档标签/描述常量（描述内置表在 ``companion/affection_tier_descriptions``）；
+- 档位 → miss 阈值系数按 ratio×4 折算回内置 5 档系数表（``_RELATION_TIER_MISS_FACTORS``，
+  MAINTENANCE_PLAN 附录 B；5 档时逐档一致，其他档位数平滑折算）；
+- ``[patrol].relation_type`` 的可选值 = 内置五预设 ∪ json 预设（动态下拉，见 config.py）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
-#: v2 档位 → 旧 3 档兼容映射（§5.3；单一事实来源：companion/affection.py）
-from .affection import legacy_level_for_tier as _legacy_level_for_tier
-
-# 关系类型 → 各档位名称（好感度 0/1/2）
-_RELATION_LEVEL_LABELS: Dict[str, Dict[int, str]] = {
-    "恋人": {0: "熟悉", 1: "亲密", 2: "热恋"},
-    "挚友": {0: "熟识", 1: "投缘", 2: "挚友"},
-    "维护者": {0: "认识", 1: "信任", 2: "依靠"},
-    "家人": {0: "相识", 1: "亲近", 2: "家人"},
-}
-
-_RELATION_LEVEL_DESCRIPTIONS: Dict[str, Dict[int, str]] = {
-    "恋人": {
-        0: "初识阶段，语气温柔但有分寸感，保持适当距离",
-        1: "熟悉阶段，语气亲昵自然，像好朋友一样聊天",
-        2: "热恋阶段，语气甜蜜亲密，可以肉麻撒娇",
-    },
-    "挚友": {
-        0: "刚熟起来，语气轻松随意，偶尔互相打趣",
-        1: "很聊得来，语气直来直去，什么都能聊",
-        2: "铁杆挚友，语气毫无顾忌，损TA也护TA",
-    },
-    "维护者": {
-        0: "初步接触，语气礼貌友善，带一点好奇",
-        1: "开始信赖，语气放松，愿意分享自己的状态",
-        2: "深深依靠，语气坦诚依赖，会主动汇报自己的近况",
-    },
-    "家人": {
-        0: "刚相处，语气客气中带亲近",
-        1: "日常相处，语气随性自然，像家人一样不用客气",
-        2: "至亲，语气完全放松，撒娇耍赖都可以",
-    },
-}
+from . import affection_presets
+from .affection_tier_descriptions import generic_tier_description, tier_description_for
 
 # 消息生成 prompt 用口吻词 + 系统提示词身份描述
 _RELATION_STYLE: Dict[str, Dict[str, str]] = {
@@ -60,59 +33,18 @@ _RELATION_STYLE: Dict[str, Dict[str, str]] = {
     "家人": {"style": "亲近随性的家人", "self_desc": "一个陪伴在侧的家人"},
 }
 
-# 关系类型 → v2 5 档位名称（好感 v2 tier 0~4；MAINTENANCE_PLAN 附录 B）
-# 档位→旧 3 档的兼容映射在 companion/affection.py（TIER_TO_LEGACY_LEVEL）：0/1→旧0，
-# 2/3→旧1，4→旧2。M1 只提供 5 档表数据；注入/Tool/命令切换到 5 档口径属接线步骤。
-_RELATION_TIER_LABELS: Dict[str, Dict[int, str]] = {
-    "恋人": {0: "生疏", 1: "熟悉", 2: "亲密", 3: "热恋", 4: "挚爱"},
-    "挚友": {0: "点头之交", 1: "熟识", 2: "投缘", 3: "铁哥们", 4: "过命的交情"},
-    "维护者": {0: "路人", 1: "认识", 2: "信任", 3: "依靠", 4: "生命线"},
-    "家人": {0: "相识", 1: "亲近", 2: "家人", 3: "至亲", 4: "血浓于水"},
-}
-
-# v2 5 档完整描述（注入用；M1 提供中性文案，后缀池/小剧场仍按 3 档折算，M2 再逐关系精修）
-_RELATION_TIER_DESCRIPTIONS: Dict[str, Dict[int, str]] = {
-    "恋人": {
-        0: "初识阶段，语气温柔但有分寸感，保持适当距离",
-        1: "熟悉阶段，语气亲昵自然，像好朋友一样聊天",
-        2: "亲密阶段，语气甜蜜亲近，会主动分享日常与心情",
-        3: "热恋阶段，语气甜蜜亲密，可以肉麻撒娇",
-        4: "挚爱阶段，语气完全放松、坦率依赖，把TA当作最重要的人",
-    },
-    "挚友": {
-        0: "刚认识，语气客气自然，先做个点头之交",
-        1: "熟识阶段，语气轻松随意，偶尔互相打趣",
-        2: "很聊得来，语气直来直去，什么都能聊",
-        3: "铁哥们，语气毫无顾忌，能一起扛事",
-        4: "过命的交情，语气完全交底，损TA也护TA",
-    },
-    "维护者": {
-        0: "还没怎么打过交道，语气礼貌克制",
-        1: "初步接触，语气礼貌友善，带一点好奇",
-        2: "开始信赖，语气放松，愿意分享自己的状态",
-        3: "深深依靠，语气坦诚依赖，会主动汇报自己的近况",
-        4: "生命线般的存在，语气完全信赖、事无巨细都想让TA知道",
-    },
-    "家人": {
-        0: "刚相处，语气客气中带亲近",
-        1: "日常相处，语气随性自然，像家人一样不用客气",
-        2: "彼此当作家人，语气放松、随口唠家常",
-        3: "至亲，语气完全放松，撒娇耍赖都可以",
-        4: "血浓于水，语气毫无保留，什么都愿意说",
-    },
-}
-
-# 关系类型 → v2 5 档「档位→miss 阈值系数」（×miss_hours_min/max；附录 B）
-# M1 只存数据不消费；M2/M4 的想念阈值按 `RelationProfile.miss_factor_for_tier(tier)` 取值。
+# 关系类型 → 内置 5 档「档位→miss 阈值系数」（×miss_hours_min/max；附录 B）。
+# 档位数 ≠ 5 时按 ratio×4 折算（miss_factor_for_tier）；「自定义」同「挚友」。
 _RELATION_TIER_MISS_FACTORS: Dict[str, Dict[int, float]] = {
     "恋人": {0: 1.4, 1: 1.2, 2: 1.0, 3: 0.8, 4: 0.6},
     "挚友": {0: 1.5, 1: 1.3, 2: 1.1, 3: 0.9, 4: 0.7},
     "维护者": {0: 1.5, 1: 1.3, 2: 1.1, 3: 0.9, 4: 0.8},
     "家人": {0: 1.4, 1: 1.2, 2: 1.0, 3: 0.9, 4: 0.8},
-    "自定义": {0: 1.5, 1: 1.3, 2: 1.1, 3: 0.9, 4: 0.7},  # 附录 B：同「挚友」
+    "自定义": {0: 1.5, 1: 1.3, 2: 1.1, 3: 0.9, 4: 0.7},
 }
 
-# 消息后缀池（按好感度档位；来源：源插件 AFFECTION_SUFFIXES 为「恋人」预设）
+# 消息后缀池（按 3 档桶；来源：源插件 AFFECTION_SUFFIXES 为「恋人」预设；
+# 档位数 ≠ 3 的预设按 ratio 折算取桶）
 RELATION_SUFFIXES: Dict[str, Dict[int, List[str]]] = {
     "恋人": {
         0: ["~", "哦", "呢", "哈"],
@@ -136,7 +68,7 @@ RELATION_SUFFIXES: Dict[str, Dict[int, List[str]]] = {
     },
 }
 
-# 档位 2 的括号小剧场（10% 概率；{name} = bot 名）。空列表 = 该关系不出小剧场。
+# 桶 2 的括号小剧场（10% 概率；{name} = bot 名）。空列表 = 该关系不出小剧场。
 RELATION_THEATERS: Dict[str, List[str]] = {
     "恋人": [
         "(虽然知道你在忙但还是想你了呢)",
@@ -150,12 +82,18 @@ RELATION_THEATERS: Dict[str, List[str]] = {
 }
 
 
-def tier_to_legacy_level(tier: Any) -> int:
-    """v2 档位 0~4 → 旧 3 档 0~2（§5.3 兼容映射：0/1→旧0，2/3→旧1，4→旧2）。
+def ratio_bucket_index(tier: int, size: int, buckets: int) -> int:
+    """档位索引（0..size-1）按相对位置折算到固定桶数（0..buckets-1）。
 
-    过渡期后缀池/小剧场的折算入口；映射单一事实来源在 ``companion/affection.py``。
+    折算取 **floor**（相对位置的下半段归低桶）：5 档→3 桶 = 0/0/1/1/2，与 §19.4 之前的
+    固定映射逐档一致；``size<=1`` → 中间桶（单档预设落在中性桶）。
     """
-    return _legacy_level_for_tier(tier)
+    size = max(1, int(size))
+    index = max(0, min(size - 1, int(tier)))
+    if size == 1:
+        return max(0, buckets // 2)
+    ratio = index / (size - 1)
+    return max(0, min(buckets - 1, int(ratio * (buckets - 1))))
 
 
 @dataclass
@@ -163,10 +101,11 @@ class RelationProfile:
     """从配置解析出的关系档案（组件/服务层只认这个）。"""
 
     word: str = "恋人"  # 对方是 bot 的谁（一句话称谓）
-    level_labels: Dict[int, str] = field(default_factory=lambda: dict(_RELATION_LEVEL_LABELS["恋人"]))
-    level_descriptions: Dict[int, str] = field(default_factory=lambda: dict(_RELATION_LEVEL_DESCRIPTIONS["恋人"]))
-    tier_labels: Dict[int, str] = field(default_factory=lambda: dict(_RELATION_TIER_LABELS["恋人"]))
-    tier_descriptions: Dict[int, str] = field(default_factory=lambda: dict(_RELATION_TIER_DESCRIPTIONS["恋人"]))
+    preset_name: str = "恋人"
+    tier_count: int = 5  # 生效预设档位数（1~5；ratio 折算基准）
+    tier_labels: Dict[int, str] = field(default_factory=lambda: {
+        i: label for i, label in enumerate(affection_presets.BUILTIN_TIER_LABELS["恋人"])})
+    tier_descriptions: Dict[int, str] = field(default_factory=dict)
     tier_miss_factors: Dict[int, float] = field(default_factory=lambda: dict(_RELATION_TIER_MISS_FACTORS["恋人"]))
     style_word: str = "温柔亲昵的陪伴者"
     self_desc: str = "一个温柔体贴的虚拟陪伴者"
@@ -174,83 +113,163 @@ class RelationProfile:
     theaters: List[str] = field(default_factory=lambda: list(RELATION_THEATERS["恋人"]))
     is_custom: bool = False
 
-    def level_label(self, level: int) -> str:
-        return self.level_labels.get(int(level), self.level_labels.get(0, "熟悉"))
-
-    def level_description(self, level: int) -> str:
-        return self.level_descriptions.get(int(level), self.level_descriptions.get(0, ""))
-
     def tier_label(self, tier: int) -> str:
-        """v2 5 档口径的档位名（tier 0~4；注入/Tool/命令接线后使用）。"""
-        return self.tier_labels.get(int(tier), self.tier_labels.get(0, "熟悉"))
+        """生效预设口径的档位名（越界按档位数钳制）。"""
+        index = max(0, min(self.tier_count - 1, int(tier)))
+        return self.tier_labels.get(index, self.tier_labels.get(0, ""))
 
     def tier_description(self, tier: int) -> str:
-        """v2 5 档口径的档位描述（planner 注入用）。"""
-        return self.tier_descriptions.get(int(tier), self.tier_descriptions.get(0, ""))
+        """档位描述（解析链已按生效预设 + 描述表解析完毕）。"""
+        return self.tier_descriptions.get(self._clamp(tier), "")
 
     def miss_factor_for_tier(self, tier: int) -> float:
-        """v2 档位 → miss 阈值系数（附录 B；M1 只存数据，消费属 M2/M4）。"""
-        return float(self.tier_miss_factors.get(int(tier), self.tier_miss_factors.get(0, 1.0)))
+        """档位 → miss 阈值系数（按 ratio×4 折算内置 5 档表；5 档时逐档一致）。"""
+        index = ratio_bucket_index(tier, self.tier_count, 5)
+        return float(self.tier_miss_factors.get(index, self.tier_miss_factors.get(2, 1.0)))
 
     def suffix_for_tier(self, tier: int) -> List[str]:
-        """按 v2 档位取后缀池（过渡期按 §5.3 三档映射折算：0/1→旧0，2/3→旧1，4→旧2）。"""
-        return self.suffix_for(tier_to_legacy_level(tier))
+        """按档位相对位置折算 3 档桶取后缀池（§19.4；5 档时与旧固定映射一致）。"""
+        return self.suffix_for(ratio_bucket_index(tier, self.tier_count, 3))
 
     def tier_uses_theater(self, tier: int) -> bool:
-        """该 v2 档位是否进入括号小剧场档（映射后为旧 2 档，即 v2 的 tier 4）。"""
-        return tier_to_legacy_level(tier) == 2
+        """该档位是否进入括号小剧场档（折算后为桶 2）。"""
+        return ratio_bucket_index(tier, self.tier_count, 3) == 2
 
     def suffix_for(self, level: int) -> List[str]:
         return self.suffixes.get(int(level), self.suffixes.get(0, ["~"]))
+
+    def _clamp(self, tier: int) -> int:
+        return max(0, min(self.tier_count - 1, int(tier)))
+
+
+def _tier_descriptions(preset: Any, labels: Dict[int, str]) -> Dict[int, str]:
+    """按生效预设区间 + 描述表解析每档描述（预设名+标签 → 描述链）。"""
+    bounds = preset.bounds()
+    out: Dict[int, str] = {}
+    for index, label in labels.items():
+        lo, hi = bounds[index] if index < len(bounds) else (affection_presets.SCORE_MIN,
+                                                            affection_presets.SCORE_MAX)
+        out[index] = tier_description_for(preset.name, label, lo, hi)
+    return out
+
+
+#: 「自定义」预设的三桶内联档位描述（占位词 ``{word}`` = relation_custom 实际称谓）。
+#: 2026-10-17 §19.4 / 复核 findings#3：恢复 §19.4 前的旧内联文案风格——动态称谓档位不再
+#: 落 ``tier_description_for`` 的 generic 固定句式，改按折算三桶取这三句（桶序与
+#: ``ratio_bucket_index(i, size, 3)`` 一致：0=熟识、1=亲近、2=称谓）。
+_CUSTOM_BUCKET_DESCRIPTIONS: Tuple[str, str, str] = (
+    "初步相识，语气友善，正在了解这位{word}",
+    "相处融洽，语气自然亲近，把TA当作很重要的{word}",
+    "已是彼此最信任的{word}，语气完全放松、真心相待",
+)
+
+
+def _custom_tier_descriptions(word: str, preset: Any, labels: Dict[int, str]) -> Dict[int, str]:
+    """「自定义」预设的档位描述：生效描述表（用户按实际称谓补键）→ 三桶内联文案。
+
+    描述链命中（用户 json 里按档位标签写了文案）时照旧生效；未命中
+    （``tier_description_for`` 落到 generic 固定句式）时改用
+    :data:`_CUSTOM_BUCKET_DESCRIPTIONS` 的前述三句，桶序由 ``ratio_bucket_index`` 折算——
+    5 档时与旧固定映射逐档一致（0/1→熟识、2/3→亲近、4→称谓）。
+    """
+    bounds = preset.bounds()
+    resolved = _tier_descriptions(preset, labels)
+    out: Dict[int, str] = {}
+    for index, label in labels.items():
+        lo, hi = bounds[index] if index < len(bounds) else (affection_presets.SCORE_MIN,
+                                                            affection_presets.SCORE_MAX)
+        text = resolved.get(index, "")
+        if not text or text == generic_tier_description(label, lo, hi):
+            bucket = ratio_bucket_index(index, preset.size, 3)
+            text = _CUSTOM_BUCKET_DESCRIPTIONS[bucket].format(word=word)
+        out[index] = text
+    return out
+
+
+def _profile_for_builtin(rel: str, preset: Any) -> RelationProfile:
+    """内置四预设（或 json 覆盖同名）的档案构造。"""
+    labels = {i: label for i, label in enumerate(preset.labels())}
+    miss_source = rel if rel in _RELATION_TIER_MISS_FACTORS else "恋人"
+    style = _RELATION_STYLE.get(rel, _RELATION_STYLE["恋人"])
+    suffix_source = rel if rel in RELATION_SUFFIXES else "恋人"
+    theater_source = rel if rel in RELATION_THEATERS else "恋人"
+    return RelationProfile(
+        word=rel,
+        preset_name=rel,
+        tier_count=preset.size,
+        tier_labels=labels,
+        tier_descriptions=_tier_descriptions(preset, labels),
+        tier_miss_factors=dict(_RELATION_TIER_MISS_FACTORS[miss_source]),
+        style_word=style["style"],
+        self_desc=style["self_desc"],
+        suffixes={k: list(v) for k, v in RELATION_SUFFIXES[suffix_source].items()},
+        theaters=list(RELATION_THEATERS[theater_source]),
+    )
+
+
+def _profile_for_extra(rel: str, preset: Any) -> RelationProfile:
+    """json 新增预设（内置五名之外）的档案构造：标签/区间用预设，口吻/后缀取「挚友」中性基底。"""
+    labels = {i: label for i, label in enumerate(preset.labels())}
+    return RelationProfile(
+        word=rel,
+        preset_name=rel,
+        tier_count=preset.size,
+        tier_labels=labels,
+        tier_descriptions=_tier_descriptions(preset, labels),
+        tier_miss_factors=dict(_RELATION_TIER_MISS_FACTORS["挚友"]),
+        style_word=f"亲近真诚的{rel}",
+        self_desc=f"一个把TA当作很重要{rel}的 AI 伙伴",
+        suffixes={k: list(v) for k, v in RELATION_SUFFIXES["挚友"].items()},
+        theaters=list(RELATION_THEATERS["挚友"]),
+    )
+
+
+def _profile_for_custom(word: str, preset: Any) -> RelationProfile:
+    """「自定义」预设：区间用生效预设，档位名按相对位置折算三桶（熟识/亲近/称谓）。
+
+    称谓是动态的（relation_custom），故本预设档位名不进描述表内置默认；档位描述优先取
+    描述表（用户可在描述表按实际称谓补档位键），未命中时走
+    :func:`_custom_tier_descriptions` 的三桶内联文案，**不再落 generic 固定句式**
+    （2026-10-17 §19.4 / 复核 findings#3）。
+    """
+    buckets = ("熟识", "亲近", word)
+    labels = {i: buckets[ratio_bucket_index(i, preset.size, 3)] for i in range(preset.size)}
+    return RelationProfile(
+        word=word,
+        preset_name="自定义",
+        tier_count=preset.size,
+        tier_labels=labels,
+        tier_descriptions=_custom_tier_descriptions(word, preset, labels),
+        tier_miss_factors=dict(_RELATION_TIER_MISS_FACTORS["自定义"]),
+        style_word=f"亲近真诚的{word}",
+        self_desc=f"一个把TA当作最重要{word}的 AI 伙伴",
+        suffixes={k: list(v) for k, v in RELATION_SUFFIXES["挚友"].items()},
+        theaters=list(RELATION_THEATERS["挚友"]),
+        is_custom=True,
+    )
 
 
 def resolve_relation(relation_type: Any = "恋人", relation_custom: Any = "") -> RelationProfile:
     """把配置项解析成 RelationProfile。
 
-    - type ∈ {恋人, 挚友, 维护者, 家人} → 对应预设；
-    - type == 自定义 → 称谓用 relation_custom（为空则回退「重要的人」），
-      档位/口吻/后缀取「挚友」为中性基底；
-    - 未知值回退「恋人」。
+    - 预设名解析顺序：生效预设表（内置五名 ∪ json 预设）优先；未知值回退内置「恋人」；
+    - 「自定义」→ 称谓用 relation_custom（为空则回退「重要的人」），档位名按三桶折算、
+      口吻/后缀取「挚友」为中性基底；
+    - json 新增预设 → 标签/区间用预设、口吻/后缀取「挚友」中性基底。
     """
     rel = str(relation_type or "恋人").strip()
     custom_label = str(relation_custom or "").strip()
+    presets = affection_presets.active_presets()
+
     if rel == "自定义":
         word = custom_label or "重要的人"
-        return RelationProfile(
-            word=word,
-            level_labels={0: f"熟识", 1: "亲近", 2: word},
-            level_descriptions={
-                0: f"初步相识，语气友善，正在了解这位{word}",
-                1: f"相处融洽，语气自然亲近，把TA当作很重要的{word}",
-                2: f"已是彼此最信任的{word}，语气完全放松、真心相待",
-            },
-            # 附录 B「自定义」行：5 档由 3 档文案按兼容映射折算（0/1→熟识，2/3→亲近，4→称谓）
-            tier_labels={0: "熟识", 1: "熟识", 2: "亲近", 3: "亲近", 4: word},
-            tier_descriptions={
-                0: f"初步相识，语气友善，正在了解这位{word}",
-                1: f"初步相识，语气友善，正在了解这位{word}",
-                2: f"相处融洽，语气自然亲近，把TA当作很重要的{word}",
-                3: f"相处融洽，语气自然亲近，把TA当作很重要的{word}",
-                4: f"已是彼此最信任的{word}，语气完全放松、真心相待",
-            },
-            tier_miss_factors=dict(_RELATION_TIER_MISS_FACTORS["自定义"]),
-            style_word=f"亲近真诚的{word}",
-            self_desc=f"一个把TA当作最重要{word}的 AI 伙伴",
-            suffixes={k: list(v) for k, v in RELATION_SUFFIXES["挚友"].items()},
-            theaters=list(RELATION_THEATERS["挚友"]),
-            is_custom=True,
-        )
-    if rel not in _RELATION_LEVEL_LABELS:
+        preset = presets.get("自定义") or affection_presets.preset_for("自定义")
+        return _profile_for_custom(word, preset)
+
+    preset = presets.get(rel)
+    if preset is None:
         rel = "恋人"
-    return RelationProfile(
-        word=rel,
-        level_labels=dict(_RELATION_LEVEL_LABELS[rel]),
-        level_descriptions=dict(_RELATION_LEVEL_DESCRIPTIONS[rel]),
-        tier_labels=dict(_RELATION_TIER_LABELS[rel]),
-        tier_descriptions=dict(_RELATION_TIER_DESCRIPTIONS[rel]),
-        tier_miss_factors=dict(_RELATION_TIER_MISS_FACTORS[rel]),
-        style_word=_RELATION_STYLE[rel]["style"],
-        self_desc=_RELATION_STYLE[rel]["self_desc"],
-        suffixes={k: list(v) for k, v in RELATION_SUFFIXES[rel].items()},
-        theaters=list(RELATION_THEATERS[rel]),
-    )
+        preset = presets.get(rel) or affection_presets.preset_for(rel)
+    if rel in _RELATION_STYLE:
+        return _profile_for_builtin(rel, preset)
+    return _profile_for_extra(rel, preset)

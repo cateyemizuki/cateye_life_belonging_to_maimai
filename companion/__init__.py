@@ -13,7 +13,7 @@
 - services          CompanionServices 服务束（plugin.py: self._companion = CompanionServices(self)）
 """
 
-from .affection import AffectionManager, LEVEL_DESCRIPTIONS, LEVEL_LABELS
+from .affection import AffectionManager
 from .components import CompanionComponentsMixin
 from .memory_manager import MemoryManager
 from .message_service import MessageService
@@ -26,8 +26,6 @@ __all__ = [
     "AffectionManager",
     "CompanionComponentsMixin",
     "CompanionServices",
-    "LEVEL_DESCRIPTIONS",
-    "LEVEL_LABELS",
     "MemoryManager",
     "MessageService",
     "PatrolService",

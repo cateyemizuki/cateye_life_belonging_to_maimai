@@ -2,22 +2,24 @@
 
 统一入口 :func:`record_rule_event` —— 频控 → 日累计限幅 → 入账 → 档位重估 → 事件日志：
 
-- 频控（§5.4）：``chat_round`` 日累计 ≤ +1.0；``user_initiated`` 日 ≤ +0.5；
+- 频控（§5.4）：``chat_round`` 日累计 ≤ +2.0；``user_initiated`` 日 ≤ +1.0；
   ``morning_exchange`` / ``night_exchange`` 各 1 次/日（**暂无触发点**：未接线，
   问候成功只写 planning 侧已发标记，不经本层入账）；``commitment_kept`` /
   ``commitment_broken`` 每约定 1 次（去重键见 ``key`` 参数）。
-- 日累计限幅（§5.5）：positive ≤ ``daily_positive_cap``(4.0)、negative ≥
-  ``-daily_negative_cap``(3.0)，超出部分记日志丢弃。
+- 日累计限幅（§5.5）：positive ≤ ``daily_positive_cap``(8.0)、negative ≥
+  ``-daily_negative_cap``(6.0)，超出部分记日志丢弃。（2026-10-17 §19.1 起 0~200 标度，
+  全部默认增量等比 ×2。）
 - 情绪调制（§六.2 B，M3 接线）：``delta_affection_final = delta × clamp(1 + 0.25 ×
   V_current × sign(delta), 0.6, 1.4)``；V_current 由 ``AffectionManager.emotion_valence()``
   读取（emotion 模块未接线/停用时返回 None → 乘数恒 1.0），开关
   ``affection.emotion_modulation``。调制系数与裁剪前后值落 decision_logs（§6.3-7）。
 
-调用方式二选一（等价）：
+调用方式二选一（等价）；示例增量取本表 ``chat_round`` 默认值
+（2026-10-17 §19.1 / 复核 findings#7：0~200 标度，0.05 的等比位 = 0.1）：
 
     from companion.affection_events import record_rule_event
-    record_rule_event(affection, "chat_round", 0.05, "一问一答")
-    affection.record_rule_event("chat_round", 0.05, "一问一答")
+    record_rule_event(affection, "chat_round", 0.1, "一问一答")
+    affection.record_rule_event("chat_round", 0.1, "一问一答")
 
 M2 的好感 LLM 裁判 kind（``llm_review`` / ``daily_review``）已登记：增量由裁判输出并在
 referee 侧二次限幅，本层只做日累计限幅与入账。其余 M3/M6 的 kind（``silence_day`` /
@@ -36,40 +38,41 @@ logger = logging.getLogger(__name__)
 #: bot 沉默多久后「对方先开口」才算 user_initiated（小时；§5.4）
 USER_INITIATED_SILENCE_HOURS = 1.0
 
-#: M1 规则事件表（§5.4；delta 为默认增量，daily_kind_cap = 同日同 kind 正增量累计上限）
+#: M1 规则事件表（§5.4；delta 为默认增量，daily_kind_cap = 同日同 kind 正增量累计上限。
+#: 2026-10-17 §19.1：0~200 标度，全部增量等比 ×2——体验等价迁移）
 RULE_EVENT_TABLE: dict[str, dict[str, Any]] = {
     "chat_round": {
-        "delta": 0.05,
-        "daily_kind_cap": 1.0,
+        "delta": 0.1,
+        "daily_kind_cap": 2.0,
         "desc": "与 target 一问一答",
-        "note": "日累计 ≤ +1.0（防刷分；消息轰炸无效）",
+        "note": "日累计 ≤ +2.0（防刷分；消息轰炸无效）",
     },
     "user_initiated": {
-        "delta": 0.15,
-        "daily_kind_cap": 0.5,
+        "delta": 0.3,
+        "daily_kind_cap": 1.0,
         "desc": "bot 沉默 ≥1h 后对方先开口",
-        "note": "日 ≤ +0.5",
+        "note": "日 ≤ +1.0",
     },
     "morning_exchange": {
-        "delta": 0.2,
+        "delta": 0.4,
         "once_per_day": True,
         "desc": "互道早安",
         "note": "各 1 次/日；暂无触发点（未接线；问候成功只写 planning 侧已发标记）",
     },
     "night_exchange": {
-        "delta": 0.2,
+        "delta": 0.4,
         "once_per_day": True,
         "desc": "互道晚安",
         "note": "各 1 次/日；暂无触发点（未接线；问候成功只写 planning 侧已发标记）",
     },
     "commitment_kept": {
-        "delta": 1.0,
+        "delta": 2.0,
         "per_key_once": True,
         "desc": "约定兑现",
         "note": "每约定 1 次",
     },
     "commitment_broken": {
-        "delta": -0.5,
+        "delta": -1.0,
         "per_key_once": True,
         "desc": "约定违约",
         "note": "每约定 1 次",
@@ -79,17 +82,17 @@ RULE_EVENT_TABLE: dict[str, dict[str, Any]] = {
     "llm_review": {
         "delta": 0.0,
         "desc": "会话采样裁判",
-        "note": "M2：delta ∈ [-2, +2.5] 由裁判传入（缺省 0 表示无事件，会被丢弃）",
+        "note": "M2：delta ∈ [-4, +5] 由裁判传入（缺省 0 表示无事件，会被丢弃）",
     },
     "daily_review": {
         "delta": 0.0,
         "desc": "关系日结",
-        "note": "M2：delta ∈ [-2, +2] 由裁判传入；独立于 kind 上限、受 §5.5 日累计限幅",
+        "note": "M2：delta ∈ [-4, +4] 由裁判传入；独立于 kind 上限、受 §5.5 日累计限幅",
     },
 }
 
-DEFAULT_DAILY_POSITIVE_CAP = 4.0
-DEFAULT_DAILY_NEGATIVE_CAP = 3.0
+DEFAULT_DAILY_POSITIVE_CAP = 8.0
+DEFAULT_DAILY_NEGATIVE_CAP = 6.0
 
 #: 情绪调制兜底乘数（无情绪上下文/开关关闭时的恒等值；M3 起真实调制见 _emotion_multiplier）
 _EMOTION_MULTIPLIER = 1.0

@@ -789,25 +789,32 @@ class CompanionComponentsMixin:
 
     @Tool(
         "lbm_mai_lover_affection",
-        description="调整与关系对象的好感度：把 score 移动到 0/1/2 兼容档对应的 v2 5 档区间中值并重估档位"
-                    "（档位名称随关系类型变化，如恋人=熟悉/亲密/热恋）",
+        description="调整与关系对象的好感度：把 score 移动到指定档位的区间中值并重估档位"
+                    "（档位数 1~5 随好感度预设表变化，档位名称如恋人=生疏/熟悉/亲密/热恋/挚爱）",
         parameters={
-            "level": {
+            "tier": {
                 "type": "integer",
-                "description": "好感度兼容档位（3 档口径），只能填 0、1 或 2",
+                "description": "好感度档位（1 起计数，上限随当前预设 1~5 档）",
                 "required": True,
             },
         },
     )
-    async def mai_tool_affection(self, level: int = 0, **kwargs: Any) -> str:
-        """LLM Tool：按 3 档兼容口径移动 score 到对应 v2 档区间（管理员兜底，跳过迟滞）。"""
+    async def mai_tool_affection(self, tier: int = 1, **kwargs: Any) -> str:
+        """LLM Tool：把 score 移到指定档（1~N，1 起计数）的区间中值（管理员兜底，跳过迟滞）。"""
         companion = self._mai_companion()
         if companion is None:
             return "好感度管理器未初始化。"
-        if level not in (0, 1, 2):
-            return f"档位只能填 0（熟悉）、1（亲密）或 2（热恋），收到的是 {level}。"
-        companion.affection.update_level(int(level))
-        self.ctx.logger.info(f"好感度已通过 Tool 调整到兼容档 {level}（score 移至对应 v2 档区间）")
+        preset = companion.affection.preset()
+        tier_count = preset.size
+        labels = "、".join(f"{i + 1}={label}" for i, label in enumerate(preset.labels()))
+        try:
+            requested = int(tier)
+        except (TypeError, ValueError):
+            return f"档位必须是 1~{tier_count} 的整数，收到的是 {tier!r}。"
+        if not 1 <= requested <= tier_count:
+            return f"档位只能填 1~{tier_count}（当前预设档位：{labels}），收到的是 {requested}。"
+        companion.affection.set_tier(requested - 1)
+        self.ctx.logger.info(f"好感度已通过 Tool 调整到第 {requested} 档（score 移至对应区间中值）")
         return f"好感度已更新：{self._mai_affection_state_line()}"
 
     # ==================================================================
@@ -850,7 +857,7 @@ class CompanionComponentsMixin:
         return False
 
     @Command(name="/lbm_mai_affection", pattern=r"(?<!\S)/lbm_mai_affection(?:\s+(?P<mai_level>\S+))?\s*$",
-             description="查看/调整好感度（score/baseline/档位/今日Δ）。用法: /lbm_mai_affection [0|1|2]")
+             description="查看/调整好感度（score/baseline/档位/今日Δ）。用法: /lbm_mai_affection [档位1~N]")
     async def mai_cmd_affection(self, **kwargs: Any) -> tuple[bool, str, bool]:
         companion = self._mai_companion()
         if not await self._authorize_command(kwargs):
@@ -872,28 +879,34 @@ class CompanionComponentsMixin:
             except Exception as e:
                 self.ctx.logger.warning(f"mai_cmd_affection 回复发送失败: {e}")
 
+        preset = companion.affection.preset() if companion else None
+        tier_count = preset.size if preset else 5
+        labels = preset.labels() if preset else ()
+        usage = "、".join(f"{i + 1}={labels[i]}" for i in range(min(tier_count, len(labels)))) \
+            or "1~%d" % tier_count
         if not level_str:
-            # 不带参数 = 查看好感 v2 状态（M2：含最近印象与关系温度）
+            # 不带参数 = 查看好感状态（M2：含最近印象与关系温度）
             current = self._mai_affection_state_line() if companion else "好感度管理器未初始化。"
             await _reply(
-                "用法: /lbm_mai_affection <0|1|2>（不带参数只看状态）\n"
-                "0 = 熟悉档区间 | 1 = 亲密档区间 | 2 = 热恋档区间（3 档兼容口径，实际按 v2 score 运行）\n"
+                f"用法: /lbm_mai_affection <1~{tier_count}>（不带参数只看状态）\n"
+                f"档位（预设「{companion.affection.preset_name() if companion else '恋人'}」）：{usage}"
+                f"（score 移至该档区间中值）\n"
                 f"当前状态: {current}"
             )
             return False, "参数错误", True
         try:
-            level = int(level_str)
+            tier_1based = int(level_str)
         except (ValueError, TypeError):
-            await _reply(f"「{level_str}」不是有效数字，请使用 0、1 或 2。")
+            await _reply(f"「{level_str}」不是有效数字，请使用 1~{tier_count}。")
             return False, "参数错误", True
-        if level not in (0, 1, 2):
-            await _reply(f"好感度档位只能是 0（熟悉）、1（亲密）或 2（热恋），收到的是 {level}。")
+        if not 1 <= tier_1based <= tier_count:
+            await _reply(f"好感度档位只能填 1~{tier_count}（当前预设：{usage}），收到的是 {tier_1based}。")
             return False, "参数错误", True
         if companion is None:
             await _reply("好感度管理器未初始化，无法调整。")
             return False, "管理器未初始化", True
-        companion.affection.update_level(level)
-        self.ctx.logger.info(f"好感度已通过命令调整到兼容档 {level}（score 移至对应 v2 档区间）")
+        companion.affection.set_tier(tier_1based - 1)
+        self.ctx.logger.info(f"好感度已通过命令调整到第 {tier_1based} 档（score 移至对应区间中值）")
         await _reply(f"好感度已更新：{self._mai_affection_state_line()}")
         return True, "好感度已调整", True
 
@@ -906,7 +919,7 @@ class CompanionComponentsMixin:
         name = self._mai_lover_name()
         help_text = (
             f"{name} 可用命令:\n"
-            "/lbm_mai_affection — 查看/调整好感度: /lbm_mai_affection [0|1|2]\n"
+            "/lbm_mai_affection — 查看/调整好感度: /lbm_mai_affection <1~档位数>\n"
             "/lbm_diag          — 排障诊断 [llm|decision|life] [天数]（管理员；旧名 mai_llm_log/mai_diag 仍可用）\n"
             "/lbm_dashboard     — 状态总览图（日程/关系/情绪/空间，管理员）\n"
             "日程与生活管理见 /lbm_plan 与 /lbm_life\n"
@@ -1384,16 +1397,13 @@ class CompanionComponentsMixin:
         return ("状态: " + "｜".join(parts)) if parts else ""
 
     def _mai_config_affection_line(self) -> str:
-        """配置摘要里的好感度段：优先 v2 实时读数（score/baseline/档位），管理器不可用回退静态档。
+        """配置摘要里的好感度段：优先实时读数（score/baseline/档位，0~200），管理器不可用回退占位。
 
         档位名规则与 :meth:`_mai_affection_state_line` 一致（优先 ``companion.relation.tier_label``）；
-        读数任一步失败（未初始化/字段缺失/异常）都降级为配置静态值 ``affection.current_level``，
-        绝不向调用方抛异常（配置摘要行不该连带整条状态总览发不出去）。
+        读数任一步失败（未初始化/字段缺失/异常）都降级为占位文案，绝不向调用方抛异常
+        （配置摘要行不该连带整条状态总览发不出去）。§19.4：v1 兼容档展示已移除。
         """
-        try:
-            fallback = f"好感度: {self.config.affection.current_level}"
-        except Exception:
-            fallback = "好感度: 未知"
+        fallback = "好感度: 未知"
         companion = self._mai_companion()
         if companion is None:
             return fallback
@@ -1402,7 +1412,6 @@ class CompanionComponentsMixin:
             score = float(affection.score())
             baseline = float(affection.baseline())
             tier = int(affection.tier())
-            level = int(affection.level())
         except Exception:
             return fallback
         label = ""
@@ -1418,7 +1427,7 @@ class CompanionComponentsMixin:
             except Exception:
                 label = str(tier)
         return (f"好感度: score {score:.1f}/baseline {baseline:.1f}/"
-                f"档位 {tier}·{label}（v1 兼容档 {level}）")
+                f"档位 {tier}·{label}")
 
     def _mai_config_summary(self, multiline: bool) -> str:
         """配置摘要（单行紧凑版给状态总览文本降级路径；多行版保留完整排版，当前无命令入口）。
@@ -1597,10 +1606,11 @@ class CompanionComponentsMixin:
                 for i in items]
 
     @API("companion_get_affection_level",
-         description="获取当前好感度档位。返回 0/1/2（兼容虚拟陪伴插件返回结构）",
+         description="获取当前好感度档位索引（0 起计数，0..N-1；N=当前预设档位数 1~5。"
+                     "2026-10-17 起 v1 三档 0/1/2 兼容口径已移除，改为返回当前档位索引）",
          version="1", public=True)
     async def mai_api_get_affection_level(self, **kwargs: Any) -> int:
         companion = self._mai_companion()
         if companion is None:
             return 0
-        return companion.affection.level()
+        return companion.affection.tier()

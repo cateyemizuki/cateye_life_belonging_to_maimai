@@ -805,20 +805,34 @@ class PatrolService:
         return True
 
     def _silence_target_bonus(self) -> float:
-        """当前档位的 target 加算加成 = step × (档位+1)（§5.3 / §6.2 A；读不到按 0）。
+        """当前档位的 target 加算加成 = step × (档位相对位置 × 4 + 1)（§5.3 / §6.2 A；读不到按 0）。
 
         step 优先取情绪服务（``plugin._emotion.target_bonus_step()``；M12/D7 起该路径已含
         「JSON 覆盖 > config > 默认」三层合并，与桥内入账的 K 同源），服务不可得（模块停用/
         热重载窗口/异常）时回退 ``[emotion].target_bonus_step`` 直读。档位读 affection 状态层；
         任一不可得时返回 0（不猜档位、不猜配置）。
+
+        2026-10-17 §19.4 / 复核 findings#1：档位数可变（1~5 档预设）后改为与
+        ``emotion/service.py`` 的 ``target_bonus()`` **同款 ratio×4+1 连续化**——档位数取
+        ``affection.preset().size``（N≤1 时 ratio=0），``tier()`` 已在状态层按生效预设钳制、
+        此处只防负数。5 档时与旧 ``step × (tier+1)`` 逐档恒等（ratio=tier/4），
+        留痕 payload 与桥内实际入账的 K 不再各写一套口径。
         """
         tier_getter = getattr(self._affection, "tier", None)
         if not callable(tier_getter):
             return 0.0
         try:
-            tier = max(0, min(4, int(tier_getter())))
+            tier = max(0, int(tier_getter()))
         except Exception:
             return 0.0
+        preset_getter = getattr(self._affection, "preset", None)
+        try:
+            preset = preset_getter() if callable(preset_getter) else None
+            count = int(getattr(preset, "size", 5)) if preset is not None else 5
+        except Exception:
+            count = 5
+        count = max(1, count)
+        ratio = 0.0 if count <= 1 else min(1.0, tier / (count - 1))
         step: Optional[float] = None
         service = self._emotion_service()
         step_getter = getattr(service, "target_bonus_step", None)
@@ -833,7 +847,7 @@ class PatrolService:
                 step = float(getattr(cfg, "target_bonus_step", 0.1) or 0.1)
             except (TypeError, ValueError):
                 step = 0.1
-        return max(0.0, min(1.0, step)) * (tier + 1)
+        return max(0.0, min(1.0, step)) * (ratio * 4.0 + 1.0)
 
     def _emotion_cfg(self) -> Any:
         """[emotion] 配置段（self._config 可能是 plugin 或配置对象本身；均可空降级）。"""
@@ -905,9 +919,12 @@ class PatrolService:
         if not callable(tier_getter):
             return 1.0
         try:
-            tier = max(0, min(4, int(tier_getter())))
+            tier = int(tier_getter())
         except Exception:
             return 1.0
+        # 档位数随生效预设（1~5 档，2026-10-17 §19）；RelationProfile.miss_factor_for_tier
+        # 内部已按 ratio 折算，此处只需防负数
+        tier = max(0, tier)
         factor_getter = getattr(getattr(self, "_relation", None), "miss_factor_for_tier", None)
         if not callable(factor_getter):
             return 1.0
