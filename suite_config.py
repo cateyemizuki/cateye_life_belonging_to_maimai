@@ -105,7 +105,8 @@ LEGACY_AFFECTION_KEYS = ("current_level",)
 #: （§9.7 教训口径：显式 pop 丢弃并登记，不做任何值搬运）。
 LEGACY_SILENCE_KEYS = {
     "patrol": ("silence_start", "silence_end"),
-    "qzone": ("silence_start", "silence_end"),
+    # post_blocked_activities 随「发空间不再按活动判定」移除（2026-10-20 用户指示）
+    "qzone": ("silence_start", "silence_end", "post_blocked_activities"),
 }
 
 #: 1.0.0（配置整理轮之前）[patrol] 「想念触发说明」的出厂文案——仅用于迁移时判断「用户改过没有」。

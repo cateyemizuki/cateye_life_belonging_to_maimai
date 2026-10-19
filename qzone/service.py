@@ -44,13 +44,11 @@ from suite_prompts import (
 )
 from .cgi import QzoneCookieManager, QzoneWebClient
 from .decision import (
-    ActivityType,
     DecisionHistory,
-    classify_activity,
-    normalize_blocked_activities,
     parse_llm_decision,
 )
 from .image_sources import collect_images
+from companion.patrol import nap_item_matches
 from planning.schedule_query import ScheduleQuery
 from core.storage import load_json, save_json_atomic
 from planning.time_utils import is_in_time_window
@@ -427,13 +425,16 @@ class QzoneService:
             result="ok" if result else "fail")
         return result
 
-    # ---- §18.4 发帖判定链（MaiTrace v3.1 移植；融合既有 require_activity/post_rate 前置层）----
+    # ---- §18.4 发帖判定链（MaiTrace v3.1 移植骨架；2026-10-20 用户指示精简）----
     async def _post_gate_chain(self, date: str, now: datetime) -> bool:
         """判定链主入口：全部闸通过返回 True；任一闸拒绝 → 记历史并返回 False。
 
-        闸序（成本从低到高）：静默时段复检 → 无活动（含睡眠）→ 睡眠硬跳 → 冷却 →
-        活动黑名单 → LLM 严判（可关）→ 掷骰上限（可关）。规则只认枚举，
-        自由文本先经 :func:`classify_activity` 归类，归类失败落 ``other`` 由 LLM 闸兜底。
+        闸序（成本从低到高）：静默时段复检 → 无活动 → 午休静默（``[patrol]
+        nap_quiet_enabled`` 开启时跨模块生效，2026-10-20 用户指示）→ 冷却 →
+        LLM 严判（可关）→ 掷骰上限（可关）。
+        **不再按活动类型拦**：原睡眠硬跳与活动黑名单两闸已移除——「是否允许发空间」
+        的时段维度只看静默（恒复用 `[schedule]` 作息 + 可选午休静默），内容质量由
+        LLM 严判把关；夜间睡觉条目天然落在静默窗内，白天午睡由午休静默/LLM 闸承接。
         """
         cfg = self._qzone_cfg()
         # 闸 0：静默时段（2026-10-20 起恒复用 [schedule] 作息，与陪伴静默同一真源；
@@ -443,52 +444,54 @@ class QzoneService:
                              now.strftime("%H:%M"), invalid_result=True):
             self._record_decision("skip", gate="silence", reason="静默时段（跟随日程作息）")
             return False
-        # 闸 1：无活动 → 不发（最保守兜底；含睡眠条目，睡眠在下一闸单独识别）
+        # 闸 1：无活动 → 不发（最保守兜底；activity_type 维度拦截已按 2026-10-20 指示移除）
         activity = self._schedule.find_current_activity(date, now, include_sleep=True)
         if activity is None:
             self._record_decision("skip", gate="no_activity", reason="当前无日程活动（含睡眠）")
             return False
-        activity_type = classify_activity(
-            activity.get("goal_type"),
-            f"{activity.get('name') or ''} {activity.get('description') or ''}",
-        )
-        # 闸 2：睡眠类硬跳过（连 LLM 都不问）
-        if activity_type is ActivityType.SLEEPING:
-            self._record_decision("skip", activity_type=activity_type.value, gate="sleeping",
-                                  reason="睡眠中（硬跳过，不花 LLM）")
+        # 闸 2：午休静默（2026-10-20 用户指示：nap_quiet_enabled 由陪伴巡检扩展到空间——
+        # 午休/小睡条目中不发说说、不监听评论；判定与 companion.patrol 同源 nap_item_matches）
+        if self._nap_quiet_enabled() and nap_item_matches(activity):
+            self._record_decision("skip", gate="nap_quiet",
+                                  reason="午休/小睡中（[patrol] nap_quiet_enabled，跨模块静默）")
             return False
         activity_name = str(activity.get("name") or activity.get("description") or "活动")
         # 闸 3：冷却（锚点只在发送成功后更新；失败不重置）
         remain_minutes = self._cooldown_remain_minutes(now)
         if remain_minutes > 0:
-            self._record_decision("skip", activity_type=activity_type.value, gate="cooldown",
+            self._record_decision("skip", gate="cooldown",
                                   reason=f"冷却中（剩余约 {remain_minutes} 分钟）")
             return False
-        # 闸 4：活动黑名单（枚举比对；黑名单配置经归一化，非法项忽略）
-        blocked = normalize_blocked_activities(getattr(cfg, "post_blocked_activities", None))
-        if activity_type.value in blocked:
-            self._record_decision("skip", activity_type=activity_type.value, gate="blacklist",
-                                  reason=f"活动黑名单（{activity_type.value}：{activity_name}）")
-            return False
-        # 闸 5：LLM 严判（可关；只认回复首字符「是/否」，格式异常一律按否）
+        # 闸 4：LLM 严判（可关；只认回复首字符「是/否」，格式异常一律按否）
         if bool(getattr(cfg, "post_llm_gate_enabled", True)):
             allowed, reason, answer = await self._llm_post_gate(activity, now)
             if not allowed:
-                self._record_decision("skip", activity_type=activity_type.value, gate="llm",
+                self._record_decision("skip", gate="llm",
                                       reason=f"LLM 严判不发（{reason or '未说明'}）",
                                       llm_answer=answer)
                 return False
-            self._record_decision("pass", activity_type=activity_type.value, gate="llm",
+            self._record_decision("pass", gate="llm",
                                   reason=f"LLM 严判通过（{reason or '未说明'}）", llm_answer=answer)
-        # 闸 6：可选掷骰（LLM 通过后的概率上限，防误判刷屏；1.0 = 不掷骰）
+        # 闸 5：可选掷骰（LLM 通过后的概率上限，防误判刷屏；1.0 = 不掷骰）
         max_chance = self._clamp_float(getattr(cfg, "post_max_chance", 1.0), 1.0, 0.0, 1.0)
         if max_chance < 1.0 and random.random() > max_chance:
-            self._record_decision("skip", activity_type=activity_type.value, gate="chance",
+            self._record_decision("skip", gate="chance",
                                   reason=f"掷骰未过（上限 {max_chance:.2f}）")
             return False
-        self._record_decision("allow", activity_type=activity_type.value, gate="chain",
+        self._record_decision("allow", gate="chain",
                               reason=f"判定链通过（{activity_name}）")
         return True
+
+    def _nap_quiet_enabled(self) -> bool:
+        """午休静默开关（``[patrol].nap_quiet_enabled``，缺省 False；2026-10-20 用户指示
+        该开关由陪伴巡检扩展到空间——开启后空间判定链同样在午休/小睡时段静默）。
+
+        配置读取兼容两种形态（与 :func:`_sleep_silence_window` 同款）：配置对象本身（含
+        ``patrol`` 段）或 plugin 实例（各段挂在 ``.config``）。"""
+        patrol = getattr(self._plugin, "patrol", None)
+        if patrol is None:
+            patrol = getattr(getattr(self._plugin, "config", None), "patrol", None)
+        return bool(getattr(patrol, "nap_quiet_enabled", False))
 
     async def _llm_post_gate(self, activity: Dict[str, Any], now: datetime) -> Tuple[bool, str, str]:
         """闸 5：LLM 严判「此刻发一条说说是否自然」。返回 ``(放行, 理由, 原文)``。
@@ -872,6 +875,17 @@ class QzoneService:
         silence_start, silence_end = _sleep_silence_window(self._plugin)
         if is_in_time_window(silence_start, silence_end, current_hhmm, invalid_result=True):
             return
+        # 午休静默（2026-10-20 用户指示：[patrol] nap_quiet_enabled 跨模块——命中午休/小睡
+        # 条目时整轮 silent 早退，发说说与评论监听都不；与外层静默闸同布局。
+        # 判定链内另有同口径闸 2，保证手动/链路直接调用时留 gate=nap_quiet 痕迹）
+        if self._nap_quiet_enabled():
+            nap_item = None
+            try:
+                nap_item = self._schedule.find_current_activity(today, now, include_sleep=True)
+            except Exception as nap_exc:
+                self.ctx.logger.warning(f"午休静默判定读日程失败（按非午休继续本轮）: {nap_exc}")
+            if nap_item_matches(nap_item):
+                return
         # 按日程发说说
         if cfg.daily_max_posts > 0 and self.posts_today() < cfg.daily_max_posts and cfg.post_by_schedule:
             # M4（§6.2 D）：发帖判定 = post_rate × mood_effect.post_rate；

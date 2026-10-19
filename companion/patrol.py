@@ -157,6 +157,25 @@ def _fallback_schedule_anchors() -> Tuple[str, str]:
         return _FALLBACK_SCHEDULE_WAKE, _FALLBACK_SCHEDULE_SLEEP
 
 
+#: 午休/小睡条目的名称词表（companion 巡检与空间静默共用；2026-10-20 用户指示
+#: `[patrol].nap_quiet_enabled` 跨模块生效——qzone 判定链经 :func:`nap_item_matches` 同源判定）
+NAP_NAME_KEYWORDS: Tuple[str, ...] = ("午休", "午睡", "小憩", "打盹")
+
+
+def nap_item_matches(item: Any) -> bool:
+    """日程条目是否命中午休/小睡（名称含关键词，或 ``goal_type == "rest"``）。
+
+    companion 巡检的午休静默与 qzone 判定链的午休静默共用本判定（2026-10-20 跨模块口径）；
+    非法入参一律 False（不把垃圾数据当成午休）。
+    """
+    if not isinstance(item, dict):
+        return False
+    name = str(item.get("name") or "")
+    if any(keyword in name for keyword in NAP_NAME_KEYWORDS):
+        return True
+    return str(item.get("goal_type") or "") == "rest"
+
+
 def resolve_silence_window(config: Any) -> SilenceWindow:
     """解析静默窗的**生效值**（2026-10-20 用户指示后的单一真源：**恒复用** ``[schedule]`` 作息）。
 
@@ -1080,18 +1099,16 @@ class PatrolService:
         """
         return resolve_silence_window(self._config)
 
-    #: 午休/小睡条目的名称词表（与 proactive_service._SLEEP_NAME_KEYWORDS 的午休类同源口径）
-    _NAP_NAME_KEYWORDS = ("午休", "午睡", "小憩", "打盹")
-
     def _nap_quiet_enabled(self) -> bool:
-        """午休静默开关（``[patrol].nap_quiet_enabled``，缺省 False = 现状：午休照常巡检）。"""
+        """午休静默开关（``[patrol].nap_quiet_enabled``，缺省 False = 现状：午休照常巡检；
+        2026-10-20 用户指示后开启时同样约束空间发帖/评论监听——qzone 判定链同源判定）。"""
         section = getattr(self._config, "patrol", None) if self._config is not None else None
         return bool(getattr(section, "nap_quiet_enabled", False))
 
     def _nap_in_progress(self, now: datetime) -> bool:
         """当前是否处于午休/小睡条目中（读日程查询；查询不可用/异常 → False 可空降级）。
 
-        识别口径：当前条目名称含 午休/午睡/小憩/打盹，或 ``goal_type == "rest"``（休息类）。
+        识别口径经 :func:`nap_item_matches`（与 qzone 空间静默同源）。
         """
         query = self._schedule
         if query is None:
@@ -1100,12 +1117,7 @@ class PatrolService:
             item = query.find_current_activity(now=now, include_sleep=True)
         except Exception:
             return False
-        if not item:
-            return False
-        name = str(item.get("name") or "")
-        if any(keyword in name for keyword in self._NAP_NAME_KEYWORDS):
-            return True
-        return str(item.get("goal_type") or "") == "rest"
+        return nap_item_matches(item)
 
     def _collect_invalid_time_keys(self, window: Optional[SilenceWindow] = None) -> list[str]:
         """收集**生效**静默窗里格式非法的（HH:MM）来源配置项，并对每个非法值告警一次。

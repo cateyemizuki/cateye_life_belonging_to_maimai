@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Dict, List
+from typing import ClassVar, Dict
 
 from maibot_sdk import Field, PluginConfigBase
 
@@ -112,17 +112,10 @@ class QzoneSectionConfig(PluginConfigBase):
             **_ui_i18n("Post cooldown (min)"),
         },
     )
-    post_blocked_activities: List[str] = Field(
-        default_factory=lambda: ["sleeping", "working", "studying", "eating", "exercising"],
-        description="活动黑名单：当前活动归类命中这些类型时本轮不发（枚举值：sleeping/waking_up/eating/"
-                    "working/studying/exercising/relaxing/socializing/commuting/hobby/self_care/other）；"
-                    "空列表=不拦",
-        json_schema_extra={
-            "label": "活动黑名单",
-            "hint": "留空 = 不按活动类型拦截",
-            **_ui_i18n("Blocked activities"),
-        },
-    )
+    # 注（2026-10-20 用户指示）：原 post_blocked_activities（活动黑名单）已删除——「是否允许
+    # 发空间」不再按活动类型判定，时段维度只看静默（恒复用 [schedule] 作息；开启
+    # [patrol].nap_quiet_enabled 时叠加午休静默），内容质量由 LLM 严判把关。
+    # 旧配置里的显式值由迁移器一并丢弃并登记。
     post_llm_gate_enabled: bool = Field(
         default=True,
         description="发帖前让模型严格判断「此刻发一条是否自然」（正反例 + 强烈压制「是」，"
