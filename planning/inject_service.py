@@ -355,6 +355,10 @@ class InjectService:
                 )
 
             # 检查对话上下文：判断是否在连续讨论日程话题
+            # （should_continue_inject 的规则 2「活动变化」需要 current_activity，
+            # 但该判据自 R0 基线起从未在此路径生效——首调传 None 时恒 False，
+            # 且取到活动后的二次调用与首调同 tick 必然返回恒等结果、只多打一条
+            # debug 日志（真机 2320 对逐字重复的根因，2026-10-20 取证），故只调一次）
             context_continue_inject = False
             context_reason: Optional[str] = None
             if self._context_cache is not None:
@@ -366,12 +370,6 @@ class InjectService:
             current_activity, current_description, all_future_activities, activity_type = (
                 await self._get_current_schedule(chat_id)
             )
-
-            # 更新对话上下文：用当前活动重新判断
-            if self._context_cache is not None and context_continue_inject:
-                context_continue_inject, context_reason = self._context_cache.should_continue_inject(
-                    user_id, current_activity,
-                )
 
             # 无当前活动不再静默早退（N1-2）：照常走「分类 → 决策 → 模板路由」，
             # 模板侧自动切到空活动变体（兜底文案见 [prompts].inject_no_activity）。

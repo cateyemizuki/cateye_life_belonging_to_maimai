@@ -127,6 +127,14 @@ _ACTION_SPOKEN = DecisionLogger.ACTION_SPOKEN
 _PLACEHOLDER_QQ = "123456789"
 
 
+def _vad_float(value: Any) -> float:
+    """三维数值字段的安全读数（缺键/坏类型 → 0.0；随图日志变动计算用）。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _message_plain_text(message: Any) -> str:
     """取入站消息纯文本（M2 会话裁判的「对话摘要」来源）。
 
@@ -1020,17 +1028,21 @@ class CompanionComponentsMixin:
                 self.ctx.logger.error(f"mai_cmd_dashboard 发送失败: {e}")
                 return False, f"发送失败: {e}", True
 
-        # F2（2026-10-11）+ 用户续批：面板图在前，其后跟随「日程与情绪变动」日志文字档
-        #（最多 98 条；无记录时不发文字档）。合并转发上限 99 条，图片占 1 条。
+        # F2（2026-10-11）+ 2026-10-20 用户口径：面板图在前，其后跟随「日程与情绪变动」
+        # 日志文字档（48h 窗口；每条消息 ≤50 条日志、单次最多 10 条消息 = 500 条；
+        # 无记录时不发文字档）。合并转发上限 99 条，图片占 1 条，分片最多 10 条。
         records: list[dict[str, Any]] = [
             {"user_id": "0", "nickname": "状态总览",
              "segments": [{"type": "image", "content": image_base64}]},
         ]
-        change_log = self._mai_change_log_text(hours=24, cap=98)
-        if change_log:
+        change_logs = self._mai_change_log_text(hours=48, cap=500)
+        total_logs = len(change_logs)
+        for index, segment_text in enumerate(change_logs):
+            nickname = ("日程与情绪变动" if total_logs == 1
+                        else f"日程与情绪变动 {index + 1}/{total_logs}")
             records.append({
-                "user_id": "0", "nickname": "日程与情绪变动",
-                "segments": [{"type": "text", "content": change_log}]},
+                "user_id": "0", "nickname": nickname,
+                "segments": [{"type": "text", "content": segment_text}]},
             )
         try:
             await self.ctx.send.forward(records, stream_id)
@@ -1042,9 +1054,10 @@ class CompanionComponentsMixin:
         except Exception as img_exc:
             # 图片只是尽力而为的附加档：它失败也必须继续落到文本档（否则管理员什么都收不到）
             self.ctx.logger.warning(f"状态总览图片回退发送失败: {img_exc}")
-        if change_log:
+        if change_logs:
             try:
-                await self.ctx.send.text(text=change_log, stream_id=stream_id)
+                for segment_text in change_logs:
+                    await self.ctx.send.text(text=segment_text, stream_id=stream_id)
                 return True, "状态总览已发送", True
             except Exception as log_exc:
                 self.ctx.logger.error(f"状态总览变动日志回退发送失败: {log_exc}")
@@ -1137,18 +1150,35 @@ class CompanionComponentsMixin:
         "emotion.low_mood_day": "连续低迷",
     }
 
-    def _mai_change_log_text(self, *, hours: int = 24, cap: int = 98) -> str:
-        """总命令随图文字（2026-10-11 用户口径）：日程变动 + 情绪变化日志，合并一条。
+    #: 三维字段 → 随图日志的变动标注名（与 emotion/vad 的低分辨率描述用词一致）
+    _VAD_DELTA_LABELS = (("valence", "愉悦度"), ("arousal", "唤醒度"), ("dominance", "支配感"))
+    #: 相邻两次情绪更新三维变动全部低于该值 → 视为「无变动」合并展示（防低分辨率文案未跨档时的重复行）
+    _VAD_SILENT_EPS = 0.005
+
+    def _mai_change_log_text(self, *, hours: int = 48, cap: int = 500,
+                             per_message: int = 50, max_messages: int = 10) -> List[str]:
+        """总命令随图文字（2026-10-11 用户口径；2026-10-20 分片与精细度改造）：日程变动 + 情绪变化日志。
 
         数据源 = 决策账本里的总线事件（EventBus 自动落账 ``bus:<event>``）：
         日程 = ``bus:schedule.*``，情绪 = ``bus:emotion.*``。合并按时间升序、只取最近
-        ``hours`` 小时、最多 ``cap`` 条（超出保最新并在尾注省略数）。日志开关关闭/
-        无记录 → 空串（该次转发不发文字档）。
+        ``hours`` 小时（48h 需覆盖今天/昨天/前天三个日历日文件）、最多 ``cap`` 条
+        （超出保最新并在尾注省略数）。
+
+        2026-10-20 用户口径：
+        - **分片发送**：返回按消息分片的列表——每片最多 ``per_message`` 条日志、
+          最多 ``max_messages`` 片（50 条/消息 × 10 消息 = 500 条）；标题行并入首片
+          （不计入 50 条），超出发送上限的部分在末片尾注说明条数。
+        - **情绪三维变动标注**：账本条目带三维绝对值（emotion.service._updated_payload
+          2026-10-20 起）时，逐条对相邻两次 ``emotion.updated`` 计算愉悦度/唤醒度/支配感
+          变动并标注「（愉悦度 +0.05｜唤醒度 −0.02）」；三维全部无变动（< _VAD_SILENT_EPS）
+          的条目合并不展示（低分辨率文案未跨档导致的逐字重复行由此消除）。
+        - **旧账本兼容**：条目缺三维字段时退化为「文案与上一条情绪更新逐字相同 → 合并」。
+        日志开关关闭/无记录 → 空列表（该次转发不发文字档）。
         """
         companion = self._mai_companion()
         logger_ = getattr(companion, "decision_logger", None) if companion else None
         if logger_ is None or not getattr(logger_, "enabled", False):
-            return ""
+            return []
         cutoff = datetime.now() - timedelta(hours=max(1, int(hours)))
         max_cap = max(1, int(cap))
         picked: "_json.deque" = _deque(maxlen=max_cap)  # noqa: 有界（账本热修）
@@ -1157,7 +1187,8 @@ class CompanionComponentsMixin:
         if log_dir is not None:
             # 热修（2026-10-11）：不再 read_entries 整文件解析——子串预过滤 + deque 封顶，
             # 内存/耗时与账本体量解耦（账本可含全部总线事件，量大）
-            for offset in (0, 1):
+            # 48h 窗口（2026-10-20）：需覆盖今天/昨天/前天三个日历日文件
+            for offset in (0, 1, 2):
                 day = datetime.now() - timedelta(days=offset)
                 path = Path(log_dir) / f"decisions_{day.strftime('%Y-%m-%d')}.jsonl"
                 try:
@@ -1184,11 +1215,11 @@ class CompanionComponentsMixin:
                 except OSError:
                     continue
         else:
-            # 桩/无 _dir 的兜底：走 read_entries（测试与降级形态）
+            # 桩/无 _dir 的兜底：走 read_entries（测试与降级形态）；48h 需覆盖 3 个日历日
             try:
-                entries = logger_.read_entries(2)
+                entries = logger_.read_entries(3)
             except Exception:
-                return ""
+                return []
             for entry in entries or []:
                 action = str((entry or {}).get("action") or "")
                 if not (action.startswith("bus:schedule.") or action.startswith("bus:emotion.")):
@@ -1204,9 +1235,11 @@ class CompanionComponentsMixin:
         dropped = max(0, total_matched - len(picked))
         ordered = sorted(picked, key=lambda item: item[0])
         if not ordered:
-            return ""
-        lines = [f"日程与情绪变动 · 最近 {hours} 小时 · 共 {len(ordered) + dropped} 条"
-                 + (f"（已省略较早 {dropped} 条）" if dropped else "")]
+            return []
+        lines: List[str] = []
+        merged_silent = 0
+        last_vad: Optional[dict] = None   # 上一条 emotion.updated 的三维绝对值（新账本格式）
+        last_detail = ""                  # 上一条 emotion.updated 的 detail 文案（旧账本退化去重）
         for when, action, entry in ordered:
             event = action[4:] if action.startswith("bus:") else action
             label = self._CHANGE_LOG_LABELS.get(event, event)
@@ -1215,8 +1248,54 @@ class CompanionComponentsMixin:
             if not detail:
                 mood = str(entry.get("mood") or "").strip()
                 detail = f"情绪基调 {mood}" if mood else ""
+            if event == "emotion.updated":
+                if all(axis in entry for axis, _ in self._VAD_DELTA_LABELS):
+                    vad = {axis: _vad_float(entry.get(axis)) for axis, _ in self._VAD_DELTA_LABELS}
+                    if last_vad is not None:
+                        deltas = {axis: vad[axis] - last_vad[axis]
+                                  for axis, _ in self._VAD_DELTA_LABELS}
+                        if all(abs(delta) < self._VAD_SILENT_EPS for delta in deltas.values()):
+                            # 三维无变动：与上一条合并（用户报障的「重复日志」即此形态）
+                            merged_silent += 1
+                            continue
+                        marks = [f"{axis_label} {deltas[axis]:+.2f}"
+                                 for axis, axis_label in self._VAD_DELTA_LABELS
+                                 if round(deltas[axis], 2) != 0.0]
+                        if marks:
+                            detail = f"{detail}（{'｜'.join(marks)}）" if detail else f"（{'｜'.join(marks)}）"
+                    last_vad = vad
+                else:
+                    # 旧账本条目（无三维字段）：只做逐字文案去重
+                    if detail and detail == last_detail:
+                        merged_silent += 1
+                        continue
+                    last_vad = None
+                last_detail = detail
             lines.append(f"[{clock}] {label}" + (f"：{detail}" if detail else ""))
-        return chr(10).join(lines)
+        total_seen = len(ordered) + dropped
+        notes: List[str] = []
+        if dropped:
+            notes.append(f"已省略较早 {dropped} 条")
+        if merged_silent:
+            notes.append(f"无变动合并 {merged_silent} 条")
+        header = (f"日程与情绪变动 · 最近 {hours} 小时 · 共 {total_seen} 条"
+                  + (f"（{'；'.join(notes)}）" if notes else ""))
+        body = lines
+        per = max(1, int(per_message))
+        max_msgs = max(1, int(max_messages))
+        chunks = [body[i:i + per] for i in range(0, len(body), per)]
+        tail_note = ""
+        if len(chunks) > max_msgs:
+            hidden = len(body) - max_msgs * per
+            tail_note = f"……（其余 {hidden} 条超出单次发送上限（{max_msgs} 条消息 × {per} 条）未展示）"
+            chunks = chunks[:max_msgs]
+        segments: List[str] = []
+        for index, chunk in enumerate(chunks):
+            msg_lines = ([header] if index == 0 else []) + chunk
+            if index == len(chunks) - 1 and tail_note:
+                msg_lines.append(tail_note)
+            segments.append("\n".join(msg_lines))
+        return segments
 
     def _mai_usage_lines(self) -> List[str]:
         """模型消耗块（F3 2026-10-11）：最近 24 小时按模型/按模块的 token 消耗。

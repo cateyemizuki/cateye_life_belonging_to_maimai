@@ -306,6 +306,23 @@ class EmotionService:
         except Exception:
             pass
 
+    def _updated_payload(self, trigger: str) -> Dict[str, Any]:
+        """``emotion.updated`` 事件载荷：``mood`` 低分辨率文案 + ``vad`` 三维绝对值。
+
+        2026-10-20 用户口径（随图变动日志精细度）：账本条目必须带三维绝对值，
+        渲染侧（companion/components）据此计算相邻两次更新的三维变动量，
+        并把「三维无变动」的重复条目合并——低分辨率文案未跨档时连续多条
+        逐字相同的日志（用户报障）由该字段支撑消除。
+        """
+        eff = self._machine.effective_vad()
+        return {
+            "mood": self.mood_text(),
+            "trigger": str(trigger),
+            "valence": round(float(eff.valence), 4),
+            "arousal": round(float(eff.arousal), 4),
+            "dominance": round(float(eff.dominance), 4),
+        }
+
     # ── 开关与门控 ──────────────────────────────────────────
     def _enabled(self) -> bool:
         """模块独立总开关 + 插件总开关。"""
@@ -679,7 +696,7 @@ class EmotionService:
                                    multiplier=self.target_multiplier(is_target),
                                    is_target=is_target, session_id=session_id, llm=True)
         # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
-        await self._publish("emotion.updated", mood=self.mood_text(), trigger="reply_evaluated")
+        await self._publish("emotion.updated", **self._updated_payload("reply_evaluated"))
 
     # ── 会话片段制（T7；REGISTRY §二：Hook 只记录 → 闲置冲刷 → 整段一次评估）──
     def note_reply_for_episode(self, session_id: str) -> None:
@@ -870,7 +887,7 @@ class EmotionService:
         self._episode_state["eval_count"] = int(self._episode_state.get("eval_count") or 0) + 1
         self._episode_state["last_eval_ts"][stream] = ts
         self._save_state()
-        await self._publish("emotion.updated", mood=self.mood_text(), trigger="episode_evaluated")
+        await self._publish("emotion.updated", **self._updated_payload("episode_evaluated"))
         self._log_decision(
             "emotion.episode_flushed", trigger_type="emotion",
             reason=f"会话片段评估入账（{flush_reason or 'flush'}）",
@@ -1236,7 +1253,7 @@ class EmotionService:
                                              multiplier=k, llm=llm_used, session_id=session_id)
         if outcome.get("ok"):
             # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
-            await self._publish("emotion.updated", mood=self.mood_text(), trigger="external_event")
+            await self._publish("emotion.updated", **self._updated_payload("external_event"))
         return outcome
 
     def _llm(self) -> Any:
@@ -2365,7 +2382,7 @@ class EmotionService:
         await self._publish("emotion.overhauled", mood=mood, levels=levels,
                             recovery_factor=applied.get("recovery_factor", 0.0),
                             sleep_hours=applied.get("sleep_hours", 0.0))
-        await self._publish("emotion.updated", mood=mood, trigger="sleep_overhaul")
+        await self._publish("emotion.updated", **self._updated_payload("sleep_overhaul"))
         self._ctx.logger.info(
             "睡眠情绪大修完成（醒后结算）：恢复系数 %.2f（睡 %.1f 小时），ΔVAD 已应用",
             applied.get("recovery_factor", 0.0), applied.get("sleep_hours", 0.0),
