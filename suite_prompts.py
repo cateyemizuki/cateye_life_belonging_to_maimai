@@ -485,7 +485,7 @@ class PromptsSectionConfig(PluginConfigBase):
 
     __ui_label__ = "提示词（高级）"
     __ui_icon__ = "message-square"
-    __ui_order__ = 8
+    __ui_order__ = 9
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Prompts (Advanced)",
                "description": "Every prompt the plugin sends to the model. Leave unchanged unless you know what you are doing."}

@@ -20,6 +20,7 @@
 - 静默窗（silence_start/silence_end）**留空 = 跟随 [schedule] 的入睡/起床锚点**（N5，第三轮）：
   非空 = 显式覆盖；巡检静默闸与 planning 晚安期限共用同一生效值解析
   （companion.patrol.resolve_silence_window），配置非法仍按静默 fail-safe 处理。
+  **（2026-10-20 用户指示：两键已移除——静默窗恒复用日程作息，入睡~起床整夜即静默。）**
 
 WebUI 元数据约定与顶层 suite_config.py 一致：
 - 每个字段带中文短标题 label + 英文 i18n + hint（**hint 必须写"改了会怎样"的短效果描述**）；
@@ -271,29 +272,9 @@ class PatrolSectionConfig(PluginConfigBase):
             **_ui_i18n("User cooldown (min)"),
         },
     )
-    silence_start: str = Field(
-        default="",
-        description="静默时段开始（HH:MM）：非空 = 自定义静默窗（支持跨午夜）。"
-                    "静默期内巡检不触发；早/晚安不受静默拦截（静默起点仅作为晚安期限的上界；"
-                    "留空 = 跟随 [schedule] sleep_time/wake_time）；配置非法按静默处理（宁可不发）",
-        json_schema_extra={
-            "label": "静默开始",
-            "hint": "静默期内巡检不触发；早/晚安不受静默拦截（起点仅作晚安期限上界）；"
-                    "留空 = 跟随 [schedule] sleep_time/wake_time；非空 = 自定义静默窗起点（HH:MM）",
-            **_ui_i18n("Silence start", "Empty = follow [schedule] sleep~wake; HH:MM = override."),
-        },
-    )
-    silence_end: str = Field(
-        default="",
-        description="静默时段结束（HH:MM）：留空 = 跟随日程作息：入睡时间~起床时间；非空 = 自定义静默窗"
-                    "（跨午夜窗的终点可早于起点；配置非法按静默处理，宁可不发）",
-        json_schema_extra={
-            "label": "静默结束",
-            "hint": "静默期内巡检不触发、静默结束后恢复；早/晚安不受静默拦截；"
-                    "留空 = 跟随 [schedule] sleep_time/wake_time；非空 = 自定义静默窗终点（HH:MM）",
-            **_ui_i18n("Silence end", "Empty = follow [schedule] sleep~wake; HH:MM = override."),
-        },
-    )
+    # 注（2026-10-20 用户指示）：原 silence_start / silence_end 两键已移除——静默窗恒复用
+    # 日程作息（[schedule] sleep_time~wake_time，入睡~起床整夜即静默），解析唯一真源 =
+    # companion.patrol.resolve_silence_window；旧配置里的显式值由迁移器丢弃并登记。
     nap_quiet_enabled: bool = Field(
         default=False,
         description="午休静默（2026-10-11 裁决⑦，默认关）：开启后，陪伴对象的日程正处于"

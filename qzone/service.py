@@ -55,6 +55,26 @@ from planning.schedule_query import ScheduleQuery
 from core.storage import load_json, save_json_atomic
 from planning.time_utils import is_in_time_window
 
+
+def _sleep_silence_window(plugin: Any) -> Tuple[str, str]:
+    """空间静默窗生效值 ``(入睡 HH:MM, 起床 HH:MM)``（2026-10-20 用户指示：恒复用日程作息）。
+
+    与陪伴静默共用同一解析真源 ``companion.patrol.resolve_silence_window``（原
+    ``[qzone] silence_start/end`` 键已删除，旧值由迁移器丢弃）；companion 未装配时
+    本地按同一口径读 ``[schedule]``，锚点缺失再退出厂兜底（23:00/07:00，仍是静默窗）。
+    返回**未规范化**原文，跨午夜与非法 fail-safe 交给 ``is_in_time_window``。
+    """
+    try:
+        from companion.patrol import resolve_silence_window
+
+        window = resolve_silence_window(plugin)
+        return window.start, window.end
+    except Exception:  # pragma: no cover - companion 未装配时的降级路径
+        schedule = getattr(getattr(plugin, "config", None), "schedule", None)
+        wake = str(getattr(schedule, "wake_time", "") or "").strip()
+        sleep = str(getattr(schedule, "sleep_time", "") or "").strip()
+        return (sleep or "23:00"), (wake or "07:00")
+
 # ---- 调用通道（按序尝试，命中后缓存）----
 # 通道1：官方 SnowLuma 适配器的语义化 QZone API（params 包一层）
 _QZONE_ACTIONS = {
@@ -416,10 +436,12 @@ class QzoneService:
         自由文本先经 :func:`classify_activity` 归类，归类失败落 ``other`` 由 LLM 闸兜底。
         """
         cfg = self._qzone_cfg()
-        # 闸 0：静默时段（复用跨午夜判定；_tick 外层已有同口径早退，此处保证链自足可单测）
-        if is_in_time_window(cfg.silence_start, cfg.silence_end,
+        # 闸 0：静默时段（2026-10-20 起恒复用 [schedule] 作息，与陪伴静默同一真源；
+        # _tick 外层已有同口径早退，此处保证链自足可单测）
+        silence_start, silence_end = _sleep_silence_window(self._plugin)
+        if is_in_time_window(silence_start, silence_end,
                              now.strftime("%H:%M"), invalid_result=True):
-            self._record_decision("skip", gate="silence", reason="空间静默时段")
+            self._record_decision("skip", gate="silence", reason="静默时段（跟随日程作息）")
             return False
         # 闸 1：无活动 → 不发（最保守兜底；含睡眠条目，睡眠在下一闸单独识别）
         activity = self._schedule.find_current_activity(date, now, include_sleep=True)
@@ -846,7 +868,9 @@ class QzoneService:
         now = datetime.now()
         today = now.strftime("%Y-%m-%d")
         current_hhmm = now.strftime("%H:%M")
-        if is_in_time_window(cfg.silence_start, cfg.silence_end, current_hhmm, invalid_result=True):
+        # 静默闸（2026-10-20 起恒复用 [schedule] 作息：入睡~起床整夜不发说说、不监听评论）
+        silence_start, silence_end = _sleep_silence_window(self._plugin)
+        if is_in_time_window(silence_start, silence_end, current_hhmm, invalid_result=True):
             return
         # 按日程发说说
         if cfg.daily_max_posts > 0 and self.posts_today() < cfg.daily_max_posts and cfg.post_by_schedule:

@@ -19,7 +19,7 @@ class QzoneSectionConfig(PluginConfigBase):
 
     __ui_label__ = "QQ 空间"
     __ui_icon__ = "cloud"
-    __ui_order__ = 10
+    __ui_order__ = 6
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "QQ Zone", "description": "Post moments by schedule, auto reply to comments."}
     }
@@ -69,12 +69,13 @@ class QzoneSectionConfig(PluginConfigBase):
         description="只在没有静默/睡眠且日程里有当前活动时才发说说",
         json_schema_extra={"label": "仅活动时发帖", **_ui_i18n("Only post during activity")},
     )
-    # ── 配图（2026-10-14 §18.1~§18.3；默认 off = 老行为逐字一致）──────────────
+    # ── 配图（2026-10-14 §18.1~§18.3；默认 emoji = 2026-10-20 用户改判，原默认 off）──────
     image_mode: str = Field(
-        default="off",
+        default="emoji",
         description="说说配图来源：off=不配图｜emoji=宿主表情包（按说说正文语义匹配）｜"
                     "library=本地随机图库｜random=两者各半掷骰。"
-                    "任何一步取图失败都只跳过该图，全部失败发纯文本（配图失败永不阻断发布）",
+                    "任何一步取图失败都只跳过该图，全部失败发纯文本（配图失败永不阻断发布）；"
+                    "旧配置里显式写过的 image_mode 值保持不变（默认值只影响未显式配置的用户）",
         json_schema_extra={
             "label": "配图来源",
             "hint": "off/emoji/library/random；emoji 与 library 都失败时自动退回纯文本",
@@ -163,20 +164,10 @@ class QzoneSectionConfig(PluginConfigBase):
         description="回退路径：cookie 不可用无法读评论正文时，检测到评论数变化经 maisaka 主动提醒",
         json_schema_extra={"label": "新评论主动提醒", **_ui_i18n("Notify new comments")},
     )
-    silence_start: str = Field(
-        default="01:00",
-        description="空间静默时段开始（HH:MM）：静默期内巡检不发说说、不监听评论（支持跨午夜；配置非法按静默处理）",
-        json_schema_extra={"label": "空间静默开始", **_ui_i18n("QZone silence start")},
-    )
-    silence_end: str = Field(
-        default="08:00",
-        description="空间静默时段结束（HH:MM）",
-        json_schema_extra={
-            "label": "空间静默结束",
-            "hint": "HH:MM；静默期内不发说说、不回评",
-            **_ui_i18n("QZone silence end"),
-        },
-    )
+    # 注（2026-10-20 用户指示）：原 silence_start / silence_end 两键已移除——空间静默窗恒复用
+    # 日程作息（[schedule] sleep_time~wake_time，入睡~起床整夜不发说说、不监听评论），
+    # 与陪伴静默共用同一解析真源 companion.patrol.resolve_silence_window；
+    # 旧配置里的显式值由迁移器丢弃并登记。
     napcat_http_host: str = Field(
         default="",
         description="备选：NapCat HTTP 服务器地址（cookie 获取降级通道 2，如 127.0.0.1）",

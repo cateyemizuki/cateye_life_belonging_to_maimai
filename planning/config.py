@@ -685,8 +685,8 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     greeting_night_enabled: bool = Field(
         default=True,
-        description="启用晚安：睡前界（= min([schedule] sleep_time, [patrol] silence_start；"
-                    "silence_start 留空跟随 sleep_time））向前随机漂移后，向候选会话道晚安",
+        description="启用晚安：睡前界（= [schedule] sleep_time；2026-10-20 起静默窗复用作息，"
+                    "silence_start 键已删除）向前随机漂移后，向候选会话道晚安",
         json_schema_extra={
             "label": "启用晚安",
             "hint": "关 = 完全不发晚安（含目标私聊与群聊）",
@@ -707,12 +707,12 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     night_drift: str = Field(
         default="10-30",
         description="晚安漂移区间（分钟，相对睡前界向前）：填 \"a-b\" 或单数字 N（= 0~N 随机）；"
-                    "睡前界 = min([schedule] sleep_time, [patrol] silence_start（留空跟随 sleep_time）），"
+                    "睡前界 = [schedule] sleep_time（2026-10-20 起静默窗复用作息，silence_start 键已删除），"
                     "触发时刻 = 睡前界 − 随机漂移（睡前的随机点）。非法值回退 10-30",
         json_schema_extra={
             "label": "晚安漂移(分钟)",
             "hint": '例 "10-30" 或 "20"；在睡前界前 10~30 分钟内随机开口'
-                    "（睡前界 = min([schedule] sleep_time, [patrol] silence_start，留空跟随 sleep_time））",
+                    "（睡前界 = [schedule] sleep_time）",
             "pattern": r"^\d+(-\d+)?$",
             **_ui_i18n("Night drift (min)", 'e.g. "10-30" or "20"'),
         },

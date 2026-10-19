@@ -99,6 +99,15 @@ LEGACY_SECTIONS = ("target", "cateye", "judge", "inject", "planning_cleanup")
 #: 不静默换标度），故只清旧键、**不做任何值搬运**（无 setdefault、无键缺失判断）。
 LEGACY_AFFECTION_KEYS = ("current_level",)
 
+#: 静默窗复用作息（2026-10-20 用户指示）后已删除的键：``[patrol]`` / ``[qzone]`` 各一对
+#: ``silence_start`` / ``silence_end``。旧配置里的显式值无新语义（静默窗恒取
+#: ``[schedule]`` sleep~wake，睡觉时间即静默时间），登记于此供迁移器入口显式 pop
+#: （§9.7 教训口径：显式 pop 丢弃并登记，不做任何值搬运）。
+LEGACY_SILENCE_KEYS = {
+    "patrol": ("silence_start", "silence_end"),
+    "qzone": ("silence_start", "silence_end"),
+}
+
 #: 1.0.0（配置整理轮之前）[patrol] 「想念触发说明」的出厂文案——仅用于迁移时判断「用户改过没有」。
 #: 为什么不拿新默认当参照：配置整理轮把该文案重写过（新版带【触发原因·想念】前缀），
 #: 拿新默认比较会把老用户的出厂值误判成「用户自定义」并搬进 [prompts]（等于把文案回退成旧版）。
@@ -215,7 +224,7 @@ class LlmSectionConfig(PluginConfigBase):
 
     __ui_label__ = "LLM 调用"
     __ui_icon__ = "cpu"
-    __ui_order__ = 6
+    __ui_order__ = 8
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "LLM Calls",
                "description": "Model routing for every LLM call the plugin makes (task names and judge parameters)."}
@@ -316,7 +325,7 @@ class AdminSectionConfig(PluginConfigBase):
 
     __ui_label__ = "管理与日志"
     __ui_icon__ = "shield"
-    __ui_order__ = 9
+    __ui_order__ = 10
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Admin & Logs", "description": "Command permissions and diagnostic logs."}
     }
@@ -431,6 +440,15 @@ class CateyeSuiteConfig(PluginConfigBase):
             for stale_key in LEGACY_AFFECTION_KEYS:
                 legacy_affection.pop(stale_key, None)
             migrated["affection"] = legacy_affection
+        #    2026-10-20：[patrol]/[qzone] 的 silence_start/silence_end 同口径显式 pop
+        #    （静默窗恒复用 [schedule] 作息，显式覆盖能力已移除）。
+        for section_name, stale_keys in LEGACY_SILENCE_KEYS.items():
+            section_data = migrated.get(section_name)
+            if isinstance(section_data, dict):
+                section_data = dict(section_data)
+                for stale_key in stale_keys:
+                    section_data.pop(stale_key, None)
+                migrated[section_name] = section_data
         plugin_section = dict(migrated.get("plugin") or {})
         already_migrated = str(plugin_section.get("layout_version") or "") == CURRENT_LAYOUT_VERSION
         # 结构版本以插件当前值为准（宿主已按"版本变化"决定升级；旧值不参与落盘）。

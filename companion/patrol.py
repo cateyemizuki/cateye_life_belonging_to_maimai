@@ -5,9 +5,10 @@
 想念（沉默阈值每轮随机采样 + 概率 + LLM 把关）→
 日程巡检（活动分享 / 日常搭话，受「启用日程巡检」开关与概率控制）。
 
-**静默窗口径（N5，2026-10-10 第三轮）**：``[patrol].silence_start/silence_end`` **留空 = 跟随
-[schedule] 的入睡/起床锚点**（入睡~起床整夜静默），非空 = 显式覆盖；生效值统一由
-:func:`resolve_silence_window` 解析（planning 的晚安期限同源），格式非法一律 fail-safe
+**静默窗口径（2026-10-20 用户指示，N5「留空跟随」收官）**：静默窗**恒复用**
+``[schedule]`` 的入睡/起床锚点（入睡~起床整夜静默；原 ``silence_start/silence_end``
+显式覆盖键已删除，旧值由迁移器丢弃）；生效值统一由 :func:`resolve_silence_window`
+解析（planning 的晚安期限、qzone 的空间静默闸同源），格式非法一律 fail-safe
 （视作静默，宁可不发）。
 
 **与早晚安的关系（2026-10-10 配置整理轮口径）**：早安/晚安只有一条驱动链——
@@ -82,13 +83,10 @@ NEUTRAL_MOOD_EFFECT: dict[str, Any] = {
 }
 
 #: 需要校验格式（HH:MM）的时间窗口配置项（非法时 fail-safe：静默视为在静默）。
-#: 早/晚安窗口字段自 B1 合并起已废弃、2026-10-10 配置整理轮**删除**，
-#: 现在只剩静默时段一项。N5（第三轮）起两键可留空 = 跟随 [schedule] 作息锚点，
-#: 校验对象相应改为**生效值**（见 :func:`resolve_silence_window`）。
-TIME_WINDOW_KEYS = (
-    "silence_start",
-    "silence_end",
-)
+#: 早/晚安窗口字段自 B1 合并起已废弃、2026-10-10 配置整理轮**删除**；
+#: 静默时段两键（silence_start/silence_end）也已随 2026-10-20 用户指示删除——
+#: 静默窗恒复用 [schedule] 作息，不再存在 patrol 段的时间窗配置键（本常量清空保留占位）。
+TIME_WINDOW_KEYS: Tuple[str, ...] = ()
 
 #: [schedule] 段或锚点缺失时的出厂兜底（与 planning.config.ScheduleSectionConfig 默认一致）
 _FALLBACK_SCHEDULE_WAKE = "07:00"
@@ -97,18 +95,19 @@ _FALLBACK_SCHEDULE_SLEEP = "23:00"
 
 @dataclass(frozen=True)
 class SilenceWindow:
-    """``[patrol]`` 静默窗的**生效值**（N5：留空 = 跟随 ``[schedule]`` 作息锚点；非空 = 显式覆盖）。
+    """静默窗的**生效值**（2026-10-20 用户指示：静默窗**恒复用** ``[schedule]`` 作息锚点）。
 
-    - ``start`` / ``end``：生效的 HH:MM 原文（不规范化，告警时原样回显用户填写的值）；
-    - ``start_source`` / ``end_source``：``"patrol"``（显式配置）或 ``"schedule"``（跟随锚点）；
+    - ``start`` / ``end``：生效的 HH:MM 原文（不规范化，告警时原样回显配置值）；
+    - ``start_source`` / ``end_source``：恒 ``"schedule"``（原 ``silence_start/end`` 显式
+      覆盖能力已随键删除而移除；字段保留供调用方兼容读取）；
     - ``invalid_keys``：格式非法（非 HH:MM）的来源配置键，非空即**整窗非法**——调用方据此走
       fail-safe（巡检视作静默、晚安观测窗关闭），**不得**静默回退成"可打扰"。
     """
 
     start: str
     end: str
-    start_source: str = "patrol"
-    end_source: str = "patrol"
+    start_source: str = "schedule"
+    end_source: str = "schedule"
     invalid_keys: Tuple[str, ...] = ()
 
     @property
@@ -119,24 +118,19 @@ class SilenceWindow:
     @property
     def start_key(self) -> str:
         """生效起点的来源配置键（``invalid_time_config`` 留痕用）。"""
-        return TIME_WINDOW_KEYS[0] if self.start_source == "patrol" else "schedule.sleep_time"
+        return "schedule.sleep_time"
 
     @property
     def end_key(self) -> str:
         """生效终点的来源配置键（``invalid_time_config`` 留痕用）。"""
-        return TIME_WINDOW_KEYS[1] if self.end_source == "patrol" else "schedule.wake_time"
+        return "schedule.wake_time"
 
     def source_note(self) -> str:
-        """可读来源标注（日志用）；两键都显式配置时为空串。"""
-        follows = [
-            name
-            for name, source in (("起点", self.start_source), ("终点", self.end_source))
-            if source == "schedule"
-        ]
-        return f"（{'、'.join(follows)}跟随日程作息）" if follows else ""
+        """可读来源标注（日志用）：静默窗恒复用作息，恒有标注。"""
+        return "（跟随日程作息）"
 
     def describe(self) -> str:
-        """日志里的可读形态：``23:00~07:00（起点、终点跟随日程作息）``。"""
+        """日志里的可读形态：``23:00~07:00（跟随日程作息）``。"""
         return f"{self.start}~{self.end}{self.source_note()}"
 
 
@@ -164,24 +158,20 @@ def _fallback_schedule_anchors() -> Tuple[str, str]:
 
 
 def resolve_silence_window(config: Any) -> SilenceWindow:
-    """解析 ``[patrol]`` 静默窗的**生效值**（N5，2026-10-10 第三轮的单一真源）。
+    """解析静默窗的**生效值**（2026-10-20 用户指示后的单一真源：**恒复用** ``[schedule]`` 作息）。
 
-    - ``silence_start`` / ``silence_end`` **留空 → 跟随** ``[schedule]``：起点取 ``sleep_time``
-      （入睡时间）、终点取 ``wake_time``（起床时间），即「入睡~起床」整夜静默；
-    - **非空 → 显式覆盖**：支持跨午夜（如 ``21:30``~``07:30``）；两键可各自独立选择跟随或覆盖；
+    - 起点取 ``[schedule].sleep_time``（入睡时间）、终点取 ``wake_time``（起床时间），
+      即「入睡~起床」整夜静默——**夜晚睡觉时间即静默时间**；原 ``[patrol].silence_start/end``
+      显式覆盖能力已随键删除而移除（旧配置显式值由迁移器丢弃并登记）；
     - **fail-safe**：生效值仍按 HH:MM 校验（``parse_hhmm``，与巡检静默闸同一口径），任一非法即
       整窗非法（``invalid_keys`` 留痕）——调用方按「宁可不发」处理，绝不静默回退成"可打扰"；
     - ``[schedule]`` 段/锚点缺失（未装配日程段）→ 用出厂锚点兜底（默认 07:00/23:00，
       仍是静默窗，不会变成可打扰）。
 
-    ``config`` 兼容 plugin 实例与配置对象。planning 侧（晚安期限）与巡检静默闸共用本函数，
-    保证两处取到的是同一个生效值；返回值是**未规范化**的原文，跨午夜判定交给
-    ``is_in_time_window``（start > end 即跨午夜）。
+    ``config`` 兼容 plugin 实例与配置对象。planning 侧（晚安期限）、巡检静默闸与 qzone 空间
+    静默闸共用本函数，保证各处取到的是同一个生效值；返回值是**未规范化**的原文，跨午夜判定
+    交给 ``is_in_time_window``（start > end 即跨午夜）。
     """
-    patrol = _config_section(config, "patrol")
-    raw_start = str(getattr(patrol, "silence_start", "") or "").strip()
-    raw_end = str(getattr(patrol, "silence_end", "") or "").strip()
-
     schedule = _config_section(config, "schedule")
     wake = str(getattr(schedule, "wake_time", "") or "").strip()
     sleep = str(getattr(schedule, "sleep_time", "") or "").strip()
@@ -190,19 +180,16 @@ def resolve_silence_window(config: Any) -> SilenceWindow:
         wake = wake or fallback_wake
         sleep = sleep or fallback_sleep
 
-    start, start_source = (raw_start, "patrol") if raw_start else (sleep, "schedule")
-    end, end_source = (raw_end, "patrol") if raw_end else (wake, "schedule")
-
     invalid: list[str] = []
-    if parse_hhmm(start, -1) < 0:
-        invalid.append(TIME_WINDOW_KEYS[0] if start_source == "patrol" else "schedule.sleep_time")
-    if parse_hhmm(end, -1) < 0:
-        invalid.append(TIME_WINDOW_KEYS[1] if end_source == "patrol" else "schedule.wake_time")
+    if parse_hhmm(sleep, -1) < 0:
+        invalid.append("schedule.sleep_time")
+    if parse_hhmm(wake, -1) < 0:
+        invalid.append("schedule.wake_time")
     return SilenceWindow(
-        start=start,
-        end=end,
-        start_source=start_source,
-        end_source=end_source,
+        start=sleep,
+        end=wake,
+        start_source="schedule",
+        end_source="schedule",
         invalid_keys=tuple(invalid),
     )
 

@@ -19,7 +19,7 @@ class EmotionSectionConfig(PluginConfigBase):
 
     __ui_label__ = "情绪系统"
     __ui_icon__ = "smile"
-    __ui_order__ = 11
+    __ui_order__ = 7
     # 2026-10-10：模型任务名（evaluator/referee）已迁入 [llm] 段统一管理。
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Emotion", "description": "VAD emotion state machine with sleep overhaul."}

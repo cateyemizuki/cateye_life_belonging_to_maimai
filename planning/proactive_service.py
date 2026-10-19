@@ -17,8 +17,9 @@
      「当天的清醒区间」内，不会跨过入睡界。
    - **激活观测窗** = ``[min(基准, 漂移点), max(期限, 漂移点)]``（两种问候同一公式）：
      早安期限 = 第一段非睡眠日程结束（无日程 → 起床 + 120 分钟）；
-     晚安期限 = ``min(入睡锚点, 生效静默起点)``（生效静默起点 = ``[patrol].silence_start``，
-     **留空即跟随 ``[schedule].sleep_time``**，N5 第三轮；见 :meth:`_silence_start_ts`）。
+     晚安期限 = 入睡锚点 ``[schedule].sleep_time``（2026-10-20 用户指示后静默窗恒复用
+     作息，原 ``[patrol].silence_start`` 键已删除，min 的静默项与入睡项合一；见
+     :meth:`_silence_start_ts`）。
    - **判定**：窗内**该流有人发过消息** → 已激活；激活后未到点 → 等待，到点即发；观察到时
      **已过点** → 立即发；观测窗结束仍无人 → 当天不再评估（放弃）。
    - ``greeting_require_activation=false`` → 不看激活，到点即发；错过观测窗（如重启跨过整窗）不补发。
@@ -663,10 +664,7 @@ class ProactiveService:
         sleep_min = _parse_hhmm_minutes(getattr(cfg, "sleep_time", ""), _DEFAULT_SLEEP_MINUTES)
         return wake_min, sleep_min
 
-    def _patrol_time(self, attr: str, default: str) -> str:
-        """读 ``[patrol]`` 时间窗配置（companion 未装配/字段缺失 → 缺省值兜底）。"""
-        patrol = getattr(getattr(self._plugin, "config", None), "patrol", None)
-        return str(getattr(patrol, attr, "") or default)
+    # 注：原 _patrol_time 已随 2026-10-20 静默键移除而删除（唯一调用点是旧静默起点降级分支）。
 
     @staticmethod
     def _midnight_ts(now: datetime) -> float:
@@ -714,8 +712,8 @@ class ProactiveService:
 
         - **早安** = 睡眠结束后**第一个非睡眠日程条目的结束**（"第一段日程结束前有人说话"）；
           无日程 → 基准 + 120 分钟（实现裁量：不给无日程留无期限观察）；
-        - **晚安** = ``min(入睡锚点, 生效静默起点)``（生效起点见 :meth:`_silence_start_ts`；
-          ``[patrol].silence_start`` 留空即跟随 ``[schedule].sleep_time``，此时 min 恒等于入睡锚点）：
+        - **晚安** = 入睡锚点（``[schedule].sleep_time``；2026-10-20 起静默窗恒复用作息，
+          原静默起点项与入睡项合一，见 :meth:`_silence_start_ts`）：
           既是激活观测上界，也是漂移点的硬界（不得在界后道晚安）。
 
         观测窗下界统一取 ``max(期限, 漂移点)``（见 :meth:`_roll_greeting`）——期限本身
@@ -752,14 +750,12 @@ class ProactiveService:
     def _silence_start_ts(self, now: datetime) -> float:
         """今晚静默时段开始的绝对时刻（**生效**静默起点，§3.2 期限列）。
 
-        N5（2026-10-10 第三轮）：生效起点 = ``[patrol].silence_start``，**留空则跟随
-        ``[schedule].sleep_time``**（与 companion/patrol.py 的巡检静默闸共用同一解析，见
-        :meth:`_effective_silence_start`）。
+        静默窗复用作息（2026-10-20 用户指示，原 N5「silence_start 留空跟随」口径随键删除收官）：
+        生效起点恒 = ``[schedule].sleep_time``（与 companion/patrol.py 的巡检静默闸、qzone
+        空间静默闸共用同一解析，见 :meth:`_effective_silence_start`）。
 
-        同 :meth:`_next_daily_anchor_ts`（以起床锚点为参照）：默认（跟随作息、如 23:00~07:00）
-        → 今天 23:00；晚间开始的静默窗（如 21:30）→ 今天 21:30，已过即视为窗口已关
-        （不再发晚安）。fail-safe：生效起点不可解析（显式值非法，或留空且
-        ``[schedule].sleep_time`` 非法）→ 返回 0（观测窗直接关闭，宁可不发），
+        同 :meth:`_next_daily_anchor_ts`（以起床锚点为参照）：如 23:00 → 今天 23:00。
+        fail-safe：``[schedule].sleep_time`` 非法 → 返回 0（观测窗直接关闭，宁可不发），
         **不**回退成"可打扰"的边界猜测。
         """
         start_text, _start_key = self._effective_silence_start()
@@ -772,12 +768,12 @@ class ProactiveService:
         return self._next_daily_anchor_ts(now, start_min)
 
     def _effective_silence_start(self) -> Tuple[str, str]:
-        """生效静默起点 ``(HH:MM 原文, 来源配置键)``（N5 单一真源 + 本地降级）。
+        """生效静默起点 ``(HH:MM 原文, 来源配置键)``（单一真源 + 本地降级）。
 
-        主路径 = ``companion.patrol.resolve_silence_window``（留空 → ``[schedule].sleep_time``；
-        非空 → 原值）。companion 未装配（裁剪部署/桩环境）→ 本地按同一口径解析：显式值优先，
-        留空读 ``[schedule].sleep_time``。两条路径都**不**把非法值改写成缺省时刻——非法由
-        :meth:`_silence_start_ts` 按 fail-safe 关闭观测窗。
+        主路径 = ``companion.patrol.resolve_silence_window``（2026-10-20 用户指示后恒取
+        ``[schedule].sleep_time``——静默窗复用作息，键已删除）。companion 未装配（裁剪部署/
+        桩环境）→ 本地按同一口径读 ``[schedule].sleep_time``。两条路径都**不**把非法值改写成
+        缺省时刻——非法由 :meth:`_silence_start_ts` 按 fail-safe 关闭观测窗。
         """
         try:
             from companion.patrol import resolve_silence_window
@@ -786,9 +782,6 @@ class ProactiveService:
             return window.start, window.start_key
         except Exception as exc:  # pragma: no cover - companion 未装配时的降级路径
             logger.debug(f"静默窗生效值解析不可用（{exc}），按本地口径降级解析")
-        raw_start = str(self._patrol_time("silence_start", "") or "").strip()
-        if raw_start:
-            return raw_start, "silence_start"
         cfg = section_or_default(self._plugin, "schedule", ScheduleSectionConfig)
         return str(getattr(cfg, "sleep_time", "") or ""), "schedule.sleep_time"
 
