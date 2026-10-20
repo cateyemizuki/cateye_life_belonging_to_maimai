@@ -55,12 +55,14 @@ from planning.time_utils import is_in_time_window
 
 
 def _sleep_silence_window(plugin: Any) -> Tuple[str, str]:
-    """空间静默窗生效值 ``(入睡 HH:MM, 起床 HH:MM)``（2026-10-20 用户指示：恒复用日程作息）。
+    """空间静默窗生效值 ``(入睡 HH:MM, 起床 HH:MM)``（2026-10-20 用户指示：恒复用作息。
 
-    与陪伴静默共用同一解析真源 ``companion.patrol.resolve_silence_window``（原
-    ``[qzone] silence_start/end`` 键已删除，旧值由迁移器丢弃）；companion 未装配时
-    本地按同一口径读 ``[schedule]``，锚点缺失再退出厂兜底（23:00/07:00，仍是静默窗）。
-    返回**未规范化**原文，跨午夜与非法 fail-safe 交给 ``is_in_time_window``。
+    §24.2 任务B（R7 依据 = 用户 2026-10-21 直派）真实化随主链自动生效：与陪伴静默共用
+    同一解析真源 ``companion.patrol.resolve_silence_window``——插件实例路径现在会**优先
+    解析真实睡眠环锚点**（今晚/今晨睡觉条目读取即解析，赖床顺延后随移）；
+    companion 未装配时本地的 ``[schedule]`` 直读降级、锚点缺失再退出厂兜底
+    （23:00/07:00，仍是静默窗）不变。返回**未规范化**原文，跨午夜与非法 fail-safe
+    交给 ``is_in_time_window``。
     """
     try:
         from companion.patrol import resolve_silence_window

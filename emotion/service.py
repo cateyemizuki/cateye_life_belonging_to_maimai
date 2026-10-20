@@ -14,6 +14,7 @@ from core.llm_utils import purpose_task
 from core.storage import load_json, save_json_atomic
 from core.time_utils import parse_hhmm
 from planning.schedule_query import ScheduleQuery
+from planning.schedule_anchors import SOURCE_REAL_SCHEDULE
 # M9（附录 §4.3 用户裁决 A2）：赖床工具名与钳制上限的**唯一定义点**在 planning/tools_service.py；
 # 提醒文本与组件注册同源引用。planning 侧不 import emotion（单向），故无循环依赖。
 from suite_prompts import (
@@ -1395,8 +1396,28 @@ class EmotionService:
         name = str(item.get("name") or "")
         return any(keyword in name for keyword in SLEEP_NAME_KEYWORDS)
 
-    def _sleep_anchors(self) -> Tuple[int, int]:
-        """``(sleep_min, wake_min)`` 作息锚点（[schedule] 配置，缺省 23:00 / 07:00）。"""
+    def _sleep_anchors(self, now: Optional[datetime] = None) -> Tuple[int, int]:
+        """``(sleep_min, wake_min)`` 作息锚点（[schedule] 配置，缺省 23:00 / 07:00）。
+
+        §24.2 任务B（R7 依据 = 用户 2026-10-21 直派）：**真实作息锚点优先**——经
+        companion.patrol 的同一 wiring 真源（``real_sleep_anchors_from_plugin``）读
+        真实睡眠环（今晚/今晨睡觉条目，读取即解析；赖床顺延后锚点随移；通过 now 传调用
+        方的判定时刻，供夜窗/条目周期与锚点取自同一帧）。锚点不可得（``_schedule_query``
+        缺失 / DB 不可用 / 纯配置对象桩）→ 现行 ``[schedule]`` 配置路径不变
+        （§7.9 fail-safe 语义不变）。emotion→companion 为方法内懒导入：companion.patrol
+        链上不 import emotion（planning 也只按鸭子类型取 emotion 束），无循环依赖。
+        """
+        try:
+            from companion.patrol import real_sleep_anchors_from_plugin
+
+            real = real_sleep_anchors_from_plugin(self._plugin, now)
+            if real is not None and real.source == SOURCE_REAL_SCHEDULE:
+                sleep_min = parse_hhmm(real.start, -1)
+                wake_min = parse_hhmm(real.end, -1)
+                if sleep_min >= 0 and wake_min >= 0:
+                    return sleep_min, wake_min
+        except Exception as exc:  # pragma: no cover - companion 未装配时的降级路径
+            logger.debug(f"真实作息锚点解析不可用（{exc}），按 [schedule] 配置路径降级")
         cfg = getattr(self._plugin.config, "schedule", None)
         sleep_time = str(getattr(cfg, "sleep_time", "") or "")
         wake_time = str(getattr(cfg, "wake_time", "") or "")
@@ -1420,8 +1441,13 @@ class EmotionService:
         return day.replace(hour=(minute // 60) % 24, minute=minute % 60, second=0, microsecond=0)
 
     def _night_window(self, now: datetime) -> Tuple[datetime, datetime]:
-        """当前所处/最近的作息夜间窗口 ``(start, end)``（按 [schedule] 锚点算整夜）。"""
-        sleep_min, wake_min = self._sleep_anchors()
+        """当前所处/最近的作息夜间窗口 ``(start, end)``（整夜按生效作息锚点算）。
+
+        §24.2 任务B（R7 2026-10-21）：锚点真实化随 ``_sleep_anchors`` 自动生效——
+        优先真实睡眠环锚点（赖床顺延后夜窗端点随移），配置路径不变；``now`` 透传给
+        锚点解析，保证窗口时刻与锚点取自同一帧。
+        """
+        sleep_min, wake_min = self._sleep_anchors(now)
         cur = now.hour * 60 + now.minute
         start_day = now if cur >= sleep_min else now - timedelta(days=1)
         start = self._at_minute(start_day, sleep_min)
@@ -1440,12 +1466,12 @@ class EmotionService:
 
         - 夜间睡眠（处于作息夜间窗口，或条目起点落在窗口内）→ 按**锚点整夜**：
           条目本身跨午夜保留原时长（如 23:00 入睡 + 8h ⇒ ``23:00–次日 07:00``，2026-10-10
-          N2/N4 起不再被截断到入睡锚点），但整夜窗口仍以 [schedule] 入睡/起床锚点为唯一
-          真源（赖床延长、锚点漂移都会让条目端点与整夜不等），不能拿条目端点当窗口，
-          否则会提前误判"醒来"；
+          N2/N4 起不再被截断到入睡锚点），但整夜窗口仍以生效作息锚点为唯一真源
+          （§24.2 任务B 起锚点优先取真实睡眠环——赖床顺延后整夜窗口端点随移），
+          不能拿条目端点当窗口，否则会提前误判"醒来"；
         - 其它（午休/小睡）→ 按条目自身的 start/end 窗口。
         """
-        sleep_min, wake_min = self._sleep_anchors()
+        sleep_min, wake_min = self._sleep_anchors(now)
         night_start, night_end = self._night_window(now)
         item_start = int((item or {}).get("start_minute") or sleep_min)
         if item is None or self._minute_in_night(item_start, sleep_min, wake_min) \
@@ -2114,7 +2140,7 @@ class EmotionService:
         elif current is not None:
             hours = self._sleep_hours(current)
         else:
-            hours = self._planned_sleep_hours(*self._sleep_anchors())
+            hours = self._planned_sleep_hours(*self._sleep_anchors(now))
         window_now = self._sleep_window_summary(now, self._sleep_period)
         r_yesterday = self.schedule_tone_sum(
             self._day_items(query, (now - timedelta(days=1)).strftime("%Y-%m-%d")))

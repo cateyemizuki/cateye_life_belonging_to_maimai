@@ -6,7 +6,7 @@
 
 ## 一、这个文件夹是什么
 
-### 4 张表各自管什么
+### 5 张表各自管什么
 
 | 文件 | 管什么 | 读它的代码 |
 |---|---|---|
@@ -14,8 +14,9 @@
 | `emotion_descriptions.json` | 每种情绪注入给 LLM 的**文字描述**（替代「百分比 + 三维约值」的干巴巴渲染） | `emotion/descriptions.py` |
 | `affection_presets.json` | 关系预设 → 好感度档位区间（总分 0~200，1~5 档自由构造） | `companion/affection_presets.py` |
 | `affection_tier_descriptions.json` | 每个档位（如「热恋」「铁哥们」）注入提示词的那句话 | `companion/affection_tier_descriptions.py` |
+| `schedule_properties.json` | **日程属性表**（2026-10-21 新增第五张）：每个日程「属性」的回复率调控倍率、属性关键词词表与展示标签/颜色 | `planning/activity_properties.py` |
 
-四张表互相独立：改一张不会影响另外三张（按表的键联动的地方见各节说明）。
+五张表互相独立：改一张不会影响另外四张（按表的键联动的地方见各节说明）。
 
 ### 改了多久生效
 
@@ -23,7 +24,7 @@
 
 所以改法固定是：**编辑并保存 json → 触发热重载（或在宿主里重启插件）**。只保存不重载，改动不会生效。
 
-四张表的读取入口：情绪两张在情绪服务构造时读（`emotion/service.py:211`、`emotion/service.py:226`），好感度两张由 `companion/services.py:42` 的 `_load_affection_tables` 读，插件加载时调一次（`companion/services.py:119`）、配置热重载时再调一次（`companion/services.py:222`）。
+读取入口：情绪两张在情绪服务构造时读（`emotion/service.py:211`、`emotion/service.py:226`），好感度两张由 `companion/services.py:42` 的 `_load_affection_tables` 读，插件加载时调一次（`companion/services.py:119`）、配置热重载时再调一次（`companion/services.py:222`）；**日程属性表**由日程服务束构造时装载（`planning/services.py` 规划束初始化里 `activity_properties.load_and_apply`，同款「加载/热重载各读一遍」），倍率消费点在 `planning/proactive_service.py` 的 `_apply_frequency`。
 
 ### 旧版文件会自动搬进来
 
@@ -37,7 +38,7 @@
 
 ### 文件缺失会怎样
 
-- 四张表都**不存在也不会报错**：`emotion_mapping.json` / `emotion_descriptions.json` / `affection_presets.json` / `affection_tier_descriptions.json` 在缺失时会各自生成一份内置默认文件（内容就是出厂默认），然后按内置默认运行。所以第一版可以直接打开生成好的文件照葫芦画瓢。
+- 五张表都**不存在也不会报错**：`emotion_mapping.json` / `emotion_descriptions.json` / `affection_presets.json` / `affection_tier_descriptions.json` / `schedule_properties.json` 在缺失时会各自生成一份内置默认文件（内容就是出厂默认），然后按内置默认运行。所以第一版可以直接打开生成好的文件照葫芦画瓢。
 
 ---
 
@@ -398,11 +399,148 @@
 
 ---
 
-## 六、FAQ
+## 六、日程属性表 `schedule_properties.json`（第五张表，2026-10-21）
+
+### 文件作用
+
+把「bot 现在做某件事时聊天频率调多高」的**回复率倍率**和「什么样的日程算哪种属性」的
+**关键词词表**外置给你改。原 `proactive_service._FREQUENCY_FACTOR_BY_GOAL_TYPE`
+频率表已删除，倍率只从这张表取（`planning/activity_properties.py` 单一真源）：
+
+- **倍率**进 bot 的主动行为频率调控（`planning/proactive_service.py` 的 `_apply_frequency`，
+  经 `ctx.frequency.set_adjust` 推给主程序）：<1 减少回复、>1 增加回复、1.0 = 不调整；
+- **关键词**用于给日程条目归类属性（纯离线字符串匹配，零 LLM 调用）；
+- **标签/颜色**显示在 `/lbm_plan list` 文字与日程图条目行上（`[属性]` 短标签 + 属性色条）。
+
+### 顶层结构与字段表
+
+```json
+{
+  "version": 1,
+  "properties": [
+    {"id": "sleep", "label": "睡觉", "goal_types": ["sleep"],
+     "keywords": ["睡觉", "睡眠", "安睡"], "reply_factor": 0.05, "color": "#5A6982"},
+    ...
+  ],
+  "default_property": {"id": "free_time", "label": "空闲", "goal_types": ["free_time", "custom"],
+                        "keywords": [], "reply_factor": 1.0, "color": "#6D8FB0"}
+}
+```
+
+| 字段 | 必填 | 类型 | 说明 |
+|---|---|---|---|
+| `version` | **是** | 整数 | 必须恰为 `1` |
+| `properties` | 否 | 数组 | 属性条目列表（缺 = 全部用内置条目） |
+| `default_property` | 否 | 对象 | 兜底条目（缺 = 内置「空闲」，free_time/1.0） |
+
+每个属性条目：
+
+| 字段 | 必填 | 类型 | 约束 |
+|---|---|---|---|
+| `id` | **是** | 字符串 | 去空白后非空，且表内互不重复 |
+| `label` | **是** | 字符串 | 去空白后非空；渲染标签是 `[label]`，推荐 **2~3 字中文**（渲染按 4 字截断） |
+| `reply_factor` | **是** | 数值 | `0 ≤ factor ≤ 2`，不能是布尔值 / 字符串 / `NaN` / `Infinity`，**缺了也不算合法条目** |
+| `goal_types` | 否 | 字符串数组 | 该属性直接认领的 `goal_type` 列表（空数组 = 只靠 keywords 万能匹配） |
+| `keywords` | 否 | 字符串数组 | 条目名含该子串就归入本属性（子串匹配） |
+| `color` | 否 | 字符串 | `"#RRGGBB"` 十六进制色或省略；**颜色写错只丢颜色位**，条目照常生效（图上回退类型色） |
+
+### 匹配口径（确定性，纯离线）
+
+一条日程（`goal_type` + 名称）按这个顺序找一个属性，先到先得：
+
+1. **`goal_type` 精确命中**：条目的 `goal_type` 出现在某条属性的 `goal_types` 里（按 json 数组顺序取第一条命中的属性）；
+2. **名称关键词子串**：第 1 步没有命中（goal_type 未被任何属性收录）时，按数组顺序找第一条「条目名含其关键词」的属性；
+3. **兜底条目**：都没命中 → `default_property`（内置 = 空闲，倍率 1.0）。
+
+注意第 1 步**优先于**第 2 步：`goal_type` 已收录的条目（如 `daily_routine`）即使名字里有
+「睡觉」，也先按 `daily_routine` 的属性取倍率——这与旧频率表按 `.get(goal_type, 1.0)` 的
+行为一致；关键词只服务「goal_type 没被收录」的条目（如自定义类型写了名字叫「午休」的活动）。
+
+### 内置默认（出厂即这套，改前先抄）
+
+| 属性 id | 标签 | goal_types | reply_factor | 色值 |
+|---|---|---|---|---|
+| `sleep` | 睡觉 | sleep | **0.05** | #5A6982 |
+| `study` | 学习 | study | **0.3** | #4A90E2 |
+| `work` | 工作 | work | **0.3** | #6E7F95 |
+| `learn_topic` | 兴趣 | learn_topic | **0.5** | #00A8A8 |
+| `exercise` | 运动 | exercise | **0.7** | #27AE60 |
+| `meal` | 用餐 | meal | **1.2** | #F2994A |
+| `rest` | 休息 | rest | **1.3** | #A3B7CE |
+| `daily_routine` | 日常 | daily_routine | 1.0 | #7F8FA6 |
+| `entertainment` | 娱乐 | entertainment | **1.5** | #9B51E0 |
+| `social_maintenance` | 社交 | social_maintenance | **1.5** | #EB568E |
+| `free_time`（兜底条目） | 空闲 | free_time、custom | 1.0 | #6D8FB0 |
+
+（粗体 = 与旧频率表数值语义一致；`free_time` / `custom` / 未收录的 goal_type 一律走兜底条目 1.0——旧表「缺 free_time/custom」的缺口随本表补齐。）
+
+内置关键词词表（与 ``mappings/README`` 之外的两套睡眠词相依但**独立保留**，改这里不影响
+静默窗/午休静默判定）：
+
+- `sleep` 属性：`睡觉` / `睡眠` / `安睡`（夜间词，与 `planning/schedule_items.NIGHT_SLEEP_NAME_KEYWORDS` 同词不同源）；
+- `rest` 属性：`午休` / `午睡` / `小憩` / `打盹`（午休词，与 `companion/patrol.NAP_NAME_KEYWORDS` 同词不同源）。
+
+### 校验规则与出错时的行为
+
+**错误分三级粒度（§24.3 冻结口径）**：
+
+| 情况 | 行为 |
+|---|---|
+| JSON 读不了 / 语法错 / 顶层不是对象 | **整文件回退内置默认**（告警） |
+| `version` 缺失 / 不是整数 / 不等于 1 | **整文件回退内置默认** |
+| 顶层出现 `version`、`properties`、`default_property` 之外的键 | **整文件回退内置默认** |
+| `properties` 不是数组 / `default_property` 不是对象 | **整文件回退**（前者）/ **回退内置兜底条目**（后者，其余照常生效） |
+| `properties` 键缺失 / 数组为空 / `default_property` 键缺失 | 视为「无自定义」，全部用内置（提示不算错） |
+| **某一个**条目坏（缺 id/label、`reply_factor` 非数值/bool/NaN/Inf/越界/缺失、`goal_types`/`keywords` 不是字符串数组、id 或 label 重复） | **只排除这一条**，其余条目照常生效 |
+| 条目里出现结构外的未知键 | **丢弃这个键**，条目其余字段照常生效（提示留账） |
+| `color` 写错（不是 `#RRGGBB` 形态） | **只丢颜色位**，条目与倍率照常生效（渲染回退类型色 → 兜底色） |
+| 该表没写的内置条目 | 沿用内置条目（**同 id 覆盖、其余内置保留**——json 只写你想改的条目即可） |
+
+每次装载的生效情况都会写进决策日志（decision log）留账：`planning.properties_applied`（生效清单）/
+`planning.properties_rejected`（整文件回退原因 + 被排除条目清单）两类 action。
+
+### 完整可抄的最小示例
+
+只想把「学习」调得更低频（0.3 → 0.1），整张表只写这一条即可（其余内置保留）：
+
+```json
+{
+  "version": 1,
+  "properties": [
+    {
+      "id": "study",
+      "label": "学习",
+      "goal_types": ["study"],
+      "keywords": ["学习", "功课"],
+      "reply_factor": 0.1,
+      "color": "#4A90E2"
+    }
+  ]
+}
+```
+
+想新增一个自定义属性（比如把自由活动改成三倍社交欲），同时改兜底条目：
+
+```json
+{
+  "version": 1,
+  "properties": [
+    {"id": "hobby", "label": "爱好", "goal_types": ["photography", "birdwatch"],
+     "keywords": ["摄影", "观鸟"], "reply_factor": 2.0, "color": "#20846B"}
+  ],
+  "default_property": {"id": "free_time", "label": "空闲", "reply_factor": 1.0}
+}
+```
+
+注意 `default_property` 只在「都匹配不上」时兜底，改它不会影响已命中的条目。
+
+---
+
+## 七、FAQ
 
 **Q：改完 json 为什么没生效？**
 
-A：四张表都**只在插件加载 / 热重载时读一遍**。保存文件后要**触发热重载或在宿主里重启插件**才会重读。
+A：五张表都**只在插件加载 / 热重载时读一遍**。保存文件后要**触发热重载或在宿主里重启插件**才会重读。
 
 如果重载后还是没变化，按顺序查：
 
@@ -412,7 +550,21 @@ A：四张表都**只在插件加载 / 热重载时读一遍**。保存文件后
    - 情绪映射表整文件回退；
    - 情绪描述表「含未知情绪键，已丢弃」；
    - 好感度预设表「有 N 个预设被排除」；
-   - 好感度档位描述表「含未知预设/档位键，已丢弃」。
+   - 好感度档位描述表「含未知预设/档位键，已丢弃」；
+   - 日程属性表整文件回退 /「有 N 个条目被排除」（`planning.properties_rejected` 留账）。
+
+**Q：日程属性表怎么调 bot 在某类活动里的回话频率？**
+
+A：改 `schedule_properties.json` 那条属性的 `reply_factor` 后热重载。倍率 <1 少说话、
+>1 多说话、1.0 = 不调整（范围 0~2，睡觉 0.05、娱乐/社交 1.5 是出厂值）。只能改已在该表的
+条目——本身就是按属性条目工作的，不在表里的 `goal_type` 一律走 `default_property`（默认
+空闲 1.0，把它改大 = 所有认不出属性的日程都更爱说话）。
+
+**Q：我把某条属性从 `schedule_properties.json` 里删了，会怎样？**
+
+A：该条目回到**内置默认**（见第六节内置默认表）——同 id 覆盖、其余内置保留的合并语义，
+条目只会回值，不会消失。想让某个 `goal_type` 归别条属性管，把它写进那条属性的 `goal_types`
+即可（数组序先到先得，写在前面的属性优先）。
 
 **Q：我把某个预设从 `affection_presets.json` 里删了，但配置里还选着它，会怎样？**
 
@@ -441,4 +593,4 @@ A：可以，**1~5 档**都行，每档的名字自己起。但要注意两点�
 
 ---
 
-> 维护提示：本文档随插件包分发，描述的是当前代码的行为；代码与文档都可能继续演进，若两者冲突，**以代码内注释为准**（各表对应的源码：`emotion/mapping_override.py`、`emotion/descriptions.py`、`companion/affection_presets.py`、`companion/affection_tier_descriptions.py`、`core/mapping_dir.py`）。
+> 维护提示：本文档随插件包分发，描述的是当前代码的行为；代码与文档都可能继续演进，若两者冲突，**以代码内注释为准**（各表对应的源码：`emotion/mapping_override.py`、`emotion/descriptions.py`、`companion/affection_presets.py`、`companion/affection_tier_descriptions.py`、`planning/activity_properties.py`、`core/mapping_dir.py`）。

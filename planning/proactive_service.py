@@ -76,7 +76,9 @@ from .config import (
 )
 from core.storage import load_json, save_json_atomic
 
+from .activity_properties import resolve_property
 from .goal_manager import get_goal_manager
+from .schedule_anchors import SOURCE_REAL_SCHEDULE
 from .time_utils import TimezoneManager, is_in_day_frame, parse_time_window
 if TYPE_CHECKING:
     from typing import Any as _Plugin
@@ -84,19 +86,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# goal_type → 频率因子映射（1.0 = 主程序默认；<1 减少回复；>1 增加回复）
-_FREQUENCY_FACTOR_BY_GOAL_TYPE: Dict[str, float] = {
-    "study": 0.3,           # 学习：低频，不打扰
-    "work": 0.3,            # 工作：低频
-    "learn_topic": 0.5,     # 学习兴趣话题：偏低
-    "sleep": 0.05,          # 睡觉：几乎不说话
-    "exercise": 0.7,        # 运动：偏低
-    "meal": 1.2,            # 吃饭：略高于平时
-    "rest": 1.3,            # 休息：高频
-    "daily_routine": 1.0,   # 日常作息：默认
-    "entertainment": 1.5,   # 娱乐：高频
-    "social_maintenance": 1.5,  # 社交：最高
-}
+# （2026-10-21 §24.3 任务C，R7 依据 = 用户直派）goal_type → 频率因子映射表
+# ``_FREQUENCY_FACTOR_BY_GOAL_TYPE`` 已删除：数值语义迁为``mappings/schedule_properties.json``
+# 的内置默认条目（planning/activity_properties.py 单一真源），``_apply_frequency`` 改经
+# :func:`activity_properties.resolve_property` 取属性倍率——倍率与关键词词表成为用户
+# 改 json 即可调整的映射表；A-21 ③④（频率表缺 free_time/custom）随内置兜底条目收敛。
 
 # ── L2 早晚安漂移（附录 §三；裁决 B1/B3/B5/B6/B7）──────────────────
 #: 漂移区间的严格形态（§3.1）：单数字 N 或 "a-b"；负数（"-5-10"/"-10"）与其他写法一律非法（B3）
@@ -563,8 +557,8 @@ class ProactiveService:
 
         # 1. 频率调控（每个 stream 独立，因子不变则跳过；不发送消息、无打扰面）
         if cfg_p.enable_frequency_modulation and activity_info is not None:
-            _, goal_type, _, _, _ = activity_info
-            await self._apply_frequency(streams, goal_type)
+            _name, goal_type = activity_info[0], activity_info[1]
+            await self._apply_frequency(streams, goal_type, name=_name)
 
         # 2. L2 早晚安漂移（§3.2/§3.3）：掷点复用 → 强制激活判定 → 触发/推迟/放弃
         await self._process_greetings(now, date_str)
@@ -584,7 +578,24 @@ class ProactiveService:
 
         F16/B2：这两个锚点定义「新一天」的起止——早安基准取 wake（= 睡眠窗口结束），
         晚安无日程时回退 sleep 锚点（B4 只做兜底优先级，不强制两者同步）。
+
+        §24.2 任务B（R7 依据 = 用户 2026-10-21 直派）：**真实作息锚点优先**——经
+        companion.patrol 的同一 wiring 真源（``real_sleep_anchors_from_plugin``）读
+        真实睡眠环（今晚/今晨睡觉条目，读取即解析；赖床顺延后锚点随移）；锚点不可得
+        （纯配置对象桩 / ``_schedule_query`` 缺失 / DB 不可用 / 解析异常）→ 现行
+        ``[schedule]`` 配置路径不变（§7.9 fail-safe 语义不变）。
         """
+        try:
+            from companion.patrol import real_sleep_anchors_from_plugin
+
+            real = real_sleep_anchors_from_plugin(self._plugin)
+            if real is not None and real.source == SOURCE_REAL_SCHEDULE:
+                wake_min = _parse_hhmm_minutes(real.end, -1)
+                sleep_min = _parse_hhmm_minutes(real.start, -1)
+                if wake_min >= 0 and sleep_min >= 0:
+                    return wake_min, sleep_min
+        except Exception as exc:  # pragma: no cover - companion 未装配时的降级路径
+            logger.debug(f"真实作息锚点解析不可用（{exc}），按配置路径降级")
         cfg = section_or_default(self._plugin, "schedule", ScheduleSectionConfig)
         wake_min = _parse_hhmm_minutes(getattr(cfg, "wake_time", ""), _DEFAULT_WAKE_MINUTES)
         sleep_min = _parse_hhmm_minutes(getattr(cfg, "sleep_time", ""), _DEFAULT_SLEEP_MINUTES)
@@ -697,9 +708,11 @@ class ProactiveService:
         """生效静默起点 ``(HH:MM 原文, 来源配置键)``（单一真源 + 本地降级）。
 
         主路径 = ``companion.patrol.resolve_silence_window``（2026-10-20 用户指示后恒取
-        ``[schedule].sleep_time``——静默窗复用作息，键已删除）。companion 未装配（裁剪部署/
-        桩环境）→ 本地按同一口径读 ``[schedule].sleep_time``。两条路径都**不**把非法值改写成
-        缺省时刻——非法由 :meth:`_silence_start_ts` 按 fail-safe 关闭观测窗。
+        ``[schedule].sleep_time``——静默窗复用作息；2026-10-21 §24.2 任务B 起插件实例路径
+        **优先真实睡眠环锚点**，今晚入睡条目原文随作息动态同步，键留痕仍为
+        ``schedule.sleep_time``）。companion 未装配（裁剪部署/桩环境）→ 本地按同一口径读
+        ``[schedule].sleep_time``。两条路径都**不**把非法值改写成缺省时刻——非法由
+        :meth:`_silence_start_ts` 按 fail-safe 关闭观测窗。
         """
         try:
             from companion.patrol import resolve_silence_window
@@ -1311,21 +1324,10 @@ class ProactiveService:
     # 查询辅助
     # ------------------------------------------------------------
 
-    def _in_sleep_window(self, current_min: int) -> bool:
-        """判断当前分钟是否处于设定的睡眠时段（入睡 → 次日起床）。
-
-        与是否开启无睡眠模式无关——只要是设定的睡眠时间，主动行为都不触发。
-        """
-        cfg = section_or_default(self._plugin, "schedule", ScheduleSectionConfig)
-        wake_min = _parse_hhmm_minutes(cfg.wake_time, _DEFAULT_WAKE_MINUTES)
-        sleep_min = _parse_hhmm_minutes(cfg.sleep_time, _DEFAULT_SLEEP_MINUTES)
-        if wake_min == sleep_min:
-            return False
-        if wake_min < sleep_min:
-            # 清醒 [wake, sleep) 同日；睡眠 [sleep, 24:00) ∪ [0, wake)
-            return not (wake_min <= current_min < sleep_min)
-        # 跨午夜夜猫子：清醒 [wake, 24:00) ∪ [0, sleep)；睡眠 [sleep, wake) 同日
-        return sleep_min <= current_min < wake_min
+    # 注（§24.2 任务B，2026-10-21）：原 ``_in_sleep_window`` 已删除——零调用死代码
+    # （盘点依据 §24.0；R7 依据 = 计划书 §24.2 用户指示）。真实作息锚点落地后
+    # 保留该副本只会成为"配置口径假源"，睡眠环判定统一收敛到
+    # planning/schedule_anchors.py（连锁消费统一经 patrol 的真源入口）。
 
     def _find_current_activity(self) -> Optional[Tuple[str, str, int, int, Dict[str, Any]]]:
         """从 GoalManager 找当前正在进行的活动。
@@ -1412,9 +1414,17 @@ class ProactiveService:
     # 频率调控
     # ------------------------------------------------------------
 
-    async def _apply_frequency(self, streams: List[str], goal_type: str) -> None:
-        """按 goal_type 映射频率因子并对每个 stream 应用（因子不变则跳过）。"""
-        target_factor = _FREQUENCY_FACTOR_BY_GOAL_TYPE.get(goal_type, 1.0)
+    async def _apply_frequency(self, streams: List[str], goal_type: str, name: str = "") -> None:
+        """按日程属性映射频率因子并对每个 stream 应用（因子不变则跳过）。
+
+        §24.3 任务C（2026-10-21）：因子改经 :func:`activity_properties.resolve_property`
+        按「日程属性」取——`goal_type` 精确命中优先、条目 name 含关键词次之、
+        ``default_property`` 兜底；每流按 ``_current_factor`` 缓存机制不变。因子值本身
+        来自 ``mappings/schedule_properties.json``（装载/热重载读一遍，改 json 即调）；
+        本模块不再持有任何频率字面量。
+        """
+        property_spec = resolve_property(goal_type, name)
+        target_factor = property_spec.reply_factor
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "frequency"):
             return  # 宿主未提供 frequency 能力（未声明时兼容）
@@ -1436,10 +1446,14 @@ class ProactiveService:
 
         if applied:
             logger.debug(
-                f"频率调控: goal_type={goal_type}, factor={target_factor}, 已应用到 {applied} 个会话"
+                f"频率调控: goal_type={goal_type}, name={name}, property={property_spec.id}, "
+                f"factor={target_factor}, 已应用到 {applied} 个会话"
             )
         if failed:
-            logger.debug(f"频率调控失败: goal_type={goal_type}, factor={target_factor}, 共 {failed} 个")
+            logger.debug(
+                f"频率调控失败: goal_type={goal_type}, name={name}, property={property_spec.id}, "
+                f"factor={target_factor}, 共 {failed} 个"
+            )
 
     # ------------------------------------------------------------
     # 主动发起

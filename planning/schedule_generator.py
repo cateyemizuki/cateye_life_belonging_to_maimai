@@ -48,7 +48,7 @@ from .generator.validator import is_gap_warning
 from .goal_manager import GoalManager, get_goal_manager
 from .schedule_db import ScheduleDB
 from .schedule_items import is_night_sleep_item
-from .time_utils import is_in_sleep_ring, normalize_day_minutes
+from .time_utils import is_in_sleep_ring, normalize_day_minutes, ring_minutes_ahead
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,10 @@ _DEFAULT_WAKE_MINUTES = 7 * 60
 _DEFAULT_SLEEP_MINUTES = 23 * 60
 
 # 降级模板（LLM 全轮失败时按工作日/周末取用；time_slot 起始，时长小时）
+# A-24.1（任务A，2026-10-21 R7 直派 / 计划书 §24.1）：起床类首条目与 ``睡觉`` 条目的钟点/时长位
+# 只是占位——``_build_fallback`` 会按 [schedule] 生效锚点动态写（``睡觉`` 行不再硬编码入睡时刻，
+# 行内书面占位留空）；中间条目按模板钟点保留，但钟点落在睡眠环内的会在构建时丢弃
+# （宁缺勿碎，避免 ``_normalize_items`` 的夹逼再产 15 分钟碎片）。
 FALLBACK_TEMPLATE = {
     "workday": [
         ("起床洗漱", "07:00", 0.5, "daily_routine", "medium", "闹钟响了，新的一天开始了"),
@@ -68,7 +72,7 @@ FALLBACK_TEMPLATE = {
         ("吃晚餐", "18:30", 1.0, "meal", "medium", "晚饭时间"),
         ("娱乐时间", "19:30", 2.0, "entertainment", "low", "看看喜欢的视频或书"),
         ("洗漱准备", "21:30", 0.5, "daily_routine", "medium", "洗漱，准备睡觉"),
-        ("睡觉", "22:00", 9.0, "sleep", "high", "晚安，明天见"),
+        ("睡觉", "", 9.0, "sleep", "high", "晚安，明天见"),
     ],
     "weekend": [
         ("自然醒", "08:30", 0.5, "daily_routine", "low", "周末不用早起，赖一会儿床"),
@@ -80,7 +84,7 @@ FALLBACK_TEMPLATE = {
         ("吃晚餐", "17:30", 1.0, "meal", "medium", "晚饭时间"),
         ("娱乐时间", "19:00", 2.5, "entertainment", "low", "刷刷视频，聊聊天"),
         ("洗漱准备", "21:30", 0.5, "daily_routine", "medium", "洗漱，准备睡觉"),
-        ("睡觉", "22:00", 9.0, "sleep", "high", "晚安，明天见"),
+        ("睡觉", "", 9.0, "sleep", "high", "晚安，明天见"),
     ],
 }
 
@@ -224,10 +228,10 @@ class ScheduleGenerator:
                     date=date, wake_time=wake_time, sleep_time=sleep_time)
         except ScheduleGenerationError as exc:
             logger.warning("日程 LLM 生成失败（%s），使用模板兜底", exc)
-            raw_items = self._build_fallback()
+            raw_items = self._build_fallback(wake_time=wake_time, sleep_time=sleep_time)
         except LLMError as exc:
             logger.warning("日程 LLM 致命错误（%s），使用模板兜底", exc)
-            raw_items = self._build_fallback()
+            raw_items = self._build_fallback(wake_time=wake_time, sleep_time=sleep_time)
 
         # 归一化为 DB 记录并落库（含约定匹配 + 消费）
         items = self._normalize_items(raw_items, date, wake_time, sleep_time)
@@ -862,21 +866,48 @@ class ScheduleGenerator:
         return [item for item in data if isinstance(item, dict) and item.get("name")]
 
     @staticmethod
-    def _build_fallback() -> List[Dict[str, Any]]:
-        """模板兜底（LLM 全轮失败时保证总有日程可用）。"""
+    def _build_fallback(wake_time: str = "07:00", sleep_time: str = "23:00") -> List[Dict[str, Any]]:
+        """模板兜底（LLM 全轮失败时保证总有日程可用）——按生效作息锚定（A-24.1 任务A）。
+
+        口径（计划书 §24.1 FallbackAnchor；调用方透传 [schedule] 生效锚点）：
+
+        - 起床类首条目 start = 起床锚点；``睡觉`` 条目 start = 入睡锚点、时长 =
+          睡眠环跨度（入睡锚点 → 起床锚点，:func:`ring_minutes_ahead`；常规作息即
+          ``wake+1440−sleep`` 分钟、跨午夜作息即 ``wake−sleep``），钳 3~12 小时；
+        - 中间条目保持模板钟点，但钟点落在睡眠环内（帧内早于起床锚点 / 不早于入睡
+          锚点，帧内口径唯一实现 = :func:`is_in_sleep_ring`）的条目**丢弃**——兜底是
+          填充物，宁缺勿碎，避免 ``_normalize_items`` 的夹逼再产 15 分钟碎片；
+        - 锚点解析非法 → 420/1380（07:00/23:00，与生成链 ``_normalize_items`` 同源）。
+          任何路径不再出现硬编码入睡时刻的兜底睡觉段，写入钟点一律来自生效锚点。
+        """
+        wake_min = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
+        sleep_min = parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES)
+        sleep_hours = max(3.0, min(12.0, ring_minutes_ahead(wake_min, sleep_min) / 60.0))
         now = datetime.now()
         tpl = FALLBACK_TEMPLATE["weekend" if now.weekday() >= 5 else "workday"]
-        return [
-            {
+        anchored: List[Dict[str, Any]] = []
+        for idx, (name, slot, hours, goal_type, priority, desc) in enumerate(tpl):
+            if idx == 0:
+                # 起床类首条目：start = 起床锚点
+                slot = _fmt_minutes(wake_min)
+            elif goal_type == "sleep":
+                # ``睡觉`` 条目：start = 入睡锚点，时长 = 睡眠环跨度（钳 3~12h）
+                slot = _fmt_minutes(sleep_min)
+                hours = sleep_hours
+            else:
+                # 中间条目保持模板钟点；钟点落在睡眠环 → 丢弃（宁缺勿碎）
+                slot_min = _parse_minutes(slot, -1)
+                if slot_min >= 0 and is_in_sleep_ring(slot_min, wake_min, sleep_min):
+                    continue
+            anchored.append({
                 "name": name,
                 "time_slot": slot,
                 "duration_hours": hours,
                 "goal_type": goal_type,
                 "priority": priority,
                 "description": desc,
-            }
-            for name, slot, hours, goal_type, priority, desc in tpl
-        ]
+            })
+        return anchored
 
     @staticmethod
     def _normalize_items(

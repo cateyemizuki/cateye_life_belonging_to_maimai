@@ -36,6 +36,7 @@ from .config import (
     ScheduleSectionConfig,
     section_or_default,
 )
+from .activity_properties import resolve_property
 from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
 from .schedule_generator import ScheduleGenerator
@@ -296,14 +297,17 @@ class ToolsService:
         def _fmt_item(goal: Any, tw: List[int], prefix: str = "") -> str:
             start_time = format_day_minute(tw[0])
             end_time = format_day_minute(tw[1])
+            # 属性短标签（§24.3 任务C）：goal_type 精确命中 / 名称关键词 / 空闲兜底
+            prop_tag = resolve_property(goal.goal_type, goal.name).reply_tag()
+            tag_prefix = f"{prop_tag} " if prop_tag else ""
             desc = ""
             if enable_detailed_description and goal.description:
                 desc = goal.description
                 if len(desc) > 30:
                     desc = desc[:27] + "..."
             if desc:
-                return f"{prefix}{start_time}-{end_time} {goal.name}\n   描述：{desc}"
-            return f"{prefix}{start_time}-{end_time} {goal.name}"
+                return f"{prefix}{start_time}-{end_time} {tag_prefix}{goal.name}\n   描述：{desc}"
+            return f"{prefix}{start_time}-{end_time} {tag_prefix}{goal.name}"
 
         date_str = now.strftime("%Y-%m-%d")
         weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]

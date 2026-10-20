@@ -5,11 +5,13 @@
 想念（沉默阈值每轮随机采样 + 概率 + LLM 把关）→
 日程巡检（活动分享 / 日常搭话，受「启用日程巡检」开关与概率控制）。
 
-**静默窗口径（2026-10-20 用户指示，N5「留空跟随」收官）**：静默窗**恒复用**
-``[schedule]`` 的入睡/起床锚点（入睡~起床整夜静默；原 ``silence_start/silence_end``
-显式覆盖键已删除，旧值由迁移器丢弃）；生效值统一由 :func:`resolve_silence_window`
-解析（planning 的晚安期限、qzone 的空间静默闸同源），格式非法一律 fail-safe
-（视作静默，宁可不发）。
+**静默窗口径（2026-10-20 用户指示，N5「留空跟随」收官；2026-10-21 §24.2 任务B 真实化）**：
+静默窗恒复用作息锚点——**插件实例路径优先真实睡眠环**（schedule.db 夜晚睡条目经
+``planning/schedule_anchors`` 解析，读取即解析；赖床顺延后锚点随移），日程不可用时回退
+``[schedule]`` 入睡/起床配置锚点（原 ``silence_start/silence_end`` 显式覆盖键已删除，旧值
+由迁移器丢弃）；生效值统一由 :func:`resolve_silence_window` 解析（planning 的晚安期限/
+早安基准、emotion 夜窗、qzone 的空间静默闸同源），格式非法一律 fail-safe（视作静默，
+宁可不发）。
 
 **与早晚安的关系（2026-10-10 配置整理轮口径）**：早安/晚安只有一条驱动链——
 planning 的 L2 漂移机制（[planning_proactive]）。本巡检器**从不**触发问候，
@@ -39,12 +41,14 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional, Tuple
 
 from core.diag import DecisionLogger
 from core.llm_utils import LLMService
 from core.time_utils import hours_between, parse_hhmm, parse_hours_range
+from planning.schedule_anchors import (SOURCE_REAL_SCHEDULE, RealAnchors,
+                                       real_sleep_anchors)
 from planning.schedule_query import ScheduleQuery
 from planning.time_utils import is_in_time_window
 from suite_prompts import (
@@ -95,13 +99,17 @@ _FALLBACK_SCHEDULE_SLEEP = "23:00"
 
 @dataclass(frozen=True)
 class SilenceWindow:
-    """静默窗的**生效值**（2026-10-20 用户指示：静默窗**恒复用** ``[schedule]`` 作息锚点）。
+    """静默窗的**生效值**（2026-10-20 用户指示：静默窗恒复用作息锚点；2026-10-21 §24.2
+    任务B 真实化：插件实例路径优先真实睡眠环）。
 
-    - ``start`` / ``end``：生效的 HH:MM 原文（不规范化，告警时原样回显配置值）；
-    - ``start_source`` / ``end_source``：恒 ``"schedule"``（原 ``silence_start/end`` 显式
-      覆盖能力已随键删除而移除；字段保留供调用方兼容读取）；
+    - ``start`` / ``end``：生效的 ``HH:MM`` 原文（未规范化：真实锚点时为实际条目的
+      入睡/起床钟点——跨午夜按 end<start 写法，交给 ``is_in_time_window``；配置路径时
+      原样回显配置值）；
+    - ``start_source`` / ``end_source``：``"schedule"``（``[schedule]`` 配置锚点，桩/
+      降级路径）或 ``"real_schedule"``（真实睡眠环条目；§24.2 两侧端点同源同条目）；
     - ``invalid_keys``：格式非法（非 HH:MM）的来源配置键，非空即**整窗非法**——调用方据此走
       fail-safe（巡检视作静默、晚安观测窗关闭），**不得**静默回退成"可打扰"。
+      （真实锚点由分钟数构造，恒合法 ⇒ 恒空。）
     """
 
     start: str
@@ -117,7 +125,7 @@ class SilenceWindow:
 
     @property
     def start_key(self) -> str:
-        """生效起点的来源配置键（``invalid_time_config`` 留痕用）。"""
+        """生效起点的来源配置键（``invalid_time_config`` 留痕用；真实锚点恒无留痕）。"""
         return "schedule.sleep_time"
 
     @property
@@ -126,7 +134,9 @@ class SilenceWindow:
         return "schedule.wake_time"
 
     def source_note(self) -> str:
-        """可读来源标注（日志用）：静默窗恒复用作息，恒有标注。"""
+        """可读来源标注（日志用；恒有标注）：配置锚点= 跟随日程作息，真实锚点= 跟随真实日程。"""
+        if self.start_source == SOURCE_REAL_SCHEDULE:
+            return "（跟随真实日程）"
         return "（跟随日程作息）"
 
     def describe(self) -> str:
@@ -157,6 +167,38 @@ def _fallback_schedule_anchors() -> Tuple[str, str]:
         return _FALLBACK_SCHEDULE_WAKE, _FALLBACK_SCHEDULE_SLEEP
 
 
+def real_sleep_anchors_from_plugin(plugin: Any, now: Optional[datetime] = None
+                                   ) -> Optional[RealAnchors]:
+    """真实作息锚点的**同一 wiring 入口**（§24.2 任务B：所有消费点共享，禁止自建副本）。
+
+    - 插件实例路径：``plugin._schedule_query.get_day_schedule`` **读取即解析**
+      （该查询为无缓存直读，不建内存镜像/不落内存映射）；今天与昨天两个日期帧都取
+      （A-16 跨夜归属：今晨的睡眠环可能写在昨天的日程里）；
+    - 任何异常（schedule_query 缺失 / DB 不可用 / 解析异常）→ 返回 ``None``，调用方走
+      ``[schedule]`` 配置路径（现行行为，§7.9：绝不静默回退成"可打扰"）；
+    - **纯配置对象**（无 ``_schedule_query`` 属性，测试桩）→ 返回 ``None``；
+    - ``now`` 缺省取本模块的 ``datetime.now()``（决策日志用例的注入时钟同一处，
+      ``mock.patch.object(companion.patrol, "datetime", ...)`` 即可生效）。
+    """
+    query = getattr(plugin, "_schedule_query", None)
+    if not callable(getattr(query, "get_day_schedule", None)):
+        return None
+    try:
+        moment = now if now is not None else datetime.now()
+        today = moment.strftime("%Y-%m-%d")
+        yesterday = (moment - timedelta(days=1)).strftime("%Y-%m-%d")
+        items_today = list(query.get_day_schedule(today) or [])
+        items_yesterday = list(query.get_day_schedule(yesterday) or [])
+        schedule = _config_section(plugin, "schedule")
+        fallback_wake, fallback_sleep = _fallback_schedule_anchors()
+        cfg_wake = str(getattr(schedule, "wake_time", "") or "").strip() or fallback_wake
+        cfg_sleep = str(getattr(schedule, "sleep_time", "") or "").strip() or fallback_sleep
+        return real_sleep_anchors(items_today, items_yesterday, now=moment,
+                                  cfg_sleep=cfg_sleep, cfg_wake=cfg_wake)
+    except Exception:
+        return None
+
+
 #: 午休/小睡条目的名称词表（companion 巡检与空间静默共用；2026-10-20 用户指示
 #: `[patrol].nap_quiet_enabled` 跨模块生效——qzone 判定链经 :func:`nap_item_matches` 同源判定）
 NAP_NAME_KEYWORDS: Tuple[str, ...] = ("午休", "午睡", "小憩", "打盹")
@@ -177,19 +219,27 @@ def nap_item_matches(item: Any) -> bool:
 
 
 def resolve_silence_window(config: Any) -> SilenceWindow:
-    """解析静默窗的**生效值**（2026-10-20 用户指示后的单一真源：**恒复用** ``[schedule]`` 作息）。
+    """解析静默窗的**生效值**（单一真源：2026-10-20 起恒复用作息；2026-10-21 §24.2 任务B
+    真实化——插件实例路径优先**真实睡眠环**锚点）。
 
-    - 起点取 ``[schedule].sleep_time``（入睡时间）、终点取 ``wake_time``（起床时间），
+    - **真实锚点路径**（``config`` 为插件实例且有 ``_schedule_query``）：经
+      :func:`real_sleep_anchors_from_plugin` 读真实睡眠环（今晚/今晨睡觉条目，跨午夜
+      end<start 写法交 ``is_in_time_window``；赖床顺延后锚点随移），``start_source`` /
+      ``end_source`` 恒 = ``"real_schedule"``；
+    - **配置路径**（纯配置对象，或日程不可用/解析异常兜底；现行行为）：
+      起点取 ``[schedule].sleep_time``（入睡时间）、终点取 ``wake_time``（起床时间），
       即「入睡~起床」整夜静默——**夜晚睡觉时间即静默时间**；原 ``[patrol].silence_start/end``
       显式覆盖能力已随键删除而移除（旧配置显式值由迁移器丢弃并登记）；
-    - **fail-safe**：生效值仍按 HH:MM 校验（``parse_hhmm``，与巡检静默闸同一口径），任一非法即
-      整窗非法（``invalid_keys`` 留痕）——调用方按「宁可不发」处理，绝不静默回退成"可打扰"；
-    - ``[schedule]`` 段/锚点缺失（未装配日程段）→ 用出厂锚点兜底（默认 07:00/23:00，
-      仍是静默窗，不会变成可打扰）。
+      ``[schedule]`` 段/锚点缺失（未装配日程段）→ 用出厂锚点兜底（默认 07:00/23:00，
+      仍是静默窗，不会变成可打扰）；
+    - **fail-safe**：配置路径的生效值仍按 HH:MM 校验（``parse_hhmm``，与巡检静默闸同一
+      口径），任一非法即整窗非法（``invalid_keys`` 留痕）——调用方按「宁可不发」处理，
+      绝不静默回退成"可打扰"。真实锚点由分钟数构造恒合法（非法条目在解析层按候选
+      不可用丢弃，不会带出非法 HH:MM），恒无 ``invalid_keys``。
 
-    ``config`` 兼容 plugin 实例与配置对象。planning 侧（晚安期限）、巡检静默闸与 qzone 空间
-    静默闸共用本函数，保证各处取到的是同一个生效值；返回值是**未规范化**的原文，跨午夜判定
-    交给 ``is_in_time_window``（start > end 即跨午夜）。
+    ``config`` 兼容 plugin 实例与配置对象。planning 侧（晚安期限 / 早安基准 / 情绪夜窗）、
+    巡检静默闸与 qzone 空间静默闸共用本函数，保证各处取到的是同一个生效值；返回值是
+    **未规范化**的原文，跨午夜判定交给 ``is_in_time_window``（start > end 即跨午夜）。
     """
     schedule = _config_section(config, "schedule")
     wake = str(getattr(schedule, "wake_time", "") or "").strip()
@@ -204,6 +254,18 @@ def resolve_silence_window(config: Any) -> SilenceWindow:
         invalid.append("schedule.sleep_time")
     if parse_hhmm(wake, -1) < 0:
         invalid.append("schedule.wake_time")
+
+    # §24.2 任务B（R7 依据 = 用户 2026-10-21 直派）：插件实例路径先真实锚点，读取即解析，
+    # 不建内存镜像；任何异常/不可得全走上面的配置路径（fail-safe 语义不变）。
+    real = real_sleep_anchors_from_plugin(config)
+    if real is not None and real.source == SOURCE_REAL_SCHEDULE:
+        return SilenceWindow(
+            start=real.start,
+            end=real.end,
+            start_source=SOURCE_REAL_SCHEDULE,
+            end_source=SOURCE_REAL_SCHEDULE,
+            invalid_keys=(),
+        )
     return SilenceWindow(
         start=sleep,
         end=wake,

@@ -364,6 +364,45 @@ class ScheduleImageGenerator:
         )
 
     # ------------------------------------------------------------
+    # 日程属性标注（§24.3 任务C 2026-10-21：条目行属性标签 + 属性色）
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _property_tag(item: Dict[str, Any]) -> str:
+        """条目行的 ``[属性]`` 短标签（调用方注入 ``property`` 文案；缺失/空白 → 不画）。
+
+        长度纪律（_cap 同思路的定长截断）：标签预截 4 字 — 属性表校验推荐 2~3 字，4 字为
+        排版硬上限，防用户超长标签挤爆 S1 行排版。
+        """
+        label = str(item.get("property") or "").strip()
+        if not label:
+            return ""
+        return f"[{label[:4]}]"
+
+    @staticmethod
+    def _parse_hex_color(value: Any) -> Optional[Tuple[int, int, int]]:
+        """``#RRGGBB`` 十六进制色 → RGB 三元组（非法形态 → ``None`` 交给回退链）。"""
+        text = str(value or "").strip()
+        if len(text) != 7 or text[0] != "#":
+            return None
+        try:
+            return (int(text[1:3], 16), int(text[3:5], 16), int(text[5:7], 16))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _row_item_color(cls, item: Dict[str, Any], goal_type: str) -> Tuple[int, int, int]:
+        """条目色（时间条/类型标色）：属性 color → ``TYPE_COLORS[goal_type]`` → 兜底色。
+
+        §24.3 冻结回退链：注入的 ``property_color`` 非法（非 ``#RRGGBB`` 形态）/ 缺失 →
+        回退 ``TYPE_COLORS[goal_type]``；未收录 goal_type → ``DEFAULT_TYPE_COLOR``。
+        """
+        parsed = cls._parse_hex_color(item.get("property_color"))
+        if parsed is not None:
+            return parsed
+        return cls.TYPE_COLORS.get(goal_type, cls.DEFAULT_TYPE_COLOR)
+
+    # ------------------------------------------------------------
     # 主入口
     # ------------------------------------------------------------
 
@@ -382,6 +421,8 @@ class ScheduleImageGenerator:
             title: 标题文字（如 "今日日程 2026-09-19 周六"）
             schedule_items: 日程项列表，每项
                 ``{"time": "HH:MM-HH:MM", "name", "description", "goal_type"}``
+                （§24.3 起 ：method:`_generate` 另可选收每项 ``property`` / ``property_color``
+                字段渲染属性标签，由调用方注入）
             width: 图片宽度（None=默认 1080）
             tz_name: 用于判定「进行中/已完成」的时区（IANA 名；None=默认）
             output_dir: 图片输出目录（宿主隔离数据目录；None=系统临时目录）
@@ -440,11 +481,14 @@ class ScheduleImageGenerator:
             for item in schedule_items or []:
                 time_str = str(item.get("time", ""))
                 status = cls._activity_status(time_str, now_minutes)
+                goal_type = str(item.get("goal_type", "custom") or "custom")
                 rows.append({
                     "time": time_str,
                     "name": str(item.get("name", "") or "")[:200],   # 热修：预截（防超大串 O(n²) 截断）
                     "desc": str(item.get("description", "") or "")[:200],
                     "status": status,
+                    "tag": cls._property_tag(item),
+                    "color": cls._row_item_color(item, goal_type),
                 })
             total = len(rows)
             # 热修（2026-10-11 服务器死机）：高度钳制 4096（旧版有、S1 重写时丢失）——
@@ -507,6 +551,17 @@ class ScheduleImageGenerator:
                           fill=INK if is_current else MUTED)
                 name_x = M2 + int(380 * s)
                 draw.text((name_x, y - int(2 * s)), row["name"], font=f_name, fill=INK)
+                # 属性标注（§24.3）：时间与活动名之间的 [属性] 短标签 + 属性色小色条
+                # （槽位 = name_x−16s 右对齐，紧邻活动名；不移动既有列位、不碰 4096 钳制）。
+                tag_text = row["tag"]
+                if tag_text:
+                    tag_font = _font(20)
+                    tag_w = draw.textlength(tag_text, font=tag_font)
+                    tag_x = name_x - int(16 * s) - tag_w
+                    bar_x = tag_x - int(12 * s)
+                    draw.rectangle([bar_x, y + int(12 * s), bar_x + int(4 * s),
+                                    y + row_h - int(14 * s)], fill=row["color"])
+                    draw.text((tag_x, y + int(8 * s)), tag_text, font=tag_font, fill=MUTED)
                 status_text = {"completed": "已完成", "current": "进行中", "upcoming": "未开始"}[
                     row["status"]]
                 _sw = inner - (name_x - M2)
@@ -551,37 +606,6 @@ class ScheduleImageGenerator:
             raise RuntimeError(f"日程图片渲染失败: {exc}") from exc
 
     # ------------------------------------------------------------
-
-    @classmethod
-    def generate_schedule_image(
-        cls,
-        title: str,
-        schedule_items: List[Dict[str, Any]],
-        width: Optional[int] = None,
-        tz_name: Optional[str] = None,
-        output_dir: Optional[Path] = None,
-    ) -> Tuple[str, str]:
-        """生成日程图片（v2：动态高度清单排版，展示全部条目）。
-
-        Args:
-            title: 标题文字（如 "今日日程 2026-09-19 周六"）
-            schedule_items: 日程项列表，每项
-                ``{"time": "HH:MM-HH:MM", "name", "description", "goal_type"}``
-            width: 图片宽度（None=默认 1080）
-            tz_name: 用于判定「进行中/已完成」的时区（IANA 名；None=默认）
-            output_dir: 图片输出目录（宿主隔离数据目录；None=系统临时目录）
-
-        Returns:
-            (图片路径, base64编码字符串)
-
-        Raises:
-            RuntimeError: pillow 未安装或找不到可用字体（调用方静默降级为文本）。
-        """
-        cls._generation_semaphore.acquire()
-        try:
-            return cls._generate(title, schedule_items, width, tz_name, output_dir)
-        finally:
-            cls._generation_semaphore.release()
 
     @classmethod
     def _build_stats_text(cls, rows: List[Dict[str, Any]]) -> str:

@@ -72,6 +72,19 @@ class PlanningServices:
         # 约定消费事件（commitment_kept/broken）经总线上报（M0；无总线时静默跳过）
         self.goal_manager.bind_event_bus(self.bus)
 
+        # 日程属性表装载（2026-10-21 §24.3 任务C：mappings/ 只在加载/重载读一遍）。
+        # EmotionService/CompanionServices 同款模式：热重载 = 宿主重导入重跑 on_load → 自动重读；
+        # root_dir 缺失（测试桩）= 纯内置；失败只告警不拖挂（内置默认恒可用）。
+        try:
+            from . import activity_properties
+            _props_result = activity_properties.load_and_apply(
+                root_dir=getattr(plugin, "_plugin_root", None),
+                decision_logger=getattr(plugin, "_decision_logger", None))
+            if _props_result.rejected:
+                logger.warning("日程属性表有 %d 个条目被排除（其余生效）", len(_props_result.rejected))
+        except Exception as exc:
+            logger.warning("日程属性表装载异常（按内置默认处理）：%s", exc)
+
         # 完整版日程生成器（多轮生成 + 约定匹配 + 上下文增强）。
         # 重绑 plugin._schedule_gen：plugin.py 既有调用点（_ensure_today_schedule /
         # /life plan regenerate）自动升级为完整管线。

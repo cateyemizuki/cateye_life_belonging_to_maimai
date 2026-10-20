@@ -15,6 +15,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from .activity_properties import resolve_property
 from .config import (
     ScheduleAdvancedSectionConfig,
     ScheduleSectionConfig,
@@ -219,8 +220,15 @@ class CommandService:
             start_time = format_day_minute(start_minutes)
             end_time = format_day_minute(end_minutes)
             type_label = _GOAL_TYPE_LABEL.get(goal.goal_type, "其他")
+            # 属性短标签（§24.3 任务C）：goal_type 精确命中 / 名称关键词 / 空闲兜底；
+            # 与类型标签同字的属性标签去重（如 [学习][学习] → 只画类型位一个）
+            prop_tag = resolve_property(goal.goal_type, goal.name).reply_tag()
+            prop_suffix = ""
+            if prop_tag and prop_tag != f"[{type_label}]":
+                prop_suffix = f" {prop_tag}"
 
-            lines.append(f"{idx}. {start_time}-{end_time}  [{type_label}] {goal.name}")
+            lines.append(f"{idx}. {start_time}-{end_time}  "
+                         f"[{type_label}]{prop_suffix} {goal.name}")
             if self._enable_detailed_description and goal.description:
                 lines.append(f"   说明：{goal.description}")
             lines.append("")  # 空行分隔
@@ -242,11 +250,16 @@ class CommandService:
         for goal in schedule_goals:
             start_minutes, end_minutes = get_time_window_from_goal(goal)
             time_str = f"{format_day_minute(start_minutes)}-{format_day_minute(end_minutes)}"
+            # §24.3：图渲染的属性标注位 —— 标签文案 + 属性色（#RRGGBB，可为空串）。
+            # schedule_image 侧合法性/缺失再走 TYPE_COLORS[goal_type] → 兜底色回退链。
+            prop_spec = resolve_property(goal.goal_type, goal.name)
             schedule_items.append({
                 "time": time_str,
                 "name": goal.name,
                 "description": goal.description if self._enable_detailed_description else "",
                 "goal_type": goal.goal_type,
+                "property": prop_spec.label,
+                "property_color": prop_spec.color,
             })
 
         tz_manager = self._make_tz_manager()
