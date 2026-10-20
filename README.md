@@ -4,7 +4,7 @@
 
 **功能亮点**
 
-- **自主规划日程**：按人设由大模型生成每天的生活（睡眠、三餐、工作、娱乐），把「麦麦现在在做什么」注入对话；活动切换、约定到期时主动开口；`/lbm_plan` 随时查看，还能渲染日程图片。
+- **自主规划日程**：按人设由大模型生成每天的生活（睡眠、三餐、工作、娱乐），把「麦麦现在在做什么」注入对话；活动切换、约定到期**不再主动私聊／群聊开口**（2026-10-20 起整条日程主动行为移除，主动消息只剩早/晚安与陪伴巡检）；`/lbm_plan` 随时查看，还能渲染日程图片。
 - **虚拟陪伴**：好感度养成（连续分＋恋人五档＋日衰减）、早晚安问候、想念、日程节点分享、陪伴对象电脑的屏幕感知旁白——都跑在概率、每日预算与静默时段（恒复用日程作息）的约束下。
 - **QQ 空间**：按日程自动发说说（可配图：宿主表情包 / 本地图库随机），自动回复评论（含楼中楼）与点赞；发帖前走「静默时段 → 当前活动（仅判断有没有活动）→ 概率 → 每日上限 → 冷却 → LLM 严判『此刻发是否自然』→ 可选掷骰」判定链（拿不准就不发；2026-10-20 起*不再按活动类型拦截*，原活动黑名单已移除）；cookie 取不到时自动降级成「有新评论」的提醒。
 - **情绪维护系统**：VAD 三维情绪状态机 + 25 种情绪原型映射；日常衰减、事件增量、睡眠期「大修」结算；情绪反过来影响主动频率、想念阈值、发帖意愿与回复语气。
@@ -61,10 +61,10 @@
 1. **看总览**：`/lbm_dashboard` —— 一条命令看四模块状态（日程／关系／情绪／空间），渲染状态图，渲染失败自动降级为纯文本（需管理员）。面板图后附带最近 48 小时的「日程与情绪变动」日志（每条消息 ≤50 条、单次最多 10 条消息；情绪更新行标注三维变动，状态未变不重复展示）。
 2. **看日程**：`/lbm_plan` —— 首次会自动生成今日日程；`/lbm_plan regenerate 加入下午跑步` 可重新生成。
 3. **初始化情绪**：`/lbm_emotion_init` —— 由宿主人设推导情绪锚点与基线；之后正常聊天即可观察语气变化，`/lbm_emotion_config` 查看或重置。
-4. **排障**：`/lbm_life status` 看各模块与通道状态；出问题用 `/lbm_diag llm|decision|life` 看调用与决策日志（需管理员）。
+4. **排障**：`/lbm_life status` 看各模块与通道状态；出问题用 `/lbm_diag llm|decision|life|streams` 看调用、决策与生命状态日志，`streams` 查看主动消息名单状态、候选解析与各候选流「最后一条非命令、非 bot 消息时间」（需管理员）。
 5. **QQ 空间**（先开 `[qzone] enabled`）：`/lbm_life qzone status` 看通道与 cookie，`/lbm_life qzone post 测试` 手动发一条，`comments` + `reply` 验证楼中楼回复。
 
-早晚安、想念、活动切换主动开口无需触发命令，会按配置的时段、概率与预算自行发生。
+早晚安、想念、陪伴巡检的日程分享无需触发命令，会按配置的时段、概率与预算自行发生；**日程活动切换／约定到期不再主动开口**（2026-10-20 移除）。
 
 ## 功能说明
 
@@ -72,8 +72,8 @@
 
 - 每日自动生成日程（默认「当天最后一个非睡眠活动结束后 90 分钟」生成次日），当天已有日程则跳过；模板兜底、过期清理、长期目标与未来约定都在 SQLite 里持久化（WAL + 损坏自愈）。
 - 生成质量可控：多轮生成 + 质量评分提前达标、三餐窗口硬约束、语义校验、自定义生活阶段、可回读最近日程／群聊历史／知识库作为上下文；生成文案与各注入块可在 `[prompts]` 逐项定制，深度调优项集中在 `[schedule_advanced]`。
-- planner 与 replyer 双通道注入当前活动（含意图分类与注入优化：冷却、概率、TTL），注入范围由 `[schedule] inject_scope` 决定（默认 `all` 覆盖所有会话）；并按活动类型动态调节聊天频率。
-- 主动行为：活动切换主动开口、早/晚安问候、约定到期强指令、睡眠窗口抑制。
+- planner 与 replyer 双通道注入当前活动（含意图分类与注入优化：冷却、概率、TTL），注入范围由 `[schedule] inject_scope` 决定（默认 `all` 覆盖所有会话）；并按活动类型动态调节聊天频率。注入提示要求**不主动提及日程**（只有被问起或需要引出新话题才简要提一句），「碎碎念」提及当前活动的概率恒为 0。
+- 主动行为：早/晚安问候、陪伴巡检的日程分享（仅陪伴目标私聊）、频率调控（只调节聊天频率、不发送消息）、睡眠窗口抑制；**日程活动切换／约定到期不再主动开口**（2026-10-20 移除）。
 - 真实节假日：`[schedule] holiday_inject_enabled`（默认开）把日期／节假日写进日程块头部，`[schedule] holiday_affects_schedule`（默认关）让生成考虑节假日。
 - 自然语言约定：`lbm_update_schedule_v4` 由「角色裁判」判断接受／未来约定／拒绝，接受则重排今日日程。
 - `/lbm_plan` 命令：查看（图片 + 文字合并转发，失败降级纯文本）、重新生成、删除目标、清理旧日程、帮助。
@@ -83,7 +83,7 @@
 - **好感度**：`score`（**0~200 连续分，初始 60**）+ `baseline`（慢速 EMA 关系底色）+ **档位表**（**1~5 档自由构造**；默认预设「恋人」= 生疏／熟悉／亲密／热恋／挚爱，区间 (0,40)(40,90)(90,140)(140,176)(176,200)）；档位区间与档位名由外置预设表 `mappings/affection_presets.json` 决定，档位注入文案由 `mappings/affection_tier_descriptions.json` 决定；档位升降有迟滞带与最短停留时长；日切时 score 向 baseline 回归。
 - **记账**：一问一答、沉默后对方先开口、约定兑现／违约等规则事件零 LLM 成本入账，单日正负增量各自限幅（互道早晚安的好感入账表项保留但**暂未接线**——问候去好感记账化后无触发点，不会实际入账）；另有可选的 LLM 裁判（会话采样 + 睡眠时段关系日结）产出增量、印象与关系温度。
 - **巡检主动链**：日切 → 总开关/每日上限 → 静默（fail-safe）→ 早/晚安已发标记观察（陪伴侧从不触发问候，仅记录观察——去重由 planning 自查 + affection 标记闭环完成）→ 想念（沉默阈值 `miss_silence_hours` 随机采样 + 概率 + LLM 把关 + 驳回冷却）→ 日程巡检（分享／日常搭话两个概率，可用 `patrol_activity_enabled` 关闭）；最小间隔、用户冷却与每日预算（`daily_max_speak` 即上限）在想念与巡检两段内把关。
-- **早/晚安**：由日程侧驱动，两个总开关 `greeting_morning_enabled` / `greeting_night_enabled`（默认都开）＋统一名单；**所有会话都先看「该会话有人说过话」才开口**（含目标私聊——避免对着空会话自说自话），早安在起床漂移点、晚安在睡前漂移点发出；问候**始终免主动打扰预算**、**不受静默时段拦截**。
+- **早/晚安**：由日程侧驱动，两个总开关 `greeting_morning_enabled` / `greeting_night_enabled`（默认都开）＋统一名单；**所有会话都先看「当日 00:00 起该会话有过非 bot、非命令的消息」才开口**（激活闸强制开启、不可关闭，查询异常按不发处理；含目标私聊——避免对着空会话自说自话），早安在起床漂移点、晚安在睡前漂移点发出；问候**始终免主动打扰预算**、**不受静默时段拦截**。
 - **静默窗（2026-10-20）**：陪伴侧巡检与空间侧发帖／评论监听的静默时段**恒复用日程作息**（`[schedule]` 入睡~起床，夜晚睡觉时间即静默时间）——原「静默开始/静默结束」配置项已移除，无需也无法在 WebUI 单独配置；问候不受静默拦截。
 - **主动打扰预算**：每日上限 `[patrol] daily_max_speak` **即上限**，只统计发往目标陪伴私聊的日程巡检与想念；达上限即拦截并留痕决策日志。
 - **关系设定**：`[patrol] relation_type` 决定对方是恋人／挚友／维护者／家人／自定义称谓，影响想念提示词、消息口吻与好感档位名称。**该键是 WebUI 动态下拉**：选项 = 内置五名（恋人／挚友／维护者／家人／自定义）∪ `mappings/affection_presets.json` 里的合法预设名（导入期动态构造 —— 改 json 后**重启或热重载**，下拉即多出该项；内置五名恒在，默认值「恋人」永不非法）。
@@ -119,7 +119,7 @@
 |---|---|
 | Hook ×10 | planning：`maisaka.planner.before_request`（注入当前日程，items 快照协议）、`maisaka.replyer.before_request`（把当前活动作为额外提示注入）｜companion：`chat.receive.before_process`（缓存发送者身份）、`chat.receive.after_process`（记录目标私聊发言时间）、`maisaka.planner.before_request`（屏幕旁白 + 好感度后缀）、`maisaka.replyer.before_model_request`（屏幕旁白）、`maisaka.replyer.after_response`（补计发言数，只观察）｜emotion：`maisaka.planner.before_request`、`maisaka.replyer.before_model_request`（情绪底色注入）、`maisaka.replyer.after_response`（情绪增量评估，只观察；夜间兼作打扰记账） |
 | Tool ×7 | planning：`lbm_get_schedule_info`（只读四视图 status/current/lover_day/goals）、`lbm_update_schedule_v4`（**唯一日程写入口**，角色裁判）、`lbm_nap_lie_in`（赖床：把今日睡眠条目的结束时间推到指定时刻；平时不进工具名册，只在赖床提醒轮被点名）｜companion：`lbm_mai_lover_send_message`、`lbm_mai_lover_affection`｜qzone：`lbm_life_qzone`（action=post 发说说 / moments 查说说）｜emotion：`lbm_emotion_report`（群聊事件上报） |
-| Command ×8 | planning：`/lbm_plan`、`/lbm_规划`（list/regenerate/delete/clear/help，图片 + 合并转发）｜companion：`/lbm_mai_affection`、`/lbm_mai_help`、`/lbm_diag`（llm/decision/life 三合一排障；别名 `/lbm_mai_llm_log`、`/lbm_mai_diag`、`/lbm_life diag`，管理员）、`/lbm_dashboard`（聚合总览，管理员）｜qzone：`/lbm_life`（status / qzone[moments/comments/post/reply/like/decisions] / diag / help）｜emotion：`/lbm_emotion_init`、`/lbm_emotion_config`（查看/reset/clear） |
+| Command ×8 | planning：`/lbm_plan`、`/lbm_规划`（list/regenerate/delete/clear/help，图片 + 合并转发）｜companion：`/lbm_mai_affection`、`/lbm_mai_help`、`/lbm_diag`（llm/decision/life/streams 排障；别名 `/lbm_mai_llm_log`、`/lbm_mai_diag`、`/lbm_life diag`，管理员）、`/lbm_dashboard`（聚合总览，管理员）｜qzone：`/lbm_life`（status / qzone[moments/comments/post/reply/like/decisions] / diag / help）｜emotion：`/lbm_emotion_init`、`/lbm_emotion_config`（查看/reset/clear） |
 | API ×4 | `get_current_activity`（planning，兼容原插件返回结构）｜`companion_get_current_activity` / `companion_get_schedule` / `companion_get_affection_level`（companion） |
 
 ## 常用配置速查
@@ -133,7 +133,6 @@
 | `[schedule] auto_generate_after_last_end_minutes` | `90` | 次日照程在「当天最后一个非睡眠活动结束后」多久生成 |
 | `[schedule] inject_scope` | `all` | 日程注入范围：`all` 所有会话 / `target_private` 仅目标私聊 |
 | `[planning_proactive] greeting_morning_enabled` / `greeting_night_enabled` | `true` / `true` | 早安／晚安总开关 |
-| `[planning_proactive] greeting_require_activation` | `true` | 有人说过话才问候（观察窗：早安=起床→第一段日程结束；晚安=最后一段日程结束→睡前界）；关 = 到点就发 |
 | `[planning_proactive] morning_drift` / `night_drift` | `"10-30"` | 漂移区间（分钟）：早安 = 起床锚点 + 随机；晚安 = 睡前界（`入睡时间`；2026-10-20 起静默窗复用作息，期限恒 = 入睡锚点）− 随机 |
 | `[planning_proactive] proactive_group_ids` / `proactive_private_ids` | `[]` / `[]` | 统一名单：群聊名单（默认黑名单，留空 = 全群）／私聊名单（默认白名单，留空 = 全不发；目标私聊在白名单下恒生效、写进黑名单则被排除） |
 | `[patrol] daily_max_speak` | `5` | 每日主动预算**即上限**（只统计日程巡检与想念；早/晚安免预算） |
@@ -148,14 +147,14 @@
 | `[schedule_advanced] emotion_influence` | `0.6` | 情绪对日程的影响强度（`0` = 关闭） |
 | `[llm] task_name` / `judge_model` | `replyer` / `""` | 主任务名／判定用模型（留空跟随主任务）；插件全部模型调用集中于此段 |
 
-> 全部 **11 个配置段、211 个可见配置项**的**键名｜类型｜默认值｜说明**总表、旧配置迁移映射、已移除项清单、注入矩阵与预算口径，见维护手册 `USAGE.md` 的「十、配置总览」（位于 `..\cateye_life_belonging_to_maimai开发文档\`）。**好感度档位（档数/档名/区间）与档位注入文案不在配置面**，而在插件包 `mappings/` 的四张映射表里，见 `mappings/README.md`。
+> 全部 **11 个配置段、195 个可见配置项**（全插件 **198 字段 / 3 隐藏 / 195 可见**）的**键名｜类型｜默认值｜说明**总表、旧配置迁移映射、已移除项清单、注入矩阵与预算口径，见维护手册 `USAGE.md` 的「十、配置总览」（位于 `..\cateye_life_belonging_to_maimai开发文档\`）。**好感度档位（档数/档名/区间）与档位注入文案不在配置面**，而在插件包 `mappings/` 的四张映射表里，见 `mappings/README.md`。
 
 ## FAQ
 
 - **配了目标 QQ 还是没人私聊我？** 先确认 `[patrol] target_qq` 已改成真实 QQ（占位值不解析）；插件需要能在宿主里查到该 QQ 的**私聊流**，查不到时每 60 秒重试一次——和目标 QQ 先互发一条消息通常就能解析到。详见维护手册 `USAGE.md` 的 FAQ（位于 `..\cateye_life_belonging_to_maimai开发文档\`）。
 - **命令没反应？** 管理员指令要求 `admin.admin_users` 里有你（留空时只有本机控制台能用）；另外若配置了 `admin.allowed_streams`，不在名单内的会话会被静默拒绝。
 - **日程图／状态图只有文字没有图？** 这是预期的静默降级：Pillow 或字体不可用、渲染超时（状态图 10 秒／日程图 15 秒）时改发纯文本，功能不受影响。
-- **早安／晚安没来、或来了两条？** 看两个总开关 `greeting_morning_enabled` / `greeting_night_enabled` 与统一名单。**问候要"有人说话"才发**（`greeting_require_activation`，默认开，所有会话一视同仁）：早安的观察窗 = 起床锚点 → 当天第一段日程结束，晚安的观察窗 = 最后一段日程结束 → 睡前界（即入睡锚点）；窗内没人说话就不发。漂移点：早安 = 起床 + 10~30 分钟；晚安 = 睡前界 − 10~30 分钟（都在各自区间里随机，**不再被静默时段吞掉**）。例行问候**始终免预算**，所以「预算用完」不是原因。目标私聊同日同类型至多一条（热重载后也生效），群聊／非目标私聊跨热重载去重尚未实现。
+- **早安／晚安没来、或来了两条？** 看两个总开关 `greeting_morning_enabled` / `greeting_night_enabled` 与统一名单。**问候必须"有人说话"才发，且不可关闭**（`greeting_require_activation` 已删除，激活闸强制开启，所有会话一视同仁）：**当日 00:00 起**该聊天流要有过**非 bot 本人、非命令**的消息（查询异常按不发处理），否则当天不发。漂移点：早安 = 起床 + 10~30 分钟；晚安 = 睡前界（入睡锚点）− 10~30 分钟（都在各自区间里随机，**不再被静默时段吞掉**）。例行问候**始终免预算**，所以「预算用完」不是原因。目标私聊同日同类型至多一条（热重载后也生效），群聊／非目标私聊跨热重载去重尚未实现。用 `/lbm_diag streams`（管理员）可直接查看名单状态与各候选流从当日 00:00 起的「最后一条非命令、非 bot 消息时间」。
 - **QQ 空间发不出去／评论不回复？** 用 `/lbm_life qzone status` 看通道与 cookie：cookie 不可用时会降级成「有新评论」的提醒而不回评；`qzone.enabled=false`、静默时段（含开启午休静默后的午休时段）、每日上限、`emotion_filter` 与发帖冷却都会拦住发帖；LLM 严判说「否」也不发——用 `/lbm_life qzone decisions` 看最近每轮判定卡在哪道闸。
 - **裁判类任务输出为空？** 建议把 `[llm] judge_model` 与情绪裁判（`[llm] emotion_referee_task_name`）、好感裁判（`[llm] review_task_name`）的任务绑到**真正的非思考型模型**——思考型模型会把小 `max_tokens` 预算花在推理上，导致正文为空。
 - **怎么临时关掉某个模块？** `[qzone] enabled=false`、`[affection] enabled=false`、`[emotion] enabled=false` 分别关闭对应模块；`[plugin] enabled=false` 则只注册组件、不跑任何循环。
