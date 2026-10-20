@@ -194,8 +194,11 @@ INJECT_HINT_FUTURE_DEFAULT = "提示：用户询问未来计划，请自然地�
 INJECT_HINT_CURRENT_DEFAULT = "提示：用户直接询问当前状态，请如实告知，并自然带出此刻的精神状态。"
 #: 对话延续时的引导行（占位符：{reason}）
 INJECT_HINT_CONTINUE_DEFAULT = "提示：对话延续中（{reason}），可自然带过当前活动。"
-#: 主动碎碎念时的引导行（占位符：无）
-INJECT_HINT_PROACTIVE_DEFAULT = "提示：可以在回答中自然带出此刻你正在做的事（一两句即可，不要刻意转移话题）。"
+#: 主动碎碎念时的引导行（占位符：无；2026-10-20 用户指示：不再引导 bot 无问自答提日程）
+INJECT_HINT_PROACTIVE_DEFAULT = (
+    "提示：不要主动提及你正在日程里做什么。只有当对方问起你在做什么、"
+    "或你确实需要引出新话题时，才简要带一句当前活动。"
+)
 #: 闲聊时的引导行（占位符：无）
 INJECT_HINT_IDLE_DEFAULT = "提示：仅供参考；不相关请完全忽略，不要刻意提及。"
 #: 无当前活动时的兜底文案（占位符：无；2026-10-10 N1-2：
@@ -266,22 +269,15 @@ SCHEDULE_ROLE_JUDGE_NO_ACTIVITY_DEFAULT = "暂无可靠日程"
 #: 角色裁判人设缺失占位（占位符：无）
 SCHEDULE_ROLE_JUDGE_NO_PERSONA_DEFAULT = "未提供"
 
-#: 活动切换主动开口 intent（按 goal_type；占位符：{activity_name}）
-PROACTIVE_INTENT_DEFAULT = "Bot 切换到新活动了，可以自然地在群里说一两句近况（活动名：{activity_name}）"
-PROACTIVE_INTENT_STUDY_DEFAULT = "Bot 刚开始学习/写代码，可以自然地在群里说一两句开始投入工作的话（活动名：{activity_name}）"
-PROACTIVE_INTENT_WORK_DEFAULT = "Bot 刚开始工作，可以自然地说一两句进入状态的话（活动名：{activity_name}）"
-PROACTIVE_INTENT_MEAL_DEFAULT = "Bot 刚开始吃饭，可以自然地在群里说一两句关于这顿饭的话（活动名：{activity_name}）"
-PROACTIVE_INTENT_REST_DEFAULT = "Bot 刚开始休息，可以自然地说一两句放松/闲下来的话（活动名：{activity_name}）"
-PROACTIVE_INTENT_EXERCISE_DEFAULT = "Bot 刚开始运动，可以自然地在群里吼一两句锻炼的话（活动名：{activity_name}）"
-PROACTIVE_INTENT_ENTERTAINMENT_DEFAULT = "Bot 刚开始娱乐/看剧/打游戏，可以自然地说一两句兴奋/期待的话（活动名：{activity_name}）"
-PROACTIVE_INTENT_SOCIAL_DEFAULT = "Bot 现在心情比较social，可以主动找群友聊聊天（活动名：{activity_name}）"
-PROACTIVE_INTENT_DAILY_ROUTINE_DEFAULT = "Bot 刚切换到日常活动，可以自然地说一句近况（活动名：{activity_name}）"
-PROACTIVE_INTENT_LEARN_TOPIC_DEFAULT = "Bot 开始钻研感兴趣的话题，可以自然地分享一点新发现（活动名：{activity_name}）"
+#: 2026-10-20 用户指示：活动切换主动开口整条移除，原 PROACTIVE_INTENT_DEFAULT 与
+#: PROACTIVE_INTENT_STUDY/WORK/MEAL/REST/EXERCISE/ENTERTAINMENT/SOCIAL/DAILY_ROUTINE/
+#: LEARN_TOPIC 及 PROACTIVE_INTENT_COMMITMENT_DEFAULT（约定到期）常量已删除，
+#: [prompts] 段的同名 Field 一并移除；主动开口只剩早/晚安。
 
-#: 早安 intent（占位符：{activity_name}）
+#: 早安 intent（纯问候导向；2026-10-20 用户指示：不再引导提及日程/安排）
 PROACTIVE_INTENT_MORNING_DEFAULT = (
     "Bot 刚睡醒，新的一天开始了，请自然地向大家道一声早安；"
-    "可以顺口提一句今天的第一个安排（{activity_name}），语气符合人设，简短随意"
+    "语气符合人设，简短随意，不要提日程或今天的安排"
 )
 #: 无今日日程时的早安 intent（占位符：无）
 PROACTIVE_INTENT_MORNING_NO_ACTIVITY_DEFAULT = (
@@ -292,17 +288,9 @@ PROACTIVE_INTENT_NIGHT_DEFAULT = (
     "Bot 准备休息了，今天快结束了，请自然地道一声晚安；"
     "语气符合人设，简短随意、不要追问对方、不要开新话题"
 )
-#: 约定到期 intent（占位符：{time_hint} / {title} / {notes_hint} / {activity_name}）
-PROACTIVE_INTENT_COMMITMENT_DEFAULT = (
-    "你之前答应过对方今天{time_hint}要在私聊里{title}（约定备注：{notes_hint}）。\n"
-    "现在到点了，请用符合人设的语气**立即在私聊里发出**这条消息（例如叫醒、问候、"
-    "提醒等），不要询问对方、不要等用户先开口、不要陷入工具调用循环。\n"
-    "活动名：{activity_name}"
-)
+#: 约定到期 intent 已随活动切换主动开口一并删除（2026-10-20 用户指示）
 
 #: 主动行为 reason 文案（进主动任务块，标注为什么触发；占位符见各条）
-PROACTIVE_REASON_ACTIVITY_DEFAULT = "planning_v4: 活动切换 → {activity_name}"
-PROACTIVE_REASON_COMMITMENT_DEFAULT = "planning_v4: 约定到期 → {title}"
 PROACTIVE_REASON_MORNING_DEFAULT = "planning_v4: 早安问候（L2 漂移）"
 PROACTIVE_REASON_NIGHT_DEFAULT = "planning_v4: 晚安问候（L2 漂移）"
 
@@ -704,59 +692,13 @@ class PromptsSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "日程·角色裁判", "rows": 12,
                            **_ui_i18n("Role judge prompt")},
     )
-    proactive_intent_default: str = Field(
-        default=PROACTIVE_INTENT_DEFAULT,
-        description="活动切换主动开口·默认（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·默认", "rows": 2, **_ui_i18n("Proactive intent (default)")},
-    )
-    proactive_intent_study: str = Field(
-        default=PROACTIVE_INTENT_STUDY_DEFAULT,
-        description="活动切换主动开口·学习 study（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·学习", "rows": 2, **_ui_i18n("Proactive intent (study)")},
-    )
-    proactive_intent_work: str = Field(
-        default=PROACTIVE_INTENT_WORK_DEFAULT,
-        description="活动切换主动开口·工作 work（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·工作", "rows": 2, **_ui_i18n("Proactive intent (work)")},
-    )
-    proactive_intent_meal: str = Field(
-        default=PROACTIVE_INTENT_MEAL_DEFAULT,
-        description="活动切换主动开口·吃饭 meal（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·吃饭", "rows": 2, **_ui_i18n("Proactive intent (meal)")},
-    )
-    proactive_intent_rest: str = Field(
-        default=PROACTIVE_INTENT_REST_DEFAULT,
-        description="活动切换主动开口·休息 rest（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·休息", "rows": 2, **_ui_i18n("Proactive intent (rest)")},
-    )
-    proactive_intent_exercise: str = Field(
-        default=PROACTIVE_INTENT_EXERCISE_DEFAULT,
-        description="活动切换主动开口·运动 exercise（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·运动", "rows": 2, **_ui_i18n("Proactive intent (exercise)")},
-    )
-    proactive_intent_entertainment: str = Field(
-        default=PROACTIVE_INTENT_ENTERTAINMENT_DEFAULT,
-        description="活动切换主动开口·娱乐 entertainment（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·娱乐", "rows": 2, **_ui_i18n("Proactive intent (entertainment)")},
-    )
-    proactive_intent_social: str = Field(
-        default=PROACTIVE_INTENT_SOCIAL_DEFAULT,
-        description="活动切换主动开口·社交 social_maintenance（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·社交", "rows": 2, **_ui_i18n("Proactive intent (social)")},
-    )
-    proactive_intent_daily_routine: str = Field(
-        default=PROACTIVE_INTENT_DAILY_ROUTINE_DEFAULT,
-        description="活动切换主动开口·日常作息 daily_routine（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·日常作息", "rows": 2, **_ui_i18n("Proactive intent (daily_routine)")},
-    )
-    proactive_intent_learn_topic: str = Field(
-        default=PROACTIVE_INTENT_LEARN_TOPIC_DEFAULT,
-        description="活动切换主动开口·兴趣 learn_topic（占位符：{activity_name}）",
-        json_schema_extra={"label": "主动·兴趣", "rows": 2, **_ui_i18n("Proactive intent (learn_topic)")},
-    )
+    # 2026-10-20 用户指示：活动切换/约定主动开口整条移除，原 proactive_intent_default 与
+    # proactive_intent_study/work/meal/rest/exercise/entertainment/social/daily_routine/
+    # learn_topic 及 proactive_intent_commitment、proactive_reason_activity/commitment
+    # 这些 Field 已删除（旧配置由迁移器/宿主忽略）。
     proactive_intent_morning: str = Field(
         default=PROACTIVE_INTENT_MORNING_DEFAULT,
-        description="早安 intent（占位符：{activity_name}）",
+        description="早安 intent（纯问候导向；无占位符，{activity_name} 传参仍兼容但不使用）",
         json_schema_extra={"label": "主动·早安", "rows": 2, **_ui_i18n("Morning intent")},
     )
     proactive_intent_morning_no_activity: str = Field(
@@ -769,22 +711,6 @@ class PromptsSectionConfig(PluginConfigBase):
         default=PROACTIVE_INTENT_NIGHT_DEFAULT,
         description="晚安 intent（无占位符）",
         json_schema_extra={"label": "主动·晚安", "rows": 2, **_ui_i18n("Night intent")},
-    )
-    proactive_intent_commitment: str = Field(
-        default=PROACTIVE_INTENT_COMMITMENT_DEFAULT,
-        description="约定到期 intent（占位符：{time_hint} {title} {notes_hint} {activity_name}）",
-        json_schema_extra={"label": "主动·约定到期", "rows": 6,
-                           **_ui_i18n("Commitment intent")},
-    )
-    proactive_reason_activity: str = Field(
-        default=PROACTIVE_REASON_ACTIVITY_DEFAULT,
-        description="活动切换的触发标注（占位符：{activity_name}）",
-        json_schema_extra={"label": "标注·活动切换", **_ui_i18n("Reason: activity switch")},
-    )
-    proactive_reason_commitment: str = Field(
-        default=PROACTIVE_REASON_COMMITMENT_DEFAULT,
-        description="约定到期的触发标注（占位符：{title}）",
-        json_schema_extra={"label": "标注·约定到期", **_ui_i18n("Reason: commitment")},
     )
     proactive_reason_morning: str = Field(
         default=PROACTIVE_REASON_MORNING_DEFAULT,

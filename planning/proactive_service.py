@@ -2,9 +2,9 @@
 
 三个职责合并在一个 60s 轮询的后台循环里：
 
-1. **活动切换主动发起** —— 活动开始后，在触发窗口内让 bot 主动开口
-   （``ctx.maisaka.proactive.trigger``）。不覆盖当天睡醒后的第一个活动，设定的睡眠时段内不触发；
-   每个 ``(stream_id, activity_name, date)`` 组合只触发一次。
+1. **问候（主动开口的唯一插件侧入口）** —— 2026-10-20 用户指示：日程主动行为整条移除后，
+   插件主动开口只剩早/晚安（强制激活闸，见 :meth:`_greeting_requires_activation`）与
+   陪伴 patrol；活动切换只做频率调控与事件发布，不再触发主动发言。
 
 2. **L2 早晚安漂移（M11 三类开关 → 2026-10-10 两开关 + 统一名单；第二轮重做状态机）** ——
    早/晚安只配漂移区间（``morning_drift`` / ``night_drift``，每流每日独立掷点），执行顺序固定为
@@ -20,9 +20,11 @@
      晚安期限 = 入睡锚点 ``[schedule].sleep_time``（2026-10-20 用户指示后静默窗恒复用
      作息，原 ``[patrol].silence_start`` 键已删除，min 的静默项与入睡项合一；见
      :meth:`_silence_start_ts`）。
-   - **判定**：窗内**该流有人发过消息** → 已激活；激活后未到点 → 等待，到点即发；观察到时
+   - **判定**：该流当日有人发过消息 → 已激活；激活后未到点 → 等待，到点即发；观察到时
      **已过点** → 立即发；观测窗结束仍无人 → 当天不再评估（放弃）。
-   - ``greeting_require_activation=false`` → 不看激活，到点即发；错过观测窗（如重启跨过整窗）不补发。
+   - **激活闸强制开启**（2026-10-20 用户指示，不提供配置项）：激活判定 = 当日（本地 00:00
+     起，观测起点更早则取观测起点）该流出现过**非 bot、非斜杠命令**的消息；宁不发不错发。
+     错过观测窗（如重启跨过整窗）不补发。
    - **静默时段不再拦截问候**（2026-10-10 第二轮）：默认静默窗 00:00-07:30 与起床锚点 07:00
      重叠，会把漂移整段吞掉（每天固定在 07:30 开口 = 漂移失效），而问候本身已由"必要性激活"
      把关（没人说话就不发）；``[patrol] silence_*`` 仍约束陪伴巡检（巡检与晚安期限共用同一
@@ -56,20 +58,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from suite_prompts import (
-    PROACTIVE_INTENT_DEFAULT,
-    PROACTIVE_INTENT_COMMITMENT_DEFAULT,
-    PROACTIVE_INTENT_DAILY_ROUTINE_DEFAULT,
-    PROACTIVE_INTENT_ENTERTAINMENT_DEFAULT,
-    PROACTIVE_INTENT_EXERCISE_DEFAULT,
-    PROACTIVE_INTENT_LEARN_TOPIC_DEFAULT,
-    PROACTIVE_INTENT_MEAL_DEFAULT,
     PROACTIVE_INTENT_MORNING_DEFAULT,
-    PROACTIVE_INTENT_REST_DEFAULT,
-    PROACTIVE_INTENT_SOCIAL_DEFAULT,
-    PROACTIVE_INTENT_STUDY_DEFAULT,
-    PROACTIVE_INTENT_WORK_DEFAULT,
-    PROACTIVE_REASON_ACTIVITY_DEFAULT,
-    PROACTIVE_REASON_COMMITMENT_DEFAULT,
+    PROACTIVE_INTENT_NIGHT_DEFAULT,
+    PROACTIVE_REASON_MORNING_DEFAULT,
+    PROACTIVE_REASON_NIGHT_DEFAULT,
     prompt,
     render,
 )
@@ -104,32 +96,6 @@ _FREQUENCY_FACTOR_BY_GOAL_TYPE: Dict[str, float] = {
     "daily_routine": 1.0,   # 日常作息：默认
     "entertainment": 1.5,   # 娱乐：高频
     "social_maintenance": 1.5,  # 社交：最高
-}
-
-# 主动发起的 intent 模板：按 goal_type 取用（2026-10-10 起默认文案在 suite_prompts，
-# 可经 [prompts] 段逐类型覆盖；键 = goal_type）
-_PROACTIVE_INTENT_PROMPT_KEYS: Dict[str, str] = {
-    "study": "proactive_intent_study",
-    "work": "proactive_intent_work",
-    "meal": "proactive_intent_meal",
-    "rest": "proactive_intent_rest",
-    "exercise": "proactive_intent_exercise",
-    "entertainment": "proactive_intent_entertainment",
-    "social_maintenance": "proactive_intent_social",
-    "daily_routine": "proactive_intent_daily_routine",
-    "learn_topic": "proactive_intent_learn_topic",
-}
-#: 各 goal_type 的出厂文案回退（[prompts] 段取不到时用）
-_PROACTIVE_INTENT_FALLBACKS: Dict[str, str] = {
-    "study": PROACTIVE_INTENT_STUDY_DEFAULT,
-    "work": PROACTIVE_INTENT_WORK_DEFAULT,
-    "meal": PROACTIVE_INTENT_MEAL_DEFAULT,
-    "rest": PROACTIVE_INTENT_REST_DEFAULT,
-    "exercise": PROACTIVE_INTENT_EXERCISE_DEFAULT,
-    "entertainment": PROACTIVE_INTENT_ENTERTAINMENT_DEFAULT,
-    "social_maintenance": PROACTIVE_INTENT_SOCIAL_DEFAULT,
-    "daily_routine": PROACTIVE_INTENT_DAILY_ROUTINE_DEFAULT,
-    "learn_topic": PROACTIVE_INTENT_LEARN_TOPIC_DEFAULT,
 }
 
 # ── L2 早晚安漂移（附录 §三；裁决 B1/B3/B5/B6/B7）──────────────────
@@ -233,7 +199,6 @@ class ProactiveService:
     STARTUP_DELAY_SECONDS = 15.0
     RESOLVE_CACHE_TTL_SUCCESS = 600.0  # 解析成功缓存 10 分钟
     RESOLVE_CACHE_TTL_FAILURE = 60.0   # 解析失败缓存 60 秒（允许恢复后重试）
-    RANDOM_DELAY_MIN_SECONDS = 30.0    # 独立随机延迟下限，避免活动刚切换就瞬间开口
 
     def __init__(self, plugin: Any) -> None:
         self._plugin = plugin
@@ -245,10 +210,8 @@ class ProactiveService:
         self._tz_manager: TimezoneManager = TimezoneManager(
             section_or_default(plugin, "schedule_advanced", ScheduleAdvancedSectionConfig).timezone
         )
-        # 已触发的主动发起记录：{(stream_id, activity_name, date_str): trigger_time}
-        self._proactive_history: Dict[Tuple[str, str, str], float] = {}
-        # 待触发的主动发起：{(stream_id, activity_name, date_str): fire_at_epoch}
-        self._pending_triggers: Dict[Tuple[str, str, str], float] = {}
+        # 2026-10-20 用户指示：原「已触发/待触发的主动发起记录」随活动切换主动发起链一并删除，
+        # 仅剩下面的问候掷点与门槛缓存。
         # L2 早晚安漂移掷点（§3.2）：{(stream_id, date_str, kind): 掷点条目}
         # 纯内存、不落盘——热重载后允许重掷（附录 §3.2 明示口径）
         self._greeting_rolls: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -572,11 +535,18 @@ class ProactiveService:
     # ------------------------------------------------------------
 
     async def _check_and_act(self) -> None:
-        """读当前活动 → 安排/落实 主动发起、L2 早晚安漂移、频率调控。"""
+        """读当前活动 → 频率调控 + L2 早晚安漂移。
+
+        闸序参照 autonomous_planning_plugin（MIT 参考实现，2026-10-20 用户指示引用）：
+        G0 总开关 → G1 会话集合 → G3 睡眠窗（问候链内部）→ 触发即判（无排期池）。
+        **2026-10-20 用户指示：日程主动行为（活动切换/约定主动开口，含非目标私聊与
+        群聊主动发送）整条移除**——原排期池/触发窗口/游离主动触发已删；插件侧唯一的
+        「主动发消息」来源只剩：早/晚安（强制「当日本流有过非 bot 消息」闸）与陪伴
+        patrol（仅目标私聊）。频率调控不发送消息，单独保留。
+        """
         cfg_p = self._proactive_cfg()
         if not (
-            cfg_p.enable_proactive_trigger
-            or cfg_p.enable_frequency_modulation
+            cfg_p.enable_frequency_modulation
             or self._greeting_kind_enabled(GREETING_MORNING)
             or self._greeting_kind_enabled(GREETING_NIGHT)
         ):
@@ -584,70 +554,26 @@ class ProactiveService:
 
         streams = await self._resolve_target_streams()
         now = self._tz_manager.get_now()
-        now_ts = time.time()
         current_min = now.hour * 60 + now.minute
         date_str = now.strftime("%Y-%m-%d")
-        in_sleep = self._in_sleep_window(current_min)
 
         activity_info = self._find_current_activity()
-        first_activity = self._find_first_activity_today()
         # M0 事件：活动切换判定处 → schedule.activity_ended / activity_started（附录 A ★）
         await self._publish_activity_transition(activity_info)
 
-        # 1. 频率调控（每个 stream 独立，因子不变则跳过）
+        # 1. 频率调控（每个 stream 独立，因子不变则跳过；不发送消息、无打扰面）
         if cfg_p.enable_frequency_modulation and activity_info is not None:
             _, goal_type, _, _, _ = activity_info
             await self._apply_frequency(streams, goal_type)
 
-        # 睡眠时段：不安排新的主动发起；已排期的到点后也会在落实阶段被放弃
-        if not in_sleep:
-            # 2. 活动切换主动发起：安排独立随机延迟（不覆盖当天第一个活动）
-            if cfg_p.enable_proactive_trigger and activity_info is not None:
-                activity_name, _goal_type, start_minutes, _end, _params = activity_info
-                is_first_activity = (
-                    first_activity is not None
-                    and first_activity[0] == activity_name
-                    and first_activity[1] == start_minutes
-                )
-                elapsed = current_min - start_minutes
-                if elapsed < 0:
-                    elapsed += 24 * 60  # 跨午夜延续：按真实经过时间计算
-                if elapsed * 60 <= self._fresh_window_seconds() and not is_first_activity:
-                    for stream_id in streams:
-                        key = (stream_id, activity_name, date_str)
-                        if key in self._proactive_history or key in self._pending_triggers:
-                            continue
-                        self._pending_triggers[key] = now_ts + self._random_delay_seconds()
-                        logger.info(
-                            f"安排主动发起: stream={stream_id}, activity={activity_name}, "
-                            f"延迟 {int(self._pending_triggers[key] - now_ts)}s"
-                        )
-
-            # 3. 活动切换主动发起之外不再排期问候：早/晚安由下面的漂移机制统一驱动（B1 合并）
-
-        # 4. 清理跨天的残留排期
-        for key in [k for k in self._pending_triggers if k[2] != date_str]:
-            self._pending_triggers.pop(key, None)
-
-        # 5. 落实到点的主动发起（重新校验：活动未切换、未进入睡眠时段）
-        due_keys = [k for k, fire_at in self._pending_triggers.items() if now_ts >= fire_at]
-        for key in due_keys:
-            self._pending_triggers.pop(key, None)
-            stream_id, activity_name, key_date = key
-            if key_date != date_str:
-                continue
-            if self._in_sleep_window(current_min):
-                logger.info(f"主动发起放弃（已进入睡眠时段）: stream={stream_id}, activity={activity_name}")
-                continue
-            current = self._find_current_activity()
-            if current is None or current[0] != activity_name:
-                logger.info(f"主动发起放弃（活动已切换）: stream={stream_id}, activity={activity_name}")
-                continue
-            await self._trigger_proactive(stream_id, activity_name, current[1], current[4])
-            self._proactive_history[key] = time.time()
-
-        # 6. L2 早晚安漂移（§3.2/§3.3）：掷点复用 → 到点激活判定 → 触发/推迟/放弃
+        # 2. L2 早晚安漂移（§3.2/§3.3）：掷点复用 → 强制激活判定 → 触发/推迟/放弃
         await self._process_greetings(now, date_str)
+
+    # 注（2026-10-20 用户指示）：原「活动切换/约定主动发起排期链」已删除——
+    # _pending_triggers / _proactive_history / _fresh_window_seconds / _random_delay_seconds
+    # / _trigger_proactive（活动与约定分支）与 [planning_proactive].enable_proactive_trigger
+    # 配置键、活动/约定 intent 提示词键一并移除（间隙触发移交无对应插件路径；活动切换后不再有插件侧触发）。
+    # 问候/频率调控照旧。
 
     # ------------------------------------------------------------
     # L2 早晚安漂移（附录 §三；裁决 B1/B3/B5/B6/B7）
@@ -868,13 +794,16 @@ class ProactiveService:
         return bool(getattr(self._proactive_cfg(), attr, True))
 
     def _greeting_requires_activation(self, cfg_p: Any) -> bool:
-        """是否需要「必要性激活」：所有会话一视同仁（含目标私聊）。
+        """强制激活闸：恒 True（2026-10-20 用户指示）。
 
-        2026-10-10 第二轮回正：此前只有群聊需要激活、目标私聊"固定生效"，与用户期望的
-        「有人在当前聊天流发过消息才算激活」不符（B1/B2 的共同成因之一）；
-        ``greeting_require_activation=false`` → 不看激活，到点即发。
+        规则：**当日该流有过非 bot 消息才问候**，宁不发不错发；因此不提供配置项——
+        原 ``[planning_proactive].greeting_require_activation`` 键已删除（2026-10-20 用户指示）。
+        参数 ``cfg_p`` 仅为调用点兼容保留，不再读取。
+
+        沿革：2026-10-10 第二轮回正时本闸由配置控制、且所有会话一视同仁（含目标私聊，
+        此前只有群聊需要激活）；2026-10-20 用户指示起强制化，不再有「到点即发」分支。
         """
-        return bool(getattr(cfg_p, "greeting_require_activation", True))
+        return True
 
     async def _other_private_qualified(self, stream_id: str, date_str: str,
                                       now: datetime, cfg_p: Any) -> bool:
@@ -913,28 +842,71 @@ class ProactiveService:
         self._greeting_other_gate[cache_key] = qualified
         return qualified
 
-    async def _stream_activated_since_wake(self, stream_id: str, since_ts: float,
-                                           until_ts: float) -> bool:
-        """自 ``since_ts`` 起该流是否有人发过消息（早/晚安统一口径：起点 = 基准点）。
+    async def _stream_active_today(self, stream_id: str, since_ts: float,
+                                   until_ts: float) -> bool:
+        """该流在「今日」是否有人发过消息（问候激活闸的唯一判定，2026-10-20 用户指示）。
 
-        2026-10-10 第二轮统一：早/晚安都用 ``[基准点, now]``（旧版晚安起点是 ``fire_at``，
-        与「漂移点之前就说话算不算激活」的语义不一致）。查询形态沿用
-        ``ctx.message.get_by_time_in_chat(stream_id, 起点ts, now, limit=1)``；
-        能力不可用/异常 → False（保守：没人说话就不打扰）。
+        口径：
+
+        - **起点** = ``min(since_ts, 当日 00:00)``——当日零点按 ``self._tz_manager.get_now()``
+          的本地时区换算成 epoch 秒（不直接用系统时区，避免宿主时区与插件配置不一致）；
+          观测起点早于零点（夜猫子作息的晚安漂移点落在凌晨）时仍取更早者，保证不把
+          「凌晨已激活」误判成未激活。
+        - **查询** = ``ctx.message.get_by_time_in_chat(stream_id, start, until_ts, limit=10,
+          filter_mai=True)``；``filter_mai`` 为宿主较新参数，抛 ``TypeError``/其他异常时**重试一次
+          不带该参数**（双保险，旧宿主也能用）。
+        - **过滤**：取每条消息的 ``processed_plain_text``，剔除空白与以 ``/`` 开头的命令消息
+          （bot 自己的发言由 ``filter_mai`` 排除；兜底再靠命令过滤，避免「只剩指令」也算激活）。
+        - **fail-closed**：能力不可用、查询异常、返回形态不可解析 → ``False``（宁不发不错发）。
         """
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "message"):
             return False
+
+        # 当日零点（本地时区）→ epoch 秒
         try:
-            msgs = await ctx_obj.message.get_by_time_in_chat(
-                stream_id, str(since_ts), str(until_ts), limit=1,
+            local_now = self._tz_manager.get_now()
+            midnight_ts = local_now.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp()
+            start_ts = min(float(since_ts), midnight_ts)
+        except Exception as exc:
+            logger.debug(f"计算今日起点失败（按未激活处理）: {exc}")
+            return False
+
+        getter = getattr(ctx_obj.message, "get_by_time_in_chat", None)
+        if not callable(getter):
+            return False
+        msgs: Any = None
+        try:
+            msgs = await getter(
+                stream_id, str(start_ts), str(until_ts), limit=10, filter_mai=True,
             )
         except Exception as exc:
-            logger.debug(f"查询会话消息失败: {exc}")
-            return False
+            # 双保险：旧宿主不认识 filter_mai → 不带该参数重试一次
+            logger.debug(f"带 filter_mai 查询会话消息失败，改为不带重试: {exc}")
+            try:
+                msgs = await getter(stream_id, str(start_ts), str(until_ts), limit=10)
+            except Exception as exc2:
+                logger.debug(f"查询会话消息失败（按未激活处理）: {exc2}")
+                return False
+
         if isinstance(msgs, dict):
             msgs = msgs.get("messages") or msgs.get("data") or []
-        return bool(msgs)
+        if not isinstance(msgs, list):
+            return False
+        for msg in msgs:
+            if isinstance(msg, dict):
+                text = msg.get("processed_plain_text")
+            else:
+                text = getattr(msg, "processed_plain_text", None)
+            if not isinstance(text, str):
+                continue
+            text = text.strip()
+            if not text or text.startswith("/"):
+                continue
+            return True
+        return False
 
     async def _enumerate_group_pairs(self) -> List[Tuple[str, str]]:
         """枚举所有群聊的 ``(群号, session_id)``（问候黑名单需要群号维度；活动切换沿用既有枚举）。"""
@@ -1084,12 +1056,16 @@ class ProactiveService:
         2026-10-10 第二轮（用户口径重做）：
 
         - 激活观测窗 = ``[baseline, observe_until]``（``observe_until`` 见 :meth:`_roll_greeting`），
-          窗口内该流有人发过消息即「已激活」——**不再分会话类型**（目标私聊同样要看激活）；
+          该流「当日」（本地 00:00 起；观测起点更早则取观测起点，见
+          :meth:`_stream_active_today`）有过非 bot、非命令消息即「已激活」——**不分会话类型**
+          （目标私聊同样要看激活）；
         - 已激活后：未到 ``fire_at`` → 等待下一 tick；到点（或观察到时已过点）→ **立即发**，
           不再因"超过期限/落在静默时段"二次拦截（满载漂移语义：点就是点）；
         - 观测窗整段结束仍无人说话 → 放弃当天该流该 kind（记 ``deadline``）；
-        - ``greeting_require_activation=false`` → 不看激活，到点即发；若此刻观测窗已整段错过
-          （如重启跨过整窗）→ 放弃，不深夜补发。
+        - **激活闸恒开**（2026-10-20 用户指示，不提供配置项）：不再有「到点即发」分支，
+          判定口径见 :meth:`_stream_active_today`（当日非 bot、非命令消息）；若观测窗已整段
+          错过（如重启跨过整窗）→ 放弃，不深夜补发。``_advance_greeting`` 里保留的 else
+          分支仅为结构兼容，正常路径不会进入。
 
         其他私聊另有前一日消息数门槛（``greeting_other_private_min_messages``）；
         目标私聊的准入在候选枚举里按统一名单判定（:meth:`_target_greeting_allowed`）。
@@ -1120,12 +1096,16 @@ class ProactiveService:
         投递同一条目的调用点有两处（见 :meth:`_evaluate_greeting`）：今天新掷的条目，
         以及**跨夜存活的历史条目**（夜猫子作息 sleep < wake 时晚安漂移点落在次日凌晨，
         条目按掷点日 key 化，今天再掷不会替它走完流程——T3 问题表 #1）。
+
+        激活判定即**最新判定**：每 tick 都按当前时间线重新查一次「今日该流是否有非 bot、
+        非命令消息」，触发前必然复核过 → 与参考插件 G9 的「双阶段复核」同形（判定与投递
+        之间不再有信任间隙），2026-10-20 用户指示。
         """
         if entry["status"] in (GREETING_STATUS_FIRED, GREETING_STATUS_ABANDONED):
             return
         observe_until = entry.get("observe_until", entry["deadline"])
         if self._greeting_requires_activation(cfg_p):
-            activated = await self._stream_activated_since_wake(
+            activated = await self._stream_active_today(
                 entry["stream_id"], entry.get("observe_from", entry["baseline"]), now_ts)
             if not activated:
                 if now_ts > observe_until:
@@ -1426,18 +1406,7 @@ class ProactiveService:
                 best = (goal.name, start, end)
         return best
 
-    def _fresh_window_seconds(self) -> float:
-        """触发窗口（秒），来自配置 ``proactive_fresh_window_minutes``。"""
-        try:
-            minutes = int(self._proactive_cfg().proactive_fresh_window_minutes)
-        except (TypeError, ValueError):
-            minutes = 10
-        return max(1, minutes) * 60.0
-
-    def _random_delay_seconds(self) -> float:
-        """生成独立随机延迟：窗口内随机，预留轮询粒度，保证窗口内必然触发。"""
-        upper = max(self.RANDOM_DELAY_MIN_SECONDS + 1.0, self._fresh_window_seconds() - self.LOOP_INTERVAL_SECONDS)
-        return random.uniform(self.RANDOM_DELAY_MIN_SECONDS, upper)
+    # 注（2026-10-20 用户指示）：原触发窗口/随机延迟助手已随活动切换主动发起链移除。
 
     # ------------------------------------------------------------
     # 频率调控
@@ -1541,61 +1510,9 @@ class ProactiveService:
             return False
         return True
 
-    async def _trigger_proactive(
-        self,
-        stream_id: str,
-        activity_name: str,
-        goal_type: str,
-        activity_params: Dict[str, Any],
-    ) -> None:
-        """对一个聊天流触发一次主动开口（约定来源走强指令模板 + high 优先级）。"""
-        is_commitment = bool(activity_params.get("is_commitment"))
-        if is_commitment:
-            commit_title = str(activity_params.get("commitment_title") or activity_name).strip()
-            commit_time = str(activity_params.get("commitment_time") or "").strip()
-            commit_notes = str(activity_params.get("commitment_notes") or "").strip()
-            intent_prompt = render(
-                prompt(self._plugin, "proactive_intent_commitment"),
-                fallback=PROACTIVE_INTENT_COMMITMENT_DEFAULT,
-                time_hint=f"{commit_time} " if commit_time else "",
-                title=commit_title,
-                notes_hint=commit_notes or "无",
-                activity_name=activity_name,
-            )
-            reason = render(
-                prompt(self._plugin, "proactive_reason_commitment"),
-                fallback=PROACTIVE_REASON_COMMITMENT_DEFAULT,
-                title=commit_title,
-            )
-        else:
-            key = _PROACTIVE_INTENT_PROMPT_KEYS.get(goal_type, "")
-            template = prompt(self._plugin, key) if key else prompt(self._plugin, "proactive_intent_default")
-            fallback = _PROACTIVE_INTENT_FALLBACKS.get(goal_type, PROACTIVE_INTENT_DEFAULT)
-            intent_prompt = render(template, fallback=fallback, activity_name=activity_name)
-            reason = render(
-                prompt(self._plugin, "proactive_reason_activity"),
-                fallback=PROACTIVE_REASON_ACTIVITY_DEFAULT,
-                activity_name=activity_name,
-            )
-
-        ok = await self._call_proactive_trigger(
-            stream_id=stream_id,
-            intent_prompt=intent_prompt,
-            reason=reason,
-            priority="high" if is_commitment else "normal",
-        )
-        if ok:
-            logger.info(
-                f"主动发起触发: stream={stream_id}, activity={activity_name}, "
-                f"goal_type={goal_type}, commitment={is_commitment}"
-            )
-            self._decision_log(
-                "trigger",
-                trigger_type="commitment_due" if is_commitment else "activity_switch",
-                reason=reason,
-                stream_id=stream_id,
-            )
-
+    # 注（2026-10-20 用户指示）：原 _trigger_proactive（活动切换/约定主动开口的指令模板组装
+    # 与触发，'commitment_due' / 'activity_switch' 两类 trigger_type）已删除；
+    # 问候链仍经 _call_proactive_trigger，PROACTIVE_REASON_* 中活动/约定文案随键移除。
     # ------------------------------------------------------------
     # 事件总线（M0）：活动切换事件（无总线时静默跳过）
     # ------------------------------------------------------------

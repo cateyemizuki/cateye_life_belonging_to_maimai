@@ -42,7 +42,9 @@ class InjectOptimizer:
         cache_ttl: int = 300,
         casual_inject_probability: float = 0.5,
         proactive_daily_quota: int = 3,
-        proactive_probability: float = 0.15,
+        # 2026-10-20 用户指示：概率归零——bot 不再被引导无问自答提及日程
+        # （保留参数与判定结构，供日后需要时显式打开；默认 0.0 = 永不命中）。
+        proactive_probability: float = 0.0,
         proactive_gap_seconds: int = 1800,
     ):
         """初始化注入优化器
@@ -51,7 +53,8 @@ class InjectOptimizer:
             cache_ttl: 缓存过期时间（秒），默认300秒（5分钟）
             casual_inject_probability: 闲聊时注入概率（0-1），默认0.5
             proactive_daily_quota: 每会话每天主动碎碎念最大次数，默认 3
-            proactive_probability: 单次命中主动碎碎念的概率（0-1），默认 0.15
+            proactive_probability: 单次命中主动碎碎念的概率（0-1），默认 0.0
+                （2026-10-20 用户指示：归零，不再引导 bot 无问自答提及日程）
             proactive_gap_seconds: 同会话两次主动碎碎念最小间隔（秒），默认 1800（30 分钟）
         """
         # 用户注入历史缓存（按 scope/session_id 分桶）
@@ -80,17 +83,18 @@ class InjectOptimizer:
         scope_id: str,
         current_activity: Optional[str],
     ) -> Tuple[bool, Optional[str]]:
-        """判断是否触发"主动碎碎念"（v4.3 新增）。
+        """判断是否触发"主动碎碎念"（v4.3 新增；2026-10-20 用户指示后恒不触发）。
 
         碎碎念命中后，``_render_unified_prompt`` 会把闲聊场景的提示从
-        "如不相关请完全忽略"切到"可以自然带出当前活动"，让 LLM 倾向于
-        在回复中提一句当前在干嘛。
+        "如不相关请完全忽略"切到「不要主动提及日程」的引导行。2026-10-20 用户指示：
+        ``proactive_probability`` 默认归零 → 本方法恒返回 ``False``（bot 不再被引导
+        无问自答提及日程），判定结构保留。
 
         触发条件（全部满足）：
             1. 有当前活动
             2. 当天该会话主动碎碎念次数未超 ``proactive_daily_quota``
             3. 距离上次主动碎碎念 ≥ ``proactive_gap_seconds`` 秒
-            4. 抛硬币命中 ``proactive_probability``
+            4. 抛硬币命中 ``proactive_probability``（0 → 永不命中）
 
         Args:
             scope_id: 会话/聊天流 ID。
@@ -124,8 +128,8 @@ class InjectOptimizer:
                 gap = int(current_time - last_time)
                 return False, f"距上次碎碎念仅 {gap} 秒，未到最小间隔"
 
-        # 概率检查
-        if random.random() > self.proactive_probability:
+        # 概率检查（2026-10-20 用户指示：概率 ≤ 0 → 恒 False，不消耗配额、不落记录）
+        if self.proactive_probability <= 0.0 or random.random() > self.proactive_probability:
             return False, f"概率未命中（p={self.proactive_probability}）"
 
         return True, None

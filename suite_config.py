@@ -109,6 +109,19 @@ LEGACY_SILENCE_KEYS = {
     "qzone": ("silence_start", "silence_end", "post_blocked_activities"),
 }
 
+#: 日程主动行为整条移除（2026-10-20 用户指示）后已删除的 ``[planning_proactive]`` 键：
+#: ``enable_proactive_trigger``（活动切换主动开口）、``proactive_fresh_window_minutes``
+#: （触发窗口），以及问候激活闸强制化后删除的 ``greeting_require_activation``。
+#: 旧值无新语义可搬运（主动入口只剩早/晚安 + 陪伴 patrol；激活闸恒开），登记于此供
+#: 迁移器入口显式 pop（§9.7 口径：显式丢弃并登记，不做值搬运）。
+LEGACY_PROACTIVE_KEYS = {
+    "planning_proactive": (
+        "enable_proactive_trigger",
+        "proactive_fresh_window_minutes",
+        "greeting_require_activation",
+    ),
+}
+
 #: 1.0.0（配置整理轮之前）[patrol] 「想念触发说明」的出厂文案——仅用于迁移时判断「用户改过没有」。
 #: 为什么不拿新默认当参照：配置整理轮把该文案重写过（新版带【触发原因·想念】前缀），
 #: 拿新默认比较会把老用户的出厂值误判成「用户自定义」并搬进 [prompts]（等于把文案回退成旧版）。
@@ -408,7 +421,10 @@ class CateyeSuiteConfig(PluginConfigBase):
         2. 各段内部改名键的搬运（llm_task_name→[llm].task_name 等）；
         3. [patrol] 段内部已删键的清理与阈值合并（companion.config.migrate_legacy_patrol）；
         4. [affection] 段内部已删键的清理（:data:`LEGACY_AFFECTION_KEYS`；2026-10-17 §19.4
-           加：v1 三档的 ``current_level`` 在入口显式 pop，两个分支都经过）。
+           加：v1 三档的 ``current_level`` 在入口显式 pop，两个分支都经过）；
+        5. [patrol]/[qzone] 的已删静默键（:data:`LEGACY_SILENCE_KEYS`）与
+           [planning_proactive] 的已删主动行为键（:data:`LEGACY_PROACTIVE_KEYS`，2026-10-20
+           用户指示）同口径在入口显式 pop（两个分支都经过）。
 
         **幂等**：迁移完成时在 ``[plugin] layout_version`` 写下本轮布局标记；下一次校验
         （迁移结果被宿主落盘后再读回）看到该标记即跳过全部值搬运——新旧同名的键
@@ -444,6 +460,16 @@ class CateyeSuiteConfig(PluginConfigBase):
         #    2026-10-20：[patrol]/[qzone] 的 silence_start/silence_end 同口径显式 pop
         #    （静默窗恒复用 [schedule] 作息，显式覆盖能力已移除）。
         for section_name, stale_keys in LEGACY_SILENCE_KEYS.items():
+            section_data = migrated.get(section_name)
+            if isinstance(section_data, dict):
+                section_data = dict(section_data)
+                for stale_key in stale_keys:
+                    section_data.pop(stale_key, None)
+                migrated[section_name] = section_data
+        #    2026-10-20 用户指示：日程主动行为整条移除 → [planning_proactive] 三个旧键
+        #    （enable_proactive_trigger / proactive_fresh_window_minutes /
+        #    greeting_require_activation）同口径在此显式 pop（两分支都经过；§9.7）。
+        for section_name, stale_keys in LEGACY_PROACTIVE_KEYS.items():
             section_data = migrated.get(section_name)
             if isinstance(section_data, dict):
                 section_data = dict(section_data)

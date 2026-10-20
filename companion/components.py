@@ -19,8 +19,8 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   （原 current_activity / status / schedule 三工具已随 T6 注册面收口移除：
   当前活动与日程查询见 lbm_get_schedule_info，状态总览见 /lbm_dashboard）
 - Commands ×4：/lbm_mai_affection（鉴权：target_qq 白名单 + 本机控制台，
-  占位默认值一律拒绝）｜/lbm_mai_help｜/lbm_diag（A5 排障三合一：
-  llm|decision|life 子命令，旧名 /lbm_mai_llm_log、/lbm_mai_diag 与
+  占位默认值一律拒绝）｜/lbm_mai_help｜/lbm_diag（A5 排障四合一：
+  llm|decision|life|streams 子命令，旧名 /lbm_mai_llm_log、/lbm_mai_diag 与
   /lbm_life diag 保留为别名；鉴权 = admin 判定）｜/lbm_dashboard
   （M7 聚合总览：四模块状态图 + 纯文本降级，文本档展开完整日程并附配置摘要；
   鉴权同 admin 判定；渲染失败/超时静默降级为纯文本）
@@ -104,12 +104,13 @@ _DIAG_REASON_LABELS: dict[str, str] = {
     "tool_send_message": "planner 通过 Tool 主动发消息",
 }
 
-#: /lbm_diag 用法帮助（无参数或未知子命令时原样回复；四行，含旧名别名对应关系）。
+#: /lbm_diag 用法帮助（无参数或未知子命令时原样回复；五行，含旧名别名对应关系）。
 _DIAG_USAGE_TEXT = (
-    "用法: /lbm_diag <llm|decision|life> [天数]（管理员）\n"
+    "用法: /lbm_diag <llm|decision|life|streams> [天数]（管理员）\n"
     "  llm [天数]      — LLM 调用日志，合并转发（1~30 天；旧名 /lbm_mai_llm_log）\n"
     "  decision [天数] — 主动行为决策日志，合并转发（1~30 天；旧名 /lbm_mai_diag）\n"
-    "  life [天数]     — 决策日志紧凑文本（1~7 天；旧名 /lbm_life diag）"
+    "  life [天数]     — 决策日志紧凑文本（1~7 天；旧名 /lbm_life diag）\n"
+    "  streams         — 主动候选流与名单状态（今日最后一条非命令消息时间）"
 )
 
 #: 注入作用域（2026-10-10 注入矩阵：目标私聊 / 含陪伴用户的群聊 / 跳过）
@@ -945,16 +946,17 @@ class CompanionComponentsMixin:
         pattern=r"(?<!\S)/lbm_diag(?:\s+(?P<diag_args>.*?))?\s*$"
                 r"|(?<!\S)(?P<legacy_llm>/lbm_mai_llm_log)(?:\s+(?P<llm_days>\S+))?\s*$"
                 r"|(?<!\S)(?P<legacy_decision>/lbm_mai_diag)(?:\s+(?P<mai_days>\S+))?\s*$",
-        description="排障诊断合一：/lbm_diag [llm|decision|life] [天数]"
+        description="排障诊断合一：/lbm_diag [llm|decision|life|streams] [天数]"
                     "（旧名 mai_llm_log/mai_diag/life diag 保留为别名）",
     )
     async def mai_cmd_diag(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        """A5 排障三合一：llm / decision / life 子命令 + 旧命令名别名直达。
+        """A5 排障四合一：llm / decision / life / streams 子命令 + 旧命令名别名直达。
 
         输出与旧三件套完全同构（llm = 旧 /lbm_mai_llm_log、decision = 旧
         /lbm_mai_diag、life = 旧 /lbm_life diag 紧凑文本）；旧名由
         pattern 的 ``legacy_llm`` / ``legacy_decision`` 命名捕获进入同一逻辑（同一组件，
-        零组件成本）。鉴权统一收归 admin 判定（旧 mai_diag/llm_log 走 target 白名单、
+        零组件成本）。``streams``（2026-10-20 用户指示）输出主动候选流/名单状态。
+        鉴权统一收归 admin 判定（旧 mai_diag/llm_log 走 target 白名单、
         旧 life diag 走 admin，收归后口径见 USAGE）。
         """
         stream_id = str(kwargs.get("stream_id", "") or "")
@@ -984,6 +986,10 @@ class CompanionComponentsMixin:
             days = self._diag_parse_days_arg(raw_days, lo=1, hi=7) or 1
             await self._diag_reply(stream_id, self._qz_diag_text(days))
             return True, "决策日志已发送", True
+        if sub == "streams":
+            # 2026-10-20 用户指示：主动候选流/名单状态诊断（纯文本三块，无 emoji）
+            await self._diag_reply(stream_id, await self._mai_diag_streams_text())
+            return True, "候选流诊断已发送", True
         # 无参数与未知子命令同档：只回用法帮助（帮助属正常应答，不算命令失败）
         await self._diag_reply(stream_id, _DIAG_USAGE_TEXT)
         return True, ("用法已发送" if not sub else f"未知子命令: {sub}"), True
@@ -1387,6 +1393,162 @@ class CompanionComponentsMixin:
             await self.ctx.send.text(text=text, stream_id=stream_id)
         except Exception as e:
             self.ctx.logger.warning(f"mai_cmd_diag 回复发送失败: {e}")
+
+    async def _mai_diag_streams_text(self) -> str:
+        """``/lbm_diag streams`` 的文本主体：主动候选流与名单状态（2026-10-20 用户指示）。
+
+        三块纯文本（无 emoji，便于日志粘贴）：
+
+        1. ``[名单状态]``：``[planning_proactive]`` 的群/私聊名单（ids + mode，模式后标注
+           留空语义：黑名单「留空=全生效」、白名单「留空=无人」）、``[patrol].target_qq``
+           与 ``enabled``、早/晚安两个总开关；
+        2. ``[候选解析]``：``self._planning.proactive`` 可用时调
+           ``_resolve_greeting_candidates(cfg)``（按目标私聊/群聊/其他私聊分类）与
+           ``_resolve_target_streams()``；不可用 → 「规划束未装配」；
+        3. ``[候选流最后一条非命令、非 bot 消息]``：逐个候选 session_id（上限 30，超出标注
+           省略数）取「今日 00:00 → 现在」（本地时区）``get_by_time_in_chat``，
+           过滤空白/斜杠命令后取最新一条的 HH:MM；无 → 今日无消息；查询异常 →
+           查询失败(宁不发)。
+
+        整体 try 兜底：任何异常都只降级为一行文本，不向调用方抛。
+        """
+        try:
+            lines: List[str] = ["[名单状态]"]
+            cfg_all = getattr(self, "config", None)
+            cfg_p = getattr(cfg_all, "planning_proactive", None)
+            patrol = getattr(cfg_all, "patrol", None)
+
+            if cfg_p is None:
+                lines.append("  [planning_proactive] 配置不可用")
+            else:
+                g_ids = list(getattr(cfg_p, "proactive_group_ids", None) or [])
+                g_mode = str(getattr(cfg_p, "proactive_group_list_mode", "blacklist")
+                             or "blacklist")
+                p_ids = list(getattr(cfg_p, "proactive_private_ids", None) or [])
+                p_mode = str(getattr(cfg_p, "proactive_private_list_mode", "whitelist")
+                             or "whitelist")
+                lines.append(f"  群聊名单: ids={g_ids} mode={g_mode}"
+                             f"{'（留空=全生效）' if g_mode == 'blacklist' else '（留空=无人）'}")
+                lines.append(f"  私聊名单: ids={p_ids} mode={p_mode}"
+                             f"{'（留空=全生效）' if p_mode == 'blacklist' else '（留空=无人）'}")
+                lines.append(
+                    f"  问候开关: morning={bool(getattr(cfg_p, 'greeting_morning_enabled', True))}"
+                    f" night={bool(getattr(cfg_p, 'greeting_night_enabled', True))}"
+                )
+            if patrol is None:
+                lines.append("  [patrol] 配置不可用")
+            else:
+                lines.append(
+                    f"  [patrol] target_qq={getattr(patrol, 'target_qq', '') or '（未设置）'}"
+                    f" enabled={bool(getattr(patrol, 'enabled', False))}"
+                )
+
+            lines.append("[候选解析]")
+            planning = getattr(self, "_planning", None)
+            svc = getattr(planning, "proactive", None)
+            greeting_cands: List[Any] = []
+            target_streams: List[str] = []
+            if svc is None:
+                lines.append("  规划束未装配（_planning.proactive 不可用）")
+            else:
+                effective_cfg = cfg_p if cfg_p is not None else svc._proactive_cfg()
+                try:
+                    greeting_cands = list(
+                        await svc._resolve_greeting_candidates(effective_cfg) or [])
+                except Exception as exc:
+                    lines.append(f"  问候候选解析失败: {exc}")
+                try:
+                    target_streams = list(await svc._resolve_target_streams() or [])
+                except Exception as exc:
+                    lines.append(f"  频率调控候选解析失败: {exc}")
+
+                by_cat = {"target": [], "group": [], "other": []}
+                for item in greeting_cands:
+                    try:
+                        cand_sid, cand_cat = item
+                    except (TypeError, ValueError):
+                        continue
+                    by_cat.setdefault(str(cand_cat), []).append(str(cand_sid))
+                lines.append(f"  问候·目标私聊: {by_cat.get('target') or '无'}")
+                lines.append(f"  问候·群聊: {by_cat.get('group') or '无'}")
+                lines.append(f"  问候·其他私聊: {by_cat.get('other') or '无'}")
+                lines.append(f"  频率调控（群聊∪私聊）: {target_streams or '无'}")
+
+            lines.append("[候选流最后一条非命令、非 bot 消息]")
+            ordered: List[str] = []
+            seen: set = set()
+            for sid in ([str(x[0]) for x in greeting_cands if isinstance(x, (tuple, list)) and x]
+                        + target_streams):
+                if sid and sid not in seen:
+                    ordered.append(sid)
+                    seen.add(sid)
+            if not ordered:
+                lines.append("  无候选流")
+            else:
+                shown = ordered[:30]
+                if len(ordered) > 30:
+                    lines.append(f"  候选流共 {len(ordered)} 个，仅列前 30 个（省略 {len(ordered) - 30} 个）")
+
+                # 今日 00:00（本地时区）→ 现在
+                try:
+                    now_dt = svc._tz_manager.get_now() if svc is not None else datetime.now()
+                except Exception:
+                    now_dt = datetime.now()
+                start_ts = now_dt.replace(
+                    hour=0, minute=0, second=0, microsecond=0).timestamp()
+                end_ts = now_dt.timestamp()
+
+                ctx_obj = getattr(self, "ctx", None)
+                getter = getattr(getattr(ctx_obj, "message", None),
+                                 "get_by_time_in_chat", None)
+                if not callable(getter):
+                    lines.append("  消息能力不可用（宁不发）")
+                else:
+                    for sid in shown:
+                        try:
+                            msgs = await getter(
+                                sid, str(start_ts), str(end_ts), limit=10, filter_mai=True)
+                        except Exception:
+                            try:
+                                msgs = await getter(
+                                    sid, str(start_ts), str(end_ts), limit=10)
+                            except Exception:
+                                lines.append(f"  {sid}: 查询失败(宁不发)")
+                                continue
+                        if isinstance(msgs, dict):
+                            msgs = msgs.get("messages") or msgs.get("data") or []
+                        if not isinstance(msgs, list):
+                            lines.append(f"  {sid}: 查询失败(宁不发)")
+                            continue
+                        best_ts: Optional[float] = None
+                        best_hm = ""
+                        found = False
+                        for msg in msgs:
+                            if not isinstance(msg, dict):
+                                continue
+                            if any(msg.get(k) is True for k in ("is_mai", "is_bot", "is_self")):
+                                continue
+                            text = str(msg.get("processed_plain_text") or "").strip()
+                            if not text or text.startswith("/"):
+                                continue
+                            found = True
+                            try:
+                                ts_f = float(msg.get("timestamp"))
+                                hm = datetime.fromtimestamp(ts_f).strftime("%H:%M")
+                            except (TypeError, ValueError, OSError):
+                                ts_f = 0.0
+                                hm = ""
+                            if best_ts is None or ts_f >= best_ts:
+                                best_ts = ts_f
+                                best_hm = hm
+                        if not found:
+                            lines.append(f"  {sid}: 今日无消息")
+                        else:
+                            lines.append(f"  {sid}: {best_hm or '有消息（时间未知）'}")
+            lines.append("[口径] 激活闸恒开（2026-10-20 用户指示）：当日非 bot、非命令消息才算激活")
+            return "\n".join(lines)
+        except Exception as exc:  # 兜底：诊断命令绝不抛
+            return f"[streams] 诊断失败: {exc}"
 
     async def _diag_llm_log(self, stream_id: str, days: Optional[int]) -> tuple[bool, str, bool]:
         """diag llm 子命令 = 旧 /lbm_mai_llm_log（llm_logger 调用日志合并转发）。"""

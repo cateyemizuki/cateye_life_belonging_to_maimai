@@ -6,9 +6,9 @@
 - ``[schedule_advanced]``  日程系统·高级设置：多轮生成 / 角色裁判 / list 绘图 / 时区 /
                            缓存 / 注入调优 / 赖床 / 情绪影响 / 后台清理（原 [inject] 与
                            [planning_cleanup] 两段并入本段）；
-- ``[planning_proactive]`` 日程主动行为：活动切换主动开口 + 早晚安两类 + 名单系统 +
-                           赖床提醒（原问候专用四名单与活动切换两名单**合并为**
-                           群聊名单 / 私聊名单两份 + 名单模式）；
+- ``[planning_proactive]`` 日程主动行为：早晚安两类 + 名单系统 + 赖床提醒（原问候专用四名单
+                           与活动切换两名单**合并为**群聊名单 / 私聊名单两份 + 名单模式；
+                           2026-10-20 用户指示：活动切换主动开口整条移除）；
 - （``[llm]`` / ``[prompts]`` 在 suite_config.py / suite_prompts.py 定义。）
 
 本模块只定义 section 类（PluginConfigBase 子类），不定义聚合模型；
@@ -560,12 +560,11 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
 
 
 class PlanningProactiveSectionConfig(PluginConfigBase):
-    """日程主动行为：活动切换主动开口 + 早晚安问候 + 名单系统 + 赖床提醒。
+    """日程主动行为：早晚安问候 + 名单系统 + 赖床提醒。
 
     与 [patrol]（陪伴巡检）分工：
-    - 本段负责活动切换主动开口（候选**恒剔除**目标陪伴私聊）与早/晚安问候
-      （问候候选**含**目标私聊，是否放行由 ``_target_greeting_allowed`` 按名单过滤），
-      以及名单过滤；
+    - 本段负责早/晚安问候（问候候选**含**目标私聊，是否放行由 ``_target_greeting_allowed``
+      按名单过滤）以及名单过滤；
     - 目标陪伴私聊的日常巡检/想念归 [patrol]；早/晚安由本段的漂移机制统一驱动
       （发过之后写标记，陪伴侧巡检见标记即不再重复开口——两模块因此不会各发一条）。
 
@@ -575,9 +574,8 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     各配一个模式开关：
     - 模式 = 黑名单（默认·群聊）：名单里的人**不**生效，留空 = 全部生效；
     - 模式 = 白名单（默认·私聊）：只有名单里的人生效，留空 = 全部不生效。
-    目标陪伴对象在**活动切换通道**始终视为在私聊黑名单中（防止日程主动开口与陪伴的
-    早/晚安撞车）；问候通道由 ``_target_greeting_allowed`` 过滤——白名单模式下目标
-    恒视为在名单内（照常问候），黑名单模式下命中其 QQ 即不问候。
+    问候通道由 ``_target_greeting_allowed`` 过滤——白名单模式下目标恒视为在名单内
+    （照常问候），黑名单模式下命中其 QQ 即不问候。
     """
 
     __ui_label__ = "日程主动行为"
@@ -588,29 +586,10 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
                "description": "Activity-switch proactive chat, morning/night greetings and chat lists."}
     }
 
-    # ── 活动切换主动发起 ─────────────────────────────────────
-    enable_proactive_trigger: bool = Field(
-        default=True,
-        description="活动切换主动开口：活动开始后在触发窗口内让 bot 主动说一两句（每个会话每个活动每天 1 次）。"
-                    "跳过当天睡醒后的第一个活动（由早安负责），睡眠时段不触发",
-        json_schema_extra={
-            "label": "启用活动切换主动开口",
-            "hint": "关 = 群聊里不再按日程切换主动发言；早/晚安不受影响",
-            **_ui_i18n("Activity-switch trigger"),
-        },
-    )
-    proactive_fresh_window_minutes: int = Field(
-        default=10,
-        ge=1,
-        le=60,
-        description="触发窗口（分钟）：活动开始后每个会话在窗口内获得独立随机延迟，延迟结束即触发；"
-                    "错过窗口不补发",
-        json_schema_extra={
-            "label": "触发窗口(分钟)",
-            "hint": "越大越不容易「活动刚开始就说话」（更像真人）",
-            **_ui_i18n("Fresh window (min)"),
-        },
-    )
+    # ── 活动频率调控 ─────────────────────────────────────────
+    # 2026-10-20 用户指示：日程主动行为整条移除——主动入口只剩早/晚安（强制激活）与
+    # 陪伴 patrol。以下两个键已删除：enable_proactive_trigger（活动切换主动开口）、
+    # proactive_fresh_window_minutes（触发窗口）；旧配置由 suite_config 迁移器显式丢弃。
     enable_frequency_modulation: bool = Field(
         default=True,
         description="按当前活动类型调节聊天频率：学习/工作时降低发言频率，休息/娱乐时提高",
@@ -652,7 +631,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         description='私聊名单（填**裸 QQ 号**如 ["789"]，也接受 private:/qq:private:/qq:（私聊）'
                     "前缀写法及 user: 变体，自动取号）："
                     "名单模式=白名单时只有这些私聊生效、留空则所有私聊都不生效；"
-                    "名单模式=黑名单时这些私聊不生效。目标陪伴对象在活动切换通道始终按黑名单处理",
+                    "名单模式=黑名单时这些私聊不生效。",
         json_schema_extra={
             "label": "私聊名单",
             "hint": '填 QQ 号（裸号或 private:/qq:private:/qq: 前缀）；'
@@ -717,18 +696,8 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
             **_ui_i18n("Night drift (min)", 'e.g. "10-30" or "20"'),
         },
     )
-    greeting_require_activation: bool = Field(
-        default=True,
-        description="问候需激活（所有会话，含目标私聊）：先在观察窗内看该会话有没有人说过话，"
-                    "有人 → 到漂移点就问候（若观察到时已过点则立即问候）；到观察窗结束仍无人 → 当天不发。"
-                    "观察窗：早安 = 起床锚点→当天第一段非睡眠日程结束；晚安 = 最后一段日程结束→"
-                    "（睡点与静默起点取先到者）。关 = 不看激活，到点即发",
-        json_schema_extra={
-            "label": "问候需激活",
-            "hint": "开 = 有人说话才问早/晚安（推荐，避免对着空会话自说自话）；关 = 到点就发",
-            **_ui_i18n("Greeting requires activation"),
-        },
-    )
+    # 2026-10-20 用户指示：greeting_require_activation 键已删除并**强制生效**——
+    # 当日该流有过非 bot 消息才问候（宁不发不错发），不再提供关闭开关。
     greeting_other_private_min_messages: int = Field(
         default=5,
         ge=5,
