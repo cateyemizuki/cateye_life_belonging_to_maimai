@@ -530,7 +530,7 @@ class ScheduleImageGenerator:
             # 底部签名
             foot_y = height - int(52 * s)
             draw.line([(M2, foot_y), (width - M2, foot_y)], fill=INK, width=2)
-            draw.text((M2, foot_y + int(12 * s)), " ".join(list("属于麦麦的生活 v2.0.0")),
+            draw.text((M2, foot_y + int(12 * s)), " ".join(list("属于麦麦的生活 v2.1.0")),
                       font=f_foot, fill=MUTED)
             sig = "Powered by Mai-Bot"
             draw.text((width - M2 - draw.textlength(sig, font=f_foot), foot_y + int(12 * s)),
