@@ -212,8 +212,10 @@ class ProactiveService:
         # L2 早晚安漂移掷点（§3.2）：{(stream_id, date_str, kind): 掷点条目}
         # 纯内存、不落盘——热重载后允许重掷（附录 §3.2 明示口径）
         self._greeting_rolls: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-        # L2 其他私聊早安门槛（§3.4/B7）当日缓存：{(stream_id, date_str): qualified}
-        self._greeting_other_gate: Dict[Tuple[str, str], bool] = {}
+        # L2 早/晚安其他私聊门槛（§3.4/B7）当日缓存：{(stream_id, date_str, kind): qualified}
+        # （R7 依据 = 用户 2026-10-21 追加三直派③，计划书 §二十五 25.3：键加 kind——
+        #  早/晚安各自的统计窗端点在各自主链首次评估时定死，互不共享）
+        self._greeting_other_gate: Dict[Tuple[str, str, str], bool] = {}
         # M11 问候名单解析告警去重（§2.4）：{(date_str, 名单签名): True}（同签名每日一条）
         self._greeting_list_warned: Dict[Tuple[str, Tuple[str, ...]], bool] = {}
         # 已应用的频率因子缓存：{stream_id: factor}（避免重复 set_adjust）
@@ -822,14 +824,24 @@ class ProactiveService:
         """
         return True
 
-    async def _other_private_qualified(self, stream_id: str, date_str: str,
-                                      now: datetime, cfg_p: Any) -> bool:
-        """其他私聊问候门槛：前一日该流消息数 ≥ ``greeting_other_private_min_messages``。
+    async def _other_private_qualified(self, stream_id: str, date_str: str, kind: str,
+                                       now: datetime, cfg_p: Any) -> bool:
+        """其他私聊问候门槛：统计窗内该流消息数 ≥ ``greeting_other_private_min_messages``。
 
-        经 ``get_by_time_in_chat`` 取「昨日 00:00 → 今日 00:00」的消息，``limit=门槛`` 即够判定；
-        能力不可用/异常/返回形态不可解析 → 按 0 处理（**不发送**）。门槛当日内不变 → 当日缓存。
+        统计窗 = **[昨日 00:00 → 该类问候开始处理的时刻)**（R7 依据 = 用户 2026-10-21
+        追加三直派③，计划书 §二十五 25.3）——不再是旧的「[昨日00:00, 今日00:00)」：
+
+        - **早安** = 用户原话口径：端点 = 早安链开始处理该流的时刻（即首次评估时的
+          ``now``），用户**当天凌晨发的消息计入**；
+        - **晚安**按同公式：端点 = 晚安链开始处理时刻，**当天白天/傍晚消息亦计入**
+          （裁量登记，用户可否决为保持旧窗）。
+
+        端点在**首次评估时定死**：判定结果连同三元组键 ``(stream_id, date_str, kind)``
+        进当日缓存，后续 tick 直接取缓存值，窗口不随墙钟（后续 tick 的 ``now``）漂移。
+        经 ``get_by_time_in_chat``（``limit=门槛`` 即够判定）；能力不可用/异常/返回形态
+        不可解析 → 按 0 处理（**不发送**，兜底不变）。
         """
-        cache_key = (stream_id, date_str)
+        cache_key = (stream_id, date_str, kind)
         if cache_key in self._greeting_other_gate:
             return self._greeting_other_gate[cache_key]
 
@@ -843,13 +855,14 @@ class ProactiveService:
         if ctx_obj is not None and hasattr(ctx_obj, "message"):
             midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
             yesterday_start = midnight - timedelta(days=1)
+            window_end = now  # 窗口端点 = 该类问候首次评估的 now（§25.3；缓存吸收后续 tick 时钟漂移）
             try:
                 msgs = await ctx_obj.message.get_by_time_in_chat(
-                    stream_id, str(yesterday_start.timestamp()), str(midnight.timestamp()),
+                    stream_id, str(yesterday_start.timestamp()), str(window_end.timestamp()),
                     limit=need,
                 )
             except Exception as exc:
-                logger.debug(f"查询前一日消息失败（按 0 处理）: stream={stream_id}, {exc}")
+                logger.debug(f"查询门槛统计窗消息失败（按 0 处理）: stream={stream_id}, {exc}")
                 msgs = None
             if isinstance(msgs, dict):
                 msgs = msgs.get("messages") or msgs.get("data") or []
@@ -1005,6 +1018,51 @@ class ProactiveService:
                 result.append((user_id, session_id))
         return result
 
+    async def stream_display_labels(self) -> Dict[str, str]:
+        """诊断用「session_id → 显示名」映射（R7 依据 = 用户 2026-10-21 追加三直派①计划书 §二十五）。
+
+        供 ``/lbm_diag streams``（companion/components.py ``_mai_diag_streams_records``，
+        §25.2 起三块 = 三节点）把纯 sid 展示位换成可读名称：单次 ``ctx.chat.get_all_streams(platform="qq")`` 全量枚举，
+        每流按 ``is_group_session`` 真值或 ``group_id`` 非空判型——群流取 ``group_name``；
+        私聊流 ``user_cardname`` 优先、``user_nickname`` 次之（均 strip 后**非空才用**）。
+        名称不可得 → 该流**不入映射**（调用方兜底回显原 session_id）。
+
+        枚举解包形态与 :meth:`_enumerate_group_pairs` 同型（dict → streams/data → list）；
+        整方法 try 兜底：能力缺失/异常/形态不可解析 → 返回空 dict（调用方全部回显 sid）。
+        纯只读，不发送业务消息、不调 LLM（§22.1 诊断契约不变）。
+        """
+        labels: Dict[str, str] = {}
+        try:
+            ctx_obj = getattr(self._plugin, "ctx", None)
+            if ctx_obj is None or not hasattr(ctx_obj, "chat"):
+                return {}
+            streams_raw = await ctx_obj.chat.get_all_streams(platform="qq")
+            if isinstance(streams_raw, dict):
+                streams_raw = streams_raw.get("streams") or streams_raw.get("data") or []
+            if not isinstance(streams_raw, list):
+                return {}
+            for stream in streams_raw:
+                if not isinstance(stream, dict):
+                    continue
+                session_id = str(stream.get("session_id") or stream.get("stream_id") or "").strip()
+                if not session_id:
+                    continue
+                # 群 = is_group_session 真值或 group_id 非空；名称不可得不入映射
+                is_group = bool(stream.get("is_group_session")) or bool(
+                    str(stream.get("group_id") or "").strip())
+                if is_group:
+                    display = str(stream.get("group_name") or "").strip()
+                else:
+                    display = str(stream.get("user_cardname") or "").strip()
+                    if not display:
+                        display = str(stream.get("user_nickname") or "").strip()
+                if display:
+                    labels[session_id] = display
+        except Exception as exc:
+            logger.debug(f"构建流显示名映射失败（诊断按纯 sid 回显）: {exc}")
+            return {}
+        return labels
+
     async def _resolve_greeting_candidates(self, cfg_p: Any) -> List[Tuple[str, str]]:
         """问候候选：目标私聊 ∪ 群聊（名单）∪ 其他私聊（名单 + 门槛）。
 
@@ -1062,6 +1120,7 @@ class ProactiveService:
             terminated = entry.get("status") in (GREETING_STATUS_FIRED, GREETING_STATUS_ABANDONED)
             if terminated or now_ts > float(entry.get("observe_until", 0) or 0):
                 self._greeting_rolls.pop(key, None)
+        # 门槛缓存跨天清理：键含 kind（§25.3 R7 三元组键），按第 2 位日期字段清即可。
         for gkey in [k for k in self._greeting_other_gate if k[1] != date_str]:
             self._greeting_other_gate.pop(gkey, None)
 
@@ -1093,7 +1152,7 @@ class ProactiveService:
             if not self._companion_enabled():
                 return
         elif category != GREETING_CATEGORY_GROUP:
-            if not await self._other_private_qualified(stream_id, date_str, now, cfg_p):
+            if not await self._other_private_qualified(stream_id, date_str, kind, now, cfg_p):
                 return
 
         # 跨夜存活的历史条目先推进：条目按「掷点日」key 化，夜猫子作息（sleep < wake）的晚安
