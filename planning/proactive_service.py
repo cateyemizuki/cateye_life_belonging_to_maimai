@@ -3,8 +3,10 @@
 三个职责合并在一个 60s 轮询的后台循环里：
 
 1. **问候（主动开口的唯一插件侧入口）** —— 2026-10-20 用户指示：日程主动行为整条移除后，
-   插件主动开口只剩早/晚安（强制激活闸，见 :meth:`_greeting_requires_activation`）与
-   陪伴 patrol；活动切换只做频率调控与事件发布，不再触发主动发言。
+   插件主动开口只剩早/晚安与陪伴 patrol；活动切换只做频率调控与事件发布，不再触发主动发言。
+   2026-10-22 用户四直派（计划书 §二十七）起分支闸门分离：目标私聊维持激活强制；群聊 =
+   必要性配置（``greeting_require_activation``，默认开）+ 今日非 bot 消息底层硬门槛；
+   其他私聊 = 「对方发送」条数阈值恒开口，不再过激活闸。
 
 2. **L2 早晚安漂移（M11 三类开关 → 2026-10-10 两开关 + 统一名单；第二轮重做状态机）** ——
    早/晚安只配漂移区间（``morning_drift`` / ``night_drift``，每流每日独立掷点），执行顺序固定为
@@ -22,11 +24,11 @@
      晚安期限 = 入睡锚点（经真实锚点解析；2026-10-20 用户指示后静默窗复用作息，原
      ``[patrol].silence_start`` 键已删除，min 的静默项与入睡项合一；见
      :meth:`_silence_start_ts`，非法 fail-closed 宁不发）。
-   - **判定**：该流当日有人发过消息 → 已激活；激活后未到点 → 等待，到点即发；观察到时
-     **已过点** → 立即发；观测窗结束仍无人 → 当天不再评估（放弃）。
-   - **激活闸强制开启**（2026-10-20 用户指示，不提供配置项）：激活判定 = 当日（本地 00:00
-     起，观测起点更早则取观测起点）该流出现过**非 bot、非斜杠命令**的消息；宁不发不错发。
-     错过观测窗（如重启跨过整窗）不补发。
+   - **判定**（2026-10-22 §二十七 分支闸门）：**目标私聊**维持激活强制——当日（本地
+     00:00 起，观测起点更早则取观测起点）出现过**非 bot、非斜杠命令**的消息才发；
+     **群聊**由 ``greeting_require_activation`` 决定是否看激活（默认开），且候选解析另有
+     「今日无任何非 bot 消息 → 不入候选」的底层硬门槛；**其他私聊**不再过激活闸，唯一开口
+     条件 = 「对方发送」消息数达到阈值。任何分支错过观测窗（如重启跨过整窗）都不补发。
    - **静默时段不再拦截问候**（2026-10-10 第二轮）：默认静默窗 00:00-07:30 与起床锚点 07:00
      重叠，会把漂移整段吞掉（每天固定在 07:30 开口 = 漂移失效），而问候本身已由"必要性激活"
      把关（没人说话就不发）；静默窗真源 = ``companion/patrol.py:resolve_silence_window``
@@ -34,7 +36,8 @@
      ``[patrol] silence_*`` 四键已删除，陪伴巡检与晚安期限共用同源）。
    - 候选矩阵：目标陪伴私聊（``[patrol].enabled`` 且**未被私聊黑名单排除**时生效）；
      群聊与其他私聊走**统一名单系统**（``proactive_group_ids`` / ``proactive_private_ids`` +
-     各自模式开关），其他私聊另有「前一日消息数 ≥ 门槛」护栏。
+     各自模式开关），群聊另有「今日非 bot 消息」硬门槛，其他私聊另有「对方发送消息数 ≥
+     门槛」护栏（统计窗 = [昨日 00:00 → 该类问候开始处理)）。
      开/关由 ``greeting_morning_enabled`` / ``greeting_night_enabled`` 两个开关统一控制。
    **例行问候始终免预算**：早/晚安触发既不查预算闸门也不计主动打扰用量；
    预算只服务 [patrol] 的巡检与想念（[patrol].daily_max_speak）。
@@ -103,7 +106,8 @@ DEFAULT_GREETING_DRIFT: Tuple[int, int] = (10, 30)
 #: 问候种类（掷点/记录键的第二维）
 GREETING_MORNING = "morning"
 GREETING_NIGHT = "night"
-#: 覆盖类别（§3.4/B7）：目标私聊（固定生效）/ 群聊（必要性激活）/ 其他私聊（单独开关 + 门槛）
+#: 覆盖类别（§3.4/B7；2026-10-22 §二十七 分支闸门分离）：目标私聊（激活强制）/
+#: 群聊（必要性配置 + 今日非 bot 消息硬门槛）/ 其他私聊（「对方发送」条数阈值恒开口）
 GREETING_CATEGORY_TARGET = "target"
 GREETING_CATEGORY_GROUP = "group"
 GREETING_CATEGORY_OTHER = "other"
@@ -221,6 +225,10 @@ class ProactiveService:
         # （R7 依据 = 用户 2026-10-21 追加三直派③，计划书 §二十五 25.3：键加 kind——
         #  早/晚安各自的统计窗端点在各自主链首次评估时定死，互不共享）
         self._greeting_other_gate: Dict[Tuple[str, str, str], bool] = {}
+        # 群聊问候底层硬门槛当日缓存（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
+        # {(session_id, date_str): 今日是否有非 bot、非命令消息}。首评实查一次并缓存，
+        # 之后同日直接复用（一日一查）；查询异常/能力缺失 → False（fail-closed 不入候选）。
+        self._greeting_group_floor: Dict[Tuple[str, str], bool] = {}
         # M11 问候名单解析告警去重（§2.4）：{(date_str, 名单签名): True}（同签名每日一条）
         self._greeting_list_warned: Dict[Tuple[str, Tuple[str, ...]], bool] = {}
         # 已应用的频率因子缓存：{stream_id: factor}（避免重复 set_adjust）
@@ -576,7 +584,8 @@ class ProactiveService:
             _name, goal_type = activity_info[0], activity_info[1]
             await self._apply_frequency(streams, goal_type, name=_name)
 
-        # 2. L2 早晚安漂移（§3.2/§3.3）：掷点复用 → 强制激活判定 → 触发/推迟/放弃
+        # 2. L2 早晚安漂移（§3.2/§3.3；2026-10-22 §27.1 分支闸门）：
+        #    掷点复用 → 候选硬门槛 → 分支判定（目标激活强制/群聊必要性/其他阈值）→ 触发/推迟/放弃
         await self._process_greetings(now, date_str)
 
     # 注（2026-10-20 用户指示）：原「活动切换/约定主动发起排期链」已删除——
@@ -824,20 +833,101 @@ class ProactiveService:
         return bool(getattr(self._proactive_cfg(), attr, True))
 
     def _greeting_requires_activation(self, cfg_p: Any) -> bool:
-        """强制激活闸：恒 True（2026-10-20 用户指示）。
+        """群聊必要性检查开关（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）。
 
-        规则：**当日该流有过非 bot 消息才问候**，宁不发不错发；因此不提供配置项——
-        原 ``[planning_proactive].greeting_require_activation`` 键已删除（2026-10-20 用户指示）。
-        参数 ``cfg_p`` 仅为调用点兼容保留，不再读取。
+        读 ``[planning_proactive].greeting_require_activation``（bool，默认 True）；
+        读不到/取值异常 → **True**（fail-closed，宁不发不错发）。**只对群聊分支生效**：
+        目标私聊维持激活强制（不经本开关），其他私聊的唯一开口条件是阈值。
 
-        沿革：2026-10-10 第二轮回正时本闸由配置控制、且所有会话一视同仁（含目标私聊，
-        此前只有群聊需要激活）；2026-10-20 用户指示起强制化，不再有「到点即发」分支。
+        沿革：2026-10-10 第二轮回正时本闸由配置控制、且所有会话一视同仁；2026-10-20
+        用户指示起强制化并删除配置键；2026-10-22 用户裁定恢复为真配置键（默认 True），
+        但收窄为仅群聊使用。
         """
-        return True
+        try:
+            value = getattr(cfg_p, "greeting_require_activation", True)
+        except Exception:
+            return True
+        if value is None:
+            return True
+        return bool(value)
+
+    def _greeting_activation_required(self, category: Any, cfg_p: Any) -> bool:
+        """分支激活闸（2026-10-22 §二十七）：目标私聊恒 True；群聊看配置；其他私聊恒 False。"""
+        if category == GREETING_CATEGORY_TARGET:
+            return True
+        if category == GREETING_CATEGORY_GROUP:
+            return self._greeting_requires_activation(cfg_p)
+        return False
+
+    async def _group_floor_ok(self, stream_id: str, date_str: str,
+                              now: datetime, use_cache: bool = True) -> bool:
+        """群聊底层硬门槛（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）。
+
+        规则：**该群今日（本地 00:00 起）无任何非 bot、非斜杠命令消息 → 不入问候候选**
+        （无条件生效，与 ``greeting_require_activation`` 无关）。首评实查一次并写入
+        ``_greeting_group_floor[(session_id, date_str)]``，同日后续直接复用（一日一查）。
+
+        查询 = ``ctx.message.get_by_time_in_chat(stream_id, 今日00:00, now, limit=1,
+        filter_mai=True)``；``filter_mai`` 为宿主较新参数，异常时按旧宿主语义重试一次
+        （不带该参数）；能力不可用/查询异常/形态不可解析 → **False**（fail-closed 不入候选）。
+
+        裁量留痕：必要性开启时，激活查询证明的「今日有人说话」与本门槛同语义；本方法
+        把结果缓存后，:meth:`_advance_greeting` 在群聊分支可据 ``floor=True`` 免去重复
+        激活查询（见该方法的复用判定）。
+        """
+        cache_key = (stream_id, date_str)
+        cache = getattr(self, "_greeting_group_floor", None)
+        if cache is None:
+            # 兼容 __new__ 直构的测试桩：缺缓存字典时按需补建；
+            # 只读支路（use_cache=False）保持纯读，不向实例挂新属性。
+            cache = {}
+            if use_cache:
+                self._greeting_group_floor = cache
+        if use_cache:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        ok = False
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        getter = getattr(getattr(ctx_obj, "message", None), "get_by_time_in_chat", None)
+        if callable(getter):
+            try:
+                midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                start_ts = midnight.timestamp()
+                end_ts = now.timestamp()
+                try:
+                    msgs = await getter(stream_id, str(start_ts), str(end_ts),
+                                        limit=1, filter_mai=True)
+                except Exception as exc:
+                    # 双保险：旧宿主不认识 filter_mai → 不带该参数重试一次
+                    logger.debug(f"带 filter_mai 查询群聊今日消息失败，改为不带重试: {exc}")
+                    msgs = await getter(stream_id, str(start_ts), str(end_ts), limit=1)
+                if isinstance(msgs, dict):
+                    msgs = msgs.get("messages") or msgs.get("data") or []
+                if isinstance(msgs, list):
+                    for msg in msgs:
+                        if isinstance(msg, dict):
+                            text = msg.get("processed_plain_text")
+                        else:
+                            text = getattr(msg, "processed_plain_text", None)
+                        if not isinstance(text, str):
+                            continue
+                        text = text.strip()
+                        if text and not text.startswith("/"):
+                            ok = True
+                            break
+            except Exception as exc:
+                logger.debug(f"群聊今日硬门槛查询失败（按无消息处理）: stream={stream_id}, {exc}")
+                ok = False
+
+        if use_cache:
+            cache[cache_key] = ok
+        return ok
 
     async def _other_private_qualified(self, stream_id: str, date_str: str, kind: str,
                                        now: datetime, cfg_p: Any) -> bool:
-        """其他私聊问候门槛：统计窗内该流消息数 ≥ ``greeting_other_private_min_messages``。
+        """其他私聊问候门槛：统计窗内**由对方发送**的消息数 ≥ ``greeting_other_private_min_messages``。
 
         统计窗 = **[昨日 00:00 → 该类问候开始处理的时刻)**（R7 依据 = 用户 2026-10-21
         追加三直派③，计划书 §二十五 25.3）——不再是旧的「[昨日00:00, 今日00:00)」：
@@ -846,6 +936,10 @@ class ProactiveService:
           ``now``），用户**当天凌晨发的消息计入**；
         - **晚安**按同公式：端点 = 晚安链开始处理时刻，**当天白天/傍晚消息亦计入**
           （裁量登记，用户可否决为保持旧窗）。
+
+        计入面（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：查询加
+        ``filter_mai=True``，**bot 自身消息不计入**；命令消息按对方普通输入计入（裁量）。
+        门槛最小 1（配置层 ``ge=1`` 已拒绝 0/负数，运行期 ``max(1, …)`` 兜底）。
 
         端点在**首次评估时定死**：判定结果连同三元组键 ``(stream_id, date_str, kind)``
         进当日缓存，后续 tick 直接取缓存值，窗口不随墙钟（后续 tick 的 ``now``）漂移。
@@ -857,21 +951,31 @@ class ProactiveService:
             return self._greeting_other_gate[cache_key]
 
         try:
-            need = max(5, int(getattr(cfg_p, "greeting_other_private_min_messages", 5) or 5))
+            raw_need = getattr(cfg_p, "greeting_other_private_min_messages", 5)
+            need = max(1, int(5 if raw_need is None else raw_need))
         except (TypeError, ValueError):
             need = 5
 
         qualified = False
         ctx_obj = getattr(self._plugin, "ctx", None)
-        if ctx_obj is not None and hasattr(ctx_obj, "message"):
+        getter = getattr(getattr(ctx_obj, "message", None), "get_by_time_in_chat", None)
+        if callable(getter):
             midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
             yesterday_start = midnight - timedelta(days=1)
             window_end = now  # 窗口端点 = 该类问候首次评估的 now（§25.3；缓存吸收后续 tick 时钟漂移）
             try:
-                msgs = await ctx_obj.message.get_by_time_in_chat(
-                    stream_id, str(yesterday_start.timestamp()), str(window_end.timestamp()),
-                    limit=need,
-                )
+                try:
+                    msgs = await getter(
+                        stream_id, str(yesterday_start.timestamp()),
+                        str(window_end.timestamp()), limit=need, filter_mai=True,
+                    )
+                except Exception as exc:
+                    # 双保险：旧宿主不认识 filter_mai → 不带该参数重试一次
+                    logger.debug(f"带 filter_mai 查询门槛统计窗失败，改为不带重试: {exc}")
+                    msgs = await getter(
+                        stream_id, str(yesterday_start.timestamp()),
+                        str(window_end.timestamp()), limit=need,
+                    )
             except Exception as exc:
                 logger.debug(f"查询门槛统计窗消息失败（按 0 处理）: stream={stream_id}, {exc}")
                 msgs = None
@@ -885,7 +989,10 @@ class ProactiveService:
 
     async def _stream_active_today(self, stream_id: str, since_ts: float,
                                    until_ts: float) -> bool:
-        """该流在「今日」是否有人发过消息（问候激活闸的唯一判定，2026-10-20 用户指示）。
+        """该流在「今日」是否有人发过消息（**目标私聊 / 必要性开启的群聊**的激活判定）。
+
+        2026-10-22 §27.1（R7）起分支闸门分离：其他私聊不再调用本方法（唯一开口条件 =
+        对方发送条数阈值）；群聊仅在 ``greeting_require_activation`` 开启时使用。
 
         口径：
 
@@ -1080,18 +1187,31 @@ class ProactiveService:
             return {}
         return labels
 
-    async def _resolve_greeting_candidates(self, cfg_p: Any) -> List[Tuple[str, str]]:
-        """问候候选：目标私聊 ∪ 群聊（名单）∪ 其他私聊（名单 + 门槛）。
+    async def _resolve_greeting_candidates(self, cfg_p: Any,
+                                           now: Optional[datetime] = None,
+                                           date_str: Optional[str] = None
+                                           ) -> List[Tuple[str, str]]:
+        """问候候选：目标私聊 ∪ 群聊（名单 + 今日硬门槛）∪ 其他私聊（名单 + 门槛）。
 
         2026-10-10 第二轮回正（B2）：**严格遵循统一名单**，不再有任何"隐藏兼容位"开关：
 
         - **目标陪伴私聊**：陪伴模块（``[patrol].enabled``）启用、目标会话已解析、
           且**未被私聊黑名单排除**（白名单模式下视为恒在名单内；黑名单模式下把目标 QQ
           写进 ``proactive_private_ids`` 即可停掉它的问候）时生效；
-        - **群聊**：走统一群聊名单（``proactive_group_ids`` + 模式；默认黑名单 + 留空 = 全群）；
+        - **群聊**：走统一群聊名单（``proactive_group_ids`` + 模式；默认黑名单 + 留空 = 全群），
+          另加**底层硬门槛**（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
+          该群今日（本地 00:00 起）无任何非 bot、非斜杠命令消息 → **不入候选**
+          （:meth:`_group_floor_ok`，缓存一日一查，查询异常 fail-closed 不入）；
         - **其他私聊**：走统一私聊名单（``proactive_private_ids`` + 模式；默认白名单 + 留空 = 全不发），
-          另需前一日消息数门槛（``greeting_other_private_min_messages``）。
+          另需「对方发送」消息数门槛（``greeting_other_private_min_messages``）。
+
+        ``now``/``date_str`` 缺省时按服务时区管理器取（便于直调与诊断）；传入调用方
+        的决策时刻可让硬门槛缓存与 ``_process_greetings`` 的日期键严格对齐。
         """
+        if now is None:
+            now = self._tz_manager.get_now()
+        if date_str is None:
+            date_str = now.strftime("%Y-%m-%d")
         candidates: List[Tuple[str, str]] = []
         seen: set = set()
 
@@ -1102,8 +1222,9 @@ class ProactiveService:
 
         for sid in await self._resolve_group_streams():
             if sid and sid not in seen:
-                candidates.append((sid, GREETING_CATEGORY_GROUP))
-                seen.add(sid)
+                if await self._group_floor_ok(sid, date_str, now):
+                    candidates.append((sid, GREETING_CATEGORY_GROUP))
+                    seen.add(sid)
 
         for sid in await self._resolve_private_streams():
             if sid and sid not in seen:
@@ -1123,7 +1244,8 @@ class ProactiveService:
                 or self._greeting_kind_enabled(GREETING_NIGHT)):
             return
         now_ts = _epoch_ts(now)
-        for stream_id, category in await self._resolve_greeting_candidates(cfg_p):
+        candidates = await self._resolve_greeting_candidates(cfg_p, now=now, date_str=date_str)
+        for stream_id, category in candidates:
             for kind in (GREETING_MORNING, GREETING_NIGHT):
                 if not self._greeting_kind_enabled(kind):
                     continue
@@ -1140,27 +1262,29 @@ class ProactiveService:
         # 门槛缓存跨天清理：键含 kind（§25.3 R7 三元组键），按第 2 位日期字段清即可。
         for gkey in [k for k in self._greeting_other_gate if k[1] != date_str]:
             self._greeting_other_gate.pop(gkey, None)
+        # 群聊硬门槛缓存跨天清理（§二十七）：键 = (session_id, date_str)，按第 2 位清。
+        floor_cache = getattr(self, "_greeting_group_floor", None) or {}
+        for fkey in [k for k in floor_cache if k[1] != date_str]:
+            floor_cache.pop(fkey, None)
 
     async def _evaluate_greeting(self, stream_id: str, category: str, kind: str,
                                  now: datetime, now_ts: float, date_str: str,
                                  cfg_p: Any) -> None:
-        """单个候选的状态机：**掷点 → 激活观测 → 到点（或已过点立即）发 / 窗关放弃**。
+        """单个候选的状态机：**掷点 → 分支闸门 → 到点（或已过点立即）发 / 窗关放弃**。
 
-        2026-10-10 第二轮（用户口径重做）：
+        2026-10-10 第二轮（用户口径重做）；2026-10-22 用户四直派（计划书 §二十七）起
+        **分支闸门分离**：
 
-        - 激活观测窗 = ``[baseline, observe_until]``（``observe_until`` 见 :meth:`_roll_greeting`），
-          该流「当日」（本地 00:00 起；观测起点更早则取观测起点，见
-          :meth:`_stream_active_today`）有过非 bot、非命令消息即「已激活」——**不分会话类型**
-          （目标私聊同样要看激活）；
-        - 已激活后：未到 ``fire_at`` → 等待下一 tick；到点（或观察到时已过点）→ **立即发**，
-          不再因"超过期限/落在静默时段"二次拦截（满载漂移语义：点就是点）；
-        - 观测窗整段结束仍无人说话 → 放弃当天该流该 kind（记 ``deadline``）；
-        - **激活闸恒开**（2026-10-20 用户指示，不提供配置项）：不再有「到点即发」分支，
-          判定口径见 :meth:`_stream_active_today`（当日非 bot、非命令消息）；若观测窗已整段
-          错过（如重启跨过整窗）→ 放弃，不深夜补发。``_advance_greeting`` 里保留的 else
-          分支仅为结构兼容，正常路径不会进入。
+        - **目标私聊**：维持激活强制——观测窗 ``[baseline, observe_until]`` 内该流「当日」
+          （本地 00:00 起；观测起点更早则取观测起点，见 :meth:`_stream_active_today`）有过
+          非 bot、非命令消息才发；否则窗内等待，整窗无人 → 放弃（``deadline``）；
+        - **群聊**：由 ``greeting_require_activation`` 决定是否看激活（默认开）；开 = 与目标
+          同口径，关 = 到点即发（观测窗整段错过 → ``window_closed`` 不补发）；
+        - **其他私聊**：**不再过激活闸**，唯一开口条件 = 统计窗内「对方发送」消息数达到
+          ``greeting_other_private_min_messages``（阈值判定在本方法入口完成）；
+        - 到点（或观察到时已过点）→ **立即发**，不再因"超过期限/落在静默时段"二次拦截；
+          观测窗整段错过（如重启跨过整窗）→ 放弃，不深夜补发。
 
-        其他私聊另有前一日消息数门槛（``greeting_other_private_min_messages``）；
         目标私聊的准入在候选枚举里按统一名单判定（:meth:`_target_greeting_allowed`）。
         """
         if not self._greeting_kind_enabled(kind):
@@ -1184,22 +1308,36 @@ class ProactiveService:
 
     async def _advance_greeting(self, entry: Dict[str, Any], now_ts: float,
                                 date_str: str, cfg_p: Any) -> None:
-        """推进一条掷点条目：已终结 → 跳过；未激活 → 等待/窗关放弃；激活后到点（或已过点）→ 发。
+        """推进一条掷点条目：已终结 → 跳过；需激活者未激活 → 等待/窗关放弃；到点 → 发。
 
         投递同一条目的调用点有两处（见 :meth:`_evaluate_greeting`）：今天新掷的条目，
         以及**跨夜存活的历史条目**（夜猫子作息 sleep < wake 时晚安漂移点落在次日凌晨，
         条目按掷点日 key 化，今天再掷不会替它走完流程——T3 问题表 #1）。
 
-        激活判定即**最新判定**：每 tick 都按当前时间线重新查一次「今日该流是否有非 bot、
-        非命令消息」，触发前必然复核过 → 与参考插件 G9 的「双阶段复核」同形（判定与投递
-        之间不再有信任间隙），2026-10-20 用户指示。
+        分支闸门（2026-10-22 §二十七）：目标私聊恒需激活；群聊按
+        ``greeting_require_activation``；其他私聊恒不需激活（阈值已在上游判定）。
+        需激活时，激活判定即**最新判定**：每 tick 都按当前时间线重新查一次「今日该流是否
+        有非 bot、非命令消息」，触发前必然复核过（与参考插件 G9 的「双阶段复核」同形）。
+
+        群聊复用（裁量留痕）：候选解析的底层硬门槛 ``_greeting_group_floor`` 已证明
+        「今日有非 bot、非命令消息」，与激活同语义 → 群聊必要性开启时若 floor=True 直接
+        视为已激活，免去重复查询；floor=False/未缓存时仍走 ``_stream_active_today``
+        （观测起点可能早于零点，需按完整窗口复核）。
         """
         if entry["status"] in (GREETING_STATUS_FIRED, GREETING_STATUS_ABANDONED):
             return
         observe_until = entry.get("observe_until", entry["deadline"])
-        if self._greeting_requires_activation(cfg_p):
-            activated = await self._stream_active_today(
-                entry["stream_id"], entry.get("observe_from", entry["baseline"]), now_ts)
+        category = entry.get("category")
+        if self._greeting_activation_required(category, cfg_p):
+            activated = None
+            if category == GREETING_CATEGORY_GROUP:
+                # 必要性开启时复用候选解析的今日硬门槛结果（同为「今日非 bot、非命令消息」）
+                floor = getattr(self, "_greeting_group_floor", None) or {}
+                if floor.get((entry["stream_id"], date_str)):
+                    activated = True
+            if activated is None:
+                activated = await self._stream_active_today(
+                    entry["stream_id"], entry.get("observe_from", entry["baseline"]), now_ts)
             if not activated:
                 if now_ts > observe_until:
                     self._abandon_greeting(entry, "deadline")
@@ -1429,7 +1567,8 @@ class ProactiveService:
         （fail-closed 按 0，宁不发）。
 
         返回 ``(计入条数, 查询是否成功)``；条数按宿主 ``limit=need`` 截断（与
-        :meth:`_other_private_qualified` 同口径）。
+        :meth:`_other_private_qualified` 同口径）。计入面 = **由对方发送**（``filter_mai=True``，
+        bot 自身消息不计入；2026-10-22 §二十七）。
         """
         ctx_obj = getattr(self._plugin, "ctx", None)
         getter = getattr(getattr(ctx_obj, "message", None), "get_by_time_in_chat", None)
@@ -1438,10 +1577,18 @@ class ProactiveService:
         midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
         yesterday_start = midnight - timedelta(days=1)
         try:
-            msgs = await getter(
-                str(stream_id), str(yesterday_start.timestamp()),
-                str(now.timestamp()), limit=need,
-            )
+            try:
+                msgs = await getter(
+                    str(stream_id), str(yesterday_start.timestamp()),
+                    str(now.timestamp()), limit=need, filter_mai=True,
+                )
+            except Exception as exc:
+                # 双保险：旧宿主不认识 filter_mai → 不带该参数重试一次
+                logger.debug(f"诊断门槛带 filter_mai 失败，改为不带重试: {exc}")
+                msgs = await getter(
+                    str(stream_id), str(yesterday_start.timestamp()),
+                    str(now.timestamp()), limit=need,
+                )
         except Exception as exc:
             logger.debug(f"诊断门槛实查失败（按 0）: stream={stream_id}, kind={kind}, {exc}")
             return 0, False
@@ -1527,23 +1674,32 @@ class ProactiveService:
             result.append(sid)
         return result
 
-    async def _resolve_greeting_candidates_readonly(self,
-                                                    cfg_p: Any = None) -> List[Tuple[str, str]]:
+    async def _resolve_greeting_candidates_readonly(self, cfg_p: Any = None,
+                                                    now: Optional[datetime] = None,
+                                                    date_str: Optional[str] = None
+                                                    ) -> List[Tuple[str, str]]:
         """诊断用问候候选解析（§26.2；与 :meth:`_resolve_greeting_candidates` 同口径）。
 
-        **纯读**：不写 ``_resolved_cache`` / ``_greeting_list_warned``，不触发名单告警；
-        枚举与解析全部走 ``use_cache=False`` 的只读支路。``cfg_p`` 仅为调用点兼容保留。
+        **纯读**：不写 ``_resolved_cache`` / ``_greeting_list_warned`` / 群聊硬门槛缓存，
+        不触发名单告警；枚举与解析全部走 ``use_cache=False`` 的只读支路。群聊段同样应用
+        「今日无任何非 bot 消息 → 不入候选」（2026-10-22 §27.1，R7）——只读实查、不落缓存。
+
+        §27.2（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：**陪伴目标聊天流
+        整条豁免**——diag 主动忽视目标流，本只读支路只返回群聊与其他私聊（序号/切片/
+        流状态均不含目标流）。``cfg_p`` 仅为调用点兼容保留；``now``/``date_str`` 缺省按
+        服务时区管理器取。
         """
         candidates: List[Tuple[str, str]] = []
         seen: set = set()
-        target = str(getattr(self._plugin, "_stream_id", "") or "").strip()
-        if target and self._companion_enabled() and self._target_greeting_allowed_readonly():
-            candidates.append((target, GREETING_CATEGORY_TARGET))
-            seen.add(target)
+        if now is None:
+            now = self._tz_manager.get_now()
+        if date_str is None:
+            date_str = now.strftime("%Y-%m-%d")
         for sid in await self._resolve_group_streams_readonly():
             if sid and sid not in seen:
-                candidates.append((sid, GREETING_CATEGORY_GROUP))
-                seen.add(sid)
+                if await self._group_floor_ok(sid, date_str, now, use_cache=False):
+                    candidates.append((sid, GREETING_CATEGORY_GROUP))
+                    seen.add(sid)
         for sid in await self._resolve_private_streams_readonly():
             if sid and sid not in seen:
                 candidates.append((sid, GREETING_CATEGORY_OTHER))
@@ -1561,16 +1717,18 @@ class ProactiveService:
                 seen.add(sid)
         return streams
 
-    async def _greeting_category_of(self, stream_id: str,
-                                    cfg_p: Any) -> Tuple[Optional[str], bool]:
+    async def _greeting_category_of(self, stream_id: str, cfg_p: Any,
+                                    now: Optional[datetime] = None
+                                    ) -> Tuple[Optional[str], bool]:
         """诊断用类别解析：``(category 或 None, 解析是否成功)``（§26.2 同帧口径）。
 
-        直接复用 :meth:`_resolve_greeting_candidates`（目标私聊/群聊/其他私聊）；不在候选中
-        → ``(None, True)``（调用方再判「仅频率调控」与「不在问候候选」）；解析抛异常 →
-        ``(None, False)``（取不到）。
+        直接复用 :meth:`_resolve_greeting_candidates_readonly`（§27.2 起该只读支路
+        **不含陪伴目标流**，故目标流在此返回 ``(None, True)`` → 调用方报「不在问候候选」）；
+        群聊段含今日硬门槛；不在候选中 → ``(None, True)``（调用方再判「仅频率调控」与
+        「不在问候候选」）；解析抛异常 → ``(None, False)``（取不到）。
         """
         try:
-            candidates = await self._resolve_greeting_candidates_readonly(cfg_p)
+            candidates = await self._resolve_greeting_candidates_readonly(cfg_p, now=now)
         except Exception as exc:
             logger.debug(f"诊断问候候选解析失败: {exc}")
             return None, False
@@ -1611,7 +1769,8 @@ class ProactiveService:
         threshold_met = True
         if category == GREETING_CATEGORY_OTHER:
             try:
-                need = max(5, int(getattr(cfg_p, "greeting_other_private_min_messages", 5) or 5))
+                raw_need = getattr(cfg_p, "greeting_other_private_min_messages", 5)
+                need = max(1, int(5 if raw_need is None else raw_need))
             except (TypeError, ValueError):
                 need = 5
             # 只读取缓存现状，绝不调用 _other_private_qualified（它会写缓存）；
@@ -1639,8 +1798,10 @@ class ProactiveService:
             reason = str(entry.get("reason") or "unknown")
             conclusion = (f"已放弃（{_GREETING_ABANDON_REASON_CN.get(reason, reason)}，"
                           f"原因={reason}）")
-        elif not self._message_query_available():
-            # 取不到必需数据：不猜激活，不落任何状态（宁不发）
+        elif ((self._greeting_activation_required(category, cfg_p)
+               or category == GREETING_CATEGORY_OTHER)
+              and not self._message_query_available()):
+            # 取不到必需数据（需激活或需门槛计数）：不猜，不落任何状态（宁不发）
             conclusion = "取不到（缺消息查询能力，宁不发）"
         else:
             if entry is not None:
@@ -1664,8 +1825,10 @@ class ProactiveService:
                 observe_from = baseline
                 observe_until = max(deadline, fire_hi)
             remaining_minutes = max(0, int((observe_until - now_ts) / 60.0))
-            activated = await self._stream_active_today(
-                stream_id, observe_from, now_ts)
+            # 2026-10-22 §二十七：目标私聊恒看激活；群聊看必要性开关；其他私聊不看激活。
+            if self._greeting_activation_required(category, cfg_p):
+                activated = await self._stream_active_today(
+                    stream_id, observe_from, now_ts)
             if category == GREETING_CATEGORY_OTHER and not threshold_met:
                 if cached_gate is False and count >= need:
                     # 首评缓存已定死为未达标：后续新增消息不改变当日实际判定
@@ -1674,7 +1837,7 @@ class ProactiveService:
                 else:
                     conclusion = (f"未满足（差门槛 {count}/{need}，"
                                   f"窗内剩 {remaining_minutes} 分钟）")
-            elif not activated:
+            elif activated is False:
                 conclusion = f"未满足（差激活，窗内剩 {remaining_minutes} 分钟）"
             elif fire_at is None:
                 if now_ts >= fire_hi:
@@ -1696,12 +1859,16 @@ class ProactiveService:
                 cache_text = ("未评" if cached_gate is None
                               else ("达标" if cached_gate else "未达标"))
                 query_text = "实查" if gate_query_ok else "实查失败按0"
+                # §27.2（R7 依据 = 用户 2026-10-22 第二批四直派）：关键量行标签改「阈值」，
+                # 计入面明确为「对方发送」；其他私聊不再过激活闸，故无「激活」行。
                 detail_parts.append(
-                    f"门槛={count}/{need}（{query_text}，缓存={cache_text}）")
+                    f"阈值={count}/{need}（对方发送，{query_text}，缓存={cache_text}）")
             elif category == GREETING_CATEGORY_TARGET:
                 detail_parts.append("门槛=不适用（目标流无门槛）")
             else:
                 detail_parts.append("门槛=不适用（群聊无门槛）")
+                detail_parts.append(
+                    "必要性=" + ("开" if self._greeting_requires_activation(cfg_p) else "关"))
             if entry is not None:
                 roll_text = str(entry.get("status") or "unknown")
                 if entry.get("reason"):
@@ -1752,16 +1919,22 @@ class ProactiveService:
 
         语义：
 
-        - **类别**（target/group/other/仅频率调控/不在问候候选）：与
-          :meth:`_resolve_greeting_candidates` 同帧解析；
+        - **类别**（group/other/仅频率调控/不在问候候选）：与
+          :meth:`_resolve_greeting_candidates` 同帧解析；§27.2 起陪伴目标聊天流由
+          diag 主动忽视（只读支路不含目标流），目标流落「不在问候候选」；
         - **两类结论**：依次取掷点现状（``_greeting_rolls``）、当日标记
           （按流 marks / 目标 affection 标记）、激活（``_stream_active_today``，当日 00:00
-          起实查）、其他私聊门槛（独立**非缓存**计数小助手），据此计算：
+          起实查；仅 target 与必要性开启的群聊）、其他私聊门槛（独立**非缓存**计数小助手，
+          计入面 = 对方发送），据此计算：
           ``已满足（下一 tick 将发送）`` / ``将发送（约 HH:MM）`` /
           ``未满足（差门槛 M/N，窗内剩 X 分钟）`` / ``未满足（差激活，窗内剩 X 分钟）`` /
           ``已放弃（原因）`` / ``今日已发`` / ``不适用（…）``；
+        - **分支关键量**（2026-10-22 §二十七）：target 显示激活行；群聊显示必要性开关行
+          （开/关，关时不做激活查询、无激活行）；其他私聊不显示激活行，门槛行标注
+          「对方发送」；
         - **目标流无门槛**：target 门槛恒不适用；群聊同上；
-        - 必需数据取不到（消息查询能力缺失/候选解析失败）→ ``取不到（宁不发）``。
+        - 必需数据取不到（需激活/需门槛计数而消息查询能力缺失，或候选解析失败）
+          → ``取不到（宁不发）``；群聊必要性关闭且非 other 时不需消息查询。
 
         **只读纪律**：不调用 :meth:`_other_private_qualified` / :meth:`_roll_greeting` /
         :meth:`_mark_stream_greeting`，不写 ``_greeting_other_gate``、``_greeting_rolls``、
@@ -1778,7 +1951,7 @@ class ProactiveService:
         now_ts = _epoch_ts(now_dt)
         cfg_p = self._proactive_cfg()
 
-        category, resolved = await self._greeting_category_of(stream_id, cfg_p)
+        category, resolved = await self._greeting_category_of(stream_id, cfg_p, now=now_dt)
         frequency_only = False
         if resolved and category is None:
             try:

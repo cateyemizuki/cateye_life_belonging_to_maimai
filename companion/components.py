@@ -1413,22 +1413,26 @@ class CompanionComponentsMixin:
            留空语义：黑名单「留空=全生效」、白名单「留空=无人」）、``[patrol].target_qq``
            与 ``enabled``、早/晚安两个总开关；
         2. ``[候选解析]``：``self._planning.proactive`` 可用时调
-           ``_resolve_greeting_candidates(cfg)``（按目标私聊/群聊/其他私聊分类）与
+           ``_resolve_greeting_candidates(cfg)``（按群聊/其他私聊分类）与
            ``_resolve_target_streams()``；不可用 → 「规划束未装配」；``[口径]`` 行并入
-           本节点结尾；
-        3. ``[候选流最后一条非命令、非 bot 消息·群聊 (第 i/N 片)]`` 与
-           ``[候选流最后一条非命令、非 bot 消息·私聊（目标/其他）(第 i/N 片)]``：
-           群聊单列、目标私聊与其他私聊并入「私聊」节点；两类各按枚举序**每 10 个流切一片**，
-           **无上限、不折叠**（§26.1 废止 §25 的候选流截断口径，R7 依据 =
-           用户 2026-10-22 三直派，计划书 §二十六）。每行取「今日 00:00 → 现在」
-           （本地时区）``get_by_time_in_chat``，过滤空白/斜杠命令后取最新一条的 HH:MM；
-           无 → 今日无消息；查询异常 → 查询失败(宁不发)。无任何候选流 → 单节点
+           本节点结尾。**陪伴目标聊天流整体不出现**（2026-10-22 §27.2，R7 依据 =
+           用户 2026-10-22 第二批四直派，计划书 §二十七）：只保留「问候·群聊」与
+           「问候·其他私聊」两行，``[patrol].target_qq`` 配置行照旧保留在块 1；
+        3. ``[候选流最后一条非命令、非 bot 消息·群聊 时段：… (第 i/N 片)]`` 与
+           ``[候选流最后一条非命令、非 bot 消息·私聊 时段：…（目标/其他）(第 i/N 片)]``：
+           群聊单列、其他私聊并入「私聊」节点（目标流不出现）；两类各按枚举序
+           **每 10 个流切一片**，**无上限、不折叠**（§26.1 废止 §25 的候选流截断口径）。
+           检查窗**分族**（§27.2）：群聊 = 今日 00:00 → now，私聊 = 昨日 00:00 → now；
+           标题时段文本每 tick 按 ``TimezoneManager`` 现算（精确到年月日）。
+           每行走 ``get_by_time_in_chat``，过滤空白/斜杠命令后取最新一条的 HH:MM；
+           无 → 历史无消息；查询异常 → 查询失败(宁不发)。无任何候选流 → 单节点
            ``[候选流最后一条非命令、非 bot 消息]`` + ``无候选流``。
 
-        序号（§26.1 同源直派）：每个问候候选流一个 ``#NN``（两位补零，≥100 自然进位），
-        编号顺序 = 目标私聊 → 群聊（枚举序）→ 其他私聊（枚举序）；行 = ``#NN {label}: {结果}``，
-        ``[候选解析]`` 块的三类问候列表行同步带 ``#NN`` 便于对照。频率调控-only 流
-        （不在问候候选）不编号、不进 [候选流最后…] 块。
+        序号（§26.1 同源直派，§27.2 起目标流豁免）：每个问候候选流一个 ``#NN``
+        （两位补零，≥100 自然进位），编号顺序 = **群聊（枚举序）→ 其他私聊（枚举序）**，
+        自 ``#01`` 起；行 = ``#NN {label}: {结果}``，``[候选解析]`` 块的群聊/其他私聊
+        列表行同步带 ``#NN``。频率调控-only 流（不在问候候选）不编号、不进
+        [候选流最后…] 块。
 
         节点记录形态与 ``_mai_build_llm_log_records`` 逐字一致：
         ``{"user_id": "0", "nickname": "streams 诊断",
@@ -1511,12 +1515,12 @@ class CompanionComponentsMixin:
                     except (TypeError, ValueError):
                         continue
                     by_cat.setdefault(str(cand_cat), []).append(str(cand_sid))
-                # §26.1 序号：编号顺序 = 目标私聊 → 群聊（枚举序）→ 其他私聊（枚举序），
-                # 与三类候选列表的展示顺序一致；同一次调用内稳定（R7 依据 = 用户
-                # 2026-10-22 三直派，计划书 §二十六）。
+                # §27.2 序号：目标流豁免后编号顺序 = 群聊（枚举序）→ 其他私聊（枚举序），
+                # 自 #01 起；同一次调用内稳定（R7 依据 = 用户 2026-10-22 第二批四直派，
+                # 计划书 §二十七）。target 类既不展示也不编号。
                 ordered_pairs: List[tuple] = []
                 numbered_seen: set = set()
-                for cand_cat in ("target", "group", "other"):
+                for cand_cat in ("group", "other"):
                     for cand_sid in by_cat.get(cand_cat, []):
                         if cand_sid and cand_sid not in numbered_seen:
                             ordered_pairs.append((cand_sid, cand_cat))
@@ -1538,13 +1542,13 @@ class CompanionComponentsMixin:
                     return f"#{num:02d} {label}" if num else label
 
                 # R7 依据 = 用户 2026-10-21 追加三直派①（计划书 §二十五）：
-                # 流展示位显示名替代纯 sid；名称不可得 → .get(sid, sid) 回显原 sid
-                target_lbl = [_num_label(s) for s in by_cat.get("target", [])]
+                # 流展示位显示名替代纯 sid；名称不可得 → .get(sid, sid) 回显原 sid。
+                # §27.2（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
+                # 陪伴目标聊天流整体不出现——目标问候列表行删除。
                 group_lbl = [_num_label(s) for s in by_cat.get("group", [])]
                 other_lbl = [_num_label(s) for s in by_cat.get("other", [])]
                 # 频率调控-only 流不编号（§26.1）：该行仍是唯一的频控名单键（群聊 ∪ 私聊）
                 freq_lbl = [stream_labels.get(s, s) for s in target_streams]
-                b2.append(f"  问候·目标私聊: {target_lbl or '无'}")
                 b2.append(f"  问候·群聊: {group_lbl or '无'}")
                 b2.append(f"  问候·其他私聊: {other_lbl or '无'}")
                 b2.append(f"  频率调控（群聊∪私聊）: {freq_lbl or '无'}")
@@ -1552,36 +1556,46 @@ class CompanionComponentsMixin:
             # §25.2：[口径] 行并入第 2 个节点（候选解析）结尾
             b2.append("[口径] 激活闸恒开（2026-10-20 用户指示）：当日非 bot、非命令消息才算激活")
 
-            # §26.1 展示重构（R7 依据 = 用户 2026-10-22 三直派，计划书 §二十六）：
-            # 群聊/私聊两族节点各按枚举序每 10 个流切一片（无上限、不折叠）；
-            # 目标私聊 + 其他私聊并入「私聊」节点；频率调控-only 流不进本块。
+            # §26.1 展示重构 + §27.2 目标流豁免（R7 依据 = 用户 2026-10-22 第二批四直派，
+            # 计划书 §二十七）：群聊/其他私聊两族节点各按枚举序每 10 个流切一片
+            # （无上限、不折叠）；陪伴目标聊天流不出现（私聊节点只装其他私聊）；
+            # 频率调控-only 流不进本块。检查窗分族：群聊 = 今日 00:00 → now，
+            # 私聊 = 昨日 00:00 → now；标题时段文本每 tick 现算。
             stream_slices: List[List[str]] = []
             if svc is None or not stream_nums:
                 stream_slices.append(["[候选流最后一条非命令、非 bot 消息]",
                                       "  无候选流"])
             else:
                 group_sids = [sid for sid, cat in ordered_pairs if cat == "group"]
-                # 私聊节点顺序 = 目标私聊（枚举序）→ 其他私聊（枚举序），与编号顺序一致
-                private_sids = [sid for sid, cat in ordered_pairs
-                                if cat in ("target", "other")]
+                # 私聊节点只装其他私聊（目标流豁免），顺序 = 枚举序，与编号一致
+                private_sids = [sid for sid, cat in ordered_pairs if cat == "other"]
 
-                # 今日 00:00（本地时区）→ 现在
+                # 时间原点：群聊片今日 00:00、私聊片昨日 00:00；终点均为现在（本地时区）
                 try:
                     now_dt = svc._tz_manager.get_now()
                 except Exception:
                     now_dt = datetime.now()
-                start_ts = now_dt.replace(
-                    hour=0, minute=0, second=0, microsecond=0).timestamp()
+                today_start = now_dt.replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+                group_start_ts = today_start.timestamp()
+                private_start_ts = (today_start - timedelta(days=1)).timestamp()
                 end_ts = now_dt.timestamp()
+                _window_fmt = "%Y-%m-%d %H:%M"
+                group_window = (f"{today_start.strftime(_window_fmt)} → "
+                                f"{now_dt.strftime(_window_fmt)}")
+                private_window = (f"{(today_start - timedelta(days=1)).strftime(_window_fmt)}"
+                                  f" → {now_dt.strftime(_window_fmt)}")
 
                 ctx_obj = getattr(self, "ctx", None)
                 getter = getattr(getattr(ctx_obj, "message", None),
                                  "get_by_time_in_chat", None)
                 last_lines: Dict[str, str] = {}
                 if callable(getter):
-                    for sid, _cat in ordered_pairs:
+                    for sid, cat in ordered_pairs:
                         label = stream_labels.get(sid, sid)
                         head = f"  #{stream_nums.get(sid, 0):02d} {label}"
+                        start_ts = (group_start_ts if cat == "group"
+                                    else private_start_ts)
                         try:
                             msgs = await getter(
                                 sid, str(start_ts), str(end_ts), limit=10, filter_mai=True)
@@ -1619,12 +1633,13 @@ class CompanionComponentsMixin:
                                 best_ts = ts_f
                                 best_hm = hm
                         if not found:
-                            last_lines[sid] = f"{head}: 今日无消息"
+                            # §27.2（R7）：全体面文案统一为「历史无消息」
+                            last_lines[sid] = f"{head}: 历史无消息"
                         else:
                             last_lines[sid] = f"{head}: {best_hm or '有消息（时间未知）'}"
 
                 def _slice_block(sids: List[str], title_fmt: str) -> List[List[str]]:
-                    """按枚举序每 10 个流切一片；标题带「第 i/N 片」。"""
+                    """按枚举序每 10 个流切一片；标题带时段与「第 i/N 片」。"""
                     blocks: List[List[str]] = []
                     total = (len(sids) + 9) // 10
                     for idx in range(total):
@@ -1642,10 +1657,12 @@ class CompanionComponentsMixin:
 
                 stream_slices.extend(_slice_block(
                     group_sids,
-                    "[候选流最后一条非命令、非 bot 消息·群聊 (第 {i}/{n} 片)]"))
+                    "[候选流最后一条非命令、非 bot 消息·群聊 时段："
+                    f"{group_window} (第 {{i}}/{{n}} 片)]"))
                 stream_slices.extend(_slice_block(
                     private_sids,
-                    "[候选流最后一条非命令、非 bot 消息·私聊（目标/其他）(第 {i}/{n} 片)]"))
+                    "[候选流最后一条非命令、非 bot 消息·私聊 时段："
+                    f"{private_window}（目标/其他）(第 {{i}}/{{n}} 片)]"))
 
             return [_record("\n".join(block))
                     for block in ([b1, b2] + stream_slices)]
@@ -1656,7 +1673,9 @@ class CompanionComponentsMixin:
         """问候候选的序号索引（与 ``_mai_diag_streams_records`` 同一编号口径）。
 
         §26.2 子查询（R7 依据 = 用户 2026-10-22 三直派，计划书 §二十六）：编号顺序 =
-        目标私聊 → 群聊（枚举序）→ 其他私聊（枚举序），两位补零、同一帧内稳定。
+        群聊（枚举序）→ 其他私聊（枚举序），两位补零、同一帧内稳定。§27.2（R7 依据 =
+        用户 2026-10-22 第二批四直派，计划书 §二十七）：**陪伴目标聊天流整条豁免**，
+        不进索引、不占序号（即使退回正式枚举支路也按 category 剔除）。
 
         返回 ``(svc, labels, ordered_pairs)``；``_planning.proactive`` 不可用 →
         ``(None, {}, [])``（调用方输出「规划束未装配」单节点）。枚举/名称映射异常均
@@ -1688,7 +1707,8 @@ class CompanionComponentsMixin:
             by_cat.setdefault(str(cand_cat), []).append(str(cand_sid))
         ordered: List[tuple] = []
         seen: set = set()
-        for cand_cat in ("target", "group", "other"):
+        # §27.2 目标流豁免：编号只含群聊 → 其他私聊；target 即便混入候选列表也剔除
+        for cand_cat in ("group", "other"):
             for cand_sid in by_cat.get(cand_cat, []):
                 if cand_sid and cand_sid not in seen:
                     ordered.append((cand_sid, cand_cat))

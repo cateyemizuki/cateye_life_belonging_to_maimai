@@ -587,9 +587,11 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     }
 
     # ── 活动频率调控 ─────────────────────────────────────────
-    # 2026-10-20 用户指示：日程主动行为整条移除——主动入口只剩早/晚安（强制激活）与
-    # 陪伴 patrol。以下两个键已删除：enable_proactive_trigger（活动切换主动开口）、
+    # 2026-10-20 用户指示：日程主动行为整条移除——主动入口只剩早/晚安与陪伴 patrol。
+    # 以下两个键已删除：enable_proactive_trigger（活动切换主动开口）、
     # proactive_fresh_window_minutes（触发窗口）；旧配置由 suite_config 迁移器显式丢弃。
+    # 2026-10-22 §27.1（R7）：早/晚安分支闸门分离（目标激活强制 / 群聊必要性配置 /
+    # 其他私聊阈值恒开口），见上方问候段注释。
     enable_frequency_modulation: bool = Field(
         default=True,
         description="按当前活动类型调节聊天频率：学习/工作时降低发言频率，休息/娱乐时提高",
@@ -697,17 +699,32 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
             **_ui_i18n("Night drift (min)", 'e.g. "10-30" or "20"'),
         },
     )
-    # 2026-10-20 用户指示：greeting_require_activation 键已删除并**强制生效**——
-    # 当日该流有过非 bot 消息才问候（宁不发不错发），不再提供关闭开关。
+    # 2026-10-22 用户裁定回归（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
+    # 恢复 greeting_require_activation 为真配置键，但**只作用于群聊分支**——群聊在问候
+    # 观察窗内无任何非 bot、非命令消息 → 跳过该群该类问候；目标私聊维持激活强制，
+    # 其他私聊的唯一开口条件是下面的「对方发送」条数阈值，均不受本开关控制。
+    greeting_require_activation: bool = Field(
+        default=True,
+        description="群聊早晚安必要性检查：群聊在问候观察窗内无任何非 bot、非命令消息 → "
+                    "跳过该群该类问候（仅影响群聊；目标私聊与其他私聊不受此开关控制）",
+        json_schema_extra={
+            "label": "群聊问候必要性检查",
+            "hint": "默认开：群里今天没人说话就不主动问早/晚安；关 = 群聊到点即发",
+            **_ui_i18n("Group greeting necessity check",
+                       "On: skip a group's greeting when nobody spoke there in the observation window."),
+        },
+    )
     greeting_other_private_min_messages: int = Field(
         default=5,
-        ge=5,
-        description="其他私聊问候门槛（条）：前一日该私聊消息数达到该值才可能收到早/晚安"
-                    "（**不允许低于 5**）；取不到消息计数按 0 处理（不发送）",
+        ge=1,
+        description="其他私聊问候门槛（条）：[昨日 00:00 → 该类问候开始处理] 窗内"
+                    "**由对方发送**的消息数达到该值才可能收到早/晚安（bot 自身消息不计入；"
+                    "至少 1 条，0/负数被拒绝）；取不到消息计数按 0 处理（不发送）",
         json_schema_extra={
             "label": "私聊问候门槛(条)",
-            "hint": "防打扰护栏：昨天没聊够 5 条就不主动问早/晚安",
-            **_ui_i18n("Other-private greeting threshold (msgs)"),
+            "hint": "防打扰护栏：昨天到点前对方没发够 5 条就不主动问早/晚安（可设 1 条）",
+            **_ui_i18n("Other-private greeting threshold (msgs)",
+                       "Counts only messages sent by the other party in the window."),
         },
     )
 
