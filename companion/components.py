@@ -110,7 +110,8 @@ _DIAG_USAGE_TEXT = (
     "  llm [天数]      — LLM 调用日志，合并转发（1~30 天；旧名 /lbm_mai_llm_log）\n"
     "  decision [天数] — 主动行为决策日志，合并转发（1~30 天；旧名 /lbm_mai_diag）\n"
     "  life [天数]     — 决策日志紧凑文本（1~7 天；旧名 /lbm_life diag）\n"
-    "  streams         — 主动候选流与名单状态（今日最后一条非命令消息时间）"
+    "  streams [序号]  — 主动候选流与名单状态；带序号只看该流早/晚安触发状态"
+    "（今日最后一条非命令消息时间）"
 )
 
 #: 注入作用域（2026-10-10 注入矩阵：目标私聊 / 含陪伴用户的群聊 / 跳过）
@@ -956,7 +957,8 @@ class CompanionComponentsMixin:
         /lbm_mai_diag、life = 旧 /lbm_life diag 紧凑文本）；旧名由
         pattern 的 ``legacy_llm`` / ``legacy_decision`` 命名捕获进入同一逻辑（同一组件，
         零组件成本）。``streams``（2026-10-20 用户指示）输出主动候选流/名单状态，
-        §25.2 起改合并转发送出（三块 = 三节点，R7：用户 2026-10-21 追加三直派②）。
+        §25.2 起改合并转发送出（§26.1 起为多节点布局：固定 2 节点 + 群聊/私聊切片；
+        R7：用户 2026-10-21 追加三直派②、2026-10-22 三直派）。
         鉴权统一收归 admin 判定（旧 mai_diag/llm_log 走 target 白名单、
         旧 life diag 走 admin，收归后口径见 USAGE）。
         """
@@ -988,10 +990,14 @@ class CompanionComponentsMixin:
             await self._diag_reply(stream_id, self._qz_diag_text(days))
             return True, "决策日志已发送", True
         if sub == "streams":
-            # 2026-10-20 用户指示：主动候选流/名单状态诊断（三块 = 三节点，无 emoji）。
+            # 2026-10-20 用户指示：主动候选流/名单状态诊断（无 emoji）。
             # R7 依据 = 用户 2026-10-21 追加三直派②（计划书 §二十五）：改合并转发送出——
             # 走 _mai_send_forward 既有 forward+纯文本回退链，forward 失败回退纯文本
-            # = 三节点 content join。
+            # = 节点 content join；§26.1 起节点数随群聊/私聊切片数变化。
+            # §26.2（R7 依据 = 用户 2026-10-22 三直派）：``streams <正整数>`` 单流触发状态，
+            # 越界/非数字经 forward 单节点提示可用序号范围。
+            if len(parts) > 1:
+                return await self._mai_diag_stream_status(stream_id, parts[1])
             records = await self._mai_diag_streams_records()
             return await self._mai_send_forward(records, stream_id, "streams 诊断")
         # 无参数与未知子命令同档：只回用法帮助（帮助属正常应答，不算命令失败）
@@ -1401,8 +1407,7 @@ class CompanionComponentsMixin:
     async def _mai_diag_streams_records(self) -> list[dict[str, Any]]:
         """``/lbm_diag streams`` 的合并转发节点主体：主动候选流与名单状态（2026-10-20 用户指示）。
 
-        三块 = 三节点（无 emoji，便于日志粘贴；§25.2 records 化，R7 依据 =
-        用户 2026-10-21 追加三直派②，计划书 §二十五）：
+        节点布局（无 emoji，便于日志粘贴；§25.2 records 化，§26.1 展示重构）：
 
         1. ``[名单状态]``：``[planning_proactive]`` 的群/私聊名单（ids + mode，模式后标注
            留空语义：黑名单「留空=全生效」、白名单「留空=无人」）、``[patrol].target_qq``
@@ -1411,10 +1416,19 @@ class CompanionComponentsMixin:
            ``_resolve_greeting_candidates(cfg)``（按目标私聊/群聊/其他私聊分类）与
            ``_resolve_target_streams()``；不可用 → 「规划束未装配」；``[口径]`` 行并入
            本节点结尾；
-        3. ``[候选流最后一条非命令、非 bot 消息]``：逐个候选 session_id（上限 30，超出标注
-           省略数）取「今日 00:00 → 现在」（本地时区）``get_by_time_in_chat``，
-           过滤空白/斜杠命令后取最新一条的 HH:MM；无 → 今日无消息；查询异常 →
-           查询失败(宁不发)。
+        3. ``[候选流最后一条非命令、非 bot 消息·群聊 (第 i/N 片)]`` 与
+           ``[候选流最后一条非命令、非 bot 消息·私聊（目标/其他）(第 i/N 片)]``：
+           群聊单列、目标私聊与其他私聊并入「私聊」节点；两类各按枚举序**每 10 个流切一片**，
+           **无上限、不折叠**（§26.1 废止 §25 的候选流截断口径，R7 依据 =
+           用户 2026-10-22 三直派，计划书 §二十六）。每行取「今日 00:00 → 现在」
+           （本地时区）``get_by_time_in_chat``，过滤空白/斜杠命令后取最新一条的 HH:MM；
+           无 → 今日无消息；查询异常 → 查询失败(宁不发)。无任何候选流 → 单节点
+           ``[候选流最后一条非命令、非 bot 消息]`` + ``无候选流``。
+
+        序号（§26.1 同源直派）：每个问候候选流一个 ``#NN``（两位补零，≥100 自然进位），
+        编号顺序 = 目标私聊 → 群聊（枚举序）→ 其他私聊（枚举序）；行 = ``#NN {label}: {结果}``，
+        ``[候选解析]`` 块的三类问候列表行同步带 ``#NN`` 便于对照。频率调控-only 流
+        （不在问候候选）不编号、不进 [候选流最后…] 块。
 
         节点记录形态与 ``_mai_build_llm_log_records`` 逐字一致：
         ``{"user_id": "0", "nickname": "streams 诊断",
@@ -1469,6 +1483,7 @@ class CompanionComponentsMixin:
             svc = getattr(planning, "proactive", None)
             greeting_cands: List[Any] = []
             target_streams: List[str] = []
+            stream_nums: Dict[str, int] = {}
             # 显示名映射：svc 不可用/取映射失败 → 保持空 dict，全部展示位回显原 sid
             stream_labels: Dict[str, str] = {}
             if svc is None:
@@ -1496,11 +1511,38 @@ class CompanionComponentsMixin:
                     except (TypeError, ValueError):
                         continue
                     by_cat.setdefault(str(cand_cat), []).append(str(cand_sid))
+                # §26.1 序号：编号顺序 = 目标私聊 → 群聊（枚举序）→ 其他私聊（枚举序），
+                # 与三类候选列表的展示顺序一致；同一次调用内稳定（R7 依据 = 用户
+                # 2026-10-22 三直派，计划书 §二十六）。
+                ordered_pairs: List[tuple] = []
+                numbered_seen: set = set()
+                for cand_cat in ("target", "group", "other"):
+                    for cand_sid in by_cat.get(cand_cat, []):
+                        if cand_sid and cand_sid not in numbered_seen:
+                            ordered_pairs.append((cand_sid, cand_cat))
+                            numbered_seen.add(cand_sid)
+                for cand_cat, cand_sids in by_cat.items():
+                    if cand_cat in ("target", "group", "other"):
+                        continue
+                    for cand_sid in cand_sids:
+                        if cand_sid and cand_sid not in numbered_seen:
+                            ordered_pairs.append((cand_sid, cand_cat))
+                            numbered_seen.add(cand_sid)
+                stream_nums = {
+                    s: idx for idx, (s, _cat) in enumerate(ordered_pairs, start=1)}
+
+                def _num_label(cand_sid: str) -> str:
+                    """``#NN 显示名``（名称不可得回显原 sid；未编号则只显示名）。"""
+                    label = stream_labels.get(cand_sid, cand_sid)
+                    num = stream_nums.get(cand_sid)
+                    return f"#{num:02d} {label}" if num else label
+
                 # R7 依据 = 用户 2026-10-21 追加三直派①（计划书 §二十五）：
                 # 流展示位显示名替代纯 sid；名称不可得 → .get(sid, sid) 回显原 sid
-                target_lbl = [stream_labels.get(s, s) for s in by_cat.get("target", [])]
-                group_lbl = [stream_labels.get(s, s) for s in by_cat.get("group", [])]
-                other_lbl = [stream_labels.get(s, s) for s in by_cat.get("other", [])]
+                target_lbl = [_num_label(s) for s in by_cat.get("target", [])]
+                group_lbl = [_num_label(s) for s in by_cat.get("group", [])]
+                other_lbl = [_num_label(s) for s in by_cat.get("other", [])]
+                # 频率调控-only 流不编号（§26.1）：该行仍是唯一的频控名单键（群聊 ∪ 私聊）
                 freq_lbl = [stream_labels.get(s, s) for s in target_streams]
                 b2.append(f"  问候·目标私聊: {target_lbl or '无'}")
                 b2.append(f"  问候·群聊: {group_lbl or '无'}")
@@ -1510,24 +1552,22 @@ class CompanionComponentsMixin:
             # §25.2：[口径] 行并入第 2 个节点（候选解析）结尾
             b2.append("[口径] 激活闸恒开（2026-10-20 用户指示）：当日非 bot、非命令消息才算激活")
 
-            b3: List[str] = ["[候选流最后一条非命令、非 bot 消息]"]
-            ordered: List[str] = []
-            seen: set = set()
-            for sid in ([str(x[0]) for x in greeting_cands if isinstance(x, (tuple, list)) and x]
-                        + target_streams):
-                if sid and sid not in seen:
-                    ordered.append(sid)
-                    seen.add(sid)
-            if not ordered:
-                b3.append("  无候选流")
+            # §26.1 展示重构（R7 依据 = 用户 2026-10-22 三直派，计划书 §二十六）：
+            # 群聊/私聊两族节点各按枚举序每 10 个流切一片（无上限、不折叠）；
+            # 目标私聊 + 其他私聊并入「私聊」节点；频率调控-only 流不进本块。
+            stream_slices: List[List[str]] = []
+            if svc is None or not stream_nums:
+                stream_slices.append(["[候选流最后一条非命令、非 bot 消息]",
+                                      "  无候选流"])
             else:
-                shown = ordered[:30]
-                if len(ordered) > 30:
-                    b3.append(f"  候选流共 {len(ordered)} 个，仅列前 30 个（省略 {len(ordered) - 30} 个）")
+                group_sids = [sid for sid, cat in ordered_pairs if cat == "group"]
+                # 私聊节点顺序 = 目标私聊（枚举序）→ 其他私聊（枚举序），与编号顺序一致
+                private_sids = [sid for sid, cat in ordered_pairs
+                                if cat in ("target", "other")]
 
                 # 今日 00:00（本地时区）→ 现在
                 try:
-                    now_dt = svc._tz_manager.get_now() if svc is not None else datetime.now()
+                    now_dt = svc._tz_manager.get_now()
                 except Exception:
                     now_dt = datetime.now()
                 start_ts = now_dt.replace(
@@ -1537,11 +1577,11 @@ class CompanionComponentsMixin:
                 ctx_obj = getattr(self, "ctx", None)
                 getter = getattr(getattr(ctx_obj, "message", None),
                                  "get_by_time_in_chat", None)
-                if not callable(getter):
-                    b3.append("  消息能力不可用（宁不发）")
-                else:
-                    for sid in shown:
+                last_lines: Dict[str, str] = {}
+                if callable(getter):
+                    for sid, _cat in ordered_pairs:
                         label = stream_labels.get(sid, sid)
+                        head = f"  #{stream_nums.get(sid, 0):02d} {label}"
                         try:
                             msgs = await getter(
                                 sid, str(start_ts), str(end_ts), limit=10, filter_mai=True)
@@ -1550,12 +1590,12 @@ class CompanionComponentsMixin:
                                 msgs = await getter(
                                     sid, str(start_ts), str(end_ts), limit=10)
                             except Exception:
-                                b3.append(f"  {label}: 查询失败(宁不发)")
+                                last_lines[sid] = f"{head}: 查询失败(宁不发)"
                                 continue
                         if isinstance(msgs, dict):
                             msgs = msgs.get("messages") or msgs.get("data") or []
                         if not isinstance(msgs, list):
-                            b3.append(f"  {label}: 查询失败(宁不发)")
+                            last_lines[sid] = f"{head}: 查询失败(宁不发)"
                             continue
                         best_ts: Optional[float] = None
                         best_hm = ""
@@ -1579,13 +1619,144 @@ class CompanionComponentsMixin:
                                 best_ts = ts_f
                                 best_hm = hm
                         if not found:
-                            b3.append(f"  {label}: 今日无消息")
+                            last_lines[sid] = f"{head}: 今日无消息"
                         else:
-                            b3.append(f"  {label}: {best_hm or '有消息（时间未知）'}")
+                            last_lines[sid] = f"{head}: {best_hm or '有消息（时间未知）'}"
 
-            return [_record("\n".join(block)) for block in (b1, b2, b3)]
+                def _slice_block(sids: List[str], title_fmt: str) -> List[List[str]]:
+                    """按枚举序每 10 个流切一片；标题带「第 i/N 片」。"""
+                    blocks: List[List[str]] = []
+                    total = (len(sids) + 9) // 10
+                    for idx in range(total):
+                        chunk = sids[idx * 10:(idx + 1) * 10]
+                        lines = [title_fmt.format(i=idx + 1, n=total)]
+                        if not callable(getter):
+                            lines.append("  消息能力不可用（宁不发）")
+                        else:
+                            lines.extend(last_lines.get(
+                                sid, f"  #{stream_nums.get(sid, 0):02d} "
+                                     f"{stream_labels.get(sid, sid)}: 查询失败(宁不发)")
+                                for sid in chunk)
+                        blocks.append(lines)
+                    return blocks
+
+                stream_slices.extend(_slice_block(
+                    group_sids,
+                    "[候选流最后一条非命令、非 bot 消息·群聊 (第 {i}/{n} 片)]"))
+                stream_slices.extend(_slice_block(
+                    private_sids,
+                    "[候选流最后一条非命令、非 bot 消息·私聊（目标/其他）(第 {i}/{n} 片)]"))
+
+            return [_record("\n".join(block))
+                    for block in ([b1, b2] + stream_slices)]
         except Exception as exc:  # 兜底：诊断命令绝不抛
             return [_record(f"[streams] 诊断失败: {exc}")]
+
+    async def _mai_diag_stream_index(self) -> tuple[Any, Dict[str, str], List[tuple]]:
+        """问候候选的序号索引（与 ``_mai_diag_streams_records`` 同一编号口径）。
+
+        §26.2 子查询（R7 依据 = 用户 2026-10-22 三直派，计划书 §二十六）：编号顺序 =
+        目标私聊 → 群聊（枚举序）→ 其他私聊（枚举序），两位补零、同一帧内稳定。
+
+        返回 ``(svc, labels, ordered_pairs)``；``_planning.proactive`` 不可用 →
+        ``(None, {}, [])``（调用方输出「规划束未装配」单节点）。枚举/名称映射异常均
+        降级为空（宁可不发，不伪造序号）。
+        """
+        planning = getattr(self, "_planning", None)
+        svc = getattr(planning, "proactive", None)
+        if svc is None:
+            return None, {}, []
+        cfg_all = getattr(self, "config", None)
+        cfg_p = getattr(cfg_all, "planning_proactive", None)
+        effective_cfg = cfg_p if cfg_p is not None else svc._proactive_cfg()
+        # 优先走服务的只读解析支路（不写解析缓存）；桩服务无该包装时退回正式枚举
+        readonly_resolver = getattr(svc, "_resolve_greeting_candidates_readonly", None)
+        resolver = readonly_resolver if callable(readonly_resolver) \
+            else svc._resolve_greeting_candidates
+        cands = list(await resolver(effective_cfg) or [])
+        try:
+            labels = dict(await svc.stream_display_labels() or {})
+        except Exception as exc:
+            self.ctx.logger.debug(f"获取流显示名失败（按纯 sid 回显）: {exc}")
+            labels = {}
+        by_cat: Dict[str, List[str]] = {"target": [], "group": [], "other": []}
+        for item in cands:
+            try:
+                cand_sid, cand_cat = item
+            except (TypeError, ValueError):
+                continue
+            by_cat.setdefault(str(cand_cat), []).append(str(cand_sid))
+        ordered: List[tuple] = []
+        seen: set = set()
+        for cand_cat in ("target", "group", "other"):
+            for cand_sid in by_cat.get(cand_cat, []):
+                if cand_sid and cand_sid not in seen:
+                    ordered.append((cand_sid, cand_cat))
+                    seen.add(cand_sid)
+        for cand_cat, cand_sids in by_cat.items():
+            if cand_cat in ("target", "group", "other"):
+                continue
+            for cand_sid in cand_sids:
+                if cand_sid and cand_sid not in seen:
+                    ordered.append((cand_sid, cand_cat))
+                    seen.add(cand_sid)
+        return svc, labels, ordered
+
+    async def _mai_diag_stream_status(self, stream_id: str,
+                                      raw_num: Any) -> tuple[bool, str, bool]:
+        """``/lbm_diag streams <序号>``：指定问候候选流的早/晚安触发状态快照（§26.2）。
+
+        单节点 ``[流 #NN {label}]``，早/晚各一行结论 + 一行「当前判定关键量」；
+        序号越界/非数字/0/负数 → 单节点提示可用序号范围与用法（经 forward，失败按
+        ``_mai_send_forward`` 回退纯文本）。状态数据一律来自
+        ``ProactiveService.greeting_trigger_status``（纯读，不写任何问候状态）。
+
+        取不到数据（规划束未装配/候选解析或状态查询异常）→ 「宁不发（取不到）」，不伪造。
+        """
+        def _record(text: str) -> dict[str, Any]:
+            return {"user_id": "0", "nickname": "streams 流状态",
+                    "segments": [{"type": "text", "content": text}]}
+
+        try:
+            num_text = str(raw_num or "").strip()
+            try:
+                num = int(num_text)
+            except (TypeError, ValueError):
+                num = 0
+            svc, labels, ordered = await self._mai_diag_stream_index()
+            if svc is None:
+                return await self._mai_send_forward(
+                    [_record("[流状态] 取不到（规划束未装配，_planning.proactive 不可用）")],
+                    stream_id, "streams 流状态")
+            total = len(ordered)
+            if num < 1 or num > total:
+                if total:
+                    usage = (f"可用序号范围: #01~#{total:02d}；"
+                             f"用法: /lbm_diag streams <序号>")
+                else:
+                    usage = ("当前无问候候选流（可用序号范围为空）；"
+                             "用法: /lbm_diag streams <序号>")
+                shown = num_text if num_text else "（空）"
+                return await self._mai_send_forward(
+                    [_record(f"[流状态] 「{shown}」不是有效序号（需正整数）。\n  {usage}")],
+                    stream_id, "streams 流状态")
+            sid, _cat = ordered[num - 1]
+            label = str(labels.get(sid, sid))
+            status = await svc.greeting_trigger_status(sid)
+            lines = [f"[流 #{num:02d} {label}]"]
+            for kind, title in (("morning", "早安"), ("night", "晚安")):
+                info = (status.get("kinds") or {}).get(kind) or {}
+                conclusion = str(info.get("conclusion") or "取不到（宁不发）")
+                lines.append(f"  {title}: {conclusion}")
+                detail = str(info.get("detail") or "").strip()
+                if detail:
+                    lines.append(f"    {detail}")
+            return await self._mai_send_forward([_record("\n".join(lines))],
+                                                stream_id, "streams 流状态")
+        except Exception as exc:  # 兜底：诊断命令绝不抛
+            return await self._mai_send_forward(
+                [_record(f"[流状态] 取不到（查询失败，宁不发）: {exc}")],
+                stream_id, "streams 流状态")
 
     async def _diag_llm_log(self, stream_id: str, days: Optional[int]) -> tuple[bool, str, bool]:
         """diag llm 子命令 = 旧 /lbm_mai_llm_log（llm_logger 调用日志合并转发）。"""

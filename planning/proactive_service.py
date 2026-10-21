@@ -111,6 +111,11 @@ GREETING_CATEGORY_OTHER = "other"
 GREETING_STATUS_PENDING = "pending"
 GREETING_STATUS_FIRED = "fired"
 GREETING_STATUS_ABANDONED = "abandoned"
+#: 诊断快照（§26.2）里放弃原因的中文说明；未知原因原样透出
+_GREETING_ABANDON_REASON_CN = {
+    "deadline": "观测窗结束仍无人说话",
+    "window_closed": "掷点时观测窗已关闭",
+}
 #: 早安无「非睡眠日程条目」时的放弃期限兜底：基准 + 120 分钟（§3.2 期限列的实现裁量）
 _MORNING_FALLBACK_DEADLINE_MINUTES = 120
 #: 睡眠条目名称兜底关键词：与 emotion/service.py 的 `_is_sleep_item` 同一依据
@@ -452,11 +457,15 @@ class ProactiveService:
             return False
         return True
 
-    async def _resolve_group_id(self, group_id: str) -> Optional[str]:
-        """把群号解析为 session_id（带解析缓存）。"""
+    async def _resolve_group_id(self, group_id: str,
+                                use_cache: bool = True) -> Optional[str]:
+        """把群号解析为 session_id（带解析缓存）。
+
+        ``use_cache=False``（§26.2 诊断快照）→ 不读不写解析缓存。
+        """
         entry = f"group:{group_id}"
         now = time.time()
-        cached = self._resolved_cache.get(entry)
+        cached = self._resolved_cache.get(entry) if use_cache else None
         if cached is not None and now < cached[1]:
             return cached[0]
 
@@ -480,8 +489,10 @@ class ProactiveService:
                     logger.warning(f"解析群 {group_id} 异常: {exc}")
             session_id = self._extract_session_id(entry, result)
 
-        ttl = self.RESOLVE_CACHE_TTL_SUCCESS if session_id else self.RESOLVE_CACHE_TTL_FAILURE
-        self._resolved_cache[entry] = (session_id, now + ttl)
+        if use_cache:
+            ttl = (self.RESOLVE_CACHE_TTL_SUCCESS if session_id
+                   else self.RESOLVE_CACHE_TTL_FAILURE)
+            self._resolved_cache[entry] = (session_id, now + ttl)
         if session_id:
             logger.info(f"解析群 {group_id} → session_id={session_id}")
         return session_id
@@ -963,11 +974,15 @@ class ProactiveService:
                 result.append((group_id, session_id))
         return result
 
-    async def _resolve_private_id(self, user_id: str) -> Optional[str]:
-        """把裸 QQ 号解析为私聊 session_id（带解析缓存；问候专用名单只收裸号，不带前缀）。"""
+    async def _resolve_private_id(self, user_id: str,
+                                  use_cache: bool = True) -> Optional[str]:
+        """把裸 QQ 号解析为私聊 session_id（带解析缓存；问候专用名单只收裸号，不带前缀）。
+
+        ``use_cache=False``（§26.2 诊断快照）→ 不读不写解析缓存，纯查询后直接返回。
+        """
         entry = f"greeting-private:{user_id}"
         now = time.time()
-        cached = self._resolved_cache.get(entry)
+        cached = self._resolved_cache.get(entry) if use_cache else None
         if cached is not None and now < cached[1]:
             return cached[0]
 
@@ -983,8 +998,10 @@ class ProactiveService:
                 logger.warning(f"解析私聊 {user_id} 异常: {exc}")
             session_id = self._extract_session_id(entry, result)
 
-        ttl = self.RESOLVE_CACHE_TTL_SUCCESS if session_id else self.RESOLVE_CACHE_TTL_FAILURE
-        self._resolved_cache[entry] = (session_id, now + ttl)
+        if use_cache:
+            ttl = (self.RESOLVE_CACHE_TTL_SUCCESS if session_id
+                   else self.RESOLVE_CACHE_TTL_FAILURE)
+            self._resolved_cache[entry] = (session_id, now + ttl)
         return session_id
 
     async def _enumerate_private_pairs(self) -> List[Tuple[str, str]]:
@@ -1022,7 +1039,7 @@ class ProactiveService:
         """诊断用「session_id → 显示名」映射（R7 依据 = 用户 2026-10-21 追加三直派①计划书 §二十五）。
 
         供 ``/lbm_diag streams``（companion/components.py ``_mai_diag_streams_records``，
-        §25.2 起三块 = 三节点）把纯 sid 展示位换成可读名称：单次 ``ctx.chat.get_all_streams(platform="qq")`` 全量枚举，
+        §25.2 起 records 化、§26.1 起按群聊/私聊切片）把纯 sid 展示位换成可读名称：单次 ``ctx.chat.get_all_streams(platform="qq")`` 全量枚举，
         每流按 ``is_group_session`` 真值或 ``group_id`` 非空判型——群流取 ``group_name``；
         私聊流 ``user_cardname`` 优先、``user_nickname`` 次之（均 strip 后**非空才用**）。
         名称不可得 → 该流**不入映射**（调用方兜底回显原 session_id）。
@@ -1391,6 +1408,422 @@ class ProactiveService:
     # （盘点依据 §24.0；R7 依据 = 计划书 §24.2 用户指示）。真实作息锚点落地后
     # 保留该副本只会成为"配置口径假源"，睡眠环判定统一收敛到
     # planning/schedule_anchors.py（连锁消费统一经 patrol 的真源入口）。
+
+    # ------------------------------------------------------------
+    # 诊断快照：指定流的下一次早/晚安触发状态（§26.2）
+    # ------------------------------------------------------------
+
+    def _message_query_available(self) -> bool:
+        """宿主是否具备 ``ctx.message.get_by_time_in_chat``（诊断快照的必需能力）。"""
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        return callable(getattr(getattr(ctx_obj, "message", None),
+                                "get_by_time_in_chat", None))
+
+    async def _count_other_private_gate_live(self, stream_id: str, kind: str,
+                                             now: datetime, need: int) -> Tuple[int, bool]:
+        """其他私聊门槛的**非缓存**实数（§26.2 诊断专用小助手，仅读）。
+
+        统计窗 = **[昨日 00:00 → now)**，端点语义与 §25.3 一致（端点 = 该类问候开始处理的
+        时刻；诊断以本次查询时刻为端点）。**不读不写** ``_greeting_other_gate``——真实链路
+        的缓存判定由调用方另行只读取用。能力缺失/查询异常/返回形态不可解析 → ``(0, False)``
+        （fail-closed 按 0，宁不发）。
+
+        返回 ``(计入条数, 查询是否成功)``；条数按宿主 ``limit=need`` 截断（与
+        :meth:`_other_private_qualified` 同口径）。
+        """
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        getter = getattr(getattr(ctx_obj, "message", None), "get_by_time_in_chat", None)
+        if not callable(getter):
+            return 0, False
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_start = midnight - timedelta(days=1)
+        try:
+            msgs = await getter(
+                str(stream_id), str(yesterday_start.timestamp()),
+                str(now.timestamp()), limit=need,
+            )
+        except Exception as exc:
+            logger.debug(f"诊断门槛实查失败（按 0）: stream={stream_id}, kind={kind}, {exc}")
+            return 0, False
+        if isinstance(msgs, dict):
+            msgs = msgs.get("messages") or msgs.get("data") or []
+        if not isinstance(msgs, list):
+            return 0, False
+        return min(len(msgs), int(need)), True
+
+    def _peek_stream_greeting_mark(self, stream_id: str, kind: str, date_str: str) -> bool:
+        """只读查询按流去重标记（§26.2）：不写盘、不落 ``_stream_greeting_marks`` 实例缓存。"""
+        marks = self._stream_greeting_marks
+        if marks is None:
+            path = self._stream_marks_path()
+            data = load_json(path, {}) if path is not None else {}
+            marks = data.get("marks") if isinstance(data, dict) else {}
+            if not isinstance(marks, dict):
+                marks = {}
+        try:
+            return bool(marks.get(str(stream_id), {}).get(str(date_str), {}).get(kind))
+        except Exception:
+            return False
+
+    def _target_greeting_allowed_readonly(self) -> bool:
+        """诊断用目标私聊准入判定（与 :meth:`_target_greeting_allowed` 同口径，纯读）。
+
+        不调用 ``_note_list_problem``（它写 ``_greeting_list_warned`` 并记决策日志）；
+        非法名单元素在诊断里按已忽略处理。
+        """
+        cfg = self._proactive_cfg()
+        ids, _problems = self._clean_id_list(
+            getattr(cfg, "proactive_private_ids", None), "private")
+        mode = str(getattr(cfg, "proactive_private_list_mode", LIST_MODE_WHITELIST)
+                   or LIST_MODE_WHITELIST)
+        target = self._target_qq()
+        if mode == LIST_MODE_BLACKLIST and target and target in set(ids):
+            return False
+        return True
+
+    async def _resolve_group_streams_readonly(self) -> List[str]:
+        """诊断用群聊生效集（与 :meth:`_resolve_group_streams` 同口径，不写解析缓存/告警）。"""
+        cfg = self._proactive_cfg()
+        ids, _problems = self._clean_id_list(
+            getattr(cfg, "proactive_group_ids", None), "group")
+        mode = str(getattr(cfg, "proactive_group_list_mode", LIST_MODE_BLACKLIST)
+                   or LIST_MODE_BLACKLIST)
+        if mode == LIST_MODE_WHITELIST:
+            if not ids:
+                return []
+            pairs: List[Tuple[str, Optional[str]]] = [
+                (gid, await self._resolve_group_id(gid, use_cache=False)) for gid in ids
+            ]
+        else:
+            excluded = set(ids)
+            pairs = [(gid, sid) for gid, sid in await self._enumerate_group_pairs()
+                     if gid not in excluded]
+        return [sid for _gid, sid in pairs if sid]
+
+    async def _resolve_private_streams_readonly(self) -> List[str]:
+        """诊断用私聊生效集（与 :meth:`_resolve_private_streams` 同口径，不写解析缓存/告警）。"""
+        cfg = self._proactive_cfg()
+        ids, _problems = self._clean_id_list(
+            getattr(cfg, "proactive_private_ids", None), "private")
+        mode = str(getattr(cfg, "proactive_private_list_mode", LIST_MODE_WHITELIST)
+                   or LIST_MODE_WHITELIST)
+        target_qq = self._target_qq()
+        if mode == LIST_MODE_WHITELIST:
+            if not ids:
+                return []
+            pairs: List[Tuple[str, Optional[str]]] = [
+                (uid, await self._resolve_private_id(uid, use_cache=False)) for uid in ids
+            ]
+        else:
+            excluded = set(ids)
+            pairs = [(uid, sid) for uid, sid in await self._enumerate_private_pairs()
+                     if uid not in excluded]
+        result: List[str] = []
+        for uid, sid in pairs:
+            if not sid:
+                continue
+            if target_qq and uid == target_qq:
+                continue
+            result.append(sid)
+        return result
+
+    async def _resolve_greeting_candidates_readonly(self,
+                                                    cfg_p: Any = None) -> List[Tuple[str, str]]:
+        """诊断用问候候选解析（§26.2；与 :meth:`_resolve_greeting_candidates` 同口径）。
+
+        **纯读**：不写 ``_resolved_cache`` / ``_greeting_list_warned``，不触发名单告警；
+        枚举与解析全部走 ``use_cache=False`` 的只读支路。``cfg_p`` 仅为调用点兼容保留。
+        """
+        candidates: List[Tuple[str, str]] = []
+        seen: set = set()
+        target = str(getattr(self._plugin, "_stream_id", "") or "").strip()
+        if target and self._companion_enabled() and self._target_greeting_allowed_readonly():
+            candidates.append((target, GREETING_CATEGORY_TARGET))
+            seen.add(target)
+        for sid in await self._resolve_group_streams_readonly():
+            if sid and sid not in seen:
+                candidates.append((sid, GREETING_CATEGORY_GROUP))
+                seen.add(sid)
+        for sid in await self._resolve_private_streams_readonly():
+            if sid and sid not in seen:
+                candidates.append((sid, GREETING_CATEGORY_OTHER))
+                seen.add(sid)
+        return candidates
+
+    async def _resolve_target_streams_readonly(self) -> List[str]:
+        """诊断用频率调控候选枚举（纯读；不写解析缓存/名单告警）。"""
+        streams: List[str] = []
+        seen: set = set()
+        for sid in ((await self._resolve_group_streams_readonly())
+                    + (await self._resolve_private_streams_readonly())):
+            if sid and sid not in seen:
+                streams.append(sid)
+                seen.add(sid)
+        return streams
+
+    async def _greeting_category_of(self, stream_id: str,
+                                    cfg_p: Any) -> Tuple[Optional[str], bool]:
+        """诊断用类别解析：``(category 或 None, 解析是否成功)``（§26.2 同帧口径）。
+
+        直接复用 :meth:`_resolve_greeting_candidates`（目标私聊/群聊/其他私聊）；不在候选中
+        → ``(None, True)``（调用方再判「仅频率调控」与「不在问候候选」）；解析抛异常 →
+        ``(None, False)``（取不到）。
+        """
+        try:
+            candidates = await self._resolve_greeting_candidates_readonly(cfg_p)
+        except Exception as exc:
+            logger.debug(f"诊断问候候选解析失败: {exc}")
+            return None, False
+        for item in candidates or []:
+            try:
+                cand_sid, cand_cat = item
+            except (TypeError, ValueError):
+                continue
+            if str(cand_sid) == stream_id:
+                return str(cand_cat), True
+        return None, True
+
+    async def _greeting_kind_status(self, stream_id: str, category: Optional[str], kind: str,
+                                    now: datetime, now_ts: float, date_str: str,
+                                    cfg_p: Any) -> Dict[str, Any]:
+        """单个 kind 的触发状态快照（纯读；§26.2 结论行 + 判定关键量）。"""
+        enabled = self._greeting_kind_enabled(kind)
+        today_key = (stream_id, date_str, kind)
+        entry = self._greeting_rolls.get(today_key)
+        # 夜猫子作息：昨天掷的晚安条目可能仍在观测，计入「下一次」现状（只读）
+        if entry is None:
+            for (entry_sid, entry_date, entry_kind), candidate in self._greeting_rolls.items():
+                if entry_sid != stream_id or entry_kind != kind or entry_date == date_str:
+                    continue
+                if (candidate.get("status") == GREETING_STATUS_PENDING
+                        and now_ts <= float(candidate.get("observe_until", 0) or 0)):
+                    entry = candidate
+                    break
+        entry_date = str((entry or {}).get("date") or date_str)
+        marked = self._peek_stream_greeting_mark(stream_id, kind, entry_date)
+        if not marked and category == GREETING_CATEGORY_TARGET:
+            marked = self._greeting_deduped_by_persisted_marker(category, kind)
+
+        need = 0
+        count = 0
+        gate_query_ok = True
+        cached_gate: Optional[bool] = None
+        threshold_met = True
+        if category == GREETING_CATEGORY_OTHER:
+            try:
+                need = max(5, int(getattr(cfg_p, "greeting_other_private_min_messages", 5) or 5))
+            except (TypeError, ValueError):
+                need = 5
+            # 只读取缓存现状，绝不调用 _other_private_qualified（它会写缓存）；
+            # 跨夜条目按其掷点日取缓存键（与真实链路 _evaluate_greeting 同口径）
+            cached_gate = self._greeting_other_gate.get(
+                (stream_id, entry_date, kind))
+            count, gate_query_ok = await self._count_other_private_gate_live(
+                stream_id, kind, now, need)
+            threshold_met = cached_gate if cached_gate is not None else (count >= need)
+
+        activated: Optional[bool] = None
+        fire_at: Optional[float] = None
+        observe_until: Optional[float] = None
+        remaining_minutes = 0
+        detail_parts: List[str] = []
+
+        if not enabled:
+            conclusion = "不适用（早安总开关关闭）" if kind == GREETING_MORNING \
+                else "不适用（晚安总开关关闭）"
+        elif marked:
+            conclusion = "今日已发"
+        elif entry is not None and entry.get("status") == GREETING_STATUS_FIRED:
+            conclusion = "今日已发"
+        elif entry is not None and entry.get("status") == GREETING_STATUS_ABANDONED:
+            reason = str(entry.get("reason") or "unknown")
+            conclusion = (f"已放弃（{_GREETING_ABANDON_REASON_CN.get(reason, reason)}，"
+                          f"原因={reason}）")
+        elif not self._message_query_available():
+            # 取不到必需数据：不猜激活，不落任何状态（宁不发）
+            conclusion = "取不到（缺消息查询能力，宁不发）"
+        else:
+            if entry is not None:
+                observe_from = float(entry.get("observe_from")
+                                     or entry.get("baseline") or now_ts)
+                observe_until = float(entry.get("observe_until")
+                                      or entry.get("deadline") or now_ts)
+                fire_at = float(entry.get("fire_at") or 0) or None
+                fire_lo = fire_hi = fire_at
+            else:
+                # 尚未掷点：按基准/期限/漂移区间估算（不调用 _roll_greeting，不写掷点表）
+                baseline = self._greeting_baseline_ts(kind, now, date_str)
+                deadline = self._greeting_deadline_ts(kind, now, date_str, baseline)
+                drift_lo, drift_hi = self._greeting_drift(kind)
+                if kind == GREETING_MORNING:
+                    fire_lo = baseline + drift_lo * 60.0
+                    fire_hi = baseline + drift_hi * 60.0
+                else:
+                    fire_lo = deadline - drift_hi * 60.0
+                    fire_hi = deadline - drift_lo * 60.0
+                observe_from = baseline
+                observe_until = max(deadline, fire_hi)
+            remaining_minutes = max(0, int((observe_until - now_ts) / 60.0))
+            activated = await self._stream_active_today(
+                stream_id, observe_from, now_ts)
+            if category == GREETING_CATEGORY_OTHER and not threshold_met:
+                if cached_gate is False and count >= need:
+                    # 首评缓存已定死为未达标：后续新增消息不改变当日实际判定
+                    conclusion = (f"未满足（差门槛（缓存未达标，实查 {count}/{need}），"
+                                  f"窗内剩 {remaining_minutes} 分钟）")
+                else:
+                    conclusion = (f"未满足（差门槛 {count}/{need}，"
+                                  f"窗内剩 {remaining_minutes} 分钟）")
+            elif not activated:
+                conclusion = f"未满足（差激活，窗内剩 {remaining_minutes} 分钟）"
+            elif fire_at is None:
+                if now_ts >= fire_hi:
+                    conclusion = "已满足（下一 tick 将发送）"
+                elif int(fire_lo) == int(fire_hi):
+                    conclusion = f"将发送（约 {self._fmt_hhmm(fire_lo)}）"
+                else:
+                    conclusion = (f"将发送（约 {self._fmt_hhmm(fire_lo)}"
+                                  f"–{self._fmt_hhmm(fire_hi)}）")
+            elif now_ts >= fire_at:
+                conclusion = "已满足（下一 tick 将发送）"
+            else:
+                conclusion = f"将发送（约 {self._fmt_hhmm(fire_at)}）"
+
+        if category is not None:
+            if activated is not None:
+                detail_parts.append("激活=" + ("是" if activated else "否"))
+            if category == GREETING_CATEGORY_OTHER:
+                cache_text = ("未评" if cached_gate is None
+                              else ("达标" if cached_gate else "未达标"))
+                query_text = "实查" if gate_query_ok else "实查失败按0"
+                detail_parts.append(
+                    f"门槛={count}/{need}（{query_text}，缓存={cache_text}）")
+            elif category == GREETING_CATEGORY_TARGET:
+                detail_parts.append("门槛=不适用（目标流无门槛）")
+            else:
+                detail_parts.append("门槛=不适用（群聊无门槛）")
+            if entry is not None:
+                roll_text = str(entry.get("status") or "unknown")
+                if entry.get("reason"):
+                    roll_text += f"({entry['reason']})"
+                detail_parts.append(f"掷点={roll_text}")
+            else:
+                detail_parts.append("掷点=未掷点")
+            point_ts = fire_at if fire_at is not None else None
+            if point_ts is None and observe_until is not None:
+                detail_parts.append(f"期限={self._fmt_hhmm(observe_until)}")
+            elif point_ts is not None:
+                detail_parts.append(f"点={self._fmt_hhmm(point_ts)}")
+            detail_parts.append("标记=" + ("是" if marked else "否"))
+
+        return {
+            "kind": kind,
+            "enabled": enabled,
+            "conclusion": conclusion,
+            "detail": " / ".join(detail_parts),
+            "activated": activated,
+            "marked": marked,
+            "threshold": {
+                "applicable": category == GREETING_CATEGORY_OTHER,
+                "need": need,
+                "count": count,
+                "met": threshold_met,
+                "cached": cached_gate,
+                "query_ok": gate_query_ok,
+            },
+            "roll": (dict(entry) if entry is not None else {}),
+            "fire_at": fire_at,
+            "observe_until": observe_until,
+        }
+
+    @staticmethod
+    def _fmt_hhmm(ts: float) -> str:
+        """epoch 秒 → ``HH:MM``（本地时区；非法时间戳回显空串）。"""
+        try:
+            return datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return ""
+
+    async def greeting_trigger_status(self, sid: str,
+                                      now: Optional[datetime] = None) -> Dict[str, Any]:
+        """指定聊天流的下一次早安/晚安触发状态快照（§26.2；**纯读**）。
+
+        R7 依据 = 用户 2026-10-22 三直派（计划书 §二十六 26.2）。
+
+        语义：
+
+        - **类别**（target/group/other/仅频率调控/不在问候候选）：与
+          :meth:`_resolve_greeting_candidates` 同帧解析；
+        - **两类结论**：依次取掷点现状（``_greeting_rolls``）、当日标记
+          （按流 marks / 目标 affection 标记）、激活（``_stream_active_today``，当日 00:00
+          起实查）、其他私聊门槛（独立**非缓存**计数小助手），据此计算：
+          ``已满足（下一 tick 将发送）`` / ``将发送（约 HH:MM）`` /
+          ``未满足（差门槛 M/N，窗内剩 X 分钟）`` / ``未满足（差激活，窗内剩 X 分钟）`` /
+          ``已放弃（原因）`` / ``今日已发`` / ``不适用（…）``；
+        - **目标流无门槛**：target 门槛恒不适用；群聊同上；
+        - 必需数据取不到（消息查询能力缺失/候选解析失败）→ ``取不到（宁不发）``。
+
+        **只读纪律**：不调用 :meth:`_other_private_qualified` / :meth:`_roll_greeting` /
+        :meth:`_mark_stream_greeting`，不写 ``_greeting_other_gate``、``_greeting_rolls``、
+        marks 文件与 affection；只做消息查询与内存读取。
+
+        返回 ``{"stream_id", "date", "category", "resolved", "frequency_only", "note",
+        "kinds": {"morning": {...}, "night": {...}}}``；每个 kind 含 ``conclusion`` /
+        ``detail`` / ``activated`` / ``marked`` / ``threshold`` / ``roll`` / ``fire_at`` /
+        ``observe_until``。
+        """
+        stream_id = str(sid or "").strip()
+        now_dt = now or self._tz_manager.get_now()
+        date_str = now_dt.strftime("%Y-%m-%d")
+        now_ts = _epoch_ts(now_dt)
+        cfg_p = self._proactive_cfg()
+
+        category, resolved = await self._greeting_category_of(stream_id, cfg_p)
+        frequency_only = False
+        if resolved and category is None:
+            try:
+                frequency_only = stream_id in (await self._resolve_target_streams_readonly())
+            except Exception as exc:
+                logger.debug(f"诊断频率调控候选解析失败: {exc}")
+                frequency_only = False
+
+        if not resolved:
+            note = "取不到（问候候选解析失败，宁不发）"
+        elif category is None:
+            note = ("不适用（仅频率调控，不在问候候选）" if frequency_only
+                    else "不适用（不在问候候选）")
+        else:
+            note = ""
+
+        kinds: Dict[str, Any] = {}
+        for kind in (GREETING_MORNING, GREETING_NIGHT):
+            if note:
+                kinds[kind] = {
+                    "kind": kind,
+                    "enabled": False,
+                    "conclusion": note,
+                    "detail": "",
+                    "activated": None,
+                    "marked": False,
+                    "threshold": {"applicable": False, "need": 0, "count": 0,
+                                  "met": False, "cached": None, "query_ok": False},
+                    "roll": {},
+                    "fire_at": None,
+                    "observe_until": None,
+                }
+            else:
+                kinds[kind] = await self._greeting_kind_status(
+                    stream_id, category, kind, now_dt, now_ts, date_str, cfg_p)
+
+        return {
+            "stream_id": stream_id,
+            "date": date_str,
+            "category": category or "",
+            "resolved": resolved,
+            "frequency_only": frequency_only,
+            "note": note,
+            "kinds": kinds,
+        }
 
     def _find_current_activity(self) -> Optional[Tuple[str, str, int, int, Dict[str, Any]]]:
         """从 GoalManager 找当前正在进行的活动。
