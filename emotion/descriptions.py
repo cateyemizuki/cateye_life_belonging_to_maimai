@@ -1,7 +1,8 @@
 """情绪描述表（F5，2026-10-11）：引导 LLM 的详细文字描述，替代「百分比 + 三维约值」渲染。
 
 - **插件根 ``mappings/`` 子文件夹 json**（2026-10-17 起读取位 = ``<root>/mappings/emotion_descriptions.json``；
-  F4/F5 期的旧根文件在新位置缺失时自动复制进来，旧文件保留不删）允许用户自行编辑：
+  表层缺失时 ``core.mapping_dir.ensure_user_table`` 补齐：旧根文件优先迁移（旧文件保留不删），
+  仍缺才从出厂种子 ``mappings/出厂映射表/`` 复制——§29.2）允许用户自行编辑：
   - 文件缺失 → 由内置默认（本模块常量）生成一份并返回默认；
   - **格式错误**（非 dict / 值非字符串）→ 整体回退内置默认（告警日志）；
   - **格式正确但出现不在映射表中的情绪键** → 丢弃那些键（用户口径），其余生效；
@@ -19,7 +20,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from core.mapping_dir import mappings_path, migrate_legacy_root_file
+from core.mapping_dir import ensure_user_table, mappings_path
 
 logger = logging.getLogger(__name__)
 
@@ -100,14 +101,16 @@ def _plugin_root() -> Path:
 
 
 def _descriptions_path(root: Path) -> Path:
-    """描述表路径（``<root>/mappings/emotion_descriptions.json``；旧根文件自动复制进来）。"""
+    """描述表路径（``<root>/mappings/emotion_descriptions.json``；缺失时 ensure_user_table 补齐）。"""
     path = mappings_path(root, ROOT_DESCRIPTIONS_FILE_NAME)
     try:
         present = path.exists()
     except OSError:
         present = False
     if not present:
-        migrate_legacy_root_file(root, ROOT_DESCRIPTIONS_FILE_NAME)
+        # §29.2（2026-10-23 直派）：migrate_legacy_root_file 调用点升级为 ensure_user_table
+        # （旧根迁移仍优先，表层仍缺才从出厂种子映射表复制；解析错误不算缺失）
+        ensure_user_table(root, ROOT_DESCRIPTIONS_FILE_NAME)
     return path
 
 

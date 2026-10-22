@@ -1407,7 +1407,7 @@ class CompanionComponentsMixin:
     async def _mai_diag_streams_records(self) -> list[dict[str, Any]]:
         """``/lbm_diag streams`` 的合并转发节点主体：主动候选流与名单状态（2026-10-20 用户指示）。
 
-        节点布局（无 emoji，便于日志粘贴；§25.2 records 化，§26.1 展示重构）：
+        节点布局（无 emoji，便于日志粘贴；§25.2 records 化，§26.1 展示重构，§29.1 序号根治）：
 
         1. ``[名单状态]``：``[planning_proactive]`` 的群/私聊名单——标题行（mode + 模式
            后标注留空语义：黑名单「留空=全生效」、白名单「留空=无人」）+ 每个配置 id
@@ -1415,14 +1415,19 @@ class CompanionComponentsMixin:
            回显、去引号；空名单保留单行、标题行后内联「（空）」）；另含
            ``[patrol].target_qq`` 与 ``enabled``、早/晚安两个总开关；
         2. ``[候选解析]``：``self._planning.proactive`` 可用时调
-           ``_resolve_greeting_candidates(cfg)``（按群聊/其他私聊分类）与
-           ``_resolve_target_streams()``；不可用 → 「规划束未装配」；``[口径]`` 行并入
-           本节点结尾。**陪伴目标聊天流整体不出现**（2026-10-22 §27.2，R7 依据 =
-           用户 2026-10-22 第二批四直派，计划书 §二十七）：只保留「问候·群聊」/
-           「问候·其他私聊」/「频率调控（群聊∪私聊）」三个标题行（§二十八 R7 依据 =
-           用户 2026-10-22 第三批直派：标题行后**每流一行**，两空格缩进 +
-           ``#NN 显示名``——频控行纯显示名、无序号；枚举序与切片/序号一致；空列表
-           标题行内联「无」；列表回显**去引号**，不再以 ``['…']`` 形态出现），
+           ``_resolve_greeting_streams_universe_readonly()``（§29.1：R7 依据 = 用户
+           2026-10-23 直派，计划书 §二十九）——候选/序号基底换**只读全集枚举**
+           （群聊生效集 ∪ 其他私聊生效集，只做名单解析、不做今日硬门槛过滤；桩服务无
+           该支路时退回只读候选支路 ``_resolve_greeting_candidates_readonly``，不再回退
+           正式枚举写缓存分支）与 ``_resolve_target_streams_readonly()``；不可用 →
+           「规划束未装配」；``[口径]`` 行并入本节点结尾。**陪伴目标聊天流整体不出现**
+           （2026-10-22 §27.2，R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
+           只保留「问候·群聊」/「问候·其他私聊」/「频率调控（群聊∪私聊）」三个标题行
+           （§二十八 R7 依据 = 用户 2026-10-22 第三批直派：标题行后**每流一行**，
+           两空格缩进 + ``#NN 显示名``——频控行纯显示名、无序号；枚举序与切片/序号一致；
+           空列表标题行内联「无」；列表回显**去引号**，不再以 ``['…']`` 形态出现），
+           [候选解析] 的「问候·群聊」行对当日查不到消息的群聊流行尾加注
+           「（今日无消息·不发晨晚问候）」（§29.1：静默群聊不丢弃、显示为历史无信息），
            ``[patrol].target_qq`` 配置行照旧保留在块 1；
         3. ``[候选流最后一条非命令、非 bot 消息·群聊 时段：… (第 i/N 片)]`` 与
            ``[候选流最后一条非命令、非 bot 消息·私聊 时段：…（目标/其他）(第 i/N 片)]``：
@@ -1431,14 +1436,21 @@ class CompanionComponentsMixin:
            检查窗**分族**（§27.2）：群聊 = 今日 00:00 → now，私聊 = 昨日 00:00 → now；
            标题时段文本每 tick 按 ``TimezoneManager`` 现算（精确到年月日）。
            每行走 ``get_by_time_in_chat``，过滤空白/斜杠命令后取最新一条的 HH:MM；
-           无 → 历史无消息；查询异常 → 查询失败(宁不发)。无任何候选流 → 单节点
+           无 → 历史无消息（§29.1：全集中的静默群聊照常占序号、进切片节点并显示
+           「历史无消息」，不丢弃）；查询异常 → 查询失败(宁不发)。无任何候选流 → 单节点
            ``[候选流最后一条非命令、非 bot 消息]`` + ``无候选流``。
 
-        序号（§26.1 同源直派，§27.2 起目标流豁免）：每个问候候选流一个 ``#NN``
-        （两位补零，≥100 自然进位），编号顺序 = **群聊（枚举序）→ 其他私聊（枚举序）**，
-        自 ``#01`` 起；行 = ``#NN {label}: {结果}``，``[候选解析]`` 块的群聊/其他私聊
-        每流行同步带 ``#NN``。频率调控-only 流（不在问候候选）不编号、不进
-        [候选流最后…] 块。
+        序号（§26.1 同源直派，§27.2 起目标流豁免，§29.1 基底换全集）：每个问候候选流
+        一个 ``#NN``（两位补零，≥100 自然进位），编号顺序 = **群聊（枚举序）→ 其他私聊
+        （枚举序）**，自 ``#01`` 起；行 = ``#NN {label}: {结果}``，``[候选解析]`` 块的
+        群聊/其他私聊每流行同步带 ``#NN``。频率调控-only 流（不在问候候选）不编号、
+        不进 [候选流最后…] 块。**全集枚举基底（§29.1）→ 跨帧稳定**（只受名单/宿主枚举
+        变化影响），主查询与子查询（``_mai_diag_stream_index``）同序号系。
+
+        诊断纯读（§29.1，R7 依据 = 用户 2026-10-23 直派，计划书 §二十九）：整链改走
+        只读全集枚举，不再调 ``_resolve_greeting_candidates``（正式写缓存分支）/ 不经
+        ``_group_floor_ok(use_cache=True)``——diag 不再写 ``_greeting_group_floor``
+        与名单告警缓存（``_greeting_list_warned``），§26.2「快照纯读」从子查询扩到全链。
 
         节点记录形态与 ``_mai_build_llm_log_records`` 逐字一致：
         ``{"user_id": "0", "nickname": "streams 诊断",
@@ -1509,13 +1521,36 @@ class CompanionComponentsMixin:
                 b2.append("  规划束未装配（_planning.proactive 不可用）")
             else:
                 effective_cfg = cfg_p if cfg_p is not None else svc._proactive_cfg()
+                # §29.1（R7 依据 = 用户 2026-10-23 直派，计划书 §二十九）：候选/序号基底
+                # 换只读全集枚举（群聊生效集 ∪ 其他私聊生效集，不做今日硬门槛过滤；目标流
+                # 不进枚举）→ 序号建立在名单全集上、同序号恒指向同一流。整链纯读：不回退
+                # 正式枚举写缓存分支（_resolve_greeting_candidates 不再在此出现）。
+                universe_resolver = getattr(
+                    svc, "_resolve_greeting_streams_universe_readonly", None)
+                if callable(universe_resolver):
+                    try:
+                        greeting_cands = list(await universe_resolver() or [])
+                    except Exception as exc:
+                        b2.append(f"  问候候选解析失败: {exc}")
+                else:
+                    # 桩服务无全集支路 → 退回只读候选支路（同样纯读；该支路仍做群聊
+                    # floor 只读实查，仅影响容量不影响纯读纪律——universe 存在时不走它）
+                    readonly_resolver = getattr(
+                        svc, "_resolve_greeting_candidates_readonly", None)
+                    if callable(readonly_resolver):
+                        try:
+                            greeting_cands = list(
+                                await readonly_resolver(effective_cfg) or [])
+                        except Exception as exc:
+                            b2.append(f"  问候候选解析失败: {exc}")
+                # §29.1 诊断全链纯读：频控行同步换只读支路（写告警/解析缓存的正式支路
+                # 仅供旧桩服务兜底；真实服务的 readonly 支路恒先命中）
+                target_resolver = getattr(svc, "_resolve_target_streams_readonly", None)
                 try:
-                    greeting_cands = list(
-                        await svc._resolve_greeting_candidates(effective_cfg) or [])
-                except Exception as exc:
-                    b2.append(f"  问候候选解析失败: {exc}")
-                try:
-                    target_streams = list(await svc._resolve_target_streams() or [])
+                    if callable(target_resolver):
+                        target_streams = list(await target_resolver() or [])
+                    else:
+                        target_streams = list(await svc._resolve_target_streams() or [])
                 except Exception as exc:
                     b2.append(f"  频率调控候选解析失败: {exc}")
                 try:
@@ -1556,53 +1591,12 @@ class CompanionComponentsMixin:
                     num = stream_nums.get(cand_sid)
                     return f"#{num:02d} {label}" if num else label
 
-                # R7 依据 = 用户 2026-10-21 追加三直派①（计划书 §二十五）：
-                # 流展示位显示名替代纯 sid；名称不可得 → .get(sid, sid) 回显原 sid。
-                # §27.2（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
-                # 陪伴目标聊天流整体不出现——目标问候列表行删除。
-                # §28.1（R7 依据 = 用户 2026-10-22 第三批直派，计划书 §二十八）：三个
-                # 列表行改「标题行 + 每流一行」，候选行 = #NN 显示名（枚举序与切片/序号
-                # 一致、stream_nums 既有）、频控行 = 纯显示名无序号；回显去引号，空列表
-                # 时标题行内联「无」（唯一单行情形）。
-                gre_group_sids = list(by_cat.get("group", []))
-                gre_other_sids = list(by_cat.get("other", []))
-                if gre_group_sids:
-                    b2.append("  问候·群聊:")
-                    for cand_sid in gre_group_sids:
-                        b2.append(f"  {_num_label(cand_sid)}")
-                else:
-                    b2.append("  问候·群聊: 无")
-                if gre_other_sids:
-                    b2.append("  问候·其他私聊:")
-                    for cand_sid in gre_other_sids:
-                        b2.append(f"  {_num_label(cand_sid)}")
-                else:
-                    b2.append("  问候·其他私聊: 无")
-                # 频率调控-only 流不编号（§26.1）：频控行仍是唯一的频控名单键（群聊 ∪ 私聊）
-                if target_streams:
-                    b2.append("  频率调控（群聊∪私聊）:")
-                    for cand_sid in target_streams:
-                        b2.append(f"  {stream_labels.get(cand_sid, cand_sid)}")
-                else:
-                    b2.append("  频率调控（群聊∪私聊）: 无")
-
-            # §25.2：[口径] 行并入第 2 个节点（候选解析）结尾
-            b2.append("[口径] 激活闸恒开（2026-10-20 用户指示）：当日非 bot、非命令消息才算激活")
-
-            # §26.1 展示重构 + §27.2 目标流豁免（R7 依据 = 用户 2026-10-22 第二批四直派，
-            # 计划书 §二十七）：群聊/其他私聊两族节点各按枚举序每 10 个流切一片
-            # （无上限、不折叠）；陪伴目标聊天流不出现（私聊节点只装其他私聊）；
-            # 频率调控-only 流不进本块。检查窗分族：群聊 = 今日 00:00 → now，
-            # 私聊 = 昨日 00:00 → now；标题时段文本每 tick 现算。
-            stream_slices: List[List[str]] = []
-            if svc is None or not stream_nums:
-                stream_slices.append(["[候选流最后一条非命令、非 bot 消息]",
-                                      "  无候选流"])
-            else:
-                group_sids = [sid for sid, cat in ordered_pairs if cat == "group"]
-                # 私聊节点只装其他私聊（目标流豁免），顺序 = 枚举序，与编号一致
-                private_sids = [sid for sid, cat in ordered_pairs if cat == "other"]
-
+                # §29.1（R7 依据 = 用户 2026-10-23 直派，计划书 §二十九）：消息实查**前移**
+                # ——先对全集流做一次 ``get_by_time_in_chat`` 窗查询，产出「流 → 行面状态」
+                # 映射（``last_lines``）+ 「当日无消息群聊」集合（``silent_group_sids``），
+                # 供 [候选解析] 群聊行尾加注与切片节点共用；同一帧、同一次查询，两处行面
+                # 状态恒一致。纯读：直接走宿主消息接口，不经 ``_group_floor_ok``（不写
+                # ``_greeting_group_floor`` 门槛缓存）。
                 # 时间原点：群聊片今日 00:00、私聊片昨日 00:00；终点均为现在（本地时区）
                 try:
                     now_dt = svc._tz_manager.get_now()
@@ -1623,6 +1617,7 @@ class CompanionComponentsMixin:
                 getter = getattr(getattr(ctx_obj, "message", None),
                                  "get_by_time_in_chat", None)
                 last_lines: Dict[str, str] = {}
+                silent_group_sids: set = set()
                 if callable(getter):
                     for sid, cat in ordered_pairs:
                         label = stream_labels.get(sid, sid)
@@ -1666,10 +1661,67 @@ class CompanionComponentsMixin:
                                 best_ts = ts_f
                                 best_hm = hm
                         if not found:
-                            # §27.2（R7）：全体面文案统一为「历史无消息」
+                            # §27.2（R7）：全体面文案统一为「历史无消息」；§29.1：全集中的
+                            # 静默群聊不丢弃——行面状态进行尾加注（问候·群聊行）与切片节点
+                            if cat == "group":
+                                silent_group_sids.add(sid)
                             last_lines[sid] = f"{head}: 历史无消息"
                         else:
                             last_lines[sid] = f"{head}: {best_hm or '有消息（时间未知）'}"
+
+                # R7 依据 = 用户 2026-10-21 追加三直派①（计划书 §二十五）：
+                # 流展示位显示名替代纯 sid；名称不可得 → .get(sid, sid) 回显原 sid。
+                # §27.2（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
+                # 陪伴目标聊天流整体不出现——目标问候列表行删除。
+                # §28.1（R7 依据 = 用户 2026-10-22 第三批直派，计划书 §二十八）：三个
+                # 列表行改「标题行 + 每流一行」，候选行 = #NN 显示名（枚举序与切片/序号
+                # 一致、stream_nums 既有）、频控行 = 纯显示名无序号；回显去引号，空列表
+                # 时标题行内联「无」（唯一单行情形）。
+                gre_group_sids = list(by_cat.get("group", []))
+                gre_other_sids = list(by_cat.get("other", []))
+                if gre_group_sids:
+                    b2.append("  问候·群聊:")
+                    for cand_sid in gre_group_sids:
+                        # §29.1（R7 依据 = 用户 2026-10-23 直派，计划书 §二十九）：静默群聊
+                        # 不丢弃——全集中的群聊照常占序号 #NN；当日查不到消息者行尾加注
+                        # 「（今日无消息·不发晨晚问候）」（查不到消息 = 行面「历史无消息」，
+                        # 判据与 _group_floor_ok 同源：非 bot、非斜杠命令、非空白文本）。
+                        note_text = ("（今日无消息·不发晨晚问候）"
+                                     if cand_sid in silent_group_sids else "")
+                        b2.append(f"  {_num_label(cand_sid)}{note_text}")
+                else:
+                    b2.append("  问候·群聊: 无")
+                if gre_other_sids:
+                    b2.append("  问候·其他私聊:")
+                    for cand_sid in gre_other_sids:
+                        b2.append(f"  {_num_label(cand_sid)}")
+                else:
+                    b2.append("  问候·其他私聊: 无")
+                # 频率调控-only 流不编号（§26.1）：频控行仍是唯一的频控名单键（群聊 ∪ 私聊）
+                if target_streams:
+                    b2.append("  频率调控（群聊∪私聊）:")
+                    for cand_sid in target_streams:
+                        b2.append(f"  {stream_labels.get(cand_sid, cand_sid)}")
+                else:
+                    b2.append("  频率调控（群聊∪私聊）: 无")
+
+            # §25.2：[口径] 行并入第 2 个节点（候选解析）结尾
+            b2.append("[口径] 激活闸恒开（2026-10-20 用户指示）：当日非 bot、非命令消息才算激活")
+
+            # §26.1 展示重构 + §27.2 目标流豁免（R7 依据 = 用户 2026-10-22 第二批四直派，
+            # 计划书 §二十七）：群聊/其他私聊两族节点各按枚举序每 10 个流切一片
+            # （无上限、不折叠）；陪伴目标聊天流不出现（私聊节点只装其他私聊）；
+            # 频率调控-only 流不进本块。检查窗分族（§29.1 起实查前移，窗口与行面状态在
+            # [候选解析] 之前一次产出）：群聊 = 今日 00:00 → now，私聊 = 昨日 00:00 → now；
+            # 标题时段文本每 tick 现算。
+            stream_slices: List[List[str]] = []
+            if svc is None or not stream_nums:
+                stream_slices.append(["[候选流最后一条非命令、非 bot 消息]",
+                                      "  无候选流"])
+            else:
+                group_sids = [sid for sid, cat in ordered_pairs if cat == "group"]
+                # 私聊节点只装其他私聊（目标流豁免），顺序 = 枚举序，与编号一致
+                private_sids = [sid for sid, cat in ordered_pairs if cat == "other"]
 
                 def _slice_block(sids: List[str], title_fmt: str) -> List[List[str]]:
                     """按枚举序每 10 个流切一片；标题带时段与「第 i/N 片」。"""
@@ -1709,6 +1761,10 @@ class CompanionComponentsMixin:
         群聊（枚举序）→ 其他私聊（枚举序），两位补零、同一帧内稳定。§27.2（R7 依据 =
         用户 2026-10-22 第二批四直派，计划书 §二十七）：**陪伴目标聊天流整条豁免**，
         不进索引、不占序号（即使退回正式枚举支路也按 category 剔除）。
+        §29.1（R7 依据 = 用户 2026-10-23 直派，计划书 §二十九）：解析支路换**只读全集
+        枚举**（``_resolve_greeting_streams_universe_readonly``：群聊生效集 ∪ 其他私聊
+        生效集，不做今日硬门槛过滤；目标流不进枚举）——``streams <序号>`` 与主查询
+        同序号系、跨帧稳定；桩服务无全集支路时退回只读候选支路（仍按 category 剔除）。
 
         返回 ``(svc, labels, ordered_pairs)``；``_planning.proactive`` 不可用 →
         ``(None, {}, [])``（调用方输出「规划束未装配」单节点）。枚举/名称映射异常均
@@ -1721,11 +1777,22 @@ class CompanionComponentsMixin:
         cfg_all = getattr(self, "config", None)
         cfg_p = getattr(cfg_all, "planning_proactive", None)
         effective_cfg = cfg_p if cfg_p is not None else svc._proactive_cfg()
-        # 优先走服务的只读解析支路（不写解析缓存）；桩服务无该包装时退回正式枚举
-        readonly_resolver = getattr(svc, "_resolve_greeting_candidates_readonly", None)
-        resolver = readonly_resolver if callable(readonly_resolver) \
-            else svc._resolve_greeting_candidates
-        cands = list(await resolver(effective_cfg) or [])
+        # §29.1：优先走只读全集枚举（与主查询同一支路 → 同序号系）；桩服务无该支路时
+        # 退回只读候选支路（readonly，不写缓存；不再退回正式枚举写缓存分支）
+        universe_resolver = getattr(
+            svc, "_resolve_greeting_streams_universe_readonly", None)
+        if callable(universe_resolver):
+            try:
+                cands = list(await universe_resolver() or [])
+            except Exception as exc:
+                self.ctx.logger.debug(f"全集枚举失败（按空候选处理）: {exc}")
+                cands = []
+        else:
+            readonly_resolver = getattr(svc, "_resolve_greeting_candidates_readonly", None)
+            if callable(readonly_resolver):
+                cands = list(await readonly_resolver(effective_cfg) or [])
+            else:
+                cands = []
         try:
             labels = dict(await svc.stream_display_labels() or {})
         except Exception as exc:

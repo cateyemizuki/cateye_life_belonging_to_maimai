@@ -115,13 +115,21 @@ def load_tier_descriptions(*, root_dir: Any = None,
     merged = _builtin_by_labels(presets)
     if root_dir is None:
         return merged
-    from core.mapping_dir import MappingReadError, mappings_path, read_json_text
+    from core.mapping_dir import MappingReadError, ensure_user_table, mappings_path, read_json_text
 
     path = mappings_path(Path(root_dir), TIER_DESCRIPTIONS_FILE_NAME)
     try:
         present = path.exists()
     except OSError:
         present = False
+    if not present:
+        # §29.2（2026-10-23 直派）：表层缺失 → ensure_user_table 按序补齐
+        # （旧根迁移优先，仍缺才从出厂种子映射表复制；解析错误不算缺失、绝不覆盖用户文件）
+        ensure_user_table(root_dir, TIER_DESCRIPTIONS_FILE_NAME)
+        try:
+            present = path.exists()
+        except OSError:
+            present = False
     if not present:
         _generate_default(path)
         return merged

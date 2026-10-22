@@ -501,13 +501,21 @@ def load_properties(*, root_dir: Any = None,
     """装载属性表（**只读一遍**；``root_dir=None`` 测试桩 → 跳过根层纯内置）。"""
     if root_dir is None:
         return PropertiesLoadResult(), builtin_table()
-    from core.mapping_dir import mappings_path  # 延迟导入：顶层零插件依赖
+    from core.mapping_dir import ensure_user_table, mappings_path  # 延迟导入：顶层零插件依赖
 
     path = mappings_path(Path(root_dir), PROPERTIES_FILE_NAME)
     try:
         present = path.exists()
     except OSError:
         present = False
+    if not present:
+        # §29.2（2026-10-23 直派）：表层缺失 → ensure_user_table 按序补齐
+        # （旧根迁移优先，仍缺才从出厂种子映射表复制；解析错误不算缺失、绝不覆盖用户文件）
+        ensure_user_table(root_dir, PROPERTIES_FILE_NAME)
+        try:
+            present = path.exists()
+        except OSError:
+            present = False
     if not present:
         _generate_default(path)
         result = PropertiesLoadResult(generated_default=True)

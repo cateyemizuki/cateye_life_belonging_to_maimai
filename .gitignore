@@ -20,6 +20,15 @@ ISSUE_SUBMISSION.md
 .maibot-release.json
 .update_backups/
 
+# ---- 映射表层 = 用户数据区（§29.2 2026-10-23 直派）----
+# 表层 mappings/*.json 与 mappings/README.md 退出随包（退出仓库跟踪）：表层 = 用户数据区
+#（不随包分发、更新插件不覆盖表层）；出厂种子 mappings/出厂映射表/ 仍随包。
+# 规则说明：``/mappings/*.json`` 前导斜杠锚定仓库根，且 ``*`` 不跨“/”，
+# 只命中表层单层 json；``mappings/README.md`` 含中段斜杠 → 同样锚定仓库根，
+# 不匹配深层 ``mappings/出厂映射表/README.md``。
+/mappings/*.json
+mappings/README.md
+
 # ---- Python 缓存 / 构建产物 / 虚拟环境 ----
 __pycache__/
 *.py[cod]

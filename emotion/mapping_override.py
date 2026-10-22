@@ -82,7 +82,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from core.mapping_dir import mappings_path, migrate_legacy_root_file
+from core.mapping_dir import ensure_user_table, mappings_path
 
 logger = logging.getLogger(__name__)
 
@@ -660,8 +660,9 @@ def load_effective(data_dir: Union[str, Path], decision_logger: Any = None,
     """F4（裁决 2026-10-11）：插件根映射表优先 → data_dir 覆盖层（M12）→ 内置默认。
 
     2026-10-17 起根表读取位 = ``<root>/mappings/emotion_mapping.json``（映射表集中子文件夹）：
-    - 新位置缺失而旧根文件 ``<root>/emotion_mapping.json`` 存在 → 先复制进 ``mappings/``
-      （只复制不删除，``core/mapping_dir``），随后按新位置读取；
+    - 新位置缺失 → :func:`core.mapping_dir.ensure_user_table` 补齐（§29.2：旧根文件
+      ``<root>/emotion_mapping.json`` 优先迁移；仍缺才从出厂种子 ``mappings/出厂映射表/``
+      复制；解析错误不算缺失、绝不覆盖用户文件），随后按新位置读取；
     - 根文件存在 → 校验：合法即生效（**不再叠加** data_dir 覆盖层——根文件是唯一
       用户编辑位）；非法 → 告警并回退**内置默认**（用户口径「格式有误时回退为
       使用默认的映射表」，不落入 data_dir 以免双重覆盖）；
@@ -680,7 +681,9 @@ def load_effective(data_dir: Union[str, Path], decision_logger: Any = None,
     except OSError:
         present = False
     if not present:
-        migrate_legacy_root_file(root, ROOT_MAPPING_FILE_NAME)
+        # §29.2（2026-10-23 直派）：migrate_legacy_root_file 调用点升级为 ensure_user_table
+        # （旧根迁移仍优先，表层仍缺才从出厂种子映射表复制；解析错误不算缺失）
+        ensure_user_table(root, ROOT_MAPPING_FILE_NAME)
         try:
             present = root_path.exists()
         except OSError:

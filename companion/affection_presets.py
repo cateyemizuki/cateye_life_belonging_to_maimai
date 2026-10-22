@@ -2,7 +2,9 @@
 
 仿 ``emotion/mapping_override.py`` 的加载契约，错误粒度为用户口径的**第三种**（预设级排除）：
 
-- 文件：``<插件根>/mappings/affection_presets.json``（映射表集中子文件夹，``core/mapping_dir``）；
+- 文件：``<插件根>/mappings/affection_presets.json``（映射表集中子文件夹，``core/mapping_dir``；
+  表层缺失时 ``ensure_user_table`` 按序补齐——旧根文件优先迁移，仍缺才从出厂种子
+  ``mappings/出厂映射表/`` 复制，§29.2）；
 - 结构::
 
     {
@@ -370,13 +372,21 @@ def load_presets(*, root_dir: Any = None,
     """装载预设表（**只读一遍**；``root_dir=None`` 测试桩 → 跳过根层纯内置）。"""
     if root_dir is None:
         return PresetsLoadResult(accepted={}), builtin_presets()
-    from core.mapping_dir import mappings_path  # 延迟导入：顶层零插件依赖
+    from core.mapping_dir import ensure_user_table, mappings_path  # 延迟导入：顶层零插件依赖
 
     path = mappings_path(Path(root_dir), PRESETS_FILE_NAME)
     try:
         present = path.exists()
     except OSError:
         present = False
+    if not present:
+        # §29.2（2026-10-23 直派）：表层缺失 → ensure_user_table 按序补齐
+        # （旧根迁移优先，仍缺才从出厂种子映射表复制；解析错误不算缺失、绝不覆盖用户文件）
+        ensure_user_table(root_dir, PRESETS_FILE_NAME)
+        try:
+            present = path.exists()
+        except OSError:
+            present = False
     if not present:
         _generate_default(path)
         result = PresetsLoadResult(accepted={}, generated_default=True)
