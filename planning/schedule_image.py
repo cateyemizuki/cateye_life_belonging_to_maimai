@@ -1,52 +1,80 @@
-"""日程图片渲染器（来源：自主规划插件 utils/schedule_image_generator.py，v2 移植版）。
+"""日程图片渲染器 —— 指导 §6 固定列网格版式（R7：2026-10-23 用户直派【按样张重绘指导】）。
 
-设计要点（照搬源插件 v2）：
-- **展示全天全部日程**：按条目数动态计算画布高度，一行一条完整铺开；
-- 干净的清单排版：浅色渐变背景 + 白色圆角卡片行；当前进行中的行用主题色
-  描边高亮，已完成整行淡化；
-- **自带字体**：打包 Noto Sans SC（SIL OFL 1.1，planning/assets/fonts/），
-  找不到打包字体时回退系统字体链；
-- 文字截断：活动名 / 描述按可用宽度测量并裁剪加省略号；
-- 跨午夜时间：``23:00-31:00``（累计分钟）与 ``23:00-07:00``（回绕写法）都能解析。
+规格真源：``开发文档/2026-10-23-渲染图重绘指导/重绘指导.md``（计划书 §三十冻结口径）。
+本文件是 ``core/render_kit.py`` 的第一个消费者：
 
-对整合契约的适配：
-- PIL（pillow）为可选依赖：import 惰性化，未安装时抛 RuntimeError，
-  由调用方静默降级为纯文本（见 INTEGRATION.md 依赖清单）；
-- 输出目录经 ``generate_schedule_image(output_dir=...)`` 传入（宿主隔离数据目录）。
+- **固定列网格** ``44 / 172 / 132 / 1fr / 92``（内容原点 x=64）：序号 64、时间 108、
+  类型 280（色条固定 x=300、标签 313）、名称 412（最大宽 488）、状态右缘 1016；
+  行底色出血 48..1032，文字永不越过 64..1016。
+- **行高** ``15 + 58 + 15 + 1 = 89``：无描述也保留 58 的名称区，所有行活动名基线一致。
+- **三种状态**：已完成（灰实心点 + faint + 色条 0.4）、进行中（tint 出血 + 4px 红左线 +
+  红实心点）、未开始（空心环 + muted）。
+- **跨午夜两行制**：主行 ``23:00–07:00``（en dash）+ 第二行 12px ``次日``；时钟文本一律由
+  :func:`planning.time_utils.format_day_minute` 派生，不手写 ``//60`` / ``−1440``。
+- **分页**（R7/§6.10/§8.3）：1~24 条单页；25~40 条每页 24 条（页脚左侧 ``1/2`` 页码）；
+  >40 条只画当日窗口（前 24 条）并在脚注注明「其余见文字版」；0 条一条 20px muted 空态。
+- **先量后画**：第一遍量行数/脚注行数算总高，第二遍绘制；footer 由内容底反推。
+- **输出契约不变**（R6）：文件名 ``schedule_today.jpg``；多页时附页写
+  ``schedule_today_p2.jpg`` 等，返回值仍是**第一页** ``(path, base64)``，调用方零改动。
+  JPEG 参数按指导 §8.5 提升为 ``quality=95, subsampling=0``（4:4:4）。
+- **2× 超采样**：仅 1× 高度 ≤2000 的页面开 2×（``core.render_kit.supersample_scale``）；
+  4096 红线按 1× 高度判断，正常内容靠分页满足，病态输入由 ``MAX_HEIGHT`` 钳制作最后防线。
+- **异常契约不变**：Pillow 缺失 / 无可用中文字体 / 渲染异常 → ``RuntimeError``，
+  调用方（``CommandService._draw_schedule_image``）静默降级为文字。
 """
 
 from __future__ import annotations
 
 import base64
-import re
-from datetime import datetime
 import io
 import logging
+import re
 import tempfile
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .time_utils import TimezoneManager
+from core import render_kit
+from core.render_kit import (
+    FAINT,
+    HAIR,
+    INK,
+    INK_SOFT,
+    MUTED,
+    PAPER,
+    RED,
+    RED_DEEP,
+    RING_DOT,
+    DONE_DOT,
+    ROWLINE,
+    TINT,
+    TRACK,
+    Canvas,
+)
+
+from .time_utils import DAY_MINUTES, TimezoneManager, format_day_minute
 
 logger = logging.getLogger(__name__)
 
 
 class ScheduleImageGenerator:
-    """生成 /plan list 日程图片（v2 清单式排版）。"""
+    """生成 ``/lbm_plan list`` 日程图片（指导 §6 固定列网格版式）。"""
 
     # 并发限制（最多 3 个并发生成）
     _generation_semaphore = threading.Semaphore(3)
 
     # 打包字体（Noto Sans SC，SIL OFL 1.1，可随插件再分发）
     BUNDLED_FONT_PATH = Path(__file__).resolve().parent / "assets" / "fonts" / "NotoSansSC-Regular.ttf"
+    BUNDLED_FONT_BOLD_PATH = (
+        Path(__file__).resolve().parent / "assets" / "fonts" / "NotoSansSC-Bold.otf")
 
     # 分辨率限制（防止 OOM）
     MAX_WIDTH = 1920
     MAX_HEIGHT = 4096
     DEFAULT_WIDTH = 1080
 
-    # ===== 活动类型 → 主题色（时间条与类型标记） =====
+    # ===== 活动类型 → 主题色（属性色缺失时的回退链，§24.3 冻结）=====
     TYPE_COLORS = {
         "meal": (242, 153, 74),
         "study": (74, 144, 226),
@@ -63,15 +91,81 @@ class ScheduleImageGenerator:
     }
     DEFAULT_TYPE_COLOR = (110, 127, 149)
 
-    # ===== 配色 =====
-    COLOR_TEXT_PRIMARY = (43, 58, 74)       # 活动名
-    COLOR_TEXT_SECONDARY = (122, 140, 163)  # 描述
-    COLOR_TEXT_TIME = (74, 105, 148)        # 时间
-    COLOR_TEXT_MUTED = (168, 180, 196)      # 已完成淡化
-    COLOR_ACCENT = (74, 144, 226)           # 主题色（进行中高亮）
-    COLOR_CARD = (255, 255, 255)
-    COLOR_CARD_BORDER = (226, 233, 242)
-    COLOR_CURRENT_BG = (234, 243, 255)
+    #: 类型列标签兜底（调用方 ``CommandService`` 恒注入 ``property``；此处只服务直接调用/测试）。
+    TYPE_LABELS = {
+        "meal": "用餐",
+        "study": "学习",
+        "work": "工作",
+        "exercise": "运动",
+        "entertainment": "娱乐",
+        "social_maintenance": "社交",
+        "learn_topic": "兴趣",
+        "health_check": "健康",
+        "daily_routine": "日常",
+        "rest": "休息",
+        "free_time": "空闲",
+        "sleep": "睡觉",
+        "custom": "空闲",
+    }
+
+    # ===== 固定列网格（§5.3 / §8.2；相对内容原点 x=64）=====
+    COLS = {
+        "idx": (0, 44, "left"),
+        "time": (44, 172, "left"),
+        "cat": (216, 132, "left"),    # 列 x=280；色条 x=300（+20 内边距）
+        "name": (348, 512, "left"),   # 绝对 x=412；最大宽 488（状态列前留 24）
+        "status": (860, 92, "right"), # 绝对 x=924..1016
+    }
+    MARGIN_X = 64
+    CONTENT_W = 952
+    ROW_BLEED_X0 = 48
+    ROW_BLEED_X1 = 1032
+    TEXT_RIGHT = 1016
+    ABS_IDX = 64
+    ABS_TIME = 108
+    ABS_CAT = 280
+    BAR_X = 300
+    CAT_TEXT_X = 313
+    ABS_NAME = 412
+    NAME_MAX_W = 488
+    ABS_STATUS_RIGHT = 1016
+
+    # ===== 纵向节奏（§6.1 实测；整数化落 Pillow）=====
+    HEADER_H = 68
+    HERO_H = 119
+    RIBBON_MARGIN_TOP = 26
+    RIBBON_H = 28
+    COLHEAD_MARGIN_TOP = 22
+    COLHEAD_H = 29
+    ROWS_TOP = HEADER_H + HERO_H + RIBBON_MARGIN_TOP + RIBBON_H \
+        + COLHEAD_MARGIN_TOP + COLHEAD_H          # 292
+    ROW_H = 89                                    # 15 + 58 + 15 + 1
+    ROW_PAD_TOP = 15
+    ROW_NAME_BLOCK_H = 58
+    #: 描述基线 = 名称基线 + round(17 * 1.35)（指导 §8.1）
+    DESC_BASELINE_OFFSET = int(round(17 * 1.35))
+    #: 跨午夜第二行「次日」基线偏移（23px 主行 ×1.1 + 3px 间距，§6.6 mockup）
+    TIME_NEXT_OFFSET = 28
+    EMPTY_BLOCK_H = 58
+    NOTES_MARGIN_TOP = 30
+    NOTES_PAD_TOP = 18
+    NOTE_LINE_H = 26
+    COMMANDS_GAP = 12
+    CMD_LINE_H = 24
+    FOOTER_MARGIN_TOP = 32
+    FOOTER_H = 62
+
+    #: 每页条数（§6.10：25~40 每页 24 条）
+    PAGE_SIZE = 24
+
+    #: 脚注口径行（§6.8）
+    NOTE_TEXT = "跨午夜条目按 24h 环标注「次日」；凌晨 00:30 起与昨日帧合并判定。"
+    #: 命令唯一一次（§6.8）
+    COMMAND_SEGMENTS = (
+        "完整日程 /lbm_plan list",
+        "重新生成 /lbm_plan regenerate",
+        "今日更新 /lbm_mai_diag decision 1",
+    )
 
     # 性能优化：字体缓存（PIL 对象在首次调用时才创建）
     _cached_fonts: Dict[Tuple[int, bool], Any] = {}
@@ -90,16 +184,11 @@ class ScheduleImageGenerator:
             raise RuntimeError(f"pillow 未安装，无法绘制日程图片: {exc}") from exc
 
     @classmethod
-    def _load_logo(cls, Image: Any):
-        """加载标题头像；目标插件暂无 logo 资源，使用主题色圆形占位。"""
-        return Image.new("RGBA", (100, 100), (74, 144, 226, 255))
-
-    BUNDLED_FONT_BOLD_PATH = (
-        Path(__file__).resolve().parent / "assets" / "fonts" / "NotoSansSC-Bold.otf")
-
-    @classmethod
     def _get_font(cls, ImageFont: Any, size: int, bold: bool = False):
-        """获取字体（带缓存）；优先打包字体，失败回退系统常见中文字体。"""
+        """获取字体（带缓存）；优先打包字体，失败回退系统常见中文字体。
+
+        指导 §5.2 / §8.6：保留既有字体链与打包字体，不引入 emoji 字体。
+        """
         key = (size, bold)
         if key in cls._cached_fonts:
             return cls._cached_fonts[key]
@@ -137,34 +226,14 @@ class ScheduleImageGenerator:
         raise RuntimeError("未找到可用的中文字体（含打包字体 planning/assets/fonts/）")
 
     @classmethod
-    def _draw_text(cls, draw: Any, xy: Tuple[int, int], text: str, fill: Tuple[int, ...],
-                   font: Any, bold: bool = False) -> None:
-        """绘制文字；bold 由 :meth:`_get_font` 装载的真粗体字重承担（F2：不再描边模拟）。"""
-        draw.text(xy, text, fill=fill, font=font)
-
-    @classmethod
-    def _text_width(cls, draw: Any, text: str, font: Any) -> int:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        return bbox[2] - bbox[0]
-
-    @classmethod
-    def _ellipsis(cls, draw: Any, text: str, font: Any, max_width: int) -> str:
-        """按像素宽度裁剪文字，超出部分以 … 结尾。"""
-        if not text:
-            return ""
-        if cls._text_width(draw, text, font) <= max_width:
-            return text
-        ell = "…"
-        chars = list(text)
-        while len(chars) > 1:
-            candidate = "".join(chars) + ell
-            if cls._text_width(draw, candidate, font) <= max_width:
-                return candidate
-            chars.pop()
-        return ell
+    def _font_loader(cls, ImageFont: Any):
+        """返回 ``loader(size, bold)`` 闭包，供 :class:`core.render_kit.Canvas` 使用。"""
+        def _load(size: int, bold: bool = False):
+            return cls._get_font(ImageFont, size, bold)
+        return _load
 
     # ------------------------------------------------------------
-    # 时间与状态
+    # 时间与状态（指导 §3.1 明确保留：解析/判定本身正确）
     # ------------------------------------------------------------
 
     @staticmethod
@@ -222,146 +291,21 @@ class ScheduleImageGenerator:
             return "completed"
         return "upcoming"
 
-    # ------------------------------------------------------------
-    # 布局
-    # ------------------------------------------------------------
+    @staticmethod
+    def _clock_text(minutes: int) -> str:
+        """日帧分钟 → ``HH:MM`` 钟点（**派生自** ``format_day_minute``，不手写 //60/−1440）。"""
+        return format_day_minute(minutes).split(" ", 1)[-1]
 
     @classmethod
-    def _build_rows(cls, draw: Any, schedule_items: List[Dict[str, Any]], now_minutes: int,
-                    s: float, fonts: Dict[str, Any], max_text_width: int) -> List[Dict[str, Any]]:
-        """为每个日程项计算展示信息（状态 / 颜色 / 截断后的文字）。"""
-        rows = []
-        for item in schedule_items:
-            time_str = str(item.get("time", ""))
-            name = str(item.get("name", "") or "")
-            desc = str(item.get("description", "") or "")
-            goal_type = str(item.get("goal_type", "custom") or "custom")
-            status = cls._activity_status(time_str, now_minutes)
-
-            if status == "current":
-                pill_text = "进行中"
-                pill_fill = (*cls.COLOR_ACCENT, 255)
-                pill_text_color = (255, 255, 255)
-            elif status == "completed":
-                pill_text = "已完成"
-                pill_fill = (245, 247, 250, 255)
-                pill_text_color = cls.COLOR_TEXT_MUTED
-            else:
-                pill_text = "未开始"
-                pill_fill = (240, 243, 248, 255)
-                pill_text_color = cls.COLOR_TEXT_SECONDARY
-
-            dim = status == "completed"
-            rows.append({
-                "time": time_str,
-                "name": cls._ellipsis(draw, name, fonts["name"], max_text_width),
-                "desc": cls._ellipsis(draw, desc, fonts["desc"], max_text_width),
-                "status": status,
-                "pill_text": pill_text,
-                "pill_fill": pill_fill,
-                "pill_text_color": pill_text_color,
-                "color": cls.TYPE_COLORS.get(goal_type, cls.DEFAULT_TYPE_COLOR),
-                "dim": dim,
-                "has_desc": bool(desc),
-            })
-        return rows
-
-    @classmethod
-    def _draw_header(cls, img: Any, draw: Any, title: str, stats_text: str,
-                     logo: Any, s: float, fonts: Dict[str, Any], ImageDraw: Any,
-                     Image: Any) -> None:
-        """绘制头部：圆形头像 + 标题 + 统计副标题。"""
-        margin_x = int(48 * s)
-
-        logo_size = int(72 * s)
-        logo_y = int(40 * s)
-
-        # 圆形裁剪头像 + 细描边
-        logo_avatar = logo.resize((logo_size, logo_size))
-        mask = Image.new("L", (logo_size, logo_size), 0)
-        ImageDraw.Draw(mask).ellipse([0, 0, logo_size, logo_size], fill=255)
-        img.paste(logo_avatar, (margin_x, logo_y), mask)
-        draw.ellipse(
-            [margin_x, logo_y, margin_x + logo_size, logo_y + logo_size],
-            outline=(210, 222, 238), width=max(1, int(2 * s)),
-        )
-
-        text_x = margin_x + logo_size + int(24 * s)
-        title_y = logo_y + int(4 * s)
-        cls._draw_text(draw, (text_x, title_y), title, cls.COLOR_TEXT_PRIMARY, fonts["title"], bold=True)
-        stats_y = title_y + int(52 * s)
-        cls._draw_text(draw, (text_x, stats_y), stats_text, cls.COLOR_TEXT_SECONDARY, fonts["stats"])
-
-    @classmethod
-    def _draw_row_card(cls, draw: Any, row: Dict[str, Any], x: int, y: int,
-                       w: int, h: int, s: float, fonts: Dict[str, Any]) -> None:
-        """绘制单行日程卡片。"""
-        radius = int(16 * s)
-        is_current = row["status"] == "current"
-        is_done = row["status"] == "completed"
-
-        # 阴影（单层低透明度）
-        shadow_offset = max(2, int(3 * s))
-        draw.rounded_rectangle(
-            [x, y + shadow_offset, x + w, y + h + shadow_offset],
-            radius=radius, fill=(90, 115, 150, 28),
-        )
-
-        # 卡片背景与描边
-        if is_current:
-            fill = (*cls.COLOR_CURRENT_BG, 255)
-            outline = (*cls.COLOR_ACCENT, 255)
-            outline_width = max(2, int(2 * s))
-        else:
-            fill = (*cls.COLOR_CARD, 250)
-            outline = (*cls.COLOR_CARD_BORDER, 255)
-            outline_width = 1
-        draw.rounded_rectangle(
-            [x, y, x + w, y + h], radius=radius,
-            fill=fill, outline=outline, width=outline_width,
-        )
-
-        # 左侧类型色条
-        bar_x = x + int(16 * s)
-        draw.rounded_rectangle(
-            [bar_x, y + int(16 * s), bar_x + int(5 * s), y + h - int(16 * s)],
-            radius=int(2 * s) + 1, fill=(*row["color"], 255),
-        )
-
-        text_color = cls.COLOR_TEXT_MUTED if is_done else cls.COLOR_TEXT_PRIMARY
-        time_color = cls.COLOR_TEXT_MUTED if is_done else cls.COLOR_TEXT_TIME
-        if is_current:
-            time_color = cls.COLOR_ACCENT
-
-        content_x = bar_x + int(5 * s) + int(20 * s)
-        line1_y = y + int(16 * s)
-
-        # 第一行：时间 + 活动名
-        cls._draw_text(draw, (content_x, line1_y), row["time"], time_color, fonts["time"], bold=is_current)
-        name_x = content_x + int(190 * s)
-        cls._draw_text(draw, (name_x, line1_y - int(3 * s)), row["name"], text_color, fonts["name"], bold=True)
-
-        # 第二行：描述（有才画）
-        if row["has_desc"]:
-            desc_y = line1_y + int(38 * s)
-            cls._draw_text(draw, (name_x, desc_y), row["desc"],
-                           cls.COLOR_TEXT_MUTED if is_done else cls.COLOR_TEXT_SECONDARY, fonts["desc"])
-
-        # 右侧状态胶囊
-        pill_w, pill_h = int(92 * s), int(34 * s)
-        pill_x = x + w - pill_w - int(20 * s)
-        pill_y = y + (h - pill_h) // 2
-        draw.rounded_rectangle(
-            [pill_x, pill_y, pill_x + pill_w, pill_y + pill_h],
-            radius=pill_h // 2, fill=row["pill_fill"],
-        )
-        pill_font = fonts["pill"]
-        text_w = cls._text_width(draw, row["pill_text"], pill_font)
-        cls._draw_text(
-            draw,
-            (pill_x + (pill_w - text_w) // 2, pill_y + int(5 * s)),
-            row["pill_text"], row["pill_text_color"], pill_font,
-        )
+    def _time_display(cls, time_str: str) -> Tuple[str, bool]:
+        """时间列展示：``(主行 HH:MM–HH:MM, 是否跨午夜)``（§6.6 两行制）。"""
+        start, end = cls._parse_time_str(time_str)
+        if end == 0 and start == 0:
+            raw = str(time_str or "")
+            return raw, raw.startswith("次日") or raw.startswith("前日")
+        main = f"{cls._clock_text(start)}–{cls._clock_text(end)}"
+        next_day = start >= DAY_MINUTES or end > DAY_MINUTES
+        return main, next_day
 
     # ------------------------------------------------------------
     # 日程属性标注（§24.3 任务C 2026-10-21：条目行属性标签 + 属性色）
@@ -372,7 +316,7 @@ class ScheduleImageGenerator:
         """条目行的 ``[属性]`` 短标签（调用方注入 ``property`` 文案；缺失/空白 → 不画）。
 
         长度纪律（_cap 同思路的定长截断）：标签预截 4 字 — 属性表校验推荐 2~3 字，4 字为
-        排版硬上限，防用户超长标签挤爆 S1 行排版。
+        排版硬上限，防用户超长标签挤爆列位。
         """
         label = str(item.get("property") or "").strip()
         if not label:
@@ -392,7 +336,7 @@ class ScheduleImageGenerator:
 
     @classmethod
     def _row_item_color(cls, item: Dict[str, Any], goal_type: str) -> Tuple[int, int, int]:
-        """条目色（时间条/类型标色）：属性 color → ``TYPE_COLORS[goal_type]`` → 兜底色。
+        """条目色（类型色条/密度条）：属性 color → ``TYPE_COLORS[goal_type]`` → 兜底色。
 
         §24.3 冻结回退链：注入的 ``property_color`` 非法（非 ``#RRGGBB`` 形态）/ 缺失 →
         回退 ``TYPE_COLORS[goal_type]``；未收录 goal_type → ``DEFAULT_TYPE_COLOR``。
@@ -401,6 +345,355 @@ class ScheduleImageGenerator:
         if parsed is not None:
             return parsed
         return cls.TYPE_COLORS.get(goal_type, cls.DEFAULT_TYPE_COLOR)
+
+    @classmethod
+    def _type_label(cls, item: Dict[str, Any]) -> str:
+        """类型列标签：属性短标签优先（去方括号），缺失回退 goal_type 中文名。"""
+        tag = cls._property_tag(item)
+        if tag:
+            return tag[1:-1]
+        goal_type = str(item.get("goal_type", "custom") or "custom")
+        return cls.TYPE_LABELS.get(goal_type, "其他")
+
+    # ------------------------------------------------------------
+    # 视图模型与分页
+    # ------------------------------------------------------------
+
+    @classmethod
+    def _build_view_model(cls, schedule_items: List[Dict[str, Any]],
+                          now_minutes: int) -> List[Dict[str, Any]]:
+        """条目 → 行视图（状态/颜色/时间两行制），不依赖 draw（先算后画）。"""
+        rows: List[Dict[str, Any]] = []
+        for item in schedule_items or []:
+            if not isinstance(item, dict):
+                continue
+            time_str = str(item.get("time", ""))
+            goal_type = str(item.get("goal_type", "custom") or "custom")
+            time_main, next_day = cls._time_display(time_str)
+            rows.append({
+                "raw_time": time_str,      # 密度条复用（解析口径与展示同一实现）
+                "time_main": time_main,
+                "next_day": next_day,
+                "name": str(item.get("name", "") or ""),
+                "desc": str(item.get("description", "") or ""),
+                "status": cls._activity_status(time_str, now_minutes),
+                "label": cls._type_label(item),
+                "color": cls._row_item_color(item, goal_type),
+            })
+        return rows
+
+    @classmethod
+    def _plan_pages(cls, total: int) -> List[Dict[str, Any]]:
+        """分页计划（§6.10）：1~24 单页；25~40 每页 24；>40 当日窗口前 24 + 文字版出口。"""
+        if total <= 0:
+            return [{"start": 0, "end": 0, "page_no": 1, "page_count": 1,
+                     "omitted": 0, "total": 0}]
+        if total <= cls.PAGE_SIZE:
+            return [{"start": 0, "end": total, "page_no": 1, "page_count": 1,
+                     "omitted": 0, "total": total}]
+        if total <= 40:
+            pages = []
+            slices = [(s, min(s + cls.PAGE_SIZE, total))
+                      for s in range(0, total, cls.PAGE_SIZE)]
+            for idx, (start, end) in enumerate(slices, 1):
+                pages.append({"start": start, "end": end, "page_no": idx,
+                              "page_count": len(slices), "omitted": 0, "total": total})
+            return pages
+        # >40：只画当日窗口（前 24 条），其余交给文字版（绝不静默截断）
+        return [{"start": 0, "end": cls.PAGE_SIZE, "page_no": 1, "page_count": 1,
+                 "omitted": total - cls.PAGE_SIZE, "total": total}]
+
+    # ------------------------------------------------------------
+    # 测量（第一遍）
+    # ------------------------------------------------------------
+
+    @classmethod
+    def _note_lines(cls, canvas: Canvas, font: Any, page: Dict[str, Any]) -> List[str]:
+        """脚注口径行；>40 时追加「其余见文字版」出口（§6.8 / §6.10）。"""
+        lines = [cls.NOTE_TEXT]
+        if page.get("omitted"):
+            lines.append(
+                f"当日窗口仅示前 {page['end'] - page['start']} 项（共 {page['total']} 项），"
+                f"其余见文字版。")
+        return [render_kit.fit_text(canvas, line, font, cls.CONTENT_W) for line in lines]
+
+    @classmethod
+    def _layout_commands(cls, canvas: Canvas, f_label: Any, f_cmd: Any) -> List[Dict[str, Any]]:
+        """命令块布局（唯一一次）：标签 + 三段命令，超宽在 ``·`` 前换行（不缩字号）。"""
+        items: List[Dict[str, Any]] = [{"line": 0, "x": cls.MARGIN_X, "text": "命令",
+                                        "kind": "label"}]
+        label_w = render_kit.text_width(canvas, "命令", f_label)
+        sep = " · "
+        sep_w = render_kit.text_width(canvas, sep, f_cmd)
+        x = cls.MARGIN_X + label_w + 10
+        line = 0
+        for idx, seg in enumerate(cls.COMMAND_SEGMENTS):
+            seg_w = render_kit.text_width(canvas, seg, f_cmd)
+            if idx and x + sep_w + seg_w > cls.TEXT_RIGHT:
+                line += 1
+                x = cls.MARGIN_X
+            if idx and x > cls.MARGIN_X:
+                items.append({"line": line, "x": x, "text": sep, "kind": "sep"})
+                x += sep_w
+            items.append({"line": line, "x": x, "text": seg, "kind": "cmd"})
+            x += seg_w
+        return items
+
+    @classmethod
+    def _measure_page(cls, Image: Any, ImageDraw: Any, ImageFont: Any,
+                      rows: List[Dict[str, Any]], page: Dict[str, Any]) -> Dict[str, Any]:
+        """测量遍：脚注/命令行数 + 行区高度 → 页面总高（不画）。"""
+        probe = Canvas(Image, ImageDraw, cls.DEFAULT_WIDTH, 1, scale=1)
+        loader = cls._font_loader(ImageFont)
+        f_note = probe.font(loader, 16)
+        f_label = probe.font(loader, 15, bold=True)
+        f_cmd = probe.font(loader, 15)
+
+        note_lines = cls._note_lines(probe, f_note, page)
+        cmd_items = cls._layout_commands(probe, f_label, f_cmd)
+        cmd_lines = max((it["line"] for it in cmd_items), default=0) + 1
+
+        rows_h = cls.EMPTY_BLOCK_H if not rows else len(rows) * cls.ROW_H
+        notes_top = cls.ROWS_TOP + rows_h + cls.NOTES_MARGIN_TOP
+        notes_h = (cls.NOTES_PAD_TOP + len(note_lines) * cls.NOTE_LINE_H
+                   + cls.COMMANDS_GAP + cmd_lines * cls.CMD_LINE_H)
+        footer_top = notes_top + notes_h + cls.FOOTER_MARGIN_TOP
+        height = footer_top + cls.FOOTER_H
+        # 4096 红线：正常分页已满足；钳制仅作病态输入的最后防线（不裁正常内容）
+        if height > cls.MAX_HEIGHT:
+            logger.warning("日程图测量高度 %s 超过 4096，触发最后防线钳制", height)
+            height = cls.MAX_HEIGHT
+        return {
+            "height": int(height),
+            "rows_h": int(rows_h),
+            "notes_top": int(notes_top),
+            "footer_top": int(footer_top),
+            "note_lines": note_lines,
+            "cmd_items": cmd_items,
+        }
+
+    # ------------------------------------------------------------
+    # 绘制（第二遍）
+    # ------------------------------------------------------------
+
+    @classmethod
+    def _draw_page_header(cls, canvas: Canvas, loader: Any) -> None:
+        """页眉：红点 + MAI · STATE / MAI · SCHEDULE（19/700，拉丁 tracking 6）+ 2px ink。"""
+        f_brand = canvas.font(loader, 19, bold=True)
+        canvas.ellipse([cls.MARGIN_X, 37, cls.MARGIN_X + 14, 51], fill=RED)
+        baseline = 55
+        render_kit.draw_tracked(canvas, (cls.MARGIN_X + 28, baseline), "MAI · STATE",
+                                f_brand, INK, 6.0)
+        render_kit.draw_tracked(canvas, (cls.TEXT_RIGHT, baseline), "MAI · SCHEDULE",
+                                f_brand, INK, 6.0, anchor="rs")
+        canvas.line([(cls.MARGIN_X, cls.HEADER_H - 1),
+                     (cls.TEXT_RIGHT, cls.HEADER_H - 1)], INK, width=2)
+
+    @classmethod
+    def _draw_hero(cls, canvas: Canvas, loader: Any, giant: str, weekday: str,
+                   now_text: str, counts_text: str) -> None:
+        """主视觉：日期 96/700 + 星期 40/700 red 同基线 + 现在/统计右对齐实测。"""
+        f_date = canvas.font(loader, 96, bold=True)
+        f_wd = canvas.font(loader, 40, bold=True)
+        f_now = canvas.font(loader, 22, bold=True)
+        f_counts = canvas.font(loader, 17)
+
+        hero_top = cls.HEADER_H
+        date_baseline = hero_top + 121
+        render_kit.draw_tracked(canvas, (cls.MARGIN_X, date_baseline), giant,
+                                f_date, INK, -3.0)
+        if weekday:
+            date_w = render_kit.tracked_width(canvas, giant, f_date, -3.0)
+            render_kit.draw_tracked(canvas, (cls.MARGIN_X + date_w + 28, date_baseline),
+                                    weekday, f_wd, RED, 0.0)
+
+        counts_text = render_kit.fit_text(canvas, counts_text, f_counts, 560)
+        now_text = render_kit.fit_text(canvas, now_text, f_now, 300)
+        counts_baseline = hero_top + cls.HERO_H - 8
+        render_kit.draw_text(canvas, (cls.TEXT_RIGHT, counts_baseline), counts_text,
+                             f_counts, MUTED, anchor="rs")
+        render_kit.draw_text(canvas, (cls.TEXT_RIGHT, counts_baseline - 30), now_text,
+                             f_now, INK, anchor="rs")
+
+    @classmethod
+    def _draw_ribbon(cls, canvas: Canvas, rows: List[Dict[str, Any]],
+                     now_minutes: int) -> None:
+        """24h 密度条（§6.4）：6px track + 属性色裁段 + 1px 间隔 + 当前 2×22 红 tick。"""
+        top = cls.HEADER_H + cls.HERO_H + cls.RIBBON_MARGIN_TOP + 11
+        canvas.rectangle([cls.MARGIN_X, top, cls.MARGIN_X + cls.CONTENT_W, top + 6],
+                         fill=TRACK)
+        for row in rows:
+            start, end = cls._parse_time_str(row.get("raw_time", ""))
+            if end <= 0:
+                continue
+            seg_start = max(0, min(DAY_MINUTES, start))
+            seg_end = max(0, min(DAY_MINUTES, end))
+            if seg_end <= seg_start:
+                continue
+            x0 = cls.MARGIN_X + int(round(seg_start / DAY_MINUTES * cls.CONTENT_W))
+            x1 = cls.MARGIN_X + int(round(seg_end / DAY_MINUTES * cls.CONTENT_W))
+            x1 = min(cls.MARGIN_X + cls.CONTENT_W, x1)
+            canvas.rectangle([x0, top, max(x0 + 1, x1 - 1), top + 6], fill=row["color"])
+        tick_x = cls.MARGIN_X + int(round(
+            max(0, min(DAY_MINUTES, now_minutes)) / DAY_MINUTES * cls.CONTENT_W))
+        tick_top = cls.HEADER_H + cls.HERO_H + cls.RIBBON_MARGIN_TOP + 2
+        canvas.rectangle([tick_x, tick_top, tick_x + 2, tick_top + 22], fill=RED)
+
+    @classmethod
+    def _draw_colhead(cls, canvas: Canvas, loader: Any) -> None:
+        """列头（§6.5）：12/400 faint tracking 1.5 + 1px ink 下划线。"""
+        f_col = canvas.font(loader, 12)
+        top = cls.ROWS_TOP - cls.COLHEAD_H
+        baseline = top + 18
+        render_kit.draw_tracked(canvas, (cls.ABS_TIME, baseline), "时间", f_col, FAINT, 1.5)
+        render_kit.draw_tracked(canvas, (cls.ABS_CAT + 20, baseline), "类型", f_col, FAINT, 1.5)
+        render_kit.draw_tracked(canvas, (cls.ABS_NAME, baseline), "安排", f_col, FAINT, 1.5)
+        render_kit.draw_tracked(canvas, (cls.TEXT_RIGHT, baseline), "状态", f_col, FAINT,
+                                1.5, anchor="rs")
+        canvas.line([(cls.MARGIN_X, cls.ROWS_TOP - 1),
+                     (cls.TEXT_RIGHT, cls.ROWS_TOP - 1)], INK, width=1)
+
+    @classmethod
+    def _draw_rows(cls, canvas: Canvas, loader: Any, rows: List[Dict[str, Any]],
+                   start_index: int) -> None:
+        """行区（§6.6/§6.7）：固定列 + 三种状态 + 两行制时间。"""
+        f_idx = canvas.font(loader, 19, bold=True)
+        f_time = canvas.font(loader, 23)
+        f_time_cur = canvas.font(loader, 23, bold=True)
+        f_next = canvas.font(loader, 12)
+        f_cat = canvas.font(loader, 17)
+        f_name = canvas.font(loader, 26, bold=True)
+        f_desc = canvas.font(loader, 17)
+        f_status = canvas.font(loader, 17)
+        f_status_cur = canvas.font(loader, 17, bold=True)
+
+        if not rows:
+            f_empty = canvas.font(loader, 20)
+            render_kit.draw_text(canvas, (cls.MARGIN_X, cls.ROWS_TOP + 38),
+                                 "今天暂无日程", f_empty, MUTED)
+            return
+
+        for offset, row in enumerate(rows):
+            index = start_index + offset + 1
+            top = cls.ROWS_TOP + offset * cls.ROW_H
+            row_base = top + cls.ROW_PAD_TOP + canvas.ascent(f_name)
+            status = row["status"]
+            is_current = status == "current"
+            is_done = status == "completed"
+
+            # 行底：进行中 tint 出血 48..1032 + 4px 红左边线
+            if is_current:
+                canvas.rectangle([cls.ROW_BLEED_X0, top, cls.ROW_BLEED_X1, top + cls.ROW_H],
+                                 fill=TINT)
+                canvas.rectangle([cls.ROW_BLEED_X0, top, cls.ROW_BLEED_X0 + 4,
+                                  top + cls.ROW_H], fill=RED)
+
+            # 序号
+            idx_color = (199, 164, 157) if is_done else RED
+            render_kit.draw_text(canvas, (cls.ABS_IDX, row_base), f"{index:02d}",
+                                 f_idx, idx_color)
+
+            # 时间（主行 + 次日第二行）
+            time_text = render_kit.fit_text(canvas, row["time_main"],
+                                            f_time_cur if is_current else f_time,
+                                            cls.COLS["time"][1])
+            time_color = FAINT if is_done else (RED if is_current else MUTED)
+            render_kit.draw_text(canvas, (cls.ABS_TIME, row_base), time_text,
+                                 f_time_cur if is_current else f_time, time_color)
+            if row.get("next_day"):
+                render_kit.draw_text(canvas, (cls.ABS_TIME, row_base + cls.TIME_NEXT_OFFSET),
+                                     "次日", f_next, FAINT)
+
+            # 类型：色条固定 x=300 + 标签 313
+            bar_color = render_kit.blend(row["color"], PAPER, 0.4) if is_done else row["color"]
+            canvas.rounded_rectangle([cls.BAR_X, row_base - 21, cls.BAR_X + 3,
+                                      row_base + 1], radius=2, fill=bar_color)
+            cat_text = render_kit.fit_text(canvas, row["label"], f_cat,
+                                           cls.COLS["cat"][1] - 20 - 3 - 10)
+            cat_color = FAINT if is_done else (INK if is_current else MUTED)
+            render_kit.draw_text(canvas, (cls.CAT_TEXT_X, row_base), cat_text, f_cat, cat_color)
+
+            # 名称 / 描述（均 1 行省略；描述基线 = 名称基线 + round(17*1.35)）
+            name_text = render_kit.fit_text(canvas, row["name"], f_name, cls.NAME_MAX_W)
+            name_color = FAINT if is_done else INK
+            render_kit.draw_text(canvas, (cls.ABS_NAME, row_base), name_text, f_name, name_color)
+            if row["desc"]:
+                desc_text = render_kit.fit_text(canvas, row["desc"], f_desc, cls.NAME_MAX_W)
+                desc_color = FAINT if is_done else (INK_SOFT if is_current else MUTED)
+                render_kit.draw_text(canvas, (cls.ABS_NAME,
+                                              row_base + cls.DESC_BASELINE_OFFSET),
+                                     desc_text, f_desc, desc_color)
+
+            # 状态：圆点 + 中文词，右缘 1016
+            status_text = {"completed": "已完成", "current": "进行中",
+                           "upcoming": "未开始"}[status]
+            f_st = f_status_cur if is_current else f_status
+            st_color = FAINT if is_done else (RED if is_current else MUTED)
+            render_kit.draw_text(canvas, (cls.ABS_STATUS_RIGHT, row_base), status_text,
+                                 f_st, st_color, anchor="rs")
+            st_w = render_kit.text_width(canvas, status_text, f_st)
+            dot_cx = cls.ABS_STATUS_RIGHT - st_w - 7 - 3
+            dot_cy = row_base - 7
+            if is_current:
+                canvas.ellipse([dot_cx - 3, dot_cy - 3, dot_cx + 3, dot_cy + 3], fill=RED)
+            elif is_done:
+                canvas.ellipse([dot_cx - 3, dot_cy - 3, dot_cx + 3, dot_cy + 3],
+                               fill=DONE_DOT)
+            else:
+                canvas.ellipse([dot_cx - 3, dot_cy - 3, dot_cx + 3, dot_cy + 3],
+                               outline=RING_DOT, width=1)
+
+            # 行分隔线（1px rowline，文字区内 64..1016）
+            canvas.line([(cls.MARGIN_X, top + cls.ROW_H - 1),
+                         (cls.TEXT_RIGHT, top + cls.ROW_H - 1)], ROWLINE, width=1)
+
+    @classmethod
+    def _draw_notes(cls, canvas: Canvas, loader: Any, layout: Dict[str, Any]) -> None:
+        """脚注（§6.8）：1px hair + 口径行 + 命令唯一一次。"""
+        notes_top = layout["notes_top"]
+        canvas.line([(cls.MARGIN_X, notes_top), (cls.TEXT_RIGHT, notes_top)],
+                    HAIR, width=1)
+        f_note = canvas.font(loader, 16)
+        f_label = canvas.font(loader, 15, bold=True)
+        f_cmd = canvas.font(loader, 15)
+
+        baseline = notes_top + cls.NOTES_PAD_TOP + canvas.ascent(f_note)
+        for line in layout["note_lines"]:
+            render_kit.draw_text(canvas, (cls.MARGIN_X, baseline), line, f_note, MUTED)
+            baseline += cls.NOTE_LINE_H
+
+        cmd_baseline = baseline + cls.COMMANDS_GAP + canvas.ascent(f_cmd)
+        for item in layout["cmd_items"]:
+            y = cmd_baseline + item["line"] * cls.CMD_LINE_H
+            if item["kind"] == "label":
+                render_kit.draw_text(canvas, (item["x"], y), item["text"], f_label, RED_DEEP)
+            elif item["kind"] == "sep":
+                render_kit.draw_text(canvas, (item["x"], y), item["text"], f_cmd, FAINT)
+            else:
+                render_kit.draw_text(canvas, (item["x"], y), item["text"], f_cmd, INK_SOFT)
+
+    @staticmethod
+    def _footer_left_text(page: Dict[str, Any]) -> str:
+        """页脚左侧文本（§6.9）：版本 + 多页 ``1/2`` 页码 / 超限「其余见文字版」。"""
+        text = "属于麦麦的生活 v2.1.0"
+        if page.get("page_count", 1) > 1:
+            text += f" · {page['page_no']}/{page['page_count']}"
+        if page.get("omitted"):
+            text += " · 其余见文字版"
+        return text
+
+    @classmethod
+    def _draw_footer(cls, canvas: Canvas, loader: Any, layout: Dict[str, Any],
+                     page: Dict[str, Any]) -> None:
+        """页脚（§6.9）：2px ink + 左版本（含页码）/ 右签名，14/400 muted，中文不 tracking。"""
+        f_foot = canvas.font(loader, 14)
+        footer_top = layout["footer_top"]
+        canvas.line([(cls.MARGIN_X, footer_top), (cls.TEXT_RIGHT, footer_top)], INK, width=2)
+        baseline = footer_top + 2 + 14 + canvas.ascent(f_foot)
+        left = cls._footer_left_text(page)
+        render_kit.draw_text(canvas, (cls.MARGIN_X, baseline), left, f_foot, MUTED)
+        render_kit.draw_text(canvas, (cls.TEXT_RIGHT, baseline), "Powered by Mai-Bot",
+                             f_foot, MUTED, anchor="rs")
 
     # ------------------------------------------------------------
     # 主入口
@@ -415,23 +708,23 @@ class ScheduleImageGenerator:
         tz_name: Optional[str] = None,
         output_dir: Optional[Path] = None,
     ) -> Tuple[str, str]:
-        """生成日程图片（v2：动态高度清单排版，展示全部条目）。
+        """生成日程图片（固定 1080 列网格，展示当日条目；多页时首文件契约不变）。
 
         Args:
             title: 标题文字（如 "今日日程 2026-09-19 周六"）
             schedule_items: 日程项列表，每项
                 ``{"time": "HH:MM-HH:MM", "name", "description", "goal_type"}``
-                （§24.3 起 ：method:`_generate` 另可选收每项 ``property`` / ``property_color``
-                字段渲染属性标签，由调用方注入）
-            width: 图片宽度（None=默认 1080）
+                （另可选 ``property`` / ``property_color`` 属性标注字段）
+            width: 兼容旧签名；版式固定 1080（指导 §5.3），传入其他值会记录日志后忽略
             tz_name: 用于判定「进行中/已完成」的时区（IANA 名；None=默认）
             output_dir: 图片输出目录（宿主隔离数据目录；None=系统临时目录）
 
         Returns:
-            (图片路径, base64编码字符串)
+            (第一页图片路径, 第一页 base64 编码字符串)；多页时附页为
+            ``schedule_today_p2.jpg`` 等（R6 文件名契约不变）。
 
         Raises:
-            RuntimeError: pillow 未安装或找不到可用字体（调用方静默降级为文本）。
+            RuntimeError: pillow 未安装、找不到可用字体或渲染失败（调用方静默降级为文本）。
         """
         cls._generation_semaphore.acquire()
         try:
@@ -448,176 +741,87 @@ class ScheduleImageGenerator:
         tz_name: Optional[str],
         output_dir: Optional[Path],
     ) -> Tuple[str, str]:
-        """瑞士极简 · S1 时刻表（2026-10-11 用户选型）。
-
-        版式：纸底/墨字/单红强调；巨型日期「MM.DD」+ 红色星期 + 统计；
-        编号行（时间/活动名真粗体/右侧状态），进行中行 = 红左边线 + 红字；
-        底部跨午夜口径说明与命令指路。高度按条目数动态计算（上限 4096）。
-        """
+        """编排：视图模型 → 分页 → 每页测量/绘制 → JPEG 落盘（quality=95, 4:4:4）。"""
         Image, ImageDraw, ImageFont = cls._require_pil()
+
+        if width and int(width) != cls.DEFAULT_WIDTH:
+            logger.info("日程图版式固定 %s 宽（指导 §5.3），忽略 width=%s",
+                        cls.DEFAULT_WIDTH, width)
+        canvas_width = cls.DEFAULT_WIDTH
+
         try:
-            width = min(int(width or 1080), 1920)
-            s = width / 1080
-            M = int(64 * s)
-            PAPER, INK, RED = (242, 241, 237), (17, 17, 17), (232, 64, 42)
-            MUTED, HAIR = (107, 107, 107), (205, 203, 196)
-
-            def _font(size, bold=False):
-                return cls._get_font(ImageFont, int(size * s), bold=bold)
-
-            f_giant, f_wd = _font(96, True), _font(44, True)
-            f_stat, f_head = _font(22), _font(20, True)
-            f_num, f_time = _font(19, True), _font(24)
-            f_time_b, f_name = _font(24, True), _font(26, True)
-            f_status, f_note, f_foot = _font(20), _font(17), _font(17)
-
             try:
                 now = TimezoneManager(tz_name).get_now() if tz_name else datetime.now()
             except Exception:
                 now = datetime.now()
             now_minutes = now.hour * 60 + now.minute
 
-            rows = []
-            for item in schedule_items or []:
-                time_str = str(item.get("time", ""))
-                status = cls._activity_status(time_str, now_minutes)
-                goal_type = str(item.get("goal_type", "custom") or "custom")
-                rows.append({
-                    "time": time_str,
-                    "name": str(item.get("name", "") or "")[:200],   # 热修：预截（防超大串 O(n²) 截断）
-                    "desc": str(item.get("description", "") or "")[:200],
-                    "status": status,
-                    "tag": cls._property_tag(item),
-                    "color": cls._row_item_color(item, goal_type),
-                })
+            rows = cls._build_view_model(schedule_items, now_minutes)
             total = len(rows)
-            # 热修（2026-10-11 服务器死机）：高度钳制 4096（旧版有、S1 重写时丢失）——
-            # 行数超限时只画能放下的部分并在底注注明
-            max_rows = max(1, int((4096 - int(240 * s) - int(90 * s) - int(110 * s)) // max(1, int(62 * s))))
-            omitted = max(0, total - max_rows)
-            rows = rows[:max_rows]
             done = sum(1 for r in rows if r["status"] == "completed")
             current = sum(1 for r in rows if r["status"] == "current")
+            upcoming = total - done - current
 
-            m_title = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(title or ""))
-            if m_title:
-                giant = f"{m_title.group(1)[-2:]}.{m_title.group(2)}" if False else \
-                    f"{m_title.group(2)}.{m_title.group(3)}"
-                try:
-                    weekday = "一二三四五六日"[datetime(
-                        int(m_title.group(1)), int(m_title.group(2)),
-                        int(m_title.group(3))).weekday()]
-                except ValueError:
-                    weekday = ""
+            giant, weekday = cls._hero_identity(title)
+            now_text = f"现在 {now.hour:02d}:{now.minute:02d}"
+            if total:
+                counts_text = (f"{total} 项 · 完成 {done} · 进行中 {current} · "
+                               f"待开始 {upcoming}")
             else:
-                giant, weekday = "今日", ""
+                counts_text = "0 项"
 
-            row_h, head_h, foot_h = int(62 * s), int(240 * s), int(110 * s)
-            height = min(head_h + len(rows) * row_h + int(90 * s) + foot_h, 4096)
-
-            img = Image.new("RGB", (width, height), PAPER)
-            draw = ImageDraw.Draw(img)
-            M2 = int(64 * s)
-            inner = width - 2 * M2
-
-            # 头部：红点 + 标记 | 右侧标记 + 2px 墨线
-            draw.ellipse([M2, int(30 * s) + 2, M2 + 18, int(30 * s) + 20], fill=RED)
-            draw.text((M2 + 30, int(30 * s)), " ".join(list("MAI · STATE")),
-                      font=_font(20, True), fill=INK)
-            draw.text((width - M2 - int(200 * s), int(30 * s)), " ".join(list("MAI · SCHEDULE")),
-                      font=_font(20, True), fill=INK)
-            draw.line([(M2, int(74 * s)), (width - M2, int(74 * s))], fill=INK, width=2)
-
-            # 巨型日期 + 红色星期 + 统计
-            draw.text((M2, int(110 * s)), giant, font=f_giant, fill=INK)
-            if weekday:
-                draw.text((M2 + int(300 * s), int(126 * s)), weekday, font=f_wd, fill=RED)
-            stats = f"{total} 项 · 完成 {done} · 进行中 {current}"
-            draw.text((M2 + int(300 * s) + (int(120 * s) if weekday else 0), int(150 * s)),
-                      stats, font=f_stat, fill=MUTED)
-            draw.line([(M2, head_h - int(6 * s)), (width - M2, head_h - int(6 * s))],
-                      fill=HAIR, width=1)
-
-            # 编号行
-            y = head_h
-            for i, row in enumerate(rows, 1):
-                is_current = row["status"] == "current"
-                if is_current:
-                    draw.rectangle([M2 - int(14 * s), y + int(6 * s),
-                                    M2 - int(6 * s), y + row_h - int(14 * s)], fill=RED)
-                draw.text((M2, y), f"{i:02d}", font=f_num, fill=RED)
-                draw.text((M2 + int(46 * s), y), row["time"],
-                          font=f_time_b if is_current else f_time,
-                          fill=INK if is_current else MUTED)
-                name_x = M2 + int(380 * s)
-                draw.text((name_x, y - int(2 * s)), row["name"], font=f_name, fill=INK)
-                # 属性标注（§24.3）：时间与活动名之间的 [属性] 短标签 + 属性色小色条
-                # （槽位 = name_x−16s 右对齐，紧邻活动名；不移动既有列位、不碰 4096 钳制）。
-                tag_text = row["tag"]
-                if tag_text:
-                    tag_font = _font(20)
-                    tag_w = draw.textlength(tag_text, font=tag_font)
-                    tag_x = name_x - int(16 * s) - tag_w
-                    bar_x = tag_x - int(12 * s)
-                    draw.rectangle([bar_x, y + int(12 * s), bar_x + int(4 * s),
-                                    y + row_h - int(14 * s)], fill=row["color"])
-                    draw.text((tag_x, y + int(8 * s)), tag_text, font=tag_font, fill=MUTED)
-                status_text = {"completed": "已完成", "current": "进行中", "upcoming": "未开始"}[
-                    row["status"]]
-                _sw = inner - (name_x - M2)
-                _sx = name_x + _sw - draw.textlength(status_text, font=f_status)
-                draw.text((_sx, y + int(4 * s)), status_text,
-                          font=_font(20, is_current), fill=RED if is_current else MUTED)
-                draw.line([(M2, y + row_h - int(16 * s)), (width - M2, y + row_h - int(16 * s))],
-                          fill=HAIR, width=1)
-                y += row_h
-
-            # 底注：跨午夜口径 + 命令指路（行数超限时注明省略数）
-            y += int(16 * s)
-            note = "跨午夜条目按 24h 环标注「次日」；晨间 00:30 起以昨日帧合并判定"
-            if omitted:
-                note += f"（条目过多，已省略较早 {omitted} 条）"
-            draw.text((M2, y), note, font=f_note, fill=MUTED)
-            hint = "完整日程 /lbm_plan list · 重新生成 /lbm_plan regenerate · 今日更新 /lbm_mai_diag decision 1"
-            _hx = width - M2 - draw.textlength(hint, font=_font(18))
-            draw.text((_hx, y + int(30 * s)), hint, font=_font(18), fill=RED)
-
-            # 底部签名
-            foot_y = height - int(52 * s)
-            draw.line([(M2, foot_y), (width - M2, foot_y)], fill=INK, width=2)
-            draw.text((M2, foot_y + int(12 * s)), " ".join(list("属于麦麦的生活 v2.1.0")),
-                      font=f_foot, fill=MUTED)
-            sig = "Powered by Mai-Bot"
-            draw.text((width - M2 - draw.textlength(sig, font=f_foot), foot_y + int(12 * s)),
-                      sig, font=f_foot, fill=MUTED)
-
-            # output_dir 缺省 = 系统临时目录（与同族渲染器同一契约）：
-            # 绝不回退到插件目录/代码目录（宿主隔离数据目录由调用方传入）。
+            pages = cls._plan_pages(total)
             save_dir = Path(output_dir) if output_dir else Path(tempfile.gettempdir())
             save_dir.mkdir(parents=True, exist_ok=True)
-            image_path = save_dir / "schedule_today.jpg"
-            img.save(str(image_path), format="JPEG", quality=90, optimize=True)
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format="JPEG", quality=90, optimize=True)
-            return str(image_path), base64.b64encode(img_byte_arr.getvalue()).decode("utf-8")
+            loader = cls._font_loader(ImageFont)
+            first_path: Optional[Path] = None
+            first_b64 = ""
+
+            for page in pages:
+                page_rows = rows[page["start"]:page["end"]]
+                layout = cls._measure_page(Image, ImageDraw, ImageFont, page_rows, page)
+                scale = render_kit.supersample_scale(layout["height"])
+                canvas = Canvas(Image, ImageDraw, canvas_width, layout["height"],
+                                scale=scale, background=PAPER)
+                cls._draw_page_header(canvas, loader)
+                cls._draw_hero(canvas, loader, giant, weekday, now_text, counts_text)
+                cls._draw_ribbon(canvas, page_rows, now_minutes)
+                cls._draw_colhead(canvas, loader)
+                cls._draw_rows(canvas, loader, page_rows, page["start"])
+                cls._draw_notes(canvas, loader, layout)
+                cls._draw_footer(canvas, loader, layout, page)
+                img = canvas.finish()
+
+                if page["page_no"] == 1:
+                    image_path = save_dir / "schedule_today.jpg"
+                else:
+                    image_path = save_dir / f"schedule_today_p{page['page_no']}.jpg"
+                img.save(str(image_path), format="JPEG", quality=95,
+                         subsampling=0, optimize=True)
+                if first_path is None:
+                    first_path = image_path
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=95,
+                             subsampling=0, optimize=True)
+                    first_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+            assert first_path is not None
+            return str(first_path), first_b64
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(f"日程图片渲染失败: {exc}") from exc
 
-    # ------------------------------------------------------------
-
-    @classmethod
-    def _build_stats_text(cls, rows: List[Dict[str, Any]]) -> str:
-        """头部统计文案：共 N 项 · 已完成 x · 进行中 y"""
-        total = len(rows)
-        if total == 0:
-            return "今天暂无日程"
-        completed = sum(1 for r in rows if r["status"] == "completed")
-        current = sum(1 for r in rows if r["status"] == "current")
-        parts = [f"共 {total} 项"]
-        if completed:
-            parts.append(f"已完成 {completed}")
-        if current:
-            parts.append(f"进行中 {current}")
-        return " · ".join(parts)
+    @staticmethod
+    def _hero_identity(title: str) -> Tuple[str, str]:
+        """标题 → (巨型日期 ``MM.DD``, 星期单字)；无日期 → ("今日", "")。"""
+        match = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(title or ""))
+        if not match:
+            return "今日", ""
+        giant = f"{match.group(2)}.{match.group(3)}"
+        try:
+            weekday = "一二三四五六日"[datetime(
+                int(match.group(1)), int(match.group(2)), int(match.group(3))).weekday()]
+        except ValueError:
+            weekday = ""
+        return giant, weekday

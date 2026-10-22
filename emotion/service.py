@@ -50,6 +50,14 @@ DEDUP_WINDOW_DEFAULT_SECONDS = 180
 _DEDUP_REGISTRY_MAX = 64
 #: 情绪评估模式合法值（REGISTRY §二.5：episode=会话闲置后整段评估 / per_reply=旧每回复 / off=不评估）
 EVALUATE_MODES = ("episode", "per_reply", "off")
+#: 五档粗粒度 → 状态总览左栏的单字/双字短词（指导 §9.2「vad_words」；与 ``_level`` 档词同源）
+_COARSE_WORDS = {
+    "很低": "很低",
+    "偏低": "偏低",
+    "中等": "中",
+    "偏高": "偏高",
+    "很高": "很高",
+}
 #: episode 片段的消息条数 / 字符数上限（超出时保留**最近**的往来并在头部标注省略）
 EPISODE_SEGMENT_MAX_MESSAGES = 40
 EPISODE_SEGMENT_MAX_CHARS = 3000
@@ -539,14 +547,33 @@ class EmotionService:
 
         只读：不落盘、不改状态机任何字段（含冻结标记）；数值口径与 ``params_summary`` /
         ``mood_text`` 同源（``labels`` 即 map_emotions 的前 3 个标签名，mood_text 取其中前 2 个）。
+
+        R7（2026-10-23 直派 §三十 / 指导 §9.2）：新增四个**结构化**字段供状态总览左栏消费，
+        既有字段语义零变化（``mood_text`` / ``labels`` / ``anchor`` / ``offset`` 原样保留）：
+
+        - ``label`` / ``share``：主标签与被激活占比（取自同一个 ``map_emotions(eff)``，
+          无命中 → 空串 / 0.0；渲染层可回退 ``mood_text``）；
+        - ``vad_words``：``{"v": ..., "a": ..., "d": ...}`` 粗粒度短词（五档 → 中/偏高…）；
+        - ``effective``：``_machine.effective_vad().to_dict()``（含静态偏移与乘数结算）——
+          与 23a 用例的三维 payload **同源**，不另算。
         """
         eff = self._machine.effective_vad()
         labels, _nearest = map_emotions(eff)
         params = self._machine.params
+        primary_label = str(labels[0][0]) if labels else ""
+        primary_share = round(float(labels[0][1]), 4) if labels else 0.0
         return {
             "initialized": bool(params.initialized),
             "mood_text": self.mood_text(),
             "labels": [str(name) for name, _share in labels[:3]],
+            "label": primary_label,
+            "share": primary_share,
+            "vad_words": {
+                "v": _COARSE_WORDS.get(_level(eff.valence), _level(eff.valence)),
+                "a": _COARSE_WORDS.get(_level(eff.arousal), _level(eff.arousal)),
+                "d": _COARSE_WORDS.get(_level(eff.dominance), _level(eff.dominance)),
+            },
+            "effective": eff.to_dict(),
             "event_count": len(self._machine.emotion_log),
             "anchor": params.anchor.to_dict(),
             "offset": params.offset.to_dict(),

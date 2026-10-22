@@ -45,6 +45,8 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 
 `/lbm_mai_*` 只对 `[patrol] target_qq` 本人（或本机控制台）开放；`/lbm_life qzone status|moments|comments` 不限权限。首次使用前请确认已配置管理员，否则 `/lbm_emotion_init` 会直接提示权限不足。
 
+`/lbm_dashboard` 与 `/lbm_plan list` 的两张图已于 2026-10-23 按重绘指导重置：1080 固定列网格、先测量后绘制、先分页后钳制；效果与边界见 CHANGELOG [2.1.0]「渲染图重绘重置」与 USAGE「图片渲染口径」。
+
 首次使用建议顺序：`/lbm_emotion_init` 初始化情绪；`/lbm_plan list` 确认日程；`/lbm_dashboard` 看整体状态。
 
 ## 四个模块
