@@ -145,7 +145,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 ## 常见问题
 
 - **日程变成了默认时段或明显被压扁？** 用 `/lbm_plan regenerate` 重新生成今日日程即可。
-- **早安或晚安没来？** 先用 `/lbm_diag streams` 查看候选流与序号，再用 `/lbm_diag streams <序号>` 查看该流下一次早安、晚安是否满足触发条件。群聊还需要今日有人说话；其他私聊需要对方发送条数达到门槛。目标陪伴私聊不在 streams 候选中；如果只是目标私聊没收到，请用 `/lbm_dashboard` 或决策日志排查。
+- **早安或晚安没来？** 先用 `/lbm_diag streams` 查看候选流与序号，再用 `/lbm_diag streams <序号>` 查看该流下一次早安、晚安是否满足触发条件。群聊还需要今日有人说话；其他私聊需要对方发送条数达到门槛。目标陪伴私聊不在 streams 候选中；如果只是目标私聊没收到，请用 `/lbm_dashboard` 或决策日志排查。streams 的候选解析与名单状态均为逐行显示：每个候选流独占一行（行首带序号）、名单与频率调控逐项列出，不再以列表形态挤在单行，无折叠、无省略。
 - **QQ 空间没发出去或没回评？** 用 `/lbm_life qzone status` 检查通道与 cookie，用 `/lbm_life qzone decisions` 查看最近卡在哪一道闸。
 - **命令没反应？** 管理员命令要求 `[admin] admin_users` 中有你；`/lbm_mai_*` 只对 `[patrol] target_qq` 本人开放。`[admin] allowed_streams` 只约束 `/lbm_plan` 与日程注入，不影响其他命令。
 - **只收到文字没有图？** 这是预期的降级：Pillow 或字体不可用、渲染超时时自动改发文字，功能不受影响。
@@ -162,7 +162,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 插件根目录以 MIT 许可发布（见 `LICENSE`）。
 
-例外：`planning/`（日程规划）是对自主规划插件 v4.9.1 的复刻与移植（保留原架构，部分文件直接移植），按 **AGPL-3.0** 单独授权。插件以源码形式分发，因此分发或修改 `planning/` 目录时需遵守 AGPL-3.0 的义务（提供对应源码、保留许可声明等）。AGPL-3.0 全文见 https://www.gnu.org/licenses/agpl-3.0.txt 。
+例外：`planning/`（日程规划）是对自主规划插件 v4.9.1 的复刻与移植（保留原架构，部分文件直接移植），按 **AGPL-3.0** 单独授权。插件以源码形式分发，因此分发或修改 `planning/` 目录时需遵守 AGPL-3.0 的义务（提供对应源码、保留许可声明等）。AGPL-3.0 全文见 [`planning/LICENSE`](planning/LICENSE)，出处与范围说明见 [`planning/README.md`](planning/README.md)。
 
 ## 参考与致谢
 

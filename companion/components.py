@@ -1409,15 +1409,21 @@ class CompanionComponentsMixin:
 
         节点布局（无 emoji，便于日志粘贴；§25.2 records 化，§26.1 展示重构）：
 
-        1. ``[名单状态]``：``[planning_proactive]`` 的群/私聊名单（ids + mode，模式后标注
-           留空语义：黑名单「留空=全生效」、白名单「留空=无人」）、``[patrol].target_qq``
-           与 ``enabled``、早/晚安两个总开关；
+        1. ``[名单状态]``：``[planning_proactive]`` 的群/私聊名单——标题行（mode + 模式
+           后标注留空语义：黑名单「留空=全生效」、白名单「留空=无人」）+ 每个配置 id
+           一行（R7 依据 = 用户 2026-10-22 第三批直派，计划书 §二十八：ids 原文逐行
+           回显、去引号；空名单保留单行、标题行后内联「（空）」）；另含
+           ``[patrol].target_qq`` 与 ``enabled``、早/晚安两个总开关；
         2. ``[候选解析]``：``self._planning.proactive`` 可用时调
            ``_resolve_greeting_candidates(cfg)``（按群聊/其他私聊分类）与
            ``_resolve_target_streams()``；不可用 → 「规划束未装配」；``[口径]`` 行并入
            本节点结尾。**陪伴目标聊天流整体不出现**（2026-10-22 §27.2，R7 依据 =
-           用户 2026-10-22 第二批四直派，计划书 §二十七）：只保留「问候·群聊」与
-           「问候·其他私聊」两行，``[patrol].target_qq`` 配置行照旧保留在块 1；
+           用户 2026-10-22 第二批四直派，计划书 §二十七）：只保留「问候·群聊」/
+           「问候·其他私聊」/「频率调控（群聊∪私聊）」三个标题行（§二十八 R7 依据 =
+           用户 2026-10-22 第三批直派：标题行后**每流一行**，两空格缩进 +
+           ``#NN 显示名``——频控行纯显示名、无序号；枚举序与切片/序号一致；空列表
+           标题行内联「无」；列表回显**去引号**，不再以 ``['…']`` 形态出现），
+           ``[patrol].target_qq`` 配置行照旧保留在块 1；
         3. ``[候选流最后一条非命令、非 bot 消息·群聊 时段：… (第 i/N 片)]`` 与
            ``[候选流最后一条非命令、非 bot 消息·私聊 时段：…（目标/其他）(第 i/N 片)]``：
            群聊单列、其他私聊并入「私聊」节点（目标流不出现）；两类各按枚举序
@@ -1431,7 +1437,7 @@ class CompanionComponentsMixin:
         序号（§26.1 同源直派，§27.2 起目标流豁免）：每个问候候选流一个 ``#NN``
         （两位补零，≥100 自然进位），编号顺序 = **群聊（枚举序）→ 其他私聊（枚举序）**，
         自 ``#01`` 起；行 = ``#NN {label}: {结果}``，``[候选解析]`` 块的群聊/其他私聊
-        列表行同步带 ``#NN``。频率调控-only 流（不在问候候选）不编号、不进
+        每流行同步带 ``#NN``。频率调控-only 流（不在问候候选）不编号、不进
         [候选流最后…] 块。
 
         节点记录形态与 ``_mai_build_llm_log_records`` 逐字一致：
@@ -1466,10 +1472,19 @@ class CompanionComponentsMixin:
                 p_ids = list(getattr(cfg_p, "proactive_private_ids", None) or [])
                 p_mode = str(getattr(cfg_p, "proactive_private_list_mode", "whitelist")
                              or "whitelist")
-                b1.append(f"  群聊名单: ids={g_ids} mode={g_mode}"
-                          f"{'（留空=全生效）' if g_mode == 'blacklist' else '（留空=无人）'}")
-                b1.append(f"  私聊名单: ids={p_ids} mode={p_mode}"
-                          f"{'（留空=全生效）' if p_mode == 'blacklist' else '（留空=无人）'}")
+                # §28.1（R7 依据 = 用户 2026-10-22 第三批直派，计划书 §二十八）：名单拆
+                # 「标题行（mode + 留空语义）+ 每个配置 id 一行」，ids 原文回显去引号；
+                # 空名单保留单行（标题行后内联「（空）」）。
+                b1.append(f"  群聊名单: mode={g_mode}"
+                          f"{'（留空=全生效）' if g_mode == 'blacklist' else '（留空=无人）'}"
+                          f"{'' if g_ids else '（空）'}")
+                for gid in g_ids:
+                    b1.append(f"  {gid}")
+                b1.append(f"  私聊名单: mode={p_mode}"
+                          f"{'（留空=全生效）' if p_mode == 'blacklist' else '（留空=无人）'}"
+                          f"{'' if p_ids else '（空）'}")
+                for pid in p_ids:
+                    b1.append(f"  {pid}")
                 b1.append(
                     f"  问候开关: morning={bool(getattr(cfg_p, 'greeting_morning_enabled', True))}"
                     f" night={bool(getattr(cfg_p, 'greeting_night_enabled', True))}"
@@ -1545,13 +1560,31 @@ class CompanionComponentsMixin:
                 # 流展示位显示名替代纯 sid；名称不可得 → .get(sid, sid) 回显原 sid。
                 # §27.2（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
                 # 陪伴目标聊天流整体不出现——目标问候列表行删除。
-                group_lbl = [_num_label(s) for s in by_cat.get("group", [])]
-                other_lbl = [_num_label(s) for s in by_cat.get("other", [])]
-                # 频率调控-only 流不编号（§26.1）：该行仍是唯一的频控名单键（群聊 ∪ 私聊）
-                freq_lbl = [stream_labels.get(s, s) for s in target_streams]
-                b2.append(f"  问候·群聊: {group_lbl or '无'}")
-                b2.append(f"  问候·其他私聊: {other_lbl or '无'}")
-                b2.append(f"  频率调控（群聊∪私聊）: {freq_lbl or '无'}")
+                # §28.1（R7 依据 = 用户 2026-10-22 第三批直派，计划书 §二十八）：三个
+                # 列表行改「标题行 + 每流一行」，候选行 = #NN 显示名（枚举序与切片/序号
+                # 一致、stream_nums 既有）、频控行 = 纯显示名无序号；回显去引号，空列表
+                # 时标题行内联「无」（唯一单行情形）。
+                gre_group_sids = list(by_cat.get("group", []))
+                gre_other_sids = list(by_cat.get("other", []))
+                if gre_group_sids:
+                    b2.append("  问候·群聊:")
+                    for cand_sid in gre_group_sids:
+                        b2.append(f"  {_num_label(cand_sid)}")
+                else:
+                    b2.append("  问候·群聊: 无")
+                if gre_other_sids:
+                    b2.append("  问候·其他私聊:")
+                    for cand_sid in gre_other_sids:
+                        b2.append(f"  {_num_label(cand_sid)}")
+                else:
+                    b2.append("  问候·其他私聊: 无")
+                # 频率调控-only 流不编号（§26.1）：频控行仍是唯一的频控名单键（群聊 ∪ 私聊）
+                if target_streams:
+                    b2.append("  频率调控（群聊∪私聊）:")
+                    for cand_sid in target_streams:
+                        b2.append(f"  {stream_labels.get(cand_sid, cand_sid)}")
+                else:
+                    b2.append("  频率调控（群聊∪私聊）: 无")
 
             # §25.2：[口径] 行并入第 2 个节点（候选解析）结尾
             b2.append("[口径] 激活闸恒开（2026-10-20 用户指示）：当日非 bot、非命令消息才算激活")
