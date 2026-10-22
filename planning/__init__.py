@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# 来源：麦麦自主规划插件 v4.9.1（xuqian13/autonomous_planning_plugin，AGPL-3.0）。
+# 本目录的许可与出处说明见 README.md，许可证全文见 LICENSE。
 """日程规划子系统（来源：自主规划插件 autonomous_planning_plugin v4.9.1，完整复刻）。
 
 模块布局：

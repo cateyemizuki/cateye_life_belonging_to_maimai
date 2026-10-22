@@ -8,6 +8,7 @@
 
 # ---- 流程 / 指导文档（禁止进仓库）----
 ISSUE_SUBMISSION.md
+/UPLOAD_AGENT.md
 
 # ---- 运行期生成的配置与数据（宿主会在插件目录生成）----
 /config.toml
