@@ -4,7 +4,7 @@
 
 - 文件：``<插件根>/mappings/affection_presets.json``（映射表集中子文件夹，``core/mapping_dir``；
   表层缺失时 ``ensure_user_table`` 按序补齐——旧根文件优先迁移，仍缺才从出厂种子
-  ``mappings/出厂映射表/`` 复制，§29.2）；
+  ``mappings/default_mappings/`` 复制，§29.2）；
 - 结构::
 
     {

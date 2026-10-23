@@ -5,7 +5,7 @@
 - :func:`migrate_legacy_root_file`：旧版放在插件根目录的映射表 json（``emotion_mapping.json`` /
   ``emotion_descriptions.json``，F4/F5 期布局）在新位置缺失时**复制**进 ``mappings/``——
   只复制、不删除、不改写用户文件（旧文件留在原处由用户自行处置）；
-- :func:`seed_path` / :func:`ensure_user_table`：出厂种子目录 ``mappings/出厂映射表/``
+- :func:`seed_path` / :func:`ensure_user_table`：出厂种子目录 ``mappings/default_mappings/``
   （2026-10-23 §二十九.2）：随包种子源；表层缺表时按序补齐——旧根资产优先（migrate），
   仍缺才从种子复制；
 - 全程 best-effort：任何文件系统异常只告警，绝不阻断映射表装载（装载方自带内置默认兜底）；
@@ -30,7 +30,7 @@ MAPPINGS_DIR_NAME = "mappings"
 #: 出厂种子子目录（2026-10-23 §29.2 直派）：随包分发的出厂默认（README + 五张 json），
 #: 只作种子源——插件运行期**只读表层** ``mappings/`` 五张表，深层不参与装载。
 #: 表层 = 用户数据区（文件不随包分发、更新插件不覆盖）；深层 = 随包种子源。
-SEED_DIR_NAME = "出厂映射表"
+SEED_DIR_NAME = "default_mappings"
 
 
 class MappingReadError(Exception):
@@ -70,7 +70,7 @@ def mappings_path(root_dir: Any, file_name: str) -> Path:
 
 
 def seed_path(root_dir: Any, file_name: str) -> Path:
-    """出厂种子路径 ``<root>/mappings/出厂映射表/<file_name>``（2026-10-23 §29.2）。"""
+    """出厂种子路径 ``<root>/mappings/default_mappings/<file_name>``（2026-10-23 §29.2）。"""
     return Path(root_dir) / MAPPINGS_DIR_NAME / SEED_DIR_NAME / file_name
 
 
@@ -103,7 +103,7 @@ def ensure_user_table(root_dir: Any, file_name: str) -> None:
     仅当表层 ``mappings/<file_name>`` **不存在**时按序动作：
 
     1. 旧根迁移（:func:`migrate_legacy_root_file`）——用户旧资产优先，种子让位；
-    2. 仍缺失 → 从出厂种子 ``mappings/出厂映射表/<file_name>`` 复制进表层
+    2. 仍缺失 → 从出厂种子 ``mappings/default_mappings/<file_name>`` 复制进表层
        （``shutil.copyfile``，复制来源 = 原 git 内容，逐字节一致）。
 
     **红线（用户 2026-10-23 直派，计划书 §29.2）：解析错误（``MappingReadError``）

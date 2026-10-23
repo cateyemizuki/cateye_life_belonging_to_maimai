@@ -661,7 +661,7 @@ def load_effective(data_dir: Union[str, Path], decision_logger: Any = None,
 
     2026-10-17 起根表读取位 = ``<root>/mappings/emotion_mapping.json``（映射表集中子文件夹）：
     - 新位置缺失 → :func:`core.mapping_dir.ensure_user_table` 补齐（§29.2：旧根文件
-      ``<root>/emotion_mapping.json`` 优先迁移；仍缺才从出厂种子 ``mappings/出厂映射表/``
+      ``<root>/emotion_mapping.json`` 优先迁移；仍缺才从出厂种子 ``mappings/default_mappings/``
       复制；解析错误不算缺失、绝不覆盖用户文件），随后按新位置读取；
     - 根文件存在 → 校验：合法即生效（**不再叠加** data_dir 覆盖层——根文件是唯一
       用户编辑位）；非法 → 告警并回退**内置默认**（用户口径「格式有误时回退为
