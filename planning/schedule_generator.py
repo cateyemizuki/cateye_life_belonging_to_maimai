@@ -46,6 +46,8 @@ from .generator import (
 )
 from .generator.validator import is_gap_warning
 from .goal_manager import GoalManager, get_goal_manager
+from .cycle_state import (REASON_FALLBACK, REASON_REGENERATE, REASON_SCHEDULED,
+                          enter_schedule_cycle, entry_context_from_plugin)  # §31.2 进账漏斗；R7 2026-10-23
 from .schedule_db import ScheduleDB
 from .schedule_items import is_night_sleep_item
 from .time_utils import is_in_sleep_ring, normalize_day_minutes, ring_minutes_ahead
@@ -182,6 +184,7 @@ class ScheduleGenerator:
         temperature: float = 0.85,
         bot_profile: Optional[Dict[str, str]] = None,
         apply: bool = True,
+        reason: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """生成并落库某天日程；多轮生成 + 质量评分，LLM 全轮失败时模板兜底。
 
@@ -190,7 +193,12 @@ class ScheduleGenerator:
         Args:
             date: 目标日期（``YYYY-MM-DD``；提示词日期取当天，日程落库按此键）。
             apply: True=落库并做约定匹配/消费；False=仅生成（仍写入日程表以便查询）。
+            reason: 进账原因（§31.2 血缘，R7 = 用户 2026-10-23 第二轮直派）：例行生成
+                缺省 ``scheduled_generate``；regenerate 指令链透传 ``regenerate``；
+                LLM 全轮失败走模板兜底时改 ``fallback_template``（仅对例行生成路径，
+                regenerate 调用点语义优先——原因按调用点区分进记录，见 notes）。
         """
+        entry_reason = str(reason or REASON_SCHEDULED)
         gen_config = ScheduleGeneratorConfig(self._build_config_dict(
             personality=personality, lover_name=lover_name, wake_time=wake_time, sleep_time=sleep_time,
             min_activities=min_activities, max_activities=max_activities, timeout_seconds=timeout_seconds,
@@ -229,9 +237,15 @@ class ScheduleGenerator:
         except ScheduleGenerationError as exc:
             logger.warning("日程 LLM 生成失败（%s），使用模板兜底", exc)
             raw_items = self._build_fallback(wake_time=wake_time, sleep_time=sleep_time)
+            # §31.2 进账原因：例行生成的模板兜底 = fallback_template（regenerate 调用点
+            # 语义优先不覆盖，R7 注明；判据面的同日/跨天归类见 planning/cycle_state.rotate）
+            if entry_reason == REASON_SCHEDULED:
+                entry_reason = REASON_FALLBACK
         except LLMError as exc:
             logger.warning("日程 LLM 致命错误（%s），使用模板兜底", exc)
             raw_items = self._build_fallback(wake_time=wake_time, sleep_time=sleep_time)
+            if entry_reason == REASON_SCHEDULED:
+                entry_reason = REASON_FALLBACK
 
         # 归一化为 DB 记录并落库（含约定匹配 + 消费）
         items = self._normalize_items(raw_items, date, wake_time, sleep_time)
@@ -242,9 +256,10 @@ class ScheduleGenerator:
         if inserted:
             logger.info("连续低迷软约束：已为 %s 强制插入一次恢复类活动（rest/social）", date)
         if apply:
-            self.apply_schedule_items(items, date, consume_commitments=True)
+            self.apply_schedule_items(items, date, consume_commitments=True,
+                                      reason=entry_reason)
         else:
-            self._db.replace_day_schedule(date, items)
+            self._replace_with_entry(date, items, entry_reason)
         logger.info("日程生成完成：%s 共 %d 项", date, len(items))
         # M0 事件：日程生成成功（自动生成/重生成统一走本方法）→ emotion/qzone（附录 A ★）
         await self._publish("schedule.generated", date=date, items=len(items))
@@ -277,7 +292,8 @@ class ScheduleGenerator:
         ``extra_prompt`` 会临时并入 custom_prompt（本实现按调用装配配置，无需还原）。
         """
         date = date or datetime.now().strftime("%Y-%m-%d")
-        removed = self._db.delete_day_schedule(date)
+        # §31.2 血缘：进账前旧日行归档（先删后写场景的"旧日行"即本次进账所替换者；R7 2026-10-23）
+        removed = self._db.delete_day_schedule(date, archive_reason=REASON_REGENERATE)
         if removed:
             logger.info("已清理 %s 的 %d 个旧日程，开始重新生成", date, removed)
 
@@ -285,7 +301,7 @@ class ScheduleGenerator:
         merged = f"{base_custom}\n\n{extra_prompt}".strip() if (base_custom or extra_prompt) else ""
         return await self.generate_daily_schedule(
             date, personality=personality, lover_name=lover_name,
-            custom_prompt=merged, apply=apply, **kwargs,
+            custom_prompt=merged, apply=apply, reason=REASON_REGENERATE, **kwargs,
         )
 
     def apply_schedule_items(
@@ -294,6 +310,7 @@ class ScheduleGenerator:
         date: str,
         *,
         consume_commitments: bool = True,
+        reason: str = REASON_SCHEDULED,
     ) -> int:
         """把日程条目落库（start/end 分钟已换算 + 约定匹配注入）。
 
@@ -301,8 +318,15 @@ class ScheduleGenerator:
         1. ``_match_commitments_to_items``：把当日 pending_commitments 一对一映射到
            条目（时间差 ≤30 分钟优先，其次标题子串），注入 ``is_commitment`` 元数据
            （ProactiveService 据此用强指令兑现约定）；
-        2. ``replace_day_schedule`` 整体写入；
+        2. ``_replace_with_entry`` 整体写入（进账漏斗：先算包络并 rotate，再写库盖戳；
+           §31.2，R7 = 用户 2026-10-23 第二轮直派）；
         3. 成功后消费（标记 COMPLETED）当日约定。
+
+        Args:
+            reason: 进账原因（四种之一，§31.2 血缘）：例行生成缺省 ``scheduled_generate``；
+                regenerate 指令链 ``regenerate``；bot 工具（赖床）``tool_edit``；模板
+                兜底 ``fallback_template``。未按新管线传原因的旧调用方/直调按缺省值。
+                **行级盖戳与四变量轮换全部由代码完成，LLM 不参与**。
 
         Returns:
             写入条数。
@@ -319,7 +343,7 @@ class ScheduleGenerator:
                 params.update(meta)
                 items[idx]["parameters"] = params
 
-        written = self._db.replace_day_schedule(date, items)
+        written = self._replace_with_entry(date, items, reason)
 
         if consume_commitments and written:
             try:
@@ -335,6 +359,23 @@ class ScheduleGenerator:
             except Exception as exc:
                 logger.warning("消费未来约定失败: %s", exc, exc_info=True)
         return written
+
+    def _replace_with_entry(self, date: str, items: List[Dict[str, Any]], reason: str) -> int:
+        """进账漏斗（§31.2，R7 = 用户 2026-10-23 第二轮直派）：写库前先经
+        ``planning.cycle_state.enter_schedule_cycle`` 算包络并 rotate（四种 reason 同用），
+        再 ``replace_day_schedule`` 落库行级盖戳。轮换与决策日志 best-effort，写库路径
+        不因状态层失败中断。"""
+        plugin = self._plugin
+        stamps = enter_schedule_cycle(
+            getattr(plugin, "_data_dir", None), date, items, reason=reason,
+            decision_logger=getattr(plugin, "_decision_logger", None),
+            **entry_context_from_plugin(plugin),
+        )
+        return self._db.replace_day_schedule(
+            date, items, entry_reason=reason,
+            cycle_start_ts=(stamps[0] if stamps else None),
+            cycle_end_ts=(stamps[1] if stamps else None),
+        )
 
     # ============================================================
     # 配置装配

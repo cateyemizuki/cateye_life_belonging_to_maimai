@@ -171,15 +171,39 @@ def real_sleep_anchors_from_plugin(plugin: Any, now: Optional[datetime] = None
                                    ) -> Optional[RealAnchors]:
     """真实作息锚点的**同一 wiring 入口**（§24.2 任务B：所有消费点共享，禁止自建副本）。
 
-    - 插件实例路径：``plugin._schedule_query.get_day_schedule`` **读取即解析**
-      （该查询为无缓存直读，不建内存镜像/不落内存映射）；今天与昨天两个日期帧都取
-      （A-16 跨夜归属：今晨的睡眠环可能写在昨天的日程里）；
-    - 任何异常（schedule_query 缺失 / DB 不可用 / 解析异常）→ 返回 ``None``，调用方走
-      ``[schedule]`` 配置路径（现行行为，§7.9：绝不静默回退成"可打扰"）；
-    - **纯配置对象**（无 ``_schedule_query`` 属性，测试桩）→ 返回 ``None``；
+    v4 真源顺序（§31.2 锚点合并 Q6，R7 = 用户 2026-10-23 第二轮直派）：
+
+    - **周期四变量路径**（插件实例且 ``plugin._data_dir`` 可得）：经
+      ``planning.cycle_state.try_load_persisted`` 读**已持久化**状态（缺失/非法 → 不拦，
+      直接走下面的条目路径），再经 ``anchors_from_cycle_state`` 出锚点对：
+      入睡 = current_cycle_end、起床 = current_cycle_start；anchored 状态以
+      ``source=config_schedule`` 透传（消费方 source_note 自动显示"跟随日程作息"）；
+    - **条目解析路径**（fail-safe 回退 = §31.2「现行配置路径」原样保留）：状态缺失/
+      anchored/病态时按 §24.2 原口径读 ``plugin._schedule_query.get_day_schedule``
+      （无缓存直读，不建内存镜像；今天与昨天两个日期帧都取）；
+    - 任何异常 → 返回 ``None``，调用方走 ``[schedule]`` 配置路径（§7.9：绝不静默回复
+      成"可打扰"）；
+    - **纯配置对象**（无 ``_schedule_query`` 属性，测试桩）→ 仍走原判据：无状态文件
+      可读 → 返回 ``None``；无副作用；
     - ``now`` 缺省取本模块的 ``datetime.now()``（决策日志用例的注入时钟同一处，
       ``mock.patch.object(companion.patrol, "datetime", ...)`` 即可生效）。
     """
+    # § 31.2 锚点合并：周期状态文件（已持久化）优先 —— 真实进账轮换后即时生效；
+    # anchored/缺失/非法 → 落回条目路径（该路径自带配置兜底，consume 面零改动）。
+    data_dir = getattr(plugin, "_data_dir", None)
+    if data_dir is not None:
+        try:
+            from planning.schedule_anchors import anchors_from_cycle_state, try_load_persisted
+            state = try_load_persisted(data_dir)
+            if state is not None:
+                advanced = _config_section(plugin, "schedule_advanced")
+                tz_name = str(getattr(advanced, "timezone", "") or "").strip()
+                from_state = anchors_from_cycle_state(state, tz_name=tz_name)
+                if from_state is not None:
+                    return from_state
+        except Exception:
+            pass  # 状态层任何异常不阻断 → 条目路径 fail-safe（§7.9 契约）
+
     query = getattr(plugin, "_schedule_query", None)
     if not callable(getattr(query, "get_day_schedule", None)):
         return None

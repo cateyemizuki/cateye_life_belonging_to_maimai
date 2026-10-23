@@ -506,6 +506,23 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
         },
     )
 
+    # ── 问候补发冷静期（§31.1 通则②；R7 = 用户 2026-10-23 第二轮直派，计划书 §31.4）──
+    greeting_min_silence_minutes: int = Field(
+        default=3,
+        ge=0,
+        description="补发冷静期：过了掷点才满足条件的补发，须 bot 本会话最近一条消息距今至少 N 分钟才开口；"
+                    "窗内一直不满足则到期仍弃。0 = 不要求冷静期（过点即时补发）",
+        json_schema_extra={
+            "label": "补发冷静期(分钟)",
+            "hint": "过点才达标的早/晚安补发前，bot 本会话须 ≥N 分钟未发言；0 = 关闭该冷却",
+            "step": 1,
+            **_ui_i18n("Backsup silence cooldown (min)",
+                       "Post-roll-point make-up greetings require this many minutes since the "
+                       "bot's latest own message in that chat; never satisfied → dropped at "
+                       "deadline."),
+        },
+    )
+
     # ── 赖床 ────────────────────────────────────────────────
     lie_in_max_until: str = Field(
         default="12:00",
@@ -700,31 +717,52 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         },
     )
     # 2026-10-22 用户裁定回归（R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
-    # 恢复 greeting_require_activation 为真配置键，但**只作用于群聊分支**——群聊在问候
-    # 观察窗内无任何非 bot、非命令消息 → 跳过该群该类问候；目标私聊维持激活强制，
-    # 其他私聊的唯一开口条件是下面的「对方发送」条数阈值，均不受本开关控制。
+    # 恢复 greeting_require_activation 为真配置键，但**只作用于群聊分支**——§31.1（R7 = 用户
+    # 2026-10-23 第二轮直派）起语义收窄为「群聊早安必要性检查」：底层硬闸（判定窗
+    # [上份日程开始, 本份日程开始) 窗内非 bot 消息 ≥1）无条件生效；本开关开 → 在硬闸之上
+    # 额外判定「今天日程第一个条目时段内非 bot 消息 ≥1」（AND）；关 → 不判。目标私聊
+    # 新口径**无条件**、其他私聊走阈值判定，均不受本开关控制。
     greeting_require_activation: bool = Field(
         default=True,
-        description="群聊早晚安必要性检查：群聊在问候观察窗内无任何非 bot、非命令消息 → "
-                    "跳过该群该类问候（仅影响群聊；目标私聊与其他私聊不受此开关控制）",
+        description="群聊早安必要性检查：硬闸（判定窗内非 bot 消息 ≥1）之上的额外判定——"
+                    "「今天日程第一个条目时段内有其他用户主动开口」（非 bot 消息 ≥1），"
+                    "关 = 不判该条（只影响群聊早安；目标私聊与其他私聊不受此开关控制）",
         json_schema_extra={
-            "label": "群聊问候必要性检查",
-            "hint": "默认开：群里今天没人说话就不主动问早/晚安；关 = 群聊到点即发",
+            "label": "群聊早安必要性检查",
+            "hint": "默认开：今天日程第一个条目时段内群里没人开口就不发早安；关 = 只看硬闸",
             **_ui_i18n("Group greeting necessity check",
-                       "On: skip a group's greeting when nobody spoke there in the observation window."),
+                       "On: a group's morning greeting additionally requires someone speaking "
+                       "inside the first schedule item's time slot today."),
         },
     )
     greeting_other_private_min_messages: int = Field(
         default=5,
         ge=1,
-        description="其他私聊问候门槛（条）：[昨日 00:00 → 该类问候开始处理] 窗内"
-                    "**由对方发送**的消息数达到该值才可能收到早/晚安（bot 自身消息不计入；"
+        description="其他私聊**早安**门槛（条）：早安判定窗 = [上份日程开始, 本份日程开始)——"
+                    "窗内**由对方发送**的消息数达到该值才可能收到早安（bot 自身消息不计入；"
+                    "至少 1 条，0/负数被拒绝）；晚安数量阈值另见 greeting_private_night_min_messages；"
+                    "取不到消息计数按 0 处理（不发送）",
+        json_schema_extra={
+            "label": "私聊早安门槛(条)",
+            "hint": "防打扰护栏：判定窗内对方没发够 5 条就不主动问早安（可设 1 条）",
+            **_ui_i18n("Other-private morning threshold (msgs)",
+                       "Counts only messages sent by the other party within "
+                       "[previous cycle start, current cycle start)."),
+        },
+    )
+    greeting_private_night_min_messages: int = Field(
+        default=5,
+        ge=1,
+        description="其他私聊**晚安**数量阈值（条）：晚安判定窗 = [本轮日程开始, 晚安结束)——"
+                    "窗内**由对方发送**的消息数达到该值即视为通过（与早安连锁二选一，OR；"
                     "至少 1 条，0/负数被拒绝）；取不到消息计数按 0 处理（不发送）",
         json_schema_extra={
-            "label": "私聊问候门槛(条)",
-            "hint": "防打扰护栏：昨天到点前对方没发够 5 条就不主动问早/晚安（可设 1 条）",
-            **_ui_i18n("Other-private greeting threshold (msgs)",
-                       "Counts only messages sent by the other party in the window."),
+            "label": "私聊晚安阈值(条)",
+            "hint": "晚安二选一之一：本轮日程开始后对方发够 N 条即通过；另一路 = 本轮已对"
+                    "该流道过早安（连锁）",
+            **_ui_i18n("Other-private night threshold (msgs)",
+                       "One branch of the night OR gate: counterparty messages >= N within "
+                       "[current cycle start, night deadline)."),
         },
     )
 

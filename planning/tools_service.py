@@ -37,6 +37,8 @@ from .config import (
     section_or_default,
 )
 from .activity_properties import resolve_property
+from .cycle_state import (REASON_TOOL_EDIT, enter_schedule_cycle,  # §31.2 进账血缘；R7 2026-10-23
+                          entry_context_from_plugin)
 from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
 from .schedule_generator import ScheduleGenerator
@@ -598,7 +600,9 @@ class ToolsService:
         入睡日的 sleep 条目属于入睡日（:meth:`_nap_schedule_date`），凌晨醒沿查询却按**日历日**
         取醒来日日程——与延长窗口重叠的清醒条目在那份日程里，须单独顺延。写回走
         ``ScheduleQuery.db`` 的 ``replace_day_schedule``（即 ``apply_schedule_items`` 的落库底层；
-        该日条目从库中原样带回元数据，且**不消费**未来约定）。失败静默（不影响本次赖床）。
+        该日条目从库中原样带回元数据，且**不消费**未来约定）；失败静默（不影响本次赖床）。
+        v4 进账血缘（§31.2，R7 2026-10-23）：写库前先经进账漏斗 rotate，行级盖戳
+        ``entry_reason="tool_edit"``（与入睡日当日写回同 reason——同属一次赖床工具修改）。
         """
         try:
             if query is None or not callable(getattr(query, "get_day_schedule", None)):
@@ -611,9 +615,19 @@ class ToolsService:
             db = getattr(query, "db", None)
             if not moved or db is None:
                 return 0
-            db.replace_day_schedule(day, items)
-            logger.info("赖床顺延：%s 的 %d 个日程条目已移到 %02d:%02d 之后",
-                        day, moved, hi // 60, hi % 60)
+            stamps = enter_schedule_cycle(
+                getattr(self._plugin, "_data_dir", None), day, items,
+                reason=REASON_TOOL_EDIT,
+                decision_logger=getattr(self._plugin, "_decision_logger", None),
+                **entry_context_from_plugin(self._plugin),
+            )
+            db.replace_day_schedule(
+                day, items, entry_reason=REASON_TOOL_EDIT,
+                cycle_start_ts=(stamps[0] if stamps else None),
+                cycle_end_ts=(stamps[1] if stamps else None),
+            )
+            logger.info("赖床顺延：%s 的 %d 个日程条目已移到 %s 之后",
+                        day, moved, format_day_minute(hi))
             return moved
         except Exception as exc:
             logger.warning("赖床顺延失败（不影响本次赖床）: %s", exc, exc_info=True)
@@ -710,7 +724,10 @@ class ToolsService:
             generator = self._get_generator()
             if generator is None:
                 return {"type": "error", "content": "日程生成器不可用（插件未完成初始化）"}
-            written = generator.apply_schedule_items(items, today, consume_commitments=False)
+            # §31.2 进账血缘（R7 2026-10-23）：赖床工具修改以 tool_edit 原因进账（行级盖戳 +
+            # rotate 由共享漏斗完成；写库前轮换 best-effort）。
+            written = generator.apply_schedule_items(items, today, consume_commitments=False,
+                                                     reason=REASON_TOOL_EDIT)
             if not written:
                 return {"type": "nap_error", "content": "日程写回失败，起床时间没有改动。"}
             if wake_day != today:

@@ -28,6 +28,15 @@ R7 依据 = 用户 2026-10-21 直派）。
 fail-safe（§7.9 契约）：日程缺失 / DB 不可用 / 解析异常由 wiring 侧（companion.patrol
 的真源入口）统一兜住，一律回退 ``[schedule]`` 配置锚点（现行行为），**绝不静默回复
 成"可打扰"**。
+
+§31.2 锚点合并（Q6 用户裁定，R7 = 用户 2026-10-23 第二轮直派）：读路径改为以**周期四变量**
+（``planning/cycle_state.py`` 状态文件 + schedule.db 行级戳）为真源——真实锚点并入新时间戳、
+时间戳与锚点一样**进账即更新**（实时生效）。映射：入睡 = ``current_cycle_end``、
+起床 = ``current_cycle_start``（:func:`anchors_from_cycle_state`）；fail-safe 回退**现行
+配置路径**（下面的条目解析 + 配置兜底原样保留，``real_sleep_anchors`` 原接口语义不变、
+保留为兼容门面）；``anchored`` 状态（无日程回退 ``[schedule]`` 两键构造）经 ``source``
+= ``config_schedule`` 透传进消费侧 ``source_note``。消费面（静默窗/夜窗/晚安期限/早安
+基准）零改动——统一经周期变量取数、自动随真源切换；跨插件 API 与 tools 查询路径不受影响。
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ from .schedule_items import find_night_sleep_item
 from .time_utils import (DAY_MINUTES, format_minutes_to_time, is_in_day_frame,
                          is_in_day_frame_marked, is_in_sleep_ring,
                          normalize_day_minutes)
+from .cycle_state import format_epoch_clock, try_load_persisted
 
 #: 真实锚点来源标记（真实睡眠环 = 实际条目原文）
 SOURCE_REAL_SCHEDULE = "real_schedule"
@@ -165,6 +175,40 @@ def _anchor_pair_of(item: Any, ring: Tuple[int, int]) -> Optional[Tuple[str, str
     if end_text == start_text:
         return None
     return start_text, end_text
+
+
+def anchors_from_cycle_state(state: Any, *, tz_name: str = "") -> Optional[RealAnchors]:
+    """周期四变量 → 生效锚点对（§31.2 锚点合并 Q6；真源读取的唯一实现）。
+
+    映射（用户原话「入睡 = current_cycle_end、起床 = current_cycle_start」）：
+
+    - ``RealAnchors.start``（入睡钟点）= ``current_cycle_end`` 的 HH:MM；
+    - ``RealAnchors.end``（起床钟点）= ``current_cycle_start`` 的 HH:MM；
+    - ``source``：状态文件未打 ``anchored``（真实日程进账轮换）= ``real_schedule``；
+      ``anchored=True``（无日程回退 ``[schedule]`` 两键构造）= ``config_schedule``
+      ——消费方 ``source_note`` 据此透传「跟随日程作息」。
+
+    病态窗（缺端点 / end≤start / 端点渲染不出钟点 / 钟点对退化同一）→ ``None``（wiring
+    侧按"状态不可得"回退现行条目解析路径）。纯 epoch/字符串消费，无 IO。
+    """
+    if state is None:
+        return None
+    start_epoch = getattr(state, "current_cycle_start", None)
+    end_epoch = getattr(state, "current_cycle_end", None)
+    if start_epoch is None or end_epoch is None:
+        return None
+    try:
+        if float(end_epoch) <= float(start_epoch):
+            return None
+    except (TypeError, ValueError):
+        return None
+    sleep_text = format_epoch_clock(end_epoch, tz_name)   # 入睡 = cycle_end
+    wake_text = format_epoch_clock(start_epoch, tz_name)  # 起床 = cycle_start
+    if not sleep_text or not wake_text or sleep_text == wake_text:
+        return None
+    source = SOURCE_CONFIG_SCHEDULE if bool(getattr(state, "anchored", False)) \
+        else SOURCE_REAL_SCHEDULE
+    return RealAnchors(start=sleep_text, end=wake_text, source=source)
 
 
 def real_sleep_anchors(items_today: Any, items_yesterday: Any, *, now: Any,

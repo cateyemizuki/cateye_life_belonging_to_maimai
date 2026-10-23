@@ -207,8 +207,9 @@ class PromptBuilder:
     ) -> List[Dict[str, Any]]:
         """按起床/入睡锚点生成一份示例日程。
 
-        - 清醒时段 [wake, sleep) 按比例铺开：起床/三餐/学习/运动/娱乐，
-          单个活动不超过 3.5 小时（超出自动拆成两条）；
+        - 清醒时段 [wake, sleep) 首尾在两锚点闭环；示例行的各段时长**刻意不均匀**
+          （§31.3 提示词放开，R7 = 用户 2026-10-23 第二轮直派：撤销「每段两小时/恒等时长」
+          锚定手法，长段短段自然搭配，只演示衔接方式与不出帧外钟点）；
         - 睡眠时段 [sleep, 次日 wake)：正常模式为"睡觉"收尾闭环；
           无睡眠模式**不生成任何条目**（该时段留空，日程止于入睡时刻）；
         - 所有清醒活动首尾相接：每个活动结束时间 = 下一个活动开始时间。
@@ -220,7 +221,7 @@ class PromptBuilder:
 
         desc = "（示例描述：按人设写一段自然叙述）" if enable_detailed else ""
 
-        # 极短清醒时段（< 8 小时）：使用极简示例，避免按比例铺开出现负时长
+        # 极短清醒时段（< 8 小时）：使用极简示例；两段活动按 60/40 切分（非均匀示意）
         if seg < 480:
             items: List[Dict[str, Any]] = []
             add = None  # 占位，下方闭包内重新绑定
@@ -238,10 +239,10 @@ class PromptBuilder:
             _add("起床洗漱", wake_min, 30, "daily_routine", "medium")
             _add("早餐", wake_min + 30, 30, "meal", "high")
             flex = seg - 150
-            half1 = max(30, flex // 2)
+            half1 = max(30, (flex * 60 // 100) // 15 * 15)
             _add("上午活动", wake_min + 60, half1, "study", "high")
             _add("午餐", wake_min + 60 + half1, 30, "meal", "high")
-            half2 = max(30, flex - half1)
+            half2 = max(15, flex - half1)
             _add("下午活动", wake_min + 90 + half1, half2, "learn_topic", "medium")
             _add("晚餐", wake_min + 90 + half1 + half2, 30, "meal", "high")
             return items
@@ -270,7 +271,10 @@ class PromptBuilder:
         cursor = wake_min + 60
         remaining = seg - 60
 
-        morning = min(210, max(60, int(remaining * 0.35)))
+        # §31.3 提示词放开（R7 = 用户 2026-10-23 第二轮直派）：示例行各段时长不等（默认作息下
+        # 4.25h / 1.5h / 1.25h / 2.5h 错落），不再按对称上限切等长段——「上午/下午各 3.5h」的
+        # 恒等形态撤销；份额上限取 15 分钟倍数，演示链的 duration与时钟可整圈互读。
+        morning = min(255, max(60, int(remaining * 0.32)))
         add(items, "上午学习", cursor, morning, "study", "high")
         cursor += morning
         remaining -= morning
@@ -288,12 +292,12 @@ class PromptBuilder:
             cursor += nap_minutes
             remaining -= nap_minutes
 
-        afternoon = min(210, max(30, int(remaining * 0.35)))
+        afternoon = min(90, max(30, int(remaining * 0.16)))
         add(items, "下午学习", cursor, afternoon, "study", "high")
         cursor += afternoon
         remaining -= afternoon
 
-        exercise = min(90, max(30, int(remaining * 0.2)))
+        exercise = min(75, max(30, int(remaining * 0.2)))
         add(items, "运动", cursor, exercise, "exercise", "medium")
         cursor += exercise
         remaining -= exercise
@@ -305,7 +309,7 @@ class PromptBuilder:
         flex = remaining - dinner_minutes - fun_minutes - wind_down_minutes
         if flex >= 60:
             if flex > 210:
-                half = flex // 2
+                half = flex * 60 // 100
                 add(items, "兴趣活动", cursor, half, "learn_topic", "medium")
                 add(items, "自由活动", cursor + half, flex - half, "free_time", "low")
             else:
@@ -362,7 +366,8 @@ class PromptBuilder:
         lines.append("  ]")
         lines.append("}")
         lines.append("")
-        lines.append(f"（根据实际情况生成{min_activities}-{max_activities}个活动，以上仅为衔接方式示例）")
+        lines.append(f"（根据实际情况生成{min_activities}-{max_activities}个活动，以上仅为衔接方式示例；"
+                     "示例各段时长刻意不均匀，只是衔接演示，不要照抄这份时长分布）")
         lines.append("")
         if no_sleep:
             lines.append("重要：上面示例展示了清醒时段无缝衔接的正确方式！（睡眠时段不生成条目）")
@@ -398,7 +403,11 @@ class PromptBuilder:
                 f"次日 {first_sleep['time_slot']}（回到 {first_sleep['name']}，完整闭环）"
             )
         lines.append("")
-        lines.append("注意：duration_hours 是活动持续时长（小时），不是重复间隔！")
+        # §31.3 提示词放开（R7 = 用户 2026-10-23 第二轮直派）：duration_hours 提示行改为
+        # 非均匀示意——时长只受 0.25~12h 界限，段间长短自然变化，不设等长锚
+        lines.append("注意：duration_hours 是活动持续时长（小时），不是重复间隔！"
+                     "各段时长在 0.25-12 小时内自然变化即可，长段短段不限，"
+                     "不要把一天切成几段相等的时长。")
         return "\n".join(lines)
 
     # ------------------------------------------------------------
@@ -621,17 +630,17 @@ class PromptBuilder:
             min_activities, max_activities,
         )
 
-        # ── 时间合理性框架（随作息/模式自适应）──────────────────
+        # ── 时间合理性框架（随作息/模式自适应）──
+        # §31.3 提示词放开（R7 = 用户 2026-10-23 第二轮直派）：本框架只作常识参考行——
+        # 撤销「早餐/午餐/晚餐必须在这个窗口」与「下午细分为 2-3 个、单段 ≤3 小时」这类
+        # 硬窗口/等长细分锚；起点=起床锚点、终点=入睡锚点、条目数在配置上下限内保持硬约束。
         if no_sleep_mode:
             night_row = f"   • {sleep_text} - 次日{wake_text}  （不生成日程条目，睡眠时段整体留空）"
         else:
             night_row = f"   • {sleep_text} - 次日{wake_text}  睡觉（睡眠时段固定不动）"
-        routine_rows = f"""   • {wake_text} 起       起床/洗漱
-   • 早餐 06:00-09:00 ← 必须在这个窗口
-   • 上午时段    学习/工作/娱乐
-   • 午餐 11:00-14:00 ← 必须在这个窗口
-   • 下午时段    可细分为2-3个不同活动，避免单个活动超过3小时
-   • 晚餐 17:00-20:00 ← 必须在这个窗口
+        routine_rows = f"""   • {wake_text} 起       起床/洗漱（日程从起床锚点开始）
+   • 上午/下午时段   学习/工作/娱乐自由组合：段长随当日内容自然变化（长段短段不限，不要切等长段）
+   • 三餐常识窗口（参考）：早餐 06:00-09:00、午餐 11:00-14:00、晚餐 17:00-20:00
    • 晚间时段    娱乐/社交/兴趣
 {night_row}"""
 
@@ -703,7 +712,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 2. 遵守常识性时间安排，参考以下框架（已按本角色作息锚点适配）：
 {routine_rows}
 
-注意：下午和晚间的大时段应该细分成多个活动，不要一个活动占据5小时以上！
+注意：各段时长随内容自然变化，长短不限（schema 界 0.25-12 小时内即可），不要求均匀切分！
 
 【要求】
 - 严格JSON格式，无注释
@@ -711,7 +720,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 - {coverage_final}
   * 每个活动结束时间 = 下个活动开始时间
   * 计算方式：结束时间 = time_slot + duration_hours
-- 注意：关键活动时间必须合理：早餐6-9点、午餐11-14点、晚餐17-20点
+- 注意：三餐大致落在常识窗口（早餐6-9点、午餐11-14点、晚餐17-20点），其余时段长度自由
 """ + ("- description填空字符串\"\"即可\n" if not enable_detailed_description else f"- description简洁，{min_desc_len}-{max_desc_len}字\n") + f"""- 体现{weekday}特色（{"周末睡懒觉" if is_weekend else "工作日早起"}）
 """
 

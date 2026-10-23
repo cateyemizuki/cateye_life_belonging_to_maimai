@@ -50,7 +50,12 @@ from companion.config import target_qq_of
 from companion.patrol import resolve_silence_window
 from core.diag import DecisionLogger
 from core.inject import pick_payload_key, project_injection, without_stale_proactive_blocks
+# §31.3 B3 修复（R7 = 用户 2026-10-23 第二轮直派，A-22 bug③）：读取渲染面时间一律
+# 经 time_utils.format_day_minute（禁手写 //60/%60；day_offset=1 行带「次日」标注），
+# 日帧行为过滤复用 schedule_query 的 _SKIP_TYPES 同语义（{"sleep"}）。
 from planning.schedule_query import ScheduleQuery
+from planning.schedule_query import _SKIP_TYPES as _SCHEDULE_SKIP_TYPES
+from planning.time_utils import DAY_MINUTES, format_day_minute
 from suite_prompts import (
     INJECT_AFFECTION_BLOCK_DEFAULT,
     TOOL_SEND_MESSAGE_DEFAULT,
@@ -1420,32 +1425,32 @@ class CompanionComponentsMixin:
            （群聊生效集 ∪ 其他私聊生效集，只做名单解析、不做今日硬门槛过滤；桩服务无
            该支路时退回只读候选支路 ``_resolve_greeting_candidates_readonly``，不再回退
            正式枚举写缓存分支）与 ``_resolve_target_streams_readonly()``；不可用 →
-           「规划束未装配」；``[口径]`` 行并入本节点结尾。**陪伴目标聊天流整体不出现**
-           （2026-10-22 §27.2，R7 依据 = 用户 2026-10-22 第二批四直派，计划书 §二十七）：
-           只保留「问候·群聊」/「问候·其他私聊」/「频率调控（群聊∪私聊）」三个标题行
-           （§二十八 R7 依据 = 用户 2026-10-22 第三批直派：标题行后**每流一行**，
-           两空格缩进 + ``#NN 显示名``——频控行纯显示名、无序号；枚举序与切片/序号一致；
-           空列表标题行内联「无」；列表回显**去引号**，不再以 ``['…']`` 形态出现），
-           [候选解析] 的「问候·群聊」行对当日查不到消息的群聊流行尾加注
-           「（今日无消息·不发晨晚问候）」（§29.1：静默群聊不丢弃、显示为历史无信息），
-           ``[patrol].target_qq`` 配置行照旧保留在块 1；
+           「规划束未装配」；``[口径]`` 行并入本节点结尾。§31.3 三流分族（R7 =
+           用户 2026-10-23 第二轮直派，计划书 §31.1/§31.3）起**目标流回归诊断可见**：
+           「问候·群聊」/「问候·其他私聊」/「问候·目标私聊（无条件）」/「频率调控
+           （群聊∪私聊）」四个标题行（§二十八逐行化形态保留：标题行后每流一行、
+           两空格缩进 + ``#NN 显示名``——频控行纯显示名、无序号；序号 = 群聊 → 其他
+           私聊 → 目标私聊，既有序号零漂移）；[候选解析] 的「问候·群聊」行对判定窗查
+           不到消息的群聊流行尾加注「（硬闸窗内无消息·不发晨晚问候）」（§29.1 静默群不
+           丢弃语义随新窗重锚），``[patrol].target_qq`` 配置行照旧保留在块 1；
         3. ``[候选流最后一条非命令、非 bot 消息·群聊 时段：… (第 i/N 片)]`` 与
            ``[候选流最后一条非命令、非 bot 消息·私聊 时段：…（目标/其他）(第 i/N 片)]``：
-           群聊单列、其他私聊并入「私聊」节点（目标流不出现）；两类各按枚举序
-           **每 10 个流切一片**，**无上限、不折叠**（§26.1 废止 §25 的候选流截断口径）。
-           检查窗**分族**（§27.2）：群聊 = 今日 00:00 → now，私聊 = 昨日 00:00 → now；
-           标题时段文本每 tick 按 ``TimezoneManager`` 现算（精确到年月日）。
+           群聊单列、其他私聊与目标流并入「私聊」节点（§31.3 三流分族：目标流回归诊断
+           可见、进私聊切片）；两类各按枚举序**每 10 个流切一片**，**无上限、不折叠**。
+           检查窗（§31.3，R7 = 用户 2026-10-23 第二轮直派）：三族同窗 =
+           **[上份日程开始 → 本份日程开始)**（早安判定窗，经 ``svc.greeting_cycle_span``
+           周期四变量读口，**不再看日历 00:00**；窗端不可得 → 行面「周期不可得」）。
            每行走 ``get_by_time_in_chat``，过滤空白/斜杠命令后取最新一条的 HH:MM；
-           无 → 历史无消息（§29.1：全集中的静默群聊照常占序号、进切片节点并显示
-           「历史无消息」，不丢弃）；查询异常 → 查询失败(宁不发)。无任何候选流 → 单节点
-           ``[候选流最后一条非命令、非 bot 消息]`` + ``无候选流``。
+           无 → 历史无消息（静默群聊照常占序号、进切片节点）；查询异常 → 查询失败(宁不发)。
+           无任何候选流 → 单节点 ``[候选流最后一条非命令、非 bot 消息]`` + ``无候选流``。
 
-        序号（§26.1 同源直派，§27.2 起目标流豁免，§29.1 基底换全集）：每个问候候选流
-        一个 ``#NN``（两位补零，≥100 自然进位），编号顺序 = **群聊（枚举序）→ 其他私聊
-        （枚举序）**，自 ``#01`` 起；行 = ``#NN {label}: {结果}``，``[候选解析]`` 块的
-        群聊/其他私聊每流行同步带 ``#NN``。频率调控-only 流（不在问候候选）不编号、
-        不进 [候选流最后…] 块。**全集枚举基底（§29.1）→ 跨帧稳定**（只受名单/宿主枚举
-        变化影响），主查询与子查询（``_mai_diag_stream_index``）同序号系。
+        序号（§26.1 同源直派 → §27.2 豁免 → §29.1 全集 → §31.3 三流分族，R7 = 用户
+        2026-10-23 第二轮直派）：每个问候候选流一个 ``#NN``（两位补零，≥100 自然进位），
+        编号顺序 = **群聊（枚举序）→ 其他私聊（枚举序）→ 目标私聊（无条件族殿后）**，
+        自 ``#01`` 起；行 = ``#NN {label}: {结果}``，``[候选解析]`` 块的每流行同步带
+        ``#NN``。频率调控-only 流（不在问候候选）不编号、不进 [候选流最后…] 块。
+        **全集枚举基底 → 跨帧稳定**（只受名单/宿主枚举变化影响），主查询与子查询
+        （``_mai_diag_stream_index``）同序号系。
 
         诊断纯读（§29.1，R7 依据 = 用户 2026-10-23 直派，计划书 §二十九）：整链改走
         只读全集枚举，不再调 ``_resolve_greeting_candidates``（正式写缓存分支）/ 不经
@@ -1501,6 +1506,20 @@ class CompanionComponentsMixin:
                     f"  问候开关: morning={bool(getattr(cfg_p, 'greeting_morning_enabled', True))}"
                     f" night={bool(getattr(cfg_p, 'greeting_night_enabled', True))}"
                 )
+                # §31.3（R7 = 用户 2026-10-23 第二轮直派）：闸门判据一行留痕
+                b1.append(
+                    f"  判据: necessity={bool(getattr(cfg_p, 'greeting_require_activation', True))}"
+                    f" 早安阈值={int(getattr(cfg_p, 'greeting_other_private_min_messages', 5) or 5)}"
+                    f" 晚安阈值={int(getattr(cfg_p, 'greeting_private_night_min_messages', 5) or 5)}"
+                )
+                try:
+                    from planning.config import ScheduleAdvancedSectionConfig as _sadv_cls
+                    _sadv = getattr(cfg_all, "schedule_advanced", None)
+                    b1.append(
+                        f"  补发冷静期={int(getattr(_sadv, 'greeting_min_silence_minutes', 3) or 0)} 分钟"
+                    )
+                except Exception:
+                    pass
             if patrol is None:
                 b1.append("  [patrol] 配置不可用")
             else:
@@ -1565,12 +1584,12 @@ class CompanionComponentsMixin:
                     except (TypeError, ValueError):
                         continue
                     by_cat.setdefault(str(cand_cat), []).append(str(cand_sid))
-                # §27.2 序号：目标流豁免后编号顺序 = 群聊（枚举序）→ 其他私聊（枚举序），
-                # 自 #01 起；同一次调用内稳定（R7 依据 = 用户 2026-10-22 第二批四直派，
-                # 计划书 §二十七）。target 类既不展示也不编号。
+                # §27.2 序号 → §31.3 三流分族（R7 = 用户 2026-10-23 第二轮直派）：
+                # 编号顺序 = 群聊（枚举序）→ 其他私聊（枚举序）→ 目标私聊（无条件族殿后，
+                # 既有序号零漂移），自 #01 起；同一次调用内稳定。
                 ordered_pairs: List[tuple] = []
                 numbered_seen: set = set()
-                for cand_cat in ("group", "other"):
+                for cand_cat in ("group", "other", "target"):
                     for cand_sid in by_cat.get(cand_cat, []):
                         if cand_sid and cand_sid not in numbered_seen:
                             ordered_pairs.append((cand_sid, cand_cat))
@@ -1597,40 +1616,49 @@ class CompanionComponentsMixin:
                 # 供 [候选解析] 群聊行尾加注与切片节点共用；同一帧、同一次查询，两处行面
                 # 状态恒一致。纯读：直接走宿主消息接口，不经 ``_group_floor_ok``（不写
                 # ``_greeting_group_floor`` 门槛缓存）。
-                # 时间原点：群聊片今日 00:00、私聊片昨日 00:00；终点均为现在（本地时区）
+                # §31.3（R7 = 用户 2026-10-23 第二轮直派）：检查窗 = **周期判定窗**
+                # [上份日程开始 → 本份日程开始)——经 svc 周期四变量读口
+                # ``greeting_cycle_span``，不再看日历 0 点；窗端不可得（0/非法）→
+                # 行面统一「周期不可得」。
                 try:
-                    now_dt = svc._tz_manager.get_now()
+                    _span = dict(svc.greeting_cycle_span() or {})
                 except Exception:
-                    now_dt = datetime.now()
-                today_start = now_dt.replace(
-                    hour=0, minute=0, second=0, microsecond=0)
-                group_start_ts = today_start.timestamp()
-                private_start_ts = (today_start - timedelta(days=1)).timestamp()
-                end_ts = now_dt.timestamp()
+                    _span = {}
+                _window_lo = float(_span.get("prev_start") or 0)
+                _window_hi = float(_span.get("cur_start") or 0)
+                span_ok = _window_lo > 0 and _window_hi > 0
                 _window_fmt = "%Y-%m-%d %H:%M"
-                group_window = (f"{today_start.strftime(_window_fmt)} → "
-                                f"{now_dt.strftime(_window_fmt)}")
-                private_window = (f"{(today_start - timedelta(days=1)).strftime(_window_fmt)}"
-                                  f" → {now_dt.strftime(_window_fmt)}")
+                if span_ok:
+                    span_text = (f"{datetime.fromtimestamp(_window_lo).strftime(_window_fmt)}"
+                                 f" → "
+                                 f"{datetime.fromtimestamp(_window_hi).strftime(_window_fmt)}")
+                else:
+                    span_text = "周期四变量不可得"
+                group_window = private_window = span_text
+                query_start_ts = _window_lo
+                query_end_ts = _window_hi
 
                 ctx_obj = getattr(self, "ctx", None)
                 getter = getattr(getattr(ctx_obj, "message", None),
                                  "get_by_time_in_chat", None)
                 last_lines: Dict[str, str] = {}
                 silent_group_sids: set = set()
-                if callable(getter):
+                if not span_ok:
+                    for sid, _cat in ordered_pairs:
+                        head = f"  #{stream_nums.get(sid, 0):02d} {stream_labels.get(sid, sid)}"
+                        last_lines[sid] = f"{head}: 周期不可得(宁不发)"
+                elif callable(getter):
                     for sid, cat in ordered_pairs:
                         label = stream_labels.get(sid, sid)
                         head = f"  #{stream_nums.get(sid, 0):02d} {label}"
-                        start_ts = (group_start_ts if cat == "group"
-                                    else private_start_ts)
+                        start_ts = query_start_ts
                         try:
                             msgs = await getter(
-                                sid, str(start_ts), str(end_ts), limit=10, filter_mai=True)
+                                sid, str(start_ts), str(query_end_ts), limit=10, filter_mai=True)
                         except Exception:
                             try:
                                 msgs = await getter(
-                                    sid, str(start_ts), str(end_ts), limit=10)
+                                    sid, str(start_ts), str(query_end_ts), limit=10)
                             except Exception:
                                 last_lines[sid] = f"{head}: 查询失败(宁不发)"
                                 continue
@@ -1682,11 +1710,10 @@ class CompanionComponentsMixin:
                 if gre_group_sids:
                     b2.append("  问候·群聊:")
                     for cand_sid in gre_group_sids:
-                        # §29.1（R7 依据 = 用户 2026-10-23 直派，计划书 §二十九）：静默群聊
-                        # 不丢弃——全集中的群聊照常占序号 #NN；当日查不到消息者行尾加注
-                        # 「（今日无消息·不发晨晚问候）」（查不到消息 = 行面「历史无消息」，
-                        # 判据与 _group_floor_ok 同源：非 bot、非斜杠命令、非空白文本）。
-                        note_text = ("（今日无消息·不发晨晚问候）"
+                        # §29.1 静默群聊不丢弃 + §31.3 新窗：判定窗查不到消息者行尾加注
+                        # 「（硬闸窗内无消息·不发晨晚问候）」（查不到消息 = 行面
+                        # 「历史无消息」，判据 = 非 bot、非斜杠命令、非空白文本）。
+                        note_text = ("（硬闸窗内无消息·不发晨晚问候）"
                                      if cand_sid in silent_group_sids else "")
                         b2.append(f"  {_num_label(cand_sid)}{note_text}")
                 else:
@@ -1697,6 +1724,14 @@ class CompanionComponentsMixin:
                         b2.append(f"  {_num_label(cand_sid)}")
                 else:
                     b2.append("  问候·其他私聊: 无")
+                # §31.3 三流分族（R7 = 用户 2026-10-23 第二轮直派）：目标流族块回归
+                gre_target_sids = list(by_cat.get("target", []))
+                if gre_target_sids:
+                    b2.append("  问候·目标私聊（无条件）:")
+                    for cand_sid in gre_target_sids:
+                        b2.append(f"  {_num_label(cand_sid)}")
+                else:
+                    b2.append("  问候·目标私聊（无条件）: 无")
                 # 频率调控-only 流不编号（§26.1）：频控行仍是唯一的频控名单键（群聊 ∪ 私聊）
                 if target_streams:
                     b2.append("  频率调控（群聊∪私聊）:")
@@ -1705,14 +1740,16 @@ class CompanionComponentsMixin:
                 else:
                     b2.append("  频率调控（群聊∪私聊）: 无")
 
-            # §25.2：[口径] 行并入第 2 个节点（候选解析）结尾
-            b2.append("[口径] 激活闸恒开（2026-10-20 用户指示）：当日非 bot、非命令消息才算激活")
+            # §25.2 → §31.3（R7 = 用户 2026-10-23 第二轮直派）：[口径] 行随新机制重写
+            b2.append("[口径] 闸门窗 = [上份日程开始 → 本份日程开始)（周期四变量，非日历 0 点）；"
+                      "群聊早安=硬闸（+必要性）逐 tick 实查、群聊晚安=连锁（marks v2）、"
+                      "其他私聊=阈值 OR 连锁、目标私聊=无条件")
 
-            # §26.1 展示重构 + §27.2 目标流豁免（R7 依据 = 用户 2026-10-22 第二批四直派，
-            # 计划书 §二十七）：群聊/其他私聊两族节点各按枚举序每 10 个流切一片
-            # （无上限、不折叠）；陪伴目标聊天流不出现（私聊节点只装其他私聊）；
-            # 频率调控-only 流不进本块。检查窗分族（§29.1 起实查前移，窗口与行面状态在
-            # [候选解析] 之前一次产出）：群聊 = 今日 00:00 → now，私聊 = 昨日 00:00 → now；
+            # §26.1 展示重构 + §27.2 目标流豁免 + §31.3 三流分族（R7 = 用户 2026-10-23
+            # 第二轮直派）：群聊/私聊（其他+目标）两族节点各按枚举序每 10 个流切一片
+            # （无上限、不折叠）；频率调控-only 流不进本块。检查窗 = §31.1 判定窗
+            # [上份日程开始 → 本份日程开始)（§31.3 起实查前移，窗口与行面状态在
+            # [候选解析] 之前一次产出，经 `greeting_cycle_span` 读口，非日历 0 点）；
             # 标题时段文本每 tick 现算。
             stream_slices: List[List[str]] = []
             if svc is None or not stream_nums:
@@ -1807,14 +1844,15 @@ class CompanionComponentsMixin:
             by_cat.setdefault(str(cand_cat), []).append(str(cand_sid))
         ordered: List[tuple] = []
         seen: set = set()
-        # §27.2 目标流豁免：编号只含群聊 → 其他私聊；target 即便混入候选列表也剔除
-        for cand_cat in ("group", "other"):
+        # §27.2 目标流豁免 → §31.3 三流分族（R7 = 用户 2026-10-23 第二轮直派）：
+        # 编号 = 群聊 → 其他私聊 → 目标私聊（无条件族殿后，既有序号零漂移）
+        for cand_cat in ("group", "other", "target"):
             for cand_sid in by_cat.get(cand_cat, []):
                 if cand_sid and cand_sid not in seen:
                     ordered.append((cand_sid, cand_cat))
                     seen.add(cand_sid)
         for cand_cat, cand_sids in by_cat.items():
-            if cand_cat in ("target", "group", "other"):
+            if cand_cat in ("group", "other", "target"):
                 continue
             for cand_sid in cand_sids:
                 if cand_sid and cand_sid not in seen:
@@ -2159,20 +2197,73 @@ class CompanionComponentsMixin:
         return str(current.get("description") or current.get("name") or "")
 
     @API("companion_get_schedule",
-         description="获取今日完整日程。返回节点列表 [{time, activity}]（兼容虚拟陪伴插件返回结构）",
+         description="获取今日完整日程。返回节点列表 [{time, activity, day_offset}]（兼容虚拟陪伴插件返回结构；"
+                     "A-22 bug③ 修复：time 一律经 time_utils.format_day_minute 渲染，"
+                     "day_offset=1 行带「次日」标注并透传 day_offset 帧归属；"
+                     "昨日 day_offset=1 行按 schedule_query 同口径跨日合并，sleep 行过滤）",
          version="1", public=True)
     async def mai_api_get_schedule(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """今日完整日程（跨插件 API 面）。§31.3 B3 修复，恢复日帧助手与帧合并口径。
+
+        与 ``schedule_query`` 同一条 24h 环（A-22 bug③ 的修法 = 「走日帧助手 + 透传/合并帧」）：
+
+        - ``time`` 只出自 :func:`planning.time_utils.format_day_minute`（本文件不再出现
+          手写 ``//60`` / ``%60``）：昨日并入行按**今日真实钟点**渲染（``00:30``），
+          今日晨钟行按当天钟点渲染，今日 ``day_offset=1`` 行（夜猫子「下一个午夜段」）经
+          ``start + DAY_MINUTES`` 环抬渲染为 ``次日 00:30``；
+        - ``day_offset`` 透传行内原值（旧行/常规行 = 0；昨日并入行 = 1 —— 该值的帧归属是
+          **明日早期钟点段**，消费方按「time = 今日钟点、origin = 昨日帧」解读）；
+        - 跨日合并：昨日日程里 ``day_offset=1`` 的行即本日真实午夜段（与
+          ``schedule_query.find_current_activity:66-81`` / ``find_next_activities:106-114``
+          同口径）；今日自身 ``day_offset=1`` 行保留在列表末段（经环抬「次日」标注），
+          两类帧行对同一环位互斥不重计；
+        - 行过滤对齐 :func:`planning.schedule_query._SKIP_TYPES` 语义（该集合 = ``{"sleep"}``
+          ——只滤睡眠行；``rest`` 等清醒行保留，与既有 _SKIP_TYPES 契约零扩张）；
+        - 排序列表 = 真实时间轴：昨日并入行（今日凌晨）→ 今日晨钟行 → 今日「次日」行，
+          消除夜猫子日表「00:30 行排最前」的时序倒挂。
+        """
         schedule_query = self._mai_schedule_query()
         if schedule_query is None:
             return []
         today = datetime.now().strftime("%Y-%m-%d")
         try:
-            items = schedule_query.get_day_schedule(today)
+            current_items = schedule_query.get_day_schedule(today)
         except Exception:
             return []
-        return [{"time": f"{int(i.get('start_minute') or 0) // 60:02d}:{int(i.get('start_minute') or 0) % 60:02d}",
-                 "activity": str(i.get("name") or "")}
-                for i in items]
+        # 跨日合并取数失败不连带今日列表（昨日帧缺行 = 宁缺勿哑的降级）
+        yesterday_items: list[dict[str, Any]] = []
+        prev_date = ScheduleQuery._previous_date(today)
+        if prev_date:
+            try:
+                yesterday_items = schedule_query.get_day_schedule(prev_date)
+            except Exception:
+                yesterday_items = []
+
+        rows: list[tuple[int, dict[str, Any]]] = []
+        for item in (current_items or []):
+            if item.get("goal_type") in _SCHEDULE_SKIP_TYPES:
+                continue
+            start = int(item.get("start_minute") or 0)
+            offset = int(item.get("day_offset") or 0)
+            ring = DAY_MINUTES if offset == 1 else 0   # day_offset=1 = 下一个午夜段行
+            rows.append((start + ring, {
+                "time": format_day_minute(start + ring),
+                "activity": str(item.get("name") or ""),
+                "day_offset": offset,
+            }))
+        for item in (yesterday_items or []):
+            # 昨日标记的「今晚午夜段」：今天就发生在 start..end 钟点区间（与 schedule_query
+            # find_current_activity 的合并分支同判定），按今日真实钟点展示、不环抬。
+            if item.get("goal_type") in _SCHEDULE_SKIP_TYPES or item.get("day_offset") != 1:
+                continue
+            start = int(item.get("start_minute") or 0)
+            rows.append((start, {
+                "time": format_day_minute(start),
+                "activity": str(item.get("name") or ""),
+                "day_offset": 1,
+            }))
+        rows.sort(key=lambda pair: pair[0])
+        return [row for _key, row in rows]
 
     @API("companion_get_affection_level",
          description="获取当前好感度档位索引（0 起计数，0..N-1；N=当前预设档位数 1~5。"

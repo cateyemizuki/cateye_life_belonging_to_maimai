@@ -1,7 +1,14 @@
 """日程 SQLite 持久化（来源：自主规划插件 database/goal_db.py + 原 schedule_db 合并演进）。
 
-两张表：
+三张表（v4 起）：
 - ``schedule_items``：按天的日程条目（ScheduleQuery / get_current_activity API 的数据源）；
+  v4 增列 ``cycle_start_ts``/``cycle_end_ts``（INTEGER，**代码盖戳**，LLM 不参与；日帧
+  分钟，跨 0 点照取 >1440 的环节点、不折回——§31.2 血缘）与 ``entry_reason``（TEXT：
+  ``tool_edit``/``regenerate``/``scheduled_generate``/``fallback_template`` 四种进账原因，
+  迁移补戳行为 ``legacy_v3``）；
+- ``schedule_archive``（v4 伴随表，纯新增）：进账前旧日行归档——行快照 + 其 cycle 戳 +
+  reason + 归档时刻（``archived_at``）与归档原因（``archive_reason`` = 引发归档的本次
+  进账 reason）；**失效时机（cleanup_old_days 保留窗）不变，归档不改任何读取行为**；
 - ``goals``：长期目标 + 未来约定（pending_commitment，goal_type 区分），
   含 conditions / parameters / deadline / progress / execution_count 全字段。
   ``GoalManager``（goal_manager.py）基于该表工作，并会把当日日程条目合成
@@ -18,7 +25,9 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from .cycle_state import REASON_LEGACY
 
 _CORRUPTION_KEYWORDS = ("malformed", "not a database", "encrypted", "corrupt")
 
@@ -37,9 +46,34 @@ class ScheduleDB:
         day_offset INTEGER,
         parameters TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT
+        updated_at TEXT,
+        cycle_start_ts INTEGER,
+        cycle_end_ts INTEGER,
+        entry_reason TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_schedule_date ON schedule_items(schedule_date);
+    CREATE TABLE IF NOT EXISTS schedule_archive (
+        archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id TEXT,
+        schedule_date TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        goal_type TEXT NOT NULL DEFAULT 'daily_routine',
+        priority TEXT NOT NULL DEFAULT 'medium',
+        start_minute INTEGER NOT NULL DEFAULT 0,
+        end_minute INTEGER NOT NULL DEFAULT 60,
+        day_offset INTEGER,
+        parameters TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        cycle_start_ts INTEGER,
+        cycle_end_ts INTEGER,
+        entry_reason TEXT,
+        archived_at TEXT NOT NULL,
+        archive_reason TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_schedule_archive_date ON schedule_archive(schedule_date);
+    CREATE INDEX IF NOT EXISTS idx_schedule_archive_archived ON schedule_archive(archived_at);
     CREATE TABLE IF NOT EXISTS goals (
         goal_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -95,8 +129,9 @@ class ScheduleDB:
                 self._conn = self._connect()
                 self._conn.executescript(self.SCHEMA)
                 self._migrate_schema_v3()
+                self._migrate_schema_v4()
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', '3')"
+                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', '4')"
                 )
                 self._conn.commit()
         except sqlite3.DatabaseError as e:
@@ -117,6 +152,40 @@ class ScheduleDB:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(schedule_items)")}
         if "day_offset" not in columns:
             self._conn.execute("ALTER TABLE schedule_items ADD COLUMN day_offset INTEGER")
+
+    def _migrate_schema_v4(self) -> None:
+        """v3→v4 增列迁移（§31.2 血缘，R7 = 用户 2026-10-23 第二轮直派）：
+
+        - ``schedule_items`` 加 ``cycle_start_ts`` / ``cycle_end_ts``（INTEGER）与
+          ``entry_reason``（TEXT）；``schedule_archive`` 伴随表由 SCHEMA 建齐；
+        - 旧行补戳 = ``min(start)`` / ``max(end)`` 环（按 ``schedule_date`` 分组，逐行盖同
+          一份包络——跨 0 点照取 >1440 的环节点、不折回）且 ``entry_reason='legacy_v3'``
+          （§31.2 legacy 库迁移口径；与本周轮新进账——由进账漏斗给的签名参数盖戳——区分开）。
+        """
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(schedule_items)")}
+        if "cycle_start_ts" not in columns:
+            self._conn.execute("ALTER TABLE schedule_items ADD COLUMN cycle_start_ts INTEGER")
+        if "cycle_end_ts" not in columns:
+            self._conn.execute("ALTER TABLE schedule_items ADD COLUMN cycle_end_ts INTEGER")
+        if "entry_reason" not in columns:
+            self._conn.execute("ALTER TABLE schedule_items ADD COLUMN entry_reason TEXT")
+        need_backfill = self._conn.execute(
+            "SELECT COUNT(*) FROM schedule_items WHERE cycle_start_ts IS NULL"
+            " OR cycle_end_ts IS NULL OR entry_reason IS NULL"
+        ).fetchone()[0]
+        if not need_backfill:
+            return
+        groups: List[Tuple[Any, Any, Any]] = self._conn.execute(
+            "SELECT schedule_date, MIN(start_minute), MAX(end_minute) FROM schedule_items"
+            " GROUP BY schedule_date"
+        ).fetchall()
+        for schedule_date, min_start, max_end in groups:
+            self._conn.execute(
+                "UPDATE schedule_items SET cycle_start_ts = ?, cycle_end_ts = ?,"
+                " entry_reason = ? WHERE schedule_date = ? AND (cycle_start_ts IS NULL"
+                " OR cycle_end_ts IS NULL OR entry_reason IS NULL)",
+                (min_start, max_end, REASON_LEGACY, schedule_date),
+            )
 
     def _quarantine_corrupt_files(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -151,16 +220,90 @@ class ScheduleDB:
             data["parameters"] = {}
         return data
 
-    def replace_day_schedule(self, schedule_date: str, items: List[Dict[str, Any]]) -> int:
-        """整体替换某天的日程（生成成功后落库）。返回写入条数。"""
+    @staticmethod
+    def _cycle_stamps_of(items: List[Dict[str, Any]]) -> Tuple[Optional[int], Optional[int]]:
+        """条目集合 → ``min(start)``/``max(end)`` 日帧分钟包络（跨 0 点照取 >1440、不折回）。
+
+        调用方未显式传包络（``cycle_start_ts``/``cycle_end_ts``）时的兜底口径（§31.2
+        「旧行补戳 = min(start)/max(end) 环」同款；进账漏斗给的包络是入睡并入形态，
+        见 planning/cycle_state.py envelope_minutes）。全部缺分钟 → ``(None, None)``。
+        """
+        starts: List[int] = []
+        ends: List[int] = []
+        for item in items or []:
+            for key, bucket in (("start_minute", starts), ("end_minute", ends)):
+                value = item.get(key)
+                if value is None:
+                    continue
+                try:
+                    bucket.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+        if not starts or not ends:
+            return None, None
+        return min(starts), max(ends)
+
+    def _archive_day_rows_locked(self, schedule_date: str, archive_reason: str,
+                                 now: str) -> int:
+        """进账前旧日行归档（只在持有连接锁/事务内调用；失败不抛——归档是纯新增）。
+
+        快照 = 行全字段 + 其 cycle 戳与原 ``entry_reason`` + ``archived_at``（归档时刻）
+        + ``archive_reason``（引发归档的本次进账 reason）。返回归档行数。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM schedule_items WHERE schedule_date = ?", (schedule_date,)
+        ).fetchall()
+        archived = 0
+        for row in rows:
+            try:
+                self._conn.execute(
+                    "INSERT INTO schedule_archive(item_id, schedule_date, name, description,"
+                    " goal_type, priority, start_minute, end_minute, day_offset, parameters,"
+                    " created_at, updated_at, cycle_start_ts, cycle_end_ts, entry_reason,"
+                    " archived_at, archive_reason)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (row["item_id"], row["schedule_date"], row["name"], row["description"],
+                     row["goal_type"], row["priority"], row["start_minute"], row["end_minute"],
+                     row["day_offset"], row["parameters"], row["created_at"], row["updated_at"],
+                     row["cycle_start_ts"], row["cycle_end_ts"], row["entry_reason"],
+                     now, archive_reason),
+                )
+                archived += 1
+            except (sqlite3.SqliteError, IndexError, TypeError, KeyError):
+                continue
+        return archived
+
+    def replace_day_schedule(
+        self,
+        schedule_date: str,
+        items: List[Dict[str, Any]],
+        entry_reason: str = REASON_LEGACY,
+        cycle_start_ts: Optional[int] = None,
+        cycle_end_ts: Optional[int] = None,
+    ) -> int:
+        """整体替换某天的日程（生成成功后落库）。返回写入条数。
+
+        v4 签名（§31.2 血缘）：``entry_reason`` = 四种进账原因之一
+        （``tool_edit``/``regenerate``/``scheduled_generate``/``fallback_template``），
+        未按新管线传原因的旧调用方/直调以 ``legacy_v3`` 如实登记；``cycle_start_ts`` /
+        ``cycle_end_ts`` = 进账漏斗包络（入睡并入口径），未传时按 ``min(start)`` /
+        ``max(end)`` 本地兜底。进账前先把同日旧行整体归档进 ``schedule_archive``
+        （行快照 + cycle 戳 + reason + 归档时刻；**失效时机不变，归档是纯新增**）。
+        """
         now = datetime.now().isoformat()
+        stamps = self._cycle_stamps_of(items)
+        start_stamp = int(cycle_start_ts) if cycle_start_ts is not None else stamps[0]
+        end_stamp = int(cycle_end_ts) if cycle_end_ts is not None else stamps[1]
+        reason = str(entry_reason or REASON_LEGACY)
         with self._lock, self._conn:
+            self._archive_day_rows_locked(schedule_date, reason, now)
             self._conn.execute("DELETE FROM schedule_items WHERE schedule_date = ?", (schedule_date,))
             for item in items:
                 self._conn.execute(
                     "INSERT INTO schedule_items(item_id, schedule_date, name, description, goal_type,"
-                    " priority, start_minute, end_minute, day_offset, parameters, created_at, updated_at)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " priority, start_minute, end_minute, day_offset, parameters, created_at, updated_at,"
+                    " cycle_start_ts, cycle_end_ts, entry_reason)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         str(item.get("item_id") or uuid.uuid4().hex),
                         schedule_date,
@@ -174,9 +317,23 @@ class ScheduleDB:
                         json.dumps(item.get("parameters") or {}, ensure_ascii=False),
                         now,
                         now,
+                        start_stamp,
+                        end_stamp,
+                        reason,
                     ),
                 )
             return len(items)
+
+    def get_archived_day_schedule(self, schedule_date: str,
+                                  limit: int = 100) -> List[Dict[str, Any]]:
+        """读归档（archived_at 升序，按行粒度；测试面与 diag 只读用，不影响任何读取行为）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM schedule_archive WHERE schedule_date = ?"
+                " ORDER BY archive_id ASC LIMIT ?",
+                (schedule_date, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_day_schedule(self, schedule_date: str) -> List[Dict[str, Any]]:
         with self._lock:
@@ -207,8 +364,18 @@ class ScheduleDB:
             cur = self._conn.execute("DELETE FROM schedule_items WHERE item_id = ?", (item_id,))
             return cur.rowcount > 0
 
-    def delete_day_schedule(self, schedule_date: str) -> int:
+    def delete_day_schedule(self, schedule_date: str, *, archive_reason: str = "") -> int:
+        """删除某天全部日程条目；``archive_reason`` 非空 → 先把旧行归档（v4 §31.2）。
+
+        regenerate 指令的进账流先经本方法清日再写（schedule_generator.regenerate_today_schedule
+        透传 reason="regenerate"）——先删后写场景下旧日行**就是本次进账所替换的旧行**，
+        归档在删除前完成（快照 + cycle 戳 + reason + 归档时刻），保住血缘；默认不归档 =
+        旧行为（失效时机不变）。
+        """
         with self._lock, self._conn:
+            if archive_reason:
+                self._archive_day_rows_locked(schedule_date, archive_reason,
+                                              datetime.now().isoformat())
             cur = self._conn.execute("DELETE FROM schedule_items WHERE schedule_date = ?", (schedule_date,))
             return cur.rowcount
 

@@ -243,9 +243,16 @@ class ScheduleSemanticValidator:
         return None
 
     def _check_duration(self, item: Dict, all_items: List[Dict]) -> Optional[str]:
-        """检查活动持续时间是否合理"""
+        """检查活动持续时间是否合理（§31.3 提示词放开同步，R7 = 用户 2026-10-23 第二轮直派）。
+
+        「每段两小时/恒等时长」锚定手法撤销——**不再罚段长不均**：旧实现里 >180 分钟
+        （3 小时）的活动会报「持续时间过长，建议不超过3小时」，把自然的长段（如一早上
+        专注学习）推进重试反馈并拉低质量分，事实上逼迫模型按等长段切分日程。本分支随
+        提示词放开整行移除；段长唯一剩的硬界 = ``_normalize_items`` 的 0.25~12h 夹紧。
+        短段守卫（<15 分钟碎片）保留——它与空档校验同属结构面（数量/锚点/空档），防
+        归一化塌缩与 15 分钟碎片，不是段长均匀性约束。
+        """
         time_slot = item.get("time_slot", "")
-        name = item.get("name", "")
 
         if not time_slot:
             return None
@@ -264,13 +271,9 @@ class ScheduleSemanticValidator:
         if next_minutes:
             duration = next_minutes - current_minutes
 
-            # 检查持续时间是否合理
+            # 检查持续时间是否合理（<15 分钟碎片守卫保留；段长上限罚分已随提示词放开移除）
             if duration < 15:
                 return f"持续时间过短（{duration}分钟），建议至少15分钟"
-
-            # 睡觉、休息、自由时间可以超过3小时
-            if duration > 180 and "自由" not in name and "休息" not in name and "睡" not in name and "安睡" not in name:
-                return f"持续时间过长（{duration}分钟），建议不超过3小时"
 
         return None
 

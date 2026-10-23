@@ -62,6 +62,27 @@ class TimezoneManager:
         return datetime.now()
 
 
+def tzinfo_of(timezone_str: str) -> Optional[tzinfo]:
+    """tz 名 → tzinfo 对象（解析失败/空名 → ``None`` = 系统本地时区；供 epoch↔本地互转用）。"""
+    if not str(timezone_str or "").strip():
+        return None
+    return TimezoneManager(timezone_str)._tz
+
+
+def epoch_to_local(epoch: Any, tz: Any = None) -> Optional[datetime]:
+    """epoch 秒 → 指定 tzinfo 的本地 datetime（§31.1 窗锚读路径的唯一实现）。
+
+    - ``tz`` 缺省 ``None`` = 系统本地时区（与 ``day_cycle_epochs(tz_name="")``、
+      决策日志 ``_fmt_hhmm`` 同一条时区链）；传入 tzinfo（例如 :func:`tzinfo_of` 的
+      返回值）按该时区换算；
+    - 非法/非数值 epoch → ``None``（调用方按"不可得"降级，不猜日期）。
+    """
+    try:
+        return datetime.fromtimestamp(float(epoch), tz)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
 # ==================== 时间窗口工具 ====================
 
 
