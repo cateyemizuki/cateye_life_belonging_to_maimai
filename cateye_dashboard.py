@@ -321,6 +321,8 @@ def emotion_block(emotion_svc: Any, config: Any, *, enabled: bool,
 
     R7（指导 §9.2）：透传快照新增的 ``label`` / ``share`` / ``vad_words`` / ``effective``；
     旧快照（无这些键）回退为空值，不破坏既有 consumers。
+    R35（2026-10-24 直派）：透传 ``recent_events``（最近 3 条情绪事件的时间/描述/ΔVAD）；
+    旧快照无键回退 ``[]``，缺键/形状异常逐条防御。
     """
     section = getattr(config, "emotion", None)
     block: Dict[str, Any] = {
@@ -328,6 +330,7 @@ def emotion_block(emotion_svc: Any, config: Any, *, enabled: bool,
         "initialized": False, "mood_text": "", "labels": [], "event_count": 0,
         "label": "", "share": 0.0, "vad_words": {},
         "effective": {}, "anchor": {}, "offset": {}, "frozen": False,
+        "recent_events": [],
     }
     service = getattr(emotion_svc, "service", None) if emotion_svc is not None else None
     if not enabled or service is None:
@@ -348,6 +351,7 @@ def emotion_block(emotion_svc: Any, config: Any, *, enabled: bool,
         "anchor": snapshot.get("anchor") if isinstance(snapshot.get("anchor"), dict) else {},
         "offset": snapshot.get("offset") if isinstance(snapshot.get("offset"), dict) else {},
         "frozen": bool(snapshot.get("frozen")),
+        "recent_events": _recent_event_rows(snapshot),
     })
     return block
 
@@ -386,6 +390,36 @@ def _vad_text(state: Dict[str, Any]) -> str:
     return (f"V={_to_float(state.get('valence')):+.2f} "
             f"A={_to_float(state.get('arousal')):+.2f} "
             f"D={_to_float(state.get('dominance')):+.2f}")
+
+
+def _recent_event_rows(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """R35：快照 ``recent_events`` 归一化（最多 3 条；缺键/非列表/条目形状异常 → 安全值）。"""
+    events = snapshot.get("recent_events") if isinstance(snapshot, dict) else None
+    if not isinstance(events, list):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for event in events[:3]:
+        if not isinstance(event, dict):
+            continue
+        rows.append({
+            "time": str(event.get("time") or "").strip(),
+            "desc": str(event.get("desc") or "").strip(),
+            "v": _to_float(event.get("v")),
+            "a": _to_float(event.get("a")),
+            "d": _to_float(event.get("d")),
+        })
+    return rows
+
+
+def _recent_delta_text(event: Dict[str, Any]) -> str:
+    """R35：单条事件的 ΔVAD 标注「（V+0.08|A-0.05|D+0.12）」；|变动| < 0.005 的维度不列
+    （与随图日志口径对齐）；三维全部低于阈值 →「（微小波动）」。"""
+    parts = []
+    for key, letter in (("v", "V"), ("a", "A"), ("d", "D")):
+        value = _to_float(event.get(key))
+        if abs(value) >= 0.005:
+            parts.append(f"{letter}{value:+.2f}")
+    return f"（{'|'.join(parts)}）" if parts else "（微小波动）"
 
 
 def _current_text(block: Dict[str, Any]) -> str:
@@ -454,6 +488,18 @@ def _emotion_lines(block: Dict[str, Any]) -> List[str]:
     ]
     if block.get("frozen"):
         lines.append("睡眠冻结中（醒后一次性结算）")
+    # R35（2026-10-24 直派）：「近期变化」段——最近 3 条已入账情绪事件的成因与 ΔVAD；
+    # §9.3 铁律：既有行零删，只追加。旧快照无 recent_events → 空列表 →「（无记录）」。
+    recent = block.get("recent_events") if isinstance(block.get("recent_events"), list) else []
+    if recent:
+        for event in recent[:3]:
+            if not isinstance(event, dict):
+                continue
+            time_text = str(event.get("time") or "").strip()
+            desc = str(event.get("desc") or "").strip() or "（无描述）"
+            lines.append(f"近期变化 {time_text} {desc}{_recent_delta_text(event)}".strip())
+    else:
+        lines.append("近期变化 （无记录）")
     return lines
 
 
@@ -787,6 +833,29 @@ def build_dashboard_view(blocks: Any, *, now: Optional[datetime] = None) -> Dict
     offset = _dict(emotion.get("offset"))
     quote_text = str(emotion.get("description") or "").strip() \
         or str(emotion.get("mood_text") or "").strip()
+    # R35（2026-10-24 直派）：「近期情绪变化」行组——最近 3 条（上限 3）已入账事件，
+    # 每条一行「HH:MM desc（V+0.08|A-0.05|D+0.12）」；desc 在测量遍经 render_kit.fit_text
+    # 按像素截断（见 _measure_dl_rows 的 recent 分支），ΔVAD 段恒可见；空列表给「（无记录）」。
+    recent_rows: List[Dict[str, Any]] = []
+    for event in (emotion.get("recent_events") or []):
+        if len(recent_rows) >= 3:
+            break
+        if not isinstance(event, dict):
+            continue
+        time_text = str(event.get("time") or "").strip()
+        desc = str(event.get("desc") or "").strip() or "（无描述）"
+        recent_rows.append({
+            "label": "近期变化" if not recent_rows else "",
+            "recent": True,
+            "segments": [
+                (f"{time_text} ", MUTED),
+                (desc, INK),
+                (_recent_delta_text(event), MUTED),
+            ],
+        })
+    if not recent_rows:
+        recent_rows.append({"label": "近期变化", "recent": False,
+                            "segments": [("（无记录）", MUTED)]})
     section_emotion = {
         "num": "03", "title": "情绪", "enabled": emotion_enabled,
         "meta": (str(emotion.get("mode") or "").strip() or "—") if emotion_enabled else "",
@@ -796,7 +865,7 @@ def build_dashboard_view(blocks: Any, *, now: Optional[datetime] = None) -> Dict
             {"label": "当日事件", "segments": [(f"{_to_int(emotion.get('event_count'))} 条", INK)]},
             {"label": "锚点", "segments": [(_fmt_vad(anchor), INK)]},
             {"label": "偏移", "segments": [(_fmt_vad(offset), INK)]},
-        ],
+        ] + recent_rows,
         "quote": quote_text,
     }
 
@@ -1165,22 +1234,41 @@ def _wrap_at_spaces(probe: Canvas, text: str, font: Any, max_w: float,
 
 def _measure_dl_rows(p: _Painter, probe: Canvas, rows: List[Dict[str, Any]],
                      content_top: float) -> float:
-    """02/03/04 定义行：label 72 + 12 gap；行高 37；1px rowline（末行无）。"""
+    """02/03/04 定义行：label 72 + 12 gap；行高 37；1px rowline（末行无）。
+
+    R35：``row["recent"]`` 行（03 情绪「近期变化」行组）三段绘制——时刻段 + desc 段 +
+    ΔVAD 段；desc 段先按「剩余宽 − ΔVAD 段宽 − 8」经 ``render_kit.fit_text`` 截断，
+    保证 ΔVAD 段恒可见（禁止字符数截断，一律像素测量）。
+    """
     row_top = content_top + 12
     for index, row in enumerate(rows):
         baseline = row_top + 6 + probe.ascent(p.font(16))
         p.text(RIGHT_X, baseline, row["label"], 13, color=MUTED, max_w=72)
         x = RIGHT_X + 84
         remaining = RIGHT_W - 84
-        for text, color in row["segments"]:
-            if remaining <= 0:
-                break
-            width = p.text(x, baseline, text, 16, color=color, max_w=remaining)
-            used = (render_kit.text_width(probe, str(text or ""), p.font(16)))
-            x += width
-            remaining -= width
-            if width < used:  # 已省略 → 后续段不再画
-                break
+        segments = list(row["segments"])
+        if row.get("recent") and len(segments) == 3:
+            (time_text, time_color), (desc_text, desc_color), (delta_text, delta_color) = segments
+            delta_w = render_kit.text_width(probe, delta_text, p.font(16))
+            time_w = p.text(x, baseline, time_text, 16, color=time_color, max_w=remaining)
+            x += time_w
+            remaining -= time_w
+            desc_max = max(10.0, remaining - delta_w - 8)
+            desc_w = p.text(x, baseline, desc_text, 16, color=desc_color, max_w=desc_max)
+            x += desc_w
+            remaining -= desc_w
+            p.text(x + 8, baseline, delta_text, 16, color=delta_color,
+                   max_w=max(10.0, remaining))
+        else:
+            for text, color in segments:
+                if remaining <= 0:
+                    break
+                width = p.text(x, baseline, text, 16, color=color, max_w=remaining)
+                used = (render_kit.text_width(probe, str(text or ""), p.font(16)))
+                x += width
+                remaining -= width
+                if width < used:  # 已省略 → 后续段不再画
+                    break
         if index < len(rows) - 1:
             p.line([RIGHT_X, row_top + _DL_ROW_H - 1, TEXT_RIGHT, row_top + _DL_ROW_H - 1],
                    ROWLINE, 1)

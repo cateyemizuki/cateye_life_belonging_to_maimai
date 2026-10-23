@@ -31,7 +31,7 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 
 | 命令 | 用途 | 权限 |
 |---|---|---|
-| `/lbm_dashboard` | 四模块状态总览图与最近变动日志 | 管理员 |
+| `/lbm_dashboard` | 四模块状态总览图与最近变动日志，情绪节附近期情绪变化 | 管理员 |
 | `/lbm_plan list` | 查看今日日程图；当天没有日程时自动生成 | 管理员 |
 | `/lbm_plan regenerate [额外要求]` | 重新生成今日日程，可附加临时要求 | 管理员 |
 | `/lbm_mai_affection <1~N>` | 把好感度直接调到第 N 档 | 目标 QQ 本人或本机控制台 |
@@ -97,6 +97,7 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 - 夜间进入睡眠窗后冻结，醒来时统一结算。
 - `/lbm_emotion_init` 由人设推导基线；`/lbm_emotion_config` 查看、`reset` 或 `clear`。
 - 情绪映射与描述可在 `mappings/` 的对应表中调整。
+- 睡眠裁判提示词已压缩 reason 与思考要求；调用 `max_tokens` 为 1024（如需进一步压思考链，见 USAGE.md「睡眠裁判思考强度配置指引」）。
 
 ### bot 自用工具
 

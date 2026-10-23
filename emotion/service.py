@@ -556,12 +556,33 @@ class EmotionService:
         - ``vad_words``：``{"v": ..., "a": ..., "d": ...}`` 粗粒度短词（五档 → 中/偏高…）；
         - ``effective``：``_machine.effective_vad().to_dict()``（含静态偏移与乘数结算）——
           与 23a 用例的三维 payload **同源**，不另算。
+
+        R35（2026-10-24 直派）：新增 ``recent_events`` = 最近 3 条**已入 ``emotion_log``**
+        的情绪事件（``{"time": "HH:MM", "desc": 事件描述截 40 字, "v"/"a"/"d": ΔVAD 四位小数}``）。
+        只读投影，既有字段零变化；冻结期 ``pending_events`` 不取——事件醒后经
+        ``unfreeze`` 并入 ``emotion_log``（state_machine §M5）才出现在本字段。
         """
         eff = self._machine.effective_vad()
         labels, _nearest = map_emotions(eff)
         params = self._machine.params
         primary_label = str(labels[0][0]) if labels else ""
         primary_share = round(float(labels[0][1]), 4) if labels else 0.0
+        recent_events = []
+        for event in list(getattr(self._machine, "emotion_log", None) or [])[-3:]:
+            delta = getattr(event, "delta_vad", None)
+            if isinstance(delta, dict):
+                v, a, d = (delta.get("valence"), delta.get("arousal"), delta.get("dominance"))
+            else:
+                v, a, d = (getattr(delta, "valence", 0.0), getattr(delta, "arousal", 0.0),
+                           getattr(delta, "dominance", 0.0))
+            timestamp = str(getattr(event, "timestamp", "") or "")
+            recent_events.append({
+                "time": timestamp[11:16] if len(timestamp) >= 16 else timestamp,
+                "desc": str(getattr(event, "event_description", "") or "")[:40],
+                "v": round(float(v if v is not None else 0.0), 4),
+                "a": round(float(a if a is not None else 0.0), 4),
+                "d": round(float(d if d is not None else 0.0), 4),
+            })
         return {
             "initialized": bool(params.initialized),
             "mood_text": self.mood_text(),
@@ -575,6 +596,7 @@ class EmotionService:
             },
             "effective": eff.to_dict(),
             "event_count": len(self._machine.emotion_log),
+            "recent_events": recent_events,
             "anchor": params.anchor.to_dict(),
             "offset": params.offset.to_dict(),
             "frozen": bool(getattr(self._machine, "frozen", False)),
