@@ -186,12 +186,12 @@ data/plugins/cateye.life_belonging_to_maimai/
 本插件站在以下项目与生态的肩膀上：
 
 1. **麦麦自主规划插件 v4（v4.9.1）**：作者靓仔（xuqian13），[github.com/xuqian13/autonomous_planning_plugin](https://github.com/xuqian13/autonomous_planning_plugin)；本插件使用 cateye 维护的 fork：[github.com/cateyemizuki/autonomous_planning_plugin](https://github.com/cateyemizuki/autonomous_planning_plugin)；许可 **AGPL-3.0**。用途：`planning/` 模块（日程生成管线、目标管理、注入、工具、命令、自动调度、日程图、事件服务等）源自其架构的复刻与移植；问候链的闸序也参照其设计。
-2. **Maizone（麦麦空间）**：作者 internetsb，许可 **MIT**（插件市场名「麦麦空间 Maizone」v3.0.3 / qzone-toolkit）。用途：QQ 空间 Web CGI 直连上传、发图与表情包模式的实现路线参考（`qzone/cgi.py`、`image_sources.py`）。
-3. **MaiTrace**：作者 Rabbit-Jia-Er，v3.1，许可 **MIT**。用途：QQ 空间发帖判定链（模型严判正反例、首字符裁定、决策历史）与图库、表情包收集思路的移植参考。
-4. **SnowLuma 适配器协议层 与 qzone-toolkit**：用途：空间动作与 Web 接口字段参考（发帖双通道的协议一致性问题即来源于此）。
-5. **MaiBot 宿主与插件开发文档 v1.x**：生态基础。
+2. **Maizone（麦麦空间）**：作者 internetsb，[github.com/internetsb/Maizone](https://github.com/internetsb/Maizone)，许可 **MIT**（插件市场名「麦麦空间 Maizone」v3.0.3 / qzone-toolkit）。用途：QQ 空间 Web CGI 直连上传、发图与表情包模式的实现路线参考（`qzone/cgi.py`、`image_sources.py`）。
+3. **MaiTrace**：作者 Rabbit-Jia-Er，v3.1，[github.com/Rabbit-Jia-Er/MaiTrace](https://github.com/Rabbit-Jia-Er/MaiTrace)，许可 **MIT**。用途：QQ 空间发帖判定链（模型严判正反例、首字符裁定、决策历史）与图库、表情包收集思路的移植参考。
+4. **SnowLuma 适配器协议层 与 qzone-toolkit**：[github.com/Mai-with-u/MaiBot-SnowLuma-Adapter](https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter)；qzone-toolkit 随 Maizone 分发（见第 2 项）。用途：空间动作与 Web 接口字段参考（发帖双通道的协议一致性问题即来源于此）。
+5. **MaiBot 宿主与插件开发文档 v1.x**：[github.com/Mai-with-u/MaiBot](https://github.com/Mai-with-u/MaiBot)，生态基础。
 
-此外，`companion/` 与 `core/` 的部分实现参考了虚拟陪伴插件 mai-love（MIT）；日程图与状态图使用 Noto Sans SC 字体，按 SIL Open Font License 1.1 分发（随包 `planning/assets/fonts/OFL.txt`）。
+此外，**`companion/` 模块由虚拟陪伴插件 mai-love 改造而来**——作者 octmicy，[github.com/octmicy/Mai_love](https://github.com/octmicy/Mai_love)，许可 **MIT**；`core/` 的部分实现（如 llm_utils）同样参考/移植自它。对照用 fork：[github.com/cateyemizuki/Mai_love](https://github.com/cateyemizuki/Mai_love)。日程图与状态图使用 Noto Sans SC 字体（[github.com/googlefonts/noto-cjk](https://github.com/googlefonts/noto-cjk)），按 SIL Open Font License 1.1 分发（随包 `planning/assets/fonts/OFL.txt`）。
 
 上述第 2、3 项为 MIT 许可的直接参考实现；第 1 项为 AGPL-3.0 复刻，另见上文许可说明。本插件对这些项目的理解与实现若有不准之处，一切以原项目为准。
 
