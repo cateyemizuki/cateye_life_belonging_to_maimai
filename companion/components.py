@@ -15,7 +15,10 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   - maisaka.replyer.before_model_request  过期主动任务块剥离 + 仅屏幕旁白注入
                                        （BLOCKING/NORMAL）
   - maisaka.replyer.after_response     90 秒窗口补计 0.5 发言数 + spoken 回执（OBSERVE/LATE）
-- Tools ×2：lbm_mai_lover_send_message / lbm_mai_lover_affection
+- Tools ×3：lbm_mai_lover_send_message / lbm_mai_lover_affection /
+  lbm_report_harassment（2026-10-24 告状：受骚扰时转达维护者；纯逻辑见
+  companion/harass_report.py，``[admin].harass_report_enabled=false`` 时不注册——
+  过滤在 plugin.get_components override）
   （原 current_activity / status / schedule 三工具已随 T6 注册面收口移除：
   当前活动与日程查询见 lbm_get_schedule_info，状态总览见 /lbm_dashboard）
 - Commands ×4：/lbm_mai_affection（鉴权：target_qq 白名单 + 本机控制台，
@@ -37,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import time
 from collections import deque as _deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -47,6 +51,16 @@ from maibot_sdk import API, Command, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from companion.config import target_qq_of
+from companion.harass_report import (
+    HARASS_TOOL_NAME,
+    TRIGGER_TYPE,
+    build_report_text,
+    cooldown_check,
+    cooldown_hint,
+    decision_fields,
+    monotonic_now,
+    resolve_maintainer_qq,
+)
 from companion.patrol import resolve_silence_window
 from core.diag import DecisionLogger
 from core.inject import pick_payload_key, project_injection, without_stale_proactive_blocks
@@ -831,6 +845,146 @@ class CompanionComponentsMixin:
         companion.affection.set_tier(requested - 1)
         self.ctx.logger.info(f"好感度已通过 Tool 调整到第 {requested} 档（score 移至对应区间中值）")
         return f"好感度已更新：{self._mai_affection_state_line()}"
+
+    # ==================================================================
+    # 告状工具（2026-10-24 用户直派，需求3）
+    # ==================================================================
+
+    def _harass_state(self) -> dict:
+        """进程内缓存：告状冷却时间戳 + 维护者解析结果（键 = 解析所用 QQ；热重载重建实例即清零）。"""
+        state = getattr(self, "_harass_cache", None)
+        if state is None:
+            state = {"last_ts": 0.0, "resolved_qq": "", "resolved_stream": ""}
+            self._harass_cache = state
+        return state
+
+    def _harass_log(self, *, action: str, reason: str, detail: str = "",
+                    maintainer_qq: str = "", location: str = "") -> None:
+        """告状决策日志留痕（trigger_type 统一 ``admin.harass_report``；日志故障不影响流程）。
+
+        三形态（reason 取值）：成功 ``reported`` / 失败 ``send_failed`` 等 /
+        冷却跳过 ``cooldown_skip``；``result`` 字段冗余同值便于按天日志 grep。
+        """
+        fields = decision_fields(result=reason, maintainer_qq=maintainer_qq,
+                                 location=location, detail=detail)
+        companion = self._mai_companion()
+        if companion is not None and getattr(companion, "decision_logger", None) is not None:
+            # 注意：fields 已含 detail（decision_fields 构造），不可再显式传 detail——
+            # _mai_log_proactive_event 的 detail 是具名参数，重复传会 TypeError。
+            self._mai_log_proactive_event(action=action, reason=reason,
+                                          trigger_type=TRIGGER_TYPE, **fields)
+            return
+        logger = getattr(self, "_decision_logger", None)
+        if logger is None:
+            return
+        try:
+            logger.record(action=action, reason=reason,
+                          trigger_type=TRIGGER_TYPE, **fields)
+        except Exception:
+            pass
+
+    def _harass_maintainer_qq(self) -> str:
+        """维护者 QQ 解析（优先级纯逻辑在 harass_report.resolve_maintainer_qq）。"""
+        admin = getattr(getattr(self, "config", None), "admin", None)
+        return resolve_maintainer_qq(
+            getattr(admin, "harass_report_target_qq", ""),
+            list(getattr(admin, "admin_users", []) or []),
+        )
+
+    async def _harass_resolve_stream(self, qq: str) -> str:
+        """维护者私聊 stream 解析（形态照 plugin._resolve_target_stream :392-414）：
+        get_stream_by_user_id 首选 → get_private_streams 遍历回退；失败返回空串。"""
+        try:
+            info = await self.ctx.chat.get_stream_by_user_id(user_id=qq)
+            payload = info.get("stream") if isinstance(info, dict) else None
+            payload = payload or info
+            if isinstance(payload, dict) and payload.get("stream_id"):
+                return str(payload["stream_id"])
+        except Exception:
+            pass
+        try:
+            streams = await self.ctx.chat.get_private_streams()
+            if isinstance(streams, dict):
+                streams = streams.get("streams") or streams.get("data") or []
+            for s in streams or []:
+                if isinstance(s, dict) and str(s.get("user_id") or "") == qq and s.get("stream_id"):
+                    return str(s["stream_id"])
+        except Exception:
+            pass
+        return ""
+
+    @Tool(
+        "lbm_report_harassment",
+        description="受到骚扰时调用（被恶意刷屏/辱骂/攻击/被故意戏弄到不适）——把情况告诉维护者，"
+                    "由维护者处理；普通玩笑与日常聊天不要调用",
+        parameters={
+            "description": {
+                "type": "string",
+                "description": "一句话说明发生了什么",
+                "required": True,
+            },
+        },
+    )
+    async def mai_tool_report_harassment(self, description: str = "", **kwargs: Any) -> str:
+        """LLM Tool: 受骚扰时向维护者告状（运维消息，不带情绪后缀；冷却与维护者解析进程内缓存）。"""
+        cfg = getattr(self, "config", None)
+        admin = getattr(cfg, "admin", None)
+        # 双保险：正常情况本工具在 harass_report_enabled=false 时已被 get_components 剔除不注册，
+        # 配置热更到关闭但组件仍驻留的窗口期在此兜底。
+        if admin is None or not bool(getattr(admin, "harass_report_enabled", True)):
+            return "告状工具未启用。"
+        text = str(description or "").strip()
+        if not text:
+            return "告状失败：请先用一句话说明发生了什么。"
+        location = str(kwargs.get("stream_id") or "").strip()
+
+        maintainer_qq = self._harass_maintainer_qq()
+        if not maintainer_qq:
+            self._harass_log(action="info", reason="no_maintainer", detail="未配置维护者",
+                             maintainer_qq="", location=location)
+            return "告状失败：未配置维护者（[admin] harass_report_target_qq 与 admin_users 皆空），无法转达。"
+
+        state = self._harass_state()
+        cooldown_minutes = max(0, int(getattr(admin, "harass_report_cooldown_minutes", 30) or 0))
+        now_ts = monotonic_now()
+        allowed, remaining = cooldown_check(now_ts, state.get("last_ts", 0.0), cooldown_minutes)
+        if not allowed:
+            self._harass_log(action="skip", reason="cooldown_skip",
+                             detail=f"冷却中跳过（剩 {remaining} 分钟）",
+                             maintainer_qq=maintainer_qq, location=location)
+            return cooldown_hint(remaining)
+
+        # 维护者解析结果进程内缓存（QQ 变了才重解析）
+        stream_id = state.get("resolved_stream") or ""
+        if state.get("resolved_qq") != maintainer_qq or not stream_id:
+            stream_id = await self._harass_resolve_stream(maintainer_qq)
+            state["resolved_qq"] = maintainer_qq
+            state["resolved_stream"] = stream_id
+        if not stream_id:
+            self._harass_log(action="info", reason="stream_resolve_failed",
+                             detail=f"维护者 {maintainer_qq} 私聊流解析失败",
+                             maintainer_qq=maintainer_qq, location=location)
+            return "告状失败：暂时联系不上维护者（私聊流解析失败），稍后再试。"
+
+        final_text = build_report_text(text, location)
+        try:
+            result = await self.ctx.send.text(text=final_text, stream_id=stream_id)
+        except Exception as e:
+            self.ctx.logger.error(f"[{HARASS_TOOL_NAME}] 发送异常: {e}")
+            self._harass_log(action="info", reason="send_failed",
+                             detail=f"发送异常: {e}", maintainer_qq=maintainer_qq,
+                             location=location)
+            return f"告状发送异常: {e}"
+        if result:
+            state["last_ts"] = now_ts
+            self._harass_log(action="trigger", reason="reported",
+                             detail=f"bot 告状：{text[:40]}", maintainer_qq=maintainer_qq,
+                             location=location)
+            return f"告状已发送: {final_text[:60]}..."
+        self._harass_log(action="info", reason="send_failed",
+                         detail="发送返回 False", maintainer_qq=maintainer_qq,
+                         location=location)
+        return "告状发送失败: 发送返回 False"
 
     # ==================================================================
     # Commands

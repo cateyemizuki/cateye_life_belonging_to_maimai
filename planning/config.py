@@ -681,6 +681,19 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
             **_ui_i18n("Morning greeting", "Off: no morning greetings anywhere."),
         },
     )
+    greeting_morning_silence_hours: float = Field(
+        default=2.0,
+        ge=0,
+        description="早安沉默闸（小时）：今日第一日程（= 周期起点）前 N 小时内该会话 bot 自己发过消息"
+                    "→ 该会话本周期跳过早安（不掷点、不建条目）。0 = 禁用该闸门；查询异常按不过处理（宁不发）",
+        json_schema_extra={
+            "label": "早安沉默闸(小时)",
+            "hint": "第一日程前 N 小时内 bot 发过消息就不发早安；0 = 关闭；默认 2",
+            **_ui_i18n("Morning silence gate (h)",
+                       "Skip the morning greeting if the bot spoke within N hours before "
+                       "the first schedule item; 0 disables."),
+        },
+    )
     greeting_night_enabled: bool = Field(
         default=True,
         description="启用晚安：睡前界（= 真实入睡锚点，2026-10-21 起优先日程实际睡眠环，日程缺失回退"

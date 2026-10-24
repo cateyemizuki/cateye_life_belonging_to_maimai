@@ -192,8 +192,12 @@ INJECT_SCHEDULE_FUTURE_LINE_DEFAULT = "  {time} - {name}"
 INJECT_HINT_FUTURE_DEFAULT = "提示：用户询问未来计划，请自然地介绍后续安排。"
 #: 询问当前时的引导行（占位符：无）
 INJECT_HINT_CURRENT_DEFAULT = "提示：用户直接询问当前状态，请如实告知，并自然带出此刻的精神状态。"
-#: 对话延续时的引导行（占位符：{reason}）
-INJECT_HINT_CONTINUE_DEFAULT = "提示：对话延续中（{reason}），可自然带过当前活动。"
+#: 对话延续时的引导行（占位符：{reason}；2026-10-24 用户直派弱化：旧版「可自然带过当前活动」
+#: 带弱鼓励色彩——现明确「只是背景信息、不问不说」，仅话题接不上时才允许用一句当前活动开新话题）
+INJECT_HINT_CONTINUE_DEFAULT = (
+    "提示：对话延续中（{reason}）。当前活动只是背景信息：用户不问就不要说；"
+    "只有当话题确实接不上、需要找新话题时，才可以用一句当前活动自然开启新话题。"
+)
 #: 主动碎碎念时的引导行（占位符：无；2026-10-20 用户指示：不再引导 bot 无问自答提日程）
 INJECT_HINT_PROACTIVE_DEFAULT = (
     "提示：不要主动提及你正在日程里做什么。只有当对方问起你在做什么、"

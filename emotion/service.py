@@ -301,6 +301,9 @@ class EmotionService:
         self._nap_reminder_counts: Dict[str, int] = {}
         #: 已提醒过的段标记 ``(cycle_key, closed_at)``：保证"本轮每段至多一次"（额度之外的第二道闸）
         self._nap_reminded_segments: set = set()
+        # R7 = 用户 2026-10-24 直派：no_sleep_mode 大修的新日程进账触发——
+        # ``schedule.generated`` 订阅的反订阅闭包（start() 挂载 / stop() 注销；无总线静默）
+        self._schedule_generated_unsub: Any = None
 
     # ── 事件总线（M0；无总线时静默跳过）─────────────────────
     def _bus(self) -> Any:
@@ -2565,6 +2568,11 @@ class EmotionService:
             return
 
         if self.is_frozen():
+            # R7 = 用户 2026-10-24 直派：no_sleep_mode 夜内不打裁判、不做 resleep/夜扰扫描——
+            # 大修改由新日程进账（schedule.generated 订阅，:meth:`_on_schedule_generated`）触发；
+            # 吵醒记账已被 note_night_reply/nap 提醒的既有 no_sleep 门控挡住，此处无需重复闭段。
+            if self._no_sleep_mode():
+                return
             # M8 段 2（附录 §2.1）：冻结期（= 睡眠周期内）每个 tick 扫一次 resleep 到期，
             # 让「回到睡眠」的闭段留痕不必等到醒沿或下一条 reply。
             # M9（附录 §4.1）：同一次扫描闭段后进入赖床提醒轮判定（仅 resleep 闭段）。
@@ -2595,6 +2603,17 @@ class EmotionService:
         # 发生在冻结前才会进当天 emotion_log（冻结期事件只入队），裁判的日志输入才完整
         await self.flush_all_episodes(reason="sleep_entry")
         self._machine.freeze(now)                        # M5：冻结（事件只入队、暂停衰减/结算）
+        # R7 = 用户 2026-10-24 直派：no_sleep_mode 夜窗兜底只 freeze + flush——跳过裁判
+        # （不打 ask_sleep_referee、不建缓存），大修改延迟到新日程进账（schedule.generated）
+        # 触发的醒沿结算链（:meth:`_on_schedule_generated`）。
+        if self._no_sleep_mode():
+            self._log_decision(
+                "emotion.sleep_overhaul", trigger_type="schedule_generated_deferred",
+                reason="no_sleep_mode：夜窗兜底冻结完成，跳过夜内裁判（no_sleep_defer，"
+                       "不掷点不建缓存），大修待新日程进账触发",
+                cycle_key=cycle_key, planned_hours=round(float(planned or 0.0), 2),
+            )
+            return
         cached = await self.compute_sleep_overhaul(now, sleep_hours=planned)
         if cached is None:
             self._ctx.logger.debug("睡眠大修计算失败：保持冻结，下一轮重试")
@@ -2684,14 +2703,86 @@ class EmotionService:
         self._save_state()
         return "已清空当天情绪日志。"
 
+    # ── R7 = 用户 2026-10-24 直派：no_sleep_mode 大修的新日程进账触发 ──
+    def _subscribe_schedule_generated(self) -> None:
+        """订阅 ``schedule.generated``（生成侧发布点 planning/schedule_generator）。
+
+        无总线（``plugin._bus`` 缺失）静默跳过；幂等：已有订阅先注销再挂（防重复回调）。
+        注销闭包存 ``_schedule_generated_unsub``，:meth:`stop` 取消。
+        """
+        bus = self._bus()
+        if bus is None:
+            return
+        self._unsubscribe_schedule_generated()
+        try:
+            self._schedule_generated_unsub = bus.subscribe(
+                "schedule.generated", self._on_schedule_generated,
+                owner="emotion_no_sleep_overhaul")
+        except Exception:
+            self._schedule_generated_unsub = None
+
+    def _unsubscribe_schedule_generated(self) -> None:
+        """注销 ``schedule.generated`` 订阅（幂等；无总线静默）。"""
+        unsub = self._schedule_generated_unsub
+        self._schedule_generated_unsub = None
+        if callable(unsub):
+            try:
+                unsub()
+            except Exception:
+                pass
+
+    async def _on_schedule_generated(self, payload: Any) -> None:
+        """``schedule.generated`` 回调：no_sleep_mode 且冻结中 → 立即执行醒沿结算链。
+
+        链序（与 ``_check_and_overhaul`` 醒沿同构，附录 §2.5/§2.3）：``close_night_interrupt_segment('wake')``
+        （no_sleep 下无段、天然空操作）→ ``flush_all_episodes('wake')`` →
+        ``compute_sleep_overhaul(now)``（失败仅告警**不重试**——下一份日程进账再试）→
+        置缓存（带 cycle_key）→ ``_apply_cached_overhaul``（内部取走缓存：unfreeze +
+        apply_sleep_overhaul + ``applied_sleep_date`` 落盘护栏，语义与醒沿一致）。
+        兼容：``no_sleep_mode=false`` 直接 return（全链行为零变化）；异常绝不外抛
+        （总线单订阅者隔离之外再加全包裹）。
+        """
+        try:
+            if not isinstance(payload, dict):
+                payload = {}
+            if not self._no_sleep_mode() or not self.is_frozen():
+                return
+            now = datetime.now()
+            self._log_decision(
+                "emotion.sleep_overhaul", trigger_type="schedule_generated",
+                reason="no_sleep_mode：新日程进账（schedule.generated）触发醒沿结算链",
+                date=str(payload.get("date") or ""), items=payload.get("items"),
+            )
+            self.close_night_interrupt_segment("wake", now=now)   # no_sleep 下无段，天然空操作
+            await self.flush_all_episodes(reason="wake")
+            cached = await self.compute_sleep_overhaul(now)
+            if cached is None:
+                self._ctx.logger.warning(
+                    "no_sleep_mode 大修：schedule.generated 触发的裁判计算失败，"
+                    "保持冻结、不重试（下一份日程进账再试）")
+                return
+            period = self._sleep_period or (now, now)
+            cached["cycle_key"] = self._cycle_key(period[0])
+            self._pending_overhaul = cached                        # apply 内部取走（:2388 语义）
+            await self._apply_cached_overhaul(now)
+        except Exception:
+            try:
+                self._ctx.logger.debug("schedule.generated 触发大修异常（忽略，不打断发布方）",
+                                       exc_info=True)
+            except Exception:
+                pass
+
     # ── 生命周期 ────────────────────────────────────────────
     def start(self) -> None:
         if self._task is not None and not self._task.done():
             return
         self._stop_event = asyncio.Event()
+        self._schedule_generated_unsub = None
+        self._subscribe_schedule_generated()
         self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
+        self._unsubscribe_schedule_generated()
         if self._stop_event is not None:
             self._stop_event.set()
         if self._task is not None:

@@ -385,6 +385,35 @@ class AdminSectionConfig(PluginConfigBase):
             **_ui_i18n("Log retention (days)"),
         },
     )
+    # ── 告状工具（2026-10-24 用户直派）：bot 受骚扰时向维护者转达 ──
+    harass_report_enabled: bool = Field(
+        default=True,
+        description="告状工具：bot 受骚扰时可向维护者告状（false = 工具不注册）",
+        json_schema_extra={
+            "label": "告状工具",
+            "hint": "bot 被恶意刷屏/辱骂/攻击时把情况转达给维护者；关闭后不注册该 Tool",
+            **_ui_i18n("Harass report"),
+        },
+    )
+    harass_report_target_qq: str = Field(
+        default="",
+        description="告状对象 QQ；留空 = 回退 admin_users 第一个纯 QQ 元素（两者皆空则工具提示未配置维护者）",
+        json_schema_extra={
+            "label": "告状对象 QQ",
+            "hint": "维护者（能处理骚扰问题的人）的 QQ 号",
+            **_ui_i18n("Harass report target"),
+        },
+    )
+    harass_report_cooldown_minutes: int = Field(
+        default=30,
+        ge=0,
+        description="告状冷却分钟数（0 = 不冷却）",
+        json_schema_extra={
+            "label": "告状冷却（分钟）",
+            "hint": "两次告状之间的最小间隔，防止刷屏维护者",
+            **_ui_i18n("Harass cooldown (min)"),
+        },
+    )
 
 
 class CateyeSuiteConfig(PluginConfigBase):

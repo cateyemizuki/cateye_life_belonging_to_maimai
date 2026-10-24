@@ -70,6 +70,7 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 - 问候闸门按三流分离（判定窗都是「上份日程开始 → 本份日程开始」这类周期窗，不看日历 0 点）：
   目标私聊**无条件**（只看陪伴模块开关，不再要求当日有消息）；群聊早安过**硬闸**（判定窗内 ≥1 条非 bot 消息，必要性开关开启的话再叠加「今天日程第一个条目时段内有人主动开口」）；其他私聊早安 = 判定窗内对方发送条数达门槛（默认 5），晚安 = 早安已发**连锁**或对方发送达晚安阈值（默认 5）二选一。
 - 群聊早安本轮没开口，当晚群晚安**连锁硬性失效**；过了掷点才达标的补发还有**冷静期**——bot 本会话最近一条消息距今 ≥ `greeting_min_silence_minutes` 分钟才开口，一直不满足则到期仍弃。
+- **早安沉默闸**（`greeting_morning_silence_hours`，默认 2 小时，0 = 关闭）：今日第一日程（周期起点）前 N 小时内 bot 自己在该会话发过消息 → 该会话本周期跳过早安（三流统一生效，含目标私聊；不掷点、不建条目）。
 - 陪伴巡检与想念只发生在目标私聊，受每日预算、最小间隔、用户冷却与静默时段约束。
 - 静默时段恒等于日程作息（入睡到起床），不需要单独配置。
 - 可选：屏幕感知旁白、周结大事记、午休静默。
@@ -101,7 +102,7 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 
 ### bot 自用工具
 
-以下工具由麦麦在对话中自行调用，无需手动输入：`lbm_get_schedule_info`、`lbm_update_schedule_v4`、`lbm_nap_lie_in`、`lbm_mai_lover_send_message`、`lbm_mai_lover_affection`、`lbm_life_qzone`、`lbm_emotion_report`。
+以下工具由麦麦在对话中自行调用，无需手动输入：`lbm_get_schedule_info`、`lbm_update_schedule_v4`、`lbm_nap_lie_in`、`lbm_mai_lover_send_message`、`lbm_mai_lover_affection`、`lbm_report_harassment`、`lbm_life_qzone`、`lbm_emotion_report`。
 
 ## 配置速查
 
@@ -116,6 +117,7 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 | `[patrol] nap_quiet_enabled` | `false` | 午休静默：巡检与空间发帖、评论监听跳过午休时段 |
 | `[planning_proactive] greeting_morning_enabled` / `greeting_night_enabled` | `true` / `true` | 早安、晚安总开关 |
 | `[planning_proactive] morning_drift` / `night_drift` | `10-30` | 问候漂移区间（分钟）：早安 = 本轮起床钟点 + 漂移；晚安 = 本轮入睡期限 − 漂移 |
+| `[planning_proactive] greeting_morning_silence_hours` | `2.0` | 早安沉默闸（小时）：今日第一日程（周期起点）前 N 小时内 bot 自己在该会话发过消息 → 该会话本周期跳过早安；0 = 关闭 |
 | `[planning_proactive] greeting_require_activation` | `true` | 群聊早安必要性检查：今天日程第一个条目时段内有人主动开口（硬闸之上仍然 AND）；关闭 = 只看硬闸 |
 | `[planning_proactive] proactive_group_ids` / `proactive_private_ids` | `[]` / `[]` | 群聊、私聊名单 |
 | `[planning_proactive] greeting_other_private_min_messages` | `5` | 其他私聊早安门槛：判定窗（上份日程开始 → 本份日程开始）内对方发送的条数达到该值；最低 1 |

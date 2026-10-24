@@ -41,6 +41,7 @@ from maibot_sdk import MaiBotPlugin
 from companion.affection import AffectionManager
 from companion.components import CompanionComponentsMixin
 from companion.config import target_qq_of
+from companion.harass_report import HARASS_TOOL_NAME
 from companion.services import CompanionServices
 from suite_config import (
     CURRENT_LAYOUT_VERSION,
@@ -195,6 +196,36 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
     config_model: ClassVar[type] = CateyeSuiteConfig
     # 订阅宿主 bot 配置热重载（人设/昵称变化自动同步）
     config_reload_subscriptions: ClassVar[Iterable[str]] = ("bot",)
+
+    # ------------------------------------------------------------------
+    # 组件注册面（2026-10-24 用户直派，需求3：告状工具「关闭不注册」）
+    # ------------------------------------------------------------------
+    def get_components(self):
+        """``[admin].harass_report_enabled=false`` 时不注册 ``lbm_report_harassment``。
+
+        super().get_components() 收集全部装饰组件后按名剔除（dict / 对象列表两种
+        收集形态都兼容，与宿主收集语义一致；离线 sdk_stub.get_components 返回
+        ``{attr: info}`` 同走 dict 分支）。配置不可读（如冒烟在 on_load 前收集）
+        → 按默认值 True 处理、不误删组件。返回形态与 super() 一致（dict 进 dict 出）。
+        """
+        components = super().get_components()
+        try:
+            enabled = bool(self.config.admin.harass_report_enabled)
+        except Exception:
+            enabled = True
+        if enabled:
+            return components
+        if isinstance(components, dict):
+            return {attr: info for attr, info in components.items()
+                    if str((info or {}).get("name") or "") != HARASS_TOOL_NAME}
+        if isinstance(components, (list, tuple)):
+            kept = []
+            for comp in components:
+                name = comp.get("name") if isinstance(comp, dict) else getattr(comp, "name", None)
+                if str(name or "") != HARASS_TOOL_NAME:
+                    kept.append(comp)
+            return type(components)(kept) if isinstance(components, tuple) else kept
+        return components
 
     # ------------------------------------------------------------------
     # 配置归一化（含「磁盘旧文件抢救」——版本升级迁移保障，T1 自 1.1.0 起建立）

@@ -1317,6 +1317,22 @@ class ProactiveService:
         """
         _prev, cur_start, _cur_end = self._cycle_pivots(cycle)
         if kind == GREETING_MORNING:
+            # 早安沉默闸（R7 = 用户 2026-10-24 直派）：第一个检查、三流分派之前——
+            # bot 在今日第一日程（= 周期起点）前 N 小时内发过消息 → 该流本周期跳过早安
+            # （durable = 不掷点不建条目，对齐群聊硬闸语义；查询异常 fail-closed）
+            silenced = await self._morning_silence_gate(stream_id, now_ts, cycle, cfg_p)
+            if silenced is None:
+                self._log_gate_skip(stream_id, kind, cycle,
+                                    "早安沉默闸查询失败（morning_silence，fail-closed，宁不发）")
+                return "skip", True
+            if not silenced:
+                hours = self._morning_silence_hours(cfg_p)
+                self._log_gate_skip(
+                    stream_id, kind, cycle,
+                    f"早安沉默闸未过（morning_silence：第一日程前 {hours:g} 小时内 bot 发过消息，"
+                    f"窗={self._fmt_span(cur_start - hours * 3600.0)} → {self._fmt_span(cur_start)}，"
+                    f"该流跳过早安）")
+                return "skip", True
             if category == GREETING_CATEGORY_GROUP:
                 hard = await self._group_morning_hard_gate(stream_id, _prev, cur_start)
                 if hard is None:
@@ -1387,6 +1403,46 @@ class ProactiveService:
             return max(0, int(getattr(advanced, "greeting_min_silence_minutes", 3) or 0))
         except (TypeError, ValueError):
             return 3
+
+    def _morning_silence_hours(self, cfg_p: Any) -> float:
+        """早安沉默闸小时数（``[planning_proactive].greeting_morning_silence_hours``，
+        R7 = 用户 2026-10-24 直派；ge=0 配置，运行期非法值回退缺省 2.0，0 = 禁用闸门）。"""
+        try:
+            raw = getattr(cfg_p, "greeting_morning_silence_hours", 2.0)
+            value = float(2.0 if raw is None else raw)
+        except (TypeError, ValueError):
+            return 2.0
+        return max(0.0, value)
+
+    async def _morning_silence_gate(self, stream_id: str, now_ts: float, cycle: CycleState,
+                                    cfg_p: Any) -> Optional[bool]:
+        """早安沉默闸（R7 = 用户 2026-10-24 直派）：bot 至少在今日第一日程（= 周期起点
+        ``cur_start``）前沉默 N 小时，否则该流跳过早安。
+
+        判定：``N > 0`` 且 ``now >= cur_start`` 时，查窗 ``[cur_start − N×3600, cur_start]``
+        内该流 bot 自身消息（``keep_bot=True`` 不带 filter_mai，逐条按 ``is_mai`` 过滤，
+        写法对齐 :meth:`_calm_gate`）——存在 ≥1 条 → 不过。三流统一受此闸（含目标私聊）。
+        返回 ``None`` = 查询异常（调用方 fail-closed 宁不发）；``N ≤ 0`` 或周期起点不可得
+        或 ``now < cur_start``（尚未进入本周期）→ 恒通过。
+        """
+        hours = self._morning_silence_hours(cfg_p)
+        if hours <= 0:
+            return True
+        _prev, cur_start, _cur_end = self._cycle_pivots(cycle)
+        if cur_start <= 0 or float(now_ts) < cur_start:
+            return True
+        msgs = await self._messages_in_window(
+            stream_id, cur_start - hours * 3600.0, cur_start,
+            limit=20, slash_filter=False, keep_bot=True)
+        if msgs is None:
+            return None
+        for msg in msgs:
+            if isinstance(msg, dict):
+                if msg.get("is_mai"):
+                    return False
+            elif getattr(msg, "is_mai", None):
+                return False
+        return True
 
     async def _advance_greeting(self, entry: Dict[str, Any], now_ts: float,
                                 date_str: str, cfg_p: Any,
@@ -1976,6 +2032,10 @@ class ProactiveService:
         gate_query_ok = True
         cached_gate: Optional[bool] = None
         threshold_met = True
+        # 早安沉默闸（R7 = 用户 2026-10-24 直派）：N>0 时早安全族需要消息查询能力
+        silence_hours = self._morning_silence_hours(cfg_p)
+        silence_gate: Optional[bool] = None
+        silence_gate_evaluated = False   # 仅在结论链 else 分支实查后为真（早退档不显示明细）
         if category == GREETING_CATEGORY_OTHER and self._message_query_available():
             need = self._threshold_need(cfg_p, kind)
             count, gate_query_ok = await self._count_threshold_live(
@@ -2009,7 +2069,8 @@ class ProactiveService:
                           f"原因={reason}）")
         elif not self._message_query_available() and (
                 (category == GREETING_CATEGORY_GROUP and kind == GREETING_MORNING)
-                or category == GREETING_CATEGORY_OTHER):
+                or category == GREETING_CATEGORY_OTHER
+                or (kind == GREETING_MORNING and silence_hours > 0)):
             # 取不到必需数据（闸窗/需门槛计数的族）：不猜，不落任何状态（宁不发）
             conclusion = "取不到（缺消息查询能力，宁不发）"
         else:
@@ -2035,7 +2096,18 @@ class ProactiveService:
                                                 fire_hi=fire_hi or 0.0,
                                                 observe_until=observe_until or 0.0)
 
-            if category == GREETING_CATEGORY_GROUP:
+            # 早安沉默闸（R7 = 用户 2026-10-24 直派）：只读实查一次；未过 → 新结论档并
+            # 短路其余档位（闸在 _pre_gate 是 durable 拒绝，不会有条目/掷点可报）
+            silence_gate = None
+            if kind == GREETING_MORNING and silence_hours > 0 and self._message_query_available():
+                silence_gate = await self._morning_silence_gate(stream_id, now_ts, cycle, cfg_p)
+                silence_gate_evaluated = True
+
+            if silence_gate is None and kind == GREETING_MORNING and silence_hours > 0:
+                conclusion = "取不到（沉默闸查询失败，宁不发）"
+            elif silence_gate is False:
+                conclusion = f"沉默闸未过（第一日程前 {silence_hours:g} 小时内 bot 发过消息）"
+            elif category == GREETING_CATEGORY_GROUP:
                 if kind == GREETING_MORNING:
                     hard = await self._group_morning_hard_gate(stream_id, win_start, cur_start)
                     if hard is None:
@@ -2118,6 +2190,18 @@ class ProactiveService:
                     remain = max(0.0, silence - quiet)
                     detail_parts.append(
                         f"补发冷静期=差 {remain:.0f} 分钟（沉默 {quiet:.0f}/{silence} 分钟）")
+            # 早安沉默闸明细（R7 = 用户 2026-10-24 直派；与 _pre_gate 同源取数，N≤0 = 关闭；
+            # 只在结论链实查过才显示——「今日已发/已放弃」等早退档不带此行）
+            if kind == GREETING_MORNING and silence_hours > 0 and silence_gate_evaluated:
+                if silence_gate is None:
+                    gate_text = "取不到（宁不发）"
+                elif silence_gate:
+                    gate_text = "通过"
+                else:
+                    gate_text = "未过"
+                detail_parts.append(
+                    f"沉默闸={gate_text}（窗={self._fmt_span(cur_start - silence_hours * 3600.0)}"
+                    f" → {self._fmt_span(cur_start)}，N={silence_hours:g}h）")
             detail_parts.append("标记=" + ("是" if marked else "否"))
 
         return {

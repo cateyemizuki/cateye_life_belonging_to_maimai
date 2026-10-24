@@ -282,6 +282,32 @@
 - **文字版**：情绪节末尾追加「近期变化」段（既有行零删，§9.3 铁律），每条一行「`近期变化 HH:MM desc（V+0.08|A-0.05|D+0.12）`」，|变动| < 0.005 的维度不列（与随图日志三维变动标注口径一致），三维全低 →「（微小波动）」；空列表显示「（无记录）」。
 - **图片版**：右栏 03 情绪节追加「近期变化」行组（每条一行、上限 3；desc 段在测量遍经 `render_kit.fit_text` 按像素截断、ΔVAD 段恒可见；空列表「（无记录）」）；测量/绘制两遍同一 `_Painter` 指令流接入；4096 钳制与按节分页契约不动。
 
+### 变更：告状工具 `lbm_report_harassment` + 日程提示词 continue 键弱化（2026-10-24，用户直派；版本不变）
+
+用户直派两项（需求3/需求4）：**① 告状工具**——bot 受骚扰时向维护者转达（小工具模块、可关闭、关闭则不注册）；**② 日程注入的「对话延续」引导词弱化**——去掉「可自然带过当前活动」的弱鼓励色彩。除告状 3 个新配置键外无其他配置项变化；**零新增 manifest 能力、零新增 LLM 调用点**（告状为纯转发，不调模型）；插件版本与 `[plugin] config_version` 维持 2.1.0 不递增。
+
+- **告状工具（新增 Tool `lbm_report_harassment`）**：bot 被恶意刷屏/辱骂/攻击/被故意戏弄到不适时，把一句话情况说明转达给维护者私聊；description 引导明确「普通玩笑与日常聊天不要调用」。发送文案为**运维消息**形态 `【告状】{（发生地：…）}{description 原文}`——**不追加情绪后缀**（不是角色消息）；kwargs 里带 `stream_id` 时作为发生地附在文案与日志。纯逻辑（维护者解析优先级/冷却判定/文案构造/决策日志字段）独立在 `companion/harass_report.py`（不触碰宿主 ctx，可独立 import 测试）；ctx 操作（stream 解析/发送/日志）在 `companion/components.py` 组件层，维护者 stream 解析形态照 `plugin._resolve_target_stream`（`get_stream_by_user_id` 首选 → `get_private_streams` 遍历回退）。
+- **维护者解析优先级**：`[admin].harass_report_target_qq` 非空优先（占位号 123456789 视为未配置）；留空回退 `admin_users` 第一个纯 QQ 元素（`qq:123456` 形式也算）；两者皆空 → 工具返回「未配置维护者」提示、不发送。
+- **冷却与缓存**：`[admin].harass_report_cooldown_minutes`（默认 30，0 = 不冷却）——冷却内再次调用返回剩余分钟提示并跳过发送；冷却时间戳与维护者解析结果**进程内缓存**（热重载/重启清零，可接受）。
+- **关闭不注册**：`plugin.py` 新增 `get_components()` override（最小化，此前无该 override）——`[admin].harass_report_enabled=false` 时从 `super().get_components()` 结果中按名剔除 `lbm_report_harassment`（dict / 对象列表两种收集形态兼容；配置不可读时按默认值处理、不误删）。Tool 入口另有双保险：组件驻留窗口期调用返回「告状工具未启用」。
+- **可观测性**：每次调用写决策日志 `trigger_type=admin.harass_report`，成功（`reported`）/失败（`send_failed`/`stream_resolve_failed`/`no_maintainer`）/冷却跳过（`cooldown_skip`）三形态齐全。
+- **日程提示词 continue 键弱化**：`[prompts].inject_hint_continue` 出厂文案（`suite_prompts.INJECT_HINT_CONTINUE_DEFAULT`）由「提示：对话延续中（{reason}），可自然带过当前活动。」改为「提示：对话延续中（{reason}）。当前活动只是背景信息：用户不问就不要说；只有当话题确实接不上、需要找新话题时，才可以用一句当前活动自然开启新话题。」（`{reason}` 占位符保留；`inject_service` 消费面零改动，键 8 `INJECT_HINT_PROACTIVE_DEFAULT` 与其余键不动）。
+- **配置面（`[admin]` 5→8 键）**：新增 `harass_report_enabled`（bool，默认 `true`）/ `harass_report_target_qq`（str，默认 `""`）/ `harass_report_cooldown_minutes`（int，默认 30，ge=0）三键；本批全插件 **+3 字段**（均可见、均落 `[admin]` 段）。
+- **组件面（29→30）**：Tool +1（`lbm_report_harassment`）；`harass_report_enabled=false` 时运行期注册面回落 29。
+- **门禁提示**：本批与同日并行批次（问候链静默窗等）先后落码，scratch 冒烟脚本（本轮不改）的组件计数断言（29 组件 / tool 7）、配置面断言与 `[planning_proactive]` 键集清单需在下一轮门禁**按当日全部批次的合计实算**统一更新（仅本批的增量 = 组件 30 / tool 8、[admin] 8 键）。
+
+### 变更：早安沉默闸 + 无睡眠模式大修改新日程进账触发（2026-10-24，用户直派；版本不变）
+
+用户直派两项（R7 = 用户 2026-10-24 直派）：**① 早安沉默闸**——bot 至少在今日第一日程（= 周期起点）前沉默 N 小时，否则该会话流跳过早安；**② 无睡眠模式大修改触发时序改造**——`[schedule].no_sleep_mode=true` 时夜内不再打睡眠裁判（不重试、不做 resleep/夜扰扫描），睡眠情绪大修改由**新日程进账**（`schedule.generated` 事件）触发醒沿结算链一次性完成。配置面 `[planning_proactive]` +1 键；**零新增 LLM 调用点**（大修仍走既有睡眠裁判 `ask_sleep_referee`，仅新增触发时机）；插件版本与 `[plugin] config_version` 维持 2.1.0 不递增。
+
+- **早安沉默闸（新配置键）**：`[planning_proactive] greeting_morning_silence_hours`（float，默认 `2.0`，`ge=0`；`0` = 禁用闸门）。闸门在 `_pre_gate` 早安分支入口、**三流分派之前**作为第一个检查：`N>0` 且 `now >= cur_start` 时，查窗 `[cur_start − N×3600, cur_start]` 内该流 bot 自身消息（`_messages_in_window(…, limit=20, keep_bot=True)` 后逐条按 `is_mai` 过滤，写法对齐补发冷静期 `_calm_gate`）——存在 ≥1 条 → `_log_gate_skip`（reason 含 `morning_silence` 与窗口）+ durable skip（**不掷点、不建条目**，对齐群聊硬闸语义）；查询异常 fail-closed（同硬闸形态）。**三流统一受此闸（含目标私聊）**；`now < cur_start`（尚未进入本周期）或周期起点不可得时恒通过。
+- **早安沉默闸（diag 同步）**：`/lbm_diag streams <序号>` 早安结论新增一档「**沉默闸未过（第一日程前 N 小时内 bot 发过消息）**」（`_greeting_kind_status` 只读实查一次、未过即短路其余档位；明细行加「沉默闸=通过/未过/取不到（窗=HH:MM → HH:MM，N=Xh）」）；消息查询能力缺失且 N>0 时早安族归入既有「取不到（缺消息查询能力，宁不发）」档（与闸门 fail-closed 行为一致）。
+- **无睡眠模式·夜内跳过裁判**：`_check_and_overhaul` 睡眠入口段（夜窗兜底 = 作息锚点整夜窗，即「日程睡眠时间」同源）在 `_no_sleep_mode()` 为真时**只 freeze + flush**——跳过 `compute_sleep_overhaul`（不打裁判、不建缓存），决策日志留痕 `emotion.sleep_overhaul`（`trigger_type=schedule_generated_deferred`，reason 含 `no_sleep_defer`）；frozen 分支在 no_sleep_mode 为真时同样**跳过裁判重试与 resleep/夜扰扫描**（`_roll_night_segment` / `_after_night_segment_closed` 加 no_sleep 门；吵醒记账仍被既有 `note_night_reply` / nap 提醒的 no_sleep 门控挡住，未改动）。
+- **无睡眠模式·新日程进账触发大修**：emotion 侧新增订阅事件总线 `schedule.generated`（生成侧发布点 `schedule_generator` 不变、无总线静默；订阅挂 `EmotionService.start()`、`stop()` 注销，owner=`emotion_no_sleep_overhaul`，幂等）。回调：`no_sleep_mode && is_frozen()` 时立即执行**醒沿结算链**——`close_night_interrupt_segment('wake')`（no_sleep 下无段、天然空操作）→ `flush_all_episodes('wake')` → `compute_sleep_overhaul(now)`（失败仅告警**不重试**，下一份日程进账再试）→ 置缓存（带 cycle_key）→ `_apply_cached_overhaul`（复用既有应用语义：unfreeze + apply_sleep_overhaul + `applied_sleep_date` 落盘护栏，缓存由 apply 内部取走）；决策日志留痕 `emotion.sleep_overhaul`（`trigger_type=schedule_generated`）。回调 try 全包、异常绝不外抛（总线单订阅者隔离之外再加兜底）。
+- **兼容**：`no_sleep_mode=false` 时全链行为零变化（订阅回调第一判直接 return；`_check_and_overhaul` 两处 no_sleep 门均短路放行旧路径）。
+- **配置面（`[planning_proactive]` 14→15 键）**：本批全插件 **+1 字段**（可见、落 `[planning_proactive]` 段）；组件面不变。
+- **门禁提示**：同日并行批次已登记的 scratch 冒烟组件/配置面断言漂移（29 组件 / tool 7 基线 vs 实际）在本批继续累积 +1 配置字段（`greeting_morning_silence_hours`），统一更新仍按当日全部批次合计在下一轮门禁执行。
+
 ## [1.1.0] - 2026-10-10
 
 配置大整理版：把配置从 13 段重排为 **11 段**，集中了提示词与模型调用，修好既有缺陷，并重做了早/晚安链。**旧配置在首次启动时自动迁移，无需手改**（幂等，可反复重启）；升级时插件会先读回磁盘上的旧配置再搬运，**跨段/改名键的用户值不会丢**。插件版本与配置版本均为 **1.1.0**（同步）。本版同时收口了第三轮真机问题（日程跨午夜写库/空档重罚、无活动兜底、静默留空跟随作息、注入链 session_id 写回、用户可见文案去 emoji）。
