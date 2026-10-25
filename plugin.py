@@ -288,8 +288,11 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._llm = LLMService(self.ctx, task_name=llm_task_name_of(cfg),
                                call_logger=self._llm_logger, config_provider=lambda: self.config)
         # 缓存窗口在 [schedule_advanced]（2026-10-10 段拆分）
+        # config_provider：PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.5 项——
+        # runtime 空闲回退睡眠条目的特判需读 [schedule] 作息锚点；动态读配置，热重载即时生效
         self._schedule_query = ScheduleQuery(
-            self._db, cache_minutes=cfg.schedule_advanced.inject_cache_minutes)
+            self._db, cache_minutes=cfg.schedule_advanced.inject_cache_minutes,
+            config_provider=lambda: self.config)
 
         # 进程内事件总线（M0，MAINTENANCE_PLAN §三）：先于服务束构造（各服务束自读 plugin._bus），
         # 预算计数器在装配时装入（先于服务束启动；M0 实际订阅者仅它）
@@ -444,6 +447,24 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             section = getattr(self.config, "life_state", None)
             if section is None or not bool(getattr(section, "enabled", False)):
                 return False
+            # 活动画像表装载（PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.6 项）：
+            # load_and_apply 此前无任何装配点调用（_ACTIVE 恒 None，RollingPlanner/LifeState
+            # 实际全用内置默认表）。挂在 [life_state].enabled 判定之后——两开关全关时零装配
+            # 动作、零决策日志副作用；热重载 = 宿主重导入重跑 on_load → 自动重读（与
+            # activity_properties 同款语义）；失败只告警不拖挂装配。
+            try:
+                from planning.activity_profiles import load_and_apply as _load_activity_profiles
+                _profiles_result = _load_activity_profiles(
+                    root_dir=getattr(self, "_plugin_root", None),
+                    decision_logger=getattr(self, "_decision_logger", None))
+                if getattr(_profiles_result, "rejected", None):
+                    self.ctx.logger.warning("活动画像表有 %d 个条目被排除（其余生效）",
+                                            len(_profiles_result.rejected))
+            except Exception as exc:
+                try:
+                    self.ctx.logger.warning("活动画像表装载异常（按内置默认处理）：%s", exc)
+                except Exception:
+                    pass
             state_file = str(getattr(section, "state_file", "") or "").strip() or "life_state.json"
             timezone_str = str(getattr(self.config.schedule_advanced, "timezone", "")
                                or "Asia/Shanghai")

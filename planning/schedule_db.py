@@ -978,6 +978,56 @@ class ScheduleDB:
             state_after=state_after, extra_metadata=metadata,
         )
 
+    def update_active_progress(self, episode_id: str, *, cur_minute: Optional[int] = None,
+                               attention_mode: Optional[str] = None) -> Optional[float]:
+        """运行中 episode 的进度/注意力档刷新（active → active，不改状态；PR1 P0 修复
+        （2026-10-26），计划书 §三十四/定稿 §2 0.1/0.2——progress 运行期随已用时长增长）。
+
+        - ``cur_minute`` 传入 → progress 按默认口径（已用/计划、上限 0.95，复用
+          :meth:`_default_episode_progress`）重算；不可计算 → 保留原 progress（不虚构）；
+        - ``attention_mode`` 传入 → 一并写回（运行期按新进度重算的注意力档）；
+        - 行不存在/非 active/两个参数都未传/写失败 → None（告警不抛）；
+          仅刷 attention_mode（``cur_minute`` 未传）时返回 None。
+        """
+        if cur_minute is None and attention_mode is None:
+            return None
+        now = datetime.now().isoformat()
+        new_progress: Optional[float] = None
+        try:
+            with self._lock, self._conn:
+                row = self._conn.execute(
+                    "SELECT planned_start_minute, planned_end_minute, actual_start_minute,"
+                    " progress FROM activity_episodes"
+                    " WHERE episode_id = ? AND status = 'active'", (episode_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if cur_minute is not None:
+                    computed = self._default_episode_progress(
+                        row["planned_start_minute"], row["planned_end_minute"],
+                        row["actual_start_minute"], int(cur_minute),
+                    )
+                    new_progress = (self._clamp_progress(row["progress"])
+                                    if computed is None else computed)
+                sets = ["updated_at = ?"]
+                params: List[Any] = [now]
+                if new_progress is not None:
+                    sets.append("progress = ?")
+                    params.append(new_progress)
+                if attention_mode is not None:
+                    sets.append("attention_mode = ?")
+                    params.append(str(attention_mode))
+                params.append(episode_id)
+                self._conn.execute(
+                    f"UPDATE activity_episodes SET {', '.join(sets)}"
+                    " WHERE episode_id = ? AND status = 'active'", params,
+                )
+            return new_progress
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            logger.warning("schedule_db: update_active_progress(%s) 失败（不抛）：%s",
+                           episode_id, e)
+            return None
+
     def resume(
         self,
         episode_id: str,

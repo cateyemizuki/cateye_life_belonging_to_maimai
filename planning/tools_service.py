@@ -178,6 +178,11 @@ class ToolsService:
             "knowledge_search_limit": adv.knowledge_search_limit,
             "cross_day_activity": adv.cross_day_activity,
             "no_sleep_mode": cfg.no_sleep_mode,
+            # PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.7 项：regenerate 链
+            # （/lbm_plan regenerate 与 update_schedule 的「今天」分支两个调用点自动受益）
+            # 跟随 [schedule].spine_mode——开启时生成 3-6 条日意图，不再恒 daily（与
+            # auto_scheduler 自动生成侧同口径）；generator 侧 **kwargs 透传，零改动。
+            "mode": "spine" if bool(getattr(cfg, "spine_mode", False)) else "daily",
             "timezone": adv.timezone,
             "llm_task_name": llm_task_name_of(self._plugin),
         }

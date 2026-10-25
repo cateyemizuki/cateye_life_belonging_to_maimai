@@ -478,6 +478,13 @@ class RollingPlanner:
         report["state"] = snapshot
         self._publish_state_changed(snapshot, now)
 
+        # PR1 P0 修复（2026-10-26），计划书 §三十四/定稿 §2 0.1/0.2：运行中 episode
+        # 每拍刷新 progress（已用/计划、上限 0.95）并按新进度重算 attention_mode
+        # 写回（低可中断 now→brief→later 随进度分档，A.3；derive_attention_mode
+        # 本体不改，只补运行期重算与写回）
+        if current is not None:
+            self._refresh_active_episode(current, cur)
+
         # 步 2：关闭到期 episode
         if current is not None:
             try:
@@ -509,7 +516,56 @@ class RollingPlanner:
                                         just_transition=report["actions"] != [])
         report["active_episode_id"] = (self._safe_active_episode() or {}).get("episode_id")
 
-    # ── 步 2/4：episode 关闭与提前收尾 ───────────────────────────────────
+    # ── 步 1.5/2/4：运行中刷新与 episode 关闭 ────────────────────────────
+    def _refresh_active_episode(self, episode: Dict[str, Any], cur: int) -> None:
+        """运行中 episode 的 progress / attention_mode 运行期刷新（只动 active 行；失败静默）。
+
+        PR1 P0 修复（2026-10-26），计划书 §三十四/定稿 §2 0.1/0.2：进度 = 已用/计划
+        （上限 0.95，ScheduleDB.update_active_progress 默认口径）；attention 按
+        derive_attention_mode（``[life_state].brief/late_attention_progress`` 配置）
+        随新进度重算，档位变化才二次写回（大多数拍次只写 progress 一行）。
+        """
+        eid = str(episode.get("episode_id") or "")
+        if not eid:
+            return
+        progress = self._db.update_active_progress(eid, cur_minute=cur)
+        if progress is None:
+            return
+        episode["progress"] = progress
+        attention = derive_attention_mode(
+            episode.get("interruptibility"), progress,
+            source=str(episode.get("source") or ""),
+            late_progress=self._cfg_float("late_attention_progress",
+                                          DEFAULT_LATE_ATTENTION_PROGRESS),
+            brief_progress=self._cfg_float("brief_attention_progress",
+                                           DEFAULT_BRIEF_ATTENTION_PROGRESS))
+        if attention == episode.get("attention_mode"):
+            return
+        self._db.update_active_progress(eid, attention_mode=attention)
+        episode["attention_mode"] = attention
+
+    @staticmethod
+    def _random_event_deltas(metadata: Any) -> Optional[Dict[str, float]]:
+        """episode 行 metadata → 随机事件 state_deltas（PR1 P0 修复（2026-10-26），
+        计划书 §三十四/定稿 §2 0.4）。
+
+        按 ``metadata.event_key`` 回查 RANDOM_EVENT_POOL（二期后由 EventCatalog.pick
+        供池）取增量；返回 None = 非随机事件行 / 已应用过（``state_deltas_applied``
+        持久标记，一次性保证）/ 池内无此 key——三种情况都不应用、不标记。
+        close-active（被 start/resume 挤掉 → interrupted）路径本轮不应用也不标记，
+        未来接线时按标记判定不会双应用。
+        """
+        if not isinstance(metadata, dict) or metadata.get("state_deltas_applied"):
+            return None
+        event_key = str(metadata.get("event_key") or "")
+        if not event_key:
+            return None
+        for event in RANDOM_EVENT_POOL:
+            if event["key"] == event_key:
+                deltas = event.get("state_deltas")
+                return dict(deltas) if isinstance(deltas, dict) else None
+        return None
+
     def _finish_episode(self, episode: Dict[str, Any], now: datetime,
                         snapshot: Any, *, actual_end_minute: Optional[int] = None,
                         reason: str = "") -> None:
@@ -517,13 +573,24 @@ class RollingPlanner:
         end = actual_end_minute
         if end is None:
             end = episode.get("actual_end_minute") or episode.get("planned_end_minute")
-        if not self._db.finish(eid, actual_end_minute=end,
-                               metadata={"close_reason": reason} if reason else None):
+        # PR1 P0 修复（2026-10-26），计划书 §三十四/定稿 §2 0.4：随机事件行按
+        # metadata.event_key 取 state_deltas，随关闭一并交 LifeState.apply_episode
+        # （事件结束后五项 ± 增量）；应用过即写 metadata.state_deltas_applied 持久
+        # 标记，重复关闭路径不会二次应用
+        deltas = self._random_event_deltas(episode.get("metadata"))
+        extra_meta: Optional[Dict[str, Any]] = {"close_reason": reason} if reason else None
+        if deltas is not None:
+            extra_meta = dict(extra_meta or {})
+            extra_meta["state_deltas_applied"] = True
+        if not self._db.finish(eid, actual_end_minute=end, metadata=extra_meta):
             return
         # 吃饭/休息完成 → 盖 last_meal_at / last_break_at（时长内变化由 tick 速率记账，不重复）
         try:
-            self._life.apply_episode({"goal_type": episode.get("goal_type"),
-                                      "status": "completed"}, now=now)
+            payload: Dict[str, Any] = {"goal_type": episode.get("goal_type"),
+                                       "status": "completed"}
+            if deltas:
+                payload["state_deltas"] = deltas
+            self._life.apply_episode(payload, now=now)
         except Exception:
             pass
         self._publish(EVENT_EPISODE_COMPLETED, episode_id=eid,
@@ -534,10 +601,15 @@ class RollingPlanner:
         self._log("rolling.episode_finished", episode_id=eid, reason=reason,
                   name=str(episode.get("name") or ""))
 
-    def _pause_episode(self, episode: Dict[str, Any], now: datetime, snapshot: Any,
+    def _pause_episode(self, episode: Dict[str, Any], now: datetime,
                        *, reason: str) -> Optional[str]:
         eid = str(episode.get("episode_id") or "")
-        if not self._db.pause(eid, metadata={"pause_reason": reason}):
+        # PR1 P0 修复（2026-10-26），计划书 §三十四/定稿 §2 0.3：硬约定抢占落真实
+        # 实际结束分钟（= 抢占时刻），progress 走默认口径（已用/计划、上限 0.95）——
+        # 恢复池按 progress×priority 排序与 <0.2 放弃门槛（§5.5/B.6.3）才能真实命中；
+        # ScheduleDB.pause「不传不虚构」的既有语义不变；原未用的 snapshot 形参顺带清理
+        if not self._db.pause(eid, actual_end_minute=minutes_of_now(now),
+                              metadata={"pause_reason": reason}):
             return None
         self._publish(EVENT_EPISODE_INTERRUPTED, episode_id=eid,
                       name=episode.get("name"), goal_type=episode.get("goal_type"),
@@ -590,7 +662,7 @@ class RollingPlanner:
             if cur >= ws and cur < we and item_key not in recorded:
                 # 到点：抢占当前 episode（可抢占——硬约定优先级最高）
                 if current is not None:
-                    self._pause_episode(current, now, snapshot, reason="hard_commitment_preempt")
+                    self._pause_episode(current, now, reason="hard_commitment_preempt")
                 self._start_commitment(c, date, cur, now, snapshot, report)
                 recorded.add(item_key)
             elif ws - HARD_COMMITMENT_WARN_MINUTES <= cur < ws and current is not None:
@@ -1049,14 +1121,22 @@ class RollingPlanner:
             metadata["note"] = cand["note"]
         eid: Optional[str] = None
         if cand["kind"] == "resume" and cand.get("resume_of"):
-            eid = self._db.resume(str(cand["resume_of"]),
-                                  planned_start_minute=cur,
-                                  planned_end_minute=cur + duration,
-                                  actual_start_minute=cur, attention_mode=attention,
-                                  state_before=self._state_brief(snapshot),
-                                  metadata=metadata)
+            # PR1 P0 修复（2026-10-26），计划书 §三十四/定稿 §2 0.4：恢复行透传原
+            # 随机事件 event_key——被抢占的随机事件恢复后再关闭时仍能按 key 取
+            # state_deltas（一次性应用由 metadata.state_deltas_applied 标记保证）
+            origin = self._db.get_episode(str(cand["resume_of"])) or {}
+            origin_meta = (origin.get("metadata")
+                           if isinstance(origin.get("metadata"), dict) else {})
+            if origin_meta.get("event_key"):
+                metadata["event_key"] = str(origin_meta["event_key"])
+            eid = self._db.resume(
+                str(cand["resume_of"]),
+                planned_start_minute=cur,
+                planned_end_minute=cur + duration,
+                actual_start_minute=cur, attention_mode=attention,
+                state_before=self._state_brief(snapshot),
+                metadata=metadata)
             if eid:
-                origin = self._db.get_episode(str(cand["resume_of"])) or {}
                 self._publish(EVENT_EPISODE_RESUMED, episode_id=eid,
                               resume_of=cand["resume_of"], name=origin.get("name"),
                               goal_type=origin.get("goal_type"))

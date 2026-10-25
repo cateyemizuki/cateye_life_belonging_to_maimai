@@ -6,8 +6,15 @@ runtime provider 注入（主设计 §9.1 读取侧改造 / P2 灰度）——�
 :meth:`ScheduleQuery.set_runtime_provider` 注入
 :class:`~planning.life_schedule.LifeScheduleReadModel`（默认 None = 旧行为）；
 ``find_current_activity`` / ``find_next_activities`` 在 provider 存在且
-``[life_state].enabled`` 时**优先读 episode**，provider 异常 / 关闭 / 取不到（None）
-一律回退旧时间窗路径（旧代码逐字保留，只加前置分支）。
+``[life_state].enabled`` 时**优先读 episode**。
+
+PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.5 项：
+``find_current_activity`` 在 provider 就绪且空闲（current=None）时**如实返回 None，
+不回退旧时间窗**（与开发文档 DEV_GUIDE §7.9 契约对齐：「runtime 空闲即如实返回
+None，不回退时间窗」，防旧时间窗「编造正在做」）。唯一例外：``include_sleep=True``
+且当前钟点在 ``[schedule]`` 睡眠环内 → 走旧时间窗匹配，仅当命中条目为睡眠类型
+（goal_type=="sleep"）才回退返回并告警（同一睡眠窗只告警一次，保护情绪睡眠链）。
+provider 异常 / 关闭仍回退旧时间窗路径（旧代码逐字保留，只加前置分支）。
 """
 
 from __future__ import annotations
@@ -19,9 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from .schedule_db import ScheduleDB
 from .time_utils import (describe_energy, format_day_minute, get_energy_level,
                          is_in_day_frame, is_in_day_frame_marked,
-                         is_upcoming_day_minute, is_upcoming_day_minute_marked,
-                         ring_minutes_ahead)
-from core.time_utils import minutes_of_now
+                         is_in_sleep_ring, is_upcoming_day_minute,
+                         is_upcoming_day_minute_marked, ring_minutes_ahead)
+from core.time_utils import minutes_of_now, parse_hhmm
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +38,20 @@ _SKIP_TYPES = {"sleep"}
 
 class ScheduleQuery:
     def __init__(self, db: ScheduleDB, cache_minutes: int = 15,
-                 runtime_provider: Optional[Any] = None) -> None:
+                 runtime_provider: Optional[Any] = None,
+                 config_provider: Optional[Any] = None) -> None:
         self._db = db
         self._cache_minutes = max(1, int(cache_minutes))
         self._cache: Dict[str, Tuple[int, Any]] = {}  # key -> (窗口号, 结果)
-        #: runtime provider（LifeScheduleReadModel；None = 旧行为——R7 滚动化改造，
-        #: 只增不改：provider 异常/关闭/取不到一律回退旧时间窗路径）
+        #: runtime provider（LifeScheduleReadModel；None = 旧行为——R7 滚动化改造；
+        #: PR1 P0 修复（2026-10-26）：就绪且空闲不再回退时间窗，见模块 docstring）
         self._runtime_provider = runtime_provider
+        #: 配置读取回调（返回插件 config；runtime 空闲回退睡眠条目的特判读
+        #: ``[schedule]`` 作息锚点用——PR1 P0 修复（2026-10-26），定稿 §2 第 0.5 项；
+        #: None = 测试桩/旧行为，特判不生效）
+        self._config_provider = config_provider
+        #: 睡眠环回退告警的窗标识（同一睡眠窗只告警一次；跨窗自动重新允许）
+        self._sleep_warn_window: str = ""
 
     def set_runtime_provider(self, provider: Optional[Any]) -> None:
         """注入/更换 runtime provider（装配期调用；传 None 恢复旧行为）。"""
@@ -75,10 +89,14 @@ class ScheduleQuery:
         （跨午夜延续）的昨日条目在今天凌晨仍可命中。
 
         R7 runtime 前置分支（滚动化改造）：provider 就绪时优先读 episode 日志；
-        provider 异常 / ``[life_state]`` 关闭 / 取不到（None = 空闲）一律落回下方
-        旧时间窗路径（逐字保留）——include_sleep 语义由 provider 透传（emotion
-        睡眠大修 / qzone 睡眠发帖链不可断）。runtime 结果不进 15 分钟缓存
-        （episode 由 5 分钟 tick 推进，缓存会引入滞后矛盾）。
+        PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.5 项：就绪且空闲
+        （current=None）→ 如实返回 None，不回退旧时间窗（DEV_GUIDE §7.9 契约：空闲
+        不回退）；唯一例外：include_sleep=True 且当前钟点在 ``[schedule]`` 睡眠环内
+        → 走旧时间窗匹配，仅当命中条目为睡眠类型（goal_type=="sleep"）才回退返回并
+        告警（同一睡眠窗只告警一次）——emotion 睡眠大修 / qzone 睡眠发帖链不可断；
+        非睡眠命中与其余情形一律 None。provider 异常 / ``[life_state]`` 关闭仍落回
+        旧时间窗路径（逐字保留，behavior 209 a) 组三态回退断言钉住）。runtime 结果
+        不进 15 分钟缓存（episode 由 5 分钟 tick 推进，缓存会引入滞后矛盾）。
         """
         provider = self._runtime_provider
         if self._runtime_ready(provider):
@@ -86,9 +104,27 @@ class ScheduleQuery:
                 runtime_current = provider.current(now, include_sleep=include_sleep)
             except Exception as exc:
                 logger.warning("runtime provider 读取当前活动失败，回退时间窗路径：%s", exc)
-                runtime_current = None
+                # 异常 ≠ 空闲：异常仍回退旧时间窗路径（与关闭同待遇）
+                return self._current_from_time_window(date, now, include_sleep)
             if runtime_current is not None:
                 return runtime_current
+            # PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.5 项：runtime
+            # 就绪且空闲 → 默认如实返回 None，不回退旧时间窗（防「编造正在做」）。
+            # 唯一例外：include_sleep=True 且当前钟点在睡眠环内，仅回退睡眠类型条目。
+            if include_sleep and self._in_sleep_ring(now):
+                fallback = self._current_from_time_window(date, now, include_sleep=True)
+                if fallback is not None and str(fallback.get("goal_type") or "") == "sleep":
+                    self._warn_night_sleep_fallback(date, now)
+                    return fallback
+            return None
+        return self._current_from_time_window(date, now, include_sleep)
+
+    def _current_from_time_window(self, date: str, now: Optional[datetime],
+                                  include_sleep: bool) -> Optional[Dict[str, Any]]:
+        """旧时间窗匹配路径（R7 前逐字保留）：窗口缓存 + 当日帧匹配 + 前一日期帧跨日合并。
+
+        include_sleep=True 时 sleep 条目也参与匹配（情绪睡眠循环用）；缓存键区分该开关。
+        """
         now = now or datetime.now()
         window = minutes_of_now(now) // self._cache_minutes
         key = f"cur_{date}_{int(bool(include_sleep))}"
@@ -127,6 +163,46 @@ class ScheduleQuery:
             self._cache.clear()
         self._cache[key] = (window, current or "")
         return current
+
+    def _in_sleep_ring(self, now: Optional[datetime]) -> bool:
+        """当前钟点是否落在 ``[schedule]`` 作息睡眠环内（time_utils.is_in_sleep_ring 口径）。
+
+        config_provider 未注入（测试桩/旧行为）或读不到作息锚点 / 异常 → False
+        （不进睡眠环回退特判，按空闲返回 None）。
+        """
+        provider = self._config_provider
+        if provider is None:
+            return False
+        try:
+            section = getattr(provider(), "schedule", None)
+            # 缺省锚点与 [schedule] 段默认一致（07:00 / 23:00，同 tools_service 口径）
+            wake_min = parse_hhmm(str(getattr(section, "wake_time", "") or ""), 7 * 60)
+            sleep_min = parse_hhmm(str(getattr(section, "sleep_time", "") or ""), 23 * 60)
+        except Exception:
+            return False
+        return is_in_sleep_ring(minutes_of_now(now or datetime.now()), wake_min, sleep_min)
+
+    def _warn_night_sleep_fallback(self, date: str, now: Optional[datetime]) -> None:
+        """睡眠环内 runtime 无 sleep episode → 回退旧睡眠条目前的告警（同一睡眠窗只一次）。
+
+        窗标识：钟点仍在入睡锚点后 = 今晚的窗（date）；已过午夜（钟点在锚点前）= 昨晚
+        的窗（前一日期帧）。跨窗自动重新允许告警。
+        """
+        now = now or datetime.now()
+        sleep_min = 23 * 60
+        try:
+            if self._config_provider is not None:
+                section = getattr(self._config_provider(), "schedule", None)
+                sleep_min = parse_hhmm(str(getattr(section, "sleep_time", "") or ""), sleep_min)
+        except Exception:
+            pass  # 读不到锚点按默认 23:00 分窗
+        window_date = date if minutes_of_now(now) >= sleep_min else (self._previous_date(date) or date)
+        if self._sleep_warn_window == window_date:
+            return
+        self._sleep_warn_window = window_date
+        logger.warning(
+            "runtime 睡眠环内无 sleep episode，回退旧时间窗睡眠条目（睡眠窗=%s）——"
+            "滚动规划器可能尚未安排今晚睡眠，请检查其运行状态", window_date)
 
     def find_next_activities(self, date: str, limit: int = 3, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """今天**还没开始**的活动（前 ``limit`` 条），跨午夜按同一个 24h 环判定。
