@@ -56,6 +56,7 @@ from core.llm_utils import LLMService, llm_task_name_of
 from emotion.components import EmotionComponentsMixin
 from emotion.services import EmotionServices
 from planning.components import PlanningComponentsMixin
+from planning.life_modulation import LifeModulationService
 from planning.life_schedule import LifeScheduleReadModel
 from planning.life_state import LifeStateService
 from planning.rolling_planner import RollingPlanner
@@ -332,6 +333,9 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._life_state: LifeStateService | None = None
         self._rolling_planner: RollingPlanner | None = None
         self._life_model: LifeScheduleReadModel | None = None
+        # 情绪调制服务（PR2，2026-10-26，定稿 §4.1.1）：只在 [life_state] enabled 且
+        # emotion_modulation_enabled=true 时才构造（惰性，见 _ensure_life_modulation）
+        self._life_modulation: LifeModulationService | None = None
         self._life_tick_task: asyncio.Task | None = None
         self._life_cleanup_date = ""
         if not cfg.plugin.enabled:
@@ -489,6 +493,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             self._life_state = None
             self._rolling_planner = None
             self._life_model = None
+            self._life_modulation = None
             try:
                 self._schedule_query.set_runtime_provider(None)
             except Exception:
@@ -558,12 +563,23 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
                 continue
 
     def _life_tick_once(self) -> None:
-        """单拍：RollingPlanner.tick（内含 LifeState 推进 / episode 终结 / 锚点 /
-        事件发布）+ 每日一次 episode 过期清理（[life_state].keep_episode_days）。"""
+        """单拍编排（PR2，2026-10-26，计划书 §三十四/定稿 §3/§4.1.4）：状态推进统一由
+        本拍编排——先 LifeState.tick（emotion_modulation_enabled=true 时带 VAD 调制）
+        再把快照传入 RollingPlanner.tick（planner 不再单独调用 life.tick，避免 VAD
+        gain 与 sleep rates 重复应用）+ 每日一次 episode 过期清理
+        （[life_state].keep_episode_days）。
+
+        快照推进失败/未装配 → planner.tick() 不带快照（planner 回退自行推进，旧行为）；
+        两开关（[life_state].enabled / emotion_modulation_enabled）全关时零调制可观测。
+        """
         planner = getattr(self, "_rolling_planner", None)
         if planner is None:
             return
-        report = planner.tick() or {}
+        snapshot = self._life_tick_state(planner)
+        if snapshot is not None:
+            report = planner.tick(life_snapshot=snapshot) or {}
+        else:
+            report = planner.tick() or {}
         date = str(report.get("date") or "")
         if not date or date == getattr(self, "_life_cleanup_date", ""):
             return
@@ -580,6 +596,100 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
                 self.ctx.logger.info("生活状态 episode 过期清理完成（删除 %d 条）", removed)
         except Exception as exc:
             self.ctx.logger.warning("生活状态 episode 清理失败（忽略）：%s", exc)
+
+    def _life_tick_state(self, planner: Any) -> dict[str, Any] | None:
+        """编排侧状态推进（PR2，2026-10-26，定稿 §3/§4.1.1）：life.tick 并返回快照。
+
+        - 未装配 LifeStateService → None（编排方回退 planner 自行推进）；
+        - ``[life_state].emotion_modulation_enabled``（默认 False，False/段缺失/读不到
+          一律按关）→ 不读 VAD、不构造调制服务，``modulation=None``（逐字旧行为）；
+        - emotion 服务不可得/停用/读数异常 → modulation=None（可空降级，§八.2 同款）；
+        - 画像解析经 ``planner.resolve_profile_key``（与 planner 步 1 同一条规则，不
+          两处漂移）；任何异常 → None，本拍不调制、不阻塞 tick 循环。
+        """
+        life = getattr(self, "_life_state", None)
+        if life is None:
+            return None
+        modulation = None
+        section = getattr(self.config, "life_state", None)
+        if section is not None and bool(getattr(section, "emotion_modulation_enabled", False)):
+            try:
+                service = self._ensure_life_modulation()
+                vad = self._emotion_vad_snapshot() if service is not None else None
+                if service is not None and vad is not None:
+                    modulation = service.compute(vad)
+            except Exception as exc:
+                modulation = None
+                try:
+                    self.ctx.logger.warning("情绪调制本拍失败（按不调制处理）：%s", exc)
+                except Exception:
+                    pass
+        try:
+            return life.tick(active_profile=planner.resolve_profile_key(),
+                             modulation=modulation)
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning("生活状态推进失败（本拍由 planner 回退处理）：%s", exc)
+            except Exception:
+                pass
+            return None
+
+    def _ensure_life_modulation(self) -> LifeModulationService | None:
+        """情绪调制服务惰性构造（PR2，2026-10-26，定稿 §4.1.1；幂等）。
+
+        只在 ``[life_state].emotion_modulation_enabled=true`` 分支内被调用（两开关全关
+        零实例化）；构造失败置 ``False`` 哨兵不再重试（防每拍告警刷屏），热重载 =
+        宿主重导入重跑 on_load 自动复位。
+        """
+        service = getattr(self, "_life_modulation", None)
+        if service is not None:
+            return service if isinstance(service, LifeModulationService) else None
+        try:
+            service = LifeModulationService(root_dir=getattr(self, "_plugin_root", None))
+            self._life_modulation = service
+            self.ctx.logger.info("情绪调制服务已启用（系数表=mappings/emotion_life_modulation.json，缺失/坏表按内置默认）")
+            return service
+        except Exception as exc:
+            self._life_modulation = False  # type: ignore[assignment]
+            try:
+                self.ctx.logger.warning("情绪调制服务构造失败（本周期内按不调制处理）：%s", exc)
+            except Exception:
+                pass
+            return None
+
+    def _emotion_vad_snapshot(self) -> Any:
+        """emotion 生效 VAD 完整快照（v/a/d；可空降级，PR2 定稿 §4.1.1）。
+
+        读数序（全鸭子类型，planning 不 import emotion 的单向依赖纪律不变）：
+        束级公共口（``effective_vad_snapshot`` / ``effective_vad``，B 员接线后自动命中）
+        → 内层状态机 ``effective_vad()`` 真源（emotion/state_machine.py，现状束层无
+        full-VAD 转发时的唯一完整读数位）。emotion 未装配/停用/全链失败 → None。
+        """
+        emotion = getattr(self, "_emotion", None)
+        if emotion is None:
+            return None
+        enabled = getattr(emotion, "is_enabled", None)
+        if callable(enabled):
+            try:
+                if not enabled():
+                    return None
+            except Exception:
+                return None
+        for name in ("effective_vad_snapshot", "effective_vad"):
+            getter = getattr(emotion, name, None)
+            if callable(getter):
+                try:
+                    return getter()
+                except Exception:
+                    return None
+        machine = getattr(getattr(emotion, "service", None), "_machine", None)
+        getter = getattr(machine, "effective_vad", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                return None
+        return None
 
     async def _start_bg(self) -> None:
         """启动后台任务（on_load 与「停用→启用」配置切换共用；幂等）。"""

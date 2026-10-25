@@ -1216,6 +1216,21 @@ class LifeStateSectionConfig(PluginConfigBase):
             **_ui_i18n("Keep episode days"),
         },
     )
+    # PR2（2026-10-26），计划书 §三十四/定稿 §4.1.1（R7 依据 = 用户 2026-10-26 直派
+    # 【日程系统二期 PR2 双向闭环·调制侧】）：情绪 → 生活状态调制开关。false（默认）
+    # 时不读 emotion VAD、不构造调制服务、modulation=None（逐字旧行为）；true 时生效
+    # VAD 经 EMA/中性死区折算五项 rise/fall 速率增益（系数表
+    # mappings/emotion_life_modulation.json，经种子链装载、缺失/坏表按内置默认=定稿表，
+    # 不设路径键——学习 profile_path 死键教训，表位置固定走 mappings 链）。
+    emotion_modulation_enabled: bool = Field(
+        default=False,
+        description="情绪调制生活状态开关：开启后精力/饥饿/专注/压力/社交电量的自然速率随生效情绪小幅起伏（默认关）",
+        json_schema_extra={
+            "label": "情绪调制生活状态",
+            "hint": "关 = 生活状态按固定速率自然变化，与情绪无关",
+            **_ui_i18n("Emotion modulation", "Off = life states drift at fixed rates, independent of mood."),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

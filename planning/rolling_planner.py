@@ -7,7 +7,9 @@
 覆盖（红线 2）；当前活动只从 episode 日志读（红线 3）。
 
 tick 七步（§3.2）：
-    1. 衰减状态（唯一推进入口 = ``LifeStateService.tick``，传当前活动画像速率）；
+    1. 取状态快照（PR2 定稿 §3/§4.1.4：planner 不再单独调用 life.tick——状态推进
+       统一由 plugin tick 编排，编排方先 ``LifeStateService.tick``（含 VAD 调制）再把
+       快照经 ``life_snapshot`` 传入；不传快照的旧调用由本方法自行推进，行为不变）；
     2. 关闭到期 episode（planned_end 到点 → completed）；
     3. 处理硬约定/吃饭/睡觉锚点（硬约定提前 15 分钟预警收尾、到点抢占、错过如实登记）；
     4. 当前 episode 终结判定（饥饿跨阈值时按节流提前收尾去吃饭）；
@@ -441,40 +443,68 @@ class RollingPlanner:
     # ================================================================
     # tick（§3.2 七步）
     # ================================================================
+    def resolve_profile_key(self, active_profile: Any = None,
+                            current: Any = None) -> Any:
+        """步 1 同款「当前活动画像」解析（只读、不推进任何状态）。
+
+        PR2（2026-10-26），计划书 §三十四/定稿 §3/§4.1.4：状态推进统一由 plugin tick
+        编排（编排方先 ``life.tick`` 再把快照经 :attr:`life_snapshot` 传入 :meth:`tick`），
+        本方法把步 1 的画像解析规则（调用方显式画像优先；睡眠类型不给速率——睡眠恢复
+        走 handle_sleep；表外类型不给速率）开放给编排方复用，避免规则两处漂移。
+        返回 ``life.tick(active_profile=...)`` 应使用的画像键（可能为 None / dict /
+        画像对象原样透传）。
+        """
+        if current is None:
+            current = self._safe_active_episode()
+        profile_key = active_profile
+        if profile_key is None and current:
+            profile_key = current.get("goal_type")
+        if isinstance(profile_key, str) and profile_key in _SKIP_SLEEP_TYPES:
+            return None  # 睡眠恢复走 handle_sleep（情绪/睡眠链），不按画像速率积分
+        if isinstance(profile_key, str) and \
+                activity_profiles.active_profiles().get(profile_key) is None:
+            return None  # 表外类型不给速率（避免 get_profile 回退告警刷屏）
+        return profile_key
+
     def tick(self, now: Optional[datetime] = None,
-             active_profile: Any = None) -> Dict[str, Any]:
+             active_profile: Any = None,
+             *,
+             life_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """推进一拍（每 5 分钟由接线层调用；0 LLM）。返回本次动作报告（诊断/测试用）。
 
         ``active_profile``：调用方显式给定的当前活动画像（None = 自动取当前 episode
         的 goal_type 解析画像；解析不到按纯被动漂移）。
+        ``life_snapshot``（PR2，2026-10-26，定稿 §3/§4.1.4；可选参数，缺省 None =
+        旧行为）：plugin tick 编排已先调用 ``life.tick`` 时传入的状态快照——本方法
+        **不再单独调用 life.tick**，直接消费传入快照（避免 VAD gain 与 sleep rates
+        重复应用）；不传时保持原行为，由步 1 自行推进（逐字不变）。
         """
         report: Dict[str, Any] = {"actions": []}
         try:
-            self._tick_inner(now, active_profile, report)
+            self._tick_inner(now, active_profile, report, life_snapshot=life_snapshot)
         except Exception as exc:
             logger.warning("rolling_planner: tick 异常（本拍跳过，不阻塞主循环）：%s", exc, exc_info=True)
             report["error"] = str(exc)
         return report
 
     def _tick_inner(self, now: Optional[datetime], active_profile: Any,
-                    report: Dict[str, Any]) -> None:
+                    report: Dict[str, Any],
+                    life_snapshot: Optional[Dict[str, Any]] = None) -> None:
         now = self._now(now)
         date = self._date_of(now)
         cur = minutes_of_now(now)
         report.update({"date": date, "cur_minute": cur})
         self._roll_daily_counters(date)
 
-        # 步 1：衰减状态（唯一推进入口 = LifeStateService.tick；速率 = 当前活动画像）
+        # 步 1：状态快照（PR2 定稿 §3/§4.1.4：planner 不再单独调用 life.tick——
+        # 状态推进统一由 plugin tick 编排，编排方先 life.tick（含 VAD 调制）再经
+        # life_snapshot 传入；不传快照（旧调用/单测）保持原行为，由本方法推进）
         current = self._safe_active_episode()
-        profile_key = active_profile
-        if profile_key is None and current:
-            profile_key = current.get("goal_type")
-        if isinstance(profile_key, str) and profile_key in _SKIP_SLEEP_TYPES:
-            profile_key = None  # 睡眠恢复走 handle_sleep（情绪/睡眠链），不按画像速率积分
-        elif isinstance(profile_key, str):
-            if activity_profiles.active_profiles().get(profile_key) is None:
-                profile_key = None  # 表外类型不给速率（避免 get_profile 回退告警刷屏）
-        snapshot = self._life.tick(now, active_profile=profile_key)
+        if life_snapshot is None:
+            snapshot = self._life.tick(
+                now, active_profile=self.resolve_profile_key(active_profile, current))
+        else:
+            snapshot = life_snapshot
         report["state"] = snapshot
         self._publish_state_changed(snapshot, now)
 

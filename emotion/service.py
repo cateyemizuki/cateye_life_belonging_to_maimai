@@ -1201,12 +1201,18 @@ class EmotionService:
     def _apply_external_delta(self, event_text: str, delta: VADState, *, source: str,
                               multiplier: float, llm: bool = False,
                               is_target: Optional[bool] = None,
-                              session_id: str = "") -> Dict[str, Any]:
+                              session_id: str = "",
+                              event_id: str = "",
+                              episode_id: str = "") -> Dict[str, Any]:
         """倍率 → ±0.5 硬限幅 → 入账 → 决策日志（evaluate_reply 与外部事件共用）。
 
         三层倍率与裁剪前/后值全部落 decision_logs（§6.3-7）：``k``（调用方 K）/
         ``global_multiplier`` / ``multiplier``（最终总倍率）+ ``delta_before`` /
         ``delta_scaled`` / ``delta_applied``。
+
+        ``event_id`` / ``episode_id``（R7 = PR2 双向闭环（2026-10-26），计划书 §三十五/
+        定稿 §4.1.2）：life.episode_* 反馈侧的调用方留痕，只落 decision_logs 与返回值，
+        不参与任何判定；旧调用方不传即逐字保持原行为。
 
         跨来源去重（§2.4.6 A3）在入账前判定：命中返回 ``duplicate_cross_source`` 且不写
         emotion_log / 不发 emotion.updated（口径见 :meth:`dedup_policy`）。
@@ -1229,6 +1235,7 @@ class EmotionService:
         self._log_decision(
             "emotion.external_event", trigger_type="emotion", reason=str(event_text or "")[:120],
             source=str(source or ""), session_id=str(session_id or ""),
+            event_id=str(event_id or ""), episode_id=str(episode_id or ""),
             is_target=(bool(is_target) if is_target is not None else None), tier=self.affection_tier(),
             target_bonus=round(self.target_bonus(), 4),
             non_target_multiplier=round(self.non_target_multiplier(), 4),
@@ -1240,14 +1247,17 @@ class EmotionService:
         return {"ok": True, "reason": "", "event": str(event_text or ""), "delta": applied,
                 "delta_before": delta, "delta_scaled": scaled, "multiplier": round(factor, 4),
                 "k": round(float(multiplier), 4), "global_multiplier": round(global_mul, 4),
-                "clipped": bool(clipped),
+                "clipped": bool(clipped), "event_id": str(event_id or ""),
+                "episode_id": str(episode_id or ""),
                 "dedup": {**self.dedup_policy(), "duplicate": False}}
 
     async def record_external_event(self, source: str, description: str,
                                     delta: Optional[VADState] = None, *,
                                     use_llm: bool = False,
                                     multiplier: float = 1.0,
-                                    session_id: str = "") -> Dict[str, Any]:
+                                    session_id: str = "",
+                                    event_id: str = "",
+                                    episode_id: str = "") -> Dict[str, Any]:
         """统一外部事件入口（§4.2 行 1 / §6.2 A）。
 
         - ``delta`` 给出模板增量 → 直接 ``record_event``（×multiplier）；
@@ -1258,6 +1268,11 @@ class EmotionService:
           即 ``final_delta = delta × global_event_multiplier × K``；
         - ``session_id``（宿主 ToolInvocation 的 stream_id / 聊天流）供跨来源去重
           （§2.4.6 A3）使用；缺省空串归入同一"未知流"；
+        - ``event_id`` / ``episode_id``（R7 = PR2 双向闭环（2026-10-26），计划书 §三十五/
+          定稿 §4.1.2 新增可选留痕参数）：life.episode_* 反馈侧（emotion/life_feedback）
+          入账时的调用方事件名 / episode 标识——只进 decision_logs 与返回值供复盘，
+          不参与任何判定/去重（episode 去重由反馈侧每日预算 entries 负责），旧调用方
+          不传即逐字保持原行为；
         - 跨来源去重先于 LLM 评估判定：命中返回 ``{"ok": False,
           "reason": "duplicate_cross_source", "dedup": {...}}``，不调 LLM、不入账；
         - 最终增量经 ±:data:`EVENT_DELTA_CLAMP` 硬限幅后入账，三层倍率与裁剪前/后
@@ -1303,7 +1318,8 @@ class EmotionService:
         else:
             return {"ok": False, "reason": "no_delta"}
         outcome = self._apply_external_delta(event_text, delta_before, source=source,
-                                             multiplier=k, llm=llm_used, session_id=session_id)
+                                             multiplier=k, llm=llm_used, session_id=session_id,
+                                             event_id=event_id, episode_id=episode_id)
         if outcome.get("ok"):
             # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
             await self._publish("emotion.updated", **self._updated_payload("external_event"))

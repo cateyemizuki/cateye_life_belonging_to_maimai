@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "smoothing_minutes": 15,
+  "dead_zone": 0.12,
+  "gain_min": 0.70,
+  "gain_max": 1.30,
+  "gains": {
+    "energy": {
+      "rise": {"low_mood": -0.25, "tension": -0.10},
+      "rise_floor": 0.75,
+      "fall": {"activation": 0.25, "low_mood": 0.15}
+    },
+    "hunger": {
+      "rise": {"low_mood": 0.20, "activation": -0.10},
+      "fall": {"low_mood": -0.10, "activation": 0.05}
+    },
+    "focus": {
+      "rise": {"activation_center": 0.35, "activation_penalty": 1.2, "low_mood": -0.25},
+      "rise_floor": 0.60,
+      "fall_same_as_rise": true
+    },
+    "stress": {
+      "rise": {"tension": 0.35, "low_mood": 0.15},
+      "fall": {"low_mood": -0.10},
+      "fall_floor": 0.80
+    },
+    "social_battery": {
+      "rise": {"low_mood": -0.15},
+      "rise_floor": 0.80,
+      "fall": {"low_mood": 0.20, "tension": 0.15}
+    }
+  },
+  "feedback": {
+    "deep_work_done": {
+      "match": {"event": "completed", "goal_types": ["work", "study"], "min_duration_minutes": 25},
+      "delta": {"valence": 0.02, "arousal": 0.0, "dominance": 0.01},
+      "daily_cap": {"valence": 0.06}
+    },
+    "work_interrupted": {
+      "match": {"event": "interrupted", "goal_types": ["work", "study"]},
+      "delta": {"valence": -0.03, "arousal": 0.02, "dominance": -0.02},
+      "daily_cap": {"valence": -0.08}
+    },
+    "rest_done": {
+      "match": {"event": "completed", "goal_types": ["rest", "exercise"]},
+      "delta": {"valence": 0.02, "arousal": -0.02, "dominance": 0.0},
+      "daily_cap": {"valence": 0.06}
+    },
+    "meal_done": {
+      "match": {"event": "completed", "goal_types": ["meal"]},
+      "delta": {"valence": 0.01, "arousal": 0.0, "dominance": 0.0},
+      "daily_cap": {"valence": 0.03}
+    },
+    "high_pressure_long_block": {
+      "match": {"event": "completed", "goal_types": ["work", "study"], "min_duration_minutes": 240},
+      "delta": {"valence": -0.02, "arousal": 0.02, "dominance": -0.01},
+      "daily_cap": {"valence": -0.06}
+    },
+    "random_minor_event": {
+      "match": {"event": "random"},
+      "delta": {"valence": 0.0, "arousal": 0.0, "dominance": 0.0}
+    }
+  }
+}

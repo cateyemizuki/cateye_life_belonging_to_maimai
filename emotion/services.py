@@ -29,6 +29,9 @@ class EmotionServices:
         self.bus = getattr(plugin, "_bus", None)
         #: 本束的事件反订阅闭包（M0 无订阅者；M3 起由 emotion.bridge 追加）
         self._event_unsubs: list = []
+        #: R7 = PR2 双向闭环（2026-10-26）：LifeState/Episode → VAD 反馈服务
+        #: （[life_state] 双开关 + 情绪总开关任一关 → 不实例化，恒 None）
+        self._life_feedback: Any = None
 
     # 事件订阅挂点（start() 调用；stop() 注销）
     def _register_event_subscriptions(self) -> None:
@@ -46,6 +49,24 @@ class EmotionServices:
         except Exception as exc:
             logger.warning("emotion 事件订阅失败（忽略）：%s", exc)
             self._unregister_event_subscriptions()
+            return
+        # R7 = PR2 双向闭环（2026-10-26），计划书 §三十五/定稿 §4.1.2：
+        # LifeState/Episode → VAD 反馈侧。三重门控（[life_state].enabled /
+        # [life_state].emotion_modulation_enabled（附录 B.6.3 灰度键，缺省关）/
+        # 情绪模块总开关）任一关 → 不实例化不订阅，零可观测；反订阅闭包并入
+        # _event_unsubs，关闭态由 _unregister_event_subscriptions 统一清理。
+        try:
+            _section = getattr(getattr(self._plugin, "config", None), "life_state", None)
+            if (_section is not None and bool(getattr(_section, "enabled", False))
+                    and bool(getattr(_section, "emotion_modulation_enabled", False))
+                    and self.is_enabled()):
+                from .life_feedback import LifeFeedbackService
+
+                self._life_feedback = LifeFeedbackService(self._plugin, self.service)
+                self._event_unsubs.extend(self._life_feedback.subscribe())
+        except Exception as exc:
+            logger.warning("情绪-生活反馈订阅失败（忽略）：%s", exc)
+            self._life_feedback = None
 
     def _unregister_event_subscriptions(self) -> None:
         """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""
@@ -55,6 +76,9 @@ class EmotionServices:
             except Exception:
                 pass
         self._event_unsubs.clear()
+        # R7 = PR2 双向闭环（2026-10-26）：反馈服务的订阅闭包已在 _event_unsubs 内一并
+        # 执行；此处只解除引用（预算文件逐次落盘，无残留后台任务）
+        self._life_feedback = None
 
     # 转发入口（plugin.py / 其他模块调用）
     def set_persona(self, lover_name: str, personality: str) -> None:
@@ -104,15 +128,19 @@ class EmotionServices:
                                     delta: Optional[VADState] = None, *,
                                     use_llm: bool = False,
                                     multiplier: float = 1.0,
-                                    session_id: str = "") -> Dict[str, Any]:
+                                    session_id: str = "",
+                                    event_id: str = "",
+                                    episode_id: str = "") -> Dict[str, Any]:
         """外部事件统一入账入口（Tool 上报路径；签名与内层一致，转发 self.service）。
 
         ``session_id``（宿主 ToolInvocation 的 stream_id / 聊天流）供 §2.4.6 A3
         跨来源去重使用；缺省空串归入同一"未知流"。
+        ``event_id`` / ``episode_id``（R7 = PR2 双向闭环（2026-10-26），计划书 §三十五/
+        定稿 §4.1.2）：life.episode_* 反馈侧留痕参数，只进 decision_logs 与返回值。
         """
         return await self.service.record_external_event(
             source, description, delta, use_llm=use_llm, multiplier=multiplier,
-            session_id=session_id)
+            session_id=session_id, event_id=event_id, episode_id=episode_id)
 
     def injection_text(self, channel: str = "replyer") -> str:
         """情绪底色注入文本（planner/replyer 注入 Hook 入口；转发 self.service）。

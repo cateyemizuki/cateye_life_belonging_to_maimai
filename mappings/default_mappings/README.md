@@ -10,8 +10,8 @@
 
 | 位置 | 角色 | 随包分发？ | 插件会写它吗？ |
 |---|---|---|---|
-| `mappings/`（表层） | **用户数据区**——你实际要改的在这里 | **否**（表层六张 `*.json` 与表层 `README.md` 退出仓库分发，`.gitignore` 已标记） | 只在表层缺表 / 无旧版可迁移时生成默认表，其余**只读** |
-| `mappings/default_mappings/`（本文件夹，深层） | **随包种子源**——出厂默认文档与六张表 | **是**，随插件版本更新 | 否（只作复制来源） |
+| `mappings/`（表层） | **用户数据区**——你实际要改的在这里 | **否**（表层七张 `*.json` 与表层 `README.md` 退出仓库分发，`.gitignore` 已标记） | 只在表层缺表 / 无旧版可迁移时生成默认表，其余**只读** |
+| `mappings/default_mappings/`（本文件夹，深层） | **随包种子源**——出厂默认文档与七张表 | **是**，随插件版本更新 | 否（只作复制来源） |
 
 - **表层缺表自动补齐**：某张表层 `json` **文件不存在**时，插件先看**旧的插件根目录版**有没有（有就复制它，优先你的旧资产），仍缺才从本文件夹**复制一份出厂默认**进表层（逐字节一致，内容与版本出厂内容相同）；
 - **解析错误不算缺失（红线）**：表层某表**存在但格式错误**时，走各表既有的「告警 + 回退内置默认」链，**绝不会**从本文件夹复制 / 覆盖你的表层文件——放心逐条修错，不怕被冲掉；
@@ -24,7 +24,7 @@
 
 ## 一、这个文件夹是什么
 
-### 6 张表各自管什么
+### 7 张表各自管什么
 
 | 文件 | 管什么 | 读它的代码 |
 |---|---|---|
@@ -34,8 +34,9 @@
 | `affection_tier_descriptions.json` | 每个档位（如「热恋」「铁哥们」）注入提示词的那句话 | `companion/affection_tier_descriptions.py` |
 | `schedule_properties.json` | **日程属性表**（2026-10-21 新增第五张）：每个日程「属性」的回复率调控倍率、属性关键词词表与展示标签/颜色 | `planning/activity_properties.py` |
 | `activity_profiles.json` | **活动画像表**（2026-10-25 新增第六张）：每种活动「类型」的时长采样分布、最小块、可中断性/切走成本、五项状态速率（生活状态层与滚动规划用） | `planning/activity_profiles.py` |
+| `emotion_life_modulation.json` | **情绪-生活调制表**（2026-10-26 新增第七张）：生活事件对情绪的有界反馈增量与日上限（`feedback` 节，已生效），以及 VAD 对生活状态的五项调制系数（`gains` 节，消费方属后续版本，当前只播种） | `emotion/life_feedback.py` |
 
-六张表互相独立：改一张不会影响另外五张（按表的键联动的地方见各节说明）。
+七张表互相独立：改一张不会影响另外六张（按表的键联动的地方见各节说明）。
 
 ### 改了多久生效
 
@@ -43,7 +44,7 @@
 
 所以改法固定是：**编辑并保存 json → 触发热重载（或在宿主里重启插件）**。只保存不重载，改动不会生效。
 
-读取入口：情绪两张在情绪服务构造时读（`emotion/service.py:211`、`emotion/service.py:226`），好感度两张由 `companion/services.py:42` 的 `_load_affection_tables` 读，插件加载时调一次（`companion/services.py:119`）、配置热重载时再调一次（`companion/services.py:222`）；**日程属性表**由日程服务束构造时装载（`planning/services.py` 规划束初始化里 `activity_properties.load_and_apply`，同款「加载/热重载各读一遍」），倍率消费点在 `planning/proactive_service.py` 的 `_apply_frequency`；**活动画像表**同款由规划束装载（`activity_profiles.load_and_apply`），消费点在生活状态层与滚动规划层（`planning/life_state.py`、`planning/activity_profiles.sample_duration`）。
+读取入口：情绪两张在情绪服务构造时读（`emotion/service.py:211`、`emotion/service.py:226`），好感度两张由 `companion/services.py:42` 的 `_load_affection_tables` 读，插件加载时调一次（`companion/services.py:119`）、配置热重载时再调一次（`companion/services.py:222`）；**日程属性表**由日程服务束构造时装载（`planning/services.py` 规划束初始化里 `activity_properties.load_and_apply`，同款「加载/热重载各读一遍」），倍率消费点在 `planning/proactive_service.py` 的 `_apply_frequency`；**活动画像表**同款由规划束装载（`activity_profiles.load_and_apply`），消费点在生活状态层与滚动规划层（`planning/life_state.py`、`planning/activity_profiles.sample_duration`）；**情绪-生活调制表**由情绪反馈服务构造时装载（`emotion/life_feedback.py`，挂在 `[life_state]` 双开关全开之后），消费点在情绪-生活反馈入账链（同文件）。
 
 ### 旧版文件会自动搬进来
 
@@ -57,7 +58,7 @@
 
 ### 文件缺失会怎样
 
-- 六张表都**不存在也不会报错**：`emotion_mapping.json` / `emotion_descriptions.json` / `affection_presets.json` / `affection_tier_descriptions.json` / `schedule_properties.json` / `activity_profiles.json` 在缺失时会各自生成一份内置默认文件（内容就是出厂默认），然后按内置默认运行。所以第一版可以直接打开生成好的文件照葫芦画瓢。
+- 七张表都**不存在也不会报错**：`emotion_mapping.json` / `emotion_descriptions.json` / `affection_presets.json` / `affection_tier_descriptions.json` / `schedule_properties.json` / `activity_profiles.json` / `emotion_life_modulation.json` 在缺失时先走「表层缺表自动补齐」（从本文件夹复制出厂种子，种子随包必有）；极端情形（连种子也没有）下前六张各自生成一份内置默认文件（内容就是出厂默认），第七张直接按内置默认运行（不在表层落文件）。所以第一版可以直接打开生成好的文件照葫芦画瓢。
 
 ---
 
@@ -682,11 +683,113 @@
 
 ---
 
-## 八、FAQ
+## 八、情绪-生活调制表 `emotion_life_modulation.json`（第七张表，2026-10-26）
+
+### 文件作用
+
+把「日程系统双向闭环」的两组系数外置给你改（`emotion/life_feedback.py` 单一真源，纯离线零 LLM）：
+
+- **`feedback` 节（已生效）**：滚动执行层的活动 episode（完成/被打断）对情绪的有界 VAD
+  增量与每日上限——bot 干完一段深度工作会小幅开心、长块高压工作会积累一点烦躁，
+  都在这里按事件类型调；
+- **`gains` 节（当前只播种）**：情绪 VAD 反过来调制精力/饥饿/专注/压力/社交电量五项
+  状态速率的 rise/fall 系数（定稿 §4.1.1 起点公式），消费方属后续版本，改了暂时不生效。
+
+这张表**默认不参与运行**：情绪-生活反馈挂在 `[life_state].enabled` 与
+`[life_state].emotion_modulation_enabled` 双开关之后（灰度键缺省关，任一关 → 不装载不订阅、
+零可观测）。睡眠期活动的情绪一律由睡眠大修统一结算，不走本表（避免双记账）。
+
+### 顶层结构与字段表
+
+```json
+{
+  "version": 1,
+  "smoothing_minutes": 15,
+  "dead_zone": 0.12,
+  "gain_min": 0.70,
+  "gain_max": 1.30,
+  "gains": { "...": "五项状态的 rise/fall 系数（后续版本消费）" },
+  "feedback": {
+    "deep_work_done": {
+      "match": {"event": "completed", "goal_types": ["work", "study"], "min_duration_minutes": 25},
+      "delta": {"valence": 0.02, "arousal": 0.0, "dominance": 0.01},
+      "daily_cap": {"valence": 0.06}
+    },
+    "...": "其余条目见种子文件"
+  }
+}
+```
+
+| 键 | 必填 | 类型 | 说明 |
+|---|---|---|---|
+| `version` | **是** | 整数 | 必须恰为 `1`，否则整文件回退内置默认 |
+| `smoothing_minutes` / `dead_zone` / `gain_min` / `gain_max` | 否 | 数值 | `gains` 节的平滑/死区/夹取参数（后续版本消费；当前只随表装载） |
+| `gains` | 否 | 对象 | 五项状态（`energy`/`hunger`/`focus`/`stress`/`social_battery`）的 `rise`/`fall` 系数与下限（后续版本消费） |
+| `feedback` | **是** | 对象 | 「规则名 → 条目」映射（本表当前唯一生效节）；缺了整文件回退内置默认 |
+
+`gains` 条目的系数写法（供后续版本对照；`rise`/`fall` 各是一组「因子名 → 系数」，
+gain = 1 + 系数和，最后夹进 `[gain_min, gain_max]`）：线性因子名只有
+`low_mood` / `activation` / `tension` 三个；`focus` 额外用 `activation_center` /
+`activation_penalty` 表达「倒 U 型」（gain = 1 − penalty×(activation − center)²，再叠加
+线性项）；`rise_floor` / `fall_floor` 给该方向的下限；`fall_same_as_rise: true` 表示
+fall 方向复用 rise 公式（focus 是容量，不区分方向）。
+
+`feedback` 每条目的字段：
+
+| 字段 | 必填 | 类型 | 说明 |
+|---|---|---|---|
+| `match.event` | 否 | 字符串 | `completed`（完成，缺省值）/ `interrupted`（被打断）/ `random`（随机小事件） |
+| `match.goal_types` | 否 | 字符串数组 | 只对这些活动类型生效（如 `["work", "study"]`）；缺省 = 不限类型 |
+| `match.min_duration_minutes` | 只对完成事件有意义 | 数值 | 时长门槛（分钟，按 24h 环折算跨午夜）；被打断事件没有时长字段，带此键的条目对打断一律不命中 |
+| `delta` | **是** | 对象 | `valence` / `arousal` / `dominance` 三轴增量（每维再过情绪侧 ±0.5 单事件硬限幅）；全零条目自动跳过 |
+| `daily_cap` | 否 | 对象 | 逐轴**每日累计上限**（带符号：正上限只封正向累计、负上限只封负向累计）；超限的条目当天整条丢弃 |
+
+一条事件可以同时命中多条（如 4 小时以上的工作块同时命中「深度工作完成」与「高压力长块」），
+逐条独立判日上限后求和，一次入账；同一 `episode_id` 当天只入账一次。每日已用量记在
+插件数据目录的 `life_feedback_budget.json`（原子写，日期滚动自动清零，可整文件删除重置），
+**不**写进情绪状态文件。
+
+### 校验规则与出错时的行为
+
+- `version` 不是 1 / 缺 `feedback` 节 / JSON 解析失败 → **整文件回退内置默认**（日志告警
+  「按内置默认处理」），`feedback` 单条缺 `delta` 按全零处理（等于跳过）；
+- **解析错误不算缺失（红线，与全体七张表一致）**：表层文件存在但坏了，绝不从深层种子
+  复制/覆盖你的文件，原地修好即可；
+- 表层缺文件 → 自动从本文件夹复制出厂种子（旧根迁移优先，见目录结构一节）；
+- `match` 里认不出的字段被忽略；`goal_types` 写错活动类型名 → 该条目永不命中（不报错）。
+
+### 热重载语义
+
+与全体七张表相同：**只在插件加载 / 热重载时读一遍**，之后常驻内存。反馈服务挂在
+`[life_state]` 双开关之后——灰度键关着时改本表完全不生效；想让它生效，先开
+`[life_state].enabled` 与 `[life_state].emotion_modulation_enabled` 两个开关再热重载。
+
+### 完整可抄的最小示例（只调一条规则）
+
+```json
+{
+  "version": 1,
+  "feedback": {
+    "deep_work_done": {
+      "match": {"event": "completed", "goal_types": ["work", "study"], "min_duration_minutes": 45},
+      "delta": {"valence": 0.03, "arousal": 0.0, "dominance": 0.01},
+      "daily_cap": {"valence": 0.09}
+    }
+  }
+}
+```
+
+只写你想改的规则就行：未写出的条目沿用内置默认（与好感度预设表同款「同名覆盖、其余保留」
+合并语义）。上面这条把「深度工作完成」的门槛从 25 分钟提到 45 分钟、单次增幅从 V+0.02
+提到 V+0.03、当日累计上限从 V+0.06 提到 V+0.09。
+
+---
+
+## 九、FAQ
 
 **Q：改完 json 为什么没生效？**
 
-A：六张表都**只在插件加载 / 热重载时读一遍**。保存文件后要**触发热重载或在宿主里重启插件**才会重读。
+A：七张表都**只在插件加载 / 热重载时读一遍**。保存文件后要**触发热重载或在宿主里重启插件**才会重读。
 
 如果重载后还是没变化，按顺序查：
 
@@ -698,7 +801,9 @@ A：六张表都**只在插件加载 / 热重载时读一遍**。保存文件后
    - 好感度预设表「有 N 个预设被排除」；
    - 好感度档位描述表「含未知预设/档位键，已丢弃」；
    - 日程属性表整文件回退 /「有 N 个条目被排除」（`planning.properties_rejected` 留账）；
-   - 活动画像表整文件回退 /「有 N 个条目被排除」（`planning.profiles_rejected` 留账）。
+   - 活动画像表整文件回退 /「有 N 个条目被排除」（`planning.profiles_rejected` 留账）；
+   - 情绪-生活调制表「按内置默认处理」（`emotion/life_feedback.py`；另注意该表还要
+     `[life_state]` 双开关全开才参与运行，开关关着时改表不生效不是故障）。
 
 **Q：日程属性表怎么调 bot 在某类活动里的回话频率？**
 
@@ -740,4 +845,4 @@ A：可以，**1~5 档**都行，每档的名字自己起。但要注意两点�
 
 ---
 
-> 维护提示：本文档随插件包分发，描述的是当前代码的行为；代码与文档都可能继续演进，若两者冲突，**以代码内注释为准**（各表对应的源码：`emotion/mapping_override.py`、`emotion/descriptions.py`、`companion/affection_presets.py`、`companion/affection_tier_descriptions.py`、`planning/activity_properties.py`、`planning/activity_profiles.py`、`core/mapping_dir.py`）。
+> 维护提示：本文档随插件包分发，描述的是当前代码的行为；代码与文档都可能继续演进，若两者冲突，**以代码内注释为准**（各表对应的源码：`emotion/mapping_override.py`、`emotion/descriptions.py`、`companion/affection_presets.py`、`companion/affection_tier_descriptions.py`、`planning/activity_properties.py`、`planning/activity_profiles.py`、`emotion/life_feedback.py`、`core/mapping_dir.py`）。

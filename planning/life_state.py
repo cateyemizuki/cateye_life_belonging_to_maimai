@@ -217,17 +217,60 @@ class LifeStateService:
             return 0.0  # 时钟回拨按 0
         return min(seconds / 60.0, DT_MAX_MINUTES)
 
-    def _apply_drift(self, dt_min: float, rates: Optional[Dict[str, float]]) -> None:
-        """被动漂移 +（可选）活动画像速率积分（每分钟；B.6.1）。"""
-        self._state["energy"] += DRIFT_ENERGY_PER_MIN * dt_min
-        self._state["hunger"] += DRIFT_HUNGER_PER_MIN * dt_min
-        self._state["focus"] += DRIFT_FOCUS_PER_MIN * dt_min
-        self._state["stress"] += DRIFT_STRESS_PER_MIN * dt_min
-        if rates:
-            for key in STATE_FIELDS:
+    def _apply_drift(self, dt_min: float, rates: Optional[Dict[str, float]],
+                     modulation: Optional[Dict[str, Dict[str, float]]] = None) -> None:
+        """被动漂移 +（可选）活动画像速率积分（每分钟；B.6.1）。
+
+        PR2（2026-10-26），计划书 §三十四/定稿 §4.1.1：``modulation`` 非 None 时，
+        每个状态的**基础 delta**（被动漂移 + 画像速率）按符号乘 rise/fall gain
+        （delta > 0 取 rise、< 0 取 fall；不乘当前状态值；缺项/坏值按 1.0 = 不调制）；
+        ``None`` = 不调制，保持与 2.1.0/PR1 逐字一致（加法次序不变）。
+        """
+        if modulation is None:
+            self._state["energy"] += DRIFT_ENERGY_PER_MIN * dt_min
+            self._state["hunger"] += DRIFT_HUNGER_PER_MIN * dt_min
+            self._state["focus"] += DRIFT_FOCUS_PER_MIN * dt_min
+            self._state["stress"] += DRIFT_STRESS_PER_MIN * dt_min
+            if rates:
+                for key in STATE_FIELDS:
+                    rate = rates.get(f"{key}_rate")
+                    if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+                        self._state[key] += float(rate) * dt_min
+            return
+        # 调制路径：先合成每状态基础 delta，再按符号乘 gain（状态 clamp 仍由
+        # _clamp_all 统一做；gain = {state: {"rise": float, "fall": float}}，见
+        # planning/life_modulation.LifeModulationService.compute）
+        for key in STATE_FIELDS:
+            spec = modulation.get(key) if isinstance(modulation.get(key), dict) else None
+            gain_pair = spec or {}
+            delta = 0.0
+            if key == "energy":
+                delta += DRIFT_ENERGY_PER_MIN * dt_min
+            elif key == "hunger":
+                delta += DRIFT_HUNGER_PER_MIN * dt_min
+            elif key == "focus":
+                delta += DRIFT_FOCUS_PER_MIN * dt_min
+            elif key == "stress":
+                delta += DRIFT_STRESS_PER_MIN * dt_min
+            if rates:
                 rate = rates.get(f"{key}_rate")
                 if isinstance(rate, (int, float)) and not isinstance(rate, bool):
-                    self._state[key] += float(rate) * dt_min
+                    delta += float(rate) * dt_min
+            if delta > 0:
+                delta *= self._modulation_gain(gain_pair.get("rise"))
+            elif delta < 0:
+                delta *= self._modulation_gain(gain_pair.get("fall"))
+            self._state[key] += delta
+
+    @staticmethod
+    def _modulation_gain(value: Any) -> float:
+        """调制 gain 宽松解析（bool/NaN/缺省一律 1.0 = 该项不调制；PR2 定稿 §4.1.1）。"""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 1.0
+        number = float(value)
+        if number != number:  # NaN 防御
+            return 1.0
+        return number
 
     def _clamp_all(self) -> None:
         """全部 0~1 clamp；睡眠债 clamp [0, 12]（B.6.1「所有值 clamp」原文）。"""
@@ -261,18 +304,23 @@ class LifeStateService:
 
     # ── 对外接口（B.5.1）───────────────────────────────────────────────────
     def tick(self, now: Optional[datetime] = None,
-             active_profile: Any = None) -> Dict[str, Any]:
+             active_profile: Any = None,
+             modulation: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, Any]:
         """唯一推进入口：被动漂移 + 当前活动画像速率积分，钳制后落盘。
 
         ``now`` 缺省取配置时区当前时间；``active_profile`` 支持
         :class:`~planning.activity_profiles.ActivityProfile` / 同构 dict /
         画像类型 id 字符串（str 经 ``activity_profiles.get_profile`` 解析）。
+        ``modulation``（PR2，2026-10-26，定稿 §4.1.1；可选参数，缺省 None 逐字旧行为）：
+        五项 rise/fall 增益（形态见 :meth:`planning.life_modulation.LifeModulationService.compute`），
+        对每个状态的基础 delta 按符号相乘后走同一 clamp；None = 不调制。
         返回 :meth:`snapshot`。落盘失败仅告警不阻塞（B.5.1「失败静默回退」）。
         """
         now = self._now(now)
         dt_min = self._dt_minutes(now)
         if dt_min > 0:
-            self._apply_drift(dt_min, rates=self._profile_rates(active_profile))
+            self._apply_drift(dt_min, rates=self._profile_rates(active_profile),
+                              modulation=modulation)
         self._last_tick_at = now
         self._updated_at = now
         self._clamp_all()

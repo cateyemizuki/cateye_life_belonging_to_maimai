@@ -27,10 +27,18 @@ logger = logging.getLogger(__name__)
 #: 插件根下集中存放用户可编辑映射表的子目录（2026-10-17 起为唯一读取位）
 MAPPINGS_DIR_NAME = "mappings"
 
-#: 出厂种子子目录（2026-10-23 §29.2 直派）：随包分发的出厂默认（README + 五张 json），
-#: 只作种子源——插件运行期**只读表层** ``mappings/`` 五张表，深层不参与装载。
+#: 出厂种子子目录（2026-10-23 §29.2 直派）：随包分发的出厂默认（README + 六张 json），
+#: 只作种子源——插件运行期**只读表层** ``mappings/`` 各张表，深层不参与装载。
 #: 表层 = 用户数据区（文件不随包分发、更新插件不覆盖）；深层 = 随包种子源。
 SEED_DIR_NAME = "default_mappings"
+
+#: 第七张表：情绪-生活调制表（R7 = PR2 双向闭环，2026-10-26，计划书 §三十五/定稿 §4.1）。
+#: 装载方 = emotion/life_feedback.py（emotion 侧唯一消费点）；gains 节为定稿 §4.1.1 的
+#: VAD→LifeState 五项 rise/fall 调制系数（消费方 planning/life_modulation 属后续 PR，
+#: 本 PR 只播种），feedback 节为 life.episode_* → VAD 事件类增量与日上限（本 PR 消费）。
+#: 与其余六表「常量在装载方模块」的惯例略有不同：按派单要求登记在本模块作为单一真源，
+#: 装载方从本处 import，避免两处各写一份字面量漂移。
+EMOTION_LIFE_MODULATION_FILE_NAME = "emotion_life_modulation.json"
 
 
 class MappingReadError(Exception):
