@@ -9,6 +9,8 @@
 - ``[planning_proactive]`` 日程主动行为：早晚安两类 + 名单系统 + 赖床提醒（原问候专用四名单
                            与活动切换两名单**合并为**群聊名单 / 私聊名单两份 + 名单模式；
                            2026-10-20 用户指示：活动切换主动开口整条移除）；
+- ``[life_state]``        生活状态（2026-10-25 滚动化改造新增，默认关：精力/饥饿/专注/压力
+                           与滚动执行的全部键位；enabled=false 时零行为）。
 - （``[llm]`` / ``[prompts]`` 在 suite_config.py / suite_prompts.py 定义。）
 
 本模块只定义 section 类（PluginConfigBase 子类），不定义聚合模型；
@@ -213,6 +215,114 @@ class ScheduleSectionConfig(PluginConfigBase):
             "label": "节假日影响日程生成",
             "hint": "默认关；开 = 节假日当天的日程会明显更「放假」",
             **_ui_i18n("Holidays affect generation", "Let holidays influence the generated schedule."),
+        },
+    )
+
+    # ── 滚动化改造（2026-10-25 滚动化改造新增，默认关）─────────────────────
+    # R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
+    # D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
+    # spine_mode=false 时本组键全部不参与任何判定，插件行为与 2.1.0 逐字一致。
+    spine_mode: bool = Field(
+        default=False,
+        description="日意图（spine）模式：每天只生成 3-6 条「今天想做什么」的稀疏意图 + 硬约定 + 作息锚点，"
+                    "不再一次排满全天；关闭时走旧的全天生成路径（行为与旧版逐字一致）",
+        json_schema_extra={
+            "label": "日意图（spine）模式",
+            "hint": "默认关；开 = 稀疏日意图（空档合法、描述精简、单轮生成、更省 token）",
+            **_ui_i18n("Spine mode",
+                       "Sparse day-intentions (3-6/day) instead of a full-day timetable."),
+        },
+    )
+    spine_min_intentions: int = Field(
+        default=3,
+        ge=1,
+        description="spine 模式每天生成的最少意图数",
+        json_schema_extra={
+            "label": "spine 最少意图数",
+            **_ui_i18n("Spine min intentions"),
+        },
+    )
+    spine_max_intentions: int = Field(
+        default=6,
+        ge=1,
+        description="spine 模式每天生成的最多意图数",
+        json_schema_extra={
+            "label": "spine 最多意图数",
+            **_ui_i18n("Spine max intentions"),
+        },
+    )
+    spine_max_described_intents: int = Field(
+        default=1,
+        ge=0,
+        description="spine 模式最多给几条重要意图写一句 note（15-25 字）；0 = 全部不写 note",
+        json_schema_extra={
+            "label": "spine 带描述意图数",
+            **_ui_i18n("Spine described intents"),
+        },
+    )
+    spine_recent_days: int = Field(
+        default=2,
+        ge=0,
+        description="spine 模式生成时回看最近 N 天日程（只取名称/时间防重复）；0 = 不回看",
+        json_schema_extra={
+            "label": "spine 回看天数",
+            **_ui_i18n("Spine recent days"),
+        },
+    )
+    spine_history_messages: int = Field(
+        default=12,
+        ge=0,
+        description="spine 模式生成时回读各会话最近 N 条聊天消息作为灵感；0 = 禁用",
+        json_schema_extra={
+            "label": "spine 历史消息条数",
+            **_ui_i18n("Spine history messages"),
+        },
+    )
+    spine_knowledge_limit: int = Field(
+        default=3,
+        ge=0,
+        description="spine 模式生成时检索知识库的最大条数；0 = 禁用",
+        json_schema_extra={
+            "label": "spine 知识库条数",
+            **_ui_i18n("Spine knowledge limit"),
+        },
+    )
+    spine_max_tokens: int = Field(
+        default=2048,
+        ge=256,
+        description="spine 模式生成的最大 token 数（输出比全天生成短得多）",
+        json_schema_extra={
+            "label": "spine 最大 token",
+            **_ui_i18n("Spine max tokens"),
+        },
+    )
+    spine_use_multi_round: bool = Field(
+        default=False,
+        description="spine 模式多轮生成：默认单轮 + 结构校验（不强制重试，质量差一点可以接受）",
+        json_schema_extra={
+            "label": "spine 多轮生成",
+            **_ui_i18n("Spine multi-round"),
+        },
+    )
+    spine_generate_at: str = Field(
+        default="00:30",
+        description="spine 模式每天生成日意图的固定时刻（HH:MM）；空串 = 沿用旧的生成时机口径"
+                    "（最后日程结束后延迟；稀疏意图下不推荐）",
+        json_schema_extra={
+            "label": "spine 生成时刻",
+            "hint": "HH:MM；留空 = 沿用旧口径（设计 §9.1：勿用稀疏意图的最后 end 触发，会过早生成次日）",
+            "pattern": r"^\d{2}:\d{2}$",
+            **_ui_i18n("Spine generate at",
+                       "Fixed daily HH:MM for spine generation; empty = legacy timing."),
+        },
+    )
+    planning_daily_token_budget: int = Field(
+        default=8000,
+        ge=0,
+        description="日程规划（spine/补丁/摘要）每日 token 预算；0 = 不设限（熔断策略本阶段未启用，预留键位）",
+        json_schema_extra={
+            "label": "规划日 token 预算",
+            **_ui_i18n("Planning daily token budget"),
         },
     )
 
@@ -916,6 +1026,196 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         if legacy_value != 5 and int(migrated.get("greeting_other_private_min_messages", 5) or 5) == 5:
             migrated["greeting_other_private_min_messages"] = legacy_value
         return migrated
+
+
+# ---------------------------------------------------------------------------
+# [life_state] 生活状态（滚动化改造新增段，默认关）
+# ---------------------------------------------------------------------------
+
+
+class LifeStateSectionConfig(PluginConfigBase):
+    """生活状态段（2026-10-25 滚动化改造新增，默认关）。
+
+    R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
+    D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
+
+    ``enabled=false`` 时整段不参与任何判定（无 tick、无状态文件、读取侧回退
+    静态能量曲线），插件行为与 2.1.0 逐字一致。设计附录 B.4.1 中的
+    ``keep_snapshot_days`` / ``patch_*`` / ``digest_*`` 等键本阶段未实现，**不登记死键**。
+    """
+
+    __ui_label__ = "生活状态（滚动化）"
+    __ui_icon__ = "activity"
+    __ui_order__ = 6
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Life State (rolling)",
+               "description": "Energy/hunger/focus/stress drives and the rolling planner. Off by default."}
+    }
+
+    enabled: bool = Field(
+        default=False,
+        description="生活状态总开关：开启后启用精力/饥饿/专注/压力连续状态与滚动执行（默认关）",
+        json_schema_extra={
+            "label": "启用生活状态",
+            "hint": "关 = 完全回到旧行为（精神状态按静态曲线展示）",
+            **_ui_i18n("Enable life state", "Master switch; off = legacy behavior."),
+        },
+    )
+    tick_seconds: int = Field(
+        default=300,
+        ge=30,
+        description="状态 tick 间隔（秒，默认 300 = 5 分钟）",
+        json_schema_extra={
+            "label": "tick 间隔(秒)",
+            **_ui_i18n("Tick interval (s)"),
+        },
+    )
+    horizon_minutes: int = Field(
+        default=90,
+        ge=30,
+        le=180,
+        description="滚动窗口长度（分钟）：只规划「现在 + 未来 N 分钟」",
+        json_schema_extra={
+            "label": "滚动窗口(分钟)",
+            **_ui_i18n("Horizon (min)"),
+        },
+    )
+    replan_cooldown_minutes: int = Field(
+        default=20,
+        ge=5,
+        description="两次重规划的最小间隔（分钟）",
+        json_schema_extra={
+            "label": "重规划冷却(分钟)",
+            **_ui_i18n("Replan cooldown (min)"),
+        },
+    )
+    max_replans_per_hour: int = Field(
+        default=2,
+        ge=1,
+        description="每小时最多重规划次数",
+        json_schema_extra={
+            "label": "每小时重规划上限",
+            **_ui_i18n("Replans per hour"),
+        },
+    )
+    random_event_rate: float = Field(
+        default=0.08,
+        ge=0.0,
+        le=0.2,
+        description="随机小事件概率（只在转场/空闲时掷骰；0.05-0.08 建议）",
+        json_schema_extra={
+            "label": "随机事件概率",
+            "step": 0.01,
+            **_ui_i18n("Random event rate"),
+        },
+    )
+    max_random_events_per_day: int = Field(
+        default=3,
+        ge=0,
+        description="每天随机小事件上限；0 = 禁用随机事件",
+        json_schema_extra={
+            "label": "每日随机事件上限",
+            **_ui_i18n("Random events per day"),
+        },
+    )
+    resume_pool_size: int = Field(
+        default=3,
+        ge=0,
+        description="恢复池容量：被打断且可恢复的活动最多保留几条；0 = 不恢复",
+        json_schema_extra={
+            "label": "恢复池容量",
+            **_ui_i18n("Resume pool size"),
+        },
+    )
+    resume_expire_minutes: int = Field(
+        default=240,
+        ge=30,
+        description="恢复池条目过期时间（分钟），过期即放弃",
+        json_schema_extra={
+            "label": "恢复池过期(分钟)",
+            **_ui_i18n("Resume expire (min)"),
+        },
+    )
+    low_energy_threshold: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="低精力阈值：低于该值时偏好休息/低强度活动",
+        json_schema_extra={
+            "label": "低精力阈值",
+            "step": 0.05,
+            **_ui_i18n("Low energy threshold"),
+        },
+    )
+    high_hunger_threshold: float = Field(
+        default=0.70,
+        ge=0.0,
+        le=1.0,
+        description="高饥饿阈值：高于该值时优先安排吃饭/加餐",
+        json_schema_extra={
+            "label": "高饥饿阈值",
+            "step": 0.05,
+            **_ui_i18n("High hunger threshold"),
+        },
+    )
+    high_stress_threshold: float = Field(
+        default=0.80,
+        ge=0.0,
+        le=1.0,
+        description="高压力阈值：高于该值时触发减压类重规划",
+        json_schema_extra={
+            "label": "高压力阈值",
+            "step": 0.05,
+            **_ui_i18n("High stress threshold"),
+        },
+    )
+    brief_attention_progress: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="简短回复进度阈值：低可中断活动进度超过该值时回复转简短（brief）",
+        json_schema_extra={
+            "label": "简短回复进度阈值",
+            "step": 0.05,
+            **_ui_i18n("Brief attention progress"),
+        },
+    )
+    late_attention_progress: float = Field(
+        default=0.70,
+        ge=0.0,
+        le=1.0,
+        description="稍后细说进度阈值：进度超过该值时回复更短（later，仅语气提示，不扣消息）",
+        json_schema_extra={
+            "label": "稍后细说进度阈值",
+            "step": 0.05,
+            **_ui_i18n("Late attention progress"),
+        },
+    )
+    profile_path: str = Field(
+        default="mappings/activity_profiles.json",
+        description="活动画像表路径（相对插件根目录；缺失时用内置默认画像）",
+        json_schema_extra={
+            "label": "活动画像表路径",
+            **_ui_i18n("Profile path"),
+        },
+    )
+    state_file: str = Field(
+        default="life_state.json",
+        description="状态持久化文件名（相对插件数据目录；损坏时重置默认）",
+        json_schema_extra={
+            "label": "状态文件名",
+            **_ui_i18n("State file"),
+        },
+    )
+    keep_episode_days: int = Field(
+        default=14,
+        ge=1,
+        description="活动 episode 日志保留天数（超过按日清理）",
+        json_schema_extra={
+            "label": "episode 保留天数",
+            **_ui_i18n("Keep episode days"),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

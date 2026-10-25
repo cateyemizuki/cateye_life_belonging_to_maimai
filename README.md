@@ -21,11 +21,11 @@
 4. 如需从 QQ 使用管理员命令，在「管理与日志」（`[admin]`）里填上你的 QQ 号；留空时仅本机控制台可用。
 5. 依赖 `httpx` 与 `Pillow`。Pillow 只用于渲染日程图与状态图，缺失或渲染失败时自动降级为纯文本。
 
-可选开关默认关闭：屏幕感知 `[patrol] screen_enabled`、QQ 空间 `[qzone] enabled`、周结大事记 `[affection] weekly_milestones_enabled`、午休静默 `[patrol] nap_quiet_enabled`。
+可选开关默认关闭：屏幕感知 `[patrol] screen_enabled`、QQ 空间 `[qzone] enabled`、周结大事记 `[affection] weekly_milestones_enabled`、午休静默 `[patrol] nap_quiet_enabled`、日程滚动化两开关（`[life_state] enabled` 与 `[schedule] spine_mode`，见「日程滚动化」小节）。
 
 **前置条件**：QQ 空间需要 SnowLuma 适配器（NapCat 画像不支持 QZone API）；屏幕感知需要「cateye 统一连接插件」且对方电脑上的客户端在线。目标私聊流解析不到时，插件每 60 秒重试一次，期间不会有任何主动消息；先与目标 QQ 互发一条消息通常即可解析到。
 
-WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好感度（`[affection]`）、日程系统（`[schedule]`）、日程系统·高级设置（`[schedule_advanced]`）、日程主动行为（`[planning_proactive]`）、QQ 空间（`[qzone]`）、情绪系统（`[emotion]`）、LLM 调用（`[llm]`）、提示词（高级）（`[prompts]`）、管理与日志（`[admin]`）。
+WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好感度（`[affection]`）、日程系统（`[schedule]`）、日程系统·高级设置（`[schedule_advanced]`）、日程主动行为（`[planning_proactive]`）、QQ 空间（`[qzone]`）、情绪系统（`[emotion]`）、LLM 调用（`[llm]`）、提示词（高级）（`[prompts]`）、管理与日志（`[admin]`）、生活状态（`[life_state]`，2026-10-25 新增段，段序排末尾）。
 
 ## 快速上手
 
@@ -38,6 +38,7 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 | `/lbm_diag llm` / `decision` / `life` | 模型调用、主动决策、空间决策日志 | 管理员 |
 | `/lbm_diag streams [序号]` | 查看问候候选流、序号与最近消息；给出序号可查该流下一次触发状态 | 管理员 |
 | `/lbm_life qzone status` | 查看 QQ 空间通道与 cookie 状态 | 不限 |
+| `/lbm_life rolling [status\|state\|episodes\|spine\|preview]` | 滚动日程调试（纯只读，五子命令；两开关全关时提示未启用） | 管理员 |
 | `/lbm_life qzone post 文本` | 手动发一条说说 | 管理员 |
 | `/lbm_emotion_init` | 由人设推导情绪基线 | 管理员 |
 | `/lbm_emotion_config` | 查看情绪参数（`reset` 恢复默认，`clear` 清空当天记录） | 管理员 |
@@ -61,6 +62,17 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 - 聊天频率随日程属性变化，倍率可在 `mappings/schedule_properties.json` 中调整。
 - 节假日可写入日程块头部，也可让生成时考虑节假日（两个独立开关）。
 - 在对话里提出日程变动时，bot 会判断接受、记为未来约定或拒绝。
+
+### 日程滚动化（默认关）
+
+> 2026-10-25 新增的日程系统滚动化改造：从「全天一张排满的表」升级为「日意图（spine）+ 滚动执行 + 生活状态 + 活动日志」。**全部新功能默认关**——`[life_state].enabled=false` 与 `[schedule].spine_mode=false` 两开关全关时，插件行为与本版本之前逐字一致，升级后不配置任何新键即与旧版完全相同。
+
+- **日意图（spine，默认关）**：开启 `[schedule].spine_mode` 后，每天由模型只生成 3~6 条「今天想做什么」的稀疏意图 + 硬约定 + 作息锚点，不再一次排满全天；其余时段交给本地规则。
+- **滚动执行与生活状态（默认关）**：开启 `[life_state].enabled` 后，bot 拥有精力/饥饿/专注/压力/社交电量五项连续状态（纯本地规则推进，零模型调用），按 5 分钟节奏在日意图框架内「走一步看一步」地选活动；被打断的活动进恢复池，可能恢复也可能不了了之。
+- **活动日志**：实际发生的事记入日程库新表（计划、进行中、完成、被打断、暂停、放弃、跳过），「我在做什么」只从真实发生读，不再按时间窗编造；旧日程表与旧路径完整保留。
+- **调试命令**：管理员可用 `/lbm_life rolling` 命令族（status / state / episodes / spine / preview 五个子命令）纯只读地查看滚动层状态，两开关全关时提示「rolling 未启用」。
+- **配置与映射表**：新增配置段 `[life_state]`（17 键）与 `[schedule]` 的 11 个 spine 键、6 条 spine 提示词键（全部默认关）；新增第六张映射表 `mappings/activity_profiles.json`（活动画像表：每类活动的时长分布、可中断性与状态速率，缺失回退内置默认）。
+- **回滚说明**：本轮改动基于 git 回滚点 `rollback/pre-rolling-20261025`（另有备份分支 `backup/pre-rolling-20261025`）；关闭两开关即回到旧行为，无需回滚代码。
 
 ### 虚拟陪伴
 
@@ -133,10 +145,10 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 
 | 位置 | 角色 |
 |---|---|
-| `mappings/`（表层） | **用户数据区**：五张映射表放这里、按需编辑；表层文件**不随插件包分发，更新插件也不会覆盖**。首次使用若表层缺表，插件自动从深层复制出厂默认补齐 |
-| `mappings/default_mappings/`（深层） | **随包种子源**：出厂说明文档与五张默认表随包分发、随插件版本更新；是否把新版出厂内容合并进你的表层，由你自行决定 |
+| `mappings/`（表层） | **用户数据区**：六张映射表放这里、按需编辑；表层文件**不随插件包分发，更新插件也不会覆盖**。首次使用若表层缺表，插件自动从深层复制出厂默认补齐 |
+| `mappings/default_mappings/`（深层） | **随包种子源**：出厂说明文档与六张默认表随包分发、随插件版本更新；是否把新版出厂内容合并进你的表层，由你自行决定 |
 
-五张映射表（表层位置、文件名不变）：
+六张映射表（表层位置、文件名不变）：
 
 | 文件 | 用途 |
 |---|---|
@@ -145,6 +157,7 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 | `affection_presets.json` | 好感度档数、档名与区间（1~5 档） |
 | `affection_tier_descriptions.json` | 各档位的注入文案 |
 | `schedule_properties.json` | 日程属性、聊天频率倍率与标签色 |
+| `activity_profiles.json` | 活动画像表（2026-10-25 新增第六张）：滚动化层每类活动的时长分布、可中断性与状态速率；滚动层关闭时不参与运行 |
 
 这些表只在插件加载或热重载时读取，修改后需要重启或重载才生效。结构、校验与错误回退规则见 `mappings/default_mappings/README.md`。
 
@@ -170,10 +183,10 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 ## 技术信息
 
-- 组件 29 个：8 个命令、10 个 Hook、7 个工具、4 个跨插件 API。
+- 组件 30 个：8 个命令、10 个 Hook、8 个工具、4 个跨插件 API（`[admin].harass_report_enabled=false` 时运行期注册面回落 29）。
 - 声明 17 项宿主能力。
-- 配置 11 个段、201 个字段（3 个隐藏、198 个可见）。
-- 用户可编辑映射表 5 张，位于 `mappings/`。
+- 配置 12 个段、239 个字段（3 个隐藏、236 个可见；2026-10-25 滚动化批实算 = 原 205 + `[schedule]` spine 11 键 + `[life_state]` 新段 17 键 + `[prompts]` 6 键）。
+- 用户可编辑映射表 6 张，位于 `mappings/`。
 
 ## 许可
 

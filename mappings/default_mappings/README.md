@@ -10,8 +10,8 @@
 
 | 位置 | 角色 | 随包分发？ | 插件会写它吗？ |
 |---|---|---|---|
-| `mappings/`（表层） | **用户数据区**——你实际要改的在这里 | **否**（表层五张 `*.json` 与表层 `README.md` 退出仓库分发，`.gitignore` 已标记） | 只在表层缺表 / 无旧版可迁移时生成默认表，其余**只读** |
-| `mappings/default_mappings/`（本文件夹，深层） | **随包种子源**——出厂默认文档与五张表 | **是**，随插件版本更新 | 否（只作复制来源） |
+| `mappings/`（表层） | **用户数据区**——你实际要改的在这里 | **否**（表层六张 `*.json` 与表层 `README.md` 退出仓库分发，`.gitignore` 已标记） | 只在表层缺表 / 无旧版可迁移时生成默认表，其余**只读** |
+| `mappings/default_mappings/`（本文件夹，深层） | **随包种子源**——出厂默认文档与六张表 | **是**，随插件版本更新 | 否（只作复制来源） |
 
 - **表层缺表自动补齐**：某张表层 `json` **文件不存在**时，插件先看**旧的插件根目录版**有没有（有就复制它，优先你的旧资产），仍缺才从本文件夹**复制一份出厂默认**进表层（逐字节一致，内容与版本出厂内容相同）；
 - **解析错误不算缺失（红线）**：表层某表**存在但格式错误**时，走各表既有的「告警 + 回退内置默认」链，**绝不会**从本文件夹复制 / 覆盖你的表层文件——放心逐条修错，不怕被冲掉；
@@ -24,7 +24,7 @@
 
 ## 一、这个文件夹是什么
 
-### 5 张表各自管什么
+### 6 张表各自管什么
 
 | 文件 | 管什么 | 读它的代码 |
 |---|---|---|
@@ -33,8 +33,9 @@
 | `affection_presets.json` | 关系预设 → 好感度档位区间（总分 0~200，1~5 档自由构造） | `companion/affection_presets.py` |
 | `affection_tier_descriptions.json` | 每个档位（如「热恋」「铁哥们」）注入提示词的那句话 | `companion/affection_tier_descriptions.py` |
 | `schedule_properties.json` | **日程属性表**（2026-10-21 新增第五张）：每个日程「属性」的回复率调控倍率、属性关键词词表与展示标签/颜色 | `planning/activity_properties.py` |
+| `activity_profiles.json` | **活动画像表**（2026-10-25 新增第六张）：每种活动「类型」的时长采样分布、最小块、可中断性/切走成本、五项状态速率（生活状态层与滚动规划用） | `planning/activity_profiles.py` |
 
-五张表互相独立：改一张不会影响另外四张（按表的键联动的地方见各节说明）。
+六张表互相独立：改一张不会影响另外五张（按表的键联动的地方见各节说明）。
 
 ### 改了多久生效
 
@@ -42,7 +43,7 @@
 
 所以改法固定是：**编辑并保存 json → 触发热重载（或在宿主里重启插件）**。只保存不重载，改动不会生效。
 
-读取入口：情绪两张在情绪服务构造时读（`emotion/service.py:211`、`emotion/service.py:226`），好感度两张由 `companion/services.py:42` 的 `_load_affection_tables` 读，插件加载时调一次（`companion/services.py:119`）、配置热重载时再调一次（`companion/services.py:222`）；**日程属性表**由日程服务束构造时装载（`planning/services.py` 规划束初始化里 `activity_properties.load_and_apply`，同款「加载/热重载各读一遍」），倍率消费点在 `planning/proactive_service.py` 的 `_apply_frequency`。
+读取入口：情绪两张在情绪服务构造时读（`emotion/service.py:211`、`emotion/service.py:226`），好感度两张由 `companion/services.py:42` 的 `_load_affection_tables` 读，插件加载时调一次（`companion/services.py:119`）、配置热重载时再调一次（`companion/services.py:222`）；**日程属性表**由日程服务束构造时装载（`planning/services.py` 规划束初始化里 `activity_properties.load_and_apply`，同款「加载/热重载各读一遍」），倍率消费点在 `planning/proactive_service.py` 的 `_apply_frequency`；**活动画像表**同款由规划束装载（`activity_profiles.load_and_apply`），消费点在生活状态层与滚动规划层（`planning/life_state.py`、`planning/activity_profiles.sample_duration`）。
 
 ### 旧版文件会自动搬进来
 
@@ -56,7 +57,7 @@
 
 ### 文件缺失会怎样
 
-- 五张表都**不存在也不会报错**：`emotion_mapping.json` / `emotion_descriptions.json` / `affection_presets.json` / `affection_tier_descriptions.json` / `schedule_properties.json` 在缺失时会各自生成一份内置默认文件（内容就是出厂默认），然后按内置默认运行。所以第一版可以直接打开生成好的文件照葫芦画瓢。
+- 六张表都**不存在也不会报错**：`emotion_mapping.json` / `emotion_descriptions.json` / `affection_presets.json` / `affection_tier_descriptions.json` / `schedule_properties.json` / `activity_profiles.json` 在缺失时会各自生成一份内置默认文件（内容就是出厂默认），然后按内置默认运行。所以第一版可以直接打开生成好的文件照葫芦画瓢。
 
 ---
 
@@ -554,11 +555,138 @@
 
 ---
 
-## 七、FAQ
+## 七、活动画像表 `activity_profiles.json`（第六张表，2026-10-25）
+
+### 文件作用
+
+把「滚动执行层决定下一步活动」所需的**每类活动参数**外置给你改（`planning/activity_profiles.py`
+单一真源，纯离线零 LLM 调用）：
+
+- **时长采样**：每种活动类型一组分布（`normal` / `lognormal` + 截断区间 + 最小块），
+  决定「这件事这次做多久」（`sample_duration`，按设计附录 B.6.2）；
+- **状态速率**：做这类活动时精力/饥饿/专注/压力/社交电量每分钟变化多少（正数增加、
+  负数减少），由生活状态层 `planning/life_state.py` 在 tick 里积分；
+- **可中断性 / 切走成本 / 恢复倾向 / 自发权重**：供滚动规划的打分与恢复池用。
+
+这些功能属于日程系统的新滚动层（默认关）；本表缺失或整表回退时，插件按内置默认画像运行，其余行为不受影响。
+
+### 顶层结构与字段表
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "work": {"label": "工作",
+             "duration": {"dist": "lognormal", "median": 50, "sigma": 0.35, "min": 25, "max": 100},
+             "min_block": 25, "interruptibility": 0.25, "switch_cost": 0.8,
+             "energy_rate": -0.0015, "hunger_rate": 0.0004, "focus_rate": -0.0010,
+             "stress_rate": 0.0010, "social_rate": 0.0000,
+             "resume_bias": 0.6, "spontaneous_weight": 0.2},
+    ...
+  }
+}
+```
+
+| 键 | 必填 | 类型 | 说明 |
+|---|---|---|---|
+| `version` | **是** | 整数 | 必须恰为 `1` |
+| `profiles` | 否 | 对象 | 「活动类型 → 画像」映射（缺 = 全部用内置画像） |
+
+每个画像条目（键 = 活动类型名，去空白后非空）：
+
+| 字段 | 必填 | 类型 | 约束 |
+|---|---|---|---|
+| `duration` | **是** | 对象 | `dist` 只允许 `normal` / `lognormal`；`normal` 必须给 `mean`、`lognormal` 必须给 `median`；`sigma` 须为正数；`min` / `max` 必填且 `0 <= min <= max`（分钟） |
+| `min_block` | **是** | 数值 | 最小块（分钟），必须为**正数**——小于它的活动不启动 |
+| `label` | 否 | 字符串 | 展示名（缺失/空白回退类型名本身） |
+| `interruptibility` | 否 | 数值 | 可中断性 0~1（缺省 0.5；越界钳入区间） |
+| `switch_cost` | 否 | 数值 | 切走成本 0~1（缺省 0.5；越界钳入区间） |
+| `energy_rate` / `hunger_rate` / `focus_rate` / `stress_rate` / `social_rate` | 否 | 数值 | 每分钟状态速率，可正可负（缺省 0.0） |
+| `resume_bias` | 否 | 数值 | 恢复池倾向 0~1（缺省 0.0；越界钳入区间） |
+| `spontaneous_weight` | 否 | 数值 | 空闲时自发被选中的权重 0~1（缺省 0.0；越界钳入区间） |
+
+内置 10 种类型（出厂即这套，与文件同内容）：`work` / `study` / `meal` / `rest` /
+`exercise` / `entertainment` / `daily_routine` / `social` / `idle` / `transition`。
+**缺类型回退 `daily_routine`**：规划时遇到表里没有的活动类型，自动按「日常」画像处理并写告警日志（每轮重载后同一类型只告警一次）。
+
+### 校验规则与出错时的行为
+
+**错误分三级粒度（与日程属性表同款）**：
+
+| 情况 | 行为 |
+|---|---|
+| JSON 读不了 / 语法错 / 顶层不是对象 | **整文件回退内置默认**（告警） |
+| `version` 缺失 / 不是整数 / 不等于 1 | **整文件回退内置默认** |
+| 顶层出现 `version`、`profiles` 之外的键 | **整文件回退内置默认** |
+| `profiles` 的值不是对象 | **整文件回退内置默认** |
+| `profiles` 键缺失 | 视为「无自定义」，全部用内置（提示不算错） |
+| **某一个**条目坏（`duration` 结构或参数非法、`min_block` 非正数/缺失、速率/比例位非数值、类型名为空白） | **只排除这一条**，其余条目照常生效 |
+| 条目里出现结构外的未知键 | **丢弃这个键**，条目其余字段照常生效（提示留账） |
+| 比例位（`interruptibility` 等）越界（写 1.5 之类） | **钳入 0~1**，条目照常生效（提示留账） |
+| 该表没写的内置类型 | 沿用内置画像（**同类型覆盖、其余内置保留**——json 只写你想改的条目即可） |
+
+每次装载的生效情况都会写进决策日志留账：`planning.profiles_applied`（生效清单）/
+`planning.profiles_rejected`（整文件回退原因 + 被排除条目清单）两类 action。
+
+### 热重载语义
+
+与另外五张表同款：**只在插件加载 / 热重载时读一遍**，之后常驻内存（模块级生效位 +
+`apply_profiles` 重绑）。改法固定是：**编辑并保存 json → 触发热重载（或在宿主里重启插件）**；
+只保存不重载，改动不会生效。改完生效范围：时长采样、状态速率、打分参数全部即时随新表取值。
+
+### 完整可抄的最小示例
+
+只想把「娱乐」调得更上头（更容易在空闲时被选中、切走成本低），整张表只写这一条即可（其余内置保留）：
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "entertainment": {
+      "label": "娱乐",
+      "duration": {"dist": "lognormal", "median": 70, "sigma": 0.45, "min": 20, "max": 150},
+      "min_block": 15,
+      "interruptibility": 0.95,
+      "switch_cost": 0.05,
+      "energy_rate": 0.0005,
+      "hunger_rate": 0.0002,
+      "focus_rate": -0.0020,
+      "stress_rate": -0.0030,
+      "social_rate": 0.0000,
+      "resume_bias": 0.1,
+      "spontaneous_weight": 0.9
+    }
+  }
+}
+```
+
+想新增一个自定义活动类型（比如「摸鱼」），直接加一个新键即可——规划层遇到这个类型就用你的画像，不用改代码：
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "slacking": {
+      "label": "摸鱼",
+      "duration": {"dist": "normal", "mean": 15, "sigma": 5, "min": 5, "max": 30},
+      "min_block": 5,
+      "interruptibility": 1.0,
+      "switch_cost": 0.0,
+      "spontaneous_weight": 0.8
+    }
+  }
+}
+```
+
+（省略的字段按缺省值生效：五个速率 0.0、`resume_bias` 0.0 等。）
+
+---
+
+## 八、FAQ
 
 **Q：改完 json 为什么没生效？**
 
-A：五张表都**只在插件加载 / 热重载时读一遍**。保存文件后要**触发热重载或在宿主里重启插件**才会重读。
+A：六张表都**只在插件加载 / 热重载时读一遍**。保存文件后要**触发热重载或在宿主里重启插件**才会重读。
 
 如果重载后还是没变化，按顺序查：
 
@@ -569,7 +697,8 @@ A：五张表都**只在插件加载 / 热重载时读一遍**。保存文件后
    - 情绪描述表「含未知情绪键，已丢弃」；
    - 好感度预设表「有 N 个预设被排除」；
    - 好感度档位描述表「含未知预设/档位键，已丢弃」；
-   - 日程属性表整文件回退 /「有 N 个条目被排除」（`planning.properties_rejected` 留账）。
+   - 日程属性表整文件回退 /「有 N 个条目被排除」（`planning.properties_rejected` 留账）；
+   - 活动画像表整文件回退 /「有 N 个条目被排除」（`planning.profiles_rejected` 留账）。
 
 **Q：日程属性表怎么调 bot 在某类活动里的回话频率？**
 
@@ -611,4 +740,4 @@ A：可以，**1~5 档**都行，每档的名字自己起。但要注意两点�
 
 ---
 
-> 维护提示：本文档随插件包分发，描述的是当前代码的行为；代码与文档都可能继续演进，若两者冲突，**以代码内注释为准**（各表对应的源码：`emotion/mapping_override.py`、`emotion/descriptions.py`、`companion/affection_presets.py`、`companion/affection_tier_descriptions.py`、`planning/activity_properties.py`、`core/mapping_dir.py`）。
+> 维护提示：本文档随插件包分发，描述的是当前代码的行为；代码与文档都可能继续演进，若两者冲突，**以代码内注释为准**（各表对应的源码：`emotion/mapping_override.py`、`emotion/descriptions.py`、`companion/affection_presets.py`、`companion/affection_tier_descriptions.py`、`planning/activity_properties.py`、`planning/activity_profiles.py`、`core/mapping_dir.py`）。

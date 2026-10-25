@@ -308,6 +308,23 @@
 - **配置面（`[planning_proactive]` 14→15 键）**：本批全插件 **+1 字段**（可见、落 `[planning_proactive]` 段）；组件面不变。
 - **门禁提示**：同日并行批次已登记的 scratch 冒烟组件/配置面断言漂移（29 组件 / tool 7 基线 vs 实际）在本批继续累积 +1 配置字段（`greeting_morning_silence_hours`），统一更新仍按当日全部批次合计在下一轮门禁执行。
 
+### 新增：日程系统滚动化改造（2026-10-25，用户直派；版本不变）
+
+> 依据：用户 2026-10-25 直派（日程系统滚动化改造，设计目录 `D:\deepseek-harness_workspace\maibot-plugins\2026-10-25-日程系统滚动化改造设计`）。本轮把日程从「全天一张排满的表」升级为「日意图（spine）+ 滚动执行 + 生活状态 + 活动日志」四层；**全部新功能默认关**——`[life_state].enabled=false` 与 `[schedule].spine_mode=false` 两开关全关时插件行为与 2.1.0 逐字一致（既有 behavior 用例仅两处 schema_version 断言随 v5 迁移同步加严，其余零改动全绿实证）。**插件版本与 `[plugin] config_version` 维持 2.1.0 不递增（政策随用户裁定递增，本轮未裁定）**。
+
+- **新模块清单（5 个新文件 + 8 个既有文件增量，旧路径/旧函数一律保留不删）**：
+  - `planning/life_state.py`（LifeStateService）：精力/饥饿/专注/压力/社交电量五项 0~1 状态 + 睡眠债 0~12h，纯本地 tick 推进（被动漂移 + 活动画像速率，零模型调用）；睡眠三档结算、episode 完成盖吃饭/休息时间戳、状态文件 `life_state.json` 原子落盘（损坏重置默认 + 告警不阻塞，重启从 last_tick_at 补算最多 24h）；
+  - `planning/rolling_planner.py`（RollingPlanner）：滚动执行核心——候选打分（硬约定/锚点/软意图/恢复池/待机/随机事件六源）、top2~3 softmax 采样、硬约定锁定三态（提前 15 分钟预警、到点抢占、错过如实登记）、打断/恢复/放弃状态机（恢复池上限与过期）、随机小事件（只在转场掷骰、每日上限、同事件 4 小时去重、模板 1 句零模型）、重规划节流（冷却 + 每小时上限 + 阈值滞回）、早晨确定性调整（按实际睡眠裁剪日意图，零模型）；
+  - `planning/life_schedule.py`（LifeScheduleReadModel）：对上层提供 current / next / today / state_line 读取门面（睡眠条目过滤语义与既有口径一致）；
+  - `planning/activity_profiles.py` + 深层种子 `mappings/default_mappings/activity_profiles.json`（**第六张映射表「活动画像表」**）：10 类内置画像（时长分布/最小块/可中断性/切走成本/五项状态速率/恢复倾向/自发权重），json 同类型覆盖内置、缺类型回退 `daily_routine`、三级校验粒度与既有映射表同款，缺失回退内置默认；
+  - 接线：`schedule_generator.py` 加 `mode="spine"` 分支（旧 `daily` 模式零删除）、`auto_scheduler.py` 加 spine 固定时刻触发、`schedule_query.py` 加 runtime provider 前置分支（缺失/关闭/异常三态回退旧时间窗逐字）、`inject_service.py` 注入块追加 runtime 实况 + 能量行 LifeState 优先逐字回退、`proactive_service.py` 仅改当前活动读取源（**主动消息链零触碰**，不新增任何主动开口）、`plugin.py` 装配（关闭即零实例化、装配失败告警回退绝不拖挂加载）、`planning/services.py` 加三个占位属性、`companion/components.py` + `qzone/components.py` 加 rolling 调试命令。
+- **schedule.db 升级 v5（只增不改）**：新增 `activity_episodes` 活动日志表（episode 全字段 + 三索引 + active 单例唯一索引），v4→v5 故障隔离迁移（失败告警不抛、旧表可读、版本下次重试）；episode 状态机 = planned/active/completed/interrupted/paused/abandoned/skipped；旧表零改动，schema_version 由 `'4'` 改按迁移结果写入 `'5'`。
+- **新配置键（全部默认关，共 +34 键）**：`[schedule]` +11 个 spine 键（`spine_mode` / `spine_min_intentions` / `spine_max_intentions` / `spine_max_described_intents` / `spine_recent_days` / `spine_history_messages` / `spine_knowledge_limit` / `spine_max_tokens` / `spine_use_multi_round` / `spine_generate_at` / `planning_daily_token_budget`）；新段 `[life_state]` 17 键（`enabled` / `tick_seconds` / `horizon_minutes` / `replan_cooldown_minutes` / `max_replans_per_hour` / `random_event_rate` / `max_random_events_per_day` / `resume_pool_size` / `resume_expire_minutes` / `low_energy_threshold` / `high_hunger_threshold` / `high_stress_threshold` / `brief_attention_progress` / `late_attention_progress` / `profile_path` / `state_file` / `keep_episode_days`）；`[prompts]` +6 个 spine 提示词键。配置面 **11 → 12 段、205 → 239 字段 / 3 隐藏 / 236 可见**（以门禁实算为准）。
+- **调试命令（管理员，纯只读零模型零副作用）**：`/lbm_life rolling [status|state|episodes|spine|preview]`——status=今日滚动概览、state=五项生活状态全字段、episodes=今日活动日志、spine=今日日意图、preview=下一 tick 候选预演；两开关全关时输出「rolling 未启用（[life_state].enabled / [schedule].spine_mode 均为 false）」。
+- **新事件与消耗标签**：`life.episode_started/completed/interrupted/resumed/abandoned`、`life.state_changed`、`life.random_event` 七事件经既有事件总线发布（旧 `schedule.*` 事件全保留）；LLM 消耗标签新增 `schedule_spine`（归属 planning 模块，`/lbm_diag llm` 与面板「模型消耗」可见）——本轮唯一新增模型调用点，滚动 tick / 状态更新 / 随机事件 / 早晨调整全部零模型调用。
+- **默认关口径与回滚点**：两开关全关下所有新分支旁路、注入文本与旧行为逐字一致（行为门禁既有 204 用例零改动全绿 + 新增 205~212 用例实证）；本轮基于 git 回滚点 tag `rollback/pre-rolling-20261025`（另有备份分支 `backup/pre-rolling-20261025`），关闭两开关即回到旧行为，无需回滚代码。
+- **门禁**：behavior 编号至 **212**（新增 205 LifeState / 206 活动画像表种子链 / 207 schedule.db v5 episodes / 208 RollingPlanner / 209 ScheduleQuery runtime provider / 210 spine 生成分支 / 211 rolling 调试命令 / 212 注入面 runtime 实况；既有 163/199 两处 schema_version 断言 4→5 同步加严，R7 注明非削弱）；smoke 更新为 12 段 / 239 字段 / 3 隐藏 / 236 可见 + 深层种子六件→七件；三件套 exit 0 全绿。**遗留（登记未实现，交后续轮/用户裁定）**：patch（补丁重规划）与 digest（日摘要）两项模型调用未实现、emotion 订阅 `life.*` 事件的耦合系数未做、`life_state_snapshots` 趋势表未建、晨间调整钩子已定义未接线、画像表落位为深层种子（`mappings/default_mappings/`，与设计字面路径 `mappings/activity_profiles.json` 不同，符合 §29.2「表层 = 用户数据区」纪律）。
+
 ## [1.1.0] - 2026-10-10
 
 配置大整理版：把配置从 13 段重排为 **11 段**，集中了提示词与模型调用，修好既有缺陷，并重做了早/晚安链。**旧配置在首次启动时自动迁移，无需手改**（幂等，可反复重启）；升级时插件会先读回磁盘上的旧配置再搬运，**跨段/改名键的用户值不会丢**。插件版本与配置版本均为 **1.1.0**（同步）。本版同时收口了第三轮真机问题（日程跨午夜写库/空档重罚、无活动兜底、静默留空跟随作息、注入链 session_id 写回、用户可见文案去 emoji）。

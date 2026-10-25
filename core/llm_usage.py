@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 #: 调用点 event → 模块（新增 LLM 调用点时同步登记；未知 event 归「其他」）
 EVENT_MODULE_MAP: Dict[str, str] = {
     "schedule_generation": "planning",
+    "schedule_spine": "planning",  # 2026-10-25 滚动化改造新增：spine 日意图生成（模块 planning）
     "role_judge": "planning",
     "miss_confirm": "companion",
     "affection_review": "companion",

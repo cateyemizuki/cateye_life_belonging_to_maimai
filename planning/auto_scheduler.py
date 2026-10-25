@@ -111,6 +111,31 @@ def clamp_due_minutes(due_minutes: int) -> int:
     return min(int(due_minutes), DAY_MINUTES - GENERATE_LEAD_MINUTES)
 
 
+def spine_generate_at_minutes(cfg: Any) -> Optional[int]:
+    """spine 模式的固定生成时刻（``[schedule].spine_generate_at``，HH:MM）→ 钟点分钟数。
+
+    2026-10-25 滚动化改造新增（R7 依据 = 用户 2026-10-25 直派，设计目录
+    D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
+
+    - ``spine_mode`` 未开 → ``None``（不参与判定）；
+    - ``spine_generate_at`` 为空串 → ``None``（沿用旧生成时机口径）；
+    - 非法 HH:MM → ``None``（保守裁量：沿用旧口径，不猜时刻）。
+
+    设计 §9.1 警告：spine 稀疏意图的最后 end 很早（如 15:00），沿用「最后 end + 延迟」
+    会在当天傍晚就过早生成次日——所以 spine 开启且配了固定时刻时**必须**用固定时刻触发。
+    """
+    if not bool(getattr(cfg, "spine_mode", False)):
+        return None
+    raw = str(getattr(cfg, "spine_generate_at", "") or "").strip()
+    if not raw:
+        return None
+    minutes = parse_hhmm(raw, -1)
+    if minutes < 0:
+        logger.debug("spine_generate_at 非法（%r），沿用旧生成时机口径", raw)
+        return None
+    return minutes
+
+
 def baseline_minutes(items: Optional[List[Dict[str, Any]]], *,
                      wake_minutes: int, sleep_minutes: int) -> int:
     """当日帧内的**基准**相对分钟数（B2/B4）。
@@ -241,6 +266,10 @@ class ScheduleAutoScheduler:
 
     def _describe_timing(self, cfg: Any) -> str:
         """启动日志用的口径描述（不参与判定）。"""
+        spine_at = spine_generate_at_minutes(cfg)
+        if spine_at is not None:
+            return (f"spine 模式：每天 {str(getattr(cfg, 'spine_generate_at', '') or '').strip()} "
+                    f"固定生成日意图（仍受新一天起点前 {GENERATE_LEAD_MINUTES} 分钟硬约束）")
         mode, value = resolve_generate_timing(cfg)
         if mode == TIMING_ABSOLUTE:
             return f"兼容读取绝对时刻 {value}（已废弃字段；仍受新一天起点前 {GENERATE_LEAD_MINUTES} 分钟硬约束）"
@@ -265,8 +294,17 @@ class ScheduleAutoScheduler:
             return []
 
     def _due_minutes_in_frame(self, frame_start: datetime, cfg: Any) -> int:
-        """当日帧内的到期分钟数 = ``clamp(基准 + 延迟, ≤ 新一天起点 − 30 分钟)``。"""
+        """当日帧内的到期分钟数 = ``clamp(基准 + 延迟, ≤ 新一天起点 − 30 分钟)``。
+
+        2026-10-25 滚动化改造新增（R7 依据 = 用户 2026-10-25 直派）：spine 模式且
+        ``spine_generate_at`` 非空时**优先**用该固定时刻（与旧绝对时刻字段同一条
+        帧内换算 + 30 分钟硬约束链）；空串/非法才沿用旧口径（设计 §9.1：勿用稀疏
+        意图的最后 end 触发，否则会过早生成次日）。
+        """
         wake_min, sleep_min = self._anchors(cfg)
+        spine_at = spine_generate_at_minutes(cfg)
+        if spine_at is not None:
+            return clamp_due_minutes(in_frame_minutes(spine_at, wake_min))
         mode, value = resolve_generate_timing(cfg)
         if mode == TIMING_ABSOLUTE:
             # 旧字段兼容路径：绝对时刻落进当日帧（同一钟点在本帧内的位置），同样受硬约束钳制
@@ -373,6 +411,10 @@ class ScheduleAutoScheduler:
             personality = str(getattr(self.plugin, "_personality", "") or "")
             lover_name = str(getattr(self.plugin, "_lover_name", "") or "麦麦")
 
+            # 2026-10-25 滚动化改造新增（R7 依据 = 用户 2026-10-25 直派）：spine_mode 开启时
+            # 走 spine 分支（生成器内部读 [schedule].spine_* 键；spine 专属参数在生成器侧
+            # 覆盖，下列共享入参照常透传；mode 缺省 daily = 旧路径零变化）
+            spine_mode = bool(getattr(cfg, "spine_mode", False))
             items = await generator.generate_daily_schedule(
                 target,
                 personality=personality,
@@ -397,8 +439,10 @@ class ScheduleAutoScheduler:
                 no_sleep_mode=cfg.no_sleep_mode,
                 timezone=adv.timezone,
                 llm_task_name=llm_task_name_of(self.plugin),
+                mode="spine" if spine_mode else "daily",
             )
-            logger.info("自动生成日程成功: %s - 共 %d 个活动", target, len(items))
+            logger.info("自动生成日程成功: %s - 共 %d 个活动%s",
+                        target, len(items), "（spine 日意图）" if spine_mode else "")
 
         except Exception as e:
             logger.error(f"自动生成日程出错: {e}", exc_info=True)

@@ -1,7 +1,18 @@
-"""日程查询：当前活动、未来活动、全天摘要（带 N 分钟窗口缓存）。"""
+"""日程查询：当前活动、未来活动、全天摘要（带 N 分钟窗口缓存）。
+
+R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
+D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）：
+runtime provider 注入（主设计 §9.1 读取侧改造 / P2 灰度）——构造参数或
+:meth:`ScheduleQuery.set_runtime_provider` 注入
+:class:`~planning.life_schedule.LifeScheduleReadModel`（默认 None = 旧行为）；
+``find_current_activity`` / ``find_next_activities`` 在 provider 存在且
+``[life_state].enabled`` 时**优先读 episode**，provider 异常 / 关闭 / 取不到（None）
+一律回退旧时间窗路径（旧代码逐字保留，只加前置分支）。
+"""
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,15 +23,33 @@ from .time_utils import (describe_energy, format_day_minute, get_energy_level,
                          ring_minutes_ahead)
 from core.time_utils import minutes_of_now
 
+logger = logging.getLogger(__name__)
+
 # sleep 类型条目不算「正在做的事」（仅 include_sleep=True 的调用方可见，如情绪睡眠循环）
 _SKIP_TYPES = {"sleep"}
 
 
 class ScheduleQuery:
-    def __init__(self, db: ScheduleDB, cache_minutes: int = 15) -> None:
+    def __init__(self, db: ScheduleDB, cache_minutes: int = 15,
+                 runtime_provider: Optional[Any] = None) -> None:
         self._db = db
         self._cache_minutes = max(1, int(cache_minutes))
         self._cache: Dict[str, Tuple[int, Any]] = {}  # key -> (窗口号, 结果)
+        #: runtime provider（LifeScheduleReadModel；None = 旧行为——R7 滚动化改造，
+        #: 只增不改：provider 异常/关闭/取不到一律回退旧时间窗路径）
+        self._runtime_provider = runtime_provider
+
+    def set_runtime_provider(self, provider: Optional[Any]) -> None:
+        """注入/更换 runtime provider（装配期调用；传 None 恢复旧行为）。"""
+        self._runtime_provider = provider
+
+    @staticmethod
+    def _runtime_ready(provider: Any) -> bool:
+        """provider 存在且 ``[life_state].enabled``（enabled 属性缺失/异常 → False=旧行为）。"""
+        try:
+            return provider is not None and bool(getattr(provider, "enabled", False))
+        except Exception:
+            return False
 
     @property
     def db(self) -> ScheduleDB:
@@ -44,7 +73,22 @@ class ScheduleQuery:
         日期帧标记）——凌晨 00:30 也能命中「23:00 → 次日 07:00」的跨午夜睡觉条目；
         并合并**前一日期帧**的行：``day_offset=1``（今晚午夜段）与 ``end>1440``
         （跨午夜延续）的昨日条目在今天凌晨仍可命中。
+
+        R7 runtime 前置分支（滚动化改造）：provider 就绪时优先读 episode 日志；
+        provider 异常 / ``[life_state]`` 关闭 / 取不到（None = 空闲）一律落回下方
+        旧时间窗路径（逐字保留）——include_sleep 语义由 provider 透传（emotion
+        睡眠大修 / qzone 睡眠发帖链不可断）。runtime 结果不进 15 分钟缓存
+        （episode 由 5 分钟 tick 推进，缓存会引入滞后矛盾）。
         """
+        provider = self._runtime_provider
+        if self._runtime_ready(provider):
+            try:
+                runtime_current = provider.current(now, include_sleep=include_sleep)
+            except Exception as exc:
+                logger.warning("runtime provider 读取当前活动失败，回退时间窗路径：%s", exc)
+                runtime_current = None
+            if runtime_current is not None:
+                return runtime_current
         now = now or datetime.now()
         window = minutes_of_now(now) // self._cache_minutes
         key = f"cur_{date}_{int(bool(include_sleep))}"
@@ -91,7 +135,20 @@ class ScheduleQuery:
         23:35 时帧首（``0`` 分钟）条目按环上的**帧尾**（今晚 24:00）算作"接下来"，
         不再被 ``start > cur`` 的单调比较漏掉；列表按环上距离排序（同帧内按 start 升序，
         帧尾条目自然排在最后）。正在进行中的尾段（如 00:30 的 ``(0, 60)``）不算"接下来"。
+
+        R7 runtime 前置分支（滚动化改造）：provider 就绪时优先读 runtime merge 视图
+        （planned episode / 恢复池 / planner 预演 / spine 意图，睡眠类型不列入）；
+        异常 / 关闭 / 取不到（空列表）→ 落回下方旧时间窗路径（逐字保留）。
         """
+        provider = self._runtime_provider
+        if self._runtime_ready(provider):
+            try:
+                runtime_next = provider.next(now, limit=limit)
+            except Exception as exc:
+                logger.warning("runtime provider 读取未来活动失败，回退时间窗路径：%s", exc)
+                runtime_next = None
+            if runtime_next:
+                return list(runtime_next)
         now = now or datetime.now()
         cur_min = minutes_of_now(now)
         upcoming: List[Tuple[int, Dict[str, Any]]] = []

@@ -11,6 +11,17 @@
 - 构造 ``ScheduleGenerator(db, llm)``；
 - ``generate_daily_schedule(date, *, personality, lover_name, wake_time, sleep_time,
   min_activities, max_activities, timeout_seconds) -> list[dict]``。
+
+2026-10-25 滚动化改造新增（R7 依据 = 用户 2026-10-25 直派，设计目录
+D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）：
+- ``generate_daily_schedule(..., mode="spine")`` 分支：每天只生成 3-6 条稀疏日意图
+  （+ 硬约定 + 作息锚点），意图按【spine 意图存储契约】写 ``schedule_items``
+  （``parameters`` 附加 ``spine/min_minutes/max_minutes/priority/hardness/
+  interruptibility/note`` 键；窗口 start/end=window 起止分钟，跨午夜 end 允许 >1440，
+  空档合法、不要求覆盖全天）；进账照走既有 ``_replace_with_entry``（打戳链路一字不动，
+  reason=scheduled_generate）；LLM 失败回退模板 spine（锚定 [schedule] 作息锚点，
+  禁硬编码时刻），不重试多轮；
+- ``mode`` 缺省 ``"daily"``：旧全天生成路径零变化。
 """
 
 from __future__ import annotations
@@ -50,7 +61,8 @@ from .cycle_state import (REASON_FALLBACK, REASON_REGENERATE, REASON_SCHEDULED,
                           enter_schedule_cycle, entry_context_from_plugin)  # §31.2 进账漏斗；R7 2026-10-23
 from .schedule_db import ScheduleDB
 from .schedule_items import is_night_sleep_item
-from .time_utils import is_in_sleep_ring, normalize_day_minutes, ring_minutes_ahead
+from .time_utils import (DAY_MINUTES, is_in_sleep_ring, normalize_day_minutes,
+                         ring_minutes_ahead)
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +197,7 @@ class ScheduleGenerator:
         bot_profile: Optional[Dict[str, str]] = None,
         apply: bool = True,
         reason: Optional[str] = None,
+        mode: str = "daily",
     ) -> List[Dict[str, Any]]:
         """生成并落库某天日程；多轮生成 + 质量评分，LLM 全轮失败时模板兜底。
 
@@ -197,7 +210,21 @@ class ScheduleGenerator:
                 缺省 ``scheduled_generate``；regenerate 指令链透传 ``regenerate``；
                 LLM 全轮失败走模板兜底时改 ``fallback_template``（仅对例行生成路径，
                 regenerate 调用点语义优先——原因按调用点区分进记录，见 notes）。
+            mode: ``"daily"``（缺省，旧全天生成路径，行为零变化）或 ``"spine"``
+                （2026-10-25 滚动化改造新增：稀疏日意图分支，见模块 docstring 与
+                :meth:`_generate_spine_schedule`）。
         """
+        # 滚动化改造（2026-10-25，默认关）：spine 分支——旧行为只在 mode="daily" 时走
+        if str(mode or "daily").strip() == "spine":
+            return await self._generate_spine_schedule(
+                date,
+                personality=personality, lover_name=lover_name,
+                wake_time=wake_time, sleep_time=sleep_time,
+                timeout_seconds=timeout_seconds, custom_prompt=custom_prompt,
+                timezone=timezone, llm_task_name=llm_task_name,
+                temperature=temperature, bot_profile=bot_profile,
+                no_sleep_mode=no_sleep_mode, apply=apply, reason=reason,
+            )
         entry_reason = str(reason or REASON_SCHEDULED)
         gen_config = ScheduleGeneratorConfig(self._build_config_dict(
             personality=personality, lover_name=lover_name, wake_time=wake_time, sleep_time=sleep_time,
@@ -376,6 +403,402 @@ class ScheduleGenerator:
             cycle_start_ts=(stamps[0] if stamps else None),
             cycle_end_ts=(stamps[1] if stamps else None),
         )
+
+    # ============================================================
+    # spine 日意图分支（2026-10-25 滚动化改造新增；R7 依据 = 用户 2026-10-25 直派，
+    # 设计目录 D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）
+    # ============================================================
+
+    #: spine 意图 parameters 键的合法取值（【spine 意图存储契约】）
+    SPINE_PRIORITIES = ("high", "medium", "low")
+    SPINE_HARDNESS = ("hard", "soft")
+
+    def _spine_params(self) -> Dict[str, Any]:
+        """读 ``[schedule]`` 的 spine_* 键（运行期活取值；插件未挂载/键非法回退出厂默认）。"""
+        cfg = getattr(getattr(self._plugin, "config", None), "schedule", None)
+
+        def _int(key: str, default: int, lo: int) -> int:
+            try:
+                value = int(getattr(cfg, key, default))
+            except (TypeError, ValueError):
+                return default
+            return value if value >= lo else default
+
+        max_intentions = _int("spine_max_intentions", 6, 1)
+        min_intentions = _int("spine_min_intentions", 3, 1)
+        if min_intentions > max_intentions:
+            min_intentions = max_intentions
+        return {
+            "min_intentions": min_intentions,
+            "max_intentions": max_intentions,
+            "max_described": _int("spine_max_described_intents", 1, 0),
+            "recent_days": _int("spine_recent_days", 2, 0),
+            "history_messages": _int("spine_history_messages", 12, 0),
+            "knowledge_limit": _int("spine_knowledge_limit", 3, 0),
+            "max_tokens": _int("spine_max_tokens", 2048, 256),
+            "use_multi_round": bool(getattr(cfg, "spine_use_multi_round", False)),
+        }
+
+    async def _generate_spine_schedule(
+        self,
+        date: str,
+        *,
+        personality: str = "",
+        lover_name: str = "麦麦",
+        wake_time: str = "07:00",
+        sleep_time: str = "23:00",
+        timeout_seconds: float = 120.0,
+        custom_prompt: str = "",
+        timezone: str = "Asia/Shanghai",
+        llm_task_name: str = "",
+        temperature: float = 0.85,
+        bot_profile: Optional[Dict[str, str]] = None,
+        no_sleep_mode: bool = False,
+        apply: bool = True,
+        reason: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """spine 分支：生成 3-6 条稀疏日意图并按【spine 意图存储契约】落库。
+
+        - 意图按契约写 ``schedule_items``：窗口 start/end = window 起止分钟
+          （跨午夜 end 允许 >1440，空档合法、不要求覆盖全天）；``parameters`` 附加
+          ``spine/min_minutes/max_minutes/priority/hardness/interruptibility/note``；
+        - 进账照走既有 :meth:`_replace_with_entry`（enter_schedule_cycle 打戳链路
+          一字不动）；例行生成 reason=``scheduled_generate``，模板兜底改
+          ``fallback_template``（与旧全天路径的血缘口径一致）；
+        - LLM 全轮失败/空响应回退模板 spine（:meth:`_build_spine_fallback`，
+          锚定 [schedule] 作息锚点、禁硬编码时刻），不强制重试多轮。
+        """
+        params = self._spine_params()
+        entry_reason = str(reason or REASON_SCHEDULED)
+        gen_config = ScheduleGeneratorConfig(self._build_config_dict(
+            personality=personality, lover_name=lover_name, wake_time=wake_time,
+            sleep_time=sleep_time, min_activities=params["min_intentions"],
+            max_activities=params["max_intentions"], timeout_seconds=timeout_seconds,
+            use_multi_round=False, max_rounds=1, quality_threshold=1.0,
+            enable_detailed_description=True, min_description_length=15,
+            max_description_length=25, max_tokens=params["max_tokens"],
+            custom_prompt=custom_prompt, recent_schedule_days=params["recent_days"],
+            history_message_limit=params["history_messages"],
+            knowledge_search_limit=params["knowledge_limit"],
+            cross_day_activity=True, no_sleep_mode=no_sleep_mode, timezone=timezone,
+            llm_task_name=llm_task_name, temperature=temperature, bot_profile=bot_profile,
+        ))
+
+        # 上下文装载（与 daily 同一批槽位；情绪块不注入——其措辞含「无缝衔接要求」，与稀疏口径冲突）
+        base = BaseScheduleGenerator(self.goal_manager, gen_config.to_dict())
+        self._load_sync_contexts(base, gen_config, date)
+        self._load_low_mood(base)
+        await self._load_holiday_context(base, date)
+        await self._load_async_contexts(base, gen_config, date)
+
+        schema = base.build_spine_schema(params["min_intentions"], params["max_intentions"])
+        prompt = base.build_spine_prompt(
+            schema,
+            min_intentions=params["min_intentions"], max_intentions=params["max_intentions"],
+            max_described=params["max_described"], no_sleep_mode=no_sleep_mode,
+        )
+
+        rows: List[Dict[str, Any]] = []
+        last_error: Optional[Exception] = None
+        # spine_use_multi_round=true 时最多 2 次同提示重试（结构校验：拿到可用意图即收），
+        # 不带反馈重试、不跑质量评分（设计 §4.2：单轮、结构校验、不强制重试）
+        for _ in range(2 if params["use_multi_round"] else 1):
+            try:
+                response = await self._call_llm(prompt, gen_config, event="schedule_spine",
+                                                parse=False)
+            except LLMError as exc:
+                # 配额耗尽 / 速率限制属致命错误，不再重试
+                last_error = exc
+                break
+            except Exception as exc:
+                last_error = exc
+                continue
+            try:
+                rows = self._spine_rows_from_intentions(
+                    self._parse_spine_response(response), date, params)
+            except Exception as exc:
+                last_error = exc
+                rows = []
+                continue
+            if rows:
+                break
+        if rows:
+            # 锚点护栏：睡觉意图缺失（且非无睡眠模式）时补一条模板睡觉意图（hard）
+            rows = self._ensure_spine_sleep_intent(rows, date, wake_time, sleep_time,
+                                                   max_intentions=params["max_intentions"])
+        else:
+            if last_error is not None:
+                logger.warning("spine LLM 生成失败（%s），使用模板 spine 兜底", last_error)
+            else:
+                logger.warning("spine LLM 响应无有效意图，使用模板 spine 兜底")
+            rows = self._build_spine_fallback(
+                date, wake_time=wake_time, sleep_time=sleep_time,
+                no_sleep_mode=no_sleep_mode, max_intentions=params["max_intentions"])
+            if entry_reason == REASON_SCHEDULED:
+                entry_reason = REASON_FALLBACK
+
+        if apply:
+            self.apply_schedule_items(rows, date, consume_commitments=True,
+                                      reason=entry_reason)
+        else:
+            self._replace_with_entry(date, rows, entry_reason)
+        logger.info("spine 日意图生成完成：%s 共 %d 条", date, len(rows))
+        await self._publish("schedule.generated", date=date, items=len(rows))
+        return rows
+
+    @staticmethod
+    def _parse_spine_response(response: str) -> List[Dict[str, Any]]:
+        """解析 spine 响应：整段 JSON → ```json 块 → 最外层 {} / []（宽松降级）。
+
+        接受 ``{"intentions": [...]}``（提示词要求）、``{"schedule_items": [...]}``
+        或裸数组；元素必须带 name。解析失败返回空表（调用方模板兜底，不抛异常）。
+        """
+        text = (response or "").strip()
+
+        def _loads(candidate: str) -> Any:
+            try:
+                return json.loads(candidate)
+            except (json.JSONDecodeError, ValueError):
+                return None
+
+        data = _loads(text)
+        if data is None:
+            fence = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
+            if fence:
+                data = _loads(fence.group(1))
+        if data is None:
+            for pattern in (r"\{.*\}", r"\[.*\]"):
+                m = re.search(pattern, text, re.DOTALL)
+                if m:
+                    data = _loads(m.group(0))
+                    if data is not None:
+                        break
+        if isinstance(data, dict):
+            data = data.get("intentions") or data.get("schedule_items")
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict) and item.get("name")]
+
+    @classmethod
+    def _spine_rows_from_intentions(
+        cls,
+        intentions: List[Dict[str, Any]],
+        date: str,
+        params: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """把 LLM 意图列表结构化成 DB 行（只做结构校验/钳制，不强制重试）。
+
+        非法意图（缺 name / window 缺失或非法）丢弃；超出 max_intentions 截断；
+        按 start_minute 排序。窗口跨午夜（end <= start）沿 24h 环抬到次日
+        （end 允许 >1440，日帧口径；禁手写 −1440，走 :data:`DAY_MINUTES`）。
+        """
+        rows: List[Dict[str, Any]] = []
+        for raw in intentions or []:
+            if not isinstance(raw, dict):
+                continue
+            row = cls._spine_intention_to_row(raw, date)
+            if row is not None:
+                rows.append(row)
+        if len(rows) > int(params.get("max_intentions", 6)):
+            rows = rows[: int(params.get("max_intentions", 6))]
+        rows.sort(key=lambda it: int(it["start_minute"]))
+        return rows
+
+    @staticmethod
+    def _spine_intention_to_row(raw: Dict[str, Any], date: str) -> Optional[Dict[str, Any]]:
+        """单条意图 → DB 行（【spine 意图存储契约】；非法返回 None）。"""
+        name = str(raw.get("name") or "").strip()
+        window = raw.get("window")
+        if not name or not isinstance(window, (list, tuple)) or len(window) < 2:
+            return None
+        start = parse_hhmm(str(window[0]), -1)
+        end = parse_hhmm(str(window[1]), -1)
+        if start < 0:
+            return None
+        if end < 0:
+            end = start + 60
+        if end <= start:
+            # 跨午夜窗口（window 止点钟点不晚于起点，如夜间 21:30 到次日 00:30）：
+            # 沿 24h 环抬到次日（end 允许 >1440）
+            end += DAY_MINUTES
+            if end <= start:
+                return None
+
+        def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                return default
+            return max(lo, min(hi, number))
+
+        min_minutes = _clamp_int(raw.get("min_minutes"), 30, 5, 720)
+        max_minutes = _clamp_int(raw.get("max_minutes"), min_minutes, 5, 720)
+        if max_minutes < min_minutes:
+            max_minutes = min_minutes
+        goal_type = str(raw.get("goal_type") or "").strip() or "daily_routine"
+        priority = str(raw.get("priority") or "").strip()
+        if priority not in ScheduleGenerator.SPINE_PRIORITIES:
+            priority = "medium"
+        hardness = str(raw.get("hardness") or "").strip()
+        if hardness not in ScheduleGenerator.SPINE_HARDNESS:
+            hardness = "soft"
+        try:
+            interruptibility = float(raw.get("interruptibility"))
+        except (TypeError, ValueError):
+            interruptibility = 0.5
+        interruptibility = max(0.0, min(1.0, interruptibility))
+        note = str(raw.get("note") or "").strip()
+        # 【spine 意图存储契约】：parameters JSON 列附加键（note 可选）
+        parameters: Dict[str, Any] = {
+            "spine": True,
+            "min_minutes": int(min_minutes),
+            "max_minutes": int(max_minutes),
+            "priority": priority,
+            "hardness": hardness,
+            "interruptibility": interruptibility,
+        }
+        if note:
+            parameters["note"] = note
+        return {
+            "name": name,
+            "description": note,  # description 列照旧使用（= note；无 note 为空串）
+            "goal_type": goal_type,
+            "priority": priority,
+            "start_minute": int(start),
+            "end_minute": int(end),
+            "day_offset": 0,
+            "parameters": parameters,
+            "schedule_date": date,
+        }
+
+    @classmethod
+    def _ensure_spine_sleep_intent(
+        cls,
+        rows: List[Dict[str, Any]],
+        date: str,
+        wake_time: str = "07:00",
+        sleep_time: str = "23:00",
+        max_intentions: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """锚点护栏：睡觉意图缺失时补一条模板睡觉意图（hardness=hard，时间固定）。
+
+        补入后若超出 ``max_intentions`` 上限，丢掉排序最靠后的软意图给硬锚点让位
+        （3~6 条契约含睡觉锚点；hard 锚点优先级高于 LLM 软意图）。
+        """
+        for row in rows:
+            name = str(row.get("name") or "")
+            if str(row.get("goal_type") or "") == "sleep" or ("睡" in name or "眠" in name):
+                return rows
+        wake_min = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
+        sleep_min = parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES)
+        span = max(180, min(720, ring_minutes_ahead(wake_min, sleep_min)))
+        rows.append(cls._spine_row(date, "睡觉", sleep_min, sleep_min + span, "sleep",
+                                   "high", span, span, hardness="hard",
+                                   interruptibility=0.05))
+        rows.sort(key=lambda it: int(it["start_minute"]))
+        try:
+            cap = max(1, int(max_intentions))
+        except (TypeError, ValueError):
+            cap = 6
+        while len(rows) > cap:
+            # 从尾部丢软意图（睡觉行 hardness=hard，恒保留）
+            victim = next((it for it in reversed(rows)
+                           if it.get("parameters", {}).get("hardness") != "hard"), None)
+            if victim is None:
+                break
+            rows.remove(victim)
+        return rows
+
+    @staticmethod
+    def _spine_row(
+        date: str,
+        name: str,
+        start: int,
+        end: int,
+        goal_type: str,
+        priority: str,
+        min_minutes: int,
+        max_minutes: int,
+        *,
+        hardness: str = "soft",
+        interruptibility: float = 0.5,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        """构造一条 spine 意图 DB 行（模板兜底与锚点护栏共用；分钟数为日帧口径）。"""
+        parameters: Dict[str, Any] = {
+            "spine": True,
+            "min_minutes": int(min_minutes),
+            "max_minutes": int(max_minutes),
+            "priority": priority,
+            "hardness": hardness,
+            "interruptibility": float(interruptibility),
+        }
+        if note:
+            parameters["note"] = note
+        return {
+            "name": name,
+            "description": note,
+            "goal_type": goal_type,
+            "priority": priority,
+            "start_minute": int(start),
+            "end_minute": int(end),
+            "day_offset": 0,
+            "parameters": parameters,
+            "schedule_date": date,
+        }
+
+    @staticmethod
+    def _build_spine_fallback(
+        date: str,
+        *,
+        wake_time: str = "07:00",
+        sleep_time: str = "23:00",
+        no_sleep_mode: bool = False,
+        max_intentions: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """模板 spine 兜底（LLM 全轮失败 / 空响应；不重试多轮，设计 §4.4）。
+
+        口径（behavior 183 守卫同源）：锚定 ``[schedule]`` 生效作息锚点生成
+        睡觉/起床/三餐 + 1 个通用意图——**禁硬编码时刻**，所有钟点一律
+        ``parse_hhmm(wake_time/sleep_time)`` 同链同源派生（早餐锚起床、午餐锚日间
+        三分点、晚餐锚入睡前沿）；跨午夜作息（sleep <= wake）的清醒跨度经
+        :func:`ring_minutes_ahead` 环距计算，不手写 −1440。
+        """
+        wake_min = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
+        sleep_min = parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES)
+        # 清醒跨度（环距；常规作息 = sleep−wake，跨午夜 = wake−sleep+1440；退化 = 全天）
+        awake_span = ring_minutes_ahead(sleep_min, wake_min) or DAY_MINUTES
+        awake_end = wake_min + awake_span  # = sleep_min（常规）或 sleep_min+1440（跨午夜）
+
+        def row(name: str, start: int, end: int, goal_type: str, priority: str,
+                min_minutes: int, max_minutes: int, interruptibility: float) -> Dict[str, Any]:
+            return ScheduleGenerator._spine_row(
+                date, name, start, end, goal_type, priority,
+                min_minutes, max_minutes, interruptibility=interruptibility)
+
+        rows: List[Dict[str, Any]] = []
+        if not no_sleep_mode:
+            span = max(180, min(720, ring_minutes_ahead(wake_min, sleep_min)))
+            rows.append(row("睡觉", sleep_min, sleep_min + span, "sleep", "high",
+                            span, span, 0.05))
+        rows.append(row("起床洗漱", wake_min, wake_min + 30, "daily_routine", "medium", 15, 30, 0.9))
+        rows.append(row("早餐", wake_min, wake_min + 120, "meal", "medium", 15, 40, 0.9))
+        mid = wake_min + awake_span // 3
+        rows.append(row("午餐", max(wake_min, mid - 90), min(awake_end, mid + 90),
+                        "meal", "medium", 20, 45, 0.9))
+        if awake_span >= 480:
+            rows.append(row("自由安排", wake_min + 150, awake_end - 330,
+                            "free_time", "low", 30, 90, 0.95))
+        if awake_span >= 360:
+            rows.append(row("晚餐", awake_end - 300, awake_end,
+                            "meal", "medium", 20, 45, 0.9))
+        if len(rows) > max_intentions:
+            # 截断保睡觉（硬锚点）：睡觉行 + 起始的 (max-1) 条
+            sleep_rows = [r for r in rows if r["goal_type"] == "sleep"]
+            others = [r for r in rows if r["goal_type"] != "sleep"]
+            rows = sleep_rows + others[: max(0, max_intentions - len(sleep_rows))]
+        rows.sort(key=lambda it: int(it["start_minute"]))
+        return rows
 
     # ============================================================
     # 配置装配
@@ -845,8 +1268,24 @@ class ScheduleGenerator:
             logger.info("无睡眠模式：销毁睡眠时段内 %d 个日程，截断 %d 个越界活动", removed, truncated)
         return kept, warnings
 
-    async def _call_llm(self, prompt: str, gen_config: ScheduleGeneratorConfig) -> List[Dict[str, Any]]:
-        """调用 LLM 并解析响应（走 core.llm_utils.LLMService，带任务路由 + 调用日志）。"""
+    async def _call_llm(
+        self,
+        prompt: str,
+        gen_config: ScheduleGeneratorConfig,
+        *,
+        event: str = "schedule_generation",
+        parse: bool = True,
+    ) -> Any:
+        """调用 LLM（走 core.llm_utils.LLMService，带任务路由 + 调用日志）。
+
+        ``event`` = 消耗账本（core/llm_usage.py）的调用点标签：旧路径恒
+        ``schedule_generation``；spine 分支传 ``schedule_spine``（2026-10-25 滚动化
+        改造新增，本轮唯一新增 LLM 调用点）。缺省值保证旧调用点零变化。
+
+        ``parse=True``（缺省）按旧口径解析成日程条目列表；``parse=False`` 返回原始
+        文本（spine 用自己的 ``_parse_spine_response``——旧解析器要求
+        ``schedule_items`` 键，会把 spine 的 ``intentions`` 响应清空）。
+        """
         task_name = gen_config.llm_task_name
         max_tokens = int(gen_config.max_tokens)
         temperature = float(self._raw_of(gen_config).get("temperature", 0.85))
@@ -859,13 +1298,13 @@ class ScheduleGenerator:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_ms=timeout_ms,
-                event="schedule_generation",
+                event=event,
             ),
             timeout=float(gen_config.generation_timeout) + 15.0,
         )
         if not response:
             raise LLMError("LLM 调用失败（空响应）")
-        return self._parse_response(response)
+        return self._parse_response(response) if parse else response
 
     # ============================================================
     # 解析 / 兜底 / 归一化 / 约定匹配

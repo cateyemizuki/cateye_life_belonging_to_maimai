@@ -22,6 +22,20 @@ Hook 入口：``maisaka.planner.before_request`` / ``maisaka.replyer.before_requ
   日程块头部先注一行「今天是 X（星期Y），节假日状态」，模板见 ``[prompts].inject_date_header``；
 - 注入文案（首行/当前行/未来行/引导行/replyer 状态块）全部读 ``[prompts]`` 段（suite_prompts）；
 - 数据查询经 GoalManager 合成视图（schedule_items 单一数据源）。
+
+R7 滚动化改造（2026-10-25 用户直派，设计目录
+D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计，主设计 §3.3/§6.6/§9.1）：
+
+- ``[life_state].enabled`` 开时注入块追加 runtime 实况（经
+  :class:`~planning.life_schedule.LifeScheduleReadModel`）：current（当前 episode
+  名称/已进行多久/进度/attention_mode/剩余分钟）+ next ≤2 条 + 状态行
+  （``LifeStateService.describe`` 最显著 1~2 项）+ recent 1~2 条（completed_today
+  尾部实际发生，用于连续性）；当前活动改读 episode（红线 3：不从时间窗编造），
+  provider 关闭/缺失/异常一律落回旧路径；
+- replyer「精神」静态能量行改优先 LifeState，缺失/关闭回退既有
+  ``describe_energy(get_energy_level(...))``（旧函数不删，
+  ``planning/time_utils._ENERGY_TABLE`` 链保留为 fallback——§6.6 口径）；
+- 开关关时注入文本与 2.1.0 逐字一致（本文件全部 runtime 分支可旁路）。
 """
 
 from __future__ import annotations
@@ -34,6 +48,8 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+from core.time_utils import minutes_of_now
+
 from .config import ScheduleAdvancedSectionConfig, ScheduleSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
 from .inject import (
@@ -45,7 +61,7 @@ from .inject import (
 from .lru_cache import LRUCache
 from .time_utils import (TimezoneManager, describe_energy, format_day_minute,
                          get_energy_level, is_in_day_frame, normalize_day_minutes,
-                         parse_time_window, strip_tz)
+                         parse_time_window, ring_minutes_ahead, strip_tz)
 from suite_prompts import (
     INJECT_DATE_HEADER_DEFAULT,
     INJECT_HINT_CONTINUE_DEFAULT,
@@ -267,9 +283,25 @@ class InjectService:
                     logger.debug(f"replyer 注入被冷却跳过: {skip_reason}")
                     return {"action": "continue"}
 
+            # R7 runtime 覆盖（[life_state].enabled 开时）：当前活动改读 episode、
+            # 未来活动改读 runtime next、剩余分钟读 episode 端点；关闭/缺失 → None
+            # = 旧路径逐字（覆盖值只在本方法局部生效，不进 15 分钟缓存）。
+            life_view = self._life_runtime_view()
+            life_remaining: Optional[int] = None
+            if life_view is not None:
+                life_ov = self._life_override_from_view(life_view)
+                current_activity = life_ov["name"]
+                current_description = life_ov["description"]
+                activity_type = life_ov["goal_type"]
+                if life_ov["future"]:
+                    future_activities = life_ov["future"]
+                life_remaining = life_ov["remaining"]
+
             if current_activity:
                 # 一次查询拿到剩余分钟（状态情绪短语已随 state_analyzer 删除，精神状态归情绪系统）
-                remaining_minutes = self._compute_activity_aux(current_activity, activity_type)
+                remaining_minutes = life_remaining
+                if remaining_minutes is None:
+                    remaining_minutes = self._compute_activity_aux(current_activity, activity_type)
                 activity_prompt = self._build_replyer_extra_prompt(
                     current_activity=current_activity,
                     description=current_description or "",
@@ -371,6 +403,23 @@ class InjectService:
                 await self._get_current_schedule(chat_id)
             )
 
+            # R7 runtime 覆盖与实况块（[life_state].enabled 开时；关闭 → 全部旁路）：
+            # 当前活动/未来活动改读 episode 口径，另把
+            # 「活动实况（已进行/进度/注意力/剩余）+ next ≤2 + 状态行 + recent ≤2」
+            # 作为追加行注入（主设计 §3.3 注入只读清单）。
+            life_view = self._life_runtime_view()
+            life_lines: List[str] = []
+            remaining_override: Optional[int] = None
+            if life_view is not None:
+                life_ov = self._life_override_from_view(life_view)
+                current_activity = life_ov["name"]
+                current_description = life_ov["description"]
+                activity_type = life_ov["goal_type"]
+                if life_ov["future"]:
+                    all_future_activities = life_ov["future"]
+                remaining_override = life_ov["remaining"]
+                life_lines = self._life_block_lines(life_view, life_ov)
+
             # 无当前活动不再静默早退（N1-2）：照常走「分类 → 决策 → 模板路由」，
             # 模板侧自动切到空活动变体（兜底文案见 [prompts].inject_no_activity）。
             # 决策仍由 optimizer 把关——空活动时它只放行「问当前/问未来/上下文延续」，
@@ -384,6 +433,8 @@ class InjectService:
                 context_continue_inject=context_continue_inject,
                 context_reason=context_reason,
                 user_id=user_id,
+                remaining_override=remaining_override,
+                life_lines=life_lines,
             )
 
             # 记录到上下文缓存
@@ -578,12 +629,18 @@ class InjectService:
         context_continue_inject: bool,
         context_reason: Optional[str],
         user_id: str,
+        remaining_override: Optional[int] = None,
+        life_lines: Optional[List[str]] = None,
     ) -> Tuple[Optional[str], bool, Optional[str]]:
         """分类 → 决策 → 模板路由。user_id 实际是会话维度 scope ID（session_id）。
 
         ``current_activity`` 允许为空（2026-10-10 N1-2）：空活动不再是「静默早退」，
         而是走同一决策管道 + 空活动文案变体；决策权仍交给 optimizer/上下文延续
         （空活动时 optimizer 只放行问当前/问未来，闲聊维持节流）。
+
+        R7：``remaining_override``（runtime episode 剩余分钟）与 ``life_lines``
+        （runtime 实况追加行）由调用方在 ``[life_state].enabled`` 开时传入；
+        缺省 None = 旧路径逐字（既有调用点与测试桩零变化）。
 
         Returns:
             (inject_content, injected, detected_intent)。``inject_content`` 为 None
@@ -618,11 +675,11 @@ class InjectService:
             return None, False, detected_intent
 
         # 3. 查询活动剩余分钟（无当前活动时无意义，直接跳过；M4：精神状态行改读
-        #    情绪 mood_text，见 _render_unified_prompt）
-        remaining_minutes = (
-            self._compute_activity_aux(current_activity, activity_type)
-            if current_activity else None
-        )
+        #    情绪 mood_text，见 _render_unified_prompt）。R7：runtime episode 剩余
+        #    分钟由调用方经 remaining_override 传入，查不到才回退旧 GoalManager 查询。
+        remaining_minutes = remaining_override
+        if remaining_minutes is None and current_activity:
+            remaining_minutes = self._compute_activity_aux(current_activity, activity_type)
 
         # 4. 主动碎碎念判定：仅 CASUAL_CHAT/UNKNOWN 才考虑
         proactive_hit = False
@@ -648,6 +705,7 @@ class InjectService:
             proactive_hit=proactive_hit,
             context_continue_inject=context_continue_inject,
             context_reason=context_reason,
+            life_lines=life_lines,
         )
         if inject_content is None:
             return None, False, detected_intent
@@ -674,6 +732,7 @@ class InjectService:
         proactive_hit: bool,
         context_continue_inject: bool,
         context_reason: Optional[str],
+        life_lines: Optional[List[str]] = None,
     ) -> Optional[str]:
         """按 intent 路由统一模板（详略与语气随意图变化；TECH/COMMAND 返回 None）。
 
@@ -761,6 +820,11 @@ class InjectService:
                 lines.extend(["", prompt(self._plugin, "inject_hint_idle")])
 
         lines.extend(["", "---", ""])
+        # R7 runtime 实况追加行（[life_state].enabled 开时由调用方传入；关闭 → None
+        # = 追加块缺席，注入文本与旧行为逐字一致）。位置：引导行之后、分隔线之前。
+        if life_lines:
+            lines.append("")
+            lines.extend(life_lines)
         return "\n".join(lines)
 
     def _no_activity_text(self) -> str:
@@ -815,14 +879,34 @@ class InjectService:
             return ""
         return self._render_replyer_status_block(state_line, future_activities)
 
+    def _replyer_energy_desc(self) -> str:
+        """replyer「精神」能量行取值（R7 滚动化改造 §6.6：LifeState 优先）。
+
+        ``[life_state].enabled`` 开且 ``LifeStateService.describe`` 可得 → 用生活状态
+        行（剥「状态：」前缀适配 ``精神：{energy}`` 模板槽）；LifeState 缺失/关闭/
+        异常 → 回退既有静态曲线 ``describe_energy(get_energy_level(...))``
+        （旧函数不删，``planning/time_utils._ENERGY_TABLE`` 链保留为 fallback）。
+        """
+        view = self._life_runtime_view()
+        if view is not None:
+            state_line = str(view.get("state_line") or "").strip()
+            if state_line:
+                prefix = "状态："
+                return state_line[len(prefix):] if state_line.startswith(prefix) else state_line
+        now = self._tz_manager.get_now()
+        return describe_energy(get_energy_level(now.hour))
+
     def _render_replyer_status_block(
         self,
         state_line: str,
         future_activities: List[Tuple[str, str]],
     ) -> str:
-        """按 ``inject_replyer_status`` 模板拼 replyer 状态块（能量 + 下一条活动）。"""
-        now = self._tz_manager.get_now()
-        energy_desc = describe_energy(get_energy_level(now.hour))
+        """按 ``inject_replyer_status`` 模板拼 replyer 状态块（能量 + 下一条活动）。
+
+        R7：能量行改经 :meth:`_replyer_energy_desc`（LifeState 优先，缺失/关闭
+        回退静态 ``describe_energy``——关闭路径取值逐字不变）。
+        """
+        energy_desc = self._replyer_energy_desc()
 
         next_line = ""
         if future_activities:
@@ -950,6 +1034,195 @@ class InjectService:
             return str(getter() or "").strip()
         except Exception:
             return ""
+
+    # ------------------------------------------------------------
+    # R7 runtime 注入视图（[life_state].enabled；关闭/缺失/异常一律旁路）
+    # ------------------------------------------------------------
+
+    def _life_read_model(self) -> Optional[Any]:
+        """:class:`~planning.life_schedule.LifeScheduleReadModel` 句柄解析（可空降级）。
+
+        取数序：接线服务束 ``plugin._planning.life_schedule`` → ``ScheduleQuery``
+        的 runtime provider（接线阶段 ``sq.set_runtime_provider(model)`` 注入，
+        :attr:`planning.schedule_query.ScheduleQuery._runtime_provider`）。
+        都缺失 → ``None``（= 旧路径逐字；服务束未挂上/测试桩不抛异常）。
+        """
+        planning = getattr(self._plugin, "_planning", None)
+        model = getattr(planning, "life_schedule", None)
+        if model is not None:
+            return model
+        query = getattr(self._plugin, "_schedule_query", None)
+        provider = getattr(query, "_runtime_provider", None)
+        return provider or None
+
+    def _life_runtime_view(self) -> Optional[Dict[str, Any]]:
+        """一次注入的 runtime 视图（只读；``[life_state].enabled`` 关 → None 旁路）。
+
+        键：``current``（episode 兼容行或 None）/ ``next``（≤2 条）/ ``state_line``
+        （LifeStateService.describe 最显著 1~2 项，可空串）/ ``completed``
+        （completed_today 尾部 ≤2 行——recent 连续性）/ ``now``（判定时刻）。
+        任何读取异常 → ``None``（回退旧时间窗路径，绝不阻塞注入）。
+        """
+        model = self._life_read_model()
+        if model is None:
+            return None
+        try:
+            if not bool(getattr(model, "enabled", False)):
+                return None
+        except Exception:
+            return None
+        try:
+            now = self._tz_manager.get_now()
+            current = model.current(now) or None
+            nxt = list(model.next(now, limit=2) or [])
+            try:
+                state_line = str(model.state_line(now, max_items=2) or "").strip()
+            except Exception:
+                state_line = ""
+            try:
+                today = model.today(now) or {}
+            except Exception:
+                today = {}
+            completed = [row for row in (today.get("completed") or [])
+                         if isinstance(row, dict)][-2:]
+            return {"current": current, "next": nxt, "state_line": state_line,
+                    "completed": completed, "now": now}
+        except Exception as exc:
+            logger.debug("life runtime 注入视图读取失败（回退旧路径）：%s", exc)
+            return None
+
+    @staticmethod
+    def _life_override_from_view(view: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """runtime 视图 → 注入四元组覆盖值（R7 红线 3：当前活动只读 episode）。
+
+        返回 ``{name, description, goal_type, remaining, future}``：runtime 空闲时
+        ``name/description/goal_type`` 为 ``None``（调用方据此走空活动变体，不从
+        schedule_items 时间窗编造「正在做」）；``future`` = runtime next ≤2 条的
+        ``(format_day_minute(start), name)`` 列表；``remaining`` = episode 端点
+        ``ring_minutes_ahead`` 环归一剩余分钟（跨午夜条目凌晨也能算对）。
+        """
+        empty = {"name": None, "description": None, "goal_type": None,
+                 "remaining": None, "future": []}
+        if not isinstance(view, dict):
+            return empty
+        current = view.get("current")
+        name: Optional[str] = None
+        description: Optional[str] = None
+        goal_type: Optional[str] = None
+        remaining: Optional[int] = None
+        if isinstance(current, dict):
+            name = str(current.get("name") or "").strip() or None
+            description = str(current.get("description") or "").strip() or None
+            goal_type = str(current.get("goal_type") or "").strip() or None
+            try:
+                end = int(current.get("end_minute") or 0)
+            except (TypeError, ValueError):
+                end = 0
+            if end > 0:
+                try:
+                    remaining = ring_minutes_ahead(end, minutes_of_now(view.get("now")))
+                except Exception:
+                    remaining = None
+        future: List[Tuple[str, str]] = []
+        for item in (view.get("next") or [])[:2]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = int(item.get("start_minute") or 0)
+            except (TypeError, ValueError):
+                continue
+            item_name = str(item.get("name") or "").strip()
+            if item_name:
+                future.append((format_day_minute(start), item_name))
+        return {"name": name, "description": description, "goal_type": goal_type,
+                "remaining": remaining, "future": future}
+
+    @staticmethod
+    def _life_block_lines(view: Optional[Dict[str, Any]],
+                          override: Optional[Dict[str, Any]]) -> List[str]:
+        """runtime 实况追加行（主设计 §3.3 注入清单；零 emoji）。
+
+        current（名称/已进行/进度/注意力/剩余）+ next ≤2 + 状态行 + recent ≤2
+        （completed_today 尾部实际发生）。视图为空 → 空列表（不追加任何行）。
+        """
+        if not isinstance(view, dict):
+            return []
+        lines: List[str] = []
+        current = view.get("current")
+        now = view.get("now")
+        cur_min = minutes_of_now(now)
+        if isinstance(current, dict):
+            segs: List[str] = []
+            try:
+                start = int(current.get("start_minute") or 0)
+            except (TypeError, ValueError):
+                start = 0
+            if start > 0:
+                # 已进行 = cur 相对 start 的环距（「经过」方向）：ring_minutes_ahead(cur, start)
+                # ——2026-10-25 门禁员修新代码 bug（R7 依据 = 用户 2026-10-25 直派【滚动化改造】）：
+                # 原写法 ring_minutes_ahead(start, cur) 是「还剩」方向，start<cur 时会渲染
+                # 「已进行 1430 分钟」这类环回大数；换参后同帧 10:00→10:10 = 10、
+                # 跨午夜 23:00→00:30 = 90，两态皆对。
+                elapsed = ring_minutes_ahead(cur_min, start)
+                if elapsed > 0:
+                    segs.append(f"已进行 {elapsed} 分钟")
+            progress = current.get("progress")
+            if isinstance(progress, (int, float)) and not isinstance(progress, bool):
+                pct = int(round(max(0.0, min(1.0, float(progress))) * 100))
+                segs.append(f"进度 {pct}%")
+            mode = str(current.get("attention_mode") or "").strip()
+            if mode:
+                segs.append(f"注意力 {mode}")
+            remaining = (override or {}).get("remaining")
+            if isinstance(remaining, int) and remaining > 0:
+                segs.append(f"约还剩 {remaining} 分钟")
+            head = str(current.get("name") or "").strip() or "当前活动"
+            if segs:
+                lines.append(f"当前活动实况：{head}，" + "，".join(segs))
+        nxt_parts: List[str] = []
+        for item in (view.get("next") or [])[:2]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = int(item.get("start_minute") or 0)
+            except (TypeError, ValueError):
+                continue
+            item_name = str(item.get("name") or "").strip()
+            if not item_name:
+                continue
+            mark = ""
+            if item.get("paused"):
+                mark = "（可恢复）"
+            elif item.get("is_preview"):
+                mark = "（预演）"
+            elif item.get("is_spine_intent"):
+                mark = "（意图）"
+            nxt_parts.append(f"{format_day_minute(start)} {item_name}{mark}")
+        if nxt_parts:
+            lines.append("接下来：" + "；".join(nxt_parts))
+        state_line = str(view.get("state_line") or "").strip()
+        if state_line:
+            lines.append(state_line)
+        for row in (view.get("completed") or [])[-2:]:
+            if not isinstance(row, dict):
+                continue
+            row_name = str(row.get("name") or "").strip()
+            if not row_name:
+                continue
+            start = row.get("actual_start_minute")
+            end = row.get("actual_end_minute")
+            if start is None:
+                start = row.get("planned_start_minute")
+            if end is None:
+                end = row.get("planned_end_minute")
+            span = ""
+            try:
+                if start is not None and end is not None:
+                    span = f"（{format_day_minute(int(start))}-{format_day_minute(int(end))}）"
+            except (TypeError, ValueError):
+                span = ""
+            lines.append(f"刚完成：{row_name}{span}")
+        return lines
 
     # ------------------------------------------------------------
     # 对外公开：当前活动快照（供 @API 转发，跨插件可调）

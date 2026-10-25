@@ -105,6 +105,14 @@ class PlanningServices:
         self.inject = InjectService(plugin, holiday_service=self.holiday)
         self.proactive = ProactiveService(plugin)
         self.cleanup = CleanupService(plugin, generator_factory=lambda: self.generator)
+        # R7 滚动化服务占位（R7 依据 = 用户 2026-10-25 直派【日程系统滚动化改造】）：
+        # 接线位（后续阶段）在此实例化 LifeStateService / RollingPlanner /
+        # LifeScheduleReadModel 并 sq.set_runtime_provider(life_schedule) + 5 分钟 tick；
+        # 当前先占位 None = 未接线（组件面 getattr 判空降级、门面审计 hasattr 通过），
+        # 两开关全关时插件行为与 2.1.0 逐字一致。
+        self.life_state: Any = None
+        self.rolling_planner: Any = None
+        self.life_schedule: Any = None
         logger.info("PlanningServices 初始化完成（完整管线已接管日程生成）")
 
     # ------------------------------------------------------------

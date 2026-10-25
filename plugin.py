@@ -56,6 +56,9 @@ from core.llm_utils import LLMService, llm_task_name_of
 from emotion.components import EmotionComponentsMixin
 from emotion.services import EmotionServices
 from planning.components import PlanningComponentsMixin
+from planning.life_schedule import LifeScheduleReadModel
+from planning.life_state import LifeStateService
+from planning.rolling_planner import RollingPlanner
 from planning.schedule_db import ScheduleDB
 from planning.schedule_query import ScheduleQuery
 from planning.services import PlanningServices
@@ -322,6 +325,12 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._stream_id = ""
         self._bg_started = False
         self._bg_tasks: list[asyncio.Task] = []
+        # 生活状态服务束（R7 滚动化改造）：默认全 None（enabled=false 时零实例化零开销）
+        self._life_state: LifeStateService | None = None
+        self._rolling_planner: RollingPlanner | None = None
+        self._life_model: LifeScheduleReadModel | None = None
+        self._life_tick_task: asyncio.Task | None = None
+        self._life_cleanup_date = ""
         if not cfg.plugin.enabled:
             self.ctx.logger.info("插件未启用（plugin.enabled=false），仅加载组件")
             return
@@ -329,6 +338,9 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         # 目标私聊 stream 解析（失败则后台重试）
         self._stream_id = await self._resolve_target_stream()
         self._apply_target(target_qq_of(cfg), self._stream_id)
+        # 生活状态装配（R7 滚动化改造，2026-10-25 用户直派）：[life_state].enabled=false
+        # 时不实例化任何新服务；失败告警回退、绝不拖挂插件加载（_setup_life_services 内保底）
+        self._setup_life_services()
         await self._start_bg()
         self.ctx.logger.info("属于麦麦的生活已加载 v%s（目标=%s，stream=%s）",
                              SUPPORTED_CONFIG_VERSION, target_qq_of(cfg) or "未配置",
@@ -358,6 +370,12 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             except (asyncio.CancelledError, Exception):
                 pass
         self._bg_started = False
+        # 生活状态停机（R7 滚动化改造）：停 tick 循环并落盘 life_state.json（先于 db.close）
+        try:
+            await self._stop_life_tick_task()
+        except Exception:
+            pass
+        self._stop_life_services()
         self._affection.flush()
         self._db.close()
         self.ctx.logger.info("属于麦麦的生活已卸载")
@@ -375,12 +393,22 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             await self._qzone.stop()
             await self._companion.stop()
             await self._planning.stop()
+            # 生活状态停机（R7 滚动化改造）：停 tick 循环 + 落盘（服务实例保留待重启用）
+            try:
+                await self._stop_life_tick_task()
+            except Exception:
+                pass
+            self._stop_life_services()
             self._bg_started = False
             return
         # 目标 QQ 变化 → 重新解析 stream
         self._stream_id = await self._resolve_target_stream()
         self._apply_target(target_qq_of(cfg), self._stream_id)
+        # 生活状态热启用（R7 滚动化改造）：[life_state].enabled 首次置真时此处补装配，
+        # 再挂 tick 循环（_start_bg 的 _bg_started 守卫会早退，故单独 _ensure）
+        self._setup_life_services()
         await self._start_bg()
+        self._ensure_life_tick_task()
         if self._stream_id:
             self._companion.patrol.start()
         if not cfg.qzone.enabled:
@@ -393,6 +421,145 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._companion.set_target(target_qq, stream_id)
         self._qzone.set_target(stream_id)
 
+    # ------------------------------------------------------------------
+    # 生活状态服务束（R7 滚动化改造）
+    # R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
+    # D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计，
+    # 主设计 §9.1 plugin.py 行 + 附录 B.4.1/B.5.1/B.5.2/B.5.3）
+    # ------------------------------------------------------------------
+    def _setup_life_services(self) -> bool:
+        """装配 LifeStateService + RollingPlanner + LifeScheduleReadModel 并注入
+        ScheduleQuery runtime provider（幂等；已装配直接 True）。
+
+        - ``[life_state].enabled=false``（段缺失/读不到一律按关）→ **不实例化任何新服务**
+          （零开销零行为变化：ScheduleQuery 无 provider，读取侧走旧时间窗路径）；
+        - 任何装配异常 → 告警日志 + 清残留引用并返回 False，**绝不拖挂插件加载**；
+        - ``spine_mode`` 生成侧经 planning/auto_scheduler 的 spine 钩子生效（生成侧已落），
+          本层无遗漏：auto_scheduler 由 PlanningServices.cleanup.run_scheduler_loop 守护启动，
+          不依赖本装配段。
+        """
+        if getattr(self, "_life_model", None) is not None:
+            return True
+        try:
+            section = getattr(self.config, "life_state", None)
+            if section is None or not bool(getattr(section, "enabled", False)):
+                return False
+            state_file = str(getattr(section, "state_file", "") or "").strip() or "life_state.json"
+            timezone_str = str(getattr(self.config.schedule_advanced, "timezone", "")
+                               or "Asia/Shanghai")
+            # 状态文件 = <plugin._data_dir>/<life_state.state_file>（B.4.1 相对数据目录）
+            life = LifeStateService(self._data_dir / state_file, timezone_str=timezone_str)
+            planner = RollingPlanner(
+                self._db, life,
+                config_provider=lambda: self.config, event_bus=getattr(self, "_bus", None),
+                decision_logger=getattr(self, "_decision_logger", None),
+                timezone_str=timezone_str)
+            model = LifeScheduleReadModel(
+                self._db, life_state=life, planner=planner,
+                config_provider=lambda: self.config, timezone_str=timezone_str)
+            self._life_state = life
+            self._rolling_planner = planner
+            self._life_model = model
+            self._schedule_query.set_runtime_provider(model)
+            self.ctx.logger.info("生活状态服务已装配（tick=%ss，状态文件=%s）",
+                                 getattr(section, "tick_seconds", 300), state_file)
+            return True
+        except Exception as exc:
+            self._life_state = None
+            self._rolling_planner = None
+            self._life_model = None
+            try:
+                self._schedule_query.set_runtime_provider(None)
+            except Exception:
+                pass
+            try:
+                self.ctx.logger.warning("生活状态服务装配失败（回退旧行为，不阻塞）：%s", exc)
+            except Exception:
+                pass
+            return False
+
+    def _ensure_life_tick_task(self) -> None:
+        """挂生活状态 tick 循环（幂等；仅已装配时）。独立间隔 [life_state].tick_seconds，
+        写法参照 companion/patrol.py 的可打断睡眠循环（wait_for + stop_event）。"""
+        if getattr(self, "_life_model", None) is None:
+            return
+        task = getattr(self, "_life_tick_task", None)
+        if task is not None and not task.done():
+            return
+        self._life_tick_task = asyncio.create_task(self._life_tick_loop())
+
+    async def _stop_life_tick_task(self) -> None:
+        """停生活状态 tick 循环（on_unload / 插件停用分支调用）。"""
+        task = getattr(self, "_life_tick_task", None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._life_tick_task = None
+
+    def _stop_life_services(self) -> None:
+        """生活状态停机：落盘 life_state.json（best-effort；tick 每拍已存，此处兜底收尾）。"""
+        life = getattr(self, "_life_state", None)
+        if life is None:
+            return
+        try:
+            life.save()
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning("生活状态停机保存失败（忽略）：%s", exc)
+            except Exception:
+                pass
+
+    async def _life_tick_loop(self) -> None:
+        """生活状态 tick 定时循环（可打断睡眠，参照 companion/patrol.py `_loop`）。
+
+        每轮活读 ``[life_state]`` 段：热重载改 tick_seconds 即时生效；开关关闭 → 循环
+        自退出（重新开启由 on_config_update 的 _ensure_life_tick_task 重新挂起）。
+        """
+        while not self._stop_event.is_set():
+            section = getattr(self.config, "life_state", None)
+            if section is None or not bool(getattr(section, "enabled", False)):
+                return
+            try:
+                self._life_tick_once()
+            except Exception:
+                pass  # 单拍失败不影响循环
+            try:
+                interval = max(30, int(getattr(section, "tick_seconds", 300)))
+            except (TypeError, ValueError):
+                interval = 300
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=float(interval))
+            except asyncio.TimeoutError:
+                continue
+
+    def _life_tick_once(self) -> None:
+        """单拍：RollingPlanner.tick（内含 LifeState 推进 / episode 终结 / 锚点 /
+        事件发布）+ 每日一次 episode 过期清理（[life_state].keep_episode_days）。"""
+        planner = getattr(self, "_rolling_planner", None)
+        if planner is None:
+            return
+        report = planner.tick() or {}
+        date = str(report.get("date") or "")
+        if not date or date == getattr(self, "_life_cleanup_date", ""):
+            return
+        section = getattr(self.config, "life_state", None)
+        keep_days = getattr(section, "keep_episode_days", 14)
+        try:
+            keep = int(keep_days) if isinstance(keep_days, int) and not isinstance(keep_days, bool) else 14
+        except (TypeError, ValueError):
+            keep = 14
+        try:
+            removed = self._db.cleanup_old_episodes(keep_days=keep)
+            self._life_cleanup_date = date
+            if removed:
+                self.ctx.logger.info("生活状态 episode 过期清理完成（删除 %d 条）", removed)
+        except Exception as exc:
+            self.ctx.logger.warning("生活状态 episode 清理失败（忽略）：%s", exc)
+
     async def _start_bg(self) -> None:
         """启动后台任务（on_load 与「停用→启用」配置切换共用；幂等）。"""
         if self._bg_started:
@@ -404,6 +571,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             self._qzone.start()
         await self._emotion.start()
         self._bg_tasks.append(asyncio.create_task(self._stream_retry_loop()))
+        self._ensure_life_tick_task()
         self._bg_started = True
 
     async def _refresh_persona(self) -> None:

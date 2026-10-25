@@ -117,6 +117,12 @@ class QzoneComponentsMixin:
                 except ValueError:
                     days = 1
                 reply = self._qz_diag_text(days)
+        elif sub == "rolling":
+            # R7 滚动化调试命令（R7 依据 = 用户 2026-10-25 直派【日程系统滚动化改造】）：
+            # 实现集中在 companion/components.py 的 _lbm_life_rolling 单一函数，
+            # 本分发表只加这一行——移除时删函数 + 本行即净（「便利移除」用户要求）。
+            reply = (self._lbm_life_rolling(rest[0].strip() if rest else "") if admin
+                     else "权限不足：仅管理员可用 /lbm_life rolling。")
         else:
             reply = f"未知子命令：{sub}\n{self._qz_help_text()}"
         await self.ctx.send.text(reply, stream_id)  # 命令回复必须显式发送
@@ -140,6 +146,7 @@ class QzoneComponentsMixin:
             "           （管理员：post 文本、reply 说说序号 [评论序号] 内容、like tid [目标QQ]、"
             "decisions [条数] 发帖判定历史）\n"
             "/lbm_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /lbm_diag life，行为相同\n"
+            "/lbm_life rolling [status|state|episodes|spine|preview] - 滚动日程调试（管理员；纯只读）\n"
             "/lbm_life help - 本帮助；日程与陪伴功能另有 /lbm_plan 与 /lbm_mai_* 命令"
         )
 

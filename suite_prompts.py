@@ -247,6 +247,49 @@ SCHEDULE_RETRY_FEEDBACK_DEFAULT = (
     "\n\n注意：**上一次生成存在以下问题，请改进：**\n\n{issues}"
     "\n**请重新生成一个更合理的日程，特别注意以上问题！**\n"
 )
+# ── spine 日意图生成提示词（2026-10-25 滚动化改造新增；R7 依据 = 用户 2026-10-25 直派，
+#    设计目录 D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）──
+# 仅 [schedule].spine_mode=true 时使用；零 emoji、不引导主动提日程、不要求长描述。
+#: spine 日意图主任务（占位符：{min_intentions} / {max_intentions} / {wake_text} /
+#: {sleep_text} / {no_sleep_line} / {described_note}）
+SCHEDULE_SPINE_TASK_DEFAULT = (
+    "【任务】生成今天的日意图（spine）JSON：\n"
+    "今天只决定 {min_intentions}-{max_intentions} 件「今天想做的事」（意图），不是排满全天的时间表。\n"
+    "- 不要求覆盖全天：意图之间、前后的空档都是合法的（自由时间不需要写成意图）\n"
+    "- 每条意图给出允许发生的窗口 window：[\"HH:MM\", \"HH:MM\"]（24 小时制，起=窗口开始，止=窗口结束）\n"
+    "- min_minutes / max_minutes：这次活动最短/最长做多少分钟（max_minutes 不得小于 min_minutes）\n"
+    "- priority：high / medium / low；hardness：hard = 硬约定（时间固定不可移动），soft = 软意图\n"
+    "- interruptibility：0~1 的小数，越高越容易被别的事情打断\n"
+    "- 作息锚点：{wake_text} 起床，{sleep_text} 入睡；软意图的窗口必须落在清醒时段内\n"
+    "{no_sleep_line}"
+    "- 三餐参考常识窗口（软参考）：早餐 06:00-09:00、午餐 11:00-14:00、晚餐 17:00-20:00\n"
+    "{described_note}"
+    "- 意图只描述角色自己的生活安排；不要安排「给对方发消息 / 等对方回复 / 主动找人聊天」一类动作\n"
+    "- 严格遵守开头的角色人设与兴趣偏好；与【最近几天日程参考】里的活动不要同名重复\n"
+    "- 只输出 JSON：{{\"intentions\": [...]}}，严格 JSON、无注释、无多余文字"
+)
+#: spine 模式的约定硬约束行（占位符：无；存在今日约定时追加）
+SCHEDULE_SPINE_COMMITMENT_NOTE_DEFAULT = (
+    "要求：上述约定是硬约定——作为今天的意图纳入（hardness=hard，时间固定），"
+    "goal_type 用 social_maintenance 或对应类型。"
+)
+#: spine 模式的睡觉锚点行（占位符：{sleep_text} / {wake_text}）
+SCHEDULE_SPINE_SLEEP_LINE_DEFAULT = (
+    "- 睡觉是一条固定意图：窗口 {sleep_text} 到次日 {wake_text}，hardness=hard，"
+    "必须包含在意图里\n"
+)
+#: spine 模式无睡眠时的锚点行（占位符：{sleep_text} / {wake_text}）
+SCHEDULE_SPINE_NO_SLEEP_LINE_DEFAULT = (
+    "- 无睡眠模式：不生成睡觉意图，睡眠时段（{sleep_text} 到次日 {wake_text}）整体留空，"
+    "任何意图的名称都不得包含「睡 / 眠 / 憩」字样\n"
+)
+#: spine 模式描述行（占位符：{max_described}）
+SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT = (
+    "- note 字段：最多给 {max_described} 条重要意图写一句 15-25 字的补充（想做什么、为什么）；"
+    "其余意图不要写 note\n"
+)
+#: spine 模式描述行（全部不写）
+SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT = "- 所有意图都不要写 note 字段\n"
 #: 角色裁判提示词（占位符：{persona} / {today_str} / {weekday} / {current_text} / {description}）
 SCHEDULE_ROLE_JUDGE_DEFAULT = (
     "【角色人设】\n{persona}\n\n"
@@ -680,6 +723,44 @@ class PromptsSectionConfig(PluginConfigBase):
         description="多轮生成的重试反馈模板（占位符：{issues}）",
         json_schema_extra={"label": "日程·重试反馈", "rows": 4,
                            **_ui_i18n("Retry feedback template")},
+    )
+    # ── spine 日意图（2026-10-25 滚动化改造新增；仅 [schedule].spine_mode=true 时使用）──
+    schedule_spine_task: str = Field(
+        default=SCHEDULE_SPINE_TASK_DEFAULT,
+        description="spine 日意图主任务（占位符：{min_intentions} {max_intentions} {wake_text} "
+                    "{sleep_text} {no_sleep_line} {described_note}）",
+        json_schema_extra={"label": "日程·spine 主任务", "rows": 12,
+                           **_ui_i18n("Spine task prompt")},
+    )
+    schedule_spine_commitment_note: str = Field(
+        default=SCHEDULE_SPINE_COMMITMENT_NOTE_DEFAULT,
+        description="spine 模式的约定硬约束行（无占位符；有今日约定时追加）",
+        json_schema_extra={"label": "日程·spine 约定行", "rows": 2,
+                           **_ui_i18n("Spine commitment note")},
+    )
+    schedule_spine_sleep_line: str = Field(
+        default=SCHEDULE_SPINE_SLEEP_LINE_DEFAULT,
+        description="spine 模式的睡觉锚点行（占位符：{sleep_text} {wake_text}）",
+        json_schema_extra={"label": "日程·spine 睡觉行", "rows": 2,
+                           **_ui_i18n("Spine sleep line")},
+    )
+    schedule_spine_no_sleep_line: str = Field(
+        default=SCHEDULE_SPINE_NO_SLEEP_LINE_DEFAULT,
+        description="spine 模式无睡眠时的锚点行（占位符：{sleep_text} {wake_text}）",
+        json_schema_extra={"label": "日程·spine 无睡眠行", "rows": 2,
+                           **_ui_i18n("Spine no-sleep line")},
+    )
+    schedule_spine_described_note: str = Field(
+        default=SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT,
+        description="spine 模式描述行（占位符：{max_described}）",
+        json_schema_extra={"label": "日程·spine 描述行", "rows": 2,
+                           **_ui_i18n("Spine described note")},
+    )
+    schedule_spine_no_described_note: str = Field(
+        default=SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT,
+        description="spine 模式描述行（全部不写 note；无占位符）",
+        json_schema_extra={"label": "日程·spine 无描述行", "rows": 2,
+                           **_ui_i18n("Spine no-described note")},
     )
     schedule_role_judge_no_activity: str = Field(
         default=SCHEDULE_ROLE_JUDGE_NO_ACTIVITY_DEFAULT,

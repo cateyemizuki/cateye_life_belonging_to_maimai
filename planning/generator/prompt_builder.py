@@ -29,6 +29,12 @@ from suite_prompts import (
     SCHEDULE_GENERATION_EXTRA_DEFAULT,
     SCHEDULE_LOW_MOOD_NOTE_DEFAULT,
     SCHEDULE_RETRY_FEEDBACK_DEFAULT,
+    SCHEDULE_SPINE_COMMITMENT_NOTE_DEFAULT,
+    SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT,
+    SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT,
+    SCHEDULE_SPINE_NO_SLEEP_LINE_DEFAULT,
+    SCHEDULE_SPINE_SLEEP_LINE_DEFAULT,
+    SCHEDULE_SPINE_TASK_DEFAULT,
     prompt as prompt_of,
     render,
 )
@@ -795,3 +801,179 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
             issues=issues_text,
         )
         return base_prompt + feedback
+
+    # ------------------------------------------------------------
+    # spine 日意图提示词（2026-10-25 滚动化改造新增；R7 依据 = 用户 2026-10-25 直派，
+    # 设计目录 D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）
+    # ------------------------------------------------------------
+
+    def build_spine_prompt(
+        self,
+        schema: Optional[Dict] = None,
+        *,
+        min_intentions: int = 3,
+        max_intentions: int = 6,
+        max_described: int = 1,
+        no_sleep_mode: bool = False,
+        yesterday_context: Optional[str] = None,
+        pending_commitments: Optional[List[Dict[str, Any]]] = None,
+        history_context: str = "",
+        knowledge_context: str = "",
+        low_mood_days: int = 0,
+        holiday_context: Optional[str] = None,
+    ) -> str:
+        """构建 spine 日意图提示词（设计 §4.2 精简口径）。
+
+        与 daily 提示词（:meth:`build_schedule_prompt`）的差异：
+
+        - 无 JSON 示例与无缝衔接演算（spine 不要求覆盖全天，空档合法）；
+        - **不注入情绪块**（``schedule_emotion_context`` 措辞含「无缝衔接要求」，
+          与稀疏口径冲突——保守裁量，登记 notes）；低迷软约束 / 节假日 / 约定 /
+          生活阶段 / 追加指令照常注入；
+        - Schema 为精简 8 字段意图卡（见 ``SchemaBuilder.build_spine_schema``）；
+          只做结构校验、不强制重试（多轮与否由调用方决定）。
+        """
+        personality, reply_style, interest, bot_name = self._get_cached_config()
+        custom_prompt = self.config.get('custom_prompt', '').strip()
+        wake_min, sleep_min = self._resolve_schedule_bounds()
+        wake_text = _fmt_minutes(wake_min)
+        sleep_text = _fmt_minutes(sleep_min)
+
+        today = self.tz_manager.get_now()
+        date_str = today.strftime("%Y-%m-%d")
+        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        weekday = weekday_names[today.weekday()]
+        is_weekend = today.weekday() >= 5
+
+        if bot_name and personality:
+            persona_line = f"你是{bot_name}，{personality}"
+        elif bot_name:
+            persona_line = f"你是{bot_name}"
+        elif personality:
+            persona_line = personality
+        else:
+            persona_line = ""
+        style_block = f"\n\n【表达风格】\n{reply_style}" if reply_style else ""
+        prompt_header = persona_line + style_block if persona_line else style_block.lstrip()
+        prompt = f"""{prompt_header}
+
+今天是{date_str} {weekday}{"（周末）" if is_weekend else ""}
+""" if prompt_header else f"""今天是{date_str} {weekday}{"（周末）" if is_weekend else ""}
+"""
+
+        yesterday_text = yesterday_context or "最近几天没有具体记录"
+        prompt += f"""
+【最近几天日程参考】
+{yesterday_text}
+"""
+
+        if history_context:
+            prompt += f"""
+【最近聊天背景】
+以下是 bot 近期在聊天中观察到的事，可作为今日意图灵感（不要直接复述）：
+{history_context}
+"""
+
+        if knowledge_context:
+            prompt += f"""
+【相关记忆参考】
+{knowledge_context}
+"""
+
+        if pending_commitments:
+            commit_lines: List[str] = ["", "【今天需要纳入的约定】"]
+            for item in pending_commitments:
+                t = (item or {}).get("time", "")
+                title = (item or {}).get("title", "")
+                notes = (item or {}).get("notes", "")
+                line = f"- {t} {title}".strip()
+                if notes:
+                    line += f"（{notes}）"
+                commit_lines.append(line)
+            prompt += "\n".join(commit_lines) + "\n"
+            prompt += render(
+                prompt_of(self._plugin_ref(), "schedule_spine_commitment_note"),
+                fallback=SCHEDULE_SPINE_COMMITMENT_NOTE_DEFAULT,
+            ) + "\n"
+
+        if custom_prompt:
+            prompt += f"""
+【当前生活阶段与今日重点】
+{custom_prompt}
+"""
+
+        # M5 低迷软约束照常注入（措辞「安排一次恢复类活动」与稀疏口径兼容）
+        days = _to_int(low_mood_days, 0)
+        if days >= LOW_MOOD_MIN_DAYS:
+            note = render(
+                prompt_of(self._plugin_ref(), "schedule_low_mood_note"),
+                fallback=SCHEDULE_LOW_MOOD_NOTE_DEFAULT,
+                days=days,
+            )
+            prompt += "\n" + note + "\n"
+
+        if holiday_context:
+            prompt += "\n" + str(holiday_context).strip() + "\n"
+
+        if _to_int(max_described, 0) >= 1:
+            described_note = render(
+                prompt_of(self._plugin_ref(), "schedule_spine_described_note"),
+                fallback=SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT,
+                max_described=_to_int(max_described, 1),
+            )
+        else:
+            described_note = render(
+                prompt_of(self._plugin_ref(), "schedule_spine_no_described_note"),
+                fallback=SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT,
+            )
+        if no_sleep_mode:
+            no_sleep_line = render(
+                prompt_of(self._plugin_ref(), "schedule_spine_no_sleep_line"),
+                fallback=SCHEDULE_SPINE_NO_SLEEP_LINE_DEFAULT,
+                sleep_text=sleep_text, wake_text=wake_text,
+            )
+        else:
+            no_sleep_line = render(
+                prompt_of(self._plugin_ref(), "schedule_spine_sleep_line"),
+                fallback=SCHEDULE_SPINE_SLEEP_LINE_DEFAULT,
+                sleep_text=sleep_text, wake_text=wake_text,
+            )
+
+        prompt += "\n" + render(
+            prompt_of(self._plugin_ref(), "schedule_spine_task"),
+            fallback=SCHEDULE_SPINE_TASK_DEFAULT,
+            min_intentions=_to_int(min_intentions, 3),
+            max_intentions=_to_int(max_intentions, 6),
+            wake_text=wake_text,
+            sleep_text=sleep_text,
+            no_sleep_line=no_sleep_line,
+            described_note=described_note,
+        ) + "\n"
+        prompt += f"\n兴趣偏好：{interest if interest else '日常生活'}\n"
+
+        # [prompts].schedule_generation_extra：用户的自由追加指令（留空不追加；与 daily 同键）
+        extra = prompt_of(self._plugin_ref(), "schedule_generation_extra")
+        if extra.strip() and extra.strip() != SCHEDULE_GENERATION_EXTRA_DEFAULT.strip():
+            prompt += "\n" + extra.strip() + "\n"
+
+        if schema:
+            import json
+            min_i = _to_int(min_intentions, 3)
+            max_i = _to_int(max_intentions, 6)
+            note_rule = (
+                f"- note：可选，最多给 {_to_int(max_described, 1)} 条重要意图写一句 15-25 字"
+                if _to_int(max_described, 0) >= 1
+                else "- 不要输出 note 字段"
+            )
+            prompt += f"""
+【Schema要求】
+- {min_i}-{max_i} 条意图（必须）
+- 必填：name(2-20字), goal_type, window, min_minutes, max_minutes, priority, hardness, interruptibility
+{note_rule}
+- window：["HH:MM", "HH:MM"] 两元素数组
+- min_minutes / max_minutes：5-720 整数，max >= min
+- interruptibility：0-1 小数
+
+Schema: {json.dumps(schema, ensure_ascii=False)}
+"""
+        return prompt

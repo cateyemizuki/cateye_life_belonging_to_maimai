@@ -116,3 +116,32 @@ class BaseScheduleGenerator:
             low_mood_days=self.low_mood_days,
             holiday_context=self.holiday_context,
         )
+
+    def build_spine_schema(self, min_intentions: int = 3, max_intentions: int = 6) -> dict:
+        """构建 spine 日意图精简 Schema（委托给 SchemaBuilder；2026-10-25 滚动化改造新增）。"""
+        return self.schema_builder.build_spine_schema(min_intentions, max_intentions)
+
+    def build_spine_prompt(
+        self,
+        schema: Optional[Dict] = None,
+        *,
+        min_intentions: int = 3,
+        max_intentions: int = 6,
+        max_described: int = 1,
+        no_sleep_mode: bool = False,
+    ) -> str:
+        """构建 spine 日意图提示词（委托给 PromptBuilder，转发既有上下文槽位；
+        2026-10-25 滚动化改造新增，R7 依据 = 用户 2026-10-25 直派）。"""
+        return self.prompt_builder.build_spine_prompt(
+            schema,
+            min_intentions=min_intentions,
+            max_intentions=max_intentions,
+            max_described=max_described,
+            no_sleep_mode=no_sleep_mode,
+            yesterday_context=self.yesterday_schedule_summary,
+            pending_commitments=self.pending_commitments,
+            history_context=self.history_context,
+            knowledge_context=self.knowledge_context,
+            low_mood_days=self.low_mood_days,
+            holiday_context=self.holiday_context,
+        )

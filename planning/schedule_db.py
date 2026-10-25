@@ -12,14 +12,24 @@
 - ``goals``：长期目标 + 未来约定（pending_commitment，goal_type 区分），
   含 conditions / parameters / deadline / progress / execution_count 全字段。
   ``GoalManager``（goal_manager.py）基于该表工作，并会把当日日程条目合成
-  为带 time_window 的 Goal 视图（单一数据源，避免双写漂移）。
+  为带 time_window 的 Goal 视图（单一数据源，避免双写漂移）；
+- ``activity_episodes``（v5 纯新增表，附录 B.1.1 全字段 DDL 原样）：活动档案/Episode 日志
+  ——记录实际发生（planned/actual、status/progress、打断/恢复/放弃与决策依据 metadata）。
+  **只增不改**：``schedule_items`` / ``goals`` / ``schedule_archive`` 等旧表一字不动；
+  v4→v5 迁移（``_migrate_schema_v5``）失败只告警不抛、不影响旧表读取（schema_version
+  保持旧值，下次初始化重试）。planned_*/actual_* 允许 >1440、``day_offset`` 与
+  ``schedule_items`` 同口径（§7.8 跨午夜条目口径）。
 
 损坏自愈：初始化遇到 malformed/not a database 时隔离旧文件重建空库。
+
+R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
+D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -28,8 +38,62 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .cycle_state import REASON_LEGACY
+from .time_utils import DAY_MINUTES
+
+logger = logging.getLogger(__name__)
 
 _CORRUPTION_KEYWORDS = ("malformed", "not a database", "encrypted", "corrupt")
+
+# v5 新增表（附录 B.1.1 全字段 DDL 原样，只增不改；不放 SCHEMA 主脚本是为了故障隔离：
+# 本块任何失败都不影响旧表的建表/读取——设计附录 B.1.3「迁移失败不影响旧库读取」）。
+_EPISODES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS activity_episodes (
+    episode_id           TEXT PRIMARY KEY,
+    schedule_date        TEXT NOT NULL,
+    day_offset           INTEGER,                -- 与 schedule_items 同口径；跨午夜用
+    source               TEXT NOT NULL,          -- spine | rolling | commitment | random | resume | manual
+    name                 TEXT NOT NULL,
+    goal_type            TEXT NOT NULL,
+    property_id          TEXT,
+    planned_start_minute INTEGER NOT NULL,
+    planned_end_minute   INTEGER NOT NULL,
+    actual_start_minute  INTEGER,
+    actual_end_minute    INTEGER,
+    status               TEXT NOT NULL,          -- planned | active | completed | interrupted | paused | abandoned | skipped
+    progress             REAL NOT NULL DEFAULT 0, -- 0..1
+    interruptibility      REAL,
+    switch_cost          REAL,
+    attention_mode       TEXT,                   -- now | brief | later
+    interrupted_by       TEXT,
+    resume_of            TEXT,
+    state_before         TEXT,                   -- JSON
+    state_after          TEXT,                   -- JSON
+    metadata             TEXT,                   -- JSON: reason/top3/seed/...
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_episodes_date_start
+    ON activity_episodes(schedule_date, planned_start_minute);
+CREATE INDEX IF NOT EXISTS idx_episodes_status
+    ON activity_episodes(status);
+CREATE INDEX IF NOT EXISTS idx_episodes_resume
+    ON activity_episodes(resume_of);
+"""
+
+# 附加约束（超出附录三索引，保守裁量）：表达式部分唯一索引强制「任意时刻最多一个
+# active episode」——非 active 行取 NULL（UNIQUE 索引中 NULL 互不冲突），active 行取 1
+# （重复即冲突）。写路径先关后开（_close_active_episodes_locked），本索引做底层兜底。
+_EPISODE_ACTIVE_SINGLETON_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_active_singleton"
+    " ON activity_episodes(CASE WHEN status = 'active' THEN 1 ELSE NULL END)"
+)
+
+#: 离散活动 goal_type 集合（附录 §5.5：吃饭/洗漱等离散活动完成即 1.0）。
+#: 内置保守只含 meal；其余离散活动由调用方 finish(..., discrete=True) 显式标记。
+EPISODE_DISCRETE_GOAL_TYPES = frozenset({"meal"})
+
+#: 默认进度上限（附录 §5.5：已用时长/计划时长，上限 0.95）。
+_EPISODE_PROGRESS_CAP = 0.95
 
 
 class ScheduleDB:
@@ -130,8 +194,18 @@ class ScheduleDB:
                 self._conn.executescript(self.SCHEMA)
                 self._migrate_schema_v3()
                 self._migrate_schema_v4()
+                # v4→v5（R7 依据 = 用户 2026-10-25 直派，设计附录 B.1.3）：迁移失败不影响
+                # 旧表读取——失败只告警，schema_version 保持旧值，下次初始化重试。
+                if self._migrate_schema_v5():
+                    version = "5"
+                else:
+                    row = self._conn.execute(
+                        "SELECT value FROM metadata WHERE key = 'schema_version'"
+                    ).fetchone()
+                    version = str(row["value"]) if row and row["value"] else "4"
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', '4')"
+                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
+                    (version,),
                 )
                 self._conn.commit()
         except sqlite3.DatabaseError as e:
@@ -141,6 +215,7 @@ class ScheduleDB:
             with self._lock:
                 self._conn = self._connect()
                 self._conn.executescript(self.SCHEMA)
+                self._migrate_schema_v5()
                 self._conn.commit()
 
     def _migrate_schema_v3(self) -> None:
@@ -186,6 +261,27 @@ class ScheduleDB:
                 " OR cycle_end_ts IS NULL OR entry_reason IS NULL)",
                 (min_start, max_end, REASON_LEGACY, schedule_date),
             )
+
+    def _migrate_schema_v5(self) -> bool:
+        """v4→v5 迁移（R7 依据 = 用户 2026-10-25 直派【日程系统滚动化改造，设计附录 B.1.1/B.1.3】）：
+
+        纯新增 ``activity_episodes`` 表 + 三索引（附录 B.1.1 全字段 DDL 原样）+ 附加的
+        active 单例部分唯一索引。**只增不改**：旧表（schedule_items / schedule_archive /
+        goals / metadata）零改动；旧库升级即建新表，旧行零迁移（episode 是全新数据）。
+        全程 try/except 隔离——任何失败告警不抛、返回 False（调用方保持 schema_version
+        旧值，下次初始化重试），旧表读取不受影响。
+        """
+        try:
+            self._conn.executescript(_EPISODES_SCHEMA)
+        except sqlite3.Error as e:
+            logger.warning("schedule_db: v5 迁移建 activity_episodes 失败（不影响旧表）：%s", e)
+            return False
+        try:
+            self._conn.execute(_EPISODE_ACTIVE_SINGLETON_INDEX_SQL)
+        except sqlite3.Error as e:
+            # 表与三索引已建齐；仅附加单例索引未成——不阻断 v5，告警留痕
+            logger.warning("schedule_db: v5 附加单例索引建立失败（不影响旧表）：%s", e)
+        return True
 
     def _quarantine_corrupt_files(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -528,3 +624,541 @@ class ScheduleDB:
         with self._lock, self._conn:
             cur = self._conn.execute(query, params)
             return cur.rowcount
+
+    # ================================================================
+    # 活动档案（activity_episodes，v5 纯新增表）CRUD
+    # R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
+    # D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）
+    # ——附录 B.1.1 全字段 DDL 原样；只增不改：schedule_items / goals /
+    # schedule_archive 等旧表一字不动。并发口径沿用本类既有模式：WAL + RLock +
+    # 短事务（with self._lock, self._conn），tick 与命令并发无死锁；所有写方法
+    # 失败告警（logger.warning）不抛，按返回值 None/False/0 表达。
+    # ================================================================
+    @staticmethod
+    def _episode_row(row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+        for field in ("state_before", "state_after", "metadata"):
+            raw = data.get(field)
+            if raw:
+                try:
+                    data[field] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    data[field] = {}
+            else:
+                data[field] = {}
+        return data
+
+    @staticmethod
+    def _dump_json_field(value: Optional[Dict[str, Any]]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _merge_json_text(raw: Any, updates: Optional[Dict[str, Any]]) -> Optional[str]:
+        """行内 JSON 字段（metadata 等）读改写：旧值解析失败按空 dict 降级、追加 updates。"""
+        base: Dict[str, Any] = {}
+        if raw:
+            try:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    base = loaded
+            except (json.JSONDecodeError, TypeError):
+                base = {}
+        if updates:
+            base.update(updates)
+        return json.dumps(base, ensure_ascii=False) if base else None
+
+    @staticmethod
+    def _clamp_progress(value: Any) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, number))
+
+    @classmethod
+    def _default_episode_progress(cls, planned_start: Any, planned_end: Any,
+                                  actual_start: Any, actual_end: Any, *,
+                                  discrete: bool = False,
+                                  allow_full: bool = False) -> Optional[float]:
+        """默认进度 = 已用时长 / 计划时长（上限 0.95）；离散活动完成（allow_full）即 1.0。
+
+        - 端点缺失/计划时长非正/倒挂不可解 → None（调用方保留原 progress 不覆盖）；
+        - 实际端点倒挂（actual_end < actual_start）按跨午夜同一 24h 环 +``DAY_MINUTES``
+          修正（与 cycle_state.py 入睡钟点环抬同款口径，禁手写 −1440）；
+        - 显式传入的 progress 永远优先（本函数只服务默认口径）。
+        """
+        try:
+            planned_span = int(planned_end) - int(planned_start)
+            used = int(actual_end) - int(actual_start)
+        except (TypeError, ValueError):
+            return None
+        if planned_span <= 0:
+            return None
+        if used < 0:
+            used += DAY_MINUTES
+        if used < 0:
+            return None
+        if allow_full and discrete:
+            return 1.0
+        return min(cls._clamp_progress(used / planned_span), _EPISODE_PROGRESS_CAP)
+
+    def _close_active_episodes_locked(self, closed_by: str,
+                                      actual_end_minute: Optional[int],
+                                      now: str, close_reason: str) -> int:
+        """关闭全部既有 active episode（「任意时刻最多一个 active」的强制点；持锁事务内调用）。
+
+        既有 active → ``status='interrupted'``（``interrupted_by`` = 关闭发起方，即新
+        episode_id），实际结束 = ``actual_end_minute``（未传 → 该行 planned_end），
+        进度按默认口径（上限 0.95），metadata 追加 close_reason / superseded_by。
+        单行失败告警不抛（返回已关闭行数）；idx_episodes_active_singleton 兜底强制。
+        """
+        closed = 0
+        rows = self._conn.execute(
+            "SELECT episode_id, planned_start_minute, planned_end_minute, actual_start_minute,"
+            " progress, metadata FROM activity_episodes WHERE status = 'active'"
+        ).fetchall()
+        for row in rows:
+            end = actual_end_minute if actual_end_minute is not None else row["planned_end_minute"]
+            progress = self._default_episode_progress(
+                row["planned_start_minute"], row["planned_end_minute"],
+                row["actual_start_minute"], end,
+            )
+            if progress is None:
+                progress = self._clamp_progress(row["progress"])
+            try:
+                self._conn.execute(
+                    "UPDATE activity_episodes SET status = 'interrupted',"
+                    " interrupted_by = COALESCE(interrupted_by, ?), actual_end_minute = ?,"
+                    " progress = ?, metadata = ?, updated_at = ?"
+                    " WHERE episode_id = ? AND status = 'active'",
+                    (closed_by, end, progress,
+                     self._merge_json_text(
+                         row["metadata"],
+                         {"close_reason": close_reason, "superseded_by": closed_by},
+                     ),
+                     now, row["episode_id"]),
+                )
+                closed += 1
+            except sqlite3.Error as e:
+                logger.warning("schedule_db: 关闭 active episode 失败（不抛）：%s", e)
+        return closed
+
+    def _insert_episode_locked(self, *, episode_id: str, schedule_date: str, day_offset: Any,
+                               source: str, name: str, goal_type: str, property_id: Any,
+                               planned_start: int, planned_end: int, actual_start: Any,
+                               status: str, progress: float = 0.0,
+                               interruptibility: Any, switch_cost: Any,
+                               attention_mode: Any, interrupted_by: Any, resume_of: Any,
+                               state_before: Optional[Dict[str, Any]],
+                               metadata: Optional[Dict[str, Any]], now: str) -> None:
+        """单行插入（持锁事务内调用；字段越界即抛由调用方统一告警吞掉）。"""
+        self._conn.execute(
+            "INSERT INTO activity_episodes(episode_id, schedule_date, day_offset, source,"
+            " name, goal_type, property_id, planned_start_minute, planned_end_minute,"
+            " actual_start_minute, status, progress, interruptibility, switch_cost,"
+            " attention_mode, interrupted_by, resume_of, state_before, metadata,"
+            " created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (episode_id, str(schedule_date), day_offset, str(source or "manual"),
+             str(name or "未命名活动")[:100], str(goal_type or "daily_routine"), property_id,
+             int(planned_start), int(planned_end), actual_start, status, self._clamp_progress(progress),
+             interruptibility, switch_cost, attention_mode, interrupted_by, resume_of,
+             self._dump_json_field(state_before), self._dump_json_field(metadata), now, now),
+        )
+
+    def start_episode(
+        self,
+        schedule_date: str,
+        name: str,
+        goal_type: str,
+        source: str,
+        planned_start_minute: int,
+        planned_end_minute: int,
+        *,
+        episode_id: Optional[str] = None,
+        day_offset: Optional[int] = None,
+        property_id: Optional[str] = None,
+        interruptibility: Optional[float] = None,
+        switch_cost: Optional[float] = None,
+        attention_mode: Optional[str] = None,
+        interrupted_by: Optional[str] = None,
+        resume_of: Optional[str] = None,
+        actual_start_minute: Optional[int] = None,
+        state_before: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """开始一个 episode（status='active'）。返回 episode_id；写失败告警不抛 → None。
+
+        start 前先关闭既有 active（任意时刻最多一个 active：既有行 → interrupted，
+        ``interrupted_by`` = 本行 id；单例唯一索引兜底）。``actual_start_minute`` 未传
+        → 取 ``planned_start_minute``（确定性兜底，DB 层不取墙钟）。metadata 存决策
+        依据（top3 候选/分数/随机种子/放弃原因等，由调用方给）。
+        """
+        eid = str(episode_id or uuid.uuid4().hex)
+        now = datetime.now().isoformat()
+        actual_start = planned_start_minute if actual_start_minute is None else int(actual_start_minute)
+        try:
+            with self._lock, self._conn:
+                self._close_active_episodes_locked(eid, actual_start, now,
+                                                   "superseded_by_start")
+                self._insert_episode_locked(
+                    episode_id=eid, schedule_date=schedule_date, day_offset=day_offset,
+                    source=source, name=name, goal_type=goal_type, property_id=property_id,
+                    planned_start=int(planned_start_minute),
+                    planned_end=int(planned_end_minute), actual_start=actual_start,
+                    status="active", interruptibility=interruptibility,
+                    switch_cost=switch_cost, attention_mode=attention_mode,
+                    interrupted_by=interrupted_by, resume_of=resume_of,
+                    state_before=state_before, metadata=metadata, now=now,
+                )
+            return eid
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            logger.warning("schedule_db: start_episode 写入失败（不抛）：%s", e)
+            return None
+
+    def plan_episode(
+        self,
+        schedule_date: str,
+        name: str,
+        goal_type: str,
+        source: str,
+        planned_start_minute: int,
+        planned_end_minute: int,
+        *,
+        episode_id: Optional[str] = None,
+        day_offset: Optional[int] = None,
+        property_id: Optional[str] = None,
+        interruptibility: Optional[float] = None,
+        switch_cost: Optional[float] = None,
+        attention_mode: Optional[str] = None,
+        interrupted_by: Optional[str] = None,
+        resume_of: Optional[str] = None,
+        state_before: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """预写入一条 planned episode（不开始、不关闭 active；spine/硬约定提前落库用）。
+
+        保守裁量新增：ask 方法清单缺 planned 行的创建入口，而 planned_future/skip 以
+        planned 行为对象——本方法补齐 Create 面，字段与 start_episode 全同、status='planned'。
+        """
+        eid = str(episode_id or uuid.uuid4().hex)
+        now = datetime.now().isoformat()
+        try:
+            with self._lock, self._conn:
+                self._insert_episode_locked(
+                    episode_id=eid, schedule_date=schedule_date, day_offset=day_offset,
+                    source=source, name=name, goal_type=goal_type, property_id=property_id,
+                    planned_start=int(planned_start_minute),
+                    planned_end=int(planned_end_minute), actual_start=None,
+                    status="planned", interruptibility=interruptibility,
+                    switch_cost=switch_cost, attention_mode=attention_mode,
+                    interrupted_by=interrupted_by, resume_of=resume_of,
+                    state_before=state_before, metadata=metadata, now=now,
+                )
+            return eid
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            logger.warning("schedule_db: plan_episode 写入失败（不抛）：%s", e)
+            return None
+
+    def _transition_episode(
+        self,
+        episode_id: str,
+        to_status: str,
+        allowed_from: Tuple[str, ...],
+        *,
+        actual_end_minute: Optional[int] = None,
+        progress: Optional[float] = None,
+        discrete: Optional[bool] = None,
+        allow_full_on_discrete: bool = False,
+        interrupted_by: Optional[str] = None,
+        state_after: Optional[Dict[str, Any]] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+        end_fallback_planned: bool = False,
+    ) -> bool:
+        """episode 状态迁移共用体（持锁短事务；行不存在/状态不合法 → False，不抛）。
+
+        ``actual_end_minute``：显式传入优先；未传时 finish 按 planned_end 兜底（视为
+        自然完成），其余迁移（pause/interrupt/abandon/skip）保持原 actual_end 不虚构。
+        progress 显式传入优先（clamp 到 [0,1]），否则按默认口径（已用/计划、上限 0.95；
+        离散活动且 allow_full_on_discrete 才 1.0），不可计算 → 保留原 progress。
+        state_after/metadata 未传 → 保留原值；metadata 传则与旧行 JSON 合并。
+        """
+        now = datetime.now().isoformat()
+        try:
+            with self._lock, self._conn:
+                row = self._conn.execute(
+                    "SELECT * FROM activity_episodes WHERE episode_id = ?", (episode_id,)
+                ).fetchone()
+                if row is None or row["status"] not in allowed_from:
+                    return False
+                if actual_end_minute is not None:
+                    end = int(actual_end_minute)
+                elif end_fallback_planned:
+                    end = row["planned_end_minute"]
+                else:
+                    end = row["actual_end_minute"]
+                if progress is not None:
+                    new_progress: float = self._clamp_progress(progress)
+                else:
+                    is_discrete = (row["goal_type"] in EPISODE_DISCRETE_GOAL_TYPES
+                                   if discrete is None else bool(discrete))
+                    new_progress = self._default_episode_progress(
+                        row["planned_start_minute"], row["planned_end_minute"],
+                        row["actual_start_minute"], end,
+                        discrete=is_discrete, allow_full=allow_full_on_discrete,
+                    )
+                    if new_progress is None:
+                        new_progress = self._clamp_progress(row["progress"])
+                self._conn.execute(
+                    "UPDATE activity_episodes SET status = ?, actual_end_minute = ?,"
+                    " progress = ?, interrupted_by = COALESCE(?, interrupted_by),"
+                    " state_after = COALESCE(?, state_after), metadata = ?, updated_at = ?"
+                    " WHERE episode_id = ? AND status = ?",
+                    (to_status, end, new_progress, interrupted_by,
+                     self._dump_json_field(state_after),
+                     self._merge_json_text(row["metadata"], extra_metadata),
+                     now, episode_id, row["status"]),
+                )
+            return True
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            logger.warning("schedule_db: episode %s -> %s 写入失败（不抛）：%s",
+                           episode_id, to_status, e)
+            return False
+
+    def finish(self, episode_id: str, *, actual_end_minute: Optional[int] = None,
+               progress: Optional[float] = None, discrete: Optional[bool] = None,
+               state_after: Optional[Dict[str, Any]] = None,
+               metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """完成 episode（active/paused → completed）。
+
+        progress 默认口径：离散活动（goal_type ∈ EPISODE_DISCRETE_GOAL_TYPES，或显式
+        ``discrete=True``）→ 1.0；其余 = 已用时长/计划时长（上限 0.95）。显式
+        ``progress`` 传入优先（clamp [0,1]；用户明确说"做完了"可由调用方传 1.0）。
+        """
+        return self._transition_episode(
+            episode_id, "completed", ("active", "paused"),
+            actual_end_minute=actual_end_minute, progress=progress, discrete=discrete,
+            allow_full_on_discrete=True, state_after=state_after, extra_metadata=metadata,
+            end_fallback_planned=True,
+        )
+
+    def interrupt(self, episode_id: str, *, interrupted_by: Optional[str] = None,
+                  actual_end_minute: Optional[int] = None,
+                  progress: Optional[float] = None,
+                  state_after: Optional[Dict[str, Any]] = None,
+                  metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """打断 episode（active → interrupted；记录 interrupted_by）。
+
+        进度：传 ``actual_end_minute``/``progress`` 时按默认口径（已用/计划、上限 0.95）
+        或显式值；都不传 → 保持原 progress、原 actual_end（不虚构进度）。
+        """
+        return self._transition_episode(
+            episode_id, "interrupted", ("active",),
+            actual_end_minute=actual_end_minute, progress=progress,
+            interrupted_by=interrupted_by, state_after=state_after, extra_metadata=metadata,
+        )
+
+    def pause(self, episode_id: str, *, actual_end_minute: Optional[int] = None,
+              progress: Optional[float] = None,
+              state_after: Optional[Dict[str, Any]] = None,
+              metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """暂停 episode（active/interrupted → paused；进度保留供恢复池使用）。
+
+        传 ``actual_end_minute``/``progress`` 时按默认口径或显式值刷新；都不传 →
+        保持原 progress / 原 actual_end（不虚构）。
+        """
+        return self._transition_episode(
+            episode_id, "paused", ("active", "interrupted"),
+            actual_end_minute=actual_end_minute, progress=progress,
+            state_after=state_after, extra_metadata=metadata,
+        )
+
+    def resume(
+        self,
+        episode_id: str,
+        *,
+        planned_start_minute: Optional[int] = None,
+        planned_end_minute: Optional[int] = None,
+        actual_start_minute: Optional[int] = None,
+        attention_mode: Optional[str] = None,
+        state_before: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """恢复 paused/interrupted episode → 新建 active 行（source='resume'、resume_of=原 id）。
+
+        进度原样保留（附录「恢复时保留」）；计划窗缺省沿用原行（调用方可传
+        ``planned_*`` 改写为剩余时长形态）；原行保持 paused 不改写状态（不覆盖历史），
+        仅 metadata 记 ``resumed_by``。已有恢复行（resume_of 命中）→ 拒绝（None），
+        不二次复活。start 前同样先关闭既有 active（任意时刻最多一个 active）。
+        返回新 episode_id；写失败/不合法 → None（告警不抛）。
+        """
+        new_id = uuid.uuid4().hex
+        now = datetime.now().isoformat()
+        try:
+            with self._lock, self._conn:
+                row = self._conn.execute(
+                    "SELECT * FROM activity_episodes WHERE episode_id = ?", (episode_id,)
+                ).fetchone()
+                if row is None or row["status"] not in ("paused", "interrupted"):
+                    return None
+                resumed_before = self._conn.execute(
+                    "SELECT COUNT(*) FROM activity_episodes WHERE resume_of = ?",
+                    (episode_id,),
+                ).fetchone()[0]
+                if resumed_before:
+                    return None
+                planned_start = row["planned_start_minute"] if planned_start_minute is None \
+                    else int(planned_start_minute)
+                planned_end = row["planned_end_minute"] if planned_end_minute is None \
+                    else int(planned_end_minute)
+                actual_start = planned_start if actual_start_minute is None \
+                    else int(actual_start_minute)
+                self._close_active_episodes_locked(new_id, actual_start, now,
+                                                   "superseded_by_resume")
+                self._insert_episode_locked(
+                    episode_id=new_id, schedule_date=row["schedule_date"],
+                    day_offset=row["day_offset"], source="resume", name=row["name"],
+                    goal_type=row["goal_type"], property_id=row["property_id"],
+                    planned_start=planned_start, planned_end=planned_end,
+                    actual_start=actual_start, status="active",
+                    progress=self._clamp_progress(row["progress"]),
+                    interruptibility=row["interruptibility"],
+                    switch_cost=row["switch_cost"],
+                    attention_mode=(attention_mode if attention_mode is not None
+                                    else row["attention_mode"]),
+                    interrupted_by=None, resume_of=episode_id,
+                    state_before=state_before, metadata=metadata, now=now,
+                )
+                self._conn.execute(
+                    "UPDATE activity_episodes SET metadata = ?, updated_at = ?"
+                    " WHERE episode_id = ? AND status = ?",
+                    (self._merge_json_text(row["metadata"], {"resumed_by": new_id}),
+                     now, episode_id, row["status"]),
+                )
+            return new_id
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            logger.warning("schedule_db: resume(%s) 写入失败（不抛）：%s", episode_id, e)
+            return None
+
+    def abandon(self, episode_id: str, *, reason: Optional[str] = None,
+                metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """放弃 episode（planned/active/paused/interrupted → abandoned）。
+
+        ``reason``（放弃原因）记入 metadata ``abandon_reason``——附录「放弃必须在日志
+        里可解释」。注意：close-active 关闭路径不经本方法（那边记 close_reason）。
+        """
+        extra = dict(metadata or {})
+        if reason is not None:
+            extra.setdefault("abandon_reason", str(reason))
+        return self._transition_episode(
+            episode_id, "abandoned", ("planned", "active", "paused", "interrupted"),
+            extra_metadata=extra or None,
+        )
+
+    def skip(self, episode_id: str, *, reason: Optional[str] = None,
+             metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """跳过 episode（planned → skipped，「未开始即过期」；原因记 metadata skip_reason）。"""
+        extra = dict(metadata or {})
+        if reason is not None:
+            extra.setdefault("skip_reason", str(reason))
+        return self._transition_episode(
+            episode_id, "skipped", ("planned",),
+            extra_metadata=extra or None,
+        )
+
+    def get_episode(self, episode_id: str) -> Optional[Dict[str, Any]]:
+        """按 episode_id 查单条（供 RollingPlanner/ReadModel 复盘单集用；只读）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM activity_episodes WHERE episode_id = ?", (episode_id,)
+            ).fetchone()
+        return self._episode_row(row) if row else None
+
+    def active_episode(self, schedule_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """当前 active episode（任意时刻最多一个；``schedule_date`` 给定则限定该日）。"""
+        query = "SELECT * FROM activity_episodes WHERE status = 'active'"
+        params: List[Any] = []
+        if schedule_date:
+            query += " AND schedule_date = ?"
+            params.append(schedule_date)
+        query += " ORDER BY created_at DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(query, params).fetchone()
+        return self._episode_row(row) if row else None
+
+    def planned_future(self, schedule_date: str, cur_minute: Optional[int] = None,
+                       limit: int = 10) -> List[Dict[str, Any]]:
+        """planned 且未开始的 episode（按 planned_start 升序；恢复池/spine 合并由上层做）。
+
+        ``cur_minute`` 未传 → 该日全部 planned。跨午夜 planned_* 允许 >1440、
+        ``day_offset`` 与 schedule_items 同口径；只查给定 schedule_date（跨日由调用方
+        按 day_offset/次日合并，与 §7.8 读取口径一致）。
+        """
+        query = ("SELECT * FROM activity_episodes WHERE status = 'planned'"
+                 " AND schedule_date = ?")
+        params: List[Any] = [schedule_date]
+        if cur_minute is not None:
+            query += " AND planned_start_minute >= ?"
+            params.append(int(cur_minute))
+        query += " ORDER BY planned_start_minute ASC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [self._episode_row(r) for r in rows]
+
+    def paused_recent(self, schedule_date: Optional[str] = None,
+                      limit: int = 5) -> List[Dict[str, Any]]:
+        """恢复池候选：status='paused' 且尚无恢复行（resume_of 未命中，不重复复活），
+        updated_at 倒序。过期/放弃判定归 RollingPlanner，本层只按序给出。"""
+        query = ("SELECT * FROM activity_episodes WHERE status = 'paused'"
+                 " AND episode_id NOT IN (SELECT resume_of FROM activity_episodes"
+                 " WHERE resume_of IS NOT NULL)")
+        params: List[Any] = []
+        if schedule_date:
+            query += " AND schedule_date = ?"
+            params.append(schedule_date)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [self._episode_row(r) for r in rows]
+
+    def completed_today(self, schedule_date: str) -> List[Dict[str, Any]]:
+        """该日已完成 episode（实际发生口径；actual_start 缺省回退 planned_start 排序）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM activity_episodes WHERE status = 'completed'"
+                " AND schedule_date = ?"
+                " ORDER BY COALESCE(actual_start_minute, planned_start_minute) ASC",
+                (schedule_date,),
+            ).fetchall()
+        return [self._episode_row(r) for r in rows]
+
+    def episodes_today(self, schedule_date: str) -> List[Dict[str, Any]]:
+        """该日全部 episode（全状态；planned_start 升序）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM activity_episodes WHERE schedule_date = ?"
+                " ORDER BY planned_start_minute ASC, created_at ASC",
+                (schedule_date,),
+            ).fetchall()
+        return [self._episode_row(r) for r in rows]
+
+    def cleanup_old_episodes(self, keep_days: int = 14) -> int:
+        """删除 keep_days 天前的 episode（附录 B.7：保留 14 天，按日清理；失败告警返 0）。"""
+        cutoff = (datetime.now().date()).toordinal() - keep_days
+        cutoff_date = datetime.fromordinal(cutoff).strftime("%Y-%m-%d")
+        try:
+            with self._lock, self._conn:
+                cur = self._conn.execute(
+                    "DELETE FROM activity_episodes WHERE schedule_date < ?", (cutoff_date,)
+                )
+                return cur.rowcount
+        except sqlite3.Error as e:
+            logger.warning("schedule_db: cleanup_old_episodes 失败（不抛）：%s", e)
+            return 0

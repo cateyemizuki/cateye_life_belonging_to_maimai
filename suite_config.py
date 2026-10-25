@@ -68,6 +68,7 @@ from companion.config import (
 )
 from emotion.config import EmotionSectionConfig
 from planning.config import (
+    LifeStateSectionConfig,
     PlanningProactiveSectionConfig,
     ScheduleAdvancedSectionConfig,
     ScheduleSectionConfig,
@@ -336,6 +337,20 @@ class LlmSectionConfig(PluginConfigBase):
     )
 
 
+class LifeStateSuiteSectionConfig(LifeStateSectionConfig):
+    """生活状态段（滚动化）——聚合挂载专用子类，仅覆盖 WebUI 段序。
+
+    R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
+    D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）：
+    ``__ui_order__`` 增 life_state=11（排末尾，不打乱既有 0~10 段序）。键位与默认值
+    全部沿用 planning/config.py 的 :class:`LifeStateSectionConfig`（单一真源，17 键、
+    enabled=False 默认关）；planning.config 上的原类保持 ``__ui_order__=6`` 不动，
+    供 ``planning.config.section_or_default`` 的未挂载兜底路径继续引用。
+    """
+
+    __ui_order__ = 11
+
+
 class AdminSectionConfig(PluginConfigBase):
     """管理与日志（跨模块共享）。"""
 
@@ -431,6 +446,8 @@ class CateyeSuiteConfig(PluginConfigBase):
     schedule: ScheduleSectionConfig = Field(default_factory=ScheduleSectionConfig)
     schedule_advanced: ScheduleAdvancedSectionConfig = Field(default_factory=ScheduleAdvancedSectionConfig)
     planning_proactive: PlanningProactiveSectionConfig = Field(default_factory=PlanningProactiveSectionConfig)
+    # 生活状态（滚动化，2026-10-25 新增段；默认关——enabled=false 时插件行为与 2.1.0 一致）
+    life_state: LifeStateSuiteSectionConfig = Field(default_factory=LifeStateSuiteSectionConfig)
     # LLM 调用集中段（本文件）与提示词集中段（suite_prompts.py）
     llm: LlmSectionConfig = Field(default_factory=LlmSectionConfig)
     prompts: PromptsSectionConfig = Field(default_factory=PromptsSectionConfig)

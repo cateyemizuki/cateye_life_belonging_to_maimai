@@ -2315,9 +2315,48 @@ class ProactiveService:
         end -= 1440``（该写法在 00:30 会把窗口错误地折成 [1380, 420) → 恒不命中）。
         返回的 ``end`` 原样保留 >1440（与 ``schedule_items.item_end_minute`` 同一口径）。
 
+        R7 滚动化改造前置分支（R7 依据 = 用户 2026-10-25 直派，设计目录
+        D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计，
+        主设计 §9.1「proactive_service._find_current_activity 优先 runtime」）：
+        ``ScheduleQuery`` 的 runtime provider 就绪（``[life_state].enabled``）时优先读
+        episode current（红线 3：当前活动只从 episode 日志读，不从时间窗编造）——
+        runtime 空闲（None）即如实返回 None，**不回退时间窗编造**；provider 未就绪/
+        异常 → 下方旧 GoalManager 路径逐字保留。只改读取源，不改任何主动链
+        （纪律 5：本方法只服务频率调控与活动切换观察事件，不构成主动开口入口）。
+
         Returns:
             ``(name, goal_type, start_minutes, end_minutes, parameters)``；没找到时为 None。
         """
+        provider = getattr(getattr(self._plugin, "_schedule_query", None),
+                           "_runtime_provider", None)
+        if provider is not None:
+            try:
+                from .schedule_query import ScheduleQuery as _ScheduleQuery
+                runtime_ready = _ScheduleQuery._runtime_ready(provider)
+            except Exception:
+                runtime_ready = False
+            if runtime_ready:
+                try:
+                    model_current = provider.current(self._tz_manager.get_now())
+                except Exception as exc:
+                    logger.debug(f"runtime current 读取失败（回退旧时间窗路径）: {exc}")
+                    model_current = None
+                if model_current is None:
+                    return None  # runtime 就绪且空闲：如实返回（不按表编造）
+                if isinstance(model_current, dict):
+                    try:
+                        start = int(model_current.get("start_minute") or 0)
+                        end = int(model_current.get("end_minute") or 0)
+                    except (TypeError, ValueError):
+                        start, end = 0, 0
+                    params = model_current.get("parameters")
+                    return (
+                        str(model_current.get("name") or ""),
+                        str(model_current.get("goal_type") or "daily_routine"),
+                        start,
+                        end,
+                        dict(params) if isinstance(params, dict) else {},
+                    )
         try:
             gm = get_goal_manager()
             goals = gm.get_active_goals(chat_id="global")
