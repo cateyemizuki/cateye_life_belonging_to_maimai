@@ -2,6 +2,11 @@
 
 This module provides JSON Schema building functionality for schedule generation.
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
+
+PR8 3.0.0 清退（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP4）：
+旧 daily 全天 schema（``build_json_schema`` 及其缓存）已删除；仅保留 spine
+日意图精简 Schema。注意：``planning/event_prompt.py`` 的同名 ``build_json_schema``
+是事件库另一实现（event_catalog 在用），与本模块无关、未触碰。
 """
 
 from typing import Any, Dict
@@ -12,12 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 class SchemaBuilder:
-    """Schema构建器 - 单一职责：构建JSON Schema
+    """Schema构建器 - 单一职责：构建JSON Schema（spine 唯一路线）
 
     该类负责：
-    1. 构建日程项的JSON Schema
-    2. 配置约束规则（字段长度、枚举值等）
-    3. 提供Schema验证标准
+    1. 构建 spine 日意图的精简 JSON Schema
+    2. 提供Schema验证标准
 
     与BaseScheduleGenerator的区别：
     - 只负责Schema构建，不涉及其他业务逻辑
@@ -31,147 +35,6 @@ class SchemaBuilder:
             config: 配置字典
         """
         self.config = config
-        self._cached_schema = None  # 缓存Schema（避免重复构建）
-
-    def build_json_schema(self) -> dict:
-        """构建JSON Schema，约束LLM输出格式
-
-        使用缓存机制，避免重复构建相同的Schema。
-
-        优势：
-        1. 强制类型检查（时间格式必须是HH:MM）
-        2. 枚举约束（goal_type只能是预定义值）
-        3. 必填字段检查
-        4. 长度限制（防止过长或过短）
-
-        Returns:
-            JSON Schema字典
-        """
-        if self._cached_schema is not None:
-            return self._cached_schema
-
-        # 从配置读取参数
-        min_activities = self.config.get('min_activities', 8)
-        max_activities = self.config.get('max_activities', 15)
-        enable_detailed_description = self.config.get('enable_detailed_description', True)
-        min_desc_len = self.config.get('min_description_length', 20)
-        max_desc_len = self.config.get('max_description_length', 50)
-
-        # 如果禁用详细描述，description不是必需字段
-        required_fields = ["name", "time_slot", "goal_type", "priority"]
-        if enable_detailed_description:
-            required_fields.append("description")
-
-        # description的schema配置
-        if enable_detailed_description:
-            description_schema = {
-                "type": "string",
-                "minLength": min_desc_len,
-                "maxLength": max_desc_len,
-                "description": f"活动描述（叙述风格，{min_desc_len}-{max_desc_len}字）"
-            }
-        else:
-            # 不启用详细描述时，允许空字符串
-            description_schema = {
-                "type": "string",
-                "maxLength": 0,
-                "description": "活动描述（留空即可）"
-            }
-
-        self._cached_schema = {
-            "type": "object",
-            "required": ["schedule_items"],
-            "properties": {
-                "schedule_items": {
-                    "type": "array",
-                    "minItems": min_activities,
-                    "maxItems": max_activities,
-                    "items": {
-                        "type": "object",
-                        "required": required_fields,
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "minLength": 2,
-                                "maxLength": 20,
-                                "description": "活动名称"
-                            },
-                            "description": description_schema,
-                            "time_slot": {
-                                "type": "string",
-                                "pattern": "^([01]?[0-9]|2[0-3]):[0-5][0-9]$",
-                                "description": "时间点，HH:MM格式（如09:30）"
-                            },
-                            "goal_type": {
-                                "type": "string",
-                                "enum": [
-                                    "daily_routine",      # 日常作息
-                                    "meal",               # 吃饭
-                                    "study",              # 学习
-                                    "work",               # 工作（模板兜底会产出）
-                                    "sleep",              # 夜间睡眠（A-21(f) 规范类型）
-                                    "entertainment",      # 娱乐
-                                    "social_maintenance", # 社交
-                                    "exercise",           # 运动
-                                    "learn_topic",        # 兴趣学习
-                                    "rest",               # 休息
-                                    "free_time",          # 自由时间
-                                    "custom"              # 自定义
-                                ],
-                                "description": "活动类型"
-                            },
-                            "priority": {
-                                "type": "string",
-                                "enum": ["high", "medium", "low"],
-                                "description": "优先级"
-                            },
-                            "duration_hours": {
-                                "type": "number",
-                                "minimum": 0.25,
-                                "maximum": 12,
-                                "description": "活动持续时长（小时）"
-                            },
-                            "emotional_tone": {
-                                "type": "object",
-                                "description": "该活动给角色带来的情绪基调（可选）：valence 效价 / arousal 唤醒 / "
-                                               "dominance 支配感，各维 [-0.5, +0.5]；沉重/紧张取负 V，"
-                                               "期待/轻松取正 V。供睡眠大修的前日残差与明日预期使用",
-                                "properties": {
-                                    "valence": {
-                                        "type": "number",
-                                        "minimum": -0.5,
-                                        "maximum": 0.5,
-                                        "description": "效价：正=愉悦/期待，负=沉重/压力"
-                                    },
-                                    "arousal": {
-                                        "type": "number",
-                                        "minimum": -0.5,
-                                        "maximum": 0.5,
-                                        "description": "唤醒：正=紧张/兴奋，负=平静/放松"
-                                    },
-                                    "dominance": {
-                                        "type": "number",
-                                        "minimum": -0.5,
-                                        "maximum": 0.5,
-                                        "description": "支配感：正=掌控/自信，负=无力/被压"
-                                    }
-                                }
-                            },
-                            "parameters": {
-                                "type": "object",
-                                "description": "额外参数"
-                            },
-                            "conditions": {
-                                "type": "object",
-                                "description": "执行条件"
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return self._cached_schema
 
     def build_spine_schema(self, min_intentions: int = 3, max_intentions: int = 6) -> dict:
         """构建 spine 日意图的精简 JSON Schema（2026-10-25 滚动化改造新增）。
@@ -182,7 +45,7 @@ class SchemaBuilder:
 
         意图卡 8 个必填字段：``name / goal_type / window / min_minutes / max_minutes /
         priority / hardness / interruptibility``；``note`` 可选（只给 1-3 条重要意图写一句）。
-        独立于旧全天 schema（``build_json_schema`` 缓存不受影响，旧路径零变化）。
+        旧全天 schema（``build_json_schema``）已随 PR8 3.0.0 daily 链清退。
         """
         try:
             lo = max(1, int(min_intentions))

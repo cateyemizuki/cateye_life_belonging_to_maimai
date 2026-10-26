@@ -1,13 +1,17 @@
 """Base Generator Module（来源：自主规划插件，改造版）。
 
 职责：
-    - 模型任务名解析（供 ScheduleGenerator 经 core.llm_utils.LLMService 调用时使用）
     - 组件协调（PromptBuilder / SchemaBuilder / ScheduleContextLoader / TimezoneManager）
 
 改造点：goal_manager 可为 None（无库场景下 PromptBuilder 仍可工作）。
+
+PR8 3.0.0 清退（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP4）：
+删旧 daily 面三个透传（``build_json_schema``/``build_schedule_prompt``/
+``build_retry_prompt``）与零调用的 ``get_model_config``（C-19）；spine 两透传与
+context 装载保留。
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import logging
 
 from ..time_utils import TimezoneManager
@@ -17,10 +21,6 @@ from .prompt_builder import PromptBuilder
 from .schema_builder import SchemaBuilder
 
 logger = logging.getLogger(__name__)
-
-# 默认模型任务名（需在主程序 model_config.toml 中预先配置）
-DEFAULT_LLM_TASK_NAME = "replyer"
-DEFAULT_TEMPERATURE = 0.85  # 提到 0.85 让日程描述更有变化（schema 校验兜底防跑偏）
 
 
 class BaseScheduleGenerator:
@@ -56,66 +56,8 @@ class BaseScheduleGenerator:
         self.context_loader = ScheduleContextLoader(goal_manager, self.tz_manager)
 
     # ========================================================================
-    # 模型配置
+    # 委托方法（薄包装，子组件承担实际逻辑；PR8 3.0.0 起仅存 spine 两透传）
     # ========================================================================
-
-    def get_model_config(self) -> Tuple[str, int, float]:
-        """获取 LLM 调用参数 ``(task_name, max_tokens, temperature)``。"""
-        task_name = str(self.config.get("llm_task_name", DEFAULT_LLM_TASK_NAME)).strip() or DEFAULT_LLM_TASK_NAME
-        max_tokens = int(self.config.get("max_tokens", 8192))
-        temperature = float(self.config.get("temperature", DEFAULT_TEMPERATURE))
-        logger.debug("LLM 任务名: %s (max_tokens=%s, temperature=%s)", task_name, max_tokens, temperature)
-        return task_name, max_tokens, temperature
-
-    # ========================================================================
-    # 委托方法（薄包装，子组件承担实际逻辑）
-    # ========================================================================
-
-    def build_json_schema(self) -> dict:
-        """构建 JSON Schema（委托给 SchemaBuilder）。"""
-        return self.schema_builder.build_json_schema()
-
-    def build_schedule_prompt(
-        self,
-        schedule_type: Any,
-        preferences: Dict[str, Any],
-        schema: Optional[Dict] = None,
-    ) -> str:
-        """构建日程生成提示词（委托给 PromptBuilder）。"""
-        return self.prompt_builder.build_schedule_prompt(
-            schedule_type,
-            preferences,
-            schema,
-            self.yesterday_schedule_summary,
-            pending_commitments=self.pending_commitments,
-            history_context=self.history_context,
-            knowledge_context=self.knowledge_context,
-            emotion_context=self.emotion_context,
-            low_mood_days=self.low_mood_days,
-            holiday_context=self.holiday_context,
-        )
-
-    def build_retry_prompt(
-        self,
-        schedule_type: Any,
-        preferences: Dict[str, Any],
-        schema: Dict,
-        previous_issues: List[str],
-    ) -> str:
-        """构建第二轮 prompt（委托给 PromptBuilder）。"""
-        return self.prompt_builder.build_retry_prompt(
-            schedule_type,
-            preferences,
-            schema,
-            previous_issues,
-            self.yesterday_schedule_summary,
-            pending_commitments=self.pending_commitments,
-            history_context=self.history_context,
-            knowledge_context=self.knowledge_context,
-            emotion_context=self.emotion_context,
-            low_mood_days=self.low_mood_days,
-            holiday_context=self.holiday_context,
-        )
 
     def build_spine_schema(self, min_intentions: int = 3, max_intentions: int = 6) -> dict:
         """构建 spine 日意图精简 Schema（委托给 SchemaBuilder；2026-10-25 滚动化改造新增）。"""
