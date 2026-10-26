@@ -1121,6 +1121,37 @@ class ScheduleDB:
             extra_metadata=extra or None,
         )
 
+    def update_episode_metadata(self, episode_id: str,
+                                updates: Dict[str, Any]) -> bool:
+        """合并追加 episode 行 metadata（不迁移状态、不碰其他字段；读改写原子）。
+
+        PR2.5 修复（2026-10-26），交接 §五.18 D1：close-active 被挤行由 planner 侧
+        补应用随机事件 deltas 后，经本方法补写 ``metadata.state_deltas_applied``
+        持久标记（防双应用沿用 PR1 0.4 同一标记口径）。
+        行不存在/``updates`` 为空/写失败 → False（告警不抛，与本类写路径同款纪律）。
+        """
+        if not updates:
+            return False
+        now = datetime.now().isoformat()
+        try:
+            with self._lock, self._conn:
+                row = self._conn.execute(
+                    "SELECT metadata FROM activity_episodes WHERE episode_id = ?",
+                    (episode_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+                self._conn.execute(
+                    "UPDATE activity_episodes SET metadata = ?, updated_at = ?"
+                    " WHERE episode_id = ?",
+                    (self._merge_json_text(row["metadata"], updates), now, episode_id),
+                )
+            return True
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            logger.warning("schedule_db: update_episode_metadata(%s) 失败（不抛）：%s",
+                           episode_id, e)
+            return False
+
     def get_episode(self, episode_id: str) -> Optional[Dict[str, Any]]:
         """按 episode_id 查单条（供 RollingPlanner/ReadModel 复盘单集用；只读）。"""
         with self._lock:

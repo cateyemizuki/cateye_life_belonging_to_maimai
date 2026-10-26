@@ -69,6 +69,30 @@ _VAD_AXES = ("valence", "arousal", "dominance")
 #: 全零增量的判定容差（低于它视为 0，跳过入账）
 _ZERO_EPS = 1e-9
 
+#: 全局每日 VAD 回写封顶（PR2.5 修复（2026-10-26），交接 §五.18 D3 / 定稿
+#: §4.1.3「每日 VAD 回写封顶」；常量对齐附录 B.3 ``daily_caps.vad_delta=0.15``。
+#: 裁量登记：附录 B.3 的 daily_caps 节在随包种子表内无对应结构，故取常量落码；
+#: 语义 = 三轴各自当日累计（含正负向）的绝对值不得超过此上限，超限整条事件丢弃）
+GLOBAL_VAD_DAILY_CAP = 0.15
+
+
+_TZ_MANAGER: Any = None
+
+
+def _tz_now() -> datetime:
+    """配置时区（Asia/Shanghai）当前时间（PR2.5 修复（2026-10-26），交接 §五.18 D4）。
+
+    与生活状态层同一时区真源链（参照 planning/life_state 的 TimezoneManager 用法），
+    预算日界与生活状态日界对齐；zoneinfo/pytz 不可用时 TimezoneManager 内部降级
+    系统本地时区。管理器模块级缓存（省重复 zoneinfo 构造开销）；延迟导入避免
+    planning 包顶层依赖进 emotion 装载链。
+    """
+    global _TZ_MANAGER
+    if _TZ_MANAGER is None:
+        from planning.time_utils import TimezoneManager
+        _TZ_MANAGER = TimezoneManager("Asia/Shanghai")
+    return _TZ_MANAGER.get_now()
+
 
 def _builtin_table() -> Dict[str, Any]:
     """内置默认表（与深层种子 ``emotion_life_modulation.json`` 同内容；种子损坏/缺失时兜底）。
@@ -313,7 +337,7 @@ class LifeFeedbackService:
                                      duration)
             if not matched:
                 return  # 随机小事件等未命中任何条目 → 零动作零可观测
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = _tz_now().strftime("%Y-%m-%d")  # PR2.5 D4：配置时区日界（原系统本地）
             budget = self._load_budget(today)
             if episode_id and episode_id in budget["entries"]:
                 logger.debug("情绪-生活反馈：episode %s 当日已入账，拒绝重复", episode_id)
@@ -344,6 +368,17 @@ class LifeFeedbackService:
                 applied_rules.append(key)
             if not applied_rules:
                 return
+            # PR2.5 修复（2026-10-26），交接 §五.18 D3 / 定稿 §4.1.3：逐规则 daily_cap
+            # 之外的全局每日封顶——budget["used"]（跨规则当日累计，原先只记账不判）
+            # 参与判定，三轴任一轴加总后 |累计| 超 GLOBAL_VAD_DAILY_CAP（附录 B.3
+            # daily_caps.vad_delta=0.15）→ 本条事件整条丢弃、预算不动账
+            used_raw = budget["used"] if isinstance(budget["used"], dict) else {}
+            for axis in _VAD_AXES:
+                projected = _to_float(used_raw.get(axis)) + delta_total[axis]
+                if abs(projected) > GLOBAL_VAD_DAILY_CAP + _ZERO_EPS:
+                    logger.debug("情绪-生活反馈：全局日上限触顶（%s 累计 %s），本次整条丢弃",
+                                 axis, used_raw)
+                    return
             result = await self._emotion.record_external_event(
                 source=LIFE_EPISODE_SOURCE, description=description,
                 delta=VADState(**delta_total), use_llm=False, multiplier=1.0,
@@ -361,7 +396,7 @@ class LifeFeedbackService:
                 budget["entries"][episode_id] = {
                     "rules": applied_rules,
                     "delta": {axis: round(delta_total[axis], 6) for axis in _VAD_AXES},
-                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "ts": _tz_now().isoformat(timespec="seconds"),  # PR2.5 D4：同上时区链
                 }
             self._save_budget(budget)
             logger.debug("情绪-生活反馈：episode %s 入账 %s（规则=%s）",
@@ -371,10 +406,20 @@ class LifeFeedbackService:
 
     @staticmethod
     def _episode_duration_minutes(payload: Dict[str, Any]) -> Optional[float]:
-        """completed 事件的 episode 时长（分钟）；payload 无起止端时返回 None。
+        """episode 时长（分钟）；无可信端点/时长字段时返回 None。
 
-        跨午夜按同一个 24h 环折算（一律走 planning/time_utils 日帧助手，禁止手写取模）。
+        PR2.5 起（2026-10-26，交接 §五.18 D6）：优先读发布侧补的
+        ``payload["duration_minutes"]``（interrupted 事件无 actual 端点也有时长，
+        反馈条目即可对打断形态设时长门槛）；缺该字段回退 actual_start/end 环折算
+        （completed 事件口径不变）。跨午夜按同一个 24h 环折算（一律走
+        planning/time_utils 日帧助手，禁止手写取模）。
         """
+        duration = payload.get("duration_minutes")
+        if duration is not None:
+            try:
+                return float(duration)
+            except (TypeError, ValueError):
+                pass
         start_raw = payload.get("actual_start_minute")
         end_raw = payload.get("actual_end_minute")
         if start_raw is None or end_raw is None:

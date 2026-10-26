@@ -193,6 +193,24 @@ class EmotionServices:
         except Exception:
             return None
 
+    def effective_vad_snapshot(self) -> Optional[Dict[str, Any]]:
+        """当前生效 VAD 完整快照（PR2.5（2026-10-26），交接 §五.18 D5，定稿 §4.1.1）。
+
+        返回 ``{"valence": float, "arousal": float, "dominance": float}``（内层
+        ``service._machine.effective_vad().to_dict()``，含静态偏移/乘数结算后的最终
+        值；VADState.to_dict 已含键名与 4 位舍入）。模块停用（emotion.enabled=false /
+        plugin.enabled=false）或读取异常 → ``None``（可空降级，§八.2）——消费方
+        （plugin._emotion_vad_snapshot 鸭子链公共口优先）本拍按不调制处理。
+        本口即 full-VAD 的正式束级转发，替换原暂借的私有
+        ``service._machine.effective_vad()`` 读数位；plugin 侧零改动即自动命中。
+        """
+        if not self.is_enabled():
+            return None
+        try:
+            return dict(self.service._machine.effective_vad().to_dict())
+        except Exception:
+            return None
+
     def is_enabled(self) -> bool:
         return self.service._enabled()
 

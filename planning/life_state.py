@@ -82,6 +82,17 @@ SLEEP_TIERS: Dict[str, Dict[str, float]] = {
 QUALITY_ENERGY_SPAN = 0.10   # energy ±0.05
 QUALITY_FOCUS_SPAN = 0.10    # focus ±0.05
 
+# ── 稳定性护栏（PR2.5 修复（2026-10-26），定稿 §4.1.3「必须实现」/交接 §五.18 D2；
+#    仅调制路径（modulation 非 None）生效，开关关/modulation=None 零影响）────────
+#: homeostatic override：精力 < 此值 → energy 的 rise gain 抬到 ≥1.0、fall gain 压到 ≤0.5
+HOMEOSTATIC_ENERGY_FLOOR = 0.2
+#: homeostatic override：精力见底时 energy fall gain 的上限（下降减半，防情绪加速耗竭）
+HOMEOSTATIC_ENERGY_FALL_MAX = 0.5
+#: homeostatic override：饥饿 > 此值 → hunger 的 fall gain 抬到 ≥1.0（不因情绪抑制食欲）
+HOMEOSTATIC_HUNGER_CEIL = 0.85
+#: 每 tick 单状态变化量上限（定稿 §4.1.3「每 tick 状态 delta 上限（如 0.03）」）
+TICK_DELTA_CAP = 0.03
+
 
 class LifeStateService:
     """生活状态服务：tick 推进 + 事件应用 + 睡眠处理 + 持久化 + 描述生成（0 LLM）。
@@ -257,10 +268,38 @@ class LifeStateService:
                 if isinstance(rate, (int, float)) and not isinstance(rate, bool):
                     delta += float(rate) * dt_min
             if delta > 0:
-                delta *= self._modulation_gain(gain_pair.get("rise"))
+                gain = self._modulation_gain(gain_pair.get("rise"))
+                # PR2.5 修复（2026-10-26），定稿 §4.1.3 homeostatic override：精力见底时
+                # 上升方向不吃情绪抑制（rise gain 抬到 ≥1.0），保证能恢复
+                if key == "energy" and self._state["energy"] < HOMEOSTATIC_ENERGY_FLOOR:
+                    gain = max(gain, 1.0)
+                delta *= gain
             elif delta < 0:
-                delta *= self._modulation_gain(gain_pair.get("fall"))
+                gain = self._modulation_gain(gain_pair.get("fall"))
+                if key == "energy" and self._state["energy"] < HOMEOSTATIC_ENERGY_FLOOR:
+                    # PR2.5 修复（2026-10-26），定稿 §4.1.3：精力见底时下降压到 ≤0.5
+                    # （耗竭减半，防情绪低落加速掏空）
+                    gain = min(gain, HOMEOSTATIC_ENERGY_FALL_MAX)
+                elif key == "hunger" and self._state["hunger"] > HOMEOSTATIC_HUNGER_CEIL:
+                    # PR2.5 修复（2026-10-26），定稿 §4.1.3：极饿时食欲恢复不被情绪抑制
+                    # （hunger 下降方向 gain 不低于 1.0）
+                    gain = max(gain, 1.0)
+                delta *= gain
             self._state[key] += delta
+
+    def _cap_tick_delta(self, before: Dict[str, float]) -> None:
+        """每 tick 单状态变化量上限（PR2.5 修复（2026-10-26），定稿 §4.1.3 /交接
+        §五.18 D2 ②；仅调制路径调用——``modulation=None`` 时不裁，逐字旧行为）。
+
+        对五项状态把本拍积分后的值夹回 ``before ± TICK_DELTA_CAP``（clamp 仍由
+        :meth:`_clamp_all` 统一做在后）。
+        """
+        for key in STATE_FIELDS:
+            delta = self._state[key] - before[key]
+            if delta > TICK_DELTA_CAP:
+                self._state[key] = before[key] + TICK_DELTA_CAP
+            elif delta < -TICK_DELTA_CAP:
+                self._state[key] = before[key] - TICK_DELTA_CAP
 
     @staticmethod
     def _modulation_gain(value: Any) -> float:
@@ -318,9 +357,14 @@ class LifeStateService:
         """
         now = self._now(now)
         dt_min = self._dt_minutes(now)
+        # PR2.5 修复（2026-10-26），定稿 §4.1.3：仅调制路径记录本拍前值，供
+        # _cap_tick_delta 做单拍变化量上限（modulation=None 零额外动作）
+        before = dict(self._state) if modulation is not None else None
         if dt_min > 0:
             self._apply_drift(dt_min, rates=self._profile_rates(active_profile),
                               modulation=modulation)
+        if before is not None:
+            self._cap_tick_delta(before)
         self._last_tick_at = now
         self._updated_at = now
         self._clamp_all()

@@ -47,7 +47,7 @@ from core.time_utils import minutes_of_now
 
 from . import activity_profiles
 from .time_utils import (DAY_MINUTES, TimezoneManager, is_in_sleep_ring,
-                         normalize_day_minutes)
+                         normalize_day_minutes, ring_minutes_ahead)
 
 logger = logging.getLogger(__name__)
 
@@ -449,8 +449,9 @@ class RollingPlanner:
 
         PR2（2026-10-26），计划书 §三十四/定稿 §3/§4.1.4：状态推进统一由 plugin tick
         编排（编排方先 ``life.tick`` 再把快照经 :attr:`life_snapshot` 传入 :meth:`tick`），
-        本方法把步 1 的画像解析规则（调用方显式画像优先；睡眠类型不给速率——睡眠恢复
-        走 handle_sleep；表外类型不给速率）开放给编排方复用，避免规则两处漂移。
+        本方法把步 1 的画像解析规则（调用方显式画像优先；睡眠类型不给速率——
+        PR2.5 订正（2026-10-26）：PR3 SleepEngine 接线前睡眠状态走被动漂移，
+        ``handle_sleep`` 暂未接线；表外类型不给速率）开放给编排方复用，避免规则两处漂移。
         返回 ``life.tick(active_profile=...)`` 应使用的画像键（可能为 None / dict /
         画像对象原样透传）。
         """
@@ -460,7 +461,8 @@ class RollingPlanner:
         if profile_key is None and current:
             profile_key = current.get("goal_type")
         if isinstance(profile_key, str) and profile_key in _SKIP_SLEEP_TYPES:
-            return None  # 睡眠恢复走 handle_sleep（情绪/睡眠链），不按画像速率积分
+            return None  # 睡眠类型不按画像速率积分（PR2.5 订正：handle_sleep 暂未接线，
+                         # PR3 SleepEngine 接线前睡眠恢复走被动漂移）
         if isinstance(profile_key, str) and \
                 activity_profiles.active_profiles().get(profile_key) is None:
             return None  # 表外类型不给速率（避免 get_profile 回退告警刷屏）
@@ -582,8 +584,9 @@ class RollingPlanner:
         按 ``metadata.event_key`` 回查 RANDOM_EVENT_POOL（二期后由 EventCatalog.pick
         供池）取增量；返回 None = 非随机事件行 / 已应用过（``state_deltas_applied``
         持久标记，一次性保证）/ 池内无此 key——三种情况都不应用、不标记。
-        close-active（被 start/resume 挤掉 → interrupted）路径本轮不应用也不标记，
-        未来接线时按标记判定不会双应用。
+        PR2.5 起（2026-10-26，交接 §五.18 D1）close-active（被 start/resume 挤掉 →
+        interrupted）路径也按本标记补应用一次（见 :meth:`_handle_squeezed_active`），
+        不会双应用。
         """
         if not isinstance(metadata, dict) or metadata.get("state_deltas_applied"):
             return None
@@ -595,6 +598,95 @@ class RollingPlanner:
                 deltas = event.get("state_deltas")
                 return dict(deltas) if isinstance(deltas, dict) else None
         return None
+
+    @staticmethod
+    def _ring_duration(start_minute: Any, end_minute: Any) -> Optional[int]:
+        """actual_start → actual_end 的时长分钟（跨午夜按同一 24h 环折算，唯一算式走
+        planning/time_utils.ring_minutes_ahead；PR2.5 修复（2026-10-26），交接
+        §五.18 D6/D1——interrupted 事件 payload 的 duration_minutes 用）。
+
+        任一端缺失/非法 → None（不虚构时长）。
+        """
+        if start_minute is None or end_minute is None:
+            return None
+        try:
+            start = int(start_minute)
+            end = int(end_minute)
+        except (TypeError, ValueError):
+            return None
+        return int(ring_minutes_ahead(end, start))
+
+    def _handle_squeezed_active(self, pre_active: Optional[Dict[str, Any]],
+                                now: datetime, new_eid: str) -> None:
+        """close-active 被挤行的补发布与状态回写（PR2.5 修复（2026-10-26），交接
+        §五.18 D1，定稿 §4.1.3 反馈闭环）。
+
+        背景：episode 被 start/resume 挤掉走 ``_close_active_episodes_locked`` →
+        interrupted（schedule_db.py 一带）时原先不发 ``life.episode_interrupted``、
+        不进 LifeState、随机事件 deltas 不应用——反馈闭环对「被新活动挤掉」这一
+        打断形态是断的。修法取「planner 调用点检测」最小方案：调用点开播前抓当前
+        active 行、开播成功后重查——状态变 interrupted 且 ``interrupted_by`` = 新行 id
+        （close-active 的唯一写法；pause 走 paused、finish 走 completed，均不在此列）
+        即判定被挤，补三件事：
+
+        1. 发布 ``life.episode_interrupted``（payload 带 ``interrupted_by="close_active"``
+           与 ``duration_minutes``（环折算）与 close_reason）；
+        2. 随机事件行按既有 ``state_deltas_applied`` 标记补应用 deltas（应用后经
+           ScheduleDB.update_episode_metadata 补写标记，防双应用沿用同一口径）；
+        3. ``LifeState.apply_episode(status=interrupted)`` 入账。
+
+        全程失败静默不阻塞主循环（与 tick 内其余链路同款纪律）。
+        """
+        if not isinstance(pre_active, dict):
+            return
+        eid = str(pre_active.get("episode_id") or "")
+        if not eid:
+            return
+        try:
+            row = self._db.get_episode(eid)
+        except Exception as exc:
+            logger.warning("rolling_planner: 被挤行重查失败（跳过补发布）：%s", exc)
+            return
+        if not isinstance(row, dict) or row.get("status") != "interrupted" \
+                or row.get("interrupted_by") != new_eid:
+            return  # 未被挤（正常开播/pause/finish 路径）→ 零动作
+        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if meta.get("close_active_handled"):
+            return  # 已补发布过（幂等保护，防同对 (被挤行, 新行) 重放重复发事件）
+        # 随机事件 deltas：按标记补应用一次；补写持久标记
+        # （state_deltas_applied=防双应用沿用 PR1 0.4 口径；close_active_handled=本路径幂等）
+        deltas = self._random_event_deltas(meta)
+        try:
+            marks: Dict[str, Any] = {"close_active_handled": True}
+            if deltas is not None:
+                marks["state_deltas_applied"] = True
+            self._db.update_episode_metadata(eid, marks)
+        except Exception:
+            pass
+        # 状态回写：interrupted 不盖 last_meal_at/last_break_at（apply_episode 既有语义），
+        # 只做 state_deltas 加法与 clamp/落盘
+        try:
+            episode_payload: Dict[str, Any] = {"goal_type": row.get("goal_type"),
+                                               "status": "interrupted"}
+            if deltas:
+                episode_payload["state_deltas"] = deltas
+            self._life.apply_episode(episode_payload, now=now)
+        except Exception:
+            pass
+        payload: Dict[str, Any] = {
+            "episode_id": eid, "name": row.get("name"),
+            "goal_type": row.get("goal_type"), "interrupted_by": "close_active",
+            "progress": row.get("progress"),
+            "close_reason": str(meta.get("close_reason") or ""),
+        }
+        duration = self._ring_duration(row.get("actual_start_minute"),
+                                       row.get("actual_end_minute"))
+        if duration is not None:
+            payload["duration_minutes"] = duration
+        self._publish(EVENT_EPISODE_INTERRUPTED, **payload)
+        self._log("rolling.episode_closed_active", episode_id=eid,
+                  interrupted_by="close_active",
+                  close_reason=str(meta.get("close_reason") or ""))
 
     def _finish_episode(self, episode: Dict[str, Any], now: datetime,
                         snapshot: Any, *, actual_end_minute: Optional[int] = None,
@@ -641,9 +733,19 @@ class RollingPlanner:
         if not self._db.pause(eid, actual_end_minute=minutes_of_now(now),
                               metadata={"pause_reason": reason}):
             return None
-        self._publish(EVENT_EPISODE_INTERRUPTED, episode_id=eid,
-                      name=episode.get("name"), goal_type=episode.get("goal_type"),
-                      interrupted_by=reason, progress=episode.get("progress"))
+        # PR2.5 修复（2026-10-26），交接 §五.18 D6：interrupted 事件补 duration_minutes
+        # （actual_end-actual_start 跨午夜按同一 24h 环折算，走 planning/time_utils；
+        # 任一端缺失不虚构——反馈侧对打断形态即可设时长门槛）
+        payload: Dict[str, Any] = {
+            "episode_id": eid, "name": episode.get("name"),
+            "goal_type": episode.get("goal_type"), "interrupted_by": reason,
+            "progress": episode.get("progress"),
+        }
+        duration = self._ring_duration(episode.get("actual_start_minute"),
+                                       minutes_of_now(now))
+        if duration is not None:
+            payload["duration_minutes"] = duration
+        self._publish(EVENT_EPISODE_INTERRUPTED, **payload)
         self._log("rolling.episode_paused", episode_id=eid, reason=reason,
                   progress=_as_number(episode.get("progress"), 0.0))
         return eid
@@ -740,6 +842,9 @@ class RollingPlanner:
                           now: datetime, snapshot: Any, report: Dict[str, Any]) -> None:
         """硬约定到点开播：时间固定（window 原样）、不采样覆盖（红线 2）。"""
         ws, we = intent["start_minute"], intent["end_minute"]
+        # PR2.5 修复（2026-10-26），交接 §五.18 D1：开播前抓当前 active——上方抢占
+        # pause 失败的兜底场景下本行会被 close-active 挤掉，补发布与状态回写
+        pre_active = self._safe_active_episode()
         eid = self._db.start_episode(
             schedule_date=date, name=intent["name"], goal_type=intent["goal_type"],
             source="commitment", planned_start_minute=ws, planned_end_minute=we,
@@ -753,6 +858,7 @@ class RollingPlanner:
             metadata={"commitment_item_id": intent["item_id"], "trigger": "hard_commitment"},
         )
         if eid:
+            self._handle_squeezed_active(pre_active, now, eid)
             self._publish(EVENT_EPISODE_STARTED, episode_id=eid, name=intent["name"],
                           goal_type=intent["goal_type"], planned_start_minute=ws,
                           planned_end_minute=we, source="commitment")
@@ -1133,6 +1239,10 @@ class RollingPlanner:
         profile = activity_profiles.get_profile(cand["profile_key"])
         source = {"commitment": "commitment", "intent": "rolling", "anchor_meal": "rolling",
                   "resume": "resume", "idle": "rolling"}.get(cand["kind"], "rolling")
+        # PR2.5 修复（2026-10-26），交接 §五.18 D1：开播/恢复前抓当前 active 行，
+        # 写入成功后若被 close-active 挤掉（interrupted 且 interrupted_by=新行 id）
+        # 则补发布 life.episode_interrupted 与状态回写（原路径静默）
+        pre_active = self._safe_active_episode()
         progress0 = 0.0
         attention = derive_attention_mode(
             cand["interruptibility"], progress0, source=source,
@@ -1157,7 +1267,10 @@ class RollingPlanner:
             origin = self._db.get_episode(str(cand["resume_of"])) or {}
             origin_meta = (origin.get("metadata")
                            if isinstance(origin.get("metadata"), dict) else {})
-            if origin_meta.get("event_key"):
+            # PR2.5 修复（2026-10-26），交接 §五.18 D1：origin 已按 close-active 路径
+            # 应用过 deltas（state_deltas_applied 标记在案）→ 不再透传 event_key，
+            # 恢复行关闭时不会二次应用（防双应用沿用同一标记口径）
+            if origin_meta.get("event_key") and not origin_meta.get("state_deltas_applied"):
                 metadata["event_key"] = str(origin_meta["event_key"])
             eid = self._db.resume(
                 str(cand["resume_of"]),
@@ -1167,6 +1280,7 @@ class RollingPlanner:
                 state_before=self._state_brief(snapshot),
                 metadata=metadata)
             if eid:
+                self._handle_squeezed_active(pre_active, now, eid)
                 self._publish(EVENT_EPISODE_RESUMED, episode_id=eid,
                               resume_of=cand["resume_of"], name=origin.get("name"),
                               goal_type=origin.get("goal_type"))
@@ -1179,6 +1293,7 @@ class RollingPlanner:
                 metadata=metadata,
             )
             if eid:
+                self._handle_squeezed_active(pre_active, now, eid)
                 self._publish(EVENT_EPISODE_STARTED, episode_id=eid, name=cand["name"],
                               goal_type=cand["goal_type"], planned_start_minute=cur,
                               planned_end_minute=cur + duration, source=source)
