@@ -371,8 +371,17 @@ class RollingPlanner:
 
     @property
     def enabled(self) -> bool:
-        """``[life_state].enabled``（配置段未落码时恒 False——默认关纪律）。"""
-        return bool(getattr(self._cfg_section(), "enabled", False))
+        """``[schedule].enabled``（PR8 3.0.0 起唯一日程总开关；配置段未落码时恒 False
+        ——默认关纪律。依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP1，
+        旧 ``[life_state].enabled`` 退役）。"""
+        provider = self._config_provider
+        if provider is None:
+            return False
+        try:
+            cfg = provider() if callable(provider) else provider
+        except Exception:
+            return False
+        return bool(getattr(getattr(cfg, "schedule", None), "enabled", False))
 
     def _emotion_modulation_enabled(self) -> bool:
         """``[life_state].emotion_modulation_enabled``（新调制开关；默认 False）。"""

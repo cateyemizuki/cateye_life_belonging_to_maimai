@@ -273,8 +273,12 @@ class InitStatus:
             lines.append(f"下次事件更新：{_short_ts(self.next_update_at)}")
         else:
             lines.append("下次事件更新：未安排")
-        lines.append(f"开关：生活状态={'开' if self.switches.get('life_state_enabled') else '关'}"
-                     f"，睡眠引擎={'开' if self.switches.get('sleep_engine_enabled') else '关'}"
+        # PR8 3.0.0：``[schedule].enabled`` 是唯一日程总开关，生活状态/睡眠引擎随之
+        # 生效或停摆（旧 [life_state] 两开关退役；依据 = 用户 2026-10-27 授权直接清理
+        # + 逐符号审定清单 WP1）。
+        schedule_on = bool(self.switches.get("life_state_enabled"))
+        lines.append(f"开关：日程={'开' if schedule_on else '关'}"
+                     f"（生活状态与睡眠引擎随日程开关）"
                      f"，生活状态文件={'有' if self.life_state_file_exists else '无'}"
                      f"，情绪参数={'已初始化' if self.emotion_initialized else '未初始化'}")
         lines.append(f"数据库：v{self.db_version or '?'}"
@@ -625,8 +629,12 @@ class InitService:
         cfg = self._current_config() if cfg is None else cfg
         freq_value = _field(cfg, "planning_proactive", "target_frequency_always_one", None)
         return {
-            "life_state_enabled": _as_bool(_field(cfg, "life_state", "enabled", False)),
-            "sleep_engine_enabled": _as_bool(_field(cfg, "life_state", "sleep_engine_enabled", False)),
+            # PR8 3.0.0：``[schedule].enabled`` 是唯一日程总开关（旧
+            # ``[life_state].enabled`` / ``[life_state].sleep_engine_enabled`` 退役；
+            # 依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP1）。两个旧
+            # switches 键名保留（诊断 details/摘要消费），取值同源自 schedule.enabled。
+            "life_state_enabled": _as_bool(_field(cfg, "schedule", "enabled", True)),
+            "sleep_engine_enabled": _as_bool(_field(cfg, "schedule", "enabled", True)),
             "event_catalog_mode": str(_field(cfg, "event_catalog", "mode", "off") or "off"),
             "frequency_always_one": _as_bool(freq_value, default=True),
             "frequency_switch_explicit": freq_value is not None,
@@ -1154,10 +1162,9 @@ class InitService:
             "sleep_engine_enabled": switches["sleep_engine_enabled"],
             "auto_enabled_new_module": False,
         }
-        if switches["sleep_engine_enabled"] and not switches["life_state_enabled"]:
-            details["sleep_engine_not_effective"] = (
-                "sleep_engine_enabled=true 但 life_state.enabled=false；"
-                "按用户裁定只提示，本次不自动启用生活状态。")
+        # PR8 3.0.0：旧「单开 sleep_engine_enabled 提示需同开生活状态」分支已删
+        # （两退役开关并入 schedule.enabled 唯一真源；依据 = 用户 2026-10-27 授权
+        # 直接清理 + 逐符号审定清单 WP1）。
         path = self._state_file_path(cfg)
         details["state_file"] = str(path)
         try:
@@ -1197,8 +1204,8 @@ class InitService:
                        "（未改动任何开关）。")
         else:
             message = "life_state.json 与 sleep_sessions 已就绪（已有状态未覆盖）。"
-        if details.get("sleep_engine_not_effective"):
-            message += " 睡眠引擎因生活状态未开启而不生效。"
+        # PR8 3.0.0：sleep_engine_not_effective 提示随单开分支一并退役（睡眠引擎随
+        # [schedule].enabled 生效；依据 = 用户 2026-10-27 授权直接清理）。
         return StageResult("state_sleep", "success", message=message, details=details)
 
     # ------------------------------------------------------------------

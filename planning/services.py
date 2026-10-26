@@ -129,8 +129,10 @@ class PlanningServices:
         # R7 滚动化服务占位（R7 依据 = 用户 2026-10-25 直派【日程系统滚动化改造】）：
         # 接线位（后续阶段）在此实例化 LifeStateService / RollingPlanner /
         # LifeScheduleReadModel 并 sq.set_runtime_provider(life_schedule) + 5 分钟 tick；
-        # 当前先占位 None = 未接线（组件面 getattr 判空降级、门面审计 hasattr 通过），
-        # 两开关全关时插件行为与 2.1.0 逐字一致。
+        # 当前先占位 None = 未接线（组件面 getattr 判空降级、门面审计 hasattr 通过）。
+        # PR8 3.0.0（依据 = 用户 2026-10-27 授权直接清理）：``[schedule].enabled`` 是
+        # 唯一日程总开关（旧 [life_state] 两开关退役），服务束装配/停摆由 plugin 按
+        # schedule.enabled 门控；本占位字段保留作 getattr 判空降级面。
         self.life_state: Any = None
         self.rolling_planner: Any = None
         self.life_schedule: Any = None

@@ -640,8 +640,9 @@ class SleepEngine:
     - ``episode_closer``：``(episode_id, actual_end_minute, reason) -> bool``（planner 接）；
     - ``sleep_endpoint_updater``：``(now, actual_end_minute, reason) -> Any``
       （planning.sleep_schedule 共享端点写回）；
-    - ``emotion_bridge``：``extend_night_sleep_until(dt) -> bool`` /
-      ``night_sleep_end_minute() -> Optional[int]``（emotion 服务束鸭子口）。
+    - ``emotion_bridge``：emotion 服务束鸭子口（PR8 3.0.0：``extend_sleep`` 整链已删
+      ——UQ-3 裁定，觉醒一律走阈值 + ``lie_in_max_until`` 上限；形参保留为兼容位，
+      当前无运行期调用）。
     """
 
     def __init__(self, *, config_provider: Any = None, life_state: Any = None,
@@ -670,7 +671,6 @@ class SleepEngine:
         self._last_continuous_hours: float = 0.0
         self._last_threshold_check_at: Optional[datetime] = None
         self._prepared: Optional[Dict[str, Any]] = None
-        self._warned_requires_life_state = False
         self._warning: Optional[str] = None
         #: 本轮睡眠是否「硬约定 lead 不足」（临时新建 < 提前量）——只诊断，不虚构准时
         self._hard_commitment_lead_short = False
@@ -707,23 +707,13 @@ class SleepEngine:
 
     @property
     def enabled(self) -> bool:
-        """``[life_state].sleep_engine_enabled`` **且** ``[life_state].enabled``。
+        """``[schedule].enabled`` 派生（PR8 3.0.0 唯一日程总开关）。
 
-        用户 2026-10-27 批准：单开睡眠键 → 明确提示需同时开启生活状态，引擎不生效；
-        不自动开启生活状态（不做偷偷改配置）。
+        旧 ``[life_state].sleep_engine_enabled`` / ``[life_state].enabled`` 两键已退役
+        （依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP1/C-4）：日程开 =
+        引擎在位即随 spine 运行态生效；日程关 = 引擎随之停摆（不切回旧路线）。
         """
-        section = self._section()
-        if section is None or not bool(getattr(section, "sleep_engine_enabled", False)):
-            return False
-        if not bool(getattr(section, "enabled", False)):
-            if not self._warned_requires_life_state:
-                self._warned_requires_life_state = True
-                self._warning = ("睡眠引擎需要同时开启生活状态"
-                                 "（[life_state].enabled=true）；当前仅 sleep_engine_enabled=true，"
-                                 "引擎不生效")
-                logger.warning(self._warning)
-            return False
-        return True
+        return bool(getattr(getattr(self._cfg_obj(), "schedule", None), "enabled", False))
 
     def diagnostics(self) -> Dict[str, Any]:
         """只读诊断（不触发任何写入；供 /lbm_life rolling 与报告核对）。"""
@@ -1532,63 +1522,6 @@ class SleepEngine:
                 reason="confirmed_awake")
         self._save_session()
         return True
-
-    def extend_sleep(self, target: Any = None, now: Optional[datetime] = None, *,
-                     reason: str = "lie_in_extend") -> Dict[str, Any]:
-        """延长睡眠端点（工具/引擎共用；不越过 ``lie_in_max_until`` 上限）。"""
-        if not self.enabled:
-            return {"extended": False, "reason": "disabled"}
-        session = self._session
-        if session is None or session.closed:
-            return {"extended": False, "reason": "no_session"}
-        current = self._now(now)
-        target_dt = self._parse(target)
-        if target_dt is None:
-            try:
-                target_dt = next_occurrence(current, int(target))
-            except (TypeError, ValueError):
-                return {"extended": False, "reason": "bad_target"}
-        cap = session.lie_in_cap_at or next_occurrence(current, self._lie_in_cap_minute())
-        new_end = min(target_dt, cap)
-        current_end = self._parse(session.metadata.get("planned_end_at"))
-        if current_end is None:
-            try:
-                current_end = datetime.strptime(session.schedule_date, "%Y-%m-%d").replace(
-                    tzinfo=current.tzinfo) + timedelta(minutes=session.planned_end_minute)
-            except (TypeError, ValueError):
-                current_end = None
-        if current_end is not None and new_end <= current_end:
-            return {"extended": False, "reason": "not_later",
-                    "new_end": new_end.isoformat()}
-        session.planned_end_minute = self._frame_minutes(new_end, session.schedule_date)
-        session.metadata["planned_end_at"] = new_end.isoformat()
-        self._save_session()
-        self._emit_once(session, f"extended:{new_end.isoformat()}", EVENT_SLEEP_EXTENDED,
-                        old_end=current_end.isoformat() if current_end else None,
-                        new_end=new_end.isoformat(), reason=reason)
-        if self._sleep_endpoint_updater is not None:
-            try:
-                self._sleep_endpoint_updater(current,
-                                             self._frame_minutes(new_end, session.schedule_date),
-                                             reason, schedule_date=session.schedule_date)
-            except TypeError:
-                try:
-                    self._sleep_endpoint_updater(
-                        current, self._frame_minutes(new_end, session.schedule_date), reason)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        bridge = self._emotion_bridge
-        extend = getattr(bridge, "extend_night_sleep_until", None)
-        if callable(extend):
-            try:
-                extend(new_end)
-            except Exception:
-                pass
-        self._log("sleep.session_extended", session_id=session.session_id,
-                  new_end=new_end.isoformat(), reason=reason)
-        return {"extended": True, "new_end": new_end.isoformat(), "reason": reason}
 
     def force_wake(self, now: Optional[datetime] = None, reason: str = "manual",
                    *, energy: Any = None) -> Dict[str, Any]:

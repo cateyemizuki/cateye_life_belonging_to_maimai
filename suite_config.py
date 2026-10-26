@@ -19,8 +19,8 @@
 提示词集中进新增 [prompts]。段名保持不变的段（plugin/patrol/affection/schedule/
 planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
-**config_version 与迁移保障（2026-10-10 第二版，已订正）**：
-开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `2.2.0`（2026-10-27 二期 PR7 开发版；2.1.0 于 2026-10-21 归档发布）；
+**config_version 与迁移保障（2026-10-10 第二版，已订正；3.0.0 起版本随 PR8 递增）**：
+开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `3.0.0`（2026-10-27 PR8 清理版；2.2.0 为 2026-10-27 二期 PR7 开发版、2.1.0 于 2026-10-21 归档发布）；
 迁移保障改由 **plugin.py 的「磁盘旧文件抢救」**（`CateyeSuitePlugin.normalize_plugin_config` 先读尚未被
 宿主覆写的磁盘 `config.toml`，把用户值并回输入）＋ 下面的 `mode="before"` 一次性迁移器共同承担。
 **旧口径（已作废）如下，仅留作教训**：宿主 Runner 在「配置版本号变化」时会
@@ -37,8 +37,22 @@ planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 离线用例直接 ``model_validate(旧字典)``、不经 merge，所以当时没抓到）。
 现在只在**输入非空**（真拿到了配置数据）时才写标记；抢救逻辑见 plugin.py。
 
-**迁移映射**（旧 → 新，全部在 :meth:`CateyeSuiteConfig._migrate_legacy_sections`）：
-- ``[target].target_qq`` → ``[patrol].target_qq``；
+**3.0.0 迁移记录（2026-10-27 PR8，用户授权直接清理；R7 依据 = 逐符号审定清单 WP2）**：
+退役键清退为**纯 pop、无值搬运**（:data:`LEGACY_ROUTE_KEYS` + :data:`LEGACY_PROACTIVE_KEYS`
+追加两 nap 键，入口显式 pop、两个分支都经过）：``[schedule].spine_mode``、
+``[schedule].planning_daily_token_budget``、``[life_state].enabled``、
+``[life_state].sleep_engine_enabled``、``[life_state].profile_path``、
+``[planning_proactive].nap_reminder_enabled``、``[planning_proactive].nap_reminder_max_per_day``。
+**全程不写 ``[schedule].enabled``**（裁定 2）：显式 ``false`` 必须保持 ``false``（不得被旧
+开关 ``true`` OR 成 ``true``）；缺省场景由 ``[schedule].enabled`` 出厂默认 ``True`` 承担
+（UQ-2：旧用户升级后 spine 生成/生活状态/睡眠引擎随默认 True 全开）。``CURRENT_LAYOUT_VERSION``
+**不换新标记**（C-12）：3.0.0 迁移是纯 pop 且已放两分支共经入口，换标记反而会让存量已迁移
+配置重跑 2026-10-10 值搬运体（非幂等缺陷史，见下）。UQ-1：显式 ``schedule.enabled=false``
+且任一旧开关为 true 时写一条一次性停摆告知日志（:func:`_warn_retired_route_switches`）。
+plugin.py ``normalize_plugin_config`` 对原始输入与磁盘抢救结果各做一次同一组 raw pop
+（在 SDK merge 出厂默认之前生效），聚合校验器入口 pop 对离线 ``model_validate`` 路径兜底。
+
+**迁移映射**（旧 → 新，全部在 :meth:`CateyeSuiteConfig._migrate_legacy_sections`）：- ``[target].target_qq`` → ``[patrol].target_qq``；
 - ``[cateye].*`` → ``[patrol].screen_*`` / ``[llm].vlm_task`` / ``[prompts].screen_*``；
 - ``[judge].*`` → ``[llm].judge_*``；
 - ``[schedule].llm_task_name`` → ``[llm].task_name``；
@@ -55,6 +69,7 @@ planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
 from __future__ import annotations
 
+import logging
 from typing import Any, ClassVar, Dict, List
 
 import pydantic
@@ -89,7 +104,7 @@ from suite_prompts import (
 # 重建设置文件（丢弃跨段旧键）。因此递增本值必须同时具备"磁盘旧文件抢救"（plugin.py 的
 # normalize_plugin_config：把尚未被覆写的磁盘 config.toml 里的用户值并回输入），
 # 否则跨段/改名键的用户值会在插件看到它们之前被丢弃 —— 见模块 docstring 的教训段。
-SUPPORTED_CONFIG_VERSION = "2.2.0"
+SUPPORTED_CONFIG_VERSION = "3.0.0"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -126,7 +141,24 @@ LEGACY_PROACTIVE_KEYS = {
     "planning_proactive": (
         "enable_proactive_trigger",
         "proactive_fresh_window_minutes",
+        # PR8 3.0.0（R7 依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP2）：
+        # 赖床提醒链退役（UQ-3/裁定 3 口径），两键随链清退——只 pop、不做值搬运。
+        "nap_reminder_enabled",
+        "nap_reminder_max_per_day",
     ),
+}
+
+#: PR8 3.0.0（2026-10-27 用户授权直接清理）：旧生成路线/运行期开关退役键。
+#: ``[schedule].enabled`` 是唯一日程总开关——spine 为唯一生成路线（``spine_mode`` 退役）、
+#: 生活状态与睡眠引擎随日程开关生效或停摆（``[life_state].enabled`` /
+#: ``sleep_engine_enabled`` / 死键 ``profile_path`` 退役）。登记于此供迁移器入口显式 pop
+#: （两分支都经过；§9.7 口径：只 pop 丢弃、不 setdefault、不做键缺失判断）。
+#: **绝不写 ``[schedule].enabled``**（裁定 2）：显式 ``false`` 不得被旧开关 ``true`` OR 成
+#: ``true``；缺省场景由 ``[schedule].enabled`` 的出厂默认 ``True`` 承担（UQ-2：旧用户升级
+#: 后 spine/生活状态/睡眠引擎随默认 True 全开，CHANGELOG/README 迁移段已说明）。
+LEGACY_ROUTE_KEYS = {
+    "schedule": ("spine_mode", "planning_daily_token_budget"),
+    "life_state": ("enabled", "sleep_engine_enabled", "profile_path"),
 }
 
 #: 1.0.0（配置整理轮之前）[patrol] 「想念触发说明」的出厂文案——仅用于迁移时判断「用户改过没有」。
@@ -158,6 +190,40 @@ def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
 #: 出厂默认配置缓存（``CateyeSuiteConfig()`` 的 model_dump；无参构造不会递归——空输入在
 #: 聚合校验器里被早退放行）。取不到时退回 ``{}``（搬运逻辑退化为老行为，不阻塞校验）。
 _FACTORY_DEFAULTS: Dict[str, Any] = {}
+
+logger = logging.getLogger(__name__)
+
+#: UQ-1 一次性告警哨兵（进程级）：显式 ``[schedule].enabled=false`` 且存在任一旧开关为
+#: true 的升级场景，整个进程生命周期只告警一次（迁移器可能因宿主重建+抢救被多次调用）。
+_ROUTE_RETIRE_WARNED = False
+
+
+def _warn_retired_route_switches(schedule_data: Any, life_data: Any) -> None:
+    """UQ-1（2026-10-27 主协调代裁）：迁移 pop 退役键前的一次性停摆告知。
+
+    仅当用户**显式**配置 ``[schedule].enabled=false`` 且 ``[life_state].enabled`` /
+    ``[life_state].sleep_engine_enabled`` 任一为 true 时告警：按裁定 2，日程开关保持
+    false（不得被旧开关 OR 成 true），原本在跑的生活状态/睡眠引擎随升级停摆——写一条
+    告警日志告知，不阻断迁移、不改任何配置值。
+    """
+    global _ROUTE_RETIRE_WARNED
+    if _ROUTE_RETIRE_WARNED:
+        return
+    try:
+        explicit_schedule_off = (isinstance(schedule_data, dict)
+                                 and schedule_data.get("enabled") is False)
+        legacy_on = (isinstance(life_data, dict)
+                     and (bool(life_data.get("enabled"))
+                          or bool(life_data.get("sleep_engine_enabled"))))
+        if explicit_schedule_off and legacy_on:
+            logger.warning(
+                "PR8 3.0.0 迁移提示：检测到 [schedule].enabled=false 且旧开关"
+                "（[life_state].enabled / [life_state].sleep_engine_enabled）为 true。"
+                "日程总开关保持关闭（不会因旧开关为 true 而开启），生活状态与睡眠引擎"
+                "随升级停摆；两个旧开关键已退役，如需启用请设置 [schedule].enabled=true。")
+            _ROUTE_RETIRE_WARNED = True
+    except Exception:  # 告警失败绝不阻塞迁移
+        pass
 
 
 def factory_defaults() -> Dict[str, Any]:
@@ -540,6 +606,18 @@ class CateyeSuiteConfig(PluginConfigBase):
         #    pop（两分支都经过；§9.7）。greeting_require_activation 已于 2026-10-22 用户
         #    裁定回归为真配置键（群聊必要性检查，R7 计划书 §二十七），不在此 pop。
         for section_name, stale_keys in LEGACY_PROACTIVE_KEYS.items():
+            section_data = migrated.get(section_name)
+            if isinstance(section_data, dict):
+                section_data = dict(section_data)
+                for stale_key in stale_keys:
+                    section_data.pop(stale_key, None)
+                migrated[section_name] = section_data
+        #    PR8 3.0.0：旧路线/运行期开关键（:data:`LEGACY_ROUTE_KEYS`）同口径在入口
+        #    显式 pop（两分支都经过；幂等天然成立）。**绝不写 [schedule].enabled**：
+        #    显式 false 保持 false（裁定 2），缺省由出厂默认 True 承担（UQ-2）。pop 前
+        #    按 UQ-1 做一次性停摆告知。
+        _warn_retired_route_switches(migrated.get("schedule"), migrated.get("life_state"))
+        for section_name, stale_keys in LEGACY_ROUTE_KEYS.items():
             section_data = migrated.get(section_name)
             if isinstance(section_data, dict):
                 section_data = dict(section_data)

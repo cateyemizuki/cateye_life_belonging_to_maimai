@@ -60,7 +60,7 @@ class LifeScheduleReadModel:
             :meth:`state_line` 返回空串）。
         planner: :class:`~planning.rolling_planner.RollingPlanner`（可选；缺失 →
             :meth:`next` 不含 planner 预演、恢复池按 B.6.3 本地判定）。
-        config_provider: 返回插件配置的可调用（``[life_state].enabled`` 读此处；
+        config_provider: 返回插件配置的可调用（``[schedule].enabled`` 读此处；
             段缺失/异常 → ``enabled=False``——默认关纪律）。
     """
 
@@ -82,12 +82,15 @@ class LifeScheduleReadModel:
             cfg = provider() if callable(provider) else provider
         except Exception:
             return None
-        return getattr(cfg, "life_state", None)
+        return cfg
 
     @property
     def enabled(self) -> bool:
-        """``[life_state].enabled``（ScheduleQuery 据此决定是否走 runtime 路径）。"""
-        return bool(getattr(self._cfg_section(), "enabled", False))
+        """``[schedule].enabled``（PR8 3.0.0 读侧唯一真源；ScheduleQuery 据此决定是否走
+        runtime 路径。依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP1：旧
+        ``[life_state].enabled`` 退役，``schedule.enabled`` 是唯一日程总开关）。"""
+        cfg = self._cfg_section()
+        return bool(getattr(getattr(cfg, "schedule", None), "enabled", False))
 
     # ── 时间助手 ─────────────────────────────────────────────────────────
     def _now(self, now: Optional[datetime]) -> datetime:

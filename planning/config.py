@@ -218,21 +218,11 @@ class ScheduleSectionConfig(PluginConfigBase):
         },
     )
 
-    # ── 滚动化改造（2026-10-25 滚动化改造新增，默认关）─────────────────────
+    # ── 滚动化改造（2026-10-25 滚动化改造新增）─────────────────────────────
     # R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
     # D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
-    # spine_mode=false 时本组键全部不参与任何判定，插件行为与 2.1.0 逐字一致。
-    spine_mode: bool = Field(
-        default=False,
-        description="日意图（spine）模式：每天只生成 3-6 条「今天想做什么」的稀疏意图 + 硬约定 + 作息锚点，"
-                    "不再一次排满全天；关闭时走旧的全天生成路径（行为与旧版逐字一致）",
-        json_schema_extra={
-            "label": "日意图（spine）模式",
-            "hint": "默认关；开 = 稀疏日意图（空档合法、描述精简、单轮生成、更省 token）",
-            **_ui_i18n("Spine mode",
-                       "Sparse day-intentions (3-6/day) instead of a full-day timetable."),
-        },
-    )
+    # PR8 3.0.0：``spine_mode`` 开关键已退役（依据 = 用户 2026-10-27 授权直接清理 +
+    # 逐符号审定清单 WP3）——spine 为唯一生成路线，本组 spine_* 键无条件参与判定。
     spine_min_intentions: int = Field(
         default=3,
         ge=1,
@@ -306,25 +296,20 @@ class ScheduleSectionConfig(PluginConfigBase):
     )
     spine_generate_at: str = Field(
         default="00:30",
-        description="spine 模式每天生成日意图的固定时刻（HH:MM）；空串 = 沿用旧的生成时机口径"
-                    "（最后日程结束后延迟；稀疏意图下不推荐）",
+        description="每天生成日意图（spine）的固定时刻（HH:MM），无条件生效；"
+                    "留空或非法值固定回落 00:30",
         json_schema_extra={
             "label": "spine 生成时刻",
-            "hint": "HH:MM；留空 = 沿用旧口径（设计 §9.1：勿用稀疏意图的最后 end 触发，会过早生成次日）",
+            "hint": "HH:MM；留空/非法 = 回落 00:30（设计 §9.1：勿用稀疏意图的最后 end 触发，会过早生成次日）",
             "pattern": r"^\d{2}:\d{2}$",
             **_ui_i18n("Spine generate at",
-                       "Fixed daily HH:MM for spine generation; empty = legacy timing."),
+                       "Fixed daily HH:MM for spine generation; empty/invalid falls back to 00:30."),
         },
     )
-    planning_daily_token_budget: int = Field(
-        default=8000,
-        ge=0,
-        description="日程规划（spine/补丁/摘要）每日 token 预算；0 = 不设限（熔断策略本阶段未启用，预留键位）",
-        json_schema_extra={
-            "label": "规划日 token 预算",
-            **_ui_i18n("Planning daily token budget"),
-        },
-    )
+    # PR8 3.0.0：``planning_daily_token_budget`` 预留键位已退役（自述「熔断策略本阶段
+    # 未启用」的自造预留键；依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP3）。
+    # 注意：``[event_catalog].daily_token_budget``（event_catalog_config.py）是事件库
+    # 另一套真实预算，与此键无关，保留。
 
 
 # ---------------------------------------------------------------------------
@@ -637,13 +622,13 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     # ── 赖床 ────────────────────────────────────────────────
     lie_in_max_until: str = Field(
         default="12:00",
-        description="赖床（推迟起床）的硬上限时刻（HH:MM）：夜间被吵醒后调用赖床工具时，"
-                    "传入的起床时间超过本值会被钳到本值；格式非法按 12:00 处理",
+        description="睡眠引擎赖床硬上限时刻（HH:MM）：觉醒时间最晚不超过本值（过点必起）；"
+                    "格式非法按 12:00 处理",
         json_schema_extra={
             "label": "赖床上限时刻",
-            "hint": "HH:MM；最大只能赖到这个点（默认 12:00）",
+            "hint": "HH:MM；最大只能睡到这个点（默认 12:00）",
             "pattern": r"^\d{1,2}:\d{2}$",
-            **_ui_i18n("Lie-in hard limit", "Hard cap for the lie-in tool (HH:MM)."),
+            **_ui_i18n("Lie-in hard limit", "Hard cap for engine lie-in (HH:MM)."),
         },
     )
 
@@ -906,26 +891,10 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         },
     )
 
-    # ── 赖床提醒 ─────────────────────────────────────────────
-    nap_reminder_enabled: bool = Field(
-        default=True,
-        description="赖床提醒：夜间被吵醒且重新睡着后，向 bot 发一条临时提醒（点名赖床工具，只在当轮有效）",
-        json_schema_extra={
-            "label": "赖床提醒",
-            "hint": "关 = 不提醒，但 bot 仍可自行推迟起床",
-            **_ui_i18n("Nap reminder"),
-        },
-    )
-    nap_reminder_max_per_day: int = Field(
-        default=2,
-        ge=1,
-        description="每个睡眠周期（不是自然日）的有效提醒次数上限：提醒发送 + 工具成功改日程各计 1 次；"
-                    "用尽后不再提醒",
-        json_schema_extra={
-            "label": "赖床提醒上限",
-            **_ui_i18n("Nap reminder cap"),
-        },
-    )
+    # PR8 3.0.0：``nap_reminder_enabled`` / ``nap_reminder_max_per_day`` 两键已退役
+    # （赖床提醒链随 UQ-3/裁定 3 清退：引擎觉醒一律走阈值 + lie_in 上限，不再发赖床提醒；
+    # 依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP3。旧消费者
+    # emotion/service._nap_cfg 经 getattr 带默认读取，缺键安全降级）。
 
     # ── 兼容位（旧问候开关/四名单）已彻底移除（2026-10-10 第二轮，用户要求）──
     # 移除理由：隐藏兼容位运行期早已不再参与判定（问候走两个总开关 + 统一名单），但用户
@@ -1051,14 +1020,16 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
 
 
 class LifeStateSectionConfig(PluginConfigBase):
-    """生活状态段（2026-10-25 滚动化改造新增，默认关）。
+    """生活状态段（2026-10-25 滚动化改造新增）。
 
     R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
     D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
 
-    ``enabled=false`` 时整段不参与任何判定（无 tick、无状态文件、读取侧回退
-    静态能量曲线），插件行为与 2.1.0 逐字一致。设计附录 B.4.1 中的
-    ``keep_snapshot_days`` / ``patch_*`` / ``digest_*`` 等键本阶段未实现，**不登记死键**。
+    PR8 3.0.0：本段不再持有总开关（依据 = 用户 2026-10-27 授权直接清理 + 逐符号
+    审定清单 WP3）——``[schedule].enabled`` 是唯一日程总开关，生活状态（含睡眠引擎）
+    随之生效或停摆；旧 ``enabled`` / ``sleep_engine_enabled`` 键已退役。
+    设计附录 B.4.1 中的 ``keep_snapshot_days`` / ``patch_*`` / ``digest_*`` 等键
+    本阶段未实现，**不登记死键**。
     """
 
     __ui_label__ = "生活状态（滚动化）"
@@ -1066,18 +1037,9 @@ class LifeStateSectionConfig(PluginConfigBase):
     __ui_order__ = 6
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Life State (rolling)",
-               "description": "Energy/hunger/focus/stress drives and the rolling planner. Off by default."}
+               "description": "Energy/hunger/focus/stress drives and the rolling planner."}
     }
 
-    enabled: bool = Field(
-        default=False,
-        description="生活状态总开关：开启后启用精力/饥饿/专注/压力连续状态与滚动执行（默认关）",
-        json_schema_extra={
-            "label": "启用生活状态",
-            "hint": "关 = 完全回到旧行为（精神状态按静态曲线展示）",
-            **_ui_i18n("Enable life state", "Master switch; off = legacy behavior."),
-        },
-    )
     tick_seconds: int = Field(
         default=300,
         ge=30,
@@ -1208,14 +1170,9 @@ class LifeStateSectionConfig(PluginConfigBase):
             **_ui_i18n("Late attention progress"),
         },
     )
-    profile_path: str = Field(
-        default="mappings/activity_profiles.json",
-        description="活动画像表路径（相对插件根目录；缺失时用内置默认画像）",
-        json_schema_extra={
-            "label": "活动画像表路径",
-            **_ui_i18n("Profile path"),
-        },
-    )
+    # PR8 3.0.0：``profile_path`` 死键已退役（画像装载固定走
+    # activity_profiles.load_and_apply(root_dir) → mappings 链，表位置固定；
+    # 依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP3）。
     state_file: str = Field(
         default="life_state.json",
         description="状态持久化文件名（相对插件数据目录；损坏时重置默认）",
@@ -1249,18 +1206,9 @@ class LifeStateSectionConfig(PluginConfigBase):
         },
     )
     # PR3 SleepEngine（2026-10-26，定稿 §4.2 + 附录 B.6.3；R7 依据 = 用户直派
-    # 【日程系统二期 PR3】）：六个睡眠键 + 一个过睡专注惩罚键，全部默认关/出厂值。
-    # sleep_engine_enabled 必须与 enabled 同开才生效（用户 2026-10-27 批准：单开只
-    # 提示需同时开启生活状态，不自动改配置）。
-    sleep_engine_enabled: bool = Field(
-        default=False,
-        description="睡眠引擎开关：开启后由精力阈值/最晚起床/硬约定状态驱动觉醒（默认关；需同时开启生活状态）",
-        json_schema_extra={
-            "label": "启用睡眠引擎",
-            "hint": "关 = 旧起床锚点/旧赖床工具行为；开 = 到点按精力决定是否赖床，12:00 必起",
-            **_ui_i18n("Sleep engine", "Off = legacy wake anchors. Requires life state enabled."),
-        },
-    )
+    # 【日程系统二期 PR3】）：睡眠键组全部出厂值。PR8 3.0.0：``sleep_engine_enabled``
+    # 开关键已退役（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP1/WP3）
+    # ——睡眠引擎随 ``[schedule].enabled`` 唯一总开关生效或停摆。
     wake_energy_threshold: float = Field(
         default=0.75,
         ge=0.0,

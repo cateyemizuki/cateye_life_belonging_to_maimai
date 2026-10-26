@@ -46,6 +46,8 @@ from companion.harass_report import HARASS_TOOL_NAME
 from companion.services import CompanionServices
 from suite_config import (
     CURRENT_LAYOUT_VERSION,
+    LEGACY_PROACTIVE_KEYS,
+    LEGACY_ROUTE_KEYS,
     LEGACY_SECTIONS,
     SUPPORTED_CONFIG_VERSION,
     CateyeSuiteConfig,
@@ -274,6 +276,30 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             incoming = _migrate_ec(incoming)
         except Exception:
             pass  # 迁移失败不阻塞宿主；段级校验器仍会再尝试一次
+        # PR8 3.0.0（R7 依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP2 落点 B）：
+        # 退役路线/运行期开关键（:data:`LEGACY_ROUTE_KEYS` + nap 两键）的 raw 前置 pop，
+        # 仿 ``_migrate_ec`` 先例对 **原始输入与磁盘抢救结果各做一次**——宿主重建+抢救会把
+        # 退役键带回，必须在 SDK「merge 出厂默认 → 校验」之前清掉。纯 pop、语义与聚合校验器
+        # 入口 pop（落点 A）一致；**绝不写 [schedule].enabled**（裁定 2：显式 false 保持
+        # false，缺省由出厂默认 True 承担）。
+        def _pop_retired_keys(payload: Any) -> Any:
+            if not isinstance(payload, dict):
+                return payload
+            out = dict(payload)
+            changed = False
+            for section_map in (LEGACY_ROUTE_KEYS, LEGACY_PROACTIVE_KEYS):
+                for section_name, stale_keys in section_map.items():
+                    section_data = out.get(section_name)
+                    if not isinstance(section_data, dict):
+                        continue
+                    cleaned = dict(section_data)
+                    for stale_key in stale_keys:
+                        if cleaned.pop(stale_key, None) is not None:
+                            changed = True
+                    out[section_name] = cleaned
+            return out if changed else payload
+
+        incoming = _pop_retired_keys(incoming)
         rescued, rescued_changed = _rescue_config_from_disk(incoming)
         try:
             migrated_rescued = _migrate_ec(rescued)
@@ -282,6 +308,10 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
                 rescued_changed = True
         except Exception:
             pass
+        rescued_popped = _pop_retired_keys(rescued)
+        if rescued_popped is not rescued:
+            rescued = rescued_popped
+            rescued_changed = True
         parent = getattr(super(), "normalize_plugin_config", None)
         if callable(parent):  # 宿主/SDK 环境：走官方 merge → 校验 → 迁移
             normalized, changed = parent(rescued)
@@ -362,14 +392,14 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._stream_id = ""
         self._bg_started = False
         self._bg_tasks: list[asyncio.Task] = []
-        # 生活状态服务束（R7 滚动化改造）：默认全 None（enabled=false 时零实例化零开销）
+        # 生活状态服务束（R7 滚动化改造）：默认全 None（[schedule].enabled=false 时零实例化零开销）
         self._life_state: LifeStateService | None = None
         self._rolling_planner: RollingPlanner | None = None
         self._life_model: LifeScheduleReadModel | None = None
-        # 情绪调制服务（PR2，2026-10-26，定稿 §4.1.1）：只在 [life_state] enabled 且
+        # 情绪调制服务（PR2，2026-10-26，定稿 §4.1.1）：只在 [life_state].
         # emotion_modulation_enabled=true 时才构造（惰性，见 _ensure_life_modulation）
         self._life_modulation: LifeModulationService | None = None
-        # 睡眠引擎（PR3，2026-10-26；[life_state].sleep_engine_enabled 且 enabled 才建）
+        # 睡眠引擎（PR3，2026-10-26；随 [schedule].enabled 唯一总开关装配/停摆）
         self._sleep_engine: SleepEngine | None = None
         # 内部重检通知（睡眠 loop 安全唤醒；日程/约定写入共同口触达，见 request_life_recheck）
         self._life_recheck_event: asyncio.Event | None = None
@@ -386,8 +416,9 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         # 目标私聊 stream 解析（失败则后台重试）
         self._stream_id = await self._resolve_target_stream()
         self._apply_target(target_qq_of(cfg), self._stream_id)
-        # 生活状态装配（R7 滚动化改造，2026-10-25 用户直派）：[life_state].enabled=false
-        # 时不实例化任何新服务；失败告警回退、绝不拖挂插件加载（_setup_life_services 内保底）
+        # 生活状态装配（R7 滚动化改造，2026-10-25 用户直派；PR8 3.0.0 起门控 =
+        # [schedule].enabled 唯一总开关）：false 时不实例化任何新服务；失败告警回退、
+        # 绝不拖挂插件加载（_setup_life_services 内保底）
         self._setup_life_services()
         await self._start_bg()
         self.ctx.logger.info("属于麦麦的生活已加载 v%s（目标=%s，stream=%s）",
@@ -462,8 +493,8 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         # 目标 QQ 变化 → 重新解析 stream
         self._stream_id = await self._resolve_target_stream()
         self._apply_target(target_qq_of(cfg), self._stream_id)
-        # 生活状态热启用（R7 滚动化改造）：[life_state].enabled 首次置真时此处补装配，
-        # 再挂 tick 循环（_start_bg 的 _bg_started 守卫会早退，故单独 _ensure）
+        # 生活状态热启用（R7 滚动化改造；PR8 3.0.0 门控 = [schedule].enabled）：首次
+        # 置真时此处补装配，再挂 tick 循环（_start_bg 的 _bg_started 守卫会早退，故单独 _ensure）
         self._setup_life_services()
         # PR3（2026-10-26，定稿 §3）：睡眠引擎随配置热更新重装配（开关由关到开/由开到关）；
         # life 反馈订阅也在此按当前开关同步（不能因 bridge 已订阅而早退）
@@ -581,30 +612,26 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         """装配 LifeStateService + RollingPlanner + LifeScheduleReadModel 并注入
         ScheduleQuery runtime provider（幂等；已装配直接 True）。
 
-        - ``[life_state].enabled=false``（段缺失/读不到一律按关）→ **不实例化任何新服务**
-          （零开销零行为变化：ScheduleQuery 无 provider，读取侧走旧时间窗路径）；
+        - ``[schedule].enabled=false``（段缺失/读不到一律按关；PR8 3.0.0 起唯一日程
+          总开关，旧 ``[life_state].enabled`` / ``sleep_engine_enabled`` 退役）→
+          **不实例化任何新服务**（零开销零行为变化：ScheduleQuery 无 provider，
+          读取侧如实「暂不可用」）；
         - 任何装配异常 → 告警日志 + 清残留引用并返回 False，**绝不拖挂插件加载**；
-        - ``spine_mode`` 生成侧经 planning/auto_scheduler 的 spine 钩子生效（生成侧已落），
-          本层无遗漏：auto_scheduler 由 PlanningServices.cleanup.run_scheduler_loop 守护启动，
-          不依赖本装配段。
+        - spine 生成侧经 planning/auto_scheduler 的 spine 钩子生效（spine 为唯一生成
+          路线），本层无遗漏：auto_scheduler 由 PlanningServices.cleanup.run_scheduler_loop
+          守护启动，不依赖本装配段。
         """
         if getattr(self, "_life_model", None) is not None:
             return True
         try:
-            section = getattr(self.config, "life_state", None)
-            if section is None or not bool(getattr(section, "enabled", False)):
-                # 用户 2026-10-27 批准：单开睡眠键只提示、不自动开启生活状态、不装配
-                if section is not None and bool(getattr(section, "sleep_engine_enabled", False)):
-                    try:
-                        self.ctx.logger.warning(
-                            "睡眠引擎需要同时开启生活状态（[life_state].enabled=true）；"
-                            "当前仅 sleep_engine_enabled=true，睡眠引擎不生效")
-                    except Exception:
-                        pass
+            schedule_on = bool(getattr(getattr(self.config, "schedule", None),
+                                       "enabled", False))
+            if not schedule_on:
                 return False
+            section = getattr(self.config, "life_state", None)
             # 活动画像表装载（PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.6 项）：
             # load_and_apply 此前无任何装配点调用（_ACTIVE 恒 None，RollingPlanner/LifeState
-            # 实际全用内置默认表）。挂在 [life_state].enabled 判定之后——两开关全关时零装配
+            # 实际全用内置默认表）。挂在 [schedule].enabled 判定之后——日程关闭时零装配
             # 动作、零决策日志副作用；热重载 = 宿主重导入重跑 on_load → 自动重读（与
             # activity_properties 同款语义）；失败只告警不拖挂装配。
             try:
@@ -649,33 +676,31 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
                 # None = 事件库装配失败 → planner 逐字回退旧内置池路径）
                 event_catalog=getattr(getattr(self, "_planning", None), "event_catalog", None))
             engine: SleepEngine | None = None
-            if bool(getattr(section, "sleep_engine_enabled", False)):
+            # PR8 3.0.0：睡眠引擎随 [schedule].enabled 装配（旧 sleep_engine_enabled
+            # 键退役；本分支已达 schedule.enabled=true，引擎 enabled 属性同源派生）。
+            try:
+                engine = SleepEngine(
+                    config_provider=lambda: self.config, life_state=life,
+                    session_store=self._db, event_bus=getattr(self, "_bus", None),
+                    decision_logger=getattr(self, "_decision_logger", None),
+                    timezone_str=timezone_str,
+                    episode_closer=planner.close_sleep_episode,
+                    sleep_endpoint_updater=SleepEndpointHook(self),
+                    emotion_bridge=getattr(self, "_emotion", None))
+                planner.set_sleep_engine(engine)
+                if engine.enabled:
+                    engine.restore()
+                    self.ctx.logger.info(
+                        "睡眠引擎已装配（阈值=%.2f，硬约定提前=%s 分钟，上限复检=%ss）",
+                        engine._wake_threshold(),  # noqa: SLF001 - 装配日志只读
+                        engine._cfg_int("sleep_hard_commitment_lead_minutes", 30),  # noqa: SLF001
+                        engine._wake_check_seconds())  # noqa: SLF001
+            except Exception as exc:
+                engine = None
                 try:
-                    engine = SleepEngine(
-                        config_provider=lambda: self.config, life_state=life,
-                        session_store=self._db, event_bus=getattr(self, "_bus", None),
-                        decision_logger=getattr(self, "_decision_logger", None),
-                        timezone_str=timezone_str,
-                        episode_closer=planner.close_sleep_episode,
-                        sleep_endpoint_updater=SleepEndpointHook(self),
-                        emotion_bridge=getattr(self, "_emotion", None))
-                    planner.set_sleep_engine(engine)
-                    if engine.enabled:
-                        engine.restore()
-                        self.ctx.logger.info(
-                            "睡眠引擎已装配（阈值=%.2f，硬约定提前=%s 分钟，上限复检=%ss）",
-                            engine._wake_threshold(),  # noqa: SLF001 - 装配日志只读
-                            engine._cfg_int("sleep_hard_commitment_lead_minutes", 30),  # noqa: SLF001
-                            engine._wake_check_seconds())  # noqa: SLF001
-                    else:
-                        self.ctx.logger.warning(
-                            engine.diagnostics().get("warning") or "睡眠引擎未生效")
-                except Exception as exc:
-                    engine = None
-                    try:
-                        self.ctx.logger.warning("睡眠引擎装配失败（回退旧行为）：%s", exc)
-                    except Exception:
-                        pass
+                    self.ctx.logger.warning("睡眠引擎装配失败（回退旧行为）：%s", exc)
+                except Exception:
+                    pass
             model = LifeScheduleReadModel(
                 self._db, life_state=life, planner=planner,
                 config_provider=lambda: self.config, timezone_str=timezone_str)
@@ -707,13 +732,11 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
     def _sync_sleep_engine(self) -> None:
         """按当前配置热更新睡眠引擎（PR3；开→装配/关→解除注入并落盘）。
 
-        不能只依赖 `_setup_life_services`（幂等早退）：引擎开关由关到开时须补装配，
-        由开到关时须解除 planner/provider（关闭不保留任何新行为）。
+        不能只依赖 `_setup_life_services`（幂等早退）：日程开关由关到开时须补装配，
+        由开到关时须解除 planner/provider（关闭不保留任何新行为）。PR8 3.0.0：
+        desired = ``[schedule].enabled`` 唯一总开关（旧 ``[life_state]`` 两开关退役）。
         """
-        section = getattr(self.config, "life_state", None)
-        desired = bool(section is not None
-                       and bool(getattr(section, "enabled", False))
-                       and bool(getattr(section, "sleep_engine_enabled", False)))
+        desired = bool(getattr(getattr(self.config, "schedule", None), "enabled", False))
         engine = getattr(self, "_sleep_engine", None)
         planner = getattr(self, "_rolling_planner", None)
         life = getattr(self, "_life_state", None)
@@ -748,10 +771,9 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             planner.set_sleep_engine(engine)
             if engine.enabled:
                 engine.restore()
-                self.ctx.logger.info("睡眠引擎已热装配（[life_state].sleep_engine_enabled=true）")
+                self.ctx.logger.info("睡眠引擎已热装配（[schedule].enabled=true）")
             else:
-                self.ctx.logger.warning(engine.diagnostics().get("warning")
-                                        or "睡眠引擎未生效")
+                self.ctx.logger.warning("睡眠引擎未生效（日程未启用或装配降级）")
             self._sleep_engine = engine
         except Exception as exc:
             self._sleep_engine = None
@@ -868,8 +890,9 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
     async def _life_tick_loop(self) -> None:
         """生活状态 tick 定时循环（可打断睡眠，参照 companion/patrol.py `_loop`）。
 
-        每轮活读 ``[life_state]`` 段：热重载改 tick_seconds 即时生效；开关关闭 → 循环
-        自退出（重新开启由 on_config_update 的 _ensure_life_tick_task 重新挂起）。
+        每轮活读 ``[life_state]`` 段：热重载改 tick_seconds 即时生效；``[schedule].enabled``
+        关闭 → 循环自退出（重新开启由 on_config_update 的 _ensure_life_tick_task 重新挂起；
+        PR8 3.0.0 起唯一日程总开关，旧 ``[life_state].enabled`` 退役）。
 
         等待上限不再恒为 ``tick_seconds``：睡眠引擎给出下一个**绝对边界**（12:00 上限 /
         硬约定阈值 / 最早起床 / 阈值复检网格）时按边界精确等待（用户 2026-10-27：固定
@@ -880,15 +903,18 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         self._life_tick_loop_ref = asyncio.get_running_loop()
         try:
             while not self._stop_event.is_set():
-                section = getattr(self.config, "life_state", None)
-                if section is None or not bool(getattr(section, "enabled", False)):
+                # PR8 3.0.0：退出门控 = [schedule].enabled 唯一总开关（旧
+                # [life_state].enabled 退役；依据 = 用户 2026-10-27 授权直接清理）。
+                if not bool(getattr(getattr(self.config, "schedule", None),
+                                    "enabled", False)):
                     return
                 try:
                     self._life_tick_once()
                 except Exception:
                     pass  # 单拍失败不影响循环
                 try:
-                    interval = max(30, int(getattr(section, "tick_seconds", 300)))
+                    interval = max(30, int(getattr(
+                        getattr(self.config, "life_state", None), "tick_seconds", 300)))
                 except (TypeError, ValueError):
                     interval = 300
                 timeout = self._life_next_wait_seconds(interval)
@@ -930,14 +956,16 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         return True
 
     def _life_next_wait_seconds(self, interval: Any) -> float:
-        """本拍等待上限 = min(tick_seconds, 到下一个绝对睡眠边界的秒数)。"""
+        """本拍等待上限 = min(tick_seconds, 到下一个绝对睡眠边界的秒数)。
+
+        PR8 3.0.0：删除旧「``sleep_engine_enabled`` 关 → 恒 base」早退——引擎在位
+        （随 ``[schedule].enabled`` 装配）即按边界等待（依据 = 用户 2026-10-27 授权
+        直接清理 + 逐符号审定清单 WP1/C-7）。
+        """
         try:
             base = max(1.0, float(interval))
         except (TypeError, ValueError):
             base = 300.0
-        section = getattr(self.config, "life_state", None)
-        if section is not None and bool(getattr(section, "sleep_engine_enabled", False)) is False:
-            return base
         engine = getattr(self, "_sleep_engine", None)
         if engine is None:
             return base
@@ -1232,9 +1260,10 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
     def _ensure_life_modulation(self) -> LifeModulationService | None:
         """情绪调制服务惰性构造（PR2，2026-10-26，定稿 §4.1.1；幂等）。
 
-        只在 ``[life_state].emotion_modulation_enabled=true`` 分支内被调用（两开关全关
-        零实例化）；构造失败置 ``False`` 哨兵不再重试（防每拍告警刷屏），热重载 =
-        宿主重导入重跑 on_load 自动复位。
+        只在 ``[life_state].emotion_modulation_enabled=true`` 分支内被调用（该开关
+        独立于日程总开关 ``[schedule].enabled`` 保留，裁定 3；日程关闭时生活状态服务束
+        不装配，本口不会被触达 → 零实例化）；构造失败置 ``False`` 哨兵不再重试
+        （防每拍告警刷屏），热重载 = 宿主重导入重跑 on_load 自动复位。
         """
         service = getattr(self, "_life_modulation", None)
         if service is not None:

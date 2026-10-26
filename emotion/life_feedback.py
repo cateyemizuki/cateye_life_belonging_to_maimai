@@ -52,7 +52,7 @@ LifeState/Episode → VAD 反馈侧：订阅滚动执行层发布的 ``life.epis
   陈旧账本（同事件重复入账 / 全局日封顶被击穿 / 账本读-改-写丢更新），await 期间被取消
   还会让已入账事件不占预算而在重试时二次入账。账本另持**进程内镜像**：写盘失败或无
   ``_data_dir`` 时同日仍按已入账账本判定（恰一次不依赖写盘成功）；
-- 开关（``[life_state].enabled`` / ``[life_state].emotion_modulation_enabled`` /
+- 开关（``[schedule].enabled`` / ``[life_state].emotion_modulation_enabled`` /
   情绪模块总开关）任一关 → 零订阅零可观测；关闭态退订清理由 EmotionServices.stop() 统一
   执行（本模块订阅闭包已并入服务束 ``_event_unsubs``）；
 - 映射表只在装载期读一遍（热重载 = 宿主重导入重跑 on_load 自动重读）：表层缺失 →
@@ -321,10 +321,13 @@ class LifeFeedbackService:
     # ── 开关门控（注册时与每条事件各判一次；任一关 → 零动作）──
     def _gate_open(self) -> bool:
         try:
-            section = getattr(getattr(self._plugin, "config", None), "life_state", None)
-            if section is None or not bool(getattr(section, "enabled", False)):
+            cfg = getattr(self._plugin, "config", None)
+            # PR8 3.0.0：``schedule.enabled`` 是唯一日程总开关（旧 ``[life_state].enabled``
+            # 退役）；``emotion_modulation_enabled`` 独立保留（裁定 3）。
+            if not bool(getattr(getattr(cfg, "schedule", None), "enabled", False)):
                 return False
-            if not bool(getattr(section, "emotion_modulation_enabled", False)):
+            if not bool(getattr(getattr(cfg, "life_state", None),
+                                "emotion_modulation_enabled", False)):
                 return False
         except Exception:
             return False
