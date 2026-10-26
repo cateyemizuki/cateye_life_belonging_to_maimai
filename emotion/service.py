@@ -1619,15 +1619,36 @@ class EmotionService:
                 broken += 1
         return float(kept - broken)
 
-    def _current_sleep_item(self, now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
-        """当前活动若为睡眠条目则返回它（sleep 需 include_sleep 才可见）。"""
+    def _runtime_current_item(self, now: Optional[datetime] = None,
+                              include_sleep: bool = False) -> Optional[Dict[str, Any]]:
+        """运行态 episode 当前活动（PR8 3.0.0 W4 新接线；未就绪/异常 → None）。
+
+        依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单（规则 5/6）：schedule_query
+        已 runtime-only，本模块经其公开访问器 :meth:`ScheduleQuery.runtime_current` 读
+        runtime episode，与注入同口径；日程未启用/未装配（provider 未就绪）→ None，
+        不伪造清醒或入睡。
+        """
         query = self._schedule_query()
-        now = now or datetime.now()
-        current = query.find_current_activity(now.strftime("%Y-%m-%d"), now, include_sleep=True) \
-            if query else None
-        if not self._is_sleep_item(current):
+        reader = getattr(query, "runtime_current", None)
+        if not callable(reader):
             return None
-        return current
+        try:
+            return reader(now, include_sleep=include_sleep)
+        except Exception:
+            return None
+
+    def _current_sleep_item(self, now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """当前睡眠条目（SleepEngine 会话/运行态视图；不再经 schedule_query 睡眠环读表）。
+
+        PR8 3.0.0（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 W4 步骤 7，
+        裁定 5）：睡眠态真源 = SleepEngine 会话与运行态 episode 视图（rolling_planner
+        按引擎锚点写入 sleep episode）。本方法读运行态 episode 的睡眠条目；引擎会话
+        睡着但 episode 尚未开出（tick 级空窗）→ 返回 None——调用方夜窗路径
+        （``_night_window`` / ``_sleep_entry_period``）兜住冻结入口，不伪造入睡；
+        runtime 未就绪 → None（不伪造清醒）。
+        """
+        item = self._runtime_current_item(now, include_sleep=True)
+        return item if self._is_sleep_item(item) else None
 
     # ── 睡眠时段判定（M5 修复：条目会被 _normalize_items 的作息锚点截断）──
     @staticmethod
@@ -2509,7 +2530,12 @@ class EmotionService:
             await self._publish("emotion.low_mood_day", **low_mood_payload)
         if query is None:
             return
-        current = query.find_current_activity(now.strftime("%Y-%m-%d"), now, include_sleep=True)
+        # PR8 3.0.0（W4 步骤 7，依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单，
+        # 裁定 5）：睡眠读取改 SleepEngine 会话/运行态 episode 视图（_runtime_current_item，
+        # rolling_planner 按引擎锚点写入 sleep episode），不再经 schedule_query 睡眠环
+        # 读表 fallback；runtime 未就绪/空闲 → None（不伪造清醒），冻结入口由下方夜窗
+        # 路径（_night_window / _sleep_entry_period）兜住，不伪造入睡。
+        current = self._runtime_current_item(now, include_sleep=True)
         sleep_item = current if self._is_sleep_item(current) else None
         awake_activity = current is not None and sleep_item is None
         engine_state = self._engine_asleep(now)

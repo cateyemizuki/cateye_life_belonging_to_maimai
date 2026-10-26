@@ -230,6 +230,11 @@ def planning_block(schedule_query: Any, goal_manager: Any, *, enabled: bool,
         for item in raw_items
     ]
 
+    # PR8 3.0.0（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 W4）：此处读数
+    # runtime-only——find_current_activity 已只走 runtime episode 视图，日程未启用/未就绪
+    # 返回 None → current/current_item 保持 None 如实留空，不读残留快照冒充；面板整体
+    # enabled 门控在 companion/components._mai_dashboard_blocks 的 planning_live
+    # （已并入 [schedule].enabled）。
     current = _call(schedule_query, "find_current_activity", date, now)
     if isinstance(current, dict):
         name = str(current.get("name") or "")

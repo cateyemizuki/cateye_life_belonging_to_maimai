@@ -51,7 +51,7 @@ from planning.schedule_anchors import (SOURCE_REAL_SCHEDULE, RealAnchors,
                                        real_sleep_anchors)
 from planning.schedule_items import is_night_sleep_item
 from planning.schedule_query import ScheduleQuery
-from planning.time_utils import is_in_time_window
+from planning.time_utils import is_in_day_frame, is_in_time_window
 from suite_prompts import (
     COMPANION_ACTIVITY_REASON_DEFAULT,
     COMPANION_DAILY_REASON_DEFAULT,
@@ -285,6 +285,40 @@ def nap_item_matches(item: Any) -> bool:
     if any(keyword in name for keyword in NAP_NAME_KEYWORDS):
         return True
     return str(item.get("goal_type") or "") == "rest"
+
+
+def nap_intent_matches_now(items: Any, now: datetime) -> bool:
+    """午休静默的 spine 意图时间窗匹配（UQ-4，用户 2026-10-27 批）。
+
+    RollingPlanner 开出 episode 前存在 ≤tick 周期的静默空窗：允许 nap_quiet 判定
+    **只读计划表 spine 意图行**（``extract_spine_intents``，``parameters.spine=true``）、
+    按同一个 24h 环时间窗（``is_in_day_frame`` 唯一口径）提前静默——**仅静默用途**，
+    调用方不得把命中结果对外伪装成「当前活动」（裁定 6）。保守约束：``day_offset==1``
+    的午夜段行不参与（与 life_schedule.next 同口径的保守跳过）；无意图/异常 → False。
+
+    Args:
+        items: 当日 ``schedule_items`` 行列表（调用方经 ``query.get_day_schedule`` 取）。
+        now: 判定时刻。
+    """
+    try:
+        from planning.rolling_planner import extract_spine_intents
+
+        intents = extract_spine_intents(items or [])
+    except Exception:
+        return False
+    if not intents:
+        return False
+    cur = now.hour * 60 + now.minute
+    for intent in intents:
+        if not isinstance(intent, dict) or str(intent.get("day_offset")) == "1":
+            continue
+        if not nap_item_matches(intent):
+            continue
+        start = int(intent.get("start_minute") or 0)
+        end = int(intent.get("end_minute") or 0)
+        if is_in_day_frame(start, end, cur):
+            return True
+    return False
 
 
 def resolve_silence_window(config: Any) -> SilenceWindow:
@@ -1147,7 +1181,14 @@ class PatrolService:
         template = prompt(self._config, "companion_miss_confirm")
         activity = self._find_current_activity(now)
         activity_line = self._format_activity_line(activity, now) if activity else ""
-        activity_context = f"你当前的活动：{activity_line}。" if activity else "你现在没有安排中的活动。"
+        if activity is not None:
+            activity_context = f"你当前的活动：{activity_line}。"
+        elif not self._schedule_enabled():
+            # PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，规则 6）：
+            # 日程关断时如实「日程未启用」，不再冒充「没有安排中的活动」。
+            activity_context = "日程未启用，暂不清楚当前的安排。"
+        else:
+            activity_context = "你现在没有安排中的活动。"
         prompt_text = render(
             template,
             fallback=COMPANION_MISS_CONFIRM_DEFAULT,
@@ -1196,13 +1237,21 @@ class PatrolService:
     # 通用小工具
     # ------------------------------------------------------------------
     def _find_current_activity(self, now: datetime) -> Optional[dict[str, Any]]:
-        """当前日程活动（ScheduleQuery 不可用时返回 None，按"无活动"降级）。"""
+        """当前日程活动（runtime-only；PR8 3.0.0 W4：ScheduleQuery 未装配/日程未启用/
+        空闲/异常 → None 如实降级，不读计划表时间窗编造）。"""
         if self._schedule is None:
             return None
         try:
             return self._schedule.find_current_activity(now.strftime("%Y-%m-%d"), now)
         except Exception:
             return None
+
+    def _schedule_enabled(self) -> bool:
+        """``[schedule].enabled``（PR8 3.0.0 唯一日程总开关；读不到/异常 → False）。"""
+        try:
+            return bool(getattr(_config_section(self._config, "schedule"), "enabled", False))
+        except Exception:
+            return False
 
     def _format_activity_line(self, activity: dict[str, Any], now: datetime) -> str:
         if self._schedule is None:
@@ -1245,18 +1294,29 @@ class PatrolService:
         return bool(getattr(section, "nap_quiet_enabled", False))
 
     def _nap_in_progress(self, now: datetime) -> bool:
-        """当前是否处于午休/小睡条目中（读日程查询；查询不可用/异常 → False 可空降级）。
+        """当前是否处于午休/小睡条目中（runtime episode 优先；查询不可用/异常 → False
+        可空降级）。
 
-        识别口径经 :func:`nap_item_matches`（与 qzone 空间静默同源）。
+        识别口径经 :func:`nap_item_matches`（与 qzone 空间静默同源）。UQ-4（用户
+        2026-10-27 批）：episode 未开出（≤tick 周期）时允许只读计划表 spine 意图行按
+        时间窗匹配提前静默（:func:`nap_intent_matches_now`）——**仅静默用途**，命中
+        结果不对外伪装「当前活动」。
         """
         query = self._schedule
         if query is None:
             return False
+        today = now.strftime("%Y-%m-%d")
         try:
-            item = query.find_current_activity(now=now, include_sleep=True)
+            item = query.find_current_activity(today, now, include_sleep=True)
+        except Exception:
+            item = None
+        if nap_item_matches(item):
+            return True
+        # UQ-4：spine 意图时间窗兜底（仅静默用途）
+        try:
+            return nap_intent_matches_now(query.get_day_schedule(today), now)
         except Exception:
             return False
-        return nap_item_matches(item)
 
     def _collect_invalid_time_keys(self, window: Optional[SilenceWindow] = None) -> list[str]:
         """收集**生效**静默窗里格式非法的（HH:MM）来源配置项，并对每个非法值告警一次。

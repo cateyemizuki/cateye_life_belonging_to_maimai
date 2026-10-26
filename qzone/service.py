@@ -48,7 +48,7 @@ from .decision import (
     parse_llm_decision,
 )
 from .image_sources import collect_images
-from companion.patrol import nap_item_matches
+from companion.patrol import nap_intent_matches_now, nap_item_matches
 from planning.schedule_query import ScheduleQuery
 from core.storage import load_json, save_json_atomic
 from planning.time_utils import is_in_time_window
@@ -404,7 +404,12 @@ class QzoneService:
         cfg = self._qzone_cfg()
         activity = self._schedule.find_current_activity(date, now)
         if cfg.require_activity and activity is None:
-            self._log("skip", trigger_type="qzone_post", reason="当前无日程活动")
+            # PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，规则 6）：
+            # find_current_activity 已 runtime-only——日程关断时 skip 理由如实「日程未启用」，
+            # 不再与 enabled=true 空闲共用「当前无日程活动」文案。
+            reason = ("日程未启用（[schedule].enabled=false）" if not self._schedule_enabled()
+                      else "当前无日程活动")
+            self._log("skip", trigger_type="qzone_post", reason=reason)
             return False
         base_rate = self._clamp_float(getattr(cfg, "post_rate", 1.0), 1.0, 0.0, 1.0)
         effective_rate = base_rate if post_rate is None else self._clamp_float(post_rate, base_rate, 0.0, 1.0)
@@ -458,7 +463,11 @@ class QzoneService:
         # 闸 1：无活动 → 不发（最保守兜底；activity_type 维度拦截已按 2026-10-20 指示移除）
         activity = self._schedule.find_current_activity(date, now, include_sleep=True)
         if activity is None:
-            self._record_decision("skip", gate="no_activity", reason="当前无日程活动（含睡眠）")
+            # PR8 3.0.0（规则 6）：find_current_activity runtime-only——日程关断（
+            # [schedule].enabled=false）时 skip 理由如实「日程未启用」，不冒充「无活动」。
+            reason = ("日程未启用（[schedule].enabled=false）" if not self._schedule_enabled()
+                      else "当前无日程活动（含睡眠）")
+            self._record_decision("skip", gate="no_activity", reason=reason)
             return False
         # 闸 2：午休静默（2026-10-20 用户指示：nap_quiet_enabled 由陪伴巡检扩展到空间——
         # 午休/小睡条目中不发说说、不监听评论；判定与 companion.patrol 同源 nap_item_matches）
@@ -504,13 +513,23 @@ class QzoneService:
             patrol = getattr(getattr(self._plugin, "config", None), "patrol", None)
         return bool(getattr(patrol, "nap_quiet_enabled", False))
 
+    def _schedule_enabled(self) -> bool:
+        """``[schedule].enabled``（PR8 3.0.0 唯一日程总开关；读不到/异常 → False=如实关断）。"""
+        try:
+            cfg = getattr(self._plugin, "config", None)
+            section = getattr(cfg, "schedule", None) or getattr(self._plugin, "schedule", None)
+            return bool(getattr(section, "enabled", False))
+        except Exception:
+            return False
+
     async def _llm_post_gate(self, activity: Dict[str, Any], now: datetime) -> Tuple[bool, str, str]:
         """闸 5：LLM 严判「此刻发一条说说是否自然」。返回 ``(放行, 理由, 原文)``。
 
         提示词从 ``[prompts].qzone_post_gate`` 渲染（写坏占位符时 render 回退默认模板）；
         判定解析走最严口径（:func:`parse_llm_decision`）；调用异常按不通过处理（保守）。
         """
-        activity_desc = self._schedule.format_activity_line(activity, now) if activity else "自由活动"
+        activity_desc = (self._schedule.format_activity_line(activity, now) if activity else
+                         ("日程未启用" if not self._schedule_enabled() else "自由活动"))
         prompt = render(
             prompt_of(self._plugin, "qzone_post_gate"),
             fallback=QZONE_POST_GATE_DEFAULT,
@@ -594,7 +613,10 @@ class QzoneService:
 
     async def generate_moment_text(self, date: str, now: datetime) -> str:
         activity = self._schedule.find_current_activity(date, now)
-        activity_desc = self._schedule.format_activity_line(activity, now) if activity else "自由活动"
+        # PR8 3.0.0（规则 6）：find_current_activity runtime-only——日程关断时占位描述
+        # 如实「日程未启用」，不再用「自由活动」冒充；enabled=true 空闲时保留原文案。
+        activity_desc = (self._schedule.format_activity_line(activity, now) if activity else
+                         ("日程未启用" if not self._schedule_enabled() else "自由活动"))
         prompt = render(
             prompt_of(self._plugin, "qzone_post"),
             fallback=QZONE_POST_PROMPT,
@@ -897,6 +919,13 @@ class QzoneService:
                 self.ctx.logger.warning(f"午休静默判定读日程失败（按非午休继续本轮）: {nap_exc}")
             if nap_item_matches(nap_item):
                 return
+            # UQ-4（用户 2026-10-27 批）：episode 未开出（≤tick 周期）时只读计划表 spine
+            # 意图行按时间窗匹配提前静默——仅静默用途，不对外伪装「当前活动」。
+            try:
+                if nap_intent_matches_now(self._schedule.get_day_schedule(today), now):
+                    return
+            except Exception:
+                pass
         # 按日程发说说
         if cfg.daily_max_posts > 0 and self.posts_today() < cfg.daily_max_posts and cfg.post_by_schedule:
             # M4（§6.2 D）：发帖判定 = post_rate × mood_effect.post_rate；

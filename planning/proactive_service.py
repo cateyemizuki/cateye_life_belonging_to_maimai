@@ -91,7 +91,7 @@ from .activity_properties import resolve_property
 from .cycle_state import (CycleState, anchored_state, day_cycle_epochs,
                           load_or_anchored)
 from .goal_manager import get_goal_manager
-from .time_utils import (TimezoneManager, epoch_to_local, is_in_day_frame,
+from .time_utils import (TimezoneManager, epoch_to_local,
                          parse_time_window, tzinfo_of)
 if TYPE_CHECKING:
     from typing import Any as _Plugin
@@ -2340,89 +2340,42 @@ class ProactiveService:
         }
 
     def _find_current_activity(self) -> Optional[Tuple[str, str, int, int, Dict[str, Any]]]:
-        """从 GoalManager 找当前正在进行的活动。
+        """当前正在进行的活动（**runtime-only**；PR8 3.0.0 W4 消费者语义收口）。
 
-        N1 读取侧（2026-10-10）：跨午夜窗口统一走 ``time_utils.is_in_day_frame``（同一个 24h
-        环，唯一实现）——``end > 1440`` 的条目（如 23:00 入睡 + 8h ⇒ 1380→1860）在凌晨
-        00:00-11:59 也能被查到"正在进行"；不再各自做 ``if end > 1440 and current_min < 720:
-        end -= 1440``（该写法在 00:30 会把窗口错误地折成 [1380, 420) → 恒不命中）。
-        返回的 ``end`` 原样保留 >1440（与 ``schedule_items.item_end_minute`` 同一口径）。
-
-        R7 滚动化改造前置分支（R7 依据 = 用户 2026-10-25 直派，设计目录
-        D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计，
-        主设计 §9.1「proactive_service._find_current_activity 优先 runtime」）：
-        ``ScheduleQuery`` 的 runtime provider 就绪（``[life_state].enabled``）时优先读
-        episode current（红线 3：当前活动只从 episode 日志读，不从时间窗编造）——
-        runtime 空闲（None）即如实返回 None，**不回退时间窗编造**；provider 未就绪/
-        异常 → 下方旧 GoalManager 路径逐字保留。只改读取源，不改任何主动链
-        （纪律 5：本方法只服务频率调控与活动切换观察事件，不构成主动开口入口）。
+        依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 W4/裁定 5：当前活动只从
+        runtime episode 视图读（红线 3），不从时间窗编造——旧 GoalManager 时间窗
+        fallback（原 :2393-2424 起）已整体删除。runtime 未就绪（``[schedule].enabled
+        =false`` / 查询未装配）/ 空闲 / 异常 → 如实返回 ``None``（=「日程未启用/暂不可
+        用」语义值：频率调控与活动切换观察事件自然旁路，主动链不受影响——纪律 5：
+        本方法只服务频率调控与活动切换观察事件，不构成主动开口入口）。
 
         Returns:
             ``(name, goal_type, start_minutes, end_minutes, parameters)``；没找到时为 None。
         """
-        provider = getattr(getattr(self._plugin, "_schedule_query", None),
-                           "_runtime_provider", None)
-        if provider is not None:
-            try:
-                from .schedule_query import ScheduleQuery as _ScheduleQuery
-                runtime_ready = _ScheduleQuery._runtime_ready(provider)
-            except Exception:
-                runtime_ready = False
-            if runtime_ready:
-                try:
-                    model_current = provider.current(self._tz_manager.get_now())
-                except Exception as exc:
-                    logger.debug(f"runtime current 读取失败（回退旧时间窗路径）: {exc}")
-                    model_current = None
-                if model_current is None:
-                    return None  # runtime 就绪且空闲：如实返回（不按表编造）
-                if isinstance(model_current, dict):
-                    try:
-                        start = int(model_current.get("start_minute") or 0)
-                        end = int(model_current.get("end_minute") or 0)
-                    except (TypeError, ValueError):
-                        start, end = 0, 0
-                    params = model_current.get("parameters")
-                    return (
-                        str(model_current.get("name") or ""),
-                        str(model_current.get("goal_type") or "daily_routine"),
-                        start,
-                        end,
-                        dict(params) if isinstance(params, dict) else {},
-                    )
+        query = getattr(self._plugin, "_schedule_query", None)
+        reader = getattr(query, "runtime_current", None)
+        if not callable(reader):
+            return None  # 日程查询未装配：如实「日程未启用」（不按 GoalManager 时间窗编造）
         try:
-            gm = get_goal_manager()
-            goals = gm.get_active_goals(chat_id="global")
-            if not goals:
-                return None
-            now = self._tz_manager.get_now()
-            current_min = now.hour * 60 + now.minute
-
-            for goal in goals:
-                # 跳过 pending_commitment 等非日程活动
-                if goal.goal_type == "pending_commitment":
-                    continue
-                tw = None
-                if goal.parameters and "time_window" in goal.parameters:
-                    tw = goal.parameters.get("time_window")
-                elif goal.conditions:
-                    tw = goal.conditions.get("time_window")
-                if not tw:
-                    continue
-                start, end = parse_time_window(tw)
-                if start is None or end is None:
-                    continue
-                if is_in_day_frame(start, end, current_min):
-                    return (
-                        goal.name,
-                        goal.goal_type or "daily_routine",
-                        start,
-                        end,
-                        dict(goal.parameters) if goal.parameters else {},
-                    )
+            model_current = reader(self._tz_manager.get_now())
         except Exception as exc:
-            logger.debug(f"查找当前活动失败: {exc}")
-        return None
+            logger.debug(f"runtime current 读取失败（如实返回 None）: {exc}")
+            return None
+        if not isinstance(model_current, dict):
+            return None  # runtime 未就绪或空闲：如实返回（不按表编造）
+        try:
+            start = int(model_current.get("start_minute") or 0)
+            end = int(model_current.get("end_minute") or 0)
+        except (TypeError, ValueError):
+            start, end = 0, 0
+        params = model_current.get("parameters")
+        return (
+            str(model_current.get("name") or ""),
+            str(model_current.get("goal_type") or "daily_routine"),
+            start,
+            end,
+            dict(params) if isinstance(params, dict) else {},
+        )
 
     # 注（2026-10-20 用户指示）：原触发窗口/随机延迟助手已随活动切换主动发起链移除。
 

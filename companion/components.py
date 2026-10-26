@@ -261,6 +261,18 @@ class CompanionComponentsMixin:
         # 服务束未挂上时直接从 plugin 兜底取（仍走 planning 模块）
         return getattr(self, "_planning", None) or getattr(self, "_schedule_query", None)
 
+    def _schedule_enabled(self) -> bool:
+        """``[schedule].enabled``（PR8 3.0.0 唯一日程总开关；读不到/异常 → False=如实关断）。
+
+        依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单：束存在 ≠ 日程启用
+        （goal_manager 在 plugin:343 无条件装配），对外取数门前必须过本开关。
+        """
+        try:
+            section = getattr(getattr(self, "config", None), "schedule", None)
+            return bool(getattr(section, "enabled", False))
+        except Exception:
+            return False
+
     def _mai_lover_name(self) -> str:
         companion = self._mai_companion()
         if companion is not None:
@@ -1259,7 +1271,11 @@ class CompanionComponentsMixin:
         emotion_svc = getattr(self, "_emotion", None)
         qzone = getattr(self, "_qzone", None)
 
-        planning_live = planning is not None and planning.goal_manager is not None
+        # PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，规则 6）：
+        # goal_manager 存在 ≠ 日程启用（plugin 装配期无条件建束）——planning_live 并入
+        # [schedule].enabled 单开关，关断时规划块如实展示「（未启用）」，不读残留快照。
+        planning_live = (planning is not None and planning.goal_manager is not None
+                         and self._schedule_enabled())
         companion_live = (companion is not None and companion.affection is not None
                           and companion.patrol is not None)
         emotion_live = emotion_svc is not None and emotion_svc.service is not None
@@ -2337,12 +2353,19 @@ class CompanionComponentsMixin:
     # ==================================================================
 
     @API("companion_get_current_activity",
-         description="获取陪伴对象当前正在做什么（活动描述字符串，无活动返回空串）",
+         description="获取陪伴对象当前正在做什么（活动描述字符串，无活动或日程未启用返回空串）",
          version="1", public=True)
     async def mai_api_get_current_activity(self, **kwargs: Any) -> str:
+        """当前活动描述（跨插件 API 面；UQ-5，用户 2026-10-27 批）。
+
+        PR8 3.0.0（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单，规则 6）：
+        ``find_current_activity`` 已 runtime-only——**日程未启用**（``[schedule].enabled
+        =false``）或 runtime 未就绪时返回**空串**（维持 v1「无活动返回空串」契约不变，
+        不破坏跨插件空串判定），docstring 标注「日程未启用」；不读残留快照冒充当前活动。
+        """
         schedule_query = self._mai_schedule_query()
-        if schedule_query is None:
-            return ""
+        if schedule_query is None or not self._schedule_enabled():
+            return ""  # 日程未启用：如实空串（UQ-5），不读残留快照冒充
         now = datetime.now()
         try:
             current = schedule_query.find_current_activity(now.strftime("%Y-%m-%d"), now)
@@ -2356,7 +2379,8 @@ class CompanionComponentsMixin:
          description="获取今日完整日程。返回节点列表 [{time, activity, day_offset}]（兼容虚拟陪伴插件返回结构；"
                      "A-22 bug③ 修复：time 一律经 time_utils.format_day_minute 渲染，"
                      "day_offset=1 行带「次日」标注并透传 day_offset 帧归属；"
-                     "昨日 day_offset=1 行按 schedule_query 同口径跨日合并，sleep 行过滤）",
+                     "昨日 day_offset=1 行按同口径跨日合并，sleep 行过滤；"
+                     "日程未启用返回空列表）",
          version="1", public=True)
     async def mai_api_get_schedule(self, **kwargs: Any) -> list[dict[str, Any]]:
         """今日完整日程（跨插件 API 面）。§31.3 B3 修复，恢复日帧助手与帧合并口径。
@@ -2369,18 +2393,22 @@ class CompanionComponentsMixin:
           ``start + DAY_MINUTES`` 环抬渲染为 ``次日 00:30``；
         - ``day_offset`` 透传行内原值（旧行/常规行 = 0；昨日并入行 = 1 —— 该值的帧归属是
           **明日早期钟点段**，消费方按「time = 今日钟点、origin = 昨日帧」解读）；
-        - 跨日合并：昨日日程里 ``day_offset=1`` 的行即本日真实午夜段（与
-          ``schedule_query.find_current_activity:66-81`` / ``find_next_activities:106-114``
-          同口径）；今日自身 ``day_offset=1`` 行保留在列表末段（经环抬「次日」标注），
-          两类帧行对同一环位互斥不重计；
+        - 跨日合并：昨日日程里 ``day_offset=1`` 的行即本日真实午夜段（本 API 自持判定，
+          按 ``ScheduleQuery._previous_date`` 取昨日帧；PR8 3.0.0 后 schedule_query 旧
+          时间窗合并分支已随读表 fallback 删除）；今日自身 ``day_offset=1`` 行保留在
+          列表末段（经环抬「次日」标注），两类帧行对同一环位互斥不重计；
         - 行过滤对齐 :func:`planning.schedule_query._SKIP_TYPES` 语义（该集合 = ``{"sleep"}``
           ——只滤睡眠行；``rest`` 等清醒行保留，与既有 _SKIP_TYPES 契约零扩张）；
         - 排序列表 = 真实时间轴：昨日并入行（今日凌晨）→ 今日晨钟行 → 今日「次日」行，
           消除夜猫子日表「00:30 行排最前」的时序倒挂。
+
+        PR8 3.0.0（UQ-7，依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单，规则 6）：
+        **日程未启用**（``[schedule].enabled=false``）时如实返回**空列表**，不返回残留
+        当日日表冒充日程仍在。
         """
         schedule_query = self._mai_schedule_query()
-        if schedule_query is None:
-            return []
+        if schedule_query is None or not self._schedule_enabled():
+            return []  # 日程未启用：如实空列表（UQ-7），不返回残留日表
         today = datetime.now().strftime("%Y-%m-%d")
         try:
             current_items = schedule_query.get_day_schedule(today)
@@ -2408,8 +2436,9 @@ class CompanionComponentsMixin:
                 "day_offset": offset,
             }))
         for item in (yesterday_items or []):
-            # 昨日标记的「今晚午夜段」：今天就发生在 start..end 钟点区间（与 schedule_query
-            # find_current_activity 的合并分支同判定），按今日真实钟点展示、不环抬。
+            # 昨日标记的「今晚午夜段」：今天就发生在 start..end 钟点区间（本 API 自持判定；
+            # schedule_query 旧时间窗合并分支已随 PR8 读表 fallback 删除），
+            # 按今日真实钟点展示、不环抬。
             if item.get("goal_type") in _SCHEDULE_SKIP_TYPES or item.get("day_offset") != 1:
                 continue
             start = int(item.get("start_minute") or 0)

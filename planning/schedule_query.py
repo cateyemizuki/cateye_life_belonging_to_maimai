@@ -1,20 +1,18 @@
-"""日程查询：当前活动、未来活动、全天摘要（带 N 分钟窗口缓存）。
+"""日程查询：当前活动、全天摘要（runtime-only；PR8 3.0.0 消费者语义收口）。
 
 R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
 D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）：
-runtime provider 注入（主设计 §9.1 读取侧改造 / P2 灰度）——构造参数或
-:meth:`ScheduleQuery.set_runtime_provider` 注入
-:class:`~planning.life_schedule.LifeScheduleReadModel`（默认 None = 旧行为）；
-``find_current_activity`` / ``find_next_activities`` 在 provider 存在且
-``[life_state].enabled`` 时**优先读 episode**。
+runtime provider 注入——构造参数或 :meth:`ScheduleQuery.set_runtime_provider` 注入
+:class:`~planning.life_schedule.LifeScheduleReadModel`。
 
-PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.5 项：
-``find_current_activity`` 在 provider 就绪且空闲（current=None）时**如实返回 None，
-不回退旧时间窗**（与开发文档 DEV_GUIDE §7.9 契约对齐：「runtime 空闲即如实返回
-None，不回退时间窗」，防旧时间窗「编造正在做」）。唯一例外：``include_sleep=True``
-且当前钟点在 ``[schedule]`` 睡眠环内 → 走旧时间窗匹配，仅当命中条目为睡眠类型
-（goal_type=="sleep"）才回退返回并告警（同一睡眠窗只告警一次，保护情绪睡眠链）。
-provider 异常 / 关闭仍回退旧时间窗路径（旧代码逐字保留，只加前置分支）。
+PR8 3.0.0（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 W4，裁定 5/6）：
+``find_current_activity`` 改 **runtime-only**——只读 runtime provider 的 episode
+当前视图；provider 未就绪（未装配或 ``[schedule].enabled=false``）/ 当前空闲 /
+读取异常一律如实返回 ``None``。旧时间窗读表路径（``_current_from_time_window``/
+睡眠环回退 ``_in_sleep_ring``/``_warn_night_sleep_fallback``）与生产零调用的
+``find_next_activities``（C-17）已整体删除：不再用计划时间伪造「正在做/已睡着/
+接下来」；对外「日程未启用/暂不可用」语义由各消费者按 ``[schedule].enabled``
+门控与空值如实呈现（规则 5/6），本查询不伪装空闲或清醒。
 """
 
 from __future__ import annotations
@@ -24,18 +22,16 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .schedule_db import ScheduleDB
-from .schedule_items import is_night_sleep_item
 from .time_utils import (describe_energy, format_day_minute, get_energy_level,
-                         is_in_day_frame, is_in_day_frame_marked,
-                         is_in_sleep_ring, is_upcoming_day_minute,
-                         is_upcoming_day_minute_marked, ring_minutes_ahead)
-from core.time_utils import minutes_of_now, parse_hhmm
+                         ring_minutes_ahead)
+from core.time_utils import minutes_of_now
 
 logger = logging.getLogger(__name__)
 
-# sleep 类型条目不算「正在做的事」（仅 include_sleep=True 的调用方可见，如情绪睡眠循环）。
-# A-21(a)（用户 2026-10-27 批）：旧 ``daily_routine`` + 名称「睡觉」也按夜间睡眠处理，
-# 判定唯一真源 = ``schedule_items.is_night_sleep_item``（goal_type==sleep 或夜间名兜底）。
+# sleep 类型条目不算「正在做的事」（本文件旧时间窗匹配删除后仅作对外口径常量保留：
+# companion/components 以 _SCHEDULE_SKIP_TYPES 引用；runtime episode 视图的睡眠跳过
+# 语义见 life_schedule.include_sleep）。
+# A-21(a)（用户 2026-10-27 批）：夜间睡眠判定唯一真源 = schedule_items.is_night_sleep_item。
 _SKIP_TYPES = {"sleep"}
 
 
@@ -44,25 +40,24 @@ class ScheduleQuery:
                  runtime_provider: Optional[Any] = None,
                  config_provider: Optional[Any] = None) -> None:
         self._db = db
-        self._cache_minutes = max(1, int(cache_minutes))
-        self._cache: Dict[str, Tuple[int, Any]] = {}  # key -> (窗口号, 结果)
-        #: runtime provider（LifeScheduleReadModel；None = 旧行为——R7 滚动化改造；
-        #: PR1 P0 修复（2026-10-26）：就绪且空闲不再回退时间窗，见模块 docstring）
+        #: runtime provider（LifeScheduleReadModel；None = 未装配——R7 滚动化改造；
+        #: PR8 3.0.0：``find_current_activity`` runtime-only，见模块 docstring）
         self._runtime_provider = runtime_provider
-        #: 配置读取回调（返回插件 config；runtime 空闲回退睡眠条目的特判读
-        #: ``[schedule]`` 作息锚点用——PR1 P0 修复（2026-10-26），定稿 §2 第 0.5 项；
-        #: None = 测试桩/旧行为，特判不生效）
+        #: 配置读取回调（PR8 3.0.0 后无内部消费者——睡眠环回退已随时间窗路径删除；
+        #: 形参与赋值保留兼容既有装配 plugin.py:357-359 与测试桩）
         self._config_provider = config_provider
-        #: 睡眠环回退告警的窗标识（同一睡眠窗只告警一次；跨窗自动重新允许）
-        self._sleep_warn_window: str = ""
+        # ``cache_minutes`` 形参保留兼容既有装配（plugin.py 传
+        # schedule_advanced.inject_cache_minutes）；旧 15 分钟时间窗缓存随
+        # ``_current_from_time_window`` 删除，查询已无缓存态。
 
     def set_runtime_provider(self, provider: Optional[Any]) -> None:
-        """注入/更换 runtime provider（装配期调用；传 None 恢复旧行为）。"""
+        """注入/更换 runtime provider（装配期调用；传 None 恢复未装配态）。"""
         self._runtime_provider = provider
 
     @staticmethod
     def _runtime_ready(provider: Any) -> bool:
-        """provider 存在且 ``[life_state].enabled``（enabled 属性缺失/异常 → False=旧行为）。"""
+        """provider 存在且 ``enabled``（经 WP1 映射 = ``[schedule].enabled`` 唯一总开关；
+        enabled 属性缺失/异常 → False = 如实未就绪）。"""
         try:
             return provider is not None and bool(getattr(provider, "enabled", False))
         except Exception:
@@ -70,11 +65,7 @@ class ScheduleQuery:
 
     @property
     def db(self) -> ScheduleDB:
-        """底层日程库（只读访问器）。
-
-        P6 顺延写回用：跨午夜赖床要顺延的是**醒来日**日程（与本查询实例同一份库），
-        不能借入睡日那一次写回携带，故按层访问同一 ``ScheduleDB``。
-        """
+        """底层日程库（只读访问器）。"""
         return self._db
 
     def get_day_schedule(self, date: str) -> List[Dict[str, Any]]:
@@ -82,177 +73,36 @@ class ScheduleQuery:
 
     def find_current_activity(self, date: str, now: Optional[datetime] = None,
                               include_sleep: bool = False) -> Optional[Dict[str, Any]]:
-        """返回当前正在进行的日程条目（默认跳过 sleep 类型）；结果按 N 分钟窗口缓存。
+        """返回当前正在进行的日程条目（runtime-only；默认跳过 sleep 类型）。
 
-        include_sleep=True 时 sleep 条目也参与匹配（情绪睡眠循环用）；
-        缓存键区分该开关，避免共享实例上不同调用方互相串用结果。
-        覆盖判定走 :func:`time_utils.is_in_day_frame_marked`（同一个 24h 环 + A-16
-        日期帧标记）——凌晨 00:30 也能命中「23:00 → 次日 07:00」的跨午夜睡觉条目；
-        并合并**前一日期帧**的行：``day_offset=1``（今晚午夜段）与 ``end>1440``
-        （跨午夜延续）的昨日条目在今天凌晨仍可命中。
+        PR8 3.0.0（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 W4，裁定 5/6）：
+        只读 runtime provider 的 episode 当前视图——provider 未就绪 / 当前空闲 / 读取
+        异常一律如实返回 ``None``，不回退计划时间窗（旧「编造正在做/睡眠环伪造已睡着」
+        路径已删）。「日程未启用/暂不可用」的对外呈现由消费者按 ``[schedule].enabled``
+        门控与空值如实给出（规则 6）。
 
-        R7 runtime 前置分支（滚动化改造）：provider 就绪时优先读 episode 日志；
-        PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.5 项：就绪且空闲
-        （current=None）→ 如实返回 None，不回退旧时间窗（DEV_GUIDE §7.9 契约：空闲
-        不回退）；唯一例外：include_sleep=True 且当前钟点在 ``[schedule]`` 睡眠环内
-        → 走旧时间窗匹配，仅当命中条目为睡眠类型（goal_type=="sleep"）才回退返回并
-        告警（同一睡眠窗只告警一次）——emotion 睡眠大修 / qzone 睡眠发帖链不可断；
-        非睡眠命中与其余情形一律 None。provider 异常 / ``[life_state]`` 关闭仍落回
-        旧时间窗路径（逐字保留，behavior 209 a) 组三态回退断言钉住）。runtime 结果
-        不进 15 分钟缓存（episode 由 5 分钟 tick 推进，缓存会引入滞后矛盾）。
+        include_sleep=True 时 sleep episode 也参与返回（情绪睡眠链依赖，见
+        life_schedule include_sleep 语义）。runtime 结果不缓存（episode 由 5 分钟
+        tick 推进，缓存会引入滞后矛盾）。``date`` 形参保留兼容既有调用方签名
+        （runtime 视图按 provider 自身的时区/日期帧取数，本方法不再使用）。
+        """
+        return self.runtime_current(now, include_sleep=include_sleep)
+
+    def runtime_current(self, now: Optional[datetime] = None,
+                        include_sleep: bool = False) -> Optional[Dict[str, Any]]:
+        """runtime provider 当前活动（公开访问器；未就绪/空闲/异常 → ``None``）。
+
+        PR8 3.0.0 新增（W4）：消费者（proactive/emotion）经此读 runtime episode，
+        与注入同口径，不再触碰 ``_runtime_provider`` 私有属性。
         """
         provider = self._runtime_provider
-        if self._runtime_ready(provider):
-            try:
-                runtime_current = provider.current(now, include_sleep=include_sleep)
-            except Exception as exc:
-                logger.warning("runtime provider 读取当前活动失败，回退时间窗路径：%s", exc)
-                # 异常 ≠ 空闲：异常仍回退旧时间窗路径（与关闭同待遇）
-                return self._current_from_time_window(date, now, include_sleep)
-            if runtime_current is not None:
-                return runtime_current
-            # PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.5 项：runtime
-            # 就绪且空闲 → 默认如实返回 None，不回退旧时间窗（防「编造正在做」）。
-            # 唯一例外：include_sleep=True 且当前钟点在睡眠环内，仅回退睡眠类型条目。
-            if include_sleep and self._in_sleep_ring(now):
-                fallback = self._current_from_time_window(date, now, include_sleep=True)
-                if fallback is not None and is_night_sleep_item(fallback):
-                    self._warn_night_sleep_fallback(date, now)
-                    return fallback
+        if not self._runtime_ready(provider):
+            return None  # 日程未启用/未装配：如实未就绪（不伪装空闲或清醒）
+        try:
+            return provider.current(now, include_sleep=include_sleep)
+        except Exception as exc:
+            logger.warning("runtime provider 读取当前活动失败（如实返回 None）：%s", exc)
             return None
-        return self._current_from_time_window(date, now, include_sleep)
-
-    def _current_from_time_window(self, date: str, now: Optional[datetime],
-                                  include_sleep: bool) -> Optional[Dict[str, Any]]:
-        """旧时间窗匹配路径（R7 前逐字保留）：窗口缓存 + 当日帧匹配 + 前一日期帧跨日合并。
-
-        include_sleep=True 时 sleep 条目也参与匹配（情绪睡眠循环用）；缓存键区分该开关。
-        """
-        now = now or datetime.now()
-        window = minutes_of_now(now) // self._cache_minutes
-        key = f"cur_{date}_{int(bool(include_sleep))}"
-        cached = self._cache.get(key)
-        if cached and cached[0] == window:
-            return cached[1] or None
-        current = None
-        cur_min = minutes_of_now(now)
-        for item in self._db.get_day_schedule(date):
-            if not include_sleep and (item.get("goal_type") in _SKIP_TYPES
-                                      or is_night_sleep_item(item)):
-                continue
-            if is_in_day_frame_marked(item.get("start_minute") or 0, item.get("end_minute") or 0,
-                                      cur_min, item.get("day_offset")):
-                current = item
-                break
-        if current is None:
-            prev_date = self._previous_date(date)
-            if prev_date:
-                for item in self._db.get_day_schedule(prev_date):
-                    if not include_sleep and (item.get("goal_type") in _SKIP_TYPES
-                                              or is_night_sleep_item(item)):
-                        continue
-                    end = int(item.get("end_minute") or 0)
-                    offset = item.get("day_offset")
-                    if offset == 1:
-                        # 昨日标记的"今晚午夜段"：今天就发生在 start..end（钟点）区间
-                        start = int(item.get("start_minute") or 0)
-                        end_clock = end if end < 1440 else end - 1440
-                        if start <= cur_min < end_clock:
-                            current = item
-                            break
-                    elif end > 1440 and is_in_day_frame(
-                            item.get("start_minute") or 0, end, cur_min):
-                        current = item
-                        break
-        if len(self._cache) > 64:  # 简单防膨胀
-            self._cache.clear()
-        self._cache[key] = (window, current or "")
-        return current
-
-    def _in_sleep_ring(self, now: Optional[datetime]) -> bool:
-        """当前钟点是否落在 ``[schedule]`` 作息睡眠环内（time_utils.is_in_sleep_ring 口径）。
-
-        config_provider 未注入（测试桩/旧行为）或读不到作息锚点 / 异常 → False
-        （不进睡眠环回退特判，按空闲返回 None）。
-        """
-        provider = self._config_provider
-        if provider is None:
-            return False
-        try:
-            section = getattr(provider(), "schedule", None)
-            # 缺省锚点与 [schedule] 段默认一致（07:00 / 23:00，同 tools_service 口径）
-            wake_min = parse_hhmm(str(getattr(section, "wake_time", "") or ""), 7 * 60)
-            sleep_min = parse_hhmm(str(getattr(section, "sleep_time", "") or ""), 23 * 60)
-        except Exception:
-            return False
-        return is_in_sleep_ring(minutes_of_now(now or datetime.now()), wake_min, sleep_min)
-
-    def _warn_night_sleep_fallback(self, date: str, now: Optional[datetime]) -> None:
-        """睡眠环内 runtime 无 sleep episode → 回退旧睡眠条目前的告警（同一睡眠窗只一次）。
-
-        窗标识：钟点仍在入睡锚点后 = 今晚的窗（date）；已过午夜（钟点在锚点前）= 昨晚
-        的窗（前一日期帧）。跨窗自动重新允许告警。
-        """
-        now = now or datetime.now()
-        sleep_min = 23 * 60
-        try:
-            if self._config_provider is not None:
-                section = getattr(self._config_provider(), "schedule", None)
-                sleep_min = parse_hhmm(str(getattr(section, "sleep_time", "") or ""), sleep_min)
-        except Exception:
-            pass  # 读不到锚点按默认 23:00 分窗
-        window_date = date if minutes_of_now(now) >= sleep_min else (self._previous_date(date) or date)
-        if self._sleep_warn_window == window_date:
-            return
-        self._sleep_warn_window = window_date
-        logger.warning(
-            "runtime 睡眠环内无 sleep episode，回退旧时间窗睡眠条目（睡眠窗=%s）——"
-            "滚动规划器可能尚未安排今晚睡眠，请检查其运行状态", window_date)
-
-    def find_next_activities(self, date: str, limit: int = 3, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-        """今天**还没开始**的活动（前 ``limit`` 条），跨午夜按同一个 24h 环判定。
-
-        ``N1 读取侧``：起点比较统一走 ``time_utils.is_upcoming_day_minute``（唯一口径）——
-        23:35 时帧首（``0`` 分钟）条目按环上的**帧尾**（今晚 24:00）算作"接下来"，
-        不再被 ``start > cur`` 的单调比较漏掉；列表按环上距离排序（同帧内按 start 升序，
-        帧尾条目自然排在最后）。正在进行中的尾段（如 00:30 的 ``(0, 60)``）不算"接下来"。
-
-        R7 runtime 前置分支（滚动化改造）：provider 就绪时优先读 runtime merge 视图
-        （planned episode / 恢复池 / planner 预演 / spine 意图，睡眠类型不列入）；
-        异常 / 关闭 / 取不到（空列表）→ 落回下方旧时间窗路径（逐字保留）。
-        """
-        provider = self._runtime_provider
-        if self._runtime_ready(provider):
-            try:
-                runtime_next = provider.next(now, limit=limit)
-            except Exception as exc:
-                logger.warning("runtime provider 读取未来活动失败，回退时间窗路径：%s", exc)
-                runtime_next = None
-            if runtime_next:
-                return list(runtime_next)
-        now = now or datetime.now()
-        cur_min = minutes_of_now(now)
-        upcoming: List[Tuple[int, Dict[str, Any]]] = []
-        for item in self._db.get_day_schedule(date):
-            if item.get("goal_type") in _SKIP_TYPES or is_night_sleep_item(item):
-                continue
-            raw_start = item.get("start_minute")
-            if not is_upcoming_day_minute_marked(raw_start, cur_min, item.get("end_minute"),
-                                                 item.get("day_offset")):
-                continue
-            upcoming.append((ring_minutes_ahead(raw_start, cur_min), item))
-        # 前一日期帧的 day_offset=1 行（昨晚标记的"今晚午夜段"）在今天尚未开始的也算"接下来"
-        prev_date = self._previous_date(date)
-        if prev_date:
-            for item in self._db.get_day_schedule(prev_date):
-                if (item.get("goal_type") in _SKIP_TYPES or is_night_sleep_item(item)
-                        or item.get("day_offset") != 1):
-                    continue
-                start = int(item.get("start_minute") or 0)
-                if start > cur_min:
-                    upcoming.append((start - cur_min, item))
-        upcoming.sort(key=lambda pair: pair[0])
-        return [item for _ahead, item in upcoming[:max(0, int(limit))]]
 
     @staticmethod
     def _previous_date(date: str) -> Optional[str]:
