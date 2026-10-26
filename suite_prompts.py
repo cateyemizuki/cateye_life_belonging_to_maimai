@@ -270,8 +270,8 @@ SCHEDULE_SPINE_TASK_DEFAULT = (
 )
 #: spine 模式的约定硬约束行（占位符：无；存在今日约定时追加）
 SCHEDULE_SPINE_COMMITMENT_NOTE_DEFAULT = (
-    "要求：上述约定是硬约定——作为今天的意图纳入（hardness=hard，时间固定），"
-    "goal_type 用 social_maintenance 或对应类型。"
+    "要求：上述约定按每条标注的 hardness 纳入——hard=时间固定的硬约定（不得改期/降级），"
+    "soft=可安排的软约定（不得被升级为 hard）；goal_type 用 social_maintenance 或对应类型。"
 )
 #: spine 模式的睡觉锚点行（占位符：{sleep_text} / {wake_text}）
 SCHEDULE_SPINE_SLEEP_LINE_DEFAULT = (

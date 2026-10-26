@@ -1,0 +1,1639 @@
+# -*- coding: utf-8 -*-
+"""PR4 EventCatalog：LLM 小事件库（独立新模块，运行时 0 LLM）。
+
+职责分层（定稿 §4.3 / 附录 B.1）：
+
+- :class:`EventCatalogStore`：``mappings/generated_events.json`` 读/写；
+  原子写 + ``.bak``（保留最近 3 份）；缺失/损坏/未知版本 → 内置池兜底；
+  装载永不改写用户文件。
+- :class:`EventCatalogValidator`：schema/语义/安全全量校验；错误码 E_*。
+- :class:`EventCatalogService`：生成（经 ``LLMService`` 唯一出口）+ 校验 +
+  全量替换 + 周期/每日一次/预算熔断/清醒闸/并发互斥 + 运行时 pick 与
+  ``state_deltas`` 查询。任何异常都不向上抛，不拖挂插件。
+- :func:`state_affinity` / ``Store.pick_event``：纯本地、0 LLM；
+  保留 4h 去重、idle/转场语义与状态加权。
+
+与旧路径兼容：
+
+- 内置池与 ``rolling_planner.RANDOM_EVENT_POOL`` 逐条一致（测试钉住），
+  生成的 ``event_id`` 统一 ``llm_`` 前缀，不覆盖内置 key；
+- 生成的 episode 建议在创建时把 :meth:`EventCatalogService.metadata_for_event`
+  的快照（``event_id/event_key/catalog_version/state_deltas``）写进 metadata；
+  关闭时优先读快照，旧 episode 无快照再回查旧内置池；
+- 本模块不 import ``rolling_planner``，避免后续 planner 反向 import 时成环。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import math
+import os
+import random
+import re
+import shutil
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from core.llm_utils import LLMResult, request_token_upper_bound
+from core.mapping_dir import MappingReadError, mappings_path, read_json_text
+from core.storage import save_json_atomic
+
+from .event_catalog_config import EventCatalogConfig, resolve_config
+from .event_prompt import (GENERATION_MAX_TOKENS, GENERATION_TEMPERATURE,
+                           EventPromptError, build_event_prompt,
+                           build_json_schema, parse_events_response)
+
+logger = logging.getLogger(__name__)
+
+# ── 常量（附录 B.1）──────────────────────────────────────────────────────────
+CATALOG_VERSION = 1
+CATALOG_FILE_NAME = "generated_events.json"
+CATALOG_STATE_FILE_NAME = "event_catalog_state.json"
+EVENT_ID_PREFIX = "llm_"
+EVENT_ID_RE = re.compile(r"^llm_[a-z0-9_]{2,48}$")
+#: 同事件 4 小时内不重复（A.7；与 rolling_planner 旧逻辑一致）
+RANDOM_EVENT_DEDUP_MINUTES = 240
+MIN_GENERATED_EVENTS = 3
+MAX_GENERATED_EVENTS = 8
+MIN_DURATION_MINUTES = 5
+MAX_DURATION_MINUTES = 30
+MIN_TEMPLATE_CHARS = 10
+MAX_TEMPLATE_CHARS = 40
+MAX_NAME_CHARS = 10
+MIN_NAME_CHARS = 2
+MAX_DELTA_ABS = 0.08
+MIN_WEIGHT = 0.1
+MAX_WEIGHT = 1.0
+#: 五维状态（禁止 sleep_debt）
+STATE_FIELDS: Tuple[str, ...] = ("energy", "hunger", "focus", "stress", "social_battery")
+#: 允许的 goal_type：禁止 sleep/meal/pending_commitment（附录 B.1.4）
+FORBIDDEN_GOAL_TYPES = frozenset({"sleep", "meal", "pending_commitment"})
+ALLOWED_GOAL_TYPES = frozenset({"daily_routine", "rest", "social", "entertainment",
+                                "exercise", "idle", "transition"})
+#: 事件生成 LLM 调用点标签（接线工人需把 schedule_events 登记到
+#: core/llm_usage.py 的 EVENT_MODULE_MAP → planning）
+LLM_EVENT_NAME = "schedule_events"
+LLM_FALLBACK_TASK = "utils"
+#: 事件生成参数硬上限（用户已锁定；配置越界也不得突破）
+EVENT_GENERATION_MAX_TOKENS = GENERATION_MAX_TOKENS
+EVENT_GENERATION_TEMPERATURE = GENERATION_TEMPERATURE
+#: 备份保留数（.bak/.bak.2/.bak.3）
+BACKUP_KEEP = 3
+#: 旧展示用粗略换算（仅 estimate_tokens；预算已改用字节上界 + 真实 usage）
+_CHARS_PER_TOKEN = 2
+#: 内置池权重固定 1.0（附录 B.1.3）
+BUILTIN_WEIGHT = 1.0
+
+BUILTIN_EVENTS: Tuple[Dict[str, Any], ...] = (
+    {"event_id": "find_thing", "name": "找东西", "min_minutes": 5, "max_minutes": 15,
+     "interruptibility": 0.95, "goal_type": "daily_routine",
+     "state_deltas": {"focus": -0.05, "stress": 0.02},
+     "templates": ("突然想不起来东西放哪了，翻了一会儿", "在找一件小东西，把抽屉翻了个遍")},
+    {"event_id": "phone_call", "name": "接电话", "min_minutes": 5, "max_minutes": 20,
+     "interruptibility": 0.90, "goal_type": "daily_routine",
+     "state_deltas": {"social_battery": -0.05},
+     "templates": ("来了个电话，接了一会儿", "接了个电话，说了几句")},
+    {"event_id": "package", "name": "拿快递", "min_minutes": 5, "max_minutes": 5,
+     "interruptibility": 0.95, "goal_type": "daily_routine",
+     "state_deltas": {"energy": -0.01},
+     "templates": ("快递到了，下去拿了一趟", "去门口取了个快递")},
+    {"event_id": "friend_msg", "name": "朋友消息", "min_minutes": 5, "max_minutes": 10,
+     "interruptibility": 0.95, "goal_type": "social",
+     "state_deltas": {"social_battery": 0.05, "stress": -0.02},
+     "templates": ("朋友发来消息，聊了几句", "回了朋友一条消息，闲聊了一会儿")},
+    {"event_id": "errand", "name": "临时差事", "min_minutes": 15, "max_minutes": 30,
+     "interruptibility": 0.80, "goal_type": "daily_routine",
+     "state_deltas": {"energy": -0.03, "stress": 0.03},
+     "templates": ("临时有件小事要处理一下", "被喊去搭了把手，花了些时间")},
+)
+
+#: 安全关键词（模板 / 名称；宁可保守，命中即 E_SAFETY）
+_SAFETY_TERMS: Tuple[str, ...] = (
+    "打架", "殴打", "杀死", "自杀", "自残", "割腕", "跳楼", "轻生", "枪", "尸体",
+    "绑架", "虐待", "下毒", "爆炸", "恐怖袭击",
+    "色情", "性爱", "裸体", "约炮", "强奸", "做爱", "嫖娼",
+    "毒品", "吸毒", "大麻", "冰毒", "赌博", "赌场", "抢劫", "偷窃", "诈骗",
+    "贿赂", "走私", "洗钱", "伪造",
+    "医院", "看病", "吃药", "药物", "手术", "处方", "诊断", "治疗",
+    "股票", "基金", "投资", "理财", "贷款", "借钱", "信用卡", "比特币", "炒股",
+    "律师", "起诉", "官司", "法院", "合同纠纷",
+    "真实地址", "门牌号",
+)
+_URL_RE = re.compile(r"(https?://|www\.|\b[\w.-]+\.(?:com|cn|net|org|io)\b)", re.IGNORECASE)
+_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
+_CONTACT_RE = re.compile(r"(qq|微信|电话|手机|联系方式)\s*[:：]?\s*\d{5,}", re.IGNORECASE)
+_ADDRESS_RE = re.compile(r"[\u4e00-\u9fa5]{1,8}(路|街|道|小区)\s*\d+\s*号")
+
+
+def builtin_events() -> List[Dict[str, Any]]:
+    """内置池的独立副本（source=builtin、key 兼容旧 event_key、weight=1.0）。"""
+    output: List[Dict[str, Any]] = []
+    for raw in BUILTIN_EVENTS:
+        event = {
+            "event_id": raw["event_id"],
+            "key": raw["event_id"],
+            "name": raw["name"],
+            "goal_type": raw["goal_type"],
+            "min_minutes": int(raw["min_minutes"]),
+            "max_minutes": int(raw["max_minutes"]),
+            "interruptibility": float(raw["interruptibility"]),
+            "weight": BUILTIN_WEIGHT,
+            "state_deltas": dict(raw.get("state_deltas") or {}),
+            "templates": list(raw.get("templates") or ()),
+            "enabled": True,
+            "source": "builtin",
+        }
+        output.append(event)
+    return output
+
+
+def estimate_tokens(text: Any) -> int:
+    """粗略 token 估算（仅兼容旧调用/展示；**不再用于预算预占或结算**）。
+
+    预算走 :func:`core.llm_utils.request_token_upper_bound` 的字节上界 + 真实
+    usage 结算；此函数不参与任何限额判断。
+    """
+    value = str(text or "")
+    return max(1, math.ceil(len(value) / _CHARS_PER_TOKEN))
+
+
+def compute_catalog_version(document: Any) -> str:
+    """稳定目录版本：内置池 / 生成库内容 + generated_at 的短哈希。"""
+    if not isinstance(document, dict):
+        return "builtin_v1"
+    events = document.get("events")
+    if not isinstance(events, list) or not events:
+        return "builtin_v1"
+    payload = json.dumps({"version": document.get("version"),
+                          "generated_at": document.get("generated_at"),
+                          "events": events}, ensure_ascii=False, sort_keys=True)
+    return "cat_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+# ── 校验 ─────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class ValidationError:
+    code: str
+    message: str
+    field: str = ""
+    event_id: str = ""
+
+    def __str__(self) -> str:
+        prefix = f"{self.code}"
+        if self.event_id:
+            prefix += f"[{self.event_id}]"
+        if self.field:
+            prefix += f".{self.field}"
+        return f"{prefix}: {self.message}"
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    errors: Tuple[ValidationError, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    @property
+    def codes(self) -> set:
+        return {e.code for e in self.errors}
+
+    @property
+    def lines(self) -> List[str]:
+        return [str(e) for e in self.errors]
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) \
+        and not (isinstance(value, float) and not math.isfinite(value))
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _danger_hit(text: str) -> bool:
+    """危险/违法/性/自伤/医疗/金融/法律等内容（E_SAFETY）。"""
+    return any(term in text for term in _SAFETY_TERMS)
+
+
+def _contact_hit(text: str) -> bool:
+    """真实 URL / 电话 / 邮箱 / QQ 微信 / 地址（E_NAME / E_TEMPLATE）。"""
+    lowered = text.lower()
+    return bool(_URL_RE.search(lowered) or _PHONE_RE.search(text)
+                or _EMAIL_RE.search(lowered) or _CONTACT_RE.search(text)
+                or _ADDRESS_RE.search(text))
+
+
+def _safety_hit(text: str) -> bool:
+    """兼容旧调用：任一危险或联系方式命中。"""
+    return _danger_hit(text) or _contact_hit(text)
+
+
+class EventCatalogValidator:
+    """附录 B.1.4 全量校验。命中任一错误 → 文档不得替换旧库。"""
+
+    def __init__(self, *, builtin_count: Optional[int] = None,
+                 max_generated_events: int = MAX_GENERATED_EVENTS,
+                 max_pool_events: int = 12,
+                 enforce_pool_cap: bool = True) -> None:
+        self.builtin_count = len(BUILTIN_EVENTS) if builtin_count is None else int(builtin_count)
+        self.max_generated_events = max(MIN_GENERATED_EVENTS,
+                                        min(MAX_GENERATED_EVENTS, int(max_generated_events)))
+        self.max_pool_events = max(1, int(max_pool_events))
+        self.enforce_pool_cap = bool(enforce_pool_cap)
+
+    # ---- 单事件 ----
+    def validate_event(self, event: Any, *, index: Optional[int] = None,
+                       reserved_ids: Iterable[str] = (),
+                       reserved_names: Iterable[str] = (),
+                       recent_names: Iterable[str] = ()) -> List[ValidationError]:
+        errors: List[ValidationError] = []
+        eid = ""
+        if not isinstance(event, dict):
+            return [ValidationError("E_SCHEMA", "事件必须是对象", f"events[{index}]")]
+        eid = _text(event.get("event_id"))
+
+        def add(code: str, message: str, field_name: str = "") -> None:
+            errors.append(ValidationError(code, message, field_name, eid))
+
+        # event_id：llm_ 前缀 + slug + 唯一
+        if not EVENT_ID_RE.match(eid):
+            add("E_ID", "event_id 必须以 llm_ 开头，且只含小写字母/数字/下划线（2-48 字符）",
+                "event_id")
+        if eid and (eid in set(reserved_ids)):
+            add("E_ID", "event_id 与内置池/保留 id 冲突", "event_id")
+
+        # name：2-10 字，无换行 / URL / 联系方式 / 危险词
+        name = _text(event.get("name"))
+        if len(name) < MIN_NAME_CHARS or len(name) > MAX_NAME_CHARS:
+            add("E_NAME", f"name 长度需 {MIN_NAME_CHARS}-{MAX_NAME_CHARS} 字", "name")
+        if "\n" in str(event.get("name") or "") or "\r" in str(event.get("name") or ""):
+            add("E_NAME", "name 不得含换行", "name")
+        if name and _contact_hit(name):
+            add("E_NAME", "name 含 URL/联系方式/真实地址", "name")
+        if name and _danger_hit(name):
+            add("E_SAFETY", "name 含危险/违法/性/自伤/医疗/金融/法律内容", "name")
+
+        # goal_type
+        goal_type = _text(event.get("goal_type"))
+        if goal_type in FORBIDDEN_GOAL_TYPES:
+            add("E_GOAL_TYPE", f"goal_type 禁止 {goal_type}", "goal_type")
+        elif goal_type not in ALLOWED_GOAL_TYPES:
+            add("E_GOAL_TYPE", f"goal_type 不在允许集合：{goal_type}", "goal_type")
+
+        # 时长
+        min_minutes = event.get("min_minutes")
+        max_minutes = event.get("max_minutes")
+        if not _is_int(min_minutes) or not _is_int(max_minutes):
+            add("E_DURATION", "min_minutes/max_minutes 必须是整数", "min_minutes")
+        else:
+            if not (MIN_DURATION_MINUTES <= min_minutes <= MAX_DURATION_MINUTES):
+                add("E_DURATION", "min_minutes 需在 5-30", "min_minutes")
+            if not (MIN_DURATION_MINUTES <= max_minutes <= MAX_DURATION_MINUTES):
+                add("E_DURATION", "max_minutes 需在 5-30", "max_minutes")
+            if max_minutes < min_minutes:
+                add("E_DURATION", "max_minutes 必须 >= min_minutes", "max_minutes")
+
+        # 可中断性
+        interruptibility = event.get("interruptibility")
+        if not _is_number(interruptibility) or not (0.0 <= float(interruptibility) <= 1.0):
+            add("E_INTERRUPT", "interruptibility 必须是 0-1 数值", "interruptibility")
+
+        # 权重
+        weight = event.get("weight")
+        if not _is_number(weight) or not (MIN_WEIGHT <= float(weight) <= MAX_WEIGHT):
+            add("E_WEIGHT", "weight 必须是 0.1-1.0 数值", "weight")
+
+        # state_deltas
+        deltas = event.get("state_deltas")
+        if not isinstance(deltas, dict):
+            add("E_DELTA", "state_deltas 必须是对象", "state_deltas")
+        else:
+            for key, value in deltas.items():
+                if key not in STATE_FIELDS:
+                    add("E_DELTA", f"state_deltas 键 {key!r} 不在五项内（禁止 sleep_debt）",
+                        "state_deltas")
+                    continue
+                if not _is_number(value) or abs(float(value)) > MAX_DELTA_ABS + 1e-12:
+                    add("E_DELTA", f"state_deltas.{key} 单次绝对值需 <=0.08", "state_deltas")
+
+        # templates
+        templates = event.get("templates")
+        if not isinstance(templates, list) or not (2 <= len(templates) <= 3):
+            add("E_TEMPLATE", "templates 必须是 2-3 条数组", "templates")
+        else:
+            seen: set = set()
+            for pos, item in enumerate(templates):
+                text = _text(item)
+                if not isinstance(item, str) or not (MIN_TEMPLATE_CHARS <= len(text) <= MAX_TEMPLATE_CHARS):
+                    add("E_TEMPLATE", f"templates[{pos}] 需为 {MIN_TEMPLATE_CHARS}-{MAX_TEMPLATE_CHARS} 字",
+                        "templates")
+                if "\n" in str(item or "") or "\r" in str(item or ""):
+                    add("E_TEMPLATE", f"templates[{pos}] 不得含换行", "templates")
+                if text and _contact_hit(text):
+                    add("E_TEMPLATE", f"templates[{pos}] 含 URL/联系方式/真实地址", "templates")
+                if text and _danger_hit(text):
+                    add("E_SAFETY", f"templates[{pos}] 含危险/违法/性/自伤/医疗/金融/法律内容",
+                        "templates")
+                if text in seen:
+                    add("E_TEMPLATE", f"templates[{pos}] 重复", "templates")
+                seen.add(text)
+
+        # enabled（可选）
+        if "enabled" in event and not isinstance(event.get("enabled"), bool):
+            add("E_SCHEMA", "enabled 必须是布尔", "enabled")
+
+        # 重复（与内置池 / 现有生成池 / 近 30 天）
+        if name:
+            reserved = {str(n).strip() for n in reserved_names if str(n or "").strip()}
+            recent = {str(n).strip() for n in recent_names if str(n or "").strip()}
+            if name in reserved:
+                add("E_DUPLICATE", "name 与内置池/现有事件重名", "name")
+            elif name in recent:
+                add("E_DUPLICATE", "name 与近 30 天事件重名", "name")
+        return errors
+
+    # ---- 整份文档 ----
+    def validate_document(self, document: Any, *, reserved_ids: Iterable[str] = (),
+                          reserved_names: Iterable[str] = (),
+                          recent_names: Iterable[str] = (),
+                          now: Optional[datetime] = None) -> ValidationResult:
+        errors: List[ValidationError] = []
+        if not isinstance(document, dict):
+            return ValidationResult((ValidationError("E_SCHEMA", "文档根必须是对象"),))
+        version = document.get("version")
+        if version != CATALOG_VERSION:
+            errors.append(ValidationError("E_SCHEMA", f"version 必须为 {CATALOG_VERSION}",
+                                          "version"))
+        for key in ("source", "model", "generated_at", "next_update_at", "prompt_hash"):
+            if key in document and not isinstance(document.get(key), str):
+                errors.append(ValidationError("E_SCHEMA", f"{key} 必须是字符串", key))
+        for key in ("generated_at", "next_update_at"):
+            raw = document.get(key)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    datetime.fromisoformat(raw.strip())
+                except ValueError:
+                    errors.append(ValidationError("E_SCHEMA", f"{key} 必须是 ISO 时间", key))
+        events = document.get("events")
+        if not isinstance(events, list):
+            errors.append(ValidationError("E_SCHEMA", "events 必须是数组", "events"))
+            return ValidationResult(tuple(errors))
+        if not (MIN_GENERATED_EVENTS <= len(events) <= self.max_generated_events):
+            errors.append(ValidationError(
+                "E_COUNT", f"生成条数需 {MIN_GENERATED_EVENTS}-{self.max_generated_events}，"
+                f"实际 {len(events)}", "events"))
+        if self.enforce_pool_cap and self.builtin_count + len(events) > self.max_pool_events:
+            errors.append(ValidationError(
+                "E_COUNT", f"内置池 {self.builtin_count} + 生成 {len(events)} 超过总池上限 "
+                f"{self.max_pool_events}", "events"))
+        seen_ids: set = set()
+        seen_names: set = set()
+        reserved_id_set = {str(x) for x in reserved_ids}
+        for index, event in enumerate(events):
+            item_errors = self.validate_event(event, index=index,
+                                              reserved_ids=reserved_id_set,
+                                              reserved_names=reserved_names,
+                                              recent_names=recent_names)
+            errors.extend(item_errors)
+            if isinstance(event, dict):
+                eid = _text(event.get("event_id"))
+                name = _text(event.get("name"))
+                if eid:
+                    if eid in seen_ids:
+                        errors.append(ValidationError("E_ID", "event_id 文档内重复",
+                                                      "event_id", eid))
+                    seen_ids.add(eid)
+                if name:
+                    if name in seen_names:
+                        errors.append(ValidationError("E_DUPLICATE", "name 文档内重复",
+                                                      "name", eid))
+                    seen_names.add(name)
+        # 排序去重，保证手动逐条输出稳定
+        unique: List[ValidationError] = []
+        seen_keys: set = set()
+        for error in errors:
+            key = (error.code, error.field, error.event_id, error.message)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                unique.append(error)
+        return ValidationResult(tuple(unique))
+
+
+@dataclass(frozen=True)
+class CatalogSnapshot:
+    """一次装载结果（只读；服务与 planner 都从这里读）。"""
+
+    path: Path
+    document: Dict[str, Any] = field(default_factory=dict)
+    generated_events: Tuple[Dict[str, Any], ...] = ()
+    builtin_events: Tuple[Dict[str, Any], ...] = ()
+    active_events: Tuple[Dict[str, Any], ...] = ()
+    version: int = CATALOG_VERSION
+    generated_at: Optional[str] = None
+    next_update_at: Optional[str] = None
+    catalog_version: str = "builtin_v1"
+    degraded: bool = False
+    reason: str = ""
+    invalid_count: int = 0
+    pool_truncated: int = 0
+
+    def get_event(self, event_id: Any) -> Optional[Dict[str, Any]]:
+        wanted = str(event_id or "")
+        for event in self.active_events:
+            if event.get("event_id") == wanted or event.get("key") == wanted:
+                return dict(event)
+        return None
+
+    def state_deltas(self, event_id: Any) -> Optional[Dict[str, float]]:
+        event = self.get_event(event_id)
+        if event is None:
+            return None
+        deltas = event.get("state_deltas")
+        return dict(deltas) if isinstance(deltas, dict) else None
+
+
+def _now_of(value: Any, tz: Optional[timezone]) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=tz or timezone.utc)
+    return datetime.now(tz or timezone.utc)
+
+
+def _parse_iso(value: Any, tz: Optional[timezone]) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=tz or timezone.utc)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=tz or timezone.utc)
+
+
+def resolve_state_deltas(metadata: Any,
+                         *, builtin: Optional[Sequence[Mapping[str, Any]]] = None
+                         ) -> Optional[Dict[str, float]]:
+    """episode metadata → 一次性 state_deltas（快照优先，旧行回退内置池）。
+
+    共享接线时 ``RollingPlanner._random_event_deltas`` 应改为先调用本函数：
+
+    - ``metadata["state_deltas"]`` 存在（新 episode 创建时快照）→ 直接用，
+      生成库后续轮换不影响进行中活动；
+    - 否则按旧 ``metadata["event_key"]`` 回查内置池（旧 episode 兼容）；
+    - ``state_deltas_applied`` 为真 → 返回 None（防双应用）。
+
+    返回 ``{}`` 表示快照存在但无增量（仍应写 applied 标记）；None 表示非随机
+    事件 / 已应用 / 旧 key 查不到。
+    """
+    if not isinstance(metadata, Mapping) or metadata.get("state_deltas_applied"):
+        return None
+    snapshot = metadata.get("state_deltas")
+    if isinstance(snapshot, dict):
+        return {key: float(value) for key, value in snapshot.items()
+                if key in STATE_FIELDS and _is_number(value)}
+    event_key = str(metadata.get("event_key") or metadata.get("event_id") or "")
+    if not event_key:
+        return None
+    for event in (builtin if builtin is not None else BUILTIN_EVENTS):
+        eid = str(event.get("event_id") or event.get("key") or "")
+        if eid == event_key:
+            deltas = event.get("state_deltas")
+            return {key: float(value) for key, value in deltas.items()
+                    if key in STATE_FIELDS and _is_number(value)} \
+                if isinstance(deltas, dict) else None
+    return None
+
+
+def state_affinity(event: Mapping[str, Any], state: Any) -> float:
+    """状态 → 事件权重乘子（纯函数；无状态/无法解析 = 1.0）。
+
+    只做温和偏好，不淘汰事件：低精力偏休息/日常、避开高消耗；高压力偏休息；
+    低专注偏日常/转场。
+    """
+    if not isinstance(state, Mapping):
+        return 1.0
+    factor = 1.0
+    goal_type = str(event.get("goal_type") or "")
+    low_energy_types = {"rest", "idle", "daily_routine"}
+    high_energy_types = {"exercise", "social", "work", "study"}
+    energy = state.get("energy")
+    if _is_number(energy):
+        if float(energy) < 0.30:
+            factor *= 1.5 if goal_type in low_energy_types else (
+                0.5 if goal_type in high_energy_types else 1.0)
+        elif float(energy) >= 0.85 and goal_type == "exercise":
+            factor *= 1.2
+    stress = state.get("stress")
+    if _is_number(stress) and float(stress) > 0.80:
+        if goal_type in ("rest", "idle"):
+            factor *= 1.3
+        elif goal_type == "social":
+            factor *= 0.6
+    focus = state.get("focus")
+    if _is_number(focus) and float(focus) < 0.30:
+        if goal_type in ("daily_routine", "idle"):
+            factor *= 1.2
+        elif goal_type in ("work", "study"):
+            factor *= 0.6
+    return max(0.05, factor)
+
+
+class EventCatalogStore:
+    """``generated_events.json`` 读写 + 装载回退 + 纯本地 pick。
+
+    构造即装载一次（只读）；``save`` 才写盘。任何异常都收敛成 ``degraded``
+    快照（内置池），绝不抛出到插件装配/ tick。
+    """
+
+    def __init__(self, path: Any, *, builtin: Optional[Sequence[Mapping[str, Any]]] = None,
+                 validator: Optional[EventCatalogValidator] = None,
+                 max_generated_events: int = MAX_GENERATED_EVENTS,
+                 max_pool_events: int = 12,
+                 enforce_pool_cap: bool = True,
+                 tz: Optional[timezone] = None,
+                 load_on_init: bool = True) -> None:
+        self.path = Path(path)
+        self._tz = tz
+        self._max_pool_events = max(1, int(max_pool_events))
+        self._enforce_pool_cap = bool(enforce_pool_cap)
+        self._builtin = tuple(self._normalize_builtin(builtin) if builtin is not None
+                              else builtin_events())
+        self._validator = validator or EventCatalogValidator(
+            builtin_count=len(self._builtin),
+            max_generated_events=max_generated_events,
+            max_pool_events=max_pool_events,
+            enforce_pool_cap=enforce_pool_cap)
+        self._snapshot = self._fallback("missing")
+        # mode=off 时**不读**生成库（2026-10-27 共享接线契约：off 不读写生成库）：
+        # 只保留内置池快照，用户文件既不删除也不改写；切到 manual/auto 时由 reload() 补读。
+        if load_on_init:
+            self.reload()
+
+    def use_builtin_only(self, reason: str = "mode_off") -> CatalogSnapshot:
+        """不读盘、只用内置池（``mode=off`` 语义；不删不改用户文件）。"""
+        self._snapshot = self._fallback(reason)
+        return self._snapshot
+
+
+    @staticmethod
+    def _normalize_builtin(items: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        output: List[Dict[str, Any]] = []
+        for raw in items:
+            eid = str(raw.get("event_id") or raw.get("key") or "")
+            output.append({
+                "event_id": eid,
+                "key": eid,
+                "name": str(raw.get("name") or ""),
+                "goal_type": str(raw.get("goal_type") or "daily_routine"),
+                "min_minutes": int(raw.get("min_minutes") or 5),
+                "max_minutes": int(raw.get("max_minutes") or 5),
+                "interruptibility": float(raw.get("interruptibility") or 0.0),
+                "weight": float(raw.get("weight") or BUILTIN_WEIGHT),
+                "state_deltas": dict(raw.get("state_deltas") or {}),
+                "templates": [str(x) for x in (raw.get("templates") or ())],
+                "enabled": True,
+                "source": "builtin",
+            })
+        return output
+
+    # ---- 装载 ----
+    def _fallback(self, reason: str, *, document: Optional[Dict[str, Any]] = None,
+                  invalid_count: int = 0, next_update_at: Optional[str] = None) -> CatalogSnapshot:
+        active = tuple(dict(e) for e in self._builtin)
+        return CatalogSnapshot(
+            path=self.path,
+            document=dict(document or {}),
+            generated_events=(),
+            builtin_events=tuple(dict(e) for e in self._builtin),
+            active_events=active,
+            version=CATALOG_VERSION,
+            generated_at=(document or {}).get("generated_at"),
+            next_update_at=next_update_at,
+            catalog_version="builtin_v1",
+            degraded=True,
+            reason=reason,
+            invalid_count=invalid_count,
+        )
+
+    def reload(self) -> CatalogSnapshot:
+        """重新读盘；坏文件/坏项只降级，不删除不重写用户文件。"""
+        try:
+            if not self.path.exists():
+                self._snapshot = self._fallback("missing")
+                return self._snapshot
+            try:
+                document = read_json_text(self.path)
+            except MappingReadError as exc:
+                logger.warning("event_catalog: 事件库读取/解析失败，回退内置池：%s", exc.detail)
+                self._snapshot = self._fallback("corrupt")
+                return self._snapshot
+            if not isinstance(document, dict):
+                self._snapshot = self._fallback("corrupt")
+                return self._snapshot
+            version = document.get("version")
+            if version != CATALOG_VERSION:
+                logger.warning("event_catalog: 不认识的版本 %r，回退内置池", version)
+                self._snapshot = self._fallback("unsupported_version", document=document)
+                return self._snapshot
+            raw_events = document.get("events")
+            if not isinstance(raw_events, list):
+                self._snapshot = self._fallback("corrupt", document=document)
+                return self._snapshot
+
+            reserved_ids = {e["event_id"] for e in self._builtin}
+            reserved_names = {e["name"] for e in self._builtin}
+            valid: List[Dict[str, Any]] = []
+            invalid_count = 0
+            for raw in raw_events:
+                item_errors = self._validator.validate_event(
+                    raw, reserved_ids=reserved_ids, reserved_names=reserved_names)
+                if item_errors:
+                    invalid_count += 1
+                    logger.warning("event_catalog: 忽略非法生成项 %s", item_errors[0])
+                    continue
+                if not isinstance(raw, dict) or raw.get("enabled", True) is False:
+                    continue
+                eid = str(raw.get("event_id"))
+                normalized = {
+                    "event_id": eid,
+                    "key": eid,
+                    "name": str(raw.get("name")).strip(),
+                    "goal_type": str(raw.get("goal_type")).strip(),
+                    "min_minutes": int(raw.get("min_minutes")),
+                    "max_minutes": int(raw.get("max_minutes")),
+                    "interruptibility": float(raw.get("interruptibility")),
+                    "weight": float(raw.get("weight")),
+                    "state_deltas": {k: float(v) for k, v in dict(raw.get("state_deltas") or {}).items()},
+                    "templates": [str(x) for x in raw.get("templates") or ()],
+                    "enabled": True,
+                    "source": "llm",
+                }
+                reserved_ids.add(eid)
+                reserved_names.add(normalized["name"])
+                valid.append(normalized)
+
+            pool_truncated = 0
+            if self._enforce_pool_cap:
+                slots = max(0, self._max_pool_events - len(self._builtin))
+                if len(valid) > slots:
+                    pool_truncated = len(valid) - slots
+                    logger.warning("event_catalog: 生成项 %d 条 + 内置 %d 条超过总池上限 %d，"
+                                   "运行期保留前 %d 条生成项（文件不重写）",
+                                   len(valid), len(self._builtin), self._max_pool_events, slots)
+                    valid = valid[:slots]
+
+            next_update_at = document.get("next_update_at")
+            if not isinstance(next_update_at, str) or not next_update_at.strip():
+                next_update_at = None
+            degraded = bool(invalid_count) or not valid
+            active = tuple(dict(e) for e in self._builtin) + tuple(dict(e) for e in valid)
+            self._snapshot = CatalogSnapshot(
+                path=self.path,
+                document=document,
+                generated_events=tuple(dict(e) for e in valid),
+                builtin_events=tuple(dict(e) for e in self._builtin),
+                active_events=active,
+                version=CATALOG_VERSION,
+                generated_at=document.get("generated_at"),
+                next_update_at=next_update_at if valid else None,
+                catalog_version=compute_catalog_version(document) if valid else "builtin_v1",
+                degraded=degraded,
+                reason=("invalid_items" if valid else "no_valid_events") if degraded else "",
+                invalid_count=invalid_count,
+                pool_truncated=pool_truncated,
+            )
+            return self._snapshot
+        except Exception as exc:  # 装载绝不影响 tick / 插件启动
+            logger.warning("event_catalog: 装载异常，回退内置池：%s", exc)
+            self._snapshot = self._fallback("error")
+            return self._snapshot
+
+    # ---- 只读视图 ----
+    @property
+    def snapshot(self) -> CatalogSnapshot:
+        return self._snapshot
+
+    @property
+    def active_events(self) -> List[Dict[str, Any]]:
+        return [dict(e) for e in self._snapshot.active_events]
+
+    @property
+    def generated_events(self) -> List[Dict[str, Any]]:
+        return [dict(e) for e in self._snapshot.generated_events]
+
+    @property
+    def catalog_version(self) -> str:
+        return self._snapshot.catalog_version
+
+    @property
+    def next_update_at(self) -> Optional[str]:
+        return self._snapshot.next_update_at
+
+    def get_event(self, event_id: Any) -> Optional[Dict[str, Any]]:
+        return self._snapshot.get_event(event_id)
+
+    def get_state_deltas(self, event_id: Any) -> Optional[Dict[str, float]]:
+        return self._snapshot.state_deltas(event_id)
+
+    def file_fingerprint(self) -> str:
+        """当前文件内容指纹（生成期间外部改动检测）。"""
+        try:
+            if not self.path.exists():
+                return ""
+            return hashlib.sha256(self.path.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
+    # ---- 原子写 + .bak ----
+    def _rotate_backup(self) -> bool:
+        if not self.path.exists():
+            return True
+        bak = Path(str(self.path) + ".bak")
+        try:
+            for index in range(BACKUP_KEEP - 1, 0, -1):
+                src = Path(f"{bak}.{index}")
+                dst = Path(f"{bak}.{index + 1}")
+                if src.exists():
+                    os.replace(src, dst)
+            if bak.exists():
+                os.replace(bak, Path(f"{bak}.2"))
+            shutil.copy2(self.path, bak)
+            return True
+        except OSError as exc:
+            logger.warning("event_catalog: 备份旧事件库失败，放弃本次替换：%s", exc)
+            return False
+
+    def save(self, document: Mapping[str, Any]) -> bool:
+        """原子替换；先备份旧文件。失败 → 旧文件保持原样。"""
+        try:
+            if self.path.exists() and not self._rotate_backup():
+                return False
+            if not save_json_atomic(self.path, dict(document)):
+                logger.warning("event_catalog: 原子写事件库失败（旧文件保留）")
+                return False
+            self.reload()
+            return True
+        except Exception as exc:
+            logger.warning("event_catalog: 保存事件库异常（旧文件保留）：%s", exc)
+            return False
+
+    # ---- 运行时 pick（0 LLM）----
+    def pick_event(self, rng: random.Random, state: Any = None, recent: Any = None,
+                   *, now: Optional[datetime] = None, context: Optional[str] = None,
+                   events: Optional[Sequence[Mapping[str, Any]]] = None,
+                   dedup_minutes: int = RANDOM_EVENT_DEDUP_MINUTES) -> Optional[Dict[str, Any]]:
+        """按权重抽样一个事件（含 ``duration_minutes``）。
+
+        ``context`` 只允许 ``None`` / ``idle`` / ``transition``（转场/空闲语义）；
+        其它上下文直接返回 ``None``。``recent`` 支持 ``{event_id: datetime|ISO}``、
+        ``[(event_id, ts)]`` 或带 ``event_id/timestamp`` 的 dict 列表。
+        """
+        if context not in (None, "idle", "transition"):
+            return None
+        now_dt = _now_of(now, self._tz)
+        last_map = self._recent_map(recent, now_dt)
+        pool = [dict(e) for e in (events if events is not None else self._snapshot.active_events)]
+        cooled: List[Dict[str, Any]] = []
+        for event in pool:
+            eid = str(event.get("event_id") or event.get("key") or "")
+            if not eid or event.get("enabled", True) is False:
+                continue
+            last = last_map.get(eid)
+            if last is not None:
+                elapsed = (now_dt - last).total_seconds()
+                if elapsed < dedup_minutes * 60:
+                    continue
+            cooled.append(event)
+        if not cooled:
+            return None
+        weights: List[float] = []
+        for event in cooled:
+            try:
+                weight = float(event.get("weight") or 0.0)
+            except (TypeError, ValueError):
+                weight = 0.0
+            weights.append(max(0.0, weight * state_affinity(event, state)))
+        if sum(weights) <= 0:
+            weights = [1.0 for _ in cooled]
+        try:
+            chosen = rng.choices(cooled, weights=weights, k=1)[0]
+        except AttributeError:  # 极简 rng 桩（只有 choice）兜底
+            chosen = rng.choice(cooled)
+        output = dict(chosen)
+        output["state_deltas"] = dict(output.get("state_deltas") or {})
+        output["templates"] = list(output.get("templates") or ())
+        min_minutes = int(output.get("min_minutes") or MIN_DURATION_MINUTES)
+        max_minutes = int(output.get("max_minutes") or min_minutes)
+        output["duration_minutes"] = rng.randint(min_minutes, max(max_minutes, min_minutes))
+        output["catalog_version"] = self.catalog_version
+        if context:
+            output["context"] = context
+        return output
+
+    def _recent_map(self, recent: Any, now: datetime) -> Dict[str, datetime]:
+        output: Dict[str, datetime] = {}
+        if not recent:
+            return output
+        items: Iterable[Any]
+        if isinstance(recent, Mapping):
+            items = recent.items()
+        elif isinstance(recent, (list, tuple)):
+            items = recent
+        else:
+            items = ()
+        for item in items:
+            eid: Any = None
+            stamp: Any = None
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                eid, stamp = item[0], item[1]
+            elif isinstance(item, Mapping):
+                eid = item.get("event_id") or item.get("key")
+                stamp = item.get("timestamp") or item.get("actual_end_at") \
+                    or item.get("last_seen_at") or item.get("ts")
+            elif isinstance(item, str):
+                eid, stamp = item, now
+            if not eid:
+                continue
+            parsed = _parse_iso(stamp, self._tz)
+            if parsed is None and _is_number(stamp):
+                try:
+                    parsed = datetime.fromtimestamp(float(stamp), self._tz)
+                except (OverflowError, OSError, ValueError):
+                    parsed = None
+            if parsed is None:
+                parsed = now
+            output[str(eid)] = parsed
+        return output
+
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    """刷新结果（manual 调用方可直接逐条 QQ；auto 只落日志）。"""
+
+    ok: bool
+    status: str
+    manual: bool = False
+    errors: Tuple[str, ...] = ()
+    reason: str = ""
+    catalog_version: str = ""
+    next_update_at: Optional[str] = None
+    events_count: int = 0
+    tokens_used: int = 0
+    called_llm: bool = False
+
+    @property
+    def error_lines(self) -> List[str]:
+        return list(self.errors)
+
+
+class EventCatalogService:
+    """事件库服务（供 plugin 装配、planner 取池、/lbm_init events 调用）。
+
+    构造参数（全部可选，便于离线测试与后续接线）：
+
+    - ``catalog_path``：事件库路径；缺省用 ``plugin_root/mappings/generated_events.json``；
+    - ``state_path``：自动检查/预算账本；缺省 ``data_dir/event_catalog_state.json``；
+      没有 ``data_dir`` 时只在进程内保存（重启会丢「当日已尝试」）；
+    - ``llm``：``core.llm_utils.LLMService``（唯一网络出口；本模块不另开请求）；
+    - ``config`` / ``config_provider``：``[event_catalog]`` section / dict / SimpleNamespace；
+    - ``auto_gate``：返回 bool 或 ``{"awake","in_sleep","hard_commitment"}`` 的闸；
+    - ``persona_provider`` / ``recent_schedule_names_provider`` /
+      ``recent_event_names_provider``：只提供人设文本与名称，**不得提供聊天正文**；
+    - ``now_provider`` / ``rng``：离线测试可注入。
+    """
+
+    def __init__(self, *, catalog_path: Any = None, plugin_root: Any = None,
+                 data_dir: Any = None, state_path: Any = None,
+                 llm: Any = None, config: Any = None,
+                 config_provider: Optional[Callable[[], Any]] = None,
+                 validator: Optional[EventCatalogValidator] = None,
+                 store: Optional[EventCatalogStore] = None,
+                 tz: Any = None, now_provider: Optional[Callable[[], datetime]] = None,
+                 rng: Optional[random.Random] = None,
+                 persona_provider: Any = None,
+                 recent_schedule_names_provider: Any = None,
+                 recent_event_names_provider: Any = None,
+                 auto_gate: Optional[Callable[[datetime], Any]] = None,
+                 allow_ungated_auto: bool = False) -> None:
+        self._tz = _tzinfo(tz) or datetime.now().astimezone().tzinfo
+        self._config = config
+        self._config_provider = config_provider
+        self._llm = llm
+        self._now_provider = now_provider
+        self._rng = rng or random.Random()
+        self._persona_provider = persona_provider
+        self._recent_schedule_provider = recent_schedule_names_provider
+        self._recent_event_provider = recent_event_names_provider
+        self._auto_gate = auto_gate
+        self._allow_ungated_auto = bool(allow_ungated_auto)
+        cfg = self._current_config()
+        if catalog_path is None:
+            if plugin_root is not None:
+                catalog_path = mappings_path(plugin_root, CATALOG_FILE_NAME)
+            else:
+                catalog_path = Path("mappings") / CATALOG_FILE_NAME
+        if state_path is None and data_dir is not None:
+            state_path = Path(data_dir) / CATALOG_STATE_FILE_NAME
+        self._state_path = Path(state_path) if state_path is not None else None
+        self._state = self._load_state()
+        self._validator = validator or EventCatalogValidator(
+            builtin_count=len(builtin_events()),
+            max_generated_events=cfg.max_generated_events,
+            max_pool_events=cfg.max_pool_events,
+            enforce_pool_cap=cfg.enforce_pool_cap)
+        self._custom_validator = validator is not None
+        self.store = store or EventCatalogStore(
+            catalog_path, validator=self._validator,
+            max_generated_events=cfg.max_generated_events,
+            max_pool_events=cfg.max_pool_events,
+            enforce_pool_cap=cfg.enforce_pool_cap, tz=self._tz,
+            # mode=off：构造期就不读生成库（off 只用内置池；不删不改用户文件）
+            load_on_init=cfg.mode != "off")
+        self._lock = asyncio.Lock()
+        self._task: Optional[asyncio.Task] = None
+        self._stopping = False
+        self._last_refresh: Optional[RefreshResult] = None
+
+    # ---- 配置 / 时间 ----
+    def _current_config(self) -> EventCatalogConfig:
+        source = self._config
+        if self._config_provider is not None:
+            try:
+                source = self._config_provider()
+            except Exception:
+                source = self._config
+        return resolve_config(source)
+
+    def _now(self, now: Optional[datetime] = None) -> datetime:
+        if now is not None:
+            return now if now.tzinfo is not None else now.replace(tzinfo=self._tz or timezone.utc)
+        try:
+            value = self._now_provider() if self._now_provider is not None else None
+        except Exception:
+            value = None
+        if isinstance(value, datetime):
+            return value if value.tzinfo is not None else value.replace(tzinfo=self._tz or timezone.utc)
+        return datetime.now(self._tz or timezone.utc)
+
+    @staticmethod
+    def _provider_value(provider: Any, default: Any) -> Any:
+        if provider is None:
+            return default
+        if callable(provider):
+            try:
+                return provider()
+            except Exception:
+                logger.debug("event_catalog: provider 取值失败（用默认）", exc_info=True)
+                return default
+        return provider
+
+    def _names_of(self, provider: Any) -> List[str]:
+        value = self._provider_value(provider, ())
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        try:
+            return [str(item) for item in value if str(item or "").strip()]
+        except TypeError:
+            return []
+
+    # ---- 状态账本（自动每日一次 / token 预算）----
+    def _load_state(self) -> Dict[str, Any]:
+        if self._state_path is None:
+            return {"version": 1}
+        try:
+            if not self._state_path.exists():
+                return {"version": 1}
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            return dict(data) if isinstance(data, dict) else {"version": 1}
+        except Exception:
+            return {"version": 1}
+
+    def _save_state(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            self._state["version"] = 1
+            save_json_atomic(self._state_path, self._state)
+        except Exception:
+            logger.debug("event_catalog: 状态账本落盘失败（忽略）", exc_info=True)
+
+    def _day_of(self, now: datetime) -> str:
+        return now.date().isoformat()
+
+    def _auto_attempted_today(self, now: datetime) -> bool:
+        return str(self._state.get("auto_last_attempt_date") or "") == self._day_of(now)
+
+    def _mark_auto_attempt(self, now: datetime) -> None:
+        self._state["auto_last_attempt_date"] = self._day_of(now)
+        self._save_state()
+
+    def _tokens_today(self, now: datetime) -> int:
+        if str(self._state.get("token_date") or "") != self._day_of(now):
+            return 0
+        try:
+            return max(0, int(self._state.get("token_used") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _write_tokens_today(self, used: int, now: datetime) -> None:
+        self._state["token_date"] = self._day_of(now)
+        self._state["token_used"] = max(0, int(used))
+        self._save_state()
+
+    def _reserve_tokens(self, amount: int, now: datetime) -> bool:
+        """调用前预占保守上界；并发/重启都先看到这笔占用。
+
+        预算 <=0 表示不限制，但仍记账。返回 False 表示本次不允许发出请求。
+        """
+        amount = max(0, int(amount))
+        budget = self._current_config().daily_token_budget
+        used = self._tokens_today(now)
+        if budget > 0 and used + amount > budget:
+            return False
+        self._write_tokens_today(used + amount, now)
+        return True
+
+    def _settle_tokens(self, reserved: int, actual: Optional[int], now: datetime, *,
+                       release_if_unused: bool = False) -> int:
+        """调用后结算本次预占，返回本次实际记账量。
+
+        - ``actual`` 可得：按真实 usage 调整（多退少补）；
+        - ``actual`` 缺失：保留整笔保守上界，不凭估算释放；
+        - ``release_if_unused=True`` 且无 actual：明确未发出/无消耗，整笔释放。
+        """
+        reserved = max(0, int(reserved))
+        used = self._tokens_today(now)
+        if actual is None:
+            if release_if_unused:
+                charged = 0
+                used = max(0, used - reserved)
+            else:
+                charged = reserved
+        else:
+            charged = max(0, int(actual))
+            used = max(0, used - reserved + charged)
+        self._write_tokens_today(used, now)
+        return charged
+
+    def _can_spend(self, estimated: int, now: datetime) -> bool:
+        """只读预检查（不占用）；真正调用前必须再走 :meth:`_reserve_tokens`。"""
+        budget = self._current_config().daily_token_budget
+        if budget <= 0:
+            return True
+        return self._tokens_today(now) + max(0, int(estimated)) <= budget
+
+    def _record_tokens(self, tokens: int, now: datetime) -> None:
+        """兼容旧内部调用：直接累加（新预算流程只用 reserve/settle）。"""
+        self._write_tokens_today(self._tokens_today(now) + max(0, int(tokens)), now)
+
+    # ---- 只读状态 / 查询 ----
+    def get_event(self, event_id: Any) -> Optional[Dict[str, Any]]:
+        return self.store.get_event(event_id)
+
+    def get_state_deltas(self, event_id: Any) -> Optional[Dict[str, float]]:
+        return self.store.get_state_deltas(event_id)
+
+    @property
+    def catalog_version(self) -> str:
+        return self.store.catalog_version
+
+    @property
+    def state_path(self) -> Optional[Path]:
+        return self._state_path
+
+    def pick_event(self, rng: random.Random, state: Any = None, recent: Any = None,
+                   *, now: Optional[datetime] = None, context: Optional[str] = None,
+                   events: Optional[Sequence[Mapping[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+        try:
+            return self.store.pick_event(rng, state, recent, now=self._now(now),
+                                         context=context, events=events)
+        except Exception as exc:  # 运行时选择失败只回退内置池/不插事件
+            logger.warning("event_catalog: pick_event 失败（本次不插随机事件）：%s", exc)
+            try:
+                return self.store.pick_event(rng, state, recent, now=self._now(now),
+                                             context=context,
+                                             events=self.store.snapshot.builtin_events)
+            except Exception:
+                return None
+
+    def metadata_for_event(self, event: Any, *, trigger: str = "random_event",
+                           description: Optional[str] = None) -> Dict[str, Any]:
+        """episode 创建时快照（库更新不改变进行中活动结算）。
+
+        返回的 ``event_id/event_key/catalog_version/event_catalog_version/
+        state_deltas`` 应原样写进 ``activity_episodes.metadata``；关闭时优先读
+        快照，不再回查事件池。旧 episode 无快照才回退旧内置池。
+        """
+        if isinstance(event, str):
+            resolved = self.store.get_event(event)
+        elif isinstance(event, Mapping):
+            resolved = dict(event)
+        else:
+            resolved = None
+        if not resolved:
+            return {}
+        eid = str(resolved.get("event_id") or resolved.get("key") or "")
+        metadata: Dict[str, Any] = {
+            "trigger": trigger,
+            "event_id": eid,
+            "event_key": eid,
+            "catalog_version": self.store.catalog_version,
+            "event_catalog_version": self.store.catalog_version,
+            "event_source": str(resolved.get("source") or ""),
+            "event_name": str(resolved.get("name") or ""),
+            "goal_type": str(resolved.get("goal_type") or ""),
+            "state_deltas": dict(resolved.get("state_deltas") or {}),
+        }
+        if description:
+            metadata["description"] = description
+        if resolved.get("duration_minutes") is not None:
+            metadata["duration_minutes"] = resolved.get("duration_minutes")
+        return metadata
+
+    def status(self) -> Dict[str, Any]:
+        cfg = self._current_config()
+        now = self._now()
+        snap = self.store.snapshot
+        last = self._last_refresh
+        return {
+            "mode": cfg.mode,
+            "path": str(self.store.path),
+            "file_exists": self.store.path.exists(),
+            "loaded": bool(snap.document) or bool(snap.active_events),
+            "degraded": bool(snap.degraded),
+            "reason": snap.reason,
+            "catalog_version": snap.catalog_version,
+            "generated_events": len(snap.generated_events),
+            "builtin_events": len(snap.builtin_events),
+            "active_events": len(snap.active_events),
+            "invalid_count": snap.invalid_count,
+            "pool_truncated": snap.pool_truncated,
+            "generated_at": snap.generated_at,
+            "next_update_at": snap.next_update_at,
+            "auto_last_attempt_date": str(self._state.get("auto_last_attempt_date") or ""),
+            "tokens_today": self._tokens_today(now),
+            "daily_token_budget": cfg.daily_token_budget,
+            "task_name": cfg.task_name,
+            "min_interval_days": cfg.min_interval_days,
+            "max_interval_days": cfg.max_interval_days,
+            "max_generated_events": cfg.max_generated_events,
+            "max_pool_events": cfg.max_pool_events,
+            "auto_running": bool(self._task is not None and not self._task.done()),
+            "last_refresh": (None if last is None else {
+                "ok": last.ok, "status": last.status, "reason": last.reason,
+                "errors": list(last.errors), "events_count": last.events_count,
+                "next_update_at": last.next_update_at,
+            }),
+        }
+
+    def status_text(self) -> str:
+        snap = self.store.snapshot
+        cfg = self._current_config()
+        parts = [f"事件库模式：{cfg.mode}",
+                 f"目录版本：{snap.catalog_version}",
+                 f"生成事件：{len(snap.generated_events)} 条 / 内置：{len(snap.builtin_events)} 条"]
+        if snap.next_update_at:
+            parts.append(f"下次更新：{snap.next_update_at}")
+        if snap.degraded:
+            parts.append(f"状态：降级（{snap.reason or 'invalid'}）")
+        return "；".join(parts)
+
+    def reload(self) -> CatalogSnapshot:
+        """重新装载事件库；``mode=off`` 时**不读**生成库（只保留内置池）。"""
+        try:
+            if self._current_config().mode == "off":
+                return self.store.use_builtin_only("mode_off")
+            return self.store.reload()
+        except Exception as exc:
+            logger.warning("event_catalog: reload 失败（保留旧快照）：%s", exc)
+            return self.store.snapshot
+
+    # ---- 生成刷新 ----
+    def _due(self, now: datetime) -> bool:
+        raw = self.store.next_update_at
+        if not raw:
+            return True
+        parsed = _parse_iso(raw, self._tz)
+        return parsed is None or now >= parsed
+
+    def _gate(self, now: datetime) -> Tuple[bool, str]:
+        if self._auto_gate is None:
+            if self._allow_ungated_auto:
+                return True, ""
+            return False, "gate_unavailable"
+        try:
+            value = self._auto_gate(now)
+        except Exception as exc:
+            logger.warning("event_catalog: 自动生成闸异常（本次跳过）：%s", exc)
+            return False, "gate_error"
+        if isinstance(value, bool):
+            return (True, "") if value else (False, "gate_denied")
+        if isinstance(value, Mapping):
+            if value.get("can_generate") is False:
+                return False, "gate_denied"
+            if not value.get("awake", True):
+                return False, "gate_not_awake"
+            if value.get("in_sleep") or value.get("sleeping"):
+                return False, "gate_in_sleep"
+            if value.get("hard_commitment"):
+                return False, "gate_hard_commitment"
+            return True, ""
+        return False, "gate_invalid"
+
+    def _skipped(self, reason: str, *, manual: bool) -> RefreshResult:
+        return RefreshResult(ok=False, status="skipped", manual=manual,
+                             errors=(reason,), reason=reason,
+                             catalog_version=self.store.catalog_version,
+                             next_update_at=self.store.next_update_at,
+                             events_count=len(self.store.generated_events))
+
+    def _failed(self, code: str, message: str, *, manual: bool, tokens: int = 0,
+                called_llm: bool = False) -> RefreshResult:
+        return RefreshResult(ok=False, status="failed", manual=manual,
+                             errors=(f"{code}: {message}",), reason=code,
+                             catalog_version=self.store.catalog_version,
+                             next_update_at=self.store.next_update_at,
+                             tokens_used=tokens, called_llm=called_llm)
+
+    async def refresh(self, *, manual: bool = False,
+                      now: Optional[datetime] = None) -> RefreshResult:
+        """生成一次并全量替换（manual=True 时错误逐条返回给调用方）。"""
+        cfg = self._current_config()
+        if cfg.mode == "off":
+            result = self._skipped("mode_off", manual=manual)
+        elif not manual and cfg.mode != "auto":
+            result = self._skipped("mode_not_auto", manual=manual)
+        else:
+            now_dt = self._now(now)
+            try:
+                async with self._lock:
+                    result = await self._refresh_locked(cfg, manual, now_dt)
+            except Exception as exc:  # 绝不拖挂插件
+                logger.warning("event_catalog: refresh 异常（旧库保留）：%s", exc)
+                result = self._failed("E_INTERNAL", str(exc), manual=manual)
+        self._last_refresh = result
+        return result
+
+    @staticmethod
+    def _effective_max_tokens(cfg: EventCatalogConfig) -> int:
+        """事件生成输出上限：配置越界也不得突破用户锁定的 1200。"""
+        try:
+            configured = int(cfg.max_tokens)
+        except (TypeError, ValueError):
+            configured = EVENT_GENERATION_MAX_TOKENS
+        return max(1, min(EVENT_GENERATION_MAX_TOKENS, configured))
+
+    def _request_upper_bound(self, prompt: Any, max_tokens: int) -> int:
+        """按实际将发给 SDK 的 system+user 载荷计算保守上界。
+
+        优先使用 LLMService 的同构实现；旧测试桩/未来替身没有该方法时，用
+        :func:`core.llm_utils.request_token_upper_bound` 对同一份 messages 计算，
+        不依赖 char/2 估算。
+        """
+        bound_fn = getattr(self._llm, "upper_bound_tokens", None)
+        if callable(bound_fn):
+            try:
+                return max(1, int(bound_fn(prompt.prompt, system_prompt=prompt.system_prompt,
+                                           max_tokens=max_tokens)))
+            except Exception:
+                logger.debug("event_catalog: upper_bound_tokens 失败，回退同构上界",
+                             exc_info=True)
+        return max(1, request_token_upper_bound(
+            prompt.prompt, system_prompt=prompt.system_prompt, max_tokens=max_tokens))
+
+    async def _call_llm_once(self, prompt: Any, *, task_name: str, max_tokens: int,
+                             temperature: float) -> LLMResult:
+        """发出恰好一次生成请求；详细结果可用时走同一响应的 LLMResult。"""
+        detailed = getattr(self._llm, "generate_detailed", None)
+        if callable(detailed):
+            return await detailed(
+                prompt.prompt,
+                system_prompt=prompt.system_prompt,
+                task_name=task_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                event=LLM_EVENT_NAME,
+                strict_params=True,
+            )
+        # 兼容旧测试桩：只有字符串返回，无 usage/错误分类；失败一律保守记账。
+        text = await self._llm.generate(
+            prompt.prompt,
+            system_prompt=prompt.system_prompt,
+            task_name=task_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            event=LLM_EVENT_NAME,
+        )
+        text = str(text or "").strip()
+        return LLMResult(ok=bool(text), text=text,
+                         category="ok" if text else "empty",
+                         task_name=task_name, request_sent=True, consumed=True,
+                         attempts=1)
+
+    async def _attempt_llm(self, prompt: Any, *, task_name: str, max_tokens: int,
+                           temperature: float, now: datetime,
+                           reserved: int) -> Tuple[LLMResult, int]:
+        """执行一次已预占预算的调用并按可用证据结算，返回 (结果, 记账量)。"""
+        result = await self._call_llm_once(
+            prompt, task_name=task_name, max_tokens=max_tokens,
+            temperature=temperature)
+        if result.usage_available and result.total_tokens is not None:
+            spent = self._settle_tokens(reserved, result.total_tokens, now)
+        elif (result.category == "task_missing" and not result.request_sent
+              and not result.consumed and not result.usage_available):
+            # 只有明确「未发出请求/无消耗」的任务缺失才释放；不确定则保留上界。
+            spent = self._settle_tokens(reserved, None, now, release_if_unused=True)
+        else:
+            spent = self._settle_tokens(reserved, None, now)
+        return result, spent
+
+    async def _refresh_locked(self, cfg: EventCatalogConfig, manual: bool,
+                              now: datetime) -> RefreshResult:
+        self.store.reload()
+        start_fp = self.store.file_fingerprint()
+        persona = str(self._provider_value(self._persona_provider, "") or "")
+        recent_schedule = self._names_of(self._recent_schedule_provider)
+        recent_events = self._names_of(self._recent_event_provider)
+        reserved_names = [e["name"] for e in self.store.snapshot.builtin_events]
+        reserved_names += [e["name"] for e in self.store.snapshot.generated_events]
+        reserved_names += recent_events
+        reserved_ids = {e["event_id"] for e in self.store.snapshot.builtin_events}
+        builtin_count = len(self.store.snapshot.builtin_events)
+        pool_slots = max(MIN_GENERATED_EVENTS, cfg.max_pool_events - builtin_count)
+        requested = max(MIN_GENERATED_EVENTS,
+                        min(cfg.max_generated_events, pool_slots))
+        prompt = build_event_prompt(persona=persona,
+                                    recent_schedule_names=recent_schedule,
+                                    existing_event_names=reserved_names,
+                                    count=requested)
+        max_tokens = self._effective_max_tokens(cfg)
+        temperature = EVENT_GENERATION_TEMPERATURE
+        per_call_bound = self._request_upper_bound(prompt, max_tokens)
+        if self._llm is None or not (
+                callable(getattr(self._llm, "generate_detailed", None))
+                or callable(getattr(self._llm, "generate", None))):
+            return self._failed("E_LLM", "LLMService 不可用", manual=manual)
+        if not self._reserve_tokens(per_call_bound, now):
+            return self._failed("E_BUDGET",
+                                "今日事件生成 token 预算不足以预占一次完整请求，本次不调用模型",
+                                manual=manual, tokens=0, called_llm=False)
+
+        charged = 0
+        model_calls = 0
+        try:
+            chosen, spent = await self._attempt_llm(
+                prompt, task_name=cfg.task_name, max_tokens=max_tokens,
+                temperature=temperature, now=now, reserved=per_call_bound)
+            charged += spent
+            model_calls += max(0, int(chosen.attempts or 0))
+        except asyncio.CancelledError:
+            # 取消时预占已落盘；无法证明未消耗，保留整笔上界（不释放）。
+            raise
+        except Exception as exc:
+            logger.warning("event_catalog: LLM 调用异常：%s", exc)
+            charged += self._settle_tokens(per_call_bound, None, now)
+            return self._failed("E_LLM", f"LLM 调用异常：{exc}", manual=manual,
+                                tokens=charged, called_llm=model_calls > 0)
+
+        if chosen.category == "task_missing" and cfg.task_name != LLM_FALLBACK_TASK:
+            logger.warning("event_catalog: 任务 %s 明确不存在，回退 %s 再试一次",
+                           cfg.task_name, LLM_FALLBACK_TASK)
+            if not self._reserve_tokens(per_call_bound, now):
+                return self._failed(
+                    "E_BUDGET", "任务缺失回退前预算不足，本次不再调用模型",
+                    manual=manual, tokens=charged, called_llm=model_calls > 0)
+            try:
+                chosen, spent = await self._attempt_llm(
+                    prompt, task_name=LLM_FALLBACK_TASK, max_tokens=max_tokens,
+                    temperature=temperature, now=now, reserved=per_call_bound)
+                charged += spent
+                model_calls += max(0, int(chosen.attempts or 0))
+            except asyncio.CancelledError:
+                raise  # 回退预占保留
+            except Exception as exc:
+                logger.warning("event_catalog: LLM 回退调用异常：%s", exc)
+                charged += self._settle_tokens(per_call_bound, None, now)
+                return self._failed("E_LLM", f"LLM 回退调用异常：{exc}",
+                                    manual=manual, tokens=charged,
+                                    called_llm=model_calls > 0)
+
+        tokens = charged
+        raw = chosen.text if chosen.ok else ""
+        if chosen.category == "task_missing":
+            return self._failed("E_LLM", f"任务缺失：{chosen.error}", manual=manual,
+                                tokens=tokens, called_llm=model_calls > 0)
+        if not str(raw or "").strip():
+            detail = chosen.error or "LLM 返回空内容"
+            return self._failed("E_LLM", f"LLM 返回空内容（{chosen.category}）：{detail}",
+                                manual=manual, tokens=tokens,
+                                called_llm=model_calls > 0)
+        try:
+            raw_events = parse_events_response(raw)
+        except EventPromptError as exc:
+            return self._failed("E_RESPONSE", str(exc), manual=manual, tokens=tokens,
+                                called_llm=model_calls > 0)
+        events = [_normalize_event(item) for item in raw_events]
+        document = {
+            "version": CATALOG_VERSION,
+            "source": "llm",
+            "model": str(getattr(self._llm, "model_name", "")
+                         or getattr(self._llm, "_model_name", "") or ""),
+            "generated_at": now.isoformat(timespec="seconds"),
+            "next_update_at": (now + timedelta(days=self._next_interval_days(cfg))).isoformat(
+                timespec="seconds"),
+            "prompt_hash": prompt.prompt_hash,
+            "events": events,
+        }
+        validator = self._validator
+        if not self._custom_validator:
+            validator = EventCatalogValidator(
+                builtin_count=builtin_count,
+                max_generated_events=cfg.max_generated_events,
+                max_pool_events=cfg.max_pool_events,
+                enforce_pool_cap=cfg.enforce_pool_cap)
+        validation = validator.validate_document(
+            document, reserved_ids=reserved_ids, reserved_names=reserved_names,
+            recent_names=recent_events)
+        if not validation.ok:
+            return RefreshResult(ok=False, status="failed", manual=manual,
+                                 errors=tuple(validation.lines), reason="E_VALIDATION",
+                                 catalog_version=self.store.catalog_version,
+                                 next_update_at=self.store.next_update_at,
+                                 events_count=0, tokens_used=tokens,
+                                 called_llm=model_calls > 0)
+        if self.store.file_fingerprint() != start_fp:
+            return self._failed("E_CONFLICT", "生成期间事件库被外部修改，放弃本次替换（旧库保留）",
+                                manual=manual, tokens=tokens,
+                                called_llm=model_calls > 0)
+        # 生成期间模式被关闭/切换（含插件停用时的 stop()）：按保守结果保留旧库，
+        # **不得**伪报成功、也不得把在飞的生成结果落盘（2026-10-27 共享接线契约）。
+        current_mode = self._current_config().mode
+        if self._stopping or current_mode == "off" or current_mode != cfg.mode:
+            return self._failed(
+                "E_MODE_CHANGED",
+                f"生成期间事件库模式已变更（{cfg.mode}→{current_mode or 'off'}），"
+                "放弃本次替换（旧库保留）",
+                manual=manual, tokens=tokens, called_llm=model_calls > 0)
+        if not self.store.save(document):
+            return self._failed("E_WRITE", "事件库原子写失败（旧库保留）", manual=manual,
+                                tokens=tokens, called_llm=model_calls > 0)
+        return RefreshResult(ok=True, status="success", manual=manual,
+                             catalog_version=self.store.catalog_version,
+                             next_update_at=self.store.next_update_at,
+                             events_count=len(self.store.generated_events),
+                             tokens_used=tokens, called_llm=model_calls > 0)
+
+    def _next_interval_days(self, cfg: EventCatalogConfig) -> int:
+        try:
+            return int(self._rng.randint(cfg.min_interval_days, cfg.max_interval_days))
+        except Exception:
+            return cfg.min_interval_days
+
+    # ---- 自动调度 ----
+    async def auto_check(self, now: Optional[datetime] = None) -> Optional[RefreshResult]:
+        """每日最多一次、到期、清醒/非睡眠/无硬约定才生成；失败当日不重试。"""
+        cfg = self._current_config()
+        if cfg.mode != "auto":
+            return None
+        now_dt = self._now(now)
+        if self._auto_attempted_today(now_dt):
+            return None
+        if not self._due(now_dt):
+            return None
+        allowed, reason = self._gate(now_dt)
+        if not allowed:
+            return self._skipped(reason, manual=False)
+        if self._lock.locked():
+            return None
+        self._mark_auto_attempt(now_dt)  # 先记当日尝试：失败也不在当天重试
+        result = await self.refresh(manual=False, now=now_dt)
+        if result is not None and result.status == "failed":
+            logger.warning("event_catalog.auto_refresh 失败（旧库保留，当日不重试）：%s",
+                           "；".join(result.error_lines))
+        return result
+
+    async def start(self) -> None:
+        """装配入口：``mode!=off`` 时装载生成库；``mode=auto`` 时挂后台检查任务。
+
+        - ``mode=off``：**不读**生成库、不启动任何后台任务（off 只用内置池；用户文件
+          不删不改）；若此前 auto 后台在跑则在此停掉；
+        - 可重复调用（on_load / 热重载 / 停用后重启共用；不会重复建任务、不会重建实例）；
+        - 任何异常只记日志，绝不拖挂插件。
+        """
+        try:
+            cfg = self._current_config()
+            if cfg.mode == "off":
+                self.store.use_builtin_only("mode_off")
+                await self.stop()
+                logger.info("event_catalog: mode=off（不读生成库、不启动后台）")
+                return
+            self.reload()
+            if cfg.auto_enabled and self._auto_gate is None and not self._allow_ungated_auto:
+                logger.warning("event_catalog: mode=auto 但未提供 auto_gate，自动生成将保持跳过"
+                               "（fail-closed；接线时需注入清醒/睡眠/硬约定闸）")
+            if cfg.auto_enabled and self._task is None:
+                self._stopping = False
+                self._task = asyncio.create_task(self._auto_loop())
+                logger.info("event_catalog: 自动事件库检查已启动（每 %ss 检查一次）",
+                            cfg.auto_check_seconds)
+        except Exception as exc:
+            logger.warning("event_catalog: start 失败（服务保持只读）：%s", exc)
+            self._task = None
+
+    async def sync_config(self) -> None:
+        """配置热更新后的模式切换口（幂等；不新建实例、不重置账本）。
+
+        ``auto→其它``/``off``：停后台；``→manual/auto``：按需读库；``auto`` 且任务
+        已在跑 → 什么都不做（避免重复后台/绕预算）。生成记账（``event_catalog_state.json``）
+        与实例始终复用同一份，故关闭再打开不会重置当日预算/「每日一次」记录。
+        """
+        await self.start()
+
+    async def stop(self) -> None:
+        """停止后台检查；可重复调用。"""
+        self._stopping = True
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("event_catalog: 自动任务退出异常（忽略）", exc_info=True)
+
+    async def _auto_loop(self) -> None:
+        while not self._stopping:
+            try:
+                await self.auto_check()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("event_catalog: 自动检查异常（继续下一轮）", exc_info=True)
+            seconds = max(30, self._current_config().auto_check_seconds)
+            try:
+                await asyncio.sleep(seconds)
+            except asyncio.CancelledError:
+                raise
+
+    def __del__(self) -> None:  # pragma: no cover - 只做兜底，不阻塞
+        try:
+            task = getattr(self, "_task", None)
+            if task is not None and not task.done():
+                task.cancel()
+        except Exception:
+            pass
+
+
+def _tzinfo(value: Any) -> Optional[timezone]:
+    if value is None or isinstance(value, timezone):
+        return value
+    name = str(value or "").strip()
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)  # type: ignore[return-value]
+    except Exception:
+        return None
+
+
+def _normalize_event(raw: Any) -> Any:
+    """只做字符串去空白（不把非法类型转成合法）；校验仍按原类型判定。"""
+    if not isinstance(raw, dict):
+        return raw
+    event = dict(raw)
+    for key in ("event_id", "name", "goal_type"):
+        if key in event and isinstance(event[key], str):
+            event[key] = event[key].strip()
+    templates = event.get("templates")
+    if isinstance(templates, list):
+        event["templates"] = [item.strip() if isinstance(item, str) else item
+                              for item in templates]
+    event.setdefault("enabled", True)
+    return event
+
+
+__all__ = [
+    "BUILTIN_EVENTS", "CatalogSnapshot", "EventCatalogService", "EventCatalogStore",
+    "EventCatalogValidator", "RefreshResult", "ValidationError", "ValidationResult",
+    "build_json_schema", "builtin_events", "compute_catalog_version", "estimate_tokens",
+    "resolve_state_deltas", "state_affinity",
+]
+

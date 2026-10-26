@@ -2454,12 +2454,13 @@ class CompanionComponentsMixin:
         或 ``[schedule].spine_mode``；两开关全关 → 「rolling 未启用」提示。
         """
         usage = (
-            "用法: /lbm_life rolling <status|state|episodes|spine|preview>"
+            "用法: /lbm_life rolling <status|state|episodes|spine|sleep|preview>"
             "（管理员；纯只读，零 LLM 零发送零副作用）\n"
             "  status   — 总览（两开关/当前 episode/next 2 条/状态行/今日 episode 计数）\n"
             "  state    — LifeState 全字段数值 + 最近阈值跨越\n"
             "  episodes — 今日 episode 逐条（状态/进度/计划 vs 实际/来源/原因）\n"
             "  spine    — 今日 spine 意图与硬约定及参数\n"
+            "  sleep    — 睡眠引擎/本夜睡眠会话只读状态（不 tick、不掷点、不落盘）\n"
             "  preview  — 下一 tick 候选 top3 与分数（planner 只读预演，不落库）"
         )
         arg_parts = (args or "").split(maxsplit=1)
@@ -2483,6 +2484,13 @@ class CompanionComponentsMixin:
             db = getattr(self, "_db", None)
             if db is None and model is not None:
                 db = getattr(model, "_db", None)
+            # 睡眠引擎（PR6 只读展示用；PR3-review 装配在 plugin._sleep_engine，
+            # 也兼容 PlanningServices.sleep_engine 与 planner._sleep_engine 三处句柄）
+            engine = getattr(planning, "sleep_engine", None)
+            if engine is None:
+                engine = getattr(self, "_sleep_engine", None)
+            if engine is None and planner is not None:
+                engine = getattr(planner, "_sleep_engine", None)
 
             def _cfg_on(section: str, key: str) -> bool:
                 try:
@@ -2590,6 +2598,13 @@ class CompanionComponentsMixin:
                         f"｜放弃 {summary.get('abandoned_count', 0)}")
                 else:
                     out.append("今日 episode：计数不可用（读模型未接线）")
+                info = _sleep_fields()
+                if info:
+                    asleep = info.get("asleep")
+                    out.append("睡眠：" + ("引擎未表态" if asleep is None
+                                          else ("睡眠中" if asleep else "已醒"))
+                               + f"｜连续 {info.get('continuous_minutes', 0)} 分钟"
+                               + f"｜打断 {info.get('interruption_count', 0)} 次")
                 return "\n".join(out)
 
             # ── state：LifeState 全字段 + 最近阈值跨越 ─────────────────────
@@ -2745,11 +2760,54 @@ class CompanionComponentsMixin:
                         + (f"｜resume_of {e.get('resume_of')}" if e.get("resume_of") else ""))
                 return "\n".join(out)
 
+            # ── sleep：睡眠引擎只读状态（PR6；不 tick/不掷点/不写状态）─────────
+            def _sleep_fields() -> dict:
+                """引擎诊断（只读；异常 → 空 dict）。"""
+                if engine is None:
+                    return {}
+                try:
+                    return dict(engine.diagnostics() or {})
+                except Exception:
+                    return {}
+
+            def _lines_sleep() -> str:
+                out = [f"[rolling sleep] {date} {now.strftime('%H:%M')}"]
+                if engine is None:
+                    out.append("睡眠引擎未装配（[life_state].sleep_engine_enabled=false "
+                               "或未接线）。")
+                else:
+                    info = _sleep_fields()
+                    out.append(f"引擎：enabled={info.get('enabled')}"
+                               + (f"｜{info.get('warning')}" if info.get("warning") else ""))
+                    asleep = info.get("asleep")
+                    if asleep is None:
+                        out.append("本夜状态：引擎不表态（未入睡/已过上限/未启用）")
+                    else:
+                        out.append("本夜状态：" + ("睡眠中" if asleep else "已醒"))
+                    out.append(f"会话：{info.get('session_id') or '无'}"
+                               f"｜连续 {info.get('continuous_minutes', 0)} 分钟"
+                               f"｜打断 {info.get('interruption_count', 0)} 次")
+                    wake_reason = str(info.get("wake_reason") or "").strip()
+                    out.append(f"醒因：{wake_reason or '（无）'}"
+                               f"｜最早醒沿 {info.get('wake_at') or '（无）'}"
+                               f"｜赖床上限 {info.get('lie_in_cap') or '（无）'}")
+                if life is not None:
+                    try:
+                        snap = dict(life.sleep_status() or {})
+                    except Exception:
+                        snap = {}
+                    if snap:
+                        out.append("LifeState 睡眠字段："
+                                   + "｜".join(f"{k}={v}" for k, v in snap.items()))
+                out.append("（纯只读：不调用 tick/force_wake，不推进睡眠时钟，不写状态文件）")
+                return "\n".join(out)
+
             renderers = {
                 "status": _lines_status,
                 "state": _lines_state,
                 "episodes": _lines_episodes,
                 "spine": _lines_spine,
+                "sleep": _lines_sleep,
                 "preview": _lines_preview,
             }
             renderer = renderers.get(sub)

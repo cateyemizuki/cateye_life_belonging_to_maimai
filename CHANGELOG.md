@@ -2,6 +2,37 @@
 
 本文件记录「属于麦麦的生活」（lbm）**面向使用者**的版本变更：新增能力、口径变化、缺陷修复与已知问题。
 
+## [2.2.0] - 2026-10-27（开发版，未发布）
+
+> 日程系统二期（PR1~PR7）离线验收完成条目。**2.2.0 为开发版，未发布**；真机灰度、观察期与 PR8 破坏性清理仍延期。
+> 最终离线证据：三件套 exit 0 + 29 个二期专项共 **263 用例** exit 0（含真实双向 2016 拍、旧 7 日、VAD 48、事件独立 9）；配置 13 段/258 字段/5 隐藏/253 可见；组件 32 = 9 命令 + 10 Hook + 9 Tool + 4 API；manifest 能力 17。
+
+### 新增：日程系统二期能力（全部默认关，唯一例外见下）
+
+- **双向闭环（默认关）**：`[life_state].emotion_modulation_enabled` —— 情绪按平滑读数轻微调制精力/饥饿/专注/压力/社交电量的变化速率（gain 夹 0.70~1.30）；活动完成/打断反向产生有界 VAD 增量（睡眠目标双向跳过）。每日 VAD 回写预算 `life_feedback_budget.json` **按最终实际入账增量**检查记账、保留逐轴净累计。
+- **睡眠引擎（默认关，须与生活状态同开）**：`[life_state].sleep_engine_enabled` —— 精力阈值（0.75）/最晚起床（复用 `lie_in_max_until`，默认 12:00）/硬约定（至少提前 30 分钟，**固定时间 hard 不因晚起顺延、迟到如实**）/过睡递减；**正式起床结束会话、completed、不进恢复池**；夜扰 <5 分钟只统计、**≥5 分钟才重置连续段**；热关闭以关闭真实时刻结束会话。**只开睡眠开关只提示依赖，不自动开生活状态。**
+- **事件库（默认 off）**：`[event_catalog]` —— `mode=off/manual/auto`；生成上限 `max_generated_events=8`、总池 `max_pool_events=12`，旧键 `max_events` 仅作兼容读法；独立任务 `schedule_events`（缺失回退 `utils`）；`daily_token_budget=9000` 保守预占 + 实际用量结算；原子写 + `.bak` 3 份；损坏回退内置池且不覆盖用户文件。
+- **统一初始化**：`/lbm_init`（全量）/ `emotion` / `events` / `status` 四用法；shared 已注册四态（入口先 `plugin.enabled` 再管理员）、阶段独立、汇总 `life_init.json`；旧 `/lbm_emotion_init` 已真正委托 `run_emotion(force=True)` 并给迁移提示（PR8 删）。
+- **目标频率恒 1（默认开，唯一例外）**：`[planning_proactive].target_frequency_always_one=true` —— 只对解析成功的目标陪伴私聊固定 1.0，其他流仍按日程属性；启动/配置热重载/目标切换自动校准，失败不写缓存。
+- **工具 v2**：`lbm_update_schedule` 为规范名，旧名 `lbm_update_schedule_v4` 独立注册别名（同一业务，PR8 删）；`lbm_get_schedule_info` 新增 `next/episodes/spine/intents` 只读视图并保留旧视图；全部零写零模型。
+- **睡眠/滚动只读诊断**：`/lbm_life rolling` 增加 `sleep` 子视图（六子命令）；纯读不改变调度/掷点/预算。
+
+### 配置 / 数据 / 映射
+
+- 新增 `[life_state]` 睡眠 7 键（`sleep_engine_enabled`、`wake_energy_threshold`、`sleep_oversleep_start_hours`、`sleep_interrupt_min_minutes`、`sleep_wake_check_seconds`、`sleep_hard_commitment_lead_minutes`、`sleep_oversleep_penalize_focus`）与 `[event_catalog]` 段；`target_frequency_always_one` 默认 true。
+- `[event_catalog].max_events` 与 `temperature` **隐藏**：前者仅兼容读法（规范字段优先），后者协议固定 0.9、改配置不生效，均为“保留读取、不提供可编辑旋钮”。
+- 调制表路径**固定** `mappings/emotion_life_modulation.json`，**不新增** `emotion_modulation_profile` 路径键。
+- `schedule.db` 升 v6（新增 `sleep_sessions`，只增不改）；用户文件 `mappings/generated_events.json`；数据文件 `life_init.json`、`life_feedback_budget.json`；`life_state.json` 损坏/未知版本先备份再内存重建，未知版本拒绝覆盖，**备份失败不得覆盖原坏文件**。
+- 升级当天旧 raw 口径 VAD 账本无法可靠换算 actual → **当日 hold（暂停新增生活反馈，旧账保留）**，次日自动进入 actual 新口径；不会重置额度或伪造 actual。
+
+### 兼容 / 回滚 / 边界
+
+- 新功能全部可单开关回滚；关闭后与 2.1.0 行为逐字一致；旧表、旧路径、旧别名保留到 PR8。
+- **shared 接线（2026-10-27）**：事件库聚合/生命周期、旧 `max_events` 迁移、频率单飞校准、`/lbm_plan list` runtime 行、`cycle_start` 实际醒来、硬约定删除/改期撤销、`life_state` 备份/未知版本保护均已落码；A-21 属性统一、D13 有界事件、饥饿护栏、真实 wake-cycle 与晨间 hard 不平移均由 PR7 完成。**离线验收：三件套 + 29 专项共 263 用例 exit 0**；映射表 7 张出厂种子在 `mappings/default_mappings/`。
+- **不承诺**跨进程/崩溃时两文件事务一致，也不承诺超出宿主 SDK 契约的硬 token 计费上限；事件预算只是请求前保守预占 + 实际结算。
+- 真机文件监视热重载、WAL 多进程、宿主事件循环边界唤醒、真实 QQ/模型与真实 usage 计费仍待真机验证（离线闭环已完成）；真机灰度、观察期与 PR8 破坏性清理不在本版。
+
+
 ## [2.0.0] - 2026-10-12
 
 第四轮（遗留清单收口）、19 项历史待裁决落地、5 项新需求与 OOM 热修——逐项变更见下方 [1.1.0] 段内

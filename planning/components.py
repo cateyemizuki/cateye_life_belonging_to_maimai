@@ -25,47 +25,75 @@ from planning.tools_service import NAP_TOOL_NAME, DEFAULT_LIE_IN_MAX_UNTIL
 
 
 class PlanningComponentsMixin:
-    """日程规划组件（3 Tool + 1 Command + 1 API + 2 HookHandler）。"""
+    """日程规划组件（4 Tool（含 1 个旧名别名）+ 1 Command + 1 API + 2 HookHandler）。"""
 
     # 供 SDK / 调试用的组件清单说明（不影响注册）
     planning_components_info: ClassVar[Dict[str, str]] = {
-        "lbm_get_schedule_info": "Tool：日程/活动/目标的只读查询（view=status/current/lover_day/goals）",
-        "lbm_update_schedule_v4": "Tool：自然语言日程变更（唯一日程写入口，角色裁判 today/future/reject）",
-        NAP_TOOL_NAME: "Tool：赖床（把今日 sleep 条目结束时间推到目标时刻；hidden，仅夜间被吵醒且收到提醒时可用）",
+        "lbm_get_schedule_info": "Tool：日程/活动/目标/运行时的只读查询"
+                                 "（view=status/current/next/episodes/spine/intents，"
+                                 "旧 lover_day/goals 保留一版）",
+        "lbm_update_schedule": "Tool（规范名）：自然语言日程变更（唯一日程写入口；"
+                               "角色裁判 today/future/reject；新层开时写 spine 意图/"
+                               "pending_commitment，硬约定代码强制 hardness=hard）",
+        "lbm_update_schedule_v4": "Tool（旧名别名，PR8 删）：与 lbm_update_schedule "
+                                  "走同一受控业务",
+        NAP_TOOL_NAME: "Tool：赖床（把今日 sleep 条目结束时间推到目标时刻；hidden，仅夜间被吵醒"
+                       "且收到提醒时可用；睡眠引擎开启时自动管理提示）",
         "lbm_planning_v4": "Command：/lbm_plan 或 /lbm_规划（list/regenerate/delete/clear/help）",
+        "lbm_init": "Command：/lbm_init [emotion|events|status]（全量幂等/定向强制/只读；先插件开关再管理员）",
         "get_current_activity": "API：当前活动快照（跨插件可调）",
         "schedule_inject_v4": "HookHandler：maisaka.planner.before_request 日程注入",
         "schedule_inject_replyer_v4": "HookHandler：maisaka.replyer.before_request 活动提醒注入",
     }
 
     # ============================================================
-    # Tools（3 个 LLM 工具）
+    # Tools（3 个 LLM 工具 + 1 个旧名别名）
     # ============================================================
 
     @Tool(
         "lbm_get_schedule_info",
-        description="查询日程/活动/目标的只读信息（四视图）",
+        description="查询日程/活动/目标的只读信息（多视图）",
         parameters={
-            "view": {"type": "string", "description": "status=今日日程状态总览（默认）| current=当前活动 | lover_day=今日完整日程 | goals=活动目标列表", "required": False},
+            "view": {"type": "string", "description": "status=今日状态总览（默认）| current=当前活动 | "
+                                                     "next=接下来两条 | episodes=今日实际 episode | "
+                                                     "spine=今日意图与硬约定 | intents=spine 别名 | "
+                                                     "lover_day=今日完整日程（旧）| goals=活动目标（旧）",
+                     "required": False},
         },
     )
     async def plan_tool_schedule_info(self, **kwargs: Any) -> Dict[str, Any]:
-        """日程/活动/目标只读查询工具入口（四视图，view 缺省/非法回落 status）。"""
+        """日程/活动/目标只读查询工具入口（view 缺省/非法回落 status）。"""
         svc = getattr(self, "_planning", None)
         if svc is None:
             return {"type": "error", "content": "插件未启用"}
         return await svc.tools.get_schedule_info(**kwargs)
 
     @Tool(
-        "lbm_update_schedule_v4",
-        description="根据自然语言请求维护日程：角色裁判决定接受/未来约定/拒绝；接受时调整今日日程，"
-                    "未来约定写入候选清单。唯一日程写入口。",
+        "lbm_update_schedule",
+        description="根据自然语言请求维护日程：角色裁判决定接受/未来约定/拒绝；接受时更新今日意图，"
+                    "未来约定写入约定清单。唯一日程写入口。",
         parameters={
             "description": {"type": "string", "description": "日程变更的自然语言描述（如\"下午两点一起学习\"、\"周末打游戏\"）", "required": True},
+            "intent": {"type": "object", "description": "可选：今日意图的归一字段（name/goal_type/priority/hardness/window 等）；缺省时按 description 判定", "required": False},
+            "commitment": {"type": "object", "description": "可选：未来约定的归一字段（date/time/title/hardness）；缺省时按 description 判定", "required": False},
         },
     )
     async def plan_tool_update_schedule(self, **kwargs: Any) -> Dict[str, Any]:
-        """角色裁判式日程更新工具入口。"""
+        """角色裁判式日程更新工具入口（规范名）。"""
+        svc = getattr(self, "_planning", None)
+        if svc is None:
+            return {"type": "error", "content": "插件未启用"}
+        return await svc.tools.update_schedule(**kwargs)
+
+    @Tool(
+        "lbm_update_schedule_v4",
+        description="【旧名别名，PR8 删除】与 lbm_update_schedule 等价的自然语言日程维护入口",
+        parameters={
+            "description": {"type": "string", "description": "日程变更的自然语言描述", "required": True},
+        },
+    )
+    async def plan_tool_update_schedule_v4(self, **kwargs: Any) -> Dict[str, Any]:
+        """旧名 ``lbm_update_schedule_v4`` 独立注册的别名入口（同一受控业务，勿加第二套逻辑）。"""
         svc = getattr(self, "_planning", None)
         if svc is None:
             return {"type": "error", "content": "插件未启用"}
@@ -138,6 +166,107 @@ class PlanningComponentsMixin:
             matched_groups=matched_groups if isinstance(matched_groups, dict) else {},
             is_local_operator=bool(is_local_operator),
         )
+
+    @Command(
+        "lbm_init",
+        description="统一初始化：全量 / 情绪 / 事件库 / 只读状态",
+        # 只注册一次（全量/emotion/events/status 四态）；负向前瞻不用 ^ 锚点（回复引用场景）
+        pattern=r"(?P<init_cmd>(?<!\S)/lbm_init(?:\s+(?P<init_args>emotion|events|status))?\s*)$",
+    )
+    async def plan_command_init(
+        self,
+        text: str = "",
+        stream_id: str = "",
+        user_id: str = "",
+        platform: str = "",
+        group_id: str = "",
+        matched_groups: Any = None,
+        is_local_operator: bool = False,
+        **kwargs: Any,
+    ) -> tuple:
+        """``/lbm_init [emotion|events|status]``（PR5 公共入口，2026-10-27 接线）。
+
+        顺序（工单要求）：先 ``[plugin].enabled``，再管理员（``admin_users`` /
+        本机控制台）。四态：缺省=全量（幂等）；``emotion``=强制情绪阶段（保持旧
+        ``/lbm_emotion_init`` 强制语义）；``events``=强制刷新事件库；``status``=只读。
+        人工调用才发 QQ，自动阶段（``manual=False``）只在服务内写汇总，本入口不参与。
+        """
+        del kwargs, platform, group_id
+        groups = matched_groups if isinstance(matched_groups, dict) else {}
+        raw = str(groups.get("init_cmd") or text or "").strip()
+        arg = str(groups.get("init_args") or "").strip().lower()
+        if not arg and raw:
+            parts = raw.split()
+            if len(parts) > 1:
+                arg = parts[1].strip().lower()
+        if arg not in ("emotion", "events", "status"):
+            arg = ""
+
+        async def _reply(message: str) -> None:
+            if stream_id:
+                try:
+                    await self.ctx.send.text(message, stream_id)
+                except Exception:
+                    pass
+
+        enabled = True
+        try:
+            enabled = bool(self.config.plugin.enabled)
+        except Exception:
+            enabled = True
+        if not enabled:
+            await _reply("插件未启用（配置 [plugin] enabled = false），初始化不可用")
+            return True, "插件未启用", True
+        if not self._init_is_admin(user_id, is_local_operator, self._init_admin_users()):
+            await _reply("你不是管理员哦~只有管理员才能执行初始化（本机控制台不受限）")
+            return True, "没有权限", True
+
+        svc = getattr(self, "_planning", None)
+        init_svc = getattr(svc, "init", None) if svc is not None else None
+        if init_svc is None:
+            await _reply("初始化服务未装配（插件未完成加载）")
+            return True, "初始化服务未装配", True
+        try:
+            if arg == "status":
+                status = init_svc.status()
+                await _reply(getattr(status, "status_text", "") or "暂无初始化状态")
+                return True, "初始化状态", True
+            if arg == "emotion":
+                result = await init_svc.run_emotion(manual=True, force=True)
+            elif arg == "events":
+                result = await init_svc.run_events(manual=True, force=True)
+            else:
+                result = await init_svc.run_full(manual=True)
+            lines = list(getattr(result, "summary_lines", ()) or ())
+            if not lines:
+                lines = [f"初始化结果：{getattr(result, 'status', 'unknown')}"]
+            await _reply("\n".join(str(x) for x in lines))
+            return True, "初始化完成", True
+        except Exception as exc:
+            await _reply(f"初始化失败：{exc}")
+            return True, "初始化失败", True
+
+    def _init_admin_users(self) -> Any:
+        """``[admin].admin_users``（读不到 → 空列表 = 仅本机控制台可执行）。"""
+        try:
+            return list(getattr(getattr(self.config, "admin", None), "admin_users", None) or [])
+        except Exception:
+            return []
+
+    @staticmethod
+    def _init_is_admin(user_id: str, is_local_operator: bool = False,
+                       admin_users: Any = None) -> bool:
+        """``/lbm_init`` 权限：本机控制台直通；否则精确匹配 ``admin_users``（末段 ID）。"""
+        if is_local_operator:
+            return True
+
+        def _id_part(raw: Any) -> str:
+            return str(raw or "").strip().rsplit(":", 1)[-1]
+
+        candidate = _id_part(user_id)
+        if not candidate:
+            return False
+        return any(_id_part(entry) == candidate for entry in (admin_users or ()))
 
     # ============================================================
     # API（对外暴露，可被其他插件通过 ctx.api.call 调用）

@@ -244,6 +244,24 @@ class GoalManager:
         """绑定事件总线（M0 装配点；允许 None=不发事件，兼容独立测试）。"""
         self._bus = bus
 
+    # ---- 变更通知（睡眠 loop 内部重检口；PR3 复核 2026-10-27）----
+    def set_change_listener(self, listener: Optional[Any]) -> None:
+        """挂/卸约定/日程写入监听（``listener(reason)``；None = 断开）。
+
+        只用于唤醒生活状态 loop 重算硬约定（睡眠中新增临近约定要即时醒，不固定等
+        下一个 tick）；不推进状态、不发消息、不调模型。
+        """
+        self._change_listener = listener
+
+    def _notify_change(self, reason: str) -> None:
+        listener = getattr(self, "_change_listener", None)
+        if listener is None:
+            return
+        try:
+            listener(reason)
+        except Exception:
+            logger.debug("GoalManager 变更通知失败（忽略）：%s", reason, exc_info=True)
+
     def _publish_soon(self, event: str, **payload: Any) -> None:
         """同步上下文发布事件（本方法非 async，publish_soon 内部 create_task）。"""
         bus = self._bus
@@ -365,7 +383,7 @@ class GoalManager:
             "reason": reason,
             "source": "user_request",
         }
-        return self.create_goal(
+        goal = self.create_goal(
             name=title,
             description=notes or title,
             goal_type="pending_commitment",
@@ -374,6 +392,9 @@ class GoalManager:
             priority="medium",
             parameters=parameters,
         )
+        # 睡眠中新增临近约定要即时重算（只唤醒睡眠 loop，不推进状态/不调模型）
+        self._notify_change("commitment_added")
+        return goal
 
     def get_pending_commitments(self, commitment_date: Optional[str] = None) -> List[Goal]:
         """查询未来约定（仅 status=active；commitment_date 留空 = 今天）。"""
@@ -536,13 +557,18 @@ class GoalManager:
         return self.update_goal_status(goal_id, GoalStatus.CANCELLED)
 
     def delete_goal(self, goal_id: str) -> bool:
-        """删除目标：goals 表未命中时回退删除日程条目（合成 Goal 场景）。"""
+        """删除目标：goals 表未命中时回退删除日程条目（合成 Goal 场景）。
+
+        2026-10-27 用户批准：删除约定要**立即撤销**原提前唤醒 → 删除成功后通知
+        内部重检口（``request_life_recheck`` 链），由睡眠引擎按当前有效约定重算。
+        """
         if self.db.get_goal(goal_id) is not None:
             deleted = self.db.delete_goal(goal_id)
         else:
             deleted = self.db.delete_schedule_item(goal_id)
         if deleted:
             logger.debug("已删除目标: %s", goal_id)
+            self._notify_change("commitment_removed")
         return deleted
 
     def _schedule_item_ids(self) -> set:
@@ -560,7 +586,10 @@ class GoalManager:
         """对合成 Goal 的字段更新落到 schedule_items（目前支持 status=completed/cancelled → 删除）。"""
         status = kwargs.get("status")
         if status in (GoalStatus.COMPLETED.value, GoalStatus.CANCELLED.value):
-            return self.db.delete_schedule_item(item_id)
+            changed = self.db.delete_schedule_item(item_id)
+            if changed:
+                self._notify_change("schedule_item_removed")
+            return changed
         # 其余字段（priority / time_window 等）日程条目暂不支持原位更新
         logger.debug("日程条目 %s 不支持字段更新: %s", item_id, list(kwargs))
         return False

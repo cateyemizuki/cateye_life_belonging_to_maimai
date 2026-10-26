@@ -87,7 +87,10 @@ class ScheduleImageGenerator:
         "rest": (163, 183, 206),
         "free_time": (109, 143, 176),
         "sleep": (90, 105, 130),
+        "work": (86, 110, 138),
         "custom": (110, 127, 149),
+        # 旧枚举外键：保留旧数据取色兼容（A-21(e) 不做破坏性清理）
+        "health_check": (22, 191, 194),
     }
     DEFAULT_TYPE_COLOR = (110, 127, 149)
 

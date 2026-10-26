@@ -439,6 +439,15 @@ class QzoneService:
         LLM 严判把关；夜间睡觉条目天然落在静默窗内，白天午睡由午休静默/LLM 闸承接。
         """
         cfg = self._qzone_cfg()
+        # 闸 0a：睡眠引擎判定仍在睡（晚醒真实状态）→ 不发；日程端点在醒来时写回真实醒点，
+        # 晚醒区间内窗口还写着旧 07:00 锚点，只看窗口会提前发帖（PR3 复核 2026-10-27）。
+        try:
+            from companion.patrol import sleep_engine_asleep
+            if sleep_engine_asleep(self._plugin, now):
+                self._record_decision("skip", gate="silence", reason="睡眠引擎判定仍在睡")
+                return False
+        except Exception:
+            pass
         # 闸 0：静默时段（2026-10-20 起恒复用 [schedule] 作息，与陪伴静默同一真源；
         # _tick 外层已有同口径早退，此处保证链自足可单测）
         silence_start, silence_end = _sleep_silence_window(self._plugin)

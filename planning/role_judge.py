@@ -1,6 +1,7 @@
 """角色裁判（来源：自主规划插件 planner/role_judge.py，移植版）。
 
-供 ``tools_service.update_schedule_v4`` 使用：把当前日程 + 人设 + 用户描述
+供 ``tools_service.update_schedule`` 使用（规范工具名 ``lbm_update_schedule``；旧名
+``lbm_update_schedule_v4`` 仍注册一版，走同一实现）：把当前日程 + 人设 + 用户描述
 扔给 LLM，让它返回 ``{"decision": "today/future/reject", ...}``，调用方
 据此决定是重生成当日日程、记录未来约定，还是拒绝不变。
 LLM 调用走统一出口 ``core.llm_utils.LLMService``（2026-10-10 收编；task_name 路由）。

@@ -40,12 +40,13 @@ from __future__ import annotations
 import logging
 import math
 import random
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.time_utils import minutes_of_now
 
 from . import activity_profiles
+from .sleep_engine import resolve_hard_commitment_start
 from .time_utils import (DAY_MINUTES, TimezoneManager, is_in_sleep_ring,
                          normalize_day_minutes, ring_minutes_ahead)
 
@@ -100,6 +101,10 @@ HARD_COMMITMENT_GRACE_MINUTES = 10
 #: 状态阈值滞回（§5.7：进入 0.30 / 退出 0.40；hunger/stress 同形各错开 0.10）
 HYSTERESIS_ENTER: Dict[str, float] = {"energy": 0.30, "hunger": 0.70, "stress": 0.80}
 HYSTERESIS_EXIT: Dict[str, float] = {"energy": 0.40, "hunger": 0.60, "stress": 0.70}
+#: D2①（定稿 §4.1.3；用户 2026-10-27 批）：极饿时吃饭候选强制最高优先级。
+#: 仅在新调制 ``[life_state].emotion_modulation_enabled=true`` 时适用；不改进食窗口
+#: 常规打分公式，也不覆盖睡眠环/硬约定最高层。
+HIGH_HUNGER_MEAL_GUARD = 0.85
 #: 常规三餐参考窗（分钟；锚点候选仅在窗内或饥饿跨阈值时出现——保守固定值，
 #: 后续可由 spine 锚点行覆盖，登记于模块 notes）
 MEAL_WINDOWS: Tuple[Tuple[int, int], ...] = (
@@ -246,9 +251,9 @@ def adjust_spine_for_morning(items: Any, sleep_hours: Any, wake_delay_minutes: A
       short 档负责，本函数不动状态；
     - 睡眠 5~7h：max_minutes ×0.85；
     - 睡眠 ≥7h / 时长非法：不动时长；
-    - 起床比锚点晚 >60 分钟：上午（start < 12:00）**硬约定**整体顺延 wake_delay 分钟
-      （start/end 同移、时长不变；软意图窗口不重写——「不重写全部意图」原文）；
-    - 硬约定永远保留（只顺延时间，绝不删除/取消）。
+    - **固定时间 hard 约定永不平移**（用户 2026-10-27 最终裁定：晚起不挪约定，迟到如实、
+      错过则 abandoned；只调整软意图；睡眠锚点按真实会话处理）；
+    - 硬约定永远保留（不删除/不取消，时间原样）。
 
     非 spine 行原样透传；``now`` 仅留签名兼容（当前规则不依赖钟点）。
     """
@@ -278,17 +283,6 @@ def adjust_spine_for_morning(items: Any, sleep_hours: Any, wake_delay_minutes: A
                 value = _as_number(new_params.get("max_minutes"), None)
                 if value is not None and value > 0:
                     new_params["max_minutes"] = max(5, int(round(value * MID_SLEEP_CUT)))
-        if hardness == "hard" and delay > 60.0:
-            try:
-                start = int(it.get("start_minute") or 0)
-                end = int(it.get("end_minute") or 0)
-            except (TypeError, ValueError):
-                start, end = 0, 0
-            # 仅上午硬边界顺延（跨午夜 end>1440 的「次日凌晨」段不在此列）
-            if 0 <= start < MORNING_BOUNDARY_MAX_MINUTE and end > start:
-                shift = int(round(delay))
-                it["start_minute"] = start + shift
-                it["end_minute"] = end + shift
         it["parameters"] = new_params
         out.append(it)
     return out
@@ -310,12 +304,27 @@ class RollingPlanner:
     def __init__(self, db: Any, life_state: Any, *, config_provider: Any = None,
                  event_bus: Any = None, timezone_str: str = "Asia/Shanghai",
                  timezone_manager: Optional[TimezoneManager] = None,
-                 decision_logger: Any = None) -> None:
+                 decision_logger: Any = None,
+                 sleep_engine: Any = None,
+                 schedule_writer: Optional[Callable[..., Any]] = None,
+                 event_catalog: Any = None,
+                 wake_recorder: Optional[Callable[..., Any]] = None) -> None:
         self._db = db
         self._life = life_state
         self._config_provider = config_provider
         self._bus = event_bus
         self._decision_logger = decision_logger
+        # PR3（2026-10-26）：睡眠引擎（可后注入；未启用 → 全部新分支旁路）
+        self._sleep_engine = sleep_engine
+        # PR4（2026-10-27 共享接线）：事件库服务（唯一实例由 PlanningServices 持有）。
+        # None = 未装配/装配失败 → 随机事件逐字回退旧 RANDOM_EVENT_POOL 路径。
+        self._event_catalog = event_catalog
+        # D9 晨间 spine 调整写回（插件注入 generator.apply_schedule_items 鸭子口；
+        # 缺失 → 只返回调整结果不落库，旧行为零变化）
+        self._schedule_writer = schedule_writer
+        #: 真实醒来记录口（插件注入 plugin._record_actual_wake_cycle；硬约定 force_wake
+        #: 不在 plugin tick 的 commit 分支内，需由 planner 成功后回调，避免漏记周期起点）
+        self._wake_recorder = wake_recorder
         self._tz = timezone_manager or TimezoneManager(timezone_str)
         # 进程内运行态（不落盘；热重载即重置——与 §八.8 热重载口径一致）
         self._rng_date: str = ""
@@ -364,6 +373,188 @@ class RollingPlanner:
     def enabled(self) -> bool:
         """``[life_state].enabled``（配置段未落码时恒 False——默认关纪律）。"""
         return bool(getattr(self._cfg_section(), "enabled", False))
+
+    def _emotion_modulation_enabled(self) -> bool:
+        """``[life_state].emotion_modulation_enabled``（新调制开关；默认 False）。"""
+        return bool(getattr(self._cfg_section(), "emotion_modulation_enabled", False))
+
+    # ── 睡眠引擎接线（PR3，2026-10-26）─────────────────────────────────
+    def set_sleep_engine(self, engine: Any) -> None:
+        """后注入睡眠引擎（plugin 先建 planner 再建 engine 时用；幂等）。"""
+        self._sleep_engine = engine
+
+    def _engine_enabled(self) -> bool:
+        engine = self._sleep_engine
+        if engine is None:
+            return False
+        enabled = getattr(engine, "enabled", None)
+        try:
+            return bool(enabled() if callable(enabled) else enabled)
+        except Exception:
+            return False
+
+    def _engine_owns_sleep(self, episode: Any) -> bool:
+        """睡眠 episode 的 planned_end 自动关闭是否交给引擎（引擎启用且是 sleep）。"""
+        if not self._engine_enabled():
+            return False
+        return str((episode or {}).get("goal_type") or "") == SLEEP_GOAL_TYPE
+
+    def _engine_allows_sleep_start(self, now: datetime) -> bool:
+        """引擎闸：本夜已睡/已醒（含硬约定早醒）→ 不再开新 sleep episode。"""
+        engine = self._sleep_engine
+        gate = getattr(engine, "should_start_sleep_episode", None)
+        if not callable(gate):
+            return True
+        try:
+            outcome = gate(now)
+        except Exception:
+            return True
+        return outcome is not False
+
+    def sleep_hard_commitment_start(self, now: Optional[datetime] = None
+                                    ) -> Optional[datetime]:
+        """睡眠引擎的硬约定开始时刻（**真实公共链路**：今日帧 + 次日帧，含已进窗）。
+
+        引擎 ``prepare_tick`` 需要绝对 ``hard_commitment_start`` 才能做「约定 − lead」正式
+        起床判定；此前 plugin 未接线 → 生产路径硬约定永不触发（只有单测手动喂）。
+        ``include_active=True``：已进入约定窗口（睡着跨过约定开始）也算 → 立即正式起床，
+        不虚构准时。纯读 DB（0 LLM），无硬约定 → None。
+        """
+        current = self._now(now)
+        frame = self._date_of(current)
+        dates = [frame]
+        try:
+            dates.append((datetime.strptime(frame, "%Y-%m-%d") + timedelta(days=1))
+                         .strftime("%Y-%m-%d"))
+        except (TypeError, ValueError):
+            pass
+        best: Optional[datetime] = None
+        for date in dates:
+            resolved = resolve_hard_commitment_start(
+                self._spine_intents_cached(date), date, current, include_active=True)
+            if resolved is not None and (best is None or resolved < best):
+                best = resolved
+        return best
+
+    def _note_actual_wake(self, now: datetime) -> None:
+        """硬约定正式起床后同步周期起点（best-effort；回调缺失 = 旧行为）。"""
+        if self._wake_recorder is None:
+            return
+        try:
+            self._wake_recorder(now)
+        except Exception:
+            logger.debug("真实醒来周期记录失败（忽略）", exc_info=True)
+
+    def _engine_wake_for_commitment(self, now: datetime) -> bool:
+        """硬约定正式起床：交给睡眠引擎完成/关闭会话（不 paused、不恢复同一活动）。"""
+        engine = self._sleep_engine
+        force = getattr(engine, "force_wake", None)
+        if not callable(force):
+            return False
+        try:
+            outcome = force(now, reason="hard_commitment")
+        except Exception:
+            return False
+        return bool(isinstance(outcome, dict) and outcome.get("woke"))
+
+    @staticmethod
+    def _episode_frame_minute(episode: Any, now: datetime) -> int:
+        """episode 所属日程日帧的分钟（跨午夜 >1440，与 schedule_items 同口径）。
+
+        睡 episode 的 ``schedule_date`` 是入睡日；晚醒时刻落到次日，不能直接用
+        ``minutes_of_now``（会写成 08:32 而非 32:32）——「严格记录真实 wake 时间」。
+        """
+        date = str((episode or {}).get("schedule_date") or "")
+        try:
+            midnight = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=now.tzinfo)
+        except (TypeError, ValueError):
+            return minutes_of_now(now)
+        return int((now - midnight).total_seconds() // 60)
+
+    def _lie_in_cap_minute(self) -> int:
+        """``[schedule_advanced].lie_in_max_until`` 分钟（非法回退 12:00）。"""
+        provider = self._config_provider
+        try:
+            cfg = provider() if callable(provider) else provider
+            advanced = getattr(cfg, "schedule_advanced", None)
+            from core.time_utils import parse_hhmm
+            minute = parse_hhmm(str(getattr(advanced, "lie_in_max_until", "") or ""), -1)
+            if minute >= 0:
+                return minute
+        except Exception:
+            pass
+        return 12 * 60
+
+    @staticmethod
+    def _planned_sleep_end(cur: int, wake_min: int, cap_minute: int,
+                           engine_enabled: bool) -> int:
+        """sleep episode 的 planned_end：引擎启用 → lie-in 上限（安全末端），否则醒锚点。"""
+        remain = (normalize_day_minutes(wake_min) - normalize_day_minutes(cur)) % DAY_MINUTES
+        if remain <= 0:
+            remain = DAY_MINUTES
+        wake_abs = cur + remain
+        if not engine_enabled:
+            return wake_abs
+        cap = wake_abs - (wake_abs % DAY_MINUTES) + normalize_day_minutes(cap_minute)
+        while cap <= wake_abs:
+            cap += DAY_MINUTES
+        return cap
+
+    def close_sleep_episode(self, episode_id: str, actual_end_minute: Any,
+                            reason: str = "") -> bool:
+        """引擎醒沿回调：关闭 sleep episode（写 actual_end、发事件、状态回写各一次）。"""
+        try:
+            row = self._db.get_episode(str(episode_id))
+        except Exception:
+            return False
+        if not isinstance(row, dict) or row.get("status") != "active":
+            return False
+        try:
+            end = int(actual_end_minute)
+        except (TypeError, ValueError):
+            end = None
+        snapshot = self._state_brief(self._life.snapshot()
+                                     if callable(getattr(self._life, "snapshot", None))
+                                     else {})
+        self._finish_episode(row, self._now(None), snapshot,
+                             actual_end_minute=end,
+                             reason=f"sleep_engine_{reason}" if reason else "sleep_engine")
+        return True
+
+    def apply_morning_spine_adjustment(self, now: Optional[datetime] = None, *,
+                                       sleep_hours: Any, wake_delay_minutes: Any = 0,
+                                       date: Optional[str] = None) -> List[Dict[str, Any]]:
+        """D9：按实际睡醒时长/延迟裁剪今日 spine 并**写回**（0 LLM；仅一次）。
+
+        读今日日程 → :func:`adjust_spine_for_morning`（纯函数）→ 有变化才经注入的
+        ``schedule_writer(items, date, reason)`` 写回（generator.apply_schedule_items，
+        consume_commitments=False）。未注入 writer/读不到日程 → 只返回调整结果。
+        """
+        current = self._now(now)
+        day = date or self._date_of(current)
+        try:
+            items = [dict(row) for row in (self._db.get_day_schedule(day) or [])
+                     if isinstance(row, dict)]
+        except Exception:
+            return []
+        if not items:
+            return []
+        adjusted = adjust_spine_for_morning(items, sleep_hours, wake_delay_minutes, current)
+        changed = any(a != b for a, b in zip(adjusted, items))
+        if not changed or self._schedule_writer is None:
+            return adjusted
+        try:
+            self._schedule_writer(adjusted, day, "morning_wake_adjust")
+        except TypeError:
+            try:
+                self._schedule_writer(adjusted, day)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        self._log("rolling.morning_adjusted", sleep_hours=_as_number(sleep_hours, 0.0),
+                  wake_delay_minutes=_as_number(wake_delay_minutes, 0.0), date=day)
+        return adjusted
 
     # ── 时间/日期助手（时区真源 = TimezoneManager）────────────────────────
     def _now(self, now: Optional[datetime]) -> datetime:
@@ -517,13 +708,15 @@ class RollingPlanner:
         if current is not None:
             self._refresh_active_episode(current, cur)
 
-        # 步 2：关闭到期 episode
+        # 步 2：关闭到期 episode（引擎启用的 sleep episode 交给 SleepEngine 决定
+        # actual_end——PR3，2026-10-26：不再按 wake 锚点自动关）
         if current is not None:
             try:
                 planned_end = int(current.get("planned_end_minute") or 0)
             except (TypeError, ValueError):
                 planned_end = 0
-            if planned_end and cur >= planned_end:
+            if planned_end and cur >= planned_end \
+                    and not self._engine_owns_sleep(current):
                 self._finish_episode(current, now, snapshot,
                                      actual_end_minute=planned_end, reason="planned_end_reached")
                 report["actions"].append("closed_due_episode")
@@ -577,26 +770,42 @@ class RollingPlanner:
         episode["attention_mode"] = attention
 
     @staticmethod
-    def _random_event_deltas(metadata: Any) -> Optional[Dict[str, float]]:
-        """episode 行 metadata → 随机事件 state_deltas（PR1 P0 修复（2026-10-26），
-        计划书 §三十四/定稿 §2 0.4）。
+    def _random_event_deltas(metadata: Any, event_catalog: Any = None
+                             ) -> Optional[Dict[str, float]]:
+        """episode 行 metadata → 随机事件 state_deltas（PR1 P0 / PR4 共享接线）。
 
-        按 ``metadata.event_key`` 回查 RANDOM_EVENT_POOL（二期后由 EventCatalog.pick
-        供池）取增量；返回 None = 非随机事件行 / 已应用过（``state_deltas_applied``
-        持久标记，一次性保证）/ 池内无此 key——三种情况都不应用、不标记。
-        PR2.5 起（2026-10-26，交接 §五.18 D1）close-active（被 start/resume 挤掉 →
-        interrupted）路径也按本标记补应用一次（见 :meth:`_handle_squeezed_active`），
-        不会双应用。
+        结算顺序（2026-10-27 接线契约）：
+        1. **快照优先**：创建 episode 时写进 ``metadata.state_deltas`` 的五项增量
+           （新库替换后老活动仍按快照结算，绝不因 key 不在当前池就静默丢增量）；
+        2. 旧行兼容：无快照 → 按 ``metadata.event_key`` 回查内置池
+           :data:`RANDOM_EVENT_POOL`（旧 episode 的既有回放口径）；
+        3. 仍找不到 → 再问运行中的事件库（同版本未替换时可解析）。
+
+        返回 None = 非随机事件行 / 已应用过（``state_deltas_applied`` 持久标记，
+        一次性保证）/ 确实无快照也无从回查——三种情况都不应用、不标记。
         """
         if not isinstance(metadata, dict) or metadata.get("state_deltas_applied"):
             return None
-        event_key = str(metadata.get("event_key") or "")
+        snapshot = metadata.get("state_deltas")
+        if isinstance(snapshot, dict) and snapshot:
+            return {str(k): float(v) for k, v in snapshot.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        event_key = str(metadata.get("event_key") or metadata.get("event_id") or "")
         if not event_key:
             return None
         for event in RANDOM_EVENT_POOL:
             if event["key"] == event_key:
                 deltas = event.get("state_deltas")
                 return dict(deltas) if isinstance(deltas, dict) else None
+        lookup = getattr(event_catalog, "get_state_deltas", None) if event_catalog is not None else None
+        if callable(lookup):
+            try:
+                found = lookup(event_key)
+            except Exception:
+                found = None
+            if isinstance(found, dict) and found:
+                return {str(k): float(v) for k, v in found.items()
+                        if isinstance(v, (int, float)) and not isinstance(v, bool)}
         return None
 
     @staticmethod
@@ -655,7 +864,7 @@ class RollingPlanner:
             return  # 已补发布过（幂等保护，防同对 (被挤行, 新行) 重放重复发事件）
         # 随机事件 deltas：按标记补应用一次；补写持久标记
         # （state_deltas_applied=防双应用沿用 PR1 0.4 口径；close_active_handled=本路径幂等）
-        deltas = self._random_event_deltas(meta)
+        deltas = self._random_event_deltas(meta, self._event_catalog)
         try:
             marks: Dict[str, Any] = {"close_active_handled": True}
             if deltas is not None:
@@ -699,7 +908,7 @@ class RollingPlanner:
         # metadata.event_key 取 state_deltas，随关闭一并交 LifeState.apply_episode
         # （事件结束后五项 ± 增量）；应用过即写 metadata.state_deltas_applied 持久
         # 标记，重复关闭路径不会二次应用
-        deltas = self._random_event_deltas(episode.get("metadata"))
+        deltas = self._random_event_deltas(episode.get("metadata"), self._event_catalog)
         extra_meta: Optional[Dict[str, Any]] = {"close_reason": reason} if reason else None
         if deltas is not None:
             extra_meta = dict(extra_meta or {})
@@ -794,11 +1003,32 @@ class RollingPlanner:
             if cur >= ws and cur < we and item_key not in recorded:
                 # 到点：抢占当前 episode（可抢占——硬约定优先级最高）
                 if current is not None:
-                    self._pause_episode(current, now, reason="hard_commitment_preempt")
+                    if self._engine_owns_sleep(current):
+                        # 用户 2026-10-27 裁定：硬约定 = **正式起床**——完成当前睡眠
+                        # 并移出恢复池；actual_end = 真实唤醒时刻，不倒填约定开始/阈值。
+                        if not self._engine_wake_for_commitment(now):
+                            # 引擎已不在睡（会话缺失/已关闭）：睡眠行照样 completed，
+                            # 绝不 paused（paused 会被恢复池重新取出，同一活动不可恢复）
+                            self._finish_episode(
+                                current, now, snapshot,
+                                actual_end_minute=self._episode_frame_minute(current, now),
+                                reason="hard_commitment_preempt")
+                            report["actions"].append("sleep_commitment_finished")
+                        else:
+                            # 2026-10-27 综合验收：硬约定在 planner 内 force_wake，
+                            # 不走 plugin._sleep_commit 的 woke 分支，必须在此同步
+                            # 真实醒来时刻（否则 cycle_start 漏记）。
+                            self._note_actual_wake(now)
+                    else:
+                        self._pause_episode(current, now, reason="hard_commitment_preempt")
                 self._start_commitment(c, date, cur, now, snapshot, report)
                 recorded.add(item_key)
             elif ws - HARD_COMMITMENT_WARN_MINUTES <= cur < ws and current is not None:
                 # 提前 15 分钟预警：当前 episode 会吃掉约定窗 → 提前收尾（§5.7 触发 2）
+                if self._engine_owns_sleep(current):
+                    # 睡眠 episode 的醒来时刻由引擎（约定 − lead）决定；这里用约定开始
+                    # 回填 actual_end 会提前宣告"已醒"并留下假历史 → 交给引擎。
+                    continue
                 try:
                     cur_end = int(current.get("planned_end_minute") or 0)
                 except (TypeError, ValueError):
@@ -869,23 +1099,37 @@ class RollingPlanner:
     # ── 睡觉锚点 ─────────────────────────────────────────────────────────
     def _start_sleep_episode(self, date: str, cur: int, now: datetime,
                              snapshot: Any, report: Dict[str, Any]) -> None:
-        """睡眠环内无当前 episode → 开一条 sleep episode（锚点，不采样覆盖）。"""
+        """睡眠环内无当前 episode → 开一条 sleep episode（锚点，不采样覆盖）。
+
+        PR3（2026-10-26，定稿 §4.2.3）：
+        - 引擎启用时 ``planned_end`` = lie-in 上限（安全末端），实际 ``actual_end``
+          由 SleepEngine 决定；引擎未启用 → 逐字旧行为（wake 锚点）。
+        - 引擎闸 ``should_start_sleep_episode`` 为 False（本夜已在睡/已醒，尤其硬约定
+          早于 wake 锚点醒来后仍处原睡眠环）→ 不再开新 episode，避免每拍重开/重复结算。
+        """
+        if not self._engine_allows_sleep_start(now):
+            return
         sleep_min, wake_min = self._sleep_anchors()
-        remain = (normalize_day_minutes(wake_min) - normalize_day_minutes(cur)) % DAY_MINUTES
-        if remain <= 0:
-            remain = DAY_MINUTES
+        engine_on = self._engine_enabled()
+        planned_end = self._planned_sleep_end(cur, wake_min, self._lie_in_cap_minute(),
+                                              engine_on)
+        metadata: Dict[str, Any] = {"trigger": "sleep_anchor",
+                                    "sleep_ring": f"{sleep_min}-{wake_min}"}
+        if engine_on:
+            metadata["sleep_engine"] = True
         eid = self._db.start_episode(
             schedule_date=date, name="睡觉", goal_type=SLEEP_GOAL_TYPE, source="rolling",
-            planned_start_minute=cur, planned_end_minute=cur + remain,
+            planned_start_minute=cur, planned_end_minute=planned_end,
             interruptibility=SLEEP_INTERRUPTIBILITY, switch_cost=1.0,
             attention_mode="later", state_before=self._state_brief(snapshot),
-            metadata={"trigger": "sleep_anchor", "sleep_ring": f"{sleep_min}-{wake_min}"},
+            metadata=metadata,
         )
         if eid:
             self._publish(EVENT_EPISODE_STARTED, episode_id=eid, name="睡觉",
                           goal_type=SLEEP_GOAL_TYPE, planned_start_minute=cur,
-                          planned_end_minute=cur + remain, source="rolling")
-            self._log("rolling.sleep_started", episode_id=eid, planned_minutes=remain)
+                          planned_end_minute=planned_end, source="rolling")
+            self._log("rolling.sleep_started", episode_id=eid,
+                      planned_minutes=max(0, planned_end - cur))
             report["actions"].append("sleep_started")
 
     # ── 重规划节流（§5.7：冷却 20 分钟 + 每小时 ≤2 次）────────────────────
@@ -1119,6 +1363,46 @@ class RollingPlanner:
         return _clamp(1.0 - boundary / hi)
 
     # ── top2-3 softmax 加权采样（§5.2：不是 argmax）──────────────────────
+    def _meal_priority_candidate(self, scored: List[Tuple[float, Dict[str, Any]]],
+                                 snapshot: Any, cur: int) -> Optional[Tuple[float,
+                                                                           Dict[str, Any]]]:
+        """D2① 极饿吃饭护栏：新调制开 + hunger > 0.85 → meal 候选最高。
+
+        只重排**已按 §5.2 公式算出的候选**，不修改公式/权重；睡眠环与「到点硬约定」
+        优先级不变（前者由 tick 步 3/5 直接返回，后者在步 3 已抢占当前 episode，
+        这里再防御性让位）；``emotion_modulation_enabled=false`` 恒返回 None = 旧行为。
+        """
+        if not self._emotion_modulation_enabled():
+            return None
+        hunger = _as_number(snapshot.get("hunger") if isinstance(snapshot, dict) else None, 0.0)
+        if hunger is None or hunger <= HIGH_HUNGER_MEAL_GUARD:
+            return None
+        if self._in_sleep_ring(cur):
+            return None  # 睡眠最高层：睡眠窗内不排活动
+        for _score, cand in scored:
+            window = cand.get("window")
+            if (cand.get("kind") == "commitment" and window
+                    and window[0] <= cur):
+                return None  # 硬约定到点最高层（正常已在步 3 开播）
+        for score, cand in scored:
+            if str(cand.get("goal_type") or "") == "meal":
+                return score, cand
+        return None
+
+    def _choose_candidate(self, scored: List[Tuple[float, Dict[str, Any]]],
+                          snapshot: Any, cur: int, rng: random.Random
+                          ) -> Tuple[Dict[str, Any], float,
+                                     List[Tuple[float, Dict[str, Any]]]]:
+        """选下一候选：极饿 meal 护栏优先；否则 top2-3 softmax（§5.2 原逻辑）。"""
+        guarded = self._meal_priority_candidate(scored, snapshot, cur)
+        if guarded is not None:
+            return guarded[1], guarded[0], [guarded]
+        temperature = max(0.01, self._cfg_float("sampling_temperature",
+                                                DEFAULT_SAMPLING_TEMPERATURE))
+        # top2-3 softmax 加权采样（不是 argmax）；选中候选不可启（min_block 不足 /
+        # 硬约定未到点）→ 从 top 余下候选按分数序改选（§5.3「改短活动或直接跳过」）
+        return self._softmax_sample(scored, rng, temperature)
+
     @staticmethod
     def _softmax_sample(scored: List[Tuple[float, Dict[str, Any]]], rng: random.Random,
                         temperature: float) -> Tuple[Dict[str, Any], float,
@@ -1196,11 +1480,7 @@ class RollingPlanner:
             score += rng.uniform(-SCORE_NOISE, SCORE_NOISE)
             scored.append((score, cand))
         scored.sort(key=lambda pair: pair[0], reverse=True)
-        temperature = max(0.01, self._cfg_float("sampling_temperature",
-                                                DEFAULT_SAMPLING_TEMPERATURE))
-        # top2-3 softmax 加权采样（不是 argmax）；选中候选不可启（min_block 不足 /
-        # 硬约定未到点）→ 从 top 余下候选按分数序改选（§5.3「改短活动或直接跳过」）
-        chosen, _score, top = self._softmax_sample(scored, rng, temperature)
+        chosen, _score, top = self._choose_candidate(scored, snapshot, cur, rng)
         top_ids = {id(c) for _s, c in top}
         order: List[Dict[str, Any]] = [c for _s, c in top]
         order += [c for _s, c in scored if id(c) not in top_ids]
@@ -1268,10 +1548,21 @@ class RollingPlanner:
             origin_meta = (origin.get("metadata")
                            if isinstance(origin.get("metadata"), dict) else {})
             # PR2.5 修复（2026-10-26），交接 §五.18 D1：origin 已按 close-active 路径
-            # 应用过 deltas（state_deltas_applied 标记在案）→ 不再透传 event_key，
-            # 恢复行关闭时不会二次应用（防双应用沿用同一标记口径）
-            if origin_meta.get("event_key") and not origin_meta.get("state_deltas_applied"):
-                metadata["event_key"] = str(origin_meta["event_key"])
+            # 应用过 deltas（state_deltas_applied 标记在案）→ 不再透传 event_key，恢复行
+            # 关闭时不会二次应用（防双应用沿用同一标记口径）。
+            # 2026-10-27 event-review F1：**未应用**时必须把整个结算快照随恢复行带走
+            # （state_deltas / event_id / 版本），否则事件库替换移除旧 key 后 finish
+            # 无法回查、增量整份漏记。``state_deltas_applied`` 本身绝不复制。
+            if not origin_meta.get("state_deltas_applied"):
+                if origin_meta.get("event_key"):
+                    metadata["event_key"] = str(origin_meta["event_key"])
+                snapshot_deltas = origin_meta.get("state_deltas")
+                if isinstance(snapshot_deltas, dict) and snapshot_deltas:
+                    metadata["state_deltas"] = dict(snapshot_deltas)
+                for key in ("event_id", "event_catalog_version", "catalog_version",
+                            "event_name"):
+                    if origin_meta.get(key) is not None:
+                        metadata[key] = origin_meta[key]
             eid = self._db.resume(
                 str(cand["resume_of"]),
                 planned_start_minute=cur,
@@ -1320,7 +1611,10 @@ class RollingPlanner:
             return []
         entries: List[Dict[str, Any]] = []
         for row in rows:
-            updated = self._parse_ts(row.get("updated_at"))
+            # 2026-10-27 event-review F2：DB updated_at 是 naive ISO，生产 now 为 aware；
+            # 必须与同函数 last_meal/last_sleep 一样传时区再比较。
+            updated = self._parse_ts(row.get("updated_at"),
+                                      tz=getattr(self._tz, "_tz", None))
             age_minutes = int((now - updated).total_seconds() / 60.0) if updated else expire + 1
             progress = _as_number(row.get("progress"), 0.0) or 0.0
             meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
@@ -1389,44 +1683,85 @@ class RollingPlanner:
 
     # ── 随机小事件（§5.6 / A.7：模板 1 句、0 LLM）────────────────────────
     def _maybe_random_event(self, date: str, cur: int, now: datetime, snapshot: Any,
-                            report: Dict[str, Any], rng: random.Random) -> bool:
-        """转场/空闲掷骰；命中且约束全过 → 开一条随机事件 episode。返回是否插入。"""
+                            report: Dict[str, Any], rng: random.Random,
+                            context: Optional[str] = None) -> bool:
+        """转场/空闲掷骰；命中且约束全过 → 开一条随机事件 episode。返回是否插入。
+
+        取池（PR4 共享接线，2026-10-27）：装配了事件库服务 → ``catalog.pick_event``
+        （加权抽样 + 4h 去重 + 时长采样，0 LLM）；未装配/选不出 → **逐字回退**旧
+        :data:`RANDOM_EVENT_POOL` 路径。日上限 / 转场门 / 低可中断语义不变。
+        创建时把 ``metadata.state_deltas`` + ``event_id`` + ``event_catalog_version``
+        快照进 episode（库替换后仍按快照结算；见 :meth:`_random_event_deltas`）。
+        """
         rate = self._cfg_float("random_event_rate", DEFAULT_RANDOM_EVENT_RATE)
         if rate <= 0 or rng.random() >= rate:
             return False
         if self._random_used >= max(1, self._cfg_int("max_random_events_per_day",
                                                      DEFAULT_MAX_RANDOM_EVENTS_PER_DAY)):
             return False
-        eligible = [e for e in RANDOM_EVENT_POOL
-                    if e["key"] not in self._random_last
-                    or (now - self._random_last[e["key"]]).total_seconds()
-                    >= RANDOM_EVENT_DEDUP_MINUTES * 60]
-        if not eligible:
-            return False  # 同事件 4h 内不重复（A.7）——池内全部冷却中
-        event = rng.choice(eligible)
-        duration = rng.randint(int(event["min_minutes"]), int(event["max_minutes"]))
+        catalog = getattr(self, "_event_catalog", None)
+        event: Optional[Dict[str, Any]] = None
+        if catalog is not None:
+            try:
+                event = catalog.pick_event(
+                    rng, self._state_brief(snapshot), self._random_last,
+                    now=now, context=context)
+            except Exception as exc:
+                logger.warning("事件库取池失败（回退内置池）：%s", exc)
+                event = None
+        if isinstance(event, dict) and event.get("name"):
+            event_key = str(event.get("event_id") or event.get("key") or "")
+            templates = [str(t) for t in (event.get("templates") or ()) if str(t or "").strip()]
+            template = rng.choice(templates) if templates else str(event.get("name") or "")
+            duration = event.get("duration_minutes")
+            try:
+                duration = int(duration) if duration is not None else \
+                    rng.randint(int(event["min_minutes"]), int(event["max_minutes"]))
+            except (TypeError, ValueError, KeyError):
+                duration = rng.randint(5, 30)
+            try:
+                metadata = catalog.metadata_for_event(event, description=template)
+            except Exception:
+                metadata = {}
+            metadata.update({"trigger": "random_event", "event_key": event_key,
+                             "description": template})
+            event = dict(event)
+            event["key"] = event_key or event.get("key", "")
+        else:
+            # 旧路径（catalog 未装配 / 取不出）：内置池 + 4h 去重 + 时长采样，逐字保留
+            eligible = [e for e in RANDOM_EVENT_POOL
+                        if e["key"] not in self._random_last
+                        or (now - self._random_last[e["key"]]).total_seconds()
+                        >= RANDOM_EVENT_DEDUP_MINUTES * 60]
+            if not eligible:
+                return False  # 同事件 4h 内不重复（A.7）——池内全部冷却中
+            picked = rng.choice(eligible)
+            duration = rng.randint(int(picked["min_minutes"]), int(picked["max_minutes"]))
+            template = rng.choice(picked["templates"])
+            event = dict(picked)
+            event_key = str(picked["key"])
+            metadata = {"trigger": "random_event", "event_key": event_key,
+                        "description": template}
         profile = activity_profiles.get_profile(event["goal_type"])
-        template = rng.choice(event["templates"])
         eid = self._db.start_episode(
             schedule_date=date, name=event["name"], goal_type=event["goal_type"],
-            source="random", planned_start_minute=cur, planned_end_minute=cur + duration,
+            source="random", planned_start_minute=cur, planned_end_minute=cur + int(duration),
             interruptibility=event["interruptibility"], switch_cost=profile.switch_cost,
             attention_mode="now", state_before=self._state_brief(snapshot),
-            metadata={"trigger": "random_event", "event_key": event["key"],
-                      "description": template},
+            metadata=metadata,
         )
         if not eid:
             return False
         self._random_used += 1
-        self._random_last[event["key"]] = now
+        self._random_last[event_key] = now
         self._publish(EVENT_RANDOM_EVENT, name=event["name"], duration_minutes=duration,
                       source="random", description=template)
         self._publish(EVENT_EPISODE_STARTED, episode_id=eid, name=event["name"],
                       goal_type=event["goal_type"], planned_start_minute=cur,
-                      planned_end_minute=cur + duration, source="random")
-        self._log("rolling.random_event", episode_id=eid, event_key=event["key"],
+                      planned_end_minute=cur + int(duration), source="random")
+        self._log("rolling.random_event", episode_id=eid, event_key=event_key,
                   duration_minutes=duration)
-        report["actions"].append(f"random_event:{event['key']}")
+        report["actions"].append(f"random_event:{event_key}")
         return True
 
     def _roll_daily_counters(self, date: str) -> None:

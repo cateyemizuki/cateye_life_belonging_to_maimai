@@ -241,7 +241,7 @@ class PromptBuilder:
                     "duration_hours": round(minutes / 60, 2),
                 })
             if not no_sleep:
-                _add("睡觉", sleep_min, sleep_minutes, "daily_routine", "high")
+                _add("睡觉", sleep_min, sleep_minutes, "sleep", "high")
             _add("起床洗漱", wake_min, 30, "daily_routine", "medium")
             _add("早餐", wake_min + 30, 30, "meal", "high")
             flex = seg - 150
@@ -268,7 +268,7 @@ class PromptBuilder:
 
         # 睡眠块（锚定入睡时刻，绕时钟闭环的收尾）；无睡眠模式不生成该块
         if not no_sleep:
-            add(items, "睡觉", sleep_min, sleep_minutes, "daily_routine", "high")
+            add(items, "睡觉", sleep_min, sleep_minutes, "sleep", "high")
 
         # 清醒块（锚定起床时刻）
         add(items, "起床洗漱", wake_min, 30, "daily_routine", "medium")
@@ -601,7 +601,7 @@ class PromptBuilder:
         else:
             routine_rule = (
                 f"{sleep_rule}：安排一个从 {sleep_text} 开始、到次日 {wake_text} 结束的"
-                f"'睡觉'活动（goal_type: daily_routine；跨午夜用大于 24h 的累计时长表达，不要硬切成两条）"
+                f"'睡觉'活动（goal_type: sleep；跨午夜用大于 24h 的累计时长表达，不要硬切成两条）"
             )
         if no_sleep_mode:
             seam_rule = (
@@ -886,9 +886,17 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
                 t = (item or {}).get("time", "")
                 title = (item or {}).get("title", "")
                 notes = (item or {}).get("notes", "")
-                line = f"- {t} {title}".strip()
+                hardness = str((item or {}).get("hardness") or "hard").strip().lower()
+                line = f"- {t} {title}（hardness={hardness}".strip()
                 if notes:
-                    line += f"（{notes}）"
+                    line += f"｜{notes}"
+                source = str((item or {}).get("source") or "").strip()
+                if source:
+                    line += f"｜来源={source}"
+                item_id = str((item or {}).get("commitment_id") or "").strip()
+                if item_id:
+                    line += f"｜ID={item_id}"
+                line += "）"
                 commit_lines.append(line)
             prompt += "\n".join(commit_lines) + "\n"
             prompt += render(

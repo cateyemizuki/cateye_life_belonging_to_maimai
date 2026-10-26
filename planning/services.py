@@ -28,9 +28,11 @@ LOW_MOOD_CACHE_MAX_AGE_HOURS = 72.0
 
 from .cleanup_service import CleanupService
 from .command_service import CommandService
+from .event_catalog import EventCatalogService
 from .goal_manager import close_goal_manager, get_goal_manager
 from .holiday_service import HolidayService
 from .inject_service import InjectService
+from .init_service import InitService
 from .proactive_service import ProactiveService
 from .schedule_generator import ScheduleGenerator
 from .tools_service import ToolsService
@@ -105,6 +107,25 @@ class PlanningServices:
         self.inject = InjectService(plugin, holiday_service=self.holiday)
         self.proactive = ProactiveService(plugin)
         self.cleanup = CleanupService(plugin, generator_factory=lambda: self.generator)
+        # ── PR4 事件库服务（2026-10-27 共享接线）：**全插件唯一实例** ──────────────
+        # 单实例是有意的：事件库的 token 预算/「每日一次自动尝试」账本是进程内锁 +
+        # 原子文件，多实例并发刷新会互相覆盖；热重载/开关切换只能复用同一实例并
+        # start/stop 后台（见 sync_event_catalog），绝不重建。
+        self.event_catalog: Any = self._build_event_catalog()
+        # 供 InitService/工具按公共属性取同一实例（plugin 侧也挂一份只读引用）
+        try:
+            plugin._event_catalog = self.event_catalog
+        except Exception:
+            pass
+        # ── PR5 统一初始化服务（/lbm_init 的业务层）：单实例、无后台 task ──────────
+        # 事件统一走上面的 EventCatalogService.refresh(manual=True)（不重复生成/预算）；
+        # 频率校准走 PR6 公共口 self.calibrate_target_frequency。
+        self.init = InitService(
+            data_dir, plugin=plugin,
+            config_provider=lambda: getattr(plugin, "config", None),
+            event_catalog=self.event_catalog,
+            frequency_calibrator=self.calibrate_target_frequency,
+        )
         # R7 滚动化服务占位（R7 依据 = 用户 2026-10-25 直派【日程系统滚动化改造】）：
         # 接线位（后续阶段）在此实例化 LifeStateService / RollingPlanner /
         # LifeScheduleReadModel 并 sq.set_runtime_provider(life_schedule) + 5 分钟 tick；
@@ -193,15 +214,255 @@ class PlanningServices:
     # 生命周期
     # ------------------------------------------------------------
 
+    # ------------------------------------------------------------
+    # 事件库服务装配 + 自动生成闸（PR4 共享接线）
+    # ------------------------------------------------------------
+
+    def _event_catalog_section(self) -> Any:
+        """``[event_catalog]`` section（热重载动态读；缺失 → None → 服务用默认 off）。"""
+        return getattr(getattr(self._plugin, "config", None), "event_catalog", None)
+
+    def _build_event_catalog(self) -> Any:
+        """构造唯一 ``EventCatalogService``（失败 → None，planner 回退内置池旧路径）。"""
+        plugin = self._plugin
+        try:
+            timezone_str = str(getattr(
+                getattr(getattr(plugin, "config", None), "schedule_advanced", None),
+                "timezone", "") or "") or "Asia/Shanghai"
+            service = EventCatalogService(
+                plugin_root=getattr(plugin, "_plugin_root", None),
+                data_dir=getattr(plugin, "_data_dir", None),
+                llm=getattr(plugin, "_llm", None),
+                config_provider=self._event_catalog_section,
+                tz=timezone_str,
+                # 清醒/非睡眠/无硬约定闸：**必须**注入（服务本身 fail-closed）
+                auto_gate=self.event_catalog_auto_gate,
+                persona_provider=lambda: str(getattr(plugin, "_personality", "") or ""),
+                recent_schedule_names_provider=self._recent_schedule_names,
+                recent_event_names_provider=self._recent_event_names,
+            )
+            logger.info("事件库服务已装配（路径=%s）", getattr(service.store, "path", "?"))
+            return service
+        except Exception as exc:
+            logger.warning("事件库服务装配失败（按内置池降级）：%s", exc)
+            return None
+
+    def _recent_schedule_names(self) -> List[str]:
+        """近 30 天已出现过的活动名（用于生成去重；取不到 → 空列表，不影响运行）。"""
+        plugin = self._plugin
+        names: List[str] = []
+        db = getattr(plugin, "_db", None)
+        for attr in ("get_recent_activity_names", "get_recent_schedule_names"):
+            fn = getattr(db, attr, None)
+            if callable(fn):
+                try:
+                    return [str(x) for x in (fn(days=30) or []) if str(x or "").strip()]
+                except Exception:
+                    continue
+        getter = getattr(db, "get_day_schedule", None)
+        if callable(getter):
+            try:
+                now = self._now()
+                for offset in range(0, 30):
+                    day = (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+                    for row in (getter(day) or []):
+                        if isinstance(row, dict):
+                            name = str(row.get("name") or "").strip()
+                            if name:
+                                names.append(name)
+            except Exception:
+                return []
+        return names
+
+    def _recent_event_names(self) -> List[str]:
+        """近 30 天生成过的事件名（episode metadata 来源；取不到 → 空列表）。"""
+        db = getattr(self._plugin, "_db", None)
+        for attr in ("get_recent_event_names", "get_recent_episode_event_names"):
+            fn = getattr(db, attr, None)
+            if callable(fn):
+                try:
+                    return [str(x) for x in (fn(days=30) or []) if str(x or "").strip()]
+                except Exception:
+                    return []
+        return []
+
+    def _now(self) -> datetime:
+        """当前时间（时区真源与日程一致；异常回退系统本地时区）。"""
+        try:
+            from .time_utils import TimezoneManager
+            tz_str = str(getattr(
+                getattr(getattr(self._plugin, "config", None), "schedule_advanced", None),
+                "timezone", "") or "") or "Asia/Shanghai"
+            return TimezoneManager(tz_str).get_now()
+        except Exception:
+            return datetime.now().astimezone()
+
+    def _legacy_asleep(self, now: Optional[datetime] = None) -> Optional[bool]:
+        """引擎不表态时的旧周期/日程回退（None = 无法判断 → 调用方 fail-closed）。"""
+        plugin = self._plugin
+        life = getattr(plugin, "_life_state", None)
+        if life is not None:
+            getter = getattr(life, "sleep_status", None)
+            if callable(getter):
+                try:
+                    status = getter()
+                    if isinstance(status, dict) and isinstance(status.get("asleep"), bool):
+                        return status["asleep"]
+                except Exception:
+                    pass
+        try:
+            from companion.patrol import real_sleep_anchors_from_plugin
+            anchors = real_sleep_anchors_from_plugin(plugin, now)
+        except Exception:
+            return None
+        if not anchors:
+            return None
+        try:
+            start, end = anchors[0], anchors[1]
+            cur = self._now() if now is None else now
+            cur_min = cur.hour * 60 + cur.minute
+            if start == end:
+                return None
+            if start > end:  # 跨午夜
+                return bool(cur_min >= start or cur_min < end)
+            return bool(start <= cur_min < end)
+        except Exception:
+            return None
+
+    def _hard_commitment_now(self, now: Optional[datetime] = None) -> Optional[bool]:
+        """今天/明天是否有**硬约定**（True/False；数据源全不可用 → None = 未知）。"""
+        plugin = self._plugin
+        sources = 0
+        cur = self._now() if now is None else now
+        today = cur.strftime("%Y-%m-%d")
+        tomorrow = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
+        # 1) 待办约定里的硬约定（parameters.hardness == "hard"）
+        goal_manager = getattr(getattr(plugin, "_planning", None), "goal_manager", None)
+        getter = getattr(goal_manager, "get_pending_commitments", None)
+        if callable(getter):
+            sources += 1
+            for day in (today, tomorrow):
+                try:
+                    rows = getter(commitment_date=day) or []
+                except Exception:
+                    continue
+                for goal in rows:
+                    params = getattr(goal, "parameters", None) or {}
+                    if isinstance(params, dict) and str(params.get("hardness") or "") == "hard":
+                        return True
+        # 2) 今日日程条目里的硬约束（parameters.hardness == "hard"）
+        query = getattr(plugin, "_schedule_query", None)
+        day_getter = getattr(query, "get_day_schedule", None)
+        if callable(day_getter):
+            sources += 1
+            try:
+                for row in (day_getter(today) or []):
+                    params = (row or {}).get("parameters") if isinstance(row, dict) else None
+                    if isinstance(params, dict) and str(params.get("hardness") or "") == "hard":
+                        return True
+            except Exception:
+                pass
+        if sources == 0:
+            return None
+        return False
+
+    def event_catalog_auto_gate(self, now: Any = None) -> Dict[str, Any]:
+        """自动事件生成的闸：清醒 / 非睡眠 / 无硬约定；**未知一律 fail-closed**。
+
+        读取顺序（PR3 交接口径）：``plugin.sleep_asleep(now)`` 是唯一权威——
+        ``True`` 在睡、``False`` 清醒、``None`` 才回退旧周期/日程判断；
+        ``None`` 再判断不出 → 直接拒绝（``sleep_unknown``）。硬约定源都不可用
+        → 拒绝（``hard_commitment_unknown``）。任何异常 → 拒绝（``gate_error``）。
+        """
+        try:
+            plugin = self._plugin
+            asleep: Any = None
+            getter = getattr(plugin, "sleep_asleep", None)
+            if callable(getter):
+                asleep = getter(now)
+            if asleep is None:
+                asleep = self._legacy_asleep(now)
+            if asleep is None:
+                return {"can_generate": False, "reason": "sleep_unknown"}
+            if asleep:
+                return {"awake": False, "in_sleep": True, "hard_commitment": False}
+            hard = self._hard_commitment_now(now)
+            if hard is None:
+                return {"can_generate": False, "reason": "hard_commitment_unknown"}
+            return {"awake": True, "in_sleep": False, "hard_commitment": bool(hard)}
+        except Exception as exc:
+            logger.warning("事件库自动闸异常（本次跳过）：%s", exc)
+            return {"can_generate": False, "reason": "gate_error"}
+
+    async def sync_event_catalog(self) -> None:
+        """配置热更新后的模式切换（off/manual/auto 三态；复用同一实例）。"""
+        service = getattr(self, "event_catalog", None)
+        if service is None:
+            return
+        sync = getattr(service, "sync_config", None)
+        try:
+            if callable(sync):
+                await sync()
+            else:
+                await service.stop()
+                await service.start()
+        except Exception as exc:
+            logger.warning("事件库模式切换失败（保持只读）：%s", exc)
+
+    async def stop_event_catalog(self) -> None:
+        """停事件库后台（插件停用/卸载；inflight 生成按保守结果保留旧库）。"""
+        service = getattr(self, "event_catalog", None)
+        if service is None:
+            return
+        try:
+            await service.stop()
+        except Exception:
+            logger.warning("事件库停止失败（忽略）", exc_info=True)
+
+    # ------------------------------------------------------------
+    # 目标频率校准（PR6，定稿 §4.5）
+    # ------------------------------------------------------------
+
+    async def calibrate_target_frequency(self, *, force: bool = True) -> Dict[str, Any]:
+        """公共转发口：``self.proactive.calibrate_target_frequency(force=...)``。
+
+        供 ``InitService`` / 插件 startup / target 解析 / 配置更新统一调用，避免各处再去
+        摸 ``proactive`` 私有属性。缺 proactive（未接线/测试桩）→ 返回 ok=False 的可读结果。
+        """
+        proactive = getattr(self, "proactive", None)
+        if proactive is None or not hasattr(proactive, "calibrate_target_frequency"):
+            return {"ok": False, "enabled": False, "target_resolved": False,
+                    "target_stream": "", "factor": 1.0, "applied": False,
+                    "skipped": "", "reason": "proactive_unavailable",
+                    "errors": ["ProactiveService 未接线"]}
+        return await proactive.calibrate_target_frequency(force=force)
+
     async def start(self) -> None:
         """启动后台循环（幂等）：清理 + 定时生成 + 注入缓存预热 + 主动行为。"""
         if self._started:
             return
         self._started = True
         self._register_event_subscriptions()
+        # 事件库（PR4）：独立于 schedule.enabled —— 事件库可单独 manual 准备；mode=off
+        # 时服务自身不读生成库、不起后台。失败只记日志，不影响其它后台循环。
+        try:
+            service = getattr(self, "event_catalog", None)
+            if service is not None:
+                await service.start()
+        except Exception as exc:
+            logger.warning("事件库启动失败（保持只读）：%s", exc)
         if not bool(getattr(self._plugin.config.schedule, "enabled", True)):
             logger.info("日程规划模块已停用（schedule.enabled=false），后台循环未启动")
             return
+        # PR6（定稿 §4.5）：启动即校准目标频率，**不等**第一次活动切换；目标未解析/
+        # 开关关闭/SDK 失败都只记日志，绝不拖挂启动（校准口内部已有可读返回）。
+        try:
+            calibration = await self.calibrate_target_frequency(force=True)
+            if calibration.get("errors"):
+                logger.info("目标频率校准未生效（%s）：%s", calibration.get("reason"),
+                            "；".join(calibration["errors"]))
+        except Exception as exc:
+            logger.warning("目标频率校准异常（忽略，不阻塞启动）：%s", exc)
         self._bg_tasks = [
             asyncio.create_task(self.cleanup.run_cleanup_loop()),
             asyncio.create_task(self.cleanup.run_scheduler_loop()),
@@ -221,6 +482,10 @@ class PlanningServices:
     async def stop(self) -> None:
         """停止并取消全部后台任务，释放 GoalManager 单例。"""
         self._unregister_event_subscriptions()
+        try:
+            await self.stop_event_catalog()
+        except Exception:
+            pass
         try:
             await self.proactive.stop()
         except Exception:
@@ -262,3 +527,8 @@ class PlanningServices:
         except Exception:
             today_count = 0
         return f"日程规划：今日 {today_count} 项活动｜注入={'开' if self._plugin.config.schedule.inject_into_planner else '关'}"
+
+    @property
+    def sleep_engine(self) -> Any:
+        """睡眠引擎只读句柄（实际装配在 plugin._sleep_engine；PR6 诊断兼容口）。"""
+        return getattr(self._plugin, "_sleep_engine", None)

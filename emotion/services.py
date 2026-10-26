@@ -29,6 +29,9 @@ class EmotionServices:
         self.bus = getattr(plugin, "_bus", None)
         #: 本束的事件反订阅闭包（M0 无订阅者；M3 起由 emotion.bridge 追加）
         self._event_unsubs: list = []
+        #: PR3（2026-10-26，定稿 §3）：life 反馈订阅独立成组——``emotion_modulation_enabled``
+        #: 热更新由关到开时只补这一组，不能因 bridge 已订阅就整体早退（2026-10-27 用户补单）。
+        self._feedback_unsubs: list = []
         #: R7 = PR2 双向闭环（2026-10-26）：LifeState/Episode → VAD 反馈服务
         #: （[life_state] 双开关 + 情绪总开关任一关 → 不实例化，恒 None）
         self._life_feedback: Any = None
@@ -40,44 +43,75 @@ class EmotionServices:
         桥内处理器绝不做绝对状态设置，只经 ``record_external_event`` 入账（§6.3-1）；
         总线缺失时静默降级（§八.2）；幂等：已注册时直接返回。
         """
-        if self.bus is None or self._event_unsubs:
+        if self.bus is None:
             return
-        try:
-            from .bridge import register_bridge
+        if not self._event_unsubs:
+            try:
+                from .bridge import register_bridge
 
-            self._event_unsubs.extend(register_bridge(self.bus, self.service, self._plugin))
-        except Exception as exc:
-            logger.warning("emotion 事件订阅失败（忽略）：%s", exc)
-            self._unregister_event_subscriptions()
-            return
+                self._event_unsubs.extend(register_bridge(self.bus, self.service, self._plugin))
+            except Exception as exc:
+                logger.warning("emotion 事件订阅失败（忽略）：%s", exc)
+                self._unregister_event_subscriptions()
+                return
         # R7 = PR2 双向闭环（2026-10-26），计划书 §三十五/定稿 §4.1.2：
-        # LifeState/Episode → VAD 反馈侧。三重门控（[life_state].enabled /
-        # [life_state].emotion_modulation_enabled（附录 B.6.3 灰度键，缺省关）/
-        # 情绪模块总开关）任一关 → 不实例化不订阅，零可观测；反订阅闭包并入
-        # _event_unsubs，关闭态由 _unregister_event_subscriptions 统一清理。
+        # LifeState/Episode → VAD 反馈侧；PR3（2026-10-26，定稿 §3）拆成独立组，
+        # 支撑 ``emotion_modulation_enabled`` 热更新由关到开（见 sync_from_config）。
+        self._sync_life_feedback()
+
+    def _sync_life_feedback(self) -> None:
+        """按当前配置同步 life 反馈订阅（幂等；开→建，关→注销，不残留回写订阅）。"""
+        if self.bus is None:
+            return
         try:
-            _section = getattr(getattr(self._plugin, "config", None), "life_state", None)
-            if (_section is not None and bool(getattr(_section, "enabled", False))
-                    and bool(getattr(_section, "emotion_modulation_enabled", False))
-                    and self.is_enabled()):
+            section = getattr(getattr(self._plugin, "config", None), "life_state", None)
+            desired = bool(
+                section is not None and bool(getattr(section, "enabled", False))
+                and bool(getattr(section, "emotion_modulation_enabled", False))
+                and self.is_enabled())
+        except Exception:
+            desired = False
+        feedback = getattr(self, "_life_feedback", None)
+        if not hasattr(self, "_feedback_unsubs"):
+            self._feedback_unsubs = []
+        if desired and feedback is None:
+            try:
                 from .life_feedback import LifeFeedbackService
 
                 self._life_feedback = LifeFeedbackService(self._plugin, self.service)
-                self._event_unsubs.extend(self._life_feedback.subscribe())
-        except Exception as exc:
-            logger.warning("情绪-生活反馈订阅失败（忽略）：%s", exc)
+                self._feedback_unsubs.extend(self._life_feedback.subscribe())
+            except Exception as exc:
+                logger.warning("情绪-生活反馈订阅失败（忽略）：%s", exc)
+                self._life_feedback = None
+        elif not desired and feedback is not None:
+            for unsub in self._feedback_unsubs:
+                try:
+                    unsub()
+                except Exception:
+                    pass
+            self._feedback_unsubs.clear()
             self._life_feedback = None
 
+    def sync_from_config(self) -> None:
+        """配置热更新入口（plugin.on_config_update 调用）：重新评估反馈订阅开关。
+
+        不能依赖「服务束重建」或 file_watcher 另起进程——同一实例下由关到开必须真正
+        补上 episode→VAD 订阅；由开到关必须注销，关闭时不保留回写订阅。
+        """
+        self._sync_life_feedback()
+
     def _unregister_event_subscriptions(self) -> None:
-        """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""
-        for unsub in self._event_unsubs:
+        """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包（bridge + life 反馈）。"""
+        for unsub in list(self._event_unsubs) + list(getattr(self, "_feedback_unsubs", [])):
             try:
                 unsub()
             except Exception:
                 pass
         self._event_unsubs.clear()
-        # R7 = PR2 双向闭环（2026-10-26）：反馈服务的订阅闭包已在 _event_unsubs 内一并
-        # 执行；此处只解除引用（预算文件逐次落盘，无残留后台任务）
+        if hasattr(self, "_feedback_unsubs"):
+            self._feedback_unsubs.clear()
+        # R7 = PR2 双向闭环（2026-10-26）：反馈服务的订阅闭包已在上面一并执行；
+        # 此处只解除引用（预算文件逐次落盘，无残留后台任务）
         self._life_feedback = None
 
     # 转发入口（plugin.py / 其他模块调用）

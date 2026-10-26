@@ -465,7 +465,8 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     # ── 角色裁判 ─────────────────────────────────────────────
     role_judge_enabled: bool = Field(
         default=True,
-        description="角色裁判模式：你（用户）通过 lbm_update_schedule_v4 用自然语言要求改日程时，让 bot 以角色身份先做判断——"
+        description="角色裁判模式：你（用户）通过 lbm_update_schedule（规范名；旧名 "
+                    "lbm_update_schedule_v4 仍注册一版）用自然语言要求改日程时，让 bot 以角色身份先做判断——"
                     "接受并改今天（today）/ 接受为未来预约（future）/ 拒绝不改（reject）。"
                     "判定失败时安全回退为「日程不变」",
         json_schema_extra={
@@ -726,6 +727,22 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
             "label": "活动频率调控",
             "hint": "关 = 不让日程影响聊天频率",
             **_ui_i18n("Frequency modulation"),
+        },
+    )
+    # 定稿 §4.5（二期）：目标陪伴私聊的回复因子恒 1.0——只对**实际解析成功**的目标
+    # 陪伴私聊生效（``plugin._stream_id`` 非空且 [patrol].target_qq 已配置），本插件
+    # 固定 1.0；其他流仍按 activity_properties 的 ``reply_factor``。开关关闭 = 逐字恢复
+    # 旧行为（目标流不再补入频率集合，全部按属性因子），不是"把所有流固定 1"。
+    target_frequency_always_one: bool = Field(
+        default=True,
+        description="目标陪伴私聊的聊天频率恒为 1.0（不受当前活动类型影响）：只对已解析成功的目标"
+                    "私聊生效，其他会话仍按活动属性调节；关 = 逐字恢复旧行为（全部按活动属性）",
+        json_schema_extra={
+            "label": "目标私聊频率恒 1",
+            "hint": "默认开：陪伴对象私聊不被学习/工作活动压低频率；关 = 全部按旧的活动属性因子",
+            **_ui_i18n("Target chat frequency = 1.0",
+                       "Keep the target companion private chat at 1.0 regardless of the "
+                       "current activity; off = legacy per-activity factors everywhere."),
         },
     )
 
@@ -1229,6 +1246,80 @@ class LifeStateSectionConfig(PluginConfigBase):
             "label": "情绪调制生活状态",
             "hint": "关 = 生活状态按固定速率自然变化，与情绪无关",
             **_ui_i18n("Emotion modulation", "Off = life states drift at fixed rates, independent of mood."),
+        },
+    )
+    # PR3 SleepEngine（2026-10-26，定稿 §4.2 + 附录 B.6.3；R7 依据 = 用户直派
+    # 【日程系统二期 PR3】）：六个睡眠键 + 一个过睡专注惩罚键，全部默认关/出厂值。
+    # sleep_engine_enabled 必须与 enabled 同开才生效（用户 2026-10-27 批准：单开只
+    # 提示需同时开启生活状态，不自动改配置）。
+    sleep_engine_enabled: bool = Field(
+        default=False,
+        description="睡眠引擎开关：开启后由精力阈值/最晚起床/硬约定状态驱动觉醒（默认关；需同时开启生活状态）",
+        json_schema_extra={
+            "label": "启用睡眠引擎",
+            "hint": "关 = 旧起床锚点/旧赖床工具行为；开 = 到点按精力决定是否赖床，12:00 必起",
+            **_ui_i18n("Sleep engine", "Off = legacy wake anchors. Requires life state enabled."),
+        },
+    )
+    wake_energy_threshold: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="觉醒精力阈值：到最早起床时间后精力达到该值即醒（默认 0.75）",
+        json_schema_extra={
+            "label": "觉醒精力阈值",
+            "step": 0.05,
+            **_ui_i18n("Wake energy threshold"),
+        },
+    )
+    sleep_oversleep_start_hours: float = Field(
+        default=9.0,
+        ge=8.0,
+        le=12.0,
+        description="过睡起点（小时）：超过该连续睡眠时长后精力转为负收益（默认 9）",
+        json_schema_extra={
+            "label": "过睡起点(小时)",
+            "step": 0.5,
+            **_ui_i18n("Oversleep starts (h)"),
+        },
+    )
+    sleep_interrupt_min_minutes: int = Field(
+        default=5,
+        ge=0,
+        le=120,
+        description="打断确认阈值（分钟）：确认清醒达到该时长才把连续睡眠段归零（默认 5）",
+        json_schema_extra={
+            "label": "打断确认(分钟)",
+            **_ui_i18n("Interrupt confirm (min)"),
+        },
+    )
+    sleep_wake_check_seconds: int = Field(
+        default=300,
+        ge=30,
+        description="觉醒阈值复检间隔（秒，默认 300 = 每 5 分钟；到点/硬约定不受此限制）",
+        json_schema_extra={
+            "label": "觉醒复检(秒)",
+            **_ui_i18n("Wake re-check (s)"),
+        },
+    )
+    sleep_hard_commitment_lead_minutes: int = Field(
+        default=30,
+        ge=0,
+        le=240,
+        description="硬约定提前唤醒（分钟，默认 30）：约定开始前该时长必须醒",
+        json_schema_extra={
+            "label": "硬约定提前(分钟)",
+            **_ui_i18n("Hard commitment lead (min)"),
+        },
+    )
+    sleep_oversleep_penalize_focus: bool = Field(
+        default=False,
+        description="过睡是否扣专注（默认关；定稿锁定「睡太久默认只影响精力」，开启后才用曲线的专注负收益）",
+        json_schema_extra={
+            "label": "过睡扣专注",
+            "hint": "关 = 睡太久只扣精力，专注不变；开 = 同时按曲线扣专注",
+            **_ui_i18n("Oversleep penalizes focus",
+                       "Off = oversleep only drains energy."),
         },
     )
 

@@ -25,7 +25,33 @@ LifeState/Episode → VAD 反馈侧：订阅滚动执行层发布的 ``life.epis
   episode_id entries 去重），经 ``core.storage.save_json_atomic`` 原子写；超日上限整条
   丢弃并 debug 日志；**绝不写进 emotion_state.json**（未知键会被 ``_save_state`` 冲掉）；
   日期滚动自然重置（读到的 date 非当天即视为新账本）；
+- **全局每日上限口径（2026-10-27 用户裁定）**：``used`` 与 ``GLOBAL_VAD_DAILY_CAP`` 按
+  **最终实际入账增量**——即经 ``record_external_event_sync`` 同一倍率真源
+  （``delta × global_event_multiplier × K``）与 ±0.5 硬限幅后的 applied 值检查并记账，
+  不是映射表规则输入 delta。判定发生在真正入账**之前**（``preview_external_delta``
+  只读预览，同一 ``_scaled_external_delta`` 真源；其间无 await），不做「先入账再回滚」；
+  实际 delta 全零的事件不占预算、不入账。逐规则 ``daily_cap`` 与 ``rules`` 累计仍按
+  **规则输入 delta** 定义（主代理审定：不为此擅改映射表数值）；
+- **冻结期（睡眠）跳过（2026-10-27 用户裁定 / Q2）**：情绪 ``is_frozen()`` 为真时事件
+  只会在状态机里入队、醒来按设计丢弃 → 没有实际入账，故反馈侧直接跳过、不占预算
+  （与 ``goal_type == sleep`` 的跳过原则一致），只留 debug 诊断；
+- **账本口径标记与旧账本迁移（2026-10-27 用户裁定）**：账本带
+  ``used_basis = applied_v1``（``BUDGET_USED_BASIS``）。同日旧账本缺该标记且 ``used``
+  非零时，历史 actual 无法由 raw 规则输入恢复 → **当日暂停新增生活反馈**（其他聊天情绪
+  来源不受影响），旧 ``used``/``rules``/``entries`` 原样保留并补
+  ``used_basis = legacy_raw_unrecoverable`` + ``budget_hold`` 留痕（不猜历史倍率、不清空
+  旧账放大额度、不把未知 actual 伪写成准确已用值）；次日 date 滚动自动进 actual 新口径。
+  旧账 ``used`` 净零但 ``rules``/``entries`` 仍有正负抵消的历史消耗时，actual 同样不可由
+  raw 恢复 → 仍 hold；只有 used/rules/entries 均空或全零的旧账才正常进入新口径
+  （不无故停一天）；同日重启仍 hold；
 - 同一 ``episode_id`` 只入账一次（entries 去重；无 episode_id 的事件无从去重，照常入账）；
+- **并发（2026-10-26 修复）**：账本读取 → 逐规则/全局日上限判定 → VAD 入账 → 账本提交
+  必须是一个**不含 await 的同步区**。入账走 ``record_external_event_sync``（同步核心，
+  无模型调用、不发布），随后立即提交账本，最后才 ``await publish_external_updated()``；
+  旧实现「``await record_external_event`` 之后再落账本」的 await 窗口会让第二个协程读到
+  陈旧账本（同事件重复入账 / 全局日封顶被击穿 / 账本读-改-写丢更新），await 期间被取消
+  还会让已入账事件不占预算而在重试时二次入账。账本另持**进程内镜像**：写盘失败或无
+  ``_data_dir`` 时同日仍按已入账账本判定（恰一次不依赖写盘成功）；
 - 开关（``[life_state].enabled`` / ``[life_state].emotion_modulation_enabled`` /
   情绪模块总开关）任一关 → 零订阅零可观测；关闭态退订清理由 EmotionServices.stop() 统一
   执行（本模块订阅闭包已并入服务束 ``_event_unsubs``）；
@@ -37,6 +63,7 @@ LifeState/Episode → VAD 反馈侧：订阅滚动执行层发布的 ``life.epis
 
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -72,8 +99,18 @@ _ZERO_EPS = 1e-9
 #: 全局每日 VAD 回写封顶（PR2.5 修复（2026-10-26），交接 §五.18 D3 / 定稿
 #: §4.1.3「每日 VAD 回写封顶」；常量对齐附录 B.3 ``daily_caps.vad_delta=0.15``。
 #: 裁量登记：附录 B.3 的 daily_caps 节在随包种子表内无对应结构，故取常量落码；
-#: 语义 = 三轴各自当日累计（含正负向）的绝对值不得超过此上限，超限整条事件丢弃）
+#: 语义 = 三轴各自当日累计（含正负向）的绝对值不得超过此上限，超限整条事件丢弃。
+#: 2026-10-27 用户裁定：累计与判定都按**最终实际入账增量**（倍率/限幅后），见模块注释。
 GLOBAL_VAD_DAILY_CAP = 0.15
+
+#: 账本 ``used`` 的口径标记（2026-10-27 用户裁定：最终实际入账增量）。
+#: 旧账本无此标记且 ``used`` 非零 → 无法由 raw 恢复 actual，保守 fail-closed（见模块注释）。
+BUDGET_USED_BASIS = "applied_v1"
+
+#: 旧账本 hold 标记（2026-10-27 用户裁定）：同日非空 raw 口径账本无法恢复 actual → 当日
+#: 暂停新增生活反馈、旧数据原样保留；次日自然滚动进 actual 新口径。此标记只表示
+#: 「当日不可用」，绝不把未知 actual 伪写成准确已用值（``used`` 保持原 raw 数值）。
+BUDGET_USED_BASIS_LEGACY = "legacy_raw_unrecoverable"
 
 
 _TZ_MANAGER: Any = None
@@ -176,6 +213,13 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _axis_dict(state: Any) -> Dict[str, float]:
+    """把 ``VADState`` / dict 统一成三轴 float dict（预算记账用；非法输入按 0）。"""
+    if isinstance(state, dict):
+        return {axis: _to_float(state.get(axis)) for axis in _VAD_AXES}
+    return {axis: _to_float(getattr(state, axis, 0.0)) for axis in _VAD_AXES}
+
+
 def _match_entries(feedback: Any, event_kind: str, goal_type: str,
                    duration_minutes: Optional[float]) -> List[Tuple[str, Dict[str, Any]]]:
     """按事件类型/goal_type/时长筛出命中的 feedback 条目（保持表内声明序）。
@@ -239,6 +283,9 @@ class LifeFeedbackService:
         # 只播种不应用（消费方 planning/life_modulation 属后续 PR），留在 self.table 供观测
         self.table = self._load_table()
         self._unsubs: list = []
+        #: 当日账本的**进程内镜像**（date + used + rules + entries）：写盘失败 / 无
+        #: ``_data_dir`` 的实例仍能在同日按已入账账本去重与累计（恰一次不依赖写盘成功）
+        self._budget_cache: Optional[Dict[str, Any]] = None
 
     # ── 映射表装载（表层缺失补链 / 解析错误回内置默认，红线：绝不动用户文件）──
     def _load_table(self) -> Dict[str, Any]:
@@ -286,6 +333,43 @@ class LifeFeedbackService:
         except Exception:
             return False
 
+    def _frozen(self) -> bool:
+        """情绪是否处睡眠冻结态（Q2 裁定：冻结期只入队、醒来丢弃 → 非实际入账）。
+
+        无 ``is_frozen`` 的旧服务/测试桩按「非冻结」处理（保持旧契约）。
+        """
+        probe = getattr(self._emotion, "is_frozen", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            return False
+
+    def _actual_applied_delta(self, delta_total: Dict[str, float],
+                              can_preview: bool) -> Tuple[Dict[str, float], bool]:
+        """求本次事件**最终实际入账增量**（判定预算用，发生在入账之前）。
+
+        有 ``preview_external_delta`` 的服务：走与入账同一倍率/限幅真源，返回 applied；
+        旧服务/测试桩无预览口 → 无法得知倍率与限幅，按规则 delta 保守代理（旧口径），
+        并返回 ``False`` 表示「非 actual 口径」（不写 ``used_basis`` 标记，后续读到该账本
+        的 actual 服务会 fail-closed，绝不把 raw 当 actual 放大额度）。
+        """
+        preview = getattr(self._emotion, "preview_external_delta", None) if can_preview else None
+        if callable(preview):
+            try:
+                result = preview(VADState(**delta_total), multiplier=1.0)
+            except Exception:
+                # 预览异常 → 无法确认真实增量：按「无实际入账」处理（不入账、不占预算，
+                # 留诊断），绝不退回 raw 代理以免低估全局累计而击穿上限。
+                logger.warning("情绪-生活反馈：实际增量预览失败（按无实际增量跳过）",
+                               exc_info=True)
+                return {axis: 0.0 for axis in _VAD_AXES}, False
+            applied = result.get("delta") if isinstance(result, dict) else None
+            if applied is not None:
+                return _axis_dict(applied), True
+        return {axis: _to_float(delta_total.get(axis)) for axis in _VAD_AXES}, False
+
     # ── 订阅（EmotionServices.start 装配；反订阅闭包并入服务束 _event_unsubs）──
     def subscribe(self) -> List[Any]:
         bus = getattr(self._plugin, "_bus", None)
@@ -325,6 +409,12 @@ class LifeFeedbackService:
                 payload = {}
             if not self._gate_open():
                 return
+            if self._frozen():
+                # Q2 裁定（2026-10-27）：冻结期事件只入 pending 且醒后丢弃 → 无实际入账，
+                # 不得消耗全局额度（与 sleep goal 跳过同一原则）；只留诊断。
+                logger.debug("情绪-生活反馈：情绪冻结态（睡眠）跳过入账，episode=%s",
+                             str(payload.get("episode_id") or ""))
+                return
             goal_type = str(payload.get("goal_type") or "").strip()
             if goal_type == SLEEP_GOAL_TYPE:
                 # 睡眠期 VAD 由 apply_sleep_overhaul 统一结算（定稿 §4.1.2），直接跳过
@@ -339,6 +429,21 @@ class LifeFeedbackService:
                 return  # 随机小事件等未命中任何条目 → 零动作零可观测
             today = _tz_now().strftime("%Y-%m-%d")  # PR2.5 D4：配置时区日界（原系统本地）
             budget = self._load_budget(today)
+            # 实际增量预览能力（新增同步公共口；旧服务/桩无 → 规则 delta 代理且不标 actual）
+            can_preview = callable(getattr(self._emotion, "preview_external_delta", None))
+            if budget.get("legacy_basis") and (
+                    budget.get("used_basis") == BUDGET_USED_BASIS_LEGACY or can_preview):
+                # 用户 2026-10-27 裁定：当日非空旧 raw 口径账本 → 暂停当天新增生活反馈，
+                # 次日 date 滚动自动用 actual 新口径恢复；其他聊天情绪来源不受影响。
+                # 旧 used/rules/entries 原样保留，只补 basis/hold 留痕（不猜历史倍率、
+                # 不清空放额度、不把未知 actual 伪写成准确已用值）。无预览口的旧服务/桩
+                # 读到未标 hold 的老文件时保持旧契约直通（无法提供 actual 记账能力），
+                # 其写出的账本不带 actual 标记 → 升级后的服务会按本规则 hold。
+                logger.debug("情绪-生活反馈：当日账本为旧 raw 口径（actual 不可恢复），"
+                             "暂停生活反馈入账至次日")
+                if budget.get("used_basis") != BUDGET_USED_BASIS_LEGACY:
+                    self._hold_legacy_budget(budget)
+                return
             if episode_id and episode_id in budget["entries"]:
                 logger.debug("情绪-生活反馈：episode %s 当日已入账，拒绝重复", episode_id)
                 return
@@ -368,41 +473,109 @@ class LifeFeedbackService:
                 applied_rules.append(key)
             if not applied_rules:
                 return
-            # PR2.5 修复（2026-10-26），交接 §五.18 D3 / 定稿 §4.1.3：逐规则 daily_cap
-            # 之外的全局每日封顶——budget["used"]（跨规则当日累计，原先只记账不判）
-            # 参与判定，三轴任一轴加总后 |累计| 超 GLOBAL_VAD_DAILY_CAP（附录 B.3
-            # daily_caps.vad_delta=0.15）→ 本条事件整条丢弃、预算不动账
+            # 全局每日上限（2026-10-27 用户裁定）：按**最终实际入账增量**判定——先经与
+            # 入账同一真源（preview → _scaled_external_delta：三层倍率 + ±0.5 限幅）求
+            # applied，再判 budget["used"]（跨规则当日净累计）+ applied 是否超
+            # GLOBAL_VAD_DAILY_CAP。真实 delta 可能在倍率后变大（如 global=2 → 0.30），
+            # 故绝不能用规则输入 delta 判全局上限；逐规则 daily_cap 仍按规则输入（主代理
+            # 审定）。判定在入账之前，超限整条丢弃、预算不动账（不做入账后回滚）。
+            actual_total, actual_basis = self._actual_applied_delta(delta_total, can_preview)
+            if all(abs(actual_total[axis]) <= _ZERO_EPS for axis in _VAD_AXES):
+                logger.debug("情绪-生活反馈：实际入账增量为全零（规则累计 %s），不占预算",
+                             delta_total)
+                return
             used_raw = budget["used"] if isinstance(budget["used"], dict) else {}
             for axis in _VAD_AXES:
-                projected = _to_float(used_raw.get(axis)) + delta_total[axis]
+                projected = _to_float(used_raw.get(axis)) + actual_total[axis]
                 if abs(projected) > GLOBAL_VAD_DAILY_CAP + _ZERO_EPS:
-                    logger.debug("情绪-生活反馈：全局日上限触顶（%s 累计 %s），本次整条丢弃",
-                                 axis, used_raw)
+                    logger.debug("情绪-生活反馈：全局日上限触顶（%s 累计 %s + 实际 %s），"
+                                 "本次整条丢弃", axis, used_raw, actual_total)
                     return
-            result = await self._emotion.record_external_event(
-                source=LIFE_EPISODE_SOURCE, description=description,
-                delta=VADState(**delta_total), use_llm=False, multiplier=1.0,
-                session_id="", event_id=f"life.episode_{event_kind}",
-                episode_id=episode_id)
-            if not (isinstance(result, dict) and result.get("ok")):
-                # 未入账（停用/去重/限幅拒绝）→ 预算不动账
-                logger.debug("情绪-生活反馈：record_external_event 未入账（%s）",
-                             result.get("reason") if isinstance(result, dict) else result)
-                return
-            budget["rules"].update(pending_rules)
-            for axis in _VAD_AXES:
-                budget["used"][axis] = _to_float(budget["used"].get(axis)) + delta_total[axis]
+            # entries 条目先按本次判定成形（ts 走配置时区链，PR2.5 D4）；入账成功才提交。
+            # ``delta`` = 实际入账值，``delta_rule`` = 规则输入值（口径可追溯）。
+            entry: Optional[Dict[str, Any]] = None
             if episode_id:
-                budget["entries"][episode_id] = {
+                entry = {
                     "rules": applied_rules,
-                    "delta": {axis: round(delta_total[axis], 6) for axis in _VAD_AXES},
+                    "delta": {axis: round(actual_total[axis], 6) for axis in _VAD_AXES},
+                    "delta_rule": {axis: round(delta_total[axis], 6) for axis in _VAD_AXES},
                     "ts": _tz_now().isoformat(timespec="seconds"),  # PR2.5 D4：同上时区链
                 }
-            self._save_budget(budget)
-            logger.debug("情绪-生活反馈：episode %s 入账 %s（规则=%s）",
-                         episode_id or "(无)", delta_total, applied_rules)
+            # ── 入账 + 旁路记账：同一同步区（其间无 await）────────────────────────
+            # 旧实现：``await record_external_event(...)`` 之后才提交账本。该 await 会发布
+            # ``emotion.updated`` 并让出事件循环，第二个协程因此能读到陈旧账本 → 同一事件
+            # 重复入账 / 全局日封顶被击穿 / 账本读-改-写丢更新；若在 await 期间被取消，还会
+            # 「VAD 已入账、账本未落」，重试即二次入账。同步核心不 yield，入账与记账在同一
+            # 同步执行内完成，单线程事件循环下即原子。
+            apply_sync = getattr(self._emotion, "record_external_event_sync", None)
+            if callable(apply_sync):
+                outcome = apply_sync(
+                    LIFE_EPISODE_SOURCE, description, VADState(**delta_total),
+                    multiplier=1.0, session_id="",
+                    event_id=f"life.episode_{event_kind}", episode_id=episode_id)
+                if not (isinstance(outcome, dict) and outcome.get("ok")):
+                    # 未入账（停用/去重拒绝）→ 预算不动账
+                    logger.debug("情绪-生活反馈：同步入账未生效（%s）",
+                                 outcome.get("reason") if isinstance(outcome, dict) else outcome)
+                    return
+                # 记账用**真正应用**的增量（同步核心返回的 applied 优先；与预览同真源，
+                # 其间无 await 故必然一致），并据此写 actual 口径标记
+                applied_outcome = outcome.get("delta")
+                commit_delta, commit_basis = actual_total, actual_basis
+                if applied_outcome is not None:
+                    commit_delta = _axis_dict(applied_outcome)
+                    commit_basis = True
+                if entry is not None:
+                    # entry 的 delta 以真正应用值为准（与 used 同一口径，预览/应用同真源）
+                    entry["delta"] = {axis: round(commit_delta[axis], 6) for axis in _VAD_AXES}
+                self._commit_budget(budget, pending_rules, commit_delta, episode_id, entry,
+                                    commit_basis)
+                # 事件面保持不变：账本已提交后才发布（取消发生在发布位时账本已落定）
+                publisher = getattr(self._emotion, "publish_external_updated", None)
+                if callable(publisher):
+                    await publisher()
+            else:
+                # 兜底：无同步核心的服务桩/旧服务（单协程桩无并发窗口）→ 既有异步入口
+                result = await self._emotion.record_external_event(
+                    source=LIFE_EPISODE_SOURCE, description=description,
+                    delta=VADState(**delta_total), use_llm=False, multiplier=1.0,
+                    session_id="", event_id=f"life.episode_{event_kind}",
+                    episode_id=episode_id)
+                if not (isinstance(result, dict) and result.get("ok")):
+                    logger.debug("情绪-生活反馈：record_external_event 未入账（%s）",
+                                 result.get("reason") if isinstance(result, dict) else result)
+                    return
+                self._commit_budget(budget, pending_rules, actual_total, episode_id, entry,
+                                    actual_basis)
+            logger.debug("情绪-生活反馈：episode %s 实际入账 %s（规则 %s，规则=%s）",
+                         episode_id or "(无)", actual_total, delta_total, applied_rules)
         except Exception:
             logger.warning("情绪-生活反馈处理异常（忽略，不影响事件链）", exc_info=True)
+
+    def _commit_budget(self, budget: Dict[str, Any], pending_rules: Dict[str, Dict[str, float]],
+                       applied: Dict[str, float], episode_id: str,
+                       entry: Optional[Dict[str, Any]], actual_basis: bool = True) -> None:
+        """把一次**已真正入账**的反馈写进账本（entries 去重 / used 全局累计 / 逐规则累计）。
+
+        R7 并发修复（2026-10-26）：只在 VAD 入账成功后的**同一同步区**调用（``_handle`` 内
+        二者无 await 间隔），使「入账恰一次」与「预算不超、不丢更新」不可分割；未入账 / 失败
+        / 入账前取消一律不进入本方法 → 不占预算。``entry`` 由 ``_handle`` 按本次判定预先成形
+        （含 ``_tz_now`` 时区链的 ts），本方法只负责并入账本与落盘。
+
+        口径（2026-10-27 用户裁定）：``budget["used"]`` 累计 ``applied``——即最终实际入账
+        增量（倍率 + ±0.5 限幅之后），不是规则输入 delta；逐规则 ``rules`` 仍累计规则输入
+        delta（``pending_rules``）。``actual_basis=False`` 仅出现在无预览口的旧服务/桩兜底
+        路径：此时 applied 只是规则 delta 代理，**不写** ``used_basis`` 标记（防止把 raw
+        当 actual 留给后续实例）。
+        """
+        budget["rules"].update(pending_rules)
+        for axis in _VAD_AXES:
+            budget["used"][axis] = _to_float(budget["used"].get(axis)) + applied[axis]
+        if actual_basis:
+            budget["used_basis"] = BUDGET_USED_BASIS
+        if episode_id and entry is not None:
+            budget["entries"][episode_id] = entry
+        self._save_budget(budget)
 
     @staticmethod
     def _episode_duration_minutes(payload: Dict[str, Any]) -> Optional[float]:
@@ -432,7 +605,16 @@ class LifeFeedbackService:
 
     # ── 每日预算（原子写；日期滚动自然重置；读写全程 best-effort）──
     def _load_budget(self, today: str) -> Dict[str, Any]:
+        """读当日账本：**进程内镜像优先**，再回落到盘上文件；非当日 → 新账本（滚动重置）。
+
+        镜像优先的理由（2026-10-26 并发修复配套）：写盘失败（``save_json_atomic`` 返回
+        False）或无 ``_data_dir`` 的实例若每次都只看盘，重试同一事件会读到陈旧账本而重复
+        入账；账本已在 ``_save_budget`` 里同步镜像，故当日口径以内存为准。
+        """
         fresh: Dict[str, Any] = {"date": today, "used": {}, "rules": {}, "entries": {}}
+        cache = self._budget_cache
+        if isinstance(cache, dict) and str(cache.get("date") or "") == today:
+            return self._mark_legacy_basis(copy.deepcopy(cache))
         if self._budget_path is None:
             return fresh
         data = load_json(self._budget_path, None)
@@ -443,10 +625,80 @@ class LifeFeedbackService:
         budget["rules"] = data.get("rules") if isinstance(data.get("rules"), dict) else {}
         budget["entries"] = (data.get("entries")
                              if isinstance(data.get("entries"), dict) else {})
+        budget["used_basis"] = str(data.get("used_basis") or "")
+        if isinstance(data.get("budget_hold"), dict):
+            budget["budget_hold"] = data["budget_hold"]
+        self._mark_legacy_basis(budget)
+        self._budget_cache = copy.deepcopy(budget)
         return budget
 
+    @staticmethod
+    def _legacy_budget_has_history(budget: Dict[str, Any]) -> bool:
+        """旧 raw 账本是否存在**无法由净 used 恢复**的历史消耗（独立复核 2026-10-27）。
+
+        只看 ``used`` 净额不够：旧账的正负事件可以互相抵消使 raw ``used`` 恰为 0，
+        而历史 ``global_event_multiplier`` 变化 / 逐事件 ±0.5 截断后的 actual 可能非零。
+        因此 ``rules`` 累计或 ``entries`` 逐条 delta 任一非零都视为有历史消耗。
+
+        ``entries`` 内逐条 delta 全零（或结构缺 delta 时保守视为有消耗）才不算；
+        只有 used/rules/entries 均空或全零（确实没有历史消耗）的旧账才可免 hold。
+        """
+        used = budget.get("used") if isinstance(budget.get("used"), dict) else {}
+        if any(abs(_to_float(used.get(axis))) > _ZERO_EPS for axis in _VAD_AXES):
+            return True
+        rules = budget.get("rules") if isinstance(budget.get("rules"), dict) else {}
+        for value in rules.values():
+            axes = value if isinstance(value, dict) else {}
+            if any(abs(_to_float(axes.get(axis))) > _ZERO_EPS for axis in _VAD_AXES):
+                return True
+        entries = budget.get("entries") if isinstance(budget.get("entries"), dict) else {}
+        for entry in entries.values():
+            delta = entry.get("delta") if isinstance(entry, dict) else None
+            if not isinstance(delta, dict):
+                # 结构不可判定（历史条目缺 delta）→ 保守视为有历史消耗
+                return True
+            if any(abs(_to_float(delta.get(axis))) > _ZERO_EPS for axis in _VAD_AXES):
+                return True
+        return False
+
+    @staticmethod
+    def _mark_legacy_basis(budget: Dict[str, Any]) -> Dict[str, Any]:
+        """标记「当日非空旧 raw 账本」：缺 actual 口径标记且存在历史消耗，或已带 legacy hold。
+
+        独立复核订正（2026-10-27）：不能只看 ``used`` 净额——正负事件抵消使 raw ``used``
+        为 0，但 ``rules``/``entries`` 有历史消耗时 actual 仍不可恢复，必须按用户裁定
+        hold；只有 used/rules/entries 均空或全零（确实没有历史消耗）才免 hold。
+        """
+        basis = str(budget.get("used_basis") or "")
+        if basis == BUDGET_USED_BASIS_LEGACY:
+            budget["legacy_basis"] = True
+        elif basis != BUDGET_USED_BASIS and LifeFeedbackService._legacy_budget_has_history(budget):
+            budget["legacy_basis"] = True
+        return budget
+
+    def _hold_legacy_budget(self, budget: Dict[str, Any]) -> None:
+        """给同日旧 raw 账本补 basis/hold 留痕（2026-10-27 用户裁定）。
+
+        只加元数据，``used`` / ``rules`` / ``entries`` 原样保留：不猜历史倍率、不回填未知
+        actual、不清空旧账放大额度。幂等（已有 hold 则不重写）；hold 随日切自然消失。
+        """
+        raw_basis = str(budget.get("used_basis") or "") or "rule_delta_unmarked"
+        budget["used_basis"] = BUDGET_USED_BASIS_LEGACY
+        if not isinstance(budget.get("budget_hold"), dict):
+            budget["budget_hold"] = {
+                "since": _tz_now().isoformat(timespec="seconds"),
+                "reason": "legacy_used_basis_unrecoverable",
+                "legacy_basis": raw_basis,
+                "note": ("当日旧账 used 为规则输入口径，actual 不可恢复；暂停当天新增生活"
+                         "反馈，次日 actual 新口径自动恢复"),
+            }
+        persisted = {key: value for key, value in budget.items() if key != "legacy_basis"}
+        self._save_budget(persisted)
+
     def _save_budget(self, budget: Dict[str, Any]) -> None:
+        # 先更新进程内镜像（当日去重与累计不依赖写盘成功），再尽力原子写盘
+        self._budget_cache = copy.deepcopy(budget)
         if self._budget_path is None:
             return
         if not save_json_atomic(self._budget_path, budget):
-            logger.debug("情绪-生活反馈：每日预算写盘失败（忽略；仅影响跨重启累计口径）")
+            logger.debug("情绪-生活反馈：每日预算写盘失败（已保留进程内镜像；仅影响跨重启口径）")

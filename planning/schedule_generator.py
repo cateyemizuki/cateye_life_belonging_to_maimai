@@ -121,6 +121,20 @@ def _fmt_minutes(minutes: int) -> str:
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
+def _canonical_generation_goal_type(name: Any, goal_type: Any) -> str:
+    """新生成条目的规范 goal_type（A-21(f)，用户 2026-10-27 批）。
+
+    夜间睡眠条目统一写 ``sleep``：兼容 LLM 受旧提示词影响仍返回
+    ``daily_routine`` 的情况；午休/午睡等名称不是夜间词，不会被误改。
+    旧数据不做迁移，读取侧由 :func:`planning.schedule_items.is_night_sleep_item` 兼容。
+    """
+    value = str(goal_type or "").strip() or "daily_routine"
+    if value != "sleep" and is_night_sleep_item({"name": str(name or ""),
+                                                 "goal_type": value}):
+        return "sleep"
+    return value
+
+
 class ScheduleGenerator:
     """日程生成器（协调器：配置 → 上下文 → 多轮生成 → 校验评分 → 落库）。"""
 
@@ -368,6 +382,25 @@ class ScheduleGenerator:
             if idx < len(items):
                 params = dict(items[idx].get("parameters") or {})
                 params.update(meta)
+                # 用户 2026-10-27 最终裁定：明确 time 的 hard 约定**原时刻固定**——
+                # 即使 LLM/近窗匹配把条目放在 09:50，也拉回 pending 的 10:00；soft 仍可窗口调度。
+                if (meta.get("commitment_hardness") == "hard"
+                        and str(meta.get("commitment_time") or "").strip()):
+                    commit_minute = _parse_minutes(str(meta["commitment_time"]), -1)
+                    if commit_minute >= 0:
+                        try:
+                            old_start = int(items[idx].get("start_minute") or commit_minute)
+                            old_end = int(items[idx].get("end_minute") or (commit_minute + 60))
+                        except (TypeError, ValueError):
+                            old_start, old_end = commit_minute, commit_minute + 60
+                        duration = max(15, old_end - old_start)
+                        items[idx]["start_minute"] = commit_minute
+                        items[idx]["end_minute"] = commit_minute + duration
+                        if items[idx].get("time_slot"):
+                            items[idx]["time_slot"] = f"{commit_minute // 60:02d}:{commit_minute % 60:02d}"
+                        params["commitment_time_fixed"] = commit_minute
+                        if old_start != commit_minute:
+                            params["commitment_time_shifted_from"] = old_start
                 items[idx]["parameters"] = params
 
         written = self._replace_with_entry(date, items, reason)
@@ -635,7 +668,7 @@ class ScheduleGenerator:
         max_minutes = _clamp_int(raw.get("max_minutes"), min_minutes, 5, 720)
         if max_minutes < min_minutes:
             max_minutes = min_minutes
-        goal_type = str(raw.get("goal_type") or "").strip() or "daily_routine"
+        goal_type = _canonical_generation_goal_type(name, raw.get("goal_type"))
         priority = str(raw.get("priority") or "").strip()
         if priority not in ScheduleGenerator.SPINE_PRIORITIES:
             priority = "medium"
@@ -686,8 +719,7 @@ class ScheduleGenerator:
         （3~6 条契约含睡觉锚点；hard 锚点优先级高于 LLM 软意图）。
         """
         for row in rows:
-            name = str(row.get("name") or "")
-            if str(row.get("goal_type") or "") == "sleep" or ("睡" in name or "眠" in name):
+            if is_night_sleep_item(row):
                 return rows
         wake_min = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
         sleep_min = parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES)
@@ -738,7 +770,7 @@ class ScheduleGenerator:
         return {
             "name": name,
             "description": note,
-            "goal_type": goal_type,
+            "goal_type": _canonical_generation_goal_type(name, goal_type),
             "priority": priority,
             "start_minute": int(start),
             "end_minute": int(end),
@@ -872,6 +904,14 @@ class ScheduleGenerator:
                     "time": (p.parameters or {}).get("time", ""),
                     "title": p.name,
                     "notes": (p.parameters or {}).get("notes", ""),
+                    # 显式 hardness 贯通：soft 保持 soft；旧无 hardness 按约定旧口径 hard
+                    "hardness": (
+                        "hard" if str((p.parameters or {}).get("hardness") or "").lower() != "soft"
+                        else "soft"
+                    ),
+                    "source": str((p.parameters or {}).get("hard_source")
+                                  or (p.parameters or {}).get("source") or "commitment"),
+                    "commitment_id": str(getattr(p, "goal_id", "") or ""),
                 }
                 for p in pending
             ] or None
@@ -1445,7 +1485,8 @@ class ScheduleGenerator:
             entry = {
                 "name": str(item.get("name") or "未命名活动"),
                 "description": str(item.get("description") or ""),
-                "goal_type": str(item.get("goal_type") or "daily_routine"),
+                "goal_type": _canonical_generation_goal_type(
+                    str(item.get("name") or ""), item.get("goal_type")),
                 "priority": str(item.get("priority") or "medium"),
                 "start_minute": start,
                 "end_minute": end,
@@ -1498,6 +1539,12 @@ class ScheduleGenerator:
             commit_title = commit.name.strip()
             commit_notes = str(params.get("notes") or "").strip()
             commit_reason = str(params.get("reason") or "").strip()
+            # 2026-10-27 用户裁定：显式 hardness 贯通到生成->DB/Planner；
+            # soft 不得被 LLM/默认升级为 hard，hard 不得降级；旧无 hardness 约定兼容 hard。
+            raw_hardness = str(params.get("hardness") or "").strip().lower()
+            commit_hardness = "soft" if raw_hardness == "soft" else "hard"
+            commit_source = str(params.get("hard_source") or params.get("source") or "commitment")
+            commit_id = str(getattr(commit, "goal_id", "") or "")
 
             best_idx: Optional[int] = None
 
@@ -1544,6 +1591,11 @@ class ScheduleGenerator:
                 "commitment_notes": commit_notes,
                 "commitment_reason": commit_reason,
                 "commitment_time": commit_time,
+                "commitment_hardness": commit_hardness,
+                "commitment_source": commit_source,
+                "commitment_id": commit_id,
+                # 显式覆盖生成侧 hardness（soft 不硬化 / hard 不降级）
+                "hardness": commit_hardness,
             }
             used_item_idx.add(best_idx)
             logger.info("约定 %r → 日程项[%d] %r", commit_title, best_idx, items[best_idx].get("name"))

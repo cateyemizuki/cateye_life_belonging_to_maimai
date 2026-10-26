@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 EVENT_MODULE_MAP: Dict[str, str] = {
     "schedule_generation": "planning",
     "schedule_spine": "planning",  # 2026-10-25 滚动化改造新增：spine 日意图生成（模块 planning）
+    "schedule_events": "planning",  # 2026-10-27 PR4 共享接线：事件库生成（唯一外部新任务名）
     "role_judge": "planning",
     "miss_confirm": "companion",
     "affection_review": "companion",

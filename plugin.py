@@ -15,6 +15,7 @@ self._qzone，组件注册由三个 components.py 的 Mixin 提供（多继承�
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from typing import Any, ClassVar, Iterable
 
 # ── 宿主运行时导入引导（勿删）──────────────────────────────────────────
@@ -59,6 +60,8 @@ from planning.components import PlanningComponentsMixin
 from planning.life_modulation import LifeModulationService
 from planning.life_schedule import LifeScheduleReadModel
 from planning.life_state import LifeStateService
+from planning.sleep_engine import NO_HARD_COMMITMENT, SleepEngine
+from planning.sleep_schedule import SleepEndpointHook
 from planning.rolling_planner import RollingPlanner
 from planning.schedule_db import ScheduleDB
 from planning.schedule_query import ScheduleQuery
@@ -72,6 +75,8 @@ from qzone.service import QzoneService
 _MISSING = object()
 #: 磁盘配置文件名（宿主 Runner 固定用这个名字，见 runner_main._save_plugin_config）
 _CONFIG_FILE_NAME = "config.toml"
+#: 调制采用观测事件（附录 B.6.1；有界内部事件，不新增消息/模型调用/路径键）
+EVENT_EMOTION_MODULATION_APPLIED = "life.emotion_modulation_applied"
 
 
 def _read_config_file(path: str) -> dict:
@@ -248,7 +253,35 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         磁盘路径取模块级 :data:`_PLUGIN_DIR`（便于离线用例替换成临时目录）；
         tomllib 缺失时回退宿主自带的 tomlkit；任何异常 → 原样返回输入（抢救失败不阻塞宿主）。
         """
-        rescued, rescued_changed = _rescue_config_from_disk(config_data)
+        # 2026-10-27 用户裁定：规范 max_generated_events 显式值（含 8）优先于旧
+        # max_events；必须在本方法即将调用的 SDK「merge 出厂默认 → 校验」之前，对
+        # **原始输入**先搬迁旧键，否则默认 8 一旦 merge 进来就无法再靠值判断显式性。
+        incoming = config_data
+        try:
+            from planning.event_catalog_config import migrate_legacy_event_catalog
+
+            def _migrate_ec(payload: Any) -> Any:
+                if not isinstance(payload, dict) or not isinstance(payload.get("event_catalog"), dict):
+                    return payload
+                before = payload["event_catalog"]
+                after = migrate_legacy_event_catalog(before)
+                if after is before:
+                    return payload
+                out = dict(payload)
+                out["event_catalog"] = after
+                return out
+
+            incoming = _migrate_ec(incoming)
+        except Exception:
+            pass  # 迁移失败不阻塞宿主；段级校验器仍会再尝试一次
+        rescued, rescued_changed = _rescue_config_from_disk(incoming)
+        try:
+            migrated_rescued = _migrate_ec(rescued)
+            if migrated_rescued is not rescued:
+                rescued = migrated_rescued
+                rescued_changed = True
+        except Exception:
+            pass
         parent = getattr(super(), "normalize_plugin_config", None)
         if callable(parent):  # 宿主/SDK 环境：走官方 merge → 校验 → 迁移
             normalized, changed = parent(rescued)
@@ -336,8 +369,16 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         # 情绪调制服务（PR2，2026-10-26，定稿 §4.1.1）：只在 [life_state] enabled 且
         # emotion_modulation_enabled=true 时才构造（惰性，见 _ensure_life_modulation）
         self._life_modulation: LifeModulationService | None = None
+        # 睡眠引擎（PR3，2026-10-26；[life_state].sleep_engine_enabled 且 enabled 才建）
+        self._sleep_engine: SleepEngine | None = None
+        # 内部重检通知（睡眠 loop 安全唤醒；日程/约定写入共同口触达，见 request_life_recheck）
+        self._life_recheck_event: asyncio.Event | None = None
+        self._life_tick_loop_ref: Any = None
         self._life_tick_task: asyncio.Task | None = None
         self._life_cleanup_date = ""
+        # PR6（2026-10-27）：目标频率校准的单飞 task 与「无 loop 时挂起」标记
+        self._frequency_calibration_task: Any = None
+        self._frequency_calibration_pending = False
         if not cfg.plugin.enabled:
             self.ctx.logger.info("插件未启用（plugin.enabled=false），仅加载组件")
             return
@@ -355,6 +396,11 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
 
     async def on_unload(self) -> None:
         await self._qzone.stop()
+        # PR6：取消未完成的频率校准 task（不留悬挂协程）
+        try:
+            await self._stop_target_frequency_calibration()
+        except Exception:
+            pass
         try:
             await self._emotion.stop()
         except Exception:
@@ -400,6 +446,11 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             await self._qzone.stop()
             await self._companion.stop()
             await self._planning.stop()
+            # PR6：插件停用时取消未完成的频率校准
+            try:
+                await self._stop_target_frequency_calibration()
+            except Exception:
+                pass
             # 生活状态停机（R7 滚动化改造）：停 tick 循环 + 落盘（服务实例保留待重启用）
             try:
                 await self._stop_life_tick_task()
@@ -414,8 +465,33 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         # 生活状态热启用（R7 滚动化改造）：[life_state].enabled 首次置真时此处补装配，
         # 再挂 tick 循环（_start_bg 的 _bg_started 守卫会早退，故单独 _ensure）
         self._setup_life_services()
+        # PR3（2026-10-26，定稿 §3）：睡眠引擎随配置热更新重装配（开关由关到开/由开到关）；
+        # life 反馈订阅也在此按当前开关同步（不能因 bridge 已订阅而早退）
+        try:
+            self._sync_sleep_engine()
+        except Exception:
+            pass
+        try:
+            self._emotion.sync_from_config()
+        except Exception:
+            pass
         await self._start_bg()
         self._ensure_life_tick_task()
+        # PR4（2026-10-27）：事件库模式随配置热更新切换（off/manual/auto 三态；复用同一
+        # 实例，只 start/stop 后台；关闭中的在飞生成按保守结果保留旧库）
+        try:
+            await self._planning.sync_event_catalog()
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning("事件库模式切换失败（保持只读）：%s", exc)
+            except Exception:
+                pass
+        # PR6：配置热更新（含目标/开关变化）后立即校准目标频率，不等活动切换
+        try:
+            await self.flush_target_frequency_calibration()
+            await self._calibrate_target_frequency()
+        except Exception:
+            pass
         if self._stream_id:
             self._companion.patrol.start()
         if not cfg.qzone.enabled:
@@ -427,6 +503,73 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
     def _apply_target(self, target_qq: str, stream_id: str) -> None:
         self._companion.set_target(target_qq, stream_id)
         self._qzone.set_target(stream_id)
+        # PR6（2026-10-27 共享接线）：目标解析成功/切换后**立即**校准目标频率，
+        # 不等第一次活动切换。本方法是 sync 装配口：绝不在此 await，也不创建
+        # 无法回收的裸协程（无 loop / 未装配 → 记 pending，由 flush 口补发）。
+        self._schedule_target_frequency_calibration()
+
+    def _schedule_target_frequency_calibration(self) -> None:
+        """在 sync 装配口安全排队一次频率校准（单飞：旧 task 先取消再重建）。"""
+        loop: Any = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            # 无事件循环（同步装配/测试直接调用）：只记待办，不创建协程对象，
+            # 下一次 async 口（_start_bg / flush_target_frequency_calibration）补齐。
+            self._frequency_calibration_pending = True
+            return
+        previous = getattr(self, "_frequency_calibration_task", None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        try:
+            self._frequency_calibration_task = loop.create_task(
+                self._calibrate_target_frequency())
+            self._frequency_calibration_pending = False
+        except Exception:
+            self._frequency_calibration_task = None
+            self._frequency_calibration_pending = True
+
+    async def _calibrate_target_frequency(self) -> None:
+        """调用 PR6 公共校准口；失败只记日志，绝不拖挂。"""
+        planning = getattr(self, "_planning", None)
+        calibrate = getattr(planning, "calibrate_target_frequency", None)
+        if not callable(calibrate):
+            return
+        try:
+            result = await calibrate(force=True)
+            if isinstance(result, dict) and (result.get("errors") or result.get("reason")):
+                self.ctx.logger.info("目标频率校准未生效（%s）：%s",
+                                     result.get("reason") or "",
+                                     "；".join(result.get("errors") or []) or "-")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning("目标频率校准异常（忽略）：%s", exc)
+            except Exception:
+                pass
+
+    async def flush_target_frequency_calibration(self) -> None:
+        """补齐 sync 阶段挂起的校准（无 loop 时只记 pending 的那次）。"""
+        if not getattr(self, "_frequency_calibration_pending", False):
+            return
+        self._frequency_calibration_pending = False
+        await self._calibrate_target_frequency()
+
+    async def _stop_target_frequency_calibration(self) -> None:
+        """取消未完成的校准 task（on_unload / 插件停用）。"""
+        task = getattr(self, "_frequency_calibration_task", None)
+        self._frequency_calibration_task = None
+        self._frequency_calibration_pending = False
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     # ------------------------------------------------------------------
     # 生活状态服务束（R7 滚动化改造）
@@ -450,6 +593,14 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         try:
             section = getattr(self.config, "life_state", None)
             if section is None or not bool(getattr(section, "enabled", False)):
+                # 用户 2026-10-27 批准：单开睡眠键只提示、不自动开启生活状态、不装配
+                if section is not None and bool(getattr(section, "sleep_engine_enabled", False)):
+                    try:
+                        self.ctx.logger.warning(
+                            "睡眠引擎需要同时开启生活状态（[life_state].enabled=true）；"
+                            "当前仅 sleep_engine_enabled=true，睡眠引擎不生效")
+                    except Exception:
+                        pass
                 return False
             # 活动画像表装载（PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.6 项）：
             # load_and_apply 此前无任何装配点调用（_ACTIVE 恒 None，RollingPlanner/LifeState
@@ -473,18 +624,66 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             timezone_str = str(getattr(self.config.schedule_advanced, "timezone", "")
                                or "Asia/Shanghai")
             # 状态文件 = <plugin._data_dir>/<life_state.state_file>（B.4.1 相对数据目录）
-            life = LifeStateService(self._data_dir / state_file, timezone_str=timezone_str)
+            # 与 InitService 共用安全解析口：越界/外部绝对路径回退默认，防运行态读写外部文件。
+            from planning.life_state import resolve_state_file_path
+            life = LifeStateService(resolve_state_file_path(self._data_dir, state_file),
+                                    timezone_str=timezone_str)
+
+            def _write_schedule_items(items: Any, date: str, reason: str = "") -> Any:
+                """D9 晨间 spine 写回：生成器共享漏斗（不消费未来约定）。"""
+                generator = getattr(self, "_schedule_gen", None)
+                apply_items = getattr(generator, "apply_schedule_items", None)
+                if not callable(apply_items):
+                    return 0
+                return apply_items(items, date, consume_commitments=False,
+                                   reason=reason or "morning_wake_adjust")
+
             planner = RollingPlanner(
                 self._db, life,
                 config_provider=lambda: self.config, event_bus=getattr(self, "_bus", None),
                 decision_logger=getattr(self, "_decision_logger", None),
-                timezone_str=timezone_str)
+                timezone_str=timezone_str, schedule_writer=_write_schedule_items,
+                # 硬约定正式起床在 planner 内 force_wake：回调同步真实醒来到周期四变量
+                wake_recorder=self._record_actual_wake_cycle,
+                # PR4 共享接线：随机事件优先从事件库取（单实例由 PlanningServices 持有；
+                # None = 事件库装配失败 → planner 逐字回退旧内置池路径）
+                event_catalog=getattr(getattr(self, "_planning", None), "event_catalog", None))
+            engine: SleepEngine | None = None
+            if bool(getattr(section, "sleep_engine_enabled", False)):
+                try:
+                    engine = SleepEngine(
+                        config_provider=lambda: self.config, life_state=life,
+                        session_store=self._db, event_bus=getattr(self, "_bus", None),
+                        decision_logger=getattr(self, "_decision_logger", None),
+                        timezone_str=timezone_str,
+                        episode_closer=planner.close_sleep_episode,
+                        sleep_endpoint_updater=SleepEndpointHook(self),
+                        emotion_bridge=getattr(self, "_emotion", None))
+                    planner.set_sleep_engine(engine)
+                    if engine.enabled:
+                        engine.restore()
+                        self.ctx.logger.info(
+                            "睡眠引擎已装配（阈值=%.2f，硬约定提前=%s 分钟，上限复检=%ss）",
+                            engine._wake_threshold(),  # noqa: SLF001 - 装配日志只读
+                            engine._cfg_int("sleep_hard_commitment_lead_minutes", 30),  # noqa: SLF001
+                            engine._wake_check_seconds())  # noqa: SLF001
+                    else:
+                        self.ctx.logger.warning(
+                            engine.diagnostics().get("warning") or "睡眠引擎未生效")
+                except Exception as exc:
+                    engine = None
+                    try:
+                        self.ctx.logger.warning("睡眠引擎装配失败（回退旧行为）：%s", exc)
+                    except Exception:
+                        pass
             model = LifeScheduleReadModel(
                 self._db, life_state=life, planner=planner,
                 config_provider=lambda: self.config, timezone_str=timezone_str)
             self._life_state = life
             self._rolling_planner = planner
             self._life_model = model
+            self._sleep_engine = engine
+            self._install_life_recheck_hooks(engine)
             self._schedule_query.set_runtime_provider(model)
             self.ctx.logger.info("生活状态服务已装配（tick=%ss，状态文件=%s）",
                                  getattr(section, "tick_seconds", 300), state_file)
@@ -494,6 +693,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             self._rolling_planner = None
             self._life_model = None
             self._life_modulation = None
+            self._sleep_engine = None
             try:
                 self._schedule_query.set_runtime_provider(None)
             except Exception:
@@ -503,6 +703,126 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             except Exception:
                 pass
             return False
+
+    def _sync_sleep_engine(self) -> None:
+        """按当前配置热更新睡眠引擎（PR3；开→装配/关→解除注入并落盘）。
+
+        不能只依赖 `_setup_life_services`（幂等早退）：引擎开关由关到开时须补装配，
+        由开到关时须解除 planner/provider（关闭不保留任何新行为）。
+        """
+        section = getattr(self.config, "life_state", None)
+        desired = bool(section is not None
+                       and bool(getattr(section, "enabled", False))
+                       and bool(getattr(section, "sleep_engine_enabled", False)))
+        engine = getattr(self, "_sleep_engine", None)
+        planner = getattr(self, "_rolling_planner", None)
+        life = getattr(self, "_life_state", None)
+        if not desired:
+            if engine is not None:
+                # 用户 2026-10-27 批准（热关闭过渡）：以关闭时刻结束当前睡眠会话，再交回
+                # 旧调度 —— actual_end=真实关闭时刻、走一次结算、不留 paused 恢复池条目、
+                # 不改既有已结束历史。注意与「硬约定=正式起床」（actual_end=约定−lead 的
+                # 真实唤醒时刻）及「夜间 <5 分钟短扰只重置连续段」是三条独立规则。
+                self._close_sleep_for_disable(engine)
+                if planner is not None:
+                    try:
+                        planner.set_sleep_engine(None)
+                    except Exception:
+                        pass
+                self._sleep_engine = None
+            self._install_life_recheck_hooks(None)
+            return
+        if engine is not None or planner is None or life is None:
+            return
+        try:
+            timezone_str = str(getattr(self.config.schedule_advanced, "timezone", "")
+                               or "Asia/Shanghai")
+            engine = SleepEngine(
+                config_provider=lambda: self.config, life_state=life,
+                session_store=self._db, event_bus=getattr(self, "_bus", None),
+                decision_logger=getattr(self, "_decision_logger", None),
+                timezone_str=timezone_str,
+                episode_closer=planner.close_sleep_episode,
+                sleep_endpoint_updater=SleepEndpointHook(self),
+                emotion_bridge=getattr(self, "_emotion", None))
+            planner.set_sleep_engine(engine)
+            if engine.enabled:
+                engine.restore()
+                self.ctx.logger.info("睡眠引擎已热装配（[life_state].sleep_engine_enabled=true）")
+            else:
+                self.ctx.logger.warning(engine.diagnostics().get("warning")
+                                        or "睡眠引擎未生效")
+            self._sleep_engine = engine
+        except Exception as exc:
+            self._sleep_engine = None
+            try:
+                self.ctx.logger.warning("睡眠引擎热装配失败（回退旧行为）：%s", exc)
+            except Exception:
+                pass
+            self._install_life_recheck_hooks(None)
+
+    def _close_sleep_for_disable(self, engine: Any) -> None:
+        """引擎热关闭/停用前正式结束当前睡眠（用户 2026-10-27 批准的热关闭过渡）。
+
+        - 正在睡（或存在未关闭会话）→ ``force_wake(reason="manual")`` 走一次性结算链：
+          会话/DB 行 ``completed``、episode 关闭（actual_end = 真实 now）、端点写回；
+        - 无未关闭会话 → 只 ``persist()``（不动历史，不虚构结束）。
+        """
+        session = getattr(engine, "_session", None)  # noqa: SLF001 - 同源会话判定
+        open_session = bool(session is not None and not getattr(session, "closed", True))
+        asleep: Any = None
+        try:
+            asleep = engine.is_asleep()
+        except Exception:
+            asleep = None
+        if open_session or asleep is True:
+            shutdown = getattr(engine, "shutdown_session", None)
+            try:
+                if callable(shutdown):
+                    outcome = shutdown(reason="manual")
+                else:
+                    outcome = engine.force_wake(reason="manual")
+                if isinstance(outcome, dict) and outcome.get("committed"):
+                    # 热关闭以关闭时刻结束会话 → 同时把真实醒点同步进周期四变量
+                    # （2026-10-27 用户批准；不改历史已醒记录）
+                    self._record_actual_wake_cycle(
+                        when=getattr(session, "closed_at", None))
+                    return
+            except Exception:
+                pass
+        try:
+            engine.persist()
+        except Exception:
+            pass
+
+    def _install_life_recheck_hooks(self, engine: Any) -> None:
+        """挂/卸「日程/约定写入 → 即时重检」通知（引擎关 → 断开，旧路径行为恢复）。
+
+        只接**已有**写入共同口（ScheduleDB 日程写入 / GoalManager 约定写入），不改
+        它们的业务语义；回调只置内部 Event，不推进状态、不发消息、不调模型。
+        """
+        callback = self._on_life_schedule_change if engine is not None else None
+        db = getattr(self, "_db", None)
+        setter = getattr(db, "set_schedule_change_listener", None)
+        if callable(setter):
+            try:
+                setter(callback)
+            except Exception:
+                pass
+        goal_manager = getattr(getattr(self, "_planning", None), "goal_manager", None)
+        gm_setter = getattr(goal_manager, "set_change_listener", None)
+        if callable(gm_setter):
+            try:
+                gm_setter(callback)
+            except Exception:
+                pass
+
+    def _on_life_schedule_change(self, *args: Any, **kwargs: Any) -> None:
+        """日程/约定写入共同口回调（可能在 DB 线程触发 → request_life_recheck 已线程安全）。"""
+        try:
+            self.request_life_recheck("schedule_changed")
+        except Exception:
+            pass
 
     def _ensure_life_tick_task(self) -> None:
         """挂生活状态 tick 循环（幂等；仅已装配时）。独立间隔 [life_state].tick_seconds，
@@ -528,6 +848,12 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
 
     def _stop_life_services(self) -> None:
         """生活状态停机：落盘 life_state.json（best-effort；tick 每拍已存，此处兜底收尾）。"""
+        engine = getattr(self, "_sleep_engine", None)
+        if engine is not None:
+            try:
+                engine.persist()
+            except Exception:
+                pass
         life = getattr(self, "_life_state", None)
         if life is None:
             return
@@ -544,38 +870,152 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
 
         每轮活读 ``[life_state]`` 段：热重载改 tick_seconds 即时生效；开关关闭 → 循环
         自退出（重新开启由 on_config_update 的 _ensure_life_tick_task 重新挂起）。
+
+        等待上限不再恒为 ``tick_seconds``：睡眠引擎给出下一个**绝对边界**（12:00 上限 /
+        硬约定阈值 / 最早起床 / 阈值复检网格）时按边界精确等待（用户 2026-10-27：固定
+        300s 会让 11:58 的下一拍睡过 12:00、让 08:02 的硬约定阈值漂到 08:03+）。
+        等待同时挂「内部重检通知」（:meth:`request_life_recheck`，日程/约定写入共同口触达），
+        睡眠中新增临近硬约定即时重算，不固定等满 5 分钟。
         """
-        while not self._stop_event.is_set():
-            section = getattr(self.config, "life_state", None)
-            if section is None or not bool(getattr(section, "enabled", False)):
-                return
+        self._life_tick_loop_ref = asyncio.get_running_loop()
+        try:
+            while not self._stop_event.is_set():
+                section = getattr(self.config, "life_state", None)
+                if section is None or not bool(getattr(section, "enabled", False)):
+                    return
+                try:
+                    self._life_tick_once()
+                except Exception:
+                    pass  # 单拍失败不影响循环
+                try:
+                    interval = max(30, int(getattr(section, "tick_seconds", 300)))
+                except (TypeError, ValueError):
+                    interval = 300
+                timeout = self._life_next_wait_seconds(interval)
+                if await self._life_wait(timeout):
+                    return
+        finally:
+            self._life_tick_loop_ref = None
+
+    def _life_recheck_event_obj(self) -> asyncio.Event:
+        """内部重检事件（惰性创建；同一实例复用 → 通知幂等）。"""
+        event = getattr(self, "_life_recheck_event", None)
+        if event is None:
+            event = asyncio.Event()
+            self._life_recheck_event = event
+        return event
+
+    def request_life_recheck(self, reason: str = "") -> bool:
+        """安全唤醒生活状态 loop 即刻重检（幂等；**不**推进状态/不发消息/不调模型）。
+
+        只做 ``Event.set``：已有未消化通知 → 返回 False（重复通知不会让循环多跑一拍）。
+        从非 loop 线程调用时经所属 loop ``call_soon_threadsafe`` 排入；loop 未起动/已结束
+        → 置位（下次循环起点立即重检）。日程写入、约定写入等共同口都接这里。
+        """
+        event = self._life_recheck_event_obj()
+        if event.is_set():
+            return False
+        loop = getattr(self, "_life_tick_loop_ref", None)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is not None and loop is not running:
             try:
-                self._life_tick_once()
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                return False
+        else:
+            event.set()
+        return True
+
+    def _life_next_wait_seconds(self, interval: Any) -> float:
+        """本拍等待上限 = min(tick_seconds, 到下一个绝对睡眠边界的秒数)。"""
+        try:
+            base = max(1.0, float(interval))
+        except (TypeError, ValueError):
+            base = 300.0
+        section = getattr(self.config, "life_state", None)
+        if section is not None and bool(getattr(section, "sleep_engine_enabled", False)) is False:
+            return base
+        engine = getattr(self, "_sleep_engine", None)
+        if engine is None:
+            return base
+        hard_start = None
+        planner = getattr(self, "_rolling_planner", None)
+        resolver = getattr(planner, "sleep_hard_commitment_start", None)
+        if callable(resolver):
+            try:
+                hard_start = resolver()
             except Exception:
-                pass  # 单拍失败不影响循环
-            try:
-                interval = max(30, int(getattr(section, "tick_seconds", 300)))
-            except (TypeError, ValueError):
-                interval = 300
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=float(interval))
-            except asyncio.TimeoutError:
-                continue
+                hard_start = None
+        try:
+            boundary = engine.next_wake_boundary(hard_commitment_start=hard_start)
+            if boundary is None:
+                return base
+            remain = (boundary - engine._now()).total_seconds()  # noqa: SLF001 - 同源时钟
+        except Exception:
+            return base
+        if remain <= 0:
+            return 1.0  # 已过边界（回拨/长间隔/刚过点）→ 尽快重检，不睡过点
+        return max(1.0, min(base, remain))
+
+    async def _life_wait(self, timeout: Any) -> bool:
+        """等待下一拍：``stop_event`` 或内部重检通知，先到先返回（True = 停机）。"""
+        try:
+            limit = max(0.0, float(timeout))
+        except (TypeError, ValueError):
+            limit = 300.0
+        recheck = self._life_recheck_event_obj()
+        if recheck.is_set():
+            recheck.clear()
+            return self._stop_event.is_set()
+        tasks = [asyncio.ensure_future(self._stop_event.wait()),
+                 asyncio.ensure_future(recheck.wait())]
+        try:
+            await asyncio.wait(set(tasks), timeout=limit,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            for task in tasks:
+                try:
+                    await task
+                except BaseException:  # noqa: BLE001 - 取消/异常都不影响循环
+                    pass
+            recheck.clear()
+        return self._stop_event.is_set()
 
     def _life_tick_once(self) -> None:
-        """单拍编排（PR2，2026-10-26，计划书 §三十四/定稿 §3/§4.1.4）：状态推进统一由
-        本拍编排——先 LifeState.tick（emotion_modulation_enabled=true 时带 VAD 调制）
-        再把快照传入 RollingPlanner.tick（planner 不再单独调用 life.tick，避免 VAD
-        gain 与 sleep rates 重复应用）+ 每日一次 episode 过期清理
-        （[life_state].keep_episode_days）。
+        """单拍编排（PR2 + PR3，定稿 §3.1 步序）：读 VAD → engine.prepare → life.tick →
+        engine.commit → planner.tick（睡眠 episode 由引擎负责，planner 跳过自动关）。
 
-        快照推进失败/未装配 → planner.tick() 不带快照（planner 回退自行推进，旧行为）；
-        两开关（[life_state].enabled / emotion_modulation_enabled）全关时零调制可观测。
+        睡眠引擎启用时 ``sleep_rates`` 只经一次 ``life.tick`` 应用（不叠加清醒漂移/
+        调制/单拍 delta 上限）；引擎关闭/未装配 → ``sleep_rates=None``，逐字旧路径。
+        本拍醒来 → 引擎一次性结算/关 episode/发 ``life.sleep_woke``，随后按实际睡眠
+        时长做 D9 晨间 spine 调整（写回今日日程）。任何新链失败都不阻塞主循环。
         """
         planner = getattr(self, "_rolling_planner", None)
         if planner is None:
             return
-        snapshot = self._life_tick_state(planner)
+        prepared = self._sleep_prepare(planner)
+        sleep_rates = (prepared or {}).get("rates")
+        snapshot = self._life_tick_state(planner, sleep_rates=sleep_rates)
+        commit = self._sleep_commit(prepared, snapshot)
+        if commit.get("woke"):
+            # 2026-10-27 用户批准：周期起点同步真实醒来时刻（早醒/晚醒都按真实时刻；
+            # 意图计划时间保持不动；后续编辑/再生成复用同一标记）
+            self._record_actual_wake_cycle(when=commit.get("woke_at"))
+            try:
+                planner.apply_morning_spine_adjustment(
+                    sleep_hours=commit.get("actual_sleep_hours"),
+                    wake_delay_minutes=commit.get("wake_delay_minutes", 0.0))
+            except Exception as exc:
+                try:
+                    self.ctx.logger.warning("晨间 spine 调整失败（忽略）：%s", exc)
+                except Exception:
+                    pass
         if snapshot is not None:
             report = planner.tick(life_snapshot=snapshot) or {}
         else:
@@ -597,19 +1037,31 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         except Exception as exc:
             self.ctx.logger.warning("生活状态 episode 清理失败（忽略）：%s", exc)
 
-    def _life_tick_state(self, planner: Any) -> dict[str, Any] | None:
-        """编排侧状态推进（PR2，2026-10-26，定稿 §3/§4.1.1）：life.tick 并返回快照。
+    def _life_tick_state(self, planner: Any,
+                         sleep_rates: Any = None) -> dict[str, Any] | None:
+        """编排侧状态推进：life.tick 并返回快照（PR2；PR3 追加 sleep_rates）。
 
         - 未装配 LifeStateService → None（编排方回退 planner 自行推进）；
-        - ``[life_state].emotion_modulation_enabled``（默认 False，False/段缺失/读不到
-          一律按关）→ 不读 VAD、不构造调制服务，``modulation=None``（逐字旧行为）；
-        - emotion 服务不可得/停用/读数异常 → modulation=None（可空降级，§八.2 同款）；
-        - 画像解析经 ``planner.resolve_profile_key``（与 planner 步 1 同一条规则，不
-          两处漂移）；任何异常 → None，本拍不调制、不阻塞 tick 循环。
+        - ``[life_state].emotion_modulation_enabled``（默认 False）→ 不读 VAD、
+          ``modulation=None``（逐字旧行为）；
+        - ``sleep_rates`` 非 None（睡眠引擎本拍给）→ 睡眠分支：只按引擎速率积分，
+          不叠加被动漂移/调制（由 ``LifeStateService.tick`` 保证）；
+        - emotion 服务不可得/停用/读数异常 → modulation=None；任何异常 → None，本拍
+          不调制、不阻塞 tick 循环。
         """
         life = getattr(self, "_life_state", None)
         if life is None:
             return None
+        if sleep_rates is not None:
+            try:
+                return life.tick(active_profile=None, modulation=None,
+                                 sleep_rates=sleep_rates)
+            except Exception as exc:
+                try:
+                    self.ctx.logger.warning("睡眠期状态推进失败（本拍回退）：%s", exc)
+                except Exception:
+                    pass
+                return None
         modulation = None
         section = getattr(self.config, "life_state", None)
         if section is not None and bool(getattr(section, "emotion_modulation_enabled", False)):
@@ -625,14 +1077,157 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
                 except Exception:
                     pass
         try:
-            return life.tick(active_profile=planner.resolve_profile_key(),
-                             modulation=modulation)
+            snapshot = life.tick(active_profile=planner.resolve_profile_key(),
+                                 modulation=modulation)
         except Exception as exc:
             try:
                 self.ctx.logger.warning("生活状态推进失败（本拍由 planner 回退处理）：%s", exc)
             except Exception:
                 pass
             return None
+        # 附录 B.6.1：只有新调制打开且 tick 成功采用调制时发布一次内部观测事件；
+        # modulation=None（开关关/服务不可得/VAD 不可得/计算失败）不发，tick 失败不发。
+        # ``gains`` 是 life_state 应用 homeostatic override / 单拍 cap **之前**的计算值，
+        # ``state_snapshot`` 才是 tick + clamp 后快照——两者作用域显式标注，不把保护量
+        # 当成数学原始 gain 伪报。
+        if modulation is not None:
+            self._publish_emotion_modulation_applied(modulation, snapshot)
+        return snapshot
+
+    def _publish_emotion_modulation_applied(self, gains: dict[str, Any],
+                                            snapshot: Any) -> None:
+        """发布 ``life.emotion_modulation_applied``（best-effort，静默失败）。"""
+        bus = getattr(self, "_bus", None)
+        if bus is None:
+            return
+        try:
+            payload = {
+                "gains": dict(gains or {}),
+                "gains_scope": "computed_pre_homeostatic_override_pre_tick_cap",
+                "state_snapshot": dict(snapshot or {}) if isinstance(snapshot, dict) else {},
+                "snapshot_scope": "post_tick_post_clamp",
+            }
+            bus.publish_soon(EVENT_EMOTION_MODULATION_APPLIED, **payload)
+        except Exception:
+            try:
+                self.ctx.logger.debug("调制观测事件发布失败（静默）")
+            except Exception:
+                pass
+
+    def _record_actual_wake_cycle(self, when: Any = None) -> None:
+        """真实醒来 → 周期四变量 ``cycle_start``（2026-10-27 用户批准；best-effort）。
+
+        - 只写「本帧真实醒来」标记（``current_start_source=actual_wake`` +
+          ``current_start_date``），后续日程编辑/再生成/重启由
+          ``cycle_state.enter_schedule_cycle`` 复用，不会被最早清醒意图的计划时间盖回；
+        - 各条意图的计划时间原样保留（不动 schedule 行）；
+        - 不新增 LLM 调用、不发任何消息、不改历史已醒记录。
+        """
+        data_dir = getattr(self, "_data_dir", None)
+        if data_dir is None:
+            return
+        try:
+            from planning.cycle_state import (entry_context_from_plugin,
+                                              record_actual_wake)
+            from planning.time_utils import TimezoneManager
+            ctx = entry_context_from_plugin(self)
+            tz_name = str(ctx.get("tz_name") or "") or "Asia/Shanghai"
+            wake_at = when
+            if not isinstance(wake_at, datetime):
+                wake_at = TimezoneManager(tz_name).get_now()
+            record_actual_wake(
+                str(data_dir), schedule_date=wake_at.strftime("%Y-%m-%d"),
+                wake_epoch=wake_at.timestamp(), reason="engine_wake", tz_name=tz_name,
+                cfg_wake=ctx.get("cfg_wake", ""), cfg_sleep=ctx.get("cfg_sleep", ""),
+                decision_logger=getattr(self, "_decision_logger", None), now=wake_at)
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning("真实醒来同步周期起点失败（忽略）：%s", exc)
+            except Exception:
+                pass
+
+    def _sleep_prepare(self, planner: Any) -> dict[str, Any] | None:
+        """睡眠引擎拍前准备（PR3，定稿 §3.1 步 2；未装配/关 → None 旧路径）。"""
+        engine = getattr(self, "_sleep_engine", None)
+        if engine is None:
+            return None
+        try:
+            current = planner.current() if callable(getattr(planner, "current", None)) else None
+            schedule = getattr(self.config, "schedule", None)
+            # 硬约定三态（2026-10-27 用户批准）：解析器不可用 → None（沿用会话缓存）；
+            # 解析器明确无有效约定 → NO_HARD_COMMITMENT（撤销缓存，不幽灵唤醒）；
+            # 有约定 → datetime（采用并缓存）。
+            hard_start: Any = None
+            resolver = getattr(planner, "sleep_hard_commitment_start", None)
+            if callable(resolver):
+                try:
+                    resolved = resolver()
+                except Exception:
+                    resolved = None
+                hard_start = (NO_HARD_COMMITMENT if resolved is None else resolved)
+            prepared = engine.prepare_tick(
+                sleep_episode=current,
+                hard_commitment_start=hard_start,
+                no_sleep_mode=bool(getattr(schedule, "no_sleep_mode", False)))
+            return prepared if isinstance(prepared, dict) else None
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning("睡眠引擎 prepare 失败（本拍按无睡眠处理）：%s", exc)
+            except Exception:
+                pass
+            return None
+
+    def _sleep_commit(self, prepared: Any, snapshot: Any) -> dict[str, Any]:
+        """睡眠引擎拍后提交（定稿 §3.1 步 4）：应用觉醒/结算/事件，恰好一次。"""
+        engine = getattr(self, "_sleep_engine", None)
+        if engine is None or not isinstance(prepared, dict):
+            return {}
+        try:
+            energy = snapshot.get("energy") if isinstance(snapshot, dict) else None
+            result = engine.commit_tick(energy=energy)
+            if isinstance(result, dict) and result.get("woke"):
+                session = getattr(engine, "_session", None)  # noqa: SLF001 - 同源会话读
+                closed_at = getattr(session, "closed_at", None)
+                if isinstance(closed_at, datetime):
+                    result["woke_at"] = closed_at
+            return result if isinstance(result, dict) else {}
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning("睡眠引擎 commit 失败（忽略本拍）：%s", exc)
+            except Exception:
+                pass
+            return {}
+
+    # ── 对外：睡眠引擎读数/打扰记账（emotion 侧按鸭子类型调用）──────────
+    def sleep_asleep(self, now: Any = None) -> Any:
+        """单一 wake provider：``True/False`` 权威，``None`` = 引擎不表态走旧窗口。"""
+        engine = getattr(self, "_sleep_engine", None)
+        if engine is None:
+            return None
+        try:
+            return engine.is_asleep(now)
+        except Exception:
+            return None
+
+    def sleep_status(self, now: Any = None) -> Any:
+        """只读睡眠状态（面板/diag；引擎不表态 → None）。"""
+        engine = getattr(self, "_sleep_engine", None)
+        if engine is None:
+            return None
+        try:
+            return engine.sleep_status(now)
+        except Exception:
+            return None
+
+    def note_sleep_interruption(self, now: Any = None) -> bool:
+        """夜间被打扰记账（emotion ``note_night_reply`` / ``emotion.sleep_interrupt`` 接）。"""
+        engine = getattr(self, "_sleep_engine", None)
+        if engine is None:
+            return False
+        try:
+            return bool(engine.note_interruption(now))
+        except Exception:
+            return False
 
     def _ensure_life_modulation(self) -> LifeModulationService | None:
         """情绪调制服务惰性构造（PR2，2026-10-26，定稿 §4.1.1；幂等）。
@@ -697,6 +1292,11 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             return
         self._stop_event = asyncio.Event()
         await self._planning.start()
+        # PR6：sync 装配口挂起的频率校准在此补发（无 loop 时不会创建裸协程）
+        try:
+            await self.flush_target_frequency_calibration()
+        except Exception:
+            pass
         await self._companion.start()
         if self.config.qzone.enabled:
             self._qzone.start()

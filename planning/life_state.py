@@ -49,6 +49,27 @@ logger = logging.getLogger(__name__)
 STATE_VERSION = 1
 #: 状态文件名（B.4.1：state_file 相对 plugin._data_dir）
 STATE_FILE_NAME = "life_state.json"
+
+
+def resolve_state_file_path(data_dir: Any, configured: Any = "") -> Path:
+    """``state_file`` → 数据目录内的安全路径（plugin 装配与 InitService 共用）。
+
+    相对路径落 ``<data_dir>/<name>``；绝对路径同样做包含校验。越界/解析失败 →
+    ``<data_dir>/life_state.json`` 并告警（不写、不创建外部路径）。
+    """
+    root = Path(data_dir).resolve()
+    name = str(configured or "").strip() or STATE_FILE_NAME
+    candidate = Path(name)
+    candidate = candidate if candidate.is_absolute() else root / candidate
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError, ValueError):
+        resolved = candidate
+    if resolved != root and root not in resolved.parents:
+        logger.warning("life_state.state_file 指向数据目录之外（%s），已回退 %s",
+                       name, root / STATE_FILE_NAME)
+        return root / STATE_FILE_NAME
+    return resolved
 #: 五项 0~1 状态字段
 STATE_FIELDS: Tuple[str, ...] = ("energy", "hunger", "focus", "stress", "social_battery")
 #: 新装/未知默认值（B.2 默认值表第一行）
@@ -122,6 +143,22 @@ class LifeStateService:
         self._last_sleep_at: Optional[datetime] = None
         self._last_tick_at: Optional[datetime] = None
         self._updated_at: Optional[datetime] = None
+        # ── 睡眠引擎字段（附录 B.2.1；PR3 2026-10-26 新增，旧文件缺键 → 默认）──
+        # 与五项状态同一份文件原子写；睡眠会话历史在 sleep_sessions 表（B.2.2）
+        self._sleep_started_at: Optional[datetime] = None
+        self._continuous_sleep_minutes: float = 0.0
+        self._sleep_interrupted: bool = False
+        self._sleep_segment_started_at: Optional[datetime] = None
+        self._last_wake_reason: Optional[str] = None
+        self._sleep_wake_target: Optional[datetime] = None
+        self._sleep_lie_in_cap: Optional[datetime] = None
+        #: 未知「未来版本」标记（非 None = 读到不认识的 version）。此状态下
+        #: **禁止覆盖用户文件**（2026-10-27 定稿口径：未知版本不猜着覆盖，先备份+告警）。
+        self._future_version: Optional[str] = None
+        #: 最近一次损坏/未知版本文件的备份路径（诊断用；只读）
+        self.last_backup_path: Optional[Path] = None
+        #: 损坏文件备份失败（原文件仍存在）→ 禁止 save 覆盖（内存降级，原字节保留）
+        self._backup_failed: bool = False
         self._load()
 
     # ── 时间助手（时区唯一真源 = TimezoneManager；禁手写换算）─────────────
@@ -159,17 +196,49 @@ class LifeStateService:
         return dt.isoformat() if dt is not None else None
 
     # ── 装载（损坏重置默认 + 告警不阻塞；从 last_tick_at 补算最多 24h）────
+    def _backup_corrupt_file(self, reason: str) -> Optional[Path]:
+        """损坏/未知版本文件先**保留备份**再重建（定稿口径；不静默毁字节）。"""
+        try:
+            if not self._path.exists():
+                return None
+            stamp = self._now().strftime("%Y%m%d-%H%M%S")
+            target = self._path.with_name(f"{self._path.name}.corrupt-{stamp}.bak")
+            import shutil
+            shutil.copy2(self._path, target)
+            self.last_backup_path = target
+            logger.warning("生活状态文件不可用（%s），已备份到 %s 后按规范默认重建",
+                           reason, target)
+            return target
+        except Exception as exc:  # pragma: no cover - 备份失败不阻塞内存降级
+            self._backup_failed = True
+            logger.warning("生活状态文件备份失败（保留原文件、禁止覆盖写盘）：%s", exc)
+            return None
+
     def _load(self) -> None:
         raw: Any = None
+        corrupt_reason = ""
         try:
             text = self._path.read_text(encoding="utf-8")
             raw = json.loads(text)
         except FileNotFoundError:
             raw = None  # 首次运行：纯默认，不算故障
         except (OSError, ValueError) as exc:
-            logger.warning("生活状态文件读取失败，重置默认（不阻塞）：%s（%s）",
-                           self._path, exc)
+            corrupt_reason = f"读取/解析失败：{exc}"
             raw = None
+        if raw is not None and not isinstance(raw, dict):
+            corrupt_reason = "顶层不是对象"
+            raw = None
+        if isinstance(raw, dict):
+            version = raw.get("version")
+            if version is not None and (not isinstance(version, int)
+                                        or isinstance(version, bool)
+                                        or version != STATE_VERSION):
+                # 未知（含未来）版本：先备份，再按规范默认在内存重建；落盘由 save() 拒绝，
+                # 避免用当前结构覆盖用户的新版本文件（真实歧义交诊断/报告）。
+                self._future_version = str(version)
+                corrupt_reason = f"version 不认识（期望 {STATE_VERSION}，实得 {version!r}）"
+        if corrupt_reason:
+            self._backup_corrupt_file(corrupt_reason)
         if raw is not None:
             self._apply_raw(raw)
         # 冷启动补算：从 last_tick_at 补被动漂移，最多 24h；时钟回拨按 0
@@ -214,6 +283,19 @@ class LifeStateService:
         self._last_sleep_at = self._parse_ts(raw.get("last_sleep_at"))
         self._last_tick_at = self._parse_ts(raw.get("last_tick_at"))
         self._updated_at = self._parse_ts(raw.get("updated_at"))
+        # 睡眠引擎字段（B.2.1）：逐字段容错，坏字段回默认、不整体作废
+        self._sleep_started_at = self._parse_ts(raw.get("sleep_started_at"))
+        continuous = raw.get("continuous_sleep_minutes")
+        if isinstance(continuous, (int, float)) and not isinstance(continuous, bool):
+            self._continuous_sleep_minutes = max(0.0, float(continuous))
+        else:
+            self._continuous_sleep_minutes = 0.0
+        self._sleep_interrupted = bool(raw.get("sleep_interrupted", False))
+        self._sleep_segment_started_at = self._parse_ts(raw.get("sleep_segment_started_at"))
+        reason = raw.get("last_wake_reason")
+        self._last_wake_reason = str(reason) if isinstance(reason, str) and reason else None
+        self._sleep_wake_target = self._parse_ts(raw.get("sleep_wake_target"))
+        self._sleep_lie_in_cap = self._parse_ts(raw.get("sleep_lie_in_cap"))
 
     # ── 推进与钳制 ─────────────────────────────────────────────────────────
     def _dt_minutes(self, now: datetime) -> float:
@@ -342,9 +424,23 @@ class LifeStateService:
             return None
 
     # ── 对外接口（B.5.1）───────────────────────────────────────────────────
+    def _apply_sleep_rates(self, dt_min: float, sleep_rates: Dict[str, float]) -> None:
+        """睡眠期积分（PR3，2026-10-26，定稿 §3.1 步 3）：只用引擎给的 ``sleep_rates``。
+
+        睡眠期**不再叠加清醒被动漂移**、不乘 VAD 调制 gain、不裁单拍 delta
+        （曲线本身已有界：精力/专注 |rate| ≤ 0.02/min）；未知/坏速率按 0。
+        """
+        for key in STATE_FIELDS:
+            rate = sleep_rates.get(f"{key}_rate")
+            if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+                number = float(rate)
+                if number == number:  # NaN 防御
+                    self._state[key] += number * dt_min
+
     def tick(self, now: Optional[datetime] = None,
              active_profile: Any = None,
-             modulation: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, Any]:
+             modulation: Optional[Dict[str, Dict[str, float]]] = None,
+             sleep_rates: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         """唯一推进入口：被动漂移 + 当前活动画像速率积分，钳制后落盘。
 
         ``now`` 缺省取配置时区当前时间；``active_profile`` 支持
@@ -353,10 +449,22 @@ class LifeStateService:
         ``modulation``（PR2，2026-10-26，定稿 §4.1.1；可选参数，缺省 None 逐字旧行为）：
         五项 rise/fall 增益（形态见 :meth:`planning.life_modulation.LifeModulationService.compute`），
         对每个状态的基础 delta 按符号相乘后走同一 clamp；None = 不调制。
+        ``sleep_rates``（PR3，2026-10-26，定稿 §3.1 步 3；可选参数，缺省 None = 逐字旧
+        行为）：睡眠引擎给的每分钟速率（``<state>_rate``），非 None 时**只**用它积分、
+        不再叠加清醒被动漂移、不乘 ``modulation``、不裁 TICK_DELTA_CAP——连续曲线
+        跨分段积分由引擎按区间平均值给出，本方法只做一次乘法，保证 tick 不重复恢复。
         返回 :meth:`snapshot`。落盘失败仅告警不阻塞（B.5.1「失败静默回退」）。
         """
         now = self._now(now)
         dt_min = self._dt_minutes(now)
+        if sleep_rates is not None:
+            if dt_min > 0:
+                self._apply_sleep_rates(dt_min, sleep_rates)
+            self._last_tick_at = now
+            self._updated_at = now
+            self._clamp_all()
+            self.save()
+            return self.snapshot()
         # PR2.5 修复（2026-10-26），定稿 §4.1.3：仅调制路径记录本拍前值，供
         # _cap_tick_delta 做单拍变化量上限（modulation=None 零额外动作）
         before = dict(self._state) if modulation is not None else None
@@ -441,6 +549,83 @@ class LifeStateService:
         self.save()
         return self.snapshot()
 
+    def apply_sleep_fields(self, fields: Any) -> Dict[str, Any]:
+        """睡眠连续段字段落盘（PR3，2026-10-26，附录 B.2.1；每拍由引擎推入）。
+
+        只接受白名单键，坏值按忽略/默认处理，**不覆盖五项状态**（精力/专注等由
+        ``tick(sleep_rates=...)`` 积分，两处不交叉）。落盘 best-effort。
+        """
+        if not isinstance(fields, dict):
+            return self.snapshot()
+        if "sleep_started_at" in fields:
+            self._sleep_started_at = self._parse_ts(fields.get("sleep_started_at"))
+        if "continuous_sleep_minutes" in fields:
+            value = fields.get("continuous_sleep_minutes")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self._continuous_sleep_minutes = max(0.0, float(value))
+        if "sleep_interrupted" in fields:
+            self._sleep_interrupted = bool(fields.get("sleep_interrupted"))
+        if "sleep_segment_started_at" in fields:
+            self._sleep_segment_started_at = self._parse_ts(
+                fields.get("sleep_segment_started_at"))
+        if "last_wake_reason" in fields:
+            reason = fields.get("last_wake_reason")
+            self._last_wake_reason = str(reason) if isinstance(reason, str) and reason else None
+        if "sleep_wake_target" in fields:
+            self._sleep_wake_target = self._parse_ts(fields.get("sleep_wake_target"))
+        if "sleep_lie_in_cap" in fields:
+            self._sleep_lie_in_cap = self._parse_ts(fields.get("sleep_lie_in_cap"))
+        self.save()
+        return self.snapshot()
+
+    def apply_sleep_settlement(self, payload: Any) -> Dict[str, Any]:
+        """**一次性**睡眠结算公共口（PR3，2026-10-26；引擎醒来时恰调一次）。
+
+        与旧 :meth:`handle_sleep` 的区别（防双记账）：
+
+        - ``handle_sleep`` = 旧三档整段覆盖（历史调用/兼容路径保留，逐字不变）；
+        - 本方法 = 连续曲线已在睡眠期逐拍积分完成，这里**只**写会话结束事实：
+          ``sleep_debt``（引擎按 B.2.2 公式算好，权威值）、``last_sleep_at``、
+          ``sleep_started_at/continuous_sleep_minutes/sleep_segment_started_at/
+          sleep_interrupted/last_wake_reason/sleep_wake_target/sleep_lie_in_cap``；
+          **绝不覆盖 energy/focus**（否则「整段持续恢复 + 醒来三档覆盖」= 双记账）。
+        """
+        if not isinstance(payload, dict):
+            return self.snapshot()
+        now = payload.get("now")
+        now_dt = self._now(now if isinstance(now, datetime) else None)
+        debt = payload.get("sleep_debt")
+        if isinstance(debt, (int, float)) and not isinstance(debt, bool):
+            self._sleep_debt = max(0.0, min(SLEEP_DEBT_MAX, float(debt)))
+        reason = payload.get("wake_reason")
+        self._last_wake_reason = (str(reason) if isinstance(reason, str) and reason else None)
+        self._continuous_sleep_minutes = 0.0
+        self._sleep_started_at = None
+        self._sleep_segment_started_at = None
+        self._sleep_interrupted = False
+        self._sleep_wake_target = None
+        self._sleep_lie_in_cap = None
+        self._last_sleep_at = now_dt
+        self._last_tick_at = now_dt
+        self._updated_at = now_dt
+        self._clamp_all()
+        self.save()
+        return self.snapshot()
+
+    def sleep_status(self) -> Dict[str, Any]:
+        """只读睡眠字段块（B.2.1；emotion/面板/测试共用，不含五项状态）。"""
+        return {
+            "sleep_started_at": self._fmt_ts(self._sleep_started_at),
+            "continuous_sleep_minutes": float(self._continuous_sleep_minutes),
+            "sleep_interrupted": bool(self._sleep_interrupted),
+            "sleep_segment_started_at": self._fmt_ts(self._sleep_segment_started_at),
+            "sleep_debt": float(self._sleep_debt),
+            "last_sleep_at": self._fmt_ts(self._last_sleep_at),
+            "last_wake_reason": self._last_wake_reason,
+            "sleep_wake_target": self._fmt_ts(self._sleep_wake_target),
+            "sleep_lie_in_cap": self._fmt_ts(self._sleep_lie_in_cap),
+        }
+
     def mental_state(self) -> float:
         """派生读数 ``energy × focus × (1 - stress)``（不单独存，附录 B.2 说明）。"""
         value = self._state["energy"] * self._state["focus"] * (1.0 - self._state["stress"])
@@ -451,7 +636,10 @@ class LifeStateService:
 
         键：``version`` / 五项状态 / ``sleep_debt`` / ``mental_state``（派生）/
         ``last_meal_at`` / ``last_break_at`` / ``last_sleep_at`` / ``last_tick_at`` /
-        ``updated_at``（时间戳为 ISO 文本，未发生为 None）。
+        ``updated_at``（时间戳为 ISO 文本，未发生为 None）；PR3 起追加附录 B.2.1
+        睡眠字段（``sleep_started_at``/``continuous_sleep_minutes``/``sleep_interrupted``/
+        ``sleep_segment_started_at``/``last_wake_reason``/``sleep_wake_target``/
+        ``sleep_lie_in_cap``）。
         """
         return {
             "version": STATE_VERSION,
@@ -463,6 +651,13 @@ class LifeStateService:
             "last_sleep_at": self._fmt_ts(self._last_sleep_at),
             "last_tick_at": self._fmt_ts(self._last_tick_at),
             "updated_at": self._fmt_ts(self._updated_at),
+            "sleep_started_at": self._fmt_ts(self._sleep_started_at),
+            "continuous_sleep_minutes": float(self._continuous_sleep_minutes),
+            "sleep_interrupted": bool(self._sleep_interrupted),
+            "sleep_segment_started_at": self._fmt_ts(self._sleep_segment_started_at),
+            "last_wake_reason": self._last_wake_reason,
+            "sleep_wake_target": self._fmt_ts(self._sleep_wake_target),
+            "sleep_lie_in_cap": self._fmt_ts(self._sleep_lie_in_cap),
         }
 
     # ── 描述（最显著 1~2 项；零 emoji）─────────────────────────────────────
@@ -519,9 +714,9 @@ class LifeStateService:
         return "状态：" + "，".join(text for _, text in items[:max_items])
 
     # ── 持久化（core.storage.save_json_atomic；失败告警不阻塞）────────────
-    def save(self) -> bool:
-        """原子写状态文件（B.2「原子写」原文）；失败仅告警返回 False。"""
-        doc = {
+    def _document(self) -> Dict[str, Any]:
+        """规范状态文档（**键结构唯一真源**：``save()`` 与默认文档共用本方法）。"""
+        return {
             "version": STATE_VERSION,
             **{key: float(self._state[key]) for key in STATE_FIELDS},
             "sleep_debt": float(self._sleep_debt),
@@ -530,8 +725,54 @@ class LifeStateService:
             "last_sleep_at": self._fmt_ts(self._last_sleep_at),
             "last_tick_at": self._fmt_ts(self._last_tick_at),
             "updated_at": self._fmt_ts(self._updated_at),
+            # PR3 睡眠引擎字段（附录 B.2.1；旧文件缺键 → 加载默认）
+            "sleep_started_at": self._fmt_ts(self._sleep_started_at),
+            "continuous_sleep_minutes": float(self._continuous_sleep_minutes),
+            "sleep_interrupted": bool(self._sleep_interrupted),
+            "sleep_segment_started_at": self._fmt_ts(self._sleep_segment_started_at),
+            "last_wake_reason": self._last_wake_reason,
+            "sleep_wake_target": self._fmt_ts(self._sleep_wake_target),
+            "sleep_lie_in_cap": self._fmt_ts(self._sleep_lie_in_cap),
         }
-        ok = save_json_atomic(self._path, doc)
+
+    def save(self) -> bool:
+        """原子写状态文件（B.2「原子写」原文）；失败仅告警返回 False。
+
+        读到**未知版本**（未来版本）时拒绝写盘：不猜着用当前结构覆盖用户文件。
+        """
+        if self._future_version is not None:
+            logger.warning("生活状态文件 version=%s 未知（本代码 %d），拒绝覆盖写盘：%s",
+                           self._future_version, STATE_VERSION, self._path)
+            return False
+        if self._backup_failed:
+            logger.warning("损坏状态文件备份失败，拒绝覆盖原文件（内存降级继续）：%s",
+                           self._path)
+            return False
+        ok = save_json_atomic(self._path, self._document())
         if not ok:
             logger.warning("生活状态文件写入失败（忽略，内存状态继续生效）：%s", self._path)
         return ok
+
+
+def default_state_document() -> Dict[str, Any]:
+    """规范默认状态文档（新装 / 损坏重建的唯一真源；**不读盘不写盘**）。
+
+    与 :meth:`LifeStateService.save` 共用 ``_document()``，因此字段集合不会像
+    静态清单那样随 PR3 新增睡眠字段而漂移（工单要求：避免 19/20 字段口径漂移）。
+    """
+    service = LifeStateService.__new__(LifeStateService)
+    service._state = dict(DEFAULT_STATE)
+    service._sleep_debt = 0.0
+    service._last_meal_at = None
+    service._last_break_at = None
+    service._last_sleep_at = None
+    service._last_tick_at = None
+    service._updated_at = None
+    service._sleep_started_at = None
+    service._continuous_sleep_minutes = 0.0
+    service._sleep_interrupted = False
+    service._sleep_segment_started_at = None
+    service._last_wake_reason = None
+    service._sleep_wake_target = None
+    service._sleep_lie_in_cap = None
+    return service._document()

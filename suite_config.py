@@ -20,7 +20,7 @@
 planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
 **config_version 与迁移保障（2026-10-10 第二版，已订正）**：
-开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `2.1.0`（2026-10-21 起；2.0.0 于 2026-10-12 发布、2026-10-20 四批变更随 2.1.0 归档发布；1.1.0 未单独发布，随 2.0.0 一并发布）；
+开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `2.2.0`（2026-10-27 二期 PR7 开发版；2.1.0 于 2026-10-21 归档发布）；
 迁移保障改由 **plugin.py 的「磁盘旧文件抢救」**（`CateyeSuitePlugin.normalize_plugin_config` 先读尚未被
 宿主覆写的磁盘 `config.toml`，把用户值并回输入）＋ 下面的 `mode="before"` 一次性迁移器共同承担。
 **旧口径（已作废）如下，仅留作教训**：宿主 Runner 在「配置版本号变化」时会
@@ -73,6 +73,10 @@ from planning.config import (
     ScheduleAdvancedSectionConfig,
     ScheduleSectionConfig,
 )
+from planning.event_catalog_config import (
+    EventCatalogSectionConfig,
+    migrate_legacy_event_catalog,
+)
 from qzone.config import QzoneSectionConfig
 from suite_prompts import (
     COMPANION_MISS_CONFIRM_DEFAULT,
@@ -85,7 +89,7 @@ from suite_prompts import (
 # 重建设置文件（丢弃跨段旧键）。因此递增本值必须同时具备"磁盘旧文件抢救"（plugin.py 的
 # normalize_plugin_config：把尚未被覆写的磁盘 config.toml 里的用户值并回输入），
 # 否则跨段/改名键的用户值会在插件看到它们之前被丢弃 —— 见模块 docstring 的教训段。
-SUPPORTED_CONFIG_VERSION = "2.1.0"
+SUPPORTED_CONFIG_VERSION = "2.2.0"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -448,6 +452,9 @@ class CateyeSuiteConfig(PluginConfigBase):
     planning_proactive: PlanningProactiveSectionConfig = Field(default_factory=PlanningProactiveSectionConfig)
     # 生活状态（滚动化，2026-10-25 新增段；默认关——enabled=false 时插件行为与 2.1.0 一致）
     life_state: LifeStateSuiteSectionConfig = Field(default_factory=LifeStateSuiteSectionConfig)
+    # 事件库（PR4，2026-10-26 新增段；默认 mode=off——连生成库都不读，只用内置池）。
+    # 段类定义在 planning/event_catalog_config.py（与运行期只读视图同源）。
+    event_catalog: EventCatalogSectionConfig = Field(default_factory=EventCatalogSectionConfig)
     # LLM 调用集中段（本文件）与提示词集中段（suite_prompts.py）
     llm: LlmSectionConfig = Field(default_factory=LlmSectionConfig)
     prompts: PromptsSectionConfig = Field(default_factory=PromptsSectionConfig)
@@ -474,6 +481,10 @@ class CateyeSuiteConfig(PluginConfigBase):
            [planning_proactive] 的已删主动行为键（:data:`LEGACY_PROACTIVE_KEYS`，2026-10-20
            用户指示）同口径在入口显式 pop（两个分支都经过）。2026-10-22 §27.1（R7）起
            ``greeting_require_activation`` 已回归真配置键，不在该元组内、旧显式值保留生效。
+        6. [event_catalog] 旧键 ``max_events`` → 规范字段 ``max_generated_events``（2026-10-27
+           用户裁定）：在**默认值填充之前**按原始字典搬迁（见
+           :func:`planning.event_catalog_config.migrate_legacy_event_catalog`），迁完显式 pop
+           旧键；规范字段原始显式值优先。
 
         **幂等**：迁移完成时在 ``[plugin] layout_version`` 写下本轮布局标记；下一次校验
         （迁移结果被宿主落盘后再读回）看到该标记即跳过全部值搬运——新旧同名的键
@@ -496,6 +507,15 @@ class CateyeSuiteConfig(PluginConfigBase):
             # 出厂默认路径（无参构造 / 空输入）：不写布局标记，也不放哨兵
             return data
         migrated = dict(data)
+        # 0a) [event_catalog] 旧键 max_events → 规范字段 max_generated_events（2026-10-27 用户裁定）。
+        #     必须发生在「默认值填充之前」：宿主/SDK 先 merge 出厂默认，之后 pydantic 的
+        #     model_fields_set 会把每个字段都当显式值，段级 resolve_config 的「规范字段优先」
+        #     判据失效 → 只写 max_events=6 的旧配置会被默认 8 吞掉。此处按原始字典搬迁后
+        #     删旧键，落盘就是规范形态（幂等：第二次进入不再有 max_events）。
+        if "event_catalog" in migrated:
+            migrated["event_catalog"] = migrate_legacy_event_catalog(
+                migrated.get("event_catalog"),
+                (factory_defaults() or {}).get("event_catalog"))
         # 0) 段内已删键清理——放在两个分支**都经过**的入口处（清旧键性质，与 already_migrated
         #    分支只清旧段同精神：不搬运、不回填）。2026-10-17 §19.4 / 复核 findings#4：
         #    v1 三档口径的 [affection].current_level 无法映射 0~200 新标度（§9.7 教训），

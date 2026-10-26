@@ -270,8 +270,15 @@ class ProactiveService:
             logger.info("日程主动行为循环已退出")
 
     async def stop(self) -> None:
-        """通知循环停止。"""
+        """通知循环停止，并清空频率因子缓存（重启/重载后按当前配置重新校准）。
+
+        清缓存的理由（定稿 §4.5）：`_current_factor` 是"已下发过"的内存幂等簿，
+        停机后宿主侧的频率状态可能已被别的组件改动（或插件重载换代），沿用旧簿会
+        让下一次 `_apply_frequency` / :meth:`calibrate_target_frequency` 误判"无需下发"。
+        只清内存、不触碰宿主（stop 不发任何写请求，也不发消息）。
+        """
         self._stop_event.set()
+        self._current_factor.clear()
 
     # ------------------------------------------------------------
     # 配置与日志辅助
@@ -686,6 +693,18 @@ class ProactiveService:
         if start is None or end is None:
             return None, None
         return int(start), int(end)
+
+    def _sleep_engine_asleep(self, now: Optional[datetime]) -> Optional[bool]:
+        """PR3：问睡眠引擎是否仍睡着（鸭子类型；``None`` = 引擎不表态 → 旧问候路径）。"""
+        engine = getattr(self._plugin, "_sleep_engine", None)
+        getter = getattr(engine, "is_asleep", None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter(now)
+        except Exception:
+            return None
+        return value if isinstance(value, bool) else None
 
     @staticmethod
     def _is_sleep_row(item: Any) -> bool:
@@ -1302,6 +1321,11 @@ class ProactiveService:
             # 硬闸不过（群聊早安，§31.1 = 不掷点/不建条目）；其他私聊阈/连锁未达标的
             # 本周期首过点前静默跳过（掷点已过者不静默——建条目后由钳制负责到期弃）
             return
+        if verdict == "pending":
+            # PR3（2026-10-26）：睡眠引擎判定仍未醒（实际醒来晚于旧 wake 锚点）→
+            # 早安**待定**（不掷点、不落 durable 标记），下一 tick 再判；关引擎/引擎不
+            # 表态 → 不会进入本分支（旧问候行为逐字不变）
+            return
 
         entry = self._roll_greeting(stream_id, category, kind, cycle, now, now_ts, date_str)
         await self._advance_greeting(entry, now_ts, date_str, cfg_p, cycle)
@@ -1317,6 +1341,15 @@ class ProactiveService:
         """
         _prev, cur_start, _cur_end = self._cycle_pivots(cycle)
         if kind == GREETING_MORNING:
+            # PR3（2026-10-26，定稿 §4.2.3 + 2026-10-27 用户端到端要求）：实际醒来晚于
+            # 旧 wake 锚点时，早安不能按旧锚点提前放行——引擎权威判定仍睡 → 待定
+            # （verdict="pending"：不掷点、不落 durable 标记；关引擎/引擎不表态 → 旧路径）
+            asleep = self._sleep_engine_asleep(now)
+            if asleep is True:
+                self._log_gate_skip(
+                    stream_id, kind, cycle,
+                    "睡眠引擎判定仍未醒（实际 wake 晚于旧锚点；早安待定，不落 durable 标记）")
+                return "pending", False
             # 早安沉默闸（R7 = 用户 2026-10-24 直派）：第一个检查、三流分派之前——
             # bot 在今日第一日程（= 周期起点）前 N 小时内发过消息 → 该流本周期跳过早安
             # （durable = 不掷点不建条目，对齐群聊硬闸语义；查询异常 fail-closed）
@@ -2405,24 +2438,41 @@ class ProactiveService:
         ``default_property`` 兜底；每流按 ``_current_factor`` 缓存机制不变。因子值本身
         来自 ``mappings/schedule_properties.json``（装载/热重载读一遍，改 json 即调）；
         本模块不再持有任何频率字面量。
+
+        定稿 §4.5（二期）：``target_frequency_always_one=true`` 时，**已解析成功的
+        目标陪伴私聊**恒为 :data:`TARGET_FREQUENCY_FACTOR`（1.0）并被补进下发集合；
+        开关关闭 → 不补目标流、全部流走属性因子（旧行为，**不是**"所有流固定 1"）。
+        只调 ``ctx.frequency.set_adjust``，不发送任何消息。
         """
         property_spec = resolve_property(goal_type, name)
-        target_factor = property_spec.reply_factor
+        base_factor = property_spec.reply_factor
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "frequency"):
             return  # 宿主未提供 frequency 能力（未声明时兼容）
 
+        # 定稿 §4.5：目标陪伴私聊本来就**不在** ``_resolve_target_streams()`` 的生效集里
+        # （陪伴对象私聊恒按黑名单剔除），故开关开时在此**补一次**；非目标流因子逐字
+        # 沿用属性表 reply_factor，不做任何"全流固定 1"的扩张。
+        target_stream = self._target_frequency_stream()
+        targets: List[Tuple[str, float]] = [(sid, base_factor) for sid in streams]
+        if target_stream:
+            if any(sid == target_stream for sid, _f in targets):
+                targets = [(sid, self.TARGET_FREQUENCY_FACTOR if sid == target_stream else factor)
+                           for sid, factor in targets]
+            else:
+                targets.append((target_stream, self.TARGET_FREQUENCY_FACTOR))
+
         applied = 0
         failed = 0
-        for stream_id in streams:
-            if self._current_factor.get(stream_id) == target_factor:
+        for stream_id, factor in targets:
+            if self._current_factor.get(stream_id) == factor:
                 continue
             try:
-                result = await ctx_obj.frequency.set_adjust(stream_id, target_factor)
+                result = await ctx_obj.frequency.set_adjust(stream_id, factor)
                 if isinstance(result, dict) and not result.get("success", False):
                     failed += 1
                     continue
-                self._current_factor[stream_id] = target_factor
+                self._current_factor[stream_id] = factor
                 applied += 1
             except Exception:
                 failed += 1
@@ -2430,13 +2480,122 @@ class ProactiveService:
         if applied:
             logger.debug(
                 f"频率调控: goal_type={goal_type}, name={name}, property={property_spec.id}, "
-                f"factor={target_factor}, 已应用到 {applied} 个会话"
+                f"factor={base_factor}, 已应用到 {applied} 个会话"
             )
         if failed:
             logger.debug(
                 f"频率调控失败: goal_type={goal_type}, name={name}, property={property_spec.id}, "
-                f"factor={target_factor}, 共 {failed} 个"
+                f"factor={base_factor}, 共 {failed} 个"
             )
+
+    #: 目标陪伴私聊的固定频率因子（定稿 §4.5：本插件固定 1.0，不再持有第二份数值真源）
+    TARGET_FREQUENCY_FACTOR = 1.0
+
+    def _target_frequency_enabled(self) -> bool:
+        """``[planning_proactive].target_frequency_always_one``（读不到一律按关）。"""
+        try:
+            return bool(getattr(self._proactive_cfg(), "target_frequency_always_one", False))
+        except Exception:
+            return False
+
+    def _target_frequency_stream(self) -> str:
+        """目标陪伴私聊流 id（开关关 / 目标未解析 → 空串）。
+
+        "已解析"口径：``[patrol].target_qq`` 非占位 **且** 插件已解析出
+        ``plugin._stream_id``（陪伴模块 set_target 用的同一份目标流）。缺任一条件即
+        视为未解析——不报错、不猜、绝不把任意流当目标。
+        """
+        if not self._target_frequency_enabled():
+            return ""
+        if not self._target_qq():
+            return ""
+        return str(getattr(self._plugin, "_stream_id", "") or "").strip()
+
+    async def calibrate_target_frequency(self, *, force: bool = False) -> Dict[str, Any]:
+        """公共校准口（定稿 §4.5；供 InitService / 插件 startup / target 解析 / 配置更新调用）。
+
+        职责：把**已解析成功的目标陪伴私聊**的频率因子立刻强制到
+        :data:`TARGET_FREQUENCY_FACTOR`（1.0），**不等下一次活动切换**。不发送消息、
+        不新增 LLM 调用，只调宿主 ``ctx.frequency.set_adjust``。
+
+        Args:
+            force: ``True`` → 额外清空**整张** ``_current_factor`` 缓存（此后下一次
+                :meth:`_apply_frequency` 会重新按属性给非目标流下发因子）。插件 startup /
+                配置更新 / 开关切换建议传 True；默认 ``False`` 只清目标流那一条后真实下发。
+
+        Returns:
+            ``{"ok", "enabled", "target_resolved", "target_stream", "factor",
+            "applied", "skipped", "reason", "errors"}``——与 pr5 频率阶段契约兼容：
+            目标未解析 → ``target_resolved=False`` / ``ok=False``（只本阶段报错，
+            绝不影响其他阶段）；开关关 → ``ok=True`` / ``skipped="disabled"``（正常降级）。
+
+        Raises:
+            不抛异常：SDK 异常/拒绝只体现在 ``ok=False`` + ``errors``，且**不写缓存**
+            （缓存保持为空 → 下一次调用真实重试）。
+        """
+        result: Dict[str, Any] = {
+            "ok": False,
+            "enabled": False,
+            "target_resolved": False,
+            "target_stream": "",
+            "factor": self.TARGET_FREQUENCY_FACTOR,
+            "applied": False,
+            "skipped": "",
+            "reason": "",
+            "errors": [],
+        }
+        enabled = self._target_frequency_enabled()
+        result["enabled"] = enabled
+        raw_stream = str(getattr(self._plugin, "_stream_id", "") or "").strip()
+        result["target_stream"] = raw_stream if enabled else ""
+
+        if not self._module_enabled():
+            # 插件/日程模块整体停用：不向宿主下发任何频率（与旧行为一致），非错误
+            result.update(ok=True, skipped="module_disabled", reason="schedule.enabled=false")
+            return result
+
+        if not enabled:
+            # 开关关 = 旧行为：目标流不再被本插件管理 → 只清该流缓存，绝不把所有流固定 1。
+            if raw_stream:
+                self._current_factor.pop(raw_stream, None)
+            result.update(ok=True, skipped="disabled",
+                          reason="target_frequency_always_one=false（旧行为）")
+            return result
+
+        if not raw_stream or not self._target_qq():
+            result["errors"].append(
+                "目标陪伴私聊未解析（[patrol].target_qq 或 plugin._stream_id 为空）")
+            result["reason"] = "target_unresolved"
+            return result
+        result["target_resolved"] = True
+
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        if ctx_obj is None or not hasattr(ctx_obj, "frequency"):
+            result["errors"].append("宿主未提供 frequency 能力（ctx.frequency 缺失）")
+            result["reason"] = "sdk_unavailable"
+            return result
+
+        if force:
+            self._current_factor.clear()
+        self._current_factor.pop(raw_stream, None)
+        try:
+            response = await ctx_obj.frequency.set_adjust(
+                raw_stream, self.TARGET_FREQUENCY_FACTOR)
+        except Exception as exc:
+            result["errors"].append(f"频率下发异常：{exc}")
+            result["reason"] = "sdk_error"
+            return result
+        if isinstance(response, dict) and not response.get("success", False):
+            detail = response.get("error") or response.get("message") or "success=false"
+            result["errors"].append(f"频率下发被宿主拒绝：{detail}")
+            result["reason"] = "sdk_rejected"
+            return result
+
+        self._current_factor[raw_stream] = self.TARGET_FREQUENCY_FACTOR
+        result.update(ok=True, applied=True, reason="applied")
+        logger.info("目标频率已校准: stream=%s factor=%s force=%s",
+                    raw_stream, self.TARGET_FREQUENCY_FACTOR, force)
+        return result
 
     # ------------------------------------------------------------
     # 主动发起

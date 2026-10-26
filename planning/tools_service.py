@@ -1,13 +1,15 @@
-"""日程信息查询（四视图只读）/ 角色裁判式日程更新 / 日程重生成的工具业务实现
+"""日程信息查询（多视图只读）/ 角色裁判式日程更新 / 日程重生成的工具业务实现
 （来源：自主规划插件 services/tools_service.py，移植版）。
 
 通过 ``self._plugin.config`` 强类型访问插件配置，通过 ``self._plugin.ctx``
 访问 SDK 能力代理；LLM 调用经宿主 ``ctx.llm.generate``（角色裁判）或
 core.llm_utils.LLMService（日程生成）。
 
-T6 注册面收口后本服务只服务两个 Tool：``get_schedule_info``（只读四视图）与
-``update_schedule``（唯一日程写入口，role_judge 裁判路径）。目标的写 API 仍在
-GoalManager（生成流水线与约定消费在用），只是不再有 Tool 注册入口。
+T6 注册面收口后本服务服务两个 Tool：``get_schedule_info``（只读多视图：v2
+status/current/next/episodes/spine/intents + 旧 lover_day/goals 一版）与
+``update_schedule``（唯一日程写入口，role_judge 裁判路径；规范工具名
+``lbm_update_schedule``，旧名 ``lbm_update_schedule_v4`` 作为独立注册别名保留一版）。
+目标的写 API 仍在 GoalManager（生成流水线与约定消费在用），只是不再有 Tool 注册入口。
 
 M9（附录 §4.3/§4.4 赖床提醒，用户裁决 C4/A2）新增第三个 Tool：``nap_lie_in`` ——
 夜间被吵醒后收到提醒才可用（``metadata["visibility"]="hidden"``，注册期不进名册）；
@@ -18,7 +20,10 @@ M9（附录 §4.3/§4.4 赖床提醒，用户裁决 C4/A2）新增第三个 Tool
 
 from __future__ import annotations
 
+import inspect
 import logging
+import re
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,10 +46,24 @@ from .cycle_state import (REASON_TOOL_EDIT, enter_schedule_cycle,  # §31.2 进�
                           entry_context_from_plugin)
 from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
+from .rolling_planner import extract_spine_intents
 from .schedule_generator import ScheduleGenerator
 from .schedule_items import find_night_sleep_item, is_night_sleep_item
+from .sleep_schedule import (
+    find_sleep_item as _shared_find_sleep_item,
+    lie_in_max_minutes as _shared_lie_in_max_minutes,
+    nap_end_datetime as _shared_nap_end_datetime,
+    nap_schedule_date as _shared_nap_schedule_date,
+    nap_tool_engine_managed_reply,
+    nap_tool_managed_by_engine,
+    normalize_hhmm as _shared_normalize_hhmm,
+    parse_nap_target as _shared_parse_nap_target,
+    postpone_items_for_lie_in as _shared_postpone_items,
+    update_sleep_endpoint,
+)
 from .time_utils import (DAY_MINUTES, TimezoneManager, format_day_minute,
-                         is_in_day_frame_marked, is_upcoming_day_minute_marked)
+                         is_in_day_frame_marked, is_upcoming_day_minute_marked,
+                         ring_minutes_ahead)
 
 logger = logging.getLogger(__name__)
 
@@ -65,47 +84,18 @@ NAP_LIE_IN_BAD_TIME_TEXT = NAP_TOOL_BAD_TIME_DEFAULT
 
 
 def parse_nap_target(value: Any) -> Optional[int]:
-    """赖床时间解析（§4.4「解析兜底」）：容忍 ``HH:MM`` / ``H:MM`` / 纯小时数。
-
-    纯小时数按整点（``"9"`` → 09:00）；全角冒号容错；非法/缺参/越界一律返回 None
-    （调用方据此给友好错误，**绝不抛异常**）。
-    """
-    raw = str(value if value is not None else "").strip().replace("：", ":")
-    if not raw:
-        return None
-    head, sep, tail = raw.partition(":")
-    try:
-        hour = int(head)
-        if not sep:
-            minute = 0                       # 纯小时数 → 整点
-        else:
-            if not tail.strip():
-                return None                  # "9:" 缺分钟
-            minute = int(tail)
-    except (TypeError, ValueError):
-        return None
-    if 0 <= hour <= 23 and 0 <= minute <= 59:
-        return hour * 60 + minute
-    return None
+    """赖床时间解析（PR3 起委托 ``planning/sleep_schedule.py`` 单一实现，逐字同口径）。"""
+    return _shared_parse_nap_target(value)
 
 
 def normalize_hhmm(value: Any, default: str = DEFAULT_LIE_IN_MAX_UNTIL) -> str:
-    """规范成 ``"HH:MM"`` 文本（非法一律回退 ``default``）。
-
-    供钳制上限的**展示与判定同源**：提醒文本里的「最晚 {lie_in_max_until}」与工具侧实际
-    钳到的分钟数由同一个函数产出，不会出现"提示 12:00、实际钳到别的值"。
-    """
-    minute = parse_nap_target(value)
-    if minute is None:
-        minute = parse_nap_target(default)
-    if minute is None:                       # default 也被写坏 → 退到规格缺省
-        minute = parse_nap_target(DEFAULT_LIE_IN_MAX_UNTIL) or 12 * 60
-    return f"{minute // 60:02d}:{minute % 60:02d}"
+    """规范成 ``"HH:MM"``（PR3 起委托 ``planning/sleep_schedule.py``，提示/钳制同源）。"""
+    return _shared_normalize_hhmm(value, default)
 
 
 def lie_in_max_minutes(value: Any) -> int:
-    """``lie_in_max_until`` 配置值 → 当天分钟数（非法回退缺省 12:00）。"""
-    return parse_nap_target(normalize_hhmm(value)) or 12 * 60
+    """``lie_in_max_until`` → 当天分钟数（PR3 起委托共享实现，非法回退 12:00）。"""
+    return _shared_lie_in_max_minutes(value)
 
 
 class ToolsService:
@@ -216,21 +206,36 @@ class ToolsService:
         generator = self._get_generator()
         if generator is None:
             raise RuntimeError("ScheduleGenerator 不可用（插件未完成初始化）")
-        return await generator.regenerate_today_schedule(
+        items = await generator.regenerate_today_schedule(
             extra_prompt=extra_prompt, apply=True, **self._generate_kwargs(),
         )
+        # 命令侧日程修改同样提示内部循环（可选口；缺省静默）
+        await self._request_life_recheck("schedule_regenerated")
+        return items
 
     # ------------------------------------------------------------
     # Tool 1：get_schedule_info（四视图只读）
     # ------------------------------------------------------------
 
-    #: view 取值（缺省/非法一律回落 status）
-    _SCHEDULE_INFO_VIEWS = ("status", "current", "lover_day", "goals")
+    #: view 取值（缺省/非法一律回落 status）。
+    #: v2（定稿 §4.6 / 附录 A.3.1）新增 status/current/next/episodes/spine/intents；
+    #: lover_day/goals 为旧视图保留一版（PR8 再删），返回口径不变。
+    _SCHEDULE_INFO_VIEWS = ("status", "current", "next", "episodes", "spine", "intents",
+                            "lover_day", "goals")
+    #: 新层（runtime）视图：新层未启用时明确回报"未启用"，不回退成时间窗编造
+    _RUNTIME_VIEWS = ("next", "episodes", "spine", "intents")
+    #: ``intents`` = ``spine`` 的别名（附录 A.3.1「别名，便于模型理解」）
+    _VIEW_ALIASES = {"intents": "spine"}
 
     async def get_schedule_info(self, view: str = "", **function_args: Any) -> Dict[str, Any]:
-        """日程/活动/目标的只读查询（view = status | current | lover_day | goals）。
+        """日程/活动/目标的只读查询（v2 + 旧视图一版）。
 
-        四视图全部只读，不触碰任何写路径（生成/落库/目标写 API 都不调用）。
+        view = ``status`` | ``current`` | ``next`` | ``episodes`` | ``spine`` |
+        ``intents``（= spine 别名）| ``lover_day``（旧）| ``goals``（旧）。
+
+        **全部视图只读**：不触碰生成/落库/目标写 API，不调用 tick、不掷点、不写状态
+        文件。``next`` / ``episodes`` / ``spine`` / ``intents`` 依赖 runtime（episode 日志），
+        新层未启用时明确回答"未启用"（不是空成功、也不是编造）。
         """
         if not self._module_enabled():
             return {"type": "error", "content": "日程规划模块未启用（配置 [日程系统] enabled）"}
@@ -238,17 +243,308 @@ class ToolsService:
         view = str(view or "").strip().lower()
         if view not in self._SCHEDULE_INFO_VIEWS:
             view = "status"  # 缺省与非法值同档：回落状态总览
+        view = self._VIEW_ALIASES.get(view, view)
         try:
             if view == "current":
-                return self._view_current()
+                return self._view_current_v2()
+            if view == "next":
+                return self._view_next()
+            if view == "episodes":
+                return self._view_episodes()
+            if view == "spine":
+                return self._view_spine()
             if view == "lover_day":
                 return self._view_lover_day()
             if view == "goals":
                 return self._view_goals()
-            return self._view_status()
+            return self._view_status_v2()
         except Exception as exc:
             logger.error(f"获取日程信息失败（view={view}）: {exc}", exc_info=True)
             return {"type": "error", "content": f"获取日程信息失败: {exc}"}
+
+    # ── runtime（episode 日志）只读句柄 ──────────────────────────────────
+    def _runtime_provider(self) -> Optional[Any]:
+        """``LifeScheduleReadModel``（``ScheduleQuery._runtime_provider``；未装配 → None）。"""
+        query = self._schedule_query()
+        provider = getattr(query, "_runtime_provider", None) if query is not None else None
+        return provider
+
+    def _runtime_ready(self) -> bool:
+        """runtime 是否就绪（= provider 存在且 ``[life_state].enabled``）。"""
+        try:
+            from .schedule_query import ScheduleQuery as _ScheduleQuery
+            return bool(_ScheduleQuery._runtime_ready(self._runtime_provider()))
+        except Exception:
+            return False
+
+    def _runtime_now(self) -> datetime:
+        return self._make_tz_manager().get_now()
+
+    @staticmethod
+    def _runtime_item_line(item: Dict[str, Any], *, cur_minute: Optional[int] = None,
+                           prefix: str = "") -> str:
+        """episode/意图行 → 一行可读文本（来源/预演/暂停标记如实标注）。"""
+        name = str(item.get("name") or "未知活动")
+        start = item.get("start_minute")
+        end = item.get("end_minute")
+        try:
+            window = f"{format_day_minute(int(start or 0))}-{format_day_minute(int(end or 0))}"
+        except (TypeError, ValueError):
+            window = ""
+        tags: List[str] = []
+        if bool(item.get("is_preview")):
+            tags.append("预演")
+        if bool(item.get("is_spine_intent")):
+            tags.append("意图")
+        if bool(item.get("paused")):
+            tags.append("暂停待恢复")
+        source = str(item.get("source") or "").strip()
+        if source:
+            tags.append(f"来源={source}")
+        status = str(item.get("status") or "").strip()
+        if status:
+            tags.append(f"状态={status}")
+        attention = str(item.get("attention_mode") or "").strip()
+        if attention:
+            tags.append(f"注意力={attention}")
+        progress = item.get("progress")
+        if isinstance(progress, (int, float)) and not isinstance(progress, bool):
+            tags.append(f"进度={int(round(max(0.0, min(1.0, float(progress))) * 100))}%")
+        if cur_minute is not None:
+            remaining = ToolsService._remaining_minutes(item, cur_minute)
+            if remaining is not None:
+                tags.append(f"剩余={remaining}分钟")
+        head = f"{prefix}{window} {name}".strip()
+        return f"{head}（{'｜'.join(tags)}）" if tags else head
+
+    @staticmethod
+    def _remaining_minutes(item: Dict[str, Any], cur_minute: int) -> Optional[int]:
+        """剩余分钟数（24h 环口径；已过 planned_end 的 active 行按 0 报，不编造负数）。"""
+        try:
+            end = int(item.get("end_minute") or 0)
+            start = int(item.get("start_minute") or 0)
+        except (TypeError, ValueError):
+            return None
+        if end <= start:
+            return None
+        if str(item.get("status") or "") == "active" and end <= cur_minute:
+            return 0
+        try:
+            return int(ring_minutes_ahead(end, cur_minute))
+        except Exception:
+            return None
+
+    def _runtime_current_item(self) -> Optional[Dict[str, Any]]:
+        """runtime 当前 episode（**不**回退时间窗：空闲即 None）。"""
+        provider = self._runtime_provider()
+        if not self._runtime_ready():
+            return None
+        try:
+            current = provider.current(self._runtime_now(), include_sleep=False)
+        except Exception as exc:
+            logger.debug(f"runtime current 读取失败: {exc}")
+            return None
+        return current if isinstance(current, dict) else None
+
+    def _runtime_next_items(self, limit: int = 2) -> Optional[List[Dict[str, Any]]]:
+        """runtime next（只读预演/意图标记原样带出）；未就绪 → None（区分"未启用"与"空"）。"""
+        if not self._runtime_ready():
+            return None
+        provider = self._runtime_provider()
+        try:
+            items = provider.next(self._runtime_now(), limit=max(1, int(limit)))
+        except Exception as exc:
+            logger.debug(f"runtime next 读取失败: {exc}")
+            return []
+        return [it for it in (items or []) if isinstance(it, dict)]
+
+    def _runtime_today(self) -> Optional[Dict[str, Any]]:
+        """runtime 当日汇总（intents/episodes/summary）；未就绪 → None。"""
+        if not self._runtime_ready():
+            return None
+        provider = self._runtime_provider()
+        today = getattr(provider, "today", None)
+        if not callable(today):
+            return {"date": "", "intents": [], "episodes": [], "summary": {}}
+        try:
+            data = today(self._runtime_now())
+        except Exception as exc:
+            logger.debug(f"runtime today 读取失败: {exc}")
+            return {"date": "", "intents": [], "episodes": [], "summary": {}}
+        return data if isinstance(data, dict) else {"date": "", "intents": [],
+                                                   "episodes": [], "summary": {}}
+
+    def list_runtime_lines(self, limit: int = 2) -> List[str]:
+        """``/lbm_plan list`` 的 runtime 只读补充行（供命令层直接追加到既有文字档）。
+
+        纯读、零写、零 LLM、零发送：runtime 未就绪 → 空列表（命令层保持旧输出）。
+        命令层接入方式（后续统一接线）：``text += "\\n\\n" + "\\n".join(
+        tools.list_runtime_lines())``；图不重绘（复用既有渲染）。
+        """
+        if not self._runtime_ready():
+            return []
+        now = self._runtime_now()
+        cur_min = now.hour * 60 + now.minute
+        lines: List[str] = ["运行态（episode 日志）"]
+        current = self._runtime_current_item()
+        if current is not None:
+            lines.append(self._runtime_item_line(current, cur_minute=cur_min, prefix="当前："))
+        else:
+            lines.append("当前：没有正在进行的 episode")
+        for item in (self._runtime_next_items(limit) or []):
+            lines.append(self._runtime_item_line(item, cur_minute=cur_min, prefix="接下来："))
+        return lines
+
+    def _spine_intents(self) -> List[Dict[str, Any]]:
+        """今日 spine 意图（新层未启用时读当天 schedule_items 的 ``parameters.spine`` 行）。
+
+        纯读：不触发任何写（生成、落库、消费约定都不调）。
+        """
+        date = self._runtime_now().strftime("%Y-%m-%d")
+        rows: List[Dict[str, Any]] = []
+        try:
+            runtime_today = self._runtime_today()
+            if runtime_today is not None and runtime_today.get("intents"):
+                rows = [it for it in runtime_today["intents"] if isinstance(it, dict)]
+            else:
+                query = self._schedule_query()
+                day_rows = query.get_day_schedule(date) if query is not None else []
+                rows = extract_spine_intents(day_rows)
+        except Exception as exc:
+            logger.debug(f"spine 意图读取失败: {exc}")
+            rows = []
+        return rows
+
+    def _view_status_v2(self) -> Dict[str, Any]:
+        """view=status：runtime 就绪 → 意图/episode/当前/接下来/状态行；否则旧总览逐字保留。"""
+        if not self._runtime_ready():
+            return self._view_status()
+        now = self._runtime_now()
+        cur_min = now.hour * 60 + now.minute
+        today = self._runtime_today() or {}
+        summary = today.get("summary") if isinstance(today.get("summary"), dict) else {}
+        current = self._runtime_current_item()
+        next_items = self._runtime_next_items(2) or []
+        state_line = ""
+        provider = self._runtime_provider()
+        try:
+            if callable(getattr(provider, "state_line", None)):
+                state_line = str(provider.state_line(now) or "").strip()
+        except Exception:
+            state_line = ""
+
+        date_str = str(today.get("date") or now.strftime("%Y-%m-%d"))
+        weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
+        lines = [
+            f"今日日程 {date_str} {weekday}",
+            f"意图 {int(summary.get('intent_count') or 0)} 条"
+            f"｜episode {int(summary.get('episode_count') or 0)} 条"
+            f"（完成 {int(summary.get('completed_count') or 0)}"
+            f"｜打断 {int(summary.get('interrupted_count') or 0)}"
+            f"｜放弃 {int(summary.get('abandoned_count') or 0)}）",
+        ]
+        if current is not None:
+            lines.append(self._runtime_item_line(current, cur_minute=cur_min, prefix="当前："))
+        else:
+            lines.append("当前：没有正在进行的 episode（空闲）")
+        if next_items:
+            lines.append("接下来：")
+            for item in next_items:
+                lines.append("  " + self._runtime_item_line(item, cur_minute=cur_min))
+        else:
+            lines.append("接下来：暂无已排活动")
+        if state_line:
+            lines.append(state_line)
+        return {"type": "schedule_info", "content": "\n".join(lines)}
+
+    def _view_current_v2(self) -> Dict[str, Any]:
+        """view=current：runtime 就绪 → 实际 episode（注意力/进度/剩余/来源）；否则旧路径。"""
+        if not self._runtime_ready():
+            return self._view_current()
+        name = str(getattr(self._plugin, "_lover_name", "") or "麦麦")
+        now = self._runtime_now()
+        cur_min = now.hour * 60 + now.minute
+        current = self._runtime_current_item()
+        if current is None:
+            return {"type": "schedule_current",
+                    "content": f"{name}现在没有安排中的活动（可能在休息）。"}
+        line = self._runtime_item_line(current, cur_minute=cur_min)
+        return {"type": "schedule_current", "content": f"{name}现在正在：{line}。"}
+
+    def _view_next(self) -> Dict[str, Any]:
+        """view=next：接下来 2 条（含来源/预演/意图标记）；新层未启用 → 明确未启用。"""
+        if not self._runtime_ready():
+            return {"type": "schedule_next",
+                    "content": "滚动化视图未启用（[life_state].enabled=false）：暂不能读取接下来"
+                               "的 episode/预演；可改用 view=status 或 lover_day 的旧日程视图。"}
+        now = self._runtime_now()
+        cur_min = now.hour * 60 + now.minute
+        items = self._runtime_next_items(2) or []
+        if not items:
+            return {"type": "schedule_next", "content": "接下来没有已排的活动。"}
+        lines = ["接下来："]
+        for item in items:
+            lines.append("  " + self._runtime_item_line(item, cur_minute=cur_min))
+        return {"type": "schedule_next", "content": "\n".join(lines)}
+
+    def _episode_rows(self) -> List[Dict[str, Any]]:
+        """今日 episode 行（只读；runtime provider 库优先，回退 ``plugin._db``）。"""
+        provider = self._runtime_provider()
+        db = (getattr(provider, "_db", None) if provider is not None else None)
+        if db is None or not callable(getattr(db, "episodes_today", None)):
+            query = self._schedule_query()
+            db = getattr(query, "db", None) if query is not None else None
+        if db is None or not callable(getattr(db, "episodes_today", None)):
+            db = getattr(self._plugin, "_db", None)
+        if db is None or not callable(getattr(db, "episodes_today", None)):
+            return []
+        try:
+            date = self._runtime_now().strftime("%Y-%m-%d")
+            return [row for row in (db.episodes_today(date) or []) if isinstance(row, dict)]
+        except Exception as exc:
+            logger.debug(f"episode 读取失败: {exc}")
+            return []
+
+    def _view_episodes(self) -> Dict[str, Any]:
+        """view=episodes：今日实际 episode（有历史就如实列出；新层未启用且无历史 → 明说）。"""
+        rows = self._episode_rows()
+        if not rows:
+            if not self._runtime_ready():
+                return {"type": "schedule_episodes",
+                        "content": "今日没有 episode 记录（滚动化视图未启用："
+                                   "[life_state].enabled=false 时不会记录实际 episode）。"}
+            return {"type": "schedule_episodes", "content": "今日还没有实际 episode 记录。"}
+        cur_min = self._runtime_now().hour * 60 + self._runtime_now().minute
+        lines = [f"今日实际 episode（{len(rows)} 条）"]
+        for row in rows:
+            lines.append("  " + self._runtime_item_line(row, cur_minute=cur_min))
+        return {"type": "schedule_episodes", "content": "\n".join(lines)}
+
+    def _view_spine(self) -> Dict[str, Any]:
+        """view=spine / intents：今日意图与硬约定（spine 存储契约只读投影）。"""
+        intents = self._spine_intents()
+        if not intents:
+            if not self._runtime_ready():
+                return {"type": "schedule_spine",
+                        "content": "今日没有 spine 意图（滚动化视图未启用："
+                                   "[life_state].enabled=false 且 [schedule].spine_mode=false）。"}
+            return {"type": "schedule_spine", "content": "今日没有 spine 意图。"}
+        hard = [it for it in intents if str(it.get("hardness") or "") == "hard"]
+        lines = [f"今日意图（{len(intents)} 条，其中硬约定 {len(hard)} 条）"]
+        for it in intents:
+            hardness = "硬约定" if str(it.get("hardness") or "") == "hard" else "软意图"
+            window = ""
+            try:
+                window = (f"{format_day_minute(int(it.get('start_minute') or 0))}-"
+                          f"{format_day_minute(int(it.get('end_minute') or 0))} ")
+            except (TypeError, ValueError):
+                window = ""
+            lines.append(f"  {window}{it.get('name') or '未命名'}"
+                         f"（{hardness}｜优先级={it.get('priority') or 'medium'}）")
+            note = str(it.get("note") or "").strip()
+            if note:
+                lines.append(f"    {note}")
+        return {"type": "schedule_spine", "content": "\n".join(lines)}
 
     def _view_status(self) -> Dict[str, Any]:
         """view=status：今日日程状态总览（正在进行 / 即将到来 / 已完成）。"""
@@ -403,18 +699,396 @@ class ToolsService:
     # Tool 2：update_schedule（唯一日程写入口，角色裁判式更新）
     # ------------------------------------------------------------
 
+    # ------------------------------------------------------------
+    # v2 写入辅助（定稿 §4.6 / 附录 A.3.2）
+    # ------------------------------------------------------------
+
+    #: 明确「承诺/绑定/截止」语义的短语：出现即硬（这是承诺本身，不需要时间词佐证）。
+    #: 只收承诺动词/截止语，**不收**泛事件词（开会/会议/面试…请看
+    #: :data:`HARD_EVENT_KEYWORDS`——它们必须有绑定证据才算硬）。
+    HARD_COMMITMENT_KEYWORDS: Tuple[str, ...] = (
+        "必须", "务必", "一定要", "一定得", "不得不", "约好", "说好", "约了", "约在",
+        "答应", "讲好", "商定", "定好", "定了", "敲定", "签了", "deadline", "截止",
+    )
+    #: 事件词：**只出现事件词不硬化**（工单缺陷：任何提及会议词都变 hard）；
+    #: 必须同时有明确时间/日期绑定证据（:data:`HARD_TIME_EVIDENCE_RE`）才算硬约定。
+    HARD_EVENT_KEYWORDS: Tuple[str, ...] = (
+        "开会", "会议", "面试", "考试", "体检", "挂号", "预约", "复诊", "看病",
+        "航班", "高铁", "飞机", "火车", "签到", "答辩", "汇报", "述职", "婚礼",
+        "手术", "开庭",
+    )
+    #: 否定/取消语境（出现在同一子句 → 事件词不硬化；绑定短语按前置 3 字否定判）
+    _HARD_NEGATION_MARKERS: Tuple[str, ...] = (
+        "不用", "不必", "不需要", "无需", "没有", "不", "没", "别", "取消", "免了",
+        "不去", "不打算", "不想", "不参加", "推掉",
+    )
+    #: 模糊/未定语境（同一子句出现 → 事件词不硬化：「可能明天开会」「有空想去看病」）
+    _HARD_HEDGE_MARKERS: Tuple[str, ...] = (
+        "可能", "也许", "或许", "大概", "有空", "如果", "要是", "考虑", "打算",
+        "想要", "想去", "看看", "看情况", "到时候", "再说", "随便", "要不要", "是不是",
+    )
+    #: 绑定证据：明确日期/星期/时刻（「明天上午10点开会」才算约定）
+    HARD_TIME_EVIDENCE_RE = re.compile(
+        r"(\d{1,2}\s*[点:：]|\d{1,2}\s*月|周[一二三四五六日天]|星期[一二三四五六日天]"
+        r"|礼拜[一二三四五六日天]|今天|今晚|明天|明早|明晚|后天|大后天|下[周月]"
+        r"|上午|下午|中午|晚上|早上|凌晨|整点|半点)")
+    #: typed 参数里表示"这是硬约定"的取值（归一用；来源 = 工具调用方 LLM 的显式声明）
+    _HARD_TYPED_VALUES: Tuple[str, ...] = ("hard", "commitment", "appointment", "reservation")
+    #: 默认意图时长（分钟）与上限
+    DEFAULT_INTENT_MINUTES = 60
+    MAX_INTENT_MINUTES = 240
+
+    def _layers(self) -> Dict[str, bool]:
+        """新层开关快照（spine / life_state / rolling 任一开启即 v2 写入生效）。"""
+        spine = bool(getattr(self._schedule_cfg(), "spine_mode", False))
+        life_section = getattr(getattr(self._plugin, "config", None), "life_state", None)
+        life = bool(getattr(life_section, "enabled", False))
+        planning = getattr(self._plugin, "_planning", None)
+        planner = (getattr(planning, "rolling_planner", None)
+                   or getattr(self._plugin, "_rolling_planner", None))
+        rolling = bool(life and planner is not None)
+        return {"spine": spine, "life": life, "rolling": rolling,
+                "enabled": bool(spine or life or rolling)}
+
+    @classmethod
+    def detect_hard_commitment(cls, description: Any, *,
+                               intent: Any = None, commitment: Any = None
+                               ) -> Tuple[bool, str]:
+        """代码侧硬约定判定（返回 ``(hard, 来源标记)``）。
+
+        **硬化证据只有两类**（2026-10-27 共享接线修补，修复「任何提及会议词都变 hard」）：
+
+        1. ``typed`` 参数的**显式**硬值（``hardness``/``kind`` ∈
+           :data:`_HARD_TYPED_VALUES`）——这是工具调用方 LLM 按用户原话给出的显式
+           声明，属于"用户要求"的转述；**但角色裁判返回的 ``parsed["hardness"]``
+           永不参与**（见 :meth:`update_schedule`），LLM 一句 hardness 不能单独翻转。
+        2. 描述文本中的**明确绑定**：
+           - 承诺/截止短语（必须/约好/截止…）且前面 3 字内没有否定词；
+           - 事件词（开会/体检/看病…）**且**同一子句有日期/时刻绑定证据，且该子句
+             既无否定（不用开会）也无模糊（可能/有空/想去）语境。
+
+        因此「可能明天开会」「有空想去看病」「不用开会」都是软意图；「明天上午10点
+        开会」「约好周六体检」「必须去开会」才是硬约定。词表全部是代码常量，LLM 既
+        不能把软意图硬化，也不能把明确约定降级。
+        """
+        for holder in (intent, commitment):
+            if not isinstance(holder, dict):
+                continue
+            raw = str(holder.get("hardness") or holder.get("kind") or "").strip().lower()
+            if raw in cls._HARD_TYPED_VALUES:
+                return True, f"typed:{raw}"
+        text = str(description or "")
+        if not text.strip():
+            return False, ""
+        # 时间/日期绑定证据按**整段**判定：一句里说"明天凌晨零点半接机，航班落地"
+        # 时事件词与时间可能分处两个子句，不得因此漏判；否定/模糊仍按**事件词所在
+        # 子句**判定（"不用开会"/"可能明天开会"/"有空想去看病" 都不会硬化）。
+        has_time = bool(cls.HARD_TIME_EVIDENCE_RE.search(text))
+        for clause in re.split(r"[，。；;！!？?\n]+", text):
+            clause = clause.strip()
+            if not clause:
+                continue
+            hard, source = cls._clause_hard(clause, has_time=has_time)
+            if hard:
+                return True, source
+        return False, ""
+
+    @classmethod
+    def _clause_hard(cls, clause: str, *, has_time: bool = False) -> Tuple[bool, str]:
+        """单子句判定（绑定短语按前置否定判；事件词需时间证据且非否定/非模糊）。"""
+        for keyword in cls.HARD_COMMITMENT_KEYWORDS:
+            start = clause.find(keyword)
+            while start >= 0:
+                prefix = clause[max(0, start - 3):start]
+                if not any(marker in prefix for marker in ("不", "没", "别", "无", "免", "取消")):
+                    return True, f"keyword:{keyword}"
+                start = clause.find(keyword, start + 1)
+        negated = any(marker in clause for marker in cls._HARD_NEGATION_MARKERS)
+        hedged = any(marker in clause for marker in cls._HARD_HEDGE_MARKERS)
+        if negated or hedged:
+            return False, ""
+        if not (has_time or cls.HARD_TIME_EVIDENCE_RE.search(clause)):
+            return False, ""
+        for keyword in cls.HARD_EVENT_KEYWORDS:
+            if keyword in clause:
+                return True, f"binding:{keyword}"
+        return False, ""
+
+    def _parse_intent_window(self, intent: Dict[str, Any], parsed: Dict[str, Any],
+                             now: datetime) -> Tuple[int, int]:
+        """意图时间窗（日帧分钟，``end`` 允许 >1440）：typed window → 裁判 time → 隐式下一刻。"""
+        start: Optional[int] = None
+        end: Optional[int] = None
+        window = intent.get("window")
+        if isinstance(window, (list, tuple)) and len(window) >= 2:
+            start = parse_hhmm(str(window[0]), -1)
+            end = parse_hhmm(str(window[1]), -1)
+            start = start if start >= 0 else None
+            end = end if end >= 0 else None
+        if start is None and intent.get("start"):
+            parsed_start = parse_hhmm(str(intent.get("start")), -1)
+            start = parsed_start if parsed_start >= 0 else None
+        if end is None and intent.get("end"):
+            parsed_end = parse_hhmm(str(intent.get("end")), -1)
+            end = parsed_end if parsed_end >= 0 else None
+        if start is None:
+            judged = parse_hhmm(str(parsed.get("time") or ""), -1)
+            start = judged if judged >= 0 else (((now.hour * 60 + now.minute) // 30 + 1) * 30) % DAY_MINUTES
+        if end is None:
+            try:
+                duration = int(intent.get("min_minutes") or self.DEFAULT_INTENT_MINUTES)
+            except (TypeError, ValueError):
+                duration = self.DEFAULT_INTENT_MINUTES
+            duration = max(5, min(self.MAX_INTENT_MINUTES, duration))
+            end = start + duration
+        if end <= start:
+            end += DAY_MINUTES  # 跨午夜意图（spine 契约：end 允许 >1440）
+        return int(start), int(end)
+
+    def _upsert_spine_intent(self, *, date: str, name: str, goal_type: str,
+                             priority: str, hardness: str, start_minute: int,
+                             end_minute: int, note: str) -> Optional[Dict[str, Any]]:
+        """写入/更新一条今日 spine 意图（走 ``ScheduleGenerator.apply_schedule_items`` 共享漏斗）。
+
+        只动 ``parameters.spine`` 行；不消费未来约定（``consume_commitments=False``）；
+        其余条目原样带回写库。返回 ``{"item_id", "written", "row"}``；生成器/库缺失 → None。
+        """
+        generator = self._get_generator()
+        query = self._schedule_query()
+        db = getattr(query, "db", None) if query is not None else None
+        if db is None:
+            db = getattr(self._plugin, "_db", None)
+        if generator is None or db is None or not callable(getattr(db, "get_day_schedule", None)):
+            return None
+        rows = [dict(row) for row in (db.get_day_schedule(date) or []) if isinstance(row, dict)]
+
+        target: Optional[Dict[str, Any]] = None
+        for row in rows:
+            params = row.get("parameters")
+            if not isinstance(params, dict) or not params.get("spine"):
+                continue
+            if str(row.get("name") or "").strip() == name:
+                target = row
+                break
+
+        params = dict(target.get("parameters") or {}) if target else {}
+        duration = max(5, int(end_minute) - int(start_minute))
+        params.update({
+            "spine": True,
+            "min_minutes": int(params.get("min_minutes") or duration),
+            "max_minutes": max(int(params.get("max_minutes") or duration), duration),
+            "priority": priority,
+            "hardness": hardness,
+            "interruptibility": 0.1 if hardness == "hard" else float(params.get("interruptibility") or 0.5),
+        })
+        if note:
+            params["note"] = note
+
+        if target is None:
+            row = {
+                "item_id": uuid.uuid4().hex,
+                "name": name,
+                "description": note,
+                "goal_type": goal_type,
+                "priority": priority,
+                "start_minute": int(start_minute),
+                "end_minute": int(end_minute),
+                "day_offset": 0,
+                "parameters": params,
+            }
+            rows.append(row)
+        else:
+            row = target
+            row.update({
+                "name": name,
+                "description": note,
+                "goal_type": goal_type,
+                "priority": priority,
+                "start_minute": int(start_minute),
+                "end_minute": int(end_minute),
+                "day_offset": row.get("day_offset") or 0,
+                "parameters": params,
+            })
+        rows.sort(key=lambda item: int(item.get("start_minute") or 0))
+        try:
+            written = int(generator.apply_schedule_items(
+                rows, date, consume_commitments=False, reason=REASON_TOOL_EDIT) or 0)
+        except Exception as exc:
+            logger.warning("spine 意图写回失败: %s", exc)
+            return None
+        if not written:
+            return None
+        return {"item_id": str(row.get("item_id") or ""), "written": written, "row": row}
+
+    async def _request_life_recheck(self, reason: str) -> None:
+        """通知插件内部睡眠/生活循环"有新约定/新日程"（``plugin.request_life_recheck``）。
+
+        2026-10-27 共享接线修补：**签名只绑定一次**，不再用「捕获 TypeError 再重调」
+        的通用 adapter（那会在业务方法内部抛 TypeError 时把有副作用的方法再跑一遍）。
+        该口只是幂等通知（bool 返回、不推进状态、不发消息、不调模型），因此按签名
+        判断是否可传 reason；不可判定时按「无参」调用，绝不重复调用。未装配（旧
+        plugin 无此口）→ 静默跳过。
+        """
+        hook = getattr(self._plugin, "request_life_recheck", None)
+        if not callable(hook):
+            return
+        try:
+            positionals = 0
+            parameters = inspect.signature(hook).parameters.values()
+            for param in parameters:
+                if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+                    positionals += 1
+                elif param.kind == param.VAR_POSITIONAL:
+                    positionals = max(positionals, 1)
+            outcome = hook(reason or "schedule_update") if positionals else hook()
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception:
+            logger.debug("request_life_recheck 调用失败（忽略）", exc_info=True)
+
+    async def _apply_future_decision(self, parsed: Dict[str, Any], description: str,
+                                     today_str: str, today: datetime,
+                                     layers: Dict[str, bool],
+                                     commitment: Dict[str, Any]) -> Dict[str, Any]:
+        """decision=future：写 pending_commitment（未来仍走约定）；新层开时记 hardness。"""
+        target_date = str(parsed.get("date") or commitment.get("date") or today_str)
+        if target_date <= today_str:
+            return {
+                "type": "schedule_unchanged",
+                "content": f"注意：未来约定日期 {target_date} 无效，日程不变",
+            }
+        title = str(parsed.get("title") or commitment.get("title") or description[:40])
+        when = str(parsed.get("time") or commitment.get("time") or "")
+        note = str(parsed.get("notes") or commitment.get("notes") or "")
+        reason = str(parsed.get("reason") or "")
+        goal = get_goal_manager().add_pending_commitment(
+            commitment_date=target_date,
+            title=title,
+            time=when,
+            notes=note,
+            reason=reason,
+        )
+        goal_id = str(getattr(goal, "goal_id", "") or "")
+        hard, hard_source = self.detect_hard_commitment(
+            description, commitment=commitment)
+        if layers["enabled"]:
+            # 显式 hardness 贯通（2026-10-27 用户裁定）：soft 也落库，hard 代码强制
+            # 不被 LLM 降级；生成侧/planner 据此保持 soft 不硬化、hard 固定时间。
+            params = dict(getattr(goal, "parameters", None) or {})
+            params.update({
+                "hardness": "hard" if hard else "soft",
+                "hard": bool(hard),
+                "hard_source": hard_source,
+                "source": str(params.get("source") or "user_request"),
+            })
+            try:
+                get_goal_manager().update_goal(goal_id, parameters=params)
+            except Exception as exc:
+                logger.warning("未来约定 hardness 落库失败（约定本身已写入）: %s", exc)
+            goal = get_goal_manager().get_goal(goal_id) or goal
+            await self._request_life_recheck("commitment_written")
+            hardness_label = "硬约定" if hard else "软约定"
+            when_label = f"｜{when}" if when else ""
+            content = (
+                f"已记录 {target_date} 的约定：{title}（{hardness_label}{when_label}｜"
+                f"约定ID={goal_id}）"
+            )
+            if note:
+                content += f"\n备注：{note}"
+            if reason:
+                content += f"\n理由：{reason}"
+            return {
+                "type": "schedule_committed",
+                "content": content,
+                "goal_id": goal_id,
+                "intent_id": goal_id,
+                "hardness": "hard" if hard else "soft",
+                "effective_time": f"{target_date} {when}".strip(),
+            }
+        # 旧行为（新层全关）：约定已写入，文案与旧版逐字一致
+        await self._request_life_recheck("commitment_written")
+        return {
+            "type": "schedule_committed",
+            "content": (
+                f"已记录 {target_date} 的约定：{parsed.get('title')}\n"
+                f"{('备注：' + parsed.get('notes')) if parsed.get('notes') else ''}\n"
+                f"{('理由：' + reason) if reason else ''}"
+            ).strip(),
+        }
+
+    async def _apply_today_decision(self, parsed: Dict[str, Any], description: str,
+                                    today_str: str, now: datetime,
+                                    intent: Dict[str, Any]) -> Dict[str, Any]:
+        """decision=today：新层开时写/更新今日 spine 意图（硬约定代码强制 hardness=hard）。"""
+        name = str(intent.get("name") or parsed.get("title") or description[:40]).strip()
+        goal_type = str(intent.get("goal_type") or "").strip() or "daily_routine"
+        priority = str(intent.get("priority") or "medium").strip().lower()
+        if priority not in ("high", "medium", "low"):
+            priority = "medium"
+        start_minute, end_minute = self._parse_intent_window(intent, parsed, now)
+        hard, hard_source = self.detect_hard_commitment(description, intent=intent)
+        hardness = "hard" if hard else "soft"
+        note = str(parsed.get("notes") or intent.get("note") or "").strip()
+        written = self._upsert_spine_intent(
+            date=today_str, name=name, goal_type=goal_type, priority=priority,
+            hardness=hardness, start_minute=start_minute, end_minute=end_minute, note=note)
+        if written is None:
+            return {"type": "error",
+                    "content": "日程生成器不可用（插件未完成初始化），今日意图未写入"}
+        await self._request_life_recheck("schedule_intent_written")
+        intent_id = written["item_id"]
+        window = f"{format_day_minute(start_minute)}-{format_day_minute(end_minute)}"
+        hardness_label = "硬约定" if hard else "软意图"
+        content = (f"已更新今日意图：{name}（{hardness_label}｜{window}｜意图ID={intent_id}）")
+        if note:
+            content += f"\n备注：{note}"
+        if hard:
+            content += f"\n生效时间：今天 {format_day_minute(start_minute)} 起"
+        return {
+            "type": "schedule_intent_updated",
+            "content": content,
+            "intent_id": intent_id,
+            "goal_id": intent_id,
+            "hardness": hardness,
+            "hard_source": hard_source,
+            "effective_time": f"{today_str} {format_day_minute(start_minute)}",
+        }
+
     async def update_schedule(self, **function_args: Any) -> Dict[str, Any]:
         if not self._module_enabled():
             return {"type": "error", "content": "日程规划模块未启用（配置 [日程系统] enabled）"}
         """根据自然语言请求更新日程：角色裁判 → today / future / reject。
 
         ``role_judge_enabled=False`` 时降级为直接 ``add_pending_commitment``（无 LLM）。
+
+        v2（定稿 §4.6 / 附录 A.3.2）：``_layers()`` 任一开启（spine / life_state / rolling）时
+        - ``today`` → 写/更新**今日 spine 意图行**（不再整日重生成，零新增 LLM 调用）；
+        - ``future`` → 仍写 ``pending_commitment``，并落 ``parameters.hardness``；
+        - 明确硬约定由 :meth:`detect_hard_commitment` **代码强制** ``hardness=hard``
+          （LLM 返回 soft 也不能降级；软意图不会因为 LLM 说 hard 就被硬化；
+          角色裁判返回的 ``parsed["hardness"]`` **永不参与**判定——只认 typed 显式
+          声明与描述里的绑定证据，2026-10-27 接线口径）；
+        - 返回内容含摘要、意图/约定 ID、是否硬约定、生效时间。
+        新层全关 → 两条分支逐字回到旧行为（today=重生成、future=旧文案）。
+
+        ``intent`` / ``commitment`` 是**可选** typed 归一参数（dict），旧调用只传
+        ``description`` 完全不受影响。
         """
         try:
             description = str(function_args.get("description", "") or "").strip()
+            intent_arg = function_args.get("intent")
+            intent_arg = intent_arg if isinstance(intent_arg, dict) else {}
+            commitment_arg = function_args.get("commitment")
+            commitment_arg = commitment_arg if isinstance(commitment_arg, dict) else {}
+            if not description:
+                # typed 参数只做"归一辅助"：description 缺省时用它兜底成裁判文本，
+                # 旧调用（只有 description）行为完全不变。
+                description = str(intent_arg.get("name")
+                                  or commitment_arg.get("title") or "").strip()
             if not description:
                 return {"type": "error", "content": "请提供日程变更描述"}
 
+            layers = self._layers()
             cfg = self._advanced_cfg()   # 裁判开关/温度/超时/最大 token 均在高级段
             goal_manager = get_goal_manager()
             tz_manager = self._make_tz_manager()
@@ -472,29 +1146,14 @@ class ToolsService:
                 return {"type": "schedule_unchanged", "content": msg}
 
             if decision == "future":
-                target_date = str(parsed.get("date") or today_str)
-                if target_date <= today_str:
-                    return {
-                        "type": "schedule_unchanged",
-                        "content": f"注意：未来约定日期 {target_date} 无效，日程不变",
-                    }
-                goal_manager.add_pending_commitment(
-                    commitment_date=target_date,
-                    title=str(parsed.get("title") or description[:40]),
-                    time=str(parsed.get("time") or ""),
-                    notes=str(parsed.get("notes") or ""),
-                    reason=reason,
-                )
-                return {
-                    "type": "schedule_committed",
-                    "content": (
-                        f"已记录 {target_date} 的约定：{parsed.get('title')}\n"
-                        f"{('备注：' + parsed.get('notes')) if parsed.get('notes') else ''}\n"
-                        f"{('理由：' + reason) if reason else ''}"
-                    ).strip(),
-                }
+                return await self._apply_future_decision(
+                    parsed, description, today_str, today, layers, commitment_arg)
 
-            # decision == "today"：重生成今日日程
+            # decision == "today"：新层开 → 写/更新 spine 意图（不重生成、不新增 LLM 调用）；
+            # 新层全关 → 旧行为逐字保留（重生成今日日程）
+            if layers["enabled"]:
+                return await self._apply_today_decision(
+                    parsed, description, today_str, today, intent_arg)
             extra_parts = [
                 f"今天临时纳入：{parsed.get('title') or description[:40]}",
             ]
@@ -512,6 +1171,7 @@ class ToolsService:
             items = await generator.regenerate_today_schedule(
                 extra_prompt=extra_prompt, apply=True, **self._generate_kwargs(),
             )
+            await self._request_life_recheck("schedule_regenerated")
             return {
                 "type": "schedule_regenerated",
                 "content": (
@@ -553,14 +1213,12 @@ class ToolsService:
         午休/午睡/小憩/打盹不算（§八.7 / C4-补充：午休本轮不动）。
         """
         rows = [item for item in (items or []) if isinstance(item, dict)]  # 本工具只吃 DB 行
-        return find_night_sleep_item(rows)
+        return _shared_find_sleep_item(rows)
 
     @staticmethod
     def _nap_end_datetime(now: datetime, minute: int) -> datetime:
-        """把"当天分钟数"落成 ``now`` 之后最近的时刻（跨午夜自动 +1 天）。"""
-        end = now.replace(hour=(int(minute) // 60) % 24, minute=int(minute) % 60,
-                          second=0, microsecond=0)
-        return end if end > now else end + timedelta(days=1)
+        """把"当天分钟数"落成 ``now`` 之后最近的时刻（PR3 起委托共享实现）。"""
+        return _shared_nap_end_datetime(now, minute)
 
     # ── P6 修复（W2）：赖床延长窗口内的清醒条目顺延 ─────────────────────
     # 缺陷：lie-in 只把 sleep 条目 end 推后时，与延长窗口重叠的**非睡眠**条目会在下一 tick
@@ -583,21 +1241,7 @@ class ToolsService:
         Returns:
             被顺延的条目数（0 = 无需改动，调用方跳过写回）。
         """
-        moved = 0
-        for item in items or []:
-            if not isinstance(item, dict) or is_night_sleep_item(item):
-                continue
-            try:
-                start = int(item.get("start_minute") or 0)
-                end = int(item.get("end_minute") or 0)
-            except (TypeError, ValueError):
-                continue
-            if end <= start or start >= hi or end <= lo:
-                continue
-            item["start_minute"] = int(hi)
-            item["end_minute"] = min(DAY_MINUTES, int(hi) + (end - start))
-            moved += 1
-        return moved
+        return _shared_postpone_items(items, lo, hi)
 
     def _postpone_wake_day_schedule(self, query: Optional[Any], day: str, lo: int, hi: int) -> int:
         """跨午夜赖床（凌晨）：**醒来日**日程的顺延写回（醒沿查询读的正是那一天的日程）。
@@ -646,13 +1290,8 @@ class ToolsService:
         故凌晨（早于 wake_time 锚点的跨午夜段）仍读**昨天**那条日程，否则读今天；夜猫子作息
         （sleep ≤ wake，同日）一律读今天。取不到锚点一律按"今天"（缺省 07:00/23:00）。
         """
-        sleep_min = parse_hhmm(self._schedule_cfg().sleep_time, 23 * 60)
-        wake_min = parse_hhmm(self._schedule_cfg().wake_time, 7 * 60)
-        cur = now.hour * 60 + now.minute
-        if sleep_min > wake_min and cur < wake_min:
-            return (now - timedelta(days=1)).strftime("%Y-%m-%d")
-        return now.strftime("%Y-%m-%d")
-
+        cfg = self._schedule_cfg()
+        return _shared_nap_schedule_date(now, cfg.sleep_time, cfg.wake_time)
     async def nap_lie_in(self, time: str = "", now: Optional[datetime] = None) -> Dict[str, Any]:
         """把**今日 sleep 条目**的结束时间推到目标时刻（附录 §4.4，用户裁决 C4；M9 落地）。
 
@@ -689,6 +1328,11 @@ class ToolsService:
         try:
             if not self._module_enabled():
                 return {"type": "error", "content": "日程规划模块未启用（配置 [日程系统] enabled）"}
+            # PR3（2026-10-26，定稿 §4.2.3）：引擎启用时旧赖床工具自动管理（保留工具名/
+            # 别名，PR8 前不删）——返回提示、不改日程、不计次、不触碰 emotion 窗口
+            engine = getattr(self._plugin, "_sleep_engine", None)
+            if nap_tool_managed_by_engine(engine):
+                return nap_tool_engine_managed_reply()
             # 1) 解析容错（先解析：缺参/非法给格式示例，不惊动任何状态）
             target_minute = parse_nap_target(time)
             if target_minute is None:
@@ -711,33 +1355,33 @@ class ToolsService:
             if wake_edge is not None and clamped <= wake_edge:
                 return {"type": "nap_error",
                         "content": "这个时间不比现在的起床时间晚，起床时间没有改动，就不多睡啦。"}
-            # 4) 写回今日日程（共享底层；只动 sleep 条目，其余条目原样保留）
+            # 4) 写回今日日程（PR3 起走 planning/sleep_schedule 共享写回：与睡眠引擎同一实现）
             query = self._schedule_query()
             items = list(query.get_day_schedule(today)) if query is not None else []
             item = self._find_sleep_item(items)
             if item is None:
                 return {"type": "nap_error",
                         "content": "今天没有找到睡觉日程，暂时没法往后推起床时间。"}
-            item["end_minute"] = int(clamped)
-            # P6：延长窗口内的清醒条目顺延到延长端点之后（否则下一 tick 醒沿被它们抢占）。
-            # 窗口在"醒来日"帧内的起点：同日 → 当前时刻；跨午夜 → 该日 0 点（见 _nap_end_datetime）。
-            end_dt = self._nap_end_datetime(current, clamped)
-            wake_day = end_dt.strftime("%Y-%m-%d")
-            window_lo = current.hour * 60 + current.minute if wake_day == today else 0
-            if wake_day == today:
-                self._postpone_items_for_lie_in(items, window_lo, clamped)
             generator = self._get_generator()
             if generator is None:
                 return {"type": "error", "content": "日程生成器不可用（插件未完成初始化）"}
-            # §31.2 进账血缘（R7 2026-10-23）：赖床工具修改以 tool_edit 原因进账（行级盖戳 +
-            # rotate 由共享漏斗完成；写库前轮换 best-effort）。
-            written = generator.apply_schedule_items(items, today, consume_commitments=False,
-                                                     reason=REASON_TOOL_EDIT)
-            if not written:
+
+            def _apply_items(rows: List[Dict[str, Any]], date: str, why: str) -> int:
+                return int(generator.apply_schedule_items(
+                    rows, date, consume_commitments=False, reason=why) or 0)
+
+            def _postpone_wake_day(day: str, lo: int, hi: int) -> int:
+                return int(self._postpone_wake_day_schedule(query, day, lo, hi) or 0)
+
+            end_dt = self._nap_end_datetime(current, clamped)
+            write = update_sleep_endpoint(
+                now=current, target_minute=clamped, items=items, sleep_item=item,
+                schedule_date=today, reason=REASON_TOOL_EDIT,
+                postpone_awake=True, apply_items=_apply_items,
+                postpone_wake_day=_postpone_wake_day, clamp_to_limit=False)
+            if not write.ok:
                 return {"type": "nap_error", "content": "日程写回失败，起床时间没有改动。"}
-            if wake_day != today:
-                # 跨午夜（凌晨赖床）：醒来日日程单独顺延（唤醒日 ≠ 入睡日，须另一份写回）
-                self._postpone_wake_day_schedule(query, wake_day, window_lo, clamped)
+            wake_day = write.wake_day or today
             # 5) + 6) 成功才通知 emotion：延长本周期窗口端点（醒沿推迟）并计一次有效提醒
             extended = emotion.extend_night_sleep_until(end_dt)
             if not extended:

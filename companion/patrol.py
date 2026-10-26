@@ -49,6 +49,7 @@ from core.llm_utils import LLMService
 from core.time_utils import hours_between, parse_hhmm, parse_hours_range
 from planning.schedule_anchors import (SOURCE_REAL_SCHEDULE, RealAnchors,
                                        real_sleep_anchors)
+from planning.schedule_items import is_night_sleep_item
 from planning.schedule_query import ScheduleQuery
 from planning.time_utils import is_in_time_window
 from suite_prompts import (
@@ -152,6 +153,21 @@ def _config_section(config: Any, attr: str) -> Any:
     return getattr(getattr(config, "config", None), attr, None)
 
 
+def sleep_engine_asleep(plugin: Any, now: Optional[datetime] = None) -> bool:
+    """睡眠引擎「仍在睡」权威读数（单一 provider 的薄封装；不表态/异常一律 False）。
+
+    晚醒（引擎还在睡、日程端点尚未写回真实醒点）时，陪伴静默与空间可用性必须按**真实
+    状态**判静默，不能按 07:00 旧锚点提前开口；引擎关/未装配 → 保持旧窗口语义。
+    """
+    getter = getattr(plugin, "sleep_asleep", None)
+    if not callable(getter):
+        return False
+    try:
+        return getter(now) is True
+    except Exception:
+        return False
+
+
 def _fallback_schedule_anchors() -> Tuple[str, str]:
     """``[schedule]`` 锚点缺失时的兜底 ``(wake_time, sleep_time)``。
 
@@ -190,6 +206,11 @@ def real_sleep_anchors_from_plugin(plugin: Any, now: Optional[datetime] = None
     """
     # § 31.2 锚点合并：周期状态文件（已持久化）优先 —— 真实进账轮换后即时生效；
     # anchored/缺失/非法 → 落回条目路径（该路径自带配置兜底，consume 面零改动）。
+    # PR3 复核（2026-10-27）：条目端点**优先于**季度状态——晚醒真实写回只改入睡日条目的
+    # 起床端点，周期四变量的 cycle_start 仍是最早清醒条目时间（07:00）。若继续让状态
+    # 抢跑，patrol 静默/qzone 可用性/emotion 夜窗都会在 08:30 仍按 07:00 判断（不一致）。
+    # 状态只保留为「条目读不到」时的兜底。
+    pair = _item_anchor_pair(plugin, now)
     data_dir = getattr(plugin, "_data_dir", None)
     if data_dir is not None:
         try:
@@ -200,10 +221,26 @@ def real_sleep_anchors_from_plugin(plugin: Any, now: Optional[datetime] = None
                 tz_name = str(getattr(advanced, "timezone", "") or "").strip()
                 from_state = anchors_from_cycle_state(state, tz_name=tz_name)
                 if from_state is not None:
+                    if pair is None:
+                        return from_state
+                    if (pair[0], pair[1]) != (from_state.start, from_state.end):
+                        return RealAnchors(start=pair[0], end=pair[1],
+                                           source=SOURCE_REAL_SCHEDULE)
                     return from_state
         except Exception:
             pass  # 状态层任何异常不阻断 → 条目路径 fail-safe（§7.9 契约）
 
+    if pair is not None:
+        return RealAnchors(start=pair[0], end=pair[1], source=SOURCE_REAL_SCHEDULE)
+    if not callable(getattr(getattr(plugin, "_schedule_query", None),
+                            "get_day_schedule", None)):
+        return None
+    # 条目读不到有效睡眠环（配置兜底/异常）→ 交给调用方走 [schedule] 路径
+    return None
+
+
+def _item_anchor_pair(plugin: Any, now: Optional[datetime]) -> Optional[Tuple[str, str]]:
+    """真实睡眠环条目 → ``(入睡 HH:MM, 起床 HH:MM)``；不可得 → ``None``（纯读）。"""
     query = getattr(plugin, "_schedule_query", None)
     if not callable(getattr(query, "get_day_schedule", None)):
         return None
@@ -217,8 +254,11 @@ def real_sleep_anchors_from_plugin(plugin: Any, now: Optional[datetime] = None
         fallback_wake, fallback_sleep = _fallback_schedule_anchors()
         cfg_wake = str(getattr(schedule, "wake_time", "") or "").strip() or fallback_wake
         cfg_sleep = str(getattr(schedule, "sleep_time", "") or "").strip() or fallback_sleep
-        return real_sleep_anchors(items_today, items_yesterday, now=moment,
+        real = real_sleep_anchors(items_today, items_yesterday, now=moment,
                                   cfg_sleep=cfg_sleep, cfg_wake=cfg_wake)
+        if real.source != SOURCE_REAL_SCHEDULE:
+            return None
+        return (real.start, real.end)
     except Exception:
         return None
 
@@ -232,9 +272,14 @@ def nap_item_matches(item: Any) -> bool:
     """日程条目是否命中午休/小睡（名称含关键词，或 ``goal_type == "rest"``）。
 
     companion 巡检的午休静默与 qzone 判定链的午休静默共用本判定（2026-10-20 跨模块口径）；
+    A-21(b)（用户 2026-10-27 批）：**夜间睡眠条目排除**——``goal_type==sleep`` 或夜间名
+    （``睡觉/睡眠/安睡``，与 :func:`planning.schedule_items.is_night_sleep_item` 同源）一律
+    不算午休，避免午夜「打盹/睡觉」被白天午休静默；午休/午睡/小憩/打盹仍命中。
     非法入参一律 False（不把垃圾数据当成午休）。
     """
     if not isinstance(item, dict):
+        return False
+    if is_night_sleep_item(item):
         return False
     name = str(item.get("name") or "")
     if any(keyword in name for keyword in NAP_NAME_KEYWORDS):
@@ -576,6 +621,14 @@ class PatrolService:
             return
         if daily_max_speak <= 0:
             mark_skip("daily_max_zero", detail="每日发言上限为 0（完全静音）")
+            finish()
+            return
+
+        # PR3 复核（2026-10-27）：晚于旧 wake 锚点仍在真实睡眠（引擎权威）→ 照样静默。
+        # 日程端点在**醒来时**才写回真实醒点，晚醒区间内窗口还写着 07:00；若只看窗口会
+        # 在 07:00 后提前开口/巡检。引擎不表态(None)/已醒 → 不改旧窗口判定。
+        if sleep_engine_asleep(self._config, now):
+            mark_skip("silence", detail="睡眠引擎判定仍在睡（真实睡眠环，晚醒未写回前）")
             finish()
             return
 

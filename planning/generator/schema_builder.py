@@ -108,6 +108,8 @@ class SchemaBuilder:
                                     "daily_routine",      # 日常作息
                                     "meal",               # 吃饭
                                     "study",              # 学习
+                                    "work",               # 工作（模板兜底会产出）
+                                    "sleep",              # 夜间睡眠（A-21(f) 规范类型）
                                     "entertainment",      # 娱乐
                                     "social_maintenance", # 社交
                                     "exercise",           # 运动
@@ -217,6 +219,8 @@ class SchemaBuilder:
                                     "daily_routine",
                                     "meal",
                                     "study",
+                                    "work",
+                                    "sleep",
                                     "entertainment",
                                     "social_maintenance",
                                     "exercise",

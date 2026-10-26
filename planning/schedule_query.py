@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .schedule_db import ScheduleDB
+from .schedule_items import is_night_sleep_item
 from .time_utils import (describe_energy, format_day_minute, get_energy_level,
                          is_in_day_frame, is_in_day_frame_marked,
                          is_in_sleep_ring, is_upcoming_day_minute,
@@ -32,7 +33,9 @@ from core.time_utils import minutes_of_now, parse_hhmm
 
 logger = logging.getLogger(__name__)
 
-# sleep 类型条目不算「正在做的事」（仅 include_sleep=True 的调用方可见，如情绪睡眠循环）
+# sleep 类型条目不算「正在做的事」（仅 include_sleep=True 的调用方可见，如情绪睡眠循环）。
+# A-21(a)（用户 2026-10-27 批）：旧 ``daily_routine`` + 名称「睡觉」也按夜间睡眠处理，
+# 判定唯一真源 = ``schedule_items.is_night_sleep_item``（goal_type==sleep 或夜间名兜底）。
 _SKIP_TYPES = {"sleep"}
 
 
@@ -113,7 +116,7 @@ class ScheduleQuery:
             # 唯一例外：include_sleep=True 且当前钟点在睡眠环内，仅回退睡眠类型条目。
             if include_sleep and self._in_sleep_ring(now):
                 fallback = self._current_from_time_window(date, now, include_sleep=True)
-                if fallback is not None and str(fallback.get("goal_type") or "") == "sleep":
+                if fallback is not None and is_night_sleep_item(fallback):
                     self._warn_night_sleep_fallback(date, now)
                     return fallback
             return None
@@ -134,7 +137,8 @@ class ScheduleQuery:
         current = None
         cur_min = minutes_of_now(now)
         for item in self._db.get_day_schedule(date):
-            if not include_sleep and item.get("goal_type") in _SKIP_TYPES:
+            if not include_sleep and (item.get("goal_type") in _SKIP_TYPES
+                                      or is_night_sleep_item(item)):
                 continue
             if is_in_day_frame_marked(item.get("start_minute") or 0, item.get("end_minute") or 0,
                                       cur_min, item.get("day_offset")):
@@ -144,7 +148,8 @@ class ScheduleQuery:
             prev_date = self._previous_date(date)
             if prev_date:
                 for item in self._db.get_day_schedule(prev_date):
-                    if not include_sleep and item.get("goal_type") in _SKIP_TYPES:
+                    if not include_sleep and (item.get("goal_type") in _SKIP_TYPES
+                                              or is_night_sleep_item(item)):
                         continue
                     end = int(item.get("end_minute") or 0)
                     offset = item.get("day_offset")
@@ -229,7 +234,7 @@ class ScheduleQuery:
         cur_min = minutes_of_now(now)
         upcoming: List[Tuple[int, Dict[str, Any]]] = []
         for item in self._db.get_day_schedule(date):
-            if item.get("goal_type") in _SKIP_TYPES:
+            if item.get("goal_type") in _SKIP_TYPES or is_night_sleep_item(item):
                 continue
             raw_start = item.get("start_minute")
             if not is_upcoming_day_minute_marked(raw_start, cur_min, item.get("end_minute"),
@@ -240,7 +245,8 @@ class ScheduleQuery:
         prev_date = self._previous_date(date)
         if prev_date:
             for item in self._db.get_day_schedule(prev_date):
-                if item.get("goal_type") in _SKIP_TYPES or item.get("day_offset") != 1:
+                if (item.get("goal_type") in _SKIP_TYPES or is_night_sleep_item(item)
+                        or item.get("day_offset") != 1):
                     continue
                 start = int(item.get("start_minute") or 0)
                 if start > cur_min:

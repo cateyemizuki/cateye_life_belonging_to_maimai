@@ -90,6 +90,13 @@ class CycleState:
     current_reason: str = ""
     anchored: bool = False
     updated_at: str = ""
+    #: 当前 cycle_start 的来源（2026-10-27 用户批准：「周期起点同步实际醒来时刻」）：
+    #: ``actual_wake`` = 睡眠引擎真实醒来；``schedule`` = 日程包络推算（旧口径）；
+    #: 空串 = 历史状态文件（按 schedule 处理）。
+    current_start_source: str = ""
+    #: 该 cycle_start 适用的日程日帧（YYYY-MM-DD）。**只有同一帧的 actual_wake 才复用**，
+    #: 避免把过往夜的历史醒来重新推导成今天（防倒写）。
+    current_start_date: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -100,6 +107,8 @@ class CycleState:
             "current_reason": self.current_reason,
             "anchored": bool(self.anchored),
             "updated_at": self.updated_at,
+            "current_start_source": self.current_start_source,
+            "current_start_date": self.current_start_date,
         }
 
     @classmethod
@@ -128,6 +137,8 @@ class CycleState:
             current_reason=str(raw.get("current_reason") or ""),
             anchored=bool(raw.get("anchored")),
             updated_at=str(raw.get("updated_at") or ""),
+            current_start_source=str(raw.get("current_start_source") or ""),
+            current_start_date=str(raw.get("current_start_date") or ""),
         )
 
 
@@ -206,6 +217,41 @@ def _calendar_days_between(new_epoch: Any, old_epoch: Any, tz_name: str) -> int:
     except (TypeError, ValueError, OSError, OverflowError):
         return 0
     return (new_day - old_day).days
+
+
+def _epoch_date(epoch: Any, tz_name: str = "") -> str:
+    """epoch → 当地日历日 ``YYYY-MM-DD``（非法 → 空串）。帧比较用。"""
+    try:
+        value = float(epoch)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    tz = _tzinfo_of(tz_name)
+    try:
+        return datetime.fromtimestamp(value, tz).strftime("%Y-%m-%d")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _frame_end_epoch(schedule_date: str, wake_epoch: Any, cfg_sleep: str,
+                     tz_name: str = "") -> Optional[float]:
+    """按**目标帧日期** + ``[schedule].sleep_time`` 推该轮入睡 epoch（不依赖当前窗）。"""
+    try:
+        day = datetime.strptime(str(schedule_date or ""), "%Y-%m-%d").date()
+        wake_value = float(wake_epoch)
+    except (TypeError, ValueError):
+        return None
+    tz = _tzinfo_of(tz_name)
+    try:
+        wake_dt = (datetime.fromtimestamp(wake_value, tz) if tz is not None
+                   else datetime.fromtimestamp(wake_value))
+    except (OSError, OverflowError, ValueError):
+        return None
+    sleep_min = parse_hhmm(str(cfg_sleep or ""), 23 * 60)
+    wake_clock = wake_dt.hour * 60 + wake_dt.minute
+    bed_day = day if sleep_min > wake_clock else day + timedelta(days=1)
+    return _epoch_for_date(bed_day, sleep_min, tz_name)
 
 
 # ============================================================
@@ -334,6 +380,107 @@ def save(data_dir: Any, state: CycleState, now: Optional[datetime] = None) -> bo
         return False
 
 
+#: 状态对象/进账漏斗共用的 cycle_start 来源标记（2026-10-27 用户批准口径）
+START_SOURCE_ACTUAL_WAKE = "actual_wake"
+START_SOURCE_SCHEDULE = "schedule"
+
+
+def actual_wake_epoch(data_dir: Any, schedule_date: str) -> Optional[float]:
+    """取「本帧真实醒来」的 epoch（无 / 非本帧 → ``None``）。
+
+    **只有同一 ``schedule_date`` 帧的 actual_wake 记录才复用**：后续日程编辑、
+    再生成、重启恢复都据此保住真实醒点；过往夜的历史醒来不会被推导成今天。
+    """
+    state = _read_state(data_dir) if data_dir is not None else None
+    if state is None or state.current_start_source != START_SOURCE_ACTUAL_WAKE:
+        return None
+    if str(state.current_start_date or "") != str(schedule_date or ""):
+        return None
+    start = state.current_cycle_start
+    return start if isinstance(start, (int, float)) and start > 0 else None
+
+
+def record_actual_wake(data_dir: Any, *, schedule_date: str, wake_epoch: Any,
+                       reason: str = "actual_wake", tz_name: str = "",
+                       cfg_wake: str = "", cfg_sleep: str = "",
+                       decision_logger: Any = None,
+                       now: Optional[datetime] = None) -> RotationResult:
+    """记录「真实醒来」→ ``current_cycle_start``（用户 2026-10-27 批准）。
+
+    - 只改当前轮 **start**（= 真实醒来 epoch）；``previous_*`` 原样保留（醒来不是换日
+      程，不倒写历史）；``current_cycle_end`` 保持（仍为今晚入睡时刻）；
+    - 幂等：同帧同醒点重复调用不重复写盘；
+    - 同帧覆盖：晚醒→更晚、早醒→更早都按**真实**时刻落地（早醒也要同步，不能回退到
+      最早清醒意图的计划时间）；
+    - 写盘失败 best-effort（返回 applied=True + 标注），不阻塞睡眠链。
+    """
+    target = str(schedule_date or "").strip()
+    try:
+        wake_value = float(wake_epoch)
+    except (TypeError, ValueError):
+        wake_value = 0.0
+    if wake_value <= 0 or not target:
+        text = "真实醒来记录无效（epoch/日帧缺失）：不更新周期"
+        _log_cycle(decision_logger, "skip", text, event="cycle_refuse",
+                   entry_reason=START_SOURCE_ACTUAL_WAKE)
+        return RotationResult(applied=False, reason=START_SOURCE_ACTUAL_WAKE, message=text)
+    state = _read_state(data_dir) if data_dir is not None else None
+    if state is None:
+        state = anchored_state(cfg_wake, cfg_sleep, tz_name, now)
+    if (state.current_start_source == START_SOURCE_ACTUAL_WAKE
+            and state.current_start_date == target
+            and state.current_cycle_start == wake_value):
+        return RotationResult(applied=False, reason=START_SOURCE_ACTUAL_WAKE,
+                              message="真实醒来已记录（幂等跳过）")
+    # 2026-10-27 综合验收：帧比较（不依赖“今日日程一定已先生成”）。
+    # - 同帧：只校正 current_start，previous 原样（醒来不是换日程）；
+    # - 跨新帧：旧 current 整轮进 previous，新帧按目标日期+睡眠锚点重算 end；
+    # - 早于当前帧：拒绝倒写历史。
+    current_frame = str(state.current_start_date or "").strip() or _epoch_date(
+        state.current_cycle_start, tz_name)
+    previous_start = state.previous_cycle_start
+    previous_end = state.previous_cycle_end
+    crossed_frame = bool(current_frame and target > current_frame)
+    if current_frame and target < current_frame:
+        text = f"真实醒来帧 {target} 早于当前帧 {current_frame}：不轮换（历史不倒写）"
+        _log_cycle(decision_logger, "skip", text, event="cycle_skip_backdated",
+                   entry_reason=START_SOURCE_ACTUAL_WAKE, schedule_date=target)
+        return RotationResult(applied=False, reason=START_SOURCE_ACTUAL_WAKE, message=text)
+    if crossed_frame and (isinstance(state.current_cycle_start, (int, float))
+                          and isinstance(state.current_cycle_end, (int, float))):
+        previous_start = state.current_cycle_start
+        previous_end = state.current_cycle_end
+    if crossed_frame:
+        end_value = _frame_end_epoch(target, wake_value, cfg_sleep, tz_name)
+    else:
+        end_value = state.current_cycle_end
+    if not (isinstance(end_value, (int, float)) and float(end_value) > wake_value):
+        # end 缺失/病态：用配置锚点推同帧入睡时刻，仍保证 end>start（消费侧另有兜底）
+        fallback_end = anchored_state(cfg_wake, cfg_sleep, tz_name, now).current_cycle_end
+        end_value = fallback_end if (isinstance(fallback_end, (int, float))
+                                     and float(fallback_end) > wake_value) else wake_value + 1
+    next_state = CycleState(
+        previous_cycle_start=previous_start,
+        previous_cycle_end=previous_end,
+        current_cycle_start=wake_value,
+        current_cycle_end=float(end_value),
+        current_reason=str(reason or START_SOURCE_ACTUAL_WAKE),
+        anchored=False,
+        updated_at=(now or _tz_now(tz_name)).isoformat(timespec="seconds"),
+        current_start_source=START_SOURCE_ACTUAL_WAKE,
+        current_start_date=target,
+    )
+    written = save(data_dir, next_state, now)
+    text = (f"周期起点同步真实醒来：{format_epoch_clock(wake_value, tz_name)}"
+            f"（帧 {target}，reason={next_state.current_reason}）")
+    _log_cycle(decision_logger, "info", text, event="cycle_actual_wake",
+               entry_reason=START_SOURCE_ACTUAL_WAKE, schedule_date=target,
+               wake_clock=format_epoch_clock(wake_value, tz_name))
+    if not written:
+        text += "（写盘失败 best-effort）"
+    return RotationResult(applied=True, reason=START_SOURCE_ACTUAL_WAKE, message=text)
+
+
 # ============================================================
 # 无日程 fail-safe（anchored 回退构造；只构造内存态、不写盘）
 # ============================================================
@@ -416,7 +563,8 @@ def _log_cycle(decision_logger: Any, action: str, reason_text: str, **fields: An
 
 def rotate(new_start: Any, new_end: Any, reason: str, *, data_dir: Any,
            cfg_wake: str = "", cfg_sleep: str = "", tz_name: str = "",
-           decision_logger: Any = None, now: Optional[datetime] = None) -> RotationResult:
+           decision_logger: Any = None, now: Optional[datetime] = None,
+           start_source: str = "", start_date: str = "") -> RotationResult:
     """新周期进账：本轮→上轮（抛弃）、新→本轮（§31.2）；返回 :class:`RotationResult`。
 
     - 例行生成（``reason="scheduled_generate"``，跨天 rotate，Q5 用户定案判据）：新窗与
@@ -517,6 +665,10 @@ def rotate(new_start: Any, new_end: Any, reason: str, *, data_dir: Any,
         current_reason=normalized_reason,
         anchored=False,
         updated_at=(now or _tz_now(tz_name)).isoformat(timespec="seconds"),
+        # 来源/帧随轮换保留：真实醒来（actual_wake）的起点不能被后续编辑/再生成盖回
+        # 最早清醒意图的计划时间（2026-10-27 用户批准）。
+        current_start_source=str(start_source or START_SOURCE_SCHEDULE),
+        current_start_date=str(start_date or ""),
     )
     written = save(data_dir, next_state, now)
     tail = "；".join(warnings)
@@ -576,7 +728,26 @@ def enter_schedule_cycle(data_dir: Any, schedule_date: str, items: Iterable[Any]
             _log_cycle(decision_logger, "info", "进账日期解析失败：本轮不轮换",
                        event="cycle_skip_bad_date", entry_reason=reason)
         else:
-            rotate(epochs[0], epochs[1], reason, data_dir=data_dir, cfg_wake=cfg_wake,
+            start_epoch, end_epoch = epochs
+            source = START_SOURCE_SCHEDULE
+            # 历史不倒写（2026-10-27 用户批准）：**早于当前帧**的进账不轮换，
+            # 免得昨天的补写把今天的四变量/真实醒点改写回过去。
+            current = _read_state(data_dir)
+            current_frame = str(getattr(current, "current_start_date", "") or "") \
+                if current is not None else ""
+            if current_frame and str(schedule_date or "") < current_frame:
+                _log_cycle(decision_logger, "skip",
+                           f"进账帧 {schedule_date} 早于当前帧 {current_frame}：不轮换（历史不倒写）",
+                           event="cycle_skip_backdated", entry_reason=reason)
+                return envelope
+            # 真实醒来优先（2026-10-27 用户批准）：**同一帧**已有 actual_wake 记录时，
+            # 起点取真实醒点（早醒/晚醒都生效），意图计划时间不动；后续编辑/再生成/
+            # 重启都经这里复用，不会被最早清醒意图 07:00 覆盖回去。
+            wake_epoch = actual_wake_epoch(data_dir, schedule_date)
+            if wake_epoch is not None and wake_epoch > 0:
+                start_epoch = float(wake_epoch)
+                source = START_SOURCE_ACTUAL_WAKE
+            rotate(start_epoch, end_epoch, reason, data_dir=data_dir, cfg_wake=cfg_wake,
                    cfg_sleep=cfg_sleep, tz_name=tz_name, decision_logger=decision_logger,
-                   now=now)
+                   now=now, start_source=source, start_date=str(schedule_date or ""))
     return envelope

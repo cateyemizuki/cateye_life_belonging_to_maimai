@@ -69,8 +69,35 @@ class EmotionComponentsMixin:
             await self.ctx.send.text("权限不足：仅管理员可执行情绪初始化。", stream_id)
             return True, "没有权限", True
         await self.ctx.send.text("正在根据人设推导情绪参数…", stream_id)
+        # 2026-10-27 共享接线：旧命令**真正委托同一情绪阶段**（InitService.run_emotion，
+        # force 保持旧强制语义），不再保留一套绕过统一编排的私有实现；只追加迁移提示，
+        # 不触发事件生成、不做全量初始化。InitService 未装配 → 保留原私有实现兜底。
+        init_svc = getattr(getattr(self, "_planning", None), "init", None)
+        run_emotion = getattr(init_svc, "run_emotion", None) if init_svc is not None else None
+        if callable(run_emotion):
+            try:
+                result = await run_emotion(manual=True, force=True)
+            except Exception as exc:
+                await self.ctx.send.text(f"情绪初始化失败：{exc}", stream_id)
+                return True, "emotion init failed", True
+            stage = result.stage("emotion") if callable(getattr(result, "stage", None)) else None
+            failed = bool(getattr(stage, "failed", False))
+            reply = str(getattr(stage, "message", "") or "").strip()
+            if failed:
+                lines = list(getattr(stage, "error_lines", ()) or ())
+                reply = reply or "；".join(lines) or "情绪初始化失败（原因未知）"
+                await self.ctx.send.text(f"情绪初始化失败：{reply}", stream_id)
+            else:
+                await self.ctx.send.text(reply or "情绪初始化完成。", stream_id)
+            await self.ctx.send.text(
+                "提示：该命令已并入统一初始化，请改用 /lbm_init emotion"
+                "（旧命令保留一版，PR8 移除）。", stream_id)
+            return True, "emotion init done", True
         reply = await svc.initialize_from_persona()
         await self.ctx.send.text(reply, stream_id)
+        await self.ctx.send.text(
+            "提示：该命令已并入统一初始化，请改用 /lbm_init emotion"
+            "（旧命令保留一版，PR8 移除）。", stream_id)
         return True, "emotion init done", True
 
     @Command("lbm_emotion_config",

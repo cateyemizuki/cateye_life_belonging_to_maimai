@@ -267,9 +267,17 @@ class EmotionService:
         #: episode 模式的待评登记（纯内存，零 LLM）：stream → {"last_activity", "first_pending"}
         #: 丢失的最坏后果只是下个片段窗口变长（水位兜底，消息不会漏）
         self._pending_episodes: Dict[str, Dict[str, float]] = {}
+        #: 正在冲刷的流（2026-10-26 并发修复）：同一流同一窗口只允许一次冲刷在飞——
+        #: 否则两个并发冲刷会各调一次评估 LLM 并把**同一片段**各入账一次（同源不入跨来源
+        #: 去重，重复事件文本也不同），共享 VAD 被重复计入。纯内存、不进状态文件。
+        self._flushing_streams: set = set()
         #: episode 水位（stream → 上次评估的 epoch 秒）与日计数（与状态同文件落盘，
         #: 缺键/坏类型 → 空默认，绝不因旧状态文件启动失败）
         self._episode_state: Dict[str, Any] = self._parse_episode_state(state.get("episode"))
+        #: per_reply 并发评估的日配额**在途预占**（2026-10-27 用户批准 Q3）：day ticket →
+        #: 在途名额数。请求开始预占（乐观），LLM 成功沿用原计数点 ``_note_evaluation_used``
+        #: 计入、失败/取消释放；纯内存（在途请求不跨重启），旧日 ticket 不污染新日额度。
+        self._eval_reserved: Dict[str, int] = {}
         #: 跨来源去重登记：stream → (最近一次真正入账的 source, monotonic 时间, 事件指纹)（§2.4.6 A3）
         self._cross_source_last: Dict[str, Tuple[str, float, str]] = {}
         self._stop_event: Optional[asyncio.Event] = None
@@ -281,6 +289,12 @@ class EmotionService:
         self._sleep_planned_hours = 0.0
         # M5 睡眠大修缓存（§4.2）：冻结期计算并缓存，醒后一次性应用；运行期状态、不落盘
         self._pending_overhaul: Optional[Dict[str, Any]] = None
+        #: D10（用户 2026-10-27 批准）：睡眠裁判失败重试上限 3 + 退避，连续 3 次失败
+        #: 升级 error 一次；成功后归零。纯运行期状态（热重载重置，见 §五 登记）。
+        self._overhaul_retry_count: int = 0
+        self._overhaul_next_retry_at: Optional[datetime] = None
+        self._overhaul_error_logged: bool = False
+        self._overhaul_abandoned: bool = False
         #: M5 睡眠周期窗口 (start, end)：按作息锚点整夜（条目会被截断，不能作窗口）
         self._sleep_period: Optional[Tuple[datetime, datetime]] = None
         #: M5 连续低迷达标状态（streak ≥ 门槛时的事件载荷；供 planning 强制插入恢复类活动）
@@ -680,28 +694,88 @@ class EmotionService:
             cap = 10
         return max(0, min(200, cap))
 
-    def _daily_quota_ok(self, now: datetime, *, label: str) -> bool:
-        """日上限判定（episode / per_reply 共用同一计数）：跨日清零；超限记决策日志。
-
-        只判定不计数——计数在真正花掉一次评估 LLM 时 +1（见 :meth:`_note_evaluation_used`）。
-        """
+    def _eval_day_count(self, now: datetime) -> Tuple[str, int]:
+        """返回 ``(day, 当日已成功评估数)``；跨日清零（episode/per_reply 共用同一计数）。"""
         day = now.strftime("%Y-%m-%d")
         if str(self._episode_state.get("eval_date") or "") != day:
             self._episode_state["eval_date"] = day
             self._episode_state["eval_count"] = 0
-        used = int(self._episode_state.get("eval_count") or 0)
+        return day, int(self._episode_state.get("eval_count") or 0)
+
+    def _daily_quota_ok(self, now: datetime, *, label: str) -> bool:
+        """日上限判定（episode 串行路径；per_reply 改走 :meth:`_reserve_evaluation_quota`）。
+
+        只判定不计数——计数在真正花掉一次评估 LLM 时 +1（见 :meth:`_note_evaluation_used`）。
+        2026-10-27 复核后续（用户批准在途日配额上限）：判定口径与 per_reply 预占一致 =
+        当日已成功数 + 当日 per_reply **在途预占数**，避免主动 flush / 模式切换在
+        per_reply 请求在途时击穿同一 ``evaluate_max_per_day``；无在途预占时逐字旧行为。
+        """
+        day, used = self._eval_day_count(now)
+        reserved = int(self._eval_reserved.get(day) or 0)
         cap = self._evaluate_max_per_day()
-        if used >= cap:
-            self._log_decision(
-                "emotion.evaluate_daily_cap", trigger_type="emotion",
-                reason=f"daily_cap：当日情绪评估已达上限（{used}/{cap} 次），本次不再调 LLM",
-                mode=str(label or ""), eval_date=day, eval_count=used, cap=cap,
-            )
+        if used + reserved >= cap:
+            if reserved > 0:
+                self._log_decision(
+                    "emotion.evaluate_daily_cap", trigger_type="emotion",
+                    reason=(f"daily_cap：当日情绪评估已达上限（{used} 次 + 在途 "
+                            f"{reserved}/{cap}），本次不再调 LLM"),
+                    mode=str(label or ""), eval_date=day, eval_count=used,
+                    reserved=reserved, cap=cap,
+                )
+            else:
+                self._log_decision(
+                    "emotion.evaluate_daily_cap", trigger_type="emotion",
+                    reason=f"daily_cap：当日情绪评估已达上限（{used}/{cap} 次），本次不再调 LLM",
+                    mode=str(label or ""), eval_date=day, eval_count=used, cap=cap,
+                )
             return False
         return True
 
-    def _note_evaluation_used(self) -> None:
-        """记一次已发生的评估：日计数 +1 并落盘（跨日由 :meth:`_daily_quota_ok` 清零）。"""
+    def _reserve_evaluation_quota(self, now: datetime, *, label: str) -> Optional[str]:
+        """per_reply 评估日配额**乐观预占**（2026-10-27 用户批准 Q3），返回 day ticket。
+
+        - 判定口径 = 当日已成功数 + 当日**在途预占数**；达上限返回 None（本次不调 LLM）；
+        - day ticket 在**请求开始**捕获，成功/释放都按 ticket 归账 → 旧请求结束时不会把
+          额度记到新日（``_note_evaluation_used(ticket)`` 有同日守卫）；
+        - 旧日 ticket 在本方法清理（在途旧请求的释放按 ticket 归旧日，对新日无影响）；
+        - 必须在 ``_llm_interval_ok`` **之后**调用（节流被挡不产生预占，避免泄漏）。
+        """
+        day, used = self._eval_day_count(now)
+        for stale in [key for key in self._eval_reserved if key != day]:
+            self._eval_reserved.pop(stale, None)
+        reserved = int(self._eval_reserved.get(day) or 0)
+        cap = self._evaluate_max_per_day()
+        if used + reserved >= cap:
+            self._log_decision(
+                "emotion.evaluate_daily_cap", trigger_type="emotion",
+                reason=(f"daily_cap：当日情绪评估已达上限（{used} 次 + 在途 {reserved}/"
+                        f"{cap}），本次不再调 LLM"),
+                mode=str(label or ""), eval_date=day, eval_count=used,
+                reserved=reserved, cap=cap,
+            )
+            return None
+        self._eval_reserved[day] = reserved + 1
+        return day
+
+    def _release_evaluation_quota(self, day: str) -> None:
+        """释放一个在途预占（失败/取消/成功后归零；多释放不减成负数）。"""
+        key = str(day or "")
+        current = int(self._eval_reserved.get(key) or 0)
+        if current <= 0:
+            return
+        if current == 1:
+            self._eval_reserved.pop(key, None)
+        else:
+            self._eval_reserved[key] = current - 1
+
+    def _note_evaluation_used(self, day: Optional[str] = None) -> None:
+        """记一次已发生的评估：日计数 +1 并落盘（跨日由 :meth:`_eval_day_count` 清零）。
+
+        Q3：``day`` 是请求开始捕获的 ticket；与当前计数日不一致（跨日完成的旧请求）时
+        不回灌新日额度——旧日额度已随日切清零、不可追溯。episode 路径不传即旧语义。
+        """
+        if day is not None and str(self._episode_state.get("eval_date") or "") != str(day):
+            return
         self._episode_state["eval_count"] = int(self._episode_state.get("eval_count") or 0) + 1
         self._save_state()
 
@@ -729,27 +803,35 @@ class EmotionService:
             return
         if not self._llm_interval_ok():
             return
-        if not self._daily_quota_ok(datetime.now(), label=f"per_reply:{str(session_id or '-')}"):
+        # Q3（2026-10-27 用户批准）：日配额改为**请求开始预占 + 成功计入 + 失败/取消释放**，
+        # 日界 = 本处捕获的 day ticket（旧请求完成不回灌新日）。成功定义不变——仍是
+        # ``evaluate_reply_delta`` 返回有效结果后由 ``_note_evaluation_used`` 计数。
+        ticket_day = self._reserve_evaluation_quota(
+            datetime.now(), label=f"per_reply:{str(session_id or '-')}")
+        if ticket_day is None:
             return
-        task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
-        user_message = await self._last_user_message_text(session_id)
         try:
-            result = await evaluate_reply_delta(self._llm(), reply_text, self._persona,
-                                                self._lover_name, task_name,
-                                                user_message=user_message,
-                                                plugin=self._plugin)
-        except Exception:
-            return
-        if not result:
-            return
-        self._note_evaluation_used()          # 日计数按"实际花掉的评估"记账
-        event, delta = result
-        is_target = self.is_target_session(session_id)
-        self._apply_external_delta(event or "日常对话", delta, source="replyer",
-                                   multiplier=self.target_multiplier(is_target),
-                                   is_target=is_target, session_id=session_id, llm=True)
-        # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
-        await self._publish("emotion.updated", **self._updated_payload("reply_evaluated"))
+            task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
+            user_message = await self._last_user_message_text(session_id)
+            try:
+                result = await evaluate_reply_delta(self._llm(), reply_text, self._persona,
+                                                    self._lover_name, task_name,
+                                                    user_message=user_message,
+                                                    plugin=self._plugin)
+            except Exception:
+                return
+            if not result:
+                return
+            self._note_evaluation_used(ticket_day)   # 原有成功计数点（唯一定义）
+            event, delta = result
+            is_target = self.is_target_session(session_id)
+            self._apply_external_delta(event or "日常对话", delta, source="replyer",
+                                       multiplier=self.target_multiplier(is_target),
+                                       is_target=is_target, session_id=session_id, llm=True)
+            # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
+            await self._publish("emotion.updated", **self._updated_payload("reply_evaluated"))
+        finally:
+            self._release_evaluation_quota(ticket_day)
 
     # ── 会话片段制（T7；REGISTRY §二：Hook 只记录 → 闲置冲刷 → 整段一次评估）──
     def note_reply_for_episode(self, session_id: str) -> None:
@@ -871,6 +953,34 @@ class EmotionService:
 
     async def flush_episode(self, stream_id: str, *, reason: str,
                             now: Optional[datetime] = None) -> bool:
+        """冲刷一个流的未结片段（**同流在飞互斥**）：并发调用只放行第一个，其余直接返回 False。
+
+        为什么需要（2026-10-26 VAD 并发修复）：冲刷在取片段后要 ``await`` 评估 LLM，这段时间
+        另一个冲刷任务（另一 tick / 外部调用）能读到**同一水位**、取到同一片段并再评估一次；
+        同源事件不进跨来源去重（``_dedup_duplicate`` 只拦不同来源），且两次评估的事件文本通常
+        不同 → 同一片段被重复计入共享 VAD。本互斥只挡**同一流**的重复冲刷，不放宽任何既有
+        判定（日上限 / A3 去重 / 水位推进全在 ``_flush_episode_stream`` 内原样执行）；被挡的
+        调用不推进水位也不丢片段——在飞的那次会推进（或在 LLM 失败时保留水位待下轮重试）。
+        """
+        stream = str(stream_id or "").strip()
+        if not stream or not self._enabled():
+            return False
+        if self._evaluate_mode() != "episode":
+            return False
+        if stream in self._flushing_streams:
+            self._log_decision(
+                "emotion.episode_flush_skipped", trigger_type="emotion",
+                reason="inflight：同一流已有冲刷在飞（本次不取片段、不重复评估/入账）",
+                stream=stream, flush_reason=str(reason or ""))
+            return False
+        self._flushing_streams.add(stream)
+        try:
+            return await self._flush_episode_stream(stream, reason=reason, now=now)
+        finally:
+            self._flushing_streams.discard(stream)
+
+    async def _flush_episode_stream(self, stream_id: str, *, reason: str,
+                                    now: Optional[datetime] = None) -> bool:
         """冲刷一个流的未结片段：读取 → A3 去重 → 整段一次评估 → 入账 → 水位/日计数落盘。
 
         返回 True 表示片段已评估并入账。False 覆盖：非 episode 模式 / 模块停用 / 日上限 /
@@ -962,10 +1072,20 @@ class EmotionService:
           使其当夜被评估而不是攒到下一夜。此刻机器仍冻结 → 评估事件按 ``record_event``
           语义只入 ``pending_events``（不直接改 VAD），随后被解冻并入日志；夜里被打扰的
           情绪后果由 sleep_interrupt 整夜合计统一入账，这里入账会双重记账。
+
+        2026-10-27 复核后续：同流已有冲刷在飞时**不得先 pop 新登记再发现被挡**——那会把
+        新登记（可能含在飞片段之外的新消息）一并丢掉；此处直接跳过该流、保留 pending，
+        交给在飞那次推进水位后的下一轮处理（不引入 LLM 真实失败自动无限重试）。
         """
         streams = list(self._pending_episodes.keys())
         done = 0
         for stream in streams:
+            if stream in self._flushing_streams:
+                self._log_decision(
+                    "emotion.episode_flush_skipped", trigger_type="emotion",
+                    reason="inflight：同一流已有冲刷在飞（保留登记，待其结束后的下一轮处理）",
+                    stream=stream, flush_reason=str(reason or ""))
+                continue
             self._pending_episodes.pop(stream, None)   # 先移除本条（成败都不再登记），
             try:                                       # 同时保留 first_pending 供冲刷日志观测
                 if await self.flush_episode(stream, reason=reason):
@@ -1198,6 +1318,26 @@ class EmotionService:
         )
         return {"ok": False, "reason": "duplicate_cross_source", "dedup": duplicate}
 
+    def _scaled_external_delta(self, delta: VADState, multiplier: float
+                               ) -> Tuple[float, float, VADState, VADState, bool]:
+        """三层倍率 → ±:data:`EVENT_DELTA_CLAMP` 硬限幅的**唯一真源**。
+
+        入账（:meth:`_apply_external_delta`）与预算预览（:meth:`preview_external_delta`）
+        共用本方法，杜绝「预算侧另抄一套倍率/限幅公式」的漂移面。返回
+        ``(global_multiplier, 总倍率 factor, 乘倍率后值 scaled, 限幅后 applied, clipped)``。
+        """
+        global_mul = self.global_event_multiplier()
+        factor = float(multiplier) * global_mul
+        scaled = VADState(delta.valence * factor, delta.arousal * factor, delta.dominance * factor)
+        applied = VADState(
+            _clip(scaled.valence, -EVENT_DELTA_CLAMP, EVENT_DELTA_CLAMP),
+            _clip(scaled.arousal, -EVENT_DELTA_CLAMP, EVENT_DELTA_CLAMP),
+            _clip(scaled.dominance, -EVENT_DELTA_CLAMP, EVENT_DELTA_CLAMP),
+        )
+        clipped = any(abs(getattr(scaled, axis)) > EVENT_DELTA_CLAMP + 1e-9
+                      for axis in ("valence", "arousal", "dominance"))
+        return global_mul, factor, scaled, applied, clipped
+
     def _apply_external_delta(self, event_text: str, delta: VADState, *, source: str,
                               multiplier: float, llm: bool = False,
                               is_target: Optional[bool] = None,
@@ -1220,16 +1360,8 @@ class EmotionService:
         skip = self._dedup_skip_result(source, session_id, event_text)
         if skip is not None:
             return skip
-        global_mul = self.global_event_multiplier()
-        factor = float(multiplier) * global_mul
-        scaled = VADState(delta.valence * factor, delta.arousal * factor, delta.dominance * factor)
-        applied = VADState(
-            _clip(scaled.valence, -EVENT_DELTA_CLAMP, EVENT_DELTA_CLAMP),
-            _clip(scaled.arousal, -EVENT_DELTA_CLAMP, EVENT_DELTA_CLAMP),
-            _clip(scaled.dominance, -EVENT_DELTA_CLAMP, EVENT_DELTA_CLAMP),
-        )
-        clipped = any(abs(getattr(scaled, axis)) > EVENT_DELTA_CLAMP + 1e-9
-                      for axis in ("valence", "arousal", "dominance"))
+        global_mul, factor, scaled, applied, clipped = self._scaled_external_delta(
+            delta, multiplier)
         self._machine.record_event(event_text or "外部事件", applied)
         self._save_state()
         self._log_decision(
@@ -1276,7 +1408,11 @@ class EmotionService:
         - 跨来源去重先于 LLM 评估判定：命中返回 ``{"ok": False,
           "reason": "duplicate_cross_source", "dedup": {...}}``，不调 LLM、不入账；
         - 最终增量经 ±:data:`EVENT_DELTA_CLAMP` 硬限幅后入账，三层倍率与裁剪前/后
-          值落 decision_logs（§6.3-7）。
+          值落 decision_logs（§6.3-7）；
+        - **模板增量分支的同步核心 = :meth:`record_external_event_sync`**（2026-10-26 并发
+          修复）：入账与「VAD 落盘」在同一无 await 的同步区内完成，发布 ``emotion.updated``
+          由 :meth:`publish_external_updated` 单独提供——需要把旁路记账（如 life_feedback
+          每日预算）与入账原子提交的调用方走同步核心，杜绝「await 后补记账」的并发窗口。
 
         Returns:
             ``{"ok", "reason", "event", "delta", "delta_before", "delta_scaled", "multiplier",
@@ -1287,6 +1423,15 @@ class EmotionService:
             ``llm_failed`` / ``duplicate_cross_source``）；``dedup`` 恒带上口径与
             ``duplicate`` 标记（口径见 :meth:`dedup_policy`）。
         """
+        if delta is not None or not use_llm:
+            # 模板增量（或「无增量且不调 LLM」的旧非法调用）→ 同步核心；成功后再发布
+            outcome = self.record_external_event_sync(
+                source, description, delta, multiplier=multiplier, session_id=session_id,
+                event_id=event_id, episode_id=episode_id)
+            if outcome.get("ok"):
+                await self.publish_external_updated()
+            return outcome
+        # ── 以下 = delta 缺省 + use_llm：既有有界评估路径（唯一含模型调用的分支）──
         if not self._enabled():
             return {"ok": False, "reason": "disabled"}
         event_text = str(description or "").strip()
@@ -1294,36 +1439,97 @@ class EmotionService:
         if skip is not None:
             return skip
         k = max(0.0, min(EXTERNAL_K_MAX, self._to_float(multiplier, 1.0)))
-        delta_before: Optional[VADState] = None
-        llm_used = False
-        if delta is not None:
-            delta_before = VADState(delta.valence, delta.arousal, delta.dominance).clipped()
-        elif use_llm:
-            if not event_text:
-                return {"ok": False, "reason": "empty_event"}
-            if not self._llm_interval_ok():
-                return {"ok": False, "reason": "throttled"}
-            task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
-            try:
-                result = await evaluate_reply_delta(self._llm(), event_text, self._persona,
-                                                    self._lover_name, task_name,
-                                                    plugin=self._plugin)
-            except Exception:
-                return {"ok": False, "reason": "llm_error"}
-            if not result:
-                return {"ok": False, "reason": "llm_failed"}
-            llm_event, delta_before = result
-            event_text = str(llm_event or "").strip()[:60] or event_text
-            llm_used = True
-        else:
-            return {"ok": False, "reason": "no_delta"}
+        if not event_text:
+            return {"ok": False, "reason": "empty_event"}
+        if not self._llm_interval_ok():
+            return {"ok": False, "reason": "throttled"}
+        task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
+        try:
+            result = await evaluate_reply_delta(self._llm(), event_text, self._persona,
+                                                self._lover_name, task_name,
+                                                plugin=self._plugin)
+        except Exception:
+            return {"ok": False, "reason": "llm_error"}
+        if not result:
+            return {"ok": False, "reason": "llm_failed"}
+        llm_event, delta_before = result
+        event_text = str(llm_event or "").strip()[:60] or event_text
         outcome = self._apply_external_delta(event_text, delta_before, source=source,
-                                             multiplier=k, llm=llm_used, session_id=session_id,
+                                             multiplier=k, llm=True, session_id=session_id,
                                              event_id=event_id, episode_id=episode_id)
         if outcome.get("ok"):
-            # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
-            await self._publish("emotion.updated", **self._updated_payload("external_event"))
+            await self.publish_external_updated()
         return outcome
+
+    def record_external_event_sync(self, source: str, description: str,
+                                   delta: Optional[VADState] = None, *,
+                                   multiplier: float = 1.0,
+                                   session_id: str = "",
+                                   event_id: str = "",
+                                   episode_id: str = "") -> Dict[str, Any]:
+        """**同步**模板增量入账核心（无 await / 无 LLM / 不发布事件）。
+
+        存在理由（2026-10-26 VAD 并发修复）：``record_external_event`` 在入账后 ``await``
+        发布 ``emotion.updated``，该 await 会让出事件循环；调用方若在 await **之后**才补做
+        旁路记账（life_feedback 的每日预算：entries 去重 + used 全局日封顶 + 逐规则上限），
+        第二个协程就能读到陈旧账本 → 同一事件重复入账 / 全局日封顶被击穿 / 预算读-改-写丢
+        更新；若在 await 期间被取消，还会出现「VAD 已入账、预算未落」或回滚后「重复入账」。
+
+        本方法把「VAD 写入 + 状态落盘」收进一个**不含 await 的同步区**：调用方在同一次同步
+        执行内完成预算提交即天然原子（单线程事件循环不存在交错），随后再自行
+        ``await self.publish_external_updated()`` 保持事件面。语义与 ``record_external_event``
+        的模板增量分支逐字一致（同一 ``_apply_external_delta``：三层倍率 / ±0.5 硬限幅 /
+        跨来源去重全部同源；``delta`` 缺省 → ``no_delta``）。
+
+        Returns:
+            与 ``record_external_event`` 同形（``{"ok", "reason", ...}``）；成功时调用方负责
+            发布 ``emotion.updated``（见 :meth:`publish_external_updated`）。
+        """
+        if not self._enabled():
+            return {"ok": False, "reason": "disabled"}
+        event_text = str(description or "").strip()
+        skip = self._dedup_skip_result(source, session_id, description)
+        if skip is not None:
+            return skip
+        if delta is None:
+            return {"ok": False, "reason": "no_delta"}
+        k = max(0.0, min(EXTERNAL_K_MAX, self._to_float(multiplier, 1.0)))
+        delta_before = VADState(delta.valence, delta.arousal, delta.dominance).clipped()
+        return self._apply_external_delta(event_text, delta_before, source=source,
+                                          multiplier=k, llm=False, session_id=session_id,
+                                          event_id=event_id, episode_id=episode_id)
+
+    def preview_external_delta(self, delta: VADState, *, multiplier: float = 1.0
+                               ) -> Dict[str, Any]:
+        """**只读**预览：本次模板增量事件将实际入账的增量（不含发布/不写状态）。
+
+        2026-10-27 用户裁定：全局每日 VAD 上限按**最终实际入账增量**执行。调用方
+        （emotion/life_feedback）必须在真正入账**之前**用它判预算，且本方法与
+        :meth:`record_external_event_sync` → :meth:`_apply_external_delta` 共用
+        :meth:`_scaled_external_delta` 同一真源（三层倍率 + ±:data:`EVENT_DELTA_CLAMP`
+        硬限幅），不复制第二套公式；入账前增量口径与 K 夹取也与同步核心一致。
+
+        Returns:
+            ``{"ok", "delta"（限幅后 applied）, "delta_before", "delta_scaled", "k",
+            "global_multiplier", "multiplier", "clipped"}``；纯计算，不改 VAD/日志/去重登记。
+        """
+        k = max(0.0, min(EXTERNAL_K_MAX, self._to_float(multiplier, 1.0)))
+        delta_before = VADState(delta.valence, delta.arousal, delta.dominance).clipped()
+        global_mul, factor, scaled, applied, clipped = self._scaled_external_delta(
+            delta_before, k)
+        return {"ok": True, "delta": applied, "delta_before": delta_before,
+                "delta_scaled": scaled, "k": round(k, 4),
+                "global_multiplier": round(global_mul, 4), "multiplier": round(factor, 4),
+                "clipped": bool(clipped)}
+
+    async def publish_external_updated(self) -> None:
+        """发布外部事件入账后的 ``emotion.updated``（M0 事件面）。
+
+        同步入账调用方（:meth:`record_external_event_sync`）在提交旁路记账**之后**调用本
+        方法，事件面与 ``record_external_event`` 逐字一致（同一 ``_updated_payload`` /
+        同一 ``trigger="external_event"``）；发布异常由 ``_publish`` 内部吞掉，绝不影响结算。
+        """
+        await self._publish("emotion.updated", **self._updated_payload("external_event"))
 
     def _llm(self) -> Any:
         llm = getattr(self._plugin, "_llm", None)
@@ -1550,11 +1756,45 @@ class EmotionService:
         return start, start + timedelta(minutes=span), max(0.5, span / 60.0)
 
     def _in_sleep_period(self, now: datetime) -> bool:
-        """当前是否处于睡眠周期窗口（冻结中按已建立窗口；否则按夜间锚点窗口）。"""
+        """当前是否处于睡眠周期窗口（PR3：睡眠引擎优先 = 单一 wake provider）。
+
+        引擎启用且本夜有会话 → 以引擎 ``is_asleep`` 为权威（07:00 旧锚点不再提前判醒，
+        08:30 引擎醒 → False）；引擎不表态（未启用/未装配/``no_sleep_mode``/无会话）→
+        ``None`` → **回退旧窗口逻辑逐字不变**（不是权威 False）。
+        """
+        engine_state = self._engine_asleep(now)
+        if engine_state is not None:
+            return bool(engine_state)
         if self._sleep_period is not None:
             return self._sleep_period[0] <= now < self._sleep_period[1]
         night_start, night_end = self._night_window(now)
         return night_start <= now < night_end
+
+    def _engine_asleep(self, now: datetime) -> Optional[bool]:
+        """问睡眠引擎是否睡着（鸭子类型：plugin.sleep_asleep / engine.is_asleep）。
+
+        Returns:
+            True/False=引擎权威；None=引擎不表态（旧窗口路径）。
+        """
+        engine = getattr(self._plugin, "_sleep_engine", None)
+        getter = getattr(engine, "is_asleep", None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter(now)
+        except Exception:
+            return None
+        return value if isinstance(value, bool) else None
+
+    #: D11（用户 2026-10-27 批准）：午休类名称关键词——退出夜间冻结/裁判链，
+    #: nap_quiet 静默功能保留（在 proactive 侧，不在本模块）。
+    NAP_NAME_KEYWORDS = ("午休", "午睡", "小憩", "打盹")
+
+    @classmethod
+    def _is_nap_item(cls, item: Any) -> bool:
+        """是否午休/小睡类条目（只看名称关键词；夜间词「睡觉/睡眠/安睡」不算午休）。"""
+        name = str((item or {}).get("name") or "") if isinstance(item, dict) else ""
+        return any(keyword in name for keyword in cls.NAP_NAME_KEYWORDS)
 
     # ── L1 夜间打扰记账：判定与归属门控（附录 §2.1/§2.2；M8 第 2 段）──────────
     # 判定 + 留痕 + 内存归档（第 2 段）；整夜合计入账与实际睡着时长消费同一份归档
@@ -1652,6 +1892,15 @@ class EmotionService:
                 "interrupt_reply_threshold", DEFAULT_INTERRUPT_REPLY_THRESHOLD):
             seg["awake"] = True
             seg["confirmed_at"] = current
+        # PR3（2026-10-26，定稿 §4.2.3）：夜间打扰同时喂给睡眠引擎的打断状态机
+        # （只记账；确认清醒 ≥ 阈值才重置连续段，不新增 LLM/事件入口）
+        engine = getattr(self._plugin, "_sleep_engine", None)
+        note = getattr(engine, "note_interruption", None)
+        if callable(note):
+            try:
+                note(current)
+            except Exception:
+                pass
         return True
 
     def _roll_night_segment(self, now: datetime) -> Optional[Dict[str, Any]]:
@@ -2407,6 +2656,11 @@ class EmotionService:
         cached, self._pending_overhaul = self._pending_overhaul, None
         # 本周期窗口在下面即被清（周期结束）：先留一份给"实际睡着时长"与醒沿结算用
         period = self._sleep_period
+        # PR3（2026-10-26，定稿 §4.2.3）：引擎可能早于旧窗口端点醒（硬约定 04:30 /
+        # 阈值 06:50）或晚于旧端点醒（赖床到 08:30）——结算窗口右端以**实际醒时刻**
+        # 封顶，actual_sleep_hours 才等于真实睡着时长（旧路径 now>=end 时不变）。
+        if period and len(period) == 2 and period[1] and now < period[1]:
+            period = (period[0], now)
         self._sleep_period = None  # 周期结束（醒沿）：后续 tick 重新按条目/锚点判定
         if cached is None:
             if self.is_frozen():
@@ -2444,6 +2698,7 @@ class EmotionService:
         applied["drained_events_count"] = night["count"]
         applied["drained_events"] = night["events"]
         self._save_state()
+        self._note_overhaul_success()  # D10：本周期裁判/结算成功 → 重试计数归零
         state = load_json(self._state_path, {}) or {}
         state["applied_sleep_date"] = str(cached.get("cycle_key") or now.strftime("%Y-%m-%d"))
         save_json_atomic(self._state_path, state)
@@ -2524,6 +2779,48 @@ class EmotionService:
             except asyncio.TimeoutError:
                 continue
 
+    # ── D10 睡眠裁判重试上限 + 退避（用户 2026-10-27 批准）──────────────
+    def _overhaul_retry_allowed(self, now: datetime) -> bool:
+        """退避窗未到 / 本周起已放弃 → 本 tick 不打裁判（防重试风暴）。"""
+        if getattr(self, "_overhaul_abandoned", False):
+            return False
+        nxt = self._overhaul_next_retry_at
+        return nxt is None or now >= nxt
+
+    def _note_overhaul_failure(self, now: datetime) -> None:
+        """一次裁判失败（D10 用户 2026-10-27：最多 3 次总尝试，含首尝试）。
+
+        - 第 1/2 次失败：指数退避 5/10 分钟后再试；
+        - 第 3 次失败：本周期放弃（不再打模型），升级 error 一次；醒沿仍会解冻/结算
+          （``_apply_cached_overhaul`` 无缓存时只 unfreeze），不会永久冻结。
+        """
+        self._overhaul_retry_count = int(self._overhaul_retry_count) + 1
+        attempt = self._overhaul_retry_count
+        if attempt >= 3:
+            self._overhaul_abandoned = True
+            self._overhaul_next_retry_at = None
+            if not self._overhaul_error_logged:
+                self._overhaul_error_logged = True
+                try:
+                    self._ctx.logger.error(
+                        "睡眠裁判连续 %d 次失败：本周期放弃裁判（升级 error 一次）；"
+                        "醒沿仍会解冻，不永久冻结", attempt)
+                except Exception:
+                    pass
+                self._log_decision(
+                    "emotion.sleep_overhaul", trigger_type="referee_retry_exhausted",
+                    reason="睡眠裁判达 3 次总尝试上限——本周期放弃，醒沿解冻不结算大修",
+                    retry_count=attempt)
+            return
+        self._overhaul_next_retry_at = now + timedelta(minutes=5 * attempt)
+
+    def _note_overhaul_success(self) -> None:
+        """裁判成功/结算完成/新周期入口：重试计数、退避与放弃标记归零。"""
+        self._overhaul_retry_count = 0
+        self._overhaul_next_retry_at = None
+        self._overhaul_error_logged = False
+        self._overhaul_abandoned = False
+
     async def _check_and_overhaul(self) -> None:
         """一个检测周期：进睡眠时段 → 冻结并在冻结期计算/缓存大修；醒沿 → 冲刷片段 + 应用缓存 + 解冻。
 
@@ -2548,6 +2845,10 @@ class EmotionService:
         current = query.find_current_activity(now.strftime("%Y-%m-%d"), now, include_sleep=True)
         sleep_item = current if self._is_sleep_item(current) else None
         awake_activity = current is not None and sleep_item is None
+        engine_state = self._engine_asleep(now)
+        if engine_state is True:
+            # 引擎权威睡眠中：旧 wake 锚点/条目端点到了也**不算醒**（单一 wake provider）
+            awake_activity = False
 
         # 醒沿：日程出现清醒活动，或已离开睡眠窗口（含条目被截断后的深夜/清晨）
         if awake_activity or (self.is_frozen() and not self._in_sleep_period(now)):
@@ -2595,19 +2896,35 @@ class EmotionService:
             closed = self._roll_night_segment(now)
             if closed is not None:
                 await self._after_night_segment_closed(closed, now)
-            if self._pending_overhaul is None:           # 上轮裁判失败 → 冻结期内重试
+            if self._pending_overhaul is None and self._overhaul_retry_allowed(now):
+                # D10（用户 2026-10-27 批准）：失败重试上限 3 + 退避（5/10/20 分钟，
+                # 上限 30），连续 3 次失败升级 error 一次；成功即归零
                 planned = float(getattr(self, "_sleep_planned_hours", 0.0) or 0.0)
                 cached = await self.compute_sleep_overhaul(now, sleep_hours=planned or None)
                 if cached is not None:
                     period = self._sleep_period or (now, now)
                     cached["cycle_key"] = self._cycle_key(period[0])
                     self._pending_overhaul = cached
+                    self._note_overhaul_success()
                 else:
-                    self._ctx.logger.debug("睡眠大修计算失败：保持冻结，下一轮重试")
+                    self._note_overhaul_failure(now)
+                    self._ctx.logger.debug(
+                        "睡眠大修计算失败：保持冻结，退避后重试（第 %d 次）",
+                        self._overhaul_retry_count)
             return
 
         # 未冻结：睡眠入口 = 睡眠条目，或已处于作息夜间窗口（如夜间启动/热重载后无条目）
         night_start, night_end = self._night_window(now)
+        # D11（用户 2026-10-27 批准）：午休退出夜间情绪冻结/裁判链（nap_quiet 静默保留
+        # 在 proactive 侧）；夜间条目/夜间窗口不受影响，no_sleep_mode 旧语义不变
+        if sleep_item is not None and self._is_nap_item(sleep_item) \
+                and not (night_start <= now < night_end):
+            self._log_decision(
+                "emotion.sleep_overhaul", trigger_type="nap_skip",
+                reason="午休退出夜间冻结/裁判链（D11 用户 2026-10-27 批准），"
+                       "仅保留 nap_quiet 静默",
+                item_name=str((sleep_item or {}).get("name") or ""))
+            return
         if sleep_item is None and not (night_start <= now < night_end):
             return                                        # 白天且无睡眠条目：无事
         period_start, period_end, planned = self._sleep_entry_period(sleep_item, now)
@@ -2615,6 +2932,8 @@ class EmotionService:
             return
         self._sleep_period = (period_start, period_end)
         cycle_key = self._cycle_key(period_start)
+        # D10：新周期入口重置重试/放弃标记（上一夜放弃不传染下一夜）
+        self._note_overhaul_success()
         # 顺序约束（REGISTRY §二.4）：先冲刷全部未结片段，再冻结/跑睡眠裁判——冲刷的入账
         # 发生在冻结前才会进当天 emotion_log（冻结期事件只入队），裁判的日志输入才完整
         await self.flush_all_episodes(reason="sleep_entry")
@@ -2632,10 +2951,14 @@ class EmotionService:
             return
         cached = await self.compute_sleep_overhaul(now, sleep_hours=planned)
         if cached is None:
-            self._ctx.logger.debug("睡眠大修计算失败：保持冻结，下一轮重试")
+            self._note_overhaul_failure(now)
+            self._ctx.logger.debug(
+                "睡眠大修计算失败：保持冻结，退避后重试（第 %d 次）",
+                self._overhaul_retry_count)
             return
         cached["cycle_key"] = cycle_key
         self._pending_overhaul = cached
+        self._note_overhaul_success()
 
     async def _sleep_entry_settled_gate(self, sleep_item: Optional[Dict[str, Any]], now: datetime,
                                         period_start: datetime, planned: Optional[float]) -> bool:

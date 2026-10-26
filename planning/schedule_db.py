@@ -35,7 +35,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .cycle_state import REASON_LEGACY
 from .time_utils import DAY_MINUTES
@@ -94,6 +94,40 @@ EPISODE_DISCRETE_GOAL_TYPES = frozenset({"meal"})
 
 #: 默认进度上限（附录 §5.5：已用时长/计划时长，上限 0.95）。
 _EPISODE_PROGRESS_CAP = 0.95
+
+# v6 纯新增表（日程系统二期 PR3，2026-10-26，附录 B.2.2 DDL 原样 + 三方法）：
+# 只增不改——旧表零改动；失败告警不抛、schema_version 保持 v5/旧值下次重试，
+# 旧表读取不受影响（与 v5 同款故障隔离）。
+_SLEEP_SESSIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sleep_sessions (
+    session_id            TEXT PRIMARY KEY,
+    schedule_date         TEXT NOT NULL,
+    planned_start_minute  INTEGER NOT NULL,
+    planned_end_minute    INTEGER NOT NULL,
+    actual_start_minute   INTEGER,
+    actual_end_minute     INTEGER,
+    wake_reason           TEXT,
+    continuous_minutes    INTEGER NOT NULL DEFAULT 0,
+    interruption_count    INTEGER NOT NULL DEFAULT 0,
+    energy_start          REAL,
+    energy_end            REAL,
+    sleep_debt_before     REAL,
+    sleep_debt_after      REAL,
+    quality               REAL,
+    metadata              TEXT,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sleep_sessions_date
+    ON sleep_sessions(schedule_date, planned_start_minute);
+"""
+
+#: ``finish_sleep_session`` 允许写回的列（白名单；metadata 走 JSON 合并）
+_SLEEP_SESSION_UPDATE_COLUMNS = (
+    "actual_start_minute", "actual_end_minute", "wake_reason",
+    "continuous_minutes", "interruption_count", "energy_start", "energy_end",
+    "sleep_debt_before", "sleep_debt_after", "quality",
+)
 
 
 class ScheduleDB:
@@ -169,7 +203,24 @@ class ScheduleDB:
         self._db_path = str(db_path)
         self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
+        #: 日程写入共同口通知（睡眠 loop 即时重检用；只唤醒，不推进状态）
+        self._schedule_change_listener: Optional[Callable[..., Any]] = None
         self._init_schema()
+
+    # ---- 变更通知（内部重检口；PR3 复核 2026-10-27）----
+    def set_schedule_change_listener(self, listener: Optional[Callable[..., Any]]) -> None:
+        """挂/卸日程写入监听（``listener(reason)``；None = 断开）。"""
+        self._schedule_change_listener = listener
+
+    def _notify_schedule_change(self, reason: str) -> None:
+        """事务提交后通知（异常/无监听一律静默，绝不影响写库结果）。"""
+        listener = getattr(self, "_schedule_change_listener", None)
+        if listener is None:
+            return
+        try:
+            listener(reason)
+        except Exception:
+            logger.debug("日程变更通知失败（忽略）：%s", reason, exc_info=True)
 
     # ---- 连接与自愈 ----
     def _connect(self) -> sqlite3.Connection:
@@ -196,7 +247,12 @@ class ScheduleDB:
                 self._migrate_schema_v4()
                 # v4→v5（R7 依据 = 用户 2026-10-25 直派，设计附录 B.1.3）：迁移失败不影响
                 # 旧表读取——失败只告警，schema_version 保持旧值，下次初始化重试。
-                if self._migrate_schema_v5():
+                v5_ok = self._migrate_schema_v5()
+                # v5→v6（PR3，2026-10-26，附录 B.2.2）：纯新增 sleep_sessions，同款故障隔离。
+                v6_ok = self._migrate_schema_v6() if v5_ok else False
+                if v6_ok:
+                    version = "6"
+                elif v5_ok:
                     version = "5"
                 else:
                     row = self._conn.execute(
@@ -216,6 +272,7 @@ class ScheduleDB:
                 self._conn = self._connect()
                 self._conn.executescript(self.SCHEMA)
                 self._migrate_schema_v5()
+                self._migrate_schema_v6()
                 self._conn.commit()
 
     def _migrate_schema_v3(self) -> None:
@@ -281,6 +338,20 @@ class ScheduleDB:
         except sqlite3.Error as e:
             # 表与三索引已建齐；仅附加单例索引未成——不阻断 v5，告警留痕
             logger.warning("schedule_db: v5 附加单例索引建立失败（不影响旧表）：%s", e)
+        return True
+
+    def _migrate_schema_v6(self) -> bool:
+        """v5→v6 迁移（PR3，2026-10-26，附录 B.2.2）：纯新增 ``sleep_sessions`` + 一索引。
+
+        **只增不改**：schedule_items / activity_episodes / goals / metadata 零改动；
+        旧库升级即建新表，旧行零迁移。全程 try/except 隔离——失败告警不抛、返回 False
+        （调用方保持 schema_version 旧值，下次初始化重试），旧表读取不受影响。
+        """
+        try:
+            self._conn.executescript(_SLEEP_SESSIONS_SCHEMA)
+        except sqlite3.Error as e:
+            logger.warning("schedule_db: v6 迁移建 sleep_sessions 失败（不影响旧表）：%s", e)
+            return False
         return True
 
     def _quarantine_corrupt_files(self) -> None:
@@ -418,7 +489,9 @@ class ScheduleDB:
                         reason,
                     ),
                 )
-            return len(items)
+        # 事务提交后再通知（睡眠 loop 即时重检；不进事务、不影响写库结果）
+        self._notify_schedule_change(reason)
+        return len(items)
 
     def get_archived_day_schedule(self, schedule_date: str,
                                   limit: int = 100) -> List[Dict[str, Any]]:
@@ -1229,6 +1302,120 @@ class ScheduleDB:
                 (schedule_date,),
             ).fetchall()
         return [self._episode_row(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # sleep_sessions（PR3 v6，2026-10-26，附录 B.2.2；纯新增，失败告警不抛）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _sleep_session_row(row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+        raw = data.get("metadata")
+        if raw:
+            try:
+                data["metadata"] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                data["metadata"] = {}
+        else:
+            data["metadata"] = {}
+        return data
+
+    def upsert_sleep_session(self, session: Any) -> bool:
+        """写入/更新一条睡眠会话（接受 SleepEngine.SleepSession 或同构 dict）。"""
+        try:
+            row = session.to_row() if callable(getattr(session, "to_row", None)) else dict(session)
+        except (TypeError, ValueError) as e:
+            logger.warning("schedule_db: sleep_sessions 行解析失败（不抛）：%s", e)
+            return False
+        try:
+            now = datetime.now().isoformat()
+            metadata = row.get("metadata")
+            if isinstance(metadata, dict):
+                metadata = json.dumps(metadata, ensure_ascii=False)
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO sleep_sessions("
+                    "session_id, schedule_date, planned_start_minute, planned_end_minute,"
+                    " actual_start_minute, actual_end_minute, wake_reason,"
+                    " continuous_minutes, interruption_count, energy_start, energy_end,"
+                    " sleep_debt_before, sleep_debt_after, quality, metadata,"
+                    " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (str(row.get("session_id") or ""), str(row.get("schedule_date") or ""),
+                     int(row.get("planned_start_minute") or 0),
+                     int(row.get("planned_end_minute") or 0),
+                     row.get("actual_start_minute"), row.get("actual_end_minute"),
+                     row.get("wake_reason"),
+                     int(row.get("continuous_minutes") or 0),
+                     int(row.get("interruption_count") or 0),
+                     row.get("energy_start"), row.get("energy_end"),
+                     row.get("sleep_debt_before"), row.get("sleep_debt_after"),
+                     row.get("quality"), metadata,
+                     str(row.get("created_at") or now), str(row.get("updated_at") or now)),
+                )
+            return True
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            logger.warning("schedule_db: upsert_sleep_session 失败（不抛）：%s", e)
+            return False
+
+    def finish_sleep_session(self, session_id: str, **fields: Any) -> bool:
+        """收尾一条睡眠会话（只更新白名单列；metadata 合并而非覆盖）。"""
+        if not session_id:
+            return False
+        updates: List[str] = []
+        params: List[Any] = []
+        for key in _SLEEP_SESSION_UPDATE_COLUMNS:
+            if key in fields:
+                updates.append(f"{key} = ?")
+                params.append(fields[key])
+        try:
+            with self._lock, self._conn:
+                if "metadata" in fields:
+                    row = self._conn.execute(
+                        "SELECT metadata FROM sleep_sessions WHERE session_id = ?",
+                        (session_id,)).fetchone()
+                    merged = self._merge_json_text(row["metadata"] if row else None,
+                                                   fields.get("metadata"))
+                    updates.append("metadata = ?")
+                    params.append(merged)
+                updates.append("updated_at = ?")
+                params.append(datetime.now().isoformat())
+                params.append(session_id)
+                cur = self._conn.execute(
+                    f"UPDATE sleep_sessions SET {', '.join(updates)}"
+                    " WHERE session_id = ?", params)
+                return cur.rowcount > 0
+        except (sqlite3.Error, ValueError, TypeError) as e:
+            logger.warning("schedule_db: finish_sleep_session 失败（不抛）：%s", e)
+            return False
+
+    def query_sleep_sessions(self, schedule_date: Optional[str] = None,
+                             limit: int = 50) -> List[Dict[str, Any]]:
+        """按日期查睡眠会话（缺省最近 ``limit`` 条；planned_start 升序）。"""
+        query = "SELECT * FROM sleep_sessions"
+        params: List[Any] = []
+        if schedule_date:
+            query += " WHERE schedule_date = ?"
+            params.append(str(schedule_date))
+        query += " ORDER BY schedule_date ASC, planned_start_minute ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        try:
+            with self._lock:
+                rows = self._conn.execute(query, params).fetchall()
+            return [self._sleep_session_row(r) for r in rows]
+        except sqlite3.Error as e:
+            logger.warning("schedule_db: query_sleep_sessions 失败（不抛）：%s", e)
+            return []
+
+    def open_sleep_session(self) -> Optional[Dict[str, Any]]:
+        """未结束（actual_end_minute IS NULL）的最近一条会话（重启恢复用）。"""
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT * FROM sleep_sessions WHERE actual_end_minute IS NULL"
+                    " ORDER BY created_at DESC LIMIT 1").fetchone()
+            return self._sleep_session_row(row) if row else None
+        except sqlite3.Error as e:
+            logger.warning("schedule_db: open_sleep_session 失败（不抛）：%s", e)
+            return None
 
     def cleanup_old_episodes(self, keep_days: int = 14) -> int:
         """删除 keep_days 天前的 episode（附录 B.7：保留 14 天，按日清理；失败告警返 0）。"""

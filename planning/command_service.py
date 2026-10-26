@@ -33,9 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 # 目标类型 → 中文标签映射（曾为 emoji；2026-10-10 N7 清洗）
+# A-21(e)（用户 2026-10-27 批）：补齐 sleep/work/custom，避免展示「其他」。
 _GOAL_TYPE_LABEL: Dict[str, str] = {
     "meal": "用餐",
     "study": "学习",
+    "work": "工作",
     "entertainment": "娱乐",
     "daily_routine": "日常",
     "social_maintenance": "社交",
@@ -43,6 +45,9 @@ _GOAL_TYPE_LABEL: Dict[str, str] = {
     "exercise": "运动",
     "rest": "休息",
     "free_time": "自由时间",
+    "sleep": "睡觉",
+    "custom": "空闲",
+    "health_check": "健康",
 }
 
 _WEEKDAY_NAMES: Dict[int, str] = {
@@ -297,6 +302,24 @@ class CommandService:
     # 子命令实现
     # ------------------------------------------------------------
 
+    def _runtime_lines_block(self) -> str:
+        """``/lbm_plan list`` 的真实 runtime 补充行（只读、零写、零 LLM）。
+
+        数据口 = ``ToolsService.list_runtime_lines()``（runtime provider 未装配 →
+        空串，命令输出与旧版逐字一致）。**不**在旧计划正文后叠一段时间窗编造的
+        「当前」——当前 episode 只从 episode 日志读，空闲就如实说空闲。
+        """
+        tools_svc = self._tools_svc()
+        getter = getattr(tools_svc, "list_runtime_lines", None) if tools_svc is not None else None
+        if not callable(getter):
+            return ""
+        try:
+            lines = getter() or []
+        except Exception as exc:
+            logger.info(f"/lbm_plan list runtime 行读取失败（忽略）：{exc}")
+            return ""
+        return "\n".join(str(line) for line in lines if str(line or "").strip())
+
     async def _handle_list(self, stream_id: str) -> None:
         """``/lbm_plan list``：今日日程（图片 + 详细文字，合并转发）。
 
@@ -328,6 +351,11 @@ class CommandService:
                 return
 
         text = self._build_status_text(schedule_goals)
+        # PR6 共享接线（2026-10-27）：真实 runtime 只读补充行（当前 episode / 接下来）。
+        # 纯数据、零发送：runtime 未启用时为空列表 → 旧输出逐字不变；图不重绘。
+        runtime_block = self._runtime_lines_block()
+        if runtime_block:
+            text = f"{text}\n\n{runtime_block}"
         image_base64 = await self._draw_schedule_image(schedule_goals)
 
         # 合并转发：F2（2026-10-11）重绘后面板自足，只发图（绘制失败时才有纯文本档）
@@ -338,6 +366,13 @@ class CommandService:
                 "nickname": "日程规划",
                 "segments": [{"type": "image", "content": image_base64}],
             })
+            if runtime_block:
+                # 图里没有 runtime 段：另起一条文字记录，避免信息丢失（不重绘图）
+                records.append({
+                    "user_id": "0",
+                    "nickname": "日程规划",
+                    "segments": [{"type": "text", "content": runtime_block}],
+                })
         else:
             records.append({
                 "user_id": "0",
