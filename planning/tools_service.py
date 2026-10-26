@@ -5,17 +5,15 @@
 访问 SDK 能力代理；LLM 调用经宿主 ``ctx.llm.generate``（角色裁判）或
 core.llm_utils.LLMService（日程生成）。
 
-T6 注册面收口后本服务服务两个 Tool：``get_schedule_info``（只读多视图：v2
-status/current/next/episodes/spine/intents + 旧 lover_day/goals 一版）与
-``update_schedule``（唯一日程写入口，role_judge 裁判路径；规范工具名
-``lbm_update_schedule``，旧名 ``lbm_update_schedule_v4`` 作为独立注册别名保留一版）。
-目标的写 API 仍在 GoalManager（生成流水线与约定消费在用），只是不再有 Tool 注册入口。
+T6 注册面收口后本服务服务两个 Tool：``get_schedule_info``（只读多视图：
+status/current/next/episodes/spine/intents）与 ``update_schedule``（唯一日程写入口，
+role_judge 裁判路径；规范工具名 ``lbm_update_schedule``）。目标的写 API 仍在
+GoalManager（生成流水线与约定消费在用），只是不再有 Tool 注册入口。
 
-M9（附录 §4.3/§4.4 赖床提醒，用户裁决 C4/A2）新增第三个 Tool：``nap_lie_in`` ——
-夜间被吵醒后收到提醒才可用（``metadata["visibility"]="hidden"``，注册期不进名册）；
-只把**今日 sleep 条目的结束时间**推到目标时刻（走 ``apply_schedule_items`` 共享底层，
-不消费未来约定、不触发重生成），并通知 emotion 延长本周期窗口 + 计一次"有效提醒次数"。
-工具名常量 :data:`NAP_TOOL_NAME` 是**唯一定义点**，提醒文本与组件注册同源引用。
+PR8 3.0.0 清退（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：旧别名
+``lbm_update_schedule_v4``、旧视图 ``lover_day``/``goals`` 与 M9 赖床工具
+``nap_lie_in`` 整链（含提醒链/extend 链）已删除；``[schedule].enabled`` 是唯一
+日程总开关，spine 为唯一生成路线。
 """
 
 from __future__ import annotations
@@ -24,17 +22,12 @@ import inspect
 import logging
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.time_utils import parse_hhmm
 
 from core.llm_utils import llm_task_name_of
-from suite_prompts import (
-    NAP_TOOL_BAD_TIME_DEFAULT,
-    NAP_TOOL_DENIED_DEFAULT,
-    prompt as prompt_of,
-)
 
 from .config import (
     ScheduleAdvancedSectionConfig,
@@ -42,64 +35,20 @@ from .config import (
     section_or_default,
 )
 from .activity_properties import resolve_property
-from .cycle_state import (REASON_TOOL_EDIT, enter_schedule_cycle,  # §31.2 进账血缘；R7 2026-10-23
-                          entry_context_from_plugin)
+from .cycle_state import REASON_TOOL_EDIT  # §31.2 进账血缘；R7 2026-10-23
 from .goal_manager import get_goal_manager
 from .role_judge import judge_schedule_request
 from .rolling_planner import extract_spine_intents
 from .schedule_generator import ScheduleGenerator
-from .schedule_items import find_night_sleep_item, is_night_sleep_item
-from .sleep_schedule import (
-    find_sleep_item as _shared_find_sleep_item,
-    lie_in_max_minutes as _shared_lie_in_max_minutes,
-    nap_end_datetime as _shared_nap_end_datetime,
-    nap_schedule_date as _shared_nap_schedule_date,
-    nap_tool_engine_managed_reply,
-    nap_tool_managed_by_engine,
-    normalize_hhmm as _shared_normalize_hhmm,
-    parse_nap_target as _shared_parse_nap_target,
-    postpone_items_for_lie_in as _shared_postpone_items,
-    update_sleep_endpoint,
-)
 from .time_utils import (DAY_MINUTES, TimezoneManager, format_day_minute,
                          is_in_day_frame_marked, is_upcoming_day_minute_marked,
                          ring_minutes_ahead)
 
 logger = logging.getLogger(__name__)
 
-# ── L3 赖床工具常量（附录 §4.3/§4.4；用户裁决 A2/C4）────────────────────────
-#: 赖床工具名（**唯一定义点**）：组件注册（planning/components.py）与提醒文本
-#: （emotion/service.py 的 NAP_REMINDER_TEMPLATE）同源引用本常量——A2 明确"工具后续会改名，
-#: 注意同步"，改名只需动这一处。
-NAP_TOOL_NAME = "lbm_nap_lie_in"
-#: 钳制上限的缺省值（[schedule_advanced] lie_in_max_until；HH:MM），§4.4「传入时间 > 上限 → 钳到上限」
-DEFAULT_LIE_IN_MAX_UNTIL = "12:00"
-#: 非睡眠周期调用的拒绝话术（出厂文案见 suite_prompts.NAP_TOOL_DENIED_DEFAULT，
-#: 2026-10-10 起可在 [prompts].nap_tool_denied 覆盖）
-NAP_LIE_IN_DENIED_TEXT = NAP_TOOL_DENIED_DEFAULT
-#: 解析失败/缺参的友好提示（可在 [prompts].nap_tool_bad_time 覆盖）
-NAP_LIE_IN_BAD_TIME_TEXT = NAP_TOOL_BAD_TIME_DEFAULT
-# 口径说明（M10 第 6 段）：夜晚睡眠条目的判定**唯一真源** = ``planning/schedule_items.py``，
-# 供本模块的 M9 赖床工具与 ``auto_scheduler.py`` 的 B2 生成锚点共用，避免两处口径漂移。
-
-
-def parse_nap_target(value: Any) -> Optional[int]:
-    """赖床时间解析（PR3 起委托 ``planning/sleep_schedule.py`` 单一实现，逐字同口径）。"""
-    return _shared_parse_nap_target(value)
-
-
-def normalize_hhmm(value: Any, default: str = DEFAULT_LIE_IN_MAX_UNTIL) -> str:
-    """规范成 ``"HH:MM"``（PR3 起委托 ``planning/sleep_schedule.py``，提示/钳制同源）。"""
-    return _shared_normalize_hhmm(value, default)
-
-
-def lie_in_max_minutes(value: Any) -> int:
-    """``lie_in_max_until`` → 当天分钟数（PR3 起委托共享实现，非法回退 12:00）。"""
-    return _shared_lie_in_max_minutes(value)
-
 
 class ToolsService:
-    """承载 3 个 LLM Tool 的业务逻辑（get_schedule_info / update_schedule / nap_lie_in）。"""
+    """承载 2 个 LLM Tool 的业务逻辑（get_schedule_info / update_schedule）。"""
 
     def __init__(self, plugin: Any, generator: Optional[ScheduleGenerator] = None) -> None:
         """
@@ -168,11 +117,11 @@ class ToolsService:
             "knowledge_search_limit": adv.knowledge_search_limit,
             "cross_day_activity": adv.cross_day_activity,
             "no_sleep_mode": cfg.no_sleep_mode,
-            # PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.7 项：regenerate 链
-            # （/lbm_plan regenerate 与 update_schedule 的「今天」分支两个调用点自动受益）
-            # 跟随 [schedule].spine_mode——开启时生成 3-6 条日意图，不再恒 daily（与
-            # auto_scheduler 自动生成侧同口径）；generator 侧 **kwargs 透传，零改动。
-            "mode": "spine" if bool(getattr(cfg, "spine_mode", False)) else "daily",
+            # PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：spine 为唯一
+            # 生成路线，mode 恒 "spine"（原 [schedule].spine_mode 三元随退役键删除）；
+            # regenerate 链（/lbm_plan regenerate 与 update_schedule 的「今天」分支）与
+            # auto_scheduler 自动生成侧同口径；generator 侧 **kwargs 透传，零改动。
+            "mode": "spine",
             "timezone": adv.timezone,
             "llm_task_name": llm_task_name_of(self._plugin),
         }
@@ -218,20 +167,19 @@ class ToolsService:
     # ------------------------------------------------------------
 
     #: view 取值（缺省/非法一律回落 status）。
-    #: v2（定稿 §4.6 / 附录 A.3.1）新增 status/current/next/episodes/spine/intents；
-    #: lover_day/goals 为旧视图保留一版（PR8 再删），返回口径不变。
-    _SCHEDULE_INFO_VIEWS = ("status", "current", "next", "episodes", "spine", "intents",
-                            "lover_day", "goals")
+    #: v2（定稿 §4.6 / 附录 A.3.1）：status/current/next/episodes/spine/intents
+    #: （PR8 3.0.0 删旧视图 lover_day/goals，依据：用户 2026-10-27 授权直接清理）。
+    _SCHEDULE_INFO_VIEWS = ("status", "current", "next", "episodes", "spine", "intents")
     #: 新层（runtime）视图：新层未启用时明确回报"未启用"，不回退成时间窗编造
     _RUNTIME_VIEWS = ("next", "episodes", "spine", "intents")
     #: ``intents`` = ``spine`` 的别名（附录 A.3.1「别名，便于模型理解」）
     _VIEW_ALIASES = {"intents": "spine"}
 
     async def get_schedule_info(self, view: str = "", **function_args: Any) -> Dict[str, Any]:
-        """日程/活动/目标的只读查询（v2 + 旧视图一版）。
+        """日程/活动/目标的只读查询（v2）。
 
         view = ``status`` | ``current`` | ``next`` | ``episodes`` | ``spine`` |
-        ``intents``（= spine 别名）| ``lover_day``（旧）| ``goals``（旧）。
+        ``intents``（= spine 别名）。
 
         **全部视图只读**：不触碰生成/落库/目标写 API，不调用 tick、不掷点、不写状态
         文件。``next`` / ``episodes`` / ``spine`` / ``intents`` 依赖 runtime（episode 日志），
@@ -253,10 +201,6 @@ class ToolsService:
                 return self._view_episodes()
             if view == "spine":
                 return self._view_spine()
-            if view == "lover_day":
-                return self._view_lover_day()
-            if view == "goals":
-                return self._view_goals()
             return self._view_status_v2()
         except Exception as exc:
             logger.error(f"获取日程信息失败（view={view}）: {exc}", exc_info=True)
@@ -270,7 +214,7 @@ class ToolsService:
         return provider
 
     def _runtime_ready(self) -> bool:
-        """runtime 是否就绪（= provider 存在且 ``[life_state].enabled``）。"""
+        """runtime 是否就绪（= provider 存在且 ``[schedule].enabled``）。"""
         try:
             from .schedule_query import ScheduleQuery as _ScheduleQuery
             return bool(_ScheduleQuery._runtime_ready(self._runtime_provider()))
@@ -475,8 +419,8 @@ class ToolsService:
         """view=next：接下来 2 条（含来源/预演/意图标记）；新层未启用 → 明确未启用。"""
         if not self._runtime_ready():
             return {"type": "schedule_next",
-                    "content": "滚动化视图未启用（[life_state].enabled=false）：暂不能读取接下来"
-                               "的 episode/预演；可改用 view=status 或 lover_day 的旧日程视图。"}
+                    "content": "日程未启用（运行态未就绪）：暂不能读取接下来"
+                               "的 episode/预演；可改用 view=status 查看状态总览。"}
         now = self._runtime_now()
         cur_min = now.hour * 60 + now.minute
         items = self._runtime_next_items(2) or []
@@ -511,8 +455,8 @@ class ToolsService:
         if not rows:
             if not self._runtime_ready():
                 return {"type": "schedule_episodes",
-                        "content": "今日没有 episode 记录（滚动化视图未启用："
-                                   "[life_state].enabled=false 时不会记录实际 episode）。"}
+                        "content": "今日没有 episode 记录（日程未启用："
+                                   "运行态未就绪时不会记录实际 episode）。"}
             return {"type": "schedule_episodes", "content": "今日还没有实际 episode 记录。"}
         cur_min = self._runtime_now().hour * 60 + self._runtime_now().minute
         lines = [f"今日实际 episode（{len(rows)} 条）"]
@@ -526,8 +470,7 @@ class ToolsService:
         if not intents:
             if not self._runtime_ready():
                 return {"type": "schedule_spine",
-                        "content": "今日没有 spine 意图（滚动化视图未启用："
-                                   "[life_state].enabled=false 且 [schedule].spine_mode=false）。"}
+                        "content": "今日没有 spine 意图（日程未启用：运行态未就绪）。"}
             return {"type": "schedule_spine", "content": "今日没有 spine 意图。"}
         hard = [it for it in intents if str(it.get("hardness") or "") == "hard"]
         lines = [f"今日意图（{len(intents)} 条，其中硬约定 {len(hard)} 条）"]
@@ -639,61 +582,23 @@ class ToolsService:
         return {"type": "schedule_info", "content": content}
 
     def _view_current(self) -> Dict[str, Any]:
-        """view=current：当前正在进行的活动（无活动给休息话术）。"""
+        """view=current 旧路径（仅 runtime 未就绪时回落；未就绪=日程未启用，如实回答）。
+
+        PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，规则 6）：
+        未启用/未就绪文案改「日程未启用」，不再用「可能在休息」冒充空闲或休息态。
+        """
         name = str(getattr(self._plugin, "_lover_name", "") or "麦麦")
         query = self._schedule_query()
         if query is None or not callable(getattr(query, "find_current_activity", None)):
             return {"type": "schedule_current",
-                    "content": f"{name}的日程服务还没准备好，暂时不清楚在做什么。"}
+                    "content": f"{name}的日程未启用（日程服务还没准备好），暂时不清楚在做什么。"}
         now = datetime.now()
         current = query.find_current_activity(now.strftime("%Y-%m-%d"), now)
         if current is None:
-            return {"type": "schedule_current", "content": f"{name}现在没有安排中的活动（可能在休息）。"}
+            return {"type": "schedule_current",
+                    "content": f"{name}现在没有安排中的活动（日程未启用）。"}
         return {"type": "schedule_current",
                 "content": f"{name}现在正在：{query.format_activity_line(current, now)}。"}
-
-    def _view_lover_day(self) -> Dict[str, Any]:
-        """view=lover_day：今日完整日程逐条（时间轴 + 名称，不截断）。"""
-        query = self._schedule_query()
-        today = self._make_tz_manager().get_now().strftime("%Y-%m-%d")
-        if query is None:
-            return {"type": "schedule_day", "content": "日程服务未就绪（planning 子模块不可用）。"}
-        items = query.get_day_schedule(today)
-        if not items:
-            return {"type": "schedule_day", "content": f"今日 ({today}) 暂无日程。"}
-        lines = [f"今日完整日程 ({today})"]
-        for item in items:
-            start = int(item.get("start_minute") or 0)
-            end = int(item.get("end_minute") or 0)
-            # 跨午夜条目（end>1440）标「次日」，不再渲染成 31:00 这类帧外钟点
-            lines.append(f"  [{format_day_minute(start)}-{format_day_minute(end)}] "
-                         f"{item.get('name', '未知')}")
-        return {"type": "schedule_day", "content": "\n".join(lines)}
-
-    def _view_goals(self) -> Dict[str, Any]:
-        """view=goals：进行中的目标列表（只读 get_active_goals，不进行任何写操作）。"""
-        goals = get_goal_manager().get_active_goals(chat_id="global")
-        if not goals:
-            return {"type": "schedule_goals", "content": "当前没有进行中的目标"}
-        lines = [f"进行中的目标（{len(goals)} 个）"]
-        for goal in goals:
-            summary = ""
-            getter = getattr(goal, "get_summary", None)
-            if callable(getter):
-                try:
-                    summary = str(getter() or "").strip()
-                except Exception:
-                    summary = ""
-            if summary:
-                lines.append(f"- {summary}")
-                continue
-            # get_summary 不可用（旧档案/桩对象）时退化为紧凑行：名称/时间窗/进度
-            tw = (getattr(goal, "parameters", None) or {}).get("time_window")
-            window = ""
-            if isinstance(tw, list) and len(tw) == 2:
-                window = f"{format_day_minute(tw[0])}-{format_day_minute(tw[1])} "
-            lines.append(f"- {window}{getattr(goal, 'name', '')}（进度 {getattr(goal, 'progress', 0)}%）")
-        return {"type": "schedule_goals", "content": "\n".join(lines)}
 
     # ------------------------------------------------------------
     # Tool 2：update_schedule（唯一日程写入口，角色裁判式更新）
@@ -739,16 +644,17 @@ class ToolsService:
     MAX_INTENT_MINUTES = 240
 
     def _layers(self) -> Dict[str, bool]:
-        """新层开关快照（spine / life_state / rolling 任一开启即 v2 写入生效）。"""
-        spine = bool(getattr(self._schedule_cfg(), "spine_mode", False))
-        life_section = getattr(getattr(self._plugin, "config", None), "life_state", None)
-        life = bool(getattr(life_section, "enabled", False))
+        """新层开关快照（PR8 3.0.0：``[schedule].enabled`` 是唯一日程总开关，spine 恒路线）。
+
+        原 ``[schedule].spine_mode`` / ``[life_state].enabled`` 双键判定随退役键删除
+        （依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）。
+        """
+        life = bool(getattr(self._schedule_cfg(), "enabled", True))
         planning = getattr(self._plugin, "_planning", None)
         planner = (getattr(planning, "rolling_planner", None)
                    or getattr(self._plugin, "_rolling_planner", None))
         rolling = bool(life and planner is not None)
-        return {"spine": spine, "life": life, "rolling": rolling,
-                "enabled": bool(spine or life or rolling)}
+        return {"spine": True, "life": life, "rolling": rolling, "enabled": True}
 
     @classmethod
     def detect_hard_commitment(cls, description: Any, *,
@@ -950,7 +856,7 @@ class ToolsService:
                                      today_str: str, today: datetime,
                                      layers: Dict[str, bool],
                                      commitment: Dict[str, Any]) -> Dict[str, Any]:
-        """decision=future：写 pending_commitment（未来仍走约定）；新层开时记 hardness。"""
+        """decision=future：写 pending_commitment（未来仍走约定）并记 hardness。"""
         target_date = str(parsed.get("date") or commitment.get("date") or today_str)
         if target_date <= today_str:
             return {
@@ -1005,7 +911,7 @@ class ToolsService:
                 "hardness": "hard" if hard else "soft",
                 "effective_time": f"{target_date} {when}".strip(),
             }
-        # 旧行为（新层全关）：约定已写入，文案与旧版逐字一致
+        # 旧行为分支（新层恒开，正常装配不可达；骨架插件兜底）：约定已写入，文案与旧版逐字一致
         await self._request_life_recheck("commitment_written")
         return {
             "type": "schedule_committed",
@@ -1061,7 +967,8 @@ class ToolsService:
 
         ``role_judge_enabled=False`` 时降级为直接 ``add_pending_commitment``（无 LLM）。
 
-        v2（定稿 §4.6 / 附录 A.3.2）：``_layers()`` 任一开启（spine / life_state / rolling）时
+        v2（定稿 §4.6 / 附录 A.3.2；PR8 3.0.0 起 ``_layers()["enabled"]`` 恒 True——
+        ``[schedule].enabled`` 唯一总开关、spine 唯一路线）：
         - ``today`` → 写/更新**今日 spine 意图行**（不再整日重生成，零新增 LLM 调用）；
         - ``future`` → 仍写 ``pending_commitment``，并落 ``parameters.hardness``；
         - 明确硬约定由 :meth:`detect_hard_commitment` **代码强制** ``hardness=hard``
@@ -1069,7 +976,7 @@ class ToolsService:
           角色裁判返回的 ``parsed["hardness"]`` **永不参与**判定——只认 typed 显式
           声明与描述里的绑定证据，2026-10-27 接线口径）；
         - 返回内容含摘要、意图/约定 ID、是否硬约定、生效时间。
-        新层全关 → 两条分支逐字回到旧行为（today=重生成、future=旧文案）。
+        （旧「新层全关」重生成分支仅为骨架插件兜底保留，正常装配下不可达。）
 
         ``intent`` / ``commitment`` 是**可选** typed 归一参数（dict），旧调用只传
         ``description`` 完全不受影响。
@@ -1149,8 +1056,8 @@ class ToolsService:
                 return await self._apply_future_decision(
                     parsed, description, today_str, today, layers, commitment_arg)
 
-            # decision == "today"：新层开 → 写/更新 spine 意图（不重生成、不新增 LLM 调用）；
-            # 新层全关 → 旧行为逐字保留（重生成今日日程）
+            # decision == "today"：写/更新 spine 意图（不重生成、不新增 LLM 调用）；
+            # 旧「新层全关」重生成分支仅为骨架插件兜底保留（正常装配不可达）
             if layers["enabled"]:
                 return await self._apply_today_decision(
                     parsed, description, today_str, today, intent_arg)
@@ -1184,216 +1091,3 @@ class ToolsService:
             logger.error(f"update_schedule 失败: {exc}", exc_info=True)
             return {"type": "error", "content": f"更新日程失败: {exc}"}
 
-    # ------------------------------------------------------------
-    # Tool 3：nap_lie_in（赖床：推迟今日睡眠条目的结束时间；§4.3/§4.4）
-    # ------------------------------------------------------------
-
-    def _emotion_bundle(self) -> Optional[Any]:
-        """emotion 服务束（``plugin._emotion``）。
-
-        ⚠ 单向依赖：planning **不 import** emotion（避免循环依赖），只按鸭子类型取束上用到的
-        三个入口：``in_night_sleep_cycle`` / ``extend_night_sleep_until`` / ``note_nap_lie_in_applied``；
-        取不到（插件未装配 emotion，或单测骨架插件）→ 返回 None，工具按"非睡眠周期"拒绝。
-        """
-        return getattr(self._plugin, "_emotion", None)
-
-    def _lie_in_max_minutes(self) -> int:
-        """[schedule_advanced] lie_in_max_until 的分钟数（非法回退 12:00；钳制与提示同源）。"""
-        return lie_in_max_minutes(getattr(self._advanced_cfg(), "lie_in_max_until",
-                                          DEFAULT_LIE_IN_MAX_UNTIL))
-
-    @staticmethod
-    def _find_sleep_item(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """今日日程里的**夜晚睡眠条目**（§4.4「读今日日程找 sleep 条目（goal_type=sleep）」）。
-
-        判定与读数委托**共享口径** ``planning/schedule_items.py``（M10 第 6 段抽出）：
-        主判 ``goal_type == "sleep"``（规格口径）；取不到时按名称含夜晚睡眠词兜底——
-        依据同 ``emotion/service.py`` 的 ``_is_sleep_item``（M5 实测：生产条目是
-        ``goal_type=daily_routine`` + 名称「睡觉」）。两轮判定都只认夜间词，
-        午休/午睡/小憩/打盹不算（§八.7 / C4-补充：午休本轮不动）。
-        """
-        rows = [item for item in (items or []) if isinstance(item, dict)]  # 本工具只吃 DB 行
-        return _shared_find_sleep_item(rows)
-
-    @staticmethod
-    def _nap_end_datetime(now: datetime, minute: int) -> datetime:
-        """把"当天分钟数"落成 ``now`` 之后最近的时刻（PR3 起委托共享实现）。"""
-        return _shared_nap_end_datetime(now, minute)
-
-    # ── P6 修复（W2）：赖床延长窗口内的清醒条目顺延 ─────────────────────
-    # 缺陷：lie-in 只把 sleep 条目 end 推后时，与延长窗口重叠的**非睡眠**条目会在下一 tick
-    # 被 ``find_current_activity(include_sleep=True)`` 命中（按 start 升序取首条匹配）→ 醒沿
-    # 判定（emotion/service.py ``_check_and_overhaul``）第一析支 ``awake_activity`` 抢先为真
-    # → woke_up 仍按旧端点触发（emotion 侧 ``_sleep_period`` 延长其实已生效，窗口统计却是
-    # 延长后的值——登记行 11:06:53 woke_up + sleep_hours=1.417 即此形态）。
-    # 修法：写回时把这类条目**顺延**到延长端点之后，只动赖床写回路径（生成/归一化契约不动）。
-
-    @staticmethod
-    def _postpone_items_for_lie_in(items: List[Dict[str, Any]], lo: int, hi: int) -> int:
-        """把赖床延长窗口 ``[lo, hi)`` 内重叠的**非睡眠**条目顺延到 ``hi`` 之后（就地改）。
-
-        红线：
-        - 只动与窗口重叠的条目（``start < hi`` 且 ``end > lo``），其余原样；
-        - 保留时长，``end`` 封顶 :data:`DAY_MINUTES`（24:00）——不产生跨午夜/``start>end`` 倒挂；
-        - 夜晚睡眠条目（共享口径 :func:`find_night_sleep_item`）**不动**：它的 ``end`` 由调用方
-          单独写（M9 as-built 口径不变，倒挂面不扩大）。
-
-        Returns:
-            被顺延的条目数（0 = 无需改动，调用方跳过写回）。
-        """
-        return _shared_postpone_items(items, lo, hi)
-
-    def _postpone_wake_day_schedule(self, query: Optional[Any], day: str, lo: int, hi: int) -> int:
-        """跨午夜赖床（凌晨）：**醒来日**日程的顺延写回（醒沿查询读的正是那一天的日程）。
-
-        入睡日的 sleep 条目属于入睡日（:meth:`_nap_schedule_date`），凌晨醒沿查询却按**日历日**
-        取醒来日日程——与延长窗口重叠的清醒条目在那份日程里，须单独顺延。写回走
-        ``ScheduleQuery.db`` 的 ``replace_day_schedule``（即 ``apply_schedule_items`` 的落库底层；
-        该日条目从库中原样带回元数据，且**不消费**未来约定）；失败静默（不影响本次赖床）。
-        v4 进账血缘（§31.2，R7 2026-10-23）：写库前先经进账漏斗 rotate，行级盖戳
-        ``entry_reason="tool_edit"``（与入睡日当日写回同 reason——同属一次赖床工具修改）。
-        """
-        try:
-            if query is None or not callable(getattr(query, "get_day_schedule", None)):
-                return 0
-            items = [dict(row) for row in (query.get_day_schedule(day) or [])
-                     if isinstance(row, dict)]
-            if not items:
-                return 0
-            moved = self._postpone_items_for_lie_in(items, lo, hi)
-            db = getattr(query, "db", None)
-            if not moved or db is None:
-                return 0
-            stamps = enter_schedule_cycle(
-                getattr(self._plugin, "_data_dir", None), day, items,
-                reason=REASON_TOOL_EDIT,
-                decision_logger=getattr(self._plugin, "_decision_logger", None),
-                **entry_context_from_plugin(self._plugin),
-            )
-            db.replace_day_schedule(
-                day, items, entry_reason=REASON_TOOL_EDIT,
-                cycle_start_ts=(stamps[0] if stamps else None),
-                cycle_end_ts=(stamps[1] if stamps else None),
-            )
-            logger.info("赖床顺延：%s 的 %d 个日程条目已移到 %s 之后",
-                        day, moved, format_day_minute(hi))
-            return moved
-        except Exception as exc:
-            logger.warning("赖床顺延失败（不影响本次赖床）: %s", exc, exc_info=True)
-            return 0
-
-    def _nap_schedule_date(self, now: datetime) -> str:
-        """"今日日程"的日期（F16/B4：**新一天起点 = [schedule] wake_time 锚点**）。
-
-        夜间睡眠条目属于**入睡日**（跨午夜条目保留原时长，如 23:00 入睡 + 8h ⇒
-        ``23:00–次日 07:00``——2026-10-10 N2/N4 起不再被作息锚点截断成 ``23:00–23:15``），
-        故凌晨（早于 wake_time 锚点的跨午夜段）仍读**昨天**那条日程，否则读今天；夜猫子作息
-        （sleep ≤ wake，同日）一律读今天。取不到锚点一律按"今天"（缺省 07:00/23:00）。
-        """
-        cfg = self._schedule_cfg()
-        return _shared_nap_schedule_date(now, cfg.sleep_time, cfg.wake_time)
-    async def nap_lie_in(self, time: str = "", now: Optional[datetime] = None) -> Dict[str, Any]:
-        """把**今日 sleep 条目**的结束时间推到目标时刻（附录 §4.4，用户裁决 C4；M9 落地）。
-
-        口径（规格原文逐条）：
-
-        1. **解析容错**：``HH:MM`` / ``H:MM`` / 纯小时数（``"9"`` → 09:00）；非法/缺参 →
-           友好错误 + 格式示例，**不抛异常**；
-        2. **非睡眠周期调用 → 拒绝**：经 ``plugin._emotion`` 服务束查询「是否处于夜间睡眠
-           周期」（白天/午休/未装配 emotion 一律拒绝），话术「你现在还不能想要赖床」；
-        3. **上限钳制**：目标 > ``[schedule_advanced] lie_in_max_until``（默认 12:00）→ 钳到该值；
-        4. **修改日程**：找**今日日程**的 sleep 条目（"今日"按 [schedule] wake_time 锚点定义的新一天：
-           凌晨仍属入睡日，见 :meth:`_nap_schedule_date`）并把 ``end_minute`` 推到目标，经**共享底层**
-           ``ScheduleGenerator.apply_schedule_items(items, today, consume_commitments=False)``
-           （:274）写回——不消费未来约定、不触发重生成；无 sleep 条目或写回失败 →
-           失败文本且**不计数**；**P6（W2）**：与延长窗口重叠的**非睡眠**条目一并**顺延**到延长
-           端点之后（同日 = 同一次写回；跨午夜 = 醒来日日程另写一次），否则下一 tick 的醒沿判定
-           会先命中这些清醒条目（``awake_activity``）→ 醒沿不随端点推迟；
-        5. **通知 emotion 延长本周期窗口结束到目标时刻**（否则醒沿会在 wake 锚点照常触发）；
-        6. **计数**：调用**并成功修改日程** → emotion 侧「有效提醒次数」+1（按 ``cycle_key``，
-           内存）；未调用/失败不计次；额度用尽只停提醒、**不阻止**本工具（本方法不判额度）。
-           口径澄清（附录 §六.补 C4，执行既有 C4「成功修改日程才计次」）：目标 ≤ 当前醒沿时
-           **先经 ``night_sleep_end_minute`` 预检**（写回前拒绝，避免日程被误写）且
-           ``extend_night_sleep_until`` 返回 False（双保险）→ 均**不计次**，返回友好提示而非
-           成功文案。
-
-        Args:
-            time: 目标时间（"HH:MM" / "H:MM" / 纯小时数）。
-            now: 当前时刻（缺省 ``datetime.now()``；测试注入时钟用）。
-
-        Returns:
-            Tool 返回载荷 ``{"type", "content"}``（宿主按 type 渲染）；任何异常都吞成
-            失败文案，绝不上抛（§八.2 可空降级）。
-        """
-        try:
-            if not self._module_enabled():
-                return {"type": "error", "content": "日程规划模块未启用（配置 [日程系统] enabled）"}
-            # PR3（2026-10-26，定稿 §4.2.3）：引擎启用时旧赖床工具自动管理（保留工具名/
-            # 别名，PR8 前不删）——返回提示、不改日程、不计次、不触碰 emotion 窗口
-            engine = getattr(self._plugin, "_sleep_engine", None)
-            if nap_tool_managed_by_engine(engine):
-                return nap_tool_engine_managed_reply()
-            # 1) 解析容错（先解析：缺参/非法给格式示例，不惊动任何状态）
-            target_minute = parse_nap_target(time)
-            if target_minute is None:
-                return {"type": "nap_error",
-                        "content": prompt_of(self._plugin, "nap_tool_bad_time")}
-            # 2) 非睡眠周期调用 → 拒绝（emotion 侧门控；无 emotion 束同样拒绝）
-            emotion = self._emotion_bundle()
-            if emotion is None or not emotion.in_night_sleep_cycle():
-                return {"type": "nap_rejected",
-                        "content": prompt_of(self._plugin, "nap_tool_denied")}
-            current = now or datetime.now()
-            today = self._nap_schedule_date(current)
-            # 3) 上限钳制
-            limit_minute = self._lie_in_max_minutes()
-            clamped = min(int(target_minute), int(limit_minute))
-            # 3.5) 预检（附录 §六.补 C4）：目标不晚于当前醒沿 → 不写日程、不计次
-            #      （否则会出现"文案说没改动、库里 sleep 条目已被写坏"）；权威判定仍在
-            #      写回后的 extend_night_sleep_until（双保险）
-            wake_edge = emotion.night_sleep_end_minute()
-            if wake_edge is not None and clamped <= wake_edge:
-                return {"type": "nap_error",
-                        "content": "这个时间不比现在的起床时间晚，起床时间没有改动，就不多睡啦。"}
-            # 4) 写回今日日程（PR3 起走 planning/sleep_schedule 共享写回：与睡眠引擎同一实现）
-            query = self._schedule_query()
-            items = list(query.get_day_schedule(today)) if query is not None else []
-            item = self._find_sleep_item(items)
-            if item is None:
-                return {"type": "nap_error",
-                        "content": "今天没有找到睡觉日程，暂时没法往后推起床时间。"}
-            generator = self._get_generator()
-            if generator is None:
-                return {"type": "error", "content": "日程生成器不可用（插件未完成初始化）"}
-
-            def _apply_items(rows: List[Dict[str, Any]], date: str, why: str) -> int:
-                return int(generator.apply_schedule_items(
-                    rows, date, consume_commitments=False, reason=why) or 0)
-
-            def _postpone_wake_day(day: str, lo: int, hi: int) -> int:
-                return int(self._postpone_wake_day_schedule(query, day, lo, hi) or 0)
-
-            end_dt = self._nap_end_datetime(current, clamped)
-            write = update_sleep_endpoint(
-                now=current, target_minute=clamped, items=items, sleep_item=item,
-                schedule_date=today, reason=REASON_TOOL_EDIT,
-                postpone_awake=True, apply_items=_apply_items,
-                postpone_wake_day=_postpone_wake_day, clamp_to_limit=False)
-            if not write.ok:
-                return {"type": "nap_error", "content": "日程写回失败，起床时间没有改动。"}
-            wake_day = write.wake_day or today
-            # 5) + 6) 成功才通知 emotion：延长本周期窗口端点（醒沿推迟）并计一次有效提醒
-            extended = emotion.extend_night_sleep_until(end_dt)
-            if not extended:
-                # 附录 §六.补 C4 口径澄清（执行既有 C4「成功修改日程才计次」）：目标不比当前醒沿晚
-                # → 窗口端点未变（未实际延长）→ 不计次，返回友好提示
-                return {"type": "nap_error",
-                        "content": "这个时间不比现在的起床时间晚，起床时间没有改动，就不多睡啦。"}
-            emotion.note_nap_lie_in_applied()
-            hhmm = f"{int(clamped) // 60:02d}:{int(clamped) % 60:02d}"
-            note = "" if clamped == target_minute else f"（超过最晚时间，已按 {hhmm} 算）"
-            return {"type": "nap_lie_in",
-                    "content": f"好，那就再睡一会儿——今天的起床时间已经推到 {hhmm}。{note}"}
-        except Exception as exc:
-            logger.error(f"nap_lie_in 失败: {exc}", exc_info=True)
-            return {"type": "nap_error", "content": f"赖床设置失败: {exc}"}

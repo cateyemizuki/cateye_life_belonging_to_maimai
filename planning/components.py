@@ -21,33 +21,32 @@ from typing import Any, ClassVar, Dict, List
 from maibot_sdk import API, Command, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
-from planning.tools_service import NAP_TOOL_NAME, DEFAULT_LIE_IN_MAX_UNTIL
-
 
 class PlanningComponentsMixin:
-    """日程规划组件（4 Tool（含 1 个旧名别名）+ 1 Command + 1 API + 2 HookHandler）。"""
+    """日程规划组件（2 Tool + 1 Command + 1 API + 2 HookHandler）。
+
+    PR8 3.0.0 清退（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：
+    旧别名 Tool ``lbm_update_schedule_v4`` 与 M9 赖床 Tool ``lbm_nap_lie_in``
+    已删除；保留 ``schedule_inject_v4`` / ``schedule_inject_replyer_v4`` /
+    ``lbm_planning_v4`` 稳定注册名（裁定 4：名字带 v4 不等于旧路线）。
+    """
 
     # 供 SDK / 调试用的组件清单说明（不影响注册）
     planning_components_info: ClassVar[Dict[str, str]] = {
         "lbm_get_schedule_info": "Tool：日程/活动/目标/运行时的只读查询"
-                                 "（view=status/current/next/episodes/spine/intents，"
-                                 "旧 lover_day/goals 保留一版）",
+                                 "（view=status/current/next/episodes/spine/intents）",
         "lbm_update_schedule": "Tool（规范名）：自然语言日程变更（唯一日程写入口；"
-                               "角色裁判 today/future/reject；新层开时写 spine 意图/"
+                               "角色裁判 today/future/reject；写 spine 意图/"
                                "pending_commitment，硬约定代码强制 hardness=hard）",
-        "lbm_update_schedule_v4": "Tool（旧名别名，PR8 删）：与 lbm_update_schedule "
-                                  "走同一受控业务",
-        NAP_TOOL_NAME: "Tool：赖床（把今日 sleep 条目结束时间推到目标时刻；hidden，仅夜间被吵醒"
-                       "且收到提醒时可用；睡眠引擎开启时自动管理提示）",
         "lbm_planning_v4": "Command：/lbm_plan 或 /lbm_规划（list/regenerate/delete/clear/help）",
         "lbm_init": "Command：/lbm_init [emotion|events|status]（全量幂等/定向强制/只读；先插件开关再管理员）",
-        "get_current_activity": "API：当前活动快照（跨插件可调）",
+        "get_current_activity": "API：当前活动快照（跨插件可调；日程未启用时 has_activity=False）",
         "schedule_inject_v4": "HookHandler：maisaka.planner.before_request 日程注入",
         "schedule_inject_replyer_v4": "HookHandler：maisaka.replyer.before_request 活动提醒注入",
     }
 
     # ============================================================
-    # Tools（3 个 LLM 工具 + 1 个旧名别名）
+    # Tools（2 个 LLM 工具）
     # ============================================================
 
     @Tool(
@@ -56,8 +55,7 @@ class PlanningComponentsMixin:
         parameters={
             "view": {"type": "string", "description": "status=今日状态总览（默认）| current=当前活动 | "
                                                      "next=接下来两条 | episodes=今日实际 episode | "
-                                                     "spine=今日意图与硬约定 | intents=spine 别名 | "
-                                                     "lover_day=今日完整日程（旧）| goals=活动目标（旧）",
+                                                     "spine=今日意图与硬约定 | intents=spine 别名",
                      "required": False},
         },
     )
@@ -84,49 +82,6 @@ class PlanningComponentsMixin:
         if svc is None:
             return {"type": "error", "content": "插件未启用"}
         return await svc.tools.update_schedule(**kwargs)
-
-    @Tool(
-        "lbm_update_schedule_v4",
-        description="【旧名别名，PR8 删除】与 lbm_update_schedule 等价的自然语言日程维护入口",
-        parameters={
-            "description": {"type": "string", "description": "日程变更的自然语言描述", "required": True},
-        },
-    )
-    async def plan_tool_update_schedule_v4(self, **kwargs: Any) -> Dict[str, Any]:
-        """旧名 ``lbm_update_schedule_v4`` 独立注册的别名入口（同一受控业务，勿加第二套逻辑）。"""
-        svc = getattr(self, "_planning", None)
-        if svc is None:
-            return {"type": "error", "content": "插件未启用"}
-        return await svc.tools.update_schedule(**kwargs)
-
-    @Tool(
-        NAP_TOOL_NAME,
-        description=(
-            "把今天的起床时间往后推（赖床）。传入目标时间，支持 \"HH:MM\"、\"H:MM\" 或纯小时数"
-            "（如 \"09:30\" / \"9:30\" / \"9\" 表示 09:00）。仅在夜间被吵醒、收到赖床提醒时可用；"
-            f"超过 [schedule_advanced] lie_in_max_until（默认 {DEFAULT_LIE_IN_MAX_UNTIL}）会被钳到该时间。"
-        ),
-        parameters={
-            "time": {"type": "string",
-                     "description": "目标起床时间（\"HH:MM\" / \"H:MM\" / 纯小时数）",
-                     "required": False},
-        },
-        # F13（附录 §4.4 用户裁决 C4）：hidden → 宿主 component_query 置 enabled=False 且不进
-        # ToolSpec 名册；暴露方案见 USAGE.md「赖床工具」段（运行时翻转 / 提示词点名 + tool_search）。
-        metadata={"visibility": "hidden"},
-    )
-    async def plan_tool_nap_lie_in(self, time: str = "", **kwargs: Any) -> Dict[str, Any]:
-        """赖床工具入口（§4.4）：委托 ``ToolsService.nap_lie_in``（plan_ 前缀满足门面审计）。
-
-        判定与钳制全在服务侧：解析容错、非睡眠周期拒绝、``lie_in_max_until`` 钳制、
-        只改今日 sleep 条目（``apply_schedule_items`` 共享底层）、成功后延长 emotion 睡眠
-        窗口并计一次有效提醒。
-        """
-        del kwargs
-        svc = getattr(self, "_planning", None)
-        if svc is None:
-            return {"type": "error", "content": "插件未启用"}
-        return await svc.tools.nap_lie_in(time=time)
 
     # ============================================================
     # Command（/lbm_plan 或 /lbm_规划）
@@ -187,8 +142,9 @@ class PlanningComponentsMixin:
         """``/lbm_init [emotion|events|status]``（PR5 公共入口，2026-10-27 接线）。
 
         顺序（工单要求）：先 ``[plugin].enabled``，再管理员（``admin_users`` /
-        本机控制台）。四态：缺省=全量（幂等）；``emotion``=强制情绪阶段（保持旧
-        ``/lbm_emotion_init`` 强制语义）；``events``=强制刷新事件库；``status``=只读。
+        本机控制台）。四态：缺省=全量（幂等）；``emotion``=强制情绪阶段
+        （PR8 3.0.0：旧独立命令 /lbm_emotion_init 已删除，统一并入本入口）；
+        ``events``=强制刷新事件库；``status``=只读。
         人工调用才发 QQ，自动阶段（``manual=False``）只在服务内写汇总，本入口不参与。
         """
         del kwargs, platform, group_id
@@ -274,7 +230,7 @@ class PlanningComponentsMixin:
 
     @API(
         "get_current_activity",
-        description="返回当前时间段最新的日程活动快照（含描述、时间窗口、即将到来活动）",
+        description="返回当前活动快照（读 runtime episode/ReadModel 视图，与注入同口径）",
         version="1",
         public=True,
     )
@@ -285,6 +241,12 @@ class PlanningComponentsMixin:
     ) -> Dict[str, Any]:
         """对外 API：当前活动快照（行为转 InjectService.get_current_activity_snapshot）。
 
+        PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，UQ-5/UQ-6 裁定）：
+        - **读 runtime episode/ReadModel 视图**（与注入同口径），不从 schedule_items
+          时间窗编造「正在做」；
+        - ``[schedule].enabled=false``（日程未启用）→ ``has_activity=False``，不读残留
+          快照冒充当前活动；runtime 未就绪 → 如实「暂不可用」（``error`` 字段标注）。
+
         其他插件调用方式::
 
             snapshot = await self.ctx.api.call(
@@ -294,6 +256,15 @@ class PlanningComponentsMixin:
                 print(snapshot["activity"]["name"])
         """
         del kwargs
+        if not bool(getattr(getattr(self.config, "schedule", None), "enabled", True)):
+            return {
+                "has_activity": False,
+                "activity": None,
+                "next_activities": [],
+                "as_of": "",
+                "timezone": "",
+                "error": "schedule_disabled",
+            }
         svc = getattr(self, "_planning", None)
         if svc is None:
             return {

@@ -1,7 +1,9 @@
 """EmotionComponentsMixin —— 情绪系统的 SDK 组件注册（装饰器方法）。
 
 组件清单（组件名带 lbm_ 前缀，与其他模块同规则）：
-- Command ×2：/lbm_emotion_init（人设初始化）、/lbm_emotion_config [reset|clear]（查看/重置）
+- Command ×1：/lbm_emotion_config [reset|clear]（查看/重置）
+  （PR8 3.0.0：旧 /lbm_emotion_init 独立命令已删除，人设初始化统一经
+  /lbm_init emotion（InitService.run_emotion）执行；依据：用户 2026-10-27 授权直接清理）
 - Tool ×1：lbm_emotion_report(event, is_target)（上报影响心情的事件；群聊 target 声明，M3）
   （原 lbm_emotion_mood 已随 T6 注册面收口移除：「你现在什么心情」类问答由情绪
   底色注入覆盖；injection_enabled=false 的组合不支持心情问答，见 USAGE.md）
@@ -33,10 +35,9 @@ from core.inject import (
 
 
 class EmotionComponentsMixin:
-    """情绪组件（2 Command + 1 Tool + 3 HookHandler）。"""
+    """情绪组件（1 Command + 1 Tool + 3 HookHandler）。"""
 
     emotion_components_info: ClassVar[Dict[str, str]] = {
-        "lbm_emotion_init": "Command：由人设自动推导情绪锚点/偏移/乘数（VAD 初始化）",
         "lbm_emotion_config": "Command：查看情绪参数；reset 子命令恢复默认",
         "lbm_emotion_report": "Tool：上报一件影响心情的事件；is_target 声明是否由重要的人引发（M3）",
         "emotion_planner_inject": "HookHandler：maisaka.planner.before_request 情绪底色注入（系统提示词后）",
@@ -56,50 +57,6 @@ class EmotionComponentsMixin:
     # ============================================================
     # Commands
     # ============================================================
-    @Command("lbm_emotion_init",
-             description="由人设自动推导情绪锚点/静态偏移/乘数并生效（VAD 情绪系统初始化）",
-             pattern=r"(?<!\S)/lbm_emotion_init\s*$")
-    async def emo_cmd_init(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        svc = self._emo_service()
-        stream_id = str(kwargs.get("stream_id", "") or "")
-        if svc is None or not self._emo_module_enabled():
-            await self.ctx.send.text("情绪模块未启用或未初始化。", stream_id)
-            return True, "emotion disabled", True
-        if not self._qz_is_admin(str(kwargs.get("user_id") or ""), bool(kwargs.get("is_local_operator"))):
-            await self.ctx.send.text("权限不足：仅管理员可执行情绪初始化。", stream_id)
-            return True, "没有权限", True
-        await self.ctx.send.text("正在根据人设推导情绪参数…", stream_id)
-        # 2026-10-27 共享接线：旧命令**真正委托同一情绪阶段**（InitService.run_emotion，
-        # force 保持旧强制语义），不再保留一套绕过统一编排的私有实现；只追加迁移提示，
-        # 不触发事件生成、不做全量初始化。InitService 未装配 → 保留原私有实现兜底。
-        init_svc = getattr(getattr(self, "_planning", None), "init", None)
-        run_emotion = getattr(init_svc, "run_emotion", None) if init_svc is not None else None
-        if callable(run_emotion):
-            try:
-                result = await run_emotion(manual=True, force=True)
-            except Exception as exc:
-                await self.ctx.send.text(f"情绪初始化失败：{exc}", stream_id)
-                return True, "emotion init failed", True
-            stage = result.stage("emotion") if callable(getattr(result, "stage", None)) else None
-            failed = bool(getattr(stage, "failed", False))
-            reply = str(getattr(stage, "message", "") or "").strip()
-            if failed:
-                lines = list(getattr(stage, "error_lines", ()) or ())
-                reply = reply or "；".join(lines) or "情绪初始化失败（原因未知）"
-                await self.ctx.send.text(f"情绪初始化失败：{reply}", stream_id)
-            else:
-                await self.ctx.send.text(reply or "情绪初始化完成。", stream_id)
-            await self.ctx.send.text(
-                "提示：该命令已并入统一初始化，请改用 /lbm_init emotion"
-                "（旧命令保留一版，PR8 移除）。", stream_id)
-            return True, "emotion init done", True
-        reply = await svc.initialize_from_persona()
-        await self.ctx.send.text(reply, stream_id)
-        await self.ctx.send.text(
-            "提示：该命令已并入统一初始化，请改用 /lbm_init emotion"
-            "（旧命令保留一版，PR8 移除）。", stream_id)
-        return True, "emotion init done", True
-
     @Command("lbm_emotion_config",
              description="查看情绪系统参数（锚点/偏移/乘数/当前VAD）；reset 子命令恢复默认",
              pattern=r"(?<!\S)/lbm_emotion_config(?:\s+(?P<emo_args>\S+))?\s*$")

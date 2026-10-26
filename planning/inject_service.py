@@ -26,16 +26,20 @@ Hook 入口：``maisaka.planner.before_request`` / ``maisaka.replyer.before_requ
 R7 滚动化改造（2026-10-25 用户直派，设计目录
 D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计，主设计 §3.3/§6.6/§9.1）：
 
-- ``[life_state].enabled`` 开时注入块追加 runtime 实况（经
+- runtime 视图就绪时（``LifeScheduleReadModel.enabled`` = ``[schedule].enabled``，
+  PR8 3.0.0 起唯一总开关）注入块追加 runtime 实况（经
   :class:`~planning.life_schedule.LifeScheduleReadModel`）：current（当前 episode
   名称/已进行多久/进度/attention_mode/剩余分钟）+ next ≤2 条 + 状态行
   （``LifeStateService.describe`` 最显著 1~2 项）+ recent 1~2 条（completed_today
   尾部实际发生，用于连续性）；当前活动改读 episode（红线 3：不从时间窗编造），
-  provider 关闭/缺失/异常一律落回旧路径；
+  provider 关闭/缺失/异常一律旁路；
 - replyer「精神」静态能量行改优先 LifeState，缺失/关闭回退既有
   ``describe_energy(get_energy_level(...))``（旧函数不删，
   ``planning/time_utils._ENERGY_TABLE`` 链保留为 fallback——§6.6 口径）；
-- 开关关时注入文本与 2.1.0 逐字一致（本文件全部 runtime 分支可旁路）。
+- PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，UQ-6）：
+  ``_get_current_schedule`` 快照链改读 runtime episode/ReadModel 视图（与注入同
+  口径），原 GoalManager 今日/昨日合成时间窗 + 15 分钟缓存编造路径删除；运行态
+  未就绪一律如实（不读残留快照冒充当前活动）。
 """
 
 from __future__ import annotations
@@ -44,7 +48,7 @@ import asyncio
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -58,10 +62,8 @@ from .inject import (
     IntentClassifier,
     UserIntent,
 )
-from .lru_cache import LRUCache
 from .time_utils import (TimezoneManager, describe_energy, format_day_minute,
-                         get_energy_level, is_in_day_frame, normalize_day_minutes,
-                         parse_time_window, ring_minutes_ahead, strip_tz)
+                         get_energy_level, parse_time_window, ring_minutes_ahead)
 from suite_prompts import (
     INJECT_DATE_HEADER_DEFAULT,
     INJECT_HINT_CONTINUE_DEFAULT,
@@ -82,7 +84,8 @@ logger = logging.getLogger(__name__)
 #: 无当前活动兜底文案（2026-10-10 N1-2：空档期不再静默早退）。
 #: 首选 ``[prompts].inject_no_activity``（suite_prompts 侧新增键）；键未落地/取不到时
 #: 用本默认——保证「无活动也给一句兜底」在任何配置版本下都成立。
-#: 语义与 ``core/inject.py`` 的同类实现一致（build_activity_prompt / build_replyer_prompt）。
+#: （PR8 3.0.0：原 core/inject.py 同类实现 build_activity_prompt / build_replyer_prompt
+#: 已删，注入文本实装以本文件为准。）
 _INJECT_NO_ACTIVITY_DEFAULT = "现在没有安排中的活动（可能在休息）。"
 
 #: replyer 复用本轮 planner 意图的最大年龄（秒，N6-1）。
@@ -126,9 +129,10 @@ class InjectService:
         self._plugin = plugin
         self._holiday = holiday_service
 
-        # 缓存 / 时区 / 注入调优（2026-10-10 起全部在 [schedule_advanced] 段）
+        # 时区 / 注入调优（2026-10-10 起全部在 [schedule_advanced] 段）。
+        # PR8 3.0.0：原 15 分钟日程 LRU 缓存（``_schedule_cache``）随时间窗编造路径
+        # 一并删除——runtime 视图读取轻量，无需缓存。
         adv = section_or_default(plugin, "schedule_advanced", ScheduleAdvancedSectionConfig)
-        self._schedule_cache: LRUCache = LRUCache(max_size=adv.cache_max_size, ttl=adv.cache_ttl)
         self._tz_manager: TimezoneManager = TimezoneManager(adv.timezone)
 
         self._intent_classifier = IntentClassifier() if adv.enable_intent_classification else None
@@ -217,7 +221,11 @@ class InjectService:
     # ------------------------------------------------------------
 
     async def preheat_cache(self) -> None:
-        """启动后预热缓存（异步任务；失败静默）。"""
+        """启动后预热（异步任务；失败静默）。
+
+        PR8 3.0.0：原 15 分钟日程缓存已随时间窗编造路径删除，本方法保留为一次
+        runtime 视图预热读取（顺带在启动期暴露取数异常便于排查）。
+        """
         try:
             await asyncio.sleep(5)  # 等待系统初始化
             logger.debug("开始预热日程缓存...")
@@ -283,9 +291,9 @@ class InjectService:
                     logger.debug(f"replyer 注入被冷却跳过: {skip_reason}")
                     return {"action": "continue"}
 
-            # R7 runtime 覆盖（[life_state].enabled 开时）：当前活动改读 episode、
-            # 未来活动改读 runtime next、剩余分钟读 episode 端点；关闭/缺失 → None
-            # = 旧路径逐字（覆盖值只在本方法局部生效，不进 15 分钟缓存）。
+            # R7 runtime 覆盖（runtime 视图就绪时）：当前活动改读 episode、
+            # 未来活动改读 runtime next、剩余分钟读 episode 端点；未就绪 → None
+            # = 空活动口径（覆盖值只在本方法局部生效，不进缓存）。
             life_view = self._life_runtime_view()
             life_remaining: Optional[int] = None
             if life_view is not None:
@@ -403,7 +411,7 @@ class InjectService:
                 await self._get_current_schedule(chat_id)
             )
 
-            # R7 runtime 覆盖与实况块（[life_state].enabled 开时；关闭 → 全部旁路）：
+            # R7 runtime 覆盖与实况块（runtime 视图就绪时；未就绪 → 全部旁路）：
             # 当前活动/未来活动改读 episode 口径，另把
             # 「活动实况（已进行/进度/注意力/剩余）+ next ≤2 + 状态行 + recent ≤2」
             # 作为追加行注入（主设计 §3.3 注入只读清单）。
@@ -639,8 +647,8 @@ class InjectService:
         （空活动时 optimizer 只放行问当前/问未来，闲聊维持节流）。
 
         R7：``remaining_override``（runtime episode 剩余分钟）与 ``life_lines``
-        （runtime 实况追加行）由调用方在 ``[life_state].enabled`` 开时传入；
-        缺省 None = 旧路径逐字（既有调用点与测试桩零变化）。
+        （runtime 实况追加行）由调用方在 runtime 视图就绪时传入；
+        缺省 None = 未就绪口径（既有调用点与测试桩零变化）。
 
         Returns:
             (inject_content, injected, detected_intent)。``inject_content`` 为 None
@@ -820,8 +828,8 @@ class InjectService:
                 lines.extend(["", prompt(self._plugin, "inject_hint_idle")])
 
         lines.extend(["", "---", ""])
-        # R7 runtime 实况追加行（[life_state].enabled 开时由调用方传入；关闭 → None
-        # = 追加块缺席，注入文本与旧行为逐字一致）。位置：引导行之后、分隔线之前。
+        # R7 runtime 实况追加行（runtime 视图就绪时由调用方传入；未就绪 → None
+        # = 追加块缺席）。位置：引导行之后、分隔线之前。
         if life_lines:
             lines.append("")
             lines.extend(life_lines)
@@ -882,8 +890,8 @@ class InjectService:
     def _replyer_energy_desc(self) -> str:
         """replyer「精神」能量行取值（R7 滚动化改造 §6.6：LifeState 优先）。
 
-        ``[life_state].enabled`` 开且 ``LifeStateService.describe`` 可得 → 用生活状态
-        行（剥「状态：」前缀适配 ``精神：{energy}`` 模板槽）；LifeState 缺失/关闭/
+        runtime 视图就绪且 ``LifeStateService.describe`` 可得 → 用生活状态
+        行（剥「状态：」前缀适配 ``精神：{energy}`` 模板槽）；LifeState 缺失/未就绪/
         异常 → 回退既有静态曲线 ``describe_energy(get_energy_level(...))``
         （旧函数不删，``planning/time_utils._ENERGY_TABLE`` 链保留为 fallback）。
         """
@@ -1036,7 +1044,7 @@ class InjectService:
             return ""
 
     # ------------------------------------------------------------
-    # R7 runtime 注入视图（[life_state].enabled；关闭/缺失/异常一律旁路）
+    # R7 runtime 注入视图（runtime 视图；未就绪/缺失/异常一律旁路）
     # ------------------------------------------------------------
 
     def _life_read_model(self) -> Optional[Any]:
@@ -1056,12 +1064,13 @@ class InjectService:
         return provider or None
 
     def _life_runtime_view(self) -> Optional[Dict[str, Any]]:
-        """一次注入的 runtime 视图（只读；``[life_state].enabled`` 关 → None 旁路）。
+        """一次注入的 runtime 视图（只读；``model.enabled``（= ``[schedule].enabled``）关
+        或 provider 缺失 → None 旁路）。
 
         键：``current``（episode 兼容行或 None）/ ``next``（≤2 条）/ ``state_line``
         （LifeStateService.describe 最显著 1~2 项，可空串）/ ``completed``
         （completed_today 尾部 ≤2 行——recent 连续性）/ ``now``（判定时刻）。
-        任何读取异常 → ``None``（回退旧时间窗路径，绝不阻塞注入）。
+        任何读取异常 → ``None``（旁路，绝不阻塞注入）。
         """
         model = self._life_read_model()
         if model is None:
@@ -1229,7 +1238,12 @@ class InjectService:
     # ------------------------------------------------------------
 
     async def get_current_activity_snapshot(self, chat_id: str = "global") -> Dict[str, Any]:
-        """返回当前时间段最新日程活动的结构化快照（与注入走同一条缓存路径）。
+        """返回当前活动快照（runtime episode/ReadModel 视图，与注入同口径）。
+
+        PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，UQ-6 裁定）：
+        不再走 GoalManager 今日/昨日合成时间窗读 schedule_items；runtime 视图未就绪
+        （``[schedule].enabled=false`` 或 provider 未装配）→ 如实「暂不可用」
+        （``error="runtime_not_ready"``），不读残留快照冒充当前活动（规则 5/6）。
 
         Returns:
             dict::
@@ -1240,219 +1254,67 @@ class InjectService:
                     "next_activities": [{"time": "HH:MM", "name": str}, ...],
                     "as_of": ISO8601 字符串,
                     "timezone": str,
-                    "error": None,
+                    "error": None | "runtime_not_ready",
                 }
         """
-        current_activity, current_description, future_activities, activity_type = (
-            await self._get_current_schedule(chat_id or "global")
-        )
-
         now = self._tz_manager.get_now()
-        activity_payload: Optional[Dict[str, Any]] = None
-        if current_activity:
-            activity_payload = {
-                "name": current_activity,
-                "description": current_description or "",
-                "goal_type": activity_type or "",
-                "time_window": self._lookup_time_window(current_activity, chat_id or "global"),
+        view = self._life_runtime_view()
+        if view is None:
+            return {
+                "has_activity": False,
+                "activity": None,
+                "next_activities": [],
+                "as_of": now.isoformat(timespec="seconds"),
+                "timezone": self._tz_manager.timezone_str,
+                "error": "runtime_not_ready",  # 运行态未就绪 = 暂不可用（如实，不编造）
             }
-
+        current = view.get("current")
+        activity_payload: Optional[Dict[str, Any]] = None
+        if isinstance(current, dict) and str(current.get("name") or "").strip():
+            window = ""
+            try:
+                window = (f"{format_day_minute(int(current.get('start_minute') or 0))}-"
+                          f"{format_day_minute(int(current.get('end_minute') or 0))}")
+            except (TypeError, ValueError):
+                window = ""
+            activity_payload = {
+                "name": str(current.get("name") or "").strip(),
+                "description": str(current.get("description") or "").strip(),
+                "goal_type": str(current.get("goal_type") or "").strip(),
+                "time_window": window,
+            }
+        future = self._life_override_from_view(view)["future"]
         return {
-            "has_activity": current_activity is not None,
+            "has_activity": activity_payload is not None,
             "activity": activity_payload,
-            "next_activities": [{"time": t, "name": n} for t, n in future_activities],
+            "next_activities": [{"time": t, "name": n} for t, n in future],
             "as_of": now.isoformat(timespec="seconds"),
             "timezone": self._tz_manager.timezone_str,
             "error": None,  # 成功路径显式给 None，让调用方能统一用 result.get("error") 判断
         }
 
-    def _lookup_time_window(self, activity_name: str, chat_id: str) -> Optional[str]:
-        """根据活动名反查时间窗口字符串（``format_day_minute`` 形态，跨午夜端点标「次日」）。"""
-        try:
-            goal_manager = get_goal_manager()
-            goals = goal_manager.get_active_goals(chat_id="global")
-            if not goals and chat_id and chat_id != "global":
-                goals = goal_manager.get_active_goals(chat_id=chat_id)
-
-            for goal in goals:
-                if goal.name != activity_name:
-                    continue
-                tw = None
-                if goal.parameters and "time_window" in goal.parameters:
-                    tw = goal.parameters.get("time_window")
-                elif goal.conditions:
-                    tw = goal.conditions.get("time_window")
-                if not tw:
-                    continue
-                start_minutes, end_minutes = parse_time_window(tw)
-                if start_minutes is None or end_minutes is None:
-                    continue
-                return f"{format_day_minute(start_minutes)}-{format_day_minute(end_minutes)}"
-        except Exception as exc:
-            logger.debug("反查时间窗口失败: %s", exc)
-        return None
-
     # ------------------------------------------------------------
-    # 当前日程查询（带 LRU 缓存）
+    # 当前日程查询（runtime 视图；与注入同口径）
     # ------------------------------------------------------------
 
     async def _get_current_schedule(
         self,
         chat_id: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str]], Optional[str]]:
-        """获取当前日程信息（带缓存；15 分钟窗口缓存键 + LRU TTL）。
+        """获取当前日程信息（runtime episode/ReadModel 视图，与注入同口径）。
+
+        PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，UQ-6 裁定）：
+        原「GoalManager 今日/昨日合成时间窗读 schedule_items + 15 分钟 LRU 缓存」
+        编造路径已删除；runtime 视图未就绪 → 全空四元组（调用方按「暂不可用」处理，
+        不读残留快照冒充当前活动）。
 
         Returns:
             ``(当前活动, 活动描述, 所有未来活动列表, 当前活动类型)``
         """
-        try:
-            now = self._tz_manager.get_now()
-            current_hour = now.hour
-            current_minute = now.minute
-
-            # 15 分钟窗口缓存键
-            time_window = (current_hour * 60 + current_minute) // 15
-            cache_key = f"{chat_id or 'global'}_{now.strftime('%Y%m%d')}_{time_window}"
-
-            # 命中缓存直接返回
-            cached_result = await self._schedule_cache.get(cache_key)
-            if cached_result is not None:
-                return cached_result
-
-            goal_manager = get_goal_manager()
-            cross_day_enabled = bool(section_or_default(
-                self._plugin, "schedule_advanced", ScheduleAdvancedSectionConfig).cross_day_activity)
-            goals = goal_manager.get_active_goals(chat_id="global")
-            if not goals and chat_id and chat_id != "global":
-                goals = goal_manager.get_active_goals(chat_id=chat_id)
-
-            if not goals:
-                result = (None, None, [], None)
-                await self._schedule_cache.set(cache_key, result)
-                return result
-
-            current_time_minutes = current_hour * 60 + current_minute
-            today_date = now.strftime("%Y-%m-%d")
-            yesterday_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-
-            scheduled_goals: List[Tuple[Any, List[int], bool, bool]] = []
-            for goal in goals:
-                # 跳过 pending_commitment（不是日程活动）
-                if goal.goal_type == "pending_commitment":
-                    continue
-                tw: Optional[List[int]] = None
-                if goal.parameters and "time_window" in goal.parameters:
-                    tw = goal.parameters.get("time_window")
-                elif goal.conditions:
-                    tw = goal.conditions.get("time_window")
-
-                if tw:
-                    is_today = False
-                    is_yesterday = False
-                    if goal.created_at:
-                        if isinstance(goal.created_at, str):
-                            is_today = goal.created_at.startswith(today_date)
-                            is_yesterday = goal.created_at.startswith(yesterday_date)
-                        else:
-                            goal_date_str = goal.created_at.strftime("%Y-%m-%d")
-                            is_today = goal_date_str == today_date
-                            is_yesterday = goal_date_str == yesterday_date
-
-                    # 跨夜开关关闭时只看今天；开启时也接受昨天创建的跨夜活动
-                    if is_today or (cross_day_enabled and is_yesterday):
-                        scheduled_goals.append((goal, tw, is_today, is_yesterday))
-
-            if not scheduled_goals:
-                result = (None, None, [], None)
-                await self._schedule_cache.set(cache_key, result)
-                return result
-
-            def _get_start_minutes(item: Tuple[Any, List[int], bool, bool]) -> int:
-                _, tw, _, _ = item
-                if not tw or len(tw) < 2:
-                    return 0
-                start_val = tw[0]
-                # 兼容旧格式（小时表示）：end_val > 24 为分钟格式
-                return start_val if tw[1] > 24 else start_val * 60
-
-            scheduled_goals.sort(key=_get_start_minutes)
-
-            # 查找当前活动：
-            #   今天创建的：直接判 current_time_minutes 是否落在 time_window 内（含跨夜）
-            #   昨天创建的：只有 time_window 跨夜（end_minutes > 1440）才可能延续到今天凌晨
-            current_activity: Optional[str] = None
-            current_description: Optional[str] = None
-            current_activity_type: Optional[str] = None
-            current_goal_created_at: Any = None
-
-            for goal, tw, is_today, is_yesterday in scheduled_goals:
-                start_minutes, end_minutes = parse_time_window(tw)
-                if start_minutes is None:
-                    continue
-
-                is_cross_day = end_minutes > 1440
-                # A-16 日期帧标记（裁决①）：合成 Goal 的 parameters 里有生成链写入的 day_offset
-                goal_offset = None
-                goal_params = getattr(goal, "parameters", None)
-                if isinstance(goal_params, dict) and goal_params.get("day_offset") is not None:
-                    try:
-                        goal_offset = int(goal_params["day_offset"])
-                    except (TypeError, ValueError):
-                        goal_offset = None
-
-                if is_today:
-                    if goal_offset == 1:
-                        # 标记为「今晚午夜段」：在自身日期帧内不会进行中（属于下一个午夜）
-                        is_in_window = False
-                    else:
-                        # 跨午夜 = 同一个 24h 环，统一走 time_utils.is_in_day_frame
-                        # （与原手写「start<=cur<1440 or cur<end-1440」逐分支等价）
-                        is_in_window = is_in_day_frame(start_minutes, end_minutes, current_time_minutes)
-                elif is_yesterday:
-                    if goal_offset == 1:
-                        # 昨日行标记的「今晚午夜段」：今天就发生在 start..end（钟点）区间
-                        end_clock = end_minutes if end_minutes < 1440 else end_minutes - 1440
-                        is_in_window = start_minutes <= current_time_minutes < end_clock
-                    elif is_cross_day:
-                        # 昨天创建的条目只可能以「今日钟点的尾段」[0, end−1440) 延续：
-                        # 不能整环判——其傍晚段属昨日钟点，此刻必然已过
-                        is_in_window = 0 <= current_time_minutes < normalize_day_minutes(end_minutes)
-                    else:
-                        continue
-                else:
-                    continue
-
-                if is_in_window:
-                    # 多个匹配时，选创建时间最新（防 tz-aware/naive 混比报错）
-                    if current_activity is None or (
-                        goal.created_at and (
-                            current_goal_created_at is None
-                            or strip_tz(goal.created_at) > strip_tz(current_goal_created_at)
-                        )
-                    ):
-                        current_activity = goal.name
-                        current_description = goal.description
-                        current_activity_type = goal.goal_type
-                        current_goal_created_at = goal.created_at
-
-            # 收集所有未来活动（仅今天创建的活动）
-            all_future_activities: List[Tuple[str, str]] = []
-            for goal, tw, is_today, _is_yesterday in scheduled_goals:
-                if not is_today:
-                    continue
-                start_val = tw[0] if len(tw) > 0 else 0
-                end_val = tw[1] if len(tw) > 1 else start_val + 60
-                start_minutes = start_val if end_val > 24 else start_val * 60
-
-                if start_minutes > current_time_minutes:
-                    hour = start_minutes // 60
-                    minute = start_minutes % 60
-                    time_str = f"{hour:02d}:{minute:02d}"
-                    all_future_activities.append((time_str, goal.name))
-
-            result = (current_activity, current_description, all_future_activities, current_activity_type)
-            await self._schedule_cache.set(cache_key, result)
-            return result
-        except Exception as exc:
-            logger.warning(f"获取当前日程信息失败: {exc}")
+        del chat_id  # runtime 视图全局一致（会话维度不再影响取数）
+        view = self._life_runtime_view()
+        if view is None:
             return (None, None, [], None)
+        override = self._life_override_from_view(view)
+        return (override["name"], override["description"],
+                list(override["future"]), override["goal_type"])

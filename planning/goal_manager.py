@@ -161,48 +161,6 @@ class Goal:
         except (ValueError, TypeError):
             return None
 
-    def get_summary(self) -> str:
-        """格式化目标摘要（含状态 / 优先级 / 进度 / 剩余时间 / 时间窗口）。
-
-        说明：本方法经 ``ToolsService._view_goals`` 的 ``getattr(goal, "get_summary")``
-        动态调用（get_schedule_info view=goals 的工具返回），不是死代码。
-        """
-        status_label = {
-            GoalStatus.ACTIVE: "进行中",
-            GoalStatus.PAUSED: "已暂停",
-            GoalStatus.COMPLETED: "已完成",
-            GoalStatus.CANCELLED: "已取消",
-        }
-        priority_label = {
-            GoalPriority.HIGH: "高",
-            GoalPriority.MEDIUM: "中",
-            GoalPriority.LOW: "低",
-        }
-        lines = [
-            f"[{status_label[self.status]}] 目标: {self.name}",
-            f"   ID: {self.goal_id[:8]}...",
-            f"   聊天流: {self.chat_id}",
-            f"   优先级: {priority_label[self.priority]}（{self.priority.value}）",
-            f"   进度: {self.progress}%",
-            f"   执行次数: {self.execution_count}",
-        ]
-        if self.deadline:
-            now = TimezoneManager().get_now()
-            time_left = strip_tz_dt(self.deadline) - strip_tz_dt(now)
-            if time_left.total_seconds() > 0:
-                days = time_left.days
-                hours = time_left.seconds // 3600
-                lines.append(f"   剩余时间: {days}天{hours}小时")
-            else:
-                lines.append("   注意：已超期")
-
-        time_window = self.parameters.get("time_window") if self.parameters else None
-        if time_window and isinstance(time_window, list) and len(time_window) == 2:
-            start_h, start_m = divmod(time_window[0], 60)
-            end_h, end_m = divmod(time_window[1], 60)
-            lines.append(f"   时间: {start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}")
-        return "\n".join(lines)
-
 
 def strip_tz_dt(dt: Optional[datetime]) -> Optional[datetime]:
     """剥离 tzinfo（与 planning.time_utils.strip_tz 等价的本地别名，避免循环导入）。"""
@@ -618,35 +576,6 @@ class GoalManager:
         if cleaned > 0:
             logger.info("🧹 清理了 %d 个过期日程条目（3 天前）", cleaned)
         return cleaned
-
-    def get_goals_summary(self, chat_id: Optional[str] = None) -> str:
-        """目标总览文本（按状态分组 + 优先级排序）。
-
-        静态盘点（插件树 + scratch）确认本方法当前无调用方；因是移植接口、
-        且静态盘点覆盖不到动态调用，本轮只清洗文案、暂不删除（待裁决）。
-        """
-        goals = self.get_all_goals(chat_id=chat_id)
-        if not goals:
-            return "当前没有任何目标"
-
-        active = [g for g in goals if g.status == GoalStatus.ACTIVE]
-        paused = [g for g in goals if g.status == GoalStatus.PAUSED]
-        completed = [g for g in goals if g.status == GoalStatus.COMPLETED]
-
-        lines = [f"目标总览 (共 {len(goals)} 个)\n"]
-        if active:
-            lines.append(f"活跃目标 ({len(active)}个):")
-            priority_order = {"high": 0, "medium": 1, "low": 2}
-            for goal in sorted(active, key=lambda g: priority_order.get(g.priority.value, 1)):
-                lines.append(goal.get_summary())
-                lines.append("")
-        if paused:
-            lines.append(f"\n暂停目标 ({len(paused)}个):")
-            for goal in paused[:3]:
-                lines.append(f"   - {goal.name}")
-        if completed:
-            lines.append(f"\n已完成 ({len(completed)}个)")
-        return "\n".join(lines)
 
     def close(self) -> None:
         """关闭数据库连接（共享实例时仅释放引用，不关底层连接）。"""

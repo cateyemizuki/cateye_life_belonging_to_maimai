@@ -143,7 +143,8 @@ class EmotionServices:
         return self.service.clear_log()
 
     async def initialize_from_persona(self) -> str:
-        """``/lbm_emotion_init`` 主体：人设 → LLM 推导 → 落盘（转发 self.service）。"""
+        """人设 → LLM 推导情绪参数 → 落盘（转发 self.service；PR8 3.0.0 后为
+        init_service.run_emotion 兜底链的生产路径，C-18 保留）。"""
         return await self.service.initialize_from_persona()
 
     def target_multiplier(self, is_target: bool) -> float:
@@ -289,45 +290,10 @@ class EmotionServices:
         except Exception:
             return []
 
-    # ── M9（附录 §4.1–§4.5）：L3 赖床链路转发（planning 赖床工具只问这三个入口；单向依赖）──
-    def in_night_sleep_cycle(self) -> bool:
-        """当前是否处于夜间睡眠周期（赖床工具「非睡眠周期调用 → 拒绝」的门控；转发 service）。
-
-        planning 侧不 import emotion，只按鸭子类型调用本入口；异常一律 False（可空降级，§八.2）。
-        """
-        try:
-            return bool(self.service.in_night_sleep_cycle())
-        except Exception:
-            return False
-
-    def night_sleep_end_minute(self) -> Optional[int]:
-        """nap 工具写回前的预检（只读转发；未在夜间周期 → None）。"""
-        svc = self.service
-        getter = getattr(svc, "night_sleep_end_minute", None)
-        if not callable(getter):
-            return None
-        return getter()
-
-    def extend_night_sleep_until(self, target: Any = None) -> bool:
-        """赖床成功后把本睡眠周期窗口结束端推到 target（转发 service；§4.4 第 5 条）。
-
-        只有「周期在册 + 新端 > 旧端 + 受 lie_in_max_until 钳制」三者同时成立才改端点，
-        返回是否真的延长（否则醒沿仍按 wake 锚点触发）。
-        """
-        try:
-            return bool(self.service.extend_night_sleep_until(target))
-        except Exception:
-            return False
-
-    def note_nap_lie_in_applied(self) -> int:
-        """赖床工具成功改写日程 → 本周期「有效提醒次数」+1（转发 service；§4.4 计数口径）。
-
-        只计数（不判额度）：额度用尽只停提醒，**不阻止**工具调用。
-        """
-        try:
-            return int(self.service.note_nap_lie_in_applied())
-        except Exception:
-            return 0
+    # PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，UQ-3）：原 M9 赖床
+    # 链路四转发口（in_night_sleep_cycle / night_sleep_end_minute / extend_night_sleep_until /
+    # note_nap_lie_in_applied）随赖床工具整链删除；夜扰记账转发（上）与 initialize_from_persona
+    # （init_service 生产兜底链）保留。
 
     @property
     def _bg_tasks(self) -> list:

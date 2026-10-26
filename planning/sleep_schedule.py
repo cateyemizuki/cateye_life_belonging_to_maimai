@@ -12,15 +12,17 @@ R7 依据 = 用户 2026-10-26 直派【日程系统二期 PR3】+ 计划盘点 D
   （M9 as-built，逐字语义；``planning_tools`` 已改为委托本模块）。
 - :func:`update_sleep_endpoint`：一条 sleep 条目端点更新的**唯一**实现
   （钳上限 → 改 sleep end → 同日顺延醒来窗口内的清醒条目 → 写回 → 跨午夜补写
-  醒来日）。调用方（旧工具/引擎）只给数据与写回回调，行为由本函数统一。
+  醒来日）。调用方（引擎）只给数据与写回回调，行为由本函数统一。
 - :class:`SleepEndpointHook`：给 ``SleepEngine`` 的 ``sleep_endpoint_updater`` 用的
   插件适配器（duck-typing 取 ``plugin._schedule_query`` / ``plugin._schedule_gen``；
   失败静默，绝不拖挂 tick）。
-- :data:`NAP_MANAGED_BY_ENGINE_TEXT` / :func:`nap_tool_managed_by_engine`：引擎启用时
-  旧赖床工具返回「由日程睡眠引擎自动管理」提示（PR8 前不删工具，仅自动管理）。
 
-依赖纪律：不 import tools_service（避免循环）；不 import emotion（只按鸭子类型调用
-``extend_night_sleep_until``）；不调用任何 LLM。
+PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，UQ-3）：旧赖床工具
+已整链删除，``nap_tool_managed_by_engine`` / ``nap_tool_engine_managed_reply`` /
+``NAP_MANAGED_BY_ENGINE_TEXT`` 随之移除；本模块保留的端点写回面只服务
+``SleepEndpointHook`` 引擎链。
+
+依赖纪律：不 import tools_service（避免循环）；不 import emotion；不调用任何 LLM。
 """
 
 from __future__ import annotations
@@ -37,9 +39,6 @@ logger = logging.getLogger(__name__)
 
 #: 钳制上限缺省（[schedule_advanced] lie_in_max_until；HH:MM）
 DEFAULT_LIE_IN_MAX_UNTIL = "12:00"
-
-#: 引擎启用时旧赖床工具的自动管理提示（PR8 前保留工具名与别名）
-NAP_MANAGED_BY_ENGINE_TEXT = "现在起床时间由日程睡眠引擎自动管理，不用再叫我赖床啦。"
 
 
 # ======================================================================
@@ -336,25 +335,11 @@ class SleepEndpointHook:
             return 0
 
 
-def nap_tool_managed_by_engine(engine: Any) -> bool:
-    """旧赖床工具是否应由睡眠引擎接管（引擎启用 → 只回提示、不改日程）。"""
-    enabled = getattr(engine, "enabled", None)
-    try:
-        return bool(enabled() if callable(enabled) else enabled)
-    except Exception:
-        return False
-
-
-def nap_tool_engine_managed_reply() -> Dict[str, str]:
-    """旧赖床工具在引擎启用时的统一返回（PR8 前不删工具，只自动管理）。"""
-    return {"type": "nap_lie_in", "content": NAP_MANAGED_BY_ENGINE_TEXT}
-
-
 __all__ = [
-    "DEFAULT_LIE_IN_MAX_UNTIL", "NAP_MANAGED_BY_ENGINE_TEXT", "EndpointUpdate",
+    "DEFAULT_LIE_IN_MAX_UNTIL", "EndpointUpdate",
     "SleepEndpointHook", "find_sleep_item", "lie_in_max_minutes",
-    "nap_end_datetime", "nap_schedule_date", "nap_tool_engine_managed_reply",
-    "nap_tool_managed_by_engine", "normalize_hhmm", "parse_nap_target",
+    "nap_end_datetime", "nap_schedule_date",
+    "normalize_hhmm", "parse_nap_target",
     "postpone_items_for_lie_in", "update_sleep_endpoint",
 ]
 

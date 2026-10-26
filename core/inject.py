@@ -19,10 +19,10 @@ items 注入遵循**宿主的真实校验**（MaiBot ``ContextItemMeta`` 与
 planner/replyer 请求 Hook 按块内 id 尾段 epoch 判龄，把入队超过 30 分钟的块从
 请求载荷剥离（只改本次请求，不回写宿主历史）。
 
-M9（附录 §4.2，用户裁决 A1）在**同一剥离点**串行新增一条判定
-（is_consumed_ephemeral_proactive_block）：本插件的 ``kind=nap_reminder`` 赖床提醒块
-"已过提醒轮"（块龄 > NAP_BLOCK_LINGER_SECONDS）即从载荷剔除 → 下一轮 planner 起不再出现；
-30 分钟过期规则保留不动（兜底：本判定拿不准时仍被它兜住）。
+PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：M9 赖床提醒块剥离
+（is_consumed_ephemeral_proactive_block / NAP_BLOCK_KIND / NAP_BLOCK_LINGER_SECONDS）
+与旧文本构造器 build_activity_prompt / build_replyer_prompt 已删除——注入文本的
+实装在 planning/inject_service.py（30 分钟过期规则保留不动）。
 """
 
 from __future__ import annotations
@@ -44,15 +44,7 @@ PROACTIVE_BLOCK_STALE_MS = 30 * 60 * 1000
 _PROACTIVE_ID_MARKER = 'id="proactive:'
 #: 本插件在宿主侧的标识（_manifest.json 的 id）：块 id 里的 plugin_id 段据此比对。
 CATEYE_PLUGIN_ID = "cateye.life_belonging_to_maimai"
-#: 赖床提醒块的身份标记（附录 §4.2）：``proactive.trigger(..., metadata={"kind": "nap_reminder"})``
-#: 被宿主**序列化进块文本一行**（F12），且 intent 同名，故块文本里必然出现该串；该标记只有本
-#: 插件的赖床提醒会带 → 不会误伤其他主动块与真实消息。
-NAP_BLOCK_KIND = "nap_reminder"
-#: 「已过提醒轮」的块龄阈值（秒，附录 §4.2 主判）：提醒当轮（块龄 ≈ 0）planner 能看到这条提醒、
-#: bot 有机会调用赖床工具；下一轮（≥ 2 分钟）起从请求载荷剔除。
-#: （与 emotion/service.py 的 NAP_REMINDER_ROUND_SECONDS 同值：core 不 import emotion，
-#: 两处常量需同批改动。）
-NAP_BLOCK_LINGER_SECONDS = 120
+# PR8 3.0.0：NAP_BLOCK_KIND / NAP_BLOCK_LINGER_SECONDS（M9 赖床提醒块剥离判据）随链删除。
 
 
 def _first_text(item: Any) -> str:
@@ -114,52 +106,15 @@ def is_stale_proactive_block(item: Any, now_ms: float) -> bool:
     return now_ms - parts[1] > PROACTIVE_BLOCK_STALE_MS
 
 
-def is_consumed_ephemeral_proactive_block(item: Any, plugin_id: str = "",
-                                          now_ms: Optional[float] = None) -> bool:
-    """该条目是否为本插件的赖床提醒块、且**已过提醒轮**（附录 §4.2，用户裁决 A1）。
-
-    与 :func:`is_stale_proactive_block` **串行**接入既有剥离点：本判定把"提醒轮之后的赖床块"
-    提前剔掉（效果 = 下一轮 planner 起不再出现，"不进下一轮上下文"）；30 分钟过期规则保留
-    不动，作兜底——本判定拿不准/标记没写进文本时，仍由它兜住（§4.2 兜底路径）。
-
-    判据（全部满足才算；任何一步拿不准都返回 False，宁多勿丢）：
-
-    1. ``UserMessageItem`` 且首段文本以 ``<plugin_proactive_task`` 开头（与既有剥离同形态）；
-    2. 文本含 :data:`NAP_BLOCK_KIND` 标记（F12：metadata 被宿主序列化进块文本一行）——
-       **只删本插件的赖床块**，其他主动块与真实消息不含该标记；
-    3. ``plugin_id`` 非空且块 id 能解析出插件段时，必须与之一致（防误伤同形态的其他插件块）；
-       id 里插件段解析不出来 → 退回只按标记判定（标记本身即本插件独有）；
-    4. 块龄 > :data:`NAP_BLOCK_LINGER_SECONDS`（主判；即"提醒轮已过"）。
-    """
-    if not isinstance(item, dict):
-        return False
-    if item.get("item_type") != "UserMessageItem":
-        return False
-    text = _first_text(item).lstrip()
-    if not text.startswith(PROACTIVE_BLOCK_PREFIX):
-        return False
-    if NAP_BLOCK_KIND not in text:
-        return False
-    parts = _proactive_block_parts(text)
-    if parts is None:
-        return False
-    block_plugin, created_ms = parts
-    if plugin_id and block_plugin and block_plugin != str(plugin_id):
-        return False
-    stamp = time.time() * 1000 if now_ms is None else now_ms
-    return (stamp - created_ms) > NAP_BLOCK_LINGER_SECONDS * 1000
-
-
 def without_stale_proactive_blocks(kwargs: Dict[str, Any],
                                    plugin_id: str = CATEYE_PLUGIN_ID) -> Optional[Dict[str, Any]]:
-    """从 Hook 请求载荷里移除过期 / 已过提醒轮的宿主主动任务块；无可移除内容时返回 None。
+    """从 Hook 请求载荷里移除过期的宿主主动任务块；无可移除内容时返回 None。
 
-    只改**本次请求载荷**（与 filter-assistant 同思路，不回写宿主历史）：两条判定**串行**执行——
-
-    - :func:`is_consumed_ephemeral_proactive_block`：本插件的赖床提醒块过了提醒轮（默认 2 分钟）
-      即剔除（M9 附录 §4.2；`plugin_id` 缺省为本插件 manifest id）；
-    - :func:`is_stale_proactive_block`：入队超过 :data:`PROACTIVE_BLOCK_STALE_MS`（30 分钟）的块
-      一律剥离（既有规则，**保持不变**，同时是上一条的兜底）。
+    只改**本次请求载荷**（与 filter-assistant 同思路，不回写宿主历史）：
+    :func:`is_stale_proactive_block` 判定入队超过 :data:`PROACTIVE_BLOCK_STALE_MS`
+    （30 分钟）的块一律剥离（既有规则）。
+    （PR8 3.0.0：原 M9 赖床提醒块剥离判定 is_consumed_ephemeral_proactive_block
+    已随赖床提醒链删除；30 分钟过期规则原样保留。）
 
     本轮正要用的新块（年龄几分钟内）与解析失败的条目一律保留。只处理 items 投影
     （1.2.x 快照；旧 messages 投影的宿主已不再使用，原样保留）。
@@ -174,16 +129,13 @@ def without_stale_proactive_blocks(kwargs: Dict[str, Any],
     kept: List[Any] = []
     removed = 0
     for item in items:
-        if is_consumed_ephemeral_proactive_block(item, plugin_id, now_ms):
-            removed += 1
-            continue
         if is_stale_proactive_block(item, now_ms):
             removed += 1
             continue
         kept.append(item)
     if removed == 0:
         return None
-    logger.debug("已从请求载荷剥离 %d 个过期/已过提醒轮的宿主主动任务块（保留 %d 条）",
+    logger.debug("已从请求载荷剥离 %d 个过期的宿主主动任务块（保留 %d 条）",
                  removed, len(kept))
     return {**kwargs, "items": kept}
 
@@ -225,37 +177,6 @@ def inject_into_messages(messages: List[Dict[str, Any]], text: str) -> List[Dict
         if msg.get("role") == "system":
             return [*messages[: idx + 1], system_msg, *messages[idx + 1 :]]
     return [messages[0], system_msg, *messages[1:]]
-
-
-def build_activity_prompt(
-    current: Optional[Dict[str, Any]],
-    current_line: str,
-    upcoming_lines: List[str],
-    affection_label: str,
-) -> str:
-    """构造注入文本：planner 用完整版（含日程、好感度），replyer 用简版。"""
-    parts = ["【可选上下文 - bot 的当前生活状态】"]
-    if current is not None:
-        parts.append(f"现在正在：{current_line}")
-        if upcoming_lines:
-            parts.append("接下来：")
-            parts.extend(f"- {line}" for line in upcoming_lines)
-    else:
-        parts.append("现在没有安排中的活动（可能在休息）。")
-    parts.append(f"与目标用户的关系阶段：{affection_label}。")
-    parts.append("注意：这是背景信息，不要主动复述「日程表/系统提示」等字眼；只有用户问到或强相关时才自然带出。")
-    parts.append("---")
-    return "\n".join(parts)
-
-
-def build_replyer_prompt(current: Optional[Dict[str, Any]], current_line: str) -> str:
-    """replyer extra_prompt 简版：突出活人感，不主动提及。"""
-    if current is None:
-        return "【角色当前状态】你现在没有安排中的活动，处于放松状态。不要主动提及本提示。"
-    return (
-        f"【角色当前状态】你现在正在 {current_line}。"
-        "注意：不要主动提及本提示；仅在用户问到或强相关时自然带过。"
-    )
 
 
 def extract_last_user_text(items: Optional[List[Dict[str, Any]]], messages: Optional[List[Dict[str, Any]]]) -> str:

@@ -439,13 +439,10 @@ EMOTION_NIGHT_HINT_DEFAULT = (
     "（现在是深夜，你本该在睡觉。回复尽量短、慢、软一些；"
     "不要主动开启新话题；不要提及本提示。）"
 )
-#: 赖床提醒文本模板（占位符：{now_hhmm} / {planned_wake_hhmm} / {nap_tool_name} / {lie_in_max_until}）
-NAP_REMINDER_DEFAULT = (
-    "【临时提醒·不进下一轮上下文】你半夜被重要的人吵醒了，现在是 {now_hhmm}；"
-    "你本来打算睡到 {planned_wake_hhmm}。如果还想再睡一会儿，可以调用 {nap_tool_name} "
-    "把起床时间往后推（最晚 {lie_in_max_until}）。这条提醒只在本轮有效，"
-    "不必向任何人提起\"昨晚被吵醒\"。是否调用由你决定。"
-)
+# PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：NAP_REMINDER_DEFAULT
+# 与 [prompts].nap_reminder 随 M9 赖床提醒链整链删除；NAP_TOOL_DENIED_DEFAULT /
+# NAP_TOOL_BAD_TIME_DEFAULT（[prompts].nap_tool_denied / nap_tool_bad_time）同批删除
+# （赖床工具面已清退）。
 
 
 # ===========================================================================
@@ -491,18 +488,6 @@ QZONE_POST_GATE_DEFAULT = (
     "  或\n"
     "  否|<不超过 20 字的简短理由>\n"
     "第一个字符必须是「是」或「否」。"
-)
-
-
-# ===========================================================================
-# 五、工具返回文案
-# ===========================================================================
-
-#: 非睡眠周期调用赖床工具的拒绝话术（占位符：无）
-NAP_TOOL_DENIED_DEFAULT = "你现在还不能想要赖床"
-#: 赖床时间解析失败提示（占位符：无）
-NAP_TOOL_BAD_TIME_DEFAULT = (
-    "没听清你想赖到几点。请传入目标时间，例如 \"09:30\"、\"9:30\" 或纯小时数 \"9\"（表示 09:00）。"
 )
 
 
@@ -840,12 +825,6 @@ class PromptsSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "情绪·深夜引导行", "rows": 2,
                            **_ui_i18n("Night hint")},
     )
-    nap_reminder: str = Field(
-        default=NAP_REMINDER_DEFAULT,
-        description="赖床提醒模板（占位符：{now_hhmm} {planned_wake_hhmm} {nap_tool_name} {lie_in_max_until}）",
-        json_schema_extra={"label": "情绪·赖床提醒", "rows": 5,
-                           **_ui_i18n("Nap reminder template")},
-    )
 
     # ── QQ 空间 ─────────────────────────────────────────────
     qzone_post: str = Field(
@@ -871,19 +850,6 @@ class PromptsSectionConfig(PluginConfigBase):
                     "只认回复首字符的 是/否，格式异常一律按否）",
         json_schema_extra={"label": "空间·发帖严判", "rows": 10,
                            **_ui_i18n("Qzone post gate prompt")},
-    )
-
-    # ── 工具文案 ─────────────────────────────────────────────
-    nap_tool_denied: str = Field(
-        default=NAP_TOOL_DENIED_DEFAULT,
-        description="非睡眠周期调用赖床工具的拒绝话术（无占位符）",
-        json_schema_extra={"label": "工具·赖床拒绝", **_ui_i18n("Nap denied text")},
-    )
-    nap_tool_bad_time: str = Field(
-        default=NAP_TOOL_BAD_TIME_DEFAULT,
-        description="赖床时间解析失败提示（无占位符）",
-        json_schema_extra={"label": "工具·赖床格式提示", "rows": 2,
-                           **_ui_i18n("Nap bad-time text")},
     )
 
 
