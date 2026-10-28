@@ -35,6 +35,7 @@ from .inject_service import InjectService
 from .init_service import InitService
 from .proactive_service import ProactiveService
 from .schedule_generator import ScheduleGenerator
+from .schedule_items import is_night_sleep_item
 from .tools_service import ToolsService
 
 if TYPE_CHECKING:
@@ -299,8 +300,16 @@ class PlanningServices:
         except Exception:
             return datetime.now().astimezone()
 
-    def _legacy_asleep(self, now: Optional[datetime] = None) -> Optional[bool]:
-        """引擎不表态时的旧周期/日程回退（None = 无法判断 → 调用方 fail-closed）。"""
+    def _runtime_asleep(self, now: Optional[datetime] = None) -> Optional[bool]:
+        """引擎不表态时的**非时间窗**回退（None = 无法判断 → 调用方 fail-closed）。
+
+        PR8 3.0.0（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 C 项）：
+        旧实现按 ``[schedule]`` 作息锚点时间窗推断睡着/清醒——与统一 runtime 真源
+        冲突，且真实 anchors 是 dataclass 时下标取值抛错、早已退化为死分支。现只读
+        真实会话/运行态：``LifeState.sleep_status``（如提供）→ ``ScheduleQuery.
+        runtime_current`` 的夜间睡眠 episode；都没有 → ``None``（未知，绝不按钟点
+        伪造确定清醒/入睡）。
+        """
         plugin = self._plugin
         life = getattr(plugin, "_life_state", None)
         if life is not None:
@@ -312,24 +321,16 @@ class PlanningServices:
                         return status["asleep"]
                 except Exception:
                     pass
-        try:
-            from companion.patrol import real_sleep_anchors_from_plugin
-            anchors = real_sleep_anchors_from_plugin(plugin, now)
-        except Exception:
-            return None
-        if not anchors:
-            return None
-        try:
-            start, end = anchors[0], anchors[1]
-            cur = self._now() if now is None else now
-            cur_min = cur.hour * 60 + cur.minute
-            if start == end:
-                return None
-            if start > end:  # 跨午夜
-                return bool(cur_min >= start or cur_min < end)
-            return bool(start <= cur_min < end)
-        except Exception:
-            return None
+        query = getattr(plugin, "_schedule_query", None)
+        runtime_current = getattr(query, "runtime_current", None)
+        if callable(runtime_current):
+            try:
+                item = runtime_current(now, include_sleep=True)
+            except Exception:
+                item = None
+            if isinstance(item, dict) and is_night_sleep_item(item):
+                return True
+        return None
 
     def _hard_commitment_now(self, now: Optional[datetime] = None) -> Optional[bool]:
         """今天/明天是否有**硬约定**（True/False；数据源全不可用 → None = 未知）。"""
@@ -383,7 +384,7 @@ class PlanningServices:
             if callable(getter):
                 asleep = getter(now)
             if asleep is None:
-                asleep = self._legacy_asleep(now)
+                asleep = self._runtime_asleep(now)
             if asleep is None:
                 return {"can_generate": False, "reason": "sleep_unknown"}
             if asleep:

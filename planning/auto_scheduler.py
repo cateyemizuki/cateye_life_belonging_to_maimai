@@ -378,12 +378,17 @@ class ScheduleAutoScheduler:
             target = date_str or self._target_date_for()
             logger.info(f"开始自动生成日程: {target}")
 
-            # 目标日已有日程 → 跳过（plugin._db 即 ScheduleDB）
+            # 目标日已有日程 → 仅当已是 spine 日表才跳过（PR8 3.0.0 / 裁定 6：
+            # 升级前旧 daily 当天/未来日表不阻断新主线；旧行保留为历史，仅以 spine
+            # 重建当前/未来日表，不批量改写已执行历史）。
             db = getattr(self.plugin, "_db", None)
             if db is not None and db.has_day_schedule(target):
-                count = len(db.get_day_schedule(target))
-                logger.info(f"{target} 已有 {count} 个日程，跳过自动生成")
-                return
+                rows = list(db.get_day_schedule(target) or [])
+                from .rolling_planner import extract_spine_intents
+                if extract_spine_intents(rows):
+                    logger.info(f"{target} 已有 {len(rows)} 个 spine 日程，跳过自动生成")
+                    return
+                logger.info(f"{target} 为旧非 spine 日表（{len(rows)} 行），按 3.0.0 重建 spine 日程")
 
             generator = self._resolve_generator()
             if generator is None:

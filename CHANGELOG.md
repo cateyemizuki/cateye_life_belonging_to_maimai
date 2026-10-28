@@ -2,9 +2,44 @@
 
 本文件记录「属于麦麦的生活」（lbm）**面向使用者**的版本变更：新增能力、口径变化、缺陷修复与已知问题。
 
+## [3.0.0] - 2026-10-27（开发版，未发布；破坏性清理）
+
+> PR8 破坏性清理：滚动化/生活状态/睡眠引擎收成**唯一主线**，旧全天日表生成路线与灰度开关整体退役。用户 2026-10-27 明确授权直接清理，不等灰度与观察期。**本版未发布，未做真机/真实模型/真实 QQ 验证**；离线验收证据见本节末尾。
+
+### 破坏性变更（升级前必读）
+
+- **唯一日程总开关 `[schedule] enabled`（默认 `true`）**：开启时同时装配 spine 日意图、滚动运行时、生活状态与睡眠引擎；关闭时日程整体停止（不生成、不注入、不主动开口，工具/命令回「日程未启用」），**不再回落到旧全天生成 fallback**。
+- **旧开关退役（一次性 pop，只丢弃不搬运）**：`[schedule] spine_mode`、`[life_state] enabled`、`[life_state] sleep_engine_enabled`、`[life_state] profile_path`（死键）、`[schedule] planning_daily_token_budget`、`[planning_proactive] nap_reminder_enabled` / `nap_reminder_max_per_day`。
+- **显式 `[schedule] enabled=false` 不被旧 true 覆盖**：3.0.0 只保证「显式 `false` 保持关闭、旧开关 `true` 不会自动反推开启」；一次性告警日志只在部分校验路径出现，并非所有 raw/normalize 路径的保证。
+- **删除的旧生成链**：旧 daily 生成、校验（validator）、质量评分（quality）、响应解析（response-parser）；spine 生成 + 模板兜底是唯一路线。
+- **删除的旧入口**：工具别名 `lbm_update_schedule_v4`、赖床工具 `lbm_nap_lie_in`、独立命令 `/lbm_emotion_init`（统一并入 `/lbm_init emotion`）、`lbm_get_schedule_info` 的 `lover_day` / `goals` 旧视图、按活动切换强制主动开口的旧链与相关提示词/工具扩展。保留 `schedule_inject_v4` / `schedule_inject_replyer_v4` / `lbm_planning_v4` 等**稳定 SDK 注册名**（名字带 v4 不代表旧路线）。
+- **仍独立、按需开启**：`[life_state] emotion_modulation_enabled`、`[event_catalog] mode` 与 `[schedule] no_sleep_mode`、`[patrol] nap_quiet_enabled`、夜间打扰统计、睡眠大修、各类上限全部保留。午休静默只读**新 spine 意图**用于静默，不伪造当前活动。
+- **数据兼容**：`CURRENT_LAYOUT_VERSION` 保持 `2026-10-10`（3.0.0 迁移是纯 pop，不换布局标记，避免存量已迁移用户重跑旧白名单搬运）；`schedule.db` v6 与历史日表行、`life_state.json`、情绪/好感/空间状态**不删除、不改写**。旧日表行不再作为当前活动来源；升级当天若目标日只有旧日表，调度会重新生成 spine 日意图（旧行归档，非破坏性）。
+
+### 口径统一（3.0.0 起）
+
+- **当前活动唯一真源 = 当前滚动 runtime**：public `companion_get_current_activity` 在无活动/日程关闭时返回空串；结构化 API 返回 `has_activity=False` 与空列表；`/lbm_plan list`、注入、QQ 空间、巡检、`/lbm_life rolling` 同源。错误/未就绪不得冒充确定清醒。
+- **睡眠会话**：正式起床结束会话、记 completed、**不进恢复池**；固定时间硬约定**不因晚起顺延，迟到如实记录**；睡眠中热关日程以关闭真实时刻结束会话并交回停止状态；**重新打开不复活旧会话**。诊断只读 `[schedule] enabled`，文案统一「日程未启用」。
+- **VAD → 生活反馈预算**：最终入账增量上限 0.15、原子区写、逐轴净累计保留；升级当天旧 raw 账本当日 hold（暂停新增、旧账保留、不重置额度），次日进入新口径；`per_reply` 预占失败即释放。
+- **事件库**：生成上限 8、总池 12（`max_generated_events` / `max_pool_events`；`max_events` 仅旧键映射）；情绪-生活调制表路径固定 `mappings/emotion_life_modulation.json`。
+
+### 真机验证与热修（2026-10-28，开发工作树未提交）
+
+- **真机首轮实弹（用户服务器 + 真实 QQ 群 392653174）**：`/lbm_life help|status|rolling sleep`、`/lbm_plan list`（日程图当场重渲染）、`/lbm_diag life`、`/lbm_emotion_config`（锚点/VAD/当日情绪事件 25 条）、`/lbm_dashboard`（总览图当场重渲染）、@ 自然消息（71.7s 后 3 条人设回复）**全部回复正常**；服务器配置迁移契约逐项核对通过（`[schedule].enabled=true`、退役键全 0 命中、`config_version=3.0.0`、`layout_version=2026-10-10`、admin/target 配置正确）；宿主热重载部署（file_watcher → Supervisor 重启完成，loaded=25 failed=0）实弹走通。
+- **修复：`/lbm_life` 帮助行 rolling 子命令清单缺 `sleep`**（真机实测帮助文本与 USAGE 六子命令口径不一致；`qzone/components.py` 帮助串与 `companion/components.py` 文档串补齐，behavior 211 断言同批更新）。
+- **修复：跨午夜 `planned_end` 的过期 episode 永不关闭**——`planned_end_minute>1440`（次日口径）的 active 行，在次日 tick 的裸 `cur` 比较下永假，步 2 不收尾 → 步 3 睡眠锚点（要求无当前 episode）与步 5 选活动被无限阻塞（真机实测：前日 23:42 的待机 episode 卡 391 分钟、当日 episode=0、每日 06:00 定时重启不解——DB active 行即它）。修法：步 2 关闭比较改用 `_episode_frame_minute`（episode 自身日帧，与 schedule_items 同口径），`actual_end`=计划末端不倒填现在；同帧（当日）到期行为逐字不变。新增 behavior 用例 231（红→绿）。
+- **部署适配（真机实测，非代码缺陷）**：`[llm].emotion_referee_task_name` 默认跟随主任务；**宿主主任务为思考型模型时，睡眠裁判会思考耗尽 `max_tokens` 导致正文为空、连续 3 次失败后本周期大修放弃**（2026-10-28 服务器实测 06:30~06:50 三败）。此类宿主应在插件配置把该键改绑便宜非思考任务（如 `utils`）；字段说明已补陷阱提示。
+- **回滚点**：服务器 `MaiBot\pr8b_hotfix_backup_20261028\`（3 个被替换原文件）+ 本地 `work\lbm-phase2\pr8b-rollback-snapshot\`；回滚 = 用备份覆盖 3 文件后 touch 触发热重载。
+
+### 验收状态
+
+- **离线验收（已完成，34/34 rc=0）**：29 个 `_phase2_*` 专项 263 cases + 新增 public chain 5 cases + 独立复核 8 cases = **276 专项 cases**，全部 rc=0；`smoke_test_cateye_test.py` 与 `_config_round_checks.py` 在 f1，`behavior_test_cateye_test.py` 最终 rc=0（f7d，230 段；f7/f7b/f7c 三次历史红保留）。29 专项与三件套证据在 `pr8-final-f1..f6.json`+`pr8-final-f8.json`（33 条），行为在 `pr8-final-f7d.json`（1 条）。原 F1/F3 三红已修复转绿，F2 改 `_runtime_asleep` 只读真实态、未知 fail-closed；保护红例完整性见 `pr8-coordinator-review.json`（私有调用名/解释字符串变化，断言不变）。**剩余仅为真实环境验证**（真机/真实模型/QQ/跨进程/真实计费）；2.2.0 的 263 用例绿仍属历史证据。**2026-10-28 真机修复轮复跑（维护树 `CATEYE_TEST_DIR`）：smoke / round / behavior 全 rc=0，behavior 231 段（新增跨午夜用例 231）**。
+- **真机首轮实弹已完成（2026-10-28，见「真机验证与热修」节）**；仍待：≥1 天稳定性长跑、真实 token 计费对账、WAL 多进程长时间观察、真实睡眠夜完整窗口（10-28 夜窗被服务器开机时间截断）。**不宣称上线稳定**。
+
 ## [2.2.0] - 2026-10-27（开发版，未发布）
 
-> 日程系统二期（PR1~PR7）离线验收完成条目。**2.2.0 为开发版，未发布**；真机灰度、观察期与 PR8 破坏性清理仍延期。
+> 日程系统二期（PR1~PR7）离线验收完成条目。**2.2.0 为开发版，未发布**；真机灰度、观察期与 PR8 破坏性清理当时仍延期。
+> **历史条目备注**：其中「PR8 破坏性清理延期」已由上方 [3.0.0] 于 2026-10-27 落地；本段保留当时口径，现行配置与开关以 [3.0.0] 与 README 为准。
 > 最终离线证据：三件套 exit 0 + 29 个二期专项共 **263 用例** exit 0（含真实双向 2016 拍、旧 7 日、VAD 48、事件独立 9）；配置 13 段/258 字段/5 隐藏/253 可见；组件 32 = 9 命令 + 10 Hook + 9 Tool + 4 API；manifest 能力 17。
 
 ### 新增：日程系统二期能力（全部默认关，唯一例外见下）

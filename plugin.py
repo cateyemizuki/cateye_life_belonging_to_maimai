@@ -698,7 +698,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             except Exception as exc:
                 engine = None
                 try:
-                    self.ctx.logger.warning("睡眠引擎装配失败（回退旧行为）：%s", exc)
+                    self.ctx.logger.warning("睡眠引擎装配失败（本次不启用引擎，睡眠态未就绪）：%s", exc)
                 except Exception:
                     pass
             model = LifeScheduleReadModel(
@@ -724,7 +724,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             except Exception:
                 pass
             try:
-                self.ctx.logger.warning("生活状态服务装配失败（回退旧行为，不阻塞）：%s", exc)
+                self.ctx.logger.warning("生活状态服务装配失败（本次不装配，运行态未就绪，不阻塞）：%s", exc)
             except Exception:
                 pass
             return False
@@ -743,7 +743,8 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         if not desired:
             if engine is not None:
                 # 用户 2026-10-27 批准（热关闭过渡）：以关闭时刻结束当前睡眠会话，再交回
-                # 旧调度 —— actual_end=真实关闭时刻、走一次结算、不留 paused 恢复池条目、
+                # 停止日程（PR8 3.0.0 无旧 fallback）—— actual_end=真实关闭时刻、走一次
+                # 结算、不留 paused 恢复池条目、
                 # 不改既有已结束历史。注意与「硬约定=正式起床」（actual_end=约定−lead 的
                 # 真实唤醒时刻）及「夜间 <5 分钟短扰只重置连续段」是三条独立规则。
                 self._close_sleep_for_disable(engine)
@@ -778,7 +779,7 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
         except Exception as exc:
             self._sleep_engine = None
             try:
-                self.ctx.logger.warning("睡眠引擎热装配失败（回退旧行为）：%s", exc)
+                self.ctx.logger.warning("睡眠引擎热装配失败（本次不启用引擎，睡眠态未就绪）：%s", exc)
             except Exception:
                 pass
             self._install_life_recheck_hooks(None)

@@ -374,9 +374,12 @@ class LlmSectionConfig(PluginConfigBase):
     )
     emotion_referee_task_name: str = Field(
         default="replyer",
-        description="情绪睡眠裁判任务名：睡眠期情绪大修使用（需要理解人设与日程，建议与主任务同档）",
+        description="情绪睡眠裁判任务名：睡眠期情绪大修使用（需要理解人设与日程，建议与主任务同档）。"
+                    "注意：宿主主任务为思考型时，思考内容会耗尽 max_tokens 导致正文为空、"
+                    "裁判连续失败后本周期大修放弃（2026-10-28 真机实测）——此时应改绑非思考任务（如 utils）",
         json_schema_extra={
             "label": "情绪裁判任务名",
+            "hint": "宿主主任务为思考型时建议改绑便宜非思考任务，否则裁判正文可能为空",
             **_ui_i18n("Emotion referee task"),
         },
     )

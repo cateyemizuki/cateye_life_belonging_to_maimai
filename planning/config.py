@@ -450,8 +450,8 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     # ── 角色裁判 ─────────────────────────────────────────────
     role_judge_enabled: bool = Field(
         default=True,
-        description="角色裁判模式：你（用户）通过 lbm_update_schedule（规范名；旧名 "
-                    "lbm_update_schedule_v4 仍注册一版）用自然语言要求改日程时，让 bot 以角色身份先做判断——"
+        description="角色裁判模式：你（用户）通过 lbm_update_schedule（PR8 3.0.0 唯一规范名；"
+                    "旧 lbm_update_schedule_v4 别名已退役）用自然语言要求改日程时，让 bot 以角色身份先做判断——"
                     "接受并改今天（today）/ 接受为未来预约（future）/ 拒绝不改（reject）。"
                     "判定失败时安全回退为「日程不变」",
         json_schema_extra={

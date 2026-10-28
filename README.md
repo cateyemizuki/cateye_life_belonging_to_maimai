@@ -1,17 +1,17 @@
 # 属于麦麦的生活
 
-> 一个 MaiBot 插件，让麦麦拥有自己的日程、关系、QQ 空间与情绪。当前开发版 **2.2.0**（未发布；最近发布版 2.1.0）。
+> 一个 MaiBot 插件，让麦麦拥有自己的日程、关系、QQ 空间与情绪。当前开发版 **3.0.0**（未发布；最近发布版 2.1.0）。
 
 ## 这个插件是什么
 
 「属于麦麦的生活」把四件互相关联的事交给麦麦自己完成：
 
-- **日程规划**：每天生成整日作息与活动，并把「现在在做什么」自然地注入对话。
+- **日程规划**：每天生成一组「日意图（spine）」并由滚动层执行成真实活动，把「现在在做什么」自然地注入对话。
 - **虚拟陪伴**：维护与陪伴对象的好感度，在合适的时间问候、想念与搭话。
 - **QQ 空间**：按日程节奏自动发说说、配图，并回复评论。
 - **情绪维护**：让情绪随聊天起伏，为回复提供底色与描述。
 
-四个模块共享同一份作息；发往目标私聊的主动消息共用每日预算（早/晚安免预算），QQ 空间另有自己的每日上限。
+四个模块共享同一份真实的作息与当前活动；发往目标私聊的主动消息共用每日预算（早/晚安免预算），QQ 空间另有自己的每日上限。
 
 ## 安装
 
@@ -21,11 +21,22 @@
 4. 如需从 QQ 使用管理员命令，在「管理与日志」（`[admin]`）里填上你的 QQ 号；留空时仅本机控制台可用。
 5. 依赖 `httpx` 与 `Pillow`。Pillow 只用于渲染日程图与状态图，缺失或渲染失败时自动降级为纯文本。
 
-可选开关默认关闭：屏幕感知 `[patrol] screen_enabled`、QQ 空间 `[qzone] enabled`、周结大事记 `[affection] weekly_milestones_enabled`、午休静默 `[patrol] nap_quiet_enabled`、日程滚动化两开关（`[life_state] enabled` 与 `[schedule] spine_mode`，见「日程滚动化」小节）。二期新增开关（`[life_state] emotion_modulation_enabled` / `sleep_engine_enabled`、`[event_catalog] mode=off`）同样默认关；唯一默认开的新功能是 `[planning_proactive] target_frequency_always_one`（见「日程系统二期」小节）。
+可选开关默认关闭：屏幕感知 `[patrol] screen_enabled`、QQ 空间 `[qzone] enabled`、周结大事记 `[affection] weekly_milestones_enabled`、午休静默 `[patrol] nap_quiet_enabled`、情绪-生活双向调制 `[life_state] emotion_modulation_enabled`、事件库生成 `[event_catalog] mode=off`。默认打开的新功能只有两项：日程主线 `[schedule] enabled=true`（见下节）与目标频率恒 1 `[planning_proactive] target_frequency_always_one=true`。
 
 **前置条件**：QQ 空间需要 SnowLuma 适配器（NapCat 画像不支持 QZone API）；屏幕感知需要「cateye 统一连接插件」且对方电脑上的客户端在线。目标私聊流解析不到时，插件每 60 秒重试一次，期间不会有任何主动消息；先与目标 QQ 互发一条消息通常即可解析到。
 
-WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好感度（`[affection]`）、日程系统（`[schedule]`）、日程系统·高级设置（`[schedule_advanced]`）、日程主动行为（`[planning_proactive]`）、QQ 空间（`[qzone]`）、情绪系统（`[emotion]`）、LLM 调用（`[llm]`）、提示词（高级）（`[prompts]`）、管理与日志（`[admin]`）、生活状态（`[life_state]`，2026-10-25 新增段，段序排末尾）。
+WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好感度（`[affection]`）、日程系统（`[schedule]`）、日程系统·高级设置（`[schedule_advanced]`）、日程主动行为（`[planning_proactive]`）、QQ 空间（`[qzone]`）、情绪系统（`[emotion]`）、LLM 调用（`[llm]`）、提示词（高级）（`[prompts]`）、管理与日志（`[admin]`）、生活状态（`[life_state]`）、事件库（`[event_catalog]`）。
+
+## 3.0.0 破坏性变更（升级必读）
+
+3.0.0 把「日程滚动化 + 生活状态 + 睡眠引擎」收成**唯一主线**，旧的两开关式灰度与旧全天日表路线已整体退役：
+
+- **唯一总开关 `[schedule] enabled`（默认 `true`）**：开启时同时装配 spine 日意图、滚动运行时、生活状态与睡眠引擎；关闭时**仅日程链**停止（不生成、不注入、日程主动链不开口，工具/命令回「日程未启用」），**不会回落到旧全天生成路线**；陪伴、QQ 空间、情绪等独立模块仍按各自开关运行。
+- **退役键（一次性迁移，只丢弃不搬运）**：`[schedule] spine_mode`、`[life_state] enabled`、`[life_state] sleep_engine_enabled`、`[life_state] profile_path`（死键）、`[schedule] planning_daily_token_budget`、`[planning_proactive] nap_reminder_enabled` / `nap_reminder_max_per_day`。若你曾显式把 `[schedule] enabled` 设为 `false`，升级后**保持关闭**，旧开关 `true` 不会自动反推开启；一次性告警日志只在部分校验路径出现，并非所有 raw/normalize 路径的保证。
+- **不再存在的旧入口**：旧 daily 生成/校验/质量评分/响应解析链、`lbm_update_schedule_v4` 工具别名、`lbm_nap_lie_in` 赖床工具、`/lbm_emotion_init` 独立命令（统一并入 `/lbm_init emotion`）、`lbm_get_schedule_info` 的 `lover_day` / `goals` 旧视图、按活动切换强制主动开口的旧链。
+- **仍然独立、按需开启**：`[life_state] emotion_modulation_enabled`（情绪-生活双向调制）、`[event_catalog] mode`（事件库生成）、`[schedule] no_sleep_mode`（无睡眠模式）、`[patrol] nap_quiet_enabled`（午休静默）、夜间打扰统计、睡眠大修、各类上限都保留。
+- **数据兼容**：`life_state.json`、日程库 `schedule.db` 与用户数据**不清空、不批量改写已执行历史**；当前/未来仅有旧非 spine 日表的日期，可把旧行归档后重建 spine 日意图（非破坏性，旧记录仍可追溯）。旧日表行不再被当作当前活动来源。
+- **回滚**：3.0.0 是破坏性清理，没有「改回旧开关」的回退路线；需要旧行为请回退插件版本与配置备份。
 
 ## 快速上手
 
@@ -33,65 +44,57 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 |---|---|---|
 | `/lbm_dashboard` | 四模块状态总览图与最近变动日志，情绪节附近期情绪变化 | 管理员 |
 | `/lbm_plan list` | 查看今日日程图；当天没有日程时自动生成 | 管理员 |
-| `/lbm_plan regenerate [额外要求]` | 重新生成今日日程，可附加临时要求 | 管理员 |
+| `/lbm_plan regenerate [额外要求]` | 重新生成今日日意图，可附加临时要求 | 管理员 |
 | `/lbm_init [emotion\|events\|status]` | 统一初始化：全量 / 情绪 / 事件库 / 只读状态 | 管理员 |
 | `/lbm_mai_affection <1~N>` | 把好感度直接调到第 N 档 | 目标 QQ 本人或本机控制台 |
 | `/lbm_diag llm` / `decision` / `life` | 模型调用、主动决策、空间决策日志 | 管理员 |
 | `/lbm_diag streams [序号]` | 查看问候候选流、序号与最近消息；给出序号可查该流下一次触发状态 | 管理员 |
 | `/lbm_life qzone status` | 查看 QQ 空间通道与 cookie 状态 | 不限 |
-| `/lbm_life rolling [status\|state\|episodes\|spine\|sleep\|preview]` | 滚动/睡眠调试（纯只读，六个子命令；两开关全关时提示未启用） | 管理员 |
+| `/lbm_life rolling [status\|state\|episodes\|spine\|sleep\|preview]` | 滚动/睡眠调试（纯只读，六个子命令；日程未启用时提示未启用） | 管理员 |
 | `/lbm_life qzone post 文本` | 手动发一条说说 | 管理员 |
-| `/lbm_emotion_init` | 由人设推导情绪基线 | 管理员 |
 | `/lbm_emotion_config` | 查看情绪参数（`reset` 恢复默认，`clear` 清空当天记录） | 管理员 |
 | `/lbm_mai_help` | 查看陪伴相关命令帮助 | 目标 QQ 本人或本机控制台 |
 
-`/lbm_mai_*` 只对 `[patrol] target_qq` 本人（或本机控制台）开放；`/lbm_life qzone status|moments|comments` 不限权限。首次使用前请确认已配置管理员，否则 `/lbm_emotion_init` 会直接提示权限不足。
+`/lbm_mai_*` 只对 `[patrol] target_qq` 本人（或本机控制台）开放；`/lbm_life qzone status|moments|comments` 不限权限。首次使用前请确认已配置管理员，否则 `/lbm_init` 会直接提示权限不足。
 
 `/lbm_dashboard` 与 `/lbm_plan list` 的两张图已于 2026-10-23 按重绘指导重置：1080 固定列网格、先测量后绘制、先分页后钳制；效果与边界见 CHANGELOG [2.1.0]「渲染图重绘重置」与 USAGE「图片渲染口径」。
 
-首次使用建议顺序：`/lbm_emotion_init` 初始化情绪；`/lbm_plan list` 确认日程；`/lbm_dashboard` 看整体状态。
+首次使用建议顺序：`/lbm_init emotion` 初始化情绪；`/lbm_plan list` 确认日程；`/lbm_dashboard` 看整体状态。
 
 ## 四个模块
 
 ### 日程规划
 
-- 每天自动生成整日日程；`[schedule] wake_time` / `sleep_time` 是生成基准（起床与入睡锚点）。
-- 每份日程**进账即成为 bot 的作息周期**：上一份日程退为「上轮边界」，新的「本轮开始（≈起床）/本轮结束（≈入睡）」持久化生效；bot 实际改了日程后（例如赖床、整日重排），静默窗与晚安时点会跟随真实作息周期，而不是固定配置。
+- 每天由模型只生成 3~6 条「今天想做什么」的稀疏意图（spine）+ 硬约定 + 作息锚点，其余时段交给滚动层按本地规则推进，不再一次排满全天。
+- `[schedule] wake_time` / `sleep_time` 仍是起床与入睡锚点；`no_sleep_mode=true` 时睡眠窗内不生成任何活动。
+- 每份日程**进账即成为 bot 的作息周期**：上一份退为「上轮边界」，新的「本轮开始（≈起床）/本轮结束（≈入睡）」持久化生效；真实睡眠会话结束时会用真实醒来时刻校正周期。
+- 当前活动只有一个真源：滚动运行时的真实 episode。空闲时如实「没有安排中的活动」，不按时间窗或旧日表编造。
 - `/lbm_plan list` 查看时刻表图，条目带日程属性标签；当天无日程时会先自动生成。
-- `/lbm_plan regenerate [额外要求]` 重建今日日程；`delete` 删除指定目标；`clear` 清理旧日程。
-- 模型生成失败时使用模板兜底，模板同样按你的作息锚定，不会把整日压成默认时段。
+- `/lbm_plan regenerate [额外要求]` 重建今日日意图；`delete` 删除指定目标；`clear` 清理旧日程。
+- 模型生成失败时使用 spine 模板兜底，模板同样按你的作息锚定。
 - 聊天频率随日程属性变化，倍率可在 `mappings/schedule_properties.json` 中调整。
 - 节假日可写入日程块头部，也可让生成时考虑节假日（两个独立开关）。
-- 在对话里提出日程变动时，bot 会判断接受、记为未来约定或拒绝。
+- 在对话里提出日程变动时，bot 会判断接受、记为未来约定或拒绝；固定时间的硬约定**不因晚起顺延，迟到如实记录**。
 
-### 日程滚动化（默认关）
+### 生活状态 / 睡眠（随日程总开关）
 
-> 2026-10-25 新增的日程系统滚动化改造：从「全天一张排满的表」升级为「日意图（spine）+ 滚动执行 + 生活状态 + 活动日志」。**全部新功能默认关**——`[life_state].enabled=false` 与 `[schedule].spine_mode=false` 两开关全关时，插件行为与本版本之前逐字一致，升级后不配置任何新键即与旧版完全相同。
+- **滚动执行与生活状态**：精力/饥饿/专注/压力/社交电量五项连续状态（纯本地规则推进，零模型调用），按 5 分钟节奏在日意图框架内「走一步看一步」地选活动；活动进度随实际进行时长增长（上限 0.95），空闲时段如实显示无活动；被打断的活动进恢复池，可能恢复也可能不了了之。
+- **情绪-生活双向联动（可选，`[life_state] emotion_modulation_enabled`，默认关）**：情绪（愉悦度/唤醒度/支配感）按平滑读数轻微加快或减慢五项生活状态的变化速率；活动完成或被打断也会小幅影响情绪。映射表固定 `mappings/emotion_life_modulation.json`，不提供路径配置键。
+- **睡眠引擎（随日程总开关，无独立开关键）**：到最早起床时间后按精力阈值（默认 0.75）决定是否赖床，最晚 `[schedule_advanced] lie_in_max_until`（默认 12:00）必起；硬约定**至少提前 30 分钟**醒，**固定时间硬约定不因晚起顺延、迟到如实记录**；**正式起床结束当前睡眠会话、记为完成、不进恢复池**；半夜短扰只统计，**确认清醒 ≥5 分钟才重置连续睡眠段、会话仍保留**。睡眠中热关闭日程，会以关闭真实时刻结束会话并交回停止状态；**重新打开不会复活旧会话**。
+- **午休静默（可选，`[patrol] nap_quiet_enabled`，默认关）**：只读取**新 spine 的今日意图**判断是否午休，仅用于静默，不伪造当前活动；旧日表不参与。
+- **活动日志**：实际发生的事记入日程库（计划、进行中、完成、被打断、暂停、放弃、跳过），「我在做什么」只从真实发生读。
+- **调试命令**：管理员可用 `/lbm_life rolling` 命令族（status / state / episodes / spine / sleep / preview 六个子命令）纯只读地查看滚动层与睡眠引擎状态；日程未启用时提示「日程未启用」。
 
-- **日意图（spine，默认关）**：开启 `[schedule].spine_mode` 后，每天由模型只生成 3~6 条「今天想做什么」的稀疏意图 + 硬约定 + 作息锚点，不再一次排满全天；`/lbm_plan regenerate` 与日程工具重排「今天」时同样按 spine 口径生成 3~6 条日意图，其余时段交给本地规则。
-- **滚动执行与生活状态（默认关）**：开启 `[life_state].enabled` 后，bot 拥有精力/饥饿/专注/压力/社交电量五项连续状态（纯本地规则推进，零模型调用），按 5 分钟节奏在日意图框架内「走一步看一步」地选活动；活动进度随实际进行时长增长（上限 0.95），空闲时段如实显示无活动；被打断的活动进恢复池，可能恢复也可能不了了之。
-- **情绪-生活双向联动（默认关，2026-10-26 PR2）**：在滚动化之上再开 `[life_state].emotion_modulation_enabled` 后，情绪与生活状态互相影响——情绪（愉悦度/唤醒度/支配感）按平滑读数轻微加快或减慢五项生活状态的变化速率（如低落时精力掉得更快、紧张时压力更难回落）；反过来，活动完成或被打断也会小幅影响情绪（如完成 25 分钟以上的专注工作情绪略升、被打断略降）。默认关：关闭时与之前行为逐字一致。
-- **活动日志**：实际发生的事记入日程库新表（计划、进行中、完成、被打断、暂停、放弃、跳过），「我在做什么」只从真实发生读，不再按时间窗编造；旧日程表与旧路径完整保留。
-- **调试命令**：管理员可用 `/lbm_life rolling` 命令族（status / state / episodes / spine / sleep / preview 六个子命令）纯只读地查看滚动层与睡眠引擎状态，两开关全关时提示「rolling 未启用」。
-- **配置与映射表**：新增配置段 `[life_state]`（2026-10-25 17 键；2026-10-26 PR2 起 18 键；2026-10-27 PR3 睡眠 7 键 → 25 键）、`[event_catalog]` 段（事件库，10 键，2 个隐藏兼容键）与 `[schedule]` 的 11 个 spine 键、6 条 spine 提示词键（全部默认关）；映射表现共七张——第六张 `mappings/activity_profiles.json`（活动画像表：每类活动的时长分布、可中断性与状态速率，缺失回退内置默认）与第七张 `mappings/emotion_life_modulation.json`（情绪-生活调制表，2026-10-26 PR2 起，默认关不装载；**路径固定，不提供 profile 路径配置键**）。
-- **回滚说明**：本轮改动基于 git 回滚点 `rollback/pre-rolling-20261025`（另有备份分支 `backup/pre-rolling-20261025`）；关闭两开关即回到旧行为，无需回滚代码。
+### 事件库（可选，默认 off）
 
-### 日程系统二期（2.2.0 开发线，默认关）
+- `[event_catalog] mode` = `off`（只用内置池）/`manual`（仅手动刷新）/`auto`（到期后台生成）。
+- 单次生成上限 `max_generated_events=8`、合并总池上限 `max_pool_events=12`；内置池至少 3 条兜底、生成项 `llm_` 前缀、全量校验通过才替换。
+- 独立模型任务 `schedule_events`（宿主没配时回退 `utils`）；`daily_token_budget=9000` 为请求前保守预占、有真实用量按实际结算。
+- 事件文件写坏/缺失/版本不认识时回退内置池并保留 `.bak`，不会覆盖你的用户文件。
 
-> 2026-10-25~27 的二期改造：在滚动化之上加入「双向闭环、睡眠引擎、事件库、统一初始化、目标频率与工具 v2」。
-> **所有新功能默认关**，唯一例外是 `[planning_proactive].target_frequency_always_one=true`（按用户要求默认开）。
-> 关闭新开关时与 2.1.0 行为逐字一致；旧路径、旧表、旧工具名保留到 PR8 清理。
+### 统一初始化
 
-- **双向闭环（默认关）**：`[life_state].emotion_modulation_enabled` 开启后，情绪（愉悦度/唤醒度/支配感）按平滑读数轻微调制五项生活状态的**变化速率**（gain 夹在 0.70~1.30），活动完成/打断也会反过来小幅影响情绪。睡眠目标类型双向跳过（睡眠大修已有）。每日 VAD 回写预算在数据目录 `life_feedback_budget.json`：按**最终实际入账增量**检查并记账、保留逐轴净累计；升级当天的旧 raw 账本无法可靠换算 actual 时**当日暂停新增生活反馈**（旧账原样保留、不重置额度），次日自动进入新口径。
-- **睡眠引擎（默认关，依赖生活状态）**：`[life_state].sleep_engine_enabled=true` 且 `[life_state].enabled=true` 才启用。到最早起床时间后按精力阈值（默认 0.75）决定是否赖床，最晚 `[schedule_advanced].lie_in_max_until`（默认 12:00）必起；硬约定**至少提前 30 分钟**醒，**固定时间硬约定不因晚起顺延、迟到如实记录**；**正式起床结束当前睡眠、记为完成、不进恢复池**；半夜短扰只统计，**确认清醒 ≥5 分钟才重置连续睡眠段、会话仍保留**。睡眠中热关闭引擎，会以关闭真实时刻结束当前会话并交回旧调度。**只开睡眠开关而不开生活状态时，只会提示依赖、不会启用引擎。**
-- **事件库（默认 off）**：`[event_catalog].mode` = `off`（只用内置池）/`manual`（仅手动刷新）/`auto`（到期后台生成）。单次生成上限 `max_generated_events=8`、合并总池上限 `max_pool_events=12`，旧键 `max_events` 仅作生成上限兼容读法；内置池至少 3 条兜底、生成项 `llm_` 前缀、全量校验通过才替换。独立模型任务 `schedule_events`（宿主没配时回退 `utils`）；`daily_token_budget=9000` 为请求前保守预占、有真实用量按实际结算。事件文件写坏/缺失/版本不认识时回退内置池并保留 `.bak`，不会覆盖你的用户文件。
-- **统一初始化**：`/lbm_init`（全量：情绪 + 事件 + 状态/睡眠 + 频率）、`/lbm_init emotion`（强制情绪，兼容旧行为）、`/lbm_init events`（强制刷新事件库）、`/lbm_init status`（只读）。阶段互相独立，失败不拖垮其他阶段；汇总写数据目录 `life_init.json`。旧 `/lbm_emotion_init` 保留一个版本并给迁移提示（PR8 删）。
-- **目标频率恒 1（默认开）**：只对解析成功的**目标陪伴私聊**固定 1.0，其他会话仍按日程属性倍率；启动、配置热重载、目标切换三处自动校准，失败不写缓存、下次重试。关闭即回到旧频率，不是“所有会话都 1.0”；也不会绕过睡眠/静默可用性。
-- **工具 v2 与只读视图**：`lbm_update_schedule` 为规范名，旧名 `lbm_update_schedule_v4` 仍独立注册（同一业务，PR8 删）；`lbm_get_schedule_info` 新增 `next/episodes/spine/intents` 只读视图，保留 `current/status/lover_day/goals`。所有视图零生成、零落库、零 tick、零发送、零模型调用。
-- **数据与迁移**：`schedule.db` 升到 v6（新增 `sleep_sessions` 表，只增不改，旧表可读）；新增用户文件 `mappings/generated_events.json`、数据文件 `life_init.json` 与 `life_feedback_budget.json`；`life_state.json` 损坏或未知版本时**先备份再内存重建**（未知版本拒绝覆盖，**备份失败不得覆盖原坏文件**）。**不承诺跨进程/崩溃时两个文件的事务一致性，也不承诺超出宿主 SDK 契约的硬 token 计费上限。**
-- **回滚**：把 `[life_state].emotion_modulation_enabled`、`sleep_engine_enabled`、`[event_catalog].mode=off`、`target_frequency_always_one=false` 改回即可回到旧行为；不需要回滚代码。破坏性清退、真机灰度与观察期在 PR8/后续执行。
-
-> **验收状态（2026-10-27）**：离线验收已完成——三件套 exit 0，29 个二期专项共 263 用例 exit 0（含真实双向 2016 拍、旧 7 日、VAD 48、事件独立 9）；版本 2.2.0 为**开发版，未发布**。真实 QQ/模型、宿主热重载/跨进程、真机 soak 与 PR8 清理仍属后续批次。
+`/lbm_init`（全量：情绪 + 事件 + 状态/睡眠 + 频率）、`/lbm_init emotion`（强制情绪）、`/lbm_init events`（强制刷新事件库）、`/lbm_init status`（只读）。阶段互相独立，失败不拖垮其他阶段；汇总写数据目录 `life_init.json`。旧 `/lbm_emotion_init` 命令已在 3.0.0 删除，请改用 `/lbm_init emotion`。
 
 ### 虚拟陪伴
 
@@ -110,13 +113,13 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 
 - `/lbm_diag streams` 的候选与序号按**三流分族**显示：「问候·群聊」「问候·其他私聊」「问候·目标私聊（无条件）」「频率调控」四块逐行输出，目标私聊流**回归诊断可见**（序号 = 群聊 → 其他私聊 → 目标私聊）。
 - 检查窗 = 周期判定窗（上份日程开始 → 本份日程开始，非日历 0 点）；判定窗内查不到消息的群聊**不从候选中丢弃**，仍占一个 `#NN` 序号、行显「历史无消息」，行尾注明「硬闸窗内无消息·不发晨晚问候」。
-- 带序号查询（`/lbm_diag streams <序号>`）与候选列表共用**同一序号系**；每流按早/晚各一行给结论（含「早安未开始（连锁待定）」「因早安未开口→晚安连锁硬性忽略」「连锁已通过」「数量闸达标 M/N」等新档），下一行给判定窗端、阈值、冷静期余量等关键量。
+- 带序号查询（`/lbm_diag streams <序号>`）与候选列表共用**同一序号系**；每流按早/晚各一行给结论（含「早安未开始（连锁待定）」「因早安未开口→晚安连锁硬性忽略」「连锁已通过」「数量闸达标 M/N」等档），下一行给判定窗端、阈值、冷静期余量等关键量。
 - 诊断全链**纯读**：不写任何问候状态（掷点、连锁标记、事件缓存），不会干扰问候链自身的判定。
 
 ### QQ 空间
 
 - 开启 `[qzone] enabled` 后，插件按日程节奏自动发说说。
-- 发帖判定链：每日上限、发帖意愿与情绪闸、是否需要当前有活动、概率、静默时段、无活动、午休静默、冷却、模型严判、掷骰；拿不准就不发。
+- 发帖判定链：每日上限、发帖意愿与情绪闸、是否需要当前有活动、概率、静默时段、无活动、午休静默、冷却、模型严判、掷骰；拿不准就不发。当前活动与「是否有活动」读运行时真源，日程关断时如实按无活动处理。
 - 配图有四种模式：`off`（不配图）、`emoji`（宿主表情包，出厂默认）、`library`（本地图库）、`random`（两者各半）。
 - 任何一张图取不到都只跳过该图，全部取不到就发纯文本，配图失败不会阻断发帖。
 - 自动回评；cookie 不可用时降级为「有新评论」提醒。点赞需手动 `/lbm_life qzone like`。
@@ -126,14 +129,15 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 
 - 情绪以愉悦度、唤醒度、支配感三个维度持续起伏，聊天中的大事件会带来冲击。
 - 情绪为回复提供底色与文字描述，也会轻微影响主动频率与发帖意愿。
-- 夜间进入睡眠窗后冻结，醒来时统一结算。
-- `/lbm_emotion_init` 由人设推导基线；`/lbm_emotion_config` 查看、`reset` 或 `clear`。
+- 夜间进入睡眠窗后冻结，醒来时统一结算；有真实睡眠会话时以会话为准，无会话时按 tick 级空窗冻结入口兜底。
+- `/lbm_init emotion` 由人设推导基线；`/lbm_emotion_config` 查看、`reset` 或 `clear`。
 - 情绪映射与描述可在 `mappings/` 的对应表中调整。
 - 睡眠裁判提示词已压缩 reason 与思考要求；调用 `max_tokens` 为 1024（如需进一步压思考链，见 USAGE.md「睡眠裁判思考强度配置指引」）。
+- 情绪→生活反馈的每日回写预算在数据目录 `life_feedback_budget.json`：按**最终实际入账增量**检查并记账、保留逐轴净累计、单次上限 0.15；升级当天的旧 raw 账本无法可靠换算 actual 时**当日暂停新增生活反馈**（旧账原样保留、不重置额度），次日自动进入新口径。
 
 ### bot 自用工具
 
-以下工具由麦麦在对话中自行调用，无需手动输入：`lbm_get_schedule_info`、`lbm_update_schedule`（旧名 `lbm_update_schedule_v4` 以独立工具别名保留）、`lbm_nap_lie_in`、`lbm_mai_lover_send_message`、`lbm_mai_lover_affection`、`lbm_report_harassment`、`lbm_life_qzone`、`lbm_emotion_report`。
+以下工具由麦麦在对话中自行调用，无需手动输入：`lbm_get_schedule_info`（只读，支持 status/current/next/episodes/spine/intents 视图）、`lbm_update_schedule`（唯一日程写入口，写 spine 意图与未来约定）、`lbm_mai_lover_send_message`、`lbm_mai_lover_affection`、`lbm_report_harassment`、`lbm_life_qzone`、`lbm_emotion_report`。3.0.0 已删除旧别名 `lbm_update_schedule_v4`、赖床工具 `lbm_nap_lie_in` 与 `lover_day` / `goals` 视图。
 
 ## 配置速查
 
@@ -141,25 +145,30 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 
 | 配置键 | 默认 | 说明 |
 |---|---|---|
+| `[schedule] enabled` | `true` | **日程唯一总开关**：开 = spine + 滚动运行时 + 生活状态 + 睡眠引擎；关 = 全部停止、无旧路线回落 |
+| `[schedule] wake_time` / `sleep_time` | `07:00` / `23:00` | 起床、入睡锚点：spine 生成与作息周期的基准 |
+| `[schedule] no_sleep_mode` | `false` | 无睡眠模式：睡眠窗内不生成任何活动、不主动开口 |
 | `[patrol] target_qq` | `123456789` | 陪伴对象 QQ；占位值 = 不主动私聊、`/lbm_mai_*` 不可用 |
 | `[admin] admin_users` | `[]` | 管理员 QQ；留空 = 仅本机控制台 |
-| `[schedule] wake_time` / `sleep_time` | `07:00` / `23:00` | 起床、入睡锚点：日程生成的基准；无真实日程时也作作息周期的兜底边界 |
 | `[patrol] relation_type` | `恋人` | bot 与对方的关系，影响口吻与档位名称 |
-| `[patrol] nap_quiet_enabled` | `false` | 午休静默：巡检与空间发帖、评论监听跳过午休时段 |
+| `[patrol] nap_quiet_enabled` | `false` | 午休静默：巡检与空间发帖跳过午休时段（只读 spine 意图） |
 | `[planning_proactive] greeting_morning_enabled` / `greeting_night_enabled` | `true` / `true` | 早安、晚安总开关 |
-| `[planning_proactive] morning_drift` / `night_drift` | `10-30` | 问候漂移区间（分钟）：早安 = 本轮起床钟点 + 漂移；晚安 = 本轮入睡期限 − 漂移 |
-| `[planning_proactive] greeting_morning_silence_hours` | `2.0` | 早安沉默闸（小时）：今日第一日程（周期起点）前 N 小时内 bot 自己在该会话发过消息 → 该会话本周期跳过早安；0 = 关闭 |
-| `[planning_proactive] greeting_require_activation` | `true` | 群聊早安必要性检查：今天日程第一个条目时段内有人主动开口（硬闸之上仍然 AND）；关闭 = 只看硬闸 |
+| `[planning_proactive] morning_drift` / `night_drift` | `10-30` | 问候漂移区间（分钟） |
+| `[planning_proactive] greeting_morning_silence_hours` | `2.0` | 早安沉默闸（小时）；0 = 关闭 |
+| `[planning_proactive] greeting_require_activation` | `true` | 群聊早安必要性检查 |
 | `[planning_proactive] proactive_group_ids` / `proactive_private_ids` | `[]` / `[]` | 群聊、私聊名单 |
-| `[planning_proactive] greeting_other_private_min_messages` | `5` | 其他私聊早安门槛：判定窗（上份日程开始 → 本份日程开始）内对方发送的条数达到该值；最低 1 |
-| `[planning_proactive] greeting_private_night_min_messages` | `5` | 其他私聊晚安阈值：本轮日程开始 → 晚安期限内对方发送条数达到该值即通过（与早安已发连锁二选一）；最低 1 |
-| `[schedule_advanced] greeting_min_silence_minutes` | `3` | 补发冷静期（分钟）：过掷点才达标的早/晚安补发，须 bot 本会话最近一条消息距今 ≥N 分钟才开口；0 = 不要求 |
+| `[planning_proactive] greeting_other_private_min_messages` | `5` | 其他私聊早安门槛 |
+| `[planning_proactive] greeting_private_night_min_messages` | `5` | 其他私聊晚安阈值 |
+| `[planning_proactive] target_frequency_always_one` | `true` | 目标陪伴私聊回复频率恒 1.0（关 = 回属性倍率） |
+| `[schedule_advanced] greeting_min_silence_minutes` | `3` | 补发冷静期（分钟）；0 = 不要求 |
+| `[schedule_advanced] lie_in_max_until` | `12:00` | 赖床硬上限时刻 |
 | `[qzone] enabled` | `false` | QQ 空间模块总开关 |
 | `[qzone] image_mode` | `emoji` | 配图来源：`off` / `emoji` / `library` / `random` |
 | `[patrol] daily_max_speak` | `5` | 每日主动预算上限，只统计巡检与想念 |
-| `[planning_proactive] target_frequency_always_one` | `true` | 目标陪伴私聊回复频率恒 1.0（唯一默认开的新功能；关 = 回属性倍率） |
-| `[life_state] sleep_engine_enabled` | `false` | 睡眠引擎（须同时开 `[life_state] enabled`；单开只提示依赖） |
-| `[event_catalog] mode` | `off` | 事件库：`off` / `manual` / `auto`（灰度建议 off → manual → auto） |
+| `[life_state] emotion_modulation_enabled` | `false` | 情绪-生活双向调制（独立于日程总开关） |
+| `[event_catalog] mode` | `off` | 事件库：`off` / `manual` / `auto` |
+
+`spine_mode`、`[life_state] enabled`、`[life_state] sleep_engine_enabled` 等旧键已退役；旧配置中的显式值在升级时被一次性 pop，不再出现在 WebUI。
 
 ## 自定义映射表
 
@@ -179,8 +188,8 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 | `affection_presets.json` | 好感度档数、档名与区间（1~5 档） |
 | `affection_tier_descriptions.json` | 各档位的注入文案 |
 | `schedule_properties.json` | 日程属性、聊天频率倍率与标签色 |
-| `activity_profiles.json` | 活动画像表（2026-10-25 新增第六张）：滚动化层每类活动的时长分布、可中断性与状态速率；滚动层关闭时不参与运行 |
-| `emotion_life_modulation.json` | 情绪-生活调制表（2026-10-26 新增第七张）：双向闭环的 gain 系数与活动反馈增量/日上限；`emotion_modulation_enabled=false` 时不装载。**路径固定，无自定义路径键** |
+| `activity_profiles.json` | 活动画像表：滚动层每类活动的时长分布、可中断性与状态速率 |
+| `emotion_life_modulation.json` | 情绪-生活调制表：双向闭环的 gain 系数与活动反馈增量/日上限；`emotion_modulation_enabled=false` 时不装载。**路径固定，无自定义路径键** |
 
 这些表只在插件加载或热重载时读取，修改后需要重启或重载才生效。结构、校验与错误回退规则见 `mappings/default_mappings/README.md`。
 
@@ -192,13 +201,15 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 这里保存日程库、情绪状态、好感档案、空间状态与日志，插件只在宿主给定的数据目录内读写。
 
-- `schedule.db`、`emotion_state.json`、`affection_memory.json`、`qzone_state.json` 等可安全删除，删除后相当于重新开始。
+- `schedule.db`、`emotion_state.json`、`affection_memory.json`、`qzone_state.json`、`life_state.json` 等可安全删除，删除后相当于重新开始。
+- `schedule.db` 为 v6（含 `sleep_sessions` 等表）；`mappings/generated_events.json`（事件库）、`life_init.json`（初始化汇总）、`life_feedback_budget.json`（情绪→生活反馈预算）为插件自管用户数据文件。
 - `qzone_cookies.json` 删除后插件会先尝试重新向适配器获取 cookie；只有适配器也取不到时，才需要检查 QQ 登录或适配器状态。
 
 ## 常见问题
 
-- **日程变成了默认时段或明显被压扁？** 用 `/lbm_plan regenerate` 重新生成今日日程即可。
-- **早安或晚安没来？** 先用 `/lbm_diag streams` 查看候选流与序号，再用 `/lbm_diag streams <序号>` 查看该流下一次早安、晚安是否满足触发条件。群聊早安需要判定窗（上份日程开始 → 本份日程开始）内有人说话（必要性开关开启时今天日程第一个条目时段内也要有人开口），且早安没开口的当晚群晚安会被连锁拦下；其他私聊早安需要对方发送条数达门槛、晚安达标即可（连锁或阈值二选一）；过点才达标的补发还受冷静期约束（默认最近 3 分钟 bot 没说过话）。目标私聊无条件，但在 streams 里「无条件」族可见；没收到时用 `/lbm_dashboard` 或决策日志排查。streams 的候选解析与名单状态均为逐行显示：每个候选流独占一行（行首带序号）、名单与频率调控逐项列出，不再以列表形态挤在单行，无折叠、无省略。
+- **升级到 3.0.0 后生活状态/睡眠不动了？** 检查 `[schedule] enabled` 是否为 `true`。旧 `[life_state] enabled` / `sleep_engine_enabled` 已退役，不会再被读取；若你曾显式关掉日程，升级后保持关闭。
+- **日程变成了默认时段或明显被压扁？** 用 `/lbm_plan regenerate` 重新生成今日日意图即可。
+- **早安或晚安没来？** 先用 `/lbm_diag streams` 查看候选流与序号，再用 `/lbm_diag streams <序号>` 查看该流下一次早安、晚安是否满足触发条件。群聊早安需要判定窗（上份日程开始 → 本份日程开始）内有人说话（必要性开关开启时今天日程第一个条目时段内也要有人开口），且早安没开口的当晚群晚安会被连锁拦下；其他私聊早安需要对方发送条数达门槛、晚安达标即可（连锁或阈值二选一）；过点才达标的补发还受冷静期约束（默认最近 3 分钟 bot 没说过话）。目标私聊无条件，但在 streams 里「无条件」族可见；没收到时用 `/lbm_dashboard` 或决策日志排查。
 - **QQ 空间没发出去或没回评？** 用 `/lbm_life qzone status` 检查通道与 cookie，用 `/lbm_life qzone decisions` 查看最近卡在哪一道闸。
 - **命令没反应？** 管理员命令要求 `[admin] admin_users` 中有你；`/lbm_mai_*` 只对 `[patrol] target_qq` 本人开放。`[admin] allowed_streams` 只约束 `/lbm_plan` 与日程注入，不影响其他命令。
 - **只收到文字没有图？** 这是预期的降级：Pillow 或字体不可用、渲染超时时自动改发文字，功能不受影响。
@@ -206,9 +217,9 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 ## 技术信息
 
-- 组件 **32 个** = 9 个命令 + 10 个 Hook + 9 个工具 + 4 个跨插件 API（`[admin].harass_report_enabled=false` 时运行期注册面回落 31）。
+- 组件 **29 个** = 8 个命令 + 10 个 Hook + 7 个工具 + 4 个跨插件 API（`[admin].harass_report_enabled=false` 时运行期注册面回落 28）。
 - 声明 **17 项**宿主能力。
-- 配置 **13 个段 / 258 字段 / 5 隐藏 / 253 可见**（`[plugin]` 3、`[patrol]` 22、`[affection]` 12、`[schedule]` 26、`[schedule_advanced]` 31、`[planning_proactive]` 16、`[life_state]` 25、`[event_catalog]` 10、`[llm]` 9、`[prompts]` 59、`[admin]` 8、`[qzone]` 20、`[emotion]` 17）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
+- 配置 **13 个段 / 248 字段 / 5 隐藏 / 243 可见**（`[plugin]` 3、`[patrol]` 22、`[affection]` 12、`[schedule]` 24、`[schedule_advanced]` 31、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 10、`[llm]` 9、`[prompts]` 56、`[admin]` 8、`[qzone]` 20、`[emotion]` 17；3.0.0 离线 stub+pydantic 实算）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
 - 用户可编辑映射表 **7 张**：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可

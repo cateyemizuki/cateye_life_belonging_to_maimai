@@ -2465,7 +2465,7 @@ class CompanionComponentsMixin:
     # ==================================================================
 
     def _lbm_life_rolling(self, args: str) -> str:
-        """滚动化调试命令主体（/lbm_life rolling <status|state|episodes|spine|preview>）。
+        """滚动化调试命令主体（/lbm_life rolling <status|state|episodes|spine|sleep|preview>）。
 
         R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
         D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
@@ -2479,13 +2479,14 @@ class CompanionComponentsMixin:
         ``rolling_planner`` / ``life_schedule`` 三属性后自动点亮）：
         PlanningServices 属性优先，读模型回退 ``ScheduleQuery._runtime_provider``，
         planner / life_state 回退读模型私有 ``_planner`` / ``_life``，db 回退
-        ``plugin._db``。开关判定 = ``[life_state].enabled``（配置段或服务属性）
-        或 ``[schedule].spine_mode``；两开关全关 → 「rolling 未启用」提示。
+        ``plugin._db``。开关判定 = ``[schedule].enabled`` 唯一总开关（PR8 3.0.0；
+        旧 ``[life_state].enabled`` / ``[schedule].spine_mode`` 已退役，不得再读）；
+        总开关关闭 → 「rolling 未启用」提示，开启但服务未接线 → 就绪=否。
         """
         usage = (
             "用法: /lbm_life rolling <status|state|episodes|spine|sleep|preview>"
             "（管理员；纯只读，零 LLM 零发送零副作用）\n"
-            "  status   — 总览（两开关/当前 episode/next 2 条/状态行/今日 episode 计数）\n"
+            "  status   — 总览（总开关/就绪/当前 episode/next 2 条/状态行/今日 episode 计数）\n"
             "  state    — LifeState 全字段数值 + 最近阈值跨越\n"
             "  episodes — 今日 episode 逐条（状态/进度/计划 vs 实际/来源/原因）\n"
             "  spine    — 今日 spine 意图与硬约定及参数\n"
@@ -2527,12 +2528,12 @@ class CompanionComponentsMixin:
                 except Exception:
                     return False
 
-            life_on = (_cfg_on("life_state", "enabled")
-                       or bool(getattr(model, "enabled", False))
-                       or bool(getattr(planner, "enabled", False)))
-            spine_on = _cfg_on("schedule", "spine_mode")
-            if not life_on and not spine_on:
-                return "rolling 未启用（[life_state].enabled / [schedule].spine_mode 均为 false）"
+            # PR8 3.0.0：日程唯一总开关 = [schedule].enabled；就绪只看真实服务句柄，
+            # 不再用已退役的 spine_mode / life_state.enabled 覆盖统一开关。
+            schedule_on = _cfg_on("schedule", "enabled")
+            runtime_ready = model is not None and planner is not None and life is not None
+            if not schedule_on:
+                return "rolling 未启用（[schedule].enabled=false）"
 
             now = datetime.now()
             date = now.strftime("%Y-%m-%d")
@@ -2546,8 +2547,9 @@ class CompanionComponentsMixin:
             # ── status：总览 ──────────────────────────────────────────────
             def _lines_status() -> str:
                 out = [f"[rolling status] {date} {now.strftime('%H:%M')}"]
-                out.append(f"开关：[life_state].enabled={life_on}"
-                           f"｜[schedule].spine_mode={spine_on}")
+                out.append(f"开关：[schedule].enabled={schedule_on}")
+                out.append(f"就绪：{'是' if runtime_ready else '否'}"
+                           f"（runtime/planner/life_state 三者齐备）")
                 out.append(f"接线：read_model={'是' if model is not None else '否'}"
                            f"｜planner={'是' if planner is not None else '否'}"
                            f"｜life_state={'是' if life is not None else '否'}")
@@ -2742,8 +2744,8 @@ class CompanionComponentsMixin:
                     except Exception as exc:
                         out.append(f"spine 意图读取失败：{exc}")
                 if not intents:
-                    out.append("今日没有 spine 意图行（[schedule].spine_mode 未开，"
-                               "或今日日程非 spine 生成）。")
+                    out.append("今日没有 spine 意图行（今日尚未生成 spine 日程，"
+                               "或旧日表未重新生成）。")
                     return "\n".join(out)
                 hard = [i for i in intents if i.get("hardness") == "hard"]
                 out.append(f"意图 {len(intents)} 条（硬约定 {len(hard)} 条）：")
@@ -2802,7 +2804,7 @@ class CompanionComponentsMixin:
             def _lines_sleep() -> str:
                 out = [f"[rolling sleep] {date} {now.strftime('%H:%M')}"]
                 if engine is None:
-                    out.append("睡眠引擎未装配（[life_state].sleep_engine_enabled=false "
+                    out.append("睡眠引擎未装配（[schedule].enabled=false "
                                "或未接线）。")
                 else:
                     info = _sleep_fields()

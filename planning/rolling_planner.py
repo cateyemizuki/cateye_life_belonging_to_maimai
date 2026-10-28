@@ -724,7 +724,13 @@ class RollingPlanner:
                 planned_end = int(current.get("planned_end_minute") or 0)
             except (TypeError, ValueError):
                 planned_end = 0
-            if planned_end and cur >= planned_end \
+            # 跨午夜口径（2026-10-28 真机缺陷修复）：planned_end 按 episode 自身日帧
+            # 存储（>1440 = 次日），关闭比较必须用同一日帧的当前分钟。裸 cur 在次日
+            # 回绕 0~1439 后对跨午夜 planned_end（如前日 23:42 idle、end=1454）永假
+            # → 步 2 永不关闭，步 3 睡眠锚点（要求无当前 episode）与步 5 选活动被
+            # 无限阻塞（真机实测卡 391 分钟、今日 episode=0，重启不解）。
+            cur_frame = self._episode_frame_minute(current, now)
+            if planned_end and cur_frame >= planned_end \
                     and not self._engine_owns_sleep(current):
                 self._finish_episode(current, now, snapshot,
                                      actual_end_minute=planned_end, reason="planned_end_reached")

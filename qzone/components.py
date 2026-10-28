@@ -146,7 +146,7 @@ class QzoneComponentsMixin:
             "           （管理员：post 文本、reply 说说序号 [评论序号] 内容、like tid [目标QQ]、"
             "decisions [条数] 发帖判定历史）\n"
             "/lbm_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /lbm_diag life，行为相同\n"
-            "/lbm_life rolling [status|state|episodes|spine|preview] - 滚动日程调试（管理员；纯只读）\n"
+            "/lbm_life rolling [status|state|episodes|spine|sleep|preview] - 滚动日程调试（管理员；纯只读）\n"
             "/lbm_life help - 本帮助；日程与陪伴功能另有 /lbm_plan 与 /lbm_mai_* 命令"
         )
 

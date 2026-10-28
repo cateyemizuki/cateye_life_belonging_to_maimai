@@ -249,7 +249,8 @@ SCHEDULE_RETRY_FEEDBACK_DEFAULT = (
 )
 # ── spine 日意图生成提示词（2026-10-25 滚动化改造新增；R7 依据 = 用户 2026-10-25 直派，
 #    设计目录 D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）──
-# 仅 [schedule].spine_mode=true 时使用；零 emoji、不引导主动提日程、不要求长描述。
+# PR8 3.0.0：spine 为唯一生成路线（旧 [schedule].spine_mode 已退役），本提示词无条件生效。
+# 零 emoji、不引导主动提日程、不要求长描述。
 #: spine 日意图主任务（占位符：{min_intentions} / {max_intentions} / {wake_text} /
 #: {sleep_text} / {no_sleep_line} / {described_note}）
 SCHEDULE_SPINE_TASK_DEFAULT = (
@@ -709,7 +710,7 @@ class PromptsSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "日程·重试反馈", "rows": 4,
                            **_ui_i18n("Retry feedback template")},
     )
-    # ── spine 日意图（2026-10-25 滚动化改造新增；仅 [schedule].spine_mode=true 时使用）──
+    # ── spine 日意图（2026-10-25 滚动化改造新增；PR8 3.0.0 起为唯一生成路线）──
     schedule_spine_task: str = Field(
         default=SCHEDULE_SPINE_TASK_DEFAULT,
         description="spine 日意图主任务（占位符：{min_intentions} {max_intentions} {wake_text} "

@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "workspace_title": "属于麦麦的生活",
+  "pages": [
+    {
+      "type": "custom",
+      "title": "状态面板",
+      "icon": "chart",
+      "placement": "sidebar",
+      "entry": "webui/index.html"
+    }
+  ]
+}

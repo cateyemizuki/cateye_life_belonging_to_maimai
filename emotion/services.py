@@ -33,7 +33,9 @@ class EmotionServices:
         #: 热更新由关到开时只补这一组，不能因 bridge 已订阅就整体早退（2026-10-27 用户补单）。
         self._feedback_unsubs: list = []
         #: R7 = PR2 双向闭环（2026-10-26）：LifeState/Episode → VAD 反馈服务
-        #: （[life_state] 双开关 + 情绪总开关任一关 → 不实例化，恒 None）
+        #: （PR8 3.0.0：``[schedule].enabled`` 唯一总开关关闭，或
+        #: ``emotion_modulation_enabled`` 关闭 → 不实例化，恒 None；旧
+        #: ``[life_state].enabled`` 已退役，不得再读）
         self._life_feedback: Any = None
 
     # 事件订阅挂点（start() 调用；stop() 注销）
@@ -64,9 +66,14 @@ class EmotionServices:
         if self.bus is None:
             return
         try:
-            section = getattr(getattr(self._plugin, "config", None), "life_state", None)
+            cfg = getattr(self._plugin, "config", None)
+            schedule = getattr(cfg, "schedule", None)
+            section = getattr(cfg, "life_state", None)
+            # PR8 3.0.0：日程总开关唯一真源 = [schedule].enabled；emotion_modulation_enabled
+            # 是独立功能设置（不因它缺失而放宽日程开关，反之亦然）。
             desired = bool(
-                section is not None and bool(getattr(section, "enabled", False))
+                schedule is not None and bool(getattr(schedule, "enabled", False))
+                and section is not None
                 and bool(getattr(section, "emotion_modulation_enabled", False))
                 and self.is_enabled())
         except Exception:
