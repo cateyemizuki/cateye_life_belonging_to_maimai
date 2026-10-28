@@ -1105,14 +1105,15 @@ class SleepEngine:
         if callable(writer):
             try:
                 writer({
-                    "sleep_started_at": session.metadata.get("sleep_started_at"),
-                    "continuous_sleep_minutes": int(session.continuous_minutes),
-                    "sleep_segment_started_at": self._iso(self._clock.started_at),
-                    "sleep_interrupted": bool(self._clock.record.interrupted),
+                    # A closed session must never re-arm LifeState during persist/unload.
+                    "sleep_started_at": None if session.closed else session.metadata.get("sleep_started_at"),
+                    "continuous_sleep_minutes": 0 if session.closed else int(session.continuous_minutes),
+                    "sleep_segment_started_at": None if session.closed else self._iso(self._clock.started_at),
+                    "sleep_interrupted": False if session.closed else bool(self._clock.record.interrupted),
                     "last_wake_reason": session.wake_reason,
                     "last_sleep_at": session.metadata.get("sleep_started_at"),
-                    "sleep_wake_target": self._iso(session.earliest_wake_at),
-                    "sleep_lie_in_cap": self._iso(session.lie_in_cap_at),
+                    "sleep_wake_target": None if session.closed else self._iso(session.earliest_wake_at),
+                    "sleep_lie_in_cap": None if session.closed else self._iso(session.lie_in_cap_at),
                 })
             except Exception:
                 pass
@@ -1146,7 +1147,10 @@ class SleepEngine:
                 except Exception:
                     session = None
         if session is None:
+            session = self._restore_recent_closed(current)
+        if session is None:
             return self._restore_from_life_state(current)
+        self._reconcile_recorded_wake(session, current)
         if session.earliest_wake_at is None:
             session.earliest_wake_at = next_occurrence(
                 current, self._anchors()[1]) if session.actual_start_minute is None else None
@@ -1165,6 +1169,72 @@ class SleepEngine:
         self._prepared = None
         return session
 
+    def _restore_recent_closed(self, current: datetime) -> Optional[SleepSession]:
+        """Retain the already-awake provider until this sleep cycle's cap after reload."""
+        query = getattr(self._store, "query_sleep_sessions", None)
+        if not callable(query):
+            return None
+        candidates: List[SleepSession] = []
+        try:
+            for offset in (0, 1):
+                date = (current-timedelta(days=offset)).strftime("%Y-%m-%d")
+                for row in query(schedule_date=date, limit=50) or []:
+                    candidate = row if isinstance(row, SleepSession) else SleepSession.from_row(row)
+                    if candidate.closed and candidate.lie_in_cap_at is not None \
+                            and current < candidate.lie_in_cap_at:
+                        candidates.append(candidate)
+        except Exception:
+            return None
+        return max(candidates, key=lambda candidate: (candidate.schedule_date,
+                   candidate.actual_start_minute or 0)) if candidates else None
+
+    def _reconcile_recorded_wake(self, session: SleepSession, current: datetime) -> None:
+        """Repair an old resurrected row from the durable wake marker, without settlement.
+
+        No debt/energy recalculation, wake event or endpoint write. A completed sleep
+        episode may supply the original reason; otherwise record the recovery honestly.
+        """
+        if session.closed:
+            return
+        fields = self._snapshot()
+        started = self._parse(session.metadata.get("sleep_started_at"))
+        settled = self._parse(fields.get("last_sleep_at"))
+        try:
+            if started is None or settled is None or not started <= settled <= current:
+                return
+        except TypeError:
+            return
+        end = self._frame_minutes(settled, session.schedule_date)
+        reason = str(fields.get("last_wake_reason") or "recovered_settlement")
+        episodes = getattr(self._store, "episodes_today", None)
+        if callable(episodes):
+            try:
+                for row in episodes(session.schedule_date) or []:
+                    if row.get("goal_type") == "sleep" and row.get("status") == "completed" \
+                            and row.get("actual_start_minute") == session.actual_start_minute \
+                            and row.get("actual_end_minute") == end:
+                        metadata = row.get("metadata") or {}
+                        candidate = str(metadata.get("close_reason") or "").removeprefix("sleep_engine_")
+                        if candidate in WAKE_REASONS:
+                            reason = candidate
+                        break
+            except Exception:
+                pass
+        session.actual_end_minute = end
+        session.closed_at = settled
+        session.wake_reason = reason
+        session.sleep_debt_after = self._debt_now()
+        session.metadata["settled"] = True
+        session.metadata["restored_from_settlement_marker"] = settled.isoformat()
+        emitted = session.metadata.setdefault("emitted", [])
+        if "woke" not in emitted:
+            emitted.append("woke")
+        self._session = session
+        self._save_session()
+        self._log("sleep.session_restore_reconciled", session_id=session.session_id,
+                  recorded_wake=settled.isoformat(), wake_reason=reason,
+                  no_new_settlement=True)
+
     def _restore_from_life_state(self, current: datetime) -> Optional[SleepSession]:
         fields = self._snapshot()
         continuous = fields.get("continuous_sleep_minutes")
@@ -1172,6 +1242,19 @@ class SleepEngine:
         started = self._parse(started_raw)
         if started is None:
             return None
+        # Old persist() could repopulate active fields after a completed wake. A
+        # durable last_sleep_at at/after this start forbids snapshot resurrection.
+        settled = self._parse(fields.get("last_sleep_at"))
+        try:
+            if settled is not None and started <= settled <= current:
+                writer = getattr(self._life, "apply_sleep_fields", None)
+                if callable(writer):
+                    writer({"sleep_started_at": None, "continuous_sleep_minutes": 0,
+                            "sleep_segment_started_at": None, "sleep_interrupted": False,
+                            "sleep_wake_target": None, "sleep_lie_in_cap": None})
+                return None
+        except (TypeError, ValueError):
+            pass
         target = self._parse(fields.get("sleep_wake_target"))
         try:
             continuous_value = int(continuous or 0)
