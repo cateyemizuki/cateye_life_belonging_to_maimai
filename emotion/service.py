@@ -278,6 +278,8 @@ class EmotionService:
         self._overhaul_next_retry_at: Optional[datetime] = None
         self._overhaul_error_logged: bool = False
         self._overhaul_abandoned: bool = False
+        self._referee_health: Dict[str, Any] = {"last_attempt_at": None, "last_success_at": None,
+                                               "error_class": "", "task": ""}
         #: M5 睡眠周期窗口 (start, end)：按作息锚点整夜（条目会被截断，不能作窗口）
         self._sleep_period: Optional[Tuple[datetime, datetime]] = None
         #: M5 连续低迷达标状态（streak ≥ 门槛时的事件载荷；供 planning 强制插入恢复类活动）
@@ -376,6 +378,17 @@ class EmotionService:
         if isinstance(previous, dict) and "applied_sleep_date" in previous:
             state["applied_sleep_date"] = previous["applied_sleep_date"]
         save_json_atomic(self._state_path, state)
+        try:
+            from .observations import EmotionObservations
+            from planning.time_utils import TimezoneManager
+            history = getattr(self, "_observations", None)
+            if history is None:
+                history = self._observations = EmotionObservations(self._state_path.with_name("emotion_observations.json"))
+            timezone_name = getattr(getattr(self._plugin.config, "schedule_advanced", None), "timezone", "Asia/Shanghai")
+            observed_at = TimezoneManager(timezone_name or "Asia/Shanghai").get_now()
+            history.sample(observed_at, self._machine.effective_vad().to_dict(), bool(self._machine.frozen))
+        except Exception:
+            pass
 
     def _save_params(self) -> None:
         save_json_atomic(self._config_path, {"params": self._machine.params.to_dict(),
@@ -2154,7 +2167,9 @@ class EmotionService:
         commitment_net = self._commitment_net_today()
         delta_limit = self.sleep_delta_limit()
 
-        referee_task = purpose_task(self._plugin, "emotion_referee", default="replyer")
+        referee_task = purpose_task(self._plugin, "emotion_referee", default="utils")
+        self._referee_health = {**getattr(self, "_referee_health", {}), "task": referee_task,
+                                "last_attempt_at": now.isoformat(), "error_class": ""}
         vad = self._machine.effective_vad()  # 裁判接收已应用偏移的值（§九.3）
         result = await ask_sleep_referee(
             self._llm(),
@@ -2169,7 +2184,9 @@ class EmotionService:
             plugin=self._plugin,
         )
         if result is None:
+            self._referee_health["error_class"] = "no_valid_structured_result"
             return None
+        self._referee_health["last_success_at"] = now.isoformat()
         delta, reasons = result
         cached = {
             "delta": delta, "reasons": reasons, "sleep_hours": hours,

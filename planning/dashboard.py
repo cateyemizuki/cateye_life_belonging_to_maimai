@@ -117,6 +117,10 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
                        'wake_at', 'lie_in_cap', 'closed_at')}
     companion = read('陪伴状态暂不可读', lambda: _companion_summary(plugin, date=date), {'available': False})
     observations = []
+    if safe_state['focus'] is not None and safe_state['focus'] < .3:
+        observations.append('专注偏低，滚动日程会提供休息恢复机会；数值不会被直接抬高。')
+    if safe_state['stress'] == 0:
+        observations.append('压力为零表示当前很放松；减压速率累积并钳到零是允许的状态。')
     if safe_state['energy'] is not None and safe_state['energy'] < .3:
         observations.append('精力偏低，留意后续休息与恢复活动。')
     if safe_state['hunger'] is not None and safe_state['hunger'] > .7:
@@ -143,6 +147,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
                   'configured_wake': str(getattr(getattr(cfg, 'schedule', None), 'wake_time', '') or '')[:8]},
         'companion': companion, 'observations': observations, 'warnings': list(dict.fromkeys(warnings))[:8],
     }
+    result.update(_extension_summary(plugin, now, hours))
     if future_state:
         result['warnings'].append('状态时间晚于当前时钟，请核对服务器时间')
     if history.get('clock_regressed'):
@@ -157,6 +162,69 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
             result['history']['downsampled'] = True
         elif len(result['schedule']['episodes']) > 10:
             result['schedule']['episodes'] = result['schedule']['episodes'][len(result['schedule']['episodes'])//2:]
-        else:
+        elif len(result.get('emotion', {}).get('history', {}).get('points', [])) > 30:
+            series = result['emotion']['history']
+            points = series['points']
+            # Keep gap flags visible when removing intermediate samples.
+            reduced = []
+            for index in range(0, len(points), 2):
+                point = dict(points[index])
+                if index and any(p.get('gap_before') for p in points[max(0,index-1):index+1]):
+                    point['gap_before'] = True
+                reduced.append(point)
+            if reduced[-1].get('at') != points[-1].get('at'):
+                reduced.append(points[-1])
+            series.update(points=reduced, downsampled=True)
+        elif result['schedule']['intents']:
             result['schedule']['intents'] = result['schedule']['intents'][:len(result['schedule']['intents'])//2]
+        else:
+            # Independent projections must never trap the read handler in a size loop.
+            result.update(emotion={'available': False, 'reason': 'payload_limit'},
+                          qzone={'available': False, 'reason': 'payload_limit'}, usage={}, health={})
+            break
+    return result
+
+
+def _extension_summary(plugin: Any, now: datetime, hours: int) -> dict[str, Any]:
+    """Independent module projections; never propagate raw event descriptions/logs."""
+    result: dict[str, Any] = {'emotion': {'available': False}, 'qzone': {'available': False},
+                              'usage': {}, 'health': {}}
+    try:
+        service = getattr(getattr(plugin, '_emotion', None), 'service', None)
+        if service is not None:
+            from core.llm_utils import purpose_task
+            raw = service.status_snapshot()
+            history = getattr(service, '_observations', None)
+            result['emotion'] = {
+                'available': True, 'enabled': bool(service._enabled()), 'frozen': bool(raw.get('frozen')),
+                'label': str(raw.get('label') or raw.get('mood_text') or '')[:80],
+                'effective': {key: _number(raw.get('effective', {}).get(key)) for key in ('valence', 'arousal', 'dominance')},
+                'event_count': int(raw.get('event_count') or 0),
+                'recent_events': [{key: row.get(key) for key in ('time', 'v', 'a', 'd')} for row in raw.get('recent_events', [])[-3:]],
+                'history': history.snapshot(now, hours) if history else {'points': []},
+                'referee': {'task': purpose_task(plugin, 'emotion_referee', default='utils'),
+                            'attempts': int(getattr(service, '_overhaul_retry_count', 0)),
+                            'cached': bool(getattr(service, '_pending_overhaul', None)),
+                            'abandoned': bool(getattr(service, '_overhaul_abandoned', False)),
+                            **{k: v for k, v in getattr(service, '_referee_health', {}).items()
+                               if k in ('last_attempt_at', 'last_success_at', 'error_class')}}}
+    except Exception:
+        result['emotion'] = {'available': False, 'reason': 'projection_unavailable'}
+    try:
+        service = getattr(plugin, '_qzone', None)
+        if service is not None:
+            raw = service.status_snapshot()
+            result['qzone'] = {'available': True, **{key: raw.get(key) for key in
+                                ('enabled', 'posts_today', 'daily_max_posts', 'reply_comments_enabled',
+                                 'cookie_health', 'delivery', 'last_post_at', 'cooldown_minutes')}}
+    except Exception:
+        result['qzone'] = {'available': False, 'reason': 'projection_unavailable'}
+    try:
+        from core.monitoring import usage_summary, runtime_health
+        data_dir = getattr(plugin, '_data_dir', None)
+        if data_dir:
+            result['usage'] = usage_summary(data_dir, now, min(hours, 48))
+        result['health'] = runtime_health(plugin, now)
+    except Exception:
+        pass
     return result

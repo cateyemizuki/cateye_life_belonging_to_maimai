@@ -26,6 +26,8 @@ mapMsgList 映射时丢弃，动作面没有任何动作能返回评论正文，
 
 from __future__ import annotations
 
+from .publish_guard import PublishLedger, preview_post, definitely_unavailable
+
 import asyncio
 import base64
 import math
@@ -153,6 +155,9 @@ class QzoneService:
         self._state: Dict[str, Any] = {}
         self._target_stream_id = ""
         self._channel_cache: Dict[str, str] = {}  # 动作 -> 命中的通道描述
+        self._publish_ledger = PublishLedger()
+        self._publish_lock = asyncio.Lock()
+        self._send_ambiguous = False
         #: §18.4 发帖判定历史（deque，最多 20 条，最新在前；进程内、热重载清零——调试用途）
         self._decision_history = DecisionHistory(20)
         #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
@@ -183,6 +188,7 @@ class QzoneService:
         self._state.setdefault("processed_list", {})  # {fid: [已回评的 comment_tid, ...]}
         #: §18.4 冷却锚点（**只在发送成功后更新**，落盘跨热重载；ISO 字符串）
         self._state.setdefault("last_post_at", "")
+        self._publish_ledger = PublishLedger(Path(data_dir) / "qzone_publish_receipts.json")
 
     def set_target(self, stream_id: str) -> None:
         """目标私聊 stream（新评论主动提醒用）。"""
@@ -218,8 +224,6 @@ class QzoneService:
         action = _QZONE_ACTIONS[kind]
         cached = self._channel_cache.get(kind)
         candidates: list[tuple[str, str]] = []
-        if cached:
-            candidates.append((cached, ""))
         candidates += [
             ("semantic", f"adapter.napcat.qzone.{action}"),
             ("semantic_full", f"maibot-team.snowluma-adapter.adapter.napcat.qzone.{action}"),
@@ -227,6 +231,10 @@ class QzoneService:
             ("passthrough_snowluma_full", _PASSTHROUGH_APIS[1]),
             ("passthrough_napcat", _PASSTHROUGH_APIS[2]),
         ]
+        if cached:
+            candidates.sort(key=lambda row: row[0] != cached)
+        if kind == "send":
+            self._send_ambiguous = False
         last_error = ""
         for channel, api_name in candidates:
             try:
@@ -236,17 +244,48 @@ class QzoneService:
                     resp = await self._ctx.api.call(api_name, params=params)
             except Exception as e:
                 last_error = f"{api_name}: {e}"
+                if kind == "send" and not definitely_unavailable(e):
+                    self._send_ambiguous = True
+                    return False, None, "发布结果待核对（动作未返回确定回执）"
                 continue
             ok, data, err = self._unwrap(resp)
             if ok:
                 self._channel_cache[kind] = channel
                 return True, data, ""
+            if kind == "send" and not definitely_unavailable(err):
+                self._send_ambiguous = True
+                return False, None, "发布结果待核对（适配器未给出可确认回执）"
             last_error = f"{api_name}: {err}"
         return False, None, last_error or "所有调用通道均不可用（检查 SnowLuma 适配器）"
 
     # ---- 说说读写 ----
     async def post_moment(self, text: str, *, images: Optional[List[bytes]] = None,
                           ugc_right: int = 1) -> Optional[Dict[str, Any]]:
+        """Serialize publishing and persist intent before dispatch; never replay uncertainty."""
+        if not str(text or "").strip():
+            return None
+        visibility = int(ugc_right) if ugc_right in (1, 4, 16, 64, 128) else 1
+        preview = preview_post(text, images, visibility)
+        async with self._publish_lock:
+            allowed, receipt = self._publish_ledger.begin(preview)
+            if not allowed:
+                if receipt.get("status") == "sent":
+                    return dict(receipt.get("result") or {}) or None
+                self._log("skip", trigger_type="qzone_post", reason="发布已排队或结果待核对，不重复发送",
+                          delivery_state=str(receipt.get("status") or "unknown"))
+                return None
+            try:
+                result = await self._post_moment_once(text, images=images, ugc_right=visibility)
+            except BaseException:
+                self._publish_ledger.finish(preview["key"], "uncertain", error="interrupted")
+                raise
+            status = "sent" if result else "uncertain" if self._send_ambiguous else "retry_wait"
+            self._publish_ledger.finish(preview["key"], status, result=result,
+                                        error="" if result else "outcome_unknown" if self._send_ambiguous else "unavailable")
+            return result
+
+    async def _post_moment_once(self, text: str, *, images: Optional[List[bytes]] = None,
+                                ugc_right: int = 1) -> Optional[Dict[str, Any]]:
         """发表说说（可带图）。优先 SnowLuma 动作通道（客户端持续维护），失败回退 Web CGI 直连。
 
         ``images`` 为收集层产出的 ``list[bytes]``（§18.1 契约：收集层只产出 bytes，与发布层解耦）：
@@ -264,13 +303,17 @@ class QzoneService:
             params["images"] = [f"base64://{base64.b64encode(img).decode('ascii')}" for img in image_list]
         ok, data, err = await self.call_action("send", params)
         result = data if ok and isinstance(data, dict) and data.get("tid") else None
-        if result is None and self._cookie_manager is not None:
+        if ok and result is None:
+            self._send_ambiguous = True
+        if result is None and not self._send_ambiguous and self._cookie_manager is not None:
             # 动作通道失败 → Web CGI 直连（发布端点相同，cookie/g_tk 与 SnowLuma 同源）
             client = await self._cookie_manager.get_client()
             if client is not None:
                 tid = await client.publish(text.strip(), images=image_list or None)
                 result = {"tid": tid, "time": ""} if tid else None
                 if result is None:
+                    # CGI may have accepted the post before its response was lost.
+                    self._send_ambiguous = True
                     err = f"{err}; CGI 直连也失败"
         self._log("trigger" if result else "skip", trigger_type="qzone_post",
                   reason=("发说说成功（含 %d 张配图）" % len(image_list)) if result and image_list
@@ -897,6 +940,27 @@ class QzoneService:
             except asyncio.TimeoutError:
                 continue
 
+    async def _process_delivery_queue(self, now: datetime) -> None:
+        """Only replay posts proven not dispatched, within existing quiet/budget gates."""
+        cfg = self._qzone_cfg()
+        if not bool(getattr(cfg, "enabled", False)):
+            return
+        limit = int(getattr(cfg, "daily_max_posts", 0) or 0)
+        if limit <= 0 or self.posts_today() >= limit:
+            return
+        last = self._state.get("last_post_at")
+        try:
+            if last and (now-datetime.fromisoformat(last)).total_seconds() < max(0, int(getattr(cfg,"post_cooldown_minutes",0) or 0))*60:
+                return
+        except (ValueError, TypeError):
+            return
+        for row in list(self._publish_ledger.rows.values()):
+            if row.get("status") == "retry_wait" and int(row.get("attempts",0)) < 2 \
+                    and float(row.get("retry_at",0)) <= now.timestamp() \
+                    and row.get("image_count") == 0 and int(row.get("characters",0)) <= 5000:
+                await self.post_moment(str(row.get("content") or ""), ugc_right=int(row.get("visibility",1)))
+                break  # One queued attempt per existing scheduler tick.
+
     async def _tick(self) -> None:
         cfg = self._qzone_cfg()
         if not cfg.enabled:
@@ -926,6 +990,7 @@ class QzoneService:
                     return
             except Exception:
                 pass
+        await self._process_delivery_queue(now)
         # 按日程发说说
         if cfg.daily_max_posts > 0 and self.posts_today() < cfg.daily_max_posts and cfg.post_by_schedule:
             # M4（§6.2 D）：发帖判定 = post_rate × mood_effect.post_rate；
@@ -1062,4 +1127,6 @@ class QzoneService:
             "cooldown_minutes": int(getattr(cfg, "post_cooldown_minutes", 0) or 0),
             "last_post_at": str(self._state.get("last_post_at") or ""),
             "last_decision": dict(self._decision_history.last() or {}),
+            "cookie_health": self._cookie_manager.status_snapshot() if self._cookie_manager and hasattr(self._cookie_manager, "status_snapshot") else {},
+            "delivery": self._publish_ledger.summary(),
         }

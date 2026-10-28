@@ -506,11 +506,12 @@ class LLMService:
         if tracker is None or not isinstance(result, dict):
             return
         try:
-            prompt_tokens, completion_tokens, total_tokens, _ = extract_usage(result)
+            prompt_tokens, completion_tokens, total_tokens, usage_available = extract_usage(result)
             tracker.record(event=event, model=result.get("model_name") or result.get("model"),
                            prompt_tokens=prompt_tokens,
                            completion_tokens=completion_tokens,
-                           total_tokens=total_tokens)
+                           total_tokens=total_tokens, usage_available=usage_available,
+                           request_id=result.get("request_id") or result.get("id") or "")
         except Exception:
             try:
                 self._ctx.logger.debug("LLM 消耗记账失败（忽略）", exc_info=True)

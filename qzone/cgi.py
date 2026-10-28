@@ -24,6 +24,8 @@ import base64
 import json
 import re
 import time
+from datetime import datetime
+from core.storage import save_json_atomic
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -86,6 +88,18 @@ class QzoneCookieManager:
         self._last_refresh = 0.0
         self._api_channel = ""  # 命中的适配器通道
         self._cached: Optional[Dict[str, str]] = None
+        self._last_attempt = 0.0
+        self._expired_cookies = None
+        self._health = {"status": "not_checked", "source": "", "last_success_at": None,
+                        "last_failure_at": None, "error_class": ""}
+
+    def _failed(self, category: str) -> None:
+        self._health.update(status=category, error_class=category,
+                            last_failure_at=datetime.now().astimezone().isoformat())
+
+    def mark_auth_expired(self) -> None:
+        self._expired_cookies = dict(self._cached or {})
+        self._failed("expired")
 
     # ---- 各级来源 ----
     async def _fetch_via_adapter(self) -> Optional[Dict[str, str]]:
@@ -100,9 +114,11 @@ class QzoneCookieManager:
                     resp = await self._ctx.api.call(api_name, action_name=action, params=params)
                 else:
                     resp = await self._ctx.api.call(api_name, params=params)
-            except Exception:
+            except Exception as exc:
+                self._failed("network_error" if isinstance(exc, (TimeoutError, ConnectionError, httpx.TransportError)) else "adapter_unavailable")
                 continue
             if not isinstance(resp, dict) or resp.get("status") != "ok":
+                self._failed("adapter_unavailable")
                 continue
             data = resp.get("data") or {}
             cookie_str = str(data.get("cookies") or "")
@@ -110,6 +126,7 @@ class QzoneCookieManager:
             if cookies.get("uin"):
                 self._api_channel = channel
                 return cookies
+            self._failed("not_logged_in")
         return None
 
     async def _fetch_via_napcat_http(self) -> Optional[Dict[str, str]]:
@@ -125,6 +142,7 @@ class QzoneCookieManager:
                 resp.raise_for_status()
                 data = resp.json()
         except Exception:
+            self._failed("network_error")
             return None
         if data.get("status") != "ok":
             return None
@@ -140,8 +158,7 @@ class QzoneCookieManager:
 
     def _save_local(self, cookies: Dict[str, str]) -> None:
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+            save_json_atomic(self._path, cookies)
         except OSError:
             pass
 
@@ -149,30 +166,48 @@ class QzoneCookieManager:
     async def get_cookies(self, force: bool = False) -> Optional[Dict[str, str]]:
         import asyncio
 
-        if not force and self._cached and (time.monotonic() - self._last_refresh) < self._refresh_interval:
+        if not force and self._health["status"] != "expired" and self._cached and (time.monotonic() - self._last_refresh) < self._refresh_interval:
             return self._cached
+        if not force and self._last_attempt and time.monotonic()-self._last_attempt < 60:
+            return self._cached
+        self._last_attempt = time.monotonic()
         for fetcher in (self._fetch_via_adapter, self._fetch_via_napcat_http, self._load_local):
             try:
                 cookies = await fetcher() if asyncio.iscoroutinefunction(fetcher) else fetcher()
             except Exception:
                 cookies = None
+            if cookies and cookies == self._expired_cookies:
+                self._failed("expired")
+                continue
             if cookies:
+                self._expired_cookies = None
                 self._cached = cookies
                 self._last_refresh = time.monotonic()
+                ready = bool(cookies.get("skey") or cookies.get("p_skey"))
+                self._health.update(status=("cached" if fetcher == self._load_local else "ready") if ready else "expired",
+                                    source="local" if fetcher == self._load_local else "adapter" if fetcher == self._fetch_via_adapter else "http",
+                                    last_success_at=datetime.now().astimezone().isoformat(),
+                                    error_class="" if ready else "expired")
                 self._save_local(cookies)
                 return cookies
         return self._cached  # 全失败时回退旧缓存
 
     async def get_client(self) -> Optional["QzoneWebClient"]:
         cookies = await self.get_cookies()
-        return QzoneWebClient(cookies) if cookies else None
+        return QzoneWebClient(cookies, on_auth_expired=self.mark_auth_expired) if cookies and (cookies.get("skey") or cookies.get("p_skey")) and self._health.get("status") != "expired" else None
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        status = dict(self._health)
+        if self._cached and status["status"] == "not_checked":
+            status["status"] = "ready" if self._cached.get("skey") or self._cached.get("p_skey") else "expired"
+        return status
 
     def status_text(self) -> str:
-        if not self._cached:
-            return "cookie：未获取"
-        uin = str(self._cached.get("uin") or "").lstrip("o0")
-        age_min = int((time.monotonic() - self._last_refresh) / 60)
-        return f"cookie：uin={uin}（{age_min} 分钟前，通道 {self._api_channel or 'local'}）"
+        snapshot = self.status_snapshot()
+        label = {"not_checked":"未获取", "not_logged_in":"尚未登录", "expired":"登录凭据过期或不完整",
+                 "adapter_unavailable":"适配器暂不可用", "network_error":"网络暂不可用",
+                 "ready":"凭据已获取", "cached":"使用本地缓存，待核验"}.get(snapshot["status"],"状态未知")
+        return f"cookie：{label}"
 
 
 class QzoneWebClient:
@@ -188,11 +223,24 @@ class QzoneWebClient:
     # 图片上传端点（移植自麦麦空间 Maizone qzone_api.py:117，MIT）
     UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
 
-    def __init__(self, cookies: Dict[str, str]) -> None:
+    def __init__(self, cookies: Dict[str, str], *, on_auth_expired=None) -> None:
+        self._on_auth_expired = on_auth_expired
         self.cookies = dict(cookies)
         self.uin = str(self.cookies.get("uin") or "").lstrip("o0")
         skey = self.cookies.get("p_skey") or self.cookies.get("skey") or ""
         self.gtk = generate_gtk(skey)
+
+    def _observe_response(self, response) -> None:
+        # Only explicit login failures are classified as expired credentials.
+        try:
+            payload = self._parse_jsonp(response.text)
+            message = str(payload.get("message") or payload.get("msg") or "").lower()
+        except (ValueError, TypeError):
+            message = ""
+        expired = response.status_code == 401 or any(marker in message for marker in
+                    ("未登录", "请先登录", "登录态失效", "登录过期", "not logged in", "login expired"))
+        if expired and self._on_auth_expired:
+            self._on_auth_expired()
 
     # ---- 响应解析 ----
     @staticmethod
@@ -244,6 +292,7 @@ class QzoneWebClient:
                                        headers=self._headers(str(target_qq)), cookies=self.cookies)
         except Exception:
             return []
+        self._observe_response(res)
         if res.status_code != 200:
             return []
         try:
@@ -317,6 +366,7 @@ class QzoneWebClient:
                                         headers=self._headers(self.uin), cookies=self.cookies)
         except Exception:
             return None
+        self._observe_response(res)
         if res.status_code != 200:
             return None
         try:
@@ -383,6 +433,7 @@ class QzoneWebClient:
                                         data=data, headers=self._headers(self.uin), cookies=self.cookies)
         except Exception:
             return None
+        self._observe_response(res)
         if res.status_code != 200 or self._extract_code(res.text) != 0:
             return None
         try:
@@ -404,6 +455,7 @@ class QzoneWebClient:
                                         data=data, headers=self._headers(self.uin), cookies=self.cookies)
         except Exception:
             return False
+        self._observe_response(res)
         return res.status_code == 200 and self._extract_code(res.text) == 0
 
     async def reply_comment(self, fid: str, target_qq: str, nickname: str,
@@ -429,6 +481,7 @@ class QzoneWebClient:
                                         data=data, headers=self._headers(self.uin), cookies=self.cookies)
         except Exception:
             return False
+        self._observe_response(res)
         return res.status_code == 200 and self._extract_code(res.text) == 0
 
     async def like(self, fid: str, target_qq: str) -> bool:
@@ -446,4 +499,5 @@ class QzoneWebClient:
                                         data=data, headers=self._headers(self.uin), cookies=self.cookies)
         except Exception:
             return False
+        self._observe_response(res)
         return res.status_code == 200 and self._extract_code(res.text) == 0

@@ -59,7 +59,8 @@ class LLMUsageTracker:
     # ---- 记账 ----
     def record(self, *, event: Any, model: Any = "",
                prompt_tokens: Any = 0, completion_tokens: Any = 0,
-               total_tokens: Any = 0) -> None:
+               total_tokens: Any = 0, request_id: Any = "",
+               usage_available: bool = False) -> None:
         """记一次调用（tokens 为 0 也记调用次数；异常一律吞掉，绝不打断业务链路）。"""
         if self._path is None:
             return
@@ -70,8 +71,13 @@ class LLMUsageTracker:
                 total = int(prompt_tokens or 0) + int(completion_tokens or 0)
             except (TypeError, ValueError):
                 total = 0
+        if total <= 0:
+            try: total = max(0, int(prompt_tokens or 0)) + max(0, int(completion_tokens or 0))
+            except (ValueError,TypeError): total = 0
         entry = {"ts": datetime.now().isoformat(timespec="seconds"),
-                 "event": str(event or ""), "model": str(model or ""), "tokens": total}
+                 "event": str(event or ""), "model": str(model or ""), "tokens": max(0,total),
+                 "request_id": str(request_id or "")[:128],
+                 "usage_source": "host_reported" if usage_available else "unavailable"}
         try:
             self._prune()
             with open(self._path, "a", encoding="utf-8") as handle:

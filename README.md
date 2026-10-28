@@ -260,3 +260,14 @@ data/plugins/cateye.life_belonging_to_maimai/
 ## 更新历程
 
 更新历程见 [CHANGELOG.md](CHANGELOG.md)。
+
+
+### 2026-10-28 生活面板扩展
+
+WebUI 的「属于麦麦的生活」展示生活趋势、实际活动/日意图、睡眠、陪伴、情绪 VAD、睡眠裁判、空间凭据健康/发布回执及模型用量。趋势支持图例、拖动缩放、采样表与安全快照导入；继承宿主颜色、明暗和图表风格。历史只记录真实采样，不补造部署前数据。
+
+专注 0 表示注意力涣散，压力 0 表示很放松。低专注/低精力/高压力会增加休息候选；修复零值在评分中误当成满值、社交电量速率字段未接线的问题。恢复遵循真实时间和活动，不直接修改状态。
+
+空间草稿在浏览器本地预览。发布以回执为准，同内容 24 小时去重；仅明确未发出的纯文字请求在原有静默、冷却和预算闸内最多尝试两次。发送结果不明会保留待核对，重启后也不自动重发；图片失败需重新提供图片，不降成队列纯文字重发。回执与凭据文件留在服务器，WebUI 不显示原文与秘密。
+
+用量统计不等同扣费证明。供应商对账可使用 `python core/reconciliation.py --ledger <llm_usage_events.jsonl> --statement <statement.json> --output <report.json>`。账单 JSON 格式：`schema_version: 1`，带时区的 `window_start/window_end`（前闭后开），`models: [{model, tokens}]`。只核对同窗口 Token 汇总，金额/折扣/税费需原始凭证；缺失 usage 与旧记录不能视为已核验。
