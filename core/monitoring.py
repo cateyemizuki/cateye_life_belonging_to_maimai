@@ -53,7 +53,12 @@ def runtime_health(plugin,now):
         for row in rows:
             serialized=' '.join(str(row.get(k) or '') for k in ('event','module','logger','logger_name'))
             if str(row.get('level','')).lower() in ('error','critical'):
-                key='plugin_errors' if 'life_belonging_to_maimai' in serialized else 'external_errors'
+                # Host usage/database logs mention the requester in SQL parameters.
+                # That marker does not transfer ownership of the host failure.
+                origins=' '.join(str(row.get(k) or '') for k in ('module','logger','logger_name'))
+                host_owned=any(part.startswith(('src.llm_models.', 'src.common.database.'))
+                               for part in origins.split())
+                key='plugin_errors' if not host_owned and 'life_belonging_to_maimai' in serialized else 'external_errors'
                 result[key]+=1
             if 'Supervisor 已重启完成: file_watcher' in serialized:
                 result['reloads']+=1;result['last_reload']=row.get('timestamp')
