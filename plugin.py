@@ -38,6 +38,7 @@ _sys.path.insert(0, _PLUGIN_DIR)
 import copy
 
 from maibot_sdk import MaiBotPlugin
+from planning.dashboard_components import LifeDashboardComponentsMixin
 
 from companion.affection import AffectionManager
 from companion.components import CompanionComponentsMixin
@@ -202,7 +203,7 @@ def _rescue_config_from_disk(config_data: object) -> tuple[object, bool]:
         return config_data, False
 
 
-class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, QzoneComponentsMixin,
+class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, CompanionComponentsMixin, QzoneComponentsMixin,
                         EmotionComponentsMixin, MaiBotPlugin):
     config_model: ClassVar[type] = CateyeSuiteConfig
     # 订阅宿主 bot 配置热重载（人设/昵称变化自动同步）
@@ -654,7 +655,8 @@ class CateyeSuitePlugin(PlanningComponentsMixin, CompanionComponentsMixin, Qzone
             # 与 InitService 共用安全解析口：越界/外部绝对路径回退默认，防运行态读写外部文件。
             from planning.life_state import resolve_state_file_path
             life = LifeStateService(resolve_state_file_path(self._data_dir, state_file),
-                                    timezone_str=timezone_str)
+                                    timezone_str=timezone_str,
+                                    decision_logger=getattr(self, "_decision_logger", None))
 
             def _write_schedule_items(items: Any, date: str, reason: str = "") -> Any:
                 """D9 晨间 spine 写回：生成器共享漏斗（不消费未来约定）。"""

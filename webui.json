@@ -1,13 +1,25 @@
 {
   "schema_version": 2,
+  "required_capabilities": ["custom_pages"],
   "workspace_title": "属于麦麦的生活",
   "pages": [
     {
-      "type": "custom",
+      "id": "overview",
+      "mode": "custom",
       "title": "状态面板",
       "icon": "chart",
       "placement": "sidebar",
-      "entry": "webui/index.html"
+      "entry": "webui/index.html",
+      "layout": "document",
+      "queries": {
+        "summary": {
+          "api": "life_dashboard",
+          "version": "1",
+          "parameters": {
+            "hours": {"type": "integer", "minimum": 6, "maximum": 168, "choices": [6, 24, 72, 168]}
+          }
+        }
+      }
     }
   ]
 }

@@ -41,6 +41,7 @@ from typing import Any, Dict, Optional, Tuple
 from core.storage import save_json_atomic
 
 from .time_utils import DAY_MINUTES, TimezoneManager
+from .life_history import LifeStateHistory
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,8 @@ class LifeStateService:
     """
 
     def __init__(self, state_path: Any, *, timezone_str: str = "Asia/Shanghai",
-                 timezone_manager: Optional[TimezoneManager] = None) -> None:
+                 timezone_manager: Optional[TimezoneManager] = None,
+                 decision_logger: Any = None) -> None:
         path = Path(state_path)
         if path.is_dir():
             path = path / STATE_FILE_NAME
@@ -159,7 +161,10 @@ class LifeStateService:
         self.last_backup_path: Optional[Path] = None
         #: 损坏文件备份失败（原文件仍存在）→ 禁止 save 覆盖（内存降级，原字节保留）
         self._backup_failed: bool = False
+        self._history = LifeStateHistory(path.with_name(f"{path.stem}_history.json"),
+                                         decision_logger=decision_logger)
         self._load()
+        self._capture_history("start", force=True)
 
     # ── 时间助手（时区唯一真源 = TimezoneManager；禁手写换算）─────────────
     def _now(self, now: Optional[datetime] = None) -> datetime:
@@ -464,6 +469,7 @@ class LifeStateService:
             self._updated_at = now
             self._clamp_all()
             self.save()
+            self._capture_history("sleep")
             return self.snapshot()
         # PR2.5 修复（2026-10-26），定稿 §4.1.3：仅调制路径记录本拍前值，供
         # _cap_tick_delta 做单拍变化量上限（modulation=None 零额外动作）
@@ -477,6 +483,7 @@ class LifeStateService:
         self._updated_at = now
         self._clamp_all()
         self.save()
+        self._capture_history("tick")
         return self.snapshot()
 
     def apply_episode(self, episode: Any, now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -508,6 +515,7 @@ class LifeStateService:
         self._updated_at = now
         self._clamp_all()
         self.save()
+        self._capture_history("episode", force=True)
         return self.snapshot()
 
     def handle_sleep(self, hours: Any, quality: Any = 0.5,
@@ -547,6 +555,7 @@ class LifeStateService:
         self._updated_at = now
         self._clamp_all()
         self.save()
+        self._capture_history("sleep_settlement", force=True)
         return self.snapshot()
 
     def apply_sleep_fields(self, fields: Any) -> Dict[str, Any]:
@@ -610,7 +619,22 @@ class LifeStateService:
         self._updated_at = now_dt
         self._clamp_all()
         self.save()
+        self._capture_history("wake", force=True)
         return self.snapshot()
+
+    def _capture_history(self, reason: str, *, force: bool = False) -> None:
+        """Observations only; history failure never changes the life tick result."""
+        if self._future_version is not None or self._backup_failed:
+            return
+        try:
+            self._history.sample(self.snapshot(), reason=reason, force=force)
+        except Exception as exc:
+            logger.debug("生活状态历史采样失败（忽略）：%s", exc)
+
+    def history_snapshot(self, *, now: Optional[datetime] = None,
+                         hours: int = 24, limit: int = 600) -> Dict[str, Any]:
+        """Read a detached, bounded observation window without ticking or writing."""
+        return self._history.snapshot(now=self._now(now), hours=hours, limit=limit)
 
     def sleep_status(self) -> Dict[str, Any]:
         """只读睡眠字段块（B.2.1；emotion/面板/测试共用，不含五项状态）。"""
