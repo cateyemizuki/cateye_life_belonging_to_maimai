@@ -15,7 +15,10 @@
   ``energy × focus × (1 - stress)``（:meth:`LifeStateService.mental_state` /
   snapshot 派生键），避免多个变量互相打架（附录 B.2 说明）；
 - 原子写：``core.storage.save_json_atomic``；加载失败/损坏：重置默认值 + 告警日志，
-  **不阻塞**（B.2 原文）；重启冷启动：从 ``last_tick_at`` 补算被动漂移，**最多补 24h**；
+  **不阻塞**（B.2 原文）；重启冷启动：**延迟漂移**（2026-10-29 离线睡眠补全重构）——
+  只解析 ``last_tick_at`` 算**原始离线 gap 秒数**（不经 24h 钳制）暂存为 pending 暴露给
+  编排方，由其按 ``planning.offline_sleep`` 分级决定清醒漂移还是睡眠结算（防与
+  ``SleepEngine.restore()`` 双重记账）；正常运行 tick 的 ``dt`` 仍钳 ``[0, DAY_MINUTES]``；
 - 时区：一律经 ``planning.time_utils.TimezoneManager``（禁手写本地时间换算）；
   tick 的 ``dt`` 钳 ``[0, DAY_MINUTES]``（24h 常量取自 planning/time_utils，
   全仓唯一 24h 常量纪律），时钟回拨按 0；
@@ -122,8 +125,10 @@ class LifeStateService:
     ``state_path``：状态文件路径（或目录——传目录时取 ``<目录>/life_state.json``）；
     ``timezone_str`` / ``timezone_manager``：时区真源（缺省 Asia/Shanghai，经
     ``planning.time_utils.TimezoneManager``，不手写本地时间换算）；
-    构造即装载（损坏/缺失重置默认 + 告警不阻塞），装载后按 ``last_tick_at`` 补算
-    被动漂移（最多 24h）。
+    构造即装载（损坏/缺失重置默认 + 告警不阻塞）；冷启动**不**直接补算漂移——
+    原始离线 gap 经 :attr:`pending_offline_gap_seconds` /
+    :meth:`consume_pending_offline_gap` 暴露给编排方（离线睡眠补全，见
+    :mod:`planning.offline_sleep`），未消费前不给任何状态施加油。
     """
 
     def __init__(self, state_path: Any, *, timezone_str: str = "Asia/Shanghai",
@@ -161,6 +166,11 @@ class LifeStateService:
         self.last_backup_path: Optional[Path] = None
         #: 损坏文件备份失败（原文件仍存在）→ 禁止 save 覆盖（内存降级，原字节保留）
         self._backup_failed: bool = False
+        #: 冷启动待结算原始离线 gap（秒；2026-10-29 离线睡眠补全重构）。``None`` =
+        #: 无待结算段（首启无 last_tick_at / 时钟回拨 / 损坏 / 未知版本——均不补全，
+        #: 维持既有备份与重建语义）。分类与结算由编排方经
+        #: ``planning.offline_sleep.plan_offline_settlement`` 用原始值做。
+        self._pending_offline_gap_seconds: Optional[float] = None
         self._history = LifeStateHistory(path.with_name(f"{path.stem}_history.json"),
                                          decision_logger=decision_logger)
         self._load()
@@ -200,7 +210,7 @@ class LifeStateService:
     def _fmt_ts(dt: Optional[datetime]) -> Optional[str]:
         return dt.isoformat() if dt is not None else None
 
-    # ── 装载（损坏重置默认 + 告警不阻塞；从 last_tick_at 补算最多 24h）────
+    # ── 装载（损坏重置默认 + 告警不阻塞；冷启动离线 gap 延迟给编排方）────
     def _backup_corrupt_file(self, reason: str) -> Optional[Path]:
         """损坏/未知版本文件先**保留备份**再重建（定稿口径；不静默毁字节）。"""
         try:
@@ -246,17 +256,18 @@ class LifeStateService:
             self._backup_corrupt_file(corrupt_reason)
         if raw is not None:
             self._apply_raw(raw)
-        # 冷启动补算：从 last_tick_at 补被动漂移，最多 24h；时钟回拨按 0
+        # 冷启动补算（2026-10-29 离线睡眠补全重构）：**延迟漂移**——本方法不再直接
+        # 施加清醒漂移。原始离线 gap（秒，未经 _dt_minutes 的 24h 钳制）暂存为
+        # pending 暴露给编排方（plugin 装配链在 SleepEngine.restore() 之前消费），
+        # 由其按 planning.offline_sleep 分级决定清醒漂移还是睡眠结算，避免双重记账。
+        # last_tick_at 仍推进到当前时刻：防止后续常规 tick 把同一段 gap 再按 24h
+        # 钳制补算一遍；此处**不落盘**——文件保留旧 last_tick_at，进程在结算前崩溃
+        # 重启时可重算同一段 gap（离线段不丢）。
         now = self._now()
-        dt_min = self._dt_minutes(now)
-        if dt_min > 0:
-            self._apply_drift(dt_min, rates=None)
+        self._pending_offline_gap_seconds = self._raw_offline_gap_seconds(now)
         self._last_tick_at = now
         self._updated_at = now
         self._clamp_all()
-        if dt_min > 0:
-            # 补算落盘 best-effort：失败只告警，下次 tick 会再写
-            self.save()
 
     def _apply_raw(self, raw: Any) -> None:
         """已解析文档 → 内存状态（字段级容错：坏字段单独回退默认，不整体作废）。"""
@@ -314,6 +325,24 @@ class LifeStateService:
         if seconds <= 0:
             return 0.0  # 时钟回拨按 0
         return min(seconds / 60.0, DT_MAX_MINUTES)
+
+    def _raw_offline_gap_seconds(self, now: datetime) -> Optional[float]:
+        """冷启动原始离线 gap（秒；**不经** :meth:`_dt_minutes` 的 24h 钳制）。
+
+        仅 ``last_tick_at`` 存在且在过去时返回正秒数；无基准 / 时钟回拨
+        （``last_tick_at`` 在未来）→ ``None``（不补全）。分类与结算用原始值
+        （``planning.offline_sleep``），正常运行 tick 的钳制仍由 :meth:`_dt_minutes`
+        负责，两口径互不干扰。
+        """
+        if self._last_tick_at is None:
+            return None
+        try:
+            seconds = (now - self._last_tick_at).total_seconds()
+        except TypeError:  # naive/aware 混撞（防御性；_aware 已归一，理论不可达）
+            return None
+        if seconds <= 0:
+            return None  # 时钟回拨（last_tick_at 在未来）→ 不补全
+        return seconds
 
     def _apply_drift(self, dt_min: float, rates: Optional[Dict[str, float]],
                      modulation: Optional[Dict[str, Dict[str, float]]] = None) -> None:
@@ -653,6 +682,28 @@ class LifeStateService:
             "sleep_wake_target": self._fmt_ts(self._sleep_wake_target),
             "sleep_lie_in_cap": self._fmt_ts(self._sleep_lie_in_cap),
         }
+
+    # ── 冷启动离线 gap（离线睡眠补全 2026-10-29；编排方专用）───────────────
+    @property
+    def pending_offline_gap_seconds(self) -> Optional[float]:
+        """冷启动原始离线 gap（秒，未钳制；``None`` = 无待结算段）。
+
+        只读视图：编排方（plugin 装配链）在 ``SleepEngine.restore()`` 之前消费；
+        分类/结算口径见 :mod:`planning.offline_sleep`。取走请走
+        :meth:`consume_pending_offline_gap`（一次性，防重复结算）。
+        """
+        return self._pending_offline_gap_seconds
+
+    def consume_pending_offline_gap(self) -> Optional[float]:
+        """一次性取走冷启动 pending gap（取走即清；``None`` = 无待结算段）。
+
+        编排方判定走睡眠结算或清醒漂移后调用本方法收口；未消费期间
+        :meth:`tick` 的常规路径不会重复补算该 gap（``last_tick_at`` 已在装载时
+        推进，见 :meth:`_load` 注释）。
+        """
+        gap = self._pending_offline_gap_seconds
+        self._pending_offline_gap_seconds = None
+        return gap
 
     def mental_state(self) -> float:
         """派生读数 ``energy × focus × (1 - stress)``（不单独存，附录 B.2 说明）。"""

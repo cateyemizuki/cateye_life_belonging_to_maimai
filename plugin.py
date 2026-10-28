@@ -15,7 +15,7 @@ self._qzone，组件注册由三个 components.py 的 Mixin 提供（多继承�
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, ClassVar, Iterable
 
 # ── 宿主运行时导入引导（勿删）──────────────────────────────────────────
@@ -62,8 +62,9 @@ from emotion.services import EmotionServices
 from planning.components import PlanningComponentsMixin
 from planning.life_modulation import LifeModulationService
 from planning.life_schedule import LifeScheduleReadModel
-from planning.life_state import LifeStateService
-from planning.sleep_engine import NO_HARD_COMMITMENT, SleepEngine
+from planning.life_state import DT_MAX_MINUTES, LifeStateService
+from planning.offline_sleep import plan_offline_settlement
+from planning.sleep_engine import EVENT_SLEEP_WOKE, NO_HARD_COMMITMENT, SleepEngine
 from planning.sleep_schedule import SleepEndpointHook
 from planning.rolling_planner import RollingPlanner
 from planning.schedule_db import ScheduleDB
@@ -678,6 +679,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 # None = 事件库装配失败 → planner 逐字回退旧内置池路径）
                 event_catalog=getattr(getattr(self, "_planning", None), "event_catalog", None))
             engine: SleepEngine | None = None
+            restored: Any = None
             # PR8 3.0.0：睡眠引擎随 [schedule].enabled 装配（旧 sleep_engine_enabled
             # 键退役；本分支已达 schedule.enabled=true，引擎 enabled 属性同源派生）。
             try:
@@ -691,7 +693,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     emotion_bridge=getattr(self, "_emotion", None))
                 planner.set_sleep_engine(engine)
                 if engine.enabled:
-                    engine.restore()
+                    # 离线睡眠补全（2026-10-29 A2 编排）：restore 先认领离线 gap——
+                    # 返回未关闭会话/恢复池条目 = 引擎持有该离线段，编排方弃置
+                    # pending（防双记账）；返回 None = 引擎拒绝，交离线结算分级。
+                    restored = engine.restore()
                     self.ctx.logger.info(
                         "睡眠引擎已装配（阈值=%.2f，硬约定提前=%s 分钟，上限复检=%ss）",
                         engine._wake_threshold(),  # noqa: SLF001 - 装配日志只读
@@ -703,6 +708,15 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     self.ctx.logger.warning("睡眠引擎装配失败（本次不启用引擎，睡眠态未就绪）：%s", exc)
                 except Exception:
                     pass
+            # 离线睡眠补全收口（LifeState 冷启动 pending gap 恰好一次消费；任何异常
+            # 内部自吞并回退旧冷启动行为，绝不拖挂装配/插件加载）。认领语义 = 引擎
+            # 恢复出**未关闭**睡眠会话（restore 也可能复活已关闭的「已醒提供者」到
+            # lie-in 上限——那不持有离线段，不算认领）。
+            self._settle_offline_gap(
+                life, planner,
+                engine_claimed=bool(engine is not None and getattr(engine, "enabled", False)
+                                    and restored is not None
+                                    and not bool(getattr(restored, "closed", False))))
             model = LifeScheduleReadModel(
                 self._db, life_state=life, planner=planner,
                 config_provider=lambda: self.config, timezone_str=timezone_str)
@@ -730,6 +744,189 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             except Exception:
                 pass
             return False
+
+    def _settle_offline_gap(self, life: Any, planner: Any, *,
+                            engine_claimed: bool) -> None:
+        """冷启动离线 gap 收口（离线睡眠补全 A2 编排，2026-10-29；本方法不抛异常）。
+
+        步序（指令 ①）：LifeState 冷启动已把原始离线 gap 暂存为 pending（A1）→
+        ``SleepEngine.restore()`` 先认领（``engine_claimed``=恢复出未关闭会话/恢复池
+        条目）→ 未被认领时按 ``planning.offline_sleep`` 分级分流：
+
+        - 引擎认领 → 离线段归引擎连续段记账，pending gap 取走即弃（防双记账）；
+        - 分级 grace（<5 分钟抖动）或结算计划生成失败 → 回退**旧冷启动清醒漂移**
+          （≤24h，与重构前 ``LifeState._load`` 补算行为等价）；
+        - nap/medium/long/overlong → :meth:`_apply_offline_settlement` 一次结算
+          （状态 gains 恰好一次 + 睡眠债 + episodes/sessions 落库 + wake 事件 +
+          long/overlong 晨间联动）。
+
+        pending gap **无条件先消费**（一次性，防后续重装配/常规 tick 重复结算）；
+        任何一步异常只告警，绝不阻塞装配/插件加载（宿主契约：on_load 失败 = 插件
+        加载失败）。
+        """
+        try:
+            gap = life.consume_pending_offline_gap()
+        except Exception as exc:
+            self._warn_quiet("离线 gap 读取失败（跳过收口，按无 pending 处理）：%s", exc)
+            return
+        if gap is None or gap <= 0:
+            return
+        if engine_claimed:
+            # 引擎持有未关闭睡眠会话/恢复池：离线段归引擎（连续钟/整晚规则）记账；
+            # pending 已取走即弃，本编排不再补漂移或补睡（防双记账）
+            self.ctx.logger.info("离线段已由睡眠引擎 restore 认领（不重复结算）")
+            return
+        try:
+            debt_before = float(life.snapshot().get("sleep_debt") or 0.0)
+        except Exception:
+            debt_before = 0.0
+        plan: Any = None
+        try:
+            plan = plan_offline_settlement(gap, debt_before)
+        except Exception as exc:
+            self._warn_quiet("离线结算计划生成失败（回退旧冷启动漂移）：%s", exc)
+        if not isinstance(plan, dict) or not plan.get("settle"):
+            # grace（或计划失败）→ 旧冷启动清醒漂移：≤24h（DT_MAX_MINUTES 与
+            # LifeState._dt_minutes 同钳制口径），等价重构前 _load 补算
+            try:
+                dt_min = min(gap / 60.0, DT_MAX_MINUTES)
+                if dt_min > 0:
+                    life._apply_drift(dt_min, rates=None)  # noqa: SLF001 - 旧冷启动漂移延迟回退
+                    life._clamp_all()  # noqa: SLF001
+                    life.save()
+                    self.ctx.logger.info("离线 %.1f 分钟按抖动级 grace 处理（旧清醒漂移回退）",
+                                         gap / 60.0)
+            except Exception as exc:
+                self._warn_quiet("离线 grace 漂移回退失败（忽略）：%s", exc)
+            return
+        try:
+            self._apply_offline_settlement(life, planner, plan)
+        except Exception as exc:
+            self._warn_quiet("离线睡眠结算失败（已尽力应用，忽略继续启动）：%s", exc)
+
+    def _apply_offline_settlement(self, life: Any, planner: Any, plan: Dict[str, Any]) -> None:
+        """应用一次离线睡眠结算（指令 ②③④；调用方已保证恰好调用一次）。
+
+        步序：pre-offline active episode 以 interrupted 关闭（``interrupted_by=
+        "offline_gap"``、进度按已用/计划封顶 0.95，走 ``ScheduleDB.interrupt``
+        默认口径）→ 状态 gains 恰好一次（``apply_episode`` 显式增量门，``gains``
+        里的 ``hours`` 键非 STATE_FIELDS 自动忽略）+ 睡眠债/醒沿字段（
+        ``apply_sleep_settlement`` 既有一次性结算口，不走 ``handle_sleep`` 三档）
+        → 一条 completed 睡眠会话（``wake_reason="offline_reconnect"``）+ 一条
+        source=offline episode 足迹（计划意图**不动**）→ 醒沿只发既有
+        ``life.sleep_woke``（载荷带 ``retroactive=True``；**不**补发
+        ``schedule.sleep_started``——那会错误触发情绪冻结/关系日结）→ long/
+        overlong 追加晨间联动（真实醒来周期同步 + 晨间 spine 调整，nap/medium
+        不触发）。各步独立容错：单步失败告警继续，不回滚已应用步。
+        """
+        tz_name = str(getattr(getattr(self.config, "schedule_advanced", None),
+                              "timezone", "") or "Asia/Shanghai")
+        from planning.time_utils import TimezoneManager
+        wake_at = TimezoneManager(tz_name).get_now()
+        gap = max(0.0, float(plan.get("gap_seconds") or 0.0))
+        sleep_start = wake_at - timedelta(seconds=gap)
+        # 日帧口径与引擎 sleep_sessions 写库完全一致（入睡日历日 + 跨午夜帧分钟 >1440）
+        sleep_date = sleep_start.strftime("%Y-%m-%d")
+        start_minute = SleepEngine._frame_minutes(sleep_start, sleep_date)  # noqa: SLF001 - 与引擎写库同口径
+        end_minute = SleepEngine._frame_minutes(wake_at, sleep_date)  # noqa: SLF001
+        plan_meta = dict(plan.get("metadata") or {})
+        # 1) pre-offline active episode → interrupted（进度走 interrupt 默认口径：
+        #    已用/计划、上限 0.95；actual_end = 入睡时刻）
+        try:
+            active = self._db.active_episode()
+            if isinstance(active, dict) and active.get("status") == "active":
+                self._db.interrupt(str(active.get("episode_id") or ""),
+                                   interrupted_by="offline_gap",
+                                   actual_end_minute=start_minute,
+                                   metadata={"close_reason": "offline_gap_settlement",
+                                             "offline_reconnect": True})
+        except Exception as exc:
+            self._warn_quiet("离线结算：pre-offline active episode 关闭失败（忽略）：%s", exc)
+        # 2) 状态 gains 恰好一次 + 睡眠债/醒沿（先拍前后快照供会话行 energy 端点）
+        before = life.snapshot()
+        after = life.apply_episode({"state_deltas": dict(plan.get("gains") or {})})
+        life.apply_sleep_settlement({
+            "sleep_debt": plan.get("sleep_debt_after"),
+            "wake_reason": "offline_reconnect",
+            "now": wake_at,
+        })
+        session_id = f"sleep:{sleep_date}:{start_minute}"
+        # 3) completed 睡眠会话（sleep_sessions 无 status 列，actual_end 非 NULL 即 completed；
+        #    走 upsert_sleep_session 既有写库口径）
+        self._db.upsert_sleep_session({
+            "session_id": session_id,
+            "schedule_date": sleep_date,
+            "planned_start_minute": start_minute,
+            "planned_end_minute": end_minute,
+            "actual_start_minute": start_minute,
+            "actual_end_minute": end_minute,
+            "wake_reason": "offline_reconnect",
+            "continuous_minutes": int(plan.get("effective_minutes") or 0),
+            "interruption_count": 0,
+            "energy_start": before.get("energy"),
+            "energy_end": after.get("energy"),
+            "sleep_debt_before": plan.get("sleep_debt_before"),
+            "sleep_debt_after": plan.get("sleep_debt_after"),
+            "quality": plan.get("quality"),
+            "metadata": {"settled": True, "emitted": ["woke"],
+                         "offline_settlement": True, **plan_meta},
+            "created_at": sleep_start.isoformat(),
+            "updated_at": wake_at.isoformat(),
+        })
+        # 4) source=offline episode 足迹（start→finish 两写复用既有公开口；
+        #    finish 默认进度 = 已用/计划封顶 0.95；close_reason 带引擎前缀，
+        #    与 _reconcile_recorded_wake 的恢复口径兼容）
+        try:
+            eid = self._db.start_episode(
+                sleep_date, str(plan.get("label") or "睡眠"), "sleep", "offline",
+                start_minute, end_minute, actual_start_minute=start_minute,
+                metadata={**plan_meta,
+                          "close_reason": "sleep_engine_offline_reconnect",
+                          "offline_settlement": True})
+            if eid:
+                self._db.finish(eid, actual_end_minute=end_minute)
+        except Exception as exc:
+            self._warn_quiet("离线结算：episode 足迹写入失败（忽略）：%s", exc)
+        # 5) 醒沿事件：既有 life.sleep_woke（payload 形态与引擎 _close_session 一致
+        #    + retroactive=True + session_id）；全树无订阅方（grep 核对），纯观测。
+        #    绝不补发 schedule.sleep_started（emotion 冻结/关系日结挂在它上面）。
+        try:
+            bus = getattr(self, "_bus", None)
+            if bus is not None:
+                bus.publish_soon(
+                    EVENT_SLEEP_WOKE,
+                    session_id=session_id,
+                    wake_reason="offline_reconnect",
+                    actual_minutes=round(gap / 60.0, 1),
+                    sleep_hours=round(float(plan.get("effective_hours") or 0.0), 4),
+                    energy=after.get("energy"),
+                    quality=plan.get("quality"),
+                    sleep_debt=plan.get("sleep_debt_after"),
+                    retroactive=True)
+        except Exception as exc:
+            self._warn_quiet("离线醒沿事件发布失败（忽略）：%s", exc)
+        # 6) 晨间联动：仅 long/overlong（分级定义即 ≥4h；nap/medium 不触发）。
+        #    wake_delay 离线路径无引擎 earliest_wake 基准，按 0（不改意图计划时间）。
+        if plan.get("category") in ("long", "overlong"):
+            try:
+                self._record_actual_wake_cycle(when=wake_at)
+                planner.apply_morning_spine_adjustment(
+                    sleep_hours=plan.get("effective_hours"), wake_delay_minutes=0.0)
+            except Exception as exc:
+                self._warn_quiet("离线晨间 spine 调整失败（忽略）：%s", exc)
+        self.ctx.logger.info(
+            "离线睡眠结算完成（分级=%s，有效 %.2fh，未记录 %.2fh，债 %.2f→%.2f）",
+            plan.get("category"), float(plan.get("effective_hours") or 0.0),
+            float(plan.get("unrecorded_seconds") or 0.0) / 3600.0,
+            float(plan.get("sleep_debt_before") or 0.0),
+            float(plan.get("sleep_debt_after") or 0.0))
+
+    def _warn_quiet(self, message: str, exc: Any) -> None:
+        """装配期容错告警（logger 自身异常也吞掉；绝不拖挂启动链）。"""
+        try:
+            self.ctx.logger.warning(message, exc)
+        except Exception:
+            pass
 
     def _sync_sleep_engine(self) -> None:
         """按当前配置热更新睡眠引擎（PR3；开→装配/关→解除注入并落盘）。

@@ -68,10 +68,13 @@ DEFAULT_LIE_IN_MAX_UNTIL = "12:00"
 #: 过睡专注惩罚开关（定稿 §1 #14：默认只扣精力；此键默认 false，本轮新增）
 DEFAULT_OVERSLEEP_PENALIZE_FOCUS = False
 
-#: 觉醒原因白名单（附录 B.2.1；状态枚举钉死，不虚构新值）
+#: 觉醒原因白名单（附录 B.2.1；状态枚举钉死，不虚构新值）。``offline_reconnect``
+#: （2026-10-29 离线睡眠补全）= 宿主离线段按 A1 分级结算后的补记醒沿：只由编排方
+#: （plugin 装配链）写入 sleep_sessions 行与 ``life.sleep_woke`` 载荷，引擎自身
+#: 不会产出该值（``_close_session`` 白名单放行后引擎路径仍不经过它）。
 WAKE_REASONS: Tuple[str, ...] = (
     "energy_threshold", "lie_in_cap", "hard_commitment", "interrupted_awake",
-    "manual", "no_sleep_mode",
+    "manual", "no_sleep_mode", "offline_reconnect",
 )
 
 #: 连续睡眠曲线（附录 B.2.4 八段；``(start_h, end_h, energy_per_hour, focus_per_hour)``）
