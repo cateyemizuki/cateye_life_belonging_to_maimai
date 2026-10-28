@@ -422,6 +422,10 @@ class LifeStateService:
                 value = getattr(source, f"{key}_rate", None)
                 if value is None and isinstance(source, dict):
                     value = source.get(f"{key}_rate")
+                if key == "social_battery" and value is None:
+                    # ActivityProfile's canonical field is social_rate, while the
+                    # state axis remains social_battery. Explicit state aliases win.
+                    value = source.get("social_rate") if isinstance(source, dict) else getattr(source, "social_rate", None)
                 rates[f"{key}_rate"] = float(value) if value is not None else 0.0
             return rates
         except Exception as exc:

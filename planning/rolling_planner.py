@@ -1281,6 +1281,31 @@ class RollingPlanner:
                 if isinstance(row.get("metadata"), dict) else "",
             })
 
+        # A depleted mind needs a real recovery opportunity even when today's
+        # spine has no rest intent. This never preempts sleep/hard commitments.
+        focus = _as_number(snapshot.get("focus"), 1.0)
+        energy = _as_number(snapshot.get("energy"), 1.0)
+        stress = _as_number(snapshot.get("stress"), 0.0)
+        needs_rest = focus < 0.30 or energy < 0.30 or stress > 0.80
+        recent_rest = False
+        try:
+            recent_rest = any(row.get("goal_type") == "rest" and row.get("status") == "completed"
+                              and row.get("actual_end_minute") is not None
+                              and 0 <= cur-int(row["actual_end_minute"]) < 15
+                              for row in self._db.episodes_today(date))
+        except Exception:
+            pass
+        if needs_rest and not recent_rest:
+            rest = activity_profiles.get_profile("rest")
+            candidates.append({
+                "kind": "anchor_rest", "name": "休息与恢复", "goal_type": "rest",
+                "priority_score": PRIORITY_SCORES["high"], "min_minutes": 15,
+                "max_minutes": 30, "interruptibility": rest.interruptibility,
+                "profile_key": "rest", "window": None, "resume_of": None,
+                "resume_bonus": 0.0, "intent_item_id": None,
+                "note": "专注偏低，给自己一段恢复时间" if focus < 0.30 else "身心需要放缓节奏",
+            })
+
         # 源 5：idle 待机（永远存在的低优先候选——A.10.1 一等公民）
         idle_profile = activity_profiles.get_profile("idle")
         candidates.append({
@@ -1309,9 +1334,9 @@ class RollingPlanner:
     def _score_candidate(self, c: Dict[str, Any], snapshot: Any, cur: int,
                          boundary: Optional[int], counts: Dict[str, int],
                          current_profile: Optional[Any]) -> float:
-        energy = _as_number(snapshot.get("energy"), 1.0) or 1.0
+        energy = _as_number(snapshot.get("energy"), 1.0)
         hunger = _as_number(snapshot.get("hunger"), 0.0) or 0.0
-        focus = _as_number(snapshot.get("focus"), 1.0) or 1.0
+        focus = _as_number(snapshot.get("focus"), 1.0)
         profile = activity_profiles.get_profile(c["profile_key"])
         goal_type = c["goal_type"]
 
