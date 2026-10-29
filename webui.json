@@ -12,7 +12,7 @@
       "icon": "chart",
       "placement": "sidebar",
       "entry": "webui/index.html",
-      "layout": "document",
+      "layout": "viewport",
       "queries": {
         "summary": {
           "api": "life_dashboard",
