@@ -23,6 +23,8 @@
 
 可选开关默认关闭：屏幕感知 `[patrol] screen_enabled`、QQ 空间 `[qzone] enabled`、周结大事记 `[affection] weekly_milestones_enabled`、午休静默 `[patrol] nap_quiet_enabled`、情绪-生活双向调制 `[life_state] emotion_modulation_enabled`、事件库生成 `[event_catalog] mode=off`。默认打开的新功能只有两项：日程主线 `[schedule] enabled=true`（见下节）与目标频率恒 1 `[planning_proactive] target_frequency_always_one=true`。
 
+屏幕感知默认只看主屏（`[patrol] screen_scope=main`，与旧版行为一致）；TA 常在副屏上干活时可改 `all`——对端（cateye 统一连接插件 v1.1.0+）多屏时逐屏抓取，全部截图一次交给视觉模型分屏概述；对端过旧、单屏客户端或负载超限自动降级时，`all` 退化为只看主屏，与 `main` 等价。
+
 **前置条件**：QQ 空间需要 SnowLuma 适配器（NapCat 画像不支持 QZone API）；屏幕感知需要「cateye 统一连接插件」且对方电脑上的客户端在线。目标私聊流解析不到时，插件每 60 秒重试一次，期间不会有任何主动消息；先与目标 QQ 互发一条消息通常即可解析到。
 
 WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好感度（`[affection]`）、日程系统（`[schedule]`）、日程系统·高级设置（`[schedule_advanced]`）、日程主动行为（`[planning_proactive]`）、QQ 空间（`[qzone]`）、情绪系统（`[emotion]`）、LLM 调用（`[llm]`）、提示词（高级）（`[prompts]`）、管理与日志（`[admin]`）、生活状态（`[life_state]`）、事件库（`[event_catalog]`）、麦麦互动（`[maimai_interaction]`，聚合段最后一段；WebUI 显示名暂为「？？？」占位，正式名未定稿）。
@@ -255,7 +257,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 - 组件 **29 个** = 8 个命令 + 10 个 Hook + 7 个工具 + 4 个跨插件 API（`[admin].harass_report_enabled=false` 时运行期注册面回落 28）。
 - 声明 **17 项**宿主能力。
-- 配置 **14 个段 / 259 字段 / 5 隐藏 / 254 可见**（`[plugin]` 3、`[patrol]` 22、`[affection]` 12、`[schedule]` 24、`[schedule_advanced]` 31、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 10、`[llm]` 9、`[prompts]` 56、`[admin]` 8、`[qzone]` 20、`[emotion]` 17、`[maimai_interaction]` 16；3.0.0 离线 stub+pydantic 实算，2026-10-30 随互动改造批新增末段）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
+- 配置 **14 个段 / 260 字段 / 5 隐藏 / 255 可见**（`[plugin]` 3、`[patrol]` 23、`[affection]` 12、`[schedule]` 24、`[schedule_advanced]` 31、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 10、`[llm]` 9、`[prompts]` 56、`[admin]` 8、`[qzone]` 20、`[emotion]` 17、`[maimai_interaction]` 16；3.0.0 离线 stub+pydantic 实算，2026-10-30 随互动改造批新增末段、随多屏插入轮 `[patrol]` 新增 `screen_scope`）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
 - 用户可编辑映射表 **7 张**：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可
