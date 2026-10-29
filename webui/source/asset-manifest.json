@@ -1,0 +1,42 @@
+{
+  "bg_emotion_empty.webp": {
+    "bytes": 51322,
+    "sha256": "f22faf97ee1ac7b88f38c9257a7f3a73162389d1104c80fb983a2451aa80ed42"
+  },
+  "bg_hero_day.webp": {
+    "bytes": 52966,
+    "sha256": "7b9afff8d1ab5f5da24294cd2f8ac3536a75e2961e415122f7e130dce2a56b44"
+  },
+  "bg_hero_night.webp": {
+    "bytes": 91414,
+    "sha256": "025244de66f6edb3c2615420d5180ea5a93764c1cc04dff207ea3bcc0d8240d1"
+  },
+  "bg_history_empty.webp": {
+    "bytes": 50086,
+    "sha256": "b1dc4cb2518a49f7d706577e3ec5da7de7050c4d14bcfd8c487c9be92f8c7367"
+  },
+  "bg_offline.webp": {
+    "bytes": 121612,
+    "sha256": "d94bc4c2182432993cded4bb8b9995a6a8e76533eb321daa1502d6696b6fda6d"
+  },
+  "bg_schedule_empty.webp": {
+    "bytes": 70170,
+    "sha256": "7053a3ce2c0e61f66c492f8b344ea763d9baddc35ffcb30bf062c59e3b0bd97f"
+  },
+  "bg_sleep.webp": {
+    "bytes": 81758,
+    "sha256": "5530d7fb95dcfa4ceab15c40cfea98b8775b0c6f89218e97b24a521e5df7819a"
+  },
+  "bg_texture_clover.webp": {
+    "bytes": 5090,
+    "sha256": "20ba95e45d43c726cf216816bcfb6c1aa7eecbffcd73cb04880940219e8aefe2"
+  },
+  "bg_usage.webp": {
+    "bytes": 67128,
+    "sha256": "f51b2efa960826458fcbfab8a287d8655b9334088da062f63086f92571426082"
+  },
+  "fish_official.svg": {
+    "bytes": 2210,
+    "sha256": "966780e3d539a7136aced201dfa795a3a5bb1ea9eaf7cc9f772ff1bad308e238"
+  }
+}
