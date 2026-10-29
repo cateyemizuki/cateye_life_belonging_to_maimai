@@ -26,6 +26,7 @@ from .bridge import apply_template_events
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
 from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
                             EmotionParams, EmotionStateMachine)
+from . import sleep_cache
 from .vad import VADState, _clip, _level, apply_mapping_tables, map_emotions, mood_summary
 
 logger = logging.getLogger(__name__)
@@ -270,7 +271,7 @@ class EmotionService:
         self._in_sleep = False
         self._sleep_started_at: Optional[datetime] = None
         self._sleep_planned_hours = 0.0
-        # M5 睡眠大修缓存（§4.2）：冻结期计算并缓存，醒后一次性应用；运行期状态、不落盘
+        # M5 睡眠大修缓存：成功回执与状态同文件持久化，醒后一次性应用
         self._pending_overhaul: Optional[Dict[str, Any]] = None
         #: D10（用户 2026-10-27 批准）：睡眠裁判失败重试上限 3 + 退避，连续 3 次失败
         #: 升级 error 一次；成功后归零。纯运行期状态（热重载重置，见 §五 登记）。
@@ -294,6 +295,7 @@ class EmotionService:
         # R7 = 用户 2026-10-24 直派：no_sleep_mode 大修的新日程进账触发——
         # ``schedule.generated`` 订阅的反订阅闭包（start() 挂载 / stop() 注销；无总线静默）
         self._schedule_generated_unsub: Any = None
+        self._restore_sleep_receipt(state, datetime.now())
 
     # ── 事件总线（M0；无总线时静默跳过）─────────────────────
     def _bus(self) -> Any:
@@ -357,7 +359,26 @@ class EmotionService:
             out["eval_count"] = 0
         return out
 
-    def _save_state(self) -> None:
+    def _restore_sleep_receipt(self, state: Dict[str, Any], now: datetime) -> None:
+        restored = sleep_cache.decode(state.get("pending_sleep_overhaul"), now)
+        if restored is None:
+            return
+        cached, period = restored
+        if state.get("applied_sleep_date") in (cached["cycle_key"], now.strftime("%Y-%m-%d")):
+            return
+        self._pending_overhaul, self._sleep_period = cached, period
+        self._sleep_started_at = period[0]
+        self._sleep_planned_hours = cached["sleep_hours"]
+        self._in_sleep = True
+        self._machine.freeze(now)
+        self._referee_health["last_success_at"] = cached["computed_at"].isoformat()
+
+    def _retain_sleep_receipt(self, cached: Dict[str, Any]) -> None:
+        self._pending_overhaul = cached
+        if self._save_state() is False:
+            logger.warning("睡眠裁判回执持久化失败：保留内存结果，重启可能重算")
+
+    def _save_state(self) -> bool:
         """状态机 + episode 水位/日计数写同一份 emotion_state.json。
 
         状态机 ``load_dict`` 只读自己认识的键（未知键忽略），故 ``episode`` 与
@@ -377,7 +398,22 @@ class EmotionService:
         previous = load_json(self._state_path, {}) or {}
         if isinstance(previous, dict) and "applied_sleep_date" in previous:
             state["applied_sleep_date"] = previous["applied_sleep_date"]
-        save_json_atomic(self._state_path, state)
+        # Keep unknown receipt versions byte-for-byte at the JSON value level.
+        prior_receipt = previous.get("pending_sleep_overhaul") if isinstance(previous, dict) else None
+        if isinstance(prior_receipt, dict) and not sleep_cache.known(prior_receipt):
+            state["pending_sleep_overhaul"] = prior_receipt
+        elif getattr(self, "_pending_overhaul", None) is not None and self._sleep_period:
+            try:
+                state["pending_sleep_overhaul"] = sleep_cache.encode(self._pending_overhaul, self._sleep_period)
+            except (ValueError, TypeError, KeyError):
+                logger.warning("睡眠裁判回执未通过持久化校验")
+        applying = getattr(self, "_saving_sleep_cycle", "")
+        if applying:
+            state["applied_sleep_date"] = applying
+            if sleep_cache.known(state.get("pending_sleep_overhaul")):
+                state.pop("pending_sleep_overhaul", None)
+        if not save_json_atomic(self._state_path, state):
+            return False
         try:
             from .observations import EmotionObservations
             from planning.time_utils import TimezoneManager
@@ -389,6 +425,8 @@ class EmotionService:
             history.sample(observed_at, self._machine.effective_vad().to_dict(), bool(self._machine.frozen))
         except Exception:
             pass
+
+        return True
 
     def _save_params(self) -> None:
         save_json_atomic(self._config_path, {"params": self._machine.params.to_dict(),
@@ -2171,6 +2209,7 @@ class EmotionService:
         self._referee_health = {**getattr(self, "_referee_health", {}), "task": referee_task,
                                 "last_attempt_at": now.isoformat(), "error_class": ""}
         vad = self._machine.effective_vad()  # 裁判接收已应用偏移的值（§九.3）
+        requested_period = self._sleep_period
         result = await ask_sleep_referee(
             self._llm(),
             persona=self._persona_text(), vad=vad,
@@ -2185,6 +2224,13 @@ class EmotionService:
         )
         if result is None:
             self._referee_health["error_class"] = "no_valid_structured_result"
+            return None
+        # The model call yields: a wake, disabled module or next cycle may have
+        # superseded this request while it was in flight.
+        state_now = load_json(self._state_path, {}) or {}
+        requested_key = self._cycle_key(requested_period[0]) if requested_period else ""
+        if self._sleep_period != requested_period or (requested_key and
+                state_now.get("applied_sleep_date") == requested_key):
             return None
         self._referee_health["last_success_at"] = now.isoformat()
         delta, reasons = result
@@ -2358,7 +2404,21 @@ class EmotionService:
             ``sleep_window_minutes``/``interrupted_minutes``/``interrupt_count``/三输入/
             夜间事件摘要留痕）；无缓存返回 None。
         """
-        cached, self._pending_overhaul = self._pending_overhaul, None
+        # No await between guard, mutation and atomic state/guard commit.
+        cached = self._pending_overhaul
+        previous_machine = self._machine.to_dict()
+        previous_pending_events = list(self._machine.pending_events)
+        was_frozen = self.is_frozen()
+        previous_state = load_json(self._state_path, {}) or {}
+        if cached and previous_state.get("applied_sleep_date") in (
+                str(cached.get("cycle_key") or ""), now.strftime("%Y-%m-%d")):
+            self._pending_overhaul = None
+            self._sleep_period = None
+            if self.is_frozen():
+                self._machine.unfreeze(now)
+            self._save_state()
+            return None
+        self._pending_overhaul = None
         # 本周期窗口在下面即被清（周期结束）：先留一份给"实际睡着时长"与醒沿结算用
         period = self._sleep_period
         # PR3（2026-10-26，定稿 §4.2.3）：引擎可能早于旧窗口端点醒（硬约定 04:30 /
@@ -2402,11 +2462,22 @@ class EmotionService:
         applied["e_tomorrow_cached"] = cached.get("e_tomorrow", VADState()).to_dict()
         applied["drained_events_count"] = night["count"]
         applied["drained_events"] = night["events"]
-        self._save_state()
+        self._saving_sleep_cycle = str(cached.get("cycle_key") or now.strftime("%Y-%m-%d"))
+        try:
+            saved = self._save_state()
+        finally:
+            self._saving_sleep_cycle = ""
+        if saved is False:
+            # Failed replace must not leave an applied in-memory value that will
+            # be applied again on retry. No event/settlement is published yet.
+            self._machine.load_dict(previous_machine)
+            self._machine.pending_events = previous_pending_events
+            if was_frozen:
+                self._machine.freeze(now)
+            self._pending_overhaul, self._sleep_period = cached, period
+            logger.error("睡眠大修状态保存失败：本次结算撤回，等待重试")
+            return None
         self._note_overhaul_success()  # D10：本周期裁判/结算成功 → 重试计数归零
-        state = load_json(self._state_path, {}) or {}
-        state["applied_sleep_date"] = str(cached.get("cycle_key") or now.strftime("%Y-%m-%d"))
-        save_json_atomic(self._state_path, state)
         self._log_decision(
             "emotion.sleep_overhaul", trigger_type="emotion",
             reason="醒后一次性应用缓存大修",
@@ -2461,6 +2532,7 @@ class EmotionService:
             self._sleep_period = None
             return {"ok": False, "reason": "睡眠裁判请求/解析失败（下一轮重试）"}
         self._pending_overhaul.setdefault("cycle_key", self._cycle_key(period_start))
+        self._retain_sleep_receipt(self._pending_overhaul)
         return await self._apply_cached_overhaul(now) or {"ok": False, "reason": "大修应用失败"}
 
     async def _loop(self) -> None:
@@ -2611,7 +2683,7 @@ class EmotionService:
                 if cached is not None:
                     period = self._sleep_period or (now, now)
                     cached["cycle_key"] = self._cycle_key(period[0])
-                    self._pending_overhaul = cached
+                    self._retain_sleep_receipt(cached)
                     self._note_overhaul_success()
                 else:
                     self._note_overhaul_failure(now)
@@ -2664,7 +2736,7 @@ class EmotionService:
                 self._overhaul_retry_count)
             return
         cached["cycle_key"] = cycle_key
-        self._pending_overhaul = cached
+        self._retain_sleep_receipt(cached)
         self._note_overhaul_success()
 
     async def _sleep_entry_settled_gate(self, sleep_item: Optional[Dict[str, Any]], now: datetime,

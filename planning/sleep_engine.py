@@ -1077,6 +1077,7 @@ class SleepEngine:
         session.sync_runtime_fields()
         self._session = session
         self._episode_id = str((episode or {}).get("episode_id") or "") or None
+        self._clock_metadata_writable = True
         self._clock.start(now)
         self._last_tick_at = now
         self._last_continuous_hours = 0.0
@@ -1097,6 +1098,17 @@ class SleepEngine:
         if session is None:
             return
         session.updated_at = self._now().isoformat()
+        if not session.closed and getattr(self, "_clock_metadata_writable", True):
+            record = self._clock.record
+            session.metadata["sleep_segment_started_at"] = self._iso(record.segment_started_at)
+            session.metadata["sleep_clock"] = {
+                "version": 1, "segment_started_at": self._iso(record.segment_started_at),
+                "interrupted": bool(record.interrupted),
+                "interrupt_started_at": self._iso(record.interrupt_started_at),
+                "last_note_at": self._iso(record.last_note_at),
+                "interrupted_minutes": float(record.interrupted_minutes),
+                "interruption_count": int(record.interruption_count),
+            }
         session.sync_runtime_fields()
         upsert = getattr(self._store, "upsert_sleep_session", None)
         if callable(upsert):
@@ -1161,16 +1173,56 @@ class SleepEngine:
             base = session.earliest_wake_at or current
             session.lie_in_cap_at = next_occurrence(base, self._lie_in_cap_minute())
         self._session = session
-        self._clock = SleepClock()
-        self._clock.record.segment_started_at = (
-            SleepSession._parse_meta_dt(session.metadata.get("sleep_segment_started_at"))
-            or current)
-        self._clock.record.continuous_minutes = float(session.continuous_minutes)
+        self._restore_clock(session, current)
         self._episode_id = str(session.metadata.get("episode_id") or "") or None
         self._last_tick_at = current
-        self._last_continuous_hours = session.continuous_minutes / 60.0
+        # Cold-load gap is owned by the existing offline handoff. Do not integrate
+        # the already elapsed segment again in the next ordinary tick.
+        self._last_continuous_hours = self._clock.continuous_minutes(current) / 60.0
         self._prepared = None
         return session
+
+    def _restore_clock(self, session: SleepSession, current: datetime) -> None:
+        """Restore the segment and interruption record, rather than restart its clock."""
+        self._clock = SleepClock()
+        payload = session.metadata.get("sleep_clock")
+        known = isinstance(payload, dict) and type(payload.get("version")) is int and payload["version"] == 1
+        self._clock_metadata_writable = not isinstance(payload, dict) or known
+
+        def stamp(raw: Any) -> Optional[datetime]:
+            value = self._parse(raw)
+            if value is None:
+                return None
+            if value.tzinfo is None and current.tzinfo is not None:
+                value = value.replace(tzinfo=current.tzinfo)
+            elif value.tzinfo is not None and current.tzinfo is None:
+                value = value.astimezone().replace(tzinfo=None)
+            return value if value <= current else None
+
+        started = stamp(session.metadata.get("sleep_started_at"))
+        segment = stamp(payload.get("segment_started_at")) if known else None
+        segment = segment or stamp(session.metadata.get("sleep_segment_started_at"))
+        if segment is None:
+            fields = self._snapshot()
+            # LifeState may contain another cycle; only its matching segment is evidence.
+            if stamp(fields.get("sleep_started_at")) == started and started is not None:
+                segment = stamp(fields.get("sleep_segment_started_at"))
+        if segment is None:
+            saved = stamp(session.updated_at) or stamp(session.created_at)
+            if saved is not None:
+                segment = saved - timedelta(minutes=max(0, session.continuous_minutes))
+        if started is not None and segment is not None and segment < started:
+            segment = started
+        self._clock.record.segment_started_at = segment or current
+        self._clock.record.interruption_count = max(0, session.interruption_count)
+        if known:
+            record = self._clock.record
+            record.interrupted_minutes = _clamp(payload.get("interrupted_minutes"), 0.0, 60.0*240.0, 0.0)
+            record.interruption_count = max(record.interruption_count,
+                int(_clamp(payload.get("interruption_count"), 0.0, 100000.0, 0.0)))
+            record.interrupt_started_at = stamp(payload.get("interrupt_started_at"))
+            record.last_note_at = stamp(payload.get("last_note_at"))
+            record.interrupted = bool(payload.get("interrupted")) and record.interrupt_started_at is not None
 
     def _restore_recent_closed(self, current: datetime) -> Optional[SleepSession]:
         """Retain the already-awake provider until this sleep cycle's cap after reload."""
