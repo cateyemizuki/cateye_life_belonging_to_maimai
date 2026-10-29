@@ -944,6 +944,28 @@ def build_dashboard_view(blocks: Any, *, now: Optional[datetime] = None) -> Dict
         ],
     }
 
+    # ── 右栏 05 消耗 · 用量口径四桶（§2.2，2026-10-29）─────────────
+    # 「待核验」改名「缺用量来源调用」（口径 = usage_source != host_reported 或
+    # usage_present 不为真）；四桶并列：正常回传 / 成功但无用量 / 失败 / 旧账本行。
+    # 仅当块带新键（buckets）时渲染，旧形状块/测试桩逐字不受影响。
+    buckets_raw = _dict(usage.get("buckets"))
+    if buckets_raw:
+        bucket_max = 0
+        bucket_cells = []
+        for key, label in (("host_reported", "正常回传"),
+                           ("success_no_usage", "成功但无用量"),
+                           ("failed", "失败"), ("legacy", "旧账本行")):
+            cell = _dict(buckets_raw.get(key))
+            bucket_calls = max(0, _to_int(cell.get("calls")))
+            bucket_max = max(bucket_max, bucket_calls)
+            bucket_cells.append((label, bucket_calls))
+        section_usage["buckets"] = [
+            {"name": label, "value": value, "value_text": f"{value:,}",
+             "frac": (value / bucket_max) if bucket_max else 0.0}
+            for label, value in bucket_cells]
+        missing_calls = max(0, _to_int(usage.get("missing_usage_source_calls")))
+        section_usage["buckets_note"] = f"缺用量来源调用 {missing_calls} 次"
+
     return {
         "header": {"date": date_text, "weekday": weekday,
                    "title": f"状态总览 · {date_text} {weekday}"},
@@ -956,7 +978,7 @@ def build_dashboard_view(blocks: Any, *, now: Optional[datetime] = None) -> Dict
         },
         "sections": [section_planning, section_companion, section_emotion,
                      section_qzone, section_usage],
-        "footer": {"left": "属于麦麦的生活 v2.1.0", "right": "Powered by Mai-Bot"},
+        "footer": {"left": "属于麦麦的生活 v3.0.0", "right": "Powered by Mai-Bot"},
     }
 
 
@@ -1395,6 +1417,33 @@ def _measure_section(view_section: Dict[str, Any], probe: Canvas,
                 bottom = rows_top + 18
             group_bottoms.append(bottom)
         content_bottom = max(group_bottoms, default=groups_top) + 4
+        # 用量口径四桶带（§2.2）：仅当视图节带 buckets 键时渲染；旧形状块逐字不进此分支。
+        bucket_rows = view_section.get("buckets") or []
+        if bucket_rows:
+            band_top = content_bottom + 12
+            p.text(RIGHT_X, band_top + probe.ascent(p.font(11, True)), "用量口径", 11,
+                   color=FAINT, tracking=2.0, max_w=RIGHT_W)
+            band_rows_top = band_top + 17
+            for row_index, row in enumerate(bucket_rows):
+                row_top = band_rows_top + row_index * 29
+                baseline = row_top + probe.ascent(p.font(12))
+                bucket_value_w = render_kit.text_width(probe, row["value_text"], p.font(12))
+                p.text(TEXT_RIGHT, baseline, row["value_text"], 12, color=MUTED,
+                       max_w=RIGHT_W, anchor="rs")
+                p.text(RIGHT_X, baseline, row["name"], 12, color=INK,
+                       max_w=max(10, RIGHT_W - bucket_value_w - 8))
+                bar_w = RIGHT_W * float(row["frac"])
+                p.rect([RIGHT_X, row_top + 17, RIGHT_X + RIGHT_W, row_top + 21],
+                       fill=(230, 227, 219))
+                if bar_w > 0:
+                    p.rect([RIGHT_X, row_top + 17, RIGHT_X + bar_w, row_top + 21], fill=INK)
+            content_bottom = band_rows_top + len(bucket_rows) * 29
+            bucket_note = str(view_section.get("buckets_note") or "").strip()
+            if bucket_note:
+                p.text(RIGHT_X, content_bottom + probe.ascent(p.font(12)), bucket_note,
+                       12, color=FAINT, max_w=RIGHT_W)
+                content_bottom += 18
+            content_bottom += 4
     else:  # pragma: no cover - 防御：未知 kind 退化为「未启用」
         p.text(RIGHT_X, content_top + probe.ascent(p.font(16)), _DISABLED_LINE, 16,
                color=MUTED, max_w=RIGHT_W)

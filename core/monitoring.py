@@ -20,7 +20,9 @@ def tail_records(path,budget=512*1024):
 def usage_summary(data_dir,now,hours=24):
     rows,truncated=tail_records(Path(data_dir)/'llm_usage_events.jsonl',2*1024*1024)
     models={};modules={};calls=unknown=0;tokens=verified_tokens=unverified_tokens=0
-    from .llm_usage import module_of_event
+    from .llm_usage import module_of_event,usage_bucket_of,missing_usage_source,empty_buckets
+    # 四桶并列输出（2026-10-29 §2.2 口径）：正常回传/成功但无用量/失败/legacy（旧行）。
+    buckets=empty_buckets()
     for row in rows:
         try:
             at=datetime.fromisoformat(str(row.get('ts','')))
@@ -28,7 +30,11 @@ def usage_summary(data_dir,now,hours=24):
             if not now-timedelta(hours=hours)<=at<=now:continue
             count=max(0,int(row.get('tokens',0)));model=str(row.get('model') or '未返回模型名')[:120]
             calls+=1;tokens+=count
-            if row.get('usage_source')!='host_reported':
+            bucket=usage_bucket_of(row);buckets[bucket]['calls']+=1;buckets[bucket]['tokens']+=count
+            # 「待核验」改名「缺用量来源调用」：口径 = usage_source != host_reported
+            # 或 usage_present 不为真（旧行无该字段 → 一律计入）。旧键名兼容输出，
+            # 新键名并列给出，渲染端下一工作流切换。
+            if missing_usage_source(row):
                 unknown+=1;unverified_tokens+=count
             else:verified_tokens+=count
             models[model]=models.get(model,0)+count
@@ -37,6 +43,8 @@ def usage_summary(data_dir,now,hours=24):
     return {'calls':calls,'tokens':tokens,'models':dict(sorted(models.items(),key=lambda r:r[1],reverse=True)[:30]),
             'host_reported_tokens':verified_tokens,'unverified_tokens':unverified_tokens,
             'modules':modules,'unverified_usage_calls':unknown,'window_hours':hours,'truncated':truncated,
+            'missing_usage_source_calls':unknown,'missing_usage_source_tokens':unverified_tokens,
+            'buckets':buckets,
             'statement_status':'not_provided','cost_verified':False,
             'note':'新记录标明宿主用量来源；缺失与旧记录单独标记。未提供供应商账单，不能据此确认实际扣费。'}
 

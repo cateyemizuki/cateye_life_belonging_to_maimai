@@ -28,6 +28,11 @@
                 72,
                 168
               ]
+            },
+            "day": {
+              "type": "string",
+              "required": false,
+              "max_length": 10
             }
           }
         }

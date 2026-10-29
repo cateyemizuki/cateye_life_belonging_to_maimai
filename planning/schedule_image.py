@@ -678,7 +678,7 @@ class ScheduleImageGenerator:
     @staticmethod
     def _footer_left_text(page: Dict[str, Any]) -> str:
         """页脚左侧文本（§6.9）：版本 + 多页 ``1/2`` 页码 / 超限「其余见文字版」。"""
-        text = "属于麦麦的生活 v2.1.0"
+        text = "属于麦麦的生活 v3.0.0"
         if page.get("page_count", 1) > 1:
             text += f" · {page['page_no']}/{page['page_count']}"
         if page.get("omitted"):

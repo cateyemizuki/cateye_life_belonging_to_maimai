@@ -1326,7 +1326,12 @@ class CompanionComponentsMixin:
                       "tokens": int((usage_summary or {}).get("tokens") or 0),
                       "calls": int((usage_summary or {}).get("calls") or 0),
                       "models": (usage_summary or {}).get("models") or {},
-                      "modules": (usage_summary or {}).get("modules") or {}},
+                      "modules": (usage_summary or {}).get("modules") or {},
+                      # 2026-10-29 §2.2 口径：四桶拆分 + 缺用量来源调用（PNG 面板展示用；
+                      # 只加键不改既有键，旧消费方不受影响）。
+                      "buckets": (usage_summary or {}).get("buckets") or {},
+                      "missing_usage_source_calls":
+                          int((usage_summary or {}).get("missing_usage_source_calls") or 0)},
         }
 
     #: 随图日志的事件中文名（bus:<event> 前缀已剥；未登记事件回退原名）

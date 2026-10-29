@@ -4,8 +4,9 @@
   ``model_name / prompt_tokens / completion_tokens / total_tokens``
   （旧宿主或测试桩没有这些字段 → 记 0 tokens、只计调用次数，面板据此提示）。
 - **落盘** = ``<data_dir>/llm_usage_events.jsonl``：每次调用一行
-  ``{"ts", "event", "model", "tokens"}``；写入时惰性裁剪超过保留期的旧行；
-  JSONL 单行追加、损坏行跳过（统计类数据，不要求事务性）。
+  ``{"ts", "event", "model", "tokens"}``（2026-10-29 口径轮起新增 ``success`` /
+  ``usage_present`` 两个布尔；旧行无新字段，聚合时归 legacy 桶，不回填不改旧行）；
+  写入时惰性裁剪超过保留期的旧行；JSONL 单行追加、损坏行跳过（统计类数据，不要求事务性）。
 - **模块归属** = ``event`` 名静态映射（各调用点的 ``event=`` 全仓唯一）。
 - **无配置项**（用户口径）；跨热重载连续（落盘），满足 §9.2「计数必须落盘」教训。
 """
@@ -43,6 +44,48 @@ MODULE_ORDER = ("planning", "companion", "emotion", "qzone", "其他")
 #: 账本保留期（小时）：面板只看 24h，多留一天缓冲
 KEEP_HOURS = 48
 
+#: 四桶键名（§2.2 模型消耗口径）：聚合结果按此并列输出。
+#: 正常回传 = 宿主标明来源且用量在场；成功但无用量；失败；legacy = 无新字段的旧行。
+BUCKET_HOST_REPORTED = "host_reported"
+BUCKET_SUCCESS_NO_USAGE = "success_no_usage"
+BUCKET_FAILED = "failed"
+BUCKET_LEGACY = "legacy"
+USAGE_BUCKETS = (BUCKET_HOST_REPORTED, BUCKET_SUCCESS_NO_USAGE, BUCKET_FAILED, BUCKET_LEGACY)
+
+
+def empty_buckets() -> Dict[str, Dict[str, int]]:
+    """四桶空骨架（聚合面统一形状；值全 0）。"""
+    return {name: {"calls": 0, "tokens": 0} for name in USAGE_BUCKETS}
+
+
+def usage_bucket_of(entry: Any) -> str:
+    """单条账本行 → 四桶键名（判定优先级：legacy > 失败 > 正常回传 > 成功但无用量）。
+
+    - **legacy**：无 ``success``/``usage_present`` 新字段的旧行（不回填不猜测）；
+    - **失败**：``success`` 非真即失败桶——失败响应即使带 0 值 usage 也归失败，
+      成败不由 usage 推断（2026-10-29 口径修正的根因即在此）；
+    - **正常回传**：``usage_source == "host_reported"`` 且 ``usage_present`` 为真；
+    - 其余（成功但宿主未回传可识别用量字段）→ **成功但无用量**。
+    """
+    if not isinstance(entry, dict):
+        return BUCKET_LEGACY
+    if "success" not in entry and "usage_present" not in entry:
+        return BUCKET_LEGACY
+    if entry.get("success") is not True:
+        return BUCKET_FAILED
+    if entry.get("usage_source") == "host_reported" and entry.get("usage_present") is True:
+        return BUCKET_HOST_REPORTED
+    return BUCKET_SUCCESS_NO_USAGE
+
+
+def missing_usage_source(entry: Any) -> bool:
+    """「缺用量来源调用」口径（§2.2 改名，替代旧「待核验」）：
+    ``usage_source != host_reported`` **或** ``usage_present`` 不为真。
+    旧行无 ``usage_present`` 字段 → 一律计入（与报告「该指标实际主要覆盖旧账本行」一致）。"""
+    if not isinstance(entry, dict):
+        return True
+    return entry.get("usage_source") != "host_reported" or entry.get("usage_present") is not True
+
 
 def module_of_event(event: Any) -> str:
     """调用点 event → 模块名（未知 event 归「其他」，不丢数）。"""
@@ -60,8 +103,16 @@ class LLMUsageTracker:
     def record(self, *, event: Any, model: Any = "",
                prompt_tokens: Any = 0, completion_tokens: Any = 0,
                total_tokens: Any = 0, request_id: Any = "",
-               usage_available: bool = False) -> None:
-        """记一次调用（tokens 为 0 也记调用次数；异常一律吞掉，绝不打断业务链路）。"""
+               usage_available: bool = False,
+               success: bool = False, usage_present: bool = False) -> None:
+        """记一次调用（tokens 为 0 也记调用次数；异常一律吞掉，绝不打断业务链路）。
+
+        2026-10-29 新增两个布尔（只加字段不改既有字段语义）：
+        - ``success``：请求成败，来自调用出口（``_result_from_response``/``_interpret``）
+          的实际结果——拿到非空正文为真；宿主失败/空正文/异常均假。成败不由 usage 推断。
+        - ``usage_present``：宿主响应里是否存在可识别的用量字段（含 0 值）；
+          与 ``usage_available``（total 可得，预算层口径）分离。
+        """
         if self._path is None:
             return
         try:
@@ -77,7 +128,9 @@ class LLMUsageTracker:
         entry = {"ts": datetime.now().isoformat(timespec="seconds"),
                  "event": str(event or ""), "model": str(model or ""), "tokens": max(0,total),
                  "request_id": str(request_id or "")[:128],
-                 "usage_source": "host_reported" if usage_available else "unavailable"}
+                 "usage_source": "host_reported" if usage_available else "unavailable",
+                 "success": bool(success),
+                 "usage_present": bool(usage_present)}
         try:
             self._prune()
             with open(self._path, "a", encoding="utf-8") as handle:
@@ -123,15 +176,23 @@ class LLMUsageTracker:
 
     # ---- 聚合 ----
     def summary(self, hours: int = 24) -> Dict[str, Any]:
-        """聚合最近 ``hours`` 小时：调用次数 / token 总量 / 按模型 / 按模块。
+        """聚合最近 ``hours`` 小时：调用次数 / token 总量 / 按模型 / 按模块 / 四桶。
 
-        返回 ``{"calls", "tokens", "models", "modules", "has_usage"}``；
+        返回 ``{"calls", "tokens", "models", "modules", "has_usage", "buckets",
+        "missing_usage_source_calls"}``；
         ``has_usage`` = 宿主是否回传过非零 token（面板据此区分"无调用"与
-        "有调用但宿主未返回用量"）。文件缺失/损坏 → 空账本（不抛异常）。
+        "有调用但宿主未返回用量"）；
+        ``buckets`` = 四桶拆分（正常回传 / 成功但无用量 / 失败 / legacy，各含
+        ``calls``/``tokens``，与既有键并列输出）；
+        ``missing_usage_source_calls`` = 缺用量来源调用次数（口径见
+        :func:`missing_usage_source`，旧「待核验」改名后的新键名）。
+        文件缺失/损坏 → 空账本（不抛异常）。
         """
         window_start = datetime.now() - timedelta(hours=max(1, int(hours)))
         calls = 0
         tokens = 0
+        missing_calls = 0
+        buckets = empty_buckets()
         models: Dict[str, int] = {}
         modules: Dict[str, int] = {}
         if self._path is not None and self._path.exists():
@@ -154,6 +215,11 @@ class LLMUsageTracker:
                         calls += 1
                         count = int((entry or {}).get("tokens") or 0)
                         tokens += count
+                        if missing_usage_source(entry):
+                            missing_calls += 1
+                        bucket = usage_bucket_of(entry)
+                        buckets[bucket]["calls"] += 1
+                        buckets[bucket]["tokens"] += count
                         model = str((entry or {}).get("model") or "")
                         module = module_of_event((entry or {}).get("event"))
                         if model:
@@ -162,4 +228,5 @@ class LLMUsageTracker:
             except OSError:
                 logger.debug("LLM 消耗账本读取失败（忽略）", exc_info=True)
         return {"calls": calls, "tokens": tokens, "models": models,
-                "modules": modules, "has_usage": tokens > 0}
+                "modules": modules, "has_usage": tokens > 0,
+                "buckets": buckets, "missing_usage_source_calls": missing_calls}

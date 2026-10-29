@@ -137,22 +137,29 @@ def _optional_int(value: Any) -> Optional[int]:
         return None
 
 
-def extract_usage(result: Any) -> tuple[Optional[int], Optional[int], Optional[int], bool]:
+def extract_usage(result: Any) -> tuple[Optional[int], Optional[int], Optional[int], bool, bool]:
     """从宿主结果读真实 usage：兼容顶层字段与 OpenAI 风格 ``usage`` 子字典。
 
-    返回 ``(prompt, completion, total, available)``。``available`` 只在 total 可得，
-    或 prompt/completion 同时可得时为 True；部分字段缺失时保持 None，预算层不会
-    凭估算释放预占。
+    返回 ``(prompt, completion, total, available, usage_present)``。
+    - ``available`` 只在 total 可得，或 prompt/completion 同时可得时为 True；
+      部分字段缺失时保持 None，预算层不会凭估算释放预占（口径不变）。
+    - ``usage_present``（2026-10-29 口径修正新增位）：宿主响应里是否存在可识别的
+      用量字段——**字段在场即真，含 0 值**（宿主失败响应常带 ``total_tokens: 0``，
+      旧口径把它当"可用"，是失败被记成 host_reported 0 的根因）。成败不再由
+      usage 推断：失败归失败桶由 ``success`` 布尔承担（见 :meth:`_record_usage`）。
     """
     if not isinstance(result, dict):
-        return None, None, None, False
+        return None, None, None, False, False
     usage = result.get("usage")
     sources = (result, usage if isinstance(usage, dict) else {})
+    usage_present = isinstance(usage, dict) and bool(usage)
 
     def pick(names: tuple[str, ...]) -> Optional[int]:
+        nonlocal usage_present
         for source in sources:
             for name in names:
                 if source.get(name) is not None:
+                    usage_present = True
                     value = _optional_int(source.get(name))
                     if value is not None:
                         return value
@@ -164,7 +171,7 @@ def extract_usage(result: Any) -> tuple[Optional[int], Optional[int], Optional[i
     if total is None and prompt is not None and completion is not None:
         total = prompt + completion
     available = total is not None
-    return prompt, completion, total, available
+    return prompt, completion, total, available, usage_present
 
 
 def _llm_section(config_or_plugin: Any) -> Any:
@@ -433,8 +440,12 @@ class LLMService:
                               request_id: str, attempts: int, strict_params: bool,
                               requested_model: str = "") -> LLMResult:
         """把一次宿主响应翻译成 LLMResult（唯一记账/记日志出口）。"""
-        self._record_usage(event, task, result)
-        prompt_tokens, completion_tokens, total_tokens, usage_available = extract_usage(result)
+        # 2026-10-29 口径修正：成败先于记账判定（与 _interpret 返回一致——拿到非空
+        # 正文才算成功），失败响应即使带 0 值 usage 也归失败桶，不再由 usage 推断成败。
+        success = bool(isinstance(result, dict) and result.get("success")
+                       and str(result.get("response") or "").strip())
+        self._record_usage(event, task, result, success=success)
+        prompt_tokens, completion_tokens, total_tokens, usage_available, usage_present = extract_usage(result)
         response_model = ""
         if isinstance(result, dict):
             response_model = str(result.get("model") or result.get("model_name") or "")
@@ -496,21 +507,26 @@ class LLMService:
             result, event=event, task=task, request_id=uuid.uuid4().hex,
             attempts=1, strict_params=False).text
 
-    def _record_usage(self, event: str, task: str, result: Any) -> None:
+    def _record_usage(self, event: str, task: str, result: Any, *,
+                      success: bool = False) -> None:
         """F3：把宿主能力载荷里的真实用量字段记入消耗账本。
 
         兼容顶层 ``prompt_tokens/completion_tokens/total_tokens`` 与 OpenAI 风格
         ``usage`` 子字典；宿主没给用量时只计调用次数，不伪造 token。
+        2026-10-29 追加 ``success``（请求成败，来自调用出口，不由 usage 推断）与
+        ``usage_present``（用量字段在场，含 0 值）两个账本布尔；旧行无新字段由
+        聚合端归 legacy 桶，不回填。
         """
         tracker = self._usage_tracker
         if tracker is None or not isinstance(result, dict):
             return
         try:
-            prompt_tokens, completion_tokens, total_tokens, usage_available = extract_usage(result)
+            prompt_tokens, completion_tokens, total_tokens, usage_available, usage_present = extract_usage(result)
             tracker.record(event=event, model=result.get("model_name") or result.get("model"),
                            prompt_tokens=prompt_tokens,
                            completion_tokens=completion_tokens,
                            total_tokens=total_tokens, usage_available=usage_available,
+                           success=success, usage_present=usage_present,
                            request_id=result.get("request_id") or result.get("id") or "")
         except Exception:
             try:
@@ -520,12 +536,16 @@ class LLMService:
 
     def usage_summary(self, hours: int = 24) -> Dict[str, Any]:
         """最近 ``hours`` 小时的消耗聚合（面板指令渲染用；账本缺失 → 空账本）。"""
+        empty_buckets = {name: {"calls": 0, "tokens": 0} for name in
+                         ("host_reported", "success_no_usage", "failed", "legacy")}
         if self._usage_tracker is None:
-            return {"calls": 0, "tokens": 0, "models": {}, "modules": {}, "has_usage": False}
+            return {"calls": 0, "tokens": 0, "models": {}, "modules": {}, "has_usage": False,
+                    "buckets": empty_buckets, "missing_usage_source_calls": 0}
         try:
             return self._usage_tracker.summary(hours)
         except Exception:
-            return {"calls": 0, "tokens": 0, "models": {}, "modules": {}, "has_usage": False}
+            return {"calls": 0, "tokens": 0, "models": {}, "modules": {}, "has_usage": False,
+                    "buckets": empty_buckets, "missing_usage_source_calls": 0}
 
     async def judge(self, prompt: str, *, event: str = "judge") -> str:
         """判定类调用（当前唯一调用点 = 想念把关；角色裁判/睡眠裁判走各自任务名，不读本入口）：
