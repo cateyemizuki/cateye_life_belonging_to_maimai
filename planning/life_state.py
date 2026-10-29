@@ -171,6 +171,9 @@ class LifeStateService:
         #: 维持既有备份与重建语义）。分类与结算由编排方经
         #: ``planning.offline_sleep.plan_offline_settlement`` 用原始值做。
         self._pending_offline_gap_seconds: Optional[float] = None
+        # A graceful stop is an observed-alive checkpoint, not a state integration tick.
+        self._last_observed_at: Optional[datetime] = None
+        self._pending_awake_before_offline_seconds: float = 0.0
         self._history = LifeStateHistory(path.with_name(f"{path.stem}_history.json"),
                                          decision_logger=decision_logger)
         self._load()
@@ -265,6 +268,12 @@ class LifeStateService:
         # 重启时可重算同一段 gap（离线段不丢）。
         now = self._now()
         self._pending_offline_gap_seconds = self._raw_offline_gap_seconds(now)
+        if self._last_observed_at is not None and self._last_tick_at is not None:
+            if self._last_tick_at <= self._last_observed_at <= now:
+                self._pending_awake_before_offline_seconds = (self._last_observed_at-self._last_tick_at).total_seconds()
+                self._pending_offline_gap_seconds = (now-self._last_observed_at).total_seconds()
+        # Clear only in memory; until settlement saves, a crash can still retry the original file.
+        self._last_observed_at = None
         self._last_tick_at = now
         self._updated_at = now
         self._clamp_all()
@@ -298,6 +307,7 @@ class LifeStateService:
         self._last_break_at = self._parse_ts(raw.get("last_break_at"))
         self._last_sleep_at = self._parse_ts(raw.get("last_sleep_at"))
         self._last_tick_at = self._parse_ts(raw.get("last_tick_at"))
+        self._last_observed_at = self._parse_ts(raw.get("last_observed_at"))
         self._updated_at = self._parse_ts(raw.get("updated_at"))
         # 睡眠引擎字段（B.2.1）：逐字段容错，坏字段回默认、不整体作废
         self._sleep_started_at = self._parse_ts(raw.get("sleep_started_at"))
@@ -692,6 +702,7 @@ class LifeStateService:
         分类/结算口径见 :mod:`planning.offline_sleep`。取走请走
         :meth:`consume_pending_offline_gap`（一次性，防重复结算）。
         """
+        # Prefer an observed graceful-stop checkpoint; old files fall back to last tick.
         return self._pending_offline_gap_seconds
 
     def consume_pending_offline_gap(self) -> Optional[float]:
@@ -704,6 +715,16 @@ class LifeStateService:
         gap = self._pending_offline_gap_seconds
         self._pending_offline_gap_seconds = None
         return gap
+
+    def consume_pending_awake_before_offline_seconds(self) -> float:
+        """Unsampled running time before a confirmed stop; consumed with the offline gap."""
+        seconds = self._pending_awake_before_offline_seconds
+        self._pending_awake_before_offline_seconds = 0.0
+        return seconds
+
+    def mark_observed_at(self, now: Optional[datetime] = None) -> None:
+        """Record a graceful unload without dropping unintegrated time since the last tick."""
+        self._last_observed_at = self._now(now)
 
     def mental_state(self) -> float:
         """派生读数 ``energy × focus × (1 - stress)``（不单独存，附录 B.2 说明）。"""
@@ -803,6 +824,7 @@ class LifeStateService:
             "last_break_at": self._fmt_ts(self._last_break_at),
             "last_sleep_at": self._fmt_ts(self._last_sleep_at),
             "last_tick_at": self._fmt_ts(self._last_tick_at),
+            "last_observed_at": self._fmt_ts(self._last_observed_at),
             "updated_at": self._fmt_ts(self._updated_at),
             # PR3 睡眠引擎字段（附录 B.2.1；旧文件缺键 → 加载默认）
             "sleep_started_at": self._fmt_ts(self._sleep_started_at),
@@ -846,6 +868,7 @@ def default_state_document() -> Dict[str, Any]:
     service._last_break_at = None
     service._last_sleep_at = None
     service._last_tick_at = None
+    service._last_observed_at = None
     service._updated_at = None
     service._sleep_started_at = None
     service._continuous_sleep_minutes = 0.0

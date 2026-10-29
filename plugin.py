@@ -766,10 +766,12 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         """
         try:
             gap = life.consume_pending_offline_gap()
+            consume_awake = getattr(life, "consume_pending_awake_before_offline_seconds", None)
+            awake_before = consume_awake() if callable(consume_awake) else 0.0
         except Exception as exc:
             self._warn_quiet("离线 gap 读取失败（跳过收口，按无 pending 处理）：%s", exc)
             return
-        if gap is None or gap <= 0:
+        if gap is None or (gap <= 0 and awake_before <= 0):
             return
         if engine_claimed:
             # 引擎持有未关闭睡眠会话/恢复池：离线段归引擎（连续钟/整晚规则）记账；
@@ -789,7 +791,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             # grace（或计划失败）→ 旧冷启动清醒漂移：≤24h（DT_MAX_MINUTES 与
             # LifeState._dt_minutes 同钳制口径），等价重构前 _load 补算
             try:
-                dt_min = min(gap / 60.0, DT_MAX_MINUTES)
+                dt_min = min((gap + awake_before) / 60.0, DT_MAX_MINUTES)
                 if dt_min > 0:
                     life._apply_drift(dt_min, rates=None)  # noqa: SLF001 - 旧冷启动漂移延迟回退
                     life._clamp_all()  # noqa: SLF001
@@ -800,6 +802,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 self._warn_quiet("离线 grace 漂移回退失败（忽略）：%s", exc)
             return
         try:
+            if awake_before > 0:
+                # This was observed running time, never inferred sleep.
+                life._apply_drift(min(awake_before / 60.0, DT_MAX_MINUTES), rates=None)
+                life._clamp_all()
             self._apply_offline_settlement(life, planner, plan)
         except Exception as exc:
             self._warn_quiet("离线睡眠结算失败（已尽力应用，忽略继续启动）：%s", exc)
@@ -1080,6 +1086,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         if life is None:
             return
         try:
+            mark_observed = getattr(life, "mark_observed_at", None)
+            if callable(mark_observed):
+                mark_observed()
             life.save()
         except Exception as exc:
             try:
