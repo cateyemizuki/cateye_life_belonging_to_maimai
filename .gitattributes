@@ -1,0 +1,2 @@
+# Preserve accepted artwork bytes, including the official SVG, across Windows checkouts.
+webui/source/assets/* -text
