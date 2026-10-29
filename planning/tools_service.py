@@ -110,7 +110,7 @@ class ToolsService:
             "enable_detailed_description": cfg.enable_detailed_description,
             "min_description_length": adv.min_description_length,
             "max_description_length": adv.max_description_length,
-            "max_tokens": adv.max_tokens,
+
             "custom_prompt": cfg.custom_prompt,
             "recent_schedule_days": adv.recent_schedule_days,
             "history_message_limit": adv.history_message_limit,
@@ -1035,7 +1035,7 @@ class ToolsService:
                 weekday=weekday,
                 task_name=llm_task_name_of(self._plugin),
                 temperature=cfg.role_judge_temperature,
-                max_tokens=cfg.max_tokens,
+
                 # 角色裁判同样受 generation_timeout 约束
                 timeout_ms=int(float(cfg.generation_timeout) * 1000),
             )

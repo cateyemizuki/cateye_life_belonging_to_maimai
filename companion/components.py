@@ -1500,7 +1500,7 @@ class CompanionComponentsMixin:
     def _mai_usage_lines(self) -> List[str]:
         """模型消耗块（F3 2026-10-11）：最近 24 小时按模型/按模块的 token 消耗。
 
-        数据源 = ``plugin._llm`` 的消耗账本（``core/llm_usage.py``，无配置项）；
+        数据源 = ``plugin._llm`` 的用量记录（``core/llm_usage.py``，无配置项）；
         服务缺失（降级形态）→ 单行提示。
         """
         from core.llm_usage import MODULE_ORDER

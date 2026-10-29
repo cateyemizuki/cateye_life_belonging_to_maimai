@@ -586,7 +586,7 @@ class QzoneService:
                 prompt,
                 task_name=purpose_task(self._plugin, "qzone", default="utils"),
                 temperature=0.2,
-                max_tokens=60,
+
                 event="qzone_post_gate",
             )
         except Exception:
@@ -677,7 +677,7 @@ class QzoneService:
             prompt,
             task_name=purpose_task(self._plugin, "qzone", default="utils"),
             temperature=0.8,
-            max_tokens=200,
+
             event="qzone_post",
         )
         return text.strip().strip('"“”')
@@ -744,7 +744,7 @@ class QzoneService:
                 reply_text = await self._llm.generate(
                     prompt,
                     task_name=purpose_task(self._plugin, "qzone", default="utils"),
-                    temperature=0.8, max_tokens=120,
+                    temperature=0.8,
                     event="qzone_reply",
                 )
                 reply_text = reply_text.strip()
@@ -876,7 +876,7 @@ class QzoneService:
             reply_text = await self._llm.generate(
                 prompt,
                 task_name=purpose_task(self._plugin, "qzone", default="utils"),
-                temperature=0.8, max_tokens=120, event="qzone_reply",
+                temperature=0.8,  event="qzone_reply",
             )
             reply_text = reply_text.strip()
             if reply_text and await self.comment_moment(tid, reply_text):

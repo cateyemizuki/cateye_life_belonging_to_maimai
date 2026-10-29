@@ -72,7 +72,6 @@ class ScheduleGeneratorConfig:
         self.quality_threshold = config_dict.get('quality_threshold', 0.85)
 
         # === 模型配置 ===
-        self.max_tokens = config_dict.get('max_tokens', 8192)
         self.generation_timeout = config_dict.get('generation_timeout', 180.0)
 
         # === 自定义Prompt ===
@@ -151,8 +150,6 @@ class ScheduleGeneratorConfig:
             )
 
         # 验证模型参数
-        if self.max_tokens < 1000:
-            logger.warning(f"max_tokens ({self.max_tokens}) 过小，可能导致响应截断")
 
         if self.generation_timeout < 10:
             raise ValueError(
@@ -209,7 +206,7 @@ class ScheduleGeneratorConfig:
             'use_multi_round': self.use_multi_round,
             'max_rounds': self.max_rounds,
             'quality_threshold': self.quality_threshold,
-            'max_tokens': self.max_tokens,
+
             'generation_timeout': self.generation_timeout,
             'custom_prompt': self.custom_prompt,
             # v4.5.0（issue #12）

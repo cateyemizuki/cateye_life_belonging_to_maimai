@@ -277,15 +277,7 @@ class ScheduleSectionConfig(PluginConfigBase):
             **_ui_i18n("Spine knowledge limit"),
         },
     )
-    spine_max_tokens: int = Field(
-        default=2048,
-        ge=256,
-        description="spine 模式生成的最大 token 数（输出比全天生成短得多）",
-        json_schema_extra={
-            "label": "spine 最大 token",
-            **_ui_i18n("Spine max tokens"),
-        },
-    )
+
     spine_use_multi_round: bool = Field(
         default=False,
         description="spine 模式多轮生成：默认单轮 + 结构校验（不强制重试，质量差一点可以接受）",
@@ -308,8 +300,7 @@ class ScheduleSectionConfig(PluginConfigBase):
     )
     # PR8 3.0.0：``planning_daily_token_budget`` 预留键位已退役（自述「熔断策略本阶段
     # 未启用」的自造预留键；依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP3）。
-    # 注意：``[event_catalog].daily_token_budget``（event_catalog_config.py）是事件库
-    # 另一套真实预算，与此键无关，保留。
+    # 2026-10-29：事件库输出长度与Token额度也交回宿主，旧键只忽略。
 
 
 # ---------------------------------------------------------------------------
@@ -363,15 +354,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
             **_ui_i18n("Quality threshold"),
         },
     )
-    max_tokens: int = Field(
-        default=8192,
-        ge=1000,
-        description="日程生成 LLM 的最大 token 数（过小可能截断日程）",
-        json_schema_extra={
-            "label": "生成最大 token",
-            **_ui_i18n("Max tokens"),
-        },
-    )
+
     generation_timeout: float = Field(
         default=180.0,
         ge=10.0,

@@ -20,7 +20,7 @@ def tail_records(path,budget=512*1024):
 def usage_summary(data_dir,now,hours=24):
     rows,truncated=tail_records(Path(data_dir)/'llm_usage_events.jsonl',2*1024*1024)
     models={};modules={};calls=unknown=0;tokens=verified_tokens=unverified_tokens=0
-    from .llm_usage import module_of_event,usage_bucket_of,missing_usage_source,empty_buckets
+    from .llm_usage import module_of_event,usage_bucket_of,missing_usage_source,empty_buckets,reported_token_count,USAGE_TERMS
     # 四桶并列输出（2026-10-29 §2.2 口径）：正常回传/成功但无用量/失败/legacy（旧行）。
     buckets=empty_buckets()
     for row in rows:
@@ -28,10 +28,10 @@ def usage_summary(data_dir,now,hours=24):
             at=datetime.fromisoformat(str(row.get('ts','')))
             if at.tzinfo is None:at=at.replace(tzinfo=now.tzinfo)
             if not now-timedelta(hours=hours)<=at<=now:continue
-            count=max(0,int(row.get('tokens',0)));model=str(row.get('model') or '未返回模型名')[:120]
+            count=reported_token_count(row);model=str(row.get('model') or '未返回模型名')[:120]
             calls+=1;tokens+=count
             bucket=usage_bucket_of(row);buckets[bucket]['calls']+=1;buckets[bucket]['tokens']+=count
-            # 「待核验」改名「缺用量来源调用」：口径 = usage_source != host_reported
+            # 「缺少来源」改名「缺用量来源调用」：口径 = usage_source != host_reported
             # 或 usage_present 不为真（旧行无该字段 → 一律计入）。旧键名兼容输出，
             # 新键名并列给出，渲染端下一工作流切换。
             if missing_usage_source(row):
@@ -41,12 +41,12 @@ def usage_summary(data_dir,now,hours=24):
             module=module_of_event(row.get('event'));modules[module]=modules.get(module,0)+count
         except (ValueError,TypeError,OverflowError):continue
     return {'calls':calls,'tokens':tokens,'models':dict(sorted(models.items(),key=lambda r:r[1],reverse=True)[:30]),
-            'host_reported_tokens':verified_tokens,'unverified_tokens':unverified_tokens,
-            'modules':modules,'unverified_usage_calls':unknown,'window_hours':hours,'truncated':truncated,
+            'host_reported_tokens':verified_tokens,
+            'modules':modules,'window_hours':hours,'truncated':truncated,
             'missing_usage_source_calls':unknown,'missing_usage_source_tokens':unverified_tokens,
             'buckets':buckets,
-            'statement_status':'not_provided','cost_verified':False,
-            'note':'新记录标明宿主用量来源；缺失与旧记录单独标记。未提供供应商账单，不能据此确认实际扣费。'}
+            'terms':USAGE_TERMS,
+            'note':'只统计宿主回传的Token；缺失时只计调用，不推算。调用次数包含失败。'}
 
 def runtime_health(plugin,now):
     result={'scope':'bounded_recent_log_tail','plugin_errors':0,'external_errors':0,'reloads':0,'last_reload':None,'truncated':False}

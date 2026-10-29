@@ -163,7 +163,7 @@ async def judge_schedule_request(
     weekday: str,
     task_name: str,
     temperature: float = 0.3,
-    max_tokens: int = 2000,
+
     timeout_ms: Optional[int] = None,
     llm_service: Any = None,
 ) -> Optional[Dict[str, Any]]:
@@ -178,7 +178,6 @@ async def judge_schedule_request(
         weekday: 今日星期标签。
         task_name: 模型任务名（走宿主任务路由）。
         temperature: LLM 温度。
-        max_tokens: LLM 最大 tokens。
         timeout_ms: LLM 调用超时（毫秒）。``None`` 使用宿主默认。
         llm_service: 统一 LLMService 实例（缺省取 ``plugin._llm``）。
 
@@ -205,7 +204,7 @@ async def judge_schedule_request(
         prompt,
         task_name=task_name,
         temperature=temperature,
-        max_tokens=max_tokens,
+
         timeout_ms=int(timeout_ms) if (timeout_ms is not None and timeout_ms > 0) else None,
         event="role_judge",
     )

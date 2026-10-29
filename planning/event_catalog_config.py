@@ -28,15 +28,7 @@ DEFAULT_MIN_GENERATED_EVENTS = 3
 #: 附录 B.1.3：active_events 总池上限（用户已裁定规范字段默认 12）
 DEFAULT_MAX_POOL_EVENTS = 12
 DEFAULT_TASK_NAME = "schedule_events"
-DEFAULT_MAX_TOKENS = 1200
 DEFAULT_TEMPERATURE = 0.9
-#: 附录 B.7 建议的「真预算」：一次生成约 1.5k+1.2k，留一点余量；
-#: 0 = 不限制（便于用户显式关闭熔断）。
-#: 2026-10-26 契约修补：预算改为「实际 messages 字节上界 + 1024 封装预留 + 1200 输出」
-#: 的保守预占，中文 prompt 单次上界约 4.3k；原 4000 连一次合法生成都无法预占。
-#: 取 9000 覆盖 1500 字符最坏 4 字节/字符（6000B）+ 1024 + 1200 = 8224 的整次上界，
-#: 并留出约 9% 余量；该字段未被用户锁定，属实现约束。
-DEFAULT_DAILY_TOKEN_BUDGET = 9000
 #: 自动检查节拍（秒）；每天最多真正生成一次，检查本身不消耗 LLM
 DEFAULT_AUTO_CHECK_SECONDS = 300
 
@@ -118,13 +110,7 @@ class EventCatalogSectionConfig(PluginConfigBase):
         description="独立 LLM 任务名；宿主未配置该任务时生成侧自动回退 utils",
         json_schema_extra={"label": "LLM 任务名", **_i18n("LLM task name")},
     )
-    max_tokens: int = Field(
-        default=DEFAULT_MAX_TOKENS,
-        ge=256,
-        le=4096,
-        description="生成输出 token 上限（定稿 1200；事件生成调用实际夹取 <=1200）",
-        json_schema_extra={"label": "输出 token 上限", **_i18n("Max output tokens")},
-    )
+
     temperature: float = Field(
         default=DEFAULT_TEMPERATURE,
         ge=0.0,
@@ -137,13 +123,7 @@ class EventCatalogSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "生成温度（固定 0.9，隐藏）", "hidden": True,
                            **_i18n("Temperature (fixed 0.9, hidden)")},
     )
-    daily_token_budget: int = Field(
-        default=DEFAULT_DAILY_TOKEN_BUDGET,
-        ge=0,
-        le=1_000_000,
-        description="事件生成每日 token 熔断阈值（0=不限制；调用前保守上界预占，有真实 usage 按实际结算）",
-        json_schema_extra={"label": "每日 token 预算", **_i18n("Daily token budget")},
-    )
+
 
     def normalized(self) -> "EventCatalogConfig":
         """Pydantic 段 → 服务只读视图（不做 IO）。"""
@@ -161,9 +141,9 @@ class EventCatalogConfig:
     max_pool_events: int = DEFAULT_MAX_POOL_EVENTS
     enforce_pool_cap: bool = True
     task_name: str = DEFAULT_TASK_NAME
-    max_tokens: int = DEFAULT_MAX_TOKENS
+
     temperature: float = DEFAULT_TEMPERATURE
-    daily_token_budget: int = DEFAULT_DAILY_TOKEN_BUDGET
+
     auto_check_seconds: int = DEFAULT_AUTO_CHECK_SECONDS
 
     @property
@@ -264,14 +244,9 @@ def resolve_config(source: Any) -> EventCatalogConfig:
     max_days = max(DEFAULT_MIN_INTERVAL_DAYS, min(DEFAULT_MAX_INTERVAL_DAYS, max_days))
     if min_days > max_days:
         min_days, max_days = max_days, min_days
-    max_tokens = max(256, min(4096, _as_int(_attr(source, "max_tokens", DEFAULT_MAX_TOKENS),
-                                            DEFAULT_MAX_TOKENS)))
     # 用户锁定 temperature=0.9（固定协议）：不读配置，避免出现「可编辑但永不生效」的死键。
     # 字段仍在 section 上（隐藏、默认 0.9）以便配置文件自洽；想改只能改本模块常量。
     temperature = DEFAULT_TEMPERATURE
-    budget = max(0, min(1_000_000, _as_int(
-        _attr(source, "daily_token_budget", DEFAULT_DAILY_TOKEN_BUDGET),
-        DEFAULT_DAILY_TOKEN_BUDGET)))
     return EventCatalogConfig(
         mode=mode,
         min_interval_days=min_days,
@@ -281,9 +256,8 @@ def resolve_config(source: Any) -> EventCatalogConfig:
                                        DEFAULT_MAX_POOL_EVENTS)),
         enforce_pool_cap=bool(_attr(source, "enforce_pool_cap", True)),
         task_name=str(_attr(source, "task_name", DEFAULT_TASK_NAME) or DEFAULT_TASK_NAME),
-        max_tokens=max_tokens,
+
         temperature=temperature,
-        daily_token_budget=budget,
         auto_check_seconds=max(30, _as_int(
             _attr(source, "auto_check_seconds", DEFAULT_AUTO_CHECK_SECONDS),
             DEFAULT_AUTO_CHECK_SECONDS)),

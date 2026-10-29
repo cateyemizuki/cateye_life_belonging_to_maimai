@@ -324,7 +324,7 @@ async def evaluate_conversation_delta(
     )
     try:
         response = await llm.generate(prompt, task_name=task_name, temperature=0.3,
-                                      max_tokens=300, event="affection_review")
+                                       event="affection_review")
     except Exception as exc:  # 宿主异常一律静默（失败哲学）
         logger.debug("会话采样裁判请求失败（跳过本轮）：%s", exc)
         return None
@@ -383,7 +383,7 @@ async def run_daily_review(
     )
     try:
         response = await llm.generate(prompt, task_name=task_name, temperature=0.3,
-                                      max_tokens=700, event="affection_daily_review")
+                                       event="affection_daily_review")
     except Exception as exc:  # 宿主异常一律静默（失败哲学）
         logger.debug("关系日结裁判请求失败（跳过本轮）：%s", exc)
         return None

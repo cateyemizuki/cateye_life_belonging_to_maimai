@@ -39,12 +39,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from core.llm_utils import LLMResult, request_token_upper_bound
+from core.llm_utils import LLMResult
 from core.mapping_dir import MappingReadError, mappings_path, read_json_text
 from core.storage import save_json_atomic
 
 from .event_catalog_config import EventCatalogConfig, resolve_config
-from .event_prompt import (GENERATION_MAX_TOKENS, GENERATION_TEMPERATURE,
+from .event_prompt import (GENERATION_TEMPERATURE,
                            EventPromptError, build_event_prompt,
                            build_json_schema, parse_events_response)
 
@@ -79,8 +79,6 @@ ALLOWED_GOAL_TYPES = frozenset({"daily_routine", "rest", "social", "entertainmen
 #: core/llm_usage.py 的 EVENT_MODULE_MAP → planning）
 LLM_EVENT_NAME = "schedule_events"
 LLM_FALLBACK_TASK = "utils"
-#: 事件生成参数硬上限（用户已锁定；配置越界也不得突破）
-EVENT_GENERATION_MAX_TOKENS = GENERATION_MAX_TOKENS
 EVENT_GENERATION_TEMPERATURE = GENERATION_TEMPERATURE
 #: 备份保留数（.bak/.bak.2/.bak.3）
 BACKUP_KEEP = 3
@@ -153,14 +151,7 @@ def builtin_events() -> List[Dict[str, Any]]:
     return output
 
 
-def estimate_tokens(text: Any) -> int:
-    """粗略 token 估算（仅兼容旧调用/展示；**不再用于预算预占或结算**）。
 
-    预算走 :func:`core.llm_utils.request_token_upper_bound` 的字节上界 + 真实
-    usage 结算；此函数不参与任何限额判断。
-    """
-    value = str(text or "")
-    return max(1, math.ceil(len(value) / _CHARS_PER_TOKEN))
 
 
 def compute_catalog_version(document: Any) -> str:
@@ -1042,7 +1033,8 @@ class EventCatalogService:
         self._save_state()
 
     def _tokens_today(self, now: datetime) -> int:
-        if str(self._state.get("token_date") or "") != self._day_of(now):
+        if (str(self._state.get("token_date") or "") != self._day_of(now)
+                or self._state.get("token_basis") != "host_reported"):
             return 0
         try:
             return max(0, int(self._state.get("token_used") or 0))
@@ -1052,49 +1044,14 @@ class EventCatalogService:
     def _write_tokens_today(self, used: int, now: datetime) -> None:
         self._state["token_date"] = self._day_of(now)
         self._state["token_used"] = max(0, int(used))
+        self._state["token_basis"] = "host_reported"
         self._save_state()
 
-    def _reserve_tokens(self, amount: int, now: datetime) -> bool:
-        """调用前预占保守上界；并发/重启都先看到这笔占用。
 
-        预算 <=0 表示不限制，但仍记账。返回 False 表示本次不允许发出请求。
-        """
-        amount = max(0, int(amount))
-        budget = self._current_config().daily_token_budget
-        used = self._tokens_today(now)
-        if budget > 0 and used + amount > budget:
-            return False
-        self._write_tokens_today(used + amount, now)
-        return True
 
-    def _settle_tokens(self, reserved: int, actual: Optional[int], now: datetime, *,
-                       release_if_unused: bool = False) -> int:
-        """调用后结算本次预占，返回本次实际记账量。
 
-        - ``actual`` 可得：按真实 usage 调整（多退少补）；
-        - ``actual`` 缺失：保留整笔保守上界，不凭估算释放；
-        - ``release_if_unused=True`` 且无 actual：明确未发出/无消耗，整笔释放。
-        """
-        reserved = max(0, int(reserved))
-        used = self._tokens_today(now)
-        if actual is None:
-            if release_if_unused:
-                charged = 0
-                used = max(0, used - reserved)
-            else:
-                charged = reserved
-        else:
-            charged = max(0, int(actual))
-            used = max(0, used - reserved + charged)
-        self._write_tokens_today(used, now)
-        return charged
 
-    def _can_spend(self, estimated: int, now: datetime) -> bool:
-        """只读预检查（不占用）；真正调用前必须再走 :meth:`_reserve_tokens`。"""
-        budget = self._current_config().daily_token_budget
-        if budget <= 0:
-            return True
-        return self._tokens_today(now) + max(0, int(estimated)) <= budget
+
 
     def _record_tokens(self, tokens: int, now: datetime) -> None:
         """兼容旧内部调用：直接累加（新预算流程只用 reserve/settle）。"""
@@ -1186,7 +1143,6 @@ class EventCatalogService:
             "next_update_at": snap.next_update_at,
             "auto_last_attempt_date": str(self._state.get("auto_last_attempt_date") or ""),
             "tokens_today": self._tokens_today(now),
-            "daily_token_budget": cfg.daily_token_budget,
             "task_name": cfg.task_name,
             "min_interval_days": cfg.min_interval_days,
             "max_interval_days": cfg.max_interval_days,
@@ -1288,34 +1244,7 @@ class EventCatalogService:
         self._last_refresh = result
         return result
 
-    @staticmethod
-    def _effective_max_tokens(cfg: EventCatalogConfig) -> int:
-        """事件生成输出上限：配置越界也不得突破用户锁定的 1200。"""
-        try:
-            configured = int(cfg.max_tokens)
-        except (TypeError, ValueError):
-            configured = EVENT_GENERATION_MAX_TOKENS
-        return max(1, min(EVENT_GENERATION_MAX_TOKENS, configured))
-
-    def _request_upper_bound(self, prompt: Any, max_tokens: int) -> int:
-        """按实际将发给 SDK 的 system+user 载荷计算保守上界。
-
-        优先使用 LLMService 的同构实现；旧测试桩/未来替身没有该方法时，用
-        :func:`core.llm_utils.request_token_upper_bound` 对同一份 messages 计算，
-        不依赖 char/2 估算。
-        """
-        bound_fn = getattr(self._llm, "upper_bound_tokens", None)
-        if callable(bound_fn):
-            try:
-                return max(1, int(bound_fn(prompt.prompt, system_prompt=prompt.system_prompt,
-                                           max_tokens=max_tokens)))
-            except Exception:
-                logger.debug("event_catalog: upper_bound_tokens 失败，回退同构上界",
-                             exc_info=True)
-        return max(1, request_token_upper_bound(
-            prompt.prompt, system_prompt=prompt.system_prompt, max_tokens=max_tokens))
-
-    async def _call_llm_once(self, prompt: Any, *, task_name: str, max_tokens: int,
+    async def _call_llm_once(self, prompt: Any, *, task_name: str,
                              temperature: float) -> LLMResult:
         """发出恰好一次生成请求；详细结果可用时走同一响应的 LLMResult。"""
         detailed = getattr(self._llm, "generate_detailed", None)
@@ -1325,7 +1254,7 @@ class EventCatalogService:
                 system_prompt=prompt.system_prompt,
                 task_name=task_name,
                 temperature=temperature,
-                max_tokens=max_tokens,
+
                 event=LLM_EVENT_NAME,
                 strict_params=True,
             )
@@ -1335,7 +1264,7 @@ class EventCatalogService:
             system_prompt=prompt.system_prompt,
             task_name=task_name,
             temperature=temperature,
-            max_tokens=max_tokens,
+
             event=LLM_EVENT_NAME,
         )
         text = str(text or "").strip()
@@ -1344,21 +1273,13 @@ class EventCatalogService:
                          task_name=task_name, request_sent=True, consumed=True,
                          attempts=1)
 
-    async def _attempt_llm(self, prompt: Any, *, task_name: str, max_tokens: int,
-                           temperature: float, now: datetime,
-                           reserved: int) -> Tuple[LLMResult, int]:
-        """执行一次已预占预算的调用并按可用证据结算，返回 (结果, 记账量)。"""
-        result = await self._call_llm_once(
-            prompt, task_name=task_name, max_tokens=max_tokens,
-            temperature=temperature)
-        if result.usage_available and result.total_tokens is not None:
-            spent = self._settle_tokens(reserved, result.total_tokens, now)
-        elif (result.category == "task_missing" and not result.request_sent
-              and not result.consumed and not result.usage_available):
-            # 只有明确「未发出请求/无消耗」的任务缺失才释放；不确定则保留上界。
-            spent = self._settle_tokens(reserved, None, now, release_if_unused=True)
-        else:
-            spent = self._settle_tokens(reserved, None, now)
+    async def _attempt_llm(self, prompt: Any, *, task_name: str,
+                           temperature: float, now: datetime) -> Tuple[LLMResult, int]:
+        """No plugin limit or precharge; accumulate only host-reported usage."""
+        result = await self._call_llm_once(prompt, task_name=task_name, temperature=temperature)
+        spent = max(0, int(result.total_tokens)) if result.usage_available and result.total_tokens is not None else 0
+        if result.usage_available:
+            self._record_tokens(spent, now)
         return result, spent
 
     async def _refresh_locked(self, cfg: EventCatalogConfig, manual: bool,
@@ -1380,53 +1301,42 @@ class EventCatalogService:
                                     recent_schedule_names=recent_schedule,
                                     existing_event_names=reserved_names,
                                     count=requested)
-        max_tokens = self._effective_max_tokens(cfg)
         temperature = EVENT_GENERATION_TEMPERATURE
-        per_call_bound = self._request_upper_bound(prompt, max_tokens)
         if self._llm is None or not (
                 callable(getattr(self._llm, "generate_detailed", None))
                 or callable(getattr(self._llm, "generate", None))):
             return self._failed("E_LLM", "LLMService 不可用", manual=manual)
-        if not self._reserve_tokens(per_call_bound, now):
-            return self._failed("E_BUDGET",
-                                "今日事件生成 token 预算不足以预占一次完整请求，本次不调用模型",
-                                manual=manual, tokens=0, called_llm=False)
-
         charged = 0
         model_calls = 0
         try:
             chosen, spent = await self._attempt_llm(
-                prompt, task_name=cfg.task_name, max_tokens=max_tokens,
-                temperature=temperature, now=now, reserved=per_call_bound)
+                prompt, task_name=cfg.task_name,
+                temperature=temperature, now=now)
             charged += spent
             model_calls += max(0, int(chosen.attempts or 0))
         except asyncio.CancelledError:
-            # 取消时预占已落盘；无法证明未消耗，保留整笔上界（不释放）。
+            # 取消不编造用量；宿主实际返回的usage才计入统计。
             raise
         except Exception as exc:
             logger.warning("event_catalog: LLM 调用异常：%s", exc)
-            charged += self._settle_tokens(per_call_bound, None, now)
+
             return self._failed("E_LLM", f"LLM 调用异常：{exc}", manual=manual,
                                 tokens=charged, called_llm=model_calls > 0)
 
         if chosen.category == "task_missing" and cfg.task_name != LLM_FALLBACK_TASK:
             logger.warning("event_catalog: 任务 %s 明确不存在，回退 %s 再试一次",
                            cfg.task_name, LLM_FALLBACK_TASK)
-            if not self._reserve_tokens(per_call_bound, now):
-                return self._failed(
-                    "E_BUDGET", "任务缺失回退前预算不足，本次不再调用模型",
-                    manual=manual, tokens=charged, called_llm=model_calls > 0)
             try:
                 chosen, spent = await self._attempt_llm(
-                    prompt, task_name=LLM_FALLBACK_TASK, max_tokens=max_tokens,
-                    temperature=temperature, now=now, reserved=per_call_bound)
+                    prompt, task_name=LLM_FALLBACK_TASK,
+                    temperature=temperature, now=now)
                 charged += spent
                 model_calls += max(0, int(chosen.attempts or 0))
             except asyncio.CancelledError:
-                raise  # 回退预占保留
+                raise
             except Exception as exc:
                 logger.warning("event_catalog: LLM 回退调用异常：%s", exc)
-                charged += self._settle_tokens(per_call_bound, None, now)
+
                 return self._failed("E_LLM", f"LLM 回退调用异常：{exc}",
                                     manual=manual, tokens=charged,
                                     called_llm=model_calls > 0)

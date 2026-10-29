@@ -32,8 +32,6 @@ from typing import Any, Callable, Dict, Optional
 
 from core.llm_usage import LLMUsageTracker
 
-#: 请求封装/聊天模板/特殊 token 的保守预留（不是估算，是固定额外上界）
-REQUEST_WRAPPER_TOKENS = 1024
 
 #: 只有宿主明确表示「任务路由不存在」才允许调用方做一次 utils 回退。
 TASK_MISSING_CODES = frozenset({"task_missing", "unknown_task"})
@@ -63,22 +61,7 @@ def prompt_payload_bytes(prompt_arg: Any) -> int:
     return len(text.encode("utf-8"))
 
 
-def request_token_upper_bound(prompt: Any, *, system_prompt: str = "",
-                              max_tokens: int = 512,
-                              wrapper_tokens: int = REQUEST_WRAPPER_TOKENS) -> int:
-    """一次请求的保守 token 上界：prompt 载荷字节数 + 固定封装预留 + 最大输出。
 
-    字节上界依据：主流 BPE/byte-level 分词器的每个 token 至少覆盖 1 个 UTF-8
-    字节，因此 token 数 <= 字节数。它不是精确 tokenizer 计数，但可证明不会低估
-    文本部分；封装固定预留覆盖 JSON-RPC/聊天模板/特殊 token。实际 usage 可用时
-    调用方应按真实 usage 结算，不用本函数回填。
-    """
-    try:
-        output = max(0, int(max_tokens))
-    except (TypeError, ValueError):
-        output = 512
-    wrapper = max(0, int(wrapper_tokens))
-    return prompt_payload_bytes(prepare_prompt_arg(prompt, system_prompt)) + wrapper + output
 
 
 def classify_llm_error(error: Any, error_code: Any = None) -> str:
@@ -142,7 +125,7 @@ def extract_usage(result: Any) -> tuple[Optional[int], Optional[int], Optional[i
 
     返回 ``(prompt, completion, total, available, usage_present)``。
     - ``available`` 只在 total 可得，或 prompt/completion 同时可得时为 True；
-      部分字段缺失时保持 None，预算层不会凭估算释放预占（口径不变）。
+      部分字段缺失时保持 None，不用插件估算补足。
     - ``usage_present``（2026-10-29 口径修正新增位）：宿主响应里是否存在可识别的
       用量字段——**字段在场即真，含 0 值**（宿主失败响应常带 ``total_tokens: 0``，
       旧口径把它当"可用"，是失败被记成 host_reported 0 的根因）。成败不再由
@@ -265,7 +248,7 @@ class LLMService:
         system_prompt: str = "",
         task_name: str = "",
         temperature: float = 0.7,
-        max_tokens: int = 512,
+
         timeout_ms: Optional[int] = None,
         event: str = "unspecified",
         model: str = "",
@@ -284,7 +267,7 @@ class LLMService:
             system_prompt=system_prompt,
             task_name=task_name,
             temperature=temperature,
-            max_tokens=max_tokens,
+
             timeout_ms=timeout_ms,
             event=event,
             model=model,
@@ -299,7 +282,7 @@ class LLMService:
         system_prompt: str = "",
         task_name: str = "",
         temperature: float = 0.7,
-        max_tokens: int = 512,
+
         timeout_ms: Optional[int] = None,
         event: str = "unspecified",
         model: str = "",
@@ -311,8 +294,7 @@ class LLMService:
         同一次响应；不额外探测任务/模型是否存在，不读写共享错误状态。
 
         ``strict_params=True``：只发一次宿主请求；不套实例级 ``model_name`` 回退，
-        不改写调用方给出的 temperature/max_tokens（max_tokens 的业务上限由调用方
-        负责，事件库会夹到 1200）。
+        保留调用方的 temperature；输出长度完全使用宿主任务配置。
         """
         request_id = uuid.uuid4().hex
         prompt_arg = prepare_prompt_arg(prompt, system_prompt)
@@ -324,7 +306,7 @@ class LLMService:
             kwargs: dict[str, Any] = {
                 "prompt": prompt_arg,
                 "temperature": temperature,
-                "max_tokens": max_tokens,
+
             }
             if override:
                 kwargs["model"] = override
@@ -358,7 +340,7 @@ class LLMService:
                     prompt=prompt_arg,
                     model=override,
                     temperature=temperature,
-                    max_tokens=max_tokens,
+
                 )
             except asyncio.CancelledError:
                 raise
@@ -378,7 +360,7 @@ class LLMService:
             "prompt": prompt_arg,
             "task_name": routed_task,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+
         }
         if self._model_name:
             # 指定具体模型：失败后降级为纯任务路由再试一次（旧语义）
@@ -390,6 +372,11 @@ class LLMService:
                         result, event=event, task=routed_task, request_id=request_id,
                         attempts=attempts, strict_params=False,
                         requested_model=self._model_name)
+                # Each host response counts, including a failed model attempt
+                # followed by the existing task-route fallback.
+                self._result_from_response(result, event=event, task=routed_task,
+                    request_id=request_id, attempts=attempts, strict_params=False,
+                    requested_model=self._model_name)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -414,13 +401,7 @@ class LLMService:
             attempts=attempts, strict_params=False,
             requested_model=self._model_name)
 
-    def upper_bound_tokens(self, prompt: Any, *, system_prompt: str = "",
-                           max_tokens: int = 512,
-                           wrapper_tokens: int = REQUEST_WRAPPER_TOKENS) -> int:
-        """本次请求（与实际发给 SDK 的 messages 同构）的保守 token 上界。"""
-        return request_token_upper_bound(prompt, system_prompt=system_prompt,
-                                         max_tokens=max_tokens,
-                                         wrapper_tokens=wrapper_tokens)
+
 
     def _exception_result(self, exc: BaseException, *, event: str, task: str,
                           request_id: str, attempts: int, category: str,
@@ -442,8 +423,7 @@ class LLMService:
         """把一次宿主响应翻译成 LLMResult（唯一记账/记日志出口）。"""
         # 2026-10-29 口径修正：成败先于记账判定（与 _interpret 返回一致——拿到非空
         # 正文才算成功），失败响应即使带 0 值 usage 也归失败桶，不再由 usage 推断成败。
-        success = bool(isinstance(result, dict) and result.get("success")
-                       and str(result.get("response") or "").strip())
+        success = bool(isinstance(result, dict) and result.get("success") is True)
         self._record_usage(event, task, result, success=success)
         prompt_tokens, completion_tokens, total_tokens, usage_available, usage_present = extract_usage(result)
         response_model = ""
@@ -518,8 +498,10 @@ class LLMService:
         聚合端归 legacy 桶，不回填。
         """
         tracker = self._usage_tracker
-        if tracker is None or not isinstance(result, dict):
+        if tracker is None:
             return
+        if not isinstance(result, dict):
+            result = {"success": False}
         try:
             prompt_tokens, completion_tokens, total_tokens, usage_available, usage_present = extract_usage(result)
             tracker.record(event=event, model=result.get("model_name") or result.get("model"),
@@ -551,10 +533,9 @@ class LLMService:
         """判定类调用（当前唯一调用点 = 想念把关；角色裁判/睡眠裁判走各自任务名，不读本入口）：
         模型与参数来自顶层 ``[llm]`` 段。
 
-        与 :meth:`generate` 的区别：调用方只给提示词拿结论；用哪个模型、最大
-        token 数、温度集中在配置里（config_provider 动态读，热更新即时生效）——
+        与 :meth:`generate` 的区别：调用方只给提示词拿结论；用哪个模型、温度集中在配置里（config_provider 动态读，热更新即时生效）——
         判定要的是稳定结论，与生成类调用的参数策略解耦。
-        旧 ``[judge]`` 段（model/max_tokens/temperature）在 ``[llm]`` 段对应字段缺省时兜底。
+        旧 ``[judge]`` 段（model/temperature）在 ``[llm]`` 段对应字段缺省时兜底。
 
         Returns:
             判定文本，失败返回空字符串（调用方按 fail-closed 处理）。
@@ -574,11 +555,6 @@ class LLMService:
             or ""
         ).strip()
         try:
-            max_tokens = int(getattr(section, "judge_max_tokens", None)
-                             or getattr(legacy, "max_tokens", 512))
-        except (TypeError, ValueError):
-            max_tokens = 512
-        try:
             temperature = float(getattr(section, "judge_temperature", None)
                                 if getattr(section, "judge_temperature", None) is not None
                                 else getattr(legacy, "temperature", 0.2))
@@ -587,7 +563,7 @@ class LLMService:
         return await self.generate(
             prompt,
             temperature=temperature,
-            max_tokens=max_tokens,
+
             event=event,
             model=model,
         )
@@ -599,7 +575,7 @@ class LLMService:
         *,
         task_name: str = "",
         temperature: float = 0.3,
-        max_tokens: int = 512,
+
         event: str = "describe_image",
     ) -> str:
         """视觉理解：把一张 base64 图片 + 提示词交给视觉模型，返回一句话描述。
@@ -619,7 +595,7 @@ class LLMService:
             "prompt": [{"role": "user", "content": content}],
             "task_name": task_name or self._task_name,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+
         }
         try:
             result = await self._ctx.llm.generate(**kwargs)

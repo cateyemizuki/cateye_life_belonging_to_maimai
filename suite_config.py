@@ -60,7 +60,7 @@ plugin.py ``normalize_plugin_config`` 对原始输入与磁盘抢救结果各做
 - ``[emotion].evaluator_task_name / referee_task_name`` → ``[llm].*``；
 - ``[qzone].llm_task_name`` → ``[llm].qzone_task_name``；
 - ``[inject].*`` / ``[planning_cleanup].*`` → ``[schedule_advanced].*``；
-- ``[schedule]`` 的 23 个深水字段（timezone / max_tokens / generation_timeout / use_multi_round /
+- ``[schedule]`` 的 23 个深水字段（timezone / generation_timeout / use_multi_round /
   max_rounds / quality_threshold / recent_schedule_days / history_message_limit / knowledge_search_limit /
   cross_day_activity / min_description_length / max_description_length / emotion_influence / lie_in_max_until /
   list_draw_image / image_timeout_seconds / role_judge_enabled / role_judge_temperature / inject_cache_minutes /
@@ -157,7 +157,11 @@ LEGACY_PROACTIVE_KEYS = {
 #: ``true``；缺省场景由 ``[schedule].enabled`` 的出厂默认 ``True`` 承担（UQ-2：旧用户升级
 #: 后 spine/生活状态/睡眠引擎随默认 True 全开，CHANGELOG/README 迁移段已说明）。
 LEGACY_ROUTE_KEYS = {
-    "schedule": ("spine_mode", "planning_daily_token_budget"),
+    "schedule": ("spine_mode", "planning_daily_token_budget", "max_tokens", "spine_max_tokens"),
+    "schedule_advanced": ("max_tokens",),
+    "llm": ("judge_max_tokens", "max_tokens"),
+    "event_catalog": ("max_tokens", "daily_token_budget"),
+    "judge": ("max_tokens",),
     "life_state": ("enabled", "sleep_engine_enabled", "profile_path"),
 }
 
@@ -170,7 +174,7 @@ _LEGACY_MISS_REASON_PROMPT_DEFAULT = (
 
 #: 2026-10-10 段拆分：从 [schedule] 迁往 [schedule_advanced] 的字段（键名不变，仅换段）
 _SCHEDULE_TO_ADVANCED_KEYS = (
-    "timezone", "max_tokens", "generation_timeout", "use_multi_round", "max_rounds",
+    "timezone", "generation_timeout", "use_multi_round", "max_rounds",
     "quality_threshold", "recent_schedule_days", "history_message_limit", "knowledge_search_limit",
     "cross_day_activity", "min_description_length", "max_description_length", "emotion_influence",
     "lie_in_max_until", "list_draw_image", "image_timeout_seconds", "role_judge_enabled",
@@ -333,25 +337,14 @@ class LlmSectionConfig(PluginConfigBase):
                     "角色裁判 / 睡眠裁判不读它（各走自己的任务名）",
         json_schema_extra={
             "label": "判断用模型",
-            "hint": "建议指到便宜、非思考型模型；用思考型模型时请把「判断最大 token」保持 512 以上。"
+            "hint": "建议选择能稳定返回简短结论的模型；输出长度由宿主任务配置控制。"
                     "只影响想念把关这类 judge() 判定，角色裁判/睡眠裁判不受影响",
             **_ui_i18n("Judge model", "Empty = follow the main task. "
                                       "Only used by judge()-style verdict calls (miss referee); "
                                       "the role judge and sleep referee use their own task names."),
         },
     )
-    judge_max_tokens: int = Field(
-        default=512,
-        ge=16,
-        le=8192,
-        description="判断调用的最大生成 token 数。思考型模型会先消耗 token 输出推理内容，"
-                    "预算太小时正文为空、判定按失败（驳回）处理",
-        json_schema_extra={
-            "label": "判断最大 token",
-            "hint": "默认 512；判定被大量驳回时可以调大",
-            **_ui_i18n("Judge max tokens"),
-        },
-    )
+
     judge_temperature: float = Field(
         default=0.2,
         ge=0.0,
@@ -375,7 +368,7 @@ class LlmSectionConfig(PluginConfigBase):
     emotion_referee_task_name: str = Field(
         default="utils",
         description="情绪睡眠裁判任务名：睡眠期情绪大修使用，默认 utils，建议选择能稳定输出结构化正文的非思考任务。"
-                    "注意：宿主主任务为思考型时，思考内容会耗尽 max_tokens 导致正文为空、"
+                    "注意：宿主主任务为思考型时，思考内容可能用尽宿主输出长度而没有正文、"
                     "裁判连续失败后本周期大修放弃（2026-10-28 真机实测）——此时应改绑非思考任务（如 utils）",
         json_schema_extra={
             "label": "情绪裁判任务名",
@@ -673,7 +666,7 @@ class CateyeSuiteConfig(PluginConfigBase):
         # 3) [judge] → [llm].judge_*
         judge_data = migrated.pop("judge", None)
         if isinstance(judge_data, dict):
-            for old, new in (("model", "judge_model"), ("max_tokens", "judge_max_tokens"),
+            for old, new in (("model", "judge_model"),
                              ("temperature", "judge_temperature")):
                 if old in judge_data:
                     llm_data.setdefault(new, judge_data.get(old))

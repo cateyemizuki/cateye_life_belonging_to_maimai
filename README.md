@@ -33,6 +33,12 @@ WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好
 
 Planner 直接提供 `message` 时不调用文案生成，因此约束放在工具说明/参数说明中；`[prompts].tool_send_message` 与 `tool_send_message_system` 只影响留空自动生成。自定义模板保持优先。相关提示已本地加强，尚未部署生产，也不是强制身份校验或发送门禁。
 
+## 模型输出与 Token 统计
+
+插件不再设置模型输出长度或每日 Token 限制；输出长度完全使用宿主任务配置。旧限制键自动忽略，其余任务路由、温度、超时、主动消息每日次数和事件池规则保留。
+
+调用次数统计收到宿主响应的请求，包含失败；Token只累计宿主明确回传的用量，缺失不推算。四类调用为正常回传、成功但无用量、失败调用、旧记录；“缺用量来源调用”是独立提示，可与失败重叠。WebUI提供说明按钮，PNG展示相同口径。
+
 ## WebUI 生活面板
 
 在宿主侧边栏打开「属于麦麦的生活 → 属于麦麦的生活」。页面通过插件自己的 `webui.json`（v2）与沙箱查询读取实时数据，自动跟随宿主主题，不需要替换宿主静态文件。
@@ -43,7 +49,6 @@ Planner 直接提供 `message` 时不调用文案生成，因此约束放在工�
 - 每 30 秒只读刷新，隐藏页面时暂停，失败保留上次快照并退避。页面不触发模型调用、主动消息或业务写入。
 - 生活历史单独写入状态文件旁的 `<状态文件名>_history.json`（默认 `life_state_history.json`）：正常 tick 至多每 5 分钟采样，另记录活动和醒沿；最多 7 天 / 2304 点。重启续接，长缺口断线；持久化历史只记真实采样，图表可按 API 的 `estimated` 标记显示小缺口线性估算与离线睡眠估算段，估算不写回历史。决策日志同步记录 `life.state_changed`，受原日志开关与保留天数约束。
 - 开发版页面现分「此刻 / 历史 / 日程 / 心情与分享 / 系统」五栏。历史、日程与心情栏支持今天/昨天/日期查询；此刻始终显示当前运行态。估算虚线、离线睡眠斜纹与真实观察分开；计划与实际活动双轨对照，缺失与清理状态如实展示。
-- 系统栏压缩展示调用数、账本 Token、缺用量来源调用，展开查看正常回传/成功但无用量/失败/旧账本四桶；这些数值不代表供应商实际账单。
 - 9 张已验收 WebP 与原版官方鱼 SVG 自包含嵌入，按宿主主题显示；支持降低动态效果。手机底部栏目、放大/全览按钮与双指缩放。
 - 查询 8 秒超时后保留旧数据，旧请求与旧导入晚返回不能覆盖新结果；独立时钟在 45 秒提示可能过期、120 秒标记陈旧，不再只凭桥连接宣称实时。
 - 本轮仅本地开发验证，尚未部署生产。页面源码位于 `webui/source/`；执行 `python tools/build_webui.py` 可重建 `webui/index.html`，无需临时素材目录或网络依赖。
@@ -58,7 +63,6 @@ Planner 直接提供 `message` 时不调用文案生成，因此约束放在工�
 3.0.0 把「日程滚动化 + 生活状态 + 睡眠引擎」收成**唯一主线**，旧的两开关式灰度与旧全天日表路线已整体退役：
 
 - **唯一总开关 `[schedule] enabled`（默认 `true`）**：开启时同时装配 spine 日意图、滚动运行时、生活状态与睡眠引擎；关闭时**仅日程链**停止（不生成、不注入、日程主动链不开口，工具/命令回「日程未启用」），**不会回落到旧全天生成路线**；陪伴、QQ 空间、情绪等独立模块仍按各自开关运行。
-- **退役键（一次性迁移，只丢弃不搬运）**：`[schedule] spine_mode`、`[life_state] enabled`、`[life_state] sleep_engine_enabled`、`[life_state] profile_path`（死键）、`[schedule] planning_daily_token_budget`、`[planning_proactive] nap_reminder_enabled` / `nap_reminder_max_per_day`。若你曾显式把 `[schedule] enabled` 设为 `false`，升级后**保持关闭**，旧开关 `true` 不会自动反推开启；一次性告警日志只在部分校验路径出现，并非所有 raw/normalize 路径的保证。
 - **不再存在的旧入口**：旧 daily 生成/校验/质量评分/响应解析链、`lbm_update_schedule_v4` 工具别名、`lbm_nap_lie_in` 赖床工具、`/lbm_emotion_init` 独立命令（统一并入 `/lbm_init emotion`）、`lbm_get_schedule_info` 的 `lover_day` / `goals` 旧视图、按活动切换强制主动开口的旧链。
 - **仍然独立、按需开启**：`[life_state] emotion_modulation_enabled`（情绪-生活双向调制）、`[event_catalog] mode`（事件库生成）、`[schedule] no_sleep_mode`（无睡眠模式）、`[patrol] nap_quiet_enabled`（午休静默）、夜间打扰统计、睡眠大修、各类上限都保留。
 - **数据兼容**：`life_state.json`、日程库 `schedule.db` 与用户数据**不清空、不批量改写已执行历史**；当前/未来仅有旧非 spine 日表的日期，可把旧行归档后重建 spine 日意图（非破坏性，旧记录仍可追溯）。旧日表行不再被当作当前活动来源。
@@ -115,7 +119,6 @@ Planner 直接提供 `message` 时不调用文案生成，因此约束放在工�
 
 - `[event_catalog] mode` = `off`（只用内置池）/`manual`（仅手动刷新）/`auto`（到期后台生成）。
 - 单次生成上限 `max_generated_events=8`、合并总池上限 `max_pool_events=12`；内置池至少 3 条兜底、生成项 `llm_` 前缀、全量校验通过才替换。
-- 独立模型任务 `schedule_events`（宿主没配时回退 `utils`）；`daily_token_budget=9000` 为请求前保守预占、有真实用量按实际结算。
 - 事件文件写坏/缺失/版本不认识时回退内置池并保留 `.bak`，不会覆盖你的用户文件。
 
 ### 统一初始化
@@ -158,8 +161,7 @@ Planner 直接提供 `message` 时不调用文案生成，因此约束放在工�
 - 夜间进入睡眠窗后冻结，醒来时统一结算；有真实睡眠会话时以会话为准，无会话时按 tick 级空窗冻结入口兜底。
 - `/lbm_init emotion` 由人设推导基线；`/lbm_emotion_config` 查看、`reset` 或 `clear`。
 - 情绪映射与描述可在 `mappings/` 的对应表中调整。
-- 睡眠裁判提示词已压缩 reason 与思考要求；调用 `max_tokens` 为 1024（如需进一步压思考链，见 USAGE.md「睡眠裁判思考强度配置指引」）。
-- 情绪→生活反馈的每日回写预算在数据目录 `life_feedback_budget.json`：按**最终实际入账增量**检查并记账、保留逐轴净累计、单次上限 0.15；升级当天的旧 raw 账本无法可靠换算 actual 时**当日暂停新增生活反馈**（旧账原样保留、不重置额度），次日自动进入新口径。
+- 情绪→生活反馈的每日回写预算在数据目录 `life_feedback_budget.json`：按**最终实际入账增量**检查并记账、保留逐轴净累计、单次上限 0.15；升级当天的旧 raw 记录无法可靠换算 actual 时**当日暂停新增生活反馈**（旧账原样保留、不重置额度），次日自动进入新口径。
 
 ### bot 自用工具
 
@@ -245,7 +247,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 - 组件 **29 个** = 8 个命令 + 10 个 Hook + 7 个工具 + 4 个跨插件 API（`[admin].harass_report_enabled=false` 时运行期注册面回落 28）。
 - 声明 **17 项**宿主能力。
-- 配置 **13 个段 / 248 字段 / 5 隐藏 / 243 可见**（`[plugin]` 3、`[patrol]` 22、`[affection]` 12、`[schedule]` 24、`[schedule_advanced]` 31、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 10、`[llm]` 9、`[prompts]` 56、`[admin]` 8、`[qzone]` 20、`[emotion]` 17；3.0.0 离线 stub+pydantic 实算）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
+- 配置 **13 个段 / 243 字段 / 5 隐藏 / 238 可见**（`[plugin]` 3、`[patrol]` 22、`[affection]` 12、`[schedule]` 24、`[schedule_advanced]` 31、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 10、`[llm]` 9、`[prompts]` 56、`[admin]` 8、`[qzone]` 20、`[emotion]` 17；3.0.0 离线 stub+pydantic 实算）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
 - 用户可编辑映射表 **7 张**：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可
@@ -281,4 +283,3 @@ WebUI 的「属于麦麦的生活」展示生活趋势、实际活动/日意图�
 
 空间草稿在浏览器本地预览。发布以回执为准，同内容 24 小时去重；仅明确未发出的纯文字请求在原有静默、冷却和预算闸内最多尝试两次。发送结果不明会保留待核对，重启后也不自动重发；图片失败需重新提供图片，不降成队列纯文字重发。回执与凭据文件留在服务器，WebUI 不显示原文与秘密。
 
-用量统计不等同扣费证明。供应商对账可使用 `python core/reconciliation.py --ledger <llm_usage_events.jsonl> --statement <statement.json> --output <report.json>`。账单 JSON 格式：`schema_version: 1`，带时区的 `window_start/window_end`（前闭后开），`models: [{model, tokens}]`。只核对同窗口 Token 汇总，金额/折扣/税费需原始凭证；缺失 usage 与旧记录不能视为已核验。

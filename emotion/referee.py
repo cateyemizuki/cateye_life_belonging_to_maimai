@@ -247,11 +247,8 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
         e_v=expectation.valence, e_a=expectation.arousal, e_d=expectation.dominance,
         commitment_net=net, limit=limit,
     )
-    # max_tokens 历史脉络：早期曾压到 600，三组 reason 长文本下会截断 JSON
-    # （宿主验证日 8 次尝试零落地实测），后上调 2000 兜底。
-    # 现行口径：思考型模型下 1024 经 W3 模板实测稳定（r33b/r34 矩阵 2/2，reasoning 227/230）；
-    # 宿主模型侧可再配 reasoning_effort=low 进一步压思考链（A-23 (f') 纯配置路径，见 USAGE.md）。
-    response = await llm.generate(prompt, task_name=task_name, temperature=0.4, max_tokens=1024,
+    # 输出长度只使用宿主任务配置；插件只校验结构化结果。
+    response = await llm.generate(prompt, task_name=task_name, temperature=0.4,
                                   event="emotion_sleep_referee")
     data = _parse_json_loose(response)
     if data is None or "delta_vad" not in data:
@@ -274,7 +271,7 @@ async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str
             fallback=INIT_SYSTEM_PROMPT,
             emotion_table=emotion_table_summary(),
         ),
-        task_name=task_name, temperature=0.4, max_tokens=900, event="emotion_init",
+        task_name=task_name, temperature=0.4,  event="emotion_init",
     )
     data = _parse_json_loose(response)
     if data is None or "anchor" not in data:
@@ -330,7 +327,7 @@ async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_na
                                       user_context=(str(user_message or "").strip()[:300]
                                                     or "（未取到用户侧消息，仅按下面内容判断）"),
                                       reply_text=body),
-        task_name=task_name, temperature=0.2, max_tokens=150, event="emotion_evaluate",
+        task_name=task_name, temperature=0.2,  event="emotion_evaluate",
     )
     data = _parse_json_loose(response)
     if data is None:

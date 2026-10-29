@@ -79,13 +79,32 @@ def usage_bucket_of(entry: Any) -> str:
 
 
 def missing_usage_source(entry: Any) -> bool:
-    """「缺用量来源调用」口径（§2.2 改名，替代旧「待核验」）：
+    """「缺用量来源调用」口径（§2.2 改名，替代旧「缺少来源」）：
     ``usage_source != host_reported`` **或** ``usage_present`` 不为真。
-    旧行无 ``usage_present`` 字段 → 一律计入（与报告「该指标实际主要覆盖旧账本行」一致）。"""
+    旧行无 ``usage_present`` 字段 → 一律计入（与报告「该指标实际主要覆盖旧记录」一致）。"""
     if not isinstance(entry, dict):
         return True
     return entry.get("usage_source") != "host_reported" or entry.get("usage_present") is not True
 
+
+def reported_token_count(entry: Any) -> int:
+    """Only retain counts explicitly attributed to a host usage response."""
+    if not isinstance(entry, dict) or entry.get("usage_source") != "host_reported":
+        return 0
+    try:
+        return max(0, int(entry.get("tokens") or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+USAGE_TERMS = {
+    "calls": {"label": "调用次数", "description": "收到宿主响应的请求数，包含失败响应；未收到响应的本地异常不计入。"},
+    "tokens": {"label": "Token 消耗", "description": "宿主回传的文本处理量；缺失时只计调用，不推算。"},
+    "missing_usage_source_calls": {"label": "缺用量来源调用", "description": "缺少完整宿主用量或新记录标记的调用，可与失败调用重叠。"},
+    "host_reported": {"label": "正常回传", "description": "宿主返回成功响应及可识别的完整用量。"},
+    "success_no_usage": {"label": "成功但无用量", "description": "success=true，但宿主未回传完整usage。"},
+    "failed": {"label": "失败调用", "description": "宿主响应的success不为true。"},
+    "legacy": {"label": "旧记录", "description": "升级前缺少success和usage_present标记的记录，保留原始记录不补写。"},
+}
 
 def module_of_event(event: Any) -> str:
     """调用点 event → 模块名（未知 event 归「其他」，不丢数）。"""
@@ -93,7 +112,7 @@ def module_of_event(event: Any) -> str:
 
 
 class LLMUsageTracker:
-    """LLM 消耗账本（JSONL 追加 + 惰性裁剪 + 按窗口聚合）。"""
+    """LLM 用量记录（JSONL 追加 + 惰性裁剪 + 按窗口聚合）。"""
 
     def __init__(self, data_dir: Any, *, keep_hours: int = KEEP_HOURS) -> None:
         self._path: Optional[Path] = Path(data_dir) / "llm_usage_events.jsonl" if data_dir else None
@@ -115,16 +134,13 @@ class LLMUsageTracker:
         """
         if self._path is None:
             return
+        # Missing usage is a missing observation, never a synthetic token count.
         try:
-            total = int(total_tokens or 0)
-        except (TypeError, ValueError):
-            try:
-                total = int(prompt_tokens or 0) + int(completion_tokens or 0)
-            except (TypeError, ValueError):
-                total = 0
-        if total <= 0:
-            try: total = max(0, int(prompt_tokens or 0)) + max(0, int(completion_tokens or 0))
-            except (ValueError,TypeError): total = 0
+            total = max(0, int(total_tokens)) if usage_available and total_tokens is not None else 0
+            if usage_available and total <= 0 and prompt_tokens is not None and completion_tokens is not None:
+                total = max(0, int(prompt_tokens)) + max(0, int(completion_tokens))
+        except (TypeError, ValueError, OverflowError):
+            total = 0
         entry = {"ts": datetime.now().isoformat(timespec="seconds"),
                  "event": str(event or ""), "model": str(model or ""), "tokens": max(0,total),
                  "request_id": str(request_id or "")[:128],
@@ -172,7 +188,7 @@ class LLMUsageTracker:
             tmp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
             tmp.replace(path)
         except Exception:
-            logger.debug("LLM 消耗账本裁剪失败（忽略）", exc_info=True)
+            logger.debug("LLM 用量记录裁剪失败（忽略）", exc_info=True)
 
     # ---- 聚合 ----
     def summary(self, hours: int = 24) -> Dict[str, Any]:
@@ -185,7 +201,7 @@ class LLMUsageTracker:
         ``buckets`` = 四桶拆分（正常回传 / 成功但无用量 / 失败 / legacy，各含
         ``calls``/``tokens``，与既有键并列输出）；
         ``missing_usage_source_calls`` = 缺用量来源调用次数（口径见
-        :func:`missing_usage_source`，旧「待核验」改名后的新键名）。
+        :func:`missing_usage_source`，旧「缺少来源」改名后的新键名）。
         文件缺失/损坏 → 空账本（不抛异常）。
         """
         window_start = datetime.now() - timedelta(hours=max(1, int(hours)))
@@ -213,7 +229,7 @@ class LLMUsageTracker:
                         except ValueError:
                             continue
                         calls += 1
-                        count = int((entry or {}).get("tokens") or 0)
+                        count = reported_token_count(entry)
                         tokens += count
                         if missing_usage_source(entry):
                             missing_calls += 1
@@ -226,7 +242,7 @@ class LLMUsageTracker:
                             models[model] = models.get(model, 0) + count
                         modules[module] = modules.get(module, 0) + count
             except OSError:
-                logger.debug("LLM 消耗账本读取失败（忽略）", exc_info=True)
+                logger.debug("LLM 用量记录读取失败（忽略）", exc_info=True)
         return {"calls": calls, "tokens": tokens, "models": models,
-                "modules": modules, "has_usage": tokens > 0,
+                "modules": modules, "has_usage": tokens > 0, "terms": USAGE_TERMS,
                 "buckets": buckets, "missing_usage_source_calls": missing_calls}

@@ -208,6 +208,6 @@ class CateyeClient:
         vlm_task = purpose_task(self._plugin, "vlm", default="vlm")
         return await llm.describe_image(
             image_b64, describe_prompt,
-            task_name=vlm_task, temperature=0.3, max_tokens=512,
+            task_name=vlm_task, temperature=0.3,
             event="cateye_screen_describe",
         )

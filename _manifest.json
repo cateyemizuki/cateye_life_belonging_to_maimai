@@ -38,8 +38,8 @@
   "plugin_type": "integration",
   "display": {
     "icon": {
-      "type": "lucide",
-      "value": "heart",
+      "type": "local",
+      "value": "assets/logo-512.webp",
       "fallback": "calendar-heart"
     }
   },

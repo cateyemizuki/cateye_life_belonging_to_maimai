@@ -143,7 +143,7 @@ class ScheduleGenerator:
         enable_detailed_description: bool = True,
         min_description_length: int = 20,
         max_description_length: int = 50,
-        max_tokens: int = 8192,
+
         custom_prompt: str = "",
         recent_schedule_days: int = 3,
         history_message_limit: int = 0,
@@ -348,7 +348,7 @@ class ScheduleGenerator:
             "recent_days": _int("spine_recent_days", 2, 0),
             "history_messages": _int("spine_history_messages", 12, 0),
             "knowledge_limit": _int("spine_knowledge_limit", 3, 0),
-            "max_tokens": _int("spine_max_tokens", 2048, 256),
+
             "use_multi_round": bool(getattr(cfg, "spine_use_multi_round", False)),
         }
 
@@ -389,7 +389,7 @@ class ScheduleGenerator:
             max_activities=params["max_intentions"], timeout_seconds=timeout_seconds,
             use_multi_round=False, max_rounds=1, quality_threshold=1.0,
             enable_detailed_description=True, min_description_length=15,
-            max_description_length=25, max_tokens=params["max_tokens"],
+            max_description_length=25,
             custom_prompt=custom_prompt, recent_schedule_days=params["recent_days"],
             history_message_limit=params["history_messages"],
             knowledge_search_limit=params["knowledge_limit"],
@@ -737,7 +737,7 @@ class ScheduleGenerator:
             "max_rounds": "max_rounds", "quality_threshold": "quality_threshold",
             "enable_detailed_description": "enable_detailed_description",
             "min_description_length": "min_description_length",
-            "max_description_length": "max_description_length", "max_tokens": "max_tokens",
+            "max_description_length": "max_description_length",
             "custom_prompt": "custom_prompt", "recent_schedule_days": "recent_schedule_days",
             "history_message_limit": "history_message_limit",
             "knowledge_search_limit": "knowledge_search_limit",
@@ -893,7 +893,6 @@ class ScheduleGenerator:
         ``_parse_response`` 已随 daily 链删除）。
         """
         task_name = gen_config.llm_task_name
-        max_tokens = int(gen_config.max_tokens)
         temperature = float(self._raw_of(gen_config).get("temperature", 0.85))
         timeout_ms = int(float(gen_config.generation_timeout) * 1000)
 
@@ -902,7 +901,7 @@ class ScheduleGenerator:
                 prompt,
                 task_name=task_name,
                 temperature=temperature,
-                max_tokens=max_tokens,
+
                 timeout_ms=timeout_ms,
                 event=event,
             ),

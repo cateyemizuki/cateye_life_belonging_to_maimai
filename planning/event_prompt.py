@@ -5,7 +5,7 @@
 
 - 上下文只放「人设 + 最近 2-3 天日程名称 + 已有事件名」，**不接收聊天原文**；
 - prompt（system + user）总字符数 ≤ 1500；
-- 独立 ``schedule_events`` 任务，``max_tokens=1200``、``temperature=0.9``；
+- 独立 ``schedule_events`` 任务，``temperature=0.9``；
 - 只要求 JSON，不要解释；响应解析容忍 markdown 围栏。
 
 本模块不调用 LLM、不读写文件；网络调用唯一出口仍是 ``core.llm_utils.LLMService``。
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from .event_catalog_config import (DEFAULT_MAX_GENERATED_EVENTS,
-                                   DEFAULT_MAX_TOKENS, DEFAULT_MIN_GENERATED_EVENTS,
+                                   DEFAULT_MIN_GENERATED_EVENTS,
                                    DEFAULT_TEMPERATURE)
 
 #: prompt 上下文硬上限（system + user 字符数）
@@ -232,5 +232,4 @@ def parse_events_response(text: Any) -> List[Dict[str, Any]]:
 
 
 #: 供接线工人导入的固定生成参数（不要在各处再写一份字面量）
-GENERATION_MAX_TOKENS = DEFAULT_MAX_TOKENS
 GENERATION_TEMPERATURE = DEFAULT_TEMPERATURE
