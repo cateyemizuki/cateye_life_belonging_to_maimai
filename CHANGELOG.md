@@ -2,6 +2,15 @@
 
 本文件记录「属于麦麦的生活」（lbm）**面向使用者**的版本变更：新增能力、口径变化、缺陷修复与已知问题。
 
+## 未发布增量 - 2026-10-29（离线睡眠/按日历史/用量四桶/缺口估算；WebUI 接入未完成）
+
+- 离线重连分级补眠：宿主/插件停止后重连，按原始离线时长分 grace/nap/medium/long/overlong；短睡/中睡不改睡眠债，长睡按整晚规则结算；离线段记为“从未被打断”的 completed 睡眠会话，写 `wake_reason=offline_reconnect`，并生成 `source=offline` 的已完成睡眠足迹；只发一次 retroactive `life.sleep_woke`，不补发 `sleep_started`。
+- 按日历史 API：`life_dashboard` 新增 `day` 参数（`webui.json` 已声明），可读取指定日的实际足迹/计划意图，带上限与 512 KiB 裁剪；旧 `hours` 路径保持兼容。
+- 用量账本四桶：新记录写 `success`/`usage_present`；聚合分「正常回传 / 成功但无用量 / 失败 / legacy 旧行」，并保留 `missing_usage_source_*` 兼容键；宿主 `llm_usage.cost` 通道核实无数据，未接费用。
+- 缺口估算：≤2h 的中间真实缺口可线性补 `estimated:true` 点；>2h 大缺口改由 completed 睡眠会话生成 `estimated_segments`；估算只在投影层，不写回真实历史，不计入真实观察点。
+- **边界**：WebUI 排版、9 张背景、day 日期条、用量四桶展示、`estimated` 虚线/斜纹尚未接入；页面仍是 2026-10-28 版。后端已通过专项与门禁，但不得宣称页面功能已上线。
+- 验证：`_phase2_offline_sleep_test` 16/16、`_phase2_dashboard_day_usage_test` 19/19；smoke/round/behavior 均 exit 0（behavior 231 段）。
+
 ## 2026-10-29 诊断与睡眠展示修正（待自然醒验收后部署）
 
 - 宿主模型/数据库模块错误即使提及调用方插件名，也归入宿主/其他来源，避免把宿主用量写入失败误计为本插件故障。仅修正只读诊断计数，不修改数据库、模型请求或睡眠行为。
