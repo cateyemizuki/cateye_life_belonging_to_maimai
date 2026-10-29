@@ -48,6 +48,19 @@ def usage_summary(data_dir,now,hours=24):
             'terms':USAGE_TERMS,
             'note':'只统计宿主回传的Token；缺失时只计调用，不推算。调用次数包含失败。'}
 
+def _log_time(value,now):
+    """Host logs mix UTC ISO timestamps and local MM-DD times; export ISO only."""
+    raw=str(value or '')
+    try:
+        at=datetime.fromisoformat(raw.replace('Z','+00:00'))
+    except ValueError:
+        try:
+            at=datetime.strptime(f'{now.year}-{raw}','%Y-%m-%d %H:%M:%S').replace(tzinfo=now.tzinfo)
+            if at>now+timedelta(days=1):at=at.replace(year=now.year-1)
+        except ValueError:return None
+    if at.tzinfo is None:at=at.replace(tzinfo=now.tzinfo)
+    return at.isoformat()
+
 def runtime_health(plugin,now):
     result={'scope':'bounded_recent_log_tail','plugin_errors':0,'external_errors':0,'reloads':0,'last_reload':None,'truncated':False}
     root=getattr(plugin,'_plugin_root',None)
@@ -69,6 +82,6 @@ def runtime_health(plugin,now):
                 key='plugin_errors' if not host_owned and 'life_belonging_to_maimai' in serialized else 'external_errors'
                 result[key]+=1
             if 'Supervisor 已重启完成: file_watcher' in serialized:
-                result['reloads']+=1;result['last_reload']=row.get('timestamp')
+                result['reloads']+=1;result['last_reload']=_log_time(row.get('timestamp'),now)
     except OSError:pass
     return result
