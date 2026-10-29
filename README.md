@@ -25,7 +25,7 @@
 
 **前置条件**：QQ 空间需要 SnowLuma 适配器（NapCat 画像不支持 QZone API）；屏幕感知需要「cateye 统一连接插件」且对方电脑上的客户端在线。目标私聊流解析不到时，插件每 60 秒重试一次，期间不会有任何主动消息；先与目标 QQ 互发一条消息通常即可解析到。
 
-WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好感度（`[affection]`）、日程系统（`[schedule]`）、日程系统·高级设置（`[schedule_advanced]`）、日程主动行为（`[planning_proactive]`）、QQ 空间（`[qzone]`）、情绪系统（`[emotion]`）、LLM 调用（`[llm]`）、提示词（高级）（`[prompts]`）、管理与日志（`[admin]`）、生活状态（`[life_state]`）、事件库（`[event_catalog]`）。
+WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好感度（`[affection]`）、日程系统（`[schedule]`）、日程系统·高级设置（`[schedule_advanced]`）、日程主动行为（`[planning_proactive]`）、QQ 空间（`[qzone]`）、情绪系统（`[emotion]`）、LLM 调用（`[llm]`）、提示词（高级）（`[prompts]`）、管理与日志（`[admin]`）、生活状态（`[life_state]`）、事件库（`[event_catalog]`）、麦麦互动（`[maimai_interaction]`，聚合段最后一段；WebUI 显示名暂为「？？？」占位，正式名未定稿）。
 
 ## 工具主动私聊
 
@@ -35,7 +35,11 @@ Planner 直接提供 `message` 时不调用文案生成，因此约束放在工�
 
 ## 生活面板详情
 
-每个数据板块的小鱼可以查看说明、精确时间与折叠历史。桌面悬停临时查看，点击固定，再点或按 Esc 收起；手机点按后打开底部详情卡，小鱼会随卡片移到标题中，再点即可关闭。仅当前板块轻微模糊，手机及降低动态模式关闭模糊。历史曲线、日期选择、日程双轨和快照导入仍可使用。宿主内采用viewport布局，页面内部滚动，避免手机底栏被宿主导航遮住。
+页面左下角有一个 45° 冒头的常驻麦麦：鼠标移入会沿对角跳出、按住会被压扁、松开后回弹一次；也可以用键盘 Tab 聚焦后按 Enter/Space 触发同样的互动。打开详情时它会暂时隐藏，关闭后回到左下角。
+
+每个数据板块左下角有一个详情入口（默认收起）。点击入口（或聚焦后按 Enter/Space）打开**全屏详情**：整页背景高斯模糊，说明、精确时间与折叠历史都在同一张面板里；按 Esc、点击面板外背景或右上角关闭按钮即可关闭，焦点回到触发入口。入口再次点击等于关闭；hover 与聚焦不会自动打开详情。移动端同样是显式点按打开，降低动态模式下关闭背景模糊。打开详情期间 30 秒只读刷新照常进行，不会重置你的滚动位置；历史曲线、日期选择、快照导入仍可使用。宿主内采用viewport布局，页面内部滚动，避免手机底栏被宿主导航遮住。
+
+「日程」栏的时间线改为纵向列表：计划（虚线轴点）与实际（实线轴点）同列展示、徽标区分，中断标红虚线、跨午夜条目续到次日、进行中的活动以当前时刻收尾；「最近变化」折叠组列在板块详情末尾，展示最近真实发生的状态与活动变化（估算采样点不入列）。互动与详情的展示参数（常驻麦麦尺寸/角度/跳出距离、背景模糊半径、最近变化条数等）由配置段 `[maimai_interaction]` 控制，默认值即可使用。
 
 ## 模型输出与 Token 统计
 
@@ -251,7 +255,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 - 组件 **29 个** = 8 个命令 + 10 个 Hook + 7 个工具 + 4 个跨插件 API（`[admin].harass_report_enabled=false` 时运行期注册面回落 28）。
 - 声明 **17 项**宿主能力。
-- 配置 **13 个段 / 243 字段 / 5 隐藏 / 238 可见**（`[plugin]` 3、`[patrol]` 22、`[affection]` 12、`[schedule]` 24、`[schedule_advanced]` 31、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 10、`[llm]` 9、`[prompts]` 56、`[admin]` 8、`[qzone]` 20、`[emotion]` 17；3.0.0 离线 stub+pydantic 实算）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
+- 配置 **14 个段 / 259 字段 / 5 隐藏 / 254 可见**（`[plugin]` 3、`[patrol]` 22、`[affection]` 12、`[schedule]` 24、`[schedule_advanced]` 31、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 10、`[llm]` 9、`[prompts]` 56、`[admin]` 8、`[qzone]` 20、`[emotion]` 17、`[maimai_interaction]` 16；3.0.0 离线 stub+pydantic 实算，2026-10-30 随互动改造批新增末段）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
 - 用户可编辑映射表 **7 张**：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可
