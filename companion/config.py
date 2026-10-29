@@ -348,6 +348,16 @@ class PatrolSectionConfig(PluginConfigBase):
             **_ui_i18n("Narration TTL (min)"),
         },
     )
+    # 多屏截图适配（2026-10-30 插入轮；对端 cateye_connect_all-in-one v1.1.0 逐屏抓取）
+    screen_scope: Literal["main", "all"] = Field(
+        default="main",
+        description="屏幕范围：main = 只看主屏（默认，与旧版一致）；all = 对方有多块屏幕时逐屏抓取并一起交给视觉模型分屏描述（对端 v1.1.0+，单屏客户端两种取值等价）",
+        json_schema_extra={
+            "label": "屏幕范围",
+            "hint": "TA 常在副屏上干活时改 all；对端或客户端过旧时 all 自动退化为只看主屏",
+            **_ui_i18n("Screen scope", "main = primary screen only; all = describe every screen on multi-monitor setups."),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,8 @@
   → 状态 ``offline``（「陪伴对象的电脑没开」）；
 - 已连接 → 调 ``cateye.connect-hub.screenshot`` 截屏（可配模糊半径），
   把截图交给视觉模型（vlm 任务）转成一句话描述；
+  2026-10-30 多屏适配：对端 v1.1.0 起逐屏抓取，``[patrol].screen_scope``
+  = ``main``（默认，只看主屏）或 ``all``（全部屏幕一次交给视觉模型分屏描述）；
 - 截图失败 / 描述失败 → 状态 ``failed``（「没看清 TA 在干什么」）。
 
 调用形态（SDK 约定）：``ctx.api.call`` 目标报错/不存在时返回
@@ -140,17 +142,19 @@ class CateyeClient:
             self._ctx.logger.info("陪伴对象电脑未连接（或 cateye 插件不可用），本轮按「电脑没开」处理")
             return ScreenPeek(PEEK_OFFLINE)
 
-        image_b64 = await self._take_screenshot()
-        if not image_b64:
+        screens = await self._capture_screens()
+        if not screens:
             self._ctx.logger.info("陪伴对象电脑截图失败，本轮按「没看清」处理")
             return ScreenPeek(PEEK_FAILED)
 
-        description = await self._describe_screenshot(image_b64)
+        selected = self._select_screens(screens)
+        description = await self._describe_screens([s["image_base64"] for s in selected],
+                                                   len(selected), len(screens))
         if not description:
             self._ctx.logger.info("屏幕截图视觉理解失败（宿主可能不支持图片输入），本轮按「没看清」处理")
             return ScreenPeek(PEEK_FAILED)
 
-        self._ctx.logger.info(f"陪伴对象电脑状态（{now.strftime('%H:%M')}）：{description}")
+        self._ctx.logger.info(f"陪伴对象电脑状态（{now.strftime('%H:%M')}，{len(selected)}/{len(screens)} 屏）：{description}")
         return ScreenPeek(PEEK_OK, description)
 
     async def is_connected(self) -> bool:
@@ -176,8 +180,15 @@ class CateyeClient:
         self._connected_cached_at = now_ts
         return connected
 
-    async def _take_screenshot(self) -> str:
-        """截取陪伴对象电脑屏幕，成功返回 base64 PNG，失败返回空串。"""
+    async def _capture_screens(self) -> list:
+        """截取陪伴对象电脑屏幕，成功返回规格化屏幕列表，失败返回空列表。
+
+        对端 ``screenshot`` v2（多屏兼容）响应含 ``screens``（每屏一项，主屏恒第 0 位且
+        ``primary=True``）与兼容键 ``image_base64``（恒为主屏）。此处统一规格化为
+        ``[{"index", "primary", "image_base64"}]``：丢弃空图条目；对端过旧（无 ``screens``
+        键）或负载降级（screens 空）时回退用 ``image_base64`` 合成单屏——两种取值下
+        单屏客户端行为与改造前一致。
+        """
         cfg = self._screen_cfg()
         blur = int(getattr(cfg, "screen_blur", None)
                    if getattr(cfg, "screen_blur", None) is not None
@@ -187,27 +198,61 @@ class CateyeClient:
             resp = await self._ctx.api.call(HUB_API_SCREENSHOT, user_id=user_id, blur=blur)
         except Exception as e:
             self._ctx.logger.debug(f"cateye 截图调用异常: {e}")
-            return ""
+            return []
         if not isinstance(resp, dict) or not resp.get("success"):
             error = resp.get("error") if isinstance(resp, dict) else type(resp).__name__
             self._ctx.logger.debug(f"cateye 截图失败: {error}")
-            return ""
-        return str(resp.get("image_base64", "") or "")
+            return []
+        screens = []
+        for raw in (resp.get("screens") or []):
+            image = str(raw.get("image_base64", "") or "") if isinstance(raw, dict) else ""
+            if not image:
+                continue
+            screens.append({"index": raw.get("index"), "primary": bool(raw.get("primary")),
+                            "image_base64": image})
+        if not screens:
+            legacy = str(resp.get("image_base64", "") or "")
+            if legacy:
+                screens = [{"index": 0, "primary": True, "image_base64": legacy}]
+        return screens
 
-    async def _describe_screenshot(self, image_b64: str) -> str:
+    def _screen_scope(self) -> str:
+        """屏幕范围取值（screen_scope；非法值一律回退 main，绝不因配置炸掉巡检）。"""
+        cfg = self._screen_cfg()
+        value = getattr(cfg, "screen_scope", "main")
+        return value if value in ("main", "all") else "main"
+
+    def _select_screens(self, screens: list) -> list:
+        """按 ``[patrol].screen_scope`` 选屏：main = 主屏一条；all = 全部（按 index 升序）。
+
+        ``all`` 只在真有多屏时改变行为：单屏客户端（对端降级 / 旧 hub）两种取值等价。
+        """
+        if self._screen_scope() != "all" or len(screens) <= 1:
+            primary = next((s for s in screens if s["primary"]), screens[0])
+            return [primary]
+        return sorted(screens, key=lambda s: (s["index"] is None, s["index"] or 0))
+
+    async def _describe_screens(self, images: list, selected: int, total: int) -> str:
         """用视觉模型把截图转成一句话描述，失败返回空串。
 
         调用统一走 ``core.llm_utils.LLMService.describe_image``（2026-10-10 收编：
         所有 LLM 调用只从这一个模块发出）；提示词与任务名分别来自
         ``[prompts].screen_describe`` 与 ``[llm].vlm_task``。
+        2026-10-30 多屏适配：多张图一次调用（``extra_images``），并在提示词后内联
+        追加分屏说明——不新增 [prompts] 键，单图时提示词与旧实现逐字一致。
         """
         llm = self._llm or _fallback_llm(self._plugin)
         if llm is None:
             return ""
         describe_prompt = prompt_of(self._plugin, "screen_describe")
+        if selected > 1:
+            describe_prompt = (f"{describe_prompt}\n"
+                               f"（对方有多块屏幕，以下 {selected} 张截图按 屏0(主屏)→屏{selected - 1} "
+                               "顺序给出：请按屏各用一小句说明在做什么，再用一句话概括整体状态）")
         vlm_task = purpose_task(self._plugin, "vlm", default="vlm")
         return await llm.describe_image(
-            image_b64, describe_prompt,
+            images[0], describe_prompt,
+            extra_images=images[1:],
             task_name=vlm_task, temperature=0.3,
             event="cateye_screen_describe",
         )

@@ -28,6 +28,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any, Callable, Dict, Optional
 
 from core.llm_usage import LLMUsageTracker
@@ -573,6 +574,7 @@ class LLMService:
         image_base64: str,
         prompt: str,
         *,
+        extra_images: Optional[Sequence[str]] = None,
         task_name: str = "",
         temperature: float = 0.3,
 
@@ -583,14 +585,22 @@ class LLMService:
         2026-10-10 由 companion/cateye_client.py 收编进本模块（所有 LLM 调用的唯一出口）。
         **消息形态与原实现逐字一致**（Data URL 的 ``image_url`` 段），避免宿主多模态解析口径漂移；
         失败返回空串由调用方降级。
+        2026-10-30 多屏适配：新增 ``extra_images``（追加的 base64 图，按给出顺序排在首图之后，
+        各自一个 ``image_url`` 段）；不传/空序列时消息形态与旧实现逐字一致，既有调用方零感知。
         """
-        content = [
+        content: list[dict[str, Any]] = [
             {"type": "text", "text": str(prompt or "")},
             {
                 "type": "image_url",
                 "image_url": {"url": f"data:image/png;base64,{image_base64}"},
             },
         ]
+        for extra in extra_images or ():
+            if isinstance(extra, str) and extra.strip():
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{extra}"},
+                })
         kwargs: dict[str, Any] = {
             "prompt": [{"role": "user", "content": content}],
             "task_name": task_name or self._task_name,
