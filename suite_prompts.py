@@ -107,12 +107,38 @@ INJECT_PROACTIVE_TURN_RULE_DEFAULT = (
     "\n- reply 的 msg_id 只能选对方发送的消息。"
 )
 
+#: Tool schema is part of the planner prompt even when it supplies the text
+#: directly (in which case the optional generator below is never called).
+TOOL_SEND_MESSAGE_DESCRIPTION = (
+    "向配置好的固定关系对象发送一条私聊消息（关系类型与口吻取自配置），"
+    "不是给当前群友或当前会话回复。仅当本轮确实要联系该配置对象时调用；"
+    "不能把群友的昵称、爱人设定或兴趣当成收件人身份，身份不确定时不要调用。"
+    "群聊冷场或没有别的事做，不单独构成转去私聊的理由。"
+    "可以自然主动联系，但内容须让收件人独立看懂，不照搬无关群聊语境，"
+    "不凭空推断对方正在做什么或是否该睡觉。message可直接传正文，留空才自动生成。"
+)
+TOOL_SEND_MESSAGE_TEXT_DESCRIPTION = (
+    "发给配置中固定关系对象的私聊正文（可选，留空自动生成）。"
+    "直接传入后不会再经文案生成或润色。只使用明确属于该对象的事实；"
+    "引用群聊话题时先确认与收件人有关，并补足必要背景。"
+    "一次只表达一个轻量想法，问句克制，不拼接通用问候、近况连问和作息叮嘱；"
+    "没有时间与作息依据时，不说‘这么晚了’‘别太晚睡’或假定对方忙闲。"
+)
 #: 工具主动发消息的生成提示词（占位符：{style_word} / {relation_word}）
 TOOL_SEND_MESSAGE_DEFAULT = (
-    "请用{style_word}的口吻，对你的{relation_word}说一句问候或分享一件小事（20-40字）。"
+    "请用{style_word}的口吻，自然地向配置中固定的{relation_word}开启一句私聊（20-40字）。"
+    "一次只表达一个轻量想法，不必凑成问候，也不必每次提问；最多一个轻问句。"
+    "没有提供对方近况、当前时间或共同经历时，不补写这些事实，不编造自己刚经历的小事。"
+    "不从其他群友的昵称、兴趣或关系设定推定收件人的身份。"
+    "不套用‘今天过得好吗’再接‘别太晚睡’的组合，不无依据劝睡或假定对方正在忙。"
+    "只输出要发送的正文。"
 )
 #: 工具主动发消息的 system prompt（占位符：{name} / {self_desc} / {relation_word}）
-TOOL_SEND_MESSAGE_SYSTEM_DEFAULT = "你是「{name}」（{self_desc}），此刻正主动找你的{relation_word}说话。"
+TOOL_SEND_MESSAGE_SYSTEM_DEFAULT = (
+    "你是「{name}」（{self_desc}），准备私聊配置中固定的{relation_word}。"
+    "主动性来自真实的联系意愿，不代表需要替对方安排作息。"
+    "保持自然口吻，让没有看过其他群聊天的人也能理解这句话；不要声称掌握未提供的近况。"
+)
 
 #: 会话采样好感裁判提示词（占位符：{lover_name} / {target_label} / {persona} /
 #: {tier_label} / {tier_desc} / {mood_text} / {recent_messages}）

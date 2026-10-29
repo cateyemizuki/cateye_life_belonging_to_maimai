@@ -27,6 +27,12 @@
 
 WebUI 段名对照：插件（`[plugin]`）、陪伴模块（`[patrol]`）、好感度（`[affection]`）、日程系统（`[schedule]`）、日程系统·高级设置（`[schedule_advanced]`）、日程主动行为（`[planning_proactive]`）、QQ 空间（`[qzone]`）、情绪系统（`[emotion]`）、LLM 调用（`[llm]`）、提示词（高级）（`[prompts]`）、管理与日志（`[admin]`）、生活状态（`[life_state]`）、事件库（`[event_catalog]`）。
 
+## 工具主动私聊
+
+`lbm_mai_lover_send_message` 始终发给配置的固定关系对象，不会按当前群友昵称改变收件人。群聊冷场本身不足以成为转去私聊的理由；正文须让收件人独立看懂，不把其他群友的兴趣、关系设定或作息当作该对象的事实。
+
+Planner 直接提供 `message` 时不调用文案生成，因此约束放在工具说明/参数说明中；`[prompts].tool_send_message` 与 `tool_send_message_system` 只影响留空自动生成。自定义模板保持优先。相关提示已本地加强，尚未部署生产，也不是强制身份校验或发送门禁。
+
 ## WebUI 生活面板
 
 在宿主侧边栏打开「属于麦麦的生活 → 属于麦麦的生活」。页面通过插件自己的 `webui.json`（v2）与沙箱查询读取实时数据，自动跟随宿主主题，不需要替换宿主静态文件。

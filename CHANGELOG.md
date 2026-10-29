@@ -4,6 +4,9 @@
 
 ## 未发布增量 - 2026-10-29（本地完成，未部署生产）
 
+- 工具主动私聊提示优化：明确固定配置收件人、群友身份与话题不可混用、冷场不单独构成私聊理由、正文需独立可理解；避免无依据推断忙闲/作息和罐头连问。直接传message时真正生效的是工具schema说明；留空自动生成的默认prompt同步优化，自定义模板不覆盖。仅提示约束，无新增发送门禁、预算变更或模型调用。专项5/5及门禁231通过，未部署。
+
+
 - 离线重连分级补眠：宿主/插件停止后重连，按原始离线时长分 grace/nap/medium/long/overlong；短睡/中睡不改睡眠债，长睡按整晚规则结算；离线段记为“从未被打断”的 completed 睡眠会话，写 `wake_reason=offline_reconnect`，并生成 `source=offline` 的已完成睡眠足迹；只发一次 retroactive `life.sleep_woke`，不补发 `sleep_started`。
 - 按日历史 API：`life_dashboard` 新增 `day` 参数（`webui.json` 已声明），可读取指定日的实际足迹/计划意图，带上限与 512 KiB 裁剪；旧 `hours` 路径保持兼容。
 - 用量账本四桶：新记录写 `success`/`usage_present`；聚合分「正常回传 / 成功但无用量 / 失败 / legacy 旧行」，并保留 `missing_usage_source_*` 兼容键；宿主 `llm_usage.cost` 通道核实无数据，未接费用。

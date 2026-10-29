@@ -75,6 +75,8 @@ from planning.time_utils import DAY_MINUTES, format_day_minute, ring_minutes_ahe
 from suite_prompts import (
     INJECT_AFFECTION_BLOCK_DEFAULT,
     TOOL_SEND_MESSAGE_DEFAULT,
+    TOOL_SEND_MESSAGE_DESCRIPTION,
+    TOOL_SEND_MESSAGE_TEXT_DESCRIPTION,
     TOOL_SEND_MESSAGE_SYSTEM_DEFAULT,
     prompt,
     render,
@@ -769,11 +771,11 @@ class CompanionComponentsMixin:
 
     @Tool(
         "lbm_mai_lover_send_message",
-        description="以 bot 的口吻向关系对象主动发送一条消息（关系类型见配置 relation_type：恋人/挚友/维护者/家人），口吻与后缀随关系自动变化",
+        description=TOOL_SEND_MESSAGE_DESCRIPTION,
         parameters={
             "message": {
                 "type": "string",
-                "description": "要发送的消息文本（可选，留空则自动生成）",
+                "description": TOOL_SEND_MESSAGE_TEXT_DESCRIPTION,
                 "required": False,
             },
         },
