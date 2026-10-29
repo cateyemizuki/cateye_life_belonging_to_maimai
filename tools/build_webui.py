@@ -16,7 +16,7 @@ def build():
         template=template.replace('{{'+key+'}}',uri)
         if asset.suffix=='.svg':template=template.replace('{{FISH_SVG}}',raw.decode('utf-8'))
         manifest[asset.name]={'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}
-    js=(SRC/'panel.js').read_text(encoding='utf-8').replace('freshnessTimer=setInterval',(SRC/'fish.js').read_text(encoding='utf-8')+'\nfreshnessTimer=setInterval',1)
+    js=(SRC/'panel.js').read_text(encoding='utf-8').replace('freshnessTimer=setInterval',(SRC/'maimai.js').read_text(encoding='utf-8')+'\n'+(SRC/'fish.js').read_text(encoding='utf-8')+'\nfreshnessTimer=setInterval',1)
     output=template.replace('{{CSS}}',css).replace('{{JS}}',js)
     assert not re.search(r'\{\{[A-Z_]+\}\}',output),'unresolved asset slot'
     assert len(output.encode('utf-8')) < 2*1024*1024,'host page limit exceeded'

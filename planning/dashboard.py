@@ -461,6 +461,49 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
     return view
 
 
+#: maimai 互动白名单投影字段（2026-10-30 交互改造）：字段名 → (类型, 出厂默认, 下限, 上限)。
+#: 只含展示/交互参数；整份配置绝不下发前端（前端默认值沿本表同值兜底，不另造第二套语义）。
+_MAIMAI_PROJECTION: dict[str, tuple[type, Any, float, float]] = {
+    'mascot_size_px': (int, 96, 48, 160),
+    'peek_angle_deg': (int, 45, 0, 90),
+    'hover_out_px': (int, 120, 0, 240),
+    'hover_out_ms': (int, 240, 80, 600),
+    'press_squash_x': (float, 1.20, 0.8, 1.6),
+    'press_squash_y': (float, 0.50, 0.2, 1.0),
+    'bounce_ms': (int, 774, 200, 3000),
+    'detail_blur_px': (int, 16, 0, 40),
+    'detail_fade_ms': (int, 220, 80, 600),
+    'detail_scale_from': (float, 0.96, 0.8, 1.0),
+    'detail_fish_size_px': (int, 56, 32, 96),
+    'history_changes_limit': (int, 30, 5, 30),
+    'history_state_epsilon': (float, 0.01, 0.001, 0.1),
+    'history_debt_epsilon': (float, 0.1, 0.01, 1.0),
+}
+
+
+def _maimai_view(cfg: Any) -> dict[str, Any]:
+    """``[maimai_interaction]`` → 面板 ``maimai`` 只读投影（白名单 + 范围钳制）。
+
+    ``bounce_easing`` 是自由字符串，投影视图里原样携带，由前端按 CSS easing
+    白名单形态校验后使用，无法识别时回退 overshoot（后端不做语法裁决）。
+    配置段缺失（防御路径，正常构造下恒存在）时按白名单出厂默认出全量视图，
+    与前端 CSS 同值兜底口径一致，不另造「关闭」歧义。
+    """
+    section = getattr(cfg, 'maimai_interaction', None)
+    view: dict[str, Any] = {'enabled': bool(getattr(section, 'enabled', True))}
+    for name, (kind, default, low, high) in _MAIMAI_PROJECTION.items():
+        raw = getattr(section, name, default)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+                or not math.isfinite(float(raw)):
+            raw = default
+        value = min(high, max(low, float(raw)))
+        view[name] = int(round(value)) if kind is int else round(value, 4)
+    easing = getattr(section, 'bounce_easing', None)
+    view['bounce_easing'] = str(easing)[:80] if isinstance(easing, str) and easing.strip() \
+        else 'cubic-bezier(.34,1.56,.64,1)'
+    return view
+
+
 def build_life_dashboard(plugin: Any, *, hours: int = 24,
                          now: datetime | None = None, day: str = "") -> dict[str, Any]:
     """只读生活面板投影。
@@ -565,6 +608,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
                   'configured_wake': str(getattr(getattr(cfg, 'schedule', None), 'wake_time', '') or '')[:8]},
         'companion': companion, 'observations': observations, 'warnings': list(dict.fromkeys(warnings))[:8],
     }
+    result['maimai'] = _maimai_view(cfg)
     result.update(_extension_summary(plugin, now, hours))
     if future_state:
         result['warnings'].append('状态时间晚于当前时钟，请核对服务器时间')

@@ -497,6 +497,112 @@ class AdminSectionConfig(PluginConfigBase):
     )
 
 
+class MaimaiInteractionSectionConfig(PluginConfigBase):
+    """麦麦互动段（2026-10-30 交互改造新增，聚合配置的最后一段）。
+
+    集中管理 WebUI 左下角常驻麦麦角色与全屏详情的展示/交互参数。
+    这些值经 ``planning.dashboard.build_life_dashboard`` 的只读 ``maimai``
+    白名单投影下发给前端（§投影只含展示/交互参数，绝不下发整份配置）；
+    前端不写第二套默认值，投影缺失时按同值 CSS 兜底显示。
+
+    正式显示名尚未定稿，暂按主计划以「？？？」占位；技术节名 maimai_interaction
+    已定稿（TOML 裸键不支持问号，见主计划第三章整合口径 §5）。
+    """
+
+    __ui_label__ = "？？？"
+    __ui_icon__ = "heart"
+    __ui_order__ = 13
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Maimai Interaction",
+               "description": "Corner mascot and fullscreen detail look & feel (display-only)."}
+    }
+
+    enabled: bool = Field(
+        default=True,
+        description="常驻麦麦与互动总开关；关闭后整个页面不显示常驻麦麦，板块详情入口仍可用",
+        json_schema_extra={
+            "label": "常驻麦麦开关",
+            "hint": "只影响左下角常驻角色；各板块详情入口不受影响",
+            **_ui_i18n("Mascot enabled", "Hides the corner mascot; detail entries stay."),
+        },
+    )
+    mascot_size_px: int = Field(
+        default=96, ge=48, le=160,
+        description="常驻麦麦基准尺寸（像素）",
+        json_schema_extra={"label": "常驻麦麦尺寸", "step": 1, **_ui_i18n("Mascot size (px)")},
+    )
+    peek_angle_deg: int = Field(
+        default=45, ge=0, le=90,
+        description="左下角冒头角度（度）",
+        json_schema_extra={"label": "冒头角度", "step": 1, **_ui_i18n("Peek angle (deg)")},
+    )
+    hover_out_px: int = Field(
+        default=120, ge=0, le=240,
+        description="鼠标移入后向外跳出的对角距离（像素）",
+        json_schema_extra={"label": "跳出距离", "step": 1, **_ui_i18n("Hover out distance (px)")},
+    )
+    hover_out_ms: int = Field(
+        default=240, ge=80, le=600,
+        description="跳出/收回动画时长（毫秒）",
+        json_schema_extra={"label": "跳出时长", "step": 10, **_ui_i18n("Hover out duration (ms)")},
+    )
+    press_squash_x: float = Field(
+        default=1.20, ge=0.8, le=1.6,
+        description="按住时的横向扩张系数",
+        json_schema_extra={"label": "按压横向扩张", "step": 0.05, **_ui_i18n("Press squash X")},
+    )
+    press_squash_y: float = Field(
+        default=0.50, ge=0.2, le=1.0,
+        description="按住时的纵向压扁系数",
+        json_schema_extra={"label": "按压纵向压扁", "step": 0.05, **_ui_i18n("Press squash Y")},
+    )
+    bounce_ms: int = Field(
+        default=774, ge=200, le=3000,
+        description="一次回弹动画周期（毫秒）",
+        json_schema_extra={"label": "回弹周期", "step": 10, **_ui_i18n("Bounce duration (ms)")},
+    )
+    bounce_easing: str = Field(
+        default="cubic-bezier(.34,1.56,.64,1)",
+        description="回弹缓动曲线（CSS easing；无法识别时前端回退为 overshoot）",
+        json_schema_extra={"label": "回弹缓动", **_ui_i18n("Bounce easing")},
+    )
+    detail_blur_px: int = Field(
+        default=16, ge=0, le=40,
+        description="全屏详情背景高斯模糊半径（像素，0 = 不模糊）",
+        json_schema_extra={"label": "详情背景模糊", "step": 1, **_ui_i18n("Detail blur (px)")},
+    )
+    detail_fade_ms: int = Field(
+        default=220, ge=80, le=600,
+        description="详情进入/退出动画时长（毫秒）",
+        json_schema_extra={"label": "详情动画时长", "step": 10, **_ui_i18n("Detail fade (ms)")},
+    )
+    detail_scale_from: float = Field(
+        default=0.96, ge=0.8, le=1.0,
+        description="详情打开时的初始缩放",
+        json_schema_extra={"label": "详情初始缩放", "step": 0.01, **_ui_i18n("Detail scale from")},
+    )
+    detail_fish_size_px: int = Field(
+        default=56, ge=32, le=96,
+        description="详情面板标题里触发麦麦的尺寸（像素）",
+        json_schema_extra={"label": "面板内麦麦尺寸", "step": 1, **_ui_i18n("Panel mascot size (px)")},
+    )
+    history_changes_limit: int = Field(
+        default=30, ge=5, le=30,
+        description="详情「最近变化」最大条数（5–30）",
+        json_schema_extra={"label": "最近变化条数", "step": 1, **_ui_i18n("Recent changes limit")},
+    )
+    history_state_epsilon: float = Field(
+        default=0.01, ge=0.001, le=0.1,
+        description="状态变化记录阈值（占比 0.001–0.1）",
+        json_schema_extra={"label": "状态变化阈值", "step": 0.001, **_ui_i18n("State epsilon")},
+    )
+    history_debt_epsilon: float = Field(
+        default=0.1, ge=0.01, le=1.0,
+        description="睡眠债变化记录阈值（小时）",
+        json_schema_extra={"label": "睡眠债阈值", "step": 0.01, **_ui_i18n("Debt epsilon (h)")},
+    )
+
+
 class CateyeSuiteConfig(PluginConfigBase):
     """插件完整配置。
 
@@ -526,6 +632,9 @@ class CateyeSuiteConfig(PluginConfigBase):
     qzone: QzoneSectionConfig = Field(default_factory=QzoneSectionConfig)
     # 情绪系统（emotion/config.py）
     emotion: EmotionSectionConfig = Field(default_factory=EmotionSectionConfig)
+    # 麦麦互动（本文件，2026-10-30 交互改造新增）：放在最后一个字段，
+    # 保证 config.toml 的最后一节就是 [maimai_interaction]（主计划第三章口径）。
+    maimai_interaction: MaimaiInteractionSectionConfig = Field(default_factory=MaimaiInteractionSectionConfig)
 
     @pydantic.model_validator(mode="before")
     @classmethod
