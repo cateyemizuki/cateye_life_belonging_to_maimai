@@ -43,6 +43,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .time_utils import DAY_MINUTES, TimezoneManager, normalize_day_minutes
+from .schedule_items import is_night_sleep_item
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +326,10 @@ def resolve_hard_commitment_start(intents: Iterable[Any], frame_date: str,
     best: Optional[datetime] = None
     for intent in intents or []:
         if not isinstance(intent, dict):
+            continue
+        # Sleep anchors belong to this engine, not to the waking-appointment
+        # deadline. Otherwise a hard 01:00 sleep row wakes itself at 01:05.
+        if is_night_sleep_item(intent):
             continue
         if str(intent.get("hardness") or "").strip().lower() != "hard":
             continue

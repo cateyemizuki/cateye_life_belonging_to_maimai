@@ -47,6 +47,7 @@ from core.time_utils import minutes_of_now
 
 from . import activity_profiles
 from .sleep_engine import resolve_hard_commitment_start
+from .schedule_items import is_night_sleep_item
 from .time_utils import (DAY_MINUTES, TimezoneManager, is_in_sleep_ring,
                          normalize_day_minutes, ring_minutes_ahead)
 
@@ -1171,7 +1172,10 @@ class RollingPlanner:
             items = self._db.get_day_schedule(date)
         except Exception:
             return []
-        return extract_spine_intents(items)
+        # The engine owns night sleep anchors. Do not also offer them as hard
+        # waking commitments, soft work candidates, or competing boundaries.
+        return extract_spine_intents([item for item in items
+                                      if not is_night_sleep_item(item)])
 
     def _intent_done_today(self, date: str, item_id: str) -> bool:
         try:

@@ -616,13 +616,15 @@ const SectionFish=(()=>{
   redraw();
   closeButton.focus({preventScroll:true});
  }
- // Tab 在面板内循环（简单焦点陷阱）；Esc 由 document 级监听统一处理。
- overlay.addEventListener('keydown',e=>{
+ // Recover focus even if a refresh or host shortcut moved it outside the
+ // overlay; listening only on the overlay misses that keyboard event.
+ document.addEventListener('keydown',e=>{
   if(e.key!=='Tab'||!current)return;
-  const focusables=[...panel.querySelectorAll('button,summary,input,textarea,select,[href],[tabindex]:not([tabindex="-1"])')].filter(node=>!node.disabled&&node.getClientRects().length);
+  const focusables=[...panel.querySelectorAll('button,summary,input,textarea,select,[href],[tabindex]:not([tabindex="-1"])')].filter(node=>!node.disabled&&node.tabIndex>=0&&node.getClientRects().length);
   if(!focusables.length)return;
   const first=focusables[0],last=focusables[focusables.length-1];
-  if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus({preventScroll:true})}
+  if(!focusables.includes(document.activeElement)){e.preventDefault();(e.shiftKey?last:first).focus({preventScroll:true})}
+  else if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus({preventScroll:true})}
   else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus({preventScroll:true})}
  });
  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&current){e.preventDefault();close(true)}});

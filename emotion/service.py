@@ -2631,6 +2631,11 @@ class EmotionService:
         if engine_state is True:
             # 引擎权威睡眠中：旧 wake 锚点/条目端点到了也**不算醒**（单一 wake provider）
             awake_activity = False
+        elif engine_state is False:
+            # A closed engine session is authoritative even when runtime is
+            # idle. A legacy night window must not refreeze an already awake
+            # bot and manufacture a second sleep/referee/recovery cycle.
+            awake_activity = True
 
         # 醒沿：日程出现清醒活动，或已离开睡眠窗口（含条目被截断后的深夜/清晨）
         if awake_activity or (self.is_frozen() and not self._in_sleep_period(now)):
