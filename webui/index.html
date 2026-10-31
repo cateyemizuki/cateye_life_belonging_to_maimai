@@ -609,6 +609,16 @@ const SectionFish=(()=>{
  const tip=el('span','fish-tail-tip');tip.setAttribute('aria-hidden','true');tip.hidden=true;overlay.append(tip);
  let changesCache={src:null,key:'',items:[]};
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
+ // 锁定滚动时滚动条消失会让居中内容整体横移（“抽一下”）——用等宽右内边距补偿。
+ const lockScroll=()=>{
+  const w=innerWidth-document.documentElement.clientWidth;
+  document.body.style.paddingRight=w>0?w+'px':'';
+  document.body.classList.add('fish-locked');
+ };
+ const unlockScroll=()=>{
+  document.body.classList.remove('fish-locked');
+  document.body.style.paddingRight='';
+ };
  const finishMs=()=>{const raw=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--maimai-detail-fade-ms'));return Number.isFinite(raw)&&raw>0?raw:220};
  // 「最近变化」：前端从 history.points / schedule.episodes / sleep.sessions 派生，不改 API。
  const CHANGES_KIND={current:'episode',companion:'none',state:'state',history:'state',sleep:'sleep',schedule:'episode',mood:'vad',sharing:'none',usage:'none',health:null};
@@ -766,7 +776,7 @@ const SectionFish=(()=>{
   tip.hidden=true;panel.style.transformOrigin='';panel.style.left='';panel.style.top='';panel.style.maxHeight='';panel.style.maxHeight='';
   const finish=()=>{
    overlay.hidden=true;overlay.classList.remove('is-open','is-closing');overlay.removeAttribute('data-section');delete overlay.dataset.align;
-   document.body.classList.remove('fish-locked');
+   unlockScroll();
    if(typeof Mascot!=='undefined')Mascot.setDetailMode(false);
    if(restoreFocus&&wasPinned&&lastTrigger)lastTrigger.focus({preventScroll:true});
   };
@@ -798,7 +808,7 @@ const SectionFish=(()=>{
  function pin(){
   if(!current||pinnedOpen)return;
   pinnedOpen=true;
-  document.body.classList.add('fish-locked');           // 固定后才启用滚动锁
+  lockScroll();                                         // 固定后才启用滚动锁（补偿滚动条宽度）
   closeButton.focus({preventScroll:true});
  }
  function open(entry,pinned=false){
@@ -813,11 +823,11 @@ const SectionFish=(()=>{
   void overlay.offsetWidth;
   overlay.classList.add('is-open');
   entry.element.classList.add('fish-open');entry.button.setAttribute('aria-expanded','true');
-  if(pinned)document.body.classList.add('fish-locked');
+  if(pinned)lockScroll();
   if(typeof Mascot!=='undefined')Mascot.setDetailMode(true);
   refresh();
   redraw();
-  requestAnimationFrame(()=>snapPanel(entry));
+  requestAnimationFrame(()=>{syncFloat(entry);snapPanel(entry)});
   if(pinned)closeButton.focus({preventScroll:true});    // 悬停预览不抢键盘焦点
  }
  // Recover focus even if a refresh or host shortcut moved it outside the
