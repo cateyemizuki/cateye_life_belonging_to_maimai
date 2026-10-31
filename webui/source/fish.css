@@ -2,12 +2,14 @@
    backdrop; the backdrop keeps a light blur (2–4px) with a low-strength veil, and a curved
    tail ties the bubble to its entry. Only the panel and its entry stay clear. */
 .fish-section{position:relative;overflow:visible!important}.fish-content{min-width:0}.fish-section .fish-content{isolation:isolate;padding-bottom:8px}
-.section-fish-button{position:absolute;left:18px;bottom:-17px;z-index:6;min-width:48px;width:48px;min-height:36px;height:36px;padding:0;border:0;background:transparent!important;border-radius:14px;overflow:visible;line-height:0;cursor:pointer}
+/* 0424 目检修正：入口贴紧卡片左下角（left:2px），鱼在剪出窗内平移+rotate(-45deg)，
+   让「橙/奶白颜色分界线」（分界中心约在图 (0.583W, 0.706H)）对准卡片角点——
+   只露叶+头顶+眼睛，身体藏进角外（参照 better_post-processing logo 冒头效果）。 */
+.section-fish-button{position:absolute;left:2px;bottom:-15px;z-index:6;min-width:48px;width:48px;min-height:36px;height:36px;padding:0;border:0;background:transparent!important;border-radius:14px;overflow:visible;line-height:0;cursor:pointer}
 .section-fish-button:hover{background:transparent}
 .fish-peek{display:block;width:44px;height:27px;margin:5px auto 0;overflow:hidden}
-/* U 计划 §2：原图朝右 → rotate(-45deg) 使头朝右上，从剪出窗里探头（非任意整图旋转）。 */
-.fish-peek>svg{display:block;width:44px;height:auto;transform:rotate(-45deg);transform-origin:50% 55%;transition:transform 210ms ease}
-.section-fish-button:hover .fish-peek>svg,.section-fish-button:focus-visible .fish-peek>svg{transform:rotate(-45deg) translateY(-2px) scale(1.07)}
+.fish-peek>svg{display:block;width:44px;height:auto;transform:translate(-30px,-6px) rotate(-12deg);transform-origin:26px 22px;transition:transform 210ms ease}
+.section-fish-button:hover .fish-peek>svg,.section-fish-button:focus-visible .fish-peek>svg{transform:translate(-30px,-6px) rotate(-12deg) translateY(-2px) scale(1.07)}
 .section-fish-button:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:3px}
 .fish-section.card>.fish-content{border-radius:inherit}
 .fish-section[data-fish-section=state]{margin-top:18px;margin-bottom:14px}
@@ -90,5 +92,5 @@ body.fish-locked{overflow:hidden}
 [data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
 @supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
 @media(max-width:1000px){.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:700px),(hover:none){.section-fish-button{left:12px;bottom:-15px;width:44px;height:40px;min-height:40px}.fish-peek{width:32px;height:24px;margin-top:8px}.fish-peek>svg{width:32px;transform:rotate(-45deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
-@media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:rotate(-45deg)!important}.fish-overlay,.fish-panel{transition:none!important}}
+@media(max-width:700px),(hover:none){.section-fish-button{left:2px;bottom:-13px;width:44px;height:40px;min-height:40px}.fish-peek{width:32px;height:24px;margin-top:8px}.fish-peek>svg{width:32px;transform:translate(-27px,3px) rotate(-12deg)!important;transform-origin:19px 16px;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
+@media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:translate(-30px,-6px) rotate(-12deg)!important}.fish-overlay,.fish-panel{transition:none!important}}

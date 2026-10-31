@@ -40,17 +40,19 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('{{BG_TE
 
 .info-wrap{display:inline-flex;position:relative;vertical-align:middle;margin-left:4px}.info-button{font:italic 11px/1 Georgia,serif;border-radius:50%;min-height:22px;min-width:22px;width:22px;height:22px;padding:0;color:var(--maibot-muted);background:var(--maibot-surface)}.info-tooltip{position:absolute;right:0;top:27px;z-index:40;width:max-content;max-width:min(280px,80vw);white-space:normal;background:var(--maibot-surface);color:var(--maibot-foreground);border:1px solid var(--maibot-border);box-shadow:0 5px 20px #0002;border-radius:8px;padding:9px 11px;font-size:11px;font-style:normal;text-align:left;line-height:1.7}
 
-/* 常驻麦麦：左下角桌宠状态机（2026-11-01 U 计划 §三）。收起探头姿态由 .is-peek 呈现
-   （展示层 rotate(-角度)，使原图朝右的麦麦头朝右上而非偏向右下）；弹出/落地/收起轨迹
-   由 WAAPI 驱动 .maimai-peek-tilt（maimai.js 状态机），按压缩放由 WAAPI 驱动
-   .maimai-peek-art（连续形变，可取消接续）。
-   按钮本体 pointer-events:none（透明方块不吃页面点击），命中区跟随旋转后的图本体。 */
-.maimai-peek{position:fixed;left:0;bottom:0;z-index:600;width:var(--maimai-mascot-size,96px);height:var(--maimai-mascot-size,96px);border:0;background:transparent!important;padding:0;overflow:visible;line-height:0;cursor:pointer;pointer-events:none}
+/* 常驻麦麦：左下角桌宠状态机（2026-11-01 U 计划 §三 + 0424 用户目检修正）。
+   收起探头姿态由 .is-peek 呈现：rotate(-角度) 使原图朝右的麦麦头朝右上，并平移
+   让「橙/奶白颜色分界线」（鱼身约 70% 高处）正好穿过视口角落点——身体藏进角
+   落、只露叶+头顶+眼睛（参照 better_post-processing logo 的冒头效果）。
+   弹出/落地/收起轨迹由 WAAPI 驱动 .maimai-peek-tilt（maimai.js 状态机），
+   按压缩放由 WAAPI 驱动 .maimai-peek-art（按下渐变压扁并保持，松开回弹）。
+   按钮本体 pointer-events:none（透明方块不吃页面点击），命中区跟随图本体。 */
+.maimai-peek{position:fixed;left:0;bottom:0;z-index:600;width:var(--maimai-mascot-size,128px);height:var(--maimai-mascot-size,128px);border:0;background:transparent!important;padding:0;overflow:visible;line-height:0;cursor:pointer;pointer-events:none}
 .maimai-peek:hover{background:transparent}
 .maimai-peek:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:-3px;border-radius:14px}
 /* 详情气泡期间：桌宠抬到遮罩之上保持姿态与轮廓清晰可辨（输入由 maimai.js 暂停）。 */
 .maimai-peek.is-above{z-index:950}
 .maimai-peek-tilt{position:absolute;inset:0;display:block;transform-origin:0 100%;will-change:transform}
-.maimai-peek.is-peek .maimai-peek-tilt{transform:rotate(calc(var(--maimai-peek-angle,45deg)*-1))}
-.maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,96px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
-@media(max-width:700px){.maimai-peek{--maimai-mascot-size:64px!important;bottom:calc(102px + env(safe-area-inset-bottom))}}
+.maimai-peek.is-peek .maimai-peek-tilt{transform:translate(0,calc(var(--maimai-mascot-size,128px)*0.234)) rotate(calc(var(--maimai-peek-angle,12deg)*-1))}
+.maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,128px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
+@media(max-width:700px){.maimai-peek{--maimai-mascot-size:72px!important;bottom:calc(102px + env(safe-area-inset-bottom))}}

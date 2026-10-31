@@ -13,18 +13,22 @@ const Mascot=(()=>{
  const art=button.querySelector('.maimai-peek-art');
  const DEFAULT_EASING='cubic-bezier(.34,1.56,.64,1)';
  // 运动常数：U 计划 §3.1 建议值（出场 450–650ms、收起延迟约 200ms），调试起点，非业务规则。
- const EMERGE_MS=560,RETREAT_MS=320,RETREAT_DELAY_MS=200,PRESS_MS=90;
+ // PRESS_MS=按下渐变压扁时长（用户 0424 目检：按下要"逐渐变扁"并保持，松开才回弹）。
+ const EMERGE_MS=560,RETREAT_MS=320,RETREAT_DELAY_MS=200,PRESS_MS=260;
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const clamp=(v,low,high)=>Math.min(high,Math.max(low,v));
  const number=(block,key,fallback)=>{const v=block?block[key]:undefined;return typeof v==='number'&&Number.isFinite(v)?v:fallback};
  const easing=value=>typeof value==='string'&&value.trim()&&/^[\w\s.,%()+\-/]*$/.test(value)&&value.length<=80?value.trim():DEFAULT_EASING;
- const cfg={angle:45,retreatPx:200,size:96,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
+ const cfg={angle:12,retreatPx:200,size:128,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
  let state='peek';               // peek | emerging | landed | retreating
  let pressing=false,detailMode=false,pendingRetreat=false,hoverArmed=true;
  let retreatTimer=null,poseAnim=null,squashAnim=null;
  let squash={sx:1,sy:1};         // 形变记账：JS 记当前值，避免每拍读布局
  let squashFrames=[{sx:1,sy:1,offset:0},{sx:1,sy:1,offset:1}];
- const peekTransform=()=>`rotate(${-cfg.angle}deg)`;
+ // 收起探头姿态：小幅 rotate(-角度) + 下移，使「橙/奶白颜色分界线」（鱼身约 70%
+ // 高处）恰好穿过视口角落点——身体藏进底边，只露叶+头顶+眼睛（logo 式冒头）。
+ // 下移系数按 12° 倾角推导（peek_angle_deg 为调参项，默认 12）。
+ const peekTransform=()=>`translate(0px, ${(0.234*cfg.size).toFixed(1)}px) rotate(${-cfg.angle}deg)`;
  const setPoseClass=()=>button.classList.toggle('is-peek',state!=='landed');
  // ---- 捏捏形变：全部 WAAPI；取消/接续都从 JS 记账的当前值出发（同帧接管，无跳帧、无布局读取） ----
  const lerp=(a,b,t)=>a+(b-a)*t;
@@ -37,12 +41,13 @@ const Mascot=(()=>{
   const t=(b.offset??1)>(a.offset??0)?clamp((p-(a.offset??0))/((b.offset??1)-(a.offset??0)),0,1):1;
   return {sx:lerp(a.sx,b.sx,t),sy:lerp(a.sy,b.sy,t)};
  }
- function startSquash(frames,duration,easingCurve){
+ function startSquash(frames,duration,easingCurve,fill){
   squashAnim?.cancel();
   squashFrames=frames;
   squashAnim=art.animate(frames.map(f=>({transform:`scale(${f.sx}, ${f.sy})`,offset:f.offset})),
-                         {duration,easing:easingCurve});
-  squashAnim.onfinish=()=>{squashAnim=null};
+                         {duration,easing:easingCurve,fill:fill||'none'});
+  // 保持句柄（fill:forwards 的按压动画结束后仍生效，须可被取消/替换）
+  squashAnim.onfinish=()=>{};
  }
  function resetSquash(){squashAnim?.cancel();squashAnim=null;squash={sx:1,sy:1}}
  // ---- 状态机：角落探头 → 弹出中 → 水平落地 →（捏捏/回弹）→ 收起中 → 角落探头 ----
@@ -137,7 +142,8 @@ const Mascot=(()=>{
   button.setAttribute('aria-pressed','true');
   const cur=currentSquash();
   squashFrames=[{sx:cur.sx,sy:cur.sy,offset:0},{sx:cfg.squashX,sy:cfg.squashY,offset:1}];
-  startSquash(squashFrames,PRESS_MS,'ease-out');             // 从当前形态连续压扁
+  // fill:'forwards' 让压扁形态在按住期间保持（松开时从实际压扁程度回弹）
+  startSquash(squashFrames,PRESS_MS,'cubic-bezier(.33,.6,.36,1)','forwards'); // 从当前形态渐变压扁
   squash={sx:cfg.squashX,sy:cfg.squashY};
  });
  button.addEventListener('pointerup',()=>releasePress(false));
@@ -166,7 +172,7 @@ const Mascot=(()=>{
   if(off)return;
   cfg.angle=clamp(number(block,'peek_angle_deg',45),0,90);
   cfg.retreatPx=clamp(number(block,'hover_out_px',200),60,320);
-  cfg.size=clamp(number(block,'mascot_size_px',96),48,160);
+  cfg.size=clamp(number(block,'mascot_size_px',128),48,192);
   cfg.squashX=clamp(number(block,'press_squash_x',1.2),0.8,1.6);
   cfg.squashY=clamp(number(block,'press_squash_y',0.5),0.2,1);
   cfg.bounceMs=clamp(number(block,'bounce_ms',774),200,3000);

@@ -530,13 +530,13 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
         },
     )
     mascot_size_px: int = Field(
-        default=96, ge=48, le=160,
-        description="常驻麦麦基准尺寸（像素）",
+        default=128, ge=48, le=192,
+        description="常驻麦麦基准尺寸（像素；2026-11-01 目检修正 96→128，探头更大更清晰）",
         json_schema_extra={"label": "常驻麦麦尺寸", "step": 1, **_ui_i18n("Mascot size (px)")},
     )
     peek_angle_deg: int = Field(
-        default=45, ge=0, le=90,
-        description="左下角冒头角度（度）",
+        default=12, ge=0, le=90,
+        description="收起探头时麦麦的头部倾斜角（度；2026-11-01 目检修正 45→12，贴近 logo 冒头效果）",
         json_schema_extra={"label": "冒头角度", "step": 1, **_ui_i18n("Peek angle (deg)")},
     )
     hover_out_px: int = Field(

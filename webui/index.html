@@ -40,31 +40,35 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('data:im
 
 .info-wrap{display:inline-flex;position:relative;vertical-align:middle;margin-left:4px}.info-button{font:italic 11px/1 Georgia,serif;border-radius:50%;min-height:22px;min-width:22px;width:22px;height:22px;padding:0;color:var(--maibot-muted);background:var(--maibot-surface)}.info-tooltip{position:absolute;right:0;top:27px;z-index:40;width:max-content;max-width:min(280px,80vw);white-space:normal;background:var(--maibot-surface);color:var(--maibot-foreground);border:1px solid var(--maibot-border);box-shadow:0 5px 20px #0002;border-radius:8px;padding:9px 11px;font-size:11px;font-style:normal;text-align:left;line-height:1.7}
 
-/* 常驻麦麦：左下角桌宠状态机（2026-11-01 U 计划 §三）。收起探头姿态由 .is-peek 呈现
-   （展示层 rotate(-角度)，使原图朝右的麦麦头朝右上而非偏向右下）；弹出/落地/收起轨迹
-   由 WAAPI 驱动 .maimai-peek-tilt（maimai.js 状态机），按压缩放由 WAAPI 驱动
-   .maimai-peek-art（连续形变，可取消接续）。
-   按钮本体 pointer-events:none（透明方块不吃页面点击），命中区跟随旋转后的图本体。 */
-.maimai-peek{position:fixed;left:0;bottom:0;z-index:600;width:var(--maimai-mascot-size,96px);height:var(--maimai-mascot-size,96px);border:0;background:transparent!important;padding:0;overflow:visible;line-height:0;cursor:pointer;pointer-events:none}
+/* 常驻麦麦：左下角桌宠状态机（2026-11-01 U 计划 §三 + 0424 用户目检修正）。
+   收起探头姿态由 .is-peek 呈现：rotate(-角度) 使原图朝右的麦麦头朝右上，并平移
+   让「橙/奶白颜色分界线」（鱼身约 70% 高处）正好穿过视口角落点——身体藏进角
+   落、只露叶+头顶+眼睛（参照 better_post-processing logo 的冒头效果）。
+   弹出/落地/收起轨迹由 WAAPI 驱动 .maimai-peek-tilt（maimai.js 状态机），
+   按压缩放由 WAAPI 驱动 .maimai-peek-art（按下渐变压扁并保持，松开回弹）。
+   按钮本体 pointer-events:none（透明方块不吃页面点击），命中区跟随图本体。 */
+.maimai-peek{position:fixed;left:0;bottom:0;z-index:600;width:var(--maimai-mascot-size,128px);height:var(--maimai-mascot-size,128px);border:0;background:transparent!important;padding:0;overflow:visible;line-height:0;cursor:pointer;pointer-events:none}
 .maimai-peek:hover{background:transparent}
 .maimai-peek:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:-3px;border-radius:14px}
 /* 详情气泡期间：桌宠抬到遮罩之上保持姿态与轮廓清晰可辨（输入由 maimai.js 暂停）。 */
 .maimai-peek.is-above{z-index:950}
 .maimai-peek-tilt{position:absolute;inset:0;display:block;transform-origin:0 100%;will-change:transform}
-.maimai-peek.is-peek .maimai-peek-tilt{transform:rotate(calc(var(--maimai-peek-angle,45deg)*-1))}
-.maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,96px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
-@media(max-width:700px){.maimai-peek{--maimai-mascot-size:64px!important;bottom:calc(102px + env(safe-area-inset-bottom))}}
+.maimai-peek.is-peek .maimai-peek-tilt{transform:translate(0,calc(var(--maimai-mascot-size,128px)*0.234)) rotate(calc(var(--maimai-peek-angle,12deg)*-1))}
+.maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,128px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
+@media(max-width:700px){.maimai-peek{--maimai-mascot-size:72px!important;bottom:calc(102px + env(safe-area-inset-bottom))}}
 
 /* Fullscreen detail layer (2026-11-01 U plan): entries stay in place and lift above the
    backdrop; the backdrop keeps a light blur (2–4px) with a low-strength veil, and a curved
    tail ties the bubble to its entry. Only the panel and its entry stay clear. */
 .fish-section{position:relative;overflow:visible!important}.fish-content{min-width:0}.fish-section .fish-content{isolation:isolate;padding-bottom:8px}
-.section-fish-button{position:absolute;left:18px;bottom:-17px;z-index:6;min-width:48px;width:48px;min-height:36px;height:36px;padding:0;border:0;background:transparent!important;border-radius:14px;overflow:visible;line-height:0;cursor:pointer}
+/* 0424 目检修正：入口贴紧卡片左下角（left:2px），鱼在剪出窗内平移+rotate(-45deg)，
+   让「橙/奶白颜色分界线」（分界中心约在图 (0.583W, 0.706H)）对准卡片角点——
+   只露叶+头顶+眼睛，身体藏进角外（参照 better_post-processing logo 冒头效果）。 */
+.section-fish-button{position:absolute;left:2px;bottom:-15px;z-index:6;min-width:48px;width:48px;min-height:36px;height:36px;padding:0;border:0;background:transparent!important;border-radius:14px;overflow:visible;line-height:0;cursor:pointer}
 .section-fish-button:hover{background:transparent}
 .fish-peek{display:block;width:44px;height:27px;margin:5px auto 0;overflow:hidden}
-/* U 计划 §2：原图朝右 → rotate(-45deg) 使头朝右上，从剪出窗里探头（非任意整图旋转）。 */
-.fish-peek>svg{display:block;width:44px;height:auto;transform:rotate(-45deg);transform-origin:50% 55%;transition:transform 210ms ease}
-.section-fish-button:hover .fish-peek>svg,.section-fish-button:focus-visible .fish-peek>svg{transform:rotate(-45deg) translateY(-2px) scale(1.07)}
+.fish-peek>svg{display:block;width:44px;height:auto;transform:translate(-30px,-6px) rotate(-12deg);transform-origin:26px 22px;transition:transform 210ms ease}
+.section-fish-button:hover .fish-peek>svg,.section-fish-button:focus-visible .fish-peek>svg{transform:translate(-30px,-6px) rotate(-12deg) translateY(-2px) scale(1.07)}
 .section-fish-button:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:3px}
 .fish-section.card>.fish-content{border-radius:inherit}
 .fish-section[data-fish-section=state]{margin-top:18px;margin-bottom:14px}
@@ -147,8 +151,8 @@ body.fish-locked{overflow:hidden}
 [data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
 @supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
 @media(max-width:1000px){.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:700px),(hover:none){.section-fish-button{left:12px;bottom:-15px;width:44px;height:40px;min-height:40px}.fish-peek{width:32px;height:24px;margin-top:8px}.fish-peek>svg{width:32px;transform:rotate(-45deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
-@media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:rotate(-45deg)!important}.fish-overlay,.fish-panel{transition:none!important}}
+@media(max-width:700px),(hover:none){.section-fish-button{left:2px;bottom:-13px;width:44px;height:40px;min-height:40px}.fish-peek{width:32px;height:24px;margin-top:8px}.fish-peek>svg{width:32px;transform:translate(-27px,3px) rotate(-12deg)!important;transform-origin:19px 16px;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
+@media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:translate(-30px,-6px) rotate(-12deg)!important}.fish-overlay,.fish-panel{transition:none!important}}
 </style><style id="host-theme"></style></head><body class="maibot-page"><main class="shell">
 <header class="mast"><div class="brand"><div class="mark" aria-hidden="true"><svg width="25" height="25" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 20c0-9 5-14 14-16 1 9-3 15-10 14M5 20 16 8M11 13v-4m0 4h4"/></svg></div><div><div class="eyebrow">MAIMAI / A LIFE OF HER OWN</div><h1>属于麦麦的生活</h1></div></div><div><div class="toolbar"><span class="status" id="connection"><i class="dot"></i><span id="connection-label">尚未连接</span></span><button class="maibot-button" id="refresh">刷新</button><button class="maibot-button" id="export" disabled>导出快照</button><button id="theme" aria-label="切换离线页面明暗主题" hidden>明 / 暗</button></div><div class="connectionline" id="updated">等待实时数据</div></div></header><div id="notice" role="status" aria-live="polite" class="banner" hidden></div><details class="card offlinehint" id="offline" hidden open><summary>离线查看 · 导入面板快照</summary><p class="note">在宿主插件页面中可自动读取实时数据。独立打开时，可导入通过“导出快照”保存的 JSON；历史从真实采样时刻开始。</p><input id="import" type="file" accept="application/json,.json" aria-label="导入生活面板快照"></details><section class="card offlinehint" id="snapshot-panel" hidden aria-label="导出面板快照"><div class="cardtop"><h2>保存这份生活快照</h2><button id="snapshot-close">收起</button></div><p class="note">全选并复制以下内容，保存为 .json 文件，即可离线导入查看。</p><textarea id="snapshot-text" readonly aria-label="快照 JSON"></textarea><button id="snapshot-select">全选内容</button></section><nav class="panel-tabs" role="tablist" aria-label="生活面板栏目"><button role="tab" id="tab-now" aria-controls="panel-now" aria-selected="true" tabindex="0" data-tab="now"><span class="tab-glyph" aria-hidden="true">◉</span>此刻</button><button role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" tabindex="-1" data-tab="history"><span class="tab-glyph" aria-hidden="true">↗</span>历史</button><button role="tab" id="tab-schedule" aria-controls="panel-schedule" aria-selected="false" tabindex="-1" data-tab="schedule"><span class="tab-glyph" aria-hidden="true">☷</span>日程</button><button role="tab" id="tab-mood" aria-controls="panel-mood" aria-selected="false" tabindex="-1" data-tab="mood"><span class="tab-glyph" aria-hidden="true">♡</span>心情与分享</button><button role="tab" id="tab-system" aria-controls="panel-system" aria-selected="false" tabindex="-1" data-tab="system"><span class="tab-glyph" aria-hidden="true">⚙</span>系统</button></nav><div class="datebar" id="datebar" hidden><div><span class="eyebrow">ONE DAY AT A TIME</span><strong id="selected-day-label">从此刻，回看每一天</strong></div><div class="date-controls"><button id="date-today" aria-pressed="false">今天</button><button id="date-yesterday" aria-pressed="false">昨天</button><label>选择日期 <input id="history-day" type="date" aria-label="选择历史日期"></label><button id="date-range">最近时段</button></div></div><section role="tabpanel" id="panel-now" aria-labelledby="tab-now" tabindex="0"><section class="grid hero" aria-label="此刻与陪伴"><article class="card maibot-card hero-scene" id="hero-scene"><div class="cardtop"><h2>此刻的生活</h2><span class="pill" id="current-kind">等待数据</span></div><div class="activityname" id="current-name">生活正在慢慢展开</div><div class="activitymeta" id="current-meta"><span>连接后查看实际正在进行的活动</span></div><div class="progress" role="progressbar" aria-label="当前活动进度" aria-valuemin="0" aria-valuemax="100" id="current-progress"><i style="width:0"></i></div><div class="splitline"><span id="current-state">—</span><span id="current-percent">—</span></div></article><article class="card maibot-card"><div class="cardtop"><h2>我们的陪伴</h2><span class="pill" id="patrol">待连接</span></div><div class="companionmain"><div><div class="note">当前关系</div><div class="tier" id="tier">—</div></div><div class="rowend"><div class="score" id="score">—</div><div class="note" id="baseline">关系分 / 基线</div></div></div><div class="smallstats"><div><span class="note">今日主动</span><strong id="budget">—</strong></div><div><span class="note">早安记录</span><strong id="morning">—</strong></div><div><span class="note">晚安记录</span><strong id="night">—</strong></div></div></article></section><div class="sectionline"><h2>身心的五个侧面</h2><span class="note" id="state-at">0–100 · 当前快照</span></div><section class="grid metrics" id="metrics" aria-label="五项生活状态"></section><div class="observations" id="observations"></div><section class="card sleep-combined" aria-label="睡眠与恢复"><article><div class="cardtop"><h2>睡眠与恢复</h2><span class="pill" id="sleep-status">—</span></div><div class="sleepstats"><div><div class="note">睡眠债</div><div class="bignum" id="debt">—</div><div class="note">小时 · 上限 12h</div></div><div><div class="note">连续睡眠</div><div class="bignum" id="continuous">—</div><div class="note">分钟 · 当前连续段</div></div><div><div class="note">精神状态</div><div class="bignum" id="mental">—</div><div class="note">精力 × 专注 × (1−压力)</div></div></div><div id="debt-chart" class="chart sleepgraph"></div><div class="note" id="sleep-anchors">等待作息信息</div></article><details class="sleep-archive"><summary>最近的睡眠 · 展开记录</summary><article><div class="cardtop"><h2>最近的睡眠</h2><span class="note">最近 7 天 · 最多 8 次</span></div><div id="sleep-list"></div></article></details></section></section>
 <section role="tabpanel" id="panel-history" aria-labelledby="tab-history" tabindex="0" hidden><section class="card maibot-card wide" aria-label="生活状态历史"><div class="cardtop charthead"><div><h2>生活的起伏</h2><div class="note" id="history-caption">每 5 分钟采样，另保留活动与醒沿观察</div></div><div class="range" id="range"><button data-hours="6" aria-pressed="false">6 小时</button><button data-hours="24" aria-pressed="true">24 小时</button><button data-hours="72" aria-pressed="false">3 天</button><button data-hours="168" aria-pressed="false">7 天</button><button id="zoom-in" aria-label="放大历史时间范围">放大</button><button id="zoom-out" aria-label="恢复完整历史时间范围">全览</button><button id="zoom-reset" hidden>重置缩放</button></div></div><p class="note estimate-key"><span>━ 真实观察</span><span>┄ 中间缺口估算</span><span>▧ 离线睡眠估算</span> · 拖动选择区间；双指可缩放</p><div class="legend" id="legend" aria-label="显示或隐藏曲线"></div><div id="history-chart" class="chart"></div><div class="chartfoot"><span class="note" id="history-info">等待真实采样点</span><button id="samples-toggle" aria-expanded="false">查看采样值</button></div><div id="samples" class="samplewrap" hidden></div><div id="history-day-summary" class="summarychips" style="margin-top:14px"></div></section></section>
@@ -405,18 +409,22 @@ const Mascot=(()=>{
  const art=button.querySelector('.maimai-peek-art');
  const DEFAULT_EASING='cubic-bezier(.34,1.56,.64,1)';
  // 运动常数：U 计划 §3.1 建议值（出场 450–650ms、收起延迟约 200ms），调试起点，非业务规则。
- const EMERGE_MS=560,RETREAT_MS=320,RETREAT_DELAY_MS=200,PRESS_MS=90;
+ // PRESS_MS=按下渐变压扁时长（用户 0424 目检：按下要"逐渐变扁"并保持，松开才回弹）。
+ const EMERGE_MS=560,RETREAT_MS=320,RETREAT_DELAY_MS=200,PRESS_MS=260;
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const clamp=(v,low,high)=>Math.min(high,Math.max(low,v));
  const number=(block,key,fallback)=>{const v=block?block[key]:undefined;return typeof v==='number'&&Number.isFinite(v)?v:fallback};
  const easing=value=>typeof value==='string'&&value.trim()&&/^[\w\s.,%()+\-/]*$/.test(value)&&value.length<=80?value.trim():DEFAULT_EASING;
- const cfg={angle:45,retreatPx:200,size:96,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
+ const cfg={angle:12,retreatPx:200,size:128,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
  let state='peek';               // peek | emerging | landed | retreating
  let pressing=false,detailMode=false,pendingRetreat=false,hoverArmed=true;
  let retreatTimer=null,poseAnim=null,squashAnim=null;
  let squash={sx:1,sy:1};         // 形变记账：JS 记当前值，避免每拍读布局
  let squashFrames=[{sx:1,sy:1,offset:0},{sx:1,sy:1,offset:1}];
- const peekTransform=()=>`rotate(${-cfg.angle}deg)`;
+ // 收起探头姿态：小幅 rotate(-角度) + 下移，使「橙/奶白颜色分界线」（鱼身约 70%
+ // 高处）恰好穿过视口角落点——身体藏进底边，只露叶+头顶+眼睛（logo 式冒头）。
+ // 下移系数按 12° 倾角推导（peek_angle_deg 为调参项，默认 12）。
+ const peekTransform=()=>`translate(0px, ${(0.234*cfg.size).toFixed(1)}px) rotate(${-cfg.angle}deg)`;
  const setPoseClass=()=>button.classList.toggle('is-peek',state!=='landed');
  // ---- 捏捏形变：全部 WAAPI；取消/接续都从 JS 记账的当前值出发（同帧接管，无跳帧、无布局读取） ----
  const lerp=(a,b,t)=>a+(b-a)*t;
@@ -429,12 +437,13 @@ const Mascot=(()=>{
   const t=(b.offset??1)>(a.offset??0)?clamp((p-(a.offset??0))/((b.offset??1)-(a.offset??0)),0,1):1;
   return {sx:lerp(a.sx,b.sx,t),sy:lerp(a.sy,b.sy,t)};
  }
- function startSquash(frames,duration,easingCurve){
+ function startSquash(frames,duration,easingCurve,fill){
   squashAnim?.cancel();
   squashFrames=frames;
   squashAnim=art.animate(frames.map(f=>({transform:`scale(${f.sx}, ${f.sy})`,offset:f.offset})),
-                         {duration,easing:easingCurve});
-  squashAnim.onfinish=()=>{squashAnim=null};
+                         {duration,easing:easingCurve,fill:fill||'none'});
+  // 保持句柄（fill:forwards 的按压动画结束后仍生效，须可被取消/替换）
+  squashAnim.onfinish=()=>{};
  }
  function resetSquash(){squashAnim?.cancel();squashAnim=null;squash={sx:1,sy:1}}
  // ---- 状态机：角落探头 → 弹出中 → 水平落地 →（捏捏/回弹）→ 收起中 → 角落探头 ----
@@ -529,7 +538,8 @@ const Mascot=(()=>{
   button.setAttribute('aria-pressed','true');
   const cur=currentSquash();
   squashFrames=[{sx:cur.sx,sy:cur.sy,offset:0},{sx:cfg.squashX,sy:cfg.squashY,offset:1}];
-  startSquash(squashFrames,PRESS_MS,'ease-out');             // 从当前形态连续压扁
+  // fill:'forwards' 让压扁形态在按住期间保持（松开时从实际压扁程度回弹）
+  startSquash(squashFrames,PRESS_MS,'cubic-bezier(.33,.6,.36,1)','forwards'); // 从当前形态渐变压扁
   squash={sx:cfg.squashX,sy:cfg.squashY};
  });
  button.addEventListener('pointerup',()=>releasePress(false));
@@ -558,7 +568,7 @@ const Mascot=(()=>{
   if(off)return;
   cfg.angle=clamp(number(block,'peek_angle_deg',45),0,90);
   cfg.retreatPx=clamp(number(block,'hover_out_px',200),60,320);
-  cfg.size=clamp(number(block,'mascot_size_px',96),48,160);
+  cfg.size=clamp(number(block,'mascot_size_px',128),48,192);
   cfg.squashX=clamp(number(block,'press_squash_x',1.2),0.8,1.6);
   cfg.squashY=clamp(number(block,'press_squash_y',0.5),0.2,1);
   cfg.bounceMs=clamp(number(block,'bounce_ms',774),200,3000);
