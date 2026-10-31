@@ -177,7 +177,7 @@ Planner 直接提供 `message` 时不调用文案生成，因此约束放在工�
 
 ### bot 自用工具
 
-以下工具由麦麦在对话中自行调用，无需手动输入：`lbm_get_schedule_info`（只读，支持 status/current/next/episodes/spine/intents 视图）、`lbm_update_schedule`（唯一日程写入口，写 spine 意图与未来约定）、`lbm_mai_lover_send_message`、`lbm_mai_lover_affection`、`lbm_report_harassment`、`lbm_life_qzone`、`lbm_emotion_report`。3.0.0 已删除旧别名 `lbm_update_schedule_v4`、赖床工具 `lbm_nap_lie_in` 与 `lover_day` / `goals` 视图。
+以下工具由麦麦在对话中自行调用，无需手动输入：`lbm_get_schedule_info`（只读，支持 status/current/next/episodes/spine/intents 视图）、`lbm_update_schedule`（唯一日程写入口，写 spine 意图与未来约定）、`lbm_mai_lover_send_message`、`lbm_mai_lover_affection`、`lbm_report_harassment`、`lbm_life_qzone`、`lbm_emotion_report`、`lbm_watch_bili_video`（看B站视频：submit 提交 BV/链接，status/result 查询进度与真实结果，cancel 取消；后台有界执行，画面采样视本机 ffmpeg 与 vlm 任务可用性如实降级，观看完成绝不自动发消息）。3.0.0 已删除旧别名 `lbm_update_schedule_v4`、赖床工具 `lbm_nap_lie_in` 与 `lover_day` / `goals` 视图。
 
 ## 配置速查
 
@@ -207,6 +207,9 @@ Planner 直接提供 `message` 时不调用文案生成，因此约束放在工�
 | `[patrol] daily_max_speak` | `5` | 每日主动预算上限，只统计巡检与想念 |
 | `[life_state] emotion_modulation_enabled` | `false` | 情绪-生活双向调制（独立于日程总开关） |
 | `[event_catalog] mode` | `off` | 事件库：`off` / `manual` / `auto` |
+| `[video_watch] enabled` | `true` | 内置视频观看模块总开关（关 = 工具如实返回未启用、日程刷视频跳过） |
+| `[video_watch] watchlist` | `[]` | 待看列表：BV 号或视频链接每行一个；日程刷视频事件从这里选片 |
+| `[video_watch] visual_enabled` | `true` | 画面采样（本机无 ffmpeg 或 vlm 任务不可用时如实降级为文本来源） |
 
 `spine_mode`、`[life_state] enabled`、`[life_state] sleep_engine_enabled` 等旧键已退役；旧配置中的显式值在升级时被一次性 pop，不再出现在 WebUI。
 
