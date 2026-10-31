@@ -55,7 +55,10 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('data:im
 .maimai-peek-tilt{position:absolute;inset:0;display:block;transform-origin:0 100%;will-change:transform}
 .maimai-peek.is-peek .maimai-peek-tilt{transform:translate(calc(var(--maimai-mascot-size,128px)*-0.234),calc(var(--maimai-mascot-size,128px)*0.234)) rotate(calc(var(--maimai-peek-angle,12deg)*-1))}
 .maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,128px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
-@media(max-width:700px){.maimai-peek{--maimai-mascot-size:72px!important;bottom:calc(102px + env(safe-area-inset-bottom))}}
+/* 自动捏捏开关：落地后出现在尾叶上方的小圆钮（maimai.js 控制显隐与激活态）。 */
+.maimai-autopin{position:fixed;left:6px;bottom:64px;z-index:601;width:26px;height:26px;min-height:26px;border-radius:50%;font-size:12px;line-height:1;padding:0;display:grid;place-items:center;pointer-events:auto}
+.maimai-autopin[aria-pressed=true]{background:var(--maibot-primary);color:#fff;border-color:var(--maibot-primary)}
+@media(max-width:700px){.maimai-peek{--maimai-mascot-size:72px!important;bottom:calc(102px + env(safe-area-inset-bottom))}.maimai-autopin{bottom:calc(56px + env(safe-area-inset-bottom))}}
 
 /* Fullscreen detail layer (2026-11-01 U plan): entries stay in place and lift above the
    backdrop; the backdrop keeps a light blur (2–4px) with a low-strength veil, and a curved
@@ -158,7 +161,7 @@ body.fish-locked{overflow:hidden}
 <section role="tabpanel" id="panel-mood" aria-labelledby="tab-mood" tabindex="0" hidden><div class="sectionline"><h2>心情与生活动态</h2></div><section class="grid two" aria-label="情绪与空间"><article class="card maibot-card"><div class="cardtop"><h2>心情的底色</h2><span class="pill" id="emotion-frozen">—</span></div><div class="tier" id="emotion-label">等待情绪数据</div><div class="smallstats" id="vad-values"></div><div class="legend"><span><i class="swatch" style="background:var(--energy)"></i>愉悦</span><span><i class="swatch" style="background:var(--focus)"></i>唤醒</span><span><i class="swatch" style="background:var(--stress)"></i>掌控</span></div><div class="chart" id="vad-chart"></div><div class="note" id="referee-health"></div></article><article class="card maibot-card"><div class="cardtop"><h2>空间与分享</h2><span class="pill" id="qzone-enabled">—</span></div><div id="qzone-summary"></div><details class="draft-preview"><summary>预览一份草稿</summary><textarea id="post-draft" maxlength="5000" aria-label="说说草稿" placeholder="想分享什么呢？"></textarea><button id="preview-post">查看预览</button><div id="post-preview" hidden></div></details><div id="delivery-list"></div></article></section></section>
 <section role="tabpanel" id="panel-system" aria-labelledby="tab-system" tabindex="0" hidden><section class="card maibot-card wide usage-scene"><div class="cardtop"><h2>模型调用与 Token</h2><span class="note" id="usage-window">—</span></div><div class="sleepstats" id="usage-metrics"></div><details class="usage-details"><summary>查看调用构成与模型明细</summary><div id="usage-buckets" class="bucket-grid"></div><div class="samplewrap" id="usage-models"></div><p class="note" id="usage-note"></p></details><div class="note" id="module-health"></div></section><section class="card health" id="health-section"><div class="cardtop"><h2 id="health-summary">数据与运行说明</h2></div><p id="health-brief" class="note">记录来源与更新情况，可点麦麦了解。</p><dl id="health-data"></dl><div class="note" id="warnings"></div></section></section>
 <footer><span>属于麦麦的生活 · 生活面板</span></footer>
-</main><button class="maimai-peek" id="maimai-peek" aria-label="捏一下麦麦" aria-pressed="false"><span class="maimai-peek-tilt"><img class="maimai-peek-art" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5NiIgaGVpZ2h0PSI2OCIgdmlld0JveD0iMCAwIDk2IDY4IiByb2xlPSJpbWciIGFyaWEtbGFiZWw9Ik1haUJvdCBNYWlTYWthIGZpc2giPgogIDxzdmcgeD0iNTEiIHk9IjAiIHdpZHRoPSIzNSIgaGVpZ2h0PSIyMCIgdmlld0JveD0iNjEwIDc1IDM2NSAyMTAiIGZpbGw9IiM4M2M4M2UiIHN0cm9rZT0iIzE4MjQxYiIgc3Ryb2tlLXdpZHRoPSIxNCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgb3ZlcmZsb3c9InZpc2libGUiPgogICAgPHBhdGggZD0iTTc3MCAyNzRDNzY2IDIzNSA3NjggMTkxIDc3MyAxNThMNzk0IDE0N0M3OTggMTg4IDc5NyAyMzUgODA5IDI3NFoiIC8+CiAgICA8cGF0aCBkPSJNNzkyIDE0M0M3ODggMTE5IDc1OSA5MyA3MjcgODZDNjk0IDc4IDY2MyA4NSA2NDEgOTlDNjE1IDExNSA2MTMgMTM1IDYyOCAxNTNDNjUwIDE3OSA2OTYgMTg1IDczMCAxODBDNzU2IDE3OCA3ODIgMTY3IDc5MiAxNTNaIiAvPgogICAgPHBhdGggZD0iTTc5NCAxNDNDNzk5IDExNyA4MzEgMTAxIDg2NCAxMDFDOTAwIDk4IDkzMCAxMTEgOTUwIDEzMEM5NzAgMTQ4IDk3MSAxNjggOTUwIDE4M0M5MjkgMTk4IDg5NCAyMDAgODY0IDE5NUM4MjkgMTkwIDc5NyAxNzQgNzk0IDE1MVoiIC8+CiAgPC9zdmc+CiAgPHN2ZyB4PSIwIiB5PSIxOCIgd2lkdGg9Ijk2IiBoZWlnaHQ9IjUwIiB2aWV3Qm94PSI2NSAyNTAgMTAyMCA1NDAiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIG92ZXJmbG93PSJ2aXNpYmxlIj4KICAgIDxwYXRoIGZpbGw9IiM4MGM0NDAiIHN0cm9rZT0iIzE4MjAxYSIgc3Ryb2tlLXdpZHRoPSIxNCIgZD0iTTMyOCAzOTRDMzMwIDM1MSAzMDkgMzE5IDI4MiAzMTlDMjY4IDMxOSAyNTggMzI1IDI1MCAzMzZDMjMzIDMxOCAyMTUgMzE4IDIwMSAzMjlDMTY5IDM1MyAxNjUgMzkyIDE3NyA0MjdDMTg1IDQ0OSAyMDAgNDY3IDIxMiA0ODBDMTgwIDQ1OCAxNDcgNDQ3IDEyNCA0NTNDOTUgNDU5IDgxIDQ4MCA4OSA1MDlMMTAxIDUyN0M4MSA1NDIgNzkgNTY3IDk0IDU4NUMxMTcgNjEzIDE2NiA2MDUgMjA5IDU4NUMxODkgNjA1IDE3MSA2MzEgMTcxIDY1OUMxNzAgNjkwIDE4NCA3MTYgMjA0IDcyMkMyMjAgNzI3IDIzNyA3MTggMjQ5IDcwOEMyNjIgNzMwIDI4NSA3MzMgMzAyIDcxOUMzMjAgNzA1IDMyNyA2ODAgMzI3IDY1MVoiIC8+CiAgICA8cGF0aCBmaWxsPSIjZjY4ZTJjIiBkPSJNMjU4IDU1NUMyNDMgNDkzIDI2NCA0NDIgMzE1IDQwMEM0MDkgMzIzIDU4NSAyNzMgNzM1IDI3MEM4MzkgMjY1IDkyMiAyODcgOTgxIDM0MUMxMDQxIDM5NSAxMDc0IDQ3OSAxMDYyIDU1NUwxMDU5IDU3MEM4MDAgNTkwIDUwMCA1ODAgMjU4IDU1NVoiIC8+CiAgICA8cGF0aCBmaWxsPSIjZjNkZGM0IiBkPSJNMjU4IDU1NUM1MDAgNTgwIDgwMCA1OTAgMTA1OSA1NzBDMTA0OCA2MzcgMTAwNyA2OTAgOTQzIDcyOUM4ODkgNzYzIDgxNyA3NzAgNzM5IDc2OUM2MTQgNzcwIDQ4NiA3NDIgMzkxIDcwMUMzMTEgNjY2IDI2OCA2MTYgMjU4IDU1NVoiIC8+CiAgICA8cGF0aCBmaWxsPSJub25lIiBzdHJva2U9IiMxODIwMWEiIHN0cm9rZS13aWR0aD0iMTQiIGQ9Ik0yNTggNTU1QzI0MyA0OTMgMjY0IDQ0MiAzMTUgNDAwQzQwOSAzMjMgNTg1IDI3MyA3MzUgMjcwQzgzOSAyNjUgOTIyIDI4NyA5ODEgMzQxQzEwNDEgMzk1IDEwNzQgNDc5IDEwNjIgNTU1QzEwNTMgNjI4IDEwMDcgNjkwIDk0MyA3MjlDODg5IDc2MyA4MTcgNzcwIDczOSA3NjlDNjE0IDc3MCA0ODYgNzQyIDM5MSA3MDFDMzExIDY2NiAyNjggNjE2IDI1OCA1NTVaIiAvPgogICAgPGcgZmlsbD0id2hpdGUiIHN0cm9rZT0iIzE0MTQxMyIgc3Ryb2tlLXdpZHRoPSIxNCI+CiAgICAgIDxlbGxpcHNlIGN4PSI3MzYiIGN5PSI0ODQiIHJ4PSI0NCIgcnk9IjQ1IiAvPgogICAgICA8ZWxsaXBzZSBjeD0iOTQ4IiBjeT0iNDg1IiByeD0iNDMiIHJ5PSI0NCIgLz4KICAgIDwvZz4KICAgIDxnIGZpbGw9IiMwODA5MDkiPgogICAgICA8ZWxsaXBzZSBjeD0iNzM3IiBjeT0iNDg1IiByeD0iMjUiIHJ5PSIyNiIgLz4KICAgICAgPGVsbGlwc2UgY3g9Ijk0OCIgY3k9IjQ4NSIgcng9IjI1IiByeT0iMjYiIC8+CiAgICAgIDxwYXRoIGQ9Ik04MDEgNTg4SDg5NEM4ODAgNjExIDg2NCA2MzMgODQ5IDY0M0M4MzQgNjM5IDgxNSA2MTMgODAxIDU4OFoiIC8+CiAgICA8L2c+CiAgPC9zdmc+Cjwvc3ZnPgo=" alt=""></span></button><template id="section-fish-art"><svg xmlns="http://www.w3.org/2000/svg" width="96" height="68" viewBox="0 0 96 68" role="img" aria-label="MaiBot MaiSaka fish">
+</main><button class="maimai-peek" id="maimai-peek" aria-label="捏一下麦麦" aria-pressed="false"><span class="maimai-peek-tilt"><img class="maimai-peek-art" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5NiIgaGVpZ2h0PSI2OCIgdmlld0JveD0iMCAwIDk2IDY4IiByb2xlPSJpbWciIGFyaWEtbGFiZWw9Ik1haUJvdCBNYWlTYWthIGZpc2giPgogIDxzdmcgeD0iNTEiIHk9IjAiIHdpZHRoPSIzNSIgaGVpZ2h0PSIyMCIgdmlld0JveD0iNjEwIDc1IDM2NSAyMTAiIGZpbGw9IiM4M2M4M2UiIHN0cm9rZT0iIzE4MjQxYiIgc3Ryb2tlLXdpZHRoPSIxNCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgb3ZlcmZsb3c9InZpc2libGUiPgogICAgPHBhdGggZD0iTTc3MCAyNzRDNzY2IDIzNSA3NjggMTkxIDc3MyAxNThMNzk0IDE0N0M3OTggMTg4IDc5NyAyMzUgODA5IDI3NFoiIC8+CiAgICA8cGF0aCBkPSJNNzkyIDE0M0M3ODggMTE5IDc1OSA5MyA3MjcgODZDNjk0IDc4IDY2MyA4NSA2NDEgOTlDNjE1IDExNSA2MTMgMTM1IDYyOCAxNTNDNjUwIDE3OSA2OTYgMTg1IDczMCAxODBDNzU2IDE3OCA3ODIgMTY3IDc5MiAxNTNaIiAvPgogICAgPHBhdGggZD0iTTc5NCAxNDNDNzk5IDExNyA4MzEgMTAxIDg2NCAxMDFDOTAwIDk4IDkzMCAxMTEgOTUwIDEzMEM5NzAgMTQ4IDk3MSAxNjggOTUwIDE4M0M5MjkgMTk4IDg5NCAyMDAgODY0IDE5NUM4MjkgMTkwIDc5NyAxNzQgNzk0IDE1MVoiIC8+CiAgPC9zdmc+CiAgPHN2ZyB4PSIwIiB5PSIxOCIgd2lkdGg9Ijk2IiBoZWlnaHQ9IjUwIiB2aWV3Qm94PSI2NSAyNTAgMTAyMCA1NDAiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIG92ZXJmbG93PSJ2aXNpYmxlIj4KICAgIDxwYXRoIGZpbGw9IiM4MGM0NDAiIHN0cm9rZT0iIzE4MjAxYSIgc3Ryb2tlLXdpZHRoPSIxNCIgZD0iTTMyOCAzOTRDMzMwIDM1MSAzMDkgMzE5IDI4MiAzMTlDMjY4IDMxOSAyNTggMzI1IDI1MCAzMzZDMjMzIDMxOCAyMTUgMzE4IDIwMSAzMjlDMTY5IDM1MyAxNjUgMzkyIDE3NyA0MjdDMTg1IDQ0OSAyMDAgNDY3IDIxMiA0ODBDMTgwIDQ1OCAxNDcgNDQ3IDEyNCA0NTNDOTUgNDU5IDgxIDQ4MCA4OSA1MDlMMTAxIDUyN0M4MSA1NDIgNzkgNTY3IDk0IDU4NUMxMTcgNjEzIDE2NiA2MDUgMjA5IDU4NUMxODkgNjA1IDE3MSA2MzEgMTcxIDY1OUMxNzAgNjkwIDE4NCA3MTYgMjA0IDcyMkMyMjAgNzI3IDIzNyA3MTggMjQ5IDcwOEMyNjIgNzMwIDI4NSA3MzMgMzAyIDcxOUMzMjAgNzA1IDMyNyA2ODAgMzI3IDY1MVoiIC8+CiAgICA8cGF0aCBmaWxsPSIjZjY4ZTJjIiBkPSJNMjU4IDU1NUMyNDMgNDkzIDI2NCA0NDIgMzE1IDQwMEM0MDkgMzIzIDU4NSAyNzMgNzM1IDI3MEM4MzkgMjY1IDkyMiAyODcgOTgxIDM0MUMxMDQxIDM5NSAxMDc0IDQ3OSAxMDYyIDU1NUwxMDU5IDU3MEM4MDAgNTkwIDUwMCA1ODAgMjU4IDU1NVoiIC8+CiAgICA8cGF0aCBmaWxsPSIjZjNkZGM0IiBkPSJNMjU4IDU1NUM1MDAgNTgwIDgwMCA1OTAgMTA1OSA1NzBDMTA0OCA2MzcgMTAwNyA2OTAgOTQzIDcyOUM4ODkgNzYzIDgxNyA3NzAgNzM5IDc2OUM2MTQgNzcwIDQ4NiA3NDIgMzkxIDcwMUMzMTEgNjY2IDI2OCA2MTYgMjU4IDU1NVoiIC8+CiAgICA8cGF0aCBmaWxsPSJub25lIiBzdHJva2U9IiMxODIwMWEiIHN0cm9rZS13aWR0aD0iMTQiIGQ9Ik0yNTggNTU1QzI0MyA0OTMgMjY0IDQ0MiAzMTUgNDAwQzQwOSAzMjMgNTg1IDI3MyA3MzUgMjcwQzgzOSAyNjUgOTIyIDI4NyA5ODEgMzQxQzEwNDEgMzk1IDEwNzQgNDc5IDEwNjIgNTU1QzEwNTMgNjI4IDEwMDcgNjkwIDk0MyA3MjlDODg5IDc2MyA4MTcgNzcwIDczOSA3NjlDNjE0IDc3MCA0ODYgNzQyIDM5MSA3MDFDMzExIDY2NiAyNjggNjE2IDI1OCA1NTVaIiAvPgogICAgPGcgZmlsbD0id2hpdGUiIHN0cm9rZT0iIzE0MTQxMyIgc3Ryb2tlLXdpZHRoPSIxNCI+CiAgICAgIDxlbGxpcHNlIGN4PSI3MzYiIGN5PSI0ODQiIHJ4PSI0NCIgcnk9IjQ1IiAvPgogICAgICA8ZWxsaXBzZSBjeD0iOTQ4IiBjeT0iNDg1IiByeD0iNDMiIHJ5PSI0NCIgLz4KICAgIDwvZz4KICAgIDxnIGZpbGw9IiMwODA5MDkiPgogICAgICA8ZWxsaXBzZSBjeD0iNzM3IiBjeT0iNDg1IiByeD0iMjUiIHJ5PSIyNiIgLz4KICAgICAgPGVsbGlwc2UgY3g9Ijk0OCIgY3k9IjQ4NSIgcng9IjI1IiByeT0iMjYiIC8+CiAgICAgIDxwYXRoIGQ9Ik04MDEgNTg4SDg5NEM4ODAgNjExIDg2NCA2MzMgODQ5IDY0M0M4MzQgNjM5IDgxNSA2MTMgODAxIDU4OFoiIC8+CiAgICA8L2c+CiAgPC9zdmc+Cjwvc3ZnPgo=" alt=""></span></button><button class="maimai-autopin" id="maimai-autopin" type="button" aria-label="自动捏捏开关" aria-pressed="false" hidden>捏</button><template id="section-fish-art"><svg xmlns="http://www.w3.org/2000/svg" width="96" height="68" viewBox="0 0 96 68" role="img" aria-label="MaiBot MaiSaka fish">
   <svg x="51" y="0" width="35" height="20" viewBox="610 75 365 210" fill="#83c83e" stroke="#18241b" stroke-width="14" stroke-linejoin="round" overflow="visible">
     <path d="M770 274C766 235 768 191 773 158L794 147C798 188 797 235 809 274Z" />
     <path d="M792 143C788 119 759 93 727 86C694 78 663 85 641 99C615 115 613 135 628 153C650 179 696 185 730 180C756 178 782 167 792 153Z" />
@@ -409,13 +412,15 @@ const Mascot=(()=>{
  // 运动常数：U 计划 §3.1 建议值（出场 450–650ms、收起延迟约 200ms），调试起点，非业务规则。
  // PRESS_MS=按下渐变压扁时长（用户 0424 目检：按下要"逐渐变扁"并保持，松开才回弹）。
  const EMERGE_MS=560,RETREAT_MS=320,RETREAT_DELAY_MS=200,PRESS_MS=260;
+ // 触发圈系数（0425 目检：缩小一圈）；REARM=解除武装（重新武装阈值）。
+ const TRIGGER_FACTOR=1.15,REARM_FACTOR=1.35;
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const clamp=(v,low,high)=>Math.min(high,Math.max(low,v));
  const number=(block,key,fallback)=>{const v=block?block[key]:undefined;return typeof v==='number'&&Number.isFinite(v)?v:fallback};
  const easing=value=>typeof value==='string'&&value.trim()&&/^[\w\s.,%()+\-/]*$/.test(value)&&value.length<=80?value.trim():DEFAULT_EASING;
  const cfg={angle:12,retreatPx:200,size:128,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
  let state='peek';               // peek | emerging | landed | retreating
- let pressing=false,detailMode=false,pendingRetreat=false,hoverArmed=true;
+ let pressing=false,detailMode=false,pendingRetreat=false,pendingEmerge=false,hoverArmed=true;
  let retreatTimer=null,poseAnim=null,squashAnim=null;
  let squash={sx:1,sy:1};         // 形变记账：JS 记当前值，避免每拍读布局
  let squashFrames=[{sx:1,sy:1,offset:0},{sx:1,sy:1,offset:1}];
@@ -423,7 +428,32 @@ const Mascot=(()=>{
  // 屏幕左缘，只露头顶+双眼；「橙/奶白颜色分界线」仍穿过视口角落点（logo 式冒头）。
  // 系数按 12° 倾角推导（peek_angle_deg 为调参项，默认 12）。
  const peekTransform=()=>`translate(${(-0.234*cfg.size).toFixed(1)}px, ${(0.234*cfg.size).toFixed(1)}px) rotate(${-cfg.angle}deg)`;
- const setPoseClass=()=>button.classList.toggle('is-peek',state!=='landed');
+ // 自动捏捏（0425 目检新增）：落地后在尾叶上方的小按钮开关；激活后按计划书
+ // 最初参数（squash 1.2/0.5、bounce 774ms overshoot）循环“压扁→回弹”，
+ // 手动捏取时暂停、松开续播；收起/详情/失焦/减少动态一律停止。
+ const pinBtn=document.getElementById('maimai-autopin');
+ let autoPin=false,autoPinTimer=null;
+ const updateAutoPinVis=()=>{if(pinBtn)pinBtn.hidden=!(state==='landed'&&!detailMode&&!reduceMotion());};
+ function stopAutoCycle(rebound){
+  clearTimeout(autoPinTimer);autoPinTimer=null;
+  if(rebound&&squashAnim){releaseAnim()}
+  if(pinBtn)pinBtn.setAttribute('aria-pressed','false');
+ }
+ function autoCycle(){
+  if(!autoPin||state!=='landed'||detailMode||reduceMotion()){stopAutoCycle(false);return}
+  squashFrames=[{sx:1,sy:1,offset:0},{sx:cfg.squashX,sy:cfg.squashY,offset:1}];
+  startSquash(squashFrames,PRESS_MS,'cubic-bezier(.33,.6,.36,1)','forwards');
+  squash={sx:cfg.squashX,sy:cfg.squashY};
+  autoPinTimer=setTimeout(()=>{releaseAnim();autoPinTimer=setTimeout(autoCycle,900)},PRESS_MS+60);
+ }
+ if(pinBtn)pinBtn.addEventListener('click',e=>{
+  e.stopPropagation();
+  autoPin=!autoPin;
+  pinBtn.setAttribute('aria-pressed',String(autoPin));
+  clearTimeout(autoPinTimer);
+  if(autoPin&&state==='landed')autoCycle();else if(!autoPin)stopAutoCycle(true);
+ });
+ const setPoseClass=()=>{button.classList.toggle('is-peek',state!=='landed');updateAutoPinVis()};
  // ---- 捏捏形变：全部 WAAPI；取消/接续都从 JS 记账的当前值出发（同帧接管，无跳帧、无布局读取） ----
  const lerp=(a,b,t)=>a+(b-a)*t;
  function currentSquash(){
@@ -447,7 +477,8 @@ const Mascot=(()=>{
  // ---- 状态机：角落探头 → 弹出中 → 水平落地 →（捏捏/回弹）→ 收起中 → 角落探头 ----
  function finishEmerge(){
   poseAnim=null;state='landed';setPoseClass();
-  if(pendingRetreat){pendingRetreat=false;retreat()}
+  if(pendingRetreat){pendingRetreat=false;retreat();return}
+  if(pendingEmerge){pendingEmerge=false;emerge()}
  }
  function emerge(){
   if(state!=='peek')return;
@@ -471,6 +502,7 @@ const Mascot=(()=>{
   if(state==='emerging'){pendingRetreat=true;return}         // 出场未完：结束后再次判断收起
   state='retreating';setPoseClass();
   releasePress(true);
+  if(autoPin){autoPin=false;stopAutoCycle(false);if(pinBtn)pinBtn.setAttribute('aria-pressed','false')}
   if(reduceMotion()){state='peek';setPoseClass();return}
   resetSquash();
   poseAnim?.cancel();
@@ -497,10 +529,11 @@ const Mascot=(()=>{
    if(e.pointerType!=='mouse'||detailMode)return;
    lastPointer={x:e.clientX,y:e.clientY};
    const d=cornerDistance(e.clientX,e.clientY);
-   if(d>=cfg.size*1.7)hoverArmed=true;
+   if(d>=cfg.size*REARM_FACTOR)hoverArmed=true;
    if(state==='peek'){
-    if(hoverArmed&&d<cfg.size*1.5){hoverArmed=false;emerge()}
-   }else evaluateRetreat();
+    if(hoverArmed&&d<cfg.size*TRIGGER_FACTOR){hoverArmed=false;emerge()}
+   }else if(state==='retreating'&&d<cfg.size*TRIGGER_FACTOR){pendingEmerge=true} // 收起中进入触发圈：收起完毕立即弹出
+   else evaluateRetreat();
   },{passive:true});
  }
  // 触屏无悬停：点空白收起（弹出/捏捏由按钮自身 pointerdown 承担）。
@@ -508,14 +541,10 @@ const Mascot=(()=>{
   if(e.pointerType!=='touch'||detailMode||state!=='landed'||button.contains(e.target))return;
   retreat();
  },{passive:true});
- window.addEventListener('blur',()=>releasePress(true));     // 窗口失焦：不永久压扁
+ window.addEventListener('blur',()=>{releasePress(true);if(autoPin){autoPin=false;stopAutoCycle(false);if(pinBtn)pinBtn.setAttribute('aria-pressed','false')}});     // 窗口失焦：不永久压扁，停自动捏捏
  document.addEventListener('visibilitychange',()=>{if(document.hidden)releasePress(true)});
  // ---- 捏捏 ----
- function releasePress(silent){
-  if(!pressing)return;
-  pressing=false;
-  button.setAttribute('aria-pressed','false');
-  if(silent){resetSquash();return}                           // 取消/失焦：直接回位，不回弹
+ function releaseAnim(){
   if(reduceMotion()){squash={sx:1,sy:1};return}
   const cur=currentSquash();
   squashFrames=[
@@ -526,6 +555,14 @@ const Mascot=(()=>{
    {sx:1,sy:1,offset:1}];
   startSquash(squashFrames,cfg.bounceMs,cfg.bounceEasing);   // 从实际压扁程度连续回弹
   squash={sx:1,sy:1};
+ }
+ function releasePress(silent){
+  if(!pressing)return;
+  pressing=false;
+  button.setAttribute('aria-pressed','false');
+  if(silent){resetSquash();return}                           // 取消/失焦：直接回位，不回弹
+  releaseAnim();
+  if(autoPin)autoPinTimer=setTimeout(autoCycle,400);         // 自动捏捏：手动捏完续播
  }
  button.addEventListener('pointerdown',e=>{
   if(e.button===2||detailMode)return;
@@ -558,7 +595,9 @@ const Mascot=(()=>{
   if(on){
    releasePress(true);
    clearTimeout(retreatTimer);retreatTimer=null;
+   if(autoPin){autoPin=false;stopAutoCycle(false);if(pinBtn)pinBtn.setAttribute('aria-pressed','false')}
   }else evaluateRetreat();
+  updateAutoPinVis();
  }
  function applyConfig(block){
   const off=block?block.enabled===false:false;

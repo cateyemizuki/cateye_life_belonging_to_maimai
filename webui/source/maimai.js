@@ -15,13 +15,15 @@ const Mascot=(()=>{
  // 运动常数：U 计划 §3.1 建议值（出场 450–650ms、收起延迟约 200ms），调试起点，非业务规则。
  // PRESS_MS=按下渐变压扁时长（用户 0424 目检：按下要"逐渐变扁"并保持，松开才回弹）。
  const EMERGE_MS=560,RETREAT_MS=320,RETREAT_DELAY_MS=200,PRESS_MS=260;
+ // 触发圈系数（0425 目检：缩小一圈）；REARM=解除武装（重新武装阈值）。
+ const TRIGGER_FACTOR=1.15,REARM_FACTOR=1.35;
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const clamp=(v,low,high)=>Math.min(high,Math.max(low,v));
  const number=(block,key,fallback)=>{const v=block?block[key]:undefined;return typeof v==='number'&&Number.isFinite(v)?v:fallback};
  const easing=value=>typeof value==='string'&&value.trim()&&/^[\w\s.,%()+\-/]*$/.test(value)&&value.length<=80?value.trim():DEFAULT_EASING;
  const cfg={angle:12,retreatPx:200,size:128,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
  let state='peek';               // peek | emerging | landed | retreating
- let pressing=false,detailMode=false,pendingRetreat=false,hoverArmed=true;
+ let pressing=false,detailMode=false,pendingRetreat=false,pendingEmerge=false,hoverArmed=true;
  let retreatTimer=null,poseAnim=null,squashAnim=null;
  let squash={sx:1,sy:1};         // 形变记账：JS 记当前值，避免每拍读布局
  let squashFrames=[{sx:1,sy:1,offset:0},{sx:1,sy:1,offset:1}];
@@ -29,7 +31,32 @@ const Mascot=(()=>{
  // 屏幕左缘，只露头顶+双眼；「橙/奶白颜色分界线」仍穿过视口角落点（logo 式冒头）。
  // 系数按 12° 倾角推导（peek_angle_deg 为调参项，默认 12）。
  const peekTransform=()=>`translate(${(-0.234*cfg.size).toFixed(1)}px, ${(0.234*cfg.size).toFixed(1)}px) rotate(${-cfg.angle}deg)`;
- const setPoseClass=()=>button.classList.toggle('is-peek',state!=='landed');
+ // 自动捏捏（0425 目检新增）：落地后在尾叶上方的小按钮开关；激活后按计划书
+ // 最初参数（squash 1.2/0.5、bounce 774ms overshoot）循环“压扁→回弹”，
+ // 手动捏取时暂停、松开续播；收起/详情/失焦/减少动态一律停止。
+ const pinBtn=document.getElementById('maimai-autopin');
+ let autoPin=false,autoPinTimer=null;
+ const updateAutoPinVis=()=>{if(pinBtn)pinBtn.hidden=!(state==='landed'&&!detailMode&&!reduceMotion());};
+ function stopAutoCycle(rebound){
+  clearTimeout(autoPinTimer);autoPinTimer=null;
+  if(rebound&&squashAnim){releaseAnim()}
+  if(pinBtn)pinBtn.setAttribute('aria-pressed','false');
+ }
+ function autoCycle(){
+  if(!autoPin||state!=='landed'||detailMode||reduceMotion()){stopAutoCycle(false);return}
+  squashFrames=[{sx:1,sy:1,offset:0},{sx:cfg.squashX,sy:cfg.squashY,offset:1}];
+  startSquash(squashFrames,PRESS_MS,'cubic-bezier(.33,.6,.36,1)','forwards');
+  squash={sx:cfg.squashX,sy:cfg.squashY};
+  autoPinTimer=setTimeout(()=>{releaseAnim();autoPinTimer=setTimeout(autoCycle,900)},PRESS_MS+60);
+ }
+ if(pinBtn)pinBtn.addEventListener('click',e=>{
+  e.stopPropagation();
+  autoPin=!autoPin;
+  pinBtn.setAttribute('aria-pressed',String(autoPin));
+  clearTimeout(autoPinTimer);
+  if(autoPin&&state==='landed')autoCycle();else if(!autoPin)stopAutoCycle(true);
+ });
+ const setPoseClass=()=>{button.classList.toggle('is-peek',state!=='landed');updateAutoPinVis()};
  // ---- 捏捏形变：全部 WAAPI；取消/接续都从 JS 记账的当前值出发（同帧接管，无跳帧、无布局读取） ----
  const lerp=(a,b,t)=>a+(b-a)*t;
  function currentSquash(){
@@ -53,7 +80,8 @@ const Mascot=(()=>{
  // ---- 状态机：角落探头 → 弹出中 → 水平落地 →（捏捏/回弹）→ 收起中 → 角落探头 ----
  function finishEmerge(){
   poseAnim=null;state='landed';setPoseClass();
-  if(pendingRetreat){pendingRetreat=false;retreat()}
+  if(pendingRetreat){pendingRetreat=false;retreat();return}
+  if(pendingEmerge){pendingEmerge=false;emerge()}
  }
  function emerge(){
   if(state!=='peek')return;
@@ -77,6 +105,7 @@ const Mascot=(()=>{
   if(state==='emerging'){pendingRetreat=true;return}         // 出场未完：结束后再次判断收起
   state='retreating';setPoseClass();
   releasePress(true);
+  if(autoPin){autoPin=false;stopAutoCycle(false);if(pinBtn)pinBtn.setAttribute('aria-pressed','false')}
   if(reduceMotion()){state='peek';setPoseClass();return}
   resetSquash();
   poseAnim?.cancel();
@@ -103,10 +132,11 @@ const Mascot=(()=>{
    if(e.pointerType!=='mouse'||detailMode)return;
    lastPointer={x:e.clientX,y:e.clientY};
    const d=cornerDistance(e.clientX,e.clientY);
-   if(d>=cfg.size*1.7)hoverArmed=true;
+   if(d>=cfg.size*REARM_FACTOR)hoverArmed=true;
    if(state==='peek'){
-    if(hoverArmed&&d<cfg.size*1.5){hoverArmed=false;emerge()}
-   }else evaluateRetreat();
+    if(hoverArmed&&d<cfg.size*TRIGGER_FACTOR){hoverArmed=false;emerge()}
+   }else if(state==='retreating'&&d<cfg.size*TRIGGER_FACTOR){pendingEmerge=true} // 收起中进入触发圈：收起完毕立即弹出
+   else evaluateRetreat();
   },{passive:true});
  }
  // 触屏无悬停：点空白收起（弹出/捏捏由按钮自身 pointerdown 承担）。
@@ -114,14 +144,10 @@ const Mascot=(()=>{
   if(e.pointerType!=='touch'||detailMode||state!=='landed'||button.contains(e.target))return;
   retreat();
  },{passive:true});
- window.addEventListener('blur',()=>releasePress(true));     // 窗口失焦：不永久压扁
+ window.addEventListener('blur',()=>{releasePress(true);if(autoPin){autoPin=false;stopAutoCycle(false);if(pinBtn)pinBtn.setAttribute('aria-pressed','false')}});     // 窗口失焦：不永久压扁，停自动捏捏
  document.addEventListener('visibilitychange',()=>{if(document.hidden)releasePress(true)});
  // ---- 捏捏 ----
- function releasePress(silent){
-  if(!pressing)return;
-  pressing=false;
-  button.setAttribute('aria-pressed','false');
-  if(silent){resetSquash();return}                           // 取消/失焦：直接回位，不回弹
+ function releaseAnim(){
   if(reduceMotion()){squash={sx:1,sy:1};return}
   const cur=currentSquash();
   squashFrames=[
@@ -132,6 +158,14 @@ const Mascot=(()=>{
    {sx:1,sy:1,offset:1}];
   startSquash(squashFrames,cfg.bounceMs,cfg.bounceEasing);   // 从实际压扁程度连续回弹
   squash={sx:1,sy:1};
+ }
+ function releasePress(silent){
+  if(!pressing)return;
+  pressing=false;
+  button.setAttribute('aria-pressed','false');
+  if(silent){resetSquash();return}                           // 取消/失焦：直接回位，不回弹
+  releaseAnim();
+  if(autoPin)autoPinTimer=setTimeout(autoCycle,400);         // 自动捏捏：手动捏完续播
  }
  button.addEventListener('pointerdown',e=>{
   if(e.button===2||detailMode)return;
@@ -164,7 +198,9 @@ const Mascot=(()=>{
   if(on){
    releasePress(true);
    clearTimeout(retreatTimer);retreatTimer=null;
+   if(autoPin){autoPin=false;stopAutoCycle(false);if(pinBtn)pinBtn.setAttribute('aria-pressed','false')}
   }else evaluateRetreat();
+  updateAutoPinVis();
  }
  function applyConfig(block){
   const off=block?block.enabled===false:false;
