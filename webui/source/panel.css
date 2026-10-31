@@ -53,6 +53,6 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('{{BG_TE
 /* 详情气泡期间：桌宠抬到遮罩之上保持姿态与轮廓清晰可辨（输入由 maimai.js 暂停）。 */
 .maimai-peek.is-above{z-index:950}
 .maimai-peek-tilt{position:absolute;inset:0;display:block;transform-origin:0 100%;will-change:transform}
-.maimai-peek.is-peek .maimai-peek-tilt{transform:translate(0,calc(var(--maimai-mascot-size,128px)*0.234)) rotate(calc(var(--maimai-peek-angle,12deg)*-1))}
+.maimai-peek.is-peek .maimai-peek-tilt{transform:translate(calc(var(--maimai-mascot-size,128px)*-0.234),calc(var(--maimai-mascot-size,128px)*0.234)) rotate(calc(var(--maimai-peek-angle,12deg)*-1))}
 .maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,128px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
 @media(max-width:700px){.maimai-peek{--maimai-mascot-size:72px!important;bottom:calc(102px + env(safe-area-inset-bottom))}}

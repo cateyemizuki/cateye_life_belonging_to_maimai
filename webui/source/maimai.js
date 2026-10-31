@@ -25,10 +25,10 @@ const Mascot=(()=>{
  let retreatTimer=null,poseAnim=null,squashAnim=null;
  let squash={sx:1,sy:1};         // 形变记账：JS 记当前值，避免每拍读布局
  let squashFrames=[{sx:1,sy:1,offset:0},{sx:1,sy:1,offset:1}];
- // 收起探头姿态：小幅 rotate(-角度) + 下移，使「橙/奶白颜色分界线」（鱼身约 70%
- // 高处）恰好穿过视口角落点——身体藏进底边，只露叶+头顶+眼睛（logo 式冒头）。
- // 下移系数按 12° 倾角推导（peek_angle_deg 为调参项，默认 12）。
- const peekTransform=()=>`translate(0px, ${(0.234*cfg.size).toFixed(1)}px) rotate(${-cfg.angle}deg)`;
+ // 收起探头姿态：小幅 rotate(-角度) + 往角落里收（左移+下沉），尾巴上的叶子移出
+ // 屏幕左缘，只露头顶+双眼；「橙/奶白颜色分界线」仍穿过视口角落点（logo 式冒头）。
+ // 系数按 12° 倾角推导（peek_angle_deg 为调参项，默认 12）。
+ const peekTransform=()=>`translate(${(-0.234*cfg.size).toFixed(1)}px, ${(0.234*cfg.size).toFixed(1)}px) rotate(${-cfg.angle}deg)`;
  const setPoseClass=()=>button.classList.toggle('is-peek',state!=='landed');
  // ---- 捏捏形变：全部 WAAPI；取消/接续都从 JS 记账的当前值出发（同帧接管，无跳帧、无布局读取） ----
  const lerp=(a,b,t)=>a+(b-a)*t;

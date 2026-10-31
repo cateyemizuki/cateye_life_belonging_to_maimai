@@ -180,7 +180,7 @@ const SectionFish=(()=>{
   clearTimeout(closeTimer);clearTimeout(hoverTimer);
   unfloatEntry(old);old.element.classList.remove('fish-open');old.button.setAttribute('aria-expanded','false');
   for(const group of old.groups)store.append(group);
-  tail.hidden=true;panel.style.transformOrigin='';
+  tail.hidden=true;panel.style.transformOrigin='';panel.style.maxHeight='';
   const finish=()=>{
    overlay.hidden=true;overlay.classList.remove('is-open','is-closing');overlay.removeAttribute('data-section');delete overlay.dataset.align;
    document.body.classList.remove('fish-locked');
@@ -191,12 +191,17 @@ const SectionFish=(()=>{
   overlay.classList.remove('is-open');overlay.classList.add('is-closing');
   closeTimer=setTimeout(finish,finishMs()+40);
  }
- // 以本次入口为原点计算面板位置/缩放原点：入口在视口上部→面板贴底，下部→贴顶，
- // 其余居中；连接边/气泡尾随后按实际位置绘制（U 计划 §4.2）。
+ // 以本次入口为原点计算面板位置/缩放原点（U 计划 §4.2 + 0425 目检适配）：
+ // 气泡放在「可用空间更多的一侧」（入口偏上→面板在其下方，偏下→在上方），
+ // 面板最大高度适配该侧空间——入口与内容都完整可见，不拘泥粘连哪一边；
+ // 连接边/气泡尾随后按实际位置绘制（drawTail 取最近边）。
  function placePanel(entry){
   const b=entry.button.getBoundingClientRect(),vh=innerHeight;
-  const ratio=(b.top+b.height/2)/vh;
-  overlay.dataset.align=ratio<.38?'bottom':ratio>.62?'top':'center';
+  const freeAbove=b.top,freeBelow=vh-b.bottom;
+  const putBelow=freeBelow>=freeAbove;
+  overlay.dataset.align=putBelow?'bottom':'top';
+  const free=Math.max(putBelow?freeBelow:freeAbove)-24;
+  panel.style.maxHeight=`${Math.max(280,Math.min(Math.round(free),Math.round(vh*0.9)))}px`;
   const p=panel.getBoundingClientRect();
   panel.style.transformOrigin=
    `${Math.min(Math.max(b.left+b.width/2-p.left,0),p.width)}px ${Math.min(Math.max(b.top+b.height/2-p.top,0),p.height)}px`;
