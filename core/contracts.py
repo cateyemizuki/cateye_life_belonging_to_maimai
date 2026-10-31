@@ -47,6 +47,21 @@ class EmotionValenceSource(Protocol):
         ...
 
 
+class SleepAnchorsSource(Protocol):
+    """真实作息锚点对情绪侧的最小查询面（D3：emotion 不再导入 companion.patrol）。
+
+    实现方 = 组合根 ``plugin.real_sleep_anchors`` 公共口（绑定 companion.patrol 的
+    同一 wiring 真源，§24.2 任务B「所有消费点共享，禁止自建副本」）；返回对象鸭子
+    兼容 ``RealAnchors``（``start``/``end`` 为 "HH:MM" 字符串、``source`` 为来源
+    标记），None = 真实锚点不可得（消费方回退 ``[schedule]`` 配置路径，§7.9 不变）。
+    """
+
+    def __call__(self, now: Any = None) -> Optional[Any]:
+        """取当前生效的真实作息锚点；``now`` = 调用方判定时刻（同帧口径）。"""
+        ...
+
+
 #: 惰性提供者（装配期注入；调用返回 None = 能力未装配）
 SleepEngineGateProvider = Callable[[], Optional[SleepEngineGate]]
 EmotionValenceSourceProvider = Callable[[], Optional[EmotionValenceSource]]
+SleepAnchorsSourceProvider = Callable[[], Optional[SleepAnchorsSource]]

@@ -185,12 +185,19 @@ class EmotionService:
     """VAD 情绪系统的运行时载体（状态机 + 持久化 + 睡眠循环 + LLM 请求编排）。"""
 
     def __init__(self, plugin: Any,
-                 sleep_gate_provider: Optional[Callable[[], Any]] = None) -> None:
+                 sleep_gate_provider: Optional[Callable[[], Any]] = None,
+                 sleep_anchors_provider: Optional[Callable[[], Any]] = None) -> None:
         self._plugin = plugin
         # D1（2026-11-01 模块解耦计划）：睡眠引擎经显式注入的惰性提供者访问
         # （core.contracts.SleepEngineGate 门面）；None = 回退旧 ``plugin._sleep_engine``
         # 属性路径（行为逐字不变，测试桩与未接线场景不受影响）。
         self._sleep_gate_provider = sleep_gate_provider
+        # D3（2026-11-01 模块解耦计划）：真实作息锚点经显式注入的查询面访问
+        # （core.contracts.SleepAnchorsSource；真源唯一 = companion.patrol 的同一
+        # wiring 入口，由组合根经 ``plugin.real_sleep_anchors`` 公共口提供）；未注入
+        # 时回退组合根公共口鸭子调用——本模块不再 import companion，
+        # emotion↔companion 依赖环自此解除（§3.1 依赖方向纪律）。
+        self._sleep_anchors_provider = sleep_anchors_provider
         self._ctx = plugin.ctx
         # 数据目录只在插件数据目录内（宿主隔离）；未接线场景绝不落宿主工作目录（插件中心评审阻断项）
         _raw_data_dir = getattr(plugin, "_data_dir", None)
@@ -1725,24 +1732,26 @@ class EmotionService:
         """``(sleep_min, wake_min)`` 作息锚点（[schedule] 配置，缺省 23:00 / 07:00）。
 
         §24.2 任务B（R7 依据 = 用户 2026-10-21 直派）：**真实作息锚点优先**——经
-        companion.patrol 的同一 wiring 真源（``real_sleep_anchors_from_plugin``）读
-        真实睡眠环（今晚/今晨睡觉条目，读取即解析；赖床顺延后锚点随移；通过 now 传调用
-        方的判定时刻，供夜窗/条目周期与锚点取自同一帧）。锚点不可得（``_schedule_query``
-        缺失 / DB 不可用 / 纯配置对象桩）→ 现行 ``[schedule]`` 配置路径不变
-        （§7.9 fail-safe 语义不变）。emotion→companion 为方法内懒导入：companion.patrol
-        链上不 import emotion（planning 也只按鸭子类型取 emotion 束），无循环依赖。
+        注入的锚点查询面（core.contracts.SleepAnchorsSource；组合根绑定
+        companion.patrol 的同一 wiring 真源，D3 起注入或经 ``plugin.real_sleep_anchors``
+        公共口鸭子调用）读真实睡眠环（今晚/今晨睡觉条目，读取即解析；赖床顺延后锚点
+        随移；通过 now 传调用方的判定时刻，供夜窗/条目周期与锚点取自同一帧）。锚点
+        不可得（查询面未注入 / ``_schedule_query`` 缺失 / DB 不可用 / 纯配置对象桩）
+        → 现行 ``[schedule]`` 配置路径不变（§7.9 fail-safe 语义不变）。
+        D3：本模块不再 import companion（emotion↔companion 环解除，§3.1）。
         """
-        try:
-            from companion.patrol import real_sleep_anchors_from_plugin
-
-            real = real_sleep_anchors_from_plugin(self._plugin, now)
-            if real is not None and real.source == SOURCE_REAL_SCHEDULE:
-                sleep_min = parse_hhmm(real.start, -1)
-                wake_min = parse_hhmm(real.end, -1)
-                if sleep_min >= 0 and wake_min >= 0:
-                    return sleep_min, wake_min
-        except Exception as exc:  # pragma: no cover - companion 未装配时的降级路径
-            logger.debug(f"真实作息锚点解析不可用（{exc}），按 [schedule] 配置路径降级")
+        source = (self._sleep_anchors_provider() if callable(self._sleep_anchors_provider)
+                  else getattr(self._plugin, "real_sleep_anchors", None))
+        if callable(source):
+            try:
+                real = source(now)
+                if real is not None and real.source == SOURCE_REAL_SCHEDULE:
+                    sleep_min = parse_hhmm(real.start, -1)
+                    wake_min = parse_hhmm(real.end, -1)
+                    if sleep_min >= 0 and wake_min >= 0:
+                        return sleep_min, wake_min
+            except Exception as exc:  # pragma: no cover - 锚点查询面异常的降级路径
+                logger.debug(f"真实作息锚点解析不可用（{exc}），按 [schedule] 配置路径降级")
         cfg = getattr(self._plugin.config, "schedule", None)
         sleep_time = str(getattr(cfg, "sleep_time", "") or "")
         wake_time = str(getattr(cfg, "wake_time", "") or "")

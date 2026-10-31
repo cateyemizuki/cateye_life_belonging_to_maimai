@@ -50,26 +50,74 @@ from .decision import (
     parse_llm_decision,
 )
 from .image_sources import collect_images
-from companion.patrol import nap_intent_matches_now, nap_item_matches
 from planning.schedule_query import ScheduleQuery
 from core.storage import load_json, save_json_atomic
 from planning.time_utils import is_in_time_window
+
+
+def _companion_gate_of(plugin: Any) -> Any:
+    """陪伴静默/午休判定门面取值（D3，2026-11-01 模块解耦计划 §3.1）。
+
+    优先经组合根公共口 ``plugin.companion_silence_gate``（鸭子调用，本模块不导入
+    companion）；公共口缺失（裸测试桩）→ 返回 None，调用方走旧 patrol 懒导入
+    shim（``_PatrolGateShim``，D5 注入化收口后随退役）。
+    """
+    getter = getattr(plugin, "companion_silence_gate", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+class _PatrolGateShim:
+    """D3 兼容 shim：无组合根门面时（裸测试桩）按旧路径懒导入 patrol 绑定。
+
+    生产路径（``plugin.companion_silence_gate`` 恒可得）不会走到。shim 只转发、
+    不持状态（§6 计划：shim 逐字转发语义，D5 全部装配显式接线后删除）。
+    """
+
+    def __init__(self, plugin: Any) -> None:
+        self._plugin = plugin
+
+    def resolve_silence_window(self) -> Any:
+        from companion.patrol import resolve_silence_window
+
+        return resolve_silence_window(self._plugin)
+
+    def nap_item_matches(self, activity: Any) -> bool:
+        from companion.patrol import nap_item_matches
+
+        return nap_item_matches(activity)
+
+    def nap_intent_matches_now(self, day_schedule: Any, now: Any = None) -> bool:
+        from companion.patrol import nap_intent_matches_now
+
+        return nap_intent_matches_now(day_schedule, now)
+
+    def sleep_engine_asleep(self, now: Any = None) -> bool:
+        from companion.patrol import sleep_engine_asleep
+
+        return sleep_engine_asleep(self._plugin, now)
 
 
 def _sleep_silence_window(plugin: Any) -> Tuple[str, str]:
     """空间静默窗生效值 ``(入睡 HH:MM, 起床 HH:MM)``（2026-10-20 用户指示：恒复用作息。
 
     §24.2 任务B（R7 依据 = 用户 2026-10-21 直派）真实化随主链自动生效：与陪伴静默共用
-    同一解析真源 ``companion.patrol.resolve_silence_window``——插件实例路径现在会**优先
-    解析真实睡眠环锚点**（今晚/今晨睡觉条目读取即解析，赖床顺延后随移）；
-    companion 未装配时本地的 ``[schedule]`` 直读降级、锚点缺失再退出厂兜底
-    （23:00/07:00，仍是静默窗）不变。返回**未规范化**原文，跨午夜与非法 fail-safe
-    交给 ``is_in_time_window``。
+    同一解析真源——D3 起经组合根公共口 ``plugin.companion_silence_gate`` 绑定
+    ``companion.patrol.resolve_silence_window``（插件实例路径**优先解析真实睡眠环锚点**：
+    今晚/今晨睡觉条目读取即解析，赖床顺延后随移）；公共口缺失的裸桩走
+    ``_PatrolGateShim`` 旧懒导入路径；companion 未装配时本地的 ``[schedule]``
+    直读降级、锚点缺失再退出厂兜底（23:00/07:00，仍是静默窗）不变。
+    返回**未规范化**原文，跨午夜与非法 fail-safe 交给 ``is_in_time_window``。
     """
+    gate = _companion_gate_of(plugin)
+    if gate is None:
+        gate = _PatrolGateShim(plugin)
     try:
-        from companion.patrol import resolve_silence_window
-
-        window = resolve_silence_window(plugin)
+        window = gate.resolve_silence_window()
         return window.start, window.end
     except Exception:  # pragma: no cover - companion 未装配时的降级路径
         schedule = getattr(getattr(plugin, "config", None), "schedule", None)
@@ -164,6 +212,15 @@ class QzoneService:
         self.bus = getattr(self._plugin, "_bus", None)
         #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
         self._event_unsubs: list = []
+
+    # ---- 跨模块只读面（D3，2026-11-01 模块解耦计划 §3.1） ----
+    def _companion_gate(self) -> Any:
+        """陪伴静默/午休判定门面：组合根公共口鸭子调用，不导入 companion。
+
+        公共口缺失（裸测试桩）→ ``_PatrolGateShim`` 旧 patrol 懒导入路径逐字保留
+        （shim 登记：qzone→companion.patrol 兼容转发，D5 全部装配显式接线后删除）。
+        """
+        return _companion_gate_of(self._plugin) or _PatrolGateShim(self._plugin)
 
     # ---- 配置段访问 ----
     def _qzone_cfg(self) -> Any:
@@ -490,8 +547,8 @@ class QzoneService:
         # 闸 0a：睡眠引擎判定仍在睡（晚醒真实状态）→ 不发；日程端点在醒来时写回真实醒点，
         # 晚醒区间内窗口还写着旧 07:00 锚点，只看窗口会提前发帖（PR3 复核 2026-10-27）。
         try:
-            from companion.patrol import sleep_engine_asleep
-            if sleep_engine_asleep(self._plugin, now):
+            gate = _companion_gate_of(self._plugin) or _PatrolGateShim(self._plugin)
+            if gate.sleep_engine_asleep(now):
                 self._record_decision("skip", gate="silence", reason="睡眠引擎判定仍在睡")
                 return False
         except Exception:
@@ -513,8 +570,9 @@ class QzoneService:
             self._record_decision("skip", gate="no_activity", reason=reason)
             return False
         # 闸 2：午休静默（2026-10-20 用户指示：nap_quiet_enabled 由陪伴巡检扩展到空间——
-        # 午休/小睡条目中不发说说、不监听评论；判定与 companion.patrol 同源 nap_item_matches）
-        if self._nap_quiet_enabled() and nap_item_matches(activity):
+        # 午休/小睡条目中不发说说、不监听评论；判定与 companion.patrol 同源——D3 起经
+        # 组合根公共门面，不导入 companion）
+        if self._nap_quiet_enabled() and self._companion_gate().nap_item_matches(activity):
             self._record_decision("skip", gate="nap_quiet",
                                   reason="午休/小睡中（[patrol] nap_quiet_enabled，跨模块静默）")
             return False
@@ -981,12 +1039,13 @@ class QzoneService:
                 nap_item = self._schedule.find_current_activity(today, now, include_sleep=True)
             except Exception as nap_exc:
                 self.ctx.logger.warning(f"午休静默判定读日程失败（按非午休继续本轮）: {nap_exc}")
-            if nap_item_matches(nap_item):
+            if self._companion_gate().nap_item_matches(nap_item):
                 return
             # UQ-4（用户 2026-10-27 批）：episode 未开出（≤tick 周期）时只读计划表 spine
             # 意图行按时间窗匹配提前静默——仅静默用途，不对外伪装「当前活动」。
             try:
-                if nap_intent_matches_now(self._schedule.get_day_schedule(today), now):
+                if self._companion_gate().nap_intent_matches_now(
+                        self._schedule.get_day_schedule(today), now):
                     return
             except Exception:
                 pass

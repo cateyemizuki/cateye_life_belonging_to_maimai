@@ -392,8 +392,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._qzone.bind_state_dir(data_dir)
         # D1（2026-11-01 模块解耦计划）：睡眠引擎门面经显式惰性提供者注入
         # （core.contracts.SleepEngineGate；引擎在 _setup_life_services 才装配，调用时才解析）
+        # D3：真实作息锚点查询面同样显式注入（SleepAnchorsSource；绑定下方
+        # real_sleep_anchors 公共口——companion.patrol 同一 wiring 真源，非副本）。
         self._emotion = EmotionServices(
-            self, sleep_gate_provider=lambda: getattr(self, "_sleep_engine", None))
+            self, sleep_gate_provider=lambda: getattr(self, "_sleep_engine", None),
+            sleep_anchors_provider=lambda: self.real_sleep_anchors)
 
         # 宿主人设（bot 配置）
         await self._refresh_persona()
@@ -1512,6 +1515,43 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             return bool(engine.note_interruption(now))
         except Exception:
             return False
+
+    # ── 对外：组合根只读委托公共口（D3，2026-11-01 模块解耦计划 §3.1）────────
+    # 消费方（emotion/qzone/planning 面板）经注入提供者或本组鸭子调用取得陪伴侧
+    # 能力，互相之间不再 import：依赖方向纪律=业务只依赖 core/contracts/自身，
+    # 只有组合根允许同时知道具体实现。
+    def real_sleep_anchors(self, now: Any = None) -> Any:
+        """真实作息锚点查询公共口：绑定 companion.patrol 的同一 wiring 真源。
+
+        emotion 侧锚点消费（注入 ``SleepAnchorsSource`` 提供者或鸭子调用本口）；
+        查询失败返回 None（消费方回退 ``[schedule]`` 配置路径，§7.9 不变）。
+        """
+        try:
+            from companion.patrol import real_sleep_anchors_from_plugin
+
+            return real_sleep_anchors_from_plugin(self, now)
+        except Exception:
+            return None
+
+    def companion_silence_gate(self) -> Any:
+        """陪伴静默/午休判定公共口：qzone 经此取判定器，不导入 companion。
+
+        门面无状态（仅绑定 patrol 真源函数），实例缓存复用；companion 缺失时
+        抛出的异常由调用方按既有降级语义处理。
+        """
+        gate = getattr(self, "_companion_silence_gate", None)
+        if gate is None:
+            from companion.silence_gate import CompanionSilenceGate
+
+            gate = CompanionSilenceGate(self)
+            self._companion_silence_gate = gate
+        return gate
+
+    def companion_summary(self, *, date: str) -> Any:
+        """陪伴摘要只读投影公共口：planning 面板经此取数，不导入 companion。"""
+        from companion.dashboard import companion_summary
+
+        return companion_summary(self, date=date)
 
     def _ensure_life_modulation(self) -> LifeModulationService | None:
         """情绪调制服务惰性构造（PR2，2026-10-26，定稿 §4.1.1；幂等）。

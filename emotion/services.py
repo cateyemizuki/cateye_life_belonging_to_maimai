@@ -23,11 +23,15 @@ class EmotionServices:
     """情绪模块服务束：状态机 + 睡眠检测循环 + 评估任务管理。"""
 
     def __init__(self, plugin: Any,
-                 sleep_gate_provider: Optional[Callable[[], Any]] = None) -> None:
+                 sleep_gate_provider: Optional[Callable[[], Any]] = None,
+                 sleep_anchors_provider: Optional[Callable[[], Any]] = None) -> None:
         self._plugin = plugin
         # D1（2026-11-01 模块解耦计划）：睡眠引擎门面提供者透传给 EmotionService
         # （core.contracts.SleepEngineGate）；None = 服务内回退旧 plugin 属性路径。
-        self.service = EmotionService(plugin, sleep_gate_provider=sleep_gate_provider)
+        # D3：真实作息锚点查询面提供者同样透传（core.contracts.SleepAnchorsSource）；
+        # None = 服务内回退组合根公共口鸭子调用（不再 import companion）。
+        self.service = EmotionService(plugin, sleep_gate_provider=sleep_gate_provider,
+                                      sleep_anchors_provider=sleep_anchors_provider)
         #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
         self.bus = getattr(plugin, "_bus", None)
         #: 本束的事件反订阅闭包（M0 无订阅者；M3 起由 emotion.bridge 追加）

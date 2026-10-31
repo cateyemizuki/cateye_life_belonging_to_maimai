@@ -12,6 +12,11 @@ from .life_history import FIELDS, MAX_POINTS, SAMPLE_SECONDS
 def _companion_summary(plugin: Any, *, date: str) -> dict[str, Any]:
     if getattr(plugin, '_companion', None) is None:
         return {'available': False}
+    # D3（2026-11-01 模块解耦计划 §3.1）：经组合根公共口取陪伴摘要，planning 不导入
+    # companion；公共口缺失（裸测试桩）→ 旧懒导入 shim 保留，D5 注入化后退役。
+    getter = getattr(plugin, 'companion_summary', None)
+    if callable(getter):
+        return getter(date=date)
     from companion.dashboard import companion_summary
     return companion_summary(plugin, date=date)
 
