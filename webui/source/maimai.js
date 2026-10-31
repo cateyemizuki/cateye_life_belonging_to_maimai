@@ -51,9 +51,10 @@ const Mascot=(()=>{
   // 立体水平旋转（激活态，0425 二次修正 + 用户复检改持续旋转）：旋转轴 = 头顶叶茎
   // 根点（约图 69%W、28%H）延伸的垂直线，rotateY 匀速连续旋转（不跟捏压节奏）；
   // 压扁脉冲（计划书原始参数）由 art 层按自己的节奏叠加，两层互不覆盖。
-  const ax=(0.69*cfg.size).toFixed(1), ay=(0.49*cfg.size).toFixed(1);
+  // 轴点用 transform-origin 相对坐标：origin(0,size) + (0.69s,-0.51s) = 叶茎根点
+  const ax=(0.69*cfg.size).toFixed(1), ay=(-0.51*cfg.size).toFixed(1);
   const P=`perspective(700px) translate(${ax}px, ${ay}px) `;
-  const S=`translate(${-ax}px, ${-ay}px)`;
+  const S=`translate(${-parseFloat(ax)}px, ${-parseFloat(ay)}px)`;
   rotateAnim?.cancel();
   rotateAnim=tilt.animate([
    {transform:P+'rotateY(0deg) '+S},
