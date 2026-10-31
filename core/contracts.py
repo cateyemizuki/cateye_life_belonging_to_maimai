@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, Dict, Optional, Protocol
 
 
 class SleepEngineGate(Protocol):
@@ -65,3 +65,23 @@ class SleepAnchorsSource(Protocol):
 SleepEngineGateProvider = Callable[[], Optional[SleepEngineGate]]
 EmotionValenceSourceProvider = Callable[[], Optional[EmotionValenceSource]]
 SleepAnchorsSourceProvider = Callable[[], Optional[SleepAnchorsSource]]
+
+
+class VideoWatchPort(Protocol):
+    """内置视频观看模块对工具/日程侧的最小动作面（B 计划 §3，2026-11-01）。
+
+    实现方 = ``video_watch.service.VideoWatchService``（生活插件内部单实例；
+    AI 工具 ``watch_bili_video`` 与 integrations/video_schedule 日程编排共用，
+    替代旧跨插件 ``ctx.api.call("cateye.bili-watch.bili_watch")`` 路径）。
+    回执为 dict：``success`` / ``status`` / ``task_id`` / ``error`` /
+    ``error_class`` / ``cached`` / ``deduped`` / ``candidate`` 等，与原型
+    WatchTaskManager 的同名动作回执保持同构（调度侧零语义迁移）。
+    """
+
+    async def handle_action(self, action: str = "", **kwargs: Any) -> Dict[str, Any]:
+        """动作分发：submit / status / result / cancel / next_candidate。"""
+        ...
+
+
+#: 视频观看端口提供者（装配期注入；返回 None = 模块未装配，调用方按降级语义处理）
+VideoWatchPortProvider = Callable[[], Optional[VideoWatchPort]]

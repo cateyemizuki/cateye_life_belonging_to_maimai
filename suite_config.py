@@ -93,6 +93,7 @@ from planning.event_catalog_config import (
     migrate_legacy_event_catalog,
 )
 from qzone.config import QzoneSectionConfig
+from video_watch.config import VideoWatchSectionConfig
 from suite_prompts import (
     COMPANION_MISS_CONFIRM_DEFAULT,
     COMPANION_MISS_REASON_DEFAULT,
@@ -630,6 +631,8 @@ class CateyeSuiteConfig(PluginConfigBase):
     qzone: QzoneSectionConfig = Field(default_factory=QzoneSectionConfig)
     # 情绪系统（emotion/config.py）
     emotion: EmotionSectionConfig = Field(default_factory=EmotionSectionConfig)
+    # 视频观看（video_watch/config.py，2026-11-01 B 线内置模块）
+    video_watch: VideoWatchSectionConfig = Field(default_factory=VideoWatchSectionConfig)
     # 麦麦互动（本文件，2026-10-30 交互改造新增）：放在最后一个字段，
     # 保证 config.toml 的最后一节就是 [maimai_interaction]（主计划第三章口径）。
     maimai_interaction: MaimaiInteractionSectionConfig = Field(default_factory=MaimaiInteractionSectionConfig)
@@ -727,6 +730,12 @@ class CateyeSuiteConfig(PluginConfigBase):
                 for stale_key in stale_keys:
                     section_data.pop(stale_key, None)
                 migrated[section_name] = section_data
+        #    B 计划（2026-11-01）：旧独立观看插件节名 [bili_watch] → 内置 [video_watch]
+        #    段（仅当新段缺位时整体搬迁，幂等：video_watch 在场即不再触发；
+        #    旧节 6 键与新段字段同名同约束，值原样保留）。
+        legacy_bili = migrated.get("bili_watch")
+        if isinstance(legacy_bili, dict) and not isinstance(migrated.get("video_watch"), dict):
+            migrated["video_watch"] = dict(legacy_bili)
         plugin_section = dict(migrated.get("plugin") or {})
         already_migrated = str(plugin_section.get("layout_version") or "") == CURRENT_LAYOUT_VERSION
         # 结构版本以插件当前值为准（宿主已按"版本变化"决定升级；旧值不参与落盘）。

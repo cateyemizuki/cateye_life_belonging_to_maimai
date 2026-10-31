@@ -74,6 +74,8 @@ from integrations.video_schedule import VideoWatchCoordinator
 from qzone.cgi import QzoneCookieManager
 from qzone.components import QzoneComponentsMixin
 from qzone.service import QzoneService
+from video_watch.components import VideoWatchComponentsMixin
+from video_watch.service import VideoWatchService
 
 # ── 磁盘旧文件抢救（2026-10-10 升级的迁移保障，详见 normalize_plugin_config）──────
 #: 「键不存在」哨兵（区分"默认值是 None"与"没有默认值可参照"）
@@ -206,7 +208,7 @@ def _rescue_config_from_disk(config_data: object) -> tuple[object, bool]:
 
 
 class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, CompanionComponentsMixin, QzoneComponentsMixin,
-                        EmotionComponentsMixin, MaiBotPlugin):
+                        EmotionComponentsMixin, VideoWatchComponentsMixin, MaiBotPlugin):
     config_model: ClassVar[type] = CateyeSuiteConfig
     # 订阅宿主 bot 配置热重载（人设/昵称变化自动同步）
     config_reload_subscriptions: ClassVar[Iterable[str]] = ("bot",)
@@ -398,6 +400,16 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self, sleep_gate_provider=lambda: getattr(self, "_sleep_engine", None),
             sleep_anchors_provider=lambda: self.real_sleep_anchors)
 
+        # B 线（2026-11-01 B 计划 §3）：内置视频观看模块——唯一服务实例（AI 工具
+        # watch_bili_video 与 integrations/video_schedule 日程编排共用，B3 起不再
+        # 跨插件调用 cateye.bili-watch）。数据默认 data_dir/video_watch；旧独立
+        # 插件节名 [bili_watch] 的配置值经 suite_config 迁移器并入 [video_watch]。
+        self._video_watch = VideoWatchService(
+            data_dir / "video_watch", logger=self.ctx.logger,
+            config_provider=lambda: self.config.video_watch,
+            llm_generate_detailed=self._llm.generate_detailed)
+        self._video_watch.start()
+
         # 宿主人设（bot 配置）
         await self._refresh_persona()
 
@@ -473,6 +485,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             pass
         self._stop_life_services()
         self._bus.stop_budget()
+        # B3：观看服务停机（原型语义：不等待进行中任务，下次加载 recover() 如实标记中断）
+        try:
+            await self._video_watch.stop()
+        except Exception:
+            pass
         self._affection.flush()
         self._db.close()
         self.ctx.logger.info("属于麦麦的生活已卸载")
@@ -1307,8 +1324,17 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         return coord
 
     async def _call_watch_api(self, action: str = "", **kwargs: Any) -> Dict[str, Any]:
-        """公共观看接口端口适配：跨插件经 ctx.api.call（api.call 能力已在 manifest 声明）。"""
-        return await self.ctx.api.call("cateye.bili-watch.bili_watch", action=action, **kwargs)
+        """公共观看接口端口适配（B3 内置化，2026-11-01 B 计划 §6）。
+
+        直接调本插件内部 video_watch 服务单实例（core.contracts.VideoWatchPort
+        同构动作面），**不再跨插件** ``ctx.api.call("cateye.bili-watch.bili_watch")``；
+        旧独立原型仓只读保留，不安装、不 import。
+        """
+        service = getattr(self, "_video_watch", None)
+        if service is None:
+            return {"success": False, "error_class": "unavailable",
+                    "error": "视频观看模块未装配（[video_watch].enabled=false 或未加载）"}
+        return await service.handle_action(action, source="schedule", **kwargs)
 
     def _kick_video_watch_sync(self) -> None:
         """单飞调度：上一拍联动未结束时不再叠加（有界；异常只告警）。"""
