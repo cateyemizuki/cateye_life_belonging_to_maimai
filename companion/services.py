@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from core.diag import DecisionLogger, LLMCallLogger
 from core.llm_utils import LLMService, llm_task_name_of
@@ -67,14 +67,15 @@ def _load_affection_tables(plugin: Any) -> None:
         logger.warning("好感度档位描述表装载失败（使用内置默认）：%s", exc)
 
 
-def _emotion_valence(plugin: Any) -> Optional[float]:
+def _emotion_valence(emotion: Any) -> Optional[float]:
     """读取情绪模块当前生效 V（M3 B2，§6.2 B）；缺失/停用/异常一律返回 None。
 
-    跨模块调用可空降级（§八.2）：``getattr(plugin, "_emotion", None)`` 判空 +
-    只用 ``is_enabled`` / ``effective_valence`` 两个公开入口，单模块停用不影响其余。
+    D1（2026-11-01 模块解耦计划）：改为直接接收情绪只读面（core.contracts.
+    EmotionValenceSource），不再由本模块伸手读 ``plugin._emotion``——由组合根
+    经惰性提供者注入。仍只用 ``is_enabled`` / ``effective_valence`` 两个公开
+    入口，单模块停用不影响其余（§八.2 可空降级不变）。
     返回 None 时好感调制乘数恒 1.0（M1 占位语义的降级路径）。
     """
-    emotion = getattr(plugin, "_emotion", None)
     if emotion is None:
         return None
     try:
@@ -98,7 +99,8 @@ def _emotion_valence(plugin: Any) -> Optional[float]:
 class CompanionServices:
     """虚拟陪伴服务束（好感度 / 巡检 / 消息 / 记忆 / 屏幕感知 / 节假日）。"""
 
-    def __init__(self, plugin: Any) -> None:
+    def __init__(self, plugin: Any,
+                 emotion_valence_provider: Optional[Callable[[], Any]] = None) -> None:
         self.plugin = plugin
         self.ctx = plugin.ctx
         # 数据目录只在插件数据目录内（宿主隔离）；未接线场景绝不落宿主工作目录（插件中心评审阻断项）
@@ -133,10 +135,14 @@ class CompanionServices:
             except Exception:
                 pass
         # M3（B2）：注入情绪效价提供者，好感入账按 §6.2 B 做情绪调制。
-        # 提供者是惰性 lambda：plugin._emotion 在本服务束构造之后才装配（plugin.py 顺序），
-        # 调用时才解析；情绪模块停用/缺失 → None → 乘数恒 1.0（可空降级，§八.2）。
+        # D1（模块解耦计划）：情绪只读面经显式惰性提供者注入（组合根装配时传
+        # lambda），本模块不再读 plugin._emotion；未注入时回退旧属性路径（行为
+        # 不变，测试桩不受影响）。提供者调用时才解析：plugin._emotion 在本服务束
+        # 构造之后才装配（plugin.py 顺序）；情绪模块停用/缺失 → None → 乘数恒
+        # 1.0（可空降级，§八.2）。
+        _valence_source = emotion_valence_provider or (lambda: getattr(plugin, "_emotion", None))
         try:
-            self.affection.set_emotion_vad_provider(lambda: _emotion_valence(plugin))
+            self.affection.set_emotion_vad_provider(lambda: _emotion_valence(_valence_source()))
         except Exception:
             pass
         self.decision_logger: Optional[DecisionLogger] = getattr(plugin, "_decision_logger", None)

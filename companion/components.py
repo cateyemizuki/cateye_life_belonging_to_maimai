@@ -66,10 +66,10 @@ from core.diag import DecisionLogger
 from core.inject import pick_payload_key, project_injection, without_stale_proactive_blocks
 # §31.3 B3 修复（R7 = 用户 2026-10-23 第二轮直派，A-22 bug③）：读取渲染面时间一律
 # 经 time_utils.format_day_minute（禁手写 //60/%60；day_offset=1 行带「次日」标注），
-# 日帧行为过滤复用 schedule_query 的 _SKIP_TYPES 同语义（{"sleep"}）。
+# 日帧行为过滤复用 schedule_query 的 SKIP_TYPES 同语义（{"sleep"}；D1 起为公开常量）。
 from planning.rolling_planner import extract_spine_intents
 from planning.schedule_query import ScheduleQuery
-from planning.schedule_query import _SKIP_TYPES as _SCHEDULE_SKIP_TYPES
+from planning.schedule_query import SKIP_TYPES as _SCHEDULE_SKIP_TYPES
 from core.time_utils import minutes_of_now
 from planning.time_utils import DAY_MINUTES, format_day_minute, ring_minutes_ahead
 from suite_prompts import (
@@ -2404,8 +2404,8 @@ class CompanionComponentsMixin:
           按 ``ScheduleQuery._previous_date`` 取昨日帧；PR8 3.0.0 后 schedule_query 旧
           时间窗合并分支已随读表 fallback 删除）；今日自身 ``day_offset=1`` 行保留在
           列表末段（经环抬「次日」标注），两类帧行对同一环位互斥不重计；
-        - 行过滤对齐 :func:`planning.schedule_query._SKIP_TYPES` 语义（该集合 = ``{"sleep"}``
-          ——只滤睡眠行；``rest`` 等清醒行保留，与既有 _SKIP_TYPES 契约零扩张）；
+        - 行过滤对齐 :func:`planning.schedule_query.SKIP_TYPES` 语义（该集合 = ``{"sleep"}``
+          ——只滤睡眠行；``rest`` 等清醒行保留，与既有 SKIP_TYPES 契约零扩张）；
         - 排序列表 = 真实时间轴：昨日并入行（今日凌晨）→ 今日晨钟行 → 今日「次日」行，
           消除夜猫子日表「00:30 行排最前」的时序倒挂。
 

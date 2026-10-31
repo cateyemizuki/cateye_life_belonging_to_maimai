@@ -373,7 +373,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
         # 服务束（内部动态读 self.config，热重载自动生效）
         self._planning = PlanningServices(self)
-        self._companion = CompanionServices(self)
+        # D1（2026-11-01 模块解耦计划）：情绪只读面经显式惰性提供者注入
+        # （core.contracts.EmotionValenceSource；_emotion 在本行之后才装配，调用时才解析）
+        self._companion = CompanionServices(
+            self, emotion_valence_provider=lambda: getattr(self, "_emotion", None))
         self._qzone_cookies = QzoneCookieManager(
             self.ctx, data_dir,
             napcat_http_host=cfg.qzone.napcat_http_host,
@@ -386,7 +389,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                                    self._decision_logger, plugin=self,
                                    cookie_manager=self._qzone_cookies)
         self._qzone.bind_state_dir(data_dir)
-        self._emotion = EmotionServices(self)
+        # D1（2026-11-01 模块解耦计划）：睡眠引擎门面经显式惰性提供者注入
+        # （core.contracts.SleepEngineGate；引擎在 _setup_life_services 才装配，调用时才解析）
+        self._emotion = EmotionServices(
+            self, sleep_gate_provider=lambda: getattr(self, "_sleep_engine", None))
 
         # 宿主人设（bot 配置）
         await self._refresh_persona()

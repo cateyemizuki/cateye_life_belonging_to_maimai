@@ -8,7 +8,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from core.llm_utils import purpose_task
 from core.storage import load_json, save_json_atomic
@@ -184,8 +184,13 @@ def _event_fingerprint(text: str) -> str:
 class EmotionService:
     """VAD 情绪系统的运行时载体（状态机 + 持久化 + 睡眠循环 + LLM 请求编排）。"""
 
-    def __init__(self, plugin: Any) -> None:
+    def __init__(self, plugin: Any,
+                 sleep_gate_provider: Optional[Callable[[], Any]] = None) -> None:
         self._plugin = plugin
+        # D1（2026-11-01 模块解耦计划）：睡眠引擎经显式注入的惰性提供者访问
+        # （core.contracts.SleepEngineGate 门面）；None = 回退旧 ``plugin._sleep_engine``
+        # 属性路径（行为逐字不变，测试桩与未接线场景不受影响）。
+        self._sleep_gate_provider = sleep_gate_provider
         self._ctx = plugin.ctx
         # 数据目录只在插件数据目录内（宿主隔离）；未接线场景绝不落宿主工作目录（插件中心评审阻断项）
         _raw_data_dir = getattr(plugin, "_data_dir", None)
@@ -1816,13 +1821,22 @@ class EmotionService:
         night_start, night_end = self._night_window(now)
         return night_start <= now < night_end
 
+    def _sleep_engine_handle(self) -> Any:
+        """D1：经注入提供者取睡眠引擎门面；未注入时回退旧属性路径（行为不变）。"""
+        if self._sleep_gate_provider is not None:
+            try:
+                return self._sleep_gate_provider()
+            except Exception:
+                return None
+        return getattr(self._plugin, "_sleep_engine", None)
+
     def _engine_asleep(self, now: datetime) -> Optional[bool]:
         """问睡眠引擎是否睡着（鸭子类型：plugin.sleep_asleep / engine.is_asleep）。
 
         Returns:
             True/False=引擎权威；None=引擎不表态（旧窗口路径）。
         """
-        engine = getattr(self._plugin, "_sleep_engine", None)
+        engine = self._sleep_engine_handle()
         getter = getattr(engine, "is_asleep", None)
         if not callable(getter):
             return None
@@ -1934,7 +1948,8 @@ class EmotionService:
             seg["confirmed_at"] = current
         # PR3（2026-10-26，定稿 §4.2.3）：夜间打扰同时喂给睡眠引擎的打断状态机
         # （只记账；确认清醒 ≥ 阈值才重置连续段，不新增 LLM/事件入口）
-        engine = getattr(self._plugin, "_sleep_engine", None)
+        # D1：引擎句柄经注入提供者取（未注入回退旧属性路径，行为不变）。
+        engine = self._sleep_engine_handle()
         note = getattr(engine, "note_interruption", None)
         if callable(note):
             try:

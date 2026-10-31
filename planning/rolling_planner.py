@@ -127,12 +127,12 @@ FOCUS_DEMAND: Dict[str, float] = {
 #: 注意力分档边界（A.3：≥0.85 高可中断；0.45~0.85 中可中断；<0.45 低可中断）
 ATTENTION_HIGH_INTERRUPTIBLE = 0.85
 ATTENTION_MID_INTERRUPTIBLE = 0.45
-#: 睡眠 episode 的 goal_type（与 schedule_items / _SKIP_TYPES 口径一致）
+#: 睡眠 episode 的 goal_type（与 schedule_items / schedule_query.SKIP_TYPES 口径一致）
 SLEEP_GOAL_TYPE = "sleep"
 #: 睡眠 episode 的可中断性（接近不可打断；A.3「开会/硬约定 0.05」同档）
 SLEEP_INTERRUPTIBILITY = 0.05
 
-#: 睡眠类型条目（与 schedule_query._SKIP_TYPES / schedule_items 夜间睡眠口径对齐）
+#: 睡眠类型条目（与 schedule_query.SKIP_TYPES / schedule_items 夜间睡眠口径对齐）
 _SKIP_SLEEP_TYPES = {SLEEP_GOAL_TYPE}
 
 # ── 随机事件池（附录 A.7 表逐条；模板 1 句描述、0 LLM）────────────────────

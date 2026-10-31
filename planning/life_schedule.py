@@ -16,7 +16,7 @@
 include_sleep 语义（**不可弄断的情绪链**）：
 
 - ``include_sleep=False``：跳过 sleep episode（与 ``planning/schedule_query.py`` 的
-  ``_SKIP_TYPES = {sleep}`` 完全一致）；
+  ``SKIP_TYPES = {sleep}`` 完全一致；D1 起为公开常量）；
 - ``include_sleep=True``：允许返回 sleep episode——``emotion/service.py``（约 :1430
   睡眠条目判定 / :2532 睡眠大修入口）与 ``qzone/service.py``（约 :450 睡眠发帖）的
   ``find_current_activity(..., include_sleep=True)`` 链依赖此语义，runtime provider
@@ -44,7 +44,7 @@ from .time_utils import (TimezoneManager, is_in_day_frame,
 
 logger = logging.getLogger(__name__)
 
-#: sleep 类型条目跳过集（与 schedule_query._SKIP_TYPES = {sleep} 对齐——口径注释，勿改语义）
+#: sleep 类型条目跳过集（与 schedule_query.SKIP_TYPES = {sleep} 对齐——口径注释，勿改语义）
 _SKIP_SLEEP_TYPES = {"sleep"}
 #: resume 恢复门槛（与 RollingPlanner §5.5/B.6.3 同口径）
 _RESUME_MIN_PROGRESS = 0.2
@@ -146,7 +146,7 @@ class LifeScheduleReadModel:
                 include_sleep: bool = False) -> Optional[Dict[str, Any]]:
         """当前活动（runtime 口径）；取不到/异常 → ``None``（调用方回退旧时间窗路径）。
 
-        ``include_sleep=False`` 跳过 sleep episode（对齐 ``schedule_query._SKIP_TYPES``）；
+        ``include_sleep=False`` 跳过 sleep episode（对齐 ``schedule_query.SKIP_TYPES``）；
         ``True`` 允许返回 sleep episode（emotion 睡眠大修 / qzone 睡眠发帖链依赖）。
         """
         try:
@@ -235,7 +235,7 @@ class LifeScheduleReadModel:
 
         def add(item: Dict[str, Any], tier: int) -> None:
             if self._is_sleep(item):
-                return  # 与 find_next_activities 的 _SKIP_TYPES 口径一致
+                return  # 与 find_next_activities 的 SKIP_TYPES 口径一致
             start = int(item.get("start_minute") or 0)
             merged.append((ring_minutes_ahead(start, cur), tier, item))
 

@@ -32,7 +32,9 @@ logger = logging.getLogger(__name__)
 # companion/components 以 _SCHEDULE_SKIP_TYPES 引用；runtime episode 视图的睡眠跳过
 # 语义见 life_schedule.include_sleep）。
 # A-21(a)（用户 2026-10-27 批）：夜间睡眠判定唯一真源 = schedule_items.is_night_sleep_item。
-_SKIP_TYPES = {"sleep"}
+# D1（2026-11-01 模块解耦计划）：转公开常量——原私有名 _SKIP_TYPES 被外部当契约
+# 引用（计划 §3.1 禁止私有符号跨模块），外部引用方 companion/components 已同步。
+SKIP_TYPES = {"sleep"}
 
 
 class ScheduleQuery:
