@@ -1,86 +1,185 @@
-/* 常驻麦麦：页面左下角 45° 冒头的互动角色。
-   两层结构：.maimai-peek-tilt 只管旋转/位移，.maimai-peek-art 只管按压缩放，
-   避免 transform 互相覆盖。参数由 life_dashboard 的 maimai 投影经 applyConfig
-   写入 CSS 变量；投影缺失时沿用同值兜底（不另造第二套默认语义）。 */
+/* 常驻麦麦：左下角桌宠状态机（2026-11-01 U 计划 §三）。
+   收起探头（原图朝右，展示层 rotate(-角度) 使头朝右上）→ 弹出（先向上弹起、
+   再下降落到左下角底部，带落地缓冲；落地时身体水平）→ 落地后接受捏捏（按下
+   从当前形态连续压扁、松开从实际压扁程度连续回弹）→ 指针远离交互区域自动收起。
+   分层：.maimai-peek-tilt 只管位移/旋转（状态机经 WAAPI 驱动），
+   .maimai-peek-art 只管按压缩放（连续形变，可取消接续，不读布局）。
+   参数由 life_dashboard 的 maimai 投影经 applyConfig 写入；投影缺失时沿用
+   同值兜底（不另造第二套默认语义）。 */
 const Mascot=(()=>{
  const button=$('maimai-peek');
- if(!button)return {applyConfig(){},setAway(){}};
+ if(!button)return {applyConfig(){},setDetailMode(){}};
+ const tilt=button.querySelector('.maimai-peek-tilt');
+ const art=button.querySelector('.maimai-peek-art');
  const DEFAULT_EASING='cubic-bezier(.34,1.56,.64,1)';
- let pressing=false,away=false;
+ // 运动常数：U 计划 §3.1 建议值（出场 450–650ms、收起延迟约 200ms），调试起点，非业务规则。
+ const EMERGE_MS=560,RETREAT_MS=320,RETREAT_DELAY_MS=200,PRESS_MS=90;
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const clamp=(v,low,high)=>Math.min(high,Math.max(low,v));
  const number=(block,key,fallback)=>{const v=block?block[key]:undefined;return typeof v==='number'&&Number.isFinite(v)?v:fallback};
  const easing=value=>typeof value==='string'&&value.trim()&&/^[\w\s.,%()+\-/]*$/.test(value)&&value.length<=80?value.trim():DEFAULT_EASING;
+ const cfg={angle:45,retreatPx:200,size:96,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
+ let state='peek';               // peek | emerging | landed | retreating
+ let pressing=false,detailMode=false,pendingRetreat=false,hoverArmed=true;
+ let retreatTimer=null,poseAnim=null,squashAnim=null;
+ let squash={sx:1,sy:1};         // 形变记账：JS 记当前值，避免每拍读布局
+ let squashFrames=[{sx:1,sy:1,offset:0},{sx:1,sy:1,offset:1}];
+ const peekTransform=()=>`rotate(${-cfg.angle}deg)`;
+ const setPoseClass=()=>button.classList.toggle('is-peek',state!=='landed');
+ // ---- 捏捏形变：全部 WAAPI；取消/接续都从 JS 记账的当前值出发（同帧接管，无跳帧、无布局读取） ----
+ const lerp=(a,b,t)=>a+(b-a)*t;
+ function currentSquash(){
+  if(!squashAnim)return squash;
+  const dur=squashAnim.effect.getTiming().duration;
+  const p=typeof dur==='number'&&dur>0?clamp((squashAnim.currentTime??0)/dur,0,1):1;
+  let i=1;while(i<squashFrames.length-1&&p>squashFrames[i].offset)i++;
+  const a=squashFrames[i-1],b=squashFrames[i];
+  const t=(b.offset??1)>(a.offset??0)?clamp((p-(a.offset??0))/((b.offset??1)-(a.offset??0)),0,1):1;
+  return {sx:lerp(a.sx,b.sx,t),sy:lerp(a.sy,b.sy,t)};
+ }
+ function startSquash(frames,duration,easingCurve){
+  squashAnim?.cancel();
+  squashFrames=frames;
+  squashAnim=art.animate(frames.map(f=>({transform:`scale(${f.sx}, ${f.sy})`,offset:f.offset})),
+                         {duration,easing:easingCurve});
+  squashAnim.onfinish=()=>{squashAnim=null};
+ }
+ function resetSquash(){squashAnim?.cancel();squashAnim=null;squash={sx:1,sy:1}}
+ // ---- 状态机：角落探头 → 弹出中 → 水平落地 →（捏捏/回弹）→ 收起中 → 角落探头 ----
+ function finishEmerge(){
+  poseAnim=null;state='landed';setPoseClass();
+  if(pendingRetreat){pendingRetreat=false;retreat()}
+ }
+ function emerge(){
+  if(state!=='peek')return;
+  clearTimeout(retreatTimer);retreatTimer=null;pendingRetreat=false;
+  state='emerging';setPoseClass();
+  resetSquash();
+  if(reduceMotion()){state='landed';setPoseClass();return}   // 减少动态：短暂稳定的姿态切换
+  poseAnim?.cancel();
+  poseAnim=tilt.animate([
+   {transform:`translate(0px, 0px) ${peekTransform()}`},
+   {transform:`translate(8px, -74px) rotate(${-cfg.angle*.3}deg)`,offset:.34},
+   {transform:'translate(2px, 8px) rotate(0deg)',offset:.62},
+   {transform:'translate(0px, -9px) rotate(0deg)',offset:.8},
+   {transform:'translate(0px, 0px) rotate(0deg)'}
+  ],{duration:EMERGE_MS,easing:'cubic-bezier(.3,.5,.3,1)'});
+  poseAnim.onfinish=finishEmerge;
+ }
+ function retreat(){
+  if(state==='peek'||state==='retreating')return;
+  clearTimeout(retreatTimer);retreatTimer=null;
+  if(state==='emerging'){pendingRetreat=true;return}         // 出场未完：结束后再次判断收起
+  state='retreating';setPoseClass();
+  releasePress(true);
+  if(reduceMotion()){state='peek';setPoseClass();return}
+  resetSquash();
+  poseAnim?.cancel();
+  poseAnim=tilt.animate([
+   {transform:'translate(0px, 0px) rotate(0deg)'},
+   {transform:`translate(-5px, 12px) rotate(${-cfg.angle*.45}deg)`,offset:.42},
+   {transform:`translate(0px, 0px) ${peekTransform()}`}
+  ],{duration:RETREAT_MS,easing:'cubic-bezier(.45,.1,.55,1)'});
+  poseAnim.onfinish=()=>{poseAnim=null;state='peek';setPoseClass()};
+ }
+ // ---- 自动收起：以左下角稳定交互区域判断（不随动画包围盒移动），进出阈值不同防抖 ----
+ const cornerDistance=(x,y)=>Math.hypot(x,y-innerHeight);
+ function evaluateRetreat(){
+  if(detailMode||pressing)return;                            // 固定详情/捏着中暂缓，结束后再判断
+  if(state!=='landed'){clearTimeout(retreatTimer);retreatTimer=null;return}
+  const d=cornerDistance(lastPointer.x,lastPointer.y);
+  if(d>cfg.retreatPx&&!retreatTimer)retreatTimer=setTimeout(retreat,RETREAT_DELAY_MS);
+  else if(d<=cfg.retreatPx*.75&&retreatTimer){clearTimeout(retreatTimer);retreatTimer=null}
+ }
+ let lastPointer={x:-1,y:-1};
+ if(matchMedia('(hover:hover) and (pointer:fine)').matches){
+  // 精确指针：指向露出的麦麦（距角落小于触发半径）弹出；进入/退出用不同半径防抖。
+  document.addEventListener('pointermove',e=>{
+   if(e.pointerType!=='mouse'||detailMode)return;
+   lastPointer={x:e.clientX,y:e.clientY};
+   const d=cornerDistance(e.clientX,e.clientY);
+   if(d>=cfg.size*1.7)hoverArmed=true;
+   if(state==='peek'){
+    if(hoverArmed&&d<cfg.size*1.5){hoverArmed=false;emerge()}
+   }else evaluateRetreat();
+  },{passive:true});
+ }
+ // 触屏无悬停：点空白收起（弹出/捏捏由按钮自身 pointerdown 承担）。
+ document.addEventListener('pointerdown',e=>{
+  if(e.pointerType!=='touch'||detailMode||state!=='landed'||button.contains(e.target))return;
+  retreat();
+ },{passive:true});
+ window.addEventListener('blur',()=>releasePress(true));     // 窗口失焦：不永久压扁
+ document.addEventListener('visibilitychange',()=>{if(document.hidden)releasePress(true)});
+ // ---- 捏捏 ----
+ function releasePress(silent){
+  if(!pressing)return;
+  pressing=false;
+  button.setAttribute('aria-pressed','false');
+  if(silent){resetSquash();return}                           // 取消/失焦：直接回位，不回弹
+  if(reduceMotion()){squash={sx:1,sy:1};return}
+  const cur=currentSquash();
+  squashFrames=[
+   {sx:cur.sx,sy:cur.sy,offset:0},
+   {sx:Math.max(.88,cur.sx*.94),sy:Math.min(1.3,cur.sy+.55*(1-cur.sy)),offset:.2},
+   {sx:Math.min(1.06,cur.sx+.3*(1.06-cur.sx)),sy:Math.max(.9,cur.sy-.4*(cur.sy-.9)),offset:.48},
+   {sx:1.02,sy:.98,offset:.74},
+   {sx:1,sy:1,offset:1}];
+  startSquash(squashFrames,cfg.bounceMs,cfg.bounceEasing);   // 从实际压扁程度连续回弹
+  squash={sx:1,sy:1};
+ }
+ button.addEventListener('pointerdown',e=>{
+  if(e.button===2||detailMode)return;
+  if(state==='peek'){emerge();return}                        // 触屏/点按探头：先弹出落地
+  if(state!=='landed')return;                                // 出场/收起中不让按压覆盖轨迹
+  pressing=true;
+  try{button.setPointerCapture(e.pointerId)}catch{}
+  button.setAttribute('aria-pressed','true');
+  const cur=currentSquash();
+  squashFrames=[{sx:cur.sx,sy:cur.sy,offset:0},{sx:cfg.squashX,sy:cfg.squashY,offset:1}];
+  startSquash(squashFrames,PRESS_MS,'ease-out');             // 从当前形态连续压扁
+  squash={sx:cfg.squashX,sy:cfg.squashY};
+ });
+ button.addEventListener('pointerup',()=>releasePress(false));
+ button.addEventListener('pointercancel',()=>releasePress(true));
+ button.addEventListener('lostpointercapture',()=>releasePress(true));
+ // 键盘激活（Enter/Space）：探头=弹出落地，落地=一次回弹；鼠标 click 跟在 pointerup 后，用 detail 区分。
+ function playBounce(){
+  if(state!=='landed'||reduceMotion())return;
+  squashFrames=[{sx:1,sy:1,offset:0},{sx:cfg.squashX*.92,sy:cfg.squashY,offset:.3},{sx:1,sy:1,offset:1}];
+  startSquash(squashFrames,Math.min(cfg.bounceMs,620),'ease-in-out');
+  squash={sx:1,sy:1};
+ }
+ button.addEventListener('click',e=>{if(e.detail===0&&!detailMode){state==='peek'?emerge():playBounce()}});
+ // ---- 详情气泡期间：桌宠保持可见清晰，只暂停捏捏输入（不再透明消失，避免双交互争指针） ----
+ function setDetailMode(on){
+  detailMode=on;
+  button.classList.toggle('is-above',on);
+  if(on){
+   releasePress(true);
+   clearTimeout(retreatTimer);retreatTimer=null;
+  }else evaluateRetreat();
+ }
  function applyConfig(block){
   const off=block?block.enabled===false:false;
   button.hidden=off;
   if(off)return;
+  cfg.angle=clamp(number(block,'peek_angle_deg',45),0,90);
+  cfg.retreatPx=clamp(number(block,'hover_out_px',200),60,320);
+  cfg.size=clamp(number(block,'mascot_size_px',96),48,160);
+  cfg.squashX=clamp(number(block,'press_squash_x',1.2),0.8,1.6);
+  cfg.squashY=clamp(number(block,'press_squash_y',0.5),0.2,1);
+  cfg.bounceMs=clamp(number(block,'bounce_ms',774),200,3000);
+  cfg.bounceEasing=easing(block?block.bounce_easing:undefined);
   const style=button.style;
-  style.setProperty('--maimai-mascot-size',clamp(number(block,'mascot_size_px',96),48,160)+'px');
-  style.setProperty('--maimai-peek-angle',clamp(number(block,'peek_angle_deg',45),0,90)+'deg');
-  style.setProperty('--maimai-hover-out',clamp(number(block,'hover_out_px',120),0,240)+'px');
-  style.setProperty('--maimai-hover-ms',clamp(number(block,'hover_out_ms',240),80,600)+'ms');
-  style.setProperty('--maimai-squash-x',clamp(number(block,'press_squash_x',1.2),0.8,1.6));
-  style.setProperty('--maimai-squash-y',clamp(number(block,'press_squash_y',0.5),0.2,1));
-  style.setProperty('--maimai-bounce-ms',clamp(number(block,'bounce_ms',774),200,3000)+'ms');
-  style.setProperty('--maimai-bounce-easing',easing(block?block.bounce_easing:undefined));
+  style.setProperty('--maimai-mascot-size',cfg.size+'px');
+  style.setProperty('--maimai-peek-angle',cfg.angle+'deg');
   const root=document.documentElement.style;
-  root.setProperty('--maimai-detail-blur',clamp(number(block,'detail_blur_px',16),0,40)+'px');
+  root.setProperty('--maimai-detail-blur',clamp(number(block,'detail_blur_px',3),0,40)+'px');
   root.setProperty('--maimai-detail-fade-ms',clamp(number(block,'detail_fade_ms',220),80,600)+'ms');
-  root.setProperty('--maimai-detail-scale',String(clamp(number(block,'detail_scale_from',0.96),0.8,1)));
-  root.setProperty('--maimai-detail-fish-size',clamp(number(block,'detail_fish_size_px',56),32,96)+'px');
+  root.setProperty('--maimai-detail-scale',String(clamp(number(block,'detail_scale_from',0.6),0.4,1)));
+  setPoseClass();
  }
- function playBounce(){
-  if(reduceMotion())return;
-  button.classList.remove('is-bouncing');
-  void button.offsetWidth;
-  button.classList.add('is-bouncing');
- }
- button.addEventListener('animationend',e=>{if(e.animationName==='maimai-peek-bounce')button.classList.remove('is-bouncing')});
- button.addEventListener('pointerdown',e=>{
-  if(e.button===2||away)return;
-  pressing=true;
-  try{button.setPointerCapture(e.pointerId)}catch{}
-  button.classList.add('is-pressed');
-  button.setAttribute('aria-pressed','true');
- });
- const release=()=>{
-  if(!pressing)return;
-  pressing=false;
-  button.classList.remove('is-pressed');
-  button.setAttribute('aria-pressed','false');
-  playBounce();
- };
- button.addEventListener('pointerup',release);
- const abort=()=>{if(!pressing)return;pressing=false;button.classList.remove('is-pressed');button.setAttribute('aria-pressed','false')};
- button.addEventListener('pointercancel',abort);
- button.addEventListener('lostpointercapture',abort);
- // 键盘激活（Enter/Space）只触发一次回弹；鼠标 click 跟在 pointerup 后，用 detail 区分。
- button.addEventListener('click',e=>{if(e.detail===0&&!away)playBounce()});
- if(matchMedia('(hover:hover) and (pointer:fine)').matches){
-  // 精确指针设备：is-out 由指针位置推导，而不是 enter/leave 事件对。
-  // 「跳出」会把图移出指针下方，enter→leave 会立刻回缩并抖动；位置推导天然稳定。
-  document.addEventListener('pointermove',e=>{
-   if(e.pointerType==='touch'||away)return;
-   const r=button.getBoundingClientRect();
-   const reach=parseFloat(getComputedStyle(button).getPropertyValue('--maimai-hover-out'))||120;
-   const inside=e.clientX>=r.left-40&&e.clientX<=r.right+reach
-             &&e.clientY>=r.top-reach&&e.clientY<=r.bottom+40;
-   button.classList.toggle('is-out',inside&&!pressing);
-  },{passive:true});
- }
- function setAway(state){
-  away=state;
-  button.classList.toggle('is-away',state);
-  if(state){
-   if(pressing){pressing=false;button.classList.remove('is-pressed');button.setAttribute('aria-pressed','false')}
-   button.setAttribute('aria-hidden','true');
-   button.tabIndex=-1;
-   button.classList.remove('is-out');
-  }else{
-   button.removeAttribute('aria-hidden');
-   button.tabIndex=0;
-  }
- }
- return {applyConfig,setAway};
+ setPoseClass();
+ return {applyConfig,setDetailMode};
 })();

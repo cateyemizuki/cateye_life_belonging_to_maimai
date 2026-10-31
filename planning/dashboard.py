@@ -466,15 +466,16 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
 _MAIMAI_PROJECTION: dict[str, tuple[type, Any, float, float]] = {
     'mascot_size_px': (int, 96, 48, 160),
     'peek_angle_deg': (int, 45, 0, 90),
-    'hover_out_px': (int, 120, 0, 240),
+    # 2026-11-01 U 计划：hover_out_* 语义改为「远离左下角交互区域的收起阈值/时长」；
+    # detail_fish_size_px 随「入口搬标题栏」退役（键已从配置模型清退）。
+    'hover_out_px': (int, 200, 60, 320),
     'hover_out_ms': (int, 240, 80, 600),
     'press_squash_x': (float, 1.20, 0.8, 1.6),
     'press_squash_y': (float, 0.50, 0.2, 1.0),
     'bounce_ms': (int, 774, 200, 3000),
-    'detail_blur_px': (int, 16, 0, 40),
+    'detail_blur_px': (int, 3, 0, 40),
     'detail_fade_ms': (int, 220, 80, 600),
-    'detail_scale_from': (float, 0.96, 0.8, 1.0),
-    'detail_fish_size_px': (int, 56, 32, 96),
+    'detail_scale_from': (float, 0.6, 0.4, 1.0),
     'history_changes_limit': (int, 30, 5, 30),
     'history_state_epsilon': (float, 0.01, 0.001, 0.1),
     'history_debt_epsilon': (float, 0.1, 0.01, 1.0),

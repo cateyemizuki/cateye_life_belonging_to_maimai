@@ -1,5 +1,9 @@
-/* Fullscreen details layer: bottom-left entries activate one modal per section;
-   the trigger button moves into the panel header and back on close.
+/* Fullscreen details layer (2026-11-01 U plan §4): each entry expands a sticky
+   bubble anchored at that entry — hover previews (no focus steal), click pins,
+   click again unpins, another entry switches. The entry never moves: the same
+   element is lifted above the backdrop in place (a placeholder keeps its
+   coordinates), and the panel opens/closes from the entry's origin with a
+   curved tail tying the bubble to the entry.
    Legacy render targets are moved, never copied. Internal names kept on purpose. */
 function fullClock(value){
  if(!value||!/^\d{4}-\d{2}-\d{2}/.test(String(value))||!date(value))return '暂无完整时间';
@@ -12,8 +16,12 @@ const SectionFish=(()=>{
  const panel=el('div','fish-panel');
  const heading=el('div','fish-popup-heading'),title=el('h2','','详情'),closeButton=el('button','fish-close','关闭');title.id='fish-popup-title';closeButton.type='button';closeButton.setAttribute('aria-label','关闭详情');closeButton.onclick=()=>close(true);heading.append(title,closeButton);
  const body=el('div','fish-popup-body'),summary=el('p','fish-popup-summary'),metadata=el('div','fish-metadata'),details=el('div','fish-records');body.append(summary,metadata,details);panel.append(heading,body);overlay.append(panel);document.body.append(overlay);
- let current=null,lastTrigger=null,closeTimer=null;
+ let current=null,lastTrigger=null,closeTimer=null,hoverTimer=null,pinnedOpen=false,floatSyncQueued=false;
  const entries=new Map();
+ // 粘连气泡尾：从入口画一条曲线连到面板最近边；入口与面板重叠（窄屏）时隐藏，
+ // 先保证面板内容、关闭按钮与入口可达（U 计划 §4.2）。
+ const FISH_NS='http://www.w3.org/2000/svg';
+ const tail=document.createElementNS(FISH_NS,'svg');tail.classList.add('fish-tail');tail.setAttribute('aria-hidden','true');tail.hidden=true;overlay.append(tail);
  let changesCache={src:null,key:'',items:[]};
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const finishMs=()=>{const raw=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--maimai-detail-fade-ms'));return Number.isFinite(raw)&&raw>0?raw:220};
@@ -110,45 +118,119 @@ const SectionFish=(()=>{
   }));
  }
  function redraw(){requestAnimationFrame(()=>{if(data){drawHistory();renderSleep();renderModules()}})}
- function restoreButton(entry){if(entry?.marker){entry.marker.replaceWith(entry.button);entry.marker=null;entry.button.classList.remove('fish-in-heading')}}
- function moveButtonIntoHeading(entry){if(entry.marker)return;entry.marker=document.createComment('fish-button-home');entry.button.replaceWith(entry.marker);entry.button.classList.add('fish-in-heading');heading.insertBefore(entry.button,closeButton)}
+ // 入口原位保留 + 提升到清晰交互层（U 计划 §4.2）：卡片自带 backdrop-filter 层叠
+ // 上下文，单靠 z-index 升不到遮罩之上——portal **同一个元素**，占位标记保持原屏幕
+ // 坐标（绝对定位按钮不参与布局流，视觉不搬家），关闭时原位归还。
+ function unfloatEntry(entry){
+  if(!entry?.floated)return;
+  entry.floated=false;
+  entry.button.classList.remove('fish-float');
+  entry.button.style.cssText='';
+  entry.home.replaceWith(entry.button);
+  entry.home=null;
+ }
+ function floatEntry(entry){
+  if(entry.floated)return;
+  entry.home=el('span','section-fish-button fish-peek-home');
+  entry.home.setAttribute('aria-hidden','true');
+  entry.button.replaceWith(entry.home);
+  document.body.append(entry.button);
+  entry.button.classList.add('fish-float');
+  entry.floated=true;
+  syncFloat(entry);
+ }
+ function syncFloat(entry){
+  if(!entry?.floated||!entry.home)return;
+  const r=entry.home.getBoundingClientRect(),b=entry.button;
+  b.style.left=r.left+'px';b.style.top=r.top+'px';
+  b.style.width=r.width+'px';b.style.height=r.height+'px';b.style.bottom='auto';
+ }
+ function drawTail(){
+  if(!current){tail.hidden=true;return}
+  const b=current.button.getBoundingClientRect(),p=panel.getBoundingClientRect();
+  if(!(b.right<p.left||b.left>p.right||b.bottom<p.top||b.top>p.bottom)){tail.hidden=true;return}
+  const bx=b.left+b.width/2,by=b.top+b.height/2;
+  const cands=[
+   {x:Math.min(Math.max(bx,p.left+28),p.right-28),y:p.top},
+   {x:Math.min(Math.max(bx,p.left+28),p.right-28),y:p.bottom},
+   {x:p.left,y:Math.min(Math.max(by,p.top+28),p.bottom-28)},
+   {x:p.right,y:Math.min(Math.max(by,p.top+28),p.bottom-28)}];
+  let best=cands[0],bd=Infinity;
+  for(const c of cands){const d=Math.hypot(c.x-bx,c.y-by);if(d<bd){bd=d;best=c}}
+  const dx=best.x-bx,dy=best.y-by;
+  const path=document.createElementNS(FISH_NS,'path');
+  path.setAttribute('d',`M ${bx} ${by} C ${bx+dx*.3-dy*.18} ${by+dy*.3+dx*.18}, ${bx+dx*.7+dy*.18} ${by+dy*.7-dx*.18}, ${best.x} ${best.y}`);
+  const dot=document.createElementNS(FISH_NS,'circle');
+  dot.setAttribute('cx',best.x);dot.setAttribute('cy',best.y);dot.setAttribute('r','3.5');
+  tail.setAttribute('viewBox',`0 0 ${innerWidth} ${innerHeight}`);
+  tail.setAttribute('width',innerWidth);tail.setAttribute('height',innerHeight);
+  tail.replaceChildren(path,dot);
+  tail.hidden=bd<12;
+ }
+ // 滚动/缩放/旋转后重新校准（测量节流到每帧一次，不逐帧全页布局）。
+ const recalibrate=()=>{
+  if(floatSyncQueued||!current)return;
+  floatSyncQueued=true;
+  requestAnimationFrame(()=>{floatSyncQueued=false;if(!current)return;syncFloat(current);drawTail()});
+ };
+ window.addEventListener('scroll',recalibrate,{passive:true,capture:true});
  function close(restoreFocus=true){
   if(!current)return;
-  const old=current;current=null;
-  clearTimeout(closeTimer);
-  restoreButton(old);old.element.classList.remove('fish-open');old.button.setAttribute('aria-expanded','false');
+  const old=current,wasPinned=pinnedOpen;current=null;pinnedOpen=false;
+  clearTimeout(closeTimer);clearTimeout(hoverTimer);
+  unfloatEntry(old);old.element.classList.remove('fish-open');old.button.setAttribute('aria-expanded','false');
   for(const group of old.groups)store.append(group);
+  tail.hidden=true;panel.style.transformOrigin='';
   const finish=()=>{
-   overlay.hidden=true;overlay.classList.remove('is-open','is-closing');overlay.removeAttribute('data-section');
+   overlay.hidden=true;overlay.classList.remove('is-open','is-closing');overlay.removeAttribute('data-section');delete overlay.dataset.align;
    document.body.classList.remove('fish-locked');
-   if(typeof Mascot!=='undefined')Mascot.setAway(false);
-   if(restoreFocus&&lastTrigger)lastTrigger.focus({preventScroll:true});
+   if(typeof Mascot!=='undefined')Mascot.setDetailMode(false);
+   if(restoreFocus&&wasPinned&&lastTrigger)lastTrigger.focus({preventScroll:true});
   };
   if(reduceMotion()){finish();return}
   overlay.classList.remove('is-open');overlay.classList.add('is-closing');
   closeTimer=setTimeout(finish,finishMs()+40);
  }
- function open(entry){
-  if(current===entry)return;
+ // 以本次入口为原点计算面板位置/缩放原点：入口在视口上部→面板贴底，下部→贴顶，
+ // 其余居中；连接边/气泡尾随后按实际位置绘制（U 计划 §4.2）。
+ function placePanel(entry){
+  const b=entry.button.getBoundingClientRect(),vh=innerHeight;
+  const ratio=(b.top+b.height/2)/vh;
+  overlay.dataset.align=ratio<.38?'bottom':ratio>.62?'top':'center';
+  const p=panel.getBoundingClientRect();
+  panel.style.transformOrigin=
+   `${Math.min(Math.max(b.left+b.width/2-p.left,0),p.width)}px ${Math.min(Math.max(b.top+b.height/2-p.top,0),p.height)}px`;
+ }
+ function pin(){
+  if(!current||pinnedOpen)return;
+  pinnedOpen=true;
+  document.body.classList.add('fish-locked');           // 固定后才启用滚动锁
+  closeButton.focus({preventScroll:true});
+ }
+ function open(entry,pinned=false){
+  if(current===entry){if(pinned)pin();return}
   if(current)close(false);
-  clearTimeout(closeTimer);overlay.classList.remove('is-closing');
-  current=entry;lastTrigger=entry.button;
+  clearTimeout(closeTimer);clearTimeout(hoverTimer);overlay.classList.remove('is-closing');
+  current=entry;lastTrigger=entry.button;pinnedOpen=pinned;
   for(const group of entry.groups){group.open=false;details.append(group)}
-  moveButtonIntoHeading(entry);
+  floatEntry(entry);
   overlay.hidden=false;overlay.dataset.section=entry.key;
+  placePanel(entry);
   void overlay.offsetWidth;
   overlay.classList.add('is-open');
   entry.element.classList.add('fish-open');entry.button.setAttribute('aria-expanded','true');
-  document.body.classList.add('fish-locked');
-  if(typeof Mascot!=='undefined')Mascot.setAway(true);
+  if(pinned)document.body.classList.add('fish-locked');
+  if(typeof Mascot!=='undefined')Mascot.setDetailMode(true);
   refresh();
   redraw();
-  closeButton.focus({preventScroll:true});
+  drawTail();
+  if(pinned)closeButton.focus({preventScroll:true});    // 悬停预览不抢键盘焦点
  }
  // Recover focus even if a refresh or host shortcut moved it outside the
  // overlay; listening only on the overlay misses that keyboard event.
+ // 固定态才启用焦点陷阱；悬停预览不抢焦点、不锁页面（U 计划 §4.1）。
  document.addEventListener('keydown',e=>{
-  if(e.key!=='Tab'||!current)return;
+  if(e.key!=='Tab'||!current||!pinnedOpen)return;
   const focusables=[...panel.querySelectorAll('button,summary,input,textarea,select,[href],[tabindex]:not([tabindex="-1"])')].filter(node=>!node.disabled&&node.tabIndex>=0&&node.getClientRects().length);
   if(!focusables.length)return;
   const first=focusables[0],last=focusables[focusables.length-1];
@@ -156,17 +238,34 @@ const SectionFish=(()=>{
   else if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus({preventScroll:true})}
   else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus({preventScroll:true})}
  });
- document.addEventListener('keydown',e=>{if(e.key==='Escape'&&current){e.preventDefault();close(true)}});
+ document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape'||!current)return;
+  // Esc 优先关说明 tooltip（U 计划 §4.1）：说明还开着就不收详情。
+  const tip=document.querySelector('.info-tooltip:not([hidden])');
+  if(tip){
+   const infoButton=tip.parentElement?.querySelector('.info-button');
+   if(infoButton)infoButton.setAttribute('aria-expanded','false');
+   tip.hidden=true;
+   e.preventDefault();
+   return;
+  }
+  e.preventDefault();close(true);
+ });
  overlay.addEventListener('pointerdown',e=>{if(e.target===overlay)e.preventDefault()});
  overlay.addEventListener('click',e=>{if(e.target===overlay)close(true)});
  overlay.addEventListener('toggle',e=>{if(e.target.tagName==='DETAILS'&&e.target.open)redraw()},true);
- window.addEventListener('resize',()=>{if(current)redraw()});
+ // 从小麦麦移到气泡正文保持展开；离开连接区域与气泡才延迟收起（未固定时）。
+ const previewCloseDelay=()=>{clearTimeout(hoverTimer);hoverTimer=setTimeout(()=>{if(current&&!pinnedOpen)close(false)},160)};
+ panel.addEventListener('pointerenter',()=>clearTimeout(hoverTimer));
+ panel.addEventListener('pointerleave',()=>{if(current&&!pinnedOpen)previewCloseDelay()});
+ window.addEventListener('resize',()=>{recalibrate();if(current)redraw()});
  function metadataRow(label,value,explanation){const row=el('div','fish-meta-row'),caption=el('span','note',label);if(explanation)caption.append(infoTip(explanation));row.append(caption,el('span','',value??'暂无记录'));return row}
  function refresh(){if(!current)return;const e=current,d=data||{};title.textContent=e.title+'详情';summary.textContent=e.summary(d);
   const rows=[['更新时间',d.generated_at?clock(d.generated_at,true):'暂无记录',fullClock(d.generated_at)],['数据来源',imported?'导入快照':'生活引擎实时记录',''],...(e.meta?.(d)||[])];
   // Reconcile in place: a timer refresh must not remove the focused explanation.
   rows.forEach(([label,value,explanation],i)=>{let row=metadata.children[i];if(!row){row=metadataRow(label,value,explanation);metadata.append(row)}else{row.firstElementChild.firstChild.textContent=label;row.lastElementChild.textContent=value??'暂无记录';const tip=row.querySelector('.info-tooltip');if(tip)tip.textContent=explanation||'暂无说明'}});while(metadata.children.length>rows.length)metadata.lastElementChild.remove();
   renderChanges(e);
+  drawTail();
  }
  function fold(label,nodes){const list=nodes.filter(Boolean);if(!list.length)return null;let group;
   if(list.length===1&&list[0].tagName==='DETAILS'){group=list[0];group.open=false}
@@ -178,9 +277,36 @@ const SectionFish=(()=>{
   const kind=CHANGES_KIND[key];
   let changesList=null;
   if(kind){const changesGroup=el('details','fish-fold fish-changes');changesList=el('ul','fish-changelist');changesGroup.append(el('summary','','最近变化'),changesList);store.append(changesGroup);allGroups.push(changesGroup)}
-  entries.set(key,{key,title:titleText,element,content,button,summary:summaryFn,meta:metaFn,groups:allGroups,changesKind:kind,changesList,marker:null});
-  // 只有点击/Enter/Space 显式激活全屏详情；hover 与普通聚焦不再打开。再次点击同一入口 = 关闭。
-  button.onclick=()=>{const entry=entries.get(key);entry===current?close(true):open(entry)};
+  entries.set(key,{key,title:titleText,element,content,button,summary:summaryFn,meta:metaFn,groups:allGroups,changesKind:kind,changesList,marker:null,floated:false,home:null});
+  // 语义（U 计划 §4.1）：hover 临时预览（不抢焦点/不锁滚动）→ 移入气泡保持 → 点击固定
+  // → 再点同入口取消固定并收起 → 点另一入口关闭旧并固定新。触屏/键盘激活=直接打开固定。
+  const entry=entries.get(key);
+  button.onclick=()=>{
+   if(current===entry){pinnedOpen?close(true):pin()}
+   else open(entry,true)};
+  if(matchMedia('(hover:hover) and (pointer:fine)').matches){
+   // 武装位：只有「真实离开入口」后才允许 hover 重新打开。portal/回流引发的伪
+   // 进入/伪离开（DOM 变更后 Chrome 重算 hover）不打开、不收起、不重新武装——
+   // 否则取消固定后的关闭会被指针停留处的伪 enter 立即重新打开。
+   entry._canHoverOpen=true;
+   button.addEventListener('pointerenter',e=>{
+    if(e.pointerType!=='mouse')return;
+    clearTimeout(hoverTimer);
+    if(overlay.classList.contains('is-closing')||!entry._canHoverOpen)return;
+    if(current!==entry){entry._canHoverOpen=false;open(entry,false)}
+   });
+   button.addEventListener('pointerleave',e=>{
+    if(e.pointerType!=='mouse')return;
+    const x=e.clientX,y=e.clientY;
+    const r=entry.button.getBoundingClientRect();
+    if(x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom)return;   // 伪离开（坐标仍在入口内）
+    if(current===entry&&!pinnedOpen){
+     clearTimeout(hoverTimer);
+     hoverTimer=setTimeout(()=>{if(current===entry&&!pinnedOpen)close(false)},160);
+    }
+    entry._canHoverOpen=true;                                  // 真实离开：重新武装
+   });
+  }
  }
  const safeTime=(value)=>value?clock(value,true):'暂无记录';
  mount('current','当前活动',$('hero-scene'),d=>d.schedule?.current?.name||'暂无正在进行的活动',d=>[['活动来源',source(d.schedule?.current?.source),'只显示实际处于进行状态的活动，计划意图不等于已发生。'],['状态时间',safeTime(d.state?.updated_at),fullClock(d.state?.updated_at)]]);

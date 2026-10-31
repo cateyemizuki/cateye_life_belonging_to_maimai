@@ -40,30 +40,31 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('data:im
 
 .info-wrap{display:inline-flex;position:relative;vertical-align:middle;margin-left:4px}.info-button{font:italic 11px/1 Georgia,serif;border-radius:50%;min-height:22px;min-width:22px;width:22px;height:22px;padding:0;color:var(--maibot-muted);background:var(--maibot-surface)}.info-tooltip{position:absolute;right:0;top:27px;z-index:40;width:max-content;max-width:min(280px,80vw);white-space:normal;background:var(--maibot-surface);color:var(--maibot-foreground);border:1px solid var(--maibot-border);box-shadow:0 5px 20px #0002;border-radius:8px;padding:9px 11px;font-size:11px;font-style:normal;text-align:left;line-height:1.7}
 
-/* 常驻麦麦：固定在 viewport 左下角，45° 冒头；z-index 低于详情遮罩(900)、高于页面内容。
-   位移/旋转在 .maimai-peek-tilt 上，按压缩放在 .maimai-peek-art 上，互不覆盖。
+/* 常驻麦麦：左下角桌宠状态机（2026-11-01 U 计划 §三）。收起探头姿态由 .is-peek 呈现
+   （展示层 rotate(-角度)，使原图朝右的麦麦头朝右上而非偏向右下）；弹出/落地/收起轨迹
+   由 WAAPI 驱动 .maimai-peek-tilt（maimai.js 状态机），按压缩放由 WAAPI 驱动
+   .maimai-peek-art（连续形变，可取消接续）。
    按钮本体 pointer-events:none（透明方块不吃页面点击），命中区跟随旋转后的图本体。 */
-.maimai-peek{position:fixed;left:0;bottom:0;z-index:600;width:var(--maimai-mascot-size,96px);height:var(--maimai-mascot-size,96px);border:0;background:transparent!important;padding:0;overflow:visible;line-height:0;cursor:pointer;transition:opacity var(--maimai-hover-ms,240ms) ease;pointer-events:none}
+.maimai-peek{position:fixed;left:0;bottom:0;z-index:600;width:var(--maimai-mascot-size,96px);height:var(--maimai-mascot-size,96px);border:0;background:transparent!important;padding:0;overflow:visible;line-height:0;cursor:pointer;pointer-events:none}
 .maimai-peek:hover{background:transparent}
 .maimai-peek:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:-3px;border-radius:14px}
-.maimai-peek[aria-hidden=true]{pointer-events:none}
-.maimai-peek.is-away{opacity:0}
-.maimai-peek-tilt{position:absolute;inset:0;display:block;transform:rotate(var(--maimai-peek-angle,45deg));transform-origin:0 100%;transition:transform var(--maimai-hover-ms,240ms) cubic-bezier(.2,.7,.3,1)}
-.maimai-peek.is-out .maimai-peek-tilt{transform:translate(calc(var(--maimai-hover-out,120px)*.707),calc(var(--maimai-hover-out,120px)*-.707)) rotate(0deg)}
-.maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,96px);height:auto;display:block;transform-origin:50% 100%;transition:transform 130ms ease;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
-.maimai-peek.is-pressed .maimai-peek-art{transform:scale(var(--maimai-squash-x,1.2),var(--maimai-squash-y,.5));transition-duration:80ms}
-.maimai-peek.is-bouncing .maimai-peek-art{animation:maimai-peek-bounce var(--maimai-bounce-ms,774ms) var(--maimai-bounce-easing,cubic-bezier(.34,1.56,.64,1))}
-@keyframes maimai-peek-bounce{0%{transform:scale(var(--maimai-squash-x,1.2),var(--maimai-squash-y,.5))}45%{transform:scale(.92,1.12)}70%{transform:scale(1.05,.95)}100%{transform:scale(1,1)}}
+/* 详情气泡期间：桌宠抬到遮罩之上保持姿态与轮廓清晰可辨（输入由 maimai.js 暂停）。 */
+.maimai-peek.is-above{z-index:950}
+.maimai-peek-tilt{position:absolute;inset:0;display:block;transform-origin:0 100%;will-change:transform}
+.maimai-peek.is-peek .maimai-peek-tilt{transform:rotate(calc(var(--maimai-peek-angle,45deg)*-1))}
+.maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,96px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
 @media(max-width:700px){.maimai-peek{--maimai-mascot-size:64px!important;bottom:calc(102px + env(safe-area-inset-bottom))}}
 
-/* Fullscreen detail layer: entries sit bottom-left, activation opens one overlay per panel;
-   the backdrop blurs the page, only the panel and its own trigger button stay clear. */
+/* Fullscreen detail layer (2026-11-01 U plan): entries stay in place and lift above the
+   backdrop; the backdrop keeps a light blur (2–4px) with a low-strength veil, and a curved
+   tail ties the bubble to its entry. Only the panel and its entry stay clear. */
 .fish-section{position:relative;overflow:visible!important}.fish-content{min-width:0}.fish-section .fish-content{isolation:isolate;padding-bottom:8px}
 .section-fish-button{position:absolute;left:18px;bottom:-17px;z-index:6;min-width:48px;width:48px;min-height:36px;height:36px;padding:0;border:0;background:transparent!important;border-radius:14px;overflow:visible;line-height:0;cursor:pointer}
 .section-fish-button:hover{background:transparent}
 .fish-peek{display:block;width:44px;height:27px;margin:5px auto 0;overflow:hidden}
-.fish-peek>svg{display:block;width:44px;height:auto;transform:translateY(4px);transform-origin:50% 80%;transition:transform 210ms ease}
-.section-fish-button:hover .fish-peek>svg,.section-fish-button:focus-visible .fish-peek>svg{transform:translateY(-1px) scale(1.07)}
+/* U 计划 §2：原图朝右 → rotate(-45deg) 使头朝右上，从剪出窗里探头（非任意整图旋转）。 */
+.fish-peek>svg{display:block;width:44px;height:auto;transform:rotate(-45deg);transform-origin:50% 55%;transition:transform 210ms ease}
+.section-fish-button:hover .fish-peek>svg,.section-fish-button:focus-visible .fish-peek>svg{transform:rotate(-45deg) translateY(-2px) scale(1.07)}
 .section-fish-button:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:3px}
 .fish-section.card>.fish-content{border-radius:inherit}
 .fish-section[data-fish-section=state]{margin-top:18px;margin-bottom:14px}
@@ -76,17 +77,20 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('data:im
 .health.fish-section{padding:18px 20px}
 .health.fish-section .cardtop{margin-bottom:8px}
 .health.fish-section p{margin:0}
-/* Overlay: fixed viewport layer; blur lives on ::before so the panel above stays sharp. */
+/* Overlay: fixed viewport layer; light blur + low-strength veil on ::before (U §4.3:
+   2–4px 建议、遮罩低强度，不隐藏背景；无 backdrop-filter 时降级为可辨认的轻遮罩)。 */
 body.fish-locked{overflow:hidden}
 .fish-overlay{position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;padding:clamp(12px,4vw,32px);opacity:0;transition:opacity var(--maimai-detail-fade-ms,220ms) ease}
+.fish-overlay[data-align=top]{align-items:flex-start}
+.fish-overlay[data-align=bottom]{align-items:flex-end}
 .fish-overlay.is-open{opacity:1}
 .fish-overlay.is-closing{opacity:0}
-.fish-overlay:before{content:"";position:absolute;inset:0;z-index:0;background:rgba(242,245,239,.55);backdrop-filter:blur(var(--maimai-detail-blur,16px));-webkit-backdrop-filter:blur(var(--maimai-detail-blur,16px))}
-[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.6)}
-@supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.94)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.94)}}
-.fish-panel{position:relative;z-index:1;display:flex;flex-direction:column;width:min(1040px,100%);max-height:90vh;border:1px solid var(--maibot-border);border-radius:18px;color:var(--maibot-foreground);box-shadow:0 16px 55px #0003;overflow:hidden;opacity:0;transform:scale(var(--maimai-detail-scale,.96));transition:opacity var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1),transform var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background)}
+.fish-overlay:before{content:"";position:absolute;inset:0;z-index:0;background:rgba(242,245,239,.2);backdrop-filter:blur(var(--maimai-detail-blur,3px));-webkit-backdrop-filter:blur(var(--maimai-detail-blur,3px))}
+[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
+@supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
+.fish-panel{position:relative;z-index:1;display:flex;flex-direction:column;width:min(1040px,100%);max-height:90vh;border:1px solid var(--maibot-border);border-radius:18px;color:var(--maibot-foreground);box-shadow:0 16px 55px #0003;overflow:hidden;opacity:0;transform:scale(var(--maimai-detail-scale,.6));transition:opacity var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1),transform var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);transform-origin:var(--maimai-origin,50% 50%)}
 .fish-overlay.is-open .fish-panel{opacity:1;transform:scale(1)}
-.fish-overlay.is-closing .fish-panel{opacity:0;transform:scale(var(--maimai-detail-scale,.96))}
+.fish-overlay.is-closing .fish-panel{opacity:0;transform:scale(var(--maimai-detail-scale,.6))}
 .fish-popup-heading{display:flex;align-items:center;gap:9px;padding:13px 15px 11px;border-bottom:1px solid var(--maibot-border);flex-shrink:0}
 .fish-popup-heading h2{font-size:14px;flex:1;margin:0}
 .fish-close{font-size:11px;min-height:30px;padding:4px 8px}
@@ -131,16 +135,20 @@ body.fish-locked{overflow:hidden}
 .fish-popup-body .info-button{min-width:24px;min-height:24px;width:24px;height:24px}
 .fish-popup-body .info-tooltip{font-size:12px}
 .fish-popup-body details[open]>summary{color:var(--maibot-primary)}
-.fish-popup-heading>.fish-in-heading{position:static;flex-shrink:0;min-height:40px;height:40px;margin:-7px 0;z-index:auto}
-.fish-popup-heading>.fish-in-heading .fish-peek{margin-top:6px;width:var(--maimai-detail-fish-size,56px);height:auto;overflow:visible}
-.fish-popup-heading>.fish-in-heading .fish-peek>svg{width:var(--maimai-detail-fish-size,56px)}
+/* U 计划 §4.2：入口不再搬进标题栏——同一元素 portal 悬浮于遮罩之上，占位标记保持
+   原屏幕坐标（视觉不搬家）；粘连气泡尾把面板与入口连成一体。 */
+.fish-peek-home{visibility:hidden!important;pointer-events:none!important}
+.fish-float{position:fixed;z-index:950;margin:0}
+.fish-tail{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:visible}
+.fish-tail path{stroke:var(--maibot-border);stroke-width:2;fill:none}
+.fish-tail circle{fill:var(--maibot-border);stroke:none}
 .fish-overlay,.section-fish-popover:before,.fish-popup-body .info-tooltip{background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background)}
-.fish-overlay:before{background:rgba(242,245,239,.55)}
-[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.6)}
-@supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.94)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.94)}}
+.fish-overlay:before{background:rgba(242,245,239,.2)}
+[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
+@supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
 @media(max-width:1000px){.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:700px),(hover:none){.section-fish-button{left:12px;bottom:-15px;width:44px;height:40px;min-height:40px}.fish-peek{width:32px;height:24px;margin-top:8px}.fish-peek>svg{width:32px;transform:translateY(4px)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
-@media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:translateY(4px)!important}.fish-overlay,.fish-panel{transition:none!important}}
+@media(max-width:700px),(hover:none){.section-fish-button{left:12px;bottom:-15px;width:44px;height:40px;min-height:40px}.fish-peek{width:32px;height:24px;margin-top:8px}.fish-peek>svg{width:32px;transform:rotate(-45deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
+@media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:rotate(-45deg)!important}.fish-overlay,.fish-panel{transition:none!important}}
 </style><style id="host-theme"></style></head><body class="maibot-page"><main class="shell">
 <header class="mast"><div class="brand"><div class="mark" aria-hidden="true"><svg width="25" height="25" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 20c0-9 5-14 14-16 1 9-3 15-10 14M5 20 16 8M11 13v-4m0 4h4"/></svg></div><div><div class="eyebrow">MAIMAI / A LIFE OF HER OWN</div><h1>属于麦麦的生活</h1></div></div><div><div class="toolbar"><span class="status" id="connection"><i class="dot"></i><span id="connection-label">尚未连接</span></span><button class="maibot-button" id="refresh">刷新</button><button class="maibot-button" id="export" disabled>导出快照</button><button id="theme" aria-label="切换离线页面明暗主题" hidden>明 / 暗</button></div><div class="connectionline" id="updated">等待实时数据</div></div></header><div id="notice" role="status" aria-live="polite" class="banner" hidden></div><details class="card offlinehint" id="offline" hidden open><summary>离线查看 · 导入面板快照</summary><p class="note">在宿主插件页面中可自动读取实时数据。独立打开时，可导入通过“导出快照”保存的 JSON；历史从真实采样时刻开始。</p><input id="import" type="file" accept="application/json,.json" aria-label="导入生活面板快照"></details><section class="card offlinehint" id="snapshot-panel" hidden aria-label="导出面板快照"><div class="cardtop"><h2>保存这份生活快照</h2><button id="snapshot-close">收起</button></div><p class="note">全选并复制以下内容，保存为 .json 文件，即可离线导入查看。</p><textarea id="snapshot-text" readonly aria-label="快照 JSON"></textarea><button id="snapshot-select">全选内容</button></section><nav class="panel-tabs" role="tablist" aria-label="生活面板栏目"><button role="tab" id="tab-now" aria-controls="panel-now" aria-selected="true" tabindex="0" data-tab="now"><span class="tab-glyph" aria-hidden="true">◉</span>此刻</button><button role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" tabindex="-1" data-tab="history"><span class="tab-glyph" aria-hidden="true">↗</span>历史</button><button role="tab" id="tab-schedule" aria-controls="panel-schedule" aria-selected="false" tabindex="-1" data-tab="schedule"><span class="tab-glyph" aria-hidden="true">☷</span>日程</button><button role="tab" id="tab-mood" aria-controls="panel-mood" aria-selected="false" tabindex="-1" data-tab="mood"><span class="tab-glyph" aria-hidden="true">♡</span>心情与分享</button><button role="tab" id="tab-system" aria-controls="panel-system" aria-selected="false" tabindex="-1" data-tab="system"><span class="tab-glyph" aria-hidden="true">⚙</span>系统</button></nav><div class="datebar" id="datebar" hidden><div><span class="eyebrow">ONE DAY AT A TIME</span><strong id="selected-day-label">从此刻，回看每一天</strong></div><div class="date-controls"><button id="date-today" aria-pressed="false">今天</button><button id="date-yesterday" aria-pressed="false">昨天</button><label>选择日期 <input id="history-day" type="date" aria-label="选择历史日期"></label><button id="date-range">最近时段</button></div></div><section role="tabpanel" id="panel-now" aria-labelledby="tab-now" tabindex="0"><section class="grid hero" aria-label="此刻与陪伴"><article class="card maibot-card hero-scene" id="hero-scene"><div class="cardtop"><h2>此刻的生活</h2><span class="pill" id="current-kind">等待数据</span></div><div class="activityname" id="current-name">生活正在慢慢展开</div><div class="activitymeta" id="current-meta"><span>连接后查看实际正在进行的活动</span></div><div class="progress" role="progressbar" aria-label="当前活动进度" aria-valuemin="0" aria-valuemax="100" id="current-progress"><i style="width:0"></i></div><div class="splitline"><span id="current-state">—</span><span id="current-percent">—</span></div></article><article class="card maibot-card"><div class="cardtop"><h2>我们的陪伴</h2><span class="pill" id="patrol">待连接</span></div><div class="companionmain"><div><div class="note">当前关系</div><div class="tier" id="tier">—</div></div><div class="rowend"><div class="score" id="score">—</div><div class="note" id="baseline">关系分 / 基线</div></div></div><div class="smallstats"><div><span class="note">今日主动</span><strong id="budget">—</strong></div><div><span class="note">早安记录</span><strong id="morning">—</strong></div><div><span class="note">晚安记录</span><strong id="night">—</strong></div></div></article></section><div class="sectionline"><h2>身心的五个侧面</h2><span class="note" id="state-at">0–100 · 当前快照</span></div><section class="grid metrics" id="metrics" aria-label="五项生活状态"></section><div class="observations" id="observations"></div><section class="card sleep-combined" aria-label="睡眠与恢复"><article><div class="cardtop"><h2>睡眠与恢复</h2><span class="pill" id="sleep-status">—</span></div><div class="sleepstats"><div><div class="note">睡眠债</div><div class="bignum" id="debt">—</div><div class="note">小时 · 上限 12h</div></div><div><div class="note">连续睡眠</div><div class="bignum" id="continuous">—</div><div class="note">分钟 · 当前连续段</div></div><div><div class="note">精神状态</div><div class="bignum" id="mental">—</div><div class="note">精力 × 专注 × (1−压力)</div></div></div><div id="debt-chart" class="chart sleepgraph"></div><div class="note" id="sleep-anchors">等待作息信息</div></article><details class="sleep-archive"><summary>最近的睡眠 · 展开记录</summary><article><div class="cardtop"><h2>最近的睡眠</h2><span class="note">最近 7 天 · 最多 8 次</span></div><div id="sleep-list"></div></article></details></section></section>
 <section role="tabpanel" id="panel-history" aria-labelledby="tab-history" tabindex="0" hidden><section class="card maibot-card wide" aria-label="生活状态历史"><div class="cardtop charthead"><div><h2>生活的起伏</h2><div class="note" id="history-caption">每 5 分钟采样，另保留活动与醒沿观察</div></div><div class="range" id="range"><button data-hours="6" aria-pressed="false">6 小时</button><button data-hours="24" aria-pressed="true">24 小时</button><button data-hours="72" aria-pressed="false">3 天</button><button data-hours="168" aria-pressed="false">7 天</button><button id="zoom-in" aria-label="放大历史时间范围">放大</button><button id="zoom-out" aria-label="恢复完整历史时间范围">全览</button><button id="zoom-reset" hidden>重置缩放</button></div></div><p class="note estimate-key"><span>━ 真实观察</span><span>┄ 中间缺口估算</span><span>▧ 离线睡眠估算</span> · 拖动选择区间；双指可缩放</p><div class="legend" id="legend" aria-label="显示或隐藏曲线"></div><div id="history-chart" class="chart"></div><div class="chartfoot"><span class="note" id="history-info">等待真实采样点</span><button id="samples-toggle" aria-expanded="false">查看采样值</button></div><div id="samples" class="samplewrap" hidden></div><div id="history-day-summary" class="summarychips" style="margin-top:14px"></div></section></section>
@@ -196,7 +204,7 @@ for(const[key]of spec){text('value-'+key,pct(s[key]));text('assessment-'+key,ass
 function dayView(){return data?.day?.available&&data.day.date===selectedDay?data.day:null}
 function lifeSeries(){return selectedDay?(dayView()?.state_history||{}):(data?.history||{})}
 function vadSeries(){return selectedDay?(dayView()?.vad_history||{}):(data?.emotion?.history||{})}
-function dayRows(){const view=dayView();return view?{...data.schedule,episodes:view.footprint?.episodes??view.footprint?.items??[],intents:view.intent?.items||[],summary:view.summary}:selectedDay?{enabled:!!data.schedule?.enabled,episodes:[],intents:[],summary:{}}:data.schedule||{}}
+function dayRows(){const view=dayView();return view?{...(data?.schedule||{}),episodes:view.footprint?.episodes??view.footprint?.items??[],intents:view.intent?.items||[],summary:view.summary}:selectedDay?{enabled:!!data?.schedule?.enabled,episodes:[],intents:[],summary:{}}:(data?.schedule||{})}
 function renderHistory(){const all=Array.isArray(lifeSeries().points)?lifeSeries().points:[],end=date(data?.generated_at);points=all.filter(p=>date(p.at)&&(selectedDay||!end||(+date(p.at)>=+end-hours*3600000&&+date(p.at)<=+end)));
 const real=points.filter(p=>!p.estimated).length,estimated=points.length-real;
 text('history-caption',selectedDay?selectedDay+' · 按日查看真实记录与估算段':`最近 ${hours} 小时 · 每 5 分钟采样，另保留活动与醒沿观察`);
@@ -382,95 +390,198 @@ function infoTip(explanation){
  const hide=()=>{tip.hidden=true;button.setAttribute('aria-expanded','false')};button.onmouseenter=show;button.onmouseleave=()=>{if(document.activeElement!==button)hide()};button.onfocus=show;button.onblur=hide;button.onkeydown=e=>{if(e.key==='Escape'&&!tip.hidden){e.stopPropagation();hide()}};let pointerWasOpen=false;button.onpointerdown=()=>{pointerWasOpen=!tip.hidden};button.onclick=e=>{e.stopPropagation();pointerWasOpen?hide():show();pointerWasOpen=false};wrap.append(button,tip);return wrap
 }
 
-/* 常驻麦麦：页面左下角 45° 冒头的互动角色。
-   两层结构：.maimai-peek-tilt 只管旋转/位移，.maimai-peek-art 只管按压缩放，
-   避免 transform 互相覆盖。参数由 life_dashboard 的 maimai 投影经 applyConfig
-   写入 CSS 变量；投影缺失时沿用同值兜底（不另造第二套默认语义）。 */
+/* 常驻麦麦：左下角桌宠状态机（2026-11-01 U 计划 §三）。
+   收起探头（原图朝右，展示层 rotate(-角度) 使头朝右上）→ 弹出（先向上弹起、
+   再下降落到左下角底部，带落地缓冲；落地时身体水平）→ 落地后接受捏捏（按下
+   从当前形态连续压扁、松开从实际压扁程度连续回弹）→ 指针远离交互区域自动收起。
+   分层：.maimai-peek-tilt 只管位移/旋转（状态机经 WAAPI 驱动），
+   .maimai-peek-art 只管按压缩放（连续形变，可取消接续，不读布局）。
+   参数由 life_dashboard 的 maimai 投影经 applyConfig 写入；投影缺失时沿用
+   同值兜底（不另造第二套默认语义）。 */
 const Mascot=(()=>{
  const button=$('maimai-peek');
- if(!button)return {applyConfig(){},setAway(){}};
+ if(!button)return {applyConfig(){},setDetailMode(){}};
+ const tilt=button.querySelector('.maimai-peek-tilt');
+ const art=button.querySelector('.maimai-peek-art');
  const DEFAULT_EASING='cubic-bezier(.34,1.56,.64,1)';
- let pressing=false,away=false;
+ // 运动常数：U 计划 §3.1 建议值（出场 450–650ms、收起延迟约 200ms），调试起点，非业务规则。
+ const EMERGE_MS=560,RETREAT_MS=320,RETREAT_DELAY_MS=200,PRESS_MS=90;
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const clamp=(v,low,high)=>Math.min(high,Math.max(low,v));
  const number=(block,key,fallback)=>{const v=block?block[key]:undefined;return typeof v==='number'&&Number.isFinite(v)?v:fallback};
  const easing=value=>typeof value==='string'&&value.trim()&&/^[\w\s.,%()+\-/]*$/.test(value)&&value.length<=80?value.trim():DEFAULT_EASING;
+ const cfg={angle:45,retreatPx:200,size:96,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
+ let state='peek';               // peek | emerging | landed | retreating
+ let pressing=false,detailMode=false,pendingRetreat=false,hoverArmed=true;
+ let retreatTimer=null,poseAnim=null,squashAnim=null;
+ let squash={sx:1,sy:1};         // 形变记账：JS 记当前值，避免每拍读布局
+ let squashFrames=[{sx:1,sy:1,offset:0},{sx:1,sy:1,offset:1}];
+ const peekTransform=()=>`rotate(${-cfg.angle}deg)`;
+ const setPoseClass=()=>button.classList.toggle('is-peek',state!=='landed');
+ // ---- 捏捏形变：全部 WAAPI；取消/接续都从 JS 记账的当前值出发（同帧接管，无跳帧、无布局读取） ----
+ const lerp=(a,b,t)=>a+(b-a)*t;
+ function currentSquash(){
+  if(!squashAnim)return squash;
+  const dur=squashAnim.effect.getTiming().duration;
+  const p=typeof dur==='number'&&dur>0?clamp((squashAnim.currentTime??0)/dur,0,1):1;
+  let i=1;while(i<squashFrames.length-1&&p>squashFrames[i].offset)i++;
+  const a=squashFrames[i-1],b=squashFrames[i];
+  const t=(b.offset??1)>(a.offset??0)?clamp((p-(a.offset??0))/((b.offset??1)-(a.offset??0)),0,1):1;
+  return {sx:lerp(a.sx,b.sx,t),sy:lerp(a.sy,b.sy,t)};
+ }
+ function startSquash(frames,duration,easingCurve){
+  squashAnim?.cancel();
+  squashFrames=frames;
+  squashAnim=art.animate(frames.map(f=>({transform:`scale(${f.sx}, ${f.sy})`,offset:f.offset})),
+                         {duration,easing:easingCurve});
+  squashAnim.onfinish=()=>{squashAnim=null};
+ }
+ function resetSquash(){squashAnim?.cancel();squashAnim=null;squash={sx:1,sy:1}}
+ // ---- 状态机：角落探头 → 弹出中 → 水平落地 →（捏捏/回弹）→ 收起中 → 角落探头 ----
+ function finishEmerge(){
+  poseAnim=null;state='landed';setPoseClass();
+  if(pendingRetreat){pendingRetreat=false;retreat()}
+ }
+ function emerge(){
+  if(state!=='peek')return;
+  clearTimeout(retreatTimer);retreatTimer=null;pendingRetreat=false;
+  state='emerging';setPoseClass();
+  resetSquash();
+  if(reduceMotion()){state='landed';setPoseClass();return}   // 减少动态：短暂稳定的姿态切换
+  poseAnim?.cancel();
+  poseAnim=tilt.animate([
+   {transform:`translate(0px, 0px) ${peekTransform()}`},
+   {transform:`translate(8px, -74px) rotate(${-cfg.angle*.3}deg)`,offset:.34},
+   {transform:'translate(2px, 8px) rotate(0deg)',offset:.62},
+   {transform:'translate(0px, -9px) rotate(0deg)',offset:.8},
+   {transform:'translate(0px, 0px) rotate(0deg)'}
+  ],{duration:EMERGE_MS,easing:'cubic-bezier(.3,.5,.3,1)'});
+  poseAnim.onfinish=finishEmerge;
+ }
+ function retreat(){
+  if(state==='peek'||state==='retreating')return;
+  clearTimeout(retreatTimer);retreatTimer=null;
+  if(state==='emerging'){pendingRetreat=true;return}         // 出场未完：结束后再次判断收起
+  state='retreating';setPoseClass();
+  releasePress(true);
+  if(reduceMotion()){state='peek';setPoseClass();return}
+  resetSquash();
+  poseAnim?.cancel();
+  poseAnim=tilt.animate([
+   {transform:'translate(0px, 0px) rotate(0deg)'},
+   {transform:`translate(-5px, 12px) rotate(${-cfg.angle*.45}deg)`,offset:.42},
+   {transform:`translate(0px, 0px) ${peekTransform()}`}
+  ],{duration:RETREAT_MS,easing:'cubic-bezier(.45,.1,.55,1)'});
+  poseAnim.onfinish=()=>{poseAnim=null;state='peek';setPoseClass()};
+ }
+ // ---- 自动收起：以左下角稳定交互区域判断（不随动画包围盒移动），进出阈值不同防抖 ----
+ const cornerDistance=(x,y)=>Math.hypot(x,y-innerHeight);
+ function evaluateRetreat(){
+  if(detailMode||pressing)return;                            // 固定详情/捏着中暂缓，结束后再判断
+  if(state!=='landed'){clearTimeout(retreatTimer);retreatTimer=null;return}
+  const d=cornerDistance(lastPointer.x,lastPointer.y);
+  if(d>cfg.retreatPx&&!retreatTimer)retreatTimer=setTimeout(retreat,RETREAT_DELAY_MS);
+  else if(d<=cfg.retreatPx*.75&&retreatTimer){clearTimeout(retreatTimer);retreatTimer=null}
+ }
+ let lastPointer={x:-1,y:-1};
+ if(matchMedia('(hover:hover) and (pointer:fine)').matches){
+  // 精确指针：指向露出的麦麦（距角落小于触发半径）弹出；进入/退出用不同半径防抖。
+  document.addEventListener('pointermove',e=>{
+   if(e.pointerType!=='mouse'||detailMode)return;
+   lastPointer={x:e.clientX,y:e.clientY};
+   const d=cornerDistance(e.clientX,e.clientY);
+   if(d>=cfg.size*1.7)hoverArmed=true;
+   if(state==='peek'){
+    if(hoverArmed&&d<cfg.size*1.5){hoverArmed=false;emerge()}
+   }else evaluateRetreat();
+  },{passive:true});
+ }
+ // 触屏无悬停：点空白收起（弹出/捏捏由按钮自身 pointerdown 承担）。
+ document.addEventListener('pointerdown',e=>{
+  if(e.pointerType!=='touch'||detailMode||state!=='landed'||button.contains(e.target))return;
+  retreat();
+ },{passive:true});
+ window.addEventListener('blur',()=>releasePress(true));     // 窗口失焦：不永久压扁
+ document.addEventListener('visibilitychange',()=>{if(document.hidden)releasePress(true)});
+ // ---- 捏捏 ----
+ function releasePress(silent){
+  if(!pressing)return;
+  pressing=false;
+  button.setAttribute('aria-pressed','false');
+  if(silent){resetSquash();return}                           // 取消/失焦：直接回位，不回弹
+  if(reduceMotion()){squash={sx:1,sy:1};return}
+  const cur=currentSquash();
+  squashFrames=[
+   {sx:cur.sx,sy:cur.sy,offset:0},
+   {sx:Math.max(.88,cur.sx*.94),sy:Math.min(1.3,cur.sy+.55*(1-cur.sy)),offset:.2},
+   {sx:Math.min(1.06,cur.sx+.3*(1.06-cur.sx)),sy:Math.max(.9,cur.sy-.4*(cur.sy-.9)),offset:.48},
+   {sx:1.02,sy:.98,offset:.74},
+   {sx:1,sy:1,offset:1}];
+  startSquash(squashFrames,cfg.bounceMs,cfg.bounceEasing);   // 从实际压扁程度连续回弹
+  squash={sx:1,sy:1};
+ }
+ button.addEventListener('pointerdown',e=>{
+  if(e.button===2||detailMode)return;
+  if(state==='peek'){emerge();return}                        // 触屏/点按探头：先弹出落地
+  if(state!=='landed')return;                                // 出场/收起中不让按压覆盖轨迹
+  pressing=true;
+  try{button.setPointerCapture(e.pointerId)}catch{}
+  button.setAttribute('aria-pressed','true');
+  const cur=currentSquash();
+  squashFrames=[{sx:cur.sx,sy:cur.sy,offset:0},{sx:cfg.squashX,sy:cfg.squashY,offset:1}];
+  startSquash(squashFrames,PRESS_MS,'ease-out');             // 从当前形态连续压扁
+  squash={sx:cfg.squashX,sy:cfg.squashY};
+ });
+ button.addEventListener('pointerup',()=>releasePress(false));
+ button.addEventListener('pointercancel',()=>releasePress(true));
+ button.addEventListener('lostpointercapture',()=>releasePress(true));
+ // 键盘激活（Enter/Space）：探头=弹出落地，落地=一次回弹；鼠标 click 跟在 pointerup 后，用 detail 区分。
+ function playBounce(){
+  if(state!=='landed'||reduceMotion())return;
+  squashFrames=[{sx:1,sy:1,offset:0},{sx:cfg.squashX*.92,sy:cfg.squashY,offset:.3},{sx:1,sy:1,offset:1}];
+  startSquash(squashFrames,Math.min(cfg.bounceMs,620),'ease-in-out');
+  squash={sx:1,sy:1};
+ }
+ button.addEventListener('click',e=>{if(e.detail===0&&!detailMode){state==='peek'?emerge():playBounce()}});
+ // ---- 详情气泡期间：桌宠保持可见清晰，只暂停捏捏输入（不再透明消失，避免双交互争指针） ----
+ function setDetailMode(on){
+  detailMode=on;
+  button.classList.toggle('is-above',on);
+  if(on){
+   releasePress(true);
+   clearTimeout(retreatTimer);retreatTimer=null;
+  }else evaluateRetreat();
+ }
  function applyConfig(block){
   const off=block?block.enabled===false:false;
   button.hidden=off;
   if(off)return;
+  cfg.angle=clamp(number(block,'peek_angle_deg',45),0,90);
+  cfg.retreatPx=clamp(number(block,'hover_out_px',200),60,320);
+  cfg.size=clamp(number(block,'mascot_size_px',96),48,160);
+  cfg.squashX=clamp(number(block,'press_squash_x',1.2),0.8,1.6);
+  cfg.squashY=clamp(number(block,'press_squash_y',0.5),0.2,1);
+  cfg.bounceMs=clamp(number(block,'bounce_ms',774),200,3000);
+  cfg.bounceEasing=easing(block?block.bounce_easing:undefined);
   const style=button.style;
-  style.setProperty('--maimai-mascot-size',clamp(number(block,'mascot_size_px',96),48,160)+'px');
-  style.setProperty('--maimai-peek-angle',clamp(number(block,'peek_angle_deg',45),0,90)+'deg');
-  style.setProperty('--maimai-hover-out',clamp(number(block,'hover_out_px',120),0,240)+'px');
-  style.setProperty('--maimai-hover-ms',clamp(number(block,'hover_out_ms',240),80,600)+'ms');
-  style.setProperty('--maimai-squash-x',clamp(number(block,'press_squash_x',1.2),0.8,1.6));
-  style.setProperty('--maimai-squash-y',clamp(number(block,'press_squash_y',0.5),0.2,1));
-  style.setProperty('--maimai-bounce-ms',clamp(number(block,'bounce_ms',774),200,3000)+'ms');
-  style.setProperty('--maimai-bounce-easing',easing(block?block.bounce_easing:undefined));
+  style.setProperty('--maimai-mascot-size',cfg.size+'px');
+  style.setProperty('--maimai-peek-angle',cfg.angle+'deg');
   const root=document.documentElement.style;
-  root.setProperty('--maimai-detail-blur',clamp(number(block,'detail_blur_px',16),0,40)+'px');
+  root.setProperty('--maimai-detail-blur',clamp(number(block,'detail_blur_px',3),0,40)+'px');
   root.setProperty('--maimai-detail-fade-ms',clamp(number(block,'detail_fade_ms',220),80,600)+'ms');
-  root.setProperty('--maimai-detail-scale',String(clamp(number(block,'detail_scale_from',0.96),0.8,1)));
-  root.setProperty('--maimai-detail-fish-size',clamp(number(block,'detail_fish_size_px',56),32,96)+'px');
+  root.setProperty('--maimai-detail-scale',String(clamp(number(block,'detail_scale_from',0.6),0.4,1)));
+  setPoseClass();
  }
- function playBounce(){
-  if(reduceMotion())return;
-  button.classList.remove('is-bouncing');
-  void button.offsetWidth;
-  button.classList.add('is-bouncing');
- }
- button.addEventListener('animationend',e=>{if(e.animationName==='maimai-peek-bounce')button.classList.remove('is-bouncing')});
- button.addEventListener('pointerdown',e=>{
-  if(e.button===2||away)return;
-  pressing=true;
-  try{button.setPointerCapture(e.pointerId)}catch{}
-  button.classList.add('is-pressed');
-  button.setAttribute('aria-pressed','true');
- });
- const release=()=>{
-  if(!pressing)return;
-  pressing=false;
-  button.classList.remove('is-pressed');
-  button.setAttribute('aria-pressed','false');
-  playBounce();
- };
- button.addEventListener('pointerup',release);
- const abort=()=>{if(!pressing)return;pressing=false;button.classList.remove('is-pressed');button.setAttribute('aria-pressed','false')};
- button.addEventListener('pointercancel',abort);
- button.addEventListener('lostpointercapture',abort);
- // 键盘激活（Enter/Space）只触发一次回弹；鼠标 click 跟在 pointerup 后，用 detail 区分。
- button.addEventListener('click',e=>{if(e.detail===0&&!away)playBounce()});
- if(matchMedia('(hover:hover) and (pointer:fine)').matches){
-  // 精确指针设备：is-out 由指针位置推导，而不是 enter/leave 事件对。
-  // 「跳出」会把图移出指针下方，enter→leave 会立刻回缩并抖动；位置推导天然稳定。
-  document.addEventListener('pointermove',e=>{
-   if(e.pointerType==='touch'||away)return;
-   const r=button.getBoundingClientRect();
-   const reach=parseFloat(getComputedStyle(button).getPropertyValue('--maimai-hover-out'))||120;
-   const inside=e.clientX>=r.left-40&&e.clientX<=r.right+reach
-             &&e.clientY>=r.top-reach&&e.clientY<=r.bottom+40;
-   button.classList.toggle('is-out',inside&&!pressing);
-  },{passive:true});
- }
- function setAway(state){
-  away=state;
-  button.classList.toggle('is-away',state);
-  if(state){
-   if(pressing){pressing=false;button.classList.remove('is-pressed');button.setAttribute('aria-pressed','false')}
-   button.setAttribute('aria-hidden','true');
-   button.tabIndex=-1;
-   button.classList.remove('is-out');
-  }else{
-   button.removeAttribute('aria-hidden');
-   button.tabIndex=0;
-  }
- }
- return {applyConfig,setAway};
+ setPoseClass();
+ return {applyConfig,setDetailMode};
 })();
 
-/* Fullscreen details layer: bottom-left entries activate one modal per section;
-   the trigger button moves into the panel header and back on close.
+/* Fullscreen details layer (2026-11-01 U plan §4): each entry expands a sticky
+   bubble anchored at that entry — hover previews (no focus steal), click pins,
+   click again unpins, another entry switches. The entry never moves: the same
+   element is lifted above the backdrop in place (a placeholder keeps its
+   coordinates), and the panel opens/closes from the entry's origin with a
+   curved tail tying the bubble to the entry.
    Legacy render targets are moved, never copied. Internal names kept on purpose. */
 function fullClock(value){
  if(!value||!/^\d{4}-\d{2}-\d{2}/.test(String(value))||!date(value))return '暂无完整时间';
@@ -483,8 +594,12 @@ const SectionFish=(()=>{
  const panel=el('div','fish-panel');
  const heading=el('div','fish-popup-heading'),title=el('h2','','详情'),closeButton=el('button','fish-close','关闭');title.id='fish-popup-title';closeButton.type='button';closeButton.setAttribute('aria-label','关闭详情');closeButton.onclick=()=>close(true);heading.append(title,closeButton);
  const body=el('div','fish-popup-body'),summary=el('p','fish-popup-summary'),metadata=el('div','fish-metadata'),details=el('div','fish-records');body.append(summary,metadata,details);panel.append(heading,body);overlay.append(panel);document.body.append(overlay);
- let current=null,lastTrigger=null,closeTimer=null;
+ let current=null,lastTrigger=null,closeTimer=null,hoverTimer=null,pinnedOpen=false,floatSyncQueued=false;
  const entries=new Map();
+ // 粘连气泡尾：从入口画一条曲线连到面板最近边；入口与面板重叠（窄屏）时隐藏，
+ // 先保证面板内容、关闭按钮与入口可达（U 计划 §4.2）。
+ const FISH_NS='http://www.w3.org/2000/svg';
+ const tail=document.createElementNS(FISH_NS,'svg');tail.classList.add('fish-tail');tail.setAttribute('aria-hidden','true');tail.hidden=true;overlay.append(tail);
  let changesCache={src:null,key:'',items:[]};
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const finishMs=()=>{const raw=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--maimai-detail-fade-ms'));return Number.isFinite(raw)&&raw>0?raw:220};
@@ -581,45 +696,119 @@ const SectionFish=(()=>{
   }));
  }
  function redraw(){requestAnimationFrame(()=>{if(data){drawHistory();renderSleep();renderModules()}})}
- function restoreButton(entry){if(entry?.marker){entry.marker.replaceWith(entry.button);entry.marker=null;entry.button.classList.remove('fish-in-heading')}}
- function moveButtonIntoHeading(entry){if(entry.marker)return;entry.marker=document.createComment('fish-button-home');entry.button.replaceWith(entry.marker);entry.button.classList.add('fish-in-heading');heading.insertBefore(entry.button,closeButton)}
+ // 入口原位保留 + 提升到清晰交互层（U 计划 §4.2）：卡片自带 backdrop-filter 层叠
+ // 上下文，单靠 z-index 升不到遮罩之上——portal **同一个元素**，占位标记保持原屏幕
+ // 坐标（绝对定位按钮不参与布局流，视觉不搬家），关闭时原位归还。
+ function unfloatEntry(entry){
+  if(!entry?.floated)return;
+  entry.floated=false;
+  entry.button.classList.remove('fish-float');
+  entry.button.style.cssText='';
+  entry.home.replaceWith(entry.button);
+  entry.home=null;
+ }
+ function floatEntry(entry){
+  if(entry.floated)return;
+  entry.home=el('span','section-fish-button fish-peek-home');
+  entry.home.setAttribute('aria-hidden','true');
+  entry.button.replaceWith(entry.home);
+  document.body.append(entry.button);
+  entry.button.classList.add('fish-float');
+  entry.floated=true;
+  syncFloat(entry);
+ }
+ function syncFloat(entry){
+  if(!entry?.floated||!entry.home)return;
+  const r=entry.home.getBoundingClientRect(),b=entry.button;
+  b.style.left=r.left+'px';b.style.top=r.top+'px';
+  b.style.width=r.width+'px';b.style.height=r.height+'px';b.style.bottom='auto';
+ }
+ function drawTail(){
+  if(!current){tail.hidden=true;return}
+  const b=current.button.getBoundingClientRect(),p=panel.getBoundingClientRect();
+  if(!(b.right<p.left||b.left>p.right||b.bottom<p.top||b.top>p.bottom)){tail.hidden=true;return}
+  const bx=b.left+b.width/2,by=b.top+b.height/2;
+  const cands=[
+   {x:Math.min(Math.max(bx,p.left+28),p.right-28),y:p.top},
+   {x:Math.min(Math.max(bx,p.left+28),p.right-28),y:p.bottom},
+   {x:p.left,y:Math.min(Math.max(by,p.top+28),p.bottom-28)},
+   {x:p.right,y:Math.min(Math.max(by,p.top+28),p.bottom-28)}];
+  let best=cands[0],bd=Infinity;
+  for(const c of cands){const d=Math.hypot(c.x-bx,c.y-by);if(d<bd){bd=d;best=c}}
+  const dx=best.x-bx,dy=best.y-by;
+  const path=document.createElementNS(FISH_NS,'path');
+  path.setAttribute('d',`M ${bx} ${by} C ${bx+dx*.3-dy*.18} ${by+dy*.3+dx*.18}, ${bx+dx*.7+dy*.18} ${by+dy*.7-dx*.18}, ${best.x} ${best.y}`);
+  const dot=document.createElementNS(FISH_NS,'circle');
+  dot.setAttribute('cx',best.x);dot.setAttribute('cy',best.y);dot.setAttribute('r','3.5');
+  tail.setAttribute('viewBox',`0 0 ${innerWidth} ${innerHeight}`);
+  tail.setAttribute('width',innerWidth);tail.setAttribute('height',innerHeight);
+  tail.replaceChildren(path,dot);
+  tail.hidden=bd<12;
+ }
+ // 滚动/缩放/旋转后重新校准（测量节流到每帧一次，不逐帧全页布局）。
+ const recalibrate=()=>{
+  if(floatSyncQueued||!current)return;
+  floatSyncQueued=true;
+  requestAnimationFrame(()=>{floatSyncQueued=false;if(!current)return;syncFloat(current);drawTail()});
+ };
+ window.addEventListener('scroll',recalibrate,{passive:true,capture:true});
  function close(restoreFocus=true){
   if(!current)return;
-  const old=current;current=null;
-  clearTimeout(closeTimer);
-  restoreButton(old);old.element.classList.remove('fish-open');old.button.setAttribute('aria-expanded','false');
+  const old=current,wasPinned=pinnedOpen;current=null;pinnedOpen=false;
+  clearTimeout(closeTimer);clearTimeout(hoverTimer);
+  unfloatEntry(old);old.element.classList.remove('fish-open');old.button.setAttribute('aria-expanded','false');
   for(const group of old.groups)store.append(group);
+  tail.hidden=true;panel.style.transformOrigin='';
   const finish=()=>{
-   overlay.hidden=true;overlay.classList.remove('is-open','is-closing');overlay.removeAttribute('data-section');
+   overlay.hidden=true;overlay.classList.remove('is-open','is-closing');overlay.removeAttribute('data-section');delete overlay.dataset.align;
    document.body.classList.remove('fish-locked');
-   if(typeof Mascot!=='undefined')Mascot.setAway(false);
-   if(restoreFocus&&lastTrigger)lastTrigger.focus({preventScroll:true});
+   if(typeof Mascot!=='undefined')Mascot.setDetailMode(false);
+   if(restoreFocus&&wasPinned&&lastTrigger)lastTrigger.focus({preventScroll:true});
   };
   if(reduceMotion()){finish();return}
   overlay.classList.remove('is-open');overlay.classList.add('is-closing');
   closeTimer=setTimeout(finish,finishMs()+40);
  }
- function open(entry){
-  if(current===entry)return;
+ // 以本次入口为原点计算面板位置/缩放原点：入口在视口上部→面板贴底，下部→贴顶，
+ // 其余居中；连接边/气泡尾随后按实际位置绘制（U 计划 §4.2）。
+ function placePanel(entry){
+  const b=entry.button.getBoundingClientRect(),vh=innerHeight;
+  const ratio=(b.top+b.height/2)/vh;
+  overlay.dataset.align=ratio<.38?'bottom':ratio>.62?'top':'center';
+  const p=panel.getBoundingClientRect();
+  panel.style.transformOrigin=
+   `${Math.min(Math.max(b.left+b.width/2-p.left,0),p.width)}px ${Math.min(Math.max(b.top+b.height/2-p.top,0),p.height)}px`;
+ }
+ function pin(){
+  if(!current||pinnedOpen)return;
+  pinnedOpen=true;
+  document.body.classList.add('fish-locked');           // 固定后才启用滚动锁
+  closeButton.focus({preventScroll:true});
+ }
+ function open(entry,pinned=false){
+  if(current===entry){if(pinned)pin();return}
   if(current)close(false);
-  clearTimeout(closeTimer);overlay.classList.remove('is-closing');
-  current=entry;lastTrigger=entry.button;
+  clearTimeout(closeTimer);clearTimeout(hoverTimer);overlay.classList.remove('is-closing');
+  current=entry;lastTrigger=entry.button;pinnedOpen=pinned;
   for(const group of entry.groups){group.open=false;details.append(group)}
-  moveButtonIntoHeading(entry);
+  floatEntry(entry);
   overlay.hidden=false;overlay.dataset.section=entry.key;
+  placePanel(entry);
   void overlay.offsetWidth;
   overlay.classList.add('is-open');
   entry.element.classList.add('fish-open');entry.button.setAttribute('aria-expanded','true');
-  document.body.classList.add('fish-locked');
-  if(typeof Mascot!=='undefined')Mascot.setAway(true);
+  if(pinned)document.body.classList.add('fish-locked');
+  if(typeof Mascot!=='undefined')Mascot.setDetailMode(true);
   refresh();
   redraw();
-  closeButton.focus({preventScroll:true});
+  drawTail();
+  if(pinned)closeButton.focus({preventScroll:true});    // 悬停预览不抢键盘焦点
  }
  // Recover focus even if a refresh or host shortcut moved it outside the
  // overlay; listening only on the overlay misses that keyboard event.
+ // 固定态才启用焦点陷阱；悬停预览不抢焦点、不锁页面（U 计划 §4.1）。
  document.addEventListener('keydown',e=>{
-  if(e.key!=='Tab'||!current)return;
+  if(e.key!=='Tab'||!current||!pinnedOpen)return;
   const focusables=[...panel.querySelectorAll('button,summary,input,textarea,select,[href],[tabindex]:not([tabindex="-1"])')].filter(node=>!node.disabled&&node.tabIndex>=0&&node.getClientRects().length);
   if(!focusables.length)return;
   const first=focusables[0],last=focusables[focusables.length-1];
@@ -627,17 +816,34 @@ const SectionFish=(()=>{
   else if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus({preventScroll:true})}
   else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus({preventScroll:true})}
  });
- document.addEventListener('keydown',e=>{if(e.key==='Escape'&&current){e.preventDefault();close(true)}});
+ document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape'||!current)return;
+  // Esc 优先关说明 tooltip（U 计划 §4.1）：说明还开着就不收详情。
+  const tip=document.querySelector('.info-tooltip:not([hidden])');
+  if(tip){
+   const infoButton=tip.parentElement?.querySelector('.info-button');
+   if(infoButton)infoButton.setAttribute('aria-expanded','false');
+   tip.hidden=true;
+   e.preventDefault();
+   return;
+  }
+  e.preventDefault();close(true);
+ });
  overlay.addEventListener('pointerdown',e=>{if(e.target===overlay)e.preventDefault()});
  overlay.addEventListener('click',e=>{if(e.target===overlay)close(true)});
  overlay.addEventListener('toggle',e=>{if(e.target.tagName==='DETAILS'&&e.target.open)redraw()},true);
- window.addEventListener('resize',()=>{if(current)redraw()});
+ // 从小麦麦移到气泡正文保持展开；离开连接区域与气泡才延迟收起（未固定时）。
+ const previewCloseDelay=()=>{clearTimeout(hoverTimer);hoverTimer=setTimeout(()=>{if(current&&!pinnedOpen)close(false)},160)};
+ panel.addEventListener('pointerenter',()=>clearTimeout(hoverTimer));
+ panel.addEventListener('pointerleave',()=>{if(current&&!pinnedOpen)previewCloseDelay()});
+ window.addEventListener('resize',()=>{recalibrate();if(current)redraw()});
  function metadataRow(label,value,explanation){const row=el('div','fish-meta-row'),caption=el('span','note',label);if(explanation)caption.append(infoTip(explanation));row.append(caption,el('span','',value??'暂无记录'));return row}
  function refresh(){if(!current)return;const e=current,d=data||{};title.textContent=e.title+'详情';summary.textContent=e.summary(d);
   const rows=[['更新时间',d.generated_at?clock(d.generated_at,true):'暂无记录',fullClock(d.generated_at)],['数据来源',imported?'导入快照':'生活引擎实时记录',''],...(e.meta?.(d)||[])];
   // Reconcile in place: a timer refresh must not remove the focused explanation.
   rows.forEach(([label,value,explanation],i)=>{let row=metadata.children[i];if(!row){row=metadataRow(label,value,explanation);metadata.append(row)}else{row.firstElementChild.firstChild.textContent=label;row.lastElementChild.textContent=value??'暂无记录';const tip=row.querySelector('.info-tooltip');if(tip)tip.textContent=explanation||'暂无说明'}});while(metadata.children.length>rows.length)metadata.lastElementChild.remove();
   renderChanges(e);
+  drawTail();
  }
  function fold(label,nodes){const list=nodes.filter(Boolean);if(!list.length)return null;let group;
   if(list.length===1&&list[0].tagName==='DETAILS'){group=list[0];group.open=false}
@@ -649,9 +855,36 @@ const SectionFish=(()=>{
   const kind=CHANGES_KIND[key];
   let changesList=null;
   if(kind){const changesGroup=el('details','fish-fold fish-changes');changesList=el('ul','fish-changelist');changesGroup.append(el('summary','','最近变化'),changesList);store.append(changesGroup);allGroups.push(changesGroup)}
-  entries.set(key,{key,title:titleText,element,content,button,summary:summaryFn,meta:metaFn,groups:allGroups,changesKind:kind,changesList,marker:null});
-  // 只有点击/Enter/Space 显式激活全屏详情；hover 与普通聚焦不再打开。再次点击同一入口 = 关闭。
-  button.onclick=()=>{const entry=entries.get(key);entry===current?close(true):open(entry)};
+  entries.set(key,{key,title:titleText,element,content,button,summary:summaryFn,meta:metaFn,groups:allGroups,changesKind:kind,changesList,marker:null,floated:false,home:null});
+  // 语义（U 计划 §4.1）：hover 临时预览（不抢焦点/不锁滚动）→ 移入气泡保持 → 点击固定
+  // → 再点同入口取消固定并收起 → 点另一入口关闭旧并固定新。触屏/键盘激活=直接打开固定。
+  const entry=entries.get(key);
+  button.onclick=()=>{
+   if(current===entry){pinnedOpen?close(true):pin()}
+   else open(entry,true)};
+  if(matchMedia('(hover:hover) and (pointer:fine)').matches){
+   // 武装位：只有「真实离开入口」后才允许 hover 重新打开。portal/回流引发的伪
+   // 进入/伪离开（DOM 变更后 Chrome 重算 hover）不打开、不收起、不重新武装——
+   // 否则取消固定后的关闭会被指针停留处的伪 enter 立即重新打开。
+   entry._canHoverOpen=true;
+   button.addEventListener('pointerenter',e=>{
+    if(e.pointerType!=='mouse')return;
+    clearTimeout(hoverTimer);
+    if(overlay.classList.contains('is-closing')||!entry._canHoverOpen)return;
+    if(current!==entry){entry._canHoverOpen=false;open(entry,false)}
+   });
+   button.addEventListener('pointerleave',e=>{
+    if(e.pointerType!=='mouse')return;
+    const x=e.clientX,y=e.clientY;
+    const r=entry.button.getBoundingClientRect();
+    if(x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom)return;   // 伪离开（坐标仍在入口内）
+    if(current===entry&&!pinnedOpen){
+     clearTimeout(hoverTimer);
+     hoverTimer=setTimeout(()=>{if(current===entry&&!pinnedOpen)close(false)},160);
+    }
+    entry._canHoverOpen=true;                                  // 真实离开：重新武装
+   });
+  }
  }
  const safeTime=(value)=>value?clock(value,true):'暂无记录';
  mount('current','当前活动',$('hero-scene'),d=>d.schedule?.current?.name||'暂无正在进行的活动',d=>[['活动来源',source(d.schedule?.current?.source),'只显示实际处于进行状态的活动，计划意图不等于已发生。'],['状态时间',safeTime(d.state?.updated_at),fullClock(d.state?.updated_at)]]);

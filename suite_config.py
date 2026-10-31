@@ -163,6 +163,9 @@ LEGACY_ROUTE_KEYS = {
     "event_catalog": ("max_tokens", "daily_token_budget"),
     "judge": ("max_tokens",),
     "life_state": ("enabled", "sleep_engine_enabled", "profile_path"),
+    # 2026-11-01 U 计划（§4.2）：入口不再搬进面板标题栏，「面板内麦麦尺寸」随之退役——
+    # 详情展开以原入口为原点的粘连气泡替代（入口原位保留）。只 pop、不做值搬运。
+    "maimai_interaction": ("detail_fish_size_px",),
 }
 
 #: 1.0.0（配置整理轮之前）[patrol] 「想念触发说明」的出厂文案——仅用于迁移时判断「用户改过没有」。
@@ -537,14 +540,14 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "冒头角度", "step": 1, **_ui_i18n("Peek angle (deg)")},
     )
     hover_out_px: int = Field(
-        default=120, ge=0, le=240,
-        description="鼠标移入后向外跳出的对角距离（像素）",
-        json_schema_extra={"label": "跳出距离", "step": 1, **_ui_i18n("Hover out distance (px)")},
+        default=200, ge=60, le=320,
+        description="指针离左下角交互区域多远后自动收起（像素；进入阈值更小，进出不同阈值防抖）",
+        json_schema_extra={"label": "收起距离", "step": 1, **_ui_i18n("Retreat distance (px)")},
     )
     hover_out_ms: int = Field(
         default=240, ge=80, le=600,
-        description="跳出/收回动画时长（毫秒）",
-        json_schema_extra={"label": "跳出时长", "step": 10, **_ui_i18n("Hover out duration (ms)")},
+        description="收起动画时长（毫秒）",
+        json_schema_extra={"label": "收起时长", "step": 10, **_ui_i18n("Retreat duration (ms)")},
     )
     press_squash_x: float = Field(
         default=1.20, ge=0.8, le=1.6,
@@ -567,8 +570,8 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "回弹缓动", **_ui_i18n("Bounce easing")},
     )
     detail_blur_px: int = Field(
-        default=16, ge=0, le=40,
-        description="全屏详情背景高斯模糊半径（像素，0 = 不模糊）",
+        default=3, ge=0, le=40,
+        description="详情背景轻微高斯模糊半径（像素，建议 2–4；0 = 不模糊。2026-11-01 起默认 3，不再浓遮罩）",
         json_schema_extra={"label": "详情背景模糊", "step": 1, **_ui_i18n("Detail blur (px)")},
     )
     detail_fade_ms: int = Field(
@@ -577,14 +580,9 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "详情动画时长", "step": 10, **_ui_i18n("Detail fade (ms)")},
     )
     detail_scale_from: float = Field(
-        default=0.96, ge=0.8, le=1.0,
-        description="详情打开时的初始缩放",
+        default=0.6, ge=0.4, le=1.0,
+        description="详情气泡从入口展开时的初始缩放（2026-11-01 起从入口原点展开）",
         json_schema_extra={"label": "详情初始缩放", "step": 0.01, **_ui_i18n("Detail scale from")},
-    )
-    detail_fish_size_px: int = Field(
-        default=56, ge=32, le=96,
-        description="详情面板标题里触发麦麦的尺寸（像素）",
-        json_schema_extra={"label": "面板内麦麦尺寸", "step": 1, **_ui_i18n("Panel mascot size (px)")},
     )
     history_changes_limit: int = Field(
         default=30, ge=5, le=30,

@@ -24,7 +24,7 @@ for(const[key]of spec){text('value-'+key,pct(s[key]));text('assessment-'+key,ass
 function dayView(){return data?.day?.available&&data.day.date===selectedDay?data.day:null}
 function lifeSeries(){return selectedDay?(dayView()?.state_history||{}):(data?.history||{})}
 function vadSeries(){return selectedDay?(dayView()?.vad_history||{}):(data?.emotion?.history||{})}
-function dayRows(){const view=dayView();return view?{...data.schedule,episodes:view.footprint?.episodes??view.footprint?.items??[],intents:view.intent?.items||[],summary:view.summary}:selectedDay?{enabled:!!data.schedule?.enabled,episodes:[],intents:[],summary:{}}:data.schedule||{}}
+function dayRows(){const view=dayView();return view?{...(data?.schedule||{}),episodes:view.footprint?.episodes??view.footprint?.items??[],intents:view.intent?.items||[],summary:view.summary}:selectedDay?{enabled:!!data?.schedule?.enabled,episodes:[],intents:[],summary:{}}:(data?.schedule||{})}
 function renderHistory(){const all=Array.isArray(lifeSeries().points)?lifeSeries().points:[],end=date(data?.generated_at);points=all.filter(p=>date(p.at)&&(selectedDay||!end||(+date(p.at)>=+end-hours*3600000&&+date(p.at)<=+end)));
 const real=points.filter(p=>!p.estimated).length,estimated=points.length-real;
 text('history-caption',selectedDay?selectedDay+' · 按日查看真实记录与估算段':`最近 ${hours} 小时 · 每 5 分钟采样，另保留活动与醒沿观察`);
