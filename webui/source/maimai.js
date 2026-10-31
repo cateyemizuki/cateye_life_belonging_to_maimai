@@ -48,24 +48,18 @@ const Mascot=(()=>{
   squashFrames=[{sx:1,sy:1,offset:0},{sx:cfg.squashX,sy:cfg.squashY,offset:1}];
   startSquash(squashFrames,PRESS_MS,'cubic-bezier(.33,.6,.36,1)','forwards');
   squash={sx:cfg.squashX,sy:cfg.squashY};
-  // 立体水平旋转（激活态，0425 二次修正）：旋转轴 = 头顶叶茎根点（约图 69%W、28%H）
-  // 延伸至垂直于水平面的垂线，rotateY 一整圈（透视投影）；压扁脉冲（计划书原始参数）
-  // 由 art 层同步叠加，两层互不覆盖。
-  const cycleMs=PRESS_MS+60+cfg.bounceMs;
+  // 立体水平旋转（激活态，0425 二次修正 + 用户复检改持续旋转）：旋转轴 = 头顶叶茎
+  // 根点（约图 69%W、28%H）延伸的垂直线，rotateY 匀速连续旋转（不跟捏压节奏）；
+  // 压扁脉冲（计划书原始参数）由 art 层按自己的节奏叠加，两层互不覆盖。
   const ax=(0.69*cfg.size).toFixed(1), ay=(0.49*cfg.size).toFixed(1);
   const P=`perspective(700px) translate(${ax}px, ${ay}px) `;
   const S=`translate(${-ax}px, ${-ay}px)`;
   rotateAnim?.cancel();
   rotateAnim=tilt.animate([
-   {transform:P+'rotateY(0deg) '+S,offset:0},
-   {transform:P+'rotateY(90deg) '+S,offset:.22},
-   {transform:P+'rotateY(180deg) '+S,offset:.45},
-   {transform:P+'rotateY(270deg) '+S,offset:.67},
-   {transform:P+'rotateY(360deg) '+S,offset:.9},
-   {transform:P+'rotateY(360deg) '+S,offset:1}
-  ],{duration:cycleMs,easing:'ease-in-out'});
-  rotateAnim.onfinish=()=>{rotateAnim=null};
-  autoPinTimer=setTimeout(()=>{releaseAnim();autoPinTimer=setTimeout(autoCycle,900)},PRESS_MS+60);
+   {transform:P+'rotateY(0deg) '+S},
+   {transform:P+'rotateY(360deg) '+S}
+  ],{duration:2600,easing:'linear',iterations:Infinity});
+  autoPinTimer=setTimeout(()=>{releaseAnim();autoPinTimer=setTimeout(autoCycle,250)},PRESS_MS+60);
  }
  if(pinBtn)pinBtn.addEventListener('click',e=>{
   e.stopPropagation();
