@@ -18,10 +18,9 @@ const SectionFish=(()=>{
  const body=el('div','fish-popup-body'),summary=el('p','fish-popup-summary'),metadata=el('div','fish-metadata'),details=el('div','fish-records');body.append(summary,metadata,details);panel.append(heading,body);overlay.append(panel);document.body.append(overlay);
  let current=null,lastTrigger=null,closeTimer=null,hoverTimer=null,pinnedOpen=false,floatSyncQueued=false;
  const entries=new Map();
- // 粘连气泡尾：从入口画一条曲线连到面板最近边；入口与面板重叠（窄屏）时隐藏，
- // 先保证面板内容、关闭按钮与入口可达（U 计划 §4.2）。
- const FISH_NS='http://www.w3.org/2000/svg';
- const tail=document.createElementNS(FISH_NS,'svg');tail.classList.add('fish-tail');tail.setAttribute('aria-hidden','true');tail.hidden=true;overlay.append(tail);
+ // 粘连气泡（0425 二次目检）：面板紧贴入口放置（空间更多的一侧），面板边缘在
+ // 入口对应位置开一个三角缺口——气泡“长”在入口上，不再用细线远程连接。
+ const tip=el('span','fish-tail-tip');tip.setAttribute('aria-hidden','true');tip.hidden=true;panel.append(tip);
  let changesCache={src:null,key:'',items:[]};
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const finishMs=()=>{const raw=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--maimai-detail-fade-ms'));return Number.isFinite(raw)&&raw>0?raw:220};
@@ -145,33 +144,24 @@ const SectionFish=(()=>{
   b.style.left=r.left+'px';b.style.top=r.top+'px';
   b.style.width=r.width+'px';b.style.height=r.height+'px';b.style.bottom='auto';
  }
- function drawTail(){
-  if(!current){tail.hidden=true;return}
-  const b=current.button.getBoundingClientRect(),p=panel.getBoundingClientRect();
-  if(!(b.right<p.left||b.left>p.right||b.bottom<p.top||b.top>p.bottom)){tail.hidden=true;return}
-  const bx=b.left+b.width/2,by=b.top+b.height/2;
-  const cands=[
-   {x:Math.min(Math.max(bx,p.left+28),p.right-28),y:p.top},
-   {x:Math.min(Math.max(bx,p.left+28),p.right-28),y:p.bottom},
-   {x:p.left,y:Math.min(Math.max(by,p.top+28),p.bottom-28)},
-   {x:p.right,y:Math.min(Math.max(by,p.top+28),p.bottom-28)}];
-  let best=cands[0],bd=Infinity;
-  for(const c of cands){const d=Math.hypot(c.x-bx,c.y-by);if(d<bd){bd=d;best=c}}
-  const dx=best.x-bx,dy=best.y-by;
-  const path=document.createElementNS(FISH_NS,'path');
-  path.setAttribute('d',`M ${bx} ${by} C ${bx+dx*.3-dy*.18} ${by+dy*.3+dx*.18}, ${bx+dx*.7+dy*.18} ${by+dy*.7-dx*.18}, ${best.x} ${best.y}`);
-  const dot=document.createElementNS(FISH_NS,'circle');
-  dot.setAttribute('cx',best.x);dot.setAttribute('cy',best.y);dot.setAttribute('r','3.5');
-  tail.setAttribute('viewBox',`0 0 ${innerWidth} ${innerHeight}`);
-  tail.setAttribute('width',innerWidth);tail.setAttribute('height',innerHeight);
-  tail.replaceChildren(path,dot);
-  tail.hidden=bd<12;
+ // 面板高度确定后贴到入口旁：上/下贴附 + 三角缺口对准入入口（随滚动/缩放重校准）。
+ function snapPanel(entry){
+  if(!current)return;
+  const b=entry.button.getBoundingClientRect(),vh=innerHeight;
+  const pRect=panel.getBoundingClientRect();
+  const below=panel.dataset.side==='below';
+  let top=below?Math.min(b.bottom+12,vh-pRect.height-10):Math.max(b.top-12-pRect.height,10);
+  panel.style.top=Math.round(Math.max(10,top))+'px';
+  const tipX=Math.min(Math.max(b.left+b.width/2-pRect.left,20),pRect.width-20);
+  tip.style.left=Math.round(pRect.left+tipX-7)+'px';
+  tip.style.top=Math.round((below?pRect.bottom:pRect.top)-7)+'px';
+  tip.hidden=false;
  }
  // 滚动/缩放/旋转后重新校准（测量节流到每帧一次，不逐帧全页布局）。
  const recalibrate=()=>{
   if(floatSyncQueued||!current)return;
   floatSyncQueued=true;
-  requestAnimationFrame(()=>{floatSyncQueued=false;if(!current)return;syncFloat(current);drawTail()});
+  requestAnimationFrame(()=>{floatSyncQueued=false;if(!current)return;syncFloat(current);snapPanel(current)});
  };
  window.addEventListener('scroll',recalibrate,{passive:true,capture:true});
  function close(restoreFocus=true){
@@ -180,7 +170,7 @@ const SectionFish=(()=>{
   clearTimeout(closeTimer);clearTimeout(hoverTimer);
   unfloatEntry(old);old.element.classList.remove('fish-open');old.button.setAttribute('aria-expanded','false');
   for(const group of old.groups)store.append(group);
-  tail.hidden=true;panel.style.transformOrigin='';panel.style.maxHeight='';
+  tip.hidden=true;panel.style.transformOrigin='';panel.style.left='';panel.style.top='';panel.style.maxHeight='';panel.style.maxHeight='';
   const finish=()=>{
    overlay.hidden=true;overlay.classList.remove('is-open','is-closing');overlay.removeAttribute('data-section');delete overlay.dataset.align;
    document.body.classList.remove('fish-locked');
@@ -196,12 +186,18 @@ const SectionFish=(()=>{
  // 面板最大高度适配该侧空间——入口与内容都完整可见，不拘泥粘连哪一边；
  // 连接边/气泡尾随后按实际位置绘制（drawTail 取最近边）。
  function placePanel(entry){
-  const b=entry.button.getBoundingClientRect(),vh=innerHeight;
+  const b=entry.button.getBoundingClientRect(),vh=innerHeight,vw=innerWidth,pad=12;
   const freeAbove=b.top,freeBelow=vh-b.bottom;
   const putBelow=freeBelow>=freeAbove;
   overlay.dataset.align=putBelow?'bottom':'top';
-  const free=Math.max(putBelow?freeBelow:freeAbove)-24;
-  panel.style.maxHeight=`${Math.max(280,Math.min(Math.round(free),Math.round(vh*0.9)))}px`;
+  panel.dataset.side=putBelow?'below':'above';
+  const free=Math.max(putBelow?freeBelow:freeAbove,240)-24;
+  panel.style.maxHeight=`${Math.min(Math.round(free),Math.round(vh*0.9))}px`;
+  // 水平：面板左缘靠近入口（长内容向右铺开），不居中漂移；宽度显式设定
+  // （absolute 子元素的百分比宽按 overlay 的 padding-box 解析，须自行钳制在视口内）
+  const panelW=Math.min(1040,vw-pad*2);
+  panel.style.width=`${Math.round(panelW)}px`;
+  panel.style.left=`${Math.round(Math.min(Math.max(b.left+b.width/2-140,pad),Math.max(pad,vw-pad-panelW)))}px`;
   const p=panel.getBoundingClientRect();
   panel.style.transformOrigin=
    `${Math.min(Math.max(b.left+b.width/2-p.left,0),p.width)}px ${Math.min(Math.max(b.top+b.height/2-p.top,0),p.height)}px`;
@@ -228,7 +224,7 @@ const SectionFish=(()=>{
   if(typeof Mascot!=='undefined')Mascot.setDetailMode(true);
   refresh();
   redraw();
-  drawTail();
+  requestAnimationFrame(()=>snapPanel(entry));
   if(pinned)closeButton.focus({preventScroll:true});    // 悬停预览不抢键盘焦点
  }
  // Recover focus even if a refresh or host shortcut moved it outside the
@@ -270,7 +266,6 @@ const SectionFish=(()=>{
   // Reconcile in place: a timer refresh must not remove the focused explanation.
   rows.forEach(([label,value,explanation],i)=>{let row=metadata.children[i];if(!row){row=metadataRow(label,value,explanation);metadata.append(row)}else{row.firstElementChild.firstChild.textContent=label;row.lastElementChild.textContent=value??'暂无记录';const tip=row.querySelector('.info-tooltip');if(tip)tip.textContent=explanation||'暂无说明'}});while(metadata.children.length>rows.length)metadata.lastElementChild.remove();
   renderChanges(e);
-  drawTail();
  }
  function fold(label,nodes){const list=nodes.filter(Boolean);if(!list.length)return null;let group;
   if(list.length===1&&list[0].tagName==='DETAILS'){group=list[0];group.open=false}

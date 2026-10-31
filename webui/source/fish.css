@@ -1,11 +1,11 @@
 /* Fullscreen detail layer (2026-11-01 U plan): entries stay in place and lift above the
    backdrop; the backdrop keeps a light blur (2–4px) with a low-strength veil, and a curved
    tail ties the bubble to its entry. Only the panel and its entry stay clear. */
-.fish-section{position:relative;overflow:visible!important}.fish-content{min-width:0}.fish-section .fish-content{isolation:isolate;padding-bottom:8px}
-/* 0424 目检修正：入口贴紧卡片左下角（left:2px），鱼在剪出窗内平移+rotate(-45deg)，
-   让「橙/奶白颜色分界线」（分界中心约在图 (0.583W, 0.706H)）对准卡片角点——
-   只露叶+头顶+眼睛，身体藏进角外（参照 better_post-processing logo 冒头效果）。 */
-.section-fish-button{position:absolute;left:8px;bottom:6px;z-index:6;width:56px;min-height:42px;height:42px;padding:0;border:0;background:transparent!important;border-radius:14px;overflow:visible;line-height:0;cursor:pointer}
+.fish-section{position:relative;overflow:hidden;border-radius:var(--maibot-radius,18px)}.fish-content{min-width:0}.fish-section .fish-content{isolation:isolate;padding-bottom:34px}
+/* 0425 目检修正：入口小麦麦放进板块框内贴左下圆角并冒头——身体越出卡片左/下边
+   的部分由卡片圆角+overflow 自然裁掉（无矩形蒙版、无凸起），眼睛完整可见；
+   各版块 .fish-content 底部留 34px 麦麦条，信息不被挡。 */
+.section-fish-button{position:absolute;left:-16px;bottom:-10px;z-index:6;width:56px;min-height:42px;height:42px;padding:0;border:0;background:transparent!important;border-radius:14px;overflow:visible;line-height:0;cursor:pointer}
 .section-fish-button:hover{background:transparent}
 .fish-peek{display:block;width:56px;height:auto;overflow:visible;margin:0}
 .fish-peek>svg{display:block;width:56px;height:auto;transform:rotate(-12deg);transform-origin:50% 70%;transition:transform 210ms ease}
@@ -26,14 +26,12 @@
    2–4px 建议、遮罩低强度，不隐藏背景；无 backdrop-filter 时降级为可辨认的轻遮罩)。 */
 body.fish-locked{overflow:hidden}
 .fish-overlay{position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;padding:clamp(12px,4vw,32px);opacity:0;transition:opacity var(--maimai-detail-fade-ms,220ms) ease}
-.fish-overlay[data-align=top]{align-items:flex-start}
-.fish-overlay[data-align=bottom]{align-items:flex-end}
 .fish-overlay.is-open{opacity:1}
 .fish-overlay.is-closing{opacity:0}
 .fish-overlay:before{content:"";position:absolute;inset:0;z-index:0;background:rgba(242,245,239,.2);backdrop-filter:blur(var(--maimai-detail-blur,3px));-webkit-backdrop-filter:blur(var(--maimai-detail-blur,3px))}
 [data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
 @supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
-.fish-panel{position:relative;z-index:1;display:flex;flex-direction:column;width:min(1040px,100%);max-height:90vh;border:1px solid var(--maibot-border);border-radius:18px;color:var(--maibot-foreground);box-shadow:0 16px 55px #0003;overflow:hidden;opacity:0;transform:scale(var(--maimai-detail-scale,.6));transition:opacity var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1),transform var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);transform-origin:var(--maimai-origin,50% 50%)}
+.fish-panel{position:absolute;z-index:1;display:flex;flex-direction:column;width:min(1040px,100%);max-height:90vh;border:1px solid var(--maibot-border);border-radius:18px;color:var(--maibot-foreground);box-shadow:0 16px 55px #0003;overflow:hidden;opacity:0;transform:scale(var(--maimai-detail-scale,.6));transition:opacity var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1),transform var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);transform-origin:var(--maimai-origin,50% 50%)}
 .fish-overlay.is-open .fish-panel{opacity:1;transform:scale(1)}
 .fish-overlay.is-closing .fish-panel{opacity:0;transform:scale(var(--maimai-detail-scale,.6))}
 .fish-popup-heading{display:flex;align-items:center;gap:9px;padding:13px 15px 11px;border-bottom:1px solid var(--maibot-border);flex-shrink:0}
@@ -84,9 +82,7 @@ body.fish-locked{overflow:hidden}
    原屏幕坐标（视觉不搬家）；粘连气泡尾把面板与入口连成一体。 */
 .fish-peek-home{visibility:hidden!important;pointer-events:none!important}
 .fish-float{position:fixed;z-index:950;margin:0}
-.fish-tail{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:visible}
-.fish-tail path{stroke:var(--maibot-border);stroke-width:2;fill:none}
-.fish-tail circle{fill:var(--maibot-border);stroke:none}
+.fish-tail-tip{position:fixed;z-index:2;width:14px;height:14px;transform:rotate(45deg);background:var(--maibot-surface);border:1px solid var(--maibot-border);border-radius:3px;pointer-events:none}
 /* 0425 修复：此规则曾把遮罩层与 ::before 一并覆盖成不透明渐变，导致「轻微高斯模糊」
    完全不生效（页面背景被整层遮死）。只保留说明 tooltip 的底色。 */
 .fish-popup-body .info-tooltip{background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background)}
@@ -94,5 +90,5 @@ body.fish-locked{overflow:hidden}
 [data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
 @supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
 @media(max-width:1000px){.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:700px),(hover:none){.section-fish-button{left:6px;bottom:4px;width:44px;height:34px;min-height:34px}.fish-peek{width:44px;height:auto;margin:0}.fish-peek>svg{width:44px;transform:rotate(-12deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
+@media(max-width:700px),(hover:none){.section-fish-button{left:-12px;bottom:-8px;width:44px;height:34px;min-height:34px}.fish-peek{width:44px;height:auto;margin:0}.fish-peek>svg{width:44px;transform:rotate(-12deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
 @media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:rotate(-12deg)!important}.fish-overlay,.fish-panel{transition:none!important}}

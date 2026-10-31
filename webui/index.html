@@ -60,11 +60,11 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('data:im
 /* Fullscreen detail layer (2026-11-01 U plan): entries stay in place and lift above the
    backdrop; the backdrop keeps a light blur (2–4px) with a low-strength veil, and a curved
    tail ties the bubble to its entry. Only the panel and its entry stay clear. */
-.fish-section{position:relative;overflow:visible!important}.fish-content{min-width:0}.fish-section .fish-content{isolation:isolate;padding-bottom:8px}
-/* 0424 目检修正：入口贴紧卡片左下角（left:2px），鱼在剪出窗内平移+rotate(-45deg)，
-   让「橙/奶白颜色分界线」（分界中心约在图 (0.583W, 0.706H)）对准卡片角点——
-   只露叶+头顶+眼睛，身体藏进角外（参照 better_post-processing logo 冒头效果）。 */
-.section-fish-button{position:absolute;left:8px;bottom:6px;z-index:6;width:56px;min-height:42px;height:42px;padding:0;border:0;background:transparent!important;border-radius:14px;overflow:visible;line-height:0;cursor:pointer}
+.fish-section{position:relative;overflow:hidden;border-radius:var(--maibot-radius,18px)}.fish-content{min-width:0}.fish-section .fish-content{isolation:isolate;padding-bottom:34px}
+/* 0425 目检修正：入口小麦麦放进板块框内贴左下圆角并冒头——身体越出卡片左/下边
+   的部分由卡片圆角+overflow 自然裁掉（无矩形蒙版、无凸起），眼睛完整可见；
+   各版块 .fish-content 底部留 34px 麦麦条，信息不被挡。 */
+.section-fish-button{position:absolute;left:-16px;bottom:-10px;z-index:6;width:56px;min-height:42px;height:42px;padding:0;border:0;background:transparent!important;border-radius:14px;overflow:visible;line-height:0;cursor:pointer}
 .section-fish-button:hover{background:transparent}
 .fish-peek{display:block;width:56px;height:auto;overflow:visible;margin:0}
 .fish-peek>svg{display:block;width:56px;height:auto;transform:rotate(-12deg);transform-origin:50% 70%;transition:transform 210ms ease}
@@ -85,14 +85,12 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('data:im
    2–4px 建议、遮罩低强度，不隐藏背景；无 backdrop-filter 时降级为可辨认的轻遮罩)。 */
 body.fish-locked{overflow:hidden}
 .fish-overlay{position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;padding:clamp(12px,4vw,32px);opacity:0;transition:opacity var(--maimai-detail-fade-ms,220ms) ease}
-.fish-overlay[data-align=top]{align-items:flex-start}
-.fish-overlay[data-align=bottom]{align-items:flex-end}
 .fish-overlay.is-open{opacity:1}
 .fish-overlay.is-closing{opacity:0}
 .fish-overlay:before{content:"";position:absolute;inset:0;z-index:0;background:rgba(242,245,239,.2);backdrop-filter:blur(var(--maimai-detail-blur,3px));-webkit-backdrop-filter:blur(var(--maimai-detail-blur,3px))}
 [data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
 @supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
-.fish-panel{position:relative;z-index:1;display:flex;flex-direction:column;width:min(1040px,100%);max-height:90vh;border:1px solid var(--maibot-border);border-radius:18px;color:var(--maibot-foreground);box-shadow:0 16px 55px #0003;overflow:hidden;opacity:0;transform:scale(var(--maimai-detail-scale,.6));transition:opacity var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1),transform var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);transform-origin:var(--maimai-origin,50% 50%)}
+.fish-panel{position:absolute;z-index:1;display:flex;flex-direction:column;width:min(1040px,100%);max-height:90vh;border:1px solid var(--maibot-border);border-radius:18px;color:var(--maibot-foreground);box-shadow:0 16px 55px #0003;overflow:hidden;opacity:0;transform:scale(var(--maimai-detail-scale,.6));transition:opacity var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1),transform var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);transform-origin:var(--maimai-origin,50% 50%)}
 .fish-overlay.is-open .fish-panel{opacity:1;transform:scale(1)}
 .fish-overlay.is-closing .fish-panel{opacity:0;transform:scale(var(--maimai-detail-scale,.6))}
 .fish-popup-heading{display:flex;align-items:center;gap:9px;padding:13px 15px 11px;border-bottom:1px solid var(--maibot-border);flex-shrink:0}
@@ -143,9 +141,7 @@ body.fish-locked{overflow:hidden}
    原屏幕坐标（视觉不搬家）；粘连气泡尾把面板与入口连成一体。 */
 .fish-peek-home{visibility:hidden!important;pointer-events:none!important}
 .fish-float{position:fixed;z-index:950;margin:0}
-.fish-tail{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:visible}
-.fish-tail path{stroke:var(--maibot-border);stroke-width:2;fill:none}
-.fish-tail circle{fill:var(--maibot-border);stroke:none}
+.fish-tail-tip{position:fixed;z-index:2;width:14px;height:14px;transform:rotate(45deg);background:var(--maibot-surface);border:1px solid var(--maibot-border);border-radius:3px;pointer-events:none}
 /* 0425 修复：此规则曾把遮罩层与 ::before 一并覆盖成不透明渐变，导致「轻微高斯模糊」
    完全不生效（页面背景被整层遮死）。只保留说明 tooltip 的底色。 */
 .fish-popup-body .info-tooltip{background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background)}
@@ -153,7 +149,7 @@ body.fish-locked{overflow:hidden}
 [data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
 @supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
 @media(max-width:1000px){.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:700px),(hover:none){.section-fish-button{left:6px;bottom:4px;width:44px;height:34px;min-height:34px}.fish-peek{width:44px;height:auto;margin:0}.fish-peek>svg{width:44px;transform:rotate(-12deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
+@media(max-width:700px),(hover:none){.section-fish-button{left:-12px;bottom:-8px;width:44px;height:34px;min-height:34px}.fish-peek{width:44px;height:auto;margin:0}.fish-peek>svg{width:44px;transform:rotate(-12deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
 @media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:rotate(-12deg)!important}.fish-overlay,.fish-panel{transition:none!important}}
 </style><style id="host-theme"></style></head><body class="maibot-page"><main class="shell">
 <header class="mast"><div class="brand"><div class="mark" aria-hidden="true"><svg width="25" height="25" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 20c0-9 5-14 14-16 1 9-3 15-10 14M5 20 16 8M11 13v-4m0 4h4"/></svg></div><div><div class="eyebrow">MAIMAI / A LIFE OF HER OWN</div><h1>属于麦麦的生活</h1></div></div><div><div class="toolbar"><span class="status" id="connection"><i class="dot"></i><span id="connection-label">尚未连接</span></span><button class="maibot-button" id="refresh">刷新</button><button class="maibot-button" id="export" disabled>导出快照</button><button id="theme" aria-label="切换离线页面明暗主题" hidden>明 / 暗</button></div><div class="connectionline" id="updated">等待实时数据</div></div></header><div id="notice" role="status" aria-live="polite" class="banner" hidden></div><details class="card offlinehint" id="offline" hidden open><summary>离线查看 · 导入面板快照</summary><p class="note">在宿主插件页面中可自动读取实时数据。独立打开时，可导入通过“导出快照”保存的 JSON；历史从真实采样时刻开始。</p><input id="import" type="file" accept="application/json,.json" aria-label="导入生活面板快照"></details><section class="card offlinehint" id="snapshot-panel" hidden aria-label="导出面板快照"><div class="cardtop"><h2>保存这份生活快照</h2><button id="snapshot-close">收起</button></div><p class="note">全选并复制以下内容，保存为 .json 文件，即可离线导入查看。</p><textarea id="snapshot-text" readonly aria-label="快照 JSON"></textarea><button id="snapshot-select">全选内容</button></section><nav class="panel-tabs" role="tablist" aria-label="生活面板栏目"><button role="tab" id="tab-now" aria-controls="panel-now" aria-selected="true" tabindex="0" data-tab="now"><span class="tab-glyph" aria-hidden="true">◉</span>此刻</button><button role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" tabindex="-1" data-tab="history"><span class="tab-glyph" aria-hidden="true">↗</span>历史</button><button role="tab" id="tab-schedule" aria-controls="panel-schedule" aria-selected="false" tabindex="-1" data-tab="schedule"><span class="tab-glyph" aria-hidden="true">☷</span>日程</button><button role="tab" id="tab-mood" aria-controls="panel-mood" aria-selected="false" tabindex="-1" data-tab="mood"><span class="tab-glyph" aria-hidden="true">♡</span>心情与分享</button><button role="tab" id="tab-system" aria-controls="panel-system" aria-selected="false" tabindex="-1" data-tab="system"><span class="tab-glyph" aria-hidden="true">⚙</span>系统</button></nav><div class="datebar" id="datebar" hidden><div><span class="eyebrow">ONE DAY AT A TIME</span><strong id="selected-day-label">从此刻，回看每一天</strong></div><div class="date-controls"><button id="date-today" aria-pressed="false">今天</button><button id="date-yesterday" aria-pressed="false">昨天</button><label>选择日期 <input id="history-day" type="date" aria-label="选择历史日期"></label><button id="date-range">最近时段</button></div></div><section role="tabpanel" id="panel-now" aria-labelledby="tab-now" tabindex="0"><section class="grid hero" aria-label="此刻与陪伴"><article class="card maibot-card hero-scene" id="hero-scene"><div class="cardtop"><h2>此刻的生活</h2><span class="pill" id="current-kind">等待数据</span></div><div class="activityname" id="current-name">生活正在慢慢展开</div><div class="activitymeta" id="current-meta"><span>连接后查看实际正在进行的活动</span></div><div class="progress" role="progressbar" aria-label="当前活动进度" aria-valuemin="0" aria-valuemax="100" id="current-progress"><i style="width:0"></i></div><div class="splitline"><span id="current-state">—</span><span id="current-percent">—</span></div></article><article class="card maibot-card"><div class="cardtop"><h2>我们的陪伴</h2><span class="pill" id="patrol">待连接</span></div><div class="companionmain"><div><div class="note">当前关系</div><div class="tier" id="tier">—</div></div><div class="rowend"><div class="score" id="score">—</div><div class="note" id="baseline">关系分 / 基线</div></div></div><div class="smallstats"><div><span class="note">今日主动</span><strong id="budget">—</strong></div><div><span class="note">早安记录</span><strong id="morning">—</strong></div><div><span class="note">晚安记录</span><strong id="night">—</strong></div></div></article></section><div class="sectionline"><h2>身心的五个侧面</h2><span class="note" id="state-at">0–100 · 当前快照</span></div><section class="grid metrics" id="metrics" aria-label="五项生活状态"></section><div class="observations" id="observations"></div><section class="card sleep-combined" aria-label="睡眠与恢复"><article><div class="cardtop"><h2>睡眠与恢复</h2><span class="pill" id="sleep-status">—</span></div><div class="sleepstats"><div><div class="note">睡眠债</div><div class="bignum" id="debt">—</div><div class="note">小时 · 上限 12h</div></div><div><div class="note">连续睡眠</div><div class="bignum" id="continuous">—</div><div class="note">分钟 · 当前连续段</div></div><div><div class="note">精神状态</div><div class="bignum" id="mental">—</div><div class="note">精力 × 专注 × (1−压力)</div></div></div><div id="debt-chart" class="chart sleepgraph"></div><div class="note" id="sleep-anchors">等待作息信息</div></article><details class="sleep-archive"><summary>最近的睡眠 · 展开记录</summary><article><div class="cardtop"><h2>最近的睡眠</h2><span class="note">最近 7 天 · 最多 8 次</span></div><div id="sleep-list"></div></article></details></section></section>
@@ -608,10 +604,9 @@ const SectionFish=(()=>{
  const body=el('div','fish-popup-body'),summary=el('p','fish-popup-summary'),metadata=el('div','fish-metadata'),details=el('div','fish-records');body.append(summary,metadata,details);panel.append(heading,body);overlay.append(panel);document.body.append(overlay);
  let current=null,lastTrigger=null,closeTimer=null,hoverTimer=null,pinnedOpen=false,floatSyncQueued=false;
  const entries=new Map();
- // 粘连气泡尾：从入口画一条曲线连到面板最近边；入口与面板重叠（窄屏）时隐藏，
- // 先保证面板内容、关闭按钮与入口可达（U 计划 §4.2）。
- const FISH_NS='http://www.w3.org/2000/svg';
- const tail=document.createElementNS(FISH_NS,'svg');tail.classList.add('fish-tail');tail.setAttribute('aria-hidden','true');tail.hidden=true;overlay.append(tail);
+ // 粘连气泡（0425 二次目检）：面板紧贴入口放置（空间更多的一侧），面板边缘在
+ // 入口对应位置开一个三角缺口——气泡“长”在入口上，不再用细线远程连接。
+ const tip=el('span','fish-tail-tip');tip.setAttribute('aria-hidden','true');tip.hidden=true;panel.append(tip);
  let changesCache={src:null,key:'',items:[]};
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const finishMs=()=>{const raw=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--maimai-detail-fade-ms'));return Number.isFinite(raw)&&raw>0?raw:220};
@@ -735,33 +730,24 @@ const SectionFish=(()=>{
   b.style.left=r.left+'px';b.style.top=r.top+'px';
   b.style.width=r.width+'px';b.style.height=r.height+'px';b.style.bottom='auto';
  }
- function drawTail(){
-  if(!current){tail.hidden=true;return}
-  const b=current.button.getBoundingClientRect(),p=panel.getBoundingClientRect();
-  if(!(b.right<p.left||b.left>p.right||b.bottom<p.top||b.top>p.bottom)){tail.hidden=true;return}
-  const bx=b.left+b.width/2,by=b.top+b.height/2;
-  const cands=[
-   {x:Math.min(Math.max(bx,p.left+28),p.right-28),y:p.top},
-   {x:Math.min(Math.max(bx,p.left+28),p.right-28),y:p.bottom},
-   {x:p.left,y:Math.min(Math.max(by,p.top+28),p.bottom-28)},
-   {x:p.right,y:Math.min(Math.max(by,p.top+28),p.bottom-28)}];
-  let best=cands[0],bd=Infinity;
-  for(const c of cands){const d=Math.hypot(c.x-bx,c.y-by);if(d<bd){bd=d;best=c}}
-  const dx=best.x-bx,dy=best.y-by;
-  const path=document.createElementNS(FISH_NS,'path');
-  path.setAttribute('d',`M ${bx} ${by} C ${bx+dx*.3-dy*.18} ${by+dy*.3+dx*.18}, ${bx+dx*.7+dy*.18} ${by+dy*.7-dx*.18}, ${best.x} ${best.y}`);
-  const dot=document.createElementNS(FISH_NS,'circle');
-  dot.setAttribute('cx',best.x);dot.setAttribute('cy',best.y);dot.setAttribute('r','3.5');
-  tail.setAttribute('viewBox',`0 0 ${innerWidth} ${innerHeight}`);
-  tail.setAttribute('width',innerWidth);tail.setAttribute('height',innerHeight);
-  tail.replaceChildren(path,dot);
-  tail.hidden=bd<12;
+ // 面板高度确定后贴到入口旁：上/下贴附 + 三角缺口对准入入口（随滚动/缩放重校准）。
+ function snapPanel(entry){
+  if(!current)return;
+  const b=entry.button.getBoundingClientRect(),vh=innerHeight;
+  const pRect=panel.getBoundingClientRect();
+  const below=panel.dataset.side==='below';
+  let top=below?Math.min(b.bottom+12,vh-pRect.height-10):Math.max(b.top-12-pRect.height,10);
+  panel.style.top=Math.round(Math.max(10,top))+'px';
+  const tipX=Math.min(Math.max(b.left+b.width/2-pRect.left,20),pRect.width-20);
+  tip.style.left=Math.round(pRect.left+tipX-7)+'px';
+  tip.style.top=Math.round((below?pRect.bottom:pRect.top)-7)+'px';
+  tip.hidden=false;
  }
  // 滚动/缩放/旋转后重新校准（测量节流到每帧一次，不逐帧全页布局）。
  const recalibrate=()=>{
   if(floatSyncQueued||!current)return;
   floatSyncQueued=true;
-  requestAnimationFrame(()=>{floatSyncQueued=false;if(!current)return;syncFloat(current);drawTail()});
+  requestAnimationFrame(()=>{floatSyncQueued=false;if(!current)return;syncFloat(current);snapPanel(current)});
  };
  window.addEventListener('scroll',recalibrate,{passive:true,capture:true});
  function close(restoreFocus=true){
@@ -770,7 +756,7 @@ const SectionFish=(()=>{
   clearTimeout(closeTimer);clearTimeout(hoverTimer);
   unfloatEntry(old);old.element.classList.remove('fish-open');old.button.setAttribute('aria-expanded','false');
   for(const group of old.groups)store.append(group);
-  tail.hidden=true;panel.style.transformOrigin='';panel.style.maxHeight='';
+  tip.hidden=true;panel.style.transformOrigin='';panel.style.left='';panel.style.top='';panel.style.maxHeight='';panel.style.maxHeight='';
   const finish=()=>{
    overlay.hidden=true;overlay.classList.remove('is-open','is-closing');overlay.removeAttribute('data-section');delete overlay.dataset.align;
    document.body.classList.remove('fish-locked');
@@ -786,12 +772,18 @@ const SectionFish=(()=>{
  // 面板最大高度适配该侧空间——入口与内容都完整可见，不拘泥粘连哪一边；
  // 连接边/气泡尾随后按实际位置绘制（drawTail 取最近边）。
  function placePanel(entry){
-  const b=entry.button.getBoundingClientRect(),vh=innerHeight;
+  const b=entry.button.getBoundingClientRect(),vh=innerHeight,vw=innerWidth,pad=12;
   const freeAbove=b.top,freeBelow=vh-b.bottom;
   const putBelow=freeBelow>=freeAbove;
   overlay.dataset.align=putBelow?'bottom':'top';
-  const free=Math.max(putBelow?freeBelow:freeAbove)-24;
-  panel.style.maxHeight=`${Math.max(280,Math.min(Math.round(free),Math.round(vh*0.9)))}px`;
+  panel.dataset.side=putBelow?'below':'above';
+  const free=Math.max(putBelow?freeBelow:freeAbove,240)-24;
+  panel.style.maxHeight=`${Math.min(Math.round(free),Math.round(vh*0.9))}px`;
+  // 水平：面板左缘靠近入口（长内容向右铺开），不居中漂移；宽度显式设定
+  // （absolute 子元素的百分比宽按 overlay 的 padding-box 解析，须自行钳制在视口内）
+  const panelW=Math.min(1040,vw-pad*2);
+  panel.style.width=`${Math.round(panelW)}px`;
+  panel.style.left=`${Math.round(Math.min(Math.max(b.left+b.width/2-140,pad),Math.max(pad,vw-pad-panelW)))}px`;
   const p=panel.getBoundingClientRect();
   panel.style.transformOrigin=
    `${Math.min(Math.max(b.left+b.width/2-p.left,0),p.width)}px ${Math.min(Math.max(b.top+b.height/2-p.top,0),p.height)}px`;
@@ -818,7 +810,7 @@ const SectionFish=(()=>{
   if(typeof Mascot!=='undefined')Mascot.setDetailMode(true);
   refresh();
   redraw();
-  drawTail();
+  requestAnimationFrame(()=>snapPanel(entry));
   if(pinned)closeButton.focus({preventScroll:true});    // 悬停预览不抢键盘焦点
  }
  // Recover focus even if a refresh or host shortcut moved it outside the
@@ -860,7 +852,6 @@ const SectionFish=(()=>{
   // Reconcile in place: a timer refresh must not remove the focused explanation.
   rows.forEach(([label,value,explanation],i)=>{let row=metadata.children[i];if(!row){row=metadataRow(label,value,explanation);metadata.append(row)}else{row.firstElementChild.firstChild.textContent=label;row.lastElementChild.textContent=value??'暂无记录';const tip=row.querySelector('.info-tooltip');if(tip)tip.textContent=explanation||'暂无说明'}});while(metadata.children.length>rows.length)metadata.lastElementChild.remove();
   renderChanges(e);
-  drawTail();
  }
  function fold(label,nodes){const list=nodes.filter(Boolean);if(!list.length)return null;let group;
   if(list.length===1&&list[0].tagName==='DETAILS'){group=list[0];group.open=false}
