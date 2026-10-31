@@ -112,19 +112,35 @@ class VideoWatchService:
         return self._manager
 
     async def stop(self) -> None:
-        """停机：不等待进行中任务（原型语义）；下次装配 recover() 如实标记中断。"""
+        """停机（S0 生命周期修复）：真正取消任务泵并终止在跑 worker——不只是丢引用。
+
+        卸载/热重载后不再有本模块的泵轮询或父侧模型调用；队列/进行中任务保留
+        台账，下次装配 ``_recover()`` 如实标记 ``interrupted_by_restart``。
+        """
+        manager = self._manager
         self._manager = None
+        if manager is not None:
+            await manager.shutdown()
 
     # ---- 动作面（VideoWatchPort；工具与日程共用同一实例/队列/缓存）----
     async def handle_action(self, action: str = "", video: str = "", task_id: str = "",
                             purpose: str = "", episode_id: str = "",
-                            source: str = "tool", **kwargs: Any) -> Dict[str, Any]:
+                            source: str = "tool", owner: str = "", force: bool = False,
+                            **kwargs: Any) -> Dict[str, Any]:
         del kwargs  # stream_id/platform 等宿主注入参数不参与观看语义
         manager = self._require_manager()
         action = str(action or "").strip().lower()
+        # S0 所有权：source=tool 视为用户显式点播（取消即 force）；日程侧由
+        # episode 推导引用身份（事件收尾只释放自己的引用，不误杀其他调用者）
+        if not owner:
+            if source == "tool":
+                # 用户经工具显式点播：取消语义为强制（S0 所有权：用户意志优先）
+                owner, force = "tool", True
+            elif source == "schedule" and episode_id:
+                owner = f"schedule:{episode_id}"
         if action == "submit":
             receipt = manager.submit(video, purpose=purpose, source=source,
-                                     episode_id=episode_id)
+                                     episode_id=episode_id, owner=owner)
             receipt["content"] = _brief_receipt_text(receipt)
             return receipt
         if action == "status":
@@ -140,10 +156,14 @@ class VideoWatchService:
                 receipt["content"] = str(receipt.get("error") or "暂无结果")
             return receipt
         if action == "cancel":
-            receipt = manager.cancel(task_id)
-            receipt["content"] = (f"任务 {task_id} 已是终态（{receipt.get('status')}），返回原终态不重跑"
-                                  if receipt.get("already_terminal")
-                                  else f"任务 {task_id} 取消请求已受理（{receipt.get('status')}）")
+            receipt = manager.cancel(task_id, owner=owner, force=force)
+            if receipt.get("released"):
+                receipt["content"] = str(receipt.get("content")
+                                         or f"任务 {task_id} 仍有其他调用者，本次只释放引用不取消")
+            else:
+                receipt["content"] = (f"任务 {task_id} 已是终态（{receipt.get('status')}），返回原终态不重跑"
+                                      if receipt.get("already_terminal")
+                                      else f"任务 {task_id} 取消请求已受理（{receipt.get('status')}）")
             return receipt
         if action == "next_candidate":
             receipt = manager.next_candidate()

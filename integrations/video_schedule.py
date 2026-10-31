@@ -108,9 +108,13 @@ class VideoWatchCoordinator:
             task_id = str(entry.get("task_id") or "")
             if task_id and not entry.get("result") and str(entry.get("stage")) not in ("unavailable", "skipped", "failed_submit"):
                 try:
-                    receipt = await self._api(action="cancel", task_id=task_id)
+                    # S0 所有权：日程收尾只释放自己的引用（owner=本 episode）；
+                    # 同一任务若被用户/其他事件共享，端口侧只释放不误杀
+                    receipt = await self._api(action="cancel", task_id=task_id,
+                                              owner=f"schedule:{episode_id}")
                     entry["cancel_receipt"] = {"status": receipt.get("status"),
-                                               "already_terminal": bool(receipt.get("already_terminal"))}
+                                               "already_terminal": bool(receipt.get("already_terminal")),
+                                               "released": bool(receipt.get("released"))}
                 except Exception as exc:
                     entry["cancel_receipt"] = {"error": str(exc)[:200]}
             # 晚到结果：取消后任务可能已完成（回执 already_terminal=completed）→ 照实存档

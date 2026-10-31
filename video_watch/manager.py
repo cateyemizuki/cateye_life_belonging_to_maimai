@@ -104,7 +104,7 @@ class WatchTaskManager:
     # 对外操作（submit/status/result/cancel/候选）
     # ------------------------------------------------------------------
     def submit(self, video: str, purpose: str = "", source: str = "tool",
-               episode_id: str = "") -> Dict[str, Any]:
+               episode_id: str = "", owner: str = "") -> Dict[str, Any]:
         from .bv import normalize_video_ref
 
         bvid = normalize_video_ref(video or "")
@@ -117,9 +117,17 @@ class WatchTaskManager:
         if isinstance(cached, dict) and cached.get("status") == _COMPLETED:
             return {"success": True, "cached": True, "task_id": cached.get("task_id", ""),
                     "status": _COMPLETED, "result": cached}
-        # 进行中去重：同 BV 只关联一个任务
+        owner = str(owner or "").strip()
+        # 进行中去重：同 BV 只关联一个任务；S0 所有权——本次调用者登记为该任务的
+        # 引用持有者之一（cancel 非 force 只撤销自己的引用，不误杀其他调用者）
         for task in self._store.load_tasks():
             if task.get("bvid") == bvid and not self._store.is_terminal(str(task.get("status"))):
+                if owner:
+                    owners = [str(o) for o in (task.get("owners") or [])]
+                    if owner not in owners:
+                        owners.append(owner)
+                        task["owners"] = owners
+                        self._store.upsert_task(task)
                 return {"success": True, "cached": False, "deduped": True,
                         "task_id": task["task_id"], "status": task.get("status")}
         tasks = self._store.load_tasks()
@@ -133,9 +141,11 @@ class WatchTaskManager:
             "purpose": str(purpose or "")[:200],
             "source": "schedule" if source == "schedule" else "tool",
             "episode_id": str(episode_id or ""),
+            "owners": [owner] if owner else [],
             "status": _QUEUED,
             "created_at": time.time(),
             "deadline_seconds": self._deadline_seconds,
+            "deadline_epoch": time.time() + self._deadline_seconds,
             "error_class": None,
             "error": None,
         }
@@ -181,7 +191,14 @@ class WatchTaskManager:
                 "error": f"任务尚未结束（当前 {status}）",
                 "task_id": task_id, "status": status}
 
-    def cancel(self, task_id: str) -> Dict[str, Any]:
+    def cancel(self, task_id: str, owner: str = "", force: bool = False) -> Dict[str, Any]:
+        """取消/释放观看任务（S0 所有权语义，B 计划/冲浪计划 §4.2）。
+
+        - ``force=True``（用户经工具显式取消）：无条件取消，清空全部引用；
+        - ``force=False``（自动事件释放）：撤销自己的引用；仍有其他调用者持有
+          时**只释放不取消**（回执 ``released=True``），避免日程收尾误杀用户的
+          显式点播或另一个事件的任务；无引用信息时保持旧行为（直接取消）。
+        """
         task = self._store.get_task(task_id or "")
         if not task:
             return {"success": False, "error_class": "not_found", "error": "任务不存在"}
@@ -190,6 +207,25 @@ class WatchTaskManager:
             # 已结束任务返回原终态，不重跑
             return {"success": True, "task_id": task_id, "status": status,
                     "already_terminal": True}
+        owner = str(owner or "").strip()
+        if not force and owner:
+            owners = [str(o) for o in (task.get("owners") or [])]
+            if owner in owners and len(owners) > 1:
+                owners.remove(owner)
+                task["owners"] = owners
+                self._store.upsert_task(task)
+                return {"success": True, "task_id": task_id, "status": status,
+                        "released": True,
+                        "content": f"任务 {task_id} 仍有其他调用者（{len(owners)}），本次只释放引用不取消"}
+        if not force:
+            # 释放最后一个引用后清空（下次 dedupe 重新登记）
+            if owner:
+                owners = [str(o) for o in (task.get("owners") or []) if o != owner]
+                task["owners"] = owners
+                self._store.upsert_task(task)
+        else:
+            task["owners"] = []
+            self._store.upsert_task(task)
         self._cancel_requested.add(task_id)
         if status == _QUEUED:
             self._set_terminal(task, _CANCELLED, "cancelled", "提交后、开始处理前被取消")
@@ -197,6 +233,35 @@ class WatchTaskManager:
         # running：由监视循环在下一个轮询点终止子进程并落终态
         return {"success": True, "task_id": task_id, "status": status,
                 "cancelling": True}
+
+    async def shutdown(self) -> None:
+        """停机（S0 生命周期修复）：取消任务泵、终止在跑 worker。
+
+        队列/进行中任务保留在台账（不伪造终态），下次装配 ``_recover()`` 如实
+        标记 ``interrupted_by_restart``；停机后不再有任何本任务的泵轮询或父侧
+        模型调用（观后感/画面摘要钩子随泵取消）。
+        """
+        # 顺序敏感：先取 worker 引用再取消泵——泵被取消时其清理路径会清空
+        # self._proc，若后取会漏掉 terminate（孤儿进程，S0 测试实证）
+        proc = self._proc
+        pump = self._pump_task
+        self._pump_task = None
+        if pump is not None and not pump.done():
+            pump.cancel()
+            try:
+                await pump
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass  # 泵自身异常即已终止，停机语义不变
+        self._proc = None
+        self._current_task_id = None
+        self._cancel_requested.clear()
+        if proc is not None and proc.returncode is None:
+            try:
+                await self._terminate(proc)
+            except Exception:
+                pass
 
     def next_candidate(self) -> Dict[str, Any]:
         """从配置 watchlist 里挑一个还没真实看过的候选（日程选片用）。"""
@@ -352,15 +417,28 @@ class WatchTaskManager:
     async def _finish(self, task: Dict[str, Any], result: Dict[str, Any]) -> None:
         status = str(result.get("status"))
         if status == _COMPLETED:
-            # 观后感（可选）：经宿主 LLM 文本任务生成；失败如实置 None，不阻塞任务
+            # 观后感/画面摘要（可选）：经宿主 LLM 生成；S0 起纳入任务总截止——
+            # 预算=剩余截止（上限 180s），耗尽/超时都如实标注并保留 worker 原始结果
             if self._impression_hook is not None:
-                try:
-                    patched = await self._impression_hook(dict(result))
-                    if isinstance(patched, dict):
-                        result = patched
-                except Exception as exc:
+                remaining = float(task.get("deadline_epoch") or 0) - time.time()
+                budget = min(180.0, remaining) if remaining > 0 else 0.0
+                if budget <= 0:
                     result["impression"] = None
-                    result["impression_error"] = f"观后感生成失败（如实降级）：{exc}"
+                    result["impression_error"] = ("父侧加工窗口已被任务总截止耗尽，"
+                                                  "保留 worker 原始结果（如实标注）")
+                else:
+                    try:
+                        patched = await asyncio.wait_for(
+                            self._impression_hook(dict(result)), timeout=budget)
+                        if isinstance(patched, dict):
+                            result = patched
+                    except asyncio.TimeoutError:
+                        result["impression"] = None
+                        result["impression_error"] = ("父侧加工（观后感/画面摘要）超过任务总截止，"
+                                                      "如实截断（不做晚到补跑）")
+                    except Exception as exc:
+                        result["impression"] = None
+                        result["impression_error"] = f"观后感生成失败（如实降级）：{exc}"
             task["status"] = _COMPLETED
             self._store.save_cache(str(task.get("bvid")), result,
                                    self._result_mode_token(result))
