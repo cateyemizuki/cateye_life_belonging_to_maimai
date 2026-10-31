@@ -53,8 +53,9 @@ class VideoWatchComponentsMixin:
                                     task_id: str = "", purpose: str = "",
                                     **kwargs: Any) -> str:
         """LLM Tool：看一个B站视频（后台执行，先回执后查询；不自动发消息）。"""
-        service = getattr(self, "_video_watch", None)
-        if service is None:
+        try:
+            service = self._video_watch  # on_load 恒装配（disabled 也建实例，仅不 start）
+        except AttributeError:
             return "视频观看模块未启用（[video_watch].enabled=false）或插件未加载。"
         try:
             receipt = await service.handle_action(
