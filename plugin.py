@@ -55,7 +55,7 @@ from suite_config import (
     factory_defaults,
 )
 from core.diag import DecisionLogger, LLMCallLogger
-from core.event_bus import EventBus, install_proactive_budget
+from integrations.proactive_delivery import ProactiveDelivery, install_proactive_budget
 from core.llm_utils import LLMService, llm_task_name_of
 from emotion.components import EmotionComponentsMixin
 from emotion.services import EmotionServices
@@ -363,7 +363,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
         # 进程内事件总线（M0，MAINTENANCE_PLAN §三）：先于服务束构造（各服务束自读 plugin._bus），
         # 预算计数器在装配时装入（先于服务束启动；M0 实际订阅者仅它）
-        self._bus = EventBus(self._decision_logger)
+        self._bus = ProactiveDelivery(self._decision_logger)
         # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
         # M11（附录 II §3.3）：预算只统计发往目标陪伴私聊的主动打扰——注入 self._stream_id
         # 取值回调（G11 权威来源，随 _apply_target/热重载更新；不新增持久化状态）
@@ -469,6 +469,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception:
             pass
         self._stop_life_services()
+        self._bus.stop_budget()
         self._affection.flush()
         self._db.close()
         self.ctx.logger.info("属于麦麦的生活已卸载")
