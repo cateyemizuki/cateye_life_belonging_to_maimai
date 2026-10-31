@@ -85,3 +85,45 @@ class VideoWatchPort(Protocol):
 
 #: 视频观看端口提供者（装配期注入；返回 None = 模块未装配，调用方按降级语义处理）
 VideoWatchPortProvider = Callable[[], Optional[VideoWatchPort]]
+
+
+class ConversationActivityPort(Protocol):
+    """对话忙闲只读面（冲浪计划书 §4.1，S1；companion.attention 实现）。
+
+    消费方（integrations 注意力门控）据此判断「没有在聊天」；``coverage``
+    非 ``"ok"`` 或 ``busy`` 为真时不得启动自动观看（fail-safe，不把
+    「没看到消息」当宿主肯定空闲）。快照字段：busy/reasons/coverage/
+    last_participation_epoch/silence_seconds/in_flight_replies。
+    """
+
+    def snapshot(self) -> Dict[str, Any]:
+        """当前忙闲快照（只读 dict；不抛异常，观测失败按不确定返回）。"""
+        ...
+
+
+class AttentionLeasePort(Protocol):
+    """自动注意力租约面（冲浪计划书 §4.2，S1；companion.attention 实现）。
+
+    SURF=自动冲浪（至多一个持有者）；直接对话经 ``acquire_chat`` 让位。
+    ``lease_valid`` 供消费方在每次模型调用/继续下一条前核对版本。
+    """
+
+    def try_acquire_surf(self, holder: str) -> Optional[Dict[str, Any]]:
+        """申请 SURF 租约；忙/不确定/被占返回 None（放弃，不等待）。"""
+        ...
+
+    def release(self, holder: str) -> bool:
+        """释放自己持有的租约（幂等）。"""
+        ...
+
+    def current(self) -> Optional[Dict[str, Any]]:
+        """当前租约（无则 None；只读副本）。"""
+        ...
+
+    def lease_valid(self, lease: Optional[Dict[str, Any]]) -> bool:
+        """租约仍在且版本未变。"""
+        ...
+
+
+#: 注意力租约提供者（装配期注入；None = 权威未装配，自动观看门控按拒绝处理）
+AttentionLeaseProvider = Callable[[], Optional[AttentionLeasePort]]

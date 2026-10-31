@@ -347,6 +347,19 @@ class CompanionComponentsMixin:
                 companion.senders.record(message_id, user_id)
         except Exception:
             pass  # 记录失败绝不影响消息处理
+        # S1（冲浪计划书 §4.1）：全局入站观测（chat.receive.before_process 覆盖所有
+        # 已接入流）喂对话忙闲事实——私聊=直接消息；群聊含 @/点名麦麦=直接，其余=环境
+        try:
+            tracker = getattr(self, "_attention_tracker", None)
+            if tracker is not None and isinstance(message, dict):
+                sid, grp = extract_session_info_from_message(message)
+                if sid:
+                    text = str(message.get("raw_message") or message.get("plain_message") or "")
+                    lover = str(getattr(self, "_lover_name", "") or "")
+                    direct = (grp is False) or (bool(grp) and ("@" in text or (bool(lover) and lover in text)))
+                    tracker.note_incoming(str(sid), direct=direct)
+        except Exception:
+            pass  # 忙闲记录失败绝不影响消息处理
         return None
 
     @HookHandler(
@@ -448,6 +461,8 @@ class CompanionComponentsMixin:
     async def mai_hook_planner_inject(self, **kwargs: Any) -> dict[str, Any]:
         """注入陪伴上下文（屏幕旁白 + 好感度 + 主动回合软约束；2026-10-10 注入矩阵）。
 
+        S1（冲浪计划书 §4.1）：planner 请求即回复生成开始——喂在途回复事实。
+
         日期行与当前活动**不再由本 Hook 注入**：日期/节假日行归日程模块
         （planning.inject_service._date_header），当前活动归日程块本身。
         本 Hook 只负责：①屏幕旁白（仅目标私聊）；②好感度块（目标私聊恒定 /
@@ -542,6 +557,9 @@ class CompanionComponentsMixin:
         分开识别、分开失效（见 screen_context）。
         """
         # mai-love v2.6.2：replyer 的上下文同样携带宿主主动任务块，一并剥离过期块
+        _tracker = getattr(self, "_attention_tracker", None)
+        if _tracker is not None:
+            _tracker.note_reply_start()
         stripped = without_stale_proactive_blocks(kwargs)
         if stripped is not None:
             kwargs = stripped
@@ -570,6 +588,9 @@ class CompanionComponentsMixin:
         仅在最近 90 秒内有 proactive trigger 时生效；补计后清除待确认触发，
         因此与顶层 speak_counter 钩子共存时不会重复计数。
         """
+        _tracker = getattr(self, "_attention_tracker", None)
+        if _tracker is not None:
+            _tracker.note_reply_end()
         companion = self._mai_companion()
         if companion is None:
             return

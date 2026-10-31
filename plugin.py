@@ -45,6 +45,7 @@ from companion.components import CompanionComponentsMixin
 from companion.config import target_qq_of
 from companion.harass_report import HARASS_TOOL_NAME
 from companion.services import CompanionServices
+from companion.attention import ConversationActivityTracker, SurfLeaseAuthority
 from suite_config import (
     CURRENT_LAYOUT_VERSION,
     LEGACY_PROACTIVE_KEYS,
@@ -366,6 +367,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 进程内事件总线（M0，MAINTENANCE_PLAN §三）：先于服务束构造（各服务束自读 plugin._bus），
         # 预算计数器在装配时装入（先于服务束启动；M0 实际订阅者仅它）
         self._bus = ProactiveDelivery(self._decision_logger)
+        # S1（冲浪计划书 §4）：对话忙闲事实 + 自动注意力租约权威（单实例，装配根
+        # 注入；hook 喂事实，integrations/video_schedule 门控消费；租约是运行态，
+        # 重载即消失→自动冲浪保守恢复，额度窗口由 video_schedule 持久化）
+        self._attention_tracker = ConversationActivityTracker()
+        self._attention = SurfLeaseAuthority(self._attention_tracker)
         # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
         # M11（附录 II §3.3）：预算只统计发往目标陪伴私聊的主动打扰——注入 self._stream_id
         # 取值回调（G11 权威来源，随 _apply_target/热重载更新；不新增持久化状态）
