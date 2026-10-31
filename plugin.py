@@ -70,6 +70,7 @@ from planning.rolling_planner import RollingPlanner
 from planning.schedule_db import ScheduleDB
 from planning.schedule_query import ScheduleQuery
 from planning.services import PlanningServices
+from integrations.video_schedule import VideoWatchCoordinator
 from qzone.cgi import QzoneCookieManager
 from qzone.components import QzoneComponentsMixin
 from qzone.service import QzoneService
@@ -1263,6 +1264,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             report = planner.tick(life_snapshot=snapshot) or {}
         else:
             report = planner.tick() or {}
+        # B 计划（2026-11-01 §5）：刷视频事件联动公共观看接口（单飞 task，失败不拖挂主循环）
+        self._kick_video_watch_sync()
         date = str(report.get("date") or "")
         if not date or date == getattr(self, "_life_cleanup_date", ""):
             return
@@ -1279,6 +1282,43 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 self.ctx.logger.info("生活状态 episode 过期清理完成（删除 %d 条）", removed)
         except Exception as exc:
             self.ctx.logger.warning("生活状态 episode 清理失败（忽略）：%s", exc)
+
+    # ── 刷视频事件联动（B 计划 §5；integrations/video_schedule 场景文件）────────
+    def _video_coordinator(self) -> VideoWatchCoordinator:
+        """惰性单例：公共观看接口端口 + 日程 episode 读取（只读，不持权威状态）。"""
+        coord = getattr(self, "_video_watch_coordinator", None)
+        if coord is None:
+            def _active() -> Optional[Dict[str, Any]]:
+                db = getattr(self, "_db", None)
+                return db.active_episode() if db is not None else None
+
+            def _by_id(episode_id: str) -> Optional[Dict[str, Any]]:
+                db = getattr(self, "_db", None)
+                return db.get_episode(episode_id) if db is not None else None
+
+            coord = VideoWatchCoordinator(
+                self._data_dir, self._call_watch_api, _active, _by_id,
+                logger=self.ctx.logger)
+            self._video_watch_coordinator = coord
+        return coord
+
+    async def _call_watch_api(self, action: str = "", **kwargs: Any) -> Dict[str, Any]:
+        """公共观看接口端口适配：跨插件经 ctx.api.call（api.call 能力已在 manifest 声明）。"""
+        return await self.ctx.api.call("cateye.bili-watch.bili_watch", action=action, **kwargs)
+
+    def _kick_video_watch_sync(self) -> None:
+        """单飞调度：上一拍联动未结束时不再叠加（有界；异常只告警）。"""
+        pending = getattr(self, "_video_watch_sync_task", None)
+        if pending is not None and not pending.done():
+            return
+        try:
+            self._video_watch_sync_task = asyncio.get_running_loop().create_task(
+                self._video_coordinator().sync())
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning("刷视频联动调度失败（忽略）：%s", exc)
+            except Exception:
+                pass
 
     def _life_tick_state(self, planner: Any,
                          sleep_rates: Any = None) -> dict[str, Any] | None:

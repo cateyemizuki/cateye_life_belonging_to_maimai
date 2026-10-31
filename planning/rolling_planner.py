@@ -157,6 +157,11 @@ RANDOM_EVENT_POOL: Tuple[Dict[str, Any], ...] = (
      "interruptibility": 0.80, "goal_type": "daily_routine",
      "state_deltas": {"energy": -0.03, "stress": 0.03},
      "templates": ("临时有件小事要处理一下", "被喊去搭了把手，花了些时间")},
+    # 2026-11-01 B 计划（§5）：回退池同口径补「刷视频」（catalog 未装配时的逐字回退路径）
+    {"key": "watch_bili", "name": "刷视频", "min_minutes": 10, "max_minutes": 25,
+     "interruptibility": 0.90, "goal_type": "entertainment",
+     "state_deltas": {"stress": -0.04, "focus": -0.02},
+     "templates": ("窝在椅子上刷了会儿B站视频", "翻了翻待看的视频，挑了一个看起来还不错的")},
 )
 #: 同一事件 4 小时内不重复（A.7）
 RANDOM_EVENT_DEDUP_MINUTES = 240

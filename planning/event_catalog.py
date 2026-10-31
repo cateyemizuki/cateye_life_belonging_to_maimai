@@ -108,6 +108,12 @@ BUILTIN_EVENTS: Tuple[Dict[str, Any], ...] = (
      "interruptibility": 0.80, "goal_type": "daily_routine",
      "state_deltas": {"energy": -0.03, "stress": 0.03},
      "templates": ("临时有件小事要处理一下", "被喊去搭了把手，花了些时间")},
+    # 2026-11-01 B 计划（§5）：刷视频 = 低优先级可中断娱乐小事件；执行侧由
+    # integrations/video_schedule 经公共观看接口驱动（无候选/能力缺失如实跳过）。
+    {"event_id": "watch_bili", "name": "刷视频", "min_minutes": 10, "max_minutes": 25,
+     "interruptibility": 0.90, "goal_type": "entertainment",
+     "state_deltas": {"stress": -0.04, "focus": -0.02},
+     "templates": ("窝在椅子上刷了会儿B站视频", "翻了翻待看的视频，挑了一个看起来还不错的")},
 )
 
 #: 安全关键词（模板 / 名称；宁可保守，命中即 E_SAFETY）
