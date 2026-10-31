@@ -8,7 +8,7 @@ utils/energy_model.py（照搬合并；C1 裁决以本侧能量曲线为唯一�
     - 新格式: [minutes, minutes]，minutes 取 0-1440（跨夜时 end 可 > 1440）
 
 分层约定：core/time_utils.py 只保留纯时间函数（parse_hhmm / minutes_of_now /
-next_run_at / hours_between）；planning 侧的时间/窗口/能量函数集中在本模块。
+hours_between）；planning 侧的时间/窗口/能量函数集中在本模块。
 """
 
 from __future__ import annotations

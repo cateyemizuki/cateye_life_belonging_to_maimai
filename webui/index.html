@@ -606,7 +606,7 @@ const SectionFish=(()=>{
  const entries=new Map();
  // 粘连气泡（0425 二次目检）：面板紧贴入口放置（空间更多的一侧），面板边缘在
  // 入口对应位置开一个三角缺口——气泡“长”在入口上，不再用细线远程连接。
- const tip=el('span','fish-tail-tip');tip.setAttribute('aria-hidden','true');tip.hidden=true;panel.append(tip);
+ const tip=el('span','fish-tail-tip');tip.setAttribute('aria-hidden','true');tip.hidden=true;overlay.append(tip);
  let changesCache={src:null,key:'',items:[]};
  const reduceMotion=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  const finishMs=()=>{const raw=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--maimai-detail-fade-ms'));return Number.isFinite(raw)&&raw>0?raw:220};
@@ -737,10 +737,17 @@ const SectionFish=(()=>{
   const pRect=panel.getBoundingClientRect();
   const below=panel.dataset.side==='below';
   let top=below?Math.min(b.bottom+12,vh-pRect.height-10):Math.max(b.top-12-pRect.height,10);
-  panel.style.top=Math.round(Math.max(10,top))+'px';
-  const tipX=Math.min(Math.max(b.left+b.width/2-pRect.left,20),pRect.width-20);
-  tip.style.left=Math.round(pRect.left+tipX-7)+'px';
-  tip.style.top=Math.round((below?pRect.bottom:pRect.top)-7)+'px';
+  // 锚定边：面板从入口一侧的固定边“生长”（top/bottom 二选一锚定），高度变化
+  // 不移动贴附边；缺口（三角）坐标只依赖入口矩形，恒定对准入入口。
+  if(below){
+   panel.style.top=Math.round(b.bottom+12)+'px';panel.style.bottom='auto';
+   tip.style.left=Math.round(b.left+b.width/2-7)+'px';
+   tip.style.top=Math.round(b.bottom+5)+'px';tip.style.bottom='auto';
+  }else{
+   panel.style.bottom=Math.round(vh-b.top+12)+'px';panel.style.top='auto';
+   tip.style.left=Math.round(b.left+b.width/2-7)+'px';
+   tip.style.top=Math.round(b.top-19)+'px';tip.style.bottom='auto';
+  }
   tip.hidden=false;
  }
  // 滚动/缩放/旋转后重新校准（测量节流到每帧一次，不逐帧全页布局）。

@@ -7,7 +7,7 @@ R0-C2：窗口类判定（is_in_time_window）已迁至 planning/time_utils.py�
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 
 def parse_hhmm(value: str, default_minutes: int = 0) -> int:
@@ -24,14 +24,6 @@ def parse_hhmm(value: str, default_minutes: int = 0) -> int:
 
 def minutes_of_now(now: datetime | None = None) -> int:
     return (now or datetime.now()).hour * 60 + (now or datetime.now()).minute
-
-
-def next_run_at(now: datetime, hhmm: str) -> datetime:
-    """返回 now 之后（含当天）最近的一次 hhmm 时刻，用于每日定时循环。"""
-    target = now.replace(hour=parse_hhmm(hhmm) // 60, minute=parse_hhmm(hhmm) % 60, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return target
 
 
 def hours_between(later: datetime, earlier: datetime) -> float:
