@@ -421,7 +421,7 @@ const Mascot=(()=>{
  const cfg={angle:12,retreatPx:200,size:128,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
  let state='peek';               // peek | emerging | landed | retreating
  let pressing=false,detailMode=false,pendingRetreat=false,pendingEmerge=false,hoverArmed=true;
- let retreatTimer=null,poseAnim=null,squashAnim=null;
+ let retreatTimer=null,poseAnim=null,squashAnim=null,rotateAnim=null;
  let squash={sx:1,sy:1};         // 形变记账：JS 记当前值，避免每拍读布局
  let squashFrames=[{sx:1,sy:1,offset:0},{sx:1,sy:1,offset:1}];
  // 收起探头姿态：小幅 rotate(-角度) + 往角落里收（左移+下沉），尾巴上的叶子移出
@@ -436,6 +436,7 @@ const Mascot=(()=>{
  const updateAutoPinVis=()=>{if(pinBtn)pinBtn.hidden=!(state==='landed'&&!detailMode&&!reduceMotion());};
  function stopAutoCycle(rebound){
   clearTimeout(autoPinTimer);autoPinTimer=null;
+  rotateAnim?.cancel();rotateAnim=null;                      // 停止旋转摆动，回到水平
   if(rebound&&squashAnim){releaseAnim()}
   if(pinBtn)pinBtn.setAttribute('aria-pressed','false');
  }
@@ -444,6 +445,23 @@ const Mascot=(()=>{
   squashFrames=[{sx:1,sy:1,offset:0},{sx:cfg.squashX,sy:cfg.squashY,offset:1}];
   startSquash(squashFrames,PRESS_MS,'cubic-bezier(.33,.6,.36,1)','forwards');
   squash={sx:cfg.squashX,sy:cfg.squashY};
+  // 立体水平旋转（激活态，0425 二次修正）：旋转轴 = 头顶叶茎根点（约图 69%W、28%H）
+  // 延伸至垂直于水平面的垂线，rotateY 一整圈（透视投影）；压扁脉冲（计划书原始参数）
+  // 由 art 层同步叠加，两层互不覆盖。
+  const cycleMs=PRESS_MS+60+cfg.bounceMs;
+  const ax=(0.69*cfg.size).toFixed(1), ay=(0.49*cfg.size).toFixed(1);
+  const P=`perspective(700px) translate(${ax}px, ${ay}px) `;
+  const S=`translate(${-ax}px, ${-ay}px)`;
+  rotateAnim?.cancel();
+  rotateAnim=tilt.animate([
+   {transform:P+'rotateY(0deg) '+S,offset:0},
+   {transform:P+'rotateY(90deg) '+S,offset:.22},
+   {transform:P+'rotateY(180deg) '+S,offset:.45},
+   {transform:P+'rotateY(270deg) '+S,offset:.67},
+   {transform:P+'rotateY(360deg) '+S,offset:.9},
+   {transform:P+'rotateY(360deg) '+S,offset:1}
+  ],{duration:cycleMs,easing:'ease-in-out'});
+  rotateAnim.onfinish=()=>{rotateAnim=null};
   autoPinTimer=setTimeout(()=>{releaseAnim();autoPinTimer=setTimeout(autoCycle,900)},PRESS_MS+60);
  }
  if(pinBtn)pinBtn.addEventListener('click',e=>{
@@ -451,6 +469,7 @@ const Mascot=(()=>{
   autoPin=!autoPin;
   pinBtn.setAttribute('aria-pressed',String(autoPin));
   clearTimeout(autoPinTimer);
+  clearTimeout(retreatTimer);retreatTimer=null;                // 清掉激活前已排队的收起定时器
   if(autoPin&&state==='landed')autoCycle();else if(!autoPin)stopAutoCycle(true);
  });
  const setPoseClass=()=>{button.classList.toggle('is-peek',state!=='landed');updateAutoPinVis()};
@@ -497,6 +516,7 @@ const Mascot=(()=>{
   poseAnim.onfinish=finishEmerge;
  }
  function retreat(){
+  if(autoPin)return;                                          // 自动捏捏激活：不自动收起
   if(state==='peek'||state==='retreating')return;
   clearTimeout(retreatTimer);retreatTimer=null;
   if(state==='emerging'){pendingRetreat=true;return}         // 出场未完：结束后再次判断收起
@@ -516,7 +536,7 @@ const Mascot=(()=>{
  // ---- 自动收起：以左下角稳定交互区域判断（不随动画包围盒移动），进出阈值不同防抖 ----
  const cornerDistance=(x,y)=>Math.hypot(x,y-innerHeight);
  function evaluateRetreat(){
-  if(detailMode||pressing)return;                            // 固定详情/捏着中暂缓，结束后再判断
+  if(detailMode||pressing||autoPin)return;                   // 固定详情/捏着中/自动捏捏激活：不自动收起
   if(state!=='landed'){clearTimeout(retreatTimer);retreatTimer=null;return}
   const d=cornerDistance(lastPointer.x,lastPointer.y);
   if(d>cfg.retreatPx&&!retreatTimer)retreatTimer=setTimeout(retreat,RETREAT_DELAY_MS);
