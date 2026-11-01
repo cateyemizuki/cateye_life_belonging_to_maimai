@@ -9,14 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 from .auto_scheduler import ScheduleAutoScheduler
 from .config import ScheduleAdvancedSectionConfig, section_or_default
 from .goal_manager import get_goal_manager
-
-if TYPE_CHECKING:
-    from typing import Any as _Plugin
 
 logger = logging.getLogger(__name__)
 

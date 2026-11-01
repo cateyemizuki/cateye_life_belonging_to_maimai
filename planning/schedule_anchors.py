@@ -46,10 +46,11 @@ from datetime import datetime
 from typing import Any, Iterable, Optional, Tuple
 
 from .schedule_items import find_night_sleep_item
-from .time_utils import (DAY_MINUTES, format_minutes_to_time, is_in_day_frame,
+from .time_utils import (DAY_MINUTES, format_minutes_to_time,
                          is_in_day_frame_marked, is_in_sleep_ring,
                          normalize_day_minutes)
-from .cycle_state import format_epoch_clock, try_load_persisted
+# try_load_persisted 经本模块再导出：companion.patrol 的惰性导入依赖此名字（勿按未用删除）
+from .cycle_state import format_epoch_clock, try_load_persisted  # noqa: F401
 
 #: 真实锚点来源标记（真实睡眠环 = 实际条目原文）
 SOURCE_REAL_SCHEDULE = "real_schedule"

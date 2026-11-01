@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .generator import LOW_MOOD_MIN_DAYS
 
@@ -37,9 +37,6 @@ from .proactive_service import ProactiveService
 from .schedule_generator import ScheduleGenerator
 from .schedule_items import is_night_sleep_item
 from .tools_service import ToolsService
-
-if TYPE_CHECKING:
-    from typing import Any as _Plugin
 
 logger = logging.getLogger(__name__)
 

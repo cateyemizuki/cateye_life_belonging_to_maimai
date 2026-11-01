@@ -45,7 +45,7 @@ from suite_prompts import (
     prompt as prompt_of,
     render,
 )
-from .cgi import QzoneCookieManager, QzoneWebClient
+from .cgi import QzoneCookieManager
 from .decision import (
     DecisionHistory,
     parse_llm_decision,

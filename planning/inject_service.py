@@ -49,7 +49,7 @@ import logging
 import re
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from core.time_utils import minutes_of_now
@@ -75,9 +75,6 @@ from suite_prompts import (
     prompt,
     render,
 )
-
-if TYPE_CHECKING:
-    from typing import Any as _Plugin
 
 logger = logging.getLogger(__name__)
 

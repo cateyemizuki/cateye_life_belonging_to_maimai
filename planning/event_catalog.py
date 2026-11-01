@@ -1549,7 +1549,7 @@ def _normalize_event(raw: Any) -> Any:
 __all__ = [
     "BUILTIN_EVENTS", "CatalogSnapshot", "EventCatalogService", "EventCatalogStore",
     "EventCatalogValidator", "RefreshResult", "ValidationError", "ValidationResult",
-    "build_json_schema", "builtin_events", "compute_catalog_version", "estimate_tokens",
+    "build_json_schema", "builtin_events", "compute_catalog_version",
     "resolve_state_deltas", "state_affinity",
 ]
 

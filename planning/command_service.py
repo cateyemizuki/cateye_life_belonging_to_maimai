@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from datetime import timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 from .activity_properties import resolve_property
 from .config import (
@@ -25,9 +25,6 @@ from .goal_manager import get_goal_manager
 from .schedule_image import ScheduleImageGenerator
 from .stream_filter import is_stream_allowed
 from .time_utils import TimezoneManager, format_day_minute, get_time_window_from_goal, strip_tz
-
-if TYPE_CHECKING:
-    from typing import Any as _Plugin
 
 logger = logging.getLogger(__name__)
 

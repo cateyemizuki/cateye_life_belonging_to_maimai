@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
-import time
 from collections import deque as _deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1438,7 +1437,7 @@ class CompanionComponentsMixin:
                                 continue
                             try:
                                 entry = _json.loads(line)
-                            except json.JSONDecodeError:
+                            except _json.JSONDecodeError:
                                 continue
                             action = str((entry or {}).get("action") or "")
                             if not (action.startswith("bus:schedule.")
@@ -1732,7 +1731,6 @@ class CompanionComponentsMixin:
                     f" 晚安阈值={int(getattr(cfg_p, 'greeting_private_night_min_messages', 5) or 5)}"
                 )
                 try:
-                    from planning.config import ScheduleAdvancedSectionConfig as _sadv_cls
                     _sadv = getattr(cfg_all, "schedule_advanced", None)
                     b1.append(
                         f"  补发冷静期={int(getattr(_sadv, 'greeting_min_silence_minutes', 3) or 0)} 分钟"

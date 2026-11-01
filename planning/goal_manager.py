@@ -21,7 +21,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from core.time_utils import parse_hhmm
 from .schedule_db import ScheduleDB
 from .time_utils import TimezoneManager
 

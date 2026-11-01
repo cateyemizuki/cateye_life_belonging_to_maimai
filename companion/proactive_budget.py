@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from core.storage import load_json, save_json_atomic
 
 logger = logging.getLogger(__name__)

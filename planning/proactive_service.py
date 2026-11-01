@@ -67,13 +67,10 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from suite_prompts import (
     PROACTIVE_INTENT_MORNING_DEFAULT,
-    PROACTIVE_INTENT_NIGHT_DEFAULT,
-    PROACTIVE_REASON_MORNING_DEFAULT,
-    PROACTIVE_REASON_NIGHT_DEFAULT,
     prompt,
     render,
 )
@@ -94,8 +91,6 @@ from .cycle_state import (CycleState, anchored_state, day_cycle_epochs,
 from .goal_manager import get_goal_manager
 from .time_utils import (TimezoneManager, epoch_to_local,
                          parse_time_window, tzinfo_of)
-if TYPE_CHECKING:
-    from typing import Any as _Plugin
 
 logger = logging.getLogger(__name__)
 

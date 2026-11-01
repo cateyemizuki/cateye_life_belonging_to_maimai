@@ -1,8 +1,10 @@
 """属于麦麦的生活（lbm）— 整合插件组合根。
 
-三个业务子模块（各自拥有 config / services / components）：
-- planning/   自主规划复刻：日程生成（多轮+评分）/ SQLite 目标库 / planner+replyer 注入 /
-  活动切换主动开口 / /plan 命令 / get_current_activity API
+四个业务子模块（各自拥有 config / services / components）：
+- planning/   日程领域内核 + 自主规划复刻：日程生成（多轮+评分）/ SQLite 目标库 /
+  planner+replyer 注入 / 活动切换主动开口 / /plan 命令 / get_current_activity API；
+  ``time_utils`` / ``schedule_query`` / ``schedule_anchors`` / ``schedule_items``
+  同时被 companion、emotion、qzone 共用，其余模块的时间窗口判定必须复用，禁止自建副本
 - companion/  虚拟陪伴复刻：好感度 / 巡检主动聊天（早安晚安想念）/ 屏幕感知 /
   陪伴对象电脑联动 / 节假日 / /mai_* 命令
 - qzone/      QQ 空间：按日程发说说（双通道）/ 自动回评（Web CGI 直连，含楼中楼）/ /life 命令
@@ -16,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar, Dict, Iterable, Optional
 
 # ── 宿主运行时导入引导（勿删）──────────────────────────────────────────
 # 宿主 Runner 用 spec_from_file_location 加载本文件，只把「plugins 根目录」和宿主

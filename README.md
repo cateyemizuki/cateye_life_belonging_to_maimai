@@ -126,6 +126,8 @@ Planner 直接提供 `message` 时不调用文案生成，因此约束放在工�
 
 ## 四个模块
 
+> **架构定位**：`planning/` 不只是并列业务模块之一，它同时承担**时间/日程领域内核**——`time_utils`、`schedule_query`、`schedule_anchors`、`schedule_items` 被陪伴、情绪、空间等模块共用。其余模块的时间窗口判定必须复用这些实现，禁止自建副本（结构守卫 `test_backend_boundaries.py` 已把存量跨模块导入逐条登记并禁止新增）。
+
 ### 日程规划
 
 - 每天由模型只生成 3~6 条「今天想做什么」的稀疏意图（spine）+ 硬约定 + 作息锚点，其余时段交给滚动层按本地规则推进，不再一次排满全天。
@@ -280,9 +282,9 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 ## 技术信息
 
-- 组件 **29 个** = 8 个命令 + 10 个 Hook + 7 个工具 + 4 个跨插件 API（`[admin].harass_report_enabled=false` 时运行期注册面回落 28）。
+- 组件 **31 个** = 8 个命令 + 10 个 Hook + 8 个工具 + 5 个跨插件 API（`[admin].harass_report_enabled=false` 时运行期注册面回落 30）。
 - 声明 **17 项**宿主能力。
-- 配置 **14 个段 / 260 字段 / 5 隐藏 / 255 可见**（`[plugin]` 3、`[patrol]` 23、`[affection]` 12、`[schedule]` 24、`[schedule_advanced]` 31、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 10、`[llm]` 9、`[prompts]` 56、`[admin]` 8、`[qzone]` 20、`[emotion]` 17、`[maimai_interaction]` 16；3.0.0 离线 stub+pydantic 实算，2026-10-30 随互动改造批新增末段、随多屏插入轮 `[patrol]` 新增 `screen_scope`）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
+- 配置 **16 个段 / 229 字段 / 5 隐藏 / 224 可见**（`[plugin]` 3、`[patrol]` 23、`[affection]` 12、`[schedule]` 23、`[schedule_advanced]` 30、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 8、`[llm]` 8、`[prompts]` 13、`[dashboard_display]` 3、`[admin]` 8、`[qzone]` 20、`[emotion]` 17、`[video_watch]` 13、`[maimai_interaction]` 12；数字由离线冒烟门禁实算并写入测试仓 `_gate_facts.json`，2026-11-02 质量整改批核对）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
 - 用户可编辑映射表 **7 张**：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可
