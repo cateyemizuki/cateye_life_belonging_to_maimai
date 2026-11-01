@@ -247,7 +247,7 @@ def _extract_frames(media_path: Path, job_dir: Path, duration: int, max_frames: 
     return frames, sampled_seconds, interval
 
 
-def _sample_visual(spec: dict, video: dict, job_dir: Path,
+def _sample_visual_legacy(spec: dict, video: dict, job_dir: Path,
                    deadline_epoch: float) -> dict:
     """有界画面采样入口：任一步不可得都如实降级，不影响文本来源结果。
 
@@ -290,6 +290,81 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path,
             "note": f"按目标时间点间隔 {interval}s 定点采样 {len(frames)} 帧（非逐帧观看）"}
 
 
+def _sample_visual(spec: dict, video: dict, job_dir: Path, deadline_epoch: float) -> dict:
+    cfg = spec.get("visual") or {}
+    if "max_montages" not in cfg:
+        return _sample_visual_legacy(spec, video, job_dir, deadline_epoch)
+    from video_watch.sampling import sample_plan, pack_montages, capability
+    cap = capability(cfg)
+    decoder = _decoder_executable(job_dir)
+    if not decoder:
+        return {"status": "not_attempted", "reason": "本机无解码器", "capability": cap}
+    source_mode = str(cfg.get("source_mode", "stream"))
+    sampling_mode = str(cfg.get("sampling_mode", "seek"))
+    if source_mode not in ("stream", "download") or sampling_mode not in ("seek", "paced"):
+        return {"status": "failed", "reason": "未知媒体读取/采样模式", "capability": cap}
+    try:
+        plan = sample_plan(float(video.get("duration_seconds") or 0),
+                           int(cfg.get("interval_seconds") or 30),
+                           min(32, max(1, int(cfg.get("max_montages") or 16))))
+    except ValueError as exc:
+        return {"status": "failed", "reason": str(exc), "capability": cap, "error_class": "montage_limit"}
+    folder = job_dir / "frames"
+    if folder.is_symlink() or folder.resolve().parent != job_dir.resolve():
+        return {"status": "failed", "reason": "抽帧目录不安全", "capability": cap}
+    folder.mkdir(parents=True, exist_ok=True)
+    media = job_dir / "media.mp4"
+    paths = []
+    started = time.monotonic()
+    try:
+        _write_progress(job_dir, "visual_media", f"{source_mode}: {plan['frame_count']} frames / {plan['montage_count']} images")
+        direct = _fetch_playurl(str(video.get("bvid") or ""), video.get("cid"))
+        parsed = _urlparse.urlsplit(direct)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise LookupError("媒体地址协议不可用")
+        source = direct
+        if source_mode == "download":
+            _download_bounded(direct, media, max(4, min(1024, int(cfg.get("max_download_mb") or 256))) * 1024 * 1024, deadline_epoch)
+            source = str(media)
+        for index, at in enumerate(plan["timestamps"]):
+            if sampling_mode == "paced":
+                wait = started + at - time.monotonic()
+                if wait > 0:
+                    if time.time() + wait >= deadline_epoch:raise LookupError("paced采样到达任务总截止")
+                    time.sleep(wait)
+            remaining = deadline_epoch - time.time()
+            if remaining <= 0:raise LookupError("画面采样到达任务总截止")
+            path = folder / f"sample_{index:04d}.jpg";paths.append(path)
+            command = [decoder, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                       "-threads", "1", "-filter_threads", "1"]
+            if source_mode == "stream":
+                command += ["-rw_timeout", "15000000", "-user_agent", _UA,
+                            "-headers", "Referer: https://www.bilibili.com/\r\n",
+                            "-protocol_whitelist", "http,https,tcp,tls,crypto"]
+            command += ["-ss", str(at), "-i", source, "-an", "-sn", "-vf", "scale=480:-2",
+                        "-frames:v", "1", "-threads", "1", "-q:v", "7", str(path)]
+            flags = (subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS if sys.platform == "win32" else 0)
+            try:process = subprocess.run(command, capture_output=True, timeout=min(30, remaining), creationflags=flags)
+            except subprocess.TimeoutExpired:raise LookupError("单个采样点超时；不自动下载全片")
+            if process.returncode or not path.exists() or not 0 < path.stat().st_size <= _FRAME_BYTES_LIMIT:
+                raise LookupError(f"{source_mode}采样点{index+1}/{plan['frame_count']}读取失败；不自动改成全片下载")
+            _write_progress(job_dir, "visual_frames", f"{index+1}/{plan['frame_count']}")
+        frames = pack_montages(paths, plan["timestamps"])
+        return {"status": "completed", "capability": cap, "frames": frames,
+                "sampled_seconds": plan["timestamps"], "frame_count": plan["frame_count"],
+                "montage_count": len(frames), "source_mode": source_mode, "sampling_mode": sampling_mode,
+                "frame_interval_seconds": int(cfg.get("interval_seconds") or 30),
+                "note": f"实际采样{len(paths)}帧，合为{len(frames)}张4×4拼图；非逐帧观看，未转写音频"}
+    except Exception as exc:
+        reason = str(exc) if isinstance(exc, (LookupError, ValueError)) else f"采样失败（{type(exc).__name__}），未发送原始媒体地址"
+        return {"status": "failed", "reason": reason[:350], "capability": cap,
+                "source_mode": source_mode, "frame_count_read": sum(p.exists() for p in paths),
+                "expected_montages": plan["montage_count"]}
+    finally:
+        for path in paths:path.unlink(missing_ok=True)
+        media.unlink(missing_ok=True)
+
+
 def run(spec: dict, result_path: Path) -> None:
     task_id = str(spec.get("task_id") or "")
     job_dir = result_path.parent
@@ -311,12 +386,12 @@ def run(spec: dict, result_path: Path) -> None:
         _fail(result_path, task_id, "network", f"元信息获取失败：{exc}")
         return
 
-    max_seconds = int(spec.get("max_video_duration_seconds") or 1800)
+    max_seconds = int(spec.get("max_video_duration_seconds", 1800))
     duration = int(video.get("duration_seconds") or 0)
     if duration <= 0:
         _fail(result_path, task_id, "unsupported_video", "视频时长未知，无法校准观看预算")
         return
-    if duration > max_seconds:
+    if max_seconds > 0 and duration > max_seconds:
         _fail(result_path, task_id, "unsupported_video",
               f"视频时长 {duration}s 超出本任务预算上限 {max_seconds}s；按计划不宣称能完整观看，已拒绝")
         return

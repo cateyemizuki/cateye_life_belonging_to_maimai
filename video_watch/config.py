@@ -1,13 +1,14 @@
 """video_watch 配置分组（B 计划 §3：并入生活插件总配置，[video_watch] 后端分组）。
 
-键与独立原型 cateye.bili-watch 的 ``bili_watch`` 节（plugin.py:63-92, cad3d2d）
-同源同约束（ge/le 逐字保留），旧原型配置值可按 suite_config 的迁移器映射加载；
+采用stream+拼图准入；旧原型配置值仍可按 suite_config 的迁移器映射加载。
+旧时长/散帧硬上限安全忽略，下载保护值只对显式download生效；
 不设 Token 上限——Token 只记录宿主回传 usage（2026-10-29 用户决策）。
 """
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Literal
+from pydantic import model_validator
 
 from maibot_sdk import Field, PluginConfigBase
 
@@ -23,7 +24,33 @@ def _ui_i18n(title_en: str, desc_en: str = "") -> dict:
 
 
 class VideoWatchSectionConfig(PluginConfigBase):
-    """观看流水线参数（资源控制；队列/时限/时长上限有界，媒体抽帧另设上限）。"""
+    """观看流水线参数：队列/总截止、媒体读取方式及最终拼图数保护。"""
+
+    __ui_label__ = "视频观看"
+    __ui_icon__ = "video"
+    __ui_order__ = 14
+
+    @model_validator(mode="before")
+    @classmethod
+    def _retire_duration_limits(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            value.pop("max_video_duration_seconds", None)
+            value.pop("visual_max_frames", None)
+        return value
+
+    source_mode: Literal["stream", "download"] = Field(
+        default="stream", description="stream：直连媒体按时间点读取，不先下载全片；download：显式下载后抽帧，受下载保护值限制；失败不会暗中切换全量下载。",
+        json_schema_extra={"label": "媒体读取方式"})
+    sampling_mode: Literal["seek", "paced"] = Field(
+        default="seek", description="seek：尽快按时间点抽帧；paced：按真实播放时间逐点采样。两者均单任务、低优先级、单解码线程。",
+        json_schema_extra={"label": "采样节奏"})
+    sample_interval_seconds: int = Field(
+        default=30, ge=5, le=600, description="每隔多少秒取一帧；不静默稀释采样。预计帧数=向上取整(视频秒数/间隔)，每16帧拼一张图片。",
+        json_schema_extra={"label": "采样间隔（秒）"})
+    visual_max_montages: int = Field(
+        default=16, ge=1, le=32, description="最终最多向视觉模型提交多少张拼图（每张4×4帧）；超出先拒绝并说明所需张数。默认30秒间隔、16张可容纳约128分钟。只记录实际Token，不推算或限制输出Token。",
+        json_schema_extra={"label": "最多提交拼图数"})
 
     enabled: bool = Field(
         default=True,
@@ -36,14 +63,9 @@ class VideoWatchSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "队列容量", **_ui_i18n("Queue capacity")},
     )
     task_deadline_seconds: int = Field(
-        default=900, ge=60, le=3600,
+        default=10800, ge=60, le=21600,
         description="单任务总时限（秒），超时终止 worker 并如实标 failed/timeout",
         json_schema_extra={"label": "任务总时限(秒)", **_ui_i18n("Task deadline (s)")},
-    )
-    max_video_duration_seconds: int = Field(
-        default=1800, ge=60, le=7200,
-        description="可观看的视频时长上限（秒）；超长视频明确拒绝，不宣称能完整观看",
-        json_schema_extra={"label": "视频时长上限(秒)", **_ui_i18n("Max video length (s)")},
     )
     summary_impression: bool = Field(
         default=True,
@@ -70,13 +92,8 @@ class VideoWatchSectionConfig(PluginConfigBase):
         description="画面理解使用的宿主任务名（须为宿主配置的多模态任务；不可用自动降级）",
         json_schema_extra={"label": "画面任务名", **_ui_i18n("Visual task name")},
     )
-    visual_max_frames: int = Field(
-        default=6, ge=1, le=12,
-        description="单任务最多抽取的帧数（等间隔采样；有界，不做逐秒观看）",
-        json_schema_extra={"label": "抽帧上限", **_ui_i18n("Max frames")},
-    )
     visual_max_download_mb: int = Field(
-        default=32, ge=4, le=128,
-        description="单任务媒体下载预算（MB，超限终止采样并如实标注）",
-        json_schema_extra={"label": "媒体下载预算(MB)", **_ui_i18n("Media budget (MB)")},
+        default=256, ge=4, le=1024,
+        description="仅download模式的媒体下载保护值（MiB）；stream不先整片下载，不按此值拒绝长视频",
+        json_schema_extra={"label": "download下载保护值（MiB）", **_ui_i18n("Media budget (MB)")},
     )

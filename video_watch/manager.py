@@ -54,7 +54,7 @@ class WatchTaskManager:
         self._queue_capacity = max(1, int(queue_capacity))
         # 下限仅作编程兜底；生产下限由配置模型 ge=60 把关（测试需要更短时限）
         self._deadline_seconds = max(1, int(task_deadline_seconds))
-        self._max_duration = max(30, int(max_video_duration_seconds))
+        self._max_duration = max(0, int(max_video_duration_seconds))
         # worker 命令可注入（隔离测试用假 worker）；默认 = 本包 worker.py 子进程
         self._worker_cmd = worker_cmd  # type: ignore[assignment]
         # 提交期缓存模式 token（B 计划 §5.1：文本缓存与画面采样缓存互不命中；
@@ -571,8 +571,24 @@ class WatchTaskManager:
             "task_id": task["task_id"], "status": status,
             "error_class": error_class, "error": error}
         atomic_write_json(job_dir / "result.json", payload)
+        self._cleanup_media(job_dir)
         self._notify_state()
         # 媒体/临时目录清理（V1 仅文本流水线，无媒体；目录保留 result/spec 供追溯）
         if self._log:
             self._log.info(f"观看任务终态 {task.get('task_id')} -> {status}"
                            + (f" ({error_class}: {error})" if error_class else ""))
+
+    def _cleanup_media(self, job_dir: Path) -> None:
+        """Remove only this task's media, never its receipts or arbitrary directories."""
+        if job_dir.is_symlink() or job_dir.resolve().parent != (self._dir / "jobs").resolve():
+            return
+        paths = [job_dir / "media.mp4"]
+        frames = job_dir / "frames"
+        if not frames.is_symlink() and frames.resolve().parent == job_dir.resolve():
+            paths.extend(frames.glob("*.jpg"))
+        for path in paths:
+            if path.is_symlink():continue
+            if path.resolve().parent not in (job_dir.resolve(), frames.resolve()):continue
+            try:path.unlink(missing_ok=True)
+            except OSError:
+                if self._log:self._log.debug("任务临时媒体暂未清除，保留结果回执")

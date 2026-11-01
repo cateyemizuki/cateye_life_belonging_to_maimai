@@ -35,6 +35,17 @@ def normalize_video_ref(raw: str) -> Optional[str]:
     text = raw.strip()
     if not text:
         return None
+    # QQ cards/quoted share text may wrap the URL in a title, suffix or [image].
+    urls = re.findall(r"https?://[^\s<>\"'\[\]，。！？（）]+", text, re.I)
+    if urls:
+        candidates = []
+        for value in urls:
+            try:host = (_urlparse.urlsplit(value).hostname or "").lower()
+            except ValueError:continue
+            if host in _BILI_VIDEO_HOSTS | _SHORT_HOSTS:candidates.append(value.rstrip(")]}.,;:!"))
+        candidates = list(dict.fromkeys(candidates))
+        if len(candidates) != 1:return None
+        text = candidates[0]
     direct = extract_bvid(text)
     # 裸 BV 号：整段就是 BV…（或夹在最少噪声里）→ 直接接受
     if _BV_RE.fullmatch(text):
@@ -85,7 +96,15 @@ def expand_short_link(url: str) -> Optional[str]:
     """
     try:
         request = _urlrequest.Request(url, method="GET", headers={"User-Agent": "bili-watch/0.1"})
-        with _urlrequest.urlopen(request, timeout=SHORT_LINK_TIMEOUT_SECONDS) as response:
+        class SafeRedirect(_urlrequest.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                target = _urlparse.urlsplit(newurl)
+                if (target.scheme not in ("http", "https") or target.username or target.password
+                        or (target.hostname or "").lower() not in _BILI_VIDEO_HOSTS | _SHORT_HOSTS):
+                    raise ValueError("短链跳转到了不支持的来源")
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+        opener = _urlrequest.build_opener(SafeRedirect())
+        with opener.open(request, timeout=SHORT_LINK_TIMEOUT_SECONDS) as response:
             final_url = str(response.geturl())
     except Exception:
         return None

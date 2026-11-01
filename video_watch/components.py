@@ -13,11 +13,12 @@ from typing import Any
 from maibot_sdk import Tool
 
 TOOL_WATCH_DESCRIPTION = (
-    "用这个工具你可以真的去「看」一个B站视频：提交 BV 号或视频链接后立即返回任务回执，"
-    "后台处理后用 action=status 查询进度、action=result 取回结构化观看结果"
-    "（标题/UP主/时长/实际读取的文本来源与画面采样/限制与失败原因），"
-    "action=cancel 取消任务。注意：结果是给你看的观看记录，不会自动发给任何群或私聊；"
-    "失效、需要会员/登录、时长超预算的视频会如实返回原因，不会假装看过。"
+    "观看用户提供的B站视频。video可以直接传原始长链接、b23.tv短链或包含链接的小程序分享文字；"
+    "必须使用上下文中的真实来源，不要猜测或编造BV号。action=resolve可先解析真实BV。"
+    "action=submit提交后台观看后结束本轮；完成/失败会由后台通知原发起聊天，"
+    "不要在同轮或后续自行反复status/result轮询，也不要重复submit催进度。"
+    "status/result仅在用户明确询问时使用一次；cancel取消。"
+    "结果只陈述实际采样；通知是点播结果交付，不会广播给其他聊天。"
 )
 
 
@@ -32,12 +33,12 @@ class VideoWatchComponentsMixin:
         parameters={
             "action": {
                 "type": "string",
-                "description": ("动作：submit（提交观看）/ status（查进度）/ "
+                "description": ("动作：resolve（解析原始链接）/ submit（后台观看，完成通知，不轮询）/ status（用户明确问进度）/ "
                                 "result（取结果）/ cancel（取消）"),
             },
             "video": {
                 "type": "string",
-                "description": "submit 必填：BV 号或 bilibili 视频页链接（含 b23.tv 短链）；当前只支持默认分P，拒绝 p>1，不会假装看完整个合集",
+                "description": "submit/resolve 必填：直接复制原始链接、小程序分享文字或BV；不要编造BV。只支持默认分P。",
             },
             "task_id": {
                 "type": "string",
@@ -51,7 +52,7 @@ class VideoWatchComponentsMixin:
     )
     async def tool_watch_bili_video(self, action: str = "", video: str = "",
                                     task_id: str = "", purpose: str = "",
-                                    **kwargs: Any) -> str:
+                                    **kwargs: Any) -> Any:
         """LLM Tool：看一个B站视频（后台执行，先回执后查询；不自动发消息）。"""
         try:
             service = self._video_watch  # on_load 恒装配（disabled 也建实例，仅不 start）
@@ -67,6 +68,21 @@ class VideoWatchComponentsMixin:
                 pass
             return f"观看能力暂不可用：{exc}"
         content = str(receipt.get("content") or "")
+        if str(action).strip().lower() == "submit" and receipt.get("success"):
+            if receipt.get("cached") and isinstance(receipt.get("result"), dict):
+                from .service import _result_summary_text
+                return {"success": True, "content": _result_summary_text(receipt["result"]),
+                        "stop_after_execution": False}
+            origin = str(kwargs.get("stream_id") or kwargs.get("session_id") or kwargs.get("chat_id") or "").strip()
+            subscribe = getattr(self, "_subscribe_video_completion", None)
+            subscribed = bool(subscribe and subscribe(str(receipt.get("task_id") or ""), origin))
+            return {"success": True, "task_id": receipt.get("task_id"),
+                    "content": content if subscribed else "任务已受理，但来源聊天通知不可用。请稍后手动查询一次，不要连续轮询。",
+                    "completion_notification": subscribed, "stop_after_execution": True}
+        if receipt.get("status") in ("queued", "running") or receipt.get("error_class") == "not_ready":
+            return {"success": bool(receipt.get("success", True)),
+                    "content": content + "；仍在后台处理，完成会通知来源聊天，请结束本轮，勿连续查询。",
+                    "stop_after_execution": True}
         if receipt.get("success") and receipt.get("task_id"):
             extra = {k: receipt.get(k) for k in ("status", "stage", "cached", "deduped",
                                                  "error_class") if receipt.get(k)}

@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import json
+import asyncio
+from .sampling import capability
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -35,7 +37,7 @@ def _brief_receipt_text(receipt: Dict[str, Any]) -> str:
                 f"状态 {receipt.get('status')}），不重复提交。")
     if receipt.get("success"):
         return (f"已受理观看任务 {receipt.get('task_id')}（当前 {receipt.get('status')}）；"
-                f"用 action=status/result 查询进度与结果。")
+                "后台处理完成后会通知发起聊天；请结束本轮，不要反复调用status/result。")
     return f"提交失败（{receipt.get('error_class')}）：{receipt.get('error')}"
 
 
@@ -96,16 +98,21 @@ class VideoWatchService:
         # 如实降级，结果按实际模式落缓存键）；False → 纯文本流水线（原型行为）
         visual_provider = None
         if cfg is None or bool(getattr(cfg, "visual_enabled", True)):
-            visual_provider = lambda: {
-                "capability": "frames-v1",
-                "max_frames": self._int_of("visual_max_frames", 6),
-                "max_download_mb": self._int_of("visual_max_download_mb", 32),
-            }
+            def visual_provider():
+                spec = {
+                    "source_mode": str(getattr(self._config(), "source_mode", "stream")),
+                    "sampling_mode": str(getattr(self._config(), "sampling_mode", "seek")),
+                    "interval_seconds": self._int_of("sample_interval_seconds", 30),
+                    "max_montages": self._int_of("visual_max_montages", 16),
+                    "max_download_mb": self._int_of("visual_max_download_mb", 256),
+                }
+                spec["capability"] = capability(spec)
+                return spec
         self._manager = WatchTaskManager(
             self._data_dir, logger=self._logger,
             queue_capacity=self._int_of("queue_capacity", 3),
-            task_deadline_seconds=self._int_of("task_deadline_seconds", 900),
-            max_video_duration_seconds=self._int_of("max_video_duration_seconds", 1800),
+            task_deadline_seconds=self._int_of("task_deadline_seconds", 10800),
+            max_video_duration_seconds=0,
             visual_provider=visual_provider,
         )
         self._manager.attach_watchlist(
@@ -136,7 +143,7 @@ class VideoWatchService:
                             purpose: str = "", episode_id: str = "",
                             source: str = "tool", owner: str = "", force: bool = False,
                             **kwargs: Any) -> Dict[str, Any]:
-        del kwargs  # stream_id/platform 等宿主注入参数不参与观看语义
+        del kwargs  # origin routing belongs to the tool completion adapter
         manager = self._require_manager()
         action = str(action or "").strip().lower()
         # S0 所有权：source=tool 视为用户显式点播（取消即 force）；日程侧由
@@ -147,6 +154,15 @@ class VideoWatchService:
                 owner, force = "tool", True
             elif source == "schedule" and episode_id:
                 owner = f"schedule:{episode_id}"
+        if action in ("submit", "resolve"):
+            from .bv import normalize_video_ref
+            normalized = await asyncio.to_thread(normalize_video_ref, video or "")
+            if not normalized:
+                return {"success": False, "error_class": "invalid_input",
+                        "error": "未解析到唯一受支持的视频。请直接传原始B站链接/短链/分享文字，不要猜测BV；当前不支持非默认分P。"}
+            video = normalized
+            if action == "resolve":
+                return {"success": True, "bvid": video, "content": "链接已解析为 " + video}
         if action == "submit":
             if source == "schedule" and not self._automatic_task_allowed(
                     {"source": source, "episode_id": episode_id, "owners": [owner]}):
@@ -224,8 +240,8 @@ class VideoWatchService:
         observations = "；".join(str(o) for o in (result.get("observations") or []))
         subtitle_text = str(result.get("subtitle_text") or "")[:1200]
         prompt = (
-            "以下是同一个B站视频按时间等间隔抽出的采样帧（附读取到的文本来源）。"
-            "请用两三句中文描述画面里实际看到的内容与整体氛围；只描述帧中可见的内容，"
+            "以下图片来自同一个B站视频：新采样模式每张是最多4×4帧按时间排序的拼图，格子下方是原片时间；"
+            "请结合时间顺序概括关键画面、内容进展与可见细节；只描述实际可见的内容，"
             "帧与帧之间的过程是推断，不要编造没出现的细节、对白或音乐。"
             + (f"\n来源：{observations}" if observations else "")
             + (f"\n字幕节选：{subtitle_text}" if subtitle_text else "")
@@ -254,7 +270,7 @@ class VideoWatchService:
             visual["summary_error"] = f"画面理解调用异常：{exc}"
         ok = getattr(llm_result, "ok", False)
         if ok:
-            visual["summary"] = str(getattr(llm_result, "text", "") or "")[:500]
+            visual["summary"] = str(getattr(llm_result, "text", "") or "")[:1600]
             visual["understanding_status"] = "completed" if visual["summary"].strip() else "failed"
             visual["summary_task"] = task_name
             visual["summary_mode"] = MODE_SAMPLED_FRAMES
@@ -324,6 +340,10 @@ class VideoWatchService:
         if self._manager is None or not bool(getattr(self._config(), "enabled", True)):
             raise RuntimeError("视频观看模块未启用（[video_watch].enabled=false）或未加载")
         return self._manager
+
+    def result_receipt(self, task_id: str) -> Dict[str, Any]:
+        """Read-only completion-port result, without model calls."""
+        return self._require_manager().result(task_id)
 
     def _automatic_task_allowed(self, task: Dict[str, Any]) -> bool:
         if task.get("source") != "schedule" or "tool" in (task.get("owners") or []):
