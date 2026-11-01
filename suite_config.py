@@ -272,7 +272,7 @@ def _strip_factory_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class PluginSectionConfig(PluginConfigBase):
-    """插件基础配置。"""
+    """插件启用与基础设置。"""
 
     __ui_label__ = "插件"
     __ui_icon__ = "package"
@@ -312,12 +312,7 @@ class PluginSectionConfig(PluginConfigBase):
 
 
 class LlmSectionConfig(PluginConfigBase):
-    """LLM 调用集中段（2026-10-10 新增）。
-
-    插件里**所有**模型调用都经 ``core/llm_utils.LLMService`` 这一个模块发出；
-    本段集中管理它们的模型路由与判定参数（原先散在 schedule/judge/affection/emotion/qzone/cateye 六处）。
-    任务名 = 宿主 ``model_config.toml`` 里的任务键（如 utils / replyer / planner）或具体模型名。
-    """
+    """选择各项功能使用的宿主模型任务。"""
 
     __ui_label__ = "LLM 调用"
     __ui_icon__ = "cpu"
@@ -408,21 +403,13 @@ class LlmSectionConfig(PluginConfigBase):
 
 
 class LifeStateSuiteSectionConfig(LifeStateSectionConfig):
-    """生活状态段（滚动化）——聚合挂载专用子类，仅覆盖 WebUI 段序。
-
-    R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
-    D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）：
-    ``__ui_order__`` 增 life_state=11（排末尾，不打乱既有 0~10 段序）。键位与默认值
-    全部沿用 planning/config.py 的 :class:`LifeStateSectionConfig`（单一真源，17 键、
-    enabled=False 默认关）；planning.config 上的原类保持 ``__ui_order__=6`` 不动，
-    供 ``planning.config.section_or_default`` 的未挂载兜底路径继续引用。
-    """
+    """设置精力、饥饿、专注、压力、社交状态及睡眠恢复。"""
 
     __ui_order__ = 11
 
 
 class AdminSectionConfig(PluginConfigBase):
-    """管理与日志（跨模块共享）。"""
+    """设置命令权限、告状接收人和诊断日志。"""
 
     __ui_label__ = "管理与日志"
     __ui_icon__ = "shield"
@@ -502,15 +489,7 @@ class AdminSectionConfig(PluginConfigBase):
 
 
 class MaimaiInteractionSectionConfig(PluginConfigBase):
-    """麦麦互动段（2026-10-30 交互改造新增，聚合配置的最后一段）。
-
-    集中管理 WebUI 左下角常驻麦麦角色与全屏详情的展示/交互参数。
-    这些值经 ``planning.dashboard.build_life_dashboard`` 的只读 ``maimai``
-    白名单投影下发给前端（§投影只含展示/交互参数，绝不下发整份配置）；
-    前端不写第二套默认值，投影缺失时按同值 CSS 兜底显示。
-
-    角色动作与详情展开参数；历史筛选参数在「数据展示」配置。
-    """
+    """调整常驻麦麦的尺寸、动作和详情展开效果。"""
 
     __ui_label__ = "麦麦互动"
     __ui_icon__ = "heart"
@@ -587,7 +566,7 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
 
 
 class DashboardDisplaySectionConfig(PluginConfigBase):
-    """生活面板历史明细的展示范围与变化过滤。"""
+    """设置历史明细的条数和变化显示阈值。"""
     __ui_label__ = "数据展示"
     __ui_icon__ = "chart-line"
     __ui_order__ = 15

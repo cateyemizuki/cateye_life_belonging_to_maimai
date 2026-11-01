@@ -15,7 +15,7 @@ def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
 
 
 class EmotionSectionConfig(PluginConfigBase):
-    """情绪维护系统（VAD 三维模型：日常增量微调 + 睡眠期大修）。"""
+    """设置情绪评估、自然变化、对话表达和睡眠恢复。"""
 
     __ui_label__ = "情绪系统"
     __ui_icon__ = "smile"

@@ -27,7 +27,7 @@ DEFAULT_MAX_GENERATED_EVENTS = 8
 DEFAULT_MIN_GENERATED_EVENTS = 3
 #: 附录 B.1.3：active_events 总池上限（用户已裁定规范字段默认 12）
 DEFAULT_MAX_POOL_EVENTS = 12
-DEFAULT_TASK_NAME = "schedule_events"
+DEFAULT_TASK_NAME = "utils"
 DEFAULT_TEMPERATURE = 0.9
 #: 自动检查节拍（秒）；每天最多真正生成一次，检查本身不消耗 LLM
 DEFAULT_AUTO_CHECK_SECONDS = 300
@@ -43,11 +43,7 @@ def _i18n(en_label: str, en_hint: str = "") -> dict:
 
 
 class EventCatalogSectionConfig(PluginConfigBase):
-    """``[event_catalog]`` 段（2026-10-26 PR4 新增，默认 off）。
-
-    规范字段 ``max_generated_events``（3~8）与 ``max_pool_events``（总池，默认 12）
-    已按用户答复落地；``max_events`` 保留为生成条数的兼容读法。
-    """
+    """生成符合角色人设的日常小事件，供空闲或转场时安排。"""
 
     __ui_label__ = "事件库（生成小事件）"
     __ui_icon__ = "sparkles"
@@ -106,7 +102,7 @@ class EventCatalogSectionConfig(PluginConfigBase):
     )
     task_name: str = Field(
         default=DEFAULT_TASK_NAME,
-        description="独立 LLM 任务名；宿主未配置该任务时生成侧自动回退 utils",
+        description="生成小事件使用的宿主任务名，默认 utils；自定义任务不存在时使用 utils",
         json_schema_extra={"label": "LLM 任务名", **_i18n("LLM task name")},
     )
 

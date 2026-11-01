@@ -15,7 +15,7 @@ def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
 
 
 class QzoneSectionConfig(PluginConfigBase):
-    """QQ 空间模块。"""
+    """设置空间发帖、配图、评论回复和新评论提醒。"""
 
     __ui_label__ = "QQ 空间"
     __ui_icon__ = "cloud"

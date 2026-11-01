@@ -43,7 +43,7 @@ def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
 
 
 class ScheduleSectionConfig(PluginConfigBase):
-    """日程系统基础设置（日常只动这一段）。"""
+    """设置每日作息、活动偏好和日程生成方式。"""
 
     __ui_label__ = "日程系统"
     __ui_icon__ = "calendar"
@@ -309,10 +309,7 @@ class ScheduleSectionConfig(PluginConfigBase):
 
 
 class ScheduleAdvancedSectionConfig(PluginConfigBase):
-    """日程系统·高级设置（原 [schedule] 深水项 + [inject] 段 + [planning_cleanup] 段）。
-
-    这里的每一项都直接影响生成质量、模型成本或渲染行为；不理解建议保持默认。
-    """
+    """调整日程生成、上下文注入、角色判断和历史保留。"""
 
     __ui_label__ = "日程系统·高级设置"
     __ui_icon__ = "sliders"
@@ -652,30 +649,14 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
 
 
 class PlanningProactiveSectionConfig(PluginConfigBase):
-    """日程主动行为：早晚安问候 + 名单系统 + 赖床提醒。
-
-    与 [patrol]（陪伴巡检）分工：
-    - 本段负责早/晚安问候（问候候选**含**目标私聊，是否放行由 ``_target_greeting_allowed``
-      按名单过滤）以及名单过滤；
-    - 目标陪伴私聊的日常巡检/想念归 [patrol]；早/晚安由本段的漂移机制统一驱动
-      （发过之后写标记，陪伴侧巡检见标记即不再重复开口——两模块因此不会各发一条）。
-
-    名单系统（2026-10-10 合并）：原「活动切换白名单（支持前缀）+ 问候专用四名单」统一为
-    群聊名单 / 私聊名单两份（**裸号或带前缀**：群聊填群号、私聊填 QQ 号，也接受
-    group:/qq:group:（群）与 private:/qq:private:/qq:（私聊）前缀写法，自动取号），
-    各配一个模式开关：
-    - 模式 = 黑名单（默认·群聊）：名单里的人**不**生效，留空 = 全部生效；
-    - 模式 = 白名单（默认·私聊）：只有名单里的人生效，留空 = 全部不生效。
-    问候通道由 ``_target_greeting_allowed`` 过滤——白名单模式下目标恒视为在名单内
-    （照常问候），黑名单模式下命中其 QQ 即不问候。
-    """
+    """设置早晚安问候、发送时间和群聊或私聊名单；日常主动聊天与想念在陪伴模块设置。"""
 
     __ui_label__ = "日程主动行为"
     __ui_icon__ = "notifications_active"
     __ui_order__ = 5
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Schedule Proactive",
-               "description": "Activity-switch proactive chat, morning/night greetings and chat lists."}
+               "description": "Morning and evening greetings, send timing and group/private chat lists."}
     }
 
     # ── 活动频率调控 ─────────────────────────────────────────
@@ -994,17 +975,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
 
 
 class LifeStateSectionConfig(PluginConfigBase):
-    """生活状态段（2026-10-25 滚动化改造新增）。
-
-    R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
-    D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
-
-    PR8 3.0.0：本段不再持有总开关（依据 = 用户 2026-10-27 授权直接清理 + 逐符号
-    审定清单 WP3）——``[schedule].enabled`` 是唯一日程总开关，生活状态（含睡眠引擎）
-    随之生效或停摆；旧 ``enabled`` / ``sleep_engine_enabled`` 键已退役。
-    设计附录 B.4.1 中的 ``keep_snapshot_days`` / ``patch_*`` / ``digest_*`` 等键
-    本阶段未实现，**不登记死键**。
-    """
+    """设置精力、饥饿、专注、压力、社交状态及睡眠恢复。"""
 
     __ui_label__ = "生活状态（滚动化）"
     __ui_icon__ = "activity"

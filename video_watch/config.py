@@ -24,7 +24,7 @@ def _ui_i18n(title_en: str, desc_en: str = "") -> dict:
 
 
 class VideoWatchSectionConfig(PluginConfigBase):
-    """观看流水线参数：队列/总截止、媒体读取方式及最终拼图数保护。"""
+    """设置视频读取、画面采样、观看队列和观后感生成。"""
 
     __ui_label__ = "视频观看"
     __ui_icon__ = "video"

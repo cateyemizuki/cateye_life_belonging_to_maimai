@@ -87,7 +87,7 @@ def target_qq_of(config: Any) -> str:
 
 
 class PatrolSectionConfig(PluginConfigBase):
-    """陪伴模块（原「主动巡检」段：目标用户 / 巡检 / 好感注入 / 屏幕感知）。"""
+    """设置陪伴对象、日常主动聊天、想念和屏幕感知。"""
 
     __ui_label__ = "陪伴模块"
     __ui_icon__ = "heart"
@@ -363,14 +363,7 @@ class PatrolSectionConfig(PluginConfigBase):
 
 
 class AffectionSectionConfig(PluginConfigBase):
-    """好感度系统（M1 v2 状态层配置，全部带默认值可关闭；2026-10-17 §19 起分数 0~200）。
-
-    `enabled=false` 时好感系统停用（不记账/不衰减/不重估；v1 三档回退语义已随
-    §19.4 移除）；`review_*` 三项为 M2 好感 LLM 裁判（会话采样 + 关系日结）的开关
-    与频控。裁判任务名统一移到 [llm] 段的 review_task_name。
-    档位区间/标签来自外置预设表 ``mappings/affection_presets.json``（1~5 档自由构造，
-    内置兜底）——本段不再含档位/区间配置。
-    """
+    """设置好感度的记录、变化和关系回顾。"""
 
     __ui_label__ = "好感度"
     __ui_icon__ = "favorite"

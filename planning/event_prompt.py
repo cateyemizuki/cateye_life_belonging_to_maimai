@@ -5,7 +5,7 @@
 
 - 上下文只放「人设 + 最近 2-3 天日程名称 + 已有事件名」，**不接收聊天原文**；
 - prompt（system + user）总字符数 ≤ 1500；
-- 独立 ``schedule_events`` 任务，``temperature=0.9``；
+- 默认使用宿主 ``utils`` 任务，``temperature=0.9``；
 - 只要求 JSON，不要解释；响应解析容忍 markdown 围栏。
 
 本模块不调用 LLM、不读写文件；网络调用唯一出口仍是 ``core.llm_utils.LLMService``。
