@@ -68,6 +68,10 @@ class VideoWatchComponentsMixin:
                 pass
             return f"观看能力暂不可用：{exc}"
         content = str(receipt.get("content") or "")
+        if receipt.get("success") is False:
+            error = str(receipt.get("error") or content or "观看请求未成功")
+            return {"success": False, "error": error, "content": content or error,
+                    "stop_after_execution": True}
         if str(action).strip().lower() == "submit" and receipt.get("success"):
             if receipt.get("cached") and isinstance(receipt.get("result"), dict):
                 from .service import _result_summary_text
