@@ -1270,7 +1270,9 @@ class RollingPlanner:
                 continue  # 保守：午夜段不参与当日相交判定（§7.8 帧首双关，避免误排）
             if self._intent_done_today(date, c["item_id"]):
                 continue
-            intersects = (ws <= cur + horizon and we > cur) or (we > DAY_MINUTES and cur < we - DAY_MINUTES)
+            # 这里只读date所属日帧的意图；>1440是未来次日，不可折回当天凌晨。
+            # 已启动的昨日跨午夜活动由_episode_frame_minute独立延续/收尾。
+            intersects = ws <= cur + horizon and we > cur
             if not intersects:
                 continue
             candidates.append(self._candidate_from_intent(c, kind="intent"))

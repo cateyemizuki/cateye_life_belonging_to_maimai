@@ -672,7 +672,7 @@ class ScheduleGenerator:
         口径（behavior 183 守卫同源）：锚定 ``[schedule]`` 生效作息锚点生成
         睡觉/起床/三餐 + 1 个通用意图——**禁硬编码时刻**，所有钟点一律
         ``parse_hhmm(wake_time/sleep_time)`` 同链同源派生（早餐锚起床、午餐锚日间
-        三分点、晚餐锚入睡前沿）；跨午夜作息（sleep <= wake）的清醒跨度经
+        三分点、晚餐锚入睡前3~5小时）；跨午夜作息（sleep <= wake）的清醒跨度经
         :func:`ring_minutes_ahead` 环距计算，不手写 −1440。
         """
         wake_min = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
@@ -701,7 +701,7 @@ class ScheduleGenerator:
             rows.append(row("自由安排", wake_min + 150, awake_end - 330,
                             "free_time", "low", 30, 90, 0.95))
         if awake_span >= 360:
-            rows.append(row("晚餐", awake_end - 300, awake_end,
+            rows.append(row("晚餐", awake_end - 300, awake_end - 180,
                             "meal", "medium", 20, 45, 0.9))
         if len(rows) > max_intentions:
             # 截断保睡觉（硬锚点）：睡觉行 + 起始的 (max-1) 条
