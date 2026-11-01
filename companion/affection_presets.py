@@ -41,6 +41,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.coerce import is_number as _is_number
+from core.mapping_table import (
+    MappingTableSpec,
+    check_top_level_keys,
+    check_version,
+    read_document,
+    resolve_table_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -185,23 +192,6 @@ class _Rejected(Exception):
         self.detail = detail
 
 
-def _check_version(raw: Dict[str, Any]) -> None:
-    if "version" not in raw:
-        raise _Rejected("version", "version_missing",
-                        f"顶层键 version：期望 int {SUPPORTED_VERSION}，实得 键缺失")
-    value = raw["version"]
-    if not isinstance(value, int) or isinstance(value, bool) or int(value) != SUPPORTED_VERSION:
-        raise _Rejected("version", "version_unsupported",
-                        f"顶层键 version：期望 int {SUPPORTED_VERSION}，实得 {_fmt(value)}")
-
-
-def _check_top_level_keys(raw: Dict[str, Any]) -> None:
-    for key in raw:
-        if key not in ("version", "presets"):
-            raise _Rejected(str(key), "unknown_key",
-                            f"顶层键 {key!r}：未知键（允许的键集 version、presets）")
-
-
 class _PresetRejected(Exception):
     """预设级早退信号：**仅排除该预设**，其余预设继续校验。"""
 
@@ -290,8 +280,8 @@ def validate_presets_document(raw: Any) -> PresetsLoadResult:
     try:
         if not isinstance(raw, dict):
             raise _Rejected("", "type", f"顶层：期望 JSON 对象，实得 {_fmt(raw)}")
-        _check_version(raw)
-        _check_top_level_keys(raw)
+        check_version(raw, SUPPORTED_VERSION, _Rejected, fmt=_fmt)
+        check_top_level_keys(raw, ("version", "presets"), _Rejected)
     except _Rejected as exc:
         return PresetsLoadResult(accepted={}, error={"error_key": exc.error_key,
                                                      "error_kind": exc.error_kind,
@@ -319,18 +309,8 @@ def validate_presets_document(raw: Any) -> PresetsLoadResult:
 
 # ── 装载入口 ──────────────────────────────────────────────────────────────
 def _plugin_root() -> Path:
-    """插件根目录（本模块位于 ``<plugin_root>/companion/`` 下）。"""
+    """插件根目录（本模块位于 ``<plugin_root>/companion/`` 下）；测试按此名 monkeypatch。"""
     return Path(__file__).resolve().parents[1]
-
-
-def _read_document(path: Path) -> Any:
-    """读取并解析预设文件；失败统一 ``_Rejected(error_kind="parse")``。"""
-    from core.mapping_dir import MappingReadError, read_json_text  # 延迟导入：顶层零插件依赖
-
-    try:
-        return read_json_text(path)
-    except MappingReadError as exc:
-        raise _Rejected("", "parse", exc.detail) from exc
 
 
 def _record(result: PresetsLoadResult, decision_logger: Any, *, merged_names: List[str]) -> None:
@@ -369,27 +349,14 @@ def load_presets(*, root_dir: Any = None,
     """装载预设表（**只读一遍**；``root_dir=None`` 测试桩 → 跳过根层纯内置）。"""
     if root_dir is None:
         return PresetsLoadResult(accepted={}), builtin_presets()
-    from core.mapping_dir import ensure_user_table, mappings_path  # 延迟导入：顶层零插件依赖
 
-    path = mappings_path(Path(root_dir), PRESETS_FILE_NAME)
-    try:
-        present = path.exists()
-    except OSError:
-        present = False
-    if not present:
-        # §29.2（2026-10-23 直派）：表层缺失 → ensure_user_table 按序补齐
-        # （旧根迁移优先，仍缺才从出厂种子映射表复制；解析错误不算缺失、绝不覆盖用户文件）
-        ensure_user_table(root_dir, PRESETS_FILE_NAME)
-        try:
-            present = path.exists()
-        except OSError:
-            present = False
-    if not present:
-        _generate_default(path)
+    spec = MappingTableSpec(PRESETS_FILE_NAME, "好感度预设表", _generate_default)
+    path, generated = resolve_table_path(root_dir, spec)
+    if generated:
         result = PresetsLoadResult(accepted={}, generated_default=True)
         return result, builtin_presets()
     try:
-        raw = _read_document(path)
+        raw = read_document(path, _Rejected)
     except _Rejected as exc:
         result = PresetsLoadResult(accepted={}, error={"error_key": exc.error_key,
                                                        "error_kind": exc.error_kind,

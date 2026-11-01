@@ -82,8 +82,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from core.coerce import is_int as _is_int, is_number as _is_number
-from core.mapping_dir import ensure_user_table, mappings_path
+from core.coerce import is_number as _is_number
+from core.mapping_table import (
+    MappingTableSpec,
+    check_top_level_keys,
+    check_version,
+    read_document,
+    resolve_table_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -229,26 +235,6 @@ def _rejected(error_key: str, error_kind: str, detail: str) -> MappingOverrideRe
 # ────────────────────────────────────────────────────────────────────────
 # 校验（纯函数）
 # ────────────────────────────────────────────────────────────────────────
-def _check_version(raw: Dict[str, Any]) -> int:
-    """① version 必填 int 且 == SUPPORTED_VERSION（bool 剔除）。"""
-    if "version" not in raw:
-        raise _Rejected("version", "version_missing",
-                        f"顶层键 version：期望 int {SUPPORTED_VERSION}，实得 键缺失")
-    value = raw["version"]
-    if not _is_int(value) or int(value) != SUPPORTED_VERSION:
-        raise _Rejected("version", "version_unsupported",
-                        f"顶层键 version：期望 int {SUPPORTED_VERSION}，实得 {_fmt(value)}")
-    return int(value)
-
-
-def _check_top_level_keys(raw: Dict[str, Any]) -> None:
-    """顶层键集（文件序取首个未知键）。"""
-    for key in raw:
-        if key not in TOP_LEVEL_KEYS:
-            raise _Rejected(str(key), "unknown_key",
-                            f"顶层键 {key!r}：未知键（允许的键集 {_allowed(TOP_LEVEL_KEYS)}）")
-
-
 def _check_exact_keys(entry: Dict[str, Any], path: str, required: Tuple[str, ...]) -> None:
     """键集恰为 ``required``：先报未知键（文件序），再报漏键（``required`` 顺序）。"""
     for key in entry:
@@ -445,8 +431,8 @@ def validate_document(raw: Any) -> MappingOverrideResult:
     try:
         if not isinstance(raw, dict):
             raise _Rejected("", "type", f"顶层：期望 JSON 对象，实得 {_fmt(raw)}")
-        version = _check_version(raw)
-        _check_top_level_keys(raw)
+        version = check_version(raw, SUPPORTED_VERSION, _Rejected, fmt=_fmt)
+        check_top_level_keys(raw, TOP_LEVEL_KEYS, _Rejected)
         prototypes = _check_prototypes(raw) if "prototypes" in raw else None
         template_events = _check_template_events(raw) if "template_events" in raw else None
         multipliers = _check_multipliers(raw) if "multipliers" in raw else None
@@ -586,28 +572,6 @@ def prototype_centers(prototypes: Optional[List[Dict[str, Any]]],
 # ────────────────────────────────────────────────────────────────────────
 # 装载入口
 # ────────────────────────────────────────────────────────────────────────
-def _read_document(path: Path) -> Any:
-    """读取并解析覆盖文件；读取/解析失败统一 ``_Rejected(error_kind="parse")``。
-
-    显式 ``json.loads``（不用 ``core/storage.load_json``：后者吞 ``JSONDecodeError``，
-    无法区分"损坏"与"缺文件"）。UTF-8 文本；容忍一个前导 BOM（Windows 记事本另存）。
-    """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise _Rejected("", "parse", f"非 UTF-8 文本（{path.name}）：{exc}") from exc
-    except OSError as exc:  # 权限/目录/被占用等
-        raise _Rejected("", "parse", f"读取失败（{path.name}）：{exc}") from exc
-    if text.startswith("\ufeff"):
-        text = text[1:]
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise _Rejected("", "parse",
-                        f"JSON 解析失败（{path.name} 行 {exc.lineno} 列 {exc.colno}）："
-                        f"{exc.msg}") from exc
-
-
 def _record_outcome(result: MappingOverrideResult, decision_logger: Any) -> None:
     """两 action 落账（``DecisionLogger.record``）；logger 为空/异常时静默跳过。"""
     if decision_logger is None:
@@ -666,24 +630,12 @@ def load_effective(data_dir: Union[str, Path], decision_logger: Any = None,
     if root_dir is None:
         return load(data_dir, decision_logger)
     root = Path(root_dir)
-    root_path = mappings_path(root, ROOT_MAPPING_FILE_NAME)
-    try:
-        present = root_path.exists()
-    except OSError:
-        present = False
-    if not present:
-        # §29.2（2026-10-23 直派）：migrate_legacy_root_file 调用点升级为 ensure_user_table
-        # （旧根迁移仍优先，表层仍缺才从出厂种子映射表复制；解析错误不算缺失）
-        ensure_user_table(root, ROOT_MAPPING_FILE_NAME)
-        try:
-            present = root_path.exists()
-        except OSError:
-            present = False
-    if not present:
-        _generate_default_root(root_path)
+    spec = MappingTableSpec(ROOT_MAPPING_FILE_NAME, "情绪映射表", _generate_default_root)
+    root_path, generated = resolve_table_path(root, spec)
+    if generated:
         return load(data_dir, decision_logger)
     try:
-        raw = _read_document(root_path)
+        raw = read_document(root_path, _Rejected)
     except _Rejected as exc:
         logger.warning("插件根目录映射表非法（%s：%s）→ 回退内置默认（不叠加 data_dir 覆盖层）",
                        exc.error_kind, exc.detail)
@@ -725,7 +677,7 @@ def load(data_dir: Union[str, Path], decision_logger: Any = None,
         logger.debug("emotion mapping override：%s 不存在 → 纯代码默认（不落 action）", path)
         return MappingOverrideResult()
     try:
-        raw = _read_document(path)
+        raw = read_document(path, _Rejected)
     except _Rejected as exc:
         result = _rejected(exc.error_key, exc.error_kind, exc.detail)
     else:

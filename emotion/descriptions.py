@@ -20,7 +20,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from core.mapping_dir import ensure_user_table, mappings_path
+from core.mapping_table import MappingTableSpec, plugin_root, resolve_table_path
 
 logger = logging.getLogger(__name__)
 
@@ -95,25 +95,6 @@ def generic_description(label: str) -> str:
             f"它正实实在在地影响着说话的语气与心境。")
 
 
-def _plugin_root() -> Path:
-    """插件根目录（本模块位于 ``<plugin_root>/emotion/`` 下）。"""
-    return Path(__file__).resolve().parents[1]
-
-
-def _descriptions_path(root: Path) -> Path:
-    """描述表路径（``<root>/mappings/emotion_descriptions.json``；缺失时 ensure_user_table 补齐）。"""
-    path = mappings_path(root, ROOT_DESCRIPTIONS_FILE_NAME)
-    try:
-        present = path.exists()
-    except OSError:
-        present = False
-    if not present:
-        # §29.2（2026-10-23 直派）：migrate_legacy_root_file 调用点升级为 ensure_user_table
-        # （旧根迁移仍优先，表层仍缺才从出厂种子映射表复制；解析错误不算缺失）
-        ensure_user_table(root, ROOT_DESCRIPTIONS_FILE_NAME)
-    return path
-
-
 def load_descriptions(*, root_dir: Any = None, known_labels: Optional[Iterable[str]] = None,
                       decision_logger: Any = None) -> Dict[str, str]:
     """装载插件根 ``mappings/`` 的情绪描述 json（F5；**只在加载/重载时调用一次**）。
@@ -126,11 +107,10 @@ def load_descriptions(*, root_dir: Any = None, known_labels: Optional[Iterable[s
     """
     known = {str(label).strip() for label in (known_labels or ()) if str(label).strip()}
     known.add(GENERIC_LABEL)
-    root = Path(root_dir) if root_dir else _plugin_root()
-    path = _descriptions_path(root)
-
-    if not path.exists():
-        _generate_default(path)
+    root = Path(root_dir) if root_dir else plugin_root(__file__)
+    spec = MappingTableSpec(ROOT_DESCRIPTIONS_FILE_NAME, "情绪描述表", _generate_default)
+    path, generated = resolve_table_path(root, spec)
+    if generated:
         return dict(DEFAULT_EMOTION_DESCRIPTIONS)
 
     try:

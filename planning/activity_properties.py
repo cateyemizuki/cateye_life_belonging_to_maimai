@@ -44,6 +44,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.coerce import is_number as _is_number
+from core.mapping_table import (
+    MappingTableSpec,
+    check_top_level_keys,
+    check_version,
+    read_document,
+    resolve_table_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,23 +222,6 @@ class _EntryRejected(Exception):
         self.detail = detail
 
 
-def _check_version(raw: Dict[str, Any]) -> None:
-    if "version" not in raw:
-        raise _Rejected("version", "version_missing",
-                        f"顶层键 version：期望 int {SUPPORTED_VERSION}，实得 键缺失")
-    value = raw["version"]
-    if not isinstance(value, int) or isinstance(value, bool) or int(value) != SUPPORTED_VERSION:
-        raise _Rejected("version", "version_unsupported",
-                        f"顶层键 version：期望 int {SUPPORTED_VERSION}，实得 {_fmt(value)}")
-
-
-def _check_top_level_keys(raw: Dict[str, Any]) -> None:
-    for key in raw:
-        if key not in ("version", "properties", "default_property"):
-            raise _Rejected(str(key), "unknown_key",
-                            f"顶层键 {key!r}：未知键（允许的键集 version、properties、default_property）")
-
-
 def _check_strings_array(raw: Any, path: str, name: str, *, allow_empty: bool = True) -> Tuple[str, ...]:
     """字符串数组校验（``goal_types``/``keywords`` 共用）；非数组/含非字符串 → 条目排除）。"""
     if raw is None:
@@ -318,8 +308,8 @@ def validate_properties_document(raw: Any) -> PropertiesLoadResult:
     try:
         if not isinstance(raw, dict):
             raise _Rejected("", "type", f"顶层：期望 JSON 对象，实得 {_fmt(raw)}")
-        _check_version(raw)
-        _check_top_level_keys(raw)
+        check_version(raw, SUPPORTED_VERSION, _Rejected, fmt=_fmt)
+        check_top_level_keys(raw, ("version", "properties", "default_property"), _Rejected)
     except _Rejected as exc:
         return PropertiesLoadResult(error={"error_key": exc.error_key,
                                            "error_kind": exc.error_kind,
@@ -417,21 +407,6 @@ def merge_tables(result: PropertiesLoadResult) -> PropertyTable:
 
 
 # ── 装载入口 ──────────────────────────────────────────────────────────────
-def _plugin_root() -> Path:
-    """插件根目录（本模块位于 ``<plugin_root>/planning/`` 下）。"""
-    return Path(__file__).resolve().parents[1]
-
-
-def _read_document(path: Path) -> Any:
-    """读取并解析属性文件；失败统一 ``_Rejected(error_kind="parse")``。"""
-    from core.mapping_dir import MappingReadError, read_json_text  # 延迟导入：顶层零插件依赖
-
-    try:
-        return read_json_text(path)
-    except MappingReadError as exc:
-        raise _Rejected("", "parse", exc.detail) from exc
-
-
 # ── 落账 action（§24.3 冻结字面量）───────────────────────────────────────
 #: 采纳（info：accepted/rejected/warnings 清单）
 ACTION_APPLIED = "planning.properties_applied"
@@ -498,27 +473,13 @@ def load_properties(*, root_dir: Any = None,
     """装载属性表（**只读一遍**；``root_dir=None`` 测试桩 → 跳过根层纯内置）。"""
     if root_dir is None:
         return PropertiesLoadResult(), builtin_table()
-    from core.mapping_dir import ensure_user_table, mappings_path  # 延迟导入：顶层零插件依赖
 
-    path = mappings_path(Path(root_dir), PROPERTIES_FILE_NAME)
+    spec = MappingTableSpec(PROPERTIES_FILE_NAME, "日程属性表", _generate_default)
+    path, generated = resolve_table_path(root_dir, spec)
+    if generated:
+        return PropertiesLoadResult(generated_default=True), builtin_table()
     try:
-        present = path.exists()
-    except OSError:
-        present = False
-    if not present:
-        # §29.2（2026-10-23 直派）：表层缺失 → ensure_user_table 按序补齐
-        # （旧根迁移优先，仍缺才从出厂种子映射表复制；解析错误不算缺失、绝不覆盖用户文件）
-        ensure_user_table(root_dir, PROPERTIES_FILE_NAME)
-        try:
-            present = path.exists()
-        except OSError:
-            present = False
-    if not present:
-        _generate_default(path)
-        result = PropertiesLoadResult(generated_default=True)
-        return result, builtin_table()
-    try:
-        raw = _read_document(path)
+        raw = read_document(path, _Rejected)
     except _Rejected as exc:
         result = PropertiesLoadResult(error={"error_key": exc.error_key,
                                              "error_kind": exc.error_kind,

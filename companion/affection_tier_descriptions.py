@@ -35,6 +35,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from core.mapping_table import MappingTableSpec, resolve_table_path
+
 logger = logging.getLogger(__name__)
 
 #: 描述表文件名（实际读取位 = ``<root>/mappings/``）
@@ -87,11 +89,6 @@ def generic_tier_description(label: str, low: float, high: float) -> str:
             f"按这一阶段的亲近程度自然相处。")
 
 
-def _plugin_root() -> Path:
-    """插件根目录（本模块位于 ``<plugin_root>/companion/`` 下）。"""
-    return Path(__file__).resolve().parents[1]
-
-
 def _log_decision(decision_logger: Any, action: str, detail: str) -> None:
     """落决策账（可选；缺失/异常静默——描述表装载故障绝不影响好感子系统）。"""
     if decision_logger is None:
@@ -115,23 +112,11 @@ def load_tier_descriptions(*, root_dir: Any = None,
     merged = _builtin_by_labels(presets)
     if root_dir is None:
         return merged
-    from core.mapping_dir import MappingReadError, ensure_user_table, mappings_path, read_json_text
+    from core.mapping_dir import MappingReadError, read_json_text
 
-    path = mappings_path(Path(root_dir), TIER_DESCRIPTIONS_FILE_NAME)
-    try:
-        present = path.exists()
-    except OSError:
-        present = False
-    if not present:
-        # §29.2（2026-10-23 直派）：表层缺失 → ensure_user_table 按序补齐
-        # （旧根迁移优先，仍缺才从出厂种子映射表复制；解析错误不算缺失、绝不覆盖用户文件）
-        ensure_user_table(root_dir, TIER_DESCRIPTIONS_FILE_NAME)
-        try:
-            present = path.exists()
-        except OSError:
-            present = False
-    if not present:
-        _generate_default(path)
+    spec = MappingTableSpec(TIER_DESCRIPTIONS_FILE_NAME, "档位描述表", _generate_default)
+    path, generated = resolve_table_path(root_dir, spec)
+    if generated:
         return merged
 
     try:
