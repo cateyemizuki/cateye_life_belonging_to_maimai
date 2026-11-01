@@ -37,7 +37,7 @@ def _brief_receipt_text(receipt: Dict[str, Any]) -> str:
                 f"状态 {receipt.get('status')}），不重复提交。")
     if receipt.get("success"):
         return (f"已受理观看任务 {receipt.get('task_id')}（当前 {receipt.get('status')}）；"
-                "后台处理完成后会通知发起聊天；请结束本轮，不要反复调用status/result。")
+                "后台处理完成后会通知发起聊天；不用等待结果，不要反复调用status/result。")
     return f"提交失败（{receipt.get('error_class')}）：{receipt.get('error')}"
 
 

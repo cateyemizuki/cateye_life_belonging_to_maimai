@@ -15,7 +15,8 @@ from maibot_sdk import Tool
 TOOL_WATCH_DESCRIPTION = (
     "观看用户提供的B站视频。video可以直接传原始长链接、b23.tv短链或包含链接的小程序分享文字；"
     "必须使用上下文中的真实来源，不要猜测或编造BV号。action=resolve可先解析真实BV。"
-    "action=submit提交后台观看后结束本轮；完成/失败会由后台通知原发起聊天，"
+    "action=submit提交后台观看后，先向用户自然回复一句确认，例如‘我去看看，看完跟你说’，"
+    "再继续正常交流，不需要等待结果。完成/失败会由后台通知原发起聊天，"
     "不要在同轮或后续自行反复status/result轮询，也不要重复submit催进度。"
     "status/result仅在用户明确询问时使用一次；cancel取消。"
     "结果只陈述实际采样；通知是点播结果交付，不会广播给其他聊天。"
@@ -53,7 +54,7 @@ class VideoWatchComponentsMixin:
     async def tool_watch_bili_video(self, action: str = "", video: str = "",
                                     task_id: str = "", purpose: str = "",
                                     **kwargs: Any) -> Any:
-        """LLM Tool：看一个B站视频（后台执行，先回执后查询；不自动发消息）。"""
+        """后台观看回执；由planner自然确认，不强制终止回合。"""
         try:
             service = self._video_watch  # on_load 恒装配（disabled 也建实例，仅不 start）
         except AttributeError:
@@ -71,7 +72,7 @@ class VideoWatchComponentsMixin:
         if receipt.get("success") is False:
             error = str(receipt.get("error") or content or "观看请求未成功")
             return {"success": False, "error": error, "content": content or error,
-                    "stop_after_execution": True}
+                    "stop_after_execution": False}
         if str(action).strip().lower() == "submit" and receipt.get("success"):
             if receipt.get("cached") and isinstance(receipt.get("result"), dict):
                 from .service import _result_summary_text
@@ -81,12 +82,13 @@ class VideoWatchComponentsMixin:
             subscribe = getattr(self, "_subscribe_video_completion", None)
             subscribed = bool(subscribe and subscribe(str(receipt.get("task_id") or ""), origin))
             return {"success": True, "task_id": receipt.get("task_id"),
-                    "content": content if subscribed else "任务已受理，但来源聊天通知不可用。请稍后手动查询一次，不要连续轮询。",
-                    "completion_notification": subscribed, "stop_after_execution": True}
+                    "content": ((content + " 请先向用户简短确认一句，例如‘我去看看，看完跟你说’，再继续正常交流；不用等待或反复查询结果。")
+                                if subscribed else "任务已受理，但来源聊天通知不可用。请先向用户说明已受理及无法自动通知；用户之后询问时查询一次，不要自行连续轮询。"),
+                    "completion_notification": subscribed, "stop_after_execution": False}
         if receipt.get("status") in ("queued", "running") or receipt.get("error_class") == "not_ready":
             return {"success": bool(receipt.get("success", True)),
-                    "content": content + "；仍在后台处理，完成会通知来源聊天，请结束本轮，勿连续查询。",
-                    "stop_after_execution": True}
+                    "content": content + "；仍在后台处理，请按当前状态简短回复用户，再继续正常交流；不用等待或连续查询。",
+                    "stop_after_execution": False}
         if receipt.get("success") and receipt.get("task_id"):
             extra = {k: receipt.get(k) for k in ("status", "stage", "cached", "deduped",
                                                  "error_class") if receipt.get(k)}
