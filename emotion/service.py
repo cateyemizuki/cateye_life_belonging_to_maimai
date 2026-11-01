@@ -22,6 +22,7 @@ from suite_prompts import (
 )
 
 from . import descriptions, mapping_override
+from . import state_store
 from .bridge import apply_template_events
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
 from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
@@ -353,23 +354,8 @@ class EmotionService:
     # ── 持久化 ──────────────────────────────────────────────
     @staticmethod
     def _parse_episode_state(raw: Any) -> Dict[str, Any]:
-        """解析状态文件里的 ``episode`` 键（水位 + 日计数）；缺键/坏类型 → 空默认，不抛。"""
-        out: Dict[str, Any] = {"last_eval_ts": {}, "eval_date": "", "eval_count": 0}
-        if not isinstance(raw, dict):
-            return out
-        raw_ts = raw.get("last_eval_ts")
-        if isinstance(raw_ts, dict):
-            for stream, value in raw_ts.items():
-                try:
-                    out["last_eval_ts"][str(stream)] = float(value)
-                except (TypeError, ValueError):
-                    continue
-        out["eval_date"] = str(raw.get("eval_date") or "")
-        try:
-            out["eval_count"] = max(0, int(raw.get("eval_count") or 0))
-        except (TypeError, ValueError):
-            out["eval_count"] = 0
-        return out
+        """解析状态文件里的 ``episode`` 键（水位 + 日计数）；实现见 state_store。"""
+        return state_store.parse_episode_state(raw)
 
     def _restore_sleep_receipt(self, state: Dict[str, Any], now: datetime) -> None:
         restored = sleep_cache.decode(state.get("pending_sleep_overhaul"), now)
@@ -398,33 +384,15 @@ class EmotionService:
         盘上已有的 ``applied_sleep_date``（醒沿结算的"本周期已结算"标记，状态机
         ``to_dict`` 不含该键）——否则 episode 冲刷/日切等任意共用出口都会把它抹掉。
         """
-        state = self._machine.to_dict()
-        state["episode"] = {
-            "last_eval_ts": {str(k): round(float(v), 3)
-                             for k, v in self._episode_state["last_eval_ts"].items()},
-            "eval_date": str(self._episode_state["eval_date"]),
-            "eval_count": int(self._episode_state["eval_count"]),
-        }
-        # P4 落盘护栏（最小 diff）：醒沿把 applied_sleep_date 直接写入文件，而本方法整体重写
-        # 该文件；覆盖式并入盘上原值（状态机不认识该键，load_dict 忽略；不改其值、不新增字段）。
-        previous = load_json(self._state_path, {}) or {}
-        if isinstance(previous, dict) and "applied_sleep_date" in previous:
-            state["applied_sleep_date"] = previous["applied_sleep_date"]
-        # Keep unknown receipt versions byte-for-byte at the JSON value level.
-        prior_receipt = previous.get("pending_sleep_overhaul") if isinstance(previous, dict) else None
-        if isinstance(prior_receipt, dict) and not sleep_cache.known(prior_receipt):
-            state["pending_sleep_overhaul"] = prior_receipt
-        elif getattr(self, "_pending_overhaul", None) is not None and self._sleep_period:
-            try:
-                state["pending_sleep_overhaul"] = sleep_cache.encode(self._pending_overhaul, self._sleep_period)
-            except (ValueError, TypeError, KeyError):
-                logger.warning("睡眠裁判回执未通过持久化校验")
-        applying = getattr(self, "_saving_sleep_cycle", "")
-        if applying:
-            state["applied_sleep_date"] = applying
-            if sleep_cache.known(state.get("pending_sleep_overhaul")):
-                state.pop("pending_sleep_overhaul", None)
-        if not save_json_atomic(self._state_path, state):
+        state = state_store.build_document(
+            self._machine.to_dict(),
+            self._episode_state,
+            previous=load_json(self._state_path, {}) or {},
+            pending_overhaul=getattr(self, "_pending_overhaul", None),
+            sleep_period=getattr(self, "_sleep_period", None),
+            applying_cycle=getattr(self, "_saving_sleep_cycle", ""),
+        )
+        if not state_store.write_document(self._state_path, state, writer=save_json_atomic):
             return False
         try:
             from .observations import EmotionObservations
@@ -441,8 +409,12 @@ class EmotionService:
         return True
 
     def _save_params(self) -> None:
-        save_json_atomic(self._config_path, {"params": self._machine.params.to_dict(),
-                                             "saved_at": datetime.now().isoformat(timespec="seconds")})
+        state_store.write_params(
+            self._config_path,
+            self._machine.params.to_dict(),
+            datetime.now().isoformat(timespec="seconds"),
+            writer=save_json_atomic,
+        )
 
     # ── 情绪查询（注入 / Tool 用）────────────────────────────
     def mood_text(self) -> str:
