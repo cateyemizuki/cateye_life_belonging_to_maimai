@@ -6,11 +6,14 @@ import json
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any
 
+from core.plugin_context import PluginContext
+
 from .time_utils import TimezoneManager, format_day_minute
 from .life_history import FIELDS, MAX_POINTS, SAMPLE_SECONDS
 
 def _companion_summary(plugin: Any, *, date: str) -> dict[str, Any]:
-    if getattr(plugin, '_companion', None) is None:
+    ctx = PluginContext(plugin)
+    if ctx.companion is None:
         return {'available': False}
     # D3（2026-11-01 模块解耦计划 §3.1）：经组合根公共口取陪伴摘要，planning 不导入
     # companion；公共口缺失（裸测试桩）→ 旧懒导入 shim 保留，D5 注入化后退役。
@@ -277,6 +280,7 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
     之类明确提示字段，不伪造数据。
     """
     from .rolling_planner import extract_spine_intents
+    ctx = PluginContext(plugin)
 
     def read(label: str, callback: Any, fallback: Any) -> Any:
         try:
@@ -291,8 +295,8 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
     day_end = day_start + timedelta(days=1)
     today = now.date()
     enabled = bool(getattr(getattr(cfg, 'schedule', None), 'enabled', False))
-    model = getattr(plugin, '_life_model', None)
-    db = getattr(plugin, '_db', None)
+    model = ctx.life_model
+    db = ctx.db
     ready = enabled and model is not None and db is not None
     view: dict[str, Any] = {
         'available': True, 'date': day, 'timezone': tz_name,
@@ -393,7 +397,7 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
     # ---- 该日五维序列（life_history 7 天环，取满保留窗后按日窗过滤）----
     state_history: dict[str, Any] = {'points': [], 'total_points': 0,
                                      'downsampled': False, 'available': False}
-    life = getattr(plugin, '_life_state', None)
+    life = ctx.life_state
     if enabled and life is not None:
         def _state_day() -> dict[str, Any]:
             full = life.history_snapshot(now=now, hours=168, limit=MAX_POINTS)
@@ -416,7 +420,7 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
     # ---- 该日 VAD 序列（emotion observations 7 天环，同口径过滤）----
     vad_history: dict[str, Any] = {'points': [], 'total_points': 0,
                                    'downsampled': False, 'available': False}
-    observations = getattr(getattr(plugin, '_emotion', None), 'service', None)
+    observations = getattr(ctx.emotion, 'service', None)
     observations = getattr(observations, '_observations', None) if observations else None
     if observations is not None:
         def _vad_day() -> dict[str, Any]:
@@ -521,7 +525,8 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
     见 :func:`_build_day_view`）；空串/非法 → 行为与既有 hours 路径逐字一致
     （非法值附 warning 字段，不改变任何既有字段语义）。
     """
-    cfg = getattr(plugin, 'config', None)
+    ctx = PluginContext(plugin)
+    cfg = ctx.config
     tz_name = str(getattr(getattr(cfg, 'schedule_advanced', None), 'timezone', '') or 'Asia/Shanghai')
     clock = TimezoneManager(tz_name)
     now = now or clock.get_now()
@@ -530,9 +535,9 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
     date = now.strftime('%Y-%m-%d')
     hours = hours if type(hours) is int and hours in (6, 24, 72, 168) else 24
     enabled = bool(getattr(getattr(cfg, 'schedule', None), 'enabled', False))
-    life = getattr(plugin, '_life_state', None)
-    model = getattr(plugin, '_life_model', None)
-    db = getattr(plugin, '_db', None)
+    life = ctx.life_state
+    model = ctx.life_model
+    db = ctx.db
     warnings: list[str] = []
 
     def read(label: str, callback: Any, fallback: Any) -> Any:
@@ -578,7 +583,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
             if len(sessions) >= 8:
                 break
         sessions.sort(key=lambda row: (row.get('schedule_date') or '', row.get('actual_start_minute') or 0), reverse=True)
-    engine = getattr(plugin, '_sleep_engine', None)
+    engine = ctx.sleep_engine
     sleep_live = read('睡眠引擎暂不可读', lambda: engine.sleep_status(now), None) if enabled and engine else None
     safe_sleep = None
     if isinstance(sleep_live, dict):
@@ -687,8 +692,9 @@ def _extension_summary(plugin: Any, now: datetime, hours: int) -> dict[str, Any]
     """Independent module projections; never propagate raw event descriptions/logs."""
     result: dict[str, Any] = {'emotion': {'available': False}, 'qzone': {'available': False},
                               'usage': {}, 'health': {}}
+    ctx = PluginContext(plugin)
     try:
-        service = getattr(getattr(plugin, '_emotion', None), 'service', None)
+        service = getattr(ctx.emotion, 'service', None)
         if service is not None:
             from core.llm_utils import purpose_task
             raw = service.status_snapshot()
@@ -709,7 +715,7 @@ def _extension_summary(plugin: Any, now: datetime, hours: int) -> dict[str, Any]
     except Exception:
         result['emotion'] = {'available': False, 'reason': 'projection_unavailable'}
     try:
-        service = getattr(plugin, '_qzone', None)
+        service = ctx.qzone
         if service is not None:
             raw = service.status_snapshot()
             result['qzone'] = {'available': True, **{key: raw.get(key) for key in
@@ -719,7 +725,7 @@ def _extension_summary(plugin: Any, now: datetime, hours: int) -> dict[str, Any]
         result['qzone'] = {'available': False, 'reason': 'projection_unavailable'}
     try:
         from core.monitoring import usage_summary, runtime_health
-        data_dir = getattr(plugin, '_data_dir', None)
+        data_dir = ctx.data_dir
         if data_dir:
             result['usage'] = usage_summary(data_dir, now, min(hours, 48))
         result['health'] = runtime_health(plugin, now)

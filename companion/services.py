@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional
 
 from core.diag import DecisionLogger, LLMCallLogger
 from core.llm_utils import LLMService, llm_task_name_of
+from core.plugin_context import PluginContext
 from planning.schedule_query import ScheduleQuery
 
 from .affection import AffectionManager
@@ -50,8 +51,9 @@ def _load_affection_tables(plugin: Any) -> None:
     """
     from . import affection_presets, affection_tier_descriptions
 
-    root_dir = getattr(plugin, "_plugin_root", None)
-    decision_logger = getattr(plugin, "_decision_logger", None)
+    ctx = PluginContext(plugin)
+    root_dir = ctx.plugin_root
+    decision_logger = ctx.decision_logger
     try:
         result = affection_presets.load_and_apply(root_dir=root_dir,
                                                   decision_logger=decision_logger)
@@ -104,14 +106,15 @@ class CompanionServices:
                  emotion_valence_provider: Optional[Callable[[], Any]] = None) -> None:
         self.plugin = plugin
         self.ctx = plugin.ctx
+        self._ctx = PluginContext(plugin)
         # 数据目录只在插件数据目录内（宿主隔离）；未接线场景绝不落宿主工作目录（插件中心评审阻断项）
-        _raw_data_dir = getattr(plugin, "_data_dir", None)
+        _raw_data_dir = self._ctx.data_dir
         if not _raw_data_dir:
             _raw_data_dir = tempfile.gettempdir()
             logger.warning("CompanionServices 未收到 plugin._data_dir，回退系统临时目录：%s", _raw_data_dir)
         self._data_dir = Path(_raw_data_dir)
         #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
-        self.bus = getattr(plugin, "_bus", None)
+        self.bus = self._ctx.bus
         #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
         self._event_unsubs: list = []
 
@@ -122,11 +125,11 @@ class CompanionServices:
         _load_affection_tables(plugin)
         # ---- 复用顶层已有实例（只增不改名；缺失时自建兜底）----
         self.affection: AffectionManager = (
-            getattr(plugin, "_affection", None)
+            self._ctx.affection
             or AffectionManager(
                 self._data_dir,
                 config_provider=lambda: plugin.config,
-                decision_logger=getattr(plugin, "_decision_logger", None),
+                decision_logger=self._ctx.decision_logger,
             )
         )
         # 好感 v2 档位变化事件需要总线（plugin._bus 在服务束构造前已就绪，可空降级）
@@ -141,20 +144,20 @@ class CompanionServices:
         # 不变，测试桩不受影响）。提供者调用时才解析：plugin._emotion 在本服务束
         # 构造之后才装配（plugin.py 顺序）；情绪模块停用/缺失 → None → 乘数恒
         # 1.0（可空降级，§八.2）。
-        _valence_source = emotion_valence_provider or (lambda: getattr(plugin, "_emotion", None))
+        _valence_source = emotion_valence_provider or (lambda: self._ctx.emotion)
         try:
             self.affection.set_emotion_vad_provider(lambda: _emotion_valence(_valence_source()))
         except Exception:
             pass
-        self.decision_logger: Optional[DecisionLogger] = getattr(plugin, "_decision_logger", None)
-        self.llm_logger: Optional[LLMCallLogger] = getattr(plugin, "_llm_logger", None)
+        self.decision_logger: Optional[DecisionLogger] = self._ctx.decision_logger
+        self.llm_logger: Optional[LLMCallLogger] = self._ctx.llm_logger
         self.llm: LLMService = (
-            getattr(plugin, "_llm", None)
+            self._ctx.llm
             or LLMService(self.ctx, task_name=llm_task_name_of(cfg), call_logger=self.llm_logger,
                           config_provider=lambda: plugin.config)
         )
         # 日程查询：消费 planning 子模块（顶层 plugin._schedule_query 即 planning.ScheduleQuery）
-        self.schedule_query: Optional[ScheduleQuery] = getattr(plugin, "_schedule_query", None)
+        self.schedule_query: Optional[ScheduleQuery] = self._ctx.schedule_query
 
         # ---- 纯 companion 服务 ----
         #: 发送者身份缓存（v2.5.0：上下文条目里只有 msg_id 与显示名，靠反查判定陪伴对象）
