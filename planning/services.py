@@ -332,6 +332,9 @@ class PlanningServices:
                 item = None
             if isinstance(item, dict) and is_night_sleep_item(item):
                 return True
+            if (isinstance(item, dict) and item.get("is_runtime_episode") is True
+                    and item.get("status") == "active" and item.get("goal_type")):
+                return False
         return None
 
     def _hard_commitment_now(self, now: Optional[datetime] = None) -> Optional[bool]:
@@ -347,6 +350,8 @@ class PlanningServices:
             try:
                 item = current_getter(cur, include_sleep=True)
             except Exception:
+                return None
+            if item is not None and not isinstance(item, dict):
                 return None
             if isinstance(item, dict):
                 hardness = item.get("hardness")
