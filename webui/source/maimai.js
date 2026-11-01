@@ -46,9 +46,14 @@ const Mascot=(()=>{
   const P=`perspective(700px) translate(${ax}px, ${ay}px) `;
   const S=`translate(${-parseFloat(ax)}px, ${-parseFloat(ay)}px)`;
   rotateAnim?.cancel();
+  // 明暗线索：正面全亮 → 背向阶段渐暗成剪影，让 360° 转动可辨识
+  // （平面贴图无此线索时，360° 与 180° 来回摆在感知上不可区分）
   rotateAnim=tilt.animate([
-   {transform:P+'rotateY(0deg) '+S},
-   {transform:P+'rotateY(360deg) '+S}
+   {transform:P+'rotateY(0deg) '+S, filter:'brightness(1)', offset:0},
+   {transform:P+'rotateY(90deg) '+S, filter:'brightness(.62)', offset:.25},
+   {transform:P+'rotateY(180deg) '+S, filter:'brightness(.45)', offset:.5},
+   {transform:P+'rotateY(270deg) '+S, filter:'brightness(.62)', offset:.75},
+   {transform:P+'rotateY(360deg) '+S, filter:'brightness(1)', offset:1}
   ],{duration:2600,easing:'linear',iterations:Infinity});
  }
  function stopSpin(){
