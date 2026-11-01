@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .generator import LOW_MOOD_MIN_DAYS
@@ -335,40 +335,58 @@ class PlanningServices:
         return None
 
     def _hard_commitment_now(self, now: Optional[datetime] = None) -> Optional[bool]:
-        """今天/明天是否有**硬约定**（True/False；数据源全不可用 → None = 未知）。"""
-        plugin = self._plugin
-        sources = 0
+        """仅当前时间窗的硬约定阻止生成；读取失败或数据未知时保守拒绝。"""
         cur = self._now() if now is None else now
-        today = cur.strftime("%Y-%m-%d")
-        tomorrow = (cur + timedelta(days=1)).strftime("%Y-%m-%d")
-        # 1) 待办约定里的硬约定（parameters.hardness == "hard"）
-        goal_manager = getattr(getattr(plugin, "_planning", None), "goal_manager", None)
-        getter = getattr(goal_manager, "get_pending_commitments", None)
-        if callable(getter):
-            sources += 1
-            for day in (today, tomorrow):
-                try:
-                    rows = getter(commitment_date=day) or []
-                except Exception:
-                    continue
-                for goal in rows:
-                    params = getattr(goal, "parameters", None) or {}
-                    if isinstance(params, dict) and str(params.get("hardness") or "") == "hard":
-                        return True
-        # 2) 今日日程条目里的硬约束（parameters.hardness == "hard"）
-        query = getattr(plugin, "_schedule_query", None)
-        day_getter = getattr(query, "get_day_schedule", None)
-        if callable(day_getter):
-            sources += 1
-            try:
-                for row in (day_getter(today) or []):
-                    params = (row or {}).get("parameters") if isinstance(row, dict) else None
-                    if isinstance(params, dict) and str(params.get("hardness") or "") == "hard":
-                        return True
-            except Exception:
-                pass
-        if sources == 0:
+        if not isinstance(cur, datetime):
             return None
+        if cur.tzinfo is None:
+            cur = cur.replace(tzinfo=self._now().tzinfo)
+        query = getattr(self._plugin, "_schedule_query", None)
+        current_getter = getattr(query, "runtime_current", None)
+        if callable(current_getter):
+            try:
+                item = current_getter(cur, include_sleep=True)
+            except Exception:
+                return None
+            if isinstance(item, dict):
+                hardness = item.get("hardness")
+                for key in ("parameters", "metadata"):
+                    nested = item.get(key)
+                    if hardness is None and isinstance(nested, dict):
+                        hardness = nested.get("hardness")
+                if str(hardness or "").lower() == "hard":
+                    return True
+        # 未执行的未来约定不等于当前占用；时间窗以真实日程为准。
+        # 同时查昨日，以覆盖 23:00–次日01:00 等跨午夜硬约定。
+        getter = getattr(query, "get_day_schedule", None)
+        if not callable(getter):
+            return None
+        midnight = cur.replace(hour=0, minute=0, second=0, microsecond=0)
+        for base in (midnight - timedelta(days=1), midnight):
+            try:
+                rows = getter(base.strftime("%Y-%m-%d"))
+            except Exception:
+                return None
+            if not isinstance(rows, (list, tuple)):
+                return None
+            for row in rows:
+                if not isinstance(row, dict):
+                    return None
+                params = row.get("parameters") or {}
+                if not isinstance(params, dict):
+                    return None
+                if str(params.get("hardness") or row.get("hardness") or "").lower() != "hard":
+                    continue
+                start, end = row.get("start_minute"), row.get("end_minute")
+                if any(isinstance(v, bool) or not isinstance(v, int) for v in (start, end)):
+                    return None
+                if not 0 <= start <= 2880 or not 0 <= end <= 4320 or start == end:
+                    return None
+                if end < start:
+                    end += 1440
+                offset = 1440 if row.get("day_offset") == 1 and start < 1440 else 0
+                if base + timedelta(minutes=start + offset) <= cur < base + timedelta(minutes=end + offset):
+                    return True
         return False
 
     def event_catalog_auto_gate(self, now: Any = None) -> Dict[str, Any]:
