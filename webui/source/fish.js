@@ -230,7 +230,7 @@ const SectionFish=(()=>{
   if(current)close(false);
   clearTimeout(closeTimer);clearTimeout(hoverTimer);overlay.classList.remove('is-closing');
   current=entry;lastTrigger=entry.button;pinnedOpen=pinned;
-  for(const group of entry.groups){group.open=false;details.append(group)}
+  for(const group of entry.groups){group.open=true;details.append(group)}  // 折叠默认展开（0425 目检：详情内不再折叠）
   floatEntry(entry);
   overlay.hidden=false;overlay.dataset.section=entry.key;
   placePanel(entry);
@@ -330,13 +330,13 @@ const SectionFish=(()=>{
  const companionCard=$('tier').closest('article');mount('companion','陪伴',companionCard,d=>d.companion?.available?`${d.companion.tier_label||'关系记录'} · 今日主动 ${count(d.companion.speak_count)} / ${count(d.companion.daily_limit)}`:'暂无陪伴记录',d=>[['巡检时间',safeTime(d.companion?.last_tick_at),fullClock(d.companion?.last_tick_at)],['今日主动','巡检与想念合并统计','早安、晚安单独展示。']]);
  mount('state','身心状态',$('metrics'),d=>d.state_available?'五项状态反映当前快照；饥饿与压力越高，需求越明显。':'暂无生活状态记录',d=>[['采样间隔','约 5 分钟','正常tick每5分钟至多采样一次，另保留活动和醒沿观察。'],['更新时间',safeTime(d.state?.updated_at),fullClock(d.state?.updated_at)],['精神状态',num(d.state?.mental_state)===null?'暂无记录':pct(d.state.mental_state)+'%','由精力×专注×(1−压力)得到；专注为0表示注意力涣散，压力为0表示放松。']],[],['grid','metrics']);
  const historyCard=$('history-chart').closest('section');const sampleGroup=fold('采样明细',[$('samples-toggle'),$('samples')]);
- mount('history','生活起伏',historyCard,()=>selectedDay?selectedDay+'的真实记录与估算':'最近'+hours+'小时的状态变化',d=>[['保留期','最近 7 天','最多2304个真实观察点；达到上限淘汰最旧点。'],['真实点',points.filter(p=>!p.estimated).length+' 个','这些值来自实际采样，不包括中间估算点。'],['估算点',points.filter(p=>p.estimated).length+' 个','仅两端有真实记录、且中间缺口不超过2小时才线性估算；虚线不计入真实点数。'],['起始时间',safeTime(lifeSeries().started_at||points[0]?.at),fullClock(lifeSeries().started_at||points[0]?.at)]],[sampleGroup]);
+ mount('history','状态变化',historyCard,()=>selectedDay?selectedDay+'的真实记录与估算':'最近'+hours+'小时的状态变化',d=>[['保留期','最近 7 天','最多2304个真实观察点；达到上限淘汰最旧点。'],['真实点',points.filter(p=>!p.estimated).length+' 个','这些值来自实际采样，不包括中间估算点。'],['估算点',points.filter(p=>p.estimated).length+' 个','仅两端有真实记录、且中间缺口不超过2小时才线性估算；虚线不计入真实点数。'],['起始时间',safeTime(lifeSeries().started_at||points[0]?.at),fullClock(lifeSeries().started_at||points[0]?.at)]],[sampleGroup]);
  const sleepCard=document.querySelector('.sleep-combined');const archive=sleepCard.querySelector('.sleep-archive');const sleepGroups=[fold('睡眠债的变化',[$('debt-chart')]),fold('作息与会话说明',[$('sleep-anchors')]),fold('最近睡眠会话',[archive])];
  mount('sleep','睡眠与恢复',sleepCard,d=>d.sleep?.current?.asleep?'正在休息，恢复以真实会话记录为准。':'当前没有进行中的睡眠会话。',d=>[['睡眠债',fix(d.state?.sleep_debt)+' 小时','这是尚未补足的休息时长记录，范围0–12小时；正式醒来时按规则结算。'],['连续睡眠',fix(d.sleep?.current?.asleep?d.sleep.current.continuous_minutes:(d.state?.continuous_sleep_minutes??0),0)+' 分钟','连续段可能因已确认的打断重置，不代表本夜总时长。'],['来源','睡眠引擎会话','离线补全会明确标记；没有采样依据的段不会变成真实点。']],sleepGroups);
  const scheduleLists=document.querySelector('.schedulegrid');const scheduleGroup=fold('实际足迹与计划明细',[scheduleLists]);
- mount('schedule','一天的篇章',$('panel-schedule'),d=>`${selectedDay||d.schedule?.date||'当日'} · 计划与实际可以不同`,d=>[['来源','日意图与实际活动记录','计划与实际分列展示；中断、未完成、已清理的计划如实显示。'],['计划记录',dayView()?.intent?.plans_available===false?'已超过保留期':'查看下方明细',dayView()?.intent?.note||'当前计划最多80条、实际足迹最多120条；日视图每序列最多288点。']],[scheduleGroup]);
+ mount('schedule','当日行程',$('panel-schedule'),d=>`${selectedDay||d.schedule?.date||'当日'} · 计划与实际可以不同`,d=>[['来源','日意图与实际活动记录','计划与实际分列展示；中断、未完成、已清理的计划如实显示。'],['计划记录',dayView()?.intent?.plans_available===false?'已超过保留期':'查看下方明细',dayView()?.intent?.note||'当前计划最多80条、实际足迹最多120条；日视图每序列最多288点。']],[scheduleGroup]);
  const moodCard=$('vad-chart').closest('article'),vadLegend=moodCard.querySelector('.legend');const moodGroups=[fold('心情的变化',[vadLegend,$('vad-chart')]),fold('睡眠调整记录',[$('referee-health')])];
- mount('mood','心情底色',moodCard,d=>d.emotion?.available?(d.emotion.label||'心情平稳'):'暂无心情记录',d=>[['当前状态',d.emotion?.frozen?'睡眠冻结中':'自然变化中','睡眠期间暂停自然变化，醒后按真实睡眠会话进行调整。'],['最近调整',safeTime(d.emotion?.referee?.last_success_at),fullClock(d.emotion?.referee?.last_success_at)]],moodGroups);
+ mount('mood','当前情绪',moodCard,d=>d.emotion?.available?(d.emotion.label||'心情平稳'):'暂无心情记录',d=>[['当前状态',d.emotion?.frozen?'睡眠冻结中':'自然变化中','睡眠期间暂停自然变化，醒后按真实睡眠会话进行调整。'],['最近调整',safeTime(d.emotion?.referee?.last_success_at),fullClock(d.emotion?.referee?.last_success_at)]],moodGroups);
  const qzoneCard=$('qzone-summary').closest('article');const qzoneGroups=[fold('最近发送记录',[$('delivery-list')]),fold('本地草稿预览',[qzoneCard.querySelector('.draft-preview')])];
  mount('sharing','空间与分享',qzoneCard,d=>d.qzone?.available?`今日分享 ${d.qzone.posts_today??0}/${d.qzone.daily_max_posts??0}`:'暂无分享记录',d=>[['最近状态获取',safeTime(d.qzone?.cookie_health?.last_success_at),fullClock(d.qzone?.cookie_health?.last_success_at)],['最近失败',safeTime(d.qzone?.cookie_health?.last_failure_at),fullClock(d.qzone?.cookie_health?.last_failure_at)],['发送结果','以确认记录为准','结果未知时不会自动重复发送。']],qzoneGroups);
  const usageCard=$('usage-metrics').closest('section'),usageGroup=fold('调用构成与模型明细',[usageCard.querySelector('.usage-details')]);
