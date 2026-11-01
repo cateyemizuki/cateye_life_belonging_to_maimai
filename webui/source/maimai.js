@@ -10,7 +10,7 @@ const Mascot=(()=>{
  const button=$('maimai-peek');
  if(!button)return {applyConfig(){},setDetailMode(){}};
  const tilt=button.querySelector('.maimai-peek-tilt');
- const art=button.querySelector('.maimai-peek-art');
+ let art=button.querySelector('.maimai-peek-art');
  const DEFAULT_EASING='cubic-bezier(.34,1.56,.64,1)';
  // 运动常数：U 计划 §3.1 建议值（出场 450–650ms、收起延迟约 200ms），调试起点，非业务规则。
  // PRESS_MS=按下渐变压扁时长（用户 0424 目检：按下要"逐渐变扁"并保持，松开才回弹）。
@@ -35,6 +35,48 @@ const Mascot=(()=>{
  // 最初参数（squash 1.2/0.5、bounce 774ms overshoot）循环“压扁→回弹”，
  // 手动捏取时暂停、松开续播；收起/详情/失焦/减少动态一律停止。
  const pinBtn=document.getElementById('maimai-autopin');
+ // 眼珠独立层（0425 目检新增）：桌宠改用内联 SVG，把两颗瞳孔从暗色组拆进
+ // 可平移的子组——原始路径/配色不动，仅运行时分组；视线随鼠标（距离越近偏移越小）。
+ let eyePupils=null,eyeRaf=0;
+ const eyeTarget={x:Math.round(innerWidth*0.7),y:Math.round(innerHeight*0.3)};
+ function setupEyes(){
+  try{
+   const tpl=$('section-fish-art');
+   if(!tpl||!tpl.content||!tpl.content.firstElementChild)return;
+   const host=el('span','maimai-peek-art');
+   host.setAttribute('aria-hidden','true');
+   host.append(tpl.content.firstElementChild.cloneNode(true));
+   let pupils=null;
+   const SVG_NS='http://www.w3.org/2000/svg';
+   for(const g of host.querySelectorAll('g[fill="#080909"]')){
+    const ells=[...g.querySelectorAll('ellipse')];
+    if(ells.length===2&&!pupils){
+     // 必须用 SVG 命名空间创建分组（el() 造出的是 HTML 命名空间节点，塞进 SVG 不渲染）
+     pupils=document.createElementNS(SVG_NS,'g');
+     pupils.setAttribute('class','fish-pupils');pupils.setAttribute('fill','#080909');
+     for(const e2 of ells)pupils.append(e2);
+     g.append(pupils);
+    }
+   }
+   if(!pupils)return;
+   art.replaceWith(host);art=host;eyePupils=pupils;
+   updateEyes();
+  }catch(e){}
+ }
+ function updateEyes(){
+  eyeRaf=0;
+  if(!eyePupils)return;
+  const white=art.querySelector('g[fill="white"] ellipse');
+  if(!white)return;
+  const wr=white.getBoundingClientRect();
+  if(!wr.width)return;
+  const cx=wr.left+wr.width/2,cy=wr.top+wr.height/2;
+  const dx=eyeTarget.x-cx,dy=eyeTarget.y-cy;
+  const d=Math.hypot(dx,dy)||1;
+  const f=clamp((d-120)/480,0.15,1);                          // 近处小幅、远处明显
+  const ux=dx/d*19*f,uy=dy/d*19*f;                            // 瞳孔在眼白内最大位移（用户单位）
+  eyePupils.style.transform=`translate(${ux.toFixed(2)}px,${uy.toFixed(2)}px)`;
+ }
  let autoPin=false,autoPinTimer=null;
  const updateAutoPinVis=()=>{if(pinBtn)pinBtn.hidden=!(state==='landed'&&!detailMode&&!reduceMotion());};
  // 持续水平旋转（激活态）：旋转轴 = 头顶叶茎根点（约图 69%W、28%H）延伸的垂直线，
@@ -46,14 +88,9 @@ const Mascot=(()=>{
   const P=`perspective(700px) translate(${ax}px, ${ay}px) `;
   const S=`translate(${-parseFloat(ax)}px, ${-parseFloat(ay)}px)`;
   rotateAnim?.cancel();
-  // 明暗线索：正面全亮 → 背向阶段渐暗成剪影，让 360° 转动可辨识
-  // （平面贴图无此线索时，360° 与 180° 来回摆在感知上不可区分）
   rotateAnim=tilt.animate([
-   {transform:P+'rotateY(0deg) '+S, filter:'brightness(1)', offset:0},
-   {transform:P+'rotateY(90deg) '+S, filter:'brightness(.62)', offset:.25},
-   {transform:P+'rotateY(180deg) '+S, filter:'brightness(.45)', offset:.5},
-   {transform:P+'rotateY(270deg) '+S, filter:'brightness(.62)', offset:.75},
-   {transform:P+'rotateY(360deg) '+S, filter:'brightness(1)', offset:1}
+   {transform:P+'rotateY(0deg) '+S,offset:0},
+   {transform:P+'rotateY(360deg) '+S,offset:1}
   ],{duration:2600,easing:'linear',iterations:Infinity});
  }
  function stopSpin(){
@@ -160,6 +197,8 @@ const Mascot=(()=>{
    if(e.pointerType!=='mouse'||detailMode)return;
    lastPointer={x:e.clientX,y:e.clientY};
    const d=cornerDistance(e.clientX,e.clientY);
+   eyeTarget.x=e.clientX;eyeTarget.y=e.clientY;
+   if(!eyeRaf)eyeRaf=requestAnimationFrame(updateEyes);
    if(d>=cfg.size*REARM_FACTOR)hoverArmed=true;
    if(state==='peek'){
     if(hoverArmed&&d<cfg.size*TRIGGER_FACTOR){hoverArmed=false;emerge()}
@@ -249,7 +288,9 @@ const Mascot=(()=>{
   root.setProperty('--maimai-detail-fade-ms',clamp(number(block,'detail_fade_ms',220),80,600)+'ms');
   root.setProperty('--maimai-detail-scale',String(clamp(number(block,'detail_scale_from',0.6),0.4,1)));
   setPoseClass();
+  if(eyeRaf)cancelAnimationFrame(eyeRaf);eyeRaf=requestAnimationFrame(updateEyes);
  }
+ setupEyes();
  setPoseClass();
  return {applyConfig,setDetailMode};
 })();

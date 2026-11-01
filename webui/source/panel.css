@@ -55,6 +55,8 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('{{BG_TE
 .maimai-peek-tilt{position:absolute;inset:0;display:block;transform-origin:0 100%;will-change:transform}
 .maimai-peek.is-peek .maimai-peek-tilt{transform:translate(calc(var(--maimai-mascot-size,128px)*-0.234),calc(var(--maimai-mascot-size,128px)*0.234)) rotate(calc(var(--maimai-peek-angle,12deg)*-1))}
 .maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,128px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
+.maimai-peek-art svg{width:100%;height:auto;display:block}
+.fish-pupils{will-change:transform}
 /* 自动捏捏开关：落地后出现在尾叶上方的小圆钮（maimai.js 控制显隐与激活态）。 */
 .maimai-autopin{position:fixed;left:6px;bottom:64px;z-index:601;width:26px;height:26px;min-height:26px;border-radius:50%;font-size:12px;line-height:1;padding:0;display:grid;place-items:center;pointer-events:auto}
 .maimai-autopin[aria-pressed=true]{background:var(--maibot-primary);color:#fff;border-color:var(--maibot-primary)}
