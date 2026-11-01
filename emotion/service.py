@@ -22,13 +22,14 @@ from suite_prompts import (
 )
 
 from . import descriptions, mapping_override
+from . import presentation
 from . import state_store
 from .bridge import apply_template_events
 from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
 from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
                             EmotionParams, EmotionStateMachine)
 from . import sleep_cache
-from .vad import VADState, _clip, _level, apply_mapping_tables, map_emotions, mood_summary
+from .vad import VADState, _clip, _level, apply_mapping_tables, mood_summary
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +48,6 @@ DEDUP_WINDOW_DEFAULT_SECONDS = 180
 _DEDUP_REGISTRY_MAX = 64
 #: 情绪评估模式合法值（REGISTRY §二.5：episode=会话闲置后整段评估 / per_reply=旧每回复 / off=不评估）
 EVALUATE_MODES = ("episode", "per_reply", "off")
-#: 五档粗粒度 → 状态总览左栏的单字/双字短词（指导 §9.2「vad_words」；与 ``_level`` 档词同源）
-_COARSE_WORDS = {
-    "很低": "很低",
-    "偏低": "偏低",
-    "中等": "中",
-    "偏高": "偏高",
-    "很高": "很高",
-}
 #: episode 片段的消息条数 / 字符数上限（超出时保留**最近**的往来并在头部标注省略）
 EPISODE_SEGMENT_MAX_MESSAGES = 40
 EPISODE_SEGMENT_MAX_CHARS = 3000
@@ -430,23 +423,13 @@ class EmotionService:
 
     def _primary_emotion_description(self) -> str:
         """当前主导情绪的详细文字描述（F5；映射表外/无命中 → 通用固定描述）。"""
-        try:
-            labels, _nearest = map_emotions(self._machine.effective_vad())
-        except Exception:
-            labels = []
         descriptions_map = getattr(self, "_emotion_descriptions", None) or {}
-        if not labels:
-            return descriptions_map.get(descriptions.GENERIC_LABEL) or                 descriptions.generic_description(descriptions.GENERIC_LABEL)
-        primary, _share = labels[0]
-        desc = descriptions_map.get(str(primary))
-        if not desc:
-            desc = descriptions.generic_description(str(primary))
         try:
-            if len(labels) > 1 and float(labels[1][1]) >= 0.25:
-                desc = f"{desc}同时夹杂着一点「{labels[1][0]}」的成分。"
-        except (TypeError, ValueError):
-            pass
-        return desc
+            return presentation.primary_emotion_description(
+                self._machine.effective_vad(), descriptions_map)
+        except Exception:
+            return descriptions_map.get(descriptions.GENERIC_LABEL) or descriptions.generic_description(
+                descriptions.GENERIC_LABEL)
 
     def emotion_description_body(self) -> str:
         """当前主导情绪的详细描述正文（F5；面板展示用，无人称前缀）。"""
@@ -458,11 +441,12 @@ class EmotionService:
         返回值作为情绪注入模板的 ``mood`` 槽 / planner 日程块的精神状态行——
         详细文字描述替代「百分比 + 三维约值」（用户口径：数值渲染不得再进 LLM 面向文本）。
         """
-        body = self._primary_emotion_description()
-        if channel == "replyer":
-            return f"你此刻的情绪：{body}"
-        name = str(getattr(self, "_lover_name", "") or "麦麦")
-        return f"{name}此刻的情绪：{body}"
+        return presentation.emotion_description_text(
+            self._machine.effective_vad(),
+            getattr(self, "_emotion_descriptions", None) or {},
+            getattr(self, "_lover_name", ""),
+            channel,
+        )
 
     def injection_text(self, channel: str = "replyer") -> str:
         """情绪底色注入文本（planner/replyer 双通道共用，以系统条目插在第一条系统提示词后）。
@@ -550,23 +534,7 @@ class EmotionService:
 
     def params_summary(self) -> str:
         """/lbm_emotion_config 查看文本。"""
-        p = self._machine.params
-        eff = self._machine.effective_vad()
-        labels, _ = map_emotions(eff)
-        label_text = "、".join(f"{n}({s:.0%})" for n, s in labels[:3]) or "复杂难名"
-        lines = [
-            f"初始化：{'已完成' if p.initialized else '未初始化（零锚点零偏移）'}",
-            f"锚点：V={p.anchor.valence:+.2f}，A={p.anchor.arousal:+.2f}，D={p.anchor.dominance:+.2f}",
-            f"静态偏移：V={p.offset.valence:+.2f}，A={p.offset.arousal:+.2f}，D={p.offset.dominance:+.2f}",
-            f"乘数：正向增益 ×{p.positive_gain:.2f}，负向衰减 ×{p.negative_decay:.2f}",
-            f"当前 VAD（含偏移）：V={eff.valence:+.2f}，A={eff.arousal:+.2f}，D={eff.dominance:+.2f}｜情绪底色：{label_text}",
-            f"当天情绪事件：{len(self._machine.emotion_log)} 条",
-        ]
-        if p.reasons:
-            for key in ("anchor", "offset", "multiplier"):
-                if p.reasons.get(key):
-                    lines.append(f"推导理由·{key}：{p.reasons[key]}")
-        return "\n".join(lines)
+        return presentation.params_summary(self._machine)
 
     def status_snapshot(self) -> Dict[str, Any]:
         """聚合总览用的只读状态快照（M7 /lbm_dashboard 消费）。
@@ -588,45 +556,7 @@ class EmotionService:
         只读投影，既有字段零变化；冻结期 ``pending_events`` 不取——事件醒后经
         ``unfreeze`` 并入 ``emotion_log``（state_machine §M5）才出现在本字段。
         """
-        eff = self._machine.effective_vad()
-        labels, _nearest = map_emotions(eff)
-        params = self._machine.params
-        primary_label = str(labels[0][0]) if labels else ""
-        primary_share = round(float(labels[0][1]), 4) if labels else 0.0
-        recent_events = []
-        for event in list(getattr(self._machine, "emotion_log", None) or [])[-3:]:
-            delta = getattr(event, "delta_vad", None)
-            if isinstance(delta, dict):
-                v, a, d = (delta.get("valence"), delta.get("arousal"), delta.get("dominance"))
-            else:
-                v, a, d = (getattr(delta, "valence", 0.0), getattr(delta, "arousal", 0.0),
-                           getattr(delta, "dominance", 0.0))
-            timestamp = str(getattr(event, "timestamp", "") or "")
-            recent_events.append({
-                "time": timestamp[11:16] if len(timestamp) >= 16 else timestamp,
-                "desc": str(getattr(event, "event_description", "") or "")[:40],
-                "v": round(float(v if v is not None else 0.0), 4),
-                "a": round(float(a if a is not None else 0.0), 4),
-                "d": round(float(d if d is not None else 0.0), 4),
-            })
-        return {
-            "initialized": bool(params.initialized),
-            "mood_text": self.mood_text(),
-            "labels": [str(name) for name, _share in labels[:3]],
-            "label": primary_label,
-            "share": primary_share,
-            "vad_words": {
-                "v": _COARSE_WORDS.get(_level(eff.valence), _level(eff.valence)),
-                "a": _COARSE_WORDS.get(_level(eff.arousal), _level(eff.arousal)),
-                "d": _COARSE_WORDS.get(_level(eff.dominance), _level(eff.dominance)),
-            },
-            "effective": eff.to_dict(),
-            "event_count": len(self._machine.emotion_log),
-            "recent_events": recent_events,
-            "anchor": params.anchor.to_dict(),
-            "offset": params.offset.to_dict(),
-            "frozen": bool(getattr(self._machine, "frozen", False)),
-        }
+        return presentation.status_snapshot(self._machine, self.mood_text())
 
     # ── 事件增量（reply Hook 调用）───────────────────────────
     def _llm_interval_ok(self) -> bool:
