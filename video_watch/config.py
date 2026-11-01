@@ -47,11 +47,15 @@ class VideoWatchSectionConfig(PluginConfigBase):
         default="seek", description="seek：尽快按时间点抽帧；paced：按真实播放时间逐点采样。两者均单任务、低优先级、单解码线程。",
         json_schema_extra={"label": "采样节奏"})
     sample_interval_seconds: int = Field(
-        default=30, ge=5, le=600, description="每隔多少秒取一帧；不静默稀释采样。预计帧数=向上取整(视频秒数/间隔)，每16帧拼一张图片。",
+        default=25, ge=5, le=600, description="每隔多少秒取一帧；不静默稀释采样。预计帧数=向上取整(视频秒数/间隔)，每16帧拼一张图片。",
         json_schema_extra={"label": "采样间隔（秒）"})
     visual_max_montages: int = Field(
-        default=16, ge=1, le=32, description="最终最多向视觉模型提交多少张拼图（每张4×4帧）；超出先拒绝并说明所需张数。默认30秒间隔、16张可容纳约128分钟。只记录实际Token，不推算或限制输出Token。",
+        default=16, ge=1, le=32, description="最终最多向视觉模型提交多少张拼图（每张4×4帧）；超出先拒绝并说明所需张数。默认25秒间隔、16张可容纳约106分钟。只记录实际Token，不推算或限制输出Token。",
         json_schema_extra={"label": "最多提交拼图数"})
+
+    cache_retention_days: int = Field(
+        default=15, ge=1, le=365, description="观看记忆保存天数，自结果保存起计算，读取不延长；仅缓存BV号和文字结果，过期后清理。",
+        json_schema_extra={"label": "观看记忆保留天数"})
 
     enabled: bool = Field(
         default=True,
@@ -75,7 +79,7 @@ class VideoWatchSectionConfig(PluginConfigBase):
     )
     impression_task_name: str = Field(
         default="",
-        description="观后感使用的宿主任务名（留空 = utils 默认任务）",
+        description="内容描述与观后感使用的宿主任务名（留空 = utils 默认任务）",
         json_schema_extra={"label": "观后感任务名", **_ui_i18n("Impression task name")},
     )
     visual_enabled: bool = Field(

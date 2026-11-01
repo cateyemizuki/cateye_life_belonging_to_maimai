@@ -36,7 +36,7 @@ _UA = "bili-watch/0.1 (personal companion plugin)"
 _HTTP_TIMEOUT = 10.0
 _SUBTITLE_TEXT_LIMIT = 20000
 
-#: 画面采样能力标记（缓存键组成部分；抽帧实现变化时升级，旧缓存不冒充新口径）
+#: 画面采样能力标记（记录实际采样口径，旧记忆不会冒充重新观看）
 VISUAL_CAPABILITY = "frames-v2-page"
 #: 单帧 base64 上限（字节）：超出的帧丢弃计数，不无界膨胀 result/回执
 _FRAME_BYTES_LIMIT = 96 * 1024
@@ -112,7 +112,7 @@ def _fetch_metadata(bvid: str) -> dict:
         **_selected_page(data),
         "title": str(data.get("title") or ""),
         "uploader": str((data.get("owner") or {}).get("name") or ""),
-        "desc": str(data.get("desc") or "")[:2000],
+        "desc": str(data.get("desc") or ""),
         "url": f"https://www.bilibili.com/video/{data.get('bvid') or bvid}",
         "published_at_ts": int(data.get("pubdate") or 0),
     }
@@ -305,7 +305,7 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path, deadline_epoch: float
         return {"status": "failed", "reason": "未知媒体读取/采样模式", "capability": cap}
     try:
         plan = sample_plan(float(video.get("duration_seconds") or 0),
-                           int(cfg.get("interval_seconds") or 30),
+                           int(cfg.get("interval_seconds") or 25),
                            min(32, max(1, int(cfg.get("max_montages") or 16))))
     except ValueError as exc:
         return {"status": "failed", "reason": str(exc), "capability": cap, "error_class": "montage_limit"}
@@ -353,7 +353,7 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path, deadline_epoch: float
         return {"status": "completed", "capability": cap, "frames": frames,
                 "sampled_seconds": plan["timestamps"], "frame_count": plan["frame_count"],
                 "montage_count": len(frames), "source_mode": source_mode, "sampling_mode": sampling_mode,
-                "frame_interval_seconds": int(cfg.get("interval_seconds") or 30),
+                "frame_interval_seconds": int(cfg.get("interval_seconds") or 25),
                 "note": f"实际采样{len(paths)}帧，合为{len(frames)}张4×4拼图；非逐帧观看，未转写音频"}
     except Exception as exc:
         reason = str(exc) if isinstance(exc, (LookupError, ValueError)) else f"采样失败（{type(exc).__name__}），未发送原始媒体地址"
@@ -426,7 +426,7 @@ def run(spec: dict, result_path: Path) -> None:
         "status": "completed",
         "video": {k: video[k] for k in ("bvid", "aid", "cid", "title", "uploader",
                                         "duration_seconds", "url", "page_number",
-                                        "page_count", "page_title")},
+                                        "page_count", "page_title", "desc")},
         "watched_range": {
             "mode": "sampled_frames" if visual_completed else "text_sources",
             "detail": (source_detail + "，并做等间隔画面采样"

@@ -45,6 +45,7 @@ class VideoWatchComponentsMixin:
                 "type": "string",
                 "description": "status/result/cancel 必填：提交回执里的任务 ID",
             },
+            "rewatch": {"type": "boolean", "description": "仅当用户明确要求重新观看时设true；否则复用15天内的观看记忆，不重复消耗。"},
             "purpose": {
                 "type": "string",
                 "description": "观看目的（可选，会记录在观看记忆里）",
@@ -52,7 +53,7 @@ class VideoWatchComponentsMixin:
         },
     )
     async def tool_watch_bili_video(self, action: str = "", video: str = "",
-                                    task_id: str = "", purpose: str = "",
+                                    task_id: str = "", purpose: str = "", rewatch: bool = False,
                                     **kwargs: Any) -> Any:
         """后台观看回执；由planner自然确认，不强制终止回合。"""
         try:
@@ -61,7 +62,7 @@ class VideoWatchComponentsMixin:
             return "视频观看模块未启用（[video_watch].enabled=false）或插件未加载。"
         try:
             receipt = await service.handle_action(
-                action, video=video, task_id=task_id, purpose=purpose, source="tool")
+                action, video=video, task_id=task_id, purpose=purpose, source="tool", rewatch=rewatch)
         except Exception as exc:
             try:
                 self.ctx.logger.error("watch_bili_video 执行失败: %s", exc)

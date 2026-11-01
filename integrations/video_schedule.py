@@ -401,6 +401,13 @@ class VideoWatchCoordinator:
             phase = "submit"
             receipt = await self._api(action="submit", video=str(candidate["bvid"]),
                                       purpose="日程刷视频", episode_id=episode_id)
+            if receipt.get("success") and receipt.get("cached"):
+                # 旧观看记忆不是新任务，不登记分享、不伪造task_id、不占观看额度。
+                if reserved and hasattr(self._quota, "refund_unstarted"):
+                    self._quota.refund_unstarted(episode_id)
+                entry.update(stage="cached_completed", cached=True, bvid=str(candidate["bvid"]),
+                             result=receipt.get("result"), closed=True)
+                return
             if not receipt.get("success") or not receipt.get("task_id"):
                 entry.update(stage="failed_submit", reason=str(receipt.get("error") or "提交被拒绝")[:200],
                              error_class=receipt.get("error_class"))
@@ -410,11 +417,6 @@ class VideoWatchCoordinator:
             entry.update(task_id=str(receipt["task_id"]), bvid=str(candidate["bvid"]),
                          stage=str(receipt.get("status") or "queued"),
                          cached=bool(receipt.get("cached")))
-            if receipt.get("cached"):
-                if reserved and hasattr(self._quota, "refund_unstarted"):
-                    self._quota.refund_unstarted(episode_id)
-                await self._archive_if_completed(entry, entry["task_id"], episode_id=episode_id)
-                return
             accepted = True
         except Exception as exc:
             entry.update(stage="failed_submit" if phase == "submit" else "unavailable",

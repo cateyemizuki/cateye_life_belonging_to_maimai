@@ -12,7 +12,7 @@ TILES_PER_IMAGE = 16
 MAX_IMAGE_BYTES = 256 * 1024
 
 
-def sample_plan(duration: float, interval: int = 30, max_montages: int = 16) -> dict:
+def sample_plan(duration: float, interval: int = 25, max_montages: int = 16) -> dict:
     if not math.isfinite(float(duration)) or duration <= 0 or interval <= 0 or max_montages <= 0:
         raise ValueError("视频时长或采样配置无效")
     count = max(1, math.ceil(duration / interval))

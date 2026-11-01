@@ -47,8 +47,9 @@ class WatchTaskManager:
                  queue_capacity: int = 3, task_deadline_seconds: int = 900,
                  max_video_duration_seconds: int = 1800,
                  worker_cmd: Optional[List[str]] = None,
-                 visual_provider: Optional[Callable[[], Optional[Dict[str, Any]]]] = None) -> None:
-        self._store = WatchStore(Path(data_dir))
+                 visual_provider: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
+                 cache_retention_days: int = 15) -> None:
+        self._store = WatchStore(Path(data_dir), cache_retention_days)
         self._dir = Path(data_dir)
         self._log = logger
         self._queue_capacity = max(1, int(queue_capacity))
@@ -57,8 +58,7 @@ class WatchTaskManager:
         self._max_duration = max(0, int(max_video_duration_seconds))
         # worker 命令可注入（隔离测试用假 worker）；默认 = 本包 worker.py 子进程
         self._worker_cmd = worker_cmd  # type: ignore[assignment]
-        # 提交期缓存模式 token（B 计划 §5.1：文本缓存与画面采样缓存互不命中；
-        # None/异常 = 纯文本来源口径，与独立原型行为一致）
+        # 采样能力标记仍用于运行任务去重与历史口径；文字记忆按BV复用。
         self._visual_provider = visual_provider
         self._proc: Optional[Any] = None
         self._current_task_id: Optional[str] = None
@@ -86,7 +86,7 @@ class WatchTaskManager:
         self._impression_hook = hook
 
     # ------------------------------------------------------------------
-    # 画面采样（B2）：spec 注入与缓存键分型
+    # 画面采样：spec注入与运行任务能力标记
     # ------------------------------------------------------------------
     def _visual_spec(self) -> Optional[Dict[str, Any]]:
         """本次装配的画面采样参数（None = 纯文本来源流水线，行为与独立原型一致）。"""
@@ -100,7 +100,7 @@ class WatchTaskManager:
         return spec if isinstance(spec, dict) and spec else None
 
     def _requested_mode_token(self) -> str:
-        """提交期缓存模式 token：请求画面采样 → frames-<能力版本>，否则文本来源。"""
+        """运行任务能力标记：请求画面采样 → frames-<能力版本>，否则文本来源。"""
         spec = self._visual_spec()
         if not spec:
             return WatchStore.DEFAULT_CACHE_MODE
@@ -109,7 +109,7 @@ class WatchTaskManager:
 
     @staticmethod
     def _result_mode_token(result: Dict[str, Any]) -> str:
-        """结果侧缓存模式 token：watched_range.mode=sampled_frames → frames-<capability>。"""
+        """历史结果能力标记；不影响按BV查找文字观看记忆。"""
         watched = result.get("watched_range") if isinstance(result.get("watched_range"), dict) else {}
         if str((watched or {}).get("mode") or "") != "sampled_frames":
             return WatchStore.DEFAULT_CACHE_MODE
@@ -124,7 +124,7 @@ class WatchTaskManager:
     # 对外操作（submit/status/result/cancel/候选）
     # ------------------------------------------------------------------
     def submit(self, video: str, purpose: str = "", source: str = "tool",
-               episode_id: str = "", owner: str = "") -> Dict[str, Any]:
+               episode_id: str = "", owner: str = "", rewatch: bool = False) -> Dict[str, Any]:
         from .bv import normalize_video_ref
 
         if self._closed:
@@ -133,13 +133,13 @@ class WatchTaskManager:
         if not bvid:
             return {"success": False, "error_class": "invalid_input",
                     "error": "无法识别的视频标识：仅支持 BV 号或 bilibili.com 视频页链接（含 b23.tv 短链）"}
-        # 缓存命中：按「本次请求的模式」查缓存（不新增观看记录——去重口径）；
-        # 旧文本缓存不会命中画面采样请求，反之亦然
+        # 文字记忆按BV命中；只有显式重看才绕过，仍遵守运行任务去重。
         requested_mode = self._requested_mode_token()
-        cached = self._store.load_cache(bvid, requested_mode)
-        if isinstance(cached, dict) and cached.get("status") == _COMPLETED:
-            return {"success": True, "cached": True, "task_id": cached.get("task_id", ""),
-                    "status": _COMPLETED, "result": cached}
+        cached = None if rewatch else self._store.load_cache(bvid)
+        if isinstance(cached, dict):
+            return {"success": True, "cached": True, "status": _COMPLETED,
+                    "result": {"status": _COMPLETED, "cached_text": cached["text"],
+                               "video": {"bvid": bvid}}}
         owner = str(owner or "").strip()
         # 进行中去重：同 BV 只关联一个任务；S0 所有权——本次调用者登记为该任务的
         # 引用持有者之一（cancel 非 force 只撤销自己的引用，不误杀其他调用者）
@@ -214,14 +214,6 @@ class WatchTaskManager:
                 visual.pop("frames", None)
             return {"success": True, "status": status, "result": data}
         if status == _COMPLETED:
-            mode = task.get("result_cache_mode") or task.get("cache_mode") or WatchStore.DEFAULT_CACHE_MODE
-            cached = self._store.load_cache(str(task.get("bvid")), str(mode))
-            if (isinstance(cached, dict) and cached.get("task_id") == task_id
-                    and cached.get("status") == _COMPLETED):
-                visual = cached.get("visual")
-                if isinstance(visual, dict):
-                    visual.pop("frames", None)
-                return {"success": True, "status": status, "result": cached}
             return {"success": False, "status": status, "error_class": "result_missing",
                     "error": "本任务结果不可得，未使用同BV其他任务的结果代替"}
         return {"success": True, "status": status, "result": {
@@ -521,8 +513,12 @@ class WatchTaskManager:
                     result["completeness"] = "visual"
             task["status"] = _COMPLETED
             task["result_cache_mode"] = self._result_mode_token(result)
-            self._store.save_cache(str(task.get("bvid")), result,
-                                   self._result_mode_token(result))
+            try:
+                self._store.save_cache(str(task.get("bvid")), result)
+            except OSError as exc:
+                # 缓存失败不能抹掉真实任务终态或触发重复观看。
+                if self._log:
+                    self._log.warning("视频文字缓存写入失败：%s", exc)
             entry = dict(result)
             entry["bvid"] = task.get("bvid")
             entry["watched_at"] = time.time()
