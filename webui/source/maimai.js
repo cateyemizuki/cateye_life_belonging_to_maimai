@@ -24,7 +24,10 @@ const Mascot=(()=>{
  const cfg={angle:12,retreatPx:200,size:128,squashX:1.2,squashY:.5,bounceMs:774,bounceEasing:DEFAULT_EASING};
  let state='peek';               // peek | emerging | landed | retreating
  let pressing=false,detailMode=false,pendingRetreat=false,pendingEmerge=false,hoverArmed=true;
- let retreatTimer=null,poseAnim=null,squashAnim=null,rotateAnim=null;
+ let retreatTimer=null,poseAnim=null,squashAnim=null,rotateAnim=null,autoPinSeq=0;
+ // 自动捏捏调度令牌：任何打断（手动捏/停止/收起）使旧链失效，链路恒单条——
+ // 否则激活态下每次手动点鱼都会复制一条定时器链，链路增殖导致疯狂抽搐。
+ const scheduleAuto=(fn,ms)=>{const g=++autoPinSeq;setTimeout(()=>{if(g===autoPinSeq)fn()},ms)};
  let squash={sx:1,sy:1};         // 形变记账：JS 记当前值，避免每拍读布局
  let squashFrames=[{sx:1,sy:1,offset:0},{sx:1,sy:1,offset:1}];
  // 收起探头姿态：小幅 rotate(-角度) + 往角落里收（左移+下沉），尾巴上的叶子移出
@@ -37,7 +40,7 @@ const Mascot=(()=>{
  const pinBtn=document.getElementById('maimai-autopin');
  // 眼珠独立层（0425 目检新增）：桌宠改用内联 SVG，把两颗瞳孔从暗色组拆进
  // 可平移的子组——原始路径/配色不动，仅运行时分组；视线随鼠标（距离越近偏移越小）。
- let eyePupils=null,eyeRaf=0;
+ let eyePupils=null,eyeLids=null,eyeRaf=0,sleepPaused=false;
  const eyeTarget={x:Math.round(innerWidth*0.7),y:Math.round(innerHeight*0.3)};
  function setupEyes(){
   try{
@@ -57,6 +60,24 @@ const Mascot=(()=>{
      for(const e2 of ells)pupils.append(e2);
      g.append(pupils);
     }
+   }
+   // 睡眠眼睑层：两道闭眼弧线（与眼白同坐标、覆盖在眼位上），睡眠态淡入
+   const whiteG=host.querySelector('g[fill="white"]');
+   if(whiteG){
+    whiteG.setAttribute('class','fish-eye-open');
+    const lids=document.createElementNS(SVG_NS,'g');
+    lids.setAttribute('class','fish-eyelids');
+    lids.setAttribute('fill','none');
+    lids.setAttribute('stroke','#141413');
+    lids.setAttribute('stroke-width','14');
+    lids.setAttribute('stroke-linecap','round');
+    for(const c of [[736,484],[948,485]]){
+     const lid=document.createElementNS(SVG_NS,'path');
+     lid.setAttribute('d',`M ${c[0]-36} ${c[1]} Q ${c[0]} ${c[1]+30} ${c[0]+36} ${c[1]}`);
+     lids.append(lid);
+    }
+    whiteG.parentElement.append(lids);
+    eyeLids=lids;
    }
    if(!pupils)return;
    art.replaceWith(host);art=host;eyePupils=pupils;
@@ -96,21 +117,31 @@ const Mascot=(()=>{
  function stopSpin(){
   rotateAnim?.cancel();rotateAnim=null;                        // 停止旋转，回到水平
  }
+ // 睡眠态（0425 目检新增）：闭眼动画；激活自动捏捏时暂停循环与旋转，
+ // 唤醒后原样恢复。实际睡眠状态的接线由后续会话完成——本事件即预留接口。
+ function setSleep(on){
+  sleepPaused=!!on;
+  art.classList.toggle('is-sleeping',on);
+  if(on){stopAutoCycle(false);stopSpin()}
+  else if(autoPin&&state==='landed'){startSpin();autoCycle()}
+  updateAutoPinVis();
+ }
+ window.addEventListener('maimai-mascot-sleep',e=>setSleep(Boolean(e.detail&&e.detail.on)));
  function stopAutoCycle(rebound){
-  clearTimeout(autoPinTimer);autoPinTimer=null;
+  autoPinSeq++;clearTimeout(autoPinTimer);autoPinTimer=null;
   stopSpin();                                                 // 停止持续旋转，回到水平
   if(rebound&&squashAnim){releaseAnim()}
   if(pinBtn)pinBtn.setAttribute('aria-pressed','false');
  }
  function autoCycle(){
-  if(!autoPin||state!=='landed'||reduceMotion()){stopAutoCycle(false);return}
+  if(!autoPin||sleepPaused||state!=='landed'||reduceMotion()){stopAutoCycle(false);return}
   // 压扁脉冲（计划书原始参数）：只在 art 层，与 tilt 的持续旋转完全独立
   // （旋转在激活时由 startSpin 创建一次，捏压循环绝不重建——否则旋转进度被
   // 周期性清零，即用户复检指出的“转一点就复位”）。
   squashFrames=[{sx:1,sy:1,offset:0},{sx:cfg.squashX,sy:cfg.squashY,offset:1}];
   startSquash(squashFrames,PRESS_MS,'cubic-bezier(.33,.6,.36,1)','forwards');
   squash={sx:cfg.squashX,sy:cfg.squashY};
-  autoPinTimer=setTimeout(()=>{releaseAnim();autoPinTimer=setTimeout(autoCycle,250)},PRESS_MS+60);
+  scheduleAuto(()=>{releaseAnim();scheduleAuto(autoCycle,250)},PRESS_MS+60);
  }
  if(pinBtn)pinBtn.addEventListener('click',e=>{
   e.stopPropagation();
@@ -232,12 +263,13 @@ const Mascot=(()=>{
   button.setAttribute('aria-pressed','false');
   if(silent){resetSquash();return}                           // 取消/失焦：直接回位，不回弹
   releaseAnim();
-  if(autoPin)autoPinTimer=setTimeout(autoCycle,400);         // 自动捏捏：手动捏完续播
+  if(autoPin)scheduleAuto(autoCycle,400);         // 自动捏捏：手动捏完续播
  }
  button.addEventListener('pointerdown',e=>{
   if(e.button===2||detailMode)return;
   if(state==='peek'){emerge();return}                        // 触屏/点按探头：先弹出落地
   if(state!=='landed')return;                                // 出场/收起中不让按压覆盖轨迹
+  autoPinSeq++;                                              // 手动捏取：打断自动链，松开续播
   pressing=true;
   try{button.setPointerCapture(e.pointerId)}catch{}
   button.setAttribute('aria-pressed','true');
@@ -275,7 +307,7 @@ const Mascot=(()=>{
   if(off)return;
   cfg.angle=clamp(number(block,'peek_angle_deg',45),0,90);
   cfg.retreatPx=clamp(number(block,'hover_out_px',200),60,320);
-  cfg.size=clamp(number(block,'mascot_size_px',128),48,192);
+  cfg.size=clamp(number(block,'mascot_size_px',144),48,192);
   cfg.squashX=clamp(number(block,'press_squash_x',1.2),0.8,1.6);
   cfg.squashY=clamp(number(block,'press_squash_y',0.5),0.2,1);
   cfg.bounceMs=clamp(number(block,'bounce_ms',774),200,3000);
@@ -292,5 +324,5 @@ const Mascot=(()=>{
  }
  setupEyes();
  setPoseClass();
- return {applyConfig,setDetailMode};
+ return {applyConfig,setDetailMode,setSleep};
 })();

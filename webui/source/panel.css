@@ -47,14 +47,14 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('{{BG_TE
    弹出/落地/收起轨迹由 WAAPI 驱动 .maimai-peek-tilt（maimai.js 状态机），
    按压缩放由 WAAPI 驱动 .maimai-peek-art（按下渐变压扁并保持，松开回弹）。
    按钮本体 pointer-events:none（透明方块不吃页面点击），命中区跟随图本体。 */
-.maimai-peek{position:fixed;left:0;bottom:0;z-index:600;width:var(--maimai-mascot-size,128px);height:var(--maimai-mascot-size,128px);border:0;background:transparent!important;padding:0;overflow:visible;line-height:0;cursor:pointer;pointer-events:none}
+.maimai-peek{position:fixed;left:0;bottom:0;z-index:600;width:var(--maimai-mascot-size,144px);height:var(--maimai-mascot-size,144px);border:0;background:transparent!important;padding:0;overflow:visible;line-height:0;cursor:pointer;pointer-events:none}
 .maimai-peek:hover{background:transparent}
 .maimai-peek:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:-3px;border-radius:14px}
 /* 详情气泡期间：桌宠抬到遮罩之上保持姿态与轮廓清晰可辨（输入由 maimai.js 暂停）。 */
 .maimai-peek.is-above{z-index:950}
 .maimai-peek-tilt{position:absolute;inset:0;display:block;transform-origin:0 100%;will-change:transform}
-.maimai-peek.is-peek .maimai-peek-tilt{transform:translate(calc(var(--maimai-mascot-size,128px)*-0.234),calc(var(--maimai-mascot-size,128px)*0.234)) rotate(calc(var(--maimai-peek-angle,12deg)*-1))}
-.maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,128px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
+.maimai-peek.is-peek .maimai-peek-tilt{transform:translate(calc(var(--maimai-mascot-size,144px)*-0.234),calc(var(--maimai-mascot-size,144px)*0.234)) rotate(calc(var(--maimai-peek-angle,12deg)*-1))}
+.maimai-peek-art{position:absolute;left:0;bottom:0;width:var(--maimai-mascot-size,144px);height:auto;display:block;transform-origin:50% 100%;filter:drop-shadow(0 8px 8px #0b321a22);pointer-events:auto}
 .maimai-peek-art svg{width:100%;height:auto;display:block}
 .fish-pupils{will-change:transform}
 /* 自动捏捏开关：落地后出现在尾叶上方的小圆钮（maimai.js 控制显隐与激活态）。 */

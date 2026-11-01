@@ -531,7 +531,7 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
         },
     )
     mascot_size_px: int = Field(
-        default=128, ge=48, le=192,
+        default=144, ge=48, le=192,
         description="常驻麦麦基准尺寸（像素；2026-11-01 目检修正 96→128，探头更大更清晰）",
         json_schema_extra={"label": "常驻麦麦尺寸", "step": 1, **_ui_i18n("Mascot size (px)")},
     )

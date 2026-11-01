@@ -470,7 +470,7 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
 #: 只含展示/交互参数；整份配置绝不下发前端（前端默认值沿本表同值兜底，不另造第二套语义）。
 _MAIMAI_PROJECTION: dict[str, tuple[type, Any, float, float]] = {
     # 2026-11-01 目检修正：mascot_size_px 96→128（探头更大更清晰）
-    'mascot_size_px': (int, 128, 48, 192),
+    'mascot_size_px': (int, 144, 48, 192),
     'peek_angle_deg': (int, 12, 0, 90),
     # 2026-11-01 U 计划：hover_out_* 语义改为「远离左下角交互区域的收起阈值/时长」；
     # detail_fish_size_px 随「入口搬标题栏」退役（键已从配置模型清退）。
