@@ -869,8 +869,8 @@ class PatrolService:
                 await bus.publish("proactive.used", source="companion",
                                   channel="patrol", intent=str(intent or ""),
                                   stream_id=self._stream_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._ctx.logger.warning("proactive.used 发布失败（预算记账可能缺失）：%s", exc)
         await self._publish_screen_narration()
         try:
             result = await self._ctx.maisaka.proactive.trigger(

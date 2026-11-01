@@ -364,8 +364,8 @@ class ScheduleDB:
                 except OSError:
                     try:
                         src.unlink()
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        logger.warning("损坏日程库既无法改名也无法删除（%s）：%s", src, exc)
 
     def close(self) -> None:
         with self._lock:

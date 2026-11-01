@@ -20,6 +20,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from core.plugin_context import PluginContext
+
 from .generator import LOW_MOOD_MIN_DAYS
 
 #: 连续低迷事件缓存的新鲜度上限（小时）：超龄一律按未激活处理
@@ -51,10 +53,11 @@ class PlanningServices:
                 self._llm / self._schedule_query 可用）
         """
         self._plugin = plugin
+        self._ctx = PluginContext(plugin)
         self._started = False
         self._bg_tasks: List[asyncio.Task] = []
         #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
-        self.bus = getattr(plugin, "_bus", None)
+        self.bus = self._ctx.bus
         #: 本束的事件反订阅闭包（M0 无订阅者；M3+ 在 _register_event_subscriptions 里追加）
         self._event_unsubs: List[Any] = []
         #: M5（§6.2 F）：最近一次睡醒情绪（emotion.overhauled payload 缓存），供日程生成
@@ -63,12 +66,12 @@ class PlanningServices:
         #: M5（§6.2 F）：连续低迷事件缓存（emotion.low_mood_day），供日程生成强制插入恢复类活动
         self._low_mood_day: Dict[str, Any] = {}
 
-        data_dir = getattr(plugin, "_data_dir", None)
+        data_dir = self._ctx.data_dir
         if data_dir is None:
             raise RuntimeError("PlanningServices 需要 plugin._data_dir 已就绪（在 on_load 中创建）")
 
         # GoalManager 单例（复用 plugin._db 的 SQLite 连接，避免双连接写竞争）
-        self.goal_manager = get_goal_manager(str(data_dir), db=plugin._db)
+        self.goal_manager = get_goal_manager(str(data_dir), db=self._ctx.db)
         # 约定消费事件（commitment_kept/broken）经总线上报（M0；无总线时静默跳过）
         self.goal_manager.bind_event_bus(self.bus)
 
@@ -78,8 +81,8 @@ class PlanningServices:
         try:
             from . import activity_properties
             _props_result = activity_properties.load_and_apply(
-                root_dir=getattr(plugin, "_plugin_root", None),
-                decision_logger=getattr(plugin, "_decision_logger", None))
+                root_dir=self._ctx.plugin_root,
+                decision_logger=self._ctx.decision_logger)
             if _props_result.rejected:
                 logger.warning("日程属性表有 %d 个条目被排除（其余生效）", len(_props_result.rejected))
         except Exception as exc:
@@ -89,7 +92,7 @@ class PlanningServices:
         # 重绑 plugin._schedule_gen：plugin.py 既有调用点（_ensure_today_schedule /
         # /life plan regenerate）自动升级为完整管线。
         self.generator = ScheduleGenerator(
-            plugin._db, plugin._llm,
+            self._ctx.db, self._ctx.llm,
             plugin=plugin, goal_manager=self.goal_manager,
         )
         try:
@@ -105,7 +108,7 @@ class PlanningServices:
         self.inject = InjectService(plugin, holiday_service=self.holiday)
         # S2（冲浪计划书 §5）：注意力租约注入——SURF 有效时活动层倍率按 0.45/0.70
         # 替换解析；None（未装配）时频率链行为与既有逐字一致
-        self.proactive = ProactiveService(plugin, attention=getattr(plugin, "_attention", None))
+        self.proactive = ProactiveService(plugin, attention=self._ctx.attention)
         self.cleanup = CleanupService(plugin, generator_factory=lambda: self.generator)
         # ── PR4 事件库服务（2026-10-27 共享接线）：**全插件唯一实例** ──────────────
         # 单实例是有意的：事件库的 token 预算/「每日一次自动尝试」账本是进程内锁 +
@@ -222,24 +225,23 @@ class PlanningServices:
 
     def _event_catalog_section(self) -> Any:
         """``[event_catalog]`` section（热重载动态读；缺失 → None → 服务用默认 off）。"""
-        return getattr(getattr(self._plugin, "config", None), "event_catalog", None)
+        return getattr(self._ctx.config, "event_catalog", None)
 
     def _build_event_catalog(self) -> Any:
         """构造唯一 ``EventCatalogService``（失败 → None，planner 回退内置池旧路径）。"""
-        plugin = self._plugin
         try:
             timezone_str = str(getattr(
-                getattr(getattr(plugin, "config", None), "schedule_advanced", None),
+                getattr(self._ctx.config, "schedule_advanced", None),
                 "timezone", "") or "") or "Asia/Shanghai"
             service = EventCatalogService(
-                plugin_root=getattr(plugin, "_plugin_root", None),
-                data_dir=getattr(plugin, "_data_dir", None),
-                llm=getattr(plugin, "_llm", None),
+                plugin_root=self._ctx.plugin_root,
+                data_dir=self._ctx.data_dir,
+                llm=self._ctx.llm,
                 config_provider=self._event_catalog_section,
                 tz=timezone_str,
                 # 清醒/非睡眠/无硬约定闸：**必须**注入（服务本身 fail-closed）
                 auto_gate=self.event_catalog_auto_gate,
-                persona_provider=lambda: str(getattr(plugin, "_personality", "") or ""),
+                persona_provider=lambda: str(self._ctx.personality or ""),
                 recent_schedule_names_provider=self._recent_schedule_names,
                 recent_event_names_provider=self._recent_event_names,
             )
@@ -251,9 +253,8 @@ class PlanningServices:
 
     def _recent_schedule_names(self) -> List[str]:
         """近 30 天已出现过的活动名（用于生成去重；取不到 → 空列表，不影响运行）。"""
-        plugin = self._plugin
         names: List[str] = []
-        db = getattr(plugin, "_db", None)
+        db = self._ctx.db
         for attr in ("get_recent_activity_names", "get_recent_schedule_names"):
             fn = getattr(db, attr, None)
             if callable(fn):
@@ -309,8 +310,7 @@ class PlanningServices:
         runtime_current`` 的夜间睡眠 episode；都没有 → ``None``（未知，绝不按钟点
         伪造确定清醒/入睡）。
         """
-        plugin = self._plugin
-        life = getattr(plugin, "_life_state", None)
+        life = self._ctx.life_state
         if life is not None:
             getter = getattr(life, "sleep_status", None)
             if callable(getter):
@@ -320,7 +320,7 @@ class PlanningServices:
                         return status["asleep"]
                 except Exception:
                     pass
-        query = getattr(plugin, "_schedule_query", None)
+        query = self._ctx.schedule_query
         runtime_current = getattr(query, "runtime_current", None)
         if callable(runtime_current):
             try:
@@ -400,9 +400,8 @@ class PlanningServices:
         → 拒绝（``hard_commitment_unknown``）。任何异常 → 拒绝（``gate_error``）。
         """
         try:
-            plugin = self._plugin
             asleep: Any = None
-            getter = getattr(plugin, "sleep_asleep", None)
+            getter = self._ctx.sleep_asleep
             if callable(getter):
                 asleep = getter(now)
             if asleep is None:

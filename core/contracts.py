@@ -127,3 +127,32 @@ class AttentionLeasePort(Protocol):
 
 #: 注意力租约提供者（装配期注入；None = 权威未装配，自动观看门控按拒绝处理）
 AttentionLeaseProvider = Callable[[], Optional[AttentionLeasePort]]
+
+
+#: 组合根字符串属性契约（2026-11-02 质量清单 P1-01 守卫白名单）。
+#:
+#: 业务包内 ``getattr(plugin, "_xxx")`` 的字面量键必须登记于此；新增键 = 扩契约 +
+#: 同步 ``core/plugin_context.PluginContext``，不得在消费点静默发明。收缩 = 删键并
+#: 迁移调用点。此清单只守**跨模块读取组合根**的字符串契约；服务束内部私有属性不在此列。
+PLUGIN_ATTR_CONTRACT = frozenset({
+    "_planning",          # planning 服务束
+    "_companion",         # companion 服务束
+    "_qzone",             # qzone 服务束
+    "_emotion",           # emotion 服务束
+    "_decision_logger",   # 决策日志
+    "_data_dir",          # 插件数据目录
+    "_db",                # 日程 SQLite 连接
+    "_llm",               # LLM 服务
+    "_llm_logger",        # LLM 调用日志
+    "_bus",               # 进程内事件总线
+    "_sleep_engine",      # 睡眠引擎
+    "_schedule_query",    # 日程只读查询
+    "_schedule_gen",      # 日程生成器
+    "_life_state",        # 生活状态
+    "_life_model",        # 生活状态模型
+    "_affection",         # 好感度管理器
+    "_lover_name",        # 陪伴对象名
+    "_personality",       # 陪伴对象人设
+    "_plugin_root",       # 插件根目录
+    "_attention",         # 注意力租约/忙闲观测
+})

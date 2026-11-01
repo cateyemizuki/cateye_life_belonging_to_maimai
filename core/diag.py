@@ -17,10 +17,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # 清理节流间隔（秒）：写入路径上最多每小时做一次过期清理
 _CLEANUP_INTERVAL_SECONDS = 3600.0
@@ -32,8 +35,8 @@ def _cleanup_dir(directory: Path, retention_days: int) -> None:
         for f in directory.glob("*.jsonl"):
             if f.stat().st_mtime < cutoff:
                 f.unlink()
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.debug("诊断日志清理失败（忽略）：%s", exc)
 
 
 def _parse_file_date(name: str, prefix: str) -> Optional[Any]:

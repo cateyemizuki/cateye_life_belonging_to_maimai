@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import time
 from datetime import datetime
 from core.storage import save_json_atomic
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 import httpx
 
@@ -159,8 +162,8 @@ class QzoneCookieManager:
     def _save_local(self, cookies: Dict[str, str]) -> None:
         try:
             save_json_atomic(self._path, cookies)
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.warning("QQ 空间 cookie 本地保存失败（忽略，当前会话继续）：%s", exc)
 
     # ---- 对外 ----
     async def get_cookies(self, force: bool = False) -> Optional[Dict[str, str]]:
