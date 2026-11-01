@@ -37,7 +37,7 @@ _HTTP_TIMEOUT = 10.0
 _SUBTITLE_TEXT_LIMIT = 20000
 
 #: 画面采样能力标记（缓存键组成部分；抽帧实现变化时升级，旧缓存不冒充新口径）
-VISUAL_CAPABILITY = "frames-v1"
+VISUAL_CAPABILITY = "frames-v2-page"
 #: 单帧 base64 上限（字节）：超出的帧丢弃计数，不无界膨胀 result/回执
 _FRAME_BYTES_LIMIT = 96 * 1024
 #: 抽帧画面宽度（等比缩放；有界采样不是逐帧观看）
@@ -75,6 +75,30 @@ def _fail(result_path: Path, task_id: str, error_class: str, error: str) -> None
     }, ensure_ascii=False), encoding="utf-8")
 
 
+def _selected_page(data: dict) -> dict:
+    """Bind duration and CID to the same page, never the collection duration."""
+    pages = data.get("pages") or []
+    if pages:
+        if not isinstance(pages, list) or any(not isinstance(p, dict) for p in pages):
+            raise LookupError("视频分P信息异常，无法确定观看范围")
+        cid = str(data.get("cid") or "")
+        index, page = next(((i, p) for i, p in enumerate(pages)
+                            if cid and str(p.get("cid") or "") == cid), (0, pages[0]))
+    else:
+        index, page = 0, data
+    try:
+        duration = int(page.get("duration") or 0)
+        number = int(page.get("page") or index + 1)
+    except (TypeError, ValueError):
+        raise LookupError("所选分P时长未知，拒绝用合集总时长推断")
+    selected_cid = str(page.get("cid") or "")
+    if duration <= 0 or not selected_cid or number <= 0:
+        raise LookupError("所选分P时长或CID未知，无法确定观看范围")
+    return {"cid": selected_cid, "duration_seconds": duration,
+            "page_number": number, "page_count": len(pages) if pages else 1,
+            "page_title": str(page.get("part") or page.get("title") or "")[:300]}
+
+
 def _fetch_metadata(bvid: str) -> dict:
     payload = _http_get_json(f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}")
     code = payload.get("code")
@@ -85,10 +109,9 @@ def _fetch_metadata(bvid: str) -> dict:
     return {
         "bvid": str(data.get("bvid") or bvid),
         "aid": str(data.get("aid") or ""),
-        "cid": str(data.get("cid") or ""),
+        **_selected_page(data),
         "title": str(data.get("title") or ""),
         "uploader": str((data.get("owner") or {}).get("name") or ""),
-        "duration_seconds": int(data.get("duration") or 0),
         "desc": str(data.get("desc") or "")[:2000],
         "url": f"https://www.bilibili.com/video/{data.get('bvid') or bvid}",
         "published_at_ts": int(data.get("pubdate") or 0),
@@ -142,6 +165,8 @@ def _fetch_playurl(bvid: str, cid: Any) -> str:
         raise LookupError(_VIEW_API_ERRORS.get(code, f"playurl code={code}"))
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     durl = data.get("durl") if isinstance(data.get("durl"), list) else []
+    if len(durl) > 1:
+        raise LookupError("媒体包含多个分段，当前采样器不拼接分段；画面采样未执行")
     first = durl[0] if durl and isinstance(durl[0], dict) else {}
     direct = str(first.get("url") or "").strip()
     if not direct:
@@ -301,7 +326,10 @@ def run(spec: dict, result_path: Path) -> None:
 
     _write_progress(job_dir, "summarize", bvid)
     observations: list = [f"标题：{video['title']}", f"UP主：{video['uploader']}",
-                          f"时长：{duration}s"]
+                          f"所选分P时长：{duration}s"]
+    if video["page_count"] > 1:
+        observations.append(f"仅处理第{video['page_number']}/{video['page_count']}P："
+                            f"{video['page_title']}；未观看其他分P")
     if video.get("desc"):
         observations.append("简介：" + video["desc"][:400])
     if subtitle.get("status") == "available":
@@ -316,16 +344,19 @@ def run(spec: dict, result_path: Path) -> None:
     elif visual.get("status") == "failed":
         observations.append(f"画面采样失败：{visual.get('reason') or ''}")
 
+    source_detail = ("实际读取标题/简介与公开CC字幕文本" if subtitle.get("status") == "available"
+                     else "实际读取标题/简介；公开CC字幕未取得")
     result = {
         "task_id": task_id,
         "status": "completed",
         "video": {k: video[k] for k in ("bvid", "aid", "cid", "title", "uploader",
-                                        "duration_seconds", "url")},
+                                        "duration_seconds", "url", "page_number",
+                                        "page_count", "page_title")},
         "watched_range": {
             "mode": "sampled_frames" if visual_completed else "text_sources",
-            "detail": ("实际读取了标题/简介/公开CC字幕文本，并做等间隔画面采样"
+            "detail": (source_detail + "，并做等间隔画面采样"
                        "（非逐帧观看，未转写音频）" if visual_completed
-                       else "实际读取了标题/简介/公开CC字幕文本；未逐帧观看画面，未转写音频"),
+                       else source_detail + "；未逐帧观看画面，未转写音频"),
         },
         "sources": {"metadata": "bilibili 公开 view API", "subtitle": subtitle.get("status")},
         "visual": visual,

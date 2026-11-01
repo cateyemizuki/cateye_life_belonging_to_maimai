@@ -47,6 +47,8 @@ def normalize_video_ref(raw: str) -> Optional[str]:
         return None
     host = (parsed.hostname or "").lower()
     if host in _BILI_VIDEO_HOSTS:
+        if not _default_page_only(parsed.query):
+            return None
         return extract_bvid(parsed.path) or (direct if _looks_like_video_path(parsed.path) else None)
     if host in _SHORT_HOSTS:
         expanded = expand_short_link(text)
@@ -59,6 +61,8 @@ def normalize_video_ref(raw: str) -> Optional[str]:
         # 二次校验：展开后的最终目标必须是 bilibili 视频页（不信任解析器单一环节）
         if (final.hostname or "").lower() not in _BILI_VIDEO_HOSTS:
             return None
+        if not _default_page_only(final.query):
+            return None
         return extract_bvid(final.path) or None
     # 其他主机：若正文里带着 BV 号也只接受 bilibili 域名形态，防任意 URL 投递
     return None
@@ -66,6 +70,12 @@ def normalize_video_ref(raw: str) -> Optional[str]:
 
 def _looks_like_video_path(path: str) -> bool:
     return "/video/" in (path or "")
+
+
+def _default_page_only(query: str) -> bool:
+    """Explicit non-default pages require their own identity/cache support."""
+    pages = _urlparse.parse_qs(query, keep_blank_values=True).get("p")
+    return pages is None or pages == ["1"]
 
 
 def expand_short_link(url: str) -> Optional[str]:

@@ -37,7 +37,7 @@ class VideoWatchComponentsMixin:
             },
             "video": {
                 "type": "string",
-                "description": "submit 必填：BV 号或 bilibili 视频页链接（含 b23.tv 短链）",
+                "description": "submit 必填：BV 号或 bilibili 视频页链接（含 b23.tv 短链）；当前只支持默认分P，拒绝 p>1，不会假装看完整个合集",
             },
             "task_id": {
                 "type": "string",
