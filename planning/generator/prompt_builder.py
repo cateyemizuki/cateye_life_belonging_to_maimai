@@ -12,6 +12,8 @@ PR8 3.0.0 清退（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审�
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
+from core.coerce import to_int as _to_int
+
 from suite_prompts import (
     SCHEDULE_GENERATION_EXTRA_DEFAULT,
     SCHEDULE_LOW_MOOD_NOTE_DEFAULT,
@@ -40,13 +42,6 @@ _DEFAULT_SLEEP_MINUTES = 23 * 60
 
 #: M5 连续低迷软约束的触发门槛（与 emotion/state_machine.LOW_MOOD_MIN_DAYS 同值；prompt 注明用）
 LOW_MOOD_MIN_DAYS = 3
-
-
-def _to_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return int(default)
 
 
 def _parse_hhmm(value: Any, default_minutes: int) -> int:

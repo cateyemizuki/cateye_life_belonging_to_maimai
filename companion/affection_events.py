@@ -33,6 +33,8 @@ import logging
 from datetime import datetime
 from typing import Any, Optional
 
+from core.coerce import to_float as _to_float
+
 logger = logging.getLogger(__name__)
 
 #: bot 沉默多久后「对方先开口」才算 user_initiated（小时；§5.4）
@@ -116,13 +118,6 @@ def _should_warn(affection: Any, kind: str, reason: str, now: datetime) -> bool:
         return False
     _cap_warned[key] = today
     return True
-
-
-def _to_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
 
 
 def _emotion_multiplier(affection: Any, delta: float) -> tuple:

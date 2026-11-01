@@ -72,6 +72,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from core.coerce import as_float as _as_float
+
 from .time_utils import TimezoneManager
 
 logger = logging.getLogger(__name__)
@@ -125,16 +127,6 @@ _TABLE_SCALARS: Tuple[Tuple[str, float], ...] = (
     ("gain_min", DEFAULT_GAIN_MIN),
     ("gain_max", DEFAULT_GAIN_MAX),
 )
-
-
-def _as_float(value: Any, default: Optional[float] = None) -> Optional[float]:
-    """宽松数值解析（bool/NaN 不算数值）；失败 → default。"""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return default
-    number = float(value)
-    if number != number:  # NaN 防御
-        return default
-    return number
 
 
 def _load_table(root_dir: Any) -> Dict[str, Any]:

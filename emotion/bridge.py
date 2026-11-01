@@ -33,6 +33,8 @@ import logging
 import random
 from typing import Any, Callable, Dict, List, Optional
 
+from core.coerce import to_float as _to_float
+
 from .vad import VADState
 
 logger = logging.getLogger(__name__)
@@ -103,13 +105,6 @@ IGNORED_EVENTS: tuple[str, ...] = (
     "qzone.posted",
     "qzone.comment_replied",
 )
-
-
-def _to_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
 
 
 class EmotionBridge:

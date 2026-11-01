@@ -40,6 +40,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.coerce import is_number as _is_number
+
 logger = logging.getLogger(__name__)
 
 # ── 文件与版本 ────────────────────────────────────────────────────────────
@@ -150,11 +152,6 @@ class PresetsLoadResult:
 
 
 # ── 工具 ─────────────────────────────────────────────────────────────────
-def _is_number(value: Any) -> bool:
-    """数值判定：int/float 且剔除 bool（``True`` 是 int 的实例，不算数值）。"""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
 def _in_score_domain(value: float) -> bool:
     """∈[0, 200] 且非 NaN/Infinity：仅当满足上界判据才收（NaN 的比较恒 False → 拒）。"""
     return SCORE_MIN <= value <= SCORE_MAX

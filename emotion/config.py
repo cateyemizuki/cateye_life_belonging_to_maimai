@@ -6,12 +6,7 @@ from typing import ClassVar, Dict, Literal
 
 from maibot_sdk import Field, PluginConfigBase
 
-
-def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
-    entry: Dict[str, str] = {"label": en_label}
-    if en_hint:
-        entry["hint"] = en_hint
-    return {"i18n": {"en": entry}}
+from core.i18n import ui_i18n as _ui_i18n
 
 
 class EmotionSectionConfig(PluginConfigBase):

@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.coerce import is_number as _is_number
+
 logger = logging.getLogger(__name__)
 
 # ── 文件与版本 ──────────────────────────────────────────────────────────
@@ -174,11 +176,6 @@ def builtin_table() -> PropertyTable:
 
 
 # ── 工具 ─────────────────────────────────────────────────────────────────
-def _is_number(value: Any) -> bool:
-    """数值判定：int/float 且剔除 bool（``True`` 是 int 的实例，不算数值）。"""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
 def _fmt(value: Any) -> str:
     text = repr(value)
     return text if len(text) <= 160 else text[:157] + "..."

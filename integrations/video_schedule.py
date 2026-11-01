@@ -27,6 +27,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
+from core.coerce import to_float as _as_float, to_int as _as_int
+
 #: 刷视频事件的 event 标识（event_catalog.BUILTIN_EVENTS / RANDOM_EVENT_POOL 同口径）
 WATCH_EVENT_KEY = "watch_bili"
 #: 链接库有界：closed 记录保留天数与条数上限（防无限增长）
@@ -64,22 +66,6 @@ def _read(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
-
-
-def _as_int(value: Any) -> int:
-    """宽松转整数（账本文件被手改/损坏时按 0 处理，不让数学运算抛异常）。"""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _as_float(value: Any) -> float:
-    """宽松转浮点（口径同上）。"""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 def _default_day() -> str:

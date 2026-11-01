@@ -13,6 +13,8 @@ from typing import Any, ClassVar, Dict, Set
 from maibot_sdk import Field, PluginConfigBase
 from pydantic import model_validator
 
+from core.i18n import ui_i18n as _ui_i18n
+
 logger = logging.getLogger(__name__)
 
 #: 已告警过"回退默认"的提示词键（进程内去重：回退告警每键至多一条，防刷日志）
@@ -25,14 +27,6 @@ def _warn_fallback_once(name: str, reason: str) -> None:
         return
     _FALLBACK_WARNED.add(name)
     logger.warning("提示词 %s 回退出厂默认模板（%s）；请检查 [prompts] 配置", name, reason)
-
-
-def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
-    """字段级英文翻译（并入 json_schema_extra；与其它 config 模块同一写法）。"""
-    entry: Dict[str, str] = {"label": en_label}
-    if en_hint:
-        entry["hint"] = en_hint
-    return {"i18n": {"en": entry}}
 
 
 # ===========================================================================

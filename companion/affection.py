@@ -41,6 +41,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+from core.coerce import to_float as _to_float, to_int as _to_int
 from core.storage import save_json_atomic
 
 from . import affection_presets
@@ -100,20 +101,6 @@ WEEKLY_TONE_LIMIT = 4
 #: 的 ×2 口径一致——旧 0~100 标度的 1.0 在新标度下等价位即 2.0；里程碑文案里的 net 数值
 #: 仍是新标度实际值，不含换算）
 WEEKLY_NET_NOTABLE = 2.0
-
-
-def _to_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _to_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return int(default)
 
 
 def _clamp_score(value: float) -> float:

@@ -33,13 +33,7 @@ from typing import Any, ClassVar, Dict, Literal, Tuple
 
 from maibot_sdk import Field, PluginConfigBase
 
-
-def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
-    """字段级英文翻译（并入 json_schema_extra；与顶层 suite_config.py 同一写法）。"""
-    entry: Dict[str, str] = {"label": en_label}
-    if en_hint:
-        entry["hint"] = en_hint
-    return {"i18n": {"en": entry}}
+from core.i18n import ui_i18n as _ui_i18n
 
 
 def _relation_type_choices() -> Tuple[str, ...]:

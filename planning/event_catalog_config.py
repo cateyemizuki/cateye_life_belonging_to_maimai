@@ -18,6 +18,8 @@ from typing import Any, ClassVar, Dict, Literal, Mapping, Optional
 
 from maibot_sdk import Field, PluginConfigBase
 
+from core.coerce import as_int as _as_int
+
 #: 代码默认（定稿 §1 #6：部署灰度先 manual，代码默认 off）
 DEFAULT_MODE = "off"
 DEFAULT_MIN_INTERVAL_DAYS = 5
@@ -159,24 +161,6 @@ def _attr(source: Any, name: str, default: Any) -> Any:
     if isinstance(source, dict):
         return source.get(name, default)
     return getattr(source, name, default)
-
-
-def _as_int(value: Any, default: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_float(value: Any, default: float) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _explicitly_set(source: Any, name: str) -> Optional[bool]:

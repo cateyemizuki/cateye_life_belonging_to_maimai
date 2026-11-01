@@ -95,6 +95,7 @@ from planning.event_catalog_config import (
 from qzone.config import QzoneSectionConfig
 from video_watch.config import VideoWatchSectionConfig
 from core.config_migration import migrate_display_config
+from core.i18n import ui_i18n as _ui_i18n
 
 from suite_prompts import (
     COMPANION_MISS_CONFIRM_DEFAULT,
@@ -187,14 +188,6 @@ _SCHEDULE_TO_ADVANCED_KEYS = (
     "role_judge_temperature", "inject_cache_minutes", "cache_ttl", "cache_max_size",
     "max_future_activities", "auto_generate_time",
 )
-
-
-def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
-    """字段级英文翻译（并入 json_schema_extra；WebUI 按 i18n[locale]['label'/'hint'] 取用）。"""
-    entry: Dict[str, str] = {"label": en_label}
-    if en_hint:
-        entry["hint"] = en_hint
-    return {"i18n": {"en": entry}}
 
 
 #: 出厂默认配置缓存（``CateyeSuiteConfig()`` 的 model_dump；无参构造不会递归——空输入在

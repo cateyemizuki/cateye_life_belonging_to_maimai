@@ -69,6 +69,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.coerce import to_float as _to_float
 from core.storage import load_json, save_json_atomic
 
 from .vad import VADState
@@ -203,14 +204,6 @@ def _builtin_table() -> Dict[str, Any]:
             },
         },
     }
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    """防御性转 float（非法输入回退默认；与 EmotionService._to_float 同语义的模块内版本）。"""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _axis_dict(state: Any) -> Dict[str, float]:

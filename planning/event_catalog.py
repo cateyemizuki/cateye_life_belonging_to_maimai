@@ -29,7 +29,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -39,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from core.coerce import is_finite_number as _is_number, is_int as _is_int
 from core.llm_utils import LLMResult
 from core.mapping_dir import MappingReadError, mappings_path, read_json_text
 from core.storage import save_json_atomic
@@ -205,15 +205,6 @@ class ValidationResult:
     @property
     def lines(self) -> List[str]:
         return [str(e) for e in self.errors]
-
-
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) \
-        and not (isinstance(value, float) and not math.isfinite(value))
-
-
-def _is_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _text(value: Any) -> str:

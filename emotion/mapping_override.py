@@ -82,6 +82,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from core.coerce import is_int as _is_int, is_number as _is_number
 from core.mapping_dir import ensure_user_table, mappings_path
 
 logger = logging.getLogger(__name__)
@@ -166,16 +167,6 @@ ACTION_REJECTED = "emotion.mapping_override_rejected"
 #: error_kind 全集（``version`` 族含两个具体值）
 ERROR_KINDS: Tuple[str, ...] = ("parse", "version_missing", "version_unsupported",
                                 "unknown_key", "incomplete_table", "type", "range")
-
-
-def _is_number(value: Any) -> bool:
-    """数值判定：``int``/``float`` 且**剔除 bool**（``True`` 是 int 的实例，不算数值）。"""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _is_int(value: Any) -> bool:
-    """``int`` 判定（同样剔除 bool）。"""
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _fmt(value: Any) -> str:

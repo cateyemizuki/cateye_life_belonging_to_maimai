@@ -12,15 +12,10 @@ from pydantic import model_validator
 
 from maibot_sdk import Field, PluginConfigBase
 
+from core.i18n import ui_i18n as _ui_i18n
+
 #: 旧独立插件配置节名 → 新分组名的映射（suite_config 迁移器读取）
 LEGACY_SECTION_NAME = "bili_watch"
-
-
-def _ui_i18n(title_en: str, desc_en: str = "") -> dict:
-    payload = {"en": {"label": title_en}}
-    if desc_en:
-        payload["en"]["hint"] = desc_en
-    return {"_ui_i18n": payload}
 
 
 class VideoWatchSectionConfig(PluginConfigBase):

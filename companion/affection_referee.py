@@ -35,6 +35,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from core.coerce import to_float as _to_float, to_int as _to_int
 from core.llm_utils import purpose_task
 from suite_prompts import AFFECTION_CONVERSATION_REVIEW_DEFAULT, AFFECTION_DAILY_REVIEW_DEFAULT
 from suite_prompts import prompt as prompt_of, render
@@ -152,20 +153,6 @@ def _parse_json_loose(text: Any) -> Optional[Dict[str, Any]]:
 def _clip(value: float, lo: float, hi: float) -> float:
     """区间裁剪（镜像 emotion/vad.py:_clip）。"""
     return max(lo, min(hi, float(value)))
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return int(default)
 
 
 def _clean_text(value: Any, limit: int) -> str:

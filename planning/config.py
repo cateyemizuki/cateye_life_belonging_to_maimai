@@ -24,17 +24,11 @@ from typing import Any, ClassVar, Dict, List, Literal
 import pydantic
 from maibot_sdk import Field, PluginConfigBase
 
+from core.i18n import ui_i18n as _ui_i18n
+
 #: 名单模式的取值（新名单系统）：blacklist = 名单内不生效；whitelist = 只对名单内生效
 LIST_MODE_BLACKLIST = "blacklist"
 LIST_MODE_WHITELIST = "whitelist"
-
-
-def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
-    """字段级英文翻译（并入 json_schema_extra；WebUI 按 i18n[locale]['label'/'hint'] 取用）。"""
-    entry: Dict[str, str] = {"label": en_label}
-    if en_hint:
-        entry["hint"] = en_hint
-    return {"i18n": {"en": entry}}
 
 
 # ---------------------------------------------------------------------------

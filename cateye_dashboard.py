@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core import render_kit
+from core.coerce import to_float as _to_float, to_int as _to_int
 from core.render_kit import (
     FAINT,
     HAIR,
@@ -155,20 +156,6 @@ def _rows(obj: Any, name: str, *args: Any) -> List[Any]:
     """取 ``obj.name(*args)`` 的列表结果；非列表/异常一律空列表。"""
     result = _call(obj, name, *args, default=[])
     return list(result) if isinstance(result, (list, tuple)) else []
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _time_range(item: Any) -> str:
