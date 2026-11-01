@@ -2,7 +2,8 @@
 
 只声明消费方实际用到的最小 Protocol 与提供者形态，无业务实现：
 本模块不得导入任何业务模块（companion/emotion/planning/qzone）或 plugin，
-只可用标准库类型（层间纪律与 core/time_utils.py:3-4 同源）。
+只可用标准库类型（层间纪律与 core/time_utils.py:3-4 同源）。另含组合根字符串
+属性契约白名单（``PLUGIN_ATTR_CONTRACT``，P1-01 结构守卫使用）。
 
 装配口径（组合根 plugin.py 负责）：提供者一律**惰性**——被注入的实例
 （睡眠引擎/情绪服务束）晚于消费方服务束装配，调用时才解析；返回 None =
