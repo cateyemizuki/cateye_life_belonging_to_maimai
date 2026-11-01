@@ -502,7 +502,7 @@ const Mascot=(()=>{
   if(pinBtn)pinBtn.setAttribute('aria-pressed','false');
  }
  function autoCycle(){
-  if(!autoPin||state!=='landed'||detailMode||reduceMotion()){stopAutoCycle(false);return}
+  if(!autoPin||state!=='landed'||reduceMotion()){stopAutoCycle(false);return}
   // 压扁脉冲（计划书原始参数）：只在 art 层，与 tilt 的持续旋转完全独立
   // （旋转在激活时由 startSpin 创建一次，捏压循环绝不重建——否则旋转进度被
   // 周期性清零，即用户复检指出的“转一点就复位”）。
@@ -662,9 +662,9 @@ const Mascot=(()=>{
   detailMode=on;
   button.classList.toggle('is-above',on);
   if(on){
-   releasePress(true);
+   releasePress(true);                                  // 仅暂停手动捏取输入
    clearTimeout(retreatTimer);retreatTimer=null;
-   if(autoPin){autoPin=false;stopAutoCycle(false);if(pinBtn)pinBtn.setAttribute('aria-pressed','false')}
+   // 自动捏捏激活态不被详情打断：循环与旋转继续，关闭详情后原样保留
   }else evaluateRetreat();
   updateAutoPinVis();
  }
