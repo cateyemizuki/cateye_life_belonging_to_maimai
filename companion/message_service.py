@@ -5,9 +5,8 @@
 2. 调用 ctx.send.text 发送文本消息；
 3. 主动发言时更新发言计数与冷却基准。
 
-当前仅 append_affection_suffix（第 1 项）在用——Tool 直发走 components 的
-「append_affection_suffix + ctx.send.text」，不经过本服务发送；
-send_to_target（第 2/3 项的发送与计数路径）为预留、无调用点。
+Tool 直发仍走 components；视频分享使用本服务的结构化回执入口，
+不得用非空失败字典的真值冒充发送成功。
 """
 
 from __future__ import annotations
@@ -54,24 +53,34 @@ class MessageService:
 
     async def send_to_target(self, text: str, stream_id: str, is_proactive: bool = True) -> bool:
         """发送消息给目标用户；主动发言成功后计 1 次发言数。"""
+        receipt = await self.send_to_target_receipt(text, stream_id, is_proactive)
+        return receipt.get("success") is True
+
+    async def send_to_target_receipt(self, text: str, stream_id: str,
+                                     is_proactive: bool = True) -> dict[str, Any]:
+        """Preserve success/unknown semantics for durable proactive delivery."""
         if not stream_id:
             self._ctx.logger.error("stream_id 为空，无法发送消息")
-            return False
+            return {"success": False, "error_class": "invalid_target"}
         final_text = self.append_affection_suffix(text)
         try:
             result = await self._ctx.send.text(text=final_text, stream_id=stream_id)
-            if result:
+            receipt = (dict(result) if isinstance(result, dict) else
+                       {"success": result} if isinstance(result, bool) else
+                       {"success": False, "uncertain": True, "error_class": "no_receipt"})
+            if receipt.get("success") is True:
                 if is_proactive:
                     self._affection.increment_speak()
                     self._ctx.logger.info("主动消息发送成功: %s...", final_text[:50])
                 else:
                     self._ctx.logger.info("被动回复发送成功: %s...", final_text[:50])
-                return True
+                return receipt
             self._ctx.logger.error("消息发送失败: 发送返回 False")
-            return False
+            return receipt
         except Exception as e:
             self._ctx.logger.error(f"消息发送异常: {e}")
-            return False
+            return {"success": False, "uncertain": True,
+                    "error_class": "exception", "error": str(e)[:200]}
 
     def append_affection_suffix(self, text: str) -> str:
         """根据好感度档位追加情绪锚点后缀；最高档桶有 10% 概率追加括号小剧场。

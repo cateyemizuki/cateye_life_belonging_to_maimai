@@ -41,6 +41,7 @@ class ConversationActivityTracker:
         self._last_direct: Dict[str, float] = {}        # 直接待答（私聊/@/点名）入站
         self._last_participation: float = 0.0           # 最近实际参与（入站直接或我方回复）
         self._reply_inflight: Dict[str, float] = {}     # stream_id -> 回复开始时刻
+        self._reply_counts: Dict[str, int] = {}         # concurrent replies can share a stream
         self._last_event: float = 0.0                   # 覆盖面暖机判定
 
     # ---- hook 喂入（全部吞异常，绝不影响消息处理）----
@@ -66,6 +67,7 @@ class ConversationActivityTracker:
             with self._lock:
                 self._last_event = now
                 self._reply_inflight[key] = now
+                self._reply_counts[key] = self._reply_counts.get(key, 0) + 1
                 self._last_participation = max(self._last_participation, now)
         except Exception:
             pass
@@ -76,7 +78,12 @@ class ConversationActivityTracker:
         try:
             with self._lock:
                 self._last_event = now
-                self._reply_inflight.pop(key, None)
+                count = self._reply_counts.get(key, 0) - 1
+                if count > 0:
+                    self._reply_counts[key] = count
+                else:
+                    self._reply_counts.pop(key, None)
+                    self._reply_inflight.pop(key, None)
                 self._last_participation = max(self._last_participation, now)
         except Exception:
             pass
@@ -101,7 +108,9 @@ class ConversationActivityTracker:
                     break
             if self._last_participation and now - self._last_participation < CHAT_SILENCE_SECONDS:
                 reasons.append("recent_participation")
-            coverage = "ok" if self._last_event else "partial"
+            # A lost end hook is unknown, not proof that an old request finished.
+            stale_reply = len(inflight) != len(self._reply_inflight)
+            coverage = "ok" if self._last_event and not stale_reply else "partial"
             return {
                 "busy": bool(reasons),
                 "reasons": reasons,
@@ -109,7 +118,7 @@ class ConversationActivityTracker:
                 "last_participation_epoch": self._last_participation or None,
                 "silence_seconds": round(now - self._last_participation, 3)
                 if self._last_participation else None,
-                "in_flight_replies": len(inflight),
+                "in_flight_replies": sum(self._reply_counts.get(k, 1) for k in inflight),
             }
 
 
@@ -181,6 +190,10 @@ class SurfLeaseAuthority:
         """消费方在每次模型调用/继续下一条前核对：租约仍在且版本未变。"""
         if not isinstance(lease, dict):
             return False
+        if lease.get("kind") == "surf":
+            snap = self._activity.snapshot()
+            if snap.get("busy") or snap.get("coverage") != "ok":
+                return False
         current = self.current()
         return bool(current and current.get("kind") == lease.get("kind")
                     and current.get("holder") == lease.get("holder")

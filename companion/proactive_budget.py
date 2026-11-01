@@ -34,6 +34,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
+from uuid import uuid4
 from typing import Any, Dict
 from core.storage import load_json, save_json_atomic
 
@@ -67,6 +69,9 @@ class ProactiveBudget:
         self._date = ""
         self._used = 0
         self._channels: Dict[str, int] = {}
+        self._lock = RLock()
+        # Sending slots survive reload; unknown delivery is held until the day rolls.
+        self._reservations: Dict[str, Dict[str, str]] = {}
         #: 持久化落点（None = 纯内存态；既有装配不传 data_dir 时行为不变）
         self._state_path: Optional[Path] = (
             Path(data_dir) / self.STATE_FILENAME if data_dir else None
@@ -125,6 +130,13 @@ class ProactiveBudget:
         self._date = date
         self._used = used
         self._channels = {}
+        reservations = raw.get("reservations")
+        if isinstance(reservations, dict):
+            self._reservations = {
+                str(key): {"channel": str(value.get("channel") or "video_share"),
+                           "stream_id": str(value.get("stream_id") or "")}
+                for key, value in reservations.items() if isinstance(value, dict)
+            }
         channels = raw.get("channels")
         if isinstance(channels, dict):
             for key, value in channels.items():
@@ -137,7 +149,7 @@ class ProactiveBudget:
         if path is None:
             return
         state = {"date": self._date, "used": self._used, "channels": dict(self._channels),
-                 "scope": self.STATE_SCOPE}
+                 "scope": self.STATE_SCOPE, "reservations": dict(self._reservations)}
         if save_json_atomic(path, state):
             self._persist_warned = False
             return
@@ -199,6 +211,7 @@ class ProactiveBudget:
             self._date = today
             self._used = 0
             self._channels = {}
+            self._reservations = {}
             self._save()
 
     def _config(self) -> Any:
@@ -248,7 +261,7 @@ class ProactiveBudget:
             return True
         self._roll_date()
         limit = self.cap()
-        if self._used < limit:
+        if self._used + len(self._reservations) < limit:
             return True
         self._log_blocked(channel, intent, limit)
         return False
@@ -271,8 +284,52 @@ class ProactiveBudget:
         """``proactive.used`` 订阅者（M0 唯一实际订阅者）：按 payload 的 stream 身份入账。"""
         if not isinstance(payload, dict):
             return
+        if payload.get("reservation_id"):
+            self.commit_reservation(str(payload["reservation_id"]))
+            return
         self.record_used(str(payload.get("channel") or ""), str(payload.get("intent") or ""),
                          str(payload.get("stream_id") or ""))
+
+    def remaining(self) -> int:
+        """Available slots include in-flight/uncertain sends; the cap is unchanged."""
+        with self._lock:
+            self._roll_date()
+            return max(0, self.cap() - self._used - len(self._reservations))
+
+    def reserve(self, channel: str, stream_id: str) -> Optional[str]:
+        """Persist a slot before I/O, only for the configured companion target."""
+        with self._lock:
+            if not self._target_stream() or not self._is_target_stream(stream_id):
+                return None
+            self._roll_date()
+            if self.remaining() <= 0:
+                return None
+            token = uuid4().hex
+            self._reservations[token] = {"channel": str(channel), "stream_id": str(stream_id)}
+            self._save()
+            if self._persist_warned:
+                self._reservations.pop(token, None)
+                return None  # Cannot persist intent: do not send.
+            return token
+
+    def commit_reservation(self, token: str) -> bool:
+        """Convert a reserved slot to one successful send, at most once."""
+        with self._lock:
+            self._roll_date()
+            entry = self._reservations.pop(str(token), None)
+            if entry is None:
+                return False
+            self.record_used(entry["channel"], "share", entry["stream_id"])
+            return True
+
+    def release_reservation(self, token: str) -> bool:
+        """Release only a confirmed unsent slot. Unknown delivery stays reserved."""
+        with self._lock:
+            self._roll_date()
+            if self._reservations.pop(str(token), None) is None:
+                return False
+            self._save()
+            return True
 
     # ---- 内部 ----
     def _log_blocked(self, channel: str, intent: str, limit: int) -> None:

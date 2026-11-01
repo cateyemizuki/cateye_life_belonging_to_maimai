@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -248,6 +249,12 @@ class ShareCandidateStore:
             # 否则午夜一过就能绕过 §7.2 的 6 小时最小间隔（保守恢复）。
             daily = _empty_daily(day)
             daily["last_sent_epoch"] = last_sent
+        # In-flight/unknown attempts retain their slot through a reload. Date roll
+        # resets the daily hold, but the six-hour attempt boundary remains.
+        if str(daily_raw.get("date") or "") == day and "held_count" in daily_raw:
+            daily["held_count"] = max(0, _as_int(daily_raw["held_count"]))
+        if daily_raw.get("last_attempt_epoch") is not None:
+            daily["last_attempt_epoch"] = _as_float(daily_raw["last_attempt_epoch"])
         out = {"version": 1, "candidates": candidates, "daily": daily}
         if out != doc:
             _atomic_write(self._path, out)
@@ -286,7 +293,8 @@ class ShareCandidateStore:
         return removed
 
     # ---- 对外面：候选 ----
-    def record_from_result(self, result: Dict[str, Any], episode_id: str) -> Optional[Dict[str, Any]]:
+    def record_from_result(self, result: Dict[str, Any], episode_id: str,
+                           target_stream: str = "") -> Optional[Dict[str, Any]]:
         """观看结果 → 分享候选（计划书 §6/§7.1）：不满足条件返回 None。
 
         仅当视觉理解成功、摘要可用且观后感非空才生成；同 BV/同 episode 不重复；
@@ -297,6 +305,8 @@ class ShareCandidateStore:
         visual = result.get("visual")
         if not isinstance(visual, dict) or str(visual.get("status") or "") != "completed":
             return None  # 未尝试/失败/text-only 部分结果不进主动分享链
+        if visual.get("understanding_status") not in (None, "completed"):
+            return None
         summary = _clean_source(visual.get("summary"), _SHARE_TEXT_MAX)
         if not summary:
             return None
@@ -331,6 +341,7 @@ class ShareCandidateStore:
                 "summary": summary,
                 "impression": impression,
                 "episode_id": episode,
+                "target_stream": str(target_stream),
                 "created_at": at,
                 "expire_at": at + SHARE_CANDIDATE_TTL_SECONDS,
                 "status": "pending",
@@ -358,6 +369,43 @@ class ShareCandidateStore:
         fresh.sort(key=self._created, reverse=True)  # 理论上至多 1 条；多出时取最新
         return dict(fresh[0])
 
+    def claim_delivery(self, share_id: str, now: Any = None) -> bool:
+        """Persist sending intent before network I/O, under the store's single lock."""
+        at = self._now(now)
+        with self._lock:
+            doc = self._load()
+            daily = doc["daily"]
+            if _as_int(daily.get("sent_count")) + _as_int(daily.get("held_count")) >= SHARE_DAILY_MAX:
+                return False
+            last = max(_as_float(daily.get("last_sent_epoch")),
+                       _as_float(daily.get("last_attempt_epoch")))
+            if last and at - last < SHARE_MIN_INTERVAL_SECONDS:
+                return False
+            for cand in doc["candidates"]:
+                if cand.get("share_id") != share_id or cand.get("status") != "pending":
+                    continue
+                if _as_float(cand.get("expire_at")) <= at:
+                    return False
+                cand.update(status="sending", attempted_at=at,
+                            previous_attempt=daily.get("last_attempt_epoch"))
+                daily["held_count"] = _as_int(daily.get("held_count")) + 1
+                daily["last_attempt_epoch"] = at
+                self._save(doc, at)
+                return True
+            return False
+
+    def defer_claim(self, share_id: str) -> None:
+        """Restore only a confirmed unsent intent, never a timeout or unknown send."""
+        with self._lock:
+            doc = self._load()
+            for cand in doc["candidates"]:
+                if cand.get("share_id") == share_id and cand.get("status") == "sending":
+                    cand["status"] = "pending"
+                    doc["daily"]["held_count"] = max(0, _as_int(doc["daily"].get("held_count")) - 1)
+                    doc["daily"]["last_attempt_epoch"] = cand.get("previous_attempt")
+                    self._save(doc, self._now())
+                    return
+
     def mark_sent(self, share_id: str, receipt: Any) -> Optional[Dict[str, Any]]:
         """记录成功投递（只对 pending 生效，重复调用不重复计数）。"""
         target_id = str(share_id or "")
@@ -371,8 +419,11 @@ class ShareCandidateStore:
                     break
             if target is None:
                 return None
-            if str(target.get("status") or "") != "pending":
+            previous_status = str(target.get("status") or "")
+            if previous_status not in ("pending", "sending"):
                 return dict(target)  # 已 sent/dropped：幂等，不再计一次
+            if previous_status == "sending":
+                doc["daily"]["held_count"] = max(0, _as_int(doc["daily"].get("held_count")) - 1)
             target["status"] = "sent"
             target["sent_at"] = at
             target["receipt"] = _json_safe(receipt)
@@ -396,8 +447,15 @@ class ShareCandidateStore:
                     break
             if target is None:
                 return None
-            if str(target.get("status") or "") != "pending":
+            previous_status = str(target.get("status") or "")
+            if previous_status not in ("pending", "sending"):
                 return dict(target)
+            if previous_status == "sending" and not uncertain:
+                doc["daily"]["held_count"] = max(0, _as_int(doc["daily"].get("held_count")) - 1)
+                doc["daily"]["last_attempt_epoch"] = target.get("previous_attempt")
+            elif uncertain and previous_status == "pending":
+                doc["daily"]["held_count"] = _as_int(doc["daily"].get("held_count")) + 1
+                doc["daily"]["last_attempt_epoch"] = at
             target["status"] = "dropped"
             target["dropped_at"] = at
             target["drop_reason"] = str(reason or "")[:300]
@@ -464,11 +522,12 @@ class ShareCandidateStore:
         with self._lock:
             daily = dict(self._load().get("daily") or _empty_daily(str(self._day_provider())))
         sent = max(0, _as_int(daily.get("sent_count")))
-        if sent >= SHARE_DAILY_MAX:
+        if sent + _as_int(daily.get("held_count")) >= SHARE_DAILY_MAX:
             return False, f"今日自动分享已达上限（{sent}/{SHARE_DAILY_MAX} 条，计划书 §7.2）"
-        last = daily.get("last_sent_epoch")
-        if last is not None:
-            elapsed = at - _as_float(last)
+        last = max(_as_float(daily.get("last_sent_epoch")),
+                   _as_float(daily.get("last_attempt_epoch")))
+        if last:
+            elapsed = at - last
             if elapsed < SHARE_MIN_INTERVAL_SECONDS:
                 need_min = max(1, int((SHARE_MIN_INTERVAL_SECONDS - elapsed) // 60) + 1)
                 return False, (f"距上次自动分享不足 {SHARE_MIN_INTERVAL_SECONDS // 3600} 小时"
@@ -495,10 +554,15 @@ class ShareDelivery:
 
     def __init__(self, store: ShareCandidateStore, *,
                  deliver: DeliverCallable,
-                 budget_remaining: BudgetCallable) -> None:
+                 budget_remaining: BudgetCallable,
+                 preflight: Optional[Callable[[], tuple]] = None,
+                 target_provider: Optional[Callable[[], str]] = None) -> None:
         self._store = store
         self._deliver = deliver
         self._budget_remaining = budget_remaining
+        self._preflight = preflight
+        self._target_provider = target_provider
+        self._delivery_lock = asyncio.Lock()
 
     @staticmethod
     def _receipt_uncertain(receipt: Any) -> bool:
@@ -525,37 +589,52 @@ class ShareDelivery:
                 "candidate": dropped}
 
     async def deliver_due(self, now: Any = None) -> Dict[str, Any]:
-        """门控通过且有新鲜候选时投递一条；返回结果摘要。
+        async with self._delivery_lock:
+            return await self._deliver_due_locked(now)
 
-        投递调用本身抛出的异常不外泄：按「结果不确定」丢弃候选（保守防重）。
-        预算回调异常同样按不可得处理，不把异常当空闲/有额度。
-        """
+    async def _deliver_due_locked(self, now: Any = None) -> Dict[str, Any]:
         at = self._store._now(now)
-        self._store.prune(at)  # 每次投递前做 TTL 收口，睡醒后不集中补发
+        self._store.prune(at)
+        if self._preflight is not None:
+            try:
+                allowed, reason = self._preflight()
+            except Exception:
+                allowed, reason = False, "发送所需状态不完整"
+            if not allowed:
+                return {"sent": False, "reason": reason, "deferred": True}
         try:
             budget = self._budget_remaining()
         except Exception:
-            budget = None  # 预算权威异常按不可得处理（保守拒绝）
+            budget = None
         allowed, reason = self._store.can_send(at, budget)
         if not allowed:
             return {"sent": False, "reason": reason}
         candidate = self._store.due_share(at)
         if not candidate:
-            return {"sent": False, "reason": "无新鲜待分享候选（不为了消耗预算凑消息）"}
+            return {"sent": False, "reason": "无新鲜待分享候选"}
+        if self._target_provider is not None:
+            target = str(self._target_provider() or "")
+            if not target or target != candidate.get("target_stream"):
+                return self._drop(candidate, "候选对象未知或已变化，不转投其他联系人", False)
         text = build_share_text(candidate)
         if not text:
-            return self._drop(candidate, "候选缺少有效 BV 号/可用理由，不生成分享（不编造）", False)
+            return self._drop(candidate, "候选缺少有效 BV 号/可用理由", False)
+        share_id = str(candidate["share_id"])
+        if not self._store.claim_delivery(share_id, at):
+            return {"sent": False, "reason": "候选已被领取或门控已变化"}
         try:
             receipt = await self._deliver(text)
+        except asyncio.CancelledError:
+            raise  # A durable sending intent is deliberately not retried after reload.
         except Exception as exc:
-            # 发送调用抛出 = 是否已送达不可核验 → 按不确定丢弃，保守防重（不盲重试）
             return self._drop(candidate, f"投递异常，结果不确定（保守防重）：{str(exc)[:200]}", True)
-        if isinstance(receipt, dict) and receipt.get("success"):
-            sent = self._store.mark_sent(str(candidate.get("share_id") or ""), receipt)
-            return {"sent": True, "share_id": str(candidate.get("share_id") or ""),
-                    "text": text, "receipt": receipt, "candidate": sent}
+        if isinstance(receipt, dict) and receipt.get("deferred") is True:
+            self._store.defer_claim(share_id)
+            return {"sent": False, "deferred": True, "reason": receipt.get("error")}
+        if isinstance(receipt, dict) and receipt.get("success") is True and not receipt.get("uncertain"):
+            sent = self._store.mark_sent(share_id, receipt)
+            return {"sent": True, "share_id": share_id, "text": text,
+                    "receipt": receipt, "candidate": sent}
         uncertain = self._receipt_uncertain(receipt)
-        detail = self._receipt_reason(receipt)
-        if uncertain:
-            return self._drop(candidate, f"投递结果不确定（保守防重）：{detail}", True)
-        return self._drop(candidate, f"投递失败：{detail}", False)
+        prefix = "投递结果不确定（保守防重）：" if uncertain else "投递失败："
+        return self._drop(candidate, prefix + self._receipt_reason(receipt), uncertain)

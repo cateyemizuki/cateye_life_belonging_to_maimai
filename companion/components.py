@@ -358,6 +358,11 @@ class CompanionComponentsMixin:
                     lover = str(getattr(self, "_lover_name", "") or "")
                     direct = (grp is False) or (bool(grp) and ("@" in text or (bool(lover) and lover in text)))
                     tracker.note_incoming(str(sid), direct=direct)
+                    if direct:
+                        service = getattr(self, "_video_watch", None)
+                        if service is not None:
+                            if service.revoke_automatic():
+                                self._request_surf_frequency_refresh()
         except Exception:
             pass  # 忙闲记录失败绝不影响消息处理
         return None
@@ -560,6 +565,10 @@ class CompanionComponentsMixin:
         _tracker = getattr(self, "_attention_tracker", None)
         if _tracker is not None:
             _tracker.note_reply_start()
+            service = getattr(self, "_video_watch", None)
+            if service is not None:
+                if service.revoke_automatic():
+                    self._request_surf_frequency_refresh()
         stripped = without_stale_proactive_blocks(kwargs)
         if stripped is not None:
             kwargs = stripped

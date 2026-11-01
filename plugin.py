@@ -336,6 +336,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     # 生命周期
     # ------------------------------------------------------------------
     async def on_load(self) -> None:
+        self._is_unloading = False
         data_dir = self.ctx.paths.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
         self._data_dir = data_dir
@@ -414,15 +415,20 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._video_watch = VideoWatchService(
             data_dir / "video_watch", logger=self.ctx.logger,
             config_provider=lambda: self.config.video_watch,
-            llm_generate_detailed=self._llm.generate_detailed)
+            llm_generate_detailed=self._llm.generate_detailed,
+            automatic_guard=self._video_automation_allowed,
+            state_changed=self._request_surf_frequency_refresh)
         self._video_watch.start()
         # S3（冲浪计划书 §7）：分享候选与投递（计入每日主动 5 次 + 6 小时/日 1 条限，
         # 经既有陪伴私聊发送路径；候选生成门在模块内=视觉理解成功且有摘要）
-        self._share_store = ShareCandidateStore(data_dir / "video_watch")
+        self._share_store = ShareCandidateStore(data_dir / "video_watch", day_provider=self._surf_day)
         self._share_delivery = ShareDelivery(
             self._share_store, deliver=self._deliver_share_candidate,
-            budget_remaining=self._share_budget_remaining)
-        self._share_recorder = self._share_store.record_from_result
+            budget_remaining=self._share_budget_remaining,
+            preflight=self._share_preflight,
+            target_provider=lambda: str(getattr(self, "_stream_id", "") or ""))
+        self._share_recorder = lambda result, episode_id: self._share_store.record_from_result(
+            result, episode_id, target_stream=str(getattr(self, "_stream_id", "") or ""))
 
         # 宿主人设（bot 配置）
         await self._refresh_persona()
@@ -464,6 +470,16 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                              self._stream_id or "待解析")
 
     async def on_unload(self) -> None:
+        self._is_unloading = True
+        # Stop single-flight integration work before any service/database teardown.
+        for task_name in ("_video_watch_sync_task", "_share_delivery_task", "_surf_frequency_task"):
+            task = getattr(self, task_name, None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
         await self._qzone.stop()
         # PR6：取消未完成的频率校准 task（不留悬挂协程）
         try:
@@ -515,6 +531,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         if scope != "self":
             return
         cfg = self.config
+        if cfg.video_watch.enabled:
+            self._video_watch.start()
+        else:
+            await self._video_watch.stop()
         self._llm.update_task(llm_task_name_of(cfg))
         self._companion.sync_from_config()
         if not cfg.plugin.enabled:
@@ -1337,7 +1357,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 self._data_dir, self._call_watch_api, _active, _by_id,
                 logger=self.ctx.logger,
                 attention=getattr(self, "_attention", None),
-                quota=SurfQuotaLedger(self._data_dir),
+                quota=SurfQuotaLedger(self._data_dir, day_provider=self._surf_day),
                 share_recorder=getattr(self, "_share_recorder", None))
             self._video_watch_coordinator = coord
         return coord
@@ -1369,42 +1389,121 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             except Exception:
                 pass
 
+    def _surf_now(self) -> Any:
+        from planning.time_utils import TimezoneManager
+        return TimezoneManager(self.config.schedule_advanced.timezone).get_now()
+
+    def video_watch_task_state(self, task_id: str) -> Dict[str, Any]:
+        try:
+            return self._video_watch.task_state(task_id)
+        except RuntimeError:
+            return {"success": False, "status": "unavailable"}
+
+    def _request_surf_frequency_refresh(self) -> None:
+        if getattr(self, "_is_unloading", False):
+            return
+        pending = getattr(self, "_surf_frequency_task", None)
+        if pending is not None and not pending.done():
+            return
+        planning = getattr(self, "_planning", None)
+        if planning is None:
+            return
+        async def refresh() -> None:
+            try:
+                await planning.proactive.refresh_activity_frequency()
+            except Exception:
+                self.ctx.logger.debug("冲浪状态变化后的回复倍率刷新失败", exc_info=True)
+        self._surf_frequency_task = asyncio.get_running_loop().create_task(refresh())
+
+    def _surf_day(self) -> str:
+        return self._surf_now().date().isoformat()
+
+    def _autonomous_context(self) -> tuple[bool, str]:
+        """One fail-closed busy/sleep gate for watching and unsolicited sharing."""
+        from planning.time_utils import is_in_time_window
+        try:
+            if not self.config.plugin.enabled or not self.config.video_watch.enabled:
+                return False, "模块未启用"
+            snap = self._attention_tracker.snapshot()
+            if snap.get("coverage") != "ok" or snap.get("busy"):
+                return False, "正在聊天或忙闲信息不完整"
+            now = self._surf_now()
+            gate = self.companion_silence_gate()
+            window = gate.resolve_silence_window()
+            if window.invalid or is_in_time_window(
+                    window.start, window.end, now.strftime("%H:%M"), invalid_result=True):
+                return False, "处于静默时间"
+            if self.sleep_asleep(now) is True:
+                return False, "真实睡眠尚未结束"
+            active = self._db.active_episode()
+            if active and gate.nap_item_matches(active):
+                return False, "当前为午休/小睡"
+            return True, ""
+        except Exception:
+            return False, "自动行为所需状态不可核验"
+
+    def _video_automation_allowed(self, episode_id: str) -> bool:
+        allowed, _ = self._autonomous_context()
+        if not allowed or not episode_id:
+            return False
+        lease = self._attention.current()
+        if not lease or lease.get("holder") != f"schedule:{episode_id}":
+            return False
+        if not self._attention.lease_valid(lease):
+            return False
+        active = self._db.active_episode() or {}
+        return (active.get("episode_id") == episode_id
+                and (active.get("metadata") or {}).get("event_key") == "watch_bili")
+
+    def _share_preflight(self) -> tuple[bool, str]:
+        allowed, reason = self._autonomous_context()
+        if not allowed:
+            return allowed, reason
+        if not self.config.patrol.enabled or not str(getattr(self, "_stream_id", "") or ""):
+            return False, "陪伴对象或主动功能尚未就绪"
+        lease = self._attention.current()
+        if lease and lease.get("kind") == "chat":
+            return False, "聊天占用中"
+        return True, ""
+
     def _share_budget_remaining(self) -> Any:
-        """分享可用的主动预算余量（计入每日 5 次；预算面不可得=保守拒绝）。"""
         budget = getattr(self, "_proactive_budget", None)
         if budget is None:
             return None
-        try:
-            return max(0, int(budget.cap()) - int(budget.used_today()))
-        except Exception:
-            return None
+        return budget.remaining()
 
     async def _deliver_share_candidate(self, text: str) -> Dict[str, Any]:
-        """分享投递：预算闸（allow_proactive）→ 既有陪伴私聊发送 → proactive.used 入账。
-
-        不新增预算写者、不扩大发送上限；发送成功即入账，失败/异常如实返回。"""
-        stream_id = str(getattr(self, "_stream_id", "") or "")
-        bus = getattr(self, "_bus", None)
-        if not stream_id or bus is None or not bus.allow_proactive(
-                channel="video_share", intent="share", stream_id=stream_id):
-            return {"success": False, "error_class": "budget",
-                    "error": "主动预算不可用或目标私聊未解析"}
-        sender = getattr(getattr(getattr(self, "_companion", None), "message", None),
-                         "send_to_target", None)
-        if not callable(sender):
-            return {"success": False, "error_class": "unavailable", "error": "陪伴发送面未装配"}
+        """Reserve the existing budget before I/O; unknown delivery remains held."""
+        allowed, reason = self._share_preflight()
+        if not allowed:
+            return {"success": False, "deferred": True, "error": reason}
+        stream_id = str(self._stream_id)
+        budget = self._proactive_budget
+        token = budget.reserve("video_share", stream_id)
+        if token is None:
+            return {"success": False, "deferred": True, "error_class": "budget"}
+        holder = "video_share"
+        self._attention.acquire_chat(holder)
+        self._video_watch.revoke_automatic()
         try:
-            sent = await sender(text, stream_id, True)
+            receipt = await asyncio.wait_for(
+                self._companion.message.send_to_target_receipt(text, stream_id, True), timeout=30)
+            if receipt.get("success") is True and not receipt.get("uncertain"):
+                budget.commit_reservation(token)
+                # Keep the existing event visible; the idempotent reservation is already committed.
+                await self._bus.publish("proactive.used", channel="video_share", intent="share",
+                                        stream_id=stream_id, reservation_id=token)
+                return receipt
+            if not receipt.get("uncertain"):
+                budget.release_reservation(token)
+            return receipt
+        except asyncio.CancelledError:
+            raise  # Persisted reservation and sending intent prevent a blind retry.
         except Exception as exc:
-            return {"success": False, "error_class": "unknown", "error": str(exc)[:200]}
-        if sent:
-            try:
-                await bus.publish("proactive.used", channel="video_share",
-                                  intent="share", stream_id=stream_id)
-            except Exception:
-                pass
-            return {"success": True}
-        return {"success": False, "error_class": "send_failed", "error": "发送失败"}
+            return {"success": False, "uncertain": True, "error_class": "unknown",
+                    "error": str(exc)[:200]}
+        finally:
+            self._attention.release(holder)
 
     def _kick_video_watch_sync(self) -> None:
         """单飞调度：上一拍联动未结束时不再叠加（有界；异常只告警）。"""

@@ -15,6 +15,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -62,7 +65,21 @@ class WatchTaskManager:
         self._cancel_requested: set = set()
         self._pump_task: Optional[asyncio.Task] = None
         self._impression_hook: Optional[Callable[[Dict[str, Any]], Any]] = None
+        self._postprocess_task: Optional[asyncio.Task] = None
+        self._task_guard: Optional[Callable[[Dict[str, Any]], bool]] = None
+        self._closed = False
+        self._state_listener: Optional[Callable[[], None]] = None
         self._recover()
+
+    def set_task_guard(self, guard: Callable[[Dict[str, Any]], bool]) -> None:
+        self._task_guard = guard
+
+    def set_state_listener(self, listener: Callable[[], None]) -> None:
+        self._state_listener = listener
+
+    def _notify_state(self) -> None:
+        if self._state_listener is not None:
+            self._state_listener()
 
     def set_impression_hook(self, hook: Optional[Callable[[Dict[str, Any]], Any]]) -> None:
         """注入观后感生成回调（插件侧经宿主 LLM 文本任务实现；失败须如实降级）。"""
@@ -97,6 +114,9 @@ class WatchTaskManager:
         if str((watched or {}).get("mode") or "") != "sampled_frames":
             return WatchStore.DEFAULT_CACHE_MODE
         visual = result.get("visual") if isinstance(result.get("visual"), dict) else {}
+        if (not str(visual.get("summary") or "").strip()
+                or visual.get("understanding_status") not in (None, "completed")):
+            return WatchStore.DEFAULT_CACHE_MODE
         capability = str((visual or {}).get("capability") or "v1").strip() or "v1"
         return f"frames-{capability}"
 
@@ -107,13 +127,16 @@ class WatchTaskManager:
                episode_id: str = "", owner: str = "") -> Dict[str, Any]:
         from .bv import normalize_video_ref
 
+        if self._closed:
+            return {"success": False, "error_class": "unavailable", "error": "观看服务已停止"}
         bvid = normalize_video_ref(video or "")
         if not bvid:
             return {"success": False, "error_class": "invalid_input",
                     "error": "无法识别的视频标识：仅支持 BV 号或 bilibili.com 视频页链接（含 b23.tv 短链）"}
         # 缓存命中：按「本次请求的模式」查缓存（不新增观看记录——去重口径）；
         # 旧文本缓存不会命中画面采样请求，反之亦然
-        cached = self._store.load_cache(bvid, self._requested_mode_token())
+        requested_mode = self._requested_mode_token()
+        cached = self._store.load_cache(bvid, requested_mode)
         if isinstance(cached, dict) and cached.get("status") == _COMPLETED:
             return {"success": True, "cached": True, "task_id": cached.get("task_id", ""),
                     "status": _COMPLETED, "result": cached}
@@ -121,7 +144,9 @@ class WatchTaskManager:
         # 进行中去重：同 BV 只关联一个任务；S0 所有权——本次调用者登记为该任务的
         # 引用持有者之一（cancel 非 force 只撤销自己的引用，不误杀其他调用者）
         for task in self._store.load_tasks():
-            if task.get("bvid") == bvid and not self._store.is_terminal(str(task.get("status"))):
+            if (task.get("bvid") == bvid
+                    and task.get("cache_mode", WatchStore.DEFAULT_CACHE_MODE) == requested_mode
+                    and not self._store.is_terminal(str(task.get("status")))):
                 if owner:
                     owners = [str(o) for o in (task.get("owners") or [])]
                     if owner not in owners:
@@ -142,6 +167,8 @@ class WatchTaskManager:
             "source": "schedule" if source == "schedule" else "tool",
             "episode_id": str(episode_id or ""),
             "owners": [owner] if owner else [],
+            "cache_mode": requested_mode,
+            "visual_spec": self._visual_spec(),
             "status": _QUEUED,
             "created_at": time.time(),
             "deadline_seconds": self._deadline_seconds,
@@ -171,25 +198,35 @@ class WatchTaskManager:
         return receipt
 
     def result(self, task_id: str) -> Dict[str, Any]:
+        # A task result is authoritative; a same-video cache is not a task identity.
         task = self._store.get_task(task_id or "")
         if not task:
             return {"success": False, "error_class": "not_found", "error": "任务不存在"}
         status = str(task.get("status"))
+        if not self._store.is_terminal(status):
+            return {"success": False, "error_class": "not_ready", "status": status,
+                    "error": "任务尚未结束"}
+        data = read_json(self._job_dir(task_id) / "result.json", None)
+        if (isinstance(data, dict) and data.get("task_id") in (None, task_id)
+                and data.get("status") == status):
+            visual = data.get("visual")
+            if isinstance(visual, dict):
+                visual.pop("frames", None)
+            return {"success": True, "status": status, "result": data}
         if status == _COMPLETED:
-            cached = self._store.load_cache(str(task.get("bvid")))
-            if isinstance(cached, dict):
+            mode = task.get("result_cache_mode") or task.get("cache_mode") or WatchStore.DEFAULT_CACHE_MODE
+            cached = self._store.load_cache(str(task.get("bvid")), str(mode))
+            if (isinstance(cached, dict) and cached.get("task_id") == task_id
+                    and cached.get("status") == _COMPLETED):
+                visual = cached.get("visual")
+                if isinstance(visual, dict):
+                    visual.pop("frames", None)
                 return {"success": True, "status": status, "result": cached}
-        if self._store.is_terminal(status):
-            result = read_json(self._job_dir(task_id) / "result.json", None)
-            if isinstance(result, dict):
-                return {"success": True, "status": status, "result": result}
-            return {"success": True, "status": status,
-                    "result": {"task_id": task_id, "status": status,
-                               "error_class": task.get("error_class"),
-                               "error": task.get("error")}}
-        return {"success": False, "error_class": "not_ready",
-                "error": f"任务尚未结束（当前 {status}）",
-                "task_id": task_id, "status": status}
+            return {"success": False, "status": status, "error_class": "result_missing",
+                    "error": "本任务结果不可得，未使用同BV其他任务的结果代替"}
+        return {"success": True, "status": status, "result": {
+            "task_id": task_id, "status": status, "error_class": task.get("error_class"),
+            "error": task.get("error")}}
 
     def cancel(self, task_id: str, owner: str = "", force: bool = False) -> Dict[str, Any]:
         """取消/释放观看任务（S0 所有权语义，B 计划/冲浪计划 §4.2）。
@@ -210,6 +247,9 @@ class WatchTaskManager:
         owner = str(owner or "").strip()
         if not force and owner:
             owners = [str(o) for o in (task.get("owners") or [])]
+            if owners and owner not in owners:
+                return {"success": False, "task_id": task_id, "status": status,
+                        "error_class": "owner_mismatch", "error": "调用者未持有本任务引用"}
             if owner in owners and len(owners) > 1:
                 owners.remove(owner)
                 task["owners"] = owners
@@ -227,6 +267,9 @@ class WatchTaskManager:
             task["owners"] = []
             self._store.upsert_task(task)
         self._cancel_requested.add(task_id)
+        if (self._current_task_id == task_id and self._postprocess_task is not None
+                and not self._postprocess_task.done()):
+            self._postprocess_task.cancel()
         if status == _QUEUED:
             self._set_terminal(task, _CANCELLED, "cancelled", "提交后、开始处理前被取消")
             return {"success": True, "task_id": task_id, "status": _CANCELLED}
@@ -243,6 +286,7 @@ class WatchTaskManager:
         """
         # 顺序敏感：先取 worker 引用再取消泵——泵被取消时其清理路径会清空
         # self._proc，若后取会漏掉 terminate（孤儿进程，S0 测试实证）
+        self._closed = True
         proc = self._proc
         pump = self._pump_task
         self._pump_task = None
@@ -257,6 +301,7 @@ class WatchTaskManager:
         self._proc = None
         self._current_task_id = None
         self._cancel_requested.clear()
+        self._postprocess_task = None
         if proc is not None and proc.returncode is None:
             try:
                 await self._terminate(proc)
@@ -293,6 +338,9 @@ class WatchTaskManager:
                 task["status"] = _FAILED
                 task["error_class"] = "interrupted_by_restart"
                 task["error"] = "宿主重启导致任务中断；结果不可复用，需重新提交"
+                atomic_write_json(self._job_dir(str(task["task_id"])) / "result.json", {
+                    "task_id": task["task_id"], "status": _FAILED,
+                    "error_class": "interrupted_by_restart", "error": task["error"]})
                 touched.append(str(task.get("task_id")))
         if touched:
             self._store.save_tasks(tasks)
@@ -313,6 +361,8 @@ class WatchTaskManager:
     # 泵：串行消费队列
     # ------------------------------------------------------------------
     def _kick(self) -> None:
+        if self._closed:
+            return
         if self._pump_task is None or self._pump_task.done():
             self._pump_task = asyncio.get_running_loop().create_task(self._pump())
 
@@ -344,13 +394,20 @@ class WatchTaskManager:
 
     async def _run_task(self, task: Dict[str, Any]) -> None:
         task_id = str(task["task_id"])
+        if self._closed or (self._task_guard is not None and not self._task_guard(task)):
+            self._set_terminal(task, _CANCELLED, "attention_revoked", "自动观看条件已失效")
+            return
         job_dir = self._job_dir(task_id)
         job_dir.mkdir(parents=True, exist_ok=True)
         spec = {"task_id": task_id, "bvid": task.get("bvid"),
                 "purpose": task.get("purpose", ""),
                 "max_video_duration_seconds": self._max_duration,
-                "deadline_epoch": time.time() + float(task.get("deadline_seconds") or self._deadline_seconds)}
-        visual_spec = self._visual_spec()
+                "deadline_epoch": float(task.get("deadline_epoch") or
+                                        time.time() + float(task.get("deadline_seconds") or self._deadline_seconds))}
+        if time.time() >= spec["deadline_epoch"]:
+            self._set_terminal(task, _FAILED, "timeout", "任务在排队期间已到总截止")
+            return
+        visual_spec = task.get("visual_spec", self._visual_spec())
         if visual_spec:
             # B2：worker 侧有界抽帧参数（不可得/失败由 worker 如实降级，不影响文本来源）
             spec["visual"] = visual_spec
@@ -358,11 +415,15 @@ class WatchTaskManager:
         task["status"] = _RUNNING
         task["started_at"] = time.time()
         self._store.upsert_task(task)
+        self._notify_state()
         cmd = [*self._watch_cmd(), str(job_dir / "spec.json"), str(job_dir / "result.json")]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, cwd=str(self._dir), stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT)
+                stderr=asyncio.subprocess.STDOUT,
+                creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+                               if os.name == "nt" else 0),
+                start_new_session=os.name != "nt")
         except Exception as exc:
             self._set_terminal(task, _FAILED, "worker_error", f"worker 启动失败: {exc}")
             return
@@ -405,16 +466,32 @@ class WatchTaskManager:
 
     @staticmethod
     async def _terminate(proc: Any) -> None:
+        # The PID is exclusively the worker created above, never a host/supervisor PID.
+        pid = getattr(proc, "pid", None)
+        if isinstance(pid, int) and pid > 0 and proc.returncode is None:
+            try:
+                if os.name == "nt":
+                    killer = await asyncio.create_subprocess_exec(
+                        "taskkill", "/PID", str(pid), "/T", "/F",
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW)
+                    await asyncio.wait_for(killer.wait(), 5)
+                else:
+                    os.killpg(pid, signal.SIGKILL)
+            except (OSError, asyncio.TimeoutError):
+                pass
         try:
             proc.kill()
         except Exception:
             pass
         try:
-            await proc.wait()
-        except Exception:
+            await asyncio.wait_for(proc.wait(), 5)
+        except (Exception, asyncio.TimeoutError):
             pass
 
     async def _finish(self, task: Dict[str, Any], result: Dict[str, Any]) -> None:
+        result["task_id"] = str(task["task_id"])
+        self._current_task_id = str(task["task_id"])
         status = str(result.get("status"))
         if status == _COMPLETED:
             # 观后感/画面摘要（可选）：经宿主 LLM 生成；S0 起纳入任务总截止——
@@ -428,18 +505,40 @@ class WatchTaskManager:
                                                   "保留 worker 原始结果（如实标注）")
                 else:
                     try:
+                        self._postprocess_task = asyncio.create_task(
+                            self._impression_hook(dict(result)))
                         patched = await asyncio.wait_for(
-                            self._impression_hook(dict(result)), timeout=budget)
+                            self._postprocess_task, timeout=budget)
                         if isinstance(patched, dict):
                             result = patched
                     except asyncio.TimeoutError:
                         result["impression"] = None
                         result["impression_error"] = ("父侧加工（观后感/画面摘要）超过任务总截止，"
                                                       "如实截断（不做晚到补跑）")
+                    except asyncio.CancelledError:
+                        if str(task["task_id"]) not in self._cancel_requested:
+                            raise
+                        self._set_terminal(task, _CANCELLED, "cancelled", "父侧加工时取消")
+                        return
                     except Exception as exc:
                         result["impression"] = None
                         result["impression_error"] = f"观后感生成失败（如实降级）：{exc}"
+                    finally:
+                        self._postprocess_task = None
+            if str(task["task_id"]) in self._cancel_requested:
+                self._set_terminal(task, _CANCELLED, "cancelled", "结果入库前取消")
+                return
+            # Enforce the result boundary even when a hook failed or exhausted its budget.
+            visual = result.get("visual")
+            if isinstance(visual, dict):
+                visual.pop("frames", None)
+                if not str(visual.get("summary") or "").strip():
+                    visual["understanding_status"] = "not_completed"
+                    result["completeness"] = "partial"
+                else:
+                    result["completeness"] = "visual"
             task["status"] = _COMPLETED
+            task["result_cache_mode"] = self._result_mode_token(result)
             self._store.save_cache(str(task.get("bvid")), result,
                                    self._result_mode_token(result))
             entry = dict(result)
@@ -468,8 +567,11 @@ class WatchTaskManager:
         task["error"] = error
         self._store.upsert_task(task)
         job_dir = self._job_dir(str(task.get("task_id")))
-        if result is not None:
-            atomic_write_json(job_dir / "result.json", result)
+        payload = result if result is not None else {
+            "task_id": task["task_id"], "status": status,
+            "error_class": error_class, "error": error}
+        atomic_write_json(job_dir / "result.json", payload)
+        self._notify_state()
         # 媒体/临时目录清理（V1 仅文本流水线，无媒体；目录保留 result/spec 供追溯）
         if self._log:
             self._log.info(f"观看任务终态 {task.get('task_id')} -> {status}"

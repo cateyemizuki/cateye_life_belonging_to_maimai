@@ -2503,6 +2503,13 @@ class ProactiveService:
             return None  # 既无事件标识、也无刷视频建链：不是刷视频活动
         if entry.get("closed"):
             return None  # 已收尾关联（防御：理论上不应与当前 episode 同 id）
+        state_provider = getattr(self._plugin, "video_watch_task_state", None)
+        if callable(state_provider):
+            state = state_provider(str(entry.get("task_id") or ""))
+            if not isinstance(state, dict) or state.get("status") != "running":
+                return None  # queued/cached/terminal is not actual watching.
+        elif entry.get("stage") not in (None, "running"):
+            return None
         lease = entry.get(_SURF_ENTRY_LEASE_KEY)
         if not isinstance(lease, dict) or str(lease.get("kind") or "") != "surf":
             return None  # 未实际持有 SURF 租约（排队未开始/已释放）
@@ -2524,6 +2531,14 @@ class ProactiveService:
         if not math.isfinite(factor) or factor < 0.0:
             return None  # 非法注入值：不覆盖
         return factor
+
+    async def refresh_activity_frequency(self) -> None:
+        """Refresh only frequency after an attention transition; never send a greeting."""
+        if not self._proactive_cfg().enable_frequency_modulation:
+            return
+        activity = self._find_current_activity()
+        name, goal_type = (activity[0], activity[1]) if activity else ("空闲", "free_time")
+        await self._apply_frequency(await self._resolve_target_streams_readonly(), goal_type, name=name)
 
     # 注（2026-10-20 用户指示）：原触发窗口/随机延迟助手已随活动切换主动发起链移除。
 

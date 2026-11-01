@@ -112,7 +112,7 @@ class SurfQuotaLedger:
         self._path = Path(store_dir) / "surf_quota.json"
         self._day_provider = day_provider or _default_day  # 缺省：本地 date
         self._clock = clock
-        self._lock = threading.Lock()  # 进程内互斥：并发入账不丢计数
+        self._lock = threading.RLock()  # reserve_once shares the same counter owner
 
     # ---- 内部 ----
     def _now(self, now: Any = None) -> float:
@@ -132,6 +132,8 @@ class SurfQuotaLedger:
             out["dedicated_used"] = max(0, _as_int(doc.get("dedicated_used")))
             last = doc.get("last_start_epoch")
             out["last_start_epoch"] = None if last is None else _as_float(last)
+            if isinstance(doc.get("claims"), dict):
+                out["claims"] = dict(doc["claims"])
             return out
         out = _empty_quota(day)  # 日切/首启：清零文案回写，重启后读到的即当日口径
         _atomic_write(self._path, out)
@@ -169,6 +171,37 @@ class SurfQuotaLedger:
             doc["minutes_used"] = round(float(doc["minutes_used"]) + need_minutes, 3)
             doc[field] = int(doc[field]) + 1
             doc["last_start_epoch"] = at
+            _atomic_write(self._path, doc)
+            return True
+
+    def reserve_once(self, episode_id: str, kind: str, minutes: float) -> bool:
+        """A durable claim prevents a reload between debit and task linking from replaying it."""
+        with self._lock:
+            doc = self._load()
+            if episode_id in doc.get("claims", {}):
+                return False
+            previous = doc.get("last_start_epoch")
+            if not self.try_consume(kind, minutes):
+                return False
+            doc = self._load()
+            doc.setdefault("claims", {})[episode_id] = {
+                "kind": kind, "minutes": minutes, "state": "reserved",
+                "previous_start": previous, "started_at": self._now()}
+            _atomic_write(self._path, doc)
+            return True
+
+    def refund_unstarted(self, episode_id: str) -> bool:
+        """Only a confirmed rejected/cached submission can release a reserved session."""
+        with self._lock:
+            doc = self._load()
+            claim = doc.get("claims", {}).get(episode_id)
+            if not claim or claim.get("state") != "reserved":
+                return False
+            doc["sessions_used"] = max(0, doc["sessions_used"] - 1)
+            field = self._KIND_FIELD[claim["kind"]]
+            doc[field] = max(0, doc[field] - 1)
+            doc["minutes_used"] = max(0.0, doc["minutes_used"] - claim["minutes"])
+            claim["state"] = "not_started"
             _atomic_write(self._path, doc)
             return True
 
@@ -307,7 +340,8 @@ class VideoWatchCoordinator:
             metadata = active.get("metadata") if isinstance(active.get("metadata"), dict) else {}
             event_key = str(metadata.get("event_key") or "")
             entry = links.get(active_id)
-            if event_key == WATCH_EVENT_KEY and not (isinstance(entry, dict) and entry.get("task_id")):
+            if event_key == WATCH_EVENT_KEY and not (
+                    isinstance(entry, dict) and (entry.get("task_id") or entry.get("closed"))):
                 entry = entry if isinstance(entry, dict) else {}
                 links[active_id] = entry
                 await self._start_watching(active_id, entry)
@@ -327,58 +361,69 @@ class VideoWatchCoordinator:
             self._save_links(links_doc)
 
     # ------------------------------------------------------------------
+    def _release_surf(self, episode_id: str, entry: Dict[str, Any]) -> None:
+        if self._attention is not None and entry.get("lease"):
+            self._attention.release(f"schedule:{episode_id}")
+        entry.pop("lease", None)
+
     async def _start_watching(self, episode_id: str, entry: Dict[str, Any]) -> None:
         entry.setdefault("started_at", time.time())
-        # S1b（计划书 §4.2）：自动观看先取 SURF 注意力租约；忙/覆盖面未确立 → 本拍不启动
-        if self._attention is not None:
-            try:
+        reserved = False
+        accepted = False
+        phase = "candidate"
+        retryable = False
+        try:
+            if self._attention is not None:
                 lease = self._attention.try_acquire_surf(f"schedule:{episode_id}")
-            except Exception as exc:
-                lease = None  # 权威异常按拒绝处理（fail-safe：不把异常当空闲）
-                if self._log:
-                    self._log.warning("SURF 租约申请异常（按拒绝处理）：%s", exc)
-            if not lease:
-                entry["stage"] = "skipped"
-                entry["reason"] = "聊天占用或覆盖面未确立，不开始自动观看"
-                if self._log:
-                    self._log.info("刷视频事件 %s：跳过（%s）", episode_id, entry["reason"])
-                return
-            entry["lease"] = lease  # 版本快照：每次轮询前核对，撤销即停看
-        try:
+                if not lease:
+                    retryable = True  # No side effect yet; a later quiet tick may try again.
+                    entry.update(stage="skipped", reason="聊天占用或覆盖面未确立，不开始自动观看")
+                    return
+                entry["lease"] = lease
             pick = await self._api(action="next_candidate")
-        except Exception as exc:
-            entry["stage"] = "unavailable"
-            entry["reason"] = f"观看能力不可用：{str(exc)[:200]}"
-            if self._log:
-                self._log.info("刷视频事件 %s：观看能力不可用，事件照常进行（%s）", episode_id, entry["reason"])
-            return
-        candidate = pick.get("candidate") if isinstance(pick, dict) else None
-        if not candidate:
-            entry["stage"] = "skipped"
-            entry["reason"] = f"无真实候选（{pick.get('reason') if isinstance(pick, dict) else 'unknown'}）；不编造 BV 号"
-            if self._log:
-                self._log.info("刷视频事件 %s：跳过（%s）", episode_id, entry["reason"])
-            return
-        try:
-            receipt = await self._api(action="submit", video=str(candidate.get("bvid")),
+            candidate = pick.get("candidate") if isinstance(pick, dict) else None
+            if not candidate:
+                entry.update(stage="skipped", reason="无真实候选，不编造 BV 号")
+                return
+            if self._attention is not None and not self._attention.lease_valid(entry.get("lease")):
+                entry.update(stage="skipped", reason="选片期间聊天开始")
+                return
+            if self._quota is not None:
+                snap = self._quota.snapshot()
+                minutes = min(20.0, max(0.0, SURF_MAX_TOTAL_MINUTES - float(snap["minutes_used"])))
+                reserve = getattr(self._quota, "reserve_once", None)
+                reserved = (reserve(episode_id, "dedicated", minutes) if callable(reserve)
+                            else self._quota.try_consume("dedicated", minutes))
+                if not reserved:
+                    entry.update(stage="skipped", reason="自动观看额度不足或本事件已申请")
+                    return
+                entry["reserved_minutes"] = minutes
+            phase = "submit"
+            receipt = await self._api(action="submit", video=str(candidate["bvid"]),
                                       purpose="日程刷视频", episode_id=episode_id)
+            if not receipt.get("success") or not receipt.get("task_id"):
+                entry.update(stage="failed_submit", reason=str(receipt.get("error") or "提交被拒绝")[:200],
+                             error_class=receipt.get("error_class"))
+                if reserved and hasattr(self._quota, "refund_unstarted"):
+                    self._quota.refund_unstarted(episode_id)
+                return
+            entry.update(task_id=str(receipt["task_id"]), bvid=str(candidate["bvid"]),
+                         stage=str(receipt.get("status") or "queued"),
+                         cached=bool(receipt.get("cached")))
+            if receipt.get("cached"):
+                if reserved and hasattr(self._quota, "refund_unstarted"):
+                    self._quota.refund_unstarted(episode_id)
+                await self._archive_if_completed(entry, entry["task_id"], episode_id=episode_id)
+                return
+            accepted = True
         except Exception as exc:
-            entry["stage"] = "failed_submit"
-            entry["reason"] = f"提交失败：{str(exc)[:200]}"
-            if self._log:
-                self._log.warning("刷视频事件 %s 提交失败：%s", episode_id, entry["reason"])
-            return
-        if receipt.get("success") and receipt.get("task_id"):
-            entry["task_id"] = str(receipt["task_id"])
-            entry["bvid"] = str(candidate.get("bvid"))
-            entry["stage"] = str(receipt.get("status") or "queued")
-            entry["cached"] = bool(receipt.get("cached"))
-            if self._log:
-                self._log.info("刷视频事件 %s 关联观看任务 %s（%s）", episode_id, entry["task_id"], entry["stage"])
-        else:
-            entry["stage"] = "failed_submit"
-            entry["reason"] = str(receipt.get("error") or "提交被拒绝")[:200]
-            entry["error_class"] = receipt.get("error_class")
+            entry.update(stage="failed_submit" if phase == "submit" else "unavailable",
+                         reason=("提交失败：" if phase == "submit" else "观看能力不可用：") + str(exc)[:160])
+            # An uncertain submission is not refunded or retried.
+        finally:
+            if not accepted:
+                entry["closed"] = not retryable
+                self._release_surf(episode_id, entry)
 
     async def _poll_status(self, episode_id: str, entry: Dict[str, Any]) -> bool:
         """有界状态轮询；S1b 起每次先核对 SURF 租约（撤销即取消任务并收尾）。"""
@@ -415,9 +460,11 @@ class VideoWatchCoordinator:
             entry["stage"] = stage
             if self._log and stage in ("running", "completed", "failed", "cancelled"):
                 self._log.info("观看任务 %s 阶段：%s", task_id, stage)
-            if stage == "completed":
-                # episode 仍在进行：真实完成结果即刻存档到关联（简短结果/感想记录到该活动）
-                await self._archive_if_completed(entry, task_id, episode_id=episode_id)
+            if stage in ("completed", "failed", "cancelled"):
+                if stage == "completed":
+                    await self._archive_if_completed(entry, task_id, episode_id=episode_id)
+                self._release_surf(episode_id, entry)
+                entry["closed"] = True
                 return True
             return True
         return False

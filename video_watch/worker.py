@@ -171,40 +171,52 @@ def _download_bounded(url: str, target: Path, max_bytes: int,
     return downloaded
 
 
+def _decoder_executable(job_dir: Path) -> str:
+    """Use PATH or this plugin's provisioned decoder; never change the host PATH."""
+    configured = shutil.which("ffmpeg")
+    if configured:
+        return configured
+    local = job_dir.parent.parent / "decoder" / "ffmpeg.exe"
+    return str(local) if local.is_file() else ""
+
+
 def _extract_frames(media_path: Path, job_dir: Path, duration: int, max_frames: int,
-                    deadline_epoch: float) -> list:
-    """ffmpeg 等间隔抽帧（自开头；帧数/宽度/单帧字节有界）。"""
+                    deadline_epoch: float) -> tuple:
+    """Seek to explicit target times; bound every decoder call by the remaining deadline."""
+    decoder = _decoder_executable(job_dir)
+    if not decoder:
+        raise LookupError("本机无 ffmpeg，画面采样未执行（如实标注）")
     interval = max(1, int(duration) // (int(max_frames) + 1))
     frames_dir = job_dir / "frames"
-    if frames_dir.exists():
-        shutil.rmtree(frames_dir, ignore_errors=True)
+    if frames_dir.is_symlink() or frames_dir.resolve().parent != job_dir.resolve():
+        raise LookupError("抽帧目录越出本任务，拒绝处理")
     frames_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        proc = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-             "-i", str(media_path),
-             "-vf", f"fps=1/{interval},scale={_FRAME_WIDTH}:-2",
-             "-frames:v", str(int(max_frames)), "-q:v", "7",
-             str(frames_dir / "frame_%03d.jpg")],
-            capture_output=True, timeout=max(30, int(deadline_epoch - time.time())))
-    except FileNotFoundError:
-        raise LookupError("本机无 ffmpeg，画面采样未执行（如实标注）")
-    except subprocess.TimeoutExpired:
-        raise LookupError("ffmpeg 抽帧超过任务总时限，采样终止（如实标注）")
-    if proc.returncode != 0:
-        detail = (proc.stderr or b"")[-400:].decode("utf-8", "replace")
-        raise LookupError(f"ffmpeg 抽帧失败：{detail or 'returncode=' + str(proc.returncode)}")
-    frames: list = []
-    sampled_seconds: list = []
-    for index, path in enumerate(sorted(frames_dir.glob("frame_*.jpg"))):
-        data = path.read_bytes()
+    frames, sampled_seconds = [], []
+    for index in range(int(max_frames)):
+        remaining = deadline_epoch - time.time()
+        if remaining <= 0:
+            raise LookupError("ffmpeg 抽帧超过任务总时限")
+        at = min(max(0.0, float(duration) - 0.05), (index + 1) * interval)
+        path = frames_dir / f"frame_{index:03d}.jpg"
+        flags = (subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+                 if sys.platform == "win32" else 0)
+        try:
+            proc = subprocess.run(
+                [decoder, "-hide_banner", "-loglevel", "error", "-y", "-threads", "1",
+                 "-ss", str(at), "-i", str(media_path), "-an", "-sn",
+                 "-vf", f"scale={_FRAME_WIDTH}:-2", "-frames:v", "1", "-q:v", "7", str(path)],
+                capture_output=True, timeout=min(30.0, remaining), creationflags=flags)
+        except subprocess.TimeoutExpired:
+            raise LookupError("ffmpeg 抽帧超过任务总时限")
+        if proc.returncode != 0:
+            raise LookupError(f"ffmpeg 抽帧失败（exit={proc.returncode}）")
+        data = path.read_bytes() if path.exists() else b""
+        path.unlink(missing_ok=True)
         if not data or len(data) > _FRAME_BYTES_LIMIT:
             continue
-        sampled_seconds.append((index + 1) * interval)
-        frames.append({"t": (index + 1) * interval, "image_format": "jpeg",
+        sampled_seconds.append(at)
+        frames.append({"t": at, "image_format": "jpeg",
                        "image_base64": base64.b64encode(data).decode("ascii")})
-        if len(frames) >= int(max_frames):
-            break
     if not frames:
         raise LookupError("ffmpeg 未产出有效帧（媒体可能损坏或编码不受支持）")
     return frames, sampled_seconds, interval
@@ -223,7 +235,7 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path,
                 "reason": "本任务按纯文本来源流水线执行（未请求画面采样）"}
     max_frames = max(1, min(12, int(cfg.get("max_frames") or 6)))
     max_bytes = max(4, min(128, int(cfg.get("max_download_mb") or 32))) * 1024 * 1024
-    if not shutil.which("ffmpeg"):
+    if not _decoder_executable(job_dir):
         return {"status": "not_attempted",
                 "reason": "本机无 ffmpeg，画面采样未执行（如实标注）",
                 "capability": VISUAL_CAPABILITY}
@@ -250,7 +262,7 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path,
     return {"status": "completed", "capability": VISUAL_CAPABILITY,
             "frames": frames, "sampled_seconds": sampled_seconds,
             "frame_interval_seconds": interval,
-            "note": f"自开头每 {interval}s 等间隔采样 {len(frames)} 帧（非逐帧观看）"}
+            "note": f"按目标时间点间隔 {interval}s 定点采样 {len(frames)} 帧（非逐帧观看）"}
 
 
 def run(spec: dict, result_path: Path) -> None:
