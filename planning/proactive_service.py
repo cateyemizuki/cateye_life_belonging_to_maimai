@@ -61,12 +61,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from suite_prompts import (
     PROACTIVE_INTENT_MORNING_DEFAULT,
@@ -104,6 +105,25 @@ logger = logging.getLogger(__name__)
 # 的内置默认条目（planning/activity_properties.py 单一真源），``_apply_frequency`` 改经
 # :func:`activity_properties.resolve_property` 取属性倍率——倍率与关键词词表成为用户
 # 改 json 即可调整的映射表；A-21 ③④（频率表缺 free_time/custom）随内置兜底条目收敛。
+
+# ── S2 具体活动/注意力状态优先的活动层倍率（冲浪计划书 §5）────────────
+#: 「专门刷视频」（dedicated）的活动层倍率（§5 建议值；**替换**而非叠乘）
+SURF_DEDICATED_FACTOR = 0.45
+#: 「空隙看看」（gap）的活动层倍率（§5 建议值；**替换**而非叠乘）
+SURF_GAP_FACTOR = 0.70
+#: 刷视频事件标识（与 integrations/video_schedule.WATCH_EVENT_KEY / event_catalog 同口径；
+#: planning 不 import integrations，避免反向依赖，故在此留字面量）
+SURF_WATCH_EVENT_KEY = "watch_bili"
+#: 视频联动条目里 SURF 租约字段（S1b 的 episode 收尾释放即读 ``entry["lease"]``）
+_SURF_ENTRY_LEASE_KEY = "lease"
+#: 视频联动条目里场景标识字段（dedicated / gap；租约自带 ``scenario`` 时作次选）
+_SURF_ENTRY_SCENARIO_KEY = "scenario"
+
+
+def _default_surf_factor(kind: str) -> float:
+    """S2 缺省场景倍率：dedicated（专门刷视频）=0.45，其余/未知按 gap=0.70（保守取小降幅）。"""
+    return SURF_DEDICATED_FACTOR if str(kind or "").strip().lower() == "dedicated" \
+        else SURF_GAP_FACTOR
 
 # ── L2 早晚安漂移（附录 §三；裁决 B1/B3/B5/B6/B7）──────────────────
 #: 漂移区间的严格形态（§3.1）：单数字 N 或 "a-b"；负数（"-5-10"/"-10"）与其他写法一律非法（B3）
@@ -203,8 +223,29 @@ class ProactiveService:
     RESOLVE_CACHE_TTL_SUCCESS = 600.0  # 解析成功缓存 10 分钟
     RESOLVE_CACHE_TTL_FAILURE = 60.0   # 解析失败缓存 60 秒（允许恢复后重试）
 
-    def __init__(self, plugin: Any) -> None:
+    def __init__(self, plugin: Any, *, attention: Any = None,
+                 surf_factor_provider: Optional[Callable[[str], float]] = None) -> None:
+        """构造服务。
+
+        Args:
+            plugin: 装配根插件对象（配置/ctx/日程查询/视频协调器都从这里只读取）。
+            attention: S2（冲浪计划书 §5）注入的注意力权威，**鸭子类型**
+                （只要求 ``lease_valid(lease) -> bool``，与
+                ``companion.attention.SurfLeaseAuthority`` 同构）。
+                ``None`` = 不启用「具体活动/注意力状态优先」解析——行为与 S2 引入前
+                逐字一致（活动层因子仍只取 ``resolve_property``）。装配侧应传
+                ``plugin._attention``。
+            surf_factor_provider: ``callable(kind) -> float``，把 SURF 场景标识
+                （``"dedicated"``/``"gap"``）映射为活动层倍率；缺省
+                :func:`_default_surf_factor`（0.45/0.70）。仅在 attention 命中有效
+                SURF 租约时调用。
+        """
         self._plugin = plugin
+        # S2（冲浪计划书 §5）：注意力权威只看 ``lease_valid``，不 import companion
+        # （D5 import 方向守卫）；``None`` 时频率链完全不碰注意力/视频条目。
+        self._attention = attention
+        self._surf_factor_provider: Callable[[str], float] = (
+            surf_factor_provider or _default_surf_factor)
         #: marks v2（§31.1 连锁桶，R7 = 用户 2026-10-23 第二轮直派）：按流按 kind 记最新
         #: 已发 ``cycle_start``（唯一值替换；旧 v1 数据视为不存在）。延迟加载；热重载后
         #: 新实例重新读盘——"重载后不再重发"（每流每 kind 同周期只发一次）。
@@ -2352,17 +2393,9 @@ class ProactiveService:
         Returns:
             ``(name, goal_type, start_minutes, end_minutes, parameters)``；没找到时为 None。
         """
-        query = getattr(self._plugin, "_schedule_query", None)
-        reader = getattr(query, "runtime_current", None)
-        if not callable(reader):
-            return None  # 日程查询未装配：如实「日程未启用」（不按 GoalManager 时间窗编造）
-        try:
-            model_current = reader(self._tz_manager.get_now())
-        except Exception as exc:
-            logger.debug(f"runtime current 读取失败（如实返回 None）: {exc}")
-            return None
-        if not isinstance(model_current, dict):
-            return None  # runtime 未就绪或空闲：如实返回（不按表编造）
+        model_current = self._runtime_current_item()
+        if model_current is None:
+            return None  # 日程查询未装配 / runtime 未就绪或空闲：如实返回（不按表编造）
         try:
             start = int(model_current.get("start_minute") or 0)
             end = int(model_current.get("end_minute") or 0)
@@ -2376,6 +2409,121 @@ class ProactiveService:
             end,
             dict(params) if isinstance(params, dict) else {},
         )
+
+    def _runtime_current_item(self) -> Optional[Dict[str, Any]]:
+        """当前 runtime episode 的原始 dict 视图（只读；未就绪/空闲/异常 → None）。
+
+        与 :meth:`_find_current_activity` 同源（``ScheduleQuery.runtime_current``），
+        但保留 dict 形态：S2 需要 ``episode_id`` 与 ``metadata.event_key``，而
+        :meth:`_find_current_activity` 的元组契约（既有消费者依赖）不承载这两个键。
+        """
+        query = getattr(self._plugin, "_schedule_query", None)
+        reader = getattr(query, "runtime_current", None)
+        if not callable(reader):
+            return None
+        try:
+            item = reader(self._tz_manager.get_now())
+        except Exception as exc:
+            logger.debug(f"runtime current 读取失败（如实返回 None）: {exc}")
+            return None
+        return item if isinstance(item, dict) else None
+
+    # ---- S2（冲浪计划书 §5）：具体活动/注意力状态优先 ----
+    @staticmethod
+    def _item_event_key(item: Dict[str, Any]) -> str:
+        """runtime 视图里的随机事件标识（metadata.event_key 优先，parameters 次之）。"""
+        for holder in ("metadata", "parameters"):
+            sub = item.get(holder)
+            if isinstance(sub, dict):
+                key = str(sub.get("event_key") or "").strip()
+                if key:
+                    return key
+        return ""
+
+    def _video_entry(self, episode_id: str) -> Dict[str, Any]:
+        """当前 episode 的刷视频联动条目只读快照（无协调器/无条目 → ``{}``）。
+
+        条目的存在本身即 ``event_key=="watch_bili"`` 的事实来源：
+        ``integrations/video_schedule.py:135`` 只对 watch_bili 事件建链；又因
+        ``life_schedule._episode_as_item`` 不回传 metadata（parameters 恒 ``{}``），
+        生产链上本方法同时承担「当前活动是不是刷视频」的判定。
+        """
+        if not episode_id:
+            return {}
+        factory = getattr(self._plugin, "_video_coordinator", None)
+        if not callable(factory):
+            return {}
+        try:
+            entry = factory().episode_state(episode_id)
+        except Exception:
+            return {}  # 协调器未装配/读盘失败：如实当「没有刷视频关联」
+        return dict(entry) if isinstance(entry, dict) else {}
+
+    @staticmethod
+    def _surf_scenario(entry: Dict[str, Any], lease: Dict[str, Any]) -> str:
+        """SURF 场景标识：条目 ``scenario`` 优先，租约自带的 ``scenario`` 次之。
+
+        未知/缺失按 ``"gap"`` 处理（0.70 的降幅小于 dedicated 的 0.45）——宁可少降，
+        不把不认识的状态误判成「专门刷视频」。
+        """
+        for holder in (entry, lease):
+            value = str(holder.get(_SURF_ENTRY_SCENARIO_KEY) or "").strip().lower()
+            if value in ("dedicated", "gap"):
+                return value
+        return "gap"
+
+    def _surf_activity_factor(self) -> Optional[float]:
+        """S2（冲浪计划书 §5）：本次活动层应替换用的 SURF 倍率；``None`` = 不覆盖。
+
+        命中需同时满足：
+        ① 构造期注入了注意力权威（``attention.lease_valid``，鸭子类型）；
+        ② 当前 runtime episode 是 ``watch_bili``（显式 ``event_key``，或视频协调器已为
+           该 episode 建链——建链只发生在 watch_bili，见 ``_video_entry`` 注释）；
+        ③ 条目里的 SURF 租约 ``entry["lease"]`` 属于本 episode（holder =
+           ``schedule:<episode_id>``，与 S1b 释放口径一致）且 ``lease_valid`` 为真。
+
+        恢复语义（计划书 §5「排队未开始、暂停/能力缺失、无候选、结束 → 重新解析当前活动
+        原有倍率」）：租约失效/条目消失即返回 ``None``，:meth:`_apply_frequency` 回落到
+        ``resolve_property`` 的当前活动因子——**不写回 1.0**，因而不覆盖学习/休息等
+        既有因子，也不需要额外的「结束恢复」写回逻辑。
+
+        缓存命中/选片请求/排队阶段不持有有效 SURF 租约 → 不降频（计划书 §5 末段）。
+        """
+        if self._attention is None:
+            return None
+        item = self._runtime_current_item()
+        if item is None:
+            return None
+        episode_id = str(item.get("episode_id") or "").strip()
+        event_key = self._item_event_key(item)
+        if event_key and event_key != SURF_WATCH_EVENT_KEY:
+            return None  # 明确是别的事件：不覆盖
+        entry = self._video_entry(episode_id)
+        if event_key != SURF_WATCH_EVENT_KEY and not entry:
+            return None  # 既无事件标识、也无刷视频建链：不是刷视频活动
+        if entry.get("closed"):
+            return None  # 已收尾关联（防御：理论上不应与当前 episode 同 id）
+        lease = entry.get(_SURF_ENTRY_LEASE_KEY)
+        if not isinstance(lease, dict) or str(lease.get("kind") or "") != "surf":
+            return None  # 未实际持有 SURF 租约（排队未开始/已释放）
+        if episode_id and str(lease.get("holder") or "") != f"schedule:{episode_id}":
+            return None  # 旧 episode 的残留租约：不属于本次活动，不降频
+        validator = getattr(self._attention, "lease_valid", None)
+        if not callable(validator):
+            return None
+        try:
+            if not validator(lease):
+                return None  # 租约失效（让位 CHAT/释放/重载）：走原解析
+        except Exception:
+            return None  # 权威异常：保守不覆盖
+        provider = self._surf_factor_provider
+        try:
+            factor = float(provider(self._surf_scenario(entry, lease)))
+        except Exception:
+            return None
+        if not math.isfinite(factor) or factor < 0.0:
+            return None  # 非法注入值：不覆盖
+        return factor
 
     # 注（2026-10-20 用户指示）：原触发窗口/随机延迟助手已随活动切换主动发起链移除。
 
@@ -2396,12 +2544,24 @@ class ProactiveService:
         目标陪伴私聊**恒为 :data:`TARGET_FREQUENCY_FACTOR`（1.0）并被补进下发集合；
         开关关闭 → 不补目标流、全部流走属性因子（旧行为，**不是**"所有流固定 1"）。
         只调 ``ctx.frequency.set_adjust``，不发送任何消息。
+
+        S2（冲浪计划书 §5，2026-11-01）：活动层因子先问
+        :meth:`_surf_activity_factor`——实际刷视频且持有效 SURF 租约时用场景值
+        （0.45/0.70）**替换**属性因子；未命中就逐字沿用 ``reply_factor``（含 1.0/学习/
+        休息）。替换关系的来源：watch_bili 事件 goal_type = ``entertainment``
+        （``planning/event_catalog.py:113``），属性表 entertainment 的
+        ``reply_factor`` = 1.5（``mappings/schedule_properties.json:73``，内置同值见
+        ``planning/activity_properties.py`` 的 entertainment 条目）——计划书明确
+        0.45/0.70 **不再乘** 这个 1.5。目标私聊仍由下方 §4.5 分支恒 1.0，不受本解析影响。
         """
         property_spec = resolve_property(goal_type, name)
-        base_factor = property_spec.reply_factor
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "frequency"):
-            return  # 宿主未提供 frequency 能力（未声明时兼容）
+            return  # 宿主未提供 frequency 能力（未声明时兼容；S2 解析也不再触发）
+        # S2（计划书 §5）：具体活动/注意力状态优先。仅当 attention 注入且当前活动确为
+        # 实际进行中的 watch_bili + 有效 SURF 租约时覆盖；否则 None → 旧行为逐字一致。
+        surf_factor = self._surf_activity_factor()
+        base_factor = surf_factor if surf_factor is not None else property_spec.reply_factor
 
         # 定稿 §4.5：目标陪伴私聊本来就**不在** ``_resolve_target_streams()`` 的生效集里
         # （陪伴对象私聊恒按黑名单剔除），故开关开时在此**补一次**；非目标流因子逐字

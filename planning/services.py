@@ -106,7 +106,9 @@ class PlanningServices:
         #: 节假日服务（2026-10-10 由 companion 迁入 planning：日期/节假日只随日程块注入）
         self.holiday = HolidayService(data_dir)
         self.inject = InjectService(plugin, holiday_service=self.holiday)
-        self.proactive = ProactiveService(plugin)
+        # S2（冲浪计划书 §5）：注意力租约注入——SURF 有效时活动层倍率按 0.45/0.70
+        # 替换解析；None（未装配）时频率链行为与既有逐字一致
+        self.proactive = ProactiveService(plugin, attention=getattr(plugin, "_attention", None))
         self.cleanup = CleanupService(plugin, generator_factory=lambda: self.generator)
         # ── PR4 事件库服务（2026-10-27 共享接线）：**全插件唯一实例** ──────────────
         # 单实例是有意的：事件库的 token 预算/「每日一次自动尝试」账本是进程内锁 +

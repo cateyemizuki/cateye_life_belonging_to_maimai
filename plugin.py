@@ -71,7 +71,8 @@ from planning.rolling_planner import RollingPlanner
 from planning.schedule_db import ScheduleDB
 from planning.schedule_query import ScheduleQuery
 from planning.services import PlanningServices
-from integrations.video_schedule import VideoWatchCoordinator
+from integrations.video_schedule import SurfQuotaLedger, VideoWatchCoordinator
+from integrations.video_companion import ShareCandidateStore, ShareDelivery
 from qzone.cgi import QzoneCookieManager
 from qzone.components import QzoneComponentsMixin
 from qzone.service import QzoneService
@@ -415,6 +416,13 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             config_provider=lambda: self.config.video_watch,
             llm_generate_detailed=self._llm.generate_detailed)
         self._video_watch.start()
+        # S3（冲浪计划书 §7）：分享候选与投递（计入每日主动 5 次 + 6 小时/日 1 条限，
+        # 经既有陪伴私聊发送路径；候选生成门在模块内=视觉理解成功且有摘要）
+        self._share_store = ShareCandidateStore(data_dir / "video_watch")
+        self._share_delivery = ShareDelivery(
+            self._share_store, deliver=self._deliver_share_candidate,
+            budget_remaining=self._share_budget_remaining)
+        self._share_recorder = self._share_store.record_from_result
 
         # 宿主人设（bot 配置）
         await self._refresh_persona()
@@ -1293,6 +1301,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             report = planner.tick() or {}
         # B 计划（2026-11-01 §5）：刷视频事件联动公共观看接口（单飞 task，失败不拖挂主循环）
         self._kick_video_watch_sync()
+        # S3：分享候选投递（有到期候选且预算/间隔满足才真正发送；单飞）
+        self._kick_share_delivery()
         date = str(report.get("date") or "")
         if not date or date == getattr(self, "_life_cleanup_date", ""):
             return
@@ -1325,7 +1335,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
             coord = VideoWatchCoordinator(
                 self._data_dir, self._call_watch_api, _active, _by_id,
-                logger=self.ctx.logger)
+                logger=self.ctx.logger,
+                attention=getattr(self, "_attention", None),
+                quota=SurfQuotaLedger(self._data_dir),
+                share_recorder=getattr(self, "_share_recorder", None))
             self._video_watch_coordinator = coord
         return coord
 
@@ -1341,6 +1354,57 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             return {"success": False, "error_class": "unavailable",
                     "error": "视频观看模块未装配（[video_watch].enabled=false 或未加载）"}
         return await service.handle_action(action, source="schedule", **kwargs)
+
+    def _kick_share_delivery(self) -> None:
+        """S3 分享投递单飞调度（无候选/不满足条件时静默，不拖挂生活 tick）。"""
+        pending = getattr(self, "_share_delivery_task", None)
+        if pending is not None and not pending.done():
+            return
+        try:
+            self._share_delivery_task = asyncio.get_running_loop().create_task(
+                self._share_delivery.deliver_due())
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning("分享投递调度失败（忽略）：%s", exc)
+            except Exception:
+                pass
+
+    def _share_budget_remaining(self) -> Any:
+        """分享可用的主动预算余量（计入每日 5 次；预算面不可得=保守拒绝）。"""
+        budget = getattr(self, "_proactive_budget", None)
+        if budget is None:
+            return None
+        try:
+            return max(0, int(budget.cap()) - int(budget.used_today()))
+        except Exception:
+            return None
+
+    async def _deliver_share_candidate(self, text: str) -> Dict[str, Any]:
+        """分享投递：预算闸（allow_proactive）→ 既有陪伴私聊发送 → proactive.used 入账。
+
+        不新增预算写者、不扩大发送上限；发送成功即入账，失败/异常如实返回。"""
+        stream_id = str(getattr(self, "_stream_id", "") or "")
+        bus = getattr(self, "_bus", None)
+        if not stream_id or bus is None or not bus.allow_proactive(
+                channel="video_share", intent="share", stream_id=stream_id):
+            return {"success": False, "error_class": "budget",
+                    "error": "主动预算不可用或目标私聊未解析"}
+        sender = getattr(getattr(getattr(self, "_companion", None), "message", None),
+                         "send_to_target", None)
+        if not callable(sender):
+            return {"success": False, "error_class": "unavailable", "error": "陪伴发送面未装配"}
+        try:
+            sent = await sender(text, stream_id, True)
+        except Exception as exc:
+            return {"success": False, "error_class": "unknown", "error": str(exc)[:200]}
+        if sent:
+            try:
+                await bus.publish("proactive.used", channel="video_share",
+                                  intent="share", stream_id=stream_id)
+            except Exception:
+                pass
+            return {"success": True}
+        return {"success": False, "error_class": "send_failed", "error": "发送失败"}
 
     def _kick_video_watch_sync(self) -> None:
         """单飞调度：上一拍联动未结束时不再叠加（有界；异常只告警）。"""
