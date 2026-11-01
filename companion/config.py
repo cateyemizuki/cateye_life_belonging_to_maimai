@@ -277,10 +277,7 @@ class PatrolSectionConfig(PluginConfigBase):
     # companion.patrol.resolve_silence_window；旧配置里的显式值由迁移器丢弃并登记。
     nap_quiet_enabled: bool = Field(
         default=False,
-        description="午休静默（2026-10-11 裁决⑦，默认关；2026-10-20 用户指示后**跨模块生效**）："
-                    "开启后，陪伴对象的日程正处于午休/小睡条目（名称含 午休/午睡/小憩/打盹，"
-                    "或目标类型为休息）时——陪伴巡检本轮不主动开口（想念/日程分享/日常搭话都跳过），"
-                    "且空间侧本轮不发说说、不监听评论（判定链与巡检同源判定）",
+        description="午休或小睡期间暂停陪伴主动聊天、空间发帖和评论轮询。",
         json_schema_extra={
             "label": "午休静默",
             "hint": "默认关（午休照常）；开启 = 午休条目进行中陪伴巡检与空间发帖/评论监听都跳过",
@@ -351,7 +348,7 @@ class PatrolSectionConfig(PluginConfigBase):
     # 多屏截图适配（2026-10-30 插入轮；对端 cateye_connect_all-in-one v1.1.0 逐屏抓取）
     screen_scope: Literal["main", "all"] = Field(
         default="main",
-        description="屏幕范围：main = 只看主屏（默认，与旧版一致）；all = 对方有多块屏幕时逐屏抓取并一起交给视觉模型分屏描述（对端 v1.1.0+，单屏客户端两种取值等价）",
+        description="屏幕范围：main只看主屏，all查看全部屏幕；多屏需要对端支持。",
         json_schema_extra={
             "label": "屏幕范围",
             "hint": "TA 常在副屏上干活时改 all；对端或客户端过旧时 all 自动退化为只看主屏",

@@ -36,6 +36,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core.llm_utils import purpose_task
+from suite_prompts import AFFECTION_CONVERSATION_REVIEW_DEFAULT, AFFECTION_DAILY_REVIEW_DEFAULT
 from suite_prompts import prompt as prompt_of, render
 
 from .affection_events import record_rule_event
@@ -68,62 +69,9 @@ EVENT_LOG_CHAR_LIMIT = 1200
 # Prompt（隔离要点：只给档位描述与低分辨率情绪描述，不给任何绝对分值）
 # ---------------------------------------------------------------------------
 
-CONVERSATION_REVIEW_PROMPT = """你是 AI 角色「{lover_name}」与{target_label}之间关系的会话观察裁判。
-你不参与对话，只看下面给出的材料，给这段相处评估一个**有界的好感度增量**。
-你看不到任何好感度数值，也看不到分数与基线，只看到关系所处的阶段描述——不要猜测具体数值。
+CONVERSATION_REVIEW_PROMPT = AFFECTION_CONVERSATION_REVIEW_DEFAULT
 
-【角色人设（判断真心程度的依据）】
-{persona}
-
-【双方关系所处的阶段】
-{tier_label}：{tier_desc}
-
-【角色近期的情绪底色（低分辨率描述，仅供理解语气）】
-{mood_text}
-
-【最近对方发来的消息（按时间从旧到新，只有对方一侧）】
-{recent_messages}
-
-【判定标准】
-1. event：用不超过 30 字概括这段相处里最值得记住的一件事；没有就写「日常闲聊」；
-2. delta：好感度增量，范围 [-4, +5]——
-   - 阿谀奉承、无意义刷屏、单方面索取：不给正分（0 或负）；
-   - 真诚的关心、共同完成一件事、化解了一次矛盾：才给正分；
-   - 明显的争吵、冒犯、被冷落：给负分；
-   - 平淡的日常闲聊：接近 0；
-3. tag 只能是 normal / conflict / apology / sweet 之一；
-4. 只输出 JSON：{{"event": "...", "delta": 0.0, "tag": "normal"}}"""
-
-DAILY_REVIEW_PROMPT = """你是 AI 角色「{lover_name}」与{target_label}之间关系的日结裁判。
-你看不到任何好感度数值，也看不到分数与基线，只看到关系所处的阶段描述——不要猜测具体数值。
-任务：根据 {date} 这一天的相处记录，给这一天对关系的影响做一个有界的总结。
-
-【角色人设】
-{persona}
-
-【双方关系所处的阶段】
-{tier_label}：{tier_desc}
-
-【今日互动统计】
-{stats}
-
-【今日事件日志（时间、类型、摘要、当日入账增量）】
-{event_log}
-
-【最近积累的相处印象（旧→新）】
-{impressions}
-
-【判定标准】
-1. delta_score：这一天对关系的影响，范围 [-4, +4]——
-   - 真诚的关心、共同完成一件事、化解矛盾：正分；
-   - 阿谀奉承、无意义刷屏：不给正分；
-   - 争吵、冒犯、被冷落、整天没有互动：负分；
-   - 平淡无事：接近 0；
-2. impressions：0~3 条，每条一句话（不超过 40 字）记下今天值得记住的事；
-   只写事实与感受，不写分数、不写评价性标签、不编造没有发生的事；
-3. tone：一句话概括今天的关系温度（不超过 30 字）；
-4. reason：必须直接引用上面事件日志或对方原话的片段作为依据，禁止脑补不存在的事；
-5. 只输出 JSON：{{"delta_score": 0.0, "impressions": ["..."], "tone": "...", "reason": "..."}}"""
+DAILY_REVIEW_PROMPT = AFFECTION_DAILY_REVIEW_DEFAULT
 
 
 # ---------------------------------------------------------------------------

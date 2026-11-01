@@ -309,22 +309,8 @@ class WatchTaskManager:
                 pass
 
     def next_candidate(self) -> Dict[str, Any]:
-        """从配置 watchlist 里挑一个还没真实看过的候选（日程选片用）。"""
-        watchlist = self._watchlist_provider() if hasattr(self, "_watchlist_provider") else []
-        watched = set(self._store.watched_bvids())
-        from .bv import normalize_video_ref
-        seen: set = set()
-        for raw in watchlist:
-            bvid = normalize_video_ref(str(raw or ""))
-            if not bvid or bvid in seen:
-                continue
-            seen.add(bvid)
-            if bvid in watched:
-                continue
-            return {"success": True, "candidate": {"bvid": bvid, "raw": str(raw)},
-                    "reason": "watchlist"}
-        reason = "watchlist_empty" if not watchlist else "all_watched"
-        return {"success": True, "candidate": None, "reason": reason}
+        """当前未接入自动候选来源，日程正常跳过；用户仍可直接点播。"""
+        return {"success": True, "candidate": None, "reason": "no_candidate_source"}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -352,10 +338,6 @@ class WatchTaskManager:
         except Exception as exc:  # pragma: no cover - 装配防御
             if self._log:
                 self._log.warning(f"观看任务恢复检查失败（忽略）: {exc}")
-
-    def attach_watchlist(self, provider: Callable[[], List[str]]) -> None:
-        """注入 watchlist 读取回调（插件装配时来自配置热读）。"""
-        self._watchlist_provider = provider  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------
     # 泵：串行消费队列

@@ -27,8 +27,8 @@ class PlanningComponentsMixin:
 
     PR8 3.0.0 清退（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：
     旧别名 Tool ``lbm_update_schedule_v4`` 与 M9 赖床 Tool ``lbm_nap_lie_in``
-    已删除；保留 ``schedule_inject_v4`` / ``schedule_inject_replyer_v4`` /
-    ``lbm_planning_v4`` 稳定注册名（裁定 4：名字带 v4 不等于旧路线）。
+    已删除；保留 ``schedule_inject`` / ``schedule_inject_replyer`` /
+    ``lbm_planning`` 注册名；用户命令入口保持 /lbm_plan。
     """
 
     # 供 SDK / 调试用的组件清单说明（不影响注册）
@@ -38,11 +38,11 @@ class PlanningComponentsMixin:
         "lbm_update_schedule": "Tool（规范名）：自然语言日程变更（唯一日程写入口；"
                                "角色裁判 today/future/reject；写 spine 意图/"
                                "pending_commitment，硬约定代码强制 hardness=hard）",
-        "lbm_planning_v4": "Command：/lbm_plan 或 /lbm_规划（list/regenerate/delete/clear/help）",
+        "lbm_planning": "Command：/lbm_plan 或 /lbm_规划（list/regenerate/delete/clear/help）",
         "lbm_init": "Command：/lbm_init [emotion|events|status]（全量幂等/定向强制/只读；先插件开关再管理员）",
         "get_current_activity": "API：当前活动快照（跨插件可调；日程未启用时 has_activity=False）",
-        "schedule_inject_v4": "HookHandler：maisaka.planner.before_request 日程注入",
-        "schedule_inject_replyer_v4": "HookHandler：maisaka.replyer.before_request 活动提醒注入",
+        "schedule_inject": "HookHandler：maisaka.planner.before_request 日程注入",
+        "schedule_inject_replyer": "HookHandler：maisaka.replyer.before_request 活动提醒注入",
     }
 
     # ============================================================
@@ -88,7 +88,7 @@ class PlanningComponentsMixin:
     # ============================================================
 
     @Command(
-        "lbm_planning_v4",
+        "lbm_planning",
         description="日程规划系统管理命令（支持 /lbm_plan 与 /lbm_规划）",
         # 用负向前瞻代替 ^ 锚点——回复引用场景下命令不在文本开头；
         # (?<!\S) 同时避免命中行中片段（照抄源插件 pattern）
@@ -283,7 +283,7 @@ class PlanningComponentsMixin:
 
     @HookHandler(
         "maisaka.planner.before_request",
-        name="schedule_inject_v4",
+        name="schedule_inject",
         description="在 Maisaka 向 LLM 发起规划请求前注入当前日程信息",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
@@ -317,7 +317,7 @@ class PlanningComponentsMixin:
 
     @HookHandler(
         "maisaka.replyer.before_request",
-        name="schedule_inject_replyer_v4",
+        name="schedule_inject_replyer",
         description="在 Maisaka replyer 调 LLM 前把当前活动注入到 extra_prompt（突出活人感，不要主动提及）",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,

@@ -433,10 +433,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     # ── 角色裁判 ─────────────────────────────────────────────
     role_judge_enabled: bool = Field(
         default=True,
-        description="角色裁判模式：你（用户）通过 lbm_update_schedule（PR8 3.0.0 唯一规范名；"
-                    "旧 lbm_update_schedule_v4 别名已退役）用自然语言要求改日程时，让 bot 以角色身份先做判断——"
-                    "接受并改今天（today）/ 接受为未来预约（future）/ 拒绝不改（reject）。"
-                    "判定失败时安全回退为「日程不变」",
+        description="修改日程前按人设判断是否接受请求；可修改今天、记录未来预约或拒绝，判定失败时保持日程不变。",
         json_schema_extra={
             "label": "角色裁判模式",
             "hint": "开 = 请求先经角色人格判断（可能被拒绝，更像真人）；"
@@ -639,8 +636,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     # ── 兼容字段（隐藏，不占界面）────────────────────────────
     auto_generate_time: str = Field(
         default="00:30",
-        description="【已废弃】旧的「每日自动生成日程的绝对时刻」（HH:MM）。仅当日程生成延迟保持默认且"
-                    "本值被改过时才生效；新配置请用「生成延迟（最后日程结束后）」",
+        description="兼容的每日生成时间（HH:MM）；仅在生成延迟未自定义时生效。",
         json_schema_extra={
             "label": "生成时刻（已废弃）",
             "placeholder": "00:30",
@@ -703,8 +699,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     # 旧行为（目标流不再补入频率集合，全部按属性因子），不是"把所有流固定 1"。
     target_frequency_always_one: bool = Field(
         default=True,
-        description="目标陪伴私聊的聊天频率恒为 1.0（不受当前活动类型影响）：只对已解析成功的目标"
-                    "私聊生效，其他会话仍按活动属性调节；关 = 逐字恢复旧行为（全部按活动属性）",
+        description="陪伴目标私聊的回复倍率固定为1.0；关闭后与其他会话一样按活动调整。",
         json_schema_extra={
             "label": "目标私聊频率恒 1",
             "hint": "默认开：陪伴对象私聊不被学习/工作活动压低频率；关 = 全部按旧的活动属性因子",
@@ -769,7 +764,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     # ── 早晚安 ──────────────────────────────────────────────
     greeting_morning_enabled: bool = Field(
         default=True,
-        description="启用早安：起床锚点（2026-10-21 起真实作息锚点优先，日程缺失回退 [schedule] 起床时间）+ 早安漂移后，向候选会话道早安",
+        description="在起床时间加随机漂移后，向符合条件的会话发送早安；日程缺失时使用配置作息。",
         json_schema_extra={
             "label": "启用早安",
             "hint": "关 = 完全不发早安（含目标私聊与群聊）",
@@ -791,8 +786,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     greeting_night_enabled: bool = Field(
         default=True,
-        description="启用晚安：睡前界（= 真实入睡锚点，2026-10-21 起优先日程实际睡眠环，日程缺失回退"
-                    "[schedule] sleep_time；静默窗复用作息，silence_start 键已删除）向前随机漂移后，向候选会话道晚安",
+        description="在入睡时间前的随机漂移窗口，向符合条件的会话发送晚安；日程缺失时使用配置作息。",
         json_schema_extra={
             "label": "启用晚安",
             "hint": "关 = 完全不发晚安（含目标私聊与群聊）",
@@ -812,10 +806,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
     night_drift: str = Field(
         default="10-30",
-        description="晚安漂移区间（分钟，相对睡前界向前）：填 \"a-b\" 或单数字 N（= 0~N 随机）；"
-                    "睡前界 = 真实入睡锚点（2026-10-21 起优先日程实际睡眠环，日程缺失回退 [schedule] sleep_time；"
-                    "静默窗复用作息，silence_start 键已删除），"
-                    "触发时刻 = 睡前界 − 随机漂移（睡前的随机点）。非法值回退 10-30",
+        description="晚安提前时间（分钟）：a-b表示随机区间，N表示0至N；非法值使用10-30。",
         json_schema_extra={
             "label": "晚安漂移(分钟)",
             "hint": '例 "10-30" 或 "20"；在睡前界前 10~30 分钟内随机开口'

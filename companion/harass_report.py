@@ -29,17 +29,21 @@ def normalize_qq(value: Any) -> str:
     return s if s.isdigit() else ""
 
 
-def resolve_maintainer_qq(target_qq: Any, admin_users: Any) -> str:
-    """维护者 QQ 解析优先级（纯函数）。
+def resolve_maintainer_qq(target_qq: Any, admin_users: Any = None,
+                          companion_target_qq: Any = None) -> str:
+    """显式告状对象 → 陪伴目标 → 宿主全局管理员；排除占位与非法账号。
 
-    1. ``[admin].harass_report_target_qq`` 非空（非占位号）→ 用它；
-    2. 否则取 ``admin_users`` 里**第一个**纯 QQ 元素（``qq:123456`` 形式也算纯 QQ）；
-    3. 两者皆空 / 全非法 / 只有占位号 → 空串（调用方返回「未配置维护者」提示）。
+    第二参数仅接收宿主管理员，保留位置参数以兼容旧纯函数调用。
     """
-    direct = normalize_qq(target_qq)
-    if direct and direct != PLACEHOLDER_QQ:
-        return direct
-    for entry in list(admin_users or []):
+    for value in (target_qq, companion_target_qq):
+        qq = normalize_qq(value)
+        if qq and qq != PLACEHOLDER_QQ:
+            return qq
+    if isinstance(admin_users, (str, int)):
+        admin_users = [admin_users]
+    if not isinstance(admin_users, (list, tuple)):
+        return ""
+    for entry in admin_users:
         qq = normalize_qq(entry)
         if qq and qq != PLACEHOLDER_QQ:
             return qq

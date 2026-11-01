@@ -14,6 +14,7 @@ import json
 import re
 from typing import Any, Dict, Optional, Tuple
 
+from suite_prompts import EMOTION_SLEEP_REFEREE_DEFAULT, EMOTION_INIT_SYSTEM_DEFAULT, EMOTION_EVALUATE_DEFAULT
 from suite_prompts import prompt as prompt_of, render
 
 from .state_machine import EmotionParams
@@ -21,87 +22,15 @@ from .state_machine import EmotionParams
 # 改调运行期 getter，两处 prompt 随「默认 ⊕ 覆盖」的合并原型表实时取值。
 from .vad import VADState, _clip, emotion_table_summary
 
-SLEEP_REFEREE_PROMPT = """你是一个客观的情绪裁判系统，负责对 AI 角色的睡眠期情绪进行大修。
-你不参与对话，只依据下面的客观数据输出 JSON。
-
-【Bot 人设】
-{persona}
-
-【当前 VAD 绝对数值】
-V: {v:+.2f}, A: {a:+.2f}, D: {d:+.2f}
-
-【当天情绪日志（原始事件流）】
-{emotion_log}
-
-【日程信息】
-前一天日程：
-{yesterday_schedule}
-第二天日程：
-{tomorrow_schedule}
-长期状态：{long_term_status}
-预计睡眠时长：{sleep_hours:.1f} 小时
-
-【情绪原型参考表】（V 效价 / A 唤醒 / D 支配）
-{emotion_table}
-
-【前一日日程情感残差 R_yesterday】（已按释怀/反刍加权求和，代码层数值项；正=释怀、负=反刍残留）
-V: {r_v:+.2f}, A: {r_a:+.2f}, D: {r_d:+.2f}
-
-【次日日程情感预期 E_tomorrow】（明日条目情感基调求和；考试/挑战 → V↓A↑D↓）
-V: {e_v:+.2f}, A: {e_a:+.2f}, D: {e_d:+.2f}
-
-【当日约定兑现情况】净兑现 {commitment_net:+.0f} 次（正=兑现多于违约，负=违约多于兑现）
-
-【评分规则】
-1. 越靠近睡前的情绪事件，权重略微增加（近因效应）；强度大的事件影响更大。
-2. 睡眠时长影响恢复效果：<5 小时恢复极差（V 负向、A 升高）；6-9 小时恢复最佳（V 回升）；>10 小时睡懵（A 大幅降低）。
-3. 日程预期：评估前一日日程是"释怀"还是"反刍"，第二日日程是"期待"还是"焦虑"（第二天有考试/挑战 → A 升高、D 降低）。
-4. 必须结合人设性格做情绪过滤（如高神经质 → 焦虑更容易留存）。
-5. R_yesterday / E_tomorrow / 约定情况是代码层已计算的参考数值，最终增量仍需你综合人设与日志判断。
-6. 给出最终的 ΔVAD（增量，非绝对值），每一维范围必须在 [-{limit:.2f}, {limit:.2f}] 之间。
-7. reason 中必须直接引用上面日程/情绪日志的原文片段作为依据，禁止脑补不存在的事件。
-
-只输出 JSON：{{"delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}, "reason_valence": "...", "reason_arousal": "...", "reason_dominance": "..."}}"""
+SLEEP_REFEREE_PROMPT = EMOTION_SLEEP_REFEREE_DEFAULT
 
 #: 睡眠裁判 ΔVAD 的兼容默认限幅（旧调用不传 delta_limit 时保持 ±0.8；
 #: M5 服务侧一律传动态限幅 0.4+0.4×[schedule_advanced].emotion_influence）
 DEFAULT_SLEEP_DELTA_LIMIT = 0.8
 
-INIT_SYSTEM_PROMPT = """你是一位情绪心理学专家，负责为 AI 角色建立 VAD（效价、唤醒度、支配感）三维情绪模型。
-V 代表愉悦度，范围 -1.0 到 1.0，正值愉悦、负值痛苦；A 代表唤醒度，-1.0 到 1.0，正值兴奋紧张、负值平静困倦；D 代表支配感，-1.0 到 1.0，正值掌控自信、负值无力顺从。
-你需要根据角色的 AI 人设，推导出该角色的情绪锚点、静态偏移值以及情绪增益与衰减系数。
+INIT_SYSTEM_PROMPT = EMOTION_INIT_SYSTEM_DEFAULT
 
-【情绪原型参考表】（供锚点定位参考）
-{emotion_table}
-
-【数值约束（超范围视为无效）】
-- 锚点 anchor：每一维 [-0.6, 0.6]（避免长期处于极端情绪）
-- 静态偏移 offset：每一维 [-0.3, 0.3]
-- 正向增益 positive_gain：[0.8, 1.3]（V>0 时乘，开心更开心/更收敛）
-- 负向衰减 negative_decay：[0.6, 1.2]（V<0 时乘，难过更持久/更快消退）
-- 正向静态偏移一般不超过 +0.3，保持负面情绪的比例才真实。
-
-必须输出严格 JSON（每个参数都要给出引用人设原文的推导理由）：
-{{"anchor": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}},
-  "offset": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}},
-  "positive_gain": 1.0, "negative_decay": 1.0,
-  "reasons": {{"anchor": "...", "offset": "...", "multiplier": "..."}}}}"""
-
-EVALUATE_PROMPT = """你是 AI 角色「{lover_name}」的情绪增量评估器。你看不到角色当前的绝对情绪数值，只根据下面这段交流内容，评估"这轮交流/这件事"给角色情绪带来的变化量 ΔVAD。
-
-【角色人设（情绪过滤依据）】
-{persona}
-
-【用户侧最后一条消息（对话上下文；可能为空）】
-{user_context}
-
-【AI 的回复内容 / 待评估的交流内容】
-{reply_text}
-
-【要求】
-1. event 用不超过 30 字概括「这轮交流发生了什么」（谁说了什么、发生了什么、结果如何），不要笼统写"日常对话"；
-2. ΔV/ΔA/ΔD 每一维范围 [-0.5, 0.5]；没有明显情绪波动时全部接近 0；
-3. 只输出 JSON：{{"event": "...", "delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}}}"""
+EVALUATE_PROMPT = EMOTION_EVALUATE_DEFAULT
 
 
 #: 评估 prompt 里「待评估正文」的默认字符预算（per_reply 旧口径；片段制由调用方放宽）

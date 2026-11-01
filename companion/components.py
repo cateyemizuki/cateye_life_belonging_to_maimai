@@ -481,7 +481,7 @@ class CompanionComponentsMixin:
         ``modified_kwargs`` 做整份替换，被 ``**kwargs`` 之外具名参数接住的键不会
         再出现在回传里。故本 Hook 不声明 ``session_id`` 具名参数，改为从 kwargs
         读取，并在**每条带 modified_kwargs 的返回分支**原样写回——否则链上后续
-        处理器（schedule_inject_v4）只会拿到空 session_id，好感度块恒 skip、
+        处理器（schedule_inject）只会拿到空 session_id，好感度块恒 skip、
         日程注入按 ``user=unknown`` 单桶冷却。
         """
         session_id = str(kwargs.get("session_id") or "")
@@ -929,13 +929,23 @@ class CompanionComponentsMixin:
         except Exception:
             pass
 
-    def _harass_maintainer_qq(self) -> str:
-        """维护者 QQ 解析（优先级纯逻辑在 harass_report.resolve_maintainer_qq）。"""
-        admin = getattr(getattr(self, "config", None), "admin", None)
-        return resolve_maintainer_qq(
-            getattr(admin, "harass_report_target_qq", ""),
-            list(getattr(admin, "admin_users", []) or []),
-        )
+    async def _harass_maintainer_qq(self) -> str:
+        """按优先级解析目标；只有前两级未配置时才只读请求宿主。"""
+        cfg = getattr(self, "config", None)
+        direct = getattr(getattr(cfg, "admin", None), "harass_report_target_qq", "")
+        companion = getattr(getattr(cfg, "patrol", None), "target_qq", "")
+        target = resolve_maintainer_qq(direct, companion_target_qq=companion)
+        if target:
+            return target
+        # 可选宿主全局管理员接口；当前宿主未提供该字段时返回空列表。
+        # 不以插件 admin.admin_users 冒充宿主全局管理员。
+        try:
+            admins = await self.ctx.config.get("permissions.admin_users", [])
+            if isinstance(admins, dict):
+                admins = admins.get("value") if admins.get("success") is True else []
+        except Exception:
+            return ""
+        return resolve_maintainer_qq(direct, admins, companion)
 
     async def _harass_resolve_stream(self, qq: str) -> str:
         """维护者私聊 stream 解析（形态照 plugin._resolve_target_stream :392-414）：
@@ -984,11 +994,11 @@ class CompanionComponentsMixin:
             return "告状失败：请先用一句话说明发生了什么。"
         location = str(kwargs.get("stream_id") or "").strip()
 
-        maintainer_qq = self._harass_maintainer_qq()
+        maintainer_qq = await self._harass_maintainer_qq()
         if not maintainer_qq:
             self._harass_log(action="info", reason="no_maintainer", detail="未配置维护者",
                              maintainer_qq="", location=location)
-            return "告状失败：未配置维护者（[admin] harass_report_target_qq 与 admin_users 皆空），无法转达。"
+            return "告状失败：未配置告状对象、陪伴目标或可用的宿主全局管理员，无法转达。"
 
         state = self._harass_state()
         cooldown_minutes = max(0, int(getattr(admin, "harass_report_cooldown_minutes", 30) or 0))

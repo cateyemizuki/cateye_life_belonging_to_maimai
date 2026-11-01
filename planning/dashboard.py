@@ -498,8 +498,10 @@ def _maimai_view(cfg: Any) -> dict[str, Any]:
     """
     section = getattr(cfg, 'maimai_interaction', None)
     view: dict[str, Any] = {'enabled': bool(getattr(section, 'enabled', True))}
+    display = getattr(cfg, 'dashboard_display', None)
     for name, (kind, default, low, high) in _MAIMAI_PROJECTION.items():
-        raw = getattr(section, name, default)
+        source = display if name.startswith('history_') else section
+        raw = getattr(source, name, default)
         if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
                 or not math.isfinite(float(raw)):
             raw = default

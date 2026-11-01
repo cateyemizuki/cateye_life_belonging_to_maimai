@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from typing import List, Literal
+from typing import Literal
 from pydantic import model_validator
 
 from maibot_sdk import Field, PluginConfigBase
@@ -37,6 +37,7 @@ class VideoWatchSectionConfig(PluginConfigBase):
             value = dict(value)
             value.pop("max_video_duration_seconds", None)
             value.pop("visual_max_frames", None)
+            value.pop("watchlist", None)
         return value
 
     source_mode: Literal["stream", "download"] = Field(
@@ -76,11 +77,6 @@ class VideoWatchSectionConfig(PluginConfigBase):
         default="",
         description="观后感使用的宿主任务名（留空 = utils 默认任务）",
         json_schema_extra={"label": "观后感任务名", **_ui_i18n("Impression task name")},
-    )
-    watchlist: List[str] = Field(
-        default_factory=list,
-        description="待看列表：BV 号或 bilibili 视频页链接（每行一个）；日程刷视频事件从这里选片",
-        json_schema_extra={"label": "待看列表", **_ui_i18n("Watchlist (BV or URL per line)")},
     )
     visual_enabled: bool = Field(
         default=True,

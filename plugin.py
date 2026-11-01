@@ -266,7 +266,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 2026-10-27 用户裁定：规范 max_generated_events 显式值（含 8）优先于旧
         # max_events；必须在本方法即将调用的 SDK「merge 出厂默认 → 校验」之前，对
         # **原始输入**先搬迁旧键，否则默认 8 一旦 merge 进来就无法再靠值判断显式性。
-        incoming = config_data
+        from core.config_migration import migrate_display_config
+        incoming = migrate_display_config(config_data)
         try:
             from planning.event_catalog_config import migrate_legacy_event_catalog
 
@@ -309,6 +310,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
         incoming = _pop_retired_keys(incoming)
         rescued, rescued_changed = _rescue_config_from_disk(incoming)
+        rescued = migrate_display_config(rescued)
         try:
             migrated_rescued = _migrate_ec(rescued)
             if migrated_rescued is not rescued:

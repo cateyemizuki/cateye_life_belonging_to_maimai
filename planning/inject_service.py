@@ -836,18 +836,8 @@ class InjectService:
         return "\n".join(lines)
 
     def _no_activity_text(self) -> str:
-        """无当前活动兜底文案（``[prompts].inject_no_activity``；2026-10-10 N1-2）。
-
-        - 键已落地且非空 → 用配置值（``render`` 占位符写坏时回退出厂默认）；
-        - 键已落地但显式为空串 → 返回空串，调用方回退旧行为（空活动不注入）；
-        - 键未落地（suite_prompts 尚未加字段，取不到属性）→ 用本文件默认文案，
-          保证「无活动也给一句兜底」在任何配置版本下都成立。
-        """
-        section = getattr(getattr(self._plugin, "config", None), "prompts", None)
-        raw = getattr(section, "inject_no_activity", None) if section is not None else None
-        if isinstance(raw, str):
-            return render(raw, fallback=_INJECT_NO_ACTIVITY_DEFAULT).strip()
-        return _INJECT_NO_ACTIVITY_DEFAULT
+        """无当前活动的固定上下文，不接受配置覆盖。"""
+        return prompt(self._plugin, "inject_no_activity")
 
     def _build_replyer_extra_prompt(
         self,

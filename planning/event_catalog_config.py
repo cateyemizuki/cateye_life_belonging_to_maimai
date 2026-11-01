@@ -59,10 +59,10 @@ class EventCatalogSectionConfig(PluginConfigBase):
 
     mode: Literal["off", "manual", "auto"] = Field(
         default=DEFAULT_MODE,
-        description="事件库模式：off=只用内置池；manual=仅手动 /lbm_init events；auto=到期后台生成（默认 off）",
+        description="事件库模式：off仅使用内置事件，manual手动生成，auto到期自动生成。",
         json_schema_extra={
             "label": "事件库模式",
-            "hint": "建议灰度顺序：off → manual → auto",
+            "hint": "自动模式按生成周期更新事件，手动模式使用初始化事件库命令。",
             **_i18n("Event catalog mode", "off = builtin pool only; manual = command only; auto = due background update."),
         },
     )
@@ -84,14 +84,14 @@ class EventCatalogSectionConfig(PluginConfigBase):
         default=DEFAULT_MAX_GENERATED_EVENTS,
         ge=DEFAULT_MIN_GENERATED_EVENTS,
         le=DEFAULT_MAX_GENERATED_EVENTS,
-        description="单次生成条数上限（规范字段；3~8，默认 8）",
+        description="每次生成的小事件条数上限（3至8）。",
         json_schema_extra={"label": "生成条数上限", **_i18n("Generated events per refresh")},
     )
     max_pool_events: int = Field(
         default=DEFAULT_MAX_POOL_EVENTS,
         ge=3,
         le=64,
-        description="合并后总池上限（规范字段；内置池 + 生成项，默认 12）",
+        description="内置与生成事件合并后的总条数上限。",
         json_schema_extra={"label": "总池上限", **_i18n("Merged pool size cap")},
     )
     max_events: int = Field(
@@ -100,8 +100,7 @@ class EventCatalogSectionConfig(PluginConfigBase):
         le=DEFAULT_MAX_GENERATED_EVENTS,
         # 兼容读法只在「原始配置归一化默认填充之前」有意义（见 migrate_legacy_event_catalog）；
         # 已迁移的配置由规范字段承载，故对 WebUI 隐藏、避免出现「可编辑却被迁移忽略」的死键。
-        description="兼容旧键（隐藏，勿新配）：归一化时在默认填充前映射到 max_generated_events；"
-                    "规范字段显式值优先（2026-10-27 用户裁定）",
+        description="生成条数上限的兼容字段；使用生成条数上限配置。",
         json_schema_extra={"label": "生成条数上限（兼容键）", "hidden": True,
                            **_i18n("Legacy generated events cap (compat, hidden)")},
     )

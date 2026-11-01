@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.diag import DecisionLogger
 from core.llm_utils import LLMService, purpose_task
+from suite_prompts import QZONE_POST_DEFAULT, QZONE_REPLY_DEFAULT
 from suite_prompts import (
     QZONE_COMMENT_REMINDER_DEFAULT,
     QZONE_POST_GATE_DEFAULT,
@@ -144,18 +145,9 @@ _PASSTHROUGH_APIS = (
     "adapter.napcat.action.call",
 )
 
-QZONE_POST_PROMPT = (
-    "你是「{lover_name}」，人设：{personality}\n"
-    "现在是 {date} {time}，你正在：{activity}。请以第一人称发一条 QQ 空间说说，"
-    "记录此刻的生活。要求：口语化、像真人发的、20~60 字、不要话题标签、不要引号、只输出说说正文。"
-)
+QZONE_POST_PROMPT = QZONE_POST_DEFAULT
 
-QZONE_REPLY_PROMPT = (
-    "你是「{lover_name}」，人设：{personality}\n"
-    "你在 QQ 空间发了这条说说：\n「{moment}」\n"
-    "好友「{nickname}」（{time}）评论了：「{comment}」\n{impression}"
-    "请写一条自然的回复（10~40 字，口语化，只输出回复正文）。"
-)
+QZONE_REPLY_PROMPT = QZONE_REPLY_DEFAULT
 
 # 已处理记录的容量上限（LRU，参考 Maizone processed_list 设计）
 _MAX_PROCESSED_FEEDS = 200

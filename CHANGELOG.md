@@ -1,5 +1,15 @@
 # 更新日志（CHANGELOG）
 
+## 配置与提示词整理（2026-11-01）
+
+- 日程命令与注入组件注册名移除历史版本后缀，用户命令入口保持不变。
+- 历史变化显示阈值与条数移至「数据展示」，旧位置值兼容迁移；「麦麦互动」仅保留交互参数。
+- 告状目标按显式对象、陪伴对象、宿主全局管理员解析；不存在有效对象时不发送。
+- 移除视频配置待看列表；直接点播与后台完成通知保持可用，自动日程无候选时跳过。
+- 常用提示词保留13项，43项内部协议改为代码维护；统一重复回退模板，好感度裁判文案对齐现行数值边界。
+- 配置说明删除历史变更叙述，保留功能、条件与单位。WebUI文件不在本批修改或部署范围。
+
+
 ## 2026-11-01 链接、stream与后台通知纠偏
 
 - 支持QQ分享文字/小程序短链，新增resolve，受控跳转且不允许猜BV。
@@ -119,7 +129,7 @@
 - **旧开关退役（一次性 pop，只丢弃不搬运）**：`[schedule] spine_mode`、`[life_state] enabled`、`[life_state] sleep_engine_enabled`、`[life_state] profile_path`（死键）、`[schedule] planning_daily_token_budget`、`[planning_proactive] nap_reminder_enabled` / `nap_reminder_max_per_day`。
 - **显式 `[schedule] enabled=false` 不被旧 true 覆盖**：3.0.0 只保证「显式 `false` 保持关闭、旧开关 `true` 不会自动反推开启」；一次性告警日志只在部分校验路径出现，并非所有 raw/normalize 路径的保证。
 - **删除的旧生成链**：旧 daily 生成、校验（validator）、质量评分（quality）、响应解析（response-parser）；spine 生成 + 模板兜底是唯一路线。
-- **删除的旧入口**：工具别名 `lbm_update_schedule_v4`、赖床工具 `lbm_nap_lie_in`、独立命令 `/lbm_emotion_init`（统一并入 `/lbm_init emotion`）、`lbm_get_schedule_info` 的 `lover_day` / `goals` 旧视图、按活动切换强制主动开口的旧链与相关提示词/工具扩展。保留 `schedule_inject_v4` / `schedule_inject_replyer_v4` / `lbm_planning_v4` 等**稳定 SDK 注册名**（名字带 v4 不代表旧路线）。
+- **删除的旧入口**：工具别名 `lbm_update_schedule_v4`、赖床工具 `lbm_nap_lie_in`、独立命令 `/lbm_emotion_init`（统一并入 `/lbm_init emotion`）、`lbm_get_schedule_info` 的 `lover_day` / `goals` 旧视图、按活动切换强制主动开口的旧链与相关提示词/工具扩展。保留 `schedule_inject` / `schedule_inject_replyer` / `lbm_planning` 等**稳定 SDK 注册名**（名字带 v4 不代表旧路线）。
 - **仍独立、按需开启**：`[life_state] emotion_modulation_enabled`、`[event_catalog] mode` 与 `[schedule] no_sleep_mode`、`[patrol] nap_quiet_enabled`、夜间打扰统计、睡眠大修、各类上限全部保留。午休静默只读**新 spine 意图**用于静默，不伪造当前活动。
 - **数据兼容**：`CURRENT_LAYOUT_VERSION` 保持 `2026-10-10`（3.0.0 迁移是纯 pop，不换布局标记，避免存量已迁移用户重跑旧白名单搬运）；`schedule.db` v6 与历史日表行、`life_state.json`、情绪/好感/空间状态**不删除、不改写**。旧日表行不再作为当前活动来源；升级当天若目标日只有旧日表，调度会重新生成 spine 日意图（旧行归档，非破坏性）。
 

@@ -94,6 +94,8 @@ from planning.event_catalog_config import (
 )
 from qzone.config import QzoneSectionConfig
 from video_watch.config import VideoWatchSectionConfig
+from core.config_migration import migrate_display_config
+
 from suite_prompts import (
     COMPANION_MISS_CONFIRM_DEFAULT,
     COMPANION_MISS_REASON_DEFAULT,
@@ -300,7 +302,7 @@ class PluginSectionConfig(PluginConfigBase):
     )
     layout_version: str = Field(
         default="",
-        description="段布局标记（2026-10-10 配置整理轮的迁移幂等用；用户不要改）",
+        description="配置结构标记，由宿主管理。",
         json_schema_extra={
             "label": "布局版本",
             "hidden": True,
@@ -371,9 +373,7 @@ class LlmSectionConfig(PluginConfigBase):
     )
     emotion_referee_task_name: str = Field(
         default="utils",
-        description="情绪睡眠裁判任务名：睡眠期情绪大修使用，默认 utils，建议选择能稳定输出结构化正文的非思考任务。"
-                    "注意：宿主主任务为思考型时，思考内容可能用尽宿主输出长度而没有正文、"
-                    "裁判连续失败后本周期大修放弃（2026-10-28 真机实测）——此时应改绑非思考任务（如 utils）",
+        description="睡眠情绪裁判使用的宿主任务名；建议使用能稳定输出JSON正文的任务。",
         json_schema_extra={
             "label": "情绪裁判任务名",
             "hint": "宿主主任务为思考型时建议改绑便宜非思考任务，否则裁判正文可能为空",
@@ -473,7 +473,7 @@ class AdminSectionConfig(PluginConfigBase):
     # ── 告状工具（2026-10-24 用户直派）：bot 受骚扰时向维护者转达 ──
     harass_report_enabled: bool = Field(
         default=True,
-        description="告状工具：bot 受骚扰时可向维护者告状（false = 工具不注册）",
+        description="受骚扰时向配置对象转达情况；关闭后不提供该工具。",
         json_schema_extra={
             "label": "告状工具",
             "hint": "bot 被恶意刷屏/辱骂/攻击时把情况转达给维护者；关闭后不注册该 Tool",
@@ -482,7 +482,7 @@ class AdminSectionConfig(PluginConfigBase):
     )
     harass_report_target_qq: str = Field(
         default="",
-        description="告状对象 QQ；留空 = 回退 admin_users 第一个纯 QQ 元素（两者皆空则工具提示未配置维护者）",
+        description="告状接收人的QQ；留空时依次使用陪伴目标、宿主全局管理员；均不可用时不发送。",
         json_schema_extra={
             "label": "告状对象 QQ",
             "hint": "维护者（能处理骚扰问题的人）的 QQ 号",
@@ -509,11 +509,10 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
     白名单投影下发给前端（§投影只含展示/交互参数，绝不下发整份配置）；
     前端不写第二套默认值，投影缺失时按同值 CSS 兜底显示。
 
-    正式显示名尚未定稿，暂按主计划以「？？？」占位；技术节名 maimai_interaction
-    已定稿（TOML 裸键不支持问号，见主计划第三章整合口径 §5）。
+    角色动作与详情展开参数；历史筛选参数在「数据展示」配置。
     """
 
-    __ui_label__ = "？？？"
+    __ui_label__ = "麦麦互动"
     __ui_icon__ = "heart"
     __ui_order__ = 13
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
@@ -532,12 +531,12 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
     )
     mascot_size_px: int = Field(
         default=144, ge=48, le=192,
-        description="常驻麦麦基准尺寸（像素；2026-11-01 目检修正 96→128，探头更大更清晰）",
+        description="常驻麦麦的基准尺寸（像素）。",
         json_schema_extra={"label": "常驻麦麦尺寸", "step": 1, **_ui_i18n("Mascot size (px)")},
     )
     peek_angle_deg: int = Field(
         default=12, ge=0, le=90,
-        description="收起探头时麦麦的头部倾斜角（度；2026-11-01 目检修正 45→12，贴近 logo 冒头效果）",
+        description="收起时的头部倾斜角（度）。",
         json_schema_extra={"label": "冒头角度", "step": 1, **_ui_i18n("Peek angle (deg)")},
     )
     hover_out_px: int = Field(
@@ -572,7 +571,7 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
     )
     detail_blur_px: int = Field(
         default=3, ge=0, le=40,
-        description="详情背景轻微高斯模糊半径（像素，建议 2–4；0 = 不模糊。2026-11-01 起默认 3，不再浓遮罩）",
+        description="详情展开时的背景模糊半径（像素）；0表示不模糊。",
         json_schema_extra={"label": "详情背景模糊", "step": 1, **_ui_i18n("Detail blur (px)")},
     )
     detail_fade_ms: int = Field(
@@ -582,9 +581,17 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
     )
     detail_scale_from: float = Field(
         default=0.6, ge=0.4, le=1.0,
-        description="详情气泡从入口展开时的初始缩放（2026-11-01 起从入口原点展开）",
+        description="详情从入口展开时的初始缩放比例。",
         json_schema_extra={"label": "详情初始缩放", "step": 0.01, **_ui_i18n("Detail scale from")},
     )
+
+
+class DashboardDisplaySectionConfig(PluginConfigBase):
+    """生活面板历史明细的展示范围与变化过滤。"""
+    __ui_label__ = "数据展示"
+    __ui_icon__ = "chart-line"
+    __ui_order__ = 15
+
     history_changes_limit: int = Field(
         default=30, ge=5, le=30,
         description="详情「最近变化」最大条数（5–30）",
@@ -625,6 +632,7 @@ class CateyeSuiteConfig(PluginConfigBase):
     # LLM 调用集中段（本文件）与提示词集中段（suite_prompts.py）
     llm: LlmSectionConfig = Field(default_factory=LlmSectionConfig)
     prompts: PromptsSectionConfig = Field(default_factory=PromptsSectionConfig)
+    dashboard_display: DashboardDisplaySectionConfig = Field(default_factory=DashboardDisplaySectionConfig)
     # 管理与日志（本文件）
     admin: AdminSectionConfig = Field(default_factory=AdminSectionConfig)
     # QQ 空间（qzone/config.py）
@@ -679,6 +687,7 @@ class CateyeSuiteConfig(PluginConfigBase):
             # 出厂默认路径（无参构造 / 空输入）：不写布局标记，也不放哨兵
             return data
         migrated = dict(data)
+        migrated = migrate_display_config(migrated)
         # 0a) [event_catalog] 旧键 max_events → 规范字段 max_generated_events（2026-10-27 用户裁定）。
         #     必须发生在「默认值填充之前」：宿主/SDK 先 merge 出厂默认，之后 pydantic 的
         #     model_fields_set 会把每个字段都当显式值，段级 resolve_config 的「规范字段优先」

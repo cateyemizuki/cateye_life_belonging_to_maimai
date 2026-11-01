@@ -1,20 +1,8 @@
-"""提示词集中模块（提示词唯一真源 + [prompts] 高级配置段）。
+"""提示词默认值与用户可定制文案。
 
-本模块承担两件事（2026-10-10 配置整理轮）：
-
-1. **唯一真源**：插件内所有会进入 LLM 上下文 / LLM 调用的提示词、注入模板、
-   主动行为 intent/reason 文案，默认值全部定义在这里（模块级 ``*_DEFAULT`` 常量），
-   不再散落在各业务模块。业务模块一律经 :func:`prompt` 读取"配置值 or 默认值"。
-2. **配置暴露**：``PromptsSectionConfig`` 把上述每条提示词暴露为 ``[prompts]`` 段
-   的一个字段（WebUI「提示词（高级）」，默认值 = 模块常量）。用户不改 = 行为与
-   整理前逐字一致；要深度定制时可在 WebUI 或 config.toml 直接改文案。
-
-占位符约定（模板里的 ``{xxx}``）：各字段的 description 里写明了可用占位符；
-渲染失败（用户把占位符写坏）时调用方一律回退默认模板并记一条 warning——
-绝不因为提示词写错而中断业务链路（§八.2 可空降级同一口径）。
-
-命名约定：``<模块>_<用途>``，与 ``[prompts]`` 字段名一一对应，
-方便在 config.toml 里按前缀分组阅读。
+内部数据协议、数值裁判、注入结构与目标约束由代码维护；配置仅保留
+陪伴口吻、屏幕描述、日程追加要求、早晚安与空间文案等常用定制入口。
+模板渲染失败回退内置值，不把配置错误带入业务链路。
 """
 
 from __future__ import annotations
@@ -23,6 +11,7 @@ import logging
 from typing import Any, ClassVar, Dict, Set
 
 from maibot_sdk import Field, PluginConfigBase
+from pydantic import model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +75,7 @@ SCREEN_NARRATION_DEFAULT = (
     "现在是{date} {time}，你看了眼{user_name}的电脑屏幕，TA正在：{description}"
 )
 SCREEN_NARRATION_OFFLINE_DEFAULT = (
-    "现在是{date} {time}，你想看一眼{user_name}的电脑屏幕，但TA的电脑没开"
+    "现在是{date} {time}，你想看一眼{user_name}的电脑屏幕，但暂时无法连接TA的电脑"
 )
 SCREEN_NARRATION_FAILED_DEFAULT = (
     "现在是{date} {time}，你看了眼{user_name}的电脑屏幕，但没看清TA在干什么"
@@ -160,7 +149,7 @@ AFFECTION_CONVERSATION_REVIEW_DEFAULT = """你是 AI 角色「{lover_name}」与
 
 【判定标准】
 1. event：用不超过 30 字概括这段相处里最值得记住的一件事；没有就写「日常闲聊」；
-2. delta：好感度增量，范围 [-2, +2.5]——
+2. delta：好感度增量，范围 [-4, +5]——
    - 阿谀奉承、无意义刷屏、单方面索取：不给正分（0 或负）；
    - 真诚的关心、共同完成一件事、化解了一次矛盾：才给正分；
    - 明显的争吵、冒犯、被冷落：给负分；
@@ -190,7 +179,7 @@ AFFECTION_DAILY_REVIEW_DEFAULT = """你是 AI 角色「{lover_name}」与{target
 {impressions}
 
 【判定标准】
-1. delta_score：这一天对关系的影响，范围 [-2, +2]——
+1. delta_score：这一天对关系的影响，范围 [-4, +4]——
    - 真诚的关心、共同完成一件事、化解矛盾：正分；
    - 阿谀奉承、无意义刷屏：不给正分；
    - 争吵、冒犯、被冷落、整天没有互动：负分；
@@ -365,8 +354,8 @@ PROACTIVE_INTENT_NIGHT_DEFAULT = (
 #: 约定到期 intent 已随活动切换主动开口一并删除（2026-10-20 用户指示）
 
 #: 主动行为 reason 文案（进主动任务块，标注为什么触发；占位符见各条）
-PROACTIVE_REASON_MORNING_DEFAULT = "planning_v4: 早安问候（L2 漂移）"
-PROACTIVE_REASON_NIGHT_DEFAULT = "planning_v4: 晚安问候（L2 漂移）"
+PROACTIVE_REASON_MORNING_DEFAULT = "日程：自然醒后的早安问候"
+PROACTIVE_REASON_NIGHT_DEFAULT = "日程：入睡前的晚安问候"
 
 
 # ===========================================================================
@@ -524,19 +513,21 @@ QZONE_POST_GATE_DEFAULT = (
 
 
 class PromptsSectionConfig(PluginConfigBase):
-    """全部内部提示词（高级设置）。
+    """用户可定制的表达风格与日程追加要求。"""
 
-    这里的每一项都是"插件发给模型的原文"。不改 = 与出厂行为逐字一致；
-    改了 = 立即生效（热重载）。改坏占位符不会中断业务——调用方会回退出厂文案
-    并在日志里记一条 warning。**不确定就不要动。**
-    """
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_internal_overrides(cls, value):
+        if isinstance(value, dict):
+            return {k: v for k, v in value.items() if k in cls.model_fields}
+        return value
 
     __ui_label__ = "提示词（高级）"
     __ui_icon__ = "message-square"
     __ui_order__ = 9
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Prompts (Advanced)",
-               "description": "Every prompt the plugin sends to the model. Leave unchanged unless you know what you are doing."}
+               "description": "Customize wording and additional schedule preferences; internal protocols are maintained by the plugin."}
     }
 
     # ── 陪伴模块 ─────────────────────────────────────────────
@@ -545,13 +536,6 @@ class PromptsSectionConfig(PluginConfigBase):
         description="想念触发时给 planner 的说明（占位符：{lover_name} {relation} {hours}）",
         json_schema_extra={"label": "想念·触发说明", "rows": 3,
                            **_ui_i18n("Miss trigger reason")},
-    )
-    companion_miss_confirm: str = Field(
-        default=COMPANION_MISS_CONFIRM_DEFAULT,
-        description="想念触发前的 LLM 把关提示词，回复 Y 才放行（占位符：{lover_name} {relation} "
-                    "{personality} {current_time} {hours} {activity_context}）",
-        json_schema_extra={"label": "想念·把关提示词", "rows": 6,
-                           **_ui_i18n("Miss confirm prompt")},
     )
     companion_activity_reason: str = Field(
         default=COMPANION_ACTIVITY_REASON_DEFAULT,
@@ -576,220 +560,21 @@ class PromptsSectionConfig(PluginConfigBase):
         description="看清屏幕时的旁白（占位符：{date} {time} {user_name} {description}）",
         json_schema_extra={"label": "屏幕旁白", "rows": 2, **_ui_i18n("Screen narration")},
     )
-    screen_narration_offline: str = Field(
-        default=SCREEN_NARRATION_OFFLINE_DEFAULT,
-        description="对方电脑没开时的旁白（占位符：{date} {time} {user_name}；留空 = 不注入）",
-        json_schema_extra={"label": "屏幕旁白·没开机", "rows": 2,
-                           **_ui_i18n("Screen narration (offline)")},
-    )
-    screen_narration_failed: str = Field(
-        default=SCREEN_NARRATION_FAILED_DEFAULT,
-        description="截图/理解失败时的旁白（占位符：{date} {time} {user_name}；留空 = 不注入）",
-        json_schema_extra={"label": "屏幕旁白·没看清", "rows": 2,
-                           **_ui_i18n("Screen narration (failed)")},
-    )
-    inject_affection_block: str = Field(
-        default=INJECT_AFFECTION_BLOCK_DEFAULT,
-        description="好感度注入块（占位符：{name} {relation_word} {target_label} {tier} "
-                    "{tier_label} {tier_desc}）",
-        json_schema_extra={"label": "注入·好感度块", "rows": 2,
-                           **_ui_i18n("Affection injection block")},
-    )
-    inject_proactive_turn_rule: str = Field(
-        default=INJECT_PROACTIVE_TURN_RULE_DEFAULT,
-        description="主动发言回合给 planner 的回复目标约束（无占位符）",
-        json_schema_extra={"label": "注入·主动回合约束", "rows": 5,
-                           **_ui_i18n("Proactive turn rule")},
-    )
     tool_send_message: str = Field(
         default=TOOL_SEND_MESSAGE_DEFAULT,
         description="工具主动发消息的生成提示词（占位符：{style_word} {relation_word}）",
         json_schema_extra={"label": "工具·主动发言提示词", "rows": 3,
                            **_ui_i18n("Tool send-message prompt")},
     )
-    tool_send_message_system: str = Field(
-        default=TOOL_SEND_MESSAGE_SYSTEM_DEFAULT,
-        description="工具主动发消息的人设声明（占位符：{name} {self_desc} {relation_word}）",
-        json_schema_extra={"label": "工具·主动发言人设", "rows": 2,
-                           **_ui_i18n("Tool send-message system prompt")},
-    )
-    affection_conversation_review: str = Field(
-        default=AFFECTION_CONVERSATION_REVIEW_DEFAULT,
-        description="会话采样好感裁判提示词（占位符：{lover_name} {target_label} {persona} "
-                    "{tier_label} {tier_desc} {mood_text} {recent_messages}）",
-        json_schema_extra={"label": "裁判·会话采样", "rows": 10,
-                           **_ui_i18n("Conversation review prompt")},
-    )
-    affection_daily_review: str = Field(
-        default=AFFECTION_DAILY_REVIEW_DEFAULT,
-        description="关系日结裁判提示词（占位符：{lover_name} {target_label} {date} {persona} "
-                    "{tier_label} {tier_desc} {stats} {event_log} {impressions}）",
-        json_schema_extra={"label": "裁判·关系日结", "rows": 10,
-                           **_ui_i18n("Daily review prompt")},
-    )
 
     # ── 日程模块 ─────────────────────────────────────────────
-    inject_schedule_header: str = Field(
-        default=INJECT_SCHEDULE_HEADER_DEFAULT,
-        description="日程注入块首行（无占位符）",
-        json_schema_extra={"label": "注入·日程块首行", **_ui_i18n("Schedule injection header")},
-    )
-    inject_schedule_current_line: str = Field(
-        default=INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
-        description="当前活动行（占位符：{activity} {description} {remaining_hint}）",
-        json_schema_extra={"label": "注入·当前活动行", "rows": 2,
-                           **_ui_i18n("Current activity line")},
-    )
-    inject_schedule_future_title: str = Field(
-        default=INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT,
-        description="未来安排标题（无占位符）",
-        json_schema_extra={"label": "注入·未来安排标题", **_ui_i18n("Future title")},
-    )
-    inject_schedule_future_line: str = Field(
-        default=INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
-        description="未来安排条目（占位符：{time} {name}）",
-        json_schema_extra={"label": "注入·未来安排条目", **_ui_i18n("Future line")},
-    )
-    inject_hint_future: str = Field(
-        default=INJECT_HINT_FUTURE_DEFAULT,
-        description="问未来时的引导行（无占位符）",
-        json_schema_extra={"label": "注入·引导·问未来", **_ui_i18n("Hint: future")},
-    )
-    inject_hint_current: str = Field(
-        default=INJECT_HINT_CURRENT_DEFAULT,
-        description="问当前时的引导行（无占位符）",
-        json_schema_extra={"label": "注入·引导·问当前", **_ui_i18n("Hint: current")},
-    )
-    inject_hint_continue: str = Field(
-        default=INJECT_HINT_CONTINUE_DEFAULT,
-        description="对话延续时的引导行（占位符：{reason}）",
-        json_schema_extra={"label": "注入·引导·延续", **_ui_i18n("Hint: continue")},
-    )
-    inject_hint_proactive: str = Field(
-        default=INJECT_HINT_PROACTIVE_DEFAULT,
-        description="主动碎碎念时的引导行（无占位符）",
-        json_schema_extra={"label": "注入·引导·碎碎念", "rows": 2,
-                           **_ui_i18n("Hint: proactive")},
-    )
-    inject_hint_idle: str = Field(
-        default=INJECT_HINT_IDLE_DEFAULT,
-        description="闲聊时的引导行（无占位符）",
-        json_schema_extra={"label": "注入·引导·闲聊", **_ui_i18n("Hint: idle")},
-    )
-    inject_no_activity: str = Field(
-        default=INJECT_NO_ACTIVITY_DEFAULT,
-        description="无当前活动时的兜底文案（无占位符；留空 = 不注入无活动兜底）",
-        json_schema_extra={"label": "注入·无活动兜底", "rows": 2,
-                           **_ui_i18n("No-activity fallback text")},
-    )
-    inject_replyer_status: str = Field(
-        default=INJECT_REPLYER_STATUS_DEFAULT,
-        description="replyer 状态块（占位符：{state_line} {energy} {next_line}）",
-        json_schema_extra={"label": "注入·replyer 状态块", "rows": 5,
-                           **_ui_i18n("Replyer status block")},
-    )
-    inject_replyer_state_line: str = Field(
-        default=INJECT_REPLYER_STATE_LINE_DEFAULT,
-        description="replyer 状态行（占位符：{activity} {description} {remaining_hint}）",
-        json_schema_extra={"label": "注入·replyer 状态行", "rows": 2,
-                           **_ui_i18n("Replyer state line")},
-    )
-    inject_replyer_next_line: str = Field(
-        default=INJECT_REPLYER_NEXT_LINE_DEFAULT,
-        description="replyer 下一条活动行（占位符：{time} {name}；留空 = 不输出）",
-        json_schema_extra={"label": "注入·replyer 下条活动", **_ui_i18n("Replyer next line")},
-    )
-    inject_date_header: str = Field(
-        default=INJECT_DATE_HEADER_DEFAULT,
-        description="日期/节假日头部（占位符：{date} {weekday} {holiday}）——开启「注入真实节假日」时注在日程块头部",
-        json_schema_extra={"label": "注入·日期头部", "rows": 2,
-                           **_ui_i18n("Date/holiday header")},
-    )
-    schedule_emotion_context: str = Field(
-        default=SCHEDULE_EMOTION_CONTEXT_DEFAULT,
-        description="日程生成·睡醒情绪块（占位符：{mood} {constraints}）",
-        json_schema_extra={"label": "日程·情绪底色块", "rows": 5,
-                           **_ui_i18n("Emotion context block")},
-    )
-    schedule_low_mood_note: str = Field(
-        default=SCHEDULE_LOW_MOOD_NOTE_DEFAULT,
-        description="日程生成·连续低迷软约束（占位符：{days}）",
-        json_schema_extra={"label": "日程·低迷软约束", "rows": 4,
-                           **_ui_i18n("Low-mood note")},
-    )
-    schedule_holiday_context: str = Field(
-        default=SCHEDULE_HOLIDAY_CONTEXT_DEFAULT,
-        description="日程生成·节假日上下文（占位符：{date} {weekday} {holiday}）——"
-                    "仅当「节假日影响日程生成」开启时追加",
-        json_schema_extra={"label": "日程·节假日上下文", "rows": 4,
-                           **_ui_i18n("Holiday generation context")},
-    )
     schedule_generation_extra: str = Field(
         default=SCHEDULE_GENERATION_EXTRA_DEFAULT,
         description="日程生成·追加指令（留空 = 不追加；会原样附在生成提示词末尾）",
         json_schema_extra={"label": "日程·追加指令", "rows": 4, "placeholder": "（留空不追加）",
                            **_ui_i18n("Extra generation instruction")},
     )
-    schedule_retry_feedback: str = Field(
-        default=SCHEDULE_RETRY_FEEDBACK_DEFAULT,
-        description="多轮生成的重试反馈模板（占位符：{issues}）",
-        json_schema_extra={"label": "日程·重试反馈", "rows": 4,
-                           **_ui_i18n("Retry feedback template")},
-    )
     # ── spine 日意图（2026-10-25 滚动化改造新增；PR8 3.0.0 起为唯一生成路线）──
-    schedule_spine_task: str = Field(
-        default=SCHEDULE_SPINE_TASK_DEFAULT,
-        description="spine 日意图主任务（占位符：{min_intentions} {max_intentions} {wake_text} "
-                    "{sleep_text} {no_sleep_line} {described_note}）",
-        json_schema_extra={"label": "日程·spine 主任务", "rows": 12,
-                           **_ui_i18n("Spine task prompt")},
-    )
-    schedule_spine_commitment_note: str = Field(
-        default=SCHEDULE_SPINE_COMMITMENT_NOTE_DEFAULT,
-        description="spine 模式的约定硬约束行（无占位符；有今日约定时追加）",
-        json_schema_extra={"label": "日程·spine 约定行", "rows": 2,
-                           **_ui_i18n("Spine commitment note")},
-    )
-    schedule_spine_sleep_line: str = Field(
-        default=SCHEDULE_SPINE_SLEEP_LINE_DEFAULT,
-        description="spine 模式的睡觉锚点行（占位符：{sleep_text} {wake_text}）",
-        json_schema_extra={"label": "日程·spine 睡觉行", "rows": 2,
-                           **_ui_i18n("Spine sleep line")},
-    )
-    schedule_spine_no_sleep_line: str = Field(
-        default=SCHEDULE_SPINE_NO_SLEEP_LINE_DEFAULT,
-        description="spine 模式无睡眠时的锚点行（占位符：{sleep_text} {wake_text}）",
-        json_schema_extra={"label": "日程·spine 无睡眠行", "rows": 2,
-                           **_ui_i18n("Spine no-sleep line")},
-    )
-    schedule_spine_described_note: str = Field(
-        default=SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT,
-        description="spine 模式描述行（占位符：{max_described}）",
-        json_schema_extra={"label": "日程·spine 描述行", "rows": 2,
-                           **_ui_i18n("Spine described note")},
-    )
-    schedule_spine_no_described_note: str = Field(
-        default=SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT,
-        description="spine 模式描述行（全部不写 note；无占位符）",
-        json_schema_extra={"label": "日程·spine 无描述行", "rows": 2,
-                           **_ui_i18n("Spine no-described note")},
-    )
-    schedule_role_judge_no_activity: str = Field(
-        default=SCHEDULE_ROLE_JUDGE_NO_ACTIVITY_DEFAULT,
-        description="角色裁判在「取不到当前日程」时的占位文案（无占位符）",
-        json_schema_extra={"label": "日程·裁判·无日程占位", **_ui_i18n("Role judge: no-activity text")},
-    )
-    schedule_role_judge_no_persona: str = Field(
-        default=SCHEDULE_ROLE_JUDGE_NO_PERSONA_DEFAULT,
-        description="角色裁判在「取不到人设」时的占位文案（无占位符）",
-        json_schema_extra={"label": "日程·裁判·无人设占位", **_ui_i18n("Role judge: no-persona text")},
-    )
-    schedule_role_judge: str = Field(
-        default=SCHEDULE_ROLE_JUDGE_DEFAULT,
-        description="角色裁判提示词（占位符：{persona} {today_str} {weekday} {current_text} {description}）",
-        json_schema_extra={"label": "日程·角色裁判", "rows": 12,
-                           **_ui_i18n("Role judge prompt")},
-    )
     # 2026-10-20 用户指示：活动切换/约定主动开口整条移除，原 proactive_intent_default 与
     # proactive_intent_study/work/meal/rest/exercise/entertainment/social/daily_routine/
     # learn_topic 及 proactive_intent_commitment、proactive_reason_activity/commitment
@@ -799,53 +584,13 @@ class PromptsSectionConfig(PluginConfigBase):
         description="早安 intent（纯问候导向；无占位符，{activity_name} 传参仍兼容但不使用）",
         json_schema_extra={"label": "主动·早安", "rows": 2, **_ui_i18n("Morning intent")},
     )
-    proactive_intent_morning_no_activity: str = Field(
-        default=PROACTIVE_INTENT_MORNING_NO_ACTIVITY_DEFAULT,
-        description="无日程时的早安 intent（无占位符）",
-        json_schema_extra={"label": "主动·早安（无日程）", "rows": 2,
-                           **_ui_i18n("Morning intent (no activity)")},
-    )
     proactive_intent_night: str = Field(
         default=PROACTIVE_INTENT_NIGHT_DEFAULT,
         description="晚安 intent（无占位符）",
         json_schema_extra={"label": "主动·晚安", "rows": 2, **_ui_i18n("Night intent")},
     )
-    proactive_reason_morning: str = Field(
-        default=PROACTIVE_REASON_MORNING_DEFAULT,
-        description="早安的触发标注（无占位符）",
-        json_schema_extra={"label": "标注·早安", **_ui_i18n("Reason: morning")},
-    )
-    proactive_reason_night: str = Field(
-        default=PROACTIVE_REASON_NIGHT_DEFAULT,
-        description="晚安的触发标注（无占位符）",
-        json_schema_extra={"label": "标注·晚安", **_ui_i18n("Reason: night")},
-    )
 
     # ── 情绪模块 ─────────────────────────────────────────────
-    emotion_sleep_referee: str = Field(
-        default=EMOTION_SLEEP_REFEREE_DEFAULT,
-        description="睡眠期情绪大修裁判提示词（占位符见 USAGE「提示词」节；不熟勿改）",
-        json_schema_extra={"label": "情绪·睡眠裁判", "rows": 12,
-                           **_ui_i18n("Sleep referee prompt")},
-    )
-    emotion_init_system: str = Field(
-        default=EMOTION_INIT_SYSTEM_DEFAULT,
-        description="人设→VAD 参数初始化提示词（占位符：{emotion_table}）",
-        json_schema_extra={"label": "情绪·初始化提示词", "rows": 10,
-                           **_ui_i18n("Emotion init prompt")},
-    )
-    emotion_evaluate: str = Field(
-        default=EMOTION_EVALUATE_DEFAULT,
-        description="回复/事件 ΔVAD 评估提示词（占位符：{lover_name} {persona} {user_context} {reply_text}）",
-        json_schema_extra={"label": "情绪·增量评估", "rows": 10,
-                           **_ui_i18n("Emotion evaluate prompt")},
-    )
-    emotion_injection: str = Field(
-        default=EMOTION_INJECTION_DEFAULT,
-        description="情绪底色注入文本（占位符：{mood}）",
-        json_schema_extra={"label": "情绪·底色注入", "rows": 4,
-                           **_ui_i18n("Emotion injection text")},
-    )
     emotion_night_hint: str = Field(
         default=EMOTION_NIGHT_HINT_DEFAULT,
         description="深夜冻结态追加行（无占位符；非冻结态不出现）",
@@ -871,13 +616,6 @@ class PromptsSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "空间·评论提醒", "rows": 2,
                            **_ui_i18n("Qzone comment reminder")},
     )
-    qzone_post_gate: str = Field(
-        default=QZONE_POST_GATE_DEFAULT,
-        description="发帖前 LLM 严判提示词（占位符：{lover_name} {personality} {current_time} {activity}；"
-                    "只认回复首字符的 是/否，格式异常一律按否）",
-        json_schema_extra={"label": "空间·发帖严判", "rows": 10,
-                           **_ui_i18n("Qzone post gate prompt")},
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -886,9 +624,65 @@ class PromptsSectionConfig(PluginConfigBase):
 
 #: 字段名 → 出厂默认（:func:`prompt` 的回退表；新增字段时同步登记）
 PROMPT_FALLBACKS: Dict[str, str] = {
-    name: str(field.default)
-    for name, field in PromptsSectionConfig.model_fields.items()
+    'companion_miss_reason': COMPANION_MISS_REASON_DEFAULT,
+    'companion_miss_confirm': COMPANION_MISS_CONFIRM_DEFAULT,
+    'companion_activity_reason': COMPANION_ACTIVITY_REASON_DEFAULT,
+    'companion_daily_reason': COMPANION_DAILY_REASON_DEFAULT,
+    'screen_describe': SCREEN_DESCRIBE_DEFAULT,
+    'screen_narration': SCREEN_NARRATION_DEFAULT,
+    'screen_narration_offline': SCREEN_NARRATION_OFFLINE_DEFAULT,
+    'screen_narration_failed': SCREEN_NARRATION_FAILED_DEFAULT,
+    'inject_affection_block': INJECT_AFFECTION_BLOCK_DEFAULT,
+    'inject_proactive_turn_rule': INJECT_PROACTIVE_TURN_RULE_DEFAULT,
+    'tool_send_message': TOOL_SEND_MESSAGE_DEFAULT,
+    'tool_send_message_system': TOOL_SEND_MESSAGE_SYSTEM_DEFAULT,
+    'affection_conversation_review': AFFECTION_CONVERSATION_REVIEW_DEFAULT,
+    'affection_daily_review': AFFECTION_DAILY_REVIEW_DEFAULT,
+    'inject_schedule_header': INJECT_SCHEDULE_HEADER_DEFAULT,
+    'inject_schedule_current_line': INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
+    'inject_schedule_future_title': INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT,
+    'inject_schedule_future_line': INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
+    'inject_hint_future': INJECT_HINT_FUTURE_DEFAULT,
+    'inject_hint_current': INJECT_HINT_CURRENT_DEFAULT,
+    'inject_hint_continue': INJECT_HINT_CONTINUE_DEFAULT,
+    'inject_hint_proactive': INJECT_HINT_PROACTIVE_DEFAULT,
+    'inject_hint_idle': INJECT_HINT_IDLE_DEFAULT,
+    'inject_no_activity': INJECT_NO_ACTIVITY_DEFAULT,
+    'inject_replyer_status': INJECT_REPLYER_STATUS_DEFAULT,
+    'inject_replyer_state_line': INJECT_REPLYER_STATE_LINE_DEFAULT,
+    'inject_replyer_next_line': INJECT_REPLYER_NEXT_LINE_DEFAULT,
+    'inject_date_header': INJECT_DATE_HEADER_DEFAULT,
+    'schedule_emotion_context': SCHEDULE_EMOTION_CONTEXT_DEFAULT,
+    'schedule_low_mood_note': SCHEDULE_LOW_MOOD_NOTE_DEFAULT,
+    'schedule_holiday_context': SCHEDULE_HOLIDAY_CONTEXT_DEFAULT,
+    'schedule_generation_extra': SCHEDULE_GENERATION_EXTRA_DEFAULT,
+    'schedule_retry_feedback': SCHEDULE_RETRY_FEEDBACK_DEFAULT,
+    'schedule_spine_task': SCHEDULE_SPINE_TASK_DEFAULT,
+    'schedule_spine_commitment_note': SCHEDULE_SPINE_COMMITMENT_NOTE_DEFAULT,
+    'schedule_spine_sleep_line': SCHEDULE_SPINE_SLEEP_LINE_DEFAULT,
+    'schedule_spine_no_sleep_line': SCHEDULE_SPINE_NO_SLEEP_LINE_DEFAULT,
+    'schedule_spine_described_note': SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT,
+    'schedule_spine_no_described_note': SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT,
+    'schedule_role_judge_no_activity': SCHEDULE_ROLE_JUDGE_NO_ACTIVITY_DEFAULT,
+    'schedule_role_judge_no_persona': SCHEDULE_ROLE_JUDGE_NO_PERSONA_DEFAULT,
+    'schedule_role_judge': SCHEDULE_ROLE_JUDGE_DEFAULT,
+    'proactive_intent_morning': PROACTIVE_INTENT_MORNING_DEFAULT,
+    'proactive_intent_morning_no_activity': PROACTIVE_INTENT_MORNING_NO_ACTIVITY_DEFAULT,
+    'proactive_intent_night': PROACTIVE_INTENT_NIGHT_DEFAULT,
+    'proactive_reason_morning': PROACTIVE_REASON_MORNING_DEFAULT,
+    'proactive_reason_night': PROACTIVE_REASON_NIGHT_DEFAULT,
+    'emotion_sleep_referee': EMOTION_SLEEP_REFEREE_DEFAULT,
+    'emotion_init_system': EMOTION_INIT_SYSTEM_DEFAULT,
+    'emotion_evaluate': EMOTION_EVALUATE_DEFAULT,
+    'emotion_injection': EMOTION_INJECTION_DEFAULT,
+    'emotion_night_hint': EMOTION_NIGHT_HINT_DEFAULT,
+    'qzone_post': QZONE_POST_DEFAULT,
+    'qzone_reply': QZONE_REPLY_DEFAULT,
+    'qzone_comment_reminder': QZONE_COMMENT_REMINDER_DEFAULT,
+    'qzone_post_gate': QZONE_POST_GATE_DEFAULT,
 }
+
+INTERNAL_PROMPT_NAMES = frozenset(PROMPT_FALLBACKS) - frozenset(PromptsSectionConfig.model_fields)
 
 
 def prompt(plugin: Any, name: str) -> str:
@@ -902,6 +696,8 @@ def prompt(plugin: Any, name: str) -> str:
     也不让提示词读取失败打断业务链路。
     """
     default = PROMPT_FALLBACKS.get(name, "")
+    if name in INTERNAL_PROMPT_NAMES:
+        return default
     section = getattr(plugin, "prompts", None)
     if section is None:
         section = getattr(getattr(plugin, "config", None), "prompts", None)

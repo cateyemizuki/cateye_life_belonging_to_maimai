@@ -45,14 +45,12 @@ class EmotionSectionConfig(PluginConfigBase):
     )
     evaluate_on_reply: bool = Field(
         default=True,
-        description="每次 bot 回复后用小模型评估该轮对话的情绪增量 ΔVAD（事件→增量映射）"
-                    "（已废弃，迁移为 evaluate_mode；显式设置 evaluate_mode 时本字段被忽略）",
+        description="回复后情绪评估的兼容开关；已设置评估模式时使用评估模式。",
         json_schema_extra={"label": "回复后评估增量", **_ui_i18n("Evaluate on reply")},
     )
     evaluate_mode: Literal["episode", "per_reply", "off"] = Field(
         default="episode",
-        description="回复后情绪评估模式：episode=会话闲置后整段评估（默认，成本封顶）| "
-                    "per_reply=每回复评估（旧模式，60s 节流）| off=不评估",
+        description="情绪评估方式：episode在会话闲置后整段评估，per_reply逐回复评估（至少间隔60秒），off关闭。",
         json_schema_extra={
             "label": "回复后评估模式",
             "hint": "episode 按会话片段整段评估（成本封顶）；per_reply 为旧每回复模式",

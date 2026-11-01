@@ -56,7 +56,7 @@ class QzoneSectionConfig(PluginConfigBase):
     )
     emotion_filter: bool = Field(
         default=True,
-        description="情绪低落时跳过发帖：当前情绪效价 V<−0.6 时本轮不发说说（低落不硬营业，M4）",
+        description="情绪效价低于−0.6时暂停空间发帖。",
         json_schema_extra={"label": "低落实时跳过发帖", **_ui_i18n("Emotion filter")},
     )
     post_by_schedule: bool = Field(
@@ -72,10 +72,7 @@ class QzoneSectionConfig(PluginConfigBase):
     # ── 配图（2026-10-14 §18.1~§18.3；默认 emoji = 2026-10-20 用户改判，原默认 off）──────
     image_mode: str = Field(
         default="emoji",
-        description="说说配图来源：off=不配图｜emoji=宿主表情包（按说说正文语义匹配）｜"
-                    "library=本地随机图库｜random=两者各半掷骰。"
-                    "任何一步取图失败都只跳过该图，全部失败发纯文本（配图失败永不阻断发布）；"
-                    "旧配置里显式写过的 image_mode 值保持不变（默认值只影响未显式配置的用户）",
+        description="说说配图：off不配图，emoji使用表情包，library使用本地图库，random随机选择来源；取图失败时发送纯文本。",
         json_schema_extra={
             "label": "配图来源",
             "hint": "off/emoji/library/random；emoji 与 library 都失败时自动退回纯文本",
