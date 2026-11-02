@@ -62,7 +62,7 @@ function chart(target,rows,keys,max=1,height=260,min=0){
    else if(edgeEstimated!==kind){const last=segment.at(-1);flush();kind=edgeEstimated;segment=[last,[x(at),y(p[key])]]}
    else segment.push([x(at),y(p[key])]);prev=p;
   }flush();
-  if(real.length)curves.append(svg('path',{d:real.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':step?3:2,'stroke-linejoin':'round','stroke-linecap':'round','data-series':key}));
+  if(real.length)curves.append(svg('path',{d:real.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':key==='stress'?3:(step?3:2),'stroke-linejoin':'round','stroke-linecap':'round','data-series':key}));
   if(estimated.length)curves.append(svg('path',{d:estimated.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':2,'stroke-dasharray':'5 5',class:'estimated-line','data-series':key}));
   if(rows.length===1&&num(rows[0][key])!==null)curves.append(svg('circle',{cx:x(Number(date(rows[0].at))),cy:y(rows[0][key]),r:3,fill:`var(${colors[key]})`}))
  }
@@ -176,13 +176,21 @@ function dayText(value){const d=date(value)||new Date();const parts=new Intl.Dat
 function zonedMidnight(day){const target=Date.parse(day+'T00:00:00Z');let guess=target;const fmt=new Intl.DateTimeFormat('en-GB',{timeZone:data?.timezone||'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});for(let i=0;i<3;i++){const parts=Object.fromEntries(fmt.formatToParts(new Date(guess)).map(p=>[p.type,p.value]));const local=Date.UTC(+parts.year,+parts.month-1,+parts.day,+parts.hour,+parts.minute,+parts.second);guess+=target-local}return guess}
 function shiftDay(day,delta){return new Date(Date.parse(day+'T12:00:00Z')+delta*86400000).toISOString().slice(0,10)}
 function setDay(day){if(imported&&day&&data.day?.date!==day){notice('这份离线快照没有所选日期，保留原有记录。');$('history-day').value=selectedDay;return}selectedDay=day;zoom=null;$('zoom-reset').hidden=true;$('history-day').value=day;if(live&&!imported)refresh(true);else if(data){render();if(day&&data.day?.date!==day)notice('这份离线快照没有所选日期，仍展示快照中的记录。')}}
-function activateTab(key,focus=false){SectionFish.close();activeTab=key;$("datebar").hidden=key==="now"||key==="system";for(const b of document.querySelectorAll('[role=tab]')){const chosen=b.dataset.tab===key;b.setAttribute('aria-selected',String(chosen));b.tabIndex=chosen?0:-1;$('panel-'+b.dataset.tab).hidden=!chosen;if(chosen&&focus)b.focus()}if(data){drawHistory();renderSleep();renderModules()}}
+function activateTab(key,focus=false){SectionFish.close();activeTab=key;$("datebar").hidden=key==="now"||key==="system";for(const b of document.querySelectorAll('[role=tab]')){const chosen=b.dataset.tab===key;b.setAttribute('aria-selected',String(chosen));b.tabIndex=chosen?0:-1;$('panel-'+b.dataset.tab).hidden=!chosen;if(chosen&&focus)b.focus()}if(data){updateDateLabel();drawHistory();renderSleep();renderModules()}}
 for(const b of document.querySelectorAll('[role=tab]')){b.onclick=()=>activateTab(b.dataset.tab);b.onkeydown=e=>{const list=[...document.querySelectorAll('[role=tab]')],i=list.indexOf(b);let next=null;if(e.key==='ArrowRight')next=list[(i+1)%list.length];if(e.key==='ArrowLeft')next=list[(i+list.length-1)%list.length];if(e.key==='Home')next=list[0];if(e.key==='End')next=list.at(-1);if(next){e.preventDefault();activateTab(next.dataset.tab,true)}}}
 $('zoom-in').onclick=()=>{if(!points.length)return;const a=zoom?.[0]??Number(date(points[0].at)),b=zoom?.[1]??Number(date(points.at(-1).at)),mid=(a+b)/2;zoom=[mid-(b-a)/4,mid+(b-a)/4];$('zoom-reset').hidden=false;drawHistory();renderSleep();renderModules()};$('zoom-out').onclick=resetZoom;
 $('history-day').onchange=e=>setDay(e.target.value);$('date-today').onclick=()=>setDay(dayText(data?.generated_at));$('date-yesterday').onclick=()=>setDay(shiftDay(dayText(data?.generated_at),-1));$('date-range').onclick=()=>setDay('');
+function updateDateLabel(){
+ if(!data)return;
+ const today=dayText(data.generated_at);let dayLabel;
+ if(activeTab==='schedule')dayLabel=(selectedDay||data.schedule?.date||today)+' · 当日行程';
+ else if(selectedDay)dayLabel=selectedDay+(selectedDay===today?' · 今天':' · 历史记录');
+ else dayLabel=activeTab==='mood'?'近期心情与生活动态':'此刻与最近时段';
+ text('selected-day-label',dayLabel);
+}
 function renderExtras(){
  const today=dayText(data.generated_at);$('history-day').max=today;
- text('selected-day-label',selectedDay?selectedDay+(selectedDay===today?' · 今天':' · 历史记录'):'此刻与最近时段');
+ updateDateLabel();
  $('date-today').setAttribute('aria-pressed',String(selectedDay===today));$('date-yesterday').setAttribute('aria-pressed',String(selectedDay===shiftDay(today,-1)));
  $('hero-scene').classList.toggle('sleeping',!!data.sleep?.current?.asleep);$('panel-mood').classList.toggle('empty-mood',!data.emotion?.available);
  const buckets=data.usage?.buckets||{};replaceInfoChildren($('usage-buckets'),...[['host_reported','正常回传'],['success_no_usage','成功但无用量'],['failed','失败调用'],['legacy','旧记录']].map(([key,label])=>{const card=el('div','bucket'),caption=el('span','note',label);caption.append(infoTip(usageTerms()[key]));card.append(caption,el('strong','',buckets[key]?.calls??'—'),el('span','note',(buckets[key]?.tokens??'—')+' Token'));return card}));
@@ -214,7 +222,9 @@ function renderTimeline(){
   const node=el('article','vtime-item '+(entry.planned?'planned':'actual')+(active?' active':'')+(r.status==='interrupted'?' interrupted':''));
   node.setAttribute('role','listitem');
   const bodyCell=el('div','vtime-body');
-  bodyCell.append(el('h3','',r.name||'未命名活动'));
+  const headCell=el('div','vtime-head');
+  headCell.append(el('h3','',r.name||'未命名活动'));
+  bodyCell.append(headCell);
   const meta=[`${minute(start)} → ${endLabel}`,entry.planned?'计划':source(r.source)];
   if(!entry.planned&&r.origin==='archived')meta.push('归档计划');
   if(!entry.planned&&r.source==='offline')meta.push('离线补全');
@@ -223,13 +233,14 @@ function renderTimeline(){
    const changes=spec.filter(([k])=>num(r.state_before[k])!==null&&num(r.state_after[k])!==null&&Math.abs(r.state_after[k]-r.state_before[k])>=.01).slice(0,3).map(([k,l])=>`${l} ${pct(r.state_before[k])}%→${pct(r.state_after[k])}%`);
    if(changes.length)bodyCell.append(el('p','vtime-change',changes.join(' · ')));
   }
-  node.append(el('time','',minute(start)),el('i','vtime-dot'),bodyCell,el('span','vtime-badge',entry.planned?(r.hardness==='hard'?'硬约定':'意图'):({active:'进行中',completed:'已完成',paused:'暂停',interrupted:'已中断',abandoned:'已放下',skipped:'已跳过',planned:'未开始'}[r.status]||r.status||'已记录')));
+  headCell.append(el('span','vtime-badge',entry.planned?(r.hardness==='hard'?'硬约定':'意图'):({active:'进行中',completed:'已完成',paused:'暂停',interrupted:'已中断',abandoned:'已放下',skipped:'已跳过',planned:'未开始'}[r.status]||r.status||'已记录')));
+  node.append(el('time','',minute(start)),el('i','vtime-dot'),bodyCell);
   list.append(node);
  }
  root.append(list);
 }
 
-let resizeTimer;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{if(data){drawHistory();renderSleep();renderModules()}},100)});
+let resizeTimer;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{if(data){updateDateLabel();drawHistory();renderSleep();renderModules()}},100)});
 function usageTerms(){return {calls:'收到宿主响应的请求数，包含失败；未收到响应的本地异常不计入。',tokens:'宿主明确回传的文本处理量。缺失时只计调用，不推算。',prompt_tokens:'宿主回传的输入 Token 总量。',completion_tokens:'宿主回传的输出 Token 总量。',cache_hit_tokens:'宿主回传的 prompt 缓存命中 Token；未回传时无法区分真 0 与未报。',missing_usage_source_calls:'缺少完整宿主用量或新标记的调用，可与失败重叠；它本身不代表失败。',host_reported:'宿主返回成功响应及完整usage。',success_no_usage:'success=true，但宿主未回传完整usage。',failed:'宿主返回失败响应。',legacy:'升级前没有success和usage_present标记的记录。'}}
 let infoSequence=0;
 function replaceInfoChildren(target,...nodes){const old=[...target.querySelectorAll('.info-button')],index=old.indexOf(document.activeElement),wasOpen=index>=0&&old[index].getAttribute('aria-expanded')==='true';target.replaceChildren(...nodes);if(index>=0){const next=target.querySelectorAll('.info-button')[index];if(next){next.focus({preventScroll:true});if(!wasOpen)next.onblur()}}}
