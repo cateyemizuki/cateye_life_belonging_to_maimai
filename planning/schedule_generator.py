@@ -903,6 +903,7 @@ class ScheduleGenerator:
                 temperature=temperature,
 
                 timeout_ms=timeout_ms,
+                module="planning",
                 event=event,
             ),
             timeout=float(gen_config.generation_timeout) + 15.0,

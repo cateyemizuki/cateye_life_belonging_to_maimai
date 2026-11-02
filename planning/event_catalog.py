@@ -1252,6 +1252,7 @@ class EventCatalogService:
                 task_name=task_name,
                 temperature=temperature,
 
+                module="planning",
                 event=LLM_EVENT_NAME,
                 strict_params=True,
             )
@@ -1262,6 +1263,7 @@ class EventCatalogService:
             task_name=task_name,
             temperature=temperature,
 
+            module="planning",
             event=LLM_EVENT_NAME,
         )
         text = str(text or "").strip()

@@ -17,10 +17,26 @@ def tail_records(path,budget=512*1024):
     except OSError:pass
     return rows,truncated
 
+def _usage_count(value):
+    """非负整数或 None；bool/非法值一律 None。"""
+    if isinstance(value,bool) or value is None:return None
+    try:return max(0,int(value))
+    except (TypeError,ValueError,OverflowError):return None
+
 def usage_summary(data_dir,now,hours=24):
+    """按窗口聚合 LLM 账本：模型 / 子模块 / token 拆分 / 缓存 / 四桶。
+
+    与 :meth:`core.llm_usage.LLMUsageTracker.summary` 保持同口径；这里额外保留
+    宿主日志的 ``truncated`` 有界读取标记。v2 行优先读 ``module`` 字段，旧行回退
+    event 映射。
+    """
     rows,truncated=tail_records(Path(data_dir)/'llm_usage_events.jsonl',2*1024*1024)
-    models={};modules={};calls=unknown=0;tokens=verified_tokens=unverified_tokens=0
-    from .llm_usage import module_of_event,usage_bucket_of,missing_usage_source,empty_buckets,reported_token_count,USAGE_TERMS
+    models={};model_calls={};modules={};module_calls={};matrix={}
+    calls=unknown=0;tokens=verified_tokens=unverified_tokens=0
+    prompt_total=completion_total=cache_hit_total=cache_miss_total=0
+    abandoned_calls=unknown_module_calls=0
+    from .llm_usage import (module_of_event,usage_bucket_of,missing_usage_source,
+                            empty_buckets,reported_token_count,USAGE_TERMS,MODULE_UNKNOWN)
     # 四桶并列输出（2026-10-29 §2.2 口径）：正常回传/成功但无用量/失败/legacy（旧行）。
     buckets=empty_buckets()
     for row in rows:
@@ -38,13 +54,32 @@ def usage_summary(data_dir,now,hours=24):
                 unknown+=1;unverified_tokens+=count
             else:verified_tokens+=count
             models[model]=models.get(model,0)+count
-            module=module_of_event(row.get('event'));modules[module]=modules.get(module,0)+count
+            model_calls[model]=model_calls.get(model,0)+1
+            module=str(row.get('module') or '') or module_of_event(row.get('event'))
+            if module==MODULE_UNKNOWN:unknown_module_calls+=1
+            modules[module]=modules.get(module,0)+count
+            module_calls[module]=module_calls.get(module,0)+1
+            cell=matrix.setdefault(module,{}).setdefault(model,{'calls':0,'tokens':0})
+            cell['calls']+=1;cell['tokens']+=count
+            prompt=_usage_count(row.get('prompt'))
+            completion=_usage_count(row.get('completion'))
+            cache_hit=_usage_count(row.get('cache_hit'))
+            cache_miss=_usage_count(row.get('cache_miss'))
+            if prompt is not None:prompt_total+=prompt
+            if completion is not None:completion_total+=completion
+            if cache_hit is not None:cache_hit_total+=cache_hit
+            if cache_miss is not None:cache_miss_total+=cache_miss
+            if row.get('abandoned') is True:abandoned_calls+=1
         except (ValueError,TypeError,OverflowError):continue
     return {'calls':calls,'tokens':tokens,'models':dict(sorted(models.items(),key=lambda r:r[1],reverse=True)[:30]),
             'host_reported_tokens':verified_tokens,
             'modules':modules,'window_hours':hours,'truncated':truncated,
             'missing_usage_source_calls':unknown,'missing_usage_source_tokens':unverified_tokens,
             'buckets':buckets,
+            'prompt_tokens':prompt_total,'completion_tokens':completion_total,
+            'cache_hit_tokens':cache_hit_total,'cache_miss_tokens':cache_miss_total,
+            'model_calls':model_calls,'module_calls':module_calls,'matrix':matrix,
+            'abandoned_calls':abandoned_calls,'unknown_module_calls':unknown_module_calls,
             'terms':USAGE_TERMS,
             'note':'只统计宿主回传的Token；缺失时只计调用，不推算。调用次数包含失败。'}
 

@@ -394,6 +394,29 @@ class LlmSectionConfig(PluginConfigBase):
         },
     )
 
+    usage_retention_hours: int = Field(
+        default=720,
+        ge=24,
+        le=720,
+        description="LLM 用量账本保留期（小时）：默认 720 = 30 天硬上限，只清理更早的行",
+        json_schema_extra={
+            "label": "用量账本保留期（小时）",
+            "hint": "默认 30 天；面板 24 小时 / 7 天 / 30 天三档都落在保留期内。调小后更早的记录会被清理",
+            **_ui_i18n("Usage ledger retention (hours)"),
+        },
+    )
+    usage_default_window_hours: int = Field(
+        default=720,
+        ge=24,
+        le=720,
+        description="模型消耗面板默认显示窗口（小时）：24 / 168 / 720，默认 720 = 30 天",
+        json_schema_extra={
+            "label": "用量默认窗口（小时）",
+            "hint": "WebUI 打开时默认展示的窗口；页面上的 24 小时 / 7 天 / 30 天选择器仍可切换",
+            **_ui_i18n("Default usage window (hours)"),
+        },
+    )
+
 
 class LifeStateSuiteSectionConfig(LifeStateSectionConfig):
     """设置精力、饥饿、专注、压力、社交状态及睡眠恢复。"""

@@ -206,6 +206,7 @@ async def judge_schedule_request(
         temperature=temperature,
 
         timeout_ms=int(timeout_ms) if (timeout_ms is not None and timeout_ms > 0) else None,
+        module="planning",
         event="role_judge",
     )
     if not response_text:

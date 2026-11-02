@@ -253,6 +253,6 @@ class CateyeClient:
         return await llm.describe_image(
             images[0], describe_prompt,
             extra_images=images[1:],
-            task_name=vlm_task, temperature=0.3,
+            module="companion", task_name=vlm_task, temperature=0.3,
             event="cateye_screen_describe",
         )

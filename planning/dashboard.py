@@ -518,6 +518,9 @@ def _maimai_view(cfg: Any) -> dict[str, Any]:
 
 
 def build_life_dashboard(plugin: Any, *, hours: int = 24,
+                         usage_hours: int = 720,
+                         usage_rows_limit: int = 0,
+                         usage_rows_offset: int = 0,
                          now: datetime | None = None, day: str = "") -> dict[str, Any]:
     """只读生活面板投影。
 
@@ -534,6 +537,8 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
         now = now.replace(tzinfo=clock.get_now().tzinfo)
     date = now.strftime('%Y-%m-%d')
     hours = hours if type(hours) is int and hours in (6, 24, 72, 168) else 24
+    usage_hours = (usage_hours if type(usage_hours) is int
+                   and usage_hours in (24, 168, 720) else 720)
     enabled = bool(getattr(getattr(cfg, 'schedule', None), 'enabled', False))
     life = ctx.life_state
     model = ctx.life_model
@@ -623,7 +628,8 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
         'companion': companion, 'observations': observations, 'warnings': list(dict.fromkeys(warnings))[:8],
     }
     result['maimai'] = _maimai_view(cfg)
-    result.update(_extension_summary(plugin, now, hours))
+    result.update(_extension_summary(plugin, now, hours, usage_hours,
+                                     usage_rows_limit, usage_rows_offset))
     if future_state:
         result['warnings'].append('状态时间晚于当前时钟，请核对服务器时间')
     if history.get('clock_regressed'):
@@ -688,7 +694,9 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
     return result
 
 
-def _extension_summary(plugin: Any, now: datetime, hours: int) -> dict[str, Any]:
+def _extension_summary(plugin: Any, now: datetime, hours: int,
+                       usage_hours: int = 720, usage_rows_limit: int = 0,
+                       usage_rows_offset: int = 0) -> dict[str, Any]:
     """Independent module projections; never propagate raw event descriptions/logs."""
     result: dict[str, Any] = {'emotion': {'available': False}, 'qzone': {'available': False},
                               'usage': {}, 'health': {}}
@@ -727,7 +735,12 @@ def _extension_summary(plugin: Any, now: datetime, hours: int) -> dict[str, Any]
         from core.monitoring import usage_summary, runtime_health
         data_dir = ctx.data_dir
         if data_dir:
-            result['usage'] = usage_summary(data_dir, now, min(hours, 48))
+            result['usage'] = usage_summary(data_dir, now, usage_hours)
+            if int(usage_rows_limit or 0) > 0:
+                from core.llm_usage import LLMUsageTracker
+                result['usage']['rows_page'] = LLMUsageTracker(data_dir).rows(
+                    usage_hours, now=now, limit=int(usage_rows_limit),
+                    offset=max(0, int(usage_rows_offset or 0)))
         result['health'] = runtime_health(plugin, now)
     except Exception:
         pass

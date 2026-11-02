@@ -362,8 +362,12 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         )
         # config_provider：judge() 等在调用时动态读顶层配置（[judge] 段热更新即时生效）
         # 任务名统一读 [llm].task_name（2026-10-10 起 LLM 调用参数集中在 [llm] 段）
-        self._llm = LLMService(self.ctx, task_name=llm_task_name_of(cfg),
-                               call_logger=self._llm_logger, config_provider=lambda: self.config)
+        self._llm = LLMService(
+            self.ctx, task_name=llm_task_name_of(cfg),
+            call_logger=self._llm_logger, config_provider=lambda: self.config,
+            usage_keep_hours=int(getattr(cfg.llm, "usage_retention_hours", 720) or 720),
+            usage_default_window_hours=int(
+                getattr(cfg.llm, "usage_default_window_hours", 720) or 720))
         # 缓存窗口在 [schedule_advanced]（2026-10-10 段拆分）
         # config_provider：PR1 P0 修复（2026-10-26），计划书 §三十四 / 定稿 §2 第 0.5 项——
         # runtime 空闲回退睡眠条目的特判需读 [schedule] 作息锚点；动态读配置，热重载即时生效
@@ -421,7 +425,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._video_watch = VideoWatchService(
             data_dir / "video_watch", logger=self.ctx.logger,
             config_provider=lambda: self.config.video_watch,
-            llm_generate_detailed=self._llm.generate_detailed,
+            llm_generate_detailed=lambda *args, **kwargs: self._llm.generate_detailed(
+                *args, module="video", **kwargs),
             automatic_guard=self._video_automation_allowed,
             state_changed=self._video_state_changed)
         self._video_watch.start()

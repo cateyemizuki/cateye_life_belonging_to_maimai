@@ -841,6 +841,7 @@ class CompanionComponentsMixin:
                     name=name, self_desc=self_desc, relation_word=relation_word,
                 ),
                 temperature=0.8,
+                module="companion",
                 event="tool_send_message",
             )
 
@@ -1348,7 +1349,7 @@ class CompanionComponentsMixin:
         llm = getattr(self, "_llm", None)
         if llm is not None and callable(getattr(llm, "usage_summary", None)):
             try:
-                usage_summary = llm.usage_summary(24)
+                usage_summary = llm.usage_summary(0)
             except Exception:
                 usage_summary = None
 
@@ -1545,17 +1546,26 @@ class CompanionComponentsMixin:
         from core.llm_usage import MODULE_ORDER
 
         llm = getattr(self, "_llm", None)
-        summary = llm.usage_summary(24) if llm is not None and callable(
+        summary = llm.usage_summary(0) if llm is not None and callable(
             getattr(llm, "usage_summary", None)) else None
         if not summary:
             return ["消耗统计不可用（LLM 服务未就绪）"]
         calls = int(summary.get("calls") or 0)
         tokens = int(summary.get("tokens") or 0)
+        window = int(summary.get("window_hours") or 24)
         if calls == 0:
-            return ["最近 24 小时：无 LLM 调用"]
-        lines = [f"最近 24 小时：{tokens} tokens / {calls} 次调用"]
+            return [f"最近 {window} 小时：无 LLM 调用"]
+        lines = [f"最近 {window} 小时：{tokens} tokens / {calls} 次调用"]
         if not summary.get("has_usage"):
             lines.append("（宿主未返回 token 用量，仅计调用次数）")
+        prompt_tokens = summary.get("prompt_tokens")
+        completion_tokens = summary.get("completion_tokens")
+        if prompt_tokens is not None or completion_tokens is not None:
+            lines.append(f"输入 {int(prompt_tokens or 0)} / 输出 {int(completion_tokens or 0)} tokens")
+        cache_hit = summary.get("cache_hit_tokens")
+        cache_miss = summary.get("cache_miss_tokens")
+        if cache_hit is not None or cache_miss is not None:
+            lines.append(f"缓存命中 {int(cache_hit or 0)} / 未命中 {int(cache_miss or 0)} tokens")
         models = summary.get("models") or {}
         for model, count in sorted(models.items(), key=lambda kv: kv[1], reverse=True)[:5]:
             lines.append(f"模型 {model or '未知'}：{count} tokens")

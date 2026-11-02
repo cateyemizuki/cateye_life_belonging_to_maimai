@@ -72,6 +72,8 @@ Planner 直接提供 `message` 时不调用文案生成，因此约束放在工�
 
 调用次数统计收到宿主响应的请求，包含失败；Token只累计宿主明确回传的用量，缺失不推算。四类调用为正常回传、成功但无用量、失败调用、旧记录；“缺用量来源调用”是独立提示，可与失败重叠。WebUI提供说明按钮，PNG展示相同口径。
 
+2026-11-02 起所有调用经 `tools/llm_gateway.py` 统一入口，每次请求必须带业务模块（planning/emotion/qzone/companion/video/core，缺失记 `unknown`）。账本按调用记录模型、模块、任务名、输入/输出 Token、缓存命中/未命中、耗时与尝试次数；默认保留 30 天，面板可选 24 小时 / 7 天 / 30 天三档（默认 30 天），并提供模块 × 模型矩阵与逐笔明细。旧账本行保持原样，按 event 映射回模块。
+
 ## WebUI 生活面板
 
 在宿主侧边栏打开「属于麦麦的生活 → 属于麦麦的生活」。页面通过插件自己的 `webui.json`（v2）与沙箱查询读取实时数据，自动跟随宿主主题，不需要替换宿主静态文件。
@@ -284,7 +286,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 - 组件 **31 个** = 8 个命令 + 10 个 Hook + 8 个工具 + 5 个跨插件 API（`[admin].harass_report_enabled=false` 时运行期注册面回落 30）。
 - 声明 **17 项**宿主能力。
-- 配置 **16 个段 / 229 字段 / 5 隐藏 / 224 可见**（`[plugin]` 3、`[patrol]` 23、`[affection]` 12、`[schedule]` 23、`[schedule_advanced]` 30、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 8、`[llm]` 8、`[prompts]` 13、`[dashboard_display]` 3、`[admin]` 8、`[qzone]` 20、`[emotion]` 17、`[video_watch]` 13、`[maimai_interaction]` 12；数字由离线冒烟门禁实算并写入测试仓 `_gate_facts.json`，2026-11-02 质量整改批核对）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
+- 配置 **16 个段 / 231 字段 / 5 隐藏 / 226 可见**（`[plugin]` 3、`[patrol]` 23、`[affection]` 12、`[schedule]` 23、`[schedule_advanced]` 30、`[planning_proactive]` 14、`[life_state]` 22、`[event_catalog]` 8、`[llm]` 10、`[prompts]` 13、`[dashboard_display]` 3、`[admin]` 8、`[qzone]` 20、`[emotion]` 17、`[video_watch]` 13、`[maimai_interaction]` 12；数字由离线冒烟门禁实算并写入测试仓 `_gate_facts.json`，2026-11-02 质量整改批核对）。`max_events`、`temperature` 为隐藏兼容键，不提供可编辑旋钮。
 - 用户可编辑映射表 **7 张**：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可

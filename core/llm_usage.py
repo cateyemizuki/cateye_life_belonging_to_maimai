@@ -1,13 +1,17 @@
-"""LLM 消耗统计（F3，2026-10-11）：按模型 / 按模块记录最近 24 小时的 token 消耗。
+"""LLM 消耗统计（F3，2026-10-11；2026-11-02 账本 v2 与 30 天保留）。
 
 - **数据源** = ``LLMService`` 唯一出口：宿主 LLM 能力返回载荷自带的
   ``model_name / prompt_tokens / completion_tokens / total_tokens``
   （旧宿主或测试桩没有这些字段 → 记 0 tokens、只计调用次数，面板据此提示）。
-- **落盘** = ``<data_dir>/llm_usage_events.jsonl``：每次调用一行
-  ``{"ts", "event", "model", "tokens"}``（2026-10-29 口径轮起新增 ``success`` /
-  ``usage_present`` 两个布尔；旧行无新字段，聚合时归 legacy 桶，不回填不改旧行）；
-  写入时惰性裁剪超过保留期的旧行；JSONL 单行追加、损坏行跳过（统计类数据，不要求事务性）。
-- **模块归属** = ``event`` 名静态映射（各调用点的 ``event=`` 全仓唯一）。
+- **落盘** = ``<data_dir>/llm_usage_events.jsonl``：每次调用一行。
+  v2 行（``schema=2``）额外记录子模块、任务名、输入/输出拆分、缓存命中/未命中、
+  耗时、尝试次数与 ``abandoned`` 标记；旧行无新字段，读取端按 legacy 桶处理，
+  不回填不改写。
+- **保留期** = ``KEEP_HOURS``（默认 720 = 30 天，硬上限）。裁剪是惰性的：仅在
+  「跨日后的首次写入」或「累计写入超过 1500 行」时全量扫描一次，避免每次记账
+  都重写账本。
+- **模块归属** = v2 行直接用 ``module`` 字段；旧行回退 ``event`` 映射
+  （:func:`module_of_event`），未知 event 归「其他」。
 - **无配置项**（用户口径）；跨热重载连续（落盘），满足 §9.2「计数必须落盘」教训。
 """
 
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -37,12 +42,22 @@ EVENT_MODULE_MAP: Dict[str, str] = {
     "qzone_post": "qzone",
     "qzone_reply": "qzone",
     "qzone_post_gate": "qzone",
+    "video_watch_visual": "video",
+    "video_watch_description": "video",
+    "video_watch_impression": "video",
 }
-#: 模块展示顺序（面板按此排序；映射外的事件归「其他」）
-MODULE_ORDER = ("planning", "companion", "emotion", "qzone", "其他")
+#: 模块展示顺序（面板按此排序；映射外的事件归「其他」，未标注的 v2 行归「unknown」）
+MODULE_ORDER = ("planning", "companion", "emotion", "qzone", "video", "core", "其他", "unknown")
+#: 子模块枚举（调用方必须使用这些值；缺失由 Gateway 记为 unknown）
+MODULE_VALUES = ("planning", "emotion", "qzone", "companion", "video", "core")
+MODULE_UNKNOWN = "unknown"
 
-#: 账本保留期（小时）：面板只看 24h，多留一天缓冲
-KEEP_HOURS = 48
+#: 账本保留期（小时）：30 天硬上限，面板三档窗口都落在保留期内
+KEEP_HOURS = 720
+#: 允许显示的窗口（小时）：24 小时 / 7 天 / 30 天
+USAGE_WINDOWS = (24, 168, 720)
+#: 默认显示窗口（30 天）
+DEFAULT_USAGE_WINDOW_HOURS = 720
 
 #: 四桶键名（§2.2 模型消耗口径）：聚合结果按此并列输出。
 #: 正常回传 = 宿主标明来源且用量在场；成功但无用量；失败；legacy = 无新字段的旧行。
@@ -96,27 +111,120 @@ def reported_token_count(entry: Any) -> int:
     except (TypeError, ValueError, OverflowError):
         return 0
 
+
+def _optional_count(value: Any) -> Optional[int]:
+    """非负整数或 None；bool/非法值一律 None（不把 False 当 0 参与统计）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def normalize_module(module: Any) -> str:
+    """把调用方给的模块名收敛到枚举；缺失/非法返回 ``unknown``。"""
+    value = str(module or "").strip().lower()
+    return value if value in MODULE_VALUES else MODULE_UNKNOWN
+
+
+def entry_module(entry: Any) -> str:
+    """单条账本行的模块：v2 行读 ``module``，旧行回退 event 映射。"""
+    if not isinstance(entry, dict):
+        return "其他"
+    value = str(entry.get("module") or "").strip()
+    if value:
+        return value
+    return module_of_event(entry.get("event"))
+
+
 USAGE_TERMS = {
     "calls": {"label": "调用次数", "description": "收到宿主响应的请求数，包含失败响应；未收到响应的本地异常不计入。"},
     "tokens": {"label": "Token 消耗", "description": "宿主回传的文本处理量；缺失时只计调用，不推算。"},
+    "prompt_tokens": {"label": "输入 Token", "description": "宿主回传的输入（prompt）Token 总量，仅统计明确回传的记录。"},
+    "completion_tokens": {"label": "输出 Token", "description": "宿主回传的输出（completion）Token 总量，仅统计明确回传的记录。"},
+    "cache_hit_tokens": {"label": "缓存命中", "description": "宿主回传的 prompt 缓存命中 Token；供应商未回传时无法区分真 0 与未报。"},
+    "cache_miss_tokens": {"label": "缓存未命中", "description": "宿主回传的 prompt 缓存未命中 Token。"},
     "missing_usage_source_calls": {"label": "缺用量来源调用", "description": "缺少完整宿主用量或新记录标记的调用，可与失败调用重叠。"},
     "host_reported": {"label": "正常回传", "description": "宿主返回成功响应及可识别的完整用量。"},
     "success_no_usage": {"label": "成功但无用量", "description": "success=true，但宿主未回传完整usage。"},
     "failed": {"label": "失败调用", "description": "宿主响应的success不为true。"},
     "legacy": {"label": "旧记录", "description": "升级前缺少success和usage_present标记的记录，保留原始记录不补写。"},
+    "abandoned": {"label": "已放弃", "description": "插件主动放弃但宿主可能已完成并计费的调用；token 缺失时只计次数。"},
 }
+
 
 def module_of_event(event: Any) -> str:
     """调用点 event → 模块名（未知 event 归「其他」，不丢数）。"""
     return EVENT_MODULE_MAP.get(str(event or ""), "其他")
 
 
+@dataclass(frozen=True)
+class UsageRow:
+    """只读账本行（诊断与逐笔明细共用；字段缺省保持 None）。"""
+
+    ts: str
+    module: str
+    event: str
+    task_name: str
+    model: str
+    prompt: Optional[int]
+    completion: Optional[int]
+    total: int
+    cache_hit: Optional[int]
+    cache_miss: Optional[int]
+    duration_ms: Optional[int]
+    attempts: Optional[int]
+    request_id: str
+    success: bool
+    usage_present: bool
+    usage_source: str
+    degraded: bool
+    abandoned: bool
+    schema: int
+
+
+def _row_of(entry: Any) -> Optional[UsageRow]:
+    if not isinstance(entry, dict):
+        return None
+    return UsageRow(
+        ts=str(entry.get("ts") or ""),
+        module=entry_module(entry),
+        event=str(entry.get("event") or ""),
+        task_name=str(entry.get("task_name") or ""),
+        model=str(entry.get("model") or ""),
+        prompt=_optional_count(entry.get("prompt")),
+        completion=_optional_count(entry.get("completion")),
+        total=reported_token_count(entry),
+        cache_hit=_optional_count(entry.get("cache_hit")),
+        cache_miss=_optional_count(entry.get("cache_miss")),
+        duration_ms=_optional_count(entry.get("duration_ms")),
+        attempts=_optional_count(entry.get("attempts")),
+        request_id=str(entry.get("request_id") or ""),
+        success=entry.get("success") is True,
+        usage_present=entry.get("usage_present") is True,
+        usage_source=str(entry.get("usage_source") or ""),
+        degraded=entry.get("degraded") is True,
+        abandoned=entry.get("abandoned") is True,
+        schema=int(entry.get("schema") or 1),
+    )
+
+
 class LLMUsageTracker:
     """LLM 用量记录（JSONL 追加 + 惰性裁剪 + 按窗口聚合）。"""
+
+    #: 未跨日时的最小裁剪间隔（写入行数）；避免每次记账全量重写账本
+    PRUNE_EVERY_WRITES = 1500
 
     def __init__(self, data_dir: Any, *, keep_hours: int = KEEP_HOURS) -> None:
         self._path: Optional[Path] = Path(data_dir) / "llm_usage_events.jsonl" if data_dir else None
         self._keep_hours = max(1, int(keep_hours))
+        self._writes_since_prune = 0
+        self._last_prune_day: Optional[str] = None
+
+    @property
+    def path(self) -> Optional[Path]:
+        return self._path
 
     # ---- 记账 ----
     def record(self, *, event: Any, model: Any = "",
@@ -124,38 +232,89 @@ class LLMUsageTracker:
                total_tokens: Any = 0, request_id: Any = "",
                usage_available: bool = False,
                success: bool = False, usage_present: bool = False) -> None:
+        """旧调用路径：保留原签名，内部转 v2（不写 module，读取端按 event 回退）。"""
+        self.record_v2(
+            event=event, module="", model=model,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            total_tokens=total_tokens, request_id=request_id,
+            usage_available=usage_available, success=success,
+            usage_present=usage_present,
+        )
+
+    def record_v2(self, *, event: Any, module: Any = "", model: Any = "",
+                  task_name: Any = "", prompt_tokens: Any = None,
+                  completion_tokens: Any = None, total_tokens: Any = None,
+                  cache_hit_tokens: Any = None, cache_miss_tokens: Any = None,
+                  duration_ms: Any = None, attempts: Any = 1,
+                  request_id: Any = "", usage_available: bool = False,
+                  success: bool = False, usage_present: bool = False,
+                  degraded: bool = False, abandoned: bool = False) -> None:
         """记一次调用（tokens 为 0 也记调用次数；异常一律吞掉，绝不打断业务链路）。
 
-        2026-10-29 新增两个布尔（只加字段不改既有字段语义）：
-        - ``success``：请求成败，来自调用出口（``_result_from_response``/``_interpret``）
-          的实际结果——拿到非空正文为真；宿主失败/空正文/异常均假。成败不由 usage 推断。
-        - ``usage_present``：宿主响应里是否存在可识别的用量字段（含 0 值）；
-          与 ``usage_available``（total 可得，预算层口径）分离。
+        v2 字段只增不改：``module`` / ``task_name`` / 输入输出拆分 / 缓存命中
+        与未命中 / ``duration_ms`` / ``attempts`` / ``degraded`` / ``abandoned``。
         """
         if self._path is None:
             return
-        # Missing usage is a missing observation, never a synthetic token count.
+        total = self._total_of(prompt_tokens, completion_tokens, total_tokens,
+                               usage_available)
+        entry = {
+            "schema": 2,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "module": str(module or ""),
+            "event": str(event or ""),
+            "task_name": str(task_name or ""),
+            "model": str(model or ""),
+            "tokens": total,
+            "prompt": _optional_count(prompt_tokens),
+            "completion": _optional_count(completion_tokens),
+            "total": _optional_count(total_tokens),
+            "cache_hit": _optional_count(cache_hit_tokens),
+            "cache_miss": _optional_count(cache_miss_tokens),
+            "duration_ms": _optional_count(duration_ms),
+            "attempts": _optional_count(attempts),
+            "request_id": str(request_id or "")[:128],
+            "usage_source": "host_reported" if usage_available else "unavailable",
+            "success": bool(success),
+            "usage_present": bool(usage_present),
+            "degraded": bool(degraded),
+            "abandoned": bool(abandoned),
+        }
         try:
-            total = max(0, int(total_tokens)) if usage_available and total_tokens is not None else 0
-            if usage_available and total <= 0 and prompt_tokens is not None and completion_tokens is not None:
-                total = max(0, int(prompt_tokens)) + max(0, int(completion_tokens))
-        except (TypeError, ValueError, OverflowError):
-            total = 0
-        entry = {"ts": datetime.now().isoformat(timespec="seconds"),
-                 "event": str(event or ""), "model": str(model or ""), "tokens": max(0,total),
-                 "request_id": str(request_id or "")[:128],
-                 "usage_source": "host_reported" if usage_available else "unavailable",
-                 "success": bool(success),
-                 "usage_present": bool(usage_present)}
-        try:
-            self._prune()
+            self._writes_since_prune += 1
+            if self._should_prune():
+                self._prune()
             with open(self._path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
             logger.debug("LLM 消耗记账写盘失败（忽略）", exc_info=True)
 
+    @staticmethod
+    def _total_of(prompt_tokens: Any, completion_tokens: Any,
+                  total_tokens: Any, usage_available: bool) -> int:
+        """明确回传才取 total；缺失时用输入+输出补齐，绝不估算。"""
+        if not usage_available:
+            return 0
+        total = _optional_count(total_tokens)
+        if total is not None:
+            return total
+        prompt = _optional_count(prompt_tokens)
+        completion = _optional_count(completion_tokens)
+        if prompt is not None and completion is not None:
+            return prompt + completion
+        return 0
+
+    def _should_prune(self) -> bool:
+        """跨日首次写入或累计写入达阈值才裁剪（默认 30 天保留期）。"""
+        today = datetime.now().date().isoformat()
+        if self._last_prune_day != today or self._writes_since_prune >= self.PRUNE_EVERY_WRITES:
+            self._last_prune_day = today
+            self._writes_since_prune = 0
+            return True
+        return False
+
     def _prune(self) -> None:
-        """惰性裁剪：全行扫描保留期内的行，无陈旧行则不重写（账本体量受保留期约束，开销可忽略）。"""
+        """惰性裁剪：全行扫描保留期内的行，无陈旧行则不重写。"""
         path = self._path
         if path is None or not path.exists():
             return
@@ -176,7 +335,7 @@ class LLMUsageTracker:
                     ts = str((entry or {}).get("ts") or "")
                     try:
                         fresh = bool(ts) and datetime.fromisoformat(ts) >= cutoff
-                    except ValueError:
+                    except (ValueError, TypeError):
                         fresh = False
                     if fresh:
                         kept.append(line)
@@ -191,26 +350,35 @@ class LLMUsageTracker:
             logger.debug("LLM 用量记录裁剪失败（忽略）", exc_info=True)
 
     # ---- 聚合 ----
-    def summary(self, hours: int = 24) -> Dict[str, Any]:
-        """聚合最近 ``hours`` 小时：调用次数 / token 总量 / 按模型 / 按模块 / 四桶。
+    def summary(self, hours: int = DEFAULT_USAGE_WINDOW_HOURS, *,
+                now: Optional[datetime] = None,
+                include_rows: bool = False) -> Dict[str, Any]:
+        """聚合最近 ``hours`` 小时：调用次数 / token / 模型 / 模块 / 输入输出 / 缓存。
 
-        返回 ``{"calls", "tokens", "models", "modules", "has_usage", "buckets",
-        "missing_usage_source_calls"}``；
-        ``has_usage`` = 宿主是否回传过非零 token（面板据此区分"无调用"与
-        "有调用但宿主未返回用量"）；
-        ``buckets`` = 四桶拆分（正常回传 / 成功但无用量 / 失败 / legacy，各含
-        ``calls``/``tokens``，与既有键并列输出）；
-        ``missing_usage_source_calls`` = 缺用量来源调用次数（口径见
-        :func:`missing_usage_source`，旧「缺少来源」改名后的新键名）。
-        文件缺失/损坏 → 空账本（不抛异常）。
+        返回既有键（``calls`` / ``tokens`` / ``models`` / ``modules`` /
+        ``has_usage`` / ``buckets`` / ``missing_usage_source_calls``）保持原语义，
+        新增：``window_hours`` / ``prompt_tokens`` / ``completion_tokens`` /
+        ``cache_hit_tokens`` / ``cache_miss_tokens`` / ``module_calls`` /
+        ``matrix``（模块 × 模型，值为 ``{calls,tokens}``）/ ``abandoned_calls`` /
+        ``unknown_module_calls`` / ``rows``（逐笔明细；仅 ``include_rows=True``
+        时收集，避免首屏 payload 膨胀）。文件缺失/损坏 → 空账本（不抛异常）。
         """
-        window_start = datetime.now() - timedelta(hours=max(1, int(hours)))
+        window_hours = max(1, int(hours or DEFAULT_USAGE_WINDOW_HOURS))
+        clock = now or datetime.now()
+        window_start = clock - timedelta(hours=window_hours)
         calls = 0
         tokens = 0
+        prompt_total = completion_total = cache_hit_total = cache_miss_total = 0
         missing_calls = 0
+        abandoned_calls = 0
+        unknown_module_calls = 0
         buckets = empty_buckets()
         models: Dict[str, int] = {}
+        model_calls: Dict[str, int] = {}
         modules: Dict[str, int] = {}
+        module_calls: Dict[str, int] = {}
+        matrix: Dict[str, Dict[str, Dict[str, int]]] = {}
+        rows: List[Dict[str, Any]] = []
         if self._path is not None and self._path.exists():
             try:
                 with open(self._path, "r", encoding="utf-8") as handle:
@@ -224,9 +392,14 @@ class LLMUsageTracker:
                             continue
                         ts = str((entry or {}).get("ts") or "")
                         try:
-                            if ts and datetime.fromisoformat(ts) < window_start:
+                            at = datetime.fromisoformat(ts)
+                            if at.tzinfo is None and clock.tzinfo is not None:
+                                at = at.replace(tzinfo=clock.tzinfo)
+                            elif at.tzinfo is not None and clock.tzinfo is None:
+                                at = at.replace(tzinfo=None)
+                            if at < window_start or at > clock:
                                 continue
-                        except ValueError:
+                        except (ValueError, TypeError):
                             continue
                         calls += 1
                         count = reported_token_count(entry)
@@ -236,13 +409,72 @@ class LLMUsageTracker:
                         bucket = usage_bucket_of(entry)
                         buckets[bucket]["calls"] += 1
                         buckets[bucket]["tokens"] += count
-                        model = str((entry or {}).get("model") or "")
-                        module = module_of_event((entry or {}).get("event"))
+                        row = _row_of(entry)
+                        if row is None:
+                            continue
+                        if row.abandoned:
+                            abandoned_calls += 1
+                        if row.module == MODULE_UNKNOWN:
+                            unknown_module_calls += 1
+                        if row.prompt is not None:
+                            prompt_total += row.prompt
+                        if row.completion is not None:
+                            completion_total += row.completion
+                        if row.cache_hit is not None:
+                            cache_hit_total += row.cache_hit
+                        if row.cache_miss is not None:
+                            cache_miss_total += row.cache_miss
+                        model = row.model
                         if model:
                             models[model] = models.get(model, 0) + count
+                            model_calls[model] = model_calls.get(model, 0) + 1
+                        module = row.module
                         modules[module] = modules.get(module, 0) + count
+                        module_calls[module] = module_calls.get(module, 0) + 1
+                        cell = matrix.setdefault(module, {}).setdefault(
+                            model or "未知模型", {"calls": 0, "tokens": 0})
+                        cell["calls"] += 1
+                        cell["tokens"] += count
+                        if include_rows:
+                            rows.append({
+                                "ts": row.ts, "module": module, "event": row.event,
+                                "task_name": row.task_name, "model": model,
+                                "prompt": row.prompt, "completion": row.completion,
+                                "tokens": count, "cache_hit": row.cache_hit,
+                                "cache_miss": row.cache_miss,
+                                "duration_ms": row.duration_ms, "attempts": row.attempts,
+                                "success": row.success, "abandoned": row.abandoned,
+                            })
             except OSError:
                 logger.debug("LLM 用量记录读取失败（忽略）", exc_info=True)
-        return {"calls": calls, "tokens": tokens, "models": models,
-                "modules": modules, "has_usage": tokens > 0, "terms": USAGE_TERMS,
-                "buckets": buckets, "missing_usage_source_calls": missing_calls}
+        rows.sort(key=lambda row: str(row.get("ts") or ""), reverse=True)
+        return {
+            "calls": calls, "tokens": tokens, "models": models,
+            "modules": modules, "has_usage": tokens > 0, "terms": USAGE_TERMS,
+            "buckets": buckets, "missing_usage_source_calls": missing_calls,
+            "window_hours": window_hours,
+            "window_start": window_start.isoformat(timespec="seconds"),
+            "prompt_tokens": prompt_total,
+            "completion_tokens": completion_total,
+            "cache_hit_tokens": cache_hit_total,
+            "cache_miss_tokens": cache_miss_total,
+            "module_calls": module_calls,
+            "model_calls": model_calls,
+            "matrix": matrix,
+            "abandoned_calls": abandoned_calls,
+            "unknown_module_calls": unknown_module_calls,
+            "rows": rows,
+        }
+
+    def rows(self, hours: int = DEFAULT_USAGE_WINDOW_HOURS, *,
+             now: Optional[datetime] = None,
+             limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+        """逐笔明细（分页；不塞进首屏 payload）。"""
+        data = self.summary(hours, now=now, include_rows=True)
+        all_rows = data["rows"]
+        start = max(0, int(offset or 0))
+        count = max(1, min(200, int(limit or 50)))
+        page = all_rows[start:start + count]
+        return {"window_hours": data["window_hours"], "total": len(all_rows),
+                "offset": start, "limit": count, "rows": page,
+                "truncated": len(all_rows) > start + len(page)}

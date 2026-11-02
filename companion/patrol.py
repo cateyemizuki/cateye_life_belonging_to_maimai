@@ -1202,7 +1202,7 @@ class PatrolService:
         # mai-love v2.6.3：判定参数（模型/max_tokens/温度）集中在 [llm] 配置段（原 [judge]）——
         # 此前与日程共用 LLM 任务且 max_tokens 写死 16，任务切到思考型模型后
         # reasoning 吃满预算、正文恒空、把关整批失败；现可在 WebUI 单独指定。
-        response = await self._llm.judge(prompt_text, event="miss_confirm")
+        response = await self._llm.judge(prompt_text, module="companion", event="miss_confirm")
         verdict = self._parse_missing_confirm(response)
         if verdict is True:
             return True

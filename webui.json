@@ -33,6 +33,27 @@
               "type": "string",
               "required": false,
               "max_length": 10
+            },
+            "usage_hours": {
+              "type": "integer",
+              "minimum": 24,
+              "maximum": 720,
+              "choices": [
+                24,
+                168,
+                720
+              ]
+            },
+            "usage_rows_limit": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 200,
+              "required": false
+            },
+            "usage_rows_offset": {
+              "type": "integer",
+              "minimum": 0,
+              "required": false
             }
           }
         }
