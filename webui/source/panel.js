@@ -157,7 +157,7 @@ function renderSleep(){const s=data.state||{},sleep=data.sleep||{},cur=sleep.cur
  const debtVal=num(s.sleep_debt),meterBox=$('debt-meter');if(meterBox){meterBox.hidden=debtVal===null;meterBox.classList.remove('sev-low','sev-mid','sev-high');if(debtVal!==null){meterBox.firstElementChild.style.width=Math.min(100,Math.max(0,debtVal/12*100))+'%';meterBox.classList.add(debtVal<=3?'sev-low':debtVal<=7?'sev-mid':'sev-high')}}
  const sparkBox=$('debt-spark');if(sparkBox)sparkDebt(sparkBox,points);
  const forecast=$('sleep-forecast');if(forecast){const wakeAt=cur?.asleep&&cur.wake_at?clock(cur.wake_at):'';forecast.hidden=!wakeAt;if(wakeAt)text('sleep-forecast','预计最早醒来 '+wakeAt)}
- chart($('debt-chart'),visiblePoints(),['sleep_debt'],12,160);text('sleep-anchors',`配置作息 ${sleep.configured_sleep||'—'} → ${sleep.configured_wake||'—'}${cur?.asleep&&cur.wake_at?' · 本会话最早醒沿 '+clock(cur.wake_at):''} · 醒睡以引擎会话为准`);const list=$('sleep-list'),rows=Array.isArray(sleep.sessions)?sleep.sessions:[];if(!rows.length){empty(list,'还没有近期睡眠会话','完整睡眠发生后会留下恢复与睡眠债记录。');return}list.replaceChildren();for(const row of rows){const box=el('div','sleeprow'),left=el('div'),right=el('div','rowend');
+ chart($('debt-chart'),visiblePoints(),['sleep_debt'],12,160);text('sleep-anchors',`配置参考 ${sleep.configured_sleep||'—'} → ${sleep.configured_wake||'—'}${(sleep.dynamic?.window_start&&sleep.dynamic?.window_end)?' · 动态入睡窗口 '+clock(sleep.dynamic.window_start)+' → '+clock(sleep.dynamic.window_end):''}${cur?.asleep&&s.sleep_started_at?' · 实际入睡 '+clock(s.sleep_started_at):''}${cur?.wake_at?' · 最早醒沿 '+clock(cur.wake_at):''}${cur?.lie_in_cap?' · 赖床上限 '+clock(cur.lie_in_cap):''} · 醒睡以引擎会话为准`);const list=$('sleep-list'),rows=Array.isArray(sleep.sessions)?sleep.sessions:[];if(!rows.length){empty(list,'还没有近期睡眠会话','完整睡眠发生后会留下恢复与睡眠债记录。');return}list.replaceChildren();for(const row of rows){const box=el('div','sleeprow'),left=el('div'),right=el('div','rowend');
   // W-08：睡眠会话跨午夜（醒来分钟早于入睡分钟）时结束侧补「次日」。
   const endShown=spanEnd(row.actual_start_minute,row.actual_end_minute);
   left.append(el('strong','',`${row.schedule_date||'—'} · ${minute(row.actual_start_minute)} → ${minute(endShown)}`),el('div','note',row.actual_end_minute===null?'会话尚未结束':`醒来：${({energy_threshold:'精力达标',lie_in_cap:'赖床上限',hard_commitment:'硬约定唤醒',interrupted_awake:'被暂时打断',manual:'手动唤醒',no_sleep_mode:'免睡模式',offline_reconnect:'离线补眠估算'}[row.wake_reason]||row.wake_reason||'未记录')}`));right.append(el('strong','',num(row.energy_start)!==null&&num(row.energy_end)!==null?`精力 ${pct(row.energy_start)} → ${pct(row.energy_end)}`:row.actual_end_minute==null?'恢复待结算':'历史恢复数据缺失'),el('div','note',`睡眠债 ${fix(row.sleep_debt_before)} → ${fix(row.sleep_debt_after)}h`));box.append(left,right);list.append(box)}}
@@ -320,7 +320,7 @@ function renderSchedule(){
     const changes=spec.filter(([k])=>num(row.state_before[k])!==null&&num(row.state_after[k])!==null&&Math.abs(row.state_after[k]-row.state_before[k])>=.01).slice(0,3).map(([k,l])=>l+' '+pct(row.state_before[k])+'→'+pct(row.state_after[k]));
     if(changes.length)center.append(el('div','statechange',changes.join(' · ')));
    }
-   box.append(el('i','trackdot'),center,el('span','rowbadge',actual?episodeLabel(row.status):(row.hardness==='hard'?'硬约定':'意图')));target.append(box);
+   box.append(el('i','trackdot'),center,el('span','rowbadge',actual?episodeLabel(row.status):(row.goal_type==='sleep'?'作息参考':row.hardness==='hard'?'硬约定':'意图')));target.append(box);
   }
  }
  rows($('episodes'),scheduleFootprint(episodes,day).reverse(),true);
@@ -709,7 +709,7 @@ function renderTimeline(){
   const node=el('article','vtime-item '+(fixed?'planned':'actual')+(active?' active':'')+(!fixed&&row.status==='interrupted'?' interrupted':''));
   node.setAttribute('role','listitem');
   const body=el('div','vtime-body'),head=el('div','vtime-head');
-  head.append(el('h3','',row.name||'未命名活动'),el('span','vtime-badge',fixed?'固定意图':episodeLabel(row.status)));
+  head.append(el('h3','',row.name||'未命名活动'),el('span','vtime-badge',fixed?(row.goal_type==='sleep'?'作息参考':'固定意图'):episodeLabel(row.status)));
   const origin=fixed?(row.origin==='archived'?'历史计划归档':'日计划'):source(row.source);
   body.append(head,el('p','note',minute(start)+separator+(active?'此刻':end===null?'待定':minute(end))+' · '+origin));
   if(row.idleSegments)body.append(idleRunDetails(row,open));

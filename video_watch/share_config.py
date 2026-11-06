@@ -1,4 +1,4 @@
-"""Independent social sharing, opt-in audiences and a conservative default."""
+"""Independent social sharing: default-on with audience activity gating."""
 from typing import ClassVar, Literal
 from maibot_sdk import Field, PluginConfigBase
 
@@ -11,15 +11,21 @@ class VideoShareSectionConfig(PluginConfigBase):
     __ui_i18n__: ClassVar[dict] = {"en": {"title": "Video social sharing"}}
 
     mode: Literal["关闭", "影子模式", "自动分享"] = Field(
-        default="影子模式", description="关闭时停止自动评估；影子模式只记录决定；自动分享按授权、静默和额度投递卡片。手动分享工具独立可用。",
+        default="自动分享", description="关闭时停止自动评估；影子模式只记录决定不发送；自动分享按授权、活跃门槛、静默和额度投递卡片。默认自动分享，评估器可自主选择不分享。手动分享工具独立可用。",
         json_schema_extra={"label": "运行模式"})
     include_companion: bool = Field(
-        default=True, description="允许将已配置的陪伴目标私聊作为自动分享候选，仍需判断内容相关性与是否适合打扰。",
+        default=True, description="允许将已配置的陪伴目标私聊作为自动分享候选，仍需判断内容相关性与是否适合打扰。陪伴私聊不受群活跃门槛限制。",
         json_schema_extra={"label": "允许陪伴目标私聊"})
+    allow_all_groups: bool = Field(
+        default=True, description="允许所有已注册且可路由的QQ群作为自动分享候选，仍受群活跃门槛、静默与额度约束，评估器自主决定是否分享。关闭后仅陪伴私聊与额外允许的聊天可候选。",
+        json_schema_extra={"label": "允许所有群"})
     allowed_chats: list[str] = Field(
-        default_factory=list, description="额外允许的聊天，每项使用group:群号或private:QQ号；留空不读取或投递其他聊天。只接受已存在且可路由的QQ会话。",
+        default_factory=list, description="在允许所有群之外精确追加的聊天，每项使用group:群号或private:QQ号；只接受已存在且可路由的QQ会话。allow_all_groups关闭时此项与陪伴私聊决定候选范围。",
         json_schema_extra={"label": "额外允许的聊天"})
-    daily_limit: int = Field(default=1, ge=0, le=10,
+    min_group_daily_messages: int = Field(default=100, ge=0, le=100000,
+        description="群当日非bot消息数低于此值时不建立/更新该群画像、也不纳入分享候选，以节省token并避免误发不活跃小群；0关闭门槛。陪伴私聊不受此限。",
+        json_schema_extra={"label": "群每日活跃门槛（非bot消息数）"})
+    daily_limit: int = Field(default=3, ge=0, le=10,
         description="所有目标合计的自动视频分享每日上限，包含发送中和结果不确定的预留；0停止自动发送。目标私聊还共用每日主动预算。",
         json_schema_extra={"label": "自动分享每日上限"})
     stream_daily_limit: int = Field(default=1, ge=1, le=5,

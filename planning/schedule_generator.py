@@ -437,7 +437,8 @@ class ScheduleGenerator:
         if rows:
             # 锚点护栏：睡觉意图缺失（且非无睡眠模式）时补一条模板睡觉意图（hard）
             rows = self._ensure_spine_sleep_intent(rows, date, wake_time, sleep_time,
-                                                   max_intentions=params["max_intentions"])
+                                                   max_intentions=params["max_intentions"],
+                                                   no_sleep_mode=no_sleep_mode)
         else:
             if last_error is not None:
                 logger.warning("spine LLM 生成失败（%s），使用模板 spine 兜底", last_error)
@@ -591,12 +592,16 @@ class ScheduleGenerator:
         wake_time: str = "07:00",
         sleep_time: str = "23:00",
         max_intentions: int = 6,
+        no_sleep_mode: bool = False,
     ) -> List[Dict[str, Any]]:
         """锚点护栏：睡觉意图缺失时补一条模板睡觉意图（hardness=hard，时间固定）。
 
         补入后若超出 ``max_intentions`` 上限，丢掉排序最靠后的软意图给硬锚点让位
         （3~6 条契约含睡觉锚点；hard 锚点优先级高于 LLM 软意图）。
+        免睡模式（no_sleep_mode）下不补睡眠意图，与模板兜底路径同口径（P1 一致性）。
         """
+        if no_sleep_mode:
+            return rows
         for row in rows:
             if is_night_sleep_item(row):
                 return rows
@@ -682,16 +687,19 @@ class ScheduleGenerator:
         awake_end = wake_min + awake_span  # = sleep_min（常规）或 sleep_min+1440（跨午夜）
 
         def row(name: str, start: int, end: int, goal_type: str, priority: str,
-                min_minutes: int, max_minutes: int, interruptibility: float) -> Dict[str, Any]:
+                min_minutes: int, max_minutes: int, interruptibility: float,
+                hardness: str = "soft") -> Dict[str, Any]:
             return ScheduleGenerator._spine_row(
                 date, name, start, end, goal_type, priority,
-                min_minutes, max_minutes, interruptibility=interruptibility)
+                min_minutes, max_minutes, interruptibility=interruptibility, hardness=hardness)
 
         rows: List[Dict[str, Any]] = []
         if not no_sleep_mode:
             span = max(180, min(720, ring_minutes_ahead(wake_min, sleep_min)))
+            # 睡眠锚点分类与正常生成/缺项补齐统一为 hard（P1）；显示类别由 WebUI
+            # 按 goal_type 独立标"作息参考"，不随生成路径成败改变（P2/P3）。
             rows.append(row("睡觉", sleep_min, sleep_min + span, "sleep", "high",
-                            span, span, 0.05))
+                            span, span, 0.05, hardness="hard"))
         rows.append(row("起床洗漱", wake_min, wake_min + 30, "daily_routine", "medium", 15, 30, 0.9))
         rows.append(row("早餐", wake_min, wake_min + 120, "meal", "medium", 15, 40, 0.9))
         mid = wake_min + awake_span // 3

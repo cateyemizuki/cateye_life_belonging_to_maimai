@@ -337,6 +337,11 @@ def resolve_hard_commitment_start(intents: Iterable[Any], frame_date: str,
             continue
         if str(intent.get("hardness") or "").strip().lower() != "hard":
             continue
+        # P3 核验门槛：仅用户明确确认的硬约定（匹配到 pending_commitment、带
+        # commitment_hardness=hard）可触发提前醒；LLM 新生成、来源不明的 hard
+        # 意图不作正式起床依据，避免临时硬意图意外唤醒。睡眠锚点已在上面排除。
+        if str(intent.get("commitment_hardness") or "").strip().lower() != "hard":
+            continue
         if str(intent.get("day_offset")) == "1":
             continue
         try:

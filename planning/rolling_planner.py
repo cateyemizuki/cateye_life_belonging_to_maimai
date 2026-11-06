@@ -182,6 +182,7 @@ def extract_spine_intents(items: Any) -> List[Dict[str, Any]]:
             "description": str(item.get("description") or ""),
             "priority": str(params.get("priority") or item.get("priority") or "medium").strip().lower(),
             "hardness": "hard" if str(params.get("hardness") or "soft").strip().lower() == "hard" else "soft",
+            "commitment_hardness": str(params.get("commitment_hardness") or "").strip().lower(),
             "min_minutes": int(_as_number(params.get("min_minutes"), 0.0) or 0.0),
             "max_minutes": int(_as_number(params.get("max_minutes"), 0.0) or 0.0),
             "interruptibility": _clamp(itp if itp is not None else 0.5),
