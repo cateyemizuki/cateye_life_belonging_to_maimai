@@ -437,7 +437,7 @@ function renderUsage(){
  if(imported||!live)renderUsageRows();
  // W-01 摘要回填：主卡补 Top3 模块与可拆分口径（纯前端按已有 prompt/completion 字段估算，
  // 宿主未回传拆分时显示 —，不造假 0；P1 的 W-09 落后端 split_coverage 字段后再换权威口径）。
- const topBox=$('usage-top');if(topBox){const top=Object.entries(usage.modules||{}).filter(([,t])=>num(t)!==null&&t>0).sort((a,b)=>b[1]-a[1]).slice(0,3);topBox.replaceChildren(...top.map(([m,t])=>el('span','',`${m} ${count(t)} Token`)));topBox.hidden=!top.length}
+ const topBox=$('usage-top');if(topBox){const top=Object.entries(usage.modules||{}).filter(([,t])=>num(t)!==null&&t>0).sort((a,b)=>b[1]-a[1]);topBox.replaceChildren(...top.map(([m,t])=>el('span','',`${usageModuleLabel(m)} ${count(t)} Token`)));topBox.hidden=!top.length}
  // W-09 权威口径（2026-11-03）：后端已回传 split_coverage 时直接使用；旧离线快照
  // 没有该字段才退回纯前端按 prompt/completion 估算（不造假 0）。
  const splitBox=$('usage-split');if(splitBox){const total=num(usage.tokens),pt=num(usage.prompt_tokens),ct=num(usage.completion_tokens),noSplit=(num(usage.prompt_reported_calls)===0&&num(usage.completion_reported_calls)===0);
