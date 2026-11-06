@@ -1935,20 +1935,35 @@ class RollingPlanner:
             event = dict(event)
             event["key"] = event_key or event.get("key", "")
         else:
-            # 服务未装配：内置池 + 4h 去重 + 时长采样。
+            # 服务未装配：内置池 + 时段过滤 + 4h 去重 + 时长采样（降级路径同样受时段约束）。
+            from .event_slots import time_slot_of, slot_remaining_minutes, event_allowed_in_slot
+            _tz = getattr(self._tz, "_tz", None)
+            slot = time_slot_of(now, _tz)
+            remaining = slot_remaining_minutes(now, _tz)
             eligible = [e for e in RANDOM_EVENT_POOL
-                        if e["key"] not in self._random_last
-                        or (now - self._random_last[e["key"]]).total_seconds()
-                        >= RANDOM_EVENT_DEDUP_MINUTES * 60]
+                        if event_allowed_in_slot(e, slot)
+                        and int(e.get("min_minutes", 5)) <= remaining
+                        and (e["key"] not in self._random_last
+                             or (now - self._random_last[e["key"]]).total_seconds()
+                             >= RANDOM_EVENT_DEDUP_MINUTES * 60)]
             if not eligible:
-                return False  # 同事件 4h 内不重复（A.7）——池内全部冷却中
+                return False  # 时段不符或同事件 4h 内冷却中——不绕过时段规则
             picked = rng.choice(eligible)
-            duration = rng.randint(int(picked["min_minutes"]), int(picked["max_minutes"]))
+            duration = rng.randint(int(picked["min_minutes"]),
+                                   min(int(picked["max_minutes"]), remaining))
             template = rng.choice(picked["templates"])
             event = dict(picked)
             event_key = str(picked["key"])
             metadata = {"trigger": "random_event", "event_key": event_key,
                         "description": template}
+        from .event_slots import time_slot_of, slot_remaining_minutes, event_allowed_in_slot
+        _tz = getattr(self._tz, "_tz", None)
+        # 抽选与开始之间可能跨越 08:00/16:00/00:00 或热重载失配：启动前再核一次时段，
+        # 一次性 claim 必须在此校验通过后才执行，避免未真正开始就消耗一次性事件。
+        if not event_allowed_in_slot(event, time_slot_of(now, _tz)):
+            return False
+        if int(duration) > slot_remaining_minutes(now, _tz):
+            return False
         profile = activity_profiles.get_profile(event["goal_type"])
         once = event.get('pool_kind') == 'one_shot'
         if once and (catalog is None or not catalog.claim_event(event, now=now)):

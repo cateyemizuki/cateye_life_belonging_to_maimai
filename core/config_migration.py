@@ -25,7 +25,8 @@ RELEASE_RETIRED = {
                           "auto_generate_time"),
     "life_state": ("settlement_model", "emotion_modulation_enabled", "dynamic_sleep_enabled"),
 }
-EVENT_CATALOG_FIELDS = ("mode", "min_interval_days", "max_interval_days", "max_generated_events", "task_name")
+EVENT_CATALOG_FIELDS = ("mode", "min_interval_days", "max_interval_days", "max_generated_events", "task_name",
+                        "period_limit_00_08", "period_limit_08_16", "period_limit_16_24")
 
 
 def migrate_release_config(value: Any) -> Any:

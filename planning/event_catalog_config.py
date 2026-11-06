@@ -23,6 +23,11 @@ DEFAULT_MAX_INTERVAL_DAYS = 15
 #: 定稿 §4.3.1 / 附录 B.6.3：生成条数上限
 DEFAULT_MAX_GENERATED_EVENTS = 8
 DEFAULT_MIN_GENERATED_EVENTS = 1
+#: v3.9.0 三时段独立生成上限（00-08 / 08-16 / 16-24），合计默认 7（=总池12-内置5）
+DEFAULT_PERIOD_LIMIT_00_08 = 1
+DEFAULT_PERIOD_LIMIT_08_16 = 3
+DEFAULT_PERIOD_LIMIT_16_24 = 3
+PERIOD_LIMIT_MAX = 8
 #: 附录 B.1.3：active_events 总池上限（用户已裁定规范字段默认 12）
 DEFAULT_MAX_POOL_EVENTS = 12
 DEFAULT_TASK_NAME = "utils"
@@ -81,6 +86,21 @@ class EventCatalogSectionConfig(PluginConfigBase):
         description="每个生成池的条数上限（1至8）；两池平分扣除内置事件后的总容量。",
         json_schema_extra={"label": "每池生成上限", "hint":"默认总容量12：内置5、可复用最多4、一次性最多3；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
     )
+    period_limit_00_08: int = Field(
+        default=DEFAULT_PERIOD_LIMIT_00_08, ge=0, le=PERIOD_LIMIT_MAX,
+        description="00:00–08:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。深夜清晨低干扰活动。",
+        json_schema_extra={"label": "00-08时段生成上限", **_i18n("00-08 slot limit")},
+    )
+    period_limit_08_16: int = Field(
+        default=DEFAULT_PERIOD_LIMIT_08_16, ge=0, le=PERIOD_LIMIT_MAX,
+        description="08:00–16:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。日间家务/照料/学习。",
+        json_schema_extra={"label": "08-16时段生成上限", **_i18n("08-16 slot limit")},
+    )
+    period_limit_16_24: int = Field(
+        default=DEFAULT_PERIOD_LIMIT_16_24, ge=0, le=PERIOD_LIMIT_MAX,
+        description="16:00–24:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。傍晚夜晚温和休闲。",
+        json_schema_extra={"label": "16-24时段生成上限", **_i18n("16-24 slot limit")},
+    )
     # 2026-11-04 配置精简轮（J 类）：max_pool_events 移入
     # mappings/internal_tuning.json[event_catalog]（内部容量）；同名只读 property 见下。
     task_name: str = Field(
@@ -114,6 +134,9 @@ class EventCatalogConfig:
     min_interval_days: int = DEFAULT_MIN_INTERVAL_DAYS
     max_interval_days: int = DEFAULT_MAX_INTERVAL_DAYS
     max_generated_events: int = DEFAULT_MAX_GENERATED_EVENTS
+    period_limit_00_08: int = DEFAULT_PERIOD_LIMIT_00_08
+    period_limit_08_16: int = DEFAULT_PERIOD_LIMIT_08_16
+    period_limit_16_24: int = DEFAULT_PERIOD_LIMIT_16_24
     max_pool_events: int = DEFAULT_MAX_POOL_EVENTS
     enforce_pool_cap: bool = True
     task_name: str = DEFAULT_TASK_NAME
@@ -121,6 +144,15 @@ class EventCatalogConfig:
     temperature: float = DEFAULT_TEMPERATURE
 
     auto_check_seconds: int = DEFAULT_AUTO_CHECK_SECONDS
+
+    @property
+    def period_limits(self) -> tuple:
+        """三时段生成上限，顺序对齐 event_slots.TIME_SLOTS。"""
+        return (self.period_limit_00_08, self.period_limit_08_16, self.period_limit_16_24)
+
+    @property
+    def period_limit_total(self) -> int:
+        return sum(self.period_limits)
 
     @property
     def generation_allowed_by_mode(self) -> bool:
@@ -205,11 +237,16 @@ def resolve_config(source: Any) -> EventCatalogConfig:
     # 用户锁定 temperature=0.9（固定协议）：不读配置，避免出现「可编辑但永不生效」的死键。
     # 字段仍在 section 上（隐藏、默认 0.9）以便配置文件自洽；想改只能改本模块常量。
     temperature = DEFAULT_TEMPERATURE
+    def _period(name: str, default: int) -> int:
+        return max(0, min(PERIOD_LIMIT_MAX, _as_int(_attr(source, name, default), default)))
     return EventCatalogConfig(
         mode=mode,
         min_interval_days=min_days,
         max_interval_days=max_days,
         max_generated_events=generated,
+        period_limit_00_08=_period("period_limit_00_08", DEFAULT_PERIOD_LIMIT_00_08),
+        period_limit_08_16=_period("period_limit_08_16", DEFAULT_PERIOD_LIMIT_08_16),
+        period_limit_16_24=_period("period_limit_16_24", DEFAULT_PERIOD_LIMIT_16_24),
         max_pool_events=max(1, _as_int(_attr(source, "max_pool_events", DEFAULT_MAX_POOL_EVENTS),
                                        DEFAULT_MAX_POOL_EVENTS)),
         enforce_pool_cap=bool(_attr(source, "enforce_pool_cap", True)),
@@ -299,6 +336,21 @@ class EventCatalogFields(PluginConfigBase):
         le=DEFAULT_MAX_GENERATED_EVENTS,
         description="每个生成池的条数上限（1至8）；两池平分扣除内置事件后的总容量。",
         json_schema_extra={"label": "每池生成上限", "hint":"默认总容量12：内置5、可复用最多4、一次性最多3；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
+    )
+    event_catalog_period_limit_00_08: int = Field(
+        default=DEFAULT_PERIOD_LIMIT_00_08, ge=0, le=PERIOD_LIMIT_MAX,
+        description="00:00–08:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。",
+        json_schema_extra={"label": "00-08时段生成上限", **_i18n("00-08 slot limit")},
+    )
+    event_catalog_period_limit_08_16: int = Field(
+        default=DEFAULT_PERIOD_LIMIT_08_16, ge=0, le=PERIOD_LIMIT_MAX,
+        description="08:00–16:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。",
+        json_schema_extra={"label": "08-16时段生成上限", **_i18n("08-16 slot limit")},
+    )
+    event_catalog_period_limit_16_24: int = Field(
+        default=DEFAULT_PERIOD_LIMIT_16_24, ge=0, le=PERIOD_LIMIT_MAX,
+        description="16:00–24:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。",
+        json_schema_extra={"label": "16-24时段生成上限", **_i18n("16-24 slot limit")},
     )
     event_catalog_task_name: str = Field(
         default=DEFAULT_TASK_NAME,

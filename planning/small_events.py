@@ -2,6 +2,8 @@
 from __future__ import annotations
 from copy import deepcopy
 
+from .event_slots import TIME_SLOTS
+
 BUILTIN_EVENTS = (
     {'event_id': 'watch_bili', 'name': '刷视频', 'min_minutes': 10, 'max_minutes': 25,
      'interruptibility': .95, 'goal_type': 'entertainment',
@@ -26,4 +28,7 @@ def builtin_events() -> list[dict]:
     for event in result:
         event.update(key=event['event_id'], weight=1., enabled=True, source='builtin', pool_kind='builtin')
         event['templates'] = list(event['templates'])
+        # 内置项同样受时段过滤（非后门）；这五项均为安静室内活动，默认覆盖三段，
+        # 可在 BUILTIN_EVENTS 显式写 allowed_slots 收窄。
+        event.setdefault('allowed_slots', list(TIME_SLOTS))
     return result

@@ -190,12 +190,21 @@ class EventCatalogValidator:
     def __init__(self, *, builtin_count: Optional[int] = None,
                  max_generated_events: int = MAX_GENERATED_EVENTS,
                  max_pool_events: int = 12,
-                 enforce_pool_cap: bool = True) -> None:
+                 enforce_pool_cap: bool = True,
+                 period_limits: Optional[Sequence[int]] = None) -> None:
         self.builtin_count = len(BUILTIN_EVENTS) if builtin_count is None else int(builtin_count)
         self.max_generated_events = max(1,
                                         min(MAX_GENERATED_EVENTS, int(max_generated_events)))
         self.max_pool_events = max(1, int(max_pool_events))
         self.enforce_pool_cap = bool(enforce_pool_cap)
+        from .event_slots import TIME_SLOTS
+        from .event_catalog_config import (DEFAULT_PERIOD_LIMIT_00_08,
+                                           DEFAULT_PERIOD_LIMIT_08_16,
+                                           DEFAULT_PERIOD_LIMIT_16_24)
+        defaults = (DEFAULT_PERIOD_LIMIT_00_08, DEFAULT_PERIOD_LIMIT_08_16, DEFAULT_PERIOD_LIMIT_16_24)
+        limits = tuple(period_limits) if period_limits is not None else defaults
+        self.period_limits = {slot: max(0, int(limits[i] if i < len(limits) else defaults[i]))
+                              for i, slot in enumerate(TIME_SLOTS)}
 
     # ---- 单事件 ----
     def validate_event(self, event: Any, *, index: Optional[int] = None,
@@ -342,8 +351,24 @@ class EventCatalogValidator:
                 errors.append(ValidationError('E_SCHEMA', str(exc), 'consumed'))
             for kind in ('reusable', 'one_shot'):
                 count = sum(isinstance(e, dict) and e.get('pool_kind') == kind for e in events)
-                if not 1 <= count <= self.max_generated_events:
-                    errors.append(ValidationError('E_COUNT', f'{kind} 条数需1-{self.max_generated_events}', 'events'))
+                if count > self.max_generated_events:
+                    errors.append(ValidationError('E_COUNT', f'{kind} 条数超过 {self.max_generated_events}', 'events'))
+            from .event_slots import TIME_SLOTS
+            slot_counts = {slot: 0 for slot in TIME_SLOTS}
+            for e in events:
+                if not isinstance(e, dict):
+                    continue
+                ts = e.get('time_slot')
+                if ts not in TIME_SLOTS:
+                    errors.append(ValidationError('E_SLOT', '生成事件必须标记有效 time_slot（00-08/08-16/16-24）',
+                                                  'time_slot', str(e.get('event_id') or '')))
+                else:
+                    slot_counts[ts] += 1
+            for slot in TIME_SLOTS:
+                if slot_counts[slot] > self.period_limits[slot]:
+                    errors.append(ValidationError('E_COUNT',
+                                                  f'{slot} 时段 {slot_counts[slot]} 条超过上限 {self.period_limits[slot]}',
+                                                  'events'))
         elif not (MIN_GENERATED_EVENTS <= len(events) <= self.max_generated_events):
             errors.append(ValidationError(
                 "E_COUNT", f"生成条数需 {MIN_GENERATED_EVENTS}-{self.max_generated_events}，"
@@ -863,6 +888,9 @@ class EventCatalogStore:
         if context not in (None, "idle", "transition"):
             return None
         now_dt = _now_of(now, self._tz)
+        from .event_slots import time_slot_of, slot_remaining_minutes, event_allowed_in_slot
+        slot = time_slot_of(now_dt, self._tz)
+        remaining = slot_remaining_minutes(now_dt, self._tz)
         last_map = self._recent_map(recent, now_dt)
         pool = [dict(e) for e in (events if events is not None else self._snapshot.active_events)]
         cooled: List[Dict[str, Any]] = []
@@ -876,6 +904,13 @@ class EventCatalogStore:
                     continue
             if not self._gate_allows(eid):
                 continue  # 运行时门控（如 video_watch.enabled 关闭 → 刷B站不可 roll）
+            if not event_allowed_in_slot(event, slot):
+                continue  # 时段过滤（含旧无标签项排除）；即使外部传入 events 也过滤
+            try:
+                if int(event.get('min_minutes') or MIN_DURATION_MINUTES) > remaining:
+                    continue  # 最小时长容纳不下当前时段剩余（如 07:59 抽 10 分钟活动）
+            except (TypeError, ValueError):
+                continue
             last = last_map.get(eid)
             if last is not None:
                 elapsed = (now_dt - last).total_seconds()
@@ -902,7 +937,11 @@ class EventCatalogStore:
         output["templates"] = list(output.get("templates") or ())
         min_minutes = int(output.get("min_minutes") or MIN_DURATION_MINUTES)
         max_minutes = int(output.get("max_minutes") or min_minutes)
+        max_minutes = min(max_minutes, remaining)  # 时长上界不越过当前时段右边界
+        if max_minutes < min_minutes:
+            return None
         output["duration_minutes"] = rng.randint(min_minutes, max(max_minutes, min_minutes))
+        output["time_slot"] = slot
         output["catalog_version"] = self.catalog_version
         if context:
             output["context"] = context
@@ -1191,6 +1230,7 @@ class EventCatalogService:
             "event_source": str(resolved.get("source") or ""),
             "event_name": str(resolved.get("name") or ""),
             "event_pool_kind": str(resolved.get('pool_kind') or 'reusable'),
+            "event_time_slot": str(resolved.get('time_slot') or ''),
             "event_generation_id": str(resolved.get('generation_id') or ''),
             "goal_type": str(resolved.get("goal_type") or ""),
             "state_deltas": dict(resolved.get("state_deltas") or {}),
@@ -1383,9 +1423,14 @@ class EventCatalogService:
         recent_schedule = self._names_of(self._recent_schedule_provider)
         recent_events = self._names_of(self._recent_event_provider)
         builtin = self.store.snapshot.builtin_events
-        counts = allocate_pools(cfg.max_pool_events, len(builtin), cfg.max_generated_events)
-        if not all(counts):
-            return self._failed('E_CAPACITY', '容量不足两类生成池各1条，保留旧事件库', manual=manual)
+        from .event_slots import TIME_SLOTS
+        from .event_pools import slot_pool_split
+        period_limits = cfg.period_limits
+        capacity = max(0, cfg.max_pool_events - len(builtin))
+        if sum(period_limits) > capacity:
+            return self._failed('E_CAPACITY',
+                                f'三时段上限之和 {sum(period_limits)} 超过可用容量 {capacity}，保留旧事件库',
+                                manual=manual)
         if self._llm is None or not (callable(getattr(self._llm, 'generate_detailed', None))
                                     or callable(getattr(self._llm, 'generate', None))):
             return self._failed('E_LLM', 'LLMService不可用', manual=manual)
@@ -1394,10 +1439,14 @@ class EventCatalogService:
         events, hashes, models, failures = [], [], [], []
         charged = 0
         model_calls = 0
-        for kind, requested in zip(('reusable', 'one_shot'), counts):
+        for slot_index, slot in enumerate(TIME_SLOTS):
+            requested = int(period_limits[slot_index])
+            if requested <= 0:
+                continue
+            reusable_n, _one_shot_n = slot_pool_split(slot_index, requested)
             prompt = build_event_prompt(persona=persona, recent_schedule_names=recent_schedule,
                 existing_event_names=reserved_names + [e.get('name', '') for e in events],
-                count=requested, min_count=1, pool_kind=kind)
+                count=requested, min_count=1, time_slot=slot)
             try:
                 chosen, spent = await self._attempt_llm(prompt, task_name=cfg.task_name,
                     temperature=EVENT_GENERATION_TEMPERATURE, now=now)
@@ -1410,23 +1459,24 @@ class EventCatalogService:
                     charged += spent
                     model_calls += max(0, int(chosen.attempts or 0))
                 if not chosen.ok or not str(chosen.text or '').strip():
-                    failures.append(f'{kind}: 模型未返回可用事件（{chosen.category}）')
+                    failures.append(f'{slot}: 模型未返回可用事件（{chosen.category}）')
                     continue
                 rows = parse_events_response(chosen.text)
                 if not 1 <= len(rows) <= requested:
-                    failures.append(f'{kind}: 返回条数不在1-{requested}内')
+                    failures.append(f'{slot}: 返回条数不在1-{requested}内')
                     continue
-                for row in rows:
+                for i, row in enumerate(rows):
                     item = _normalize_event(row)
-                    item['pool_kind'] = kind
+                    item['pool_kind'] = 'reusable' if i < reusable_n else 'one_shot'
+                    item['time_slot'] = slot
                     events.append(item)
                 hashes.append(prompt.prompt_hash)
                 models.append(str(getattr(self._llm, 'model_name', '') or ''))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning('event_catalog: %s生成失败，保留旧双池：%s', kind, exc)
-                failures.append(f'{kind}: 生成响应不可用')
+                logger.warning('event_catalog: %s时段生成失败，保留旧库：%s', slot, exc)
+                failures.append(f'{slot}: 生成响应不可用')
         if failures:
             return self._failed('E_LLM', '；'.join(failures), manual=manual,
                                 tokens=charged, called_llm=model_calls > 0)
@@ -1440,7 +1490,8 @@ class EventCatalogService:
         }
         validator = self._validator if self._custom_validator else EventCatalogValidator(
             builtin_count=len(builtin), max_generated_events=cfg.max_generated_events,
-            max_pool_events=cfg.max_pool_events, enforce_pool_cap=True)
+            max_pool_events=cfg.max_pool_events, enforce_pool_cap=True,
+            period_limits=cfg.period_limits)
         validation = validator.validate_document(document, reserved_ids=reserved_ids,
             reserved_names=reserved_names, recent_names=recent_events)
         if not validation.ok:

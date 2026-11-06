@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 
-POOL_VERSION = 2
+POOL_VERSION = 3
 POOL_KINDS = ('builtin', 'reusable', 'one_shot')
 
 
@@ -18,10 +18,29 @@ def allocate_pools(total: int, builtin: int, per_pool: int) -> tuple[int, int]:
     return min(int(per_pool), (slots + 1)//2), min(int(per_pool), slots//2)
 
 
+def slot_pool_split(slot_index: int, requested: int) -> tuple[int, int]:
+    """v3.9.0：一个时段批次内 (reusable, one_shot) 配额。
+
+    默认上限 1/3/3 时对齐改造建议表：00-08=(1,0)、08-16=(2,1)、16-24=(1,2)，
+    合计 reusable=4 / one_shot=3。自定义上限按同比例取整，深夜批全可复用。
+    """
+    requested = max(0, int(requested))
+    if requested == 0:
+        return 0, 0
+    if slot_index <= 0:
+        return requested, 0
+    if slot_index == 1:
+        reusable = (requested * 2 + 2) // 3
+    else:
+        reusable = (requested + 2) // 3
+    reusable = min(requested, reusable)
+    return reusable, requested - reusable
+
+
 def normalize_cycle(document: dict) -> dict:
     """Migrate legacy generated rows in memory; bad receipts never resurrect events."""
     if (not isinstance(document, dict) or type(document.get('version')) is not int
-            or document.get('version') not in (1, POOL_VERSION)):
+            or document.get('version') not in (1, 2, POOL_VERSION)):
         raise ValueError('unsupported event pool version')
     doc = deepcopy(document)
     events = doc.get('events')

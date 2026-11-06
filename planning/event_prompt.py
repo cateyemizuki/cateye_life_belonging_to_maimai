@@ -85,11 +85,13 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
                        existing_event_names: Sequence[Any] = (),
                        count: int = DEFAULT_MAX_GENERATED_EVENTS,
                        pool_kind: str = 'reusable', min_count: int = DEFAULT_MIN_GENERATED_EVENTS,
-                       max_chars: int = PROMPT_MAX_CHARS) -> PromptBuildResult:
+                       max_chars: int = PROMPT_MAX_CHARS, time_slot: str = "") -> PromptBuildResult:
     """构造生成 prompt（≤ ``max_chars`` 字符，含 system）。
 
     ``recent_schedule_names`` / ``existing_event_names`` 只接受名称字符串；
     调用方不得传聊天正文（本函数没有接收正文的参数）。
+    ``time_slot`` 非空时按三时段批次生成（v3.9.0），注入时段窗口与场景约束；
+    为空时沿用旧 reusable/one_shot 单池措辞（兼容）。
     """
     try:
         count_int = int(count)
@@ -113,9 +115,16 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
     def compose(p: str, r: str, e: str) -> str:
         lines = [f"为角色生成 {minimum}-{count_int} 条日常小事件，"
                  "用作空闲或转场时的 filler。"]
-        lines.append('本次生成：周期内可复用小事件，可在间隔后再次发生。' if pool_kind == 'reusable' else
-                     '本次生成：一次性小事件，在本次生成周期内抽中即移除。每条有具体可完成的小目标；'
-                     '不要生成反复休息、发呆或转场，goal_type不要使用rest/idle/transition。')
+        if time_slot:
+            from .event_slots import SLOT_WINDOW_TEXT, SLOT_GUIDANCE
+            lines.append(f"时段：{SLOT_WINDOW_TEXT.get(time_slot, time_slot)}。"
+                         f"{SLOT_GUIDANCE.get(time_slot, '')}")
+            lines.append('本批次含可复用与一次性小事件（pool_kind 由服务端分配）；每条有具体可完成的小目标，'
+                         'goal_type 不要使用 rest/idle/transition。只生成该时段普遍适合开展的活动。')
+        else:
+            lines.append('本次生成：周期内可复用小事件，可在间隔后再次发生。' if pool_kind == 'reusable' else
+                         '本次生成：一次性小事件，在本次生成周期内抽中即移除。每条有具体可完成的小目标；'
+                         '不要生成反复休息、发呆或转场，goal_type不要使用rest/idle/transition。')
         if p:
             lines.append(f"人设：{p}")
         if r:

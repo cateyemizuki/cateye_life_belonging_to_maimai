@@ -2,7 +2,7 @@
 
 通过 ``self._plugin.ctx.send.text(...) / ctx.send.forward(...)`` 发送消息。
 
-子命令：list / regenerate / delete / clear / help。
+子命令：list / regenerate / events / delete / clear / help。
 - list：今日日程（图片 + 详细文字合并转发；无日程时自动先生成）；
 - 图片绘制失败/超时**静默**降级为纯文字（不提示失败）；
 - send.forward / send.image 能力宿主未声明时自动回退纯文本。
@@ -147,6 +147,8 @@ class CommandService:
             await self._handle_list(stream_id)
         elif subcommand == "regenerate":
             await self._handle_regenerate(stream_id, parts)
+        elif subcommand == "events":
+            await self._handle_events(stream_id, parts)
         elif subcommand == "delete":
             return await self._handle_delete(stream_id, parts)
         elif subcommand == "clear":
@@ -420,6 +422,34 @@ class CommandService:
         msg = f"已重新生成今日日程，共 {len(items)} 项活动\n\n提示：使用 /lbm_plan list 查看（图片+文字详情）"
         await self._send(stream_id, msg)
 
+    async def _handle_events(self, stream_id: str, parts: List[str]) -> None:
+        """``/lbm_plan events [force]``：按三时段重新生成小事件库（v3.9.0）。
+
+        manual=True 即忽略生成周期立即生成；force 为显式别名。旧无时段标签的事件库
+        会被整份替换（原子发布，任一时段失败则保留旧库）。模式 off 时不生成。
+        """
+        catalog = getattr(self._plugin, "_event_catalog", None)
+        if catalog is None:
+            await self._send(stream_id, "事件库服务未装配（日程模块未启用或事件库关闭）。")
+            return
+        await self._send(stream_id, "正在按三时段（00-08/08-16/16-24）重新生成小事件库…")
+        try:
+            result = await catalog.refresh(manual=True)
+        except Exception as exc:
+            logger.error(f"重新生成小事件库失败: {exc}", exc_info=True)
+            await self._send(stream_id, f"重新生成小事件库失败: {exc}")
+            return
+        if result is None:
+            await self._send(stream_id, "事件库刷新未执行。")
+            return
+        if result.ok:
+            await self._send(stream_id,
+                             f"小事件库已更新：生成 {result.events_count} 条（带时段标签），"
+                             f"版本 {result.catalog_version}。旧无时段事件已替换。")
+        else:
+            detail = "；".join(result.error_lines) if getattr(result, "error_lines", None) else str(result.reason)
+            await self._send(stream_id, f"小事件库生成失败（旧库保留）：{detail}")
+
     async def _handle_delete(self, stream_id: str, parts: List[str]) -> Tuple[bool, str, bool]:
         """``/lbm_plan delete <id|序号>``：删除目标（含合成视图的日程条目）。"""
         goal_manager = get_goal_manager()
@@ -518,6 +548,7 @@ class CommandService:
 命令列表:
 /lbm_plan list - 查看今日日程（图片+详细文字合并转发；无日程时自动先生成）
 /lbm_plan regenerate [额外要求] - 重新生成今日日程（先删今天再重生，可附加临时要求）
+/lbm_plan events [force] - 按三时段重新生成小事件库（替换旧无时段标签事件）
 /lbm_plan delete <goal_id或序号> - 删除指定目标
 /lbm_plan clear - 清理昨天及更早的旧日程
 /lbm_plan sleep - 在动态睡眠的允许窗口内立即入睡
