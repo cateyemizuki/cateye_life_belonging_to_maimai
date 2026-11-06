@@ -12,10 +12,13 @@
   [schedule] 的 wake/sleep 锚点 + [planning_proactive] 的漂移区间决定；
 - 问候豁免最小间隔改为**始终生效**（不再提供配置项）；想念**不豁免**；
 - 目标陪伴私聊打扰上限（旧 proactive_target_daily_cap / global_proactive_cap）**删除**：
-  每日预算（daily_max_speak）即上限，只统计日程巡检与想念两类触发；
-- 想念阈值合并为一个区间字段 miss_silence_hours（``"4-8"`` 或单数字 ``8`` = 0~8）；
+  每日预算（daily_max_speak）即上限（2026-11-04 重写后巡检侧仅想念一类触发）；
+- 想念阈值合并为一个区间字段 miss_silence_hours（``"4-8"`` 或单数字 ``8`` = 0~8；
+  2026-11-04 重写后仅服务沉默事件，不再参与想念判定）；
 - 想念避开未来日程及其窗口**删除**（该功能整体移除）；
-- 新增想念开关（miss_enabled，已有）+ 日程巡检开关（patrol_activity_enabled）；
+- 2026-11-04 主动行为重写：日程巡检三键（patrol_activity_enabled / activity_trigger_rate /
+  default_speak_rate）与 miss_speak_rate 退役（纯 pop 迁移）；想念改状态驱动概率公式
+  （companion.miss_trigger 内部常量）；
 - 屏幕感知（原 [cateye] 段）并入本段，前缀 screen_*；提示词一律移入 [prompts]；
 - 静默窗（silence_start/silence_end）**留空 = 跟随 [schedule] 的入睡/起床锚点**（N5，第三轮）：
   非空 = 显式覆盖；巡检静默闸与 planning 晚安期限共用同一生效值解析
@@ -31,9 +34,12 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Dict, Literal, Tuple
 
+from pydantic import field_validator
+
 from maibot_sdk import Field, PluginConfigBase
 
 from core.i18n import ui_i18n as _ui_i18n
+from core.internal_tuning import tuning_value as _tuning_value
 
 
 def _relation_type_choices() -> Tuple[str, ...]:
@@ -81,7 +87,7 @@ def target_qq_of(config: Any) -> str:
 
 
 class PatrolSectionConfig(PluginConfigBase):
-    """设置陪伴对象、日常主动聊天、想念和屏幕感知。"""
+    """设置陪伴对象、日常主动聊天、想念和打扰限制。"""
 
     __ui_label__ = "陪伴模块"
     __ui_icon__ = "heart"
@@ -136,6 +142,21 @@ class PatrolSectionConfig(PluginConfigBase):
     )
 
     # ── 巡检循环 ─────────────────────────────────────────────
+    proactive_reply_target_mode: Literal["浅处理", "深度处理"] = Field(
+        default="浅处理",
+        description="陪伴私聊的插件主动任务如何选择回复目标：浅处理提示planner使用用户最后一条来信；深度处理还会在执行reply前改写目标消息ID。",
+        json_schema_extra={
+            "label": "主动回复目标处理",
+            "hint": "默认只加提示；深度处理仅改本轮reply的目标ID，保留不回复的选择，不影响普通来信回合。",
+            **_ui_i18n("Proactive reply target", "Prompt only by default; deep mode also corrects the reply target before execution."),
+        },
+    )
+
+    @field_validator("proactive_reply_target_mode", mode="before")
+    @classmethod
+    def _normalize_reply_target_mode(cls, value: Any) -> str:
+        return "深度处理" if value in ("deep", "深度处理") else "浅处理"
+
     proactive_trigger_enabled: bool = Field(
         default=True,
         description="主动巡检总开关：开启后按下方各触发开关与概率判断该不该主动说话",
@@ -156,128 +177,34 @@ class PatrolSectionConfig(PluginConfigBase):
             **_ui_i18n("Check interval (min)"),
         },
     )
-    patrol_activity_enabled: bool = Field(
-        default=True,
-        description="日程巡检开关：巡检发现 bot 正在某个日程活动时，按下方概率主动分享/搭话",
-        json_schema_extra={
-            "label": "启用日程巡检",
-            "hint": "关 = 不再按日程活动主动开口；想念不受影响",
-            **_ui_i18n("Enable activity patrol", "Off: no proactive chat tied to schedule activities."),
-        },
-    )
-    activity_trigger_rate: float = Field(
-        default=0.6,
-        ge=0.0,
-        le=1.0,
-        description="日程巡检概率：巡检命中当前有日程活动时，主动分享一次的概率",
-        json_schema_extra={
-            "label": "巡检·日程分享概率",
-            "step": 0.05,
-            "hint": "0 = 完全不分享日程；0.6 ≈ 每 10 轮里有 6 轮会开口",
-            **_ui_i18n("Activity share rate"),
-        },
-    )
-    default_speak_rate: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=1.0,
-        description="日程巡检概率：巡检时没有正在进行的日程活动，纯日常搭话一次的概率",
-        json_schema_extra={
-            "label": "巡检·日常搭话概率",
-            "step": 0.05,
-            "hint": "0 = 不在没有活动时搭话；与上一项独立",
-            **_ui_i18n("Daily chat rate"),
-        },
-    )
+    # 注（2026-11-04 主动行为重写，用户直派规格）：日程巡检整条删除——
+    # patrol_activity_enabled / activity_trigger_rate / default_speak_rate 三键退役
+    # （旧值经 suite_config.LEGACY_PATROL_RETIRED_KEYS 入口纯 pop，无新语义可搬运）；
+    # miss_speak_rate 一并退役——想念概率改由状态驱动公式内部常量决定
+    # （companion.miss_trigger：base 0.65 × 生活状态 × 情绪 × 好感，各因子有界）。
     miss_enabled: bool = Field(
         default=True,
-        description="想念开关：目标用户沉默超过阈值后按概率主动说想TA（每天最多一次）",
+        description="结合人设联系倾向、沉默时间和当前状态产生想念动机，由planner自主决定是否交流。",
         json_schema_extra={
             "label": "启用想念",
-            "hint": "关 = 永不因沉默主动开口；用户沉默时长、概率与 LLM 把关仍按下方配置",
+            "hint": "同一来信沉默周期最多受理一次；精力不足、正在聊天或不适合打扰时跳过。",
             **_ui_i18n("Enable miss trigger", "Off: never starts a chat out of missing someone."),
-        },
-    )
-    miss_silence_hours: str = Field(
-        default="4-8",
-        description="想念阈值（小时）：用户沉默超过该时长才考虑想念。写 \"4-8\" = 区间内每轮随机取阈值"
-                    "（沉默越久越容易触发）；只写一个数字如 8 = 0~8 区间的宽松写法",
-        json_schema_extra={
-            "label": "想念阈值(小时)",
-            "placeholder": "4-8",
-            "pattern": r"^\d+(\.\d+)?(-\d+(\.\d+)?)?$",
-            "hint": '写 "4-8"（推荐）或单个数字 8（= 0~8）；非法值回退 4-8',
-            **_ui_i18n("Miss silence threshold (hours)", 'e.g. "4-8", or a single number 8 = 0-8.'),
-        },
-    )
-    miss_speak_rate: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=1.0,
-        description="想念概率：每轮巡检在沉默超过阈值后真的开口说想念的概率",
-        json_schema_extra={
-            "label": "想念概率",
-            "step": 0.05,
-            "hint": "0 = 只判断不开口；1 = 一超阈值就开口",
-            **_ui_i18n("Miss rate"),
-        },
-    )
-    miss_llm_check_enabled: bool = Field(
-        default=True,
-        description="想念 LLM 把关：开口前让模型以角色身份判断此刻合不合适（回答 Y 才发），驳回后 30 分钟不再判断",
-        json_schema_extra={
-            "label": "想念 LLM 把关",
-            "hint": "关 = 少一次模型调用、更机械；开 = 深夜/忙碌时更不容易打扰",
-            **_ui_i18n("Miss LLM gate"),
         },
     )
     daily_max_speak: int = Field(
         default=5,
         ge=0,
         le=50,
-        description="每日预算（次）：陪伴侧主动发言的每日上限，只统计日程巡检与想念；"
-                    "早/晚安不占预算（由日程侧驱动）",
+        description="目标私聊的每日可选主动回合上限，包含想念、刷QQ和视频分享动机；早午晚安免预算。",
         json_schema_extra={
             "label": "每日预算",
-            "hint": "0 = 陪伴侧完全静音；只对目标私聊计数（群聊/其他私聊不受限）",
-            **_ui_i18n("Daily budget", "Only counts patrol triggers and miss; greetings are exempt."),
-        },
-    )
-    min_trigger_interval_minutes: int = Field(
-        default=240,
-        ge=0,
-        le=1440,
-        description="最小间隔（分钟）：任意两次巡检/想念主动发言之间的硬性间隔，0 = 不限制；"
-                    "早/晚安始终豁免本限制",
-        json_schema_extra={
-            "label": "最小间隔(分钟)",
-            "hint": "默认 240 分钟（4 小时）；早/晚安不看本项",
-            **_ui_i18n("Min interval (min)", "Greetings are always exempt."),
-        },
-    )
-    user_cooldown_minutes: int = Field(
-        default=30,
-        ge=0,
-        le=180,
-        description="用户冷却（分钟）：对方最后一次发言后多久内不主动打扰（想念/巡检受控，早/晚安不受控）",
-        json_schema_extra={
-            "label": "用户冷却(分钟)",
-            "hint": "对方刚说完话就别插嘴；默认 30 分钟",
-            **_ui_i18n("User cooldown (min)"),
+            "hint": "0 = 停止可选主动回合；仅目标私聊计数，受理回合不等于实际发出消息。",
+            **_ui_i18n("Daily budget", "Counts optional proactive turns in the target private chat; greetings are exempt."),
         },
     )
     # 注（2026-10-20 用户指示）：原 silence_start / silence_end 两键已移除——静默窗恒复用
     # 日程作息（[schedule] sleep_time~wake_time，入睡~起床整夜即静默），解析唯一真源 =
     # companion.patrol.resolve_silence_window；旧配置里的显式值由迁移器丢弃并登记。
-    nap_quiet_enabled: bool = Field(
-        default=False,
-        description="午休或小睡期间暂停陪伴主动聊天、空间发帖和评论轮询。",
-        json_schema_extra={
-            "label": "午休静默",
-            "hint": "默认关（午休照常）；开启 = 午休条目进行中陪伴巡检与空间发帖/评论监听都跳过",
-            **_ui_i18n("Nap quiet", "Skip proactive turns and qzone posting while a nap schedule item is active."),
-        },
-    )
 
 
     # ── 好感度注入 ───────────────────────────────────────────
@@ -296,59 +223,16 @@ class PatrolSectionConfig(PluginConfigBase):
         },
     )
 
-    # ── 屏幕感知（原 [cateye] 段）────────────────────────────
-    screen_enabled: bool = Field(
-        default=False,
-        description="屏幕感知：每次主动触发前经 cateye.connect-hub 截一张陪伴对象电脑的屏幕并转述成一句旁白",
-        json_schema_extra={
-            "label": "启用屏幕感知",
-            "hint": "需要「cateye 统一连接插件」且对方电脑开着客户端；默认关",
-            **_ui_i18n("Enable screen awareness",
-                       "Requires the cateye connect-hub plugin and an online client on the lover's PC."),
-        },
-    )
-    screen_blur: int = Field(
-        default=0,
-        ge=0,
-        le=64,
-        description="截图模糊半径（0-64）：0 = 清晰；介意隐私可设 30 左右（视觉模型仍能看出大概在干什么）",
-        json_schema_extra={
-            "label": "截图模糊半径",
-            "hint": "越大越看不清细节；0 = 不模糊",
-            **_ui_i18n("Screenshot blur"),
-        },
-    )
-    screen_timeout_seconds: float = Field(
-        default=20.0,
-        ge=5.0,
-        le=120.0,
-        description="查看电脑（截图 + 视觉理解）整体超时（秒）；超时不阻塞巡检，本轮按不可用处理",
-        json_schema_extra={
-            "label": "查看超时(秒)",
-            **_ui_i18n("Peek timeout (s)"),
-        },
-    )
-    screen_context_ttl_minutes: int = Field(
-        default=90,
-        ge=0,
-        le=1440,
-        description="屏幕旁白存活上限（分钟）：超过即丢弃不再注入；0 = 不限时",
-        json_schema_extra={
-            "label": "旁白存活上限(分钟)",
-            "hint": "防止几小时前的屏幕画面一直被当成「现在」",
-            **_ui_i18n("Narration TTL (min)"),
-        },
-    )
-    # 多屏截图适配（2026-10-30 插入轮；对端 cateye_connect_all-in-one v1.1.0 逐屏抓取）
-    screen_scope: Literal["main", "all"] = Field(
-        default="main",
-        description="屏幕范围：main只看主屏，all查看全部屏幕；多屏需要对端支持。",
-        json_schema_extra={
-            "label": "屏幕范围",
-            "hint": "TA 常在副屏上干活时改 all；对端或客户端过旧时 all 自动退化为只看主屏",
-            **_ui_i18n("Screen scope", "main = primary screen only; all = describe every screen on multi-monitor setups."),
-        },
-    )
+    # ── J 类内部调参（只读桥接 → mappings/internal_tuning.json[patrol]）──────
+    @property
+    def screen_timeout_seconds(self) -> float:
+        """查看电脑整体超时（秒）；现场微调改 mappings/internal_tuning.json。"""
+        return float(_tuning_value("patrol", "screen_timeout_seconds"))
+
+    @property
+    def screen_context_ttl_minutes(self) -> int:
+        """屏幕旁白存活上限（分钟）；0 = 不限时。"""
+        return int(_tuning_value("patrol", "screen_context_ttl_minutes"))
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +245,7 @@ class AffectionSectionConfig(PluginConfigBase):
 
     __ui_label__ = "好感度"
     __ui_icon__ = "favorite"
-    __ui_order__ = 2
+    __ui_order__ = 3
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Affection", "description": "Companion affection system (score 0-200, JSON presets)."}
     }
@@ -425,18 +309,9 @@ class AffectionSectionConfig(PluginConfigBase):
             **_ui_i18n("Daily negative cap"),
         },
     )
-    tier_hysteresis: float = Field(
-        default=6.0,
-        ge=0.0,
-        le=60.0,
-        description="档位迟滞带（分）：升档需 score ≥ 当前档上界 + 该值，降档需 ≤ 下界 − 该值（0=无迟滞）",
-        json_schema_extra={
-            "label": "档位迟滞带",
-            "step": 0.5,
-            "hint": "防止在档位边界反复横跳",
-            **_ui_i18n("Tier hysteresis"),
-        },
-    )
+    # 2026-11-04 配置精简轮（J 类）：tier_hysteresis 移入
+    # mappings/internal_tuning.json[affection]（纯内部阈值；本段生产现值未证实，
+    # 走值搬运而非硬编码）。旧 TOML 键经 migrate_internal_tuning 消费，不丢值。
     tier_min_dwell_hours: float = Field(
         default=24.0,
         ge=0.0,
@@ -498,6 +373,12 @@ class AffectionSectionConfig(PluginConfigBase):
             **_ui_i18n("Weekly milestones"),
         },
     )
+
+    # ── J 类内部调参（只读桥接 → mappings/internal_tuning.json[affection]）────
+    @property
+    def tier_hysteresis(self) -> float:
+        """档位迟滞带（分）：防边界横跳；现场微调改 internal_tuning.json。"""
+        return float(_tuning_value("affection", "tier_hysteresis"))
 
 
 # ---------------------------------------------------------------------------

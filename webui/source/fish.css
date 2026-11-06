@@ -13,7 +13,10 @@
 .section-fish-button:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:3px}
 .fish-section.card>.fish-content{border-radius:inherit}
 .fish-section[data-fish-section=state]{margin-top:18px;margin-bottom:14px}
-.fish-section[data-fish-section=state]>.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}
+/* W-10（2026-11-03）：不再固定 5 列——列数梯度由 panel.css 的 .metrics 断点链
+   （5/4/3/2）统一驱动；这里只保留布局必需的 display/gap，否则本规则的特异性
+   会压过 panel.css 的断点，1000–1199 的 4 列永远不生效。 */
+.fish-section[data-fish-section=state]>.metrics{display:grid;gap:12px}
 .fish-section[data-fish-section=usage]{margin-bottom:4px}
 .fish-section.sleep-combined{display:block;max-height:none!important}
 .sleep-combined>.fish-content>.fish-content{display:block}
@@ -31,7 +34,7 @@ body.fish-locked{overflow:hidden}
 .fish-overlay:before{content:"";position:absolute;inset:0;z-index:0;background:rgba(242,245,239,.2);backdrop-filter:blur(var(--maimai-detail-blur,3px));-webkit-backdrop-filter:blur(var(--maimai-detail-blur,3px))}
 [data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
 @supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
-.fish-panel{position:absolute;z-index:1;display:flex;flex-direction:column;width:min(1040px,100%);max-height:90vh;border:1px solid var(--maibot-border);border-radius:18px;color:var(--maibot-foreground);box-shadow:0 16px 55px #0003;overflow:hidden;opacity:0;transform:scale(var(--maimai-detail-scale,.6));transition:opacity var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1),transform var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);transform-origin:var(--maimai-origin,50% 50%)}
+.fish-panel{position:absolute;z-index:1;display:flex;flex-direction:column;width:min(1040px,100%);max-height:90vh;border:1px solid var(--maibot-border);border-radius:var(--maibot-radius,18px);color:var(--maibot-foreground);box-shadow:0 16px 55px #0003;overflow:hidden;opacity:0;transform:scale(var(--maimai-detail-scale,.6));transition:opacity var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1),transform var(--maimai-detail-fade-ms,220ms) cubic-bezier(.2,.7,.3,1);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);transform-origin:var(--maimai-origin,50% 50%)}
 .fish-overlay.is-open .fish-panel{opacity:1;transform:scale(1)}
 .fish-overlay.is-closing .fish-panel{opacity:0;transform:scale(var(--maimai-detail-scale,.6))}
 .fish-popup-heading{display:flex;align-items:center;gap:9px;padding:13px 15px 11px;border-bottom:1px solid var(--maibot-border);flex-shrink:0}
@@ -77,14 +80,15 @@ body.fish-locked{overflow:hidden}
 .fish-records:empty{display:none}
 .fish-metadata .info-tooltip,.fish-fold .info-tooltip{position:fixed;left:12px;right:12px;top:auto;bottom:calc(80px + env(safe-area-inset-bottom));width:auto;max-width:min(360px,calc(100vw - 24px));z-index:1010}
 .fish-meta-row .info-wrap{vertical-align:baseline}
-.fish-popup-body .info-button{min-width:24px;min-height:24px;width:24px;height:24px}
+.fish-popup-body .info-button{min-width:18px;min-height:18px;width:18px;height:18px}
 .fish-popup-body .info-tooltip{font-size:12px}
 .fish-popup-body details[open]>summary{color:var(--maibot-primary)}
 /* U 计划 §4.2：入口不再搬进标题栏——同一元素 portal 悬浮于遮罩之上，占位标记保持
    原屏幕坐标（视觉不搬家）；粘连气泡尾把面板与入口连成一体。 */
+/* 小鱼入口 portal 到遮罩之上时，原位占位标记保持坐标（视觉不搬家）。 */
 .fish-peek-home{visibility:hidden!important;pointer-events:none!important}
 .fish-float{position:fixed;z-index:950;margin:0}
-.fish-tail-tip{position:fixed;z-index:2;width:14px;height:14px;transform:rotate(45deg);background:var(--maibot-surface);border:1px solid var(--maibot-border);border-radius:3px;pointer-events:none}
+.fish-tail-tip{position:fixed;z-index:2;width:14px;height:14px;transform:rotate(45deg);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);border:1px solid var(--maibot-border);border-radius:3px;pointer-events:none}
 /* 0425 修复：此规则曾把遮罩层与 ::before 一并覆盖成不透明渐变，导致「轻微高斯模糊」
    完全不生效（页面背景被整层遮死）。只保留说明 tooltip 的底色。 */
 .fish-popup-body .info-tooltip{background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background)}
@@ -92,5 +96,5 @@ body.fish-locked{overflow:hidden}
 [data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
 @supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
 @media(max-width:1000px){.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:700px),(hover:none){.section-fish-button{left:-12px;bottom:-8px;width:44px;height:34px;min-height:34px}.fish-peek{width:44px;height:auto;margin:0}.fish-peek>svg{width:44px;transform:rotate(-12deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:16px}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px;grid-template-columns:minmax(0,1fr)}.fish-popup-body>*{min-width:0}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:26px;min-width:26px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
+@media(max-width:700px),(hover:none){.section-fish-button{left:-12px;bottom:-8px;width:44px;height:34px;min-height:34px}.fish-peek{width:44px;height:auto;margin:0}.fish-peek>svg{width:44px;transform:rotate(-12deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:var(--maibot-radius,18px)}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px;grid-template-columns:minmax(0,1fr)}.fish-popup-body>*{min-width:0}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:16px;min-width:16px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
 @media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:rotate(-12deg)!important}.fish-overlay,.fish-panel{transition:none!important}}

@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
-"""PR4 事件库配置段（独立新文件；后续共享接线工人从这里导入并挂到聚合配置）。
+"""Small-event configuration and the flattened schedule fields.
 
-为什么单独成文件：本轮 `planning/config.py` / `suite_config.py` 由其他工人
-占用，PR4 不能并行编辑；本模块只定义 ``[event_catalog]`` 段与轻量只读视图，
-挂载前 `EventCatalogService` 也能用 :func:`resolve_config` 拿到默认值运行。
-
-`max_events` 两义已由用户裁定：**拆成生成上限 8、总池上限 12**，
-``max_events`` 保留为生成上限的兼容读法；同时给出规范字段时规范字段优先。
-本文件登记 ``max_generated_events`` / ``max_pool_events`` 两个规范字段，
-服务侧默认按「生成 3~8、合并总池 <=12」执行，内置池至少 3 条。
+Reusable and one-shot requests share a total capacity. After the five builtins,
+remaining slots split evenly (odd slot to reusable), each capped by the user's
+per-pool generation limit. Legacy event_catalog input is migrated by the root.
 """
 
 from __future__ import annotations
@@ -19,6 +14,7 @@ from typing import Any, ClassVar, Dict, Literal, Mapping, Optional
 from maibot_sdk import Field, PluginConfigBase
 
 from core.coerce import as_int as _as_int
+from core.internal_tuning import tuning_value as _tuning_value
 
 #: 代码默认（定稿 §1 #6：部署灰度先 manual，代码默认 off）
 DEFAULT_MODE = "off"
@@ -26,7 +22,7 @@ DEFAULT_MIN_INTERVAL_DAYS = 5
 DEFAULT_MAX_INTERVAL_DAYS = 15
 #: 定稿 §4.3.1 / 附录 B.6.3：生成条数上限
 DEFAULT_MAX_GENERATED_EVENTS = 8
-DEFAULT_MIN_GENERATED_EVENTS = 3
+DEFAULT_MIN_GENERATED_EVENTS = 1
 #: 附录 B.1.3：active_events 总池上限（用户已裁定规范字段默认 12）
 DEFAULT_MAX_POOL_EVENTS = 12
 DEFAULT_TASK_NAME = "utils"
@@ -82,45 +78,28 @@ class EventCatalogSectionConfig(PluginConfigBase):
         default=DEFAULT_MAX_GENERATED_EVENTS,
         ge=DEFAULT_MIN_GENERATED_EVENTS,
         le=DEFAULT_MAX_GENERATED_EVENTS,
-        description="每次生成的小事件条数上限（3至8）。",
-        json_schema_extra={"label": "生成条数上限", **_i18n("Generated events per refresh")},
+        description="每个生成池的条数上限（1至8）；两池平分扣除内置事件后的总容量。",
+        json_schema_extra={"label": "每池生成上限", "hint":"默认总容量12：内置5、可复用最多4、一次性最多3；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
     )
-    max_pool_events: int = Field(
-        default=DEFAULT_MAX_POOL_EVENTS,
-        ge=3,
-        le=64,
-        description="内置与生成事件合并后的总条数上限。",
-        json_schema_extra={"label": "总池上限", **_i18n("Merged pool size cap")},
-    )
-    max_events: int = Field(
-        default=DEFAULT_MAX_GENERATED_EVENTS,
-        ge=DEFAULT_MIN_GENERATED_EVENTS,
-        le=DEFAULT_MAX_GENERATED_EVENTS,
-        # 兼容读法只在「原始配置归一化默认填充之前」有意义（见 migrate_legacy_event_catalog）；
-        # 已迁移的配置由规范字段承载，故对 WebUI 隐藏、避免出现「可编辑却被迁移忽略」的死键。
-        description="生成条数上限的兼容字段；使用生成条数上限配置。",
-        json_schema_extra={"label": "生成条数上限（兼容键）", "hidden": True,
-                           **_i18n("Legacy generated events cap (compat, hidden)")},
-    )
+    # 2026-11-04 配置精简轮（J 类）：max_pool_events 移入
+    # mappings/internal_tuning.json[event_catalog]（内部容量）；同名只读 property 见下。
     task_name: str = Field(
         default=DEFAULT_TASK_NAME,
         description="生成小事件使用的宿主任务名，默认 utils；自定义任务不存在时使用 utils",
         json_schema_extra={"label": "LLM 任务名", **_i18n("LLM task name")},
     )
 
-    temperature: float = Field(
-        default=DEFAULT_TEMPERATURE,
-        ge=0.0,
-        le=2.0,
-        # 2026-10-27 用户锁定 0.9：服务端固定发送 0.9（用户 2026-10-26/27 参数裁定）。
-        # 若仍作为可见可编辑键，用户填任何值都会被硬编码忽略——即「新死键」。
-        # 故：字段保留（配置文件/兼容读取仍看得到），但对 WebUI 隐藏、且 resolve_config
-        # 一律返回 DEFAULT_TEMPERATURE；改温度只能改代码常量（协议固定）。
-        description="生成温度（隐藏；协议固定 0.9，配置值不生效，勿编辑）",
-        json_schema_extra={"label": "生成温度（固定 0.9，隐藏）", "hidden": True,
-                           **_i18n("Temperature (fixed 0.9, hidden)")},
-    )
+    # H 类（2026-11-04 配置精简轮）：
+    # - ``max_events`` 隐藏兼容 Field 已删：旧键仍由 migrate_legacy_event_catalog 在
+    #   默认填充前搬进规范键 max_generated_events 后 pop（生产两键同值 8，无损）；
+    #   resolve_config 对原始 dict 的旧读法兜底保留。
+    # - ``temperature`` 隐藏 Field 已删：2026-10-27 用户锁定 0.9，resolve_config 恒返回
+    #   DEFAULT_TEMPERATURE（配置值本就不生效）；旧 TOML 键经 LEGACY_ROUTE_KEYS 入口 pop。
 
+    @property
+    def max_pool_events(self) -> int:
+        """内置与生成事件合并后的总条数上限（J 类 → internal_tuning.json）。"""
+        return int(_tuning_value("event_catalog", "max_pool_events"))
 
     def normalized(self) -> "EventCatalogConfig":
         """Pydantic 段 → 服务只读视图（不做 IO）。"""
@@ -286,3 +265,43 @@ def migrate_legacy_event_catalog(section: Any,
     out.pop("max_events", None)
     return out
 
+
+
+class EventCatalogFields(PluginConfigBase):
+    """小事件生成参数，在日程板块展示。"""
+
+    event_catalog_mode: Literal["off", "manual", "auto"] = Field(
+        default=DEFAULT_MODE,
+        description="事件库模式：off仅使用内置事件，manual手动生成，auto到期自动生成。",
+        json_schema_extra={
+            "label": "事件库模式",
+            "hint": "自动模式按生成周期更新事件，手动模式使用初始化事件库命令。",
+            **_i18n("Event catalog mode", "off = builtin pool only; manual = command only; auto = due background update."),
+        },
+    )
+    event_catalog_min_interval_days: int = Field(
+        default=DEFAULT_MIN_INTERVAL_DAYS,
+        ge=1,
+        le=365,
+        description="生成周期下限（天，建议 5）",
+        json_schema_extra={"label": "生成周期下限(天)", **_i18n("Min interval (days)")},
+    )
+    event_catalog_max_interval_days: int = Field(
+        default=DEFAULT_MAX_INTERVAL_DAYS,
+        ge=1,
+        le=365,
+        description="生成周期上限（天，建议 15）",
+        json_schema_extra={"label": "生成周期上限(天)", **_i18n("Max interval (days)")},
+    )
+    event_catalog_max_generated_events: int = Field(
+        default=DEFAULT_MAX_GENERATED_EVENTS,
+        ge=DEFAULT_MIN_GENERATED_EVENTS,
+        le=DEFAULT_MAX_GENERATED_EVENTS,
+        description="每个生成池的条数上限（1至8）；两池平分扣除内置事件后的总容量。",
+        json_schema_extra={"label": "每池生成上限", "hint":"默认总容量12：内置5、可复用最多4、一次性最多3；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
+    )
+    event_catalog_task_name: str = Field(
+        default=DEFAULT_TASK_NAME,
+        description="生成小事件使用的宿主任务名，默认 utils；自定义任务不存在时使用 utils",
+        json_schema_extra={"label": "LLM 任务名", **_i18n("LLM task name")},
+    )

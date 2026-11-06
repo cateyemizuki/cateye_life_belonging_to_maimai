@@ -33,6 +33,8 @@ import os
 import random
 import re
 import shutil
+import threading
+from uuid import uuid4
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -44,6 +46,7 @@ from core.mapping_dir import MappingReadError, mappings_path, read_json_text
 from core.storage import save_json_atomic
 
 from .event_catalog_config import EventCatalogConfig, resolve_config
+from .event_pools import POOL_VERSION, normalize_cycle, allocate_pools, catalog_write_guard
 from .event_prompt import (GENERATION_TEMPERATURE,
                            EventPromptError, build_event_prompt,
                            build_json_schema, parse_events_response)
@@ -51,7 +54,7 @@ from .event_prompt import (GENERATION_TEMPERATURE,
 logger = logging.getLogger(__name__)
 
 # ── 常量（附录 B.1）──────────────────────────────────────────────────────────
-CATALOG_VERSION = 1
+CATALOG_VERSION = POOL_VERSION
 CATALOG_FILE_NAME = "generated_events.json"
 CATALOG_STATE_FILE_NAME = "event_catalog_state.json"
 EVENT_ID_PREFIX = "llm_"
@@ -86,35 +89,12 @@ BACKUP_KEEP = 3
 _CHARS_PER_TOKEN = 2
 #: 内置池权重固定 1.0（附录 B.1.3）
 BUILTIN_WEIGHT = 1.0
+#: 刷视频小事件 key（2026-11-04 刷视频功能批）：事件本体已在内置池（B 计划
+#: 2026-11-01），本批补「启用门控」——仅当 [video_watch].enabled=true 时可被
+#: roll 到（装配根经 set_event_gate 注入动态配置闸；热重载即时生效）。
+VIDEO_WATCH_EVENT_KEY = "watch_bili"
 
-BUILTIN_EVENTS: Tuple[Dict[str, Any], ...] = (
-    {"event_id": "find_thing", "name": "找东西", "min_minutes": 5, "max_minutes": 15,
-     "interruptibility": 0.95, "goal_type": "daily_routine",
-     "state_deltas": {"focus": -0.05, "stress": 0.02},
-     "templates": ("突然想不起来东西放哪了，翻了一会儿", "在找一件小东西，把抽屉翻了个遍")},
-    {"event_id": "phone_call", "name": "接电话", "min_minutes": 5, "max_minutes": 20,
-     "interruptibility": 0.90, "goal_type": "daily_routine",
-     "state_deltas": {"social_battery": -0.05},
-     "templates": ("来了个电话，接了一会儿", "接了个电话，说了几句")},
-    {"event_id": "package", "name": "拿快递", "min_minutes": 5, "max_minutes": 5,
-     "interruptibility": 0.95, "goal_type": "daily_routine",
-     "state_deltas": {"energy": -0.01},
-     "templates": ("快递到了，下去拿了一趟", "去门口取了个快递")},
-    {"event_id": "friend_msg", "name": "朋友消息", "min_minutes": 5, "max_minutes": 10,
-     "interruptibility": 0.95, "goal_type": "social",
-     "state_deltas": {"social_battery": 0.05, "stress": -0.02},
-     "templates": ("朋友发来消息，聊了几句", "回了朋友一条消息，闲聊了一会儿")},
-    {"event_id": "errand", "name": "临时差事", "min_minutes": 15, "max_minutes": 30,
-     "interruptibility": 0.80, "goal_type": "daily_routine",
-     "state_deltas": {"energy": -0.03, "stress": 0.03},
-     "templates": ("临时有件小事要处理一下", "被喊去搭了把手，花了些时间")},
-    # 2026-11-01 B 计划（§5）：刷视频 = 低优先级可中断娱乐小事件；执行侧由
-    # integrations/video_schedule 经公共观看接口驱动（无候选/能力缺失如实跳过）。
-    {"event_id": "watch_bili", "name": "刷视频", "min_minutes": 10, "max_minutes": 25,
-     "interruptibility": 0.90, "goal_type": "entertainment",
-     "state_deltas": {"stress": -0.04, "focus": -0.02},
-     "templates": ("窝在椅子上刷了会儿B站视频", "翻了翻待看的视频，挑了一个看起来还不错的")},
-)
+from .small_events import BUILTIN_EVENTS, builtin_events
 
 #: 安全关键词（模板 / 名称；宁可保守，命中即 E_SAFETY）
 _SAFETY_TERMS: Tuple[str, ...] = (
@@ -133,31 +113,6 @@ _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 _CONTACT_RE = re.compile(r"(qq|微信|电话|手机|联系方式)\s*[:：]?\s*\d{5,}", re.IGNORECASE)
 _ADDRESS_RE = re.compile(r"[\u4e00-\u9fa5]{1,8}(路|街|道|小区)\s*\d+\s*号")
-
-
-def builtin_events() -> List[Dict[str, Any]]:
-    """内置池的独立副本（source=builtin、key 兼容旧 event_key、weight=1.0）。"""
-    output: List[Dict[str, Any]] = []
-    for raw in BUILTIN_EVENTS:
-        event = {
-            "event_id": raw["event_id"],
-            "key": raw["event_id"],
-            "name": raw["name"],
-            "goal_type": raw["goal_type"],
-            "min_minutes": int(raw["min_minutes"]),
-            "max_minutes": int(raw["max_minutes"]),
-            "interruptibility": float(raw["interruptibility"]),
-            "weight": BUILTIN_WEIGHT,
-            "state_deltas": dict(raw.get("state_deltas") or {}),
-            "templates": list(raw.get("templates") or ()),
-            "enabled": True,
-            "source": "builtin",
-        }
-        output.append(event)
-    return output
-
-
-
 
 
 def compute_catalog_version(document: Any) -> str:
@@ -237,7 +192,7 @@ class EventCatalogValidator:
                  max_pool_events: int = 12,
                  enforce_pool_cap: bool = True) -> None:
         self.builtin_count = len(BUILTIN_EVENTS) if builtin_count is None else int(builtin_count)
-        self.max_generated_events = max(MIN_GENERATED_EVENTS,
+        self.max_generated_events = max(1,
                                         min(MAX_GENERATED_EVENTS, int(max_generated_events)))
         self.max_pool_events = max(1, int(max_pool_events))
         self.enforce_pool_cap = bool(enforce_pool_cap)
@@ -362,7 +317,7 @@ class EventCatalogValidator:
         if not isinstance(document, dict):
             return ValidationResult((ValidationError("E_SCHEMA", "文档根必须是对象"),))
         version = document.get("version")
-        if version != CATALOG_VERSION:
+        if version not in (1, CATALOG_VERSION):
             errors.append(ValidationError("E_SCHEMA", f"version 必须为 {CATALOG_VERSION}",
                                           "version"))
         for key in ("source", "model", "generated_at", "next_update_at", "prompt_hash"):
@@ -379,11 +334,21 @@ class EventCatalogValidator:
         if not isinstance(events, list):
             errors.append(ValidationError("E_SCHEMA", "events 必须是数组", "events"))
             return ValidationResult(tuple(errors))
-        if not (MIN_GENERATED_EVENTS <= len(events) <= self.max_generated_events):
+        dual = version == CATALOG_VERSION
+        if dual:
+            try:
+                normalize_cycle(document)
+            except ValueError as exc:
+                errors.append(ValidationError('E_SCHEMA', str(exc), 'consumed'))
+            for kind in ('reusable', 'one_shot'):
+                count = sum(isinstance(e, dict) and e.get('pool_kind') == kind for e in events)
+                if not 1 <= count <= self.max_generated_events:
+                    errors.append(ValidationError('E_COUNT', f'{kind} 条数需1-{self.max_generated_events}', 'events'))
+        elif not (MIN_GENERATED_EVENTS <= len(events) <= self.max_generated_events):
             errors.append(ValidationError(
                 "E_COUNT", f"生成条数需 {MIN_GENERATED_EVENTS}-{self.max_generated_events}，"
                 f"实际 {len(events)}", "events"))
-        if self.enforce_pool_cap and self.builtin_count + len(events) > self.max_pool_events:
+        if (dual or self.enforce_pool_cap) and self.builtin_count + len(events) > self.max_pool_events:
             errors.append(ValidationError(
                 "E_COUNT", f"内置池 {self.builtin_count} + 生成 {len(events)} 超过总池上限 "
                 f"{self.max_pool_events}", "events"))
@@ -396,6 +361,10 @@ class EventCatalogValidator:
                                               reserved_names=reserved_names,
                                               recent_names=recent_names)
             errors.extend(item_errors)
+            if (isinstance(event, dict) and event.get('pool_kind') == 'one_shot'
+                    and event.get('goal_type') in ('rest', 'idle', 'transition')):
+                errors.append(ValidationError('E_GOAL_TYPE', '一次性事件应有具体小目标，不是反复休息或转场',
+                                              'goal_type', str(event.get('event_id') or '')))
             if isinstance(event, dict):
                 eid = _text(event.get("event_id"))
                 name = _text(event.get("name"))
@@ -438,9 +407,27 @@ class CatalogSnapshot:
     invalid_count: int = 0
     pool_truncated: int = 0
 
+    @property
+    def generation_id(self) -> str:
+        return str(self.document.get('generation_id') or '')
+
+    @property
+    def reusable_events(self) -> Tuple[Dict[str, Any], ...]:
+        return tuple(dict(e) for e in self.generated_events if e.get('pool_kind') == 'reusable')
+
+    @property
+    def one_shot_events(self) -> Tuple[Dict[str, Any], ...]:
+        return tuple(dict(e) for e in self.active_events if e.get('pool_kind') == 'one_shot')
+
+    @property
+    def consumed_events(self) -> Tuple[Dict[str, Any], ...]:
+        receipts = self.document.get('consumed') or {}
+        return tuple(dict(e, consumption=dict(receipts[e['event_id']]))
+                     for e in self.generated_events if e.get('event_id') in receipts)
+
     def get_event(self, event_id: Any) -> Optional[Dict[str, Any]]:
         wanted = str(event_id or "")
-        for event in self.active_events:
+        for event in (*self.builtin_events, *self.generated_events):
             if event.get("event_id") == wanted or event.get("key") == wanted:
                 return dict(event)
         return None
@@ -554,6 +541,7 @@ class EventCatalogStore:
                  tz: Optional[timezone] = None,
                  load_on_init: bool = True) -> None:
         self.path = Path(path)
+        self._write_lock = threading.RLock()
         self._tz = tz
         self._max_pool_events = max(1, int(max_pool_events))
         self._enforce_pool_cap = bool(enforce_pool_cap)
@@ -565,10 +553,32 @@ class EventCatalogStore:
             max_pool_events=max_pool_events,
             enforce_pool_cap=enforce_pool_cap)
         self._snapshot = self._fallback("missing")
+        # 运行时事件门控（2026-11-04 刷视频功能批）：event_key -> bool；
+        # None = 不设闸（旧行为）。闸是动态配置读数，不进快照/不改用户文件。
+        self._event_gate: Optional[Callable[[str], bool]] = None
         # mode=off 时**不读**生成库（2026-10-27 共享接线契约：off 不读写生成库）：
         # 只保留内置池快照，用户文件既不删除也不改写；切到 manual/auto 时由 reload() 补读。
         if load_on_init:
             self.reload()
+
+    def set_event_gate(self, gate: Optional[Callable[[str], bool]]) -> None:
+        """注入运行时事件门控（装配根用；pick 时逐事件询问，False = 不可 roll）。
+
+        闸异常按「该事件不可用」处理（fail-closed）；当前唯一消费场景 =
+        watch_bili 随 [video_watch].enabled 启停（用户规格：启用看视频功能时
+        自动把「刷B站」加入可 roll 的小事件池，关闭即移出）。
+        """
+        self._event_gate = gate
+
+    def _gate_allows(self, event_id: str) -> bool:
+        gate = self._event_gate
+        if gate is None:
+            return True
+        try:
+            return bool(gate(event_id))
+        except Exception:
+            logger.debug("event_catalog: 事件门控异常（按不可用处理）：%s", event_id)
+            return False
 
     def use_builtin_only(self, reason: str = "mode_off") -> CatalogSnapshot:
         """不读盘、只用内置池（``mode=off`` 语义；不删不改用户文件）。"""
@@ -594,6 +604,7 @@ class EventCatalogStore:
                 "templates": [str(x) for x in (raw.get("templates") or ())],
                 "enabled": True,
                 "source": "builtin",
+                "pool_kind": "builtin",
             })
         return output
 
@@ -632,9 +643,15 @@ class EventCatalogStore:
                 self._snapshot = self._fallback("corrupt")
                 return self._snapshot
             version = document.get("version")
-            if version != CATALOG_VERSION:
+            if version not in (1, CATALOG_VERSION):
                 logger.warning("event_catalog: 不认识的版本 %r，回退内置池", version)
                 self._snapshot = self._fallback("unsupported_version", document=document)
+                return self._snapshot
+            try:
+                document = normalize_cycle(document)
+            except ValueError as exc:
+                logger.warning('event_catalog: 消耗状态不可核验，仅使用内置池：%s', exc)
+                self._snapshot = self._fallback('invalid_consumption_state')
                 return self._snapshot
             raw_events = document.get("events")
             if not isinstance(raw_events, list):
@@ -668,6 +685,8 @@ class EventCatalogStore:
                     "templates": [str(x) for x in raw.get("templates") or ()],
                     "enabled": True,
                     "source": "llm",
+                    "pool_kind": raw['pool_kind'],
+                    "generation_id": document['generation_id'],
                 }
                 reserved_ids.add(eid)
                 reserved_names.add(normalized["name"])
@@ -687,7 +706,9 @@ class EventCatalogStore:
             if not isinstance(next_update_at, str) or not next_update_at.strip():
                 next_update_at = None
             degraded = bool(invalid_count) or not valid
-            active = tuple(dict(e) for e in self._builtin) + tuple(dict(e) for e in valid)
+            consumed = document['consumed']
+            active = tuple(dict(e, pool_kind='builtin') for e in self._builtin) + tuple(
+                dict(e) for e in valid if e['event_id'] not in consumed)
             self._snapshot = CatalogSnapshot(
                 path=self.path,
                 document=document,
@@ -764,19 +785,69 @@ class EventCatalogStore:
             logger.warning("event_catalog: 备份旧事件库失败，放弃本次替换：%s", exc)
             return False
 
-    def save(self, document: Mapping[str, Any]) -> bool:
+    def save(self, document: Mapping[str, Any], *, expected_fingerprint: Optional[str] = None) -> bool:
         """原子替换；先备份旧文件。失败 → 旧文件保持原样。"""
         try:
-            if self.path.exists() and not self._rotate_backup():
-                return False
-            if not save_json_atomic(self.path, dict(document)):
-                logger.warning("event_catalog: 原子写事件库失败（旧文件保留）")
-                return False
-            self.reload()
-            return True
+            normalized = normalize_cycle(dict(document))
+            with self._write_lock, catalog_write_guard(self.path):
+                if expected_fingerprint is not None and self.file_fingerprint() != expected_fingerprint:
+                    return False
+                if self.path.exists() and not self._rotate_backup():
+                    return False
+                if not save_json_atomic(self.path, normalized):
+                    logger.warning("event_catalog: 原子写事件库失败（旧文件保留）")
+                    return False
+                self.reload()
+                return True
         except Exception as exc:
             logger.warning("event_catalog: 保存事件库异常（旧文件保留）：%s", exc)
             return False
+
+    def claim_event(self, event: Mapping[str, Any], *, now: Optional[datetime] = None) -> bool:
+        """Final draw consumes one-shot events before episode creation; never on preview."""
+        if event.get('pool_kind') != 'one_shot':
+            return True
+        try:
+            with self._write_lock, catalog_write_guard(self.path):
+                document = normalize_cycle(read_json_text(self.path))
+                eid = str(event.get('event_id') or event.get('key') or '')
+                if event.get('generation_id') != document['generation_id'] or eid in document['consumed']:
+                    return False
+                actual = next((e for e in document['events'] if isinstance(e, dict)
+                               and e.get('event_id') == eid and e.get('pool_kind') == 'one_shot'), None)
+                if actual is None or not self._gate_allows(eid):
+                    return False
+                document['consumed'][eid] = {'generation_id': document['generation_id'],
+                    'status': 'selected', 'picked_at': _now_of(now, self._tz).isoformat(timespec='seconds')}
+                if not save_json_atomic(self.path, document):
+                    return False
+                self.reload()
+                return True
+        except Exception:
+            logger.warning('event_catalog: 一次性事件消耗无法持久化，本次不执行', exc_info=True)
+            return False
+
+    def finish_claim(self, event: Mapping[str, Any], status: str, episode_id: str = '',
+                     *, reason: str = '') -> None:
+        if event.get('pool_kind') != 'one_shot' or status not in ('started', 'start_failed', 'interrupted', 'completed'):
+            return
+        try:
+            with self._write_lock, catalog_write_guard(self.path):
+                document = normalize_cycle(read_json_text(self.path))
+                if document['generation_id'] != event.get('generation_id'):
+                    return  # next cycle must not receive an old activity's receipt
+                receipt = document['consumed'].get(str(event.get('event_id') or event.get('key') or ''))
+                if not isinstance(receipt, dict):
+                    return
+                if receipt.get('status') in ('completed', 'interrupted', 'start_failed'):
+                    return  # a late callback cannot turn a terminal receipt back into started
+                receipt.update(status=status, episode_id=str(episode_id)[:120])
+                if reason:
+                    receipt['reason'] = str(reason)[:120]
+                if save_json_atomic(self.path, document):
+                    self.reload()
+        except Exception:
+            logger.warning('event_catalog: 一次性事件结果未补记，原消耗记录仍保留', exc_info=True)
 
     # ---- 运行时 pick（0 LLM）----
     def pick_event(self, rng: random.Random, state: Any = None, recent: Any = None,
@@ -799,6 +870,12 @@ class EventCatalogStore:
             eid = str(event.get("event_id") or event.get("key") or "")
             if not eid or event.get("enabled", True) is False:
                 continue
+            if event.get('pool_kind') == 'one_shot':
+                if (event.get('generation_id') != self._snapshot.generation_id
+                        or eid in (self._snapshot.document.get('consumed') or {})):
+                    continue
+            if not self._gate_allows(eid):
+                continue  # 运行时门控（如 video_watch.enabled 关闭 → 刷B站不可 roll）
             last = last_map.get(eid)
             if last is not None:
                 elapsed = (now_dt - last).total_seconds()
@@ -1061,6 +1138,10 @@ class EventCatalogService:
     def get_state_deltas(self, event_id: Any) -> Optional[Dict[str, float]]:
         return self.store.get_state_deltas(event_id)
 
+    def set_event_gate(self, gate: Optional[Callable[[str], bool]]) -> None:
+        """运行时事件门控（透传 store；装配根注入 video_watch.enabled 闸）。"""
+        self.store.set_event_gate(gate)
+
     @property
     def catalog_version(self) -> str:
         return self.store.catalog_version
@@ -1109,6 +1190,8 @@ class EventCatalogService:
             "event_catalog_version": self.store.catalog_version,
             "event_source": str(resolved.get("source") or ""),
             "event_name": str(resolved.get("name") or ""),
+            "event_pool_kind": str(resolved.get('pool_kind') or 'reusable'),
+            "event_generation_id": str(resolved.get('generation_id') or ''),
             "goal_type": str(resolved.get("goal_type") or ""),
             "state_deltas": dict(resolved.get("state_deltas") or {}),
         }
@@ -1117,6 +1200,13 @@ class EventCatalogService:
         if resolved.get("duration_minutes") is not None:
             metadata["duration_minutes"] = resolved.get("duration_minutes")
         return metadata
+
+    def claim_event(self, event: Mapping[str, Any], *, now: Optional[datetime] = None) -> bool:
+        return self.store.claim_event(event, now=self._now(now))
+
+    def finish_claim(self, event: Mapping[str, Any], status: str, episode_id: str = '',
+                     *, reason: str = '') -> None:
+        self.store.finish_claim(event, status, episode_id, reason=reason)
 
     def status(self) -> Dict[str, Any]:
         cfg = self._current_config()
@@ -1132,6 +1222,10 @@ class EventCatalogService:
             "reason": snap.reason,
             "catalog_version": snap.catalog_version,
             "generated_events": len(snap.generated_events),
+            "reusable_events": len(snap.reusable_events),
+            "one_shot_remaining": len(snap.one_shot_events),
+            "one_shot_consumed": len(snap.consumed_events),
+            "generation_id": snap.generation_id,
             "builtin_events": len(snap.builtin_events),
             "active_events": len(snap.active_events),
             "invalid_count": snap.invalid_count,
@@ -1285,126 +1379,89 @@ class EventCatalogService:
                               now: datetime) -> RefreshResult:
         self.store.reload()
         start_fp = self.store.file_fingerprint()
-        persona = str(self._provider_value(self._persona_provider, "") or "")
+        persona = str(self._provider_value(self._persona_provider, '') or '')
         recent_schedule = self._names_of(self._recent_schedule_provider)
         recent_events = self._names_of(self._recent_event_provider)
-        reserved_names = [e["name"] for e in self.store.snapshot.builtin_events]
-        reserved_names += [e["name"] for e in self.store.snapshot.generated_events]
-        reserved_names += recent_events
-        reserved_ids = {e["event_id"] for e in self.store.snapshot.builtin_events}
-        builtin_count = len(self.store.snapshot.builtin_events)
-        pool_slots = max(MIN_GENERATED_EVENTS, cfg.max_pool_events - builtin_count)
-        requested = max(MIN_GENERATED_EVENTS,
-                        min(cfg.max_generated_events, pool_slots))
-        prompt = build_event_prompt(persona=persona,
-                                    recent_schedule_names=recent_schedule,
-                                    existing_event_names=reserved_names,
-                                    count=requested)
-        temperature = EVENT_GENERATION_TEMPERATURE
-        if self._llm is None or not (
-                callable(getattr(self._llm, "generate_detailed", None))
-                or callable(getattr(self._llm, "generate", None))):
-            return self._failed("E_LLM", "LLMService 不可用", manual=manual)
+        builtin = self.store.snapshot.builtin_events
+        counts = allocate_pools(cfg.max_pool_events, len(builtin), cfg.max_generated_events)
+        if not all(counts):
+            return self._failed('E_CAPACITY', '容量不足两类生成池各1条，保留旧事件库', manual=manual)
+        if self._llm is None or not (callable(getattr(self._llm, 'generate_detailed', None))
+                                    or callable(getattr(self._llm, 'generate', None))):
+            return self._failed('E_LLM', 'LLMService不可用', manual=manual)
+        reserved_names = [e['name'] for e in (*builtin, *self.store.snapshot.generated_events)] + recent_events
+        reserved_ids = {e['event_id'] for e in builtin}
+        events, hashes, models, failures = [], [], [], []
         charged = 0
         model_calls = 0
-        try:
-            chosen, spent = await self._attempt_llm(
-                prompt, task_name=cfg.task_name,
-                temperature=temperature, now=now)
-            charged += spent
-            model_calls += max(0, int(chosen.attempts or 0))
-        except asyncio.CancelledError:
-            # 取消不编造用量；宿主实际返回的usage才计入统计。
-            raise
-        except Exception as exc:
-            logger.warning("event_catalog: LLM 调用异常：%s", exc)
-
-            return self._failed("E_LLM", f"LLM 调用异常：{exc}", manual=manual,
-                                tokens=charged, called_llm=model_calls > 0)
-
-        if chosen.category == "task_missing" and cfg.task_name != LLM_FALLBACK_TASK:
-            logger.warning("event_catalog: 任务 %s 明确不存在，回退 %s 再试一次",
-                           cfg.task_name, LLM_FALLBACK_TASK)
+        for kind, requested in zip(('reusable', 'one_shot'), counts):
+            prompt = build_event_prompt(persona=persona, recent_schedule_names=recent_schedule,
+                existing_event_names=reserved_names + [e.get('name', '') for e in events],
+                count=requested, min_count=1, pool_kind=kind)
             try:
-                chosen, spent = await self._attempt_llm(
-                    prompt, task_name=LLM_FALLBACK_TASK,
-                    temperature=temperature, now=now)
+                chosen, spent = await self._attempt_llm(prompt, task_name=cfg.task_name,
+                    temperature=EVENT_GENERATION_TEMPERATURE, now=now)
                 charged += spent
                 model_calls += max(0, int(chosen.attempts or 0))
+                # A declared-but-missing task sent no model request; resolve its normal fallback.
+                if chosen.category == 'task_missing' and cfg.task_name != LLM_FALLBACK_TASK:
+                    chosen, spent = await self._attempt_llm(prompt, task_name=LLM_FALLBACK_TASK,
+                        temperature=EVENT_GENERATION_TEMPERATURE, now=now)
+                    charged += spent
+                    model_calls += max(0, int(chosen.attempts or 0))
+                if not chosen.ok or not str(chosen.text or '').strip():
+                    failures.append(f'{kind}: 模型未返回可用事件（{chosen.category}）')
+                    continue
+                rows = parse_events_response(chosen.text)
+                if not 1 <= len(rows) <= requested:
+                    failures.append(f'{kind}: 返回条数不在1-{requested}内')
+                    continue
+                for row in rows:
+                    item = _normalize_event(row)
+                    item['pool_kind'] = kind
+                    events.append(item)
+                hashes.append(prompt.prompt_hash)
+                models.append(str(getattr(self._llm, 'model_name', '') or ''))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("event_catalog: LLM 回退调用异常：%s", exc)
-
-                return self._failed("E_LLM", f"LLM 回退调用异常：{exc}",
-                                    manual=manual, tokens=charged,
-                                    called_llm=model_calls > 0)
-
-        tokens = charged
-        raw = chosen.text if chosen.ok else ""
-        if chosen.category == "task_missing":
-            return self._failed("E_LLM", f"任务缺失：{chosen.error}", manual=manual,
-                                tokens=tokens, called_llm=model_calls > 0)
-        if not str(raw or "").strip():
-            detail = chosen.error or "LLM 返回空内容"
-            return self._failed("E_LLM", f"LLM 返回空内容（{chosen.category}）：{detail}",
-                                manual=manual, tokens=tokens,
-                                called_llm=model_calls > 0)
-        try:
-            raw_events = parse_events_response(raw)
-        except EventPromptError as exc:
-            return self._failed("E_RESPONSE", str(exc), manual=manual, tokens=tokens,
-                                called_llm=model_calls > 0)
-        events = [_normalize_event(item) for item in raw_events]
+                logger.warning('event_catalog: %s生成失败，保留旧双池：%s', kind, exc)
+                failures.append(f'{kind}: 生成响应不可用')
+        if failures:
+            return self._failed('E_LLM', '；'.join(failures), manual=manual,
+                                tokens=charged, called_llm=model_calls > 0)
         document = {
-            "version": CATALOG_VERSION,
-            "source": "llm",
-            "model": str(getattr(self._llm, "model_name", "")
-                         or getattr(self._llm, "_model_name", "") or ""),
-            "generated_at": now.isoformat(timespec="seconds"),
-            "next_update_at": (now + timedelta(days=self._next_interval_days(cfg))).isoformat(
-                timespec="seconds"),
-            "prompt_hash": prompt.prompt_hash,
-            "events": events,
+            'version': CATALOG_VERSION, 'source': 'llm', 'model': ','.join(models),
+            'generation_id': 'generation_' + uuid4().hex,
+            'generated_at': now.isoformat(timespec='seconds'),
+            'next_update_at': (now + timedelta(days=self._next_interval_days(cfg))).isoformat(timespec='seconds'),
+            'prompt_hash': hashlib.sha256('|'.join(hashes).encode()).hexdigest(),
+            'events': events, 'consumed': {},
         }
-        validator = self._validator
-        if not self._custom_validator:
-            validator = EventCatalogValidator(
-                builtin_count=builtin_count,
-                max_generated_events=cfg.max_generated_events,
-                max_pool_events=cfg.max_pool_events,
-                enforce_pool_cap=cfg.enforce_pool_cap)
-        validation = validator.validate_document(
-            document, reserved_ids=reserved_ids, reserved_names=reserved_names,
-            recent_names=recent_events)
+        validator = self._validator if self._custom_validator else EventCatalogValidator(
+            builtin_count=len(builtin), max_generated_events=cfg.max_generated_events,
+            max_pool_events=cfg.max_pool_events, enforce_pool_cap=True)
+        validation = validator.validate_document(document, reserved_ids=reserved_ids,
+            reserved_names=reserved_names, recent_names=recent_events)
         if not validation.ok:
-            return RefreshResult(ok=False, status="failed", manual=manual,
-                                 errors=tuple(validation.lines), reason="E_VALIDATION",
-                                 catalog_version=self.store.catalog_version,
-                                 next_update_at=self.store.next_update_at,
-                                 events_count=0, tokens_used=tokens,
-                                 called_llm=model_calls > 0)
-        if self.store.file_fingerprint() != start_fp:
-            return self._failed("E_CONFLICT", "生成期间事件库被外部修改，放弃本次替换（旧库保留）",
-                                manual=manual, tokens=tokens,
-                                called_llm=model_calls > 0)
-        # 生成期间模式被关闭/切换（含插件停用时的 stop()）：按保守结果保留旧库，
-        # **不得**伪报成功、也不得把在飞的生成结果落盘（2026-10-27 共享接线契约）。
+            return RefreshResult(ok=False, status='failed', manual=manual,
+                errors=tuple(validation.lines), reason='E_VALIDATION',
+                catalog_version=self.store.catalog_version, next_update_at=self.store.next_update_at,
+                events_count=0, tokens_used=charged, called_llm=model_calls > 0)
         current_mode = self._current_config().mode
-        if self._stopping or current_mode == "off" or current_mode != cfg.mode:
-            return self._failed(
-                "E_MODE_CHANGED",
-                f"生成期间事件库模式已变更（{cfg.mode}→{current_mode or 'off'}），"
-                "放弃本次替换（旧库保留）",
-                manual=manual, tokens=tokens, called_llm=model_calls > 0)
-        if not self.store.save(document):
-            return self._failed("E_WRITE", "事件库原子写失败（旧库保留）", manual=manual,
-                                tokens=tokens, called_llm=model_calls > 0)
-        return RefreshResult(ok=True, status="success", manual=manual,
-                             catalog_version=self.store.catalog_version,
-                             next_update_at=self.store.next_update_at,
-                             events_count=len(self.store.generated_events),
-                             tokens_used=tokens, called_llm=model_calls > 0)
+        if self._stopping or current_mode == 'off' or current_mode != cfg.mode:
+            return self._failed('E_MODE_CHANGED', '生成期间模式已变化，保留旧事件库', manual=manual,
+                                tokens=charged, called_llm=model_calls > 0)
+        if self.store.file_fingerprint() != start_fp:
+            return self._failed('E_CONFLICT', '生成期间事件库或消耗记录变化，保留旧库', manual=manual,
+                                tokens=charged, called_llm=model_calls > 0)
+        if not self.store.save(document, expected_fingerprint=start_fp):
+            return self._failed('E_WRITE', '双池原子发布失败，保留旧库', manual=manual,
+                                tokens=charged, called_llm=model_calls > 0)
+        return RefreshResult(ok=True, status='success', manual=manual,
+            catalog_version=self.store.catalog_version, next_update_at=self.store.next_update_at,
+            events_count=len(self.store.generated_events), tokens_used=charged, called_llm=model_calls > 0)
+
 
     def _next_interval_days(self, cfg: EventCatalogConfig) -> int:
         try:

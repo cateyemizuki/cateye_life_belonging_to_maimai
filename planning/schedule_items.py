@@ -28,6 +28,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 #: 夜晚睡眠条目的名称兜底关键词（**只含夜间词**；午休/午睡/小憩/打盹不算）
 NIGHT_SLEEP_NAME_KEYWORDS: Tuple[str, ...] = ("睡觉", "睡眠", "安睡")
+NAP_NAME_KEYWORDS: Tuple[str, ...] = ("午休", "午睡", "小憩", "打盹", "小睡")
 
 
 def _field(item: Any, name: str) -> Any:
@@ -45,6 +46,11 @@ def is_night_sleep_item(item: Any) -> bool:
         return True
     name = str(_field(item, "name") or "")
     return any(keyword in name for keyword in NIGHT_SLEEP_NAME_KEYWORDS)
+
+
+def is_named_nap(item: Any) -> bool:
+    name = str(_field(item, "name") or "")
+    return any(keyword in name for keyword in NAP_NAME_KEYWORDS)
 
 
 def item_end_minute(item: Any) -> Optional[int]:

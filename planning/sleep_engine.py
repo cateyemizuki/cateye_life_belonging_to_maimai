@@ -44,6 +44,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .time_utils import DAY_MINUTES, TimezoneManager, normalize_day_minutes
 from .schedule_items import is_night_sleep_item
+from .circadian import (bounded, circadian_sleepiness, night_window, onset_band,
+                       phase_shift, sleep_score)
+from core.internal_tuning import tuning_section
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +78,7 @@ DEFAULT_OVERSLEEP_PENALIZE_FOCUS = False
 #: 不会产出该值（``_close_session`` 白名单放行后引擎路径仍不经过它）。
 WAKE_REASONS: Tuple[str, ...] = (
     "energy_threshold", "lie_in_cap", "hard_commitment", "interrupted_awake",
-    "manual", "no_sleep_mode", "offline_reconnect",
+    "manual", "no_sleep_mode", "offline_reconnect", "wake_window_end",
 )
 
 #: 连续睡眠曲线（附录 B.2.4 八段；``(start_h, end_h, energy_per_hour, focus_per_hour)``）
@@ -307,7 +310,8 @@ def wake_decision(now: datetime, *, energy: Any, earliest_wake: datetime,
 def resolve_hard_commitment_start(intents: Iterable[Any], frame_date: str,
                                   after: datetime,
                                   horizon: Optional[datetime] = None,
-                                  include_active: bool = False
+                                 include_active: bool = False, *,
+                                 allow_midnight: bool = False
                                   ) -> Optional[datetime]:
     """从 spine 意图里取 ``after`` 之后最近的**硬约定**开始时刻（0 LLM、纯读）。
 
@@ -336,11 +340,11 @@ def resolve_hard_commitment_start(intents: Iterable[Any], frame_date: str,
         if str(intent.get("day_offset")) == "1":
             continue
         try:
-            start = int(intent.get("start_minute") or 0)
+            start = int(intent["start_minute"]) if allow_midnight else int(intent.get("start_minute") or 0)
             end = int(intent.get("end_minute") or 0)
-        except (TypeError, ValueError):
+        except (KeyError, TypeError, ValueError):
             continue
-        if start <= 0 or end <= start:
+        if start < (0 if allow_midnight else 1) or end <= start:
             continue
         start_at = midnight + timedelta(minutes=start)
         if start_at <= after:
@@ -620,7 +624,10 @@ class MemorySleepSessionStore:
                              limit: int = 50) -> List[SleepSession]:
         rows = [s for s in self.rows.values()
                 if schedule_date is None or s.schedule_date == schedule_date]
-        rows.sort(key=lambda s: (s.schedule_date, s.planned_start_minute))
+        # 与 ScheduleDB 同口径（评估 P1 修复，2026-11-04）：缺省 = 最近 limit 条
+        # （DESC，重启抑制门 _recently_woke 依赖）；给定日期 = 该日升序。
+        rows.sort(key=lambda s: (s.schedule_date, s.planned_start_minute),
+                  reverse=schedule_date is None)
         return rows[:max(1, int(limit))]
 
     def open_sleep_session(self) -> Optional[SleepSession]:
@@ -682,6 +689,10 @@ class SleepEngine:
         self._warning: Optional[str] = None
         #: 本轮睡眠是否「硬约定 lead 不足」（临时新建 < 提前量）——只诊断，不虚构准时
         self._hard_commitment_lead_short = False
+        self._dynamic_view: Dict[str, Any] = {}
+        self._phase_key: Optional[datetime] = None
+        self._phase_minutes = 0
+        self._nap_decision: Dict[str, str] = {}
 
     # ── 配置 ──────────────────────────────────────────────────────────
     def _cfg_obj(self) -> Any:
@@ -726,7 +737,7 @@ class SleepEngine:
     def diagnostics(self) -> Dict[str, Any]:
         """只读诊断（不触发任何写入；供 /lbm_life rolling 与报告核对）。"""
         session = self._session
-        return {
+        result = {
             "enabled": self.enabled,
             "warning": self._warning,
             "session_id": session.session_id if session else None,
@@ -740,6 +751,135 @@ class SleepEngine:
                 "hard_commitment_start"))) if session else None),
             "hard_commitment_lead_short": bool(self._hard_commitment_lead_short),
         }
+        if self.dynamic_enabled:
+            result["dynamic"] = self.dynamic_status()
+        return result
+
+    @property
+    def dynamic_enabled(self) -> bool:
+        return self.enabled and not self._no_sleep_mode()
+
+    def dynamic_status(self, now: Optional[datetime] = None) -> Dict[str, Any]:
+        if not self.dynamic_enabled:
+            return {}
+        current = self._now(now)
+        result = dict(self._dynamic_view)
+        if self._nap_decision.get("nap_date") == current.date().isoformat():
+            result.update(self._nap_decision)
+        session = self._session
+        if session is not None:
+            if not session.closed:
+                return {**result, **(session.metadata.get("dynamic_sleep") or {}), "band": "asleep"}
+            if session.closed_at and 0 <= current.timestamp() - session.closed_at.timestamp() < 900:
+                result["band"] = "waking"
+        return result
+
+    def record_nap(self, date: str, reason: str) -> None:
+        self._nap_decision = {"nap_date": date, "nap_reason": reason}
+
+    def _adapt_phase(self, bedtime: datetime, sleep_min: int) -> int:
+        if self._phase_key == bedtime:
+            return self._phase_minutes
+        query = getattr(self._store, "query_sleep_sessions", None)
+        rows = query(limit=24) if callable(query) else []
+        offsets: Dict[str, int] = {}
+        previous: Optional[int] = None
+        for row in rows or []:
+            session = row if isinstance(row, SleepSession) else SleepSession.from_row(row)
+            start = self._parse(session.metadata.get("sleep_started_at"))
+            dynamic = session.metadata.get("dynamic_sleep") or {}
+            if (not session.closed or not start or session.wake_reason not in {
+                    "energy_threshold", "lie_in_cap", "wake_window_end"}
+                    or dynamic.get("onset_reason") == "manual"
+                    or session.metadata.get("estimated") or session.metadata.get("restored")
+                    or (session.metadata.get("actual_sleep_hours") or 0) < 2):
+                continue
+            if not 0 <= (bedtime.date() - start.date()).days <= 7 or start >= bedtime:
+                continue
+            night = str(dynamic.get("bedtime") or start.isoformat())[:10]
+            offsets.setdefault(night, (start.hour * 60 + start.minute - sleep_min + 720) % 1440 - 720)
+            if previous is None and type(dynamic.get("phase_minutes")) is int:
+                previous = dynamic["phase_minutes"]
+        self._phase_minutes = phase_shift(list(reversed(list(offsets.values()))), previous or 0)
+        self._phase_key = bedtime
+        return self._phase_minutes
+
+    def dynamic_window(self, now: datetime):
+        return night_window(now, *self._anchors(), self._cfg_int("sleep_drift_max_minutes", 45))
+
+    def next_onset_boundary(self, now: Optional[datetime] = None) -> Optional[datetime]:
+        if not self.dynamic_enabled or self.is_asleep(now):
+            return None
+        current = self._now(now)
+        window = self.dynamic_window(current)
+        return next((point for point in (window.start, window.latest_start) if point > current), None)
+
+    def actual_wake_today(self, now: datetime) -> Optional[datetime]:
+        query = getattr(self._store, "query_sleep_sessions", None)
+        if not callable(query):
+            return None
+        for row in query(limit=8) or []:
+            session = row if isinstance(row, SleepSession) else SleepSession.from_row(row)
+            wake = self._parse(session.metadata.get("closed_at"))
+            if (session.closed and wake and wake.date() == now.date() and wake <= now
+                    and session.wake_reason != "offline_reconnect"
+                    and (session.metadata.get("actual_sleep_hours") or 0) > 0):
+                return wake
+        return None
+
+    def evaluate_onset(self, now: datetime, snapshot: Dict[str, Any], *,
+                       hard_start: Optional[datetime] = None,
+                       interruptibility: float = 1, engagement: float = 0, blocked: bool = False,
+                       manual: bool = False) -> Optional[Dict[str, Any]]:
+        """Only the planner starts an episode, after the engine has accepted its onset."""
+        if not self.dynamic_enabled:
+            return None
+        window = self.dynamic_window(now)
+        sleep_min, _ = self._anchors()
+        cfg = tuning_section("dynamic_sleep")
+        try:
+            phase = self._adapt_phase(window.bedtime, sleep_min)
+        except Exception:
+            logger.debug("睡眠相位历史暂不可读", exc_info=True)
+            phase = 0
+        day_shift = cfg["weekend_phase_minutes"] if window.wake.weekday() >= 5 else cfg["weekday_phase_minutes"]
+        peak = (sleep_min + 180 + bounded(day_shift + cfg["chronotype_offset_minutes"] + phase, -90, 90)) % 1440
+        weights = tuple(bounded(cfg[key], 0, 1) for key in (
+            "pressure_weight", "circadian_weight", "debt_weight"))
+        total = sum(weights)
+        weights = tuple(weight / total for weight in weights) if total else (.50, .30, .20)
+        lead = self._cfg_float("sleep_hard_commitment_lead_minutes",
+                               DEFAULT_HARD_COMMITMENT_LEAD_MINUTES)
+        hard_due = hard_commitment_deadline(hard_start, lead)
+        bonus = 12 if hard_due and now < hard_due < window.wake else 0
+        energy = self._energy_now(snapshot.get("energy"))
+        parts = sleep_score(energy, self._debt_now(), now.hour * 60 + now.minute, peak,
+                            bonus, interruptibility, engagement=engagement, weights=weights)
+        previous = self._dynamic_view.get("band") if self._dynamic_view.get("bedtime") == window.bedtime.isoformat() else "awake"
+        band = onset_band(parts["score"], previous) if window.start - timedelta(minutes=90) <= now <= window.latest_start else "awake"
+        within = window.start <= now <= window.latest_start + timedelta(minutes=5)
+        due = hard_due is not None and hard_due <= now + timedelta(minutes=15)
+        reason = None
+        if (within and now < window.earliest_wake and not due and not blocked
+                and self.should_start_sleep_episode(now)):
+            if manual:
+                reason = "manual"
+            elif now >= window.latest_start:
+                reason = "anchor_bound"
+            elif band == "winding_down" and now <= window.latest_start:
+                reason = "score"
+        cfg_cap = next_occurrence(window.wake, self._lie_in_cap_minute())
+        latest = min(window.latest_wake, cfg_cap)
+        self._dynamic_view = {
+            **parts, "band": band, "bedtime": window.bedtime.isoformat(),
+            "window_start": window.start.isoformat(), "window_end": window.latest_start.isoformat(),
+            "earliest_wake": window.earliest_wake.isoformat(), "latest_wake": latest.isoformat(),
+            "wake_anchor": window.wake.isoformat(), "phase_minutes": phase,
+            "peak_minute": peak, "onset_reason": reason,
+            "window_sets_cap": window.latest_wake <= cfg_cap,
+            "decision": reason or ("hard_commitment" if due else "busy" if blocked else "waiting"),
+        }
+        return dict(self._dynamic_view) if reason else None
 
     # ── 时间 / 序列化助手 ─────────────────────────────────────────────
     def _now(self, now: Optional[datetime] = None) -> datetime:
@@ -797,11 +937,17 @@ class SleepEngine:
         return minute
 
     def _interrupt_threshold(self) -> float:
-        return max(0.0, self._cfg_float("sleep_interrupt_min_minutes",
-                                        DEFAULT_INTERRUPT_MIN_MINUTES))
+        base = max(0.0, self._cfg_float("sleep_interrupt_min_minutes",
+                                       DEFAULT_INTERRUPT_MIN_MINUTES))
+        if self._session and self._session.metadata.get("dynamic_sleep"):
+            sensitivity = bounded(tuning_section("dynamic_sleep")["awakening_sensitivity"], 0, 1, .30)
+            return base * (1.3 - sensitivity)
+        return base
 
     def _wake_check_seconds(self) -> int:
-        return max(30, self._cfg_int("sleep_wake_check_seconds", DEFAULT_WAKE_CHECK_SECONDS))
+        # H 类（3.1.0 配置精简轮）：[life_state].sleep_wake_check_seconds 退役为
+        # 内部节拍常量（生产现值=默认 300 已证实；到点/硬约定明确豁免此复检粒度）。
+        return DEFAULT_WAKE_CHECK_SECONDS
 
     def _wake_threshold(self) -> float:
         return _clamp(self._cfg_float("wake_energy_threshold", DEFAULT_WAKE_ENERGY_THRESHOLD),
@@ -861,13 +1007,15 @@ class SleepEngine:
             return None
         session = self._session
         if session is None:
-            return None
+            return False if self.dynamic_enabled else None
         if self._no_sleep_mode():
             # no_sleep_mode：不启用引擎觉醒判定 → provider「不可用」，旧窗口语义保留
             return None
         current = self._now(now)
         if not session.closed:
             return True
+        if self.dynamic_enabled:
+            return False
         cap = session.lie_in_cap_at
         if isinstance(cap, datetime) and current < cap:
             return False
@@ -879,7 +1027,8 @@ class SleepEngine:
         if asleep is None:
             return None
         session = self._session
-        assert session is not None
+        if session is None:
+            return {"asleep": False}
         return {
             "session_id": session.session_id,
             "asleep": bool(asleep),
@@ -1053,6 +1202,14 @@ class SleepEngine:
         frame_date = self._frame_date_at(now)
         earliest_wake = next_occurrence(now, wake_min)
         cap = next_occurrence(earliest_wake, self._lie_in_cap_minute())
+        dynamic = ((episode or {}).get("metadata") or {}).get("dynamic_sleep")
+        if isinstance(dynamic, dict):
+            early = self._parse(dynamic.get("earliest_wake"))
+            late = self._parse(dynamic.get("latest_wake"))
+            if early and late and now < early <= late:
+                earliest_wake, cap = early, late
+            else:
+                dynamic = None
         planned_start = self._frame_minutes(now, frame_date)
         span_minutes = int((earliest_wake - now).total_seconds() // 60)
         try:
@@ -1079,6 +1236,8 @@ class SleepEngine:
             lie_in_cap_at=cap,
         )
         session.metadata["sleep_started_at"] = now.isoformat()
+        if dynamic:
+            session.metadata["dynamic_sleep"] = dict(dynamic)
         session.sync_runtime_fields()
         self._session = session
         self._episode_id = str((episode or {}).get("episode_id") or "") or None
@@ -1350,7 +1509,8 @@ class SleepEngine:
         self._clock = SleepClock()
         self._clock.record.segment_started_at = (
             self._parse(fields.get("sleep_segment_started_at")) or started)
-        self._clock.record.continuous_minutes = float(continuous_value)
+        # 评估 P4 修复（2026-11-04）：删除对 InterruptionRecord 不存在字段
+        # continuous_minutes 的死赋值（无读取方；连续段由 segment_started_at 推算）。
         self._last_tick_at = current
         self._log("sleep.session_restored", session_id=session.session_id,
                   schedule_date=frame_date, continuous_minutes=continuous_value)
@@ -1434,15 +1594,20 @@ class SleepEngine:
             if span_minutes > 0:
                 energy_rate = gains["energy"] / span_minutes
                 focus_rate = gains["focus"] / span_minutes
+                hunger_rate = SLEEP_HUNGER_PER_MIN
+                stress_rate = SLEEP_STRESS_PER_MIN
             else:
-                energy_rate, focus_rate, _, _ = sleep_rates_at(
-                    h_after, oversleep_start_hours=self._oversleep_start(),
-                    penalize_focus=self._penalize_focus())
+                # 边界拍（会话首拍/确认清醒重置/时钟回拨 dt=0）：引擎连续段未推进，
+                # 速率全 0（评估 P4 修复，2026-11-04）——旧实现取最低档曲线速率，
+                # life.tick 按自身全 dt（含清醒部分）积分造成微量过施加。
+                energy_rate = focus_rate = 0.0
+                hunger_rate = stress_rate = 0.0
             rates = {
+                "elapsed_sleep_minutes": max(0.0, min(dt_min, (h_after - h_before) * 60.0)),
                 "energy_rate": max(-0.02, min(0.02, energy_rate)),
                 "focus_rate": max(-0.02, min(0.02, focus_rate)),
-                "hunger_rate": SLEEP_HUNGER_PER_MIN,
-                "stress_rate": SLEEP_STRESS_PER_MIN,
+                "hunger_rate": hunger_rate,
+                "stress_rate": stress_rate,
                 "social_battery_rate": 0.0,
             }
         # 阈值复检节流（到点/硬约定不受影响）
@@ -1456,6 +1621,11 @@ class SleepEngine:
             else:
                 self._last_threshold_check_at = current
         effective_hard = self._resolve_hard_commitment(hard_commitment_start, session)
+        dynamic = session.metadata.get("dynamic_sleep") or {}
+        threshold = self._wake_threshold()
+        if dynamic:
+            rhythm = circadian_sleepiness(current.hour * 60 + current.minute, dynamic["peak_minute"])
+            threshold = bounded(threshold + .06 * (rhythm / 50 - 1), 0, 1)
         decision = wake_decision(
             current, energy=self._energy_now(energy), earliest_wake=earliest,
             lie_in_cap=session.lie_in_cap_at or
@@ -1464,8 +1634,10 @@ class SleepEngine:
             hard_commitment_lead_minutes=self._cfg_float(
                 "sleep_hard_commitment_lead_minutes",
                 DEFAULT_HARD_COMMITMENT_LEAD_MINUTES),
-            wake_energy_threshold=self._wake_threshold(),
+            wake_energy_threshold=threshold,
             check_due=check_due, no_sleep_mode=no_sleep_mode)
+        if dynamic and decision.reason == "lie_in_cap" and dynamic.get("window_sets_cap"):
+            decision = WakeDecision(True, "wake_window_end", decision.deadline)
         # 硬约定 lead 诊断（临时新建 < 提前量 → 立即醒 + 可诊断，**不**倒填准时）
         lead_minutes = self._cfg_float("sleep_hard_commitment_lead_minutes",
                                        DEFAULT_HARD_COMMITMENT_LEAD_MINUTES)
@@ -1627,12 +1799,18 @@ class SleepEngine:
                         energy=session.energy_end,
                         quality=session.quality,
                         sleep_debt=session.sleep_debt_after)
+        # 评估 P3 修复（2026-11-04）：woke 发送标记随 metadata.emitted 补一次落盘。
+        # 旧实现最后一次写库（上方 _save_session/finish）都在 _emit_once 之前，
+        # 重启前未 persist 时 emitted 缺 woke（生产 sleep:2026-10-31:155 实例）。
+        # 会话已 closed：本次写库对 LifeState 睡眠字段是同值幂等，不重复结算。
+        self._save_session()
         self._log("sleep.session_woke", session_id=session.session_id,
                   wake_reason=reason, sleep_hours=round(actual_hours, 3),
                   quality=session.quality, sleep_debt=session.sleep_debt_after,
                   continuous_minutes=session.continuous_minutes)
         self._prepared = None
-        earliest = session.earliest_wake_at
+        dynamic = session.metadata.get("dynamic_sleep") or {}
+        earliest = self._parse(dynamic.get("wake_anchor")) or session.earliest_wake_at
         wake_delay = 0.0
         if isinstance(earliest, datetime) and now > earliest:
             wake_delay = (now - earliest).total_seconds() / 60.0
@@ -1652,6 +1830,9 @@ class SleepEngine:
             return False
         current = self._now(now)
         outcome = self._clock.note_interruption(current, self._interrupt_threshold())
+        if session.metadata.get("dynamic_sleep"):
+            self._dynamic_view["interruption"] = ("confirmed" if outcome.get("reset") else
+                                                  "brief" if outcome.get("counted") else "ignored")
         if not outcome.get("counted"):
             return False
         session.interruption_count = int(outcome.get("interruption_count") or 0)

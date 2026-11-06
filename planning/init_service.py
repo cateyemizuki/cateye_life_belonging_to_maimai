@@ -62,7 +62,7 @@ SUMMARY_VERSION = 1
 SUMMARY_HISTORY_LIMIT = 5
 
 #: 业务阶段顺序（preflight / summary 为框架阶段，不计入四阶段 DoD）
-STAGE_ORDER: Tuple[str, ...] = ("emotion", "events", "state_sleep", "frequency")
+STAGE_ORDER: Tuple[str, ...] = ("emotion", "events", "state_sleep", "frequency", "video_interest", "companion_disposition")
 
 #: 当前 ``life_state.json`` 的完整字段及缺失时的最小默认值。
 #: **唯一真源 = planning.life_state.default_state_document()**（与服务 save() 共用
@@ -322,6 +322,8 @@ def _stage_label(name: str) -> str:
         "events": "事件库",
         "state_sleep": "状态/睡眠",
         "frequency": "目标频率",
+        "video_interest": "刷视频偏好",
+        "companion_disposition": "联系倾向",
         "summary": "汇总",
     }.get(name, name or "阶段")
 
@@ -646,9 +648,10 @@ class InitService:
         工单要求：「state_file 等相对路径不得绕出数据目录」。绝对路径同样做包含校验
         （只允许数据目录内部），越界不写、不创建，改回 ``<data_dir>/life_state.json``。
         """
-        cfg = self._current_config() if cfg is None else cfg
-        name = str(_field(cfg, "life_state", "state_file", STATE_FILE_NAME) or "").strip()
-        return resolve_state_file_path(self.data_dir, name or STATE_FILE_NAME)
+        # H 类（3.1.0 配置精简轮）：[life_state].state_file 退役为常量 STATE_FILE_NAME
+        # （逐字 'life_state.json'，生产现值=默认已证实；改名即丢生产状态）。
+        # cfg 参数保留签名兼容（调用方仍传配置），不再读取已删键。
+        return resolve_state_file_path(self.data_dir, STATE_FILE_NAME)
 
     def _timezone_str(self, cfg: Any = None) -> str:
         cfg = self._current_config() if cfg is None else cfg
@@ -1444,6 +1447,31 @@ class InitService:
             if command == "full":
                 plan.append(("state_sleep", lambda: self._stage_state_sleep(cfg)))
                 plan.append(("frequency", lambda: self._stage_frequency(cfg)))
+                video_initializer = getattr(self._plugin, "_initialize_video_interest", None)
+                if manual and callable(video_initializer):
+                    async def video_stage() -> StageResult:
+                        result = await video_initializer()
+                        state = result.get("status") if isinstance(result, dict) else "unavailable"
+                        return StageResult("video_interest",
+                            "success" if state == "fresh" else "skipped" if state == "disabled" else "failed",
+                            message=(f"已按人设重置视频偏好（{len(result.get('keywords') or [])} 个关键词）"
+                                     if state == "fresh" else "视频模块关闭，跳过偏好初始化"
+                                     if state == "disabled" else "偏好生成失败，旧偏好已失效"),
+                            reason=str(state), details={"source": "persona_init"})
+                    plan.append(("video_interest", video_stage))
+
+            if command == "full":
+                initializer = getattr(self._plugin, '_initialize_companion_disposition', None)
+                if callable(initializer):
+                    async def disposition_stage() -> StageResult:
+                        profile = await initializer(force=bool(manual))
+                        generated = profile.get('source') == 'persona_llm'
+                        return StageResult('companion_disposition', 'success' if generated else 'skipped',
+                                           message='已生成人设联系倾向' if generated else '采用中性联系倾向',
+                                           details={'source': profile.get('source'),
+                                                    'anchor_hours': profile.get('anchor_hours'),
+                                                    'loneliness': profile.get('loneliness')})
+                    plan.append(('companion_disposition', disposition_stage))
 
             cancelled_stage = ""
             for name, factory in plan:
@@ -1488,7 +1516,7 @@ class InitService:
     # 公开入口
     # ------------------------------------------------------------------
     async def run_full(self, *, manual: bool = True) -> InitResult:
-        """全量：情绪 + 事件（到期才生成）+ 状态/睡眠 + 频率 + 汇总。"""
+        """全量：基础四阶段 + 显式初始化的视频偏好重置 + 汇总。"""
         return await self._execute("full", manual=manual, emotion_force=False,
                                    events_force=False)
 

@@ -28,6 +28,11 @@ class IntentClassifier:
     通过关键词匹配和权重评分，识别用户消息的意图类型。
     性能目标：< 10ms，准确率 > 85%
 
+    2026-11-04 调优（评估问题3/P1-03，遗留#8）：``tuning_enabled=True``（默认）
+    走调优路径——future 强指示词优先、单字「在/刚」降权、具体技术词阈值与闲聊
+    兜底联调；``False`` 时完整回退旧分类行为（:meth:`_classify_legacy` 逐字保留）。
+    开关由 ``[schedule_advanced].intent_tuning_enabled`` 经 InjectService 传入。
+
     Attributes:
         current_keywords: 询问当前状态的关键词集合
         future_keywords: 询问未来计划的关键词集合
@@ -36,8 +41,30 @@ class IntentClassifier:
         casual_keywords: 闲聊寒暄的关键词集合
     """
 
-    def __init__(self):
-        """初始化意图分类器，预定义关键词库"""
+    #: 调优路径：future 强指示词——命中且无 current 强指示词时优先判「问未来」，
+    #: 压过「做什么/刚/在」等 current 宽词（修复「今晚打算做什么」误判 query_current）
+    _FUTURE_STRONG = (
+        "今晚", "明晚", "明天", "后天", "打算", "计划", "接下来",
+        "待会", "等下", "稍后", "一会儿", "之后", "安排",
+    )
+    #: 调优路径：current 强指示词——与 future 强指示词同现时不抢优先，落回评分比较
+    _CURRENT_STRONG = ("现在", "正在", "在做", "在干", "当前", "此刻", "目前", "这会儿")
+    #: 调优路径：具体技术词——区别于「怎么/如何/为什么/什么是」等泛疑问词；
+    #: 命中其一且 tech 得分 ≥0.4 即判技术问答（修复「帮我看看这个报错」0.413 漏判），
+    #: 泛疑问词单独命中不享受降阈值（避免「怎么了」被误判技术而拒注入）
+    _TECH_SPECIFIC = frozenset({
+        "报错", "错误", "异常", "bug", "代码", "程序", "脚本", "函数",
+        "数据库", "服务器", "api", "接口", "调试", "配置", "安装", "兼容", "版本",
+    })
+
+    def __init__(self, tuning_enabled: bool = True):
+        """初始化意图分类器，预定义关键词库
+
+        Args:
+            tuning_enabled: 是否启用 2026-11-04 调优路径（默认 True）；
+                False = 完整回退旧分类行为（旧路径代码保留于 _classify_legacy）
+        """
+        self._tuning_enabled = bool(tuning_enabled)
 
         # 询问当前状态的关键词（高权重）
         self.current_keywords = {
@@ -101,7 +128,112 @@ class IntentClassifier:
         logger.debug("意图分类器初始化完成")
 
     def classify(self, message: str) -> Tuple[UserIntent, float]:
-        """分类用户消息意图
+        """分类用户消息意图（按 tuning_enabled 分派调优 / 旧路径）
+
+        调优路径优先级（从高到低）：
+        1. 命令执行（最高优先级，与旧路径一致）
+        2. 技术问答（原阈值 >0.5 保留；具体技术词命中且 ≥0.4 也判技术）
+        3. future 强指示词优先（无 current 强指示词时直接判「问未来」）
+        4. 询问当前状态（单字「刚/在」降权；活动动词须组合「刚才/刚刚/在+动词」）
+        5. 询问未来计划（弱指示/混合场景评分）
+        6. 闲聊寒暄（默认兜底 0.40；短问句不再一律判 query_current）
+
+        Args:
+            message: 用户消息文本
+
+        Returns:
+            (意图类型, 置信度分数 0-1)
+
+        Examples:
+            >>> classifier = IntentClassifier()
+            >>> classifier.classify("你现在在干嘛？")[0]
+            <UserIntent.QUERY_CURRENT: 'query_current'>
+
+            >>> classifier.classify("/help")
+            (<UserIntent.COMMAND_EXECUTION: 'command'>, 1.0)
+        """
+        if not self._tuning_enabled:
+            return self._classify_legacy(message)
+
+        if not message or not message.strip():
+            return UserIntent.UNKNOWN, 0.0
+
+        message = message.strip().lower()
+        logger.debug(f"意图分类输入(调优): '{message[:50]}...'")
+
+        # 1. 命令检测（最高优先级，置信度1.0；与旧路径一致）
+        if self._command_regex.match(message):
+            logger.debug(f"检测到命令: {message[:20]}...")
+            return UserIntent.COMMAND_EXECUTION, 1.0
+
+        # 2. 技术问答检测：原阈值 >0.5 保留；另「具体技术词命中且 ≥0.4」也判技术，
+        #    修复「帮我看看这个报错」（tech=0.413<0.5）漏判为闲聊导致日程误注入。
+        #    泛疑问词（怎么/如何/为什么/什么是）单独命中不享受降阈值。
+        tech_score = self._calculate_keyword_score(message, self.tech_keywords)
+        if tech_score > 0.5 or (
+            tech_score >= 0.4 and any(kw in message for kw in self._TECH_SPECIFIC)
+        ):
+            logger.debug(f"检测到技术问答(调优): score={tech_score:.2f}")
+            return UserIntent.TECH_QUESTION, tech_score
+
+        # 3. future 强指示词优先：压过「做什么/刚/在」等 current 宽词
+        #    （修复「今晚打算做什么」误判 query_current）；与 current 强指示词
+        #    （现在/正在…）同现时不抢优先，落到下方评分比较。
+        has_current_strong = any(kw in message for kw in self._CURRENT_STRONG)
+        if not has_current_strong and any(kw in message for kw in self._FUTURE_STRONG):
+            future_score = self._calculate_keyword_score(message, self.future_keywords)
+            future_score = min(1.0, max(future_score, 0.55) * 1.5)
+            logger.debug(f"检测到未来强指示词(调优): score={future_score:.2f}")
+            return UserIntent.QUERY_FUTURE, future_score
+
+        # 4. 询问当前状态检测：单字「刚/在」不再单独计分（降权），
+        #    「刚才/刚刚/在哪/去哪」等双字词照常。
+        current_score = self._calculate_keyword_score(
+            message, self.current_keywords - {"刚", "在"})
+        if has_current_strong:
+            current_score = min(1.0, current_score * 1.5)
+
+        # 反问句检测（沿用旧规则）："你不是...吗" + 活动动词
+        if ("你不是" in message or "不是" in message) and ("吗" in message or "?" in message or "？" in message):
+            if any(verb in message for verb in self.activity_verbs):
+                logger.debug("检测到反问句 + 活动动词，判定为询问当前状态")
+                current_score = max(current_score, 0.85)
+
+        # 活动动词组合增强（调优）：要求「刚才/刚刚」或「在+动词」组合；
+        # 裸单字「刚/在」（如陈述句「我刚吃完饭」）不再触发 0.80 强判。
+        if any(verb in message for verb in self.activity_verbs):
+            if any(kw in message for kw in ("刚才", "刚刚")) or any(
+                f"在{verb}" in message for verb in self.activity_verbs
+            ):
+                logger.debug("检测到活动动词 + 时间词组合，判定为询问当前状态")
+                current_score = max(current_score, 0.80)
+
+        if current_score > 0.4:
+            logger.debug(f"检测到询问当前状态(调优): score={current_score:.2f}")
+            return UserIntent.QUERY_CURRENT, current_score
+
+        # 5. 询问未来计划检测（弱指示/混合场景，沿用旧增强）
+        future_score = self._calculate_keyword_score(message, self.future_keywords)
+        if any(kw in message for kw in ["接下来", "等下", "计划", "安排", "打算"]):
+            future_score = min(1.0, future_score * 1.5)
+        if future_score > 0.4:
+            logger.debug(f"检测到询问未来计划(调优): score={future_score:.2f}")
+            return UserIntent.QUERY_FUTURE, future_score
+
+        # 6. 闲聊寒暄检测（沿用旧阈值）
+        casual_score = self._calculate_keyword_score(message, self.casual_keywords)
+        if casual_score > 0.3:
+            logger.debug(f"检测到闲聊寒暄(调优): score={casual_score:.2f}")
+            return UserIntent.CASUAL_CHAT, casual_score
+
+        # 7. 默认：闲聊。旧路径「短问句一律 query_current(0.6)」已移除——
+        #    「吃了吗？」这类寒暄与无标点「吃了吗」统一落闲聊兜底，口径一致；
+        #    0.40 恰过 InjectOptimizer 的低置信度拒绝线（<0.4），闲聊概率/冷却照常节流。
+        logger.debug("未匹配到明确意图，归类为闲聊(调优)")
+        return UserIntent.CASUAL_CHAT, 0.40
+
+    def _classify_legacy(self, message: str) -> Tuple[UserIntent, float]:
+        """旧分类路径（2026-11-04 调优前行为逐字保留；tuning_enabled=False 时回退用）
 
         分类优先级（从高到低）：
         1. 命令执行（最高优先级）
@@ -115,14 +247,6 @@ class IntentClassifier:
 
         Returns:
             (意图类型, 置信度分数 0-1)
-
-        Examples:
-            >>> classifier = IntentClassifier()
-            >>> classifier.classify("你现在在干嘛？")
-            (UserIntent.QUERY_CURRENT, 0.95)
-
-            >>> classifier.classify("/help")
-            (UserIntent.COMMAND_EXECUTION, 1.0)
         """
         if not message or not message.strip():
             return UserIntent.UNKNOWN, 0.0

@@ -7,6 +7,7 @@ from typing import ClassVar, Dict, Literal
 from maibot_sdk import Field, PluginConfigBase
 
 from core.i18n import ui_i18n as _ui_i18n
+from core.internal_tuning import tuning_value as _tuning_value
 
 
 class EmotionSectionConfig(PluginConfigBase):
@@ -52,13 +53,8 @@ class EmotionSectionConfig(PluginConfigBase):
             **_ui_i18n("Evaluate mode", "episode: evaluate one idle session segment at a time."),
         },
     )
-    episode_idle_minutes: int = Field(
-        default=10,
-        ge=1,
-        le=720,
-        description="episode 模式：会话闲置多少分钟后冲刷评估该流片段",
-        json_schema_extra={"label": "片段闲置阈值(分钟)", **_ui_i18n("Episode idle minutes (min)")},
-    )
+    # 2026-11-04 配置精简轮（J 类）：episode_idle_minutes 移入
+    # mappings/internal_tuning.json[emotion]（内部批处理阈值）；同名只读 property 见类尾。
     evaluate_max_per_day: int = Field(
         default=10,
         ge=0,
@@ -90,14 +86,8 @@ class EmotionSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "非目标事件倍率", "step": 0.05,
                            **_ui_i18n("Non-target event multiplier")},
     )
-    target_bonus_step: float = Field(
-        default=0.1,
-        ge=0.0,
-        le=1.0,
-        description="target 每档情绪加成步长（加算）：加成 = step × (档位+1)，档 0~4 对应 +0.1~+0.5",
-        json_schema_extra={"label": "目标加成步长", "step": 0.01,
-                           **_ui_i18n("Target bonus step")},
-    )
+    # J 类：target_bonus_step → internal_tuning.json[emotion]（内部权重；
+    # emotion_mapping.json 的 multipliers 覆盖优先级不变，见 _merged_multiplier）。
     injection_enabled: bool = Field(
         default=True,
         description="把当前情绪底色（模糊化描述）注入 replyer 提示词，引导语气与情绪一致",
@@ -109,13 +99,7 @@ class EmotionSectionConfig(PluginConfigBase):
         description="跨来源去重：自动评估（replyer）与 emotion_report 工具对同一事件的重复入账只计一次（§2.4.6 A3）",
         json_schema_extra={"label": "跨来源去重", **_ui_i18n("Cross-source dedup")},
     )
-    dedup_window_seconds: int = Field(
-        default=180,
-        ge=0,
-        le=3600,
-        description="跨来源去重时间窗（秒）：同一聊天流内两条来源先后入账超过该间隔则各自计入；0=关闭窗口判定",
-        json_schema_extra={"label": "去重时间窗(秒)", **_ui_i18n("Dedup window (s)")},
-    )
+    # J 类：dedup_window_seconds → internal_tuning.json[emotion]（内部阈值；类尾 property）。
     check_interval_minutes: int = Field(
         default=10,
         ge=1,
@@ -148,8 +132,25 @@ class EmotionSectionConfig(PluginConfigBase):
         ge=1,
         le=1440,
         description="夜间打扰判定：自最后一次 reply 起该时长内无新 reply 即视为再次睡着（打扰段闭合，回到睡眠态）",
-        json_schema_extra={"label": "重新入睡判定(分钟)", **_ui_i18n("Resleep minutes (min)")},
+        json_schema_extra={"label": "重新入睡判定(分钟)", **_ui_i18n("Resleep minutes")},
     )
+
+    # ── J 类内部调参（只读桥接 → mappings/internal_tuning.json[emotion]）───────
+    @property
+    def episode_idle_minutes(self) -> int:
+        """episode 模式会话闲置冲刷阈值（分钟）。"""
+        return int(_tuning_value("emotion", "episode_idle_minutes"))
+
+    @property
+    def target_bonus_step(self) -> float:
+        """target 每档情绪加成步长（emotion_mapping.json 覆盖优先）。"""
+        return float(_tuning_value("emotion", "target_bonus_step"))
+
+    @property
+    def dedup_window_seconds(self) -> int:
+        """跨来源去重时间窗（秒）；0 = 关闭窗口判定。"""
+        return int(_tuning_value("emotion", "dedup_window_seconds"))
+
     # 注：M6 的 emoji 情绪联动键已于 2026-10-11 按用户裁决随实现一并移除
     # （自 T6 起无消费组件；DEV_GUIDE 附录 A-7）。**维持移除不变**——2026-10-14 §18.2
     # 恢复的是 manifest 能力声明与空间侧表情包配图（消费点在 qzone），与本键无关。

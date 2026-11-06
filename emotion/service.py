@@ -57,6 +57,10 @@ EPISODE_PROMPT_BUDGET_CHARS = EPISODE_SEGMENT_MAX_CHARS + 200
 #: 该流从未评估过（水位缺失）时的回看窗口（分钟）：绝不把 start_time=0 递给宿主，
 #: 否则 limit 取回的是该流**最早**的若干条消息，与"最近一段往来"语义相反
 EPISODE_BOOTSTRAP_LOOKBACK_MINUTES = 120.0
+#: F3（2026-11-04 模块评估）：episode 水位保留窗（秒）——水位 ts 超过该窗的流条目随
+#: 水位写入清理（水位表此前只增不减，状态文件随唯一流数线性增长）；被清理流再次评估
+#: 时水位缺失 → 走上方 bootstrap 回看窗，语义安全（报告建议口径）
+EPISODE_WATERMARK_TTL_SECONDS = 7 * 24 * 3600.0
 #: 片段行里判定 bot 自身的条目标记键（宿主形态不一，取到即用；取不到统一标 "msg"）
 _BOT_MARK_KEYS = ("is_mai", "is_bot", "is_self")
 #: 插件侧 bot 自身 QQ 的属性名（与片段条目的 user_info.user_id 比对）
@@ -397,7 +401,13 @@ class EmotionService:
             observed_at = TimezoneManager(timezone_name or "Asia/Shanghai").get_now()
             history.sample(observed_at, self._machine.effective_vad().to_dict(), bool(self._machine.frozen))
         except Exception:
-            pass
+            # F6（2026-11-04 模块评估）：观测旁路故障留一次性诊断（旁路隔离不变，
+            # 不影响 VAD 结算）；每次落盘都会采样，重复告警会刷屏，故只警告一次。
+            # getattr 兜底：测试经 __new__ 构造实例时该属性可能未初始化。
+            if not getattr(self, "_observations_fault_warned", False):
+                self._observations_fault_warned = True
+                logger.warning("情绪观测采样旁路异常（不影响 VAD 结算；后续同类不再重复告警）",
+                               exc_info=True)
 
         return True
 
@@ -642,12 +652,11 @@ class EmotionService:
         return day, int(self._episode_state.get("eval_count") or 0)
 
     def _daily_quota_ok(self, now: datetime, *, label: str) -> bool:
-        """日上限判定（episode 串行路径；per_reply 改走 :meth:`_reserve_evaluation_quota`）。
+        """日上限判定（只判定不预占；保留兼容旧调用方/测试）。
 
-        只判定不计数——计数在真正花掉一次评估 LLM 时 +1（见 :meth:`_note_evaluation_used`）。
-        2026-10-27 复核后续（用户批准在途日配额上限）：判定口径与 per_reply 预占一致 =
-        当日已成功数 + 当日 per_reply **在途预占数**，避免主动 flush / 模式切换在
-        per_reply 请求在途时击穿同一 ``evaluate_max_per_day``；无在途预占时逐字旧行为。
+        F2（2026-11-04 模块评估 P1-09）起 episode 与 per_reply 两条评估路径都改走
+        :meth:`_reserve_evaluation_quota`（判定+在途预占同一同步区），本方法不再被
+        生产路径调用；口径仍为 当日已成功数 + 当日在途预占数。
         """
         day, used = self._eval_day_count(now)
         reserved = int(self._eval_reserved.get(day) or 0)
@@ -718,9 +727,26 @@ class EmotionService:
         self._episode_state["eval_count"] = int(self._episode_state.get("eval_count") or 0) + 1
         self._save_state()
 
+    def _prune_stale_watermarks(self, now_ts: float) -> int:
+        """F3（2026-11-04 模块评估）：清理超过保留窗的水位条目，返回清理条数。
+
+        水位表唯一 pruning 点；被清理流的水位缺失后首评走 bootstrap 回看
+        （:data:`EPISODE_BOOTSTRAP_LOOKBACK_MINUTES`），不会取回该流最早的消息。
+        """
+        watermarks = self._episode_state["last_eval_ts"]
+        cutoff = float(now_ts) - EPISODE_WATERMARK_TTL_SECONDS
+        stale = [key for key, value in watermarks.items() if float(value) < cutoff]
+        for key in stale:
+            watermarks.pop(key, None)
+        if stale:
+            logger.debug("episode 水位清理：%d 个流超过 %.0f 天保留窗",
+                         len(stale), EPISODE_WATERMARK_TTL_SECONDS / 86400.0)
+        return len(stale)
+
     def _advance_watermark(self, stream_id: str, ts: float) -> None:
         """推进某流的评估水位并落盘（= 丢弃该片段：同一段文本不再重复消费）。"""
         self._episode_state["last_eval_ts"][str(stream_id)] = float(ts)
+        self._prune_stale_watermarks(time.time())
         self._save_state()
 
     async def evaluate_reply(self, reply_text: str, session_id: str = "") -> None:
@@ -938,67 +964,77 @@ class EmotionService:
         ts = current.timestamp()
         flush_reason = str(reason or "")
         pending_seconds = self._pending_seconds(stream)
-        if not self._daily_quota_ok(current, label=f"episode:{flush_reason or 'flush'}"):
+        # F2（2026-11-04 模块评估 P1-09）：日配额改为**在途预占**（与 per_reply Q3 同构）——
+        # 判定与预占同一同步区：总线回调（_on_schedule_generated → flush_all_episodes）
+        # 与情绪循环任务并发冲刷**不同流**时，不再双双通过 used=cap-1 的判定各 +1
+        # 击穿 evaluate_max_per_day。成功计数点/水位推进语义逐字不变，预占在 finally 释放。
+        ticket_day = self._reserve_evaluation_quota(
+            current, label=f"episode:{flush_reason or 'flush'}")
+        if ticket_day is None:
             # 日上限（裁定 REGISTRY §二.3）：该片段**丢弃不并入次日**（避免陈旧上下文），
             # 水位推进防重复取同一段；已有决策日志可回放
             self._advance_watermark(stream, ts)
             return False
-        since = float(self._episode_state["last_eval_ts"].get(stream, 0.0) or 0.0)
-        segment = await self._fetch_episode_segment(stream, since)
-        if not segment:
-            # 无可评内容（窗口内没有消息/宿主不可用）：水位推进防死循环重试
-            self._advance_watermark(stream, ts)
-            self._log_decision("emotion.episode_flush_skipped", trigger_type="emotion",
-                               reason="empty_segment：片段窗口内没有可评内容",
-                               stream=stream, flush_reason=flush_reason,
-                               pending_seconds=pending_seconds)
-            return False
-        skip = self._dedup_skip_result("replyer", stream, segment)
-        if skip is not None:
-            # A3 照旧：同流窗口内工具上报已入账 → 本片段不入账（去重日志已由上面落账）
-            self._advance_watermark(stream, ts)
-            self._log_decision("emotion.episode_flush_skipped", trigger_type="emotion",
-                               reason="duplicate_cross_source：与工具上报同流窗口内重复",
-                               stream=stream, flush_reason=flush_reason,
-                               pending_seconds=pending_seconds)
-            return False
-        task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
         try:
-            result = await evaluate_reply_delta(self._llm(), segment, self._persona,
-                                                self._lover_name, task_name, user_message="",
-                                                reply_max_chars=EPISODE_PROMPT_BUDGET_CHARS,
-                                                reply_keep_recent=True,
-                                                plugin=self._plugin)
-        except Exception:
-            return False          # 水位不推进：下轮重试（费用已花，不重复取同一段）
-        if not result:
-            return False
-        event, delta = result
-        is_target = self.is_target_session(stream)
-        outcome = self._apply_external_delta(event or "会话片段", delta, source="replyer",
-                                             multiplier=self.target_multiplier(is_target),
-                                             is_target=is_target, session_id=stream, llm=True)
-        if not outcome.get("ok"):
-            # 评估期间工具上报抢先入账（唯一竞态）：LLM 已消费该片段，水位照推防重复扣费
-            self._advance_watermark(stream, ts)
-            self._log_decision("emotion.episode_flush_skipped", trigger_type="emotion",
-                               reason=f"apply_rejected：{outcome.get('reason') or '未入账'}",
-                               stream=stream, flush_reason=flush_reason,
-                               pending_seconds=pending_seconds)
-            return False
-        self._episode_state["eval_count"] = int(self._episode_state.get("eval_count") or 0) + 1
-        self._episode_state["last_eval_ts"][stream] = ts
-        self._save_state()
-        await self._publish("emotion.updated", **self._updated_payload("episode_evaluated"))
-        self._log_decision(
-            "emotion.episode_flushed", trigger_type="emotion",
-            reason=f"会话片段评估入账（{flush_reason or 'flush'}）",
-            stream=stream, flush_reason=flush_reason, pending_seconds=pending_seconds,
-            messages=int(segment.count("\n")) + 1, chars=len(segment),
-            eval_count=int(self._episode_state["eval_count"]), cap=self._evaluate_max_per_day(),
-            is_target=bool(is_target), k=round(self.target_multiplier(is_target), 4),
-        )
-        return True
+            since = float(self._episode_state["last_eval_ts"].get(stream, 0.0) or 0.0)
+            segment = await self._fetch_episode_segment(stream, since)
+            if not segment:
+                # 无可评内容（窗口内没有消息/宿主不可用）：水位推进防死循环重试
+                self._advance_watermark(stream, ts)
+                self._log_decision("emotion.episode_flush_skipped", trigger_type="emotion",
+                                   reason="empty_segment：片段窗口内没有可评内容",
+                                   stream=stream, flush_reason=flush_reason,
+                                   pending_seconds=pending_seconds)
+                return False
+            skip = self._dedup_skip_result("replyer", stream, segment)
+            if skip is not None:
+                # A3 照旧：同流窗口内工具上报已入账 → 本片段不入账（去重日志已由上面落账）
+                self._advance_watermark(stream, ts)
+                self._log_decision("emotion.episode_flush_skipped", trigger_type="emotion",
+                                   reason="duplicate_cross_source：与工具上报同流窗口内重复",
+                                   stream=stream, flush_reason=flush_reason,
+                                   pending_seconds=pending_seconds)
+                return False
+            task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
+            try:
+                result = await evaluate_reply_delta(self._llm(), segment, self._persona,
+                                                    self._lover_name, task_name, user_message="",
+                                                    reply_max_chars=EPISODE_PROMPT_BUDGET_CHARS,
+                                                    reply_keep_recent=True,
+                                                    plugin=self._plugin)
+            except Exception:
+                return False          # 水位不推进：下轮重试（费用已花，不重复取同一段）
+            if not result:
+                return False
+            event, delta = result
+            is_target = self.is_target_session(stream)
+            outcome = self._apply_external_delta(event or "会话片段", delta, source="replyer",
+                                                 multiplier=self.target_multiplier(is_target),
+                                                 is_target=is_target, session_id=stream, llm=True)
+            if not outcome.get("ok"):
+                # 评估期间工具上报抢先入账（唯一竞态）：LLM 已消费该片段，水位照推防重复扣费
+                self._advance_watermark(stream, ts)
+                self._log_decision("emotion.episode_flush_skipped", trigger_type="emotion",
+                                   reason=f"apply_rejected：{outcome.get('reason') or '未入账'}",
+                                   stream=stream, flush_reason=flush_reason,
+                                   pending_seconds=pending_seconds)
+                return False
+            self._episode_state["eval_count"] = int(self._episode_state.get("eval_count") or 0) + 1
+            self._episode_state["last_eval_ts"][stream] = ts
+            self._prune_stale_watermarks(ts)   # F3：成功入账的水位写入同样触发清理
+            self._save_state()
+            await self._publish("emotion.updated", **self._updated_payload("episode_evaluated"))
+            self._log_decision(
+                "emotion.episode_flushed", trigger_type="emotion",
+                reason=f"会话片段评估入账（{flush_reason or 'flush'}）",
+                stream=stream, flush_reason=flush_reason, pending_seconds=pending_seconds,
+                messages=int(segment.count("\n")) + 1, chars=len(segment),
+                eval_count=int(self._episode_state["eval_count"]), cap=self._evaluate_max_per_day(),
+                is_target=bool(is_target), k=round(self.target_multiplier(is_target), 4),
+            )
+            return True
+        finally:
+            self._release_evaluation_quota(ticket_day)
 
     async def flush_all_episodes(self, *, reason: str) -> int:
         """串行冲刷全部已登记流（避免 LLM 并发）；无论成败清空登记，返回成功条数。
@@ -1485,13 +1521,10 @@ class EmotionService:
         parts = [f"名称：{self._lover_name}"]
         if self._persona:
             parts.append(f"性格与人设：{self._persona[:800]}")
-        custom = str(getattr(getattr(self._plugin.config, "schedule", None), "custom_prompt", "") or "")
-        if custom:
-            parts.append(f"当前生活阶段：{custom[:300]}")
         return "\n".join(parts)
 
     def _long_term_status(self) -> str:
-        return str(getattr(getattr(self._plugin.config, "schedule", None), "custom_prompt", "") or "普通时期")
+        return "普通时期"
 
     @staticmethod
     def _day_summary(query: Optional[ScheduleQuery], date: str) -> str:
@@ -2474,7 +2507,10 @@ class EmotionService:
                     await self._check_and_overhaul()
                     await self.flush_idle_episodes()
             except Exception:
-                pass
+                # F1（2026-11-04 模块评估 P1-10）：捕获必留痕——原 except-pass 使
+                # 裁判数值非法等异常零诊断；循环本身继续下一 tick 的语义不变。
+                logger.warning("情绪睡眠检测循环本 tick 异常（跳过，下一轮重试）",
+                               exc_info=True)
             cfg = getattr(self._plugin.config, "emotion", None)
             interval = max(1, int(getattr(cfg, "check_interval_minutes", 10) or 10)) * 60
             try:
@@ -2523,6 +2559,23 @@ class EmotionService:
         self._overhaul_next_retry_at = None
         self._overhaul_error_logged = False
         self._overhaul_abandoned = False
+
+    async def _compute_overhaul_counted(self, now: datetime,
+                                        sleep_hours: Optional[float]) -> Optional[Dict[str, Any]]:
+        """F1（2026-11-04 模块评估 P1-10）：``compute_sleep_overhaul`` 的异常护栏。
+
+        意外异常（如裁判数值位非法抛出的 ValueError）在此留痕并按一次裁判失败返回
+        None，交由调用方既有的「None → :meth:`_note_overhaul_failure`」计入 D10
+        重试上限/退避——不再冒泡到 ``_loop`` 被吞掉而绕过"最多 3 次总尝试"。
+        正常返回值（含 None）逐字透传；其余调用方（run_sleep_overhaul /
+        _on_schedule_generated）语义不受影响。
+        """
+        try:
+            return await self.compute_sleep_overhaul(now, sleep_hours=sleep_hours)
+        except Exception:
+            logger.warning("睡眠大修计算意外异常（按一次裁判失败计入 D10 重试）",
+                           exc_info=True)
+            return None
 
     async def _check_and_overhaul(self) -> None:
         """一个检测周期：进睡眠时段 → 冻结并在冻结期计算/缓存大修；醒沿 → 冲刷片段 + 应用缓存 + 解冻。
@@ -2610,7 +2663,7 @@ class EmotionService:
                 # D10（用户 2026-10-27 批准）：失败重试上限 3 + 退避（5/10/20 分钟，
                 # 上限 30），连续 3 次失败升级 error 一次；成功即归零
                 planned = float(getattr(self, "_sleep_planned_hours", 0.0) or 0.0)
-                cached = await self.compute_sleep_overhaul(now, sleep_hours=planned or None)
+                cached = await self._compute_overhaul_counted(now, sleep_hours=planned or None)
                 if cached is not None:
                     period = self._sleep_period or (now, now)
                     cached["cycle_key"] = self._cycle_key(period[0])
@@ -2659,7 +2712,7 @@ class EmotionService:
                 cycle_key=cycle_key, planned_hours=round(float(planned or 0.0), 2),
             )
             return
-        cached = await self.compute_sleep_overhaul(now, sleep_hours=planned)
+        cached = await self._compute_overhaul_counted(now, sleep_hours=planned)
         if cached is None:
             self._note_overhaul_failure(now)
             self._ctx.logger.debug(

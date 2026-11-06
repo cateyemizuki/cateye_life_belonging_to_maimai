@@ -12,9 +12,12 @@
   竖分隔线 x=379、右栏 5 节 601（01 日程 / 02 陪伴 / 03 情绪 / 04 空间 / 05 消耗）。
   所有文本先 ``fit_text`` / ``wrap_text`` 按像素宽度测量，anchor 基线绘制。
 - **两遍绘制**（指导 §8.3）：``_measure_dashboard`` 先算出每块/每节高度与所有绘制指令，
-  ``_draw_dashboard`` 只按测量结果落笔；footer 由内容底部 + 26 反推，不依赖 4096 钳制
-  裁掉内容。超限时按右栏节分页（``dashboard_today_p2.jpg`` 等，首文件契约不变：
-  返回第一页 ``(path, base64)``）。
+  ``_draw_dashboard`` 只按测量结果落笔；footer 由内容底部 + 26 反推。超限时按右栏节分页
+  （``dashboard_today_p2.jpg`` 等，首文件契约不变：返回第一页 ``(path, base64)``）。
+  分页边界（finding #6，2026-11-04）：正常数据恒 1 页（页高 ≤4096，钳制为 no-op、不裁内容）；
+  病态超长单节超预算仍独占一页，但页高钳到 4096 红线（footer 钳入红线内、超高内容在红线处
+  裁切，内存有界）；p≥2 仅落盘、聊天仍只发第一页（完整投递另行评审）；渲染前清理旧
+  ``dashboard_today_p*.jpg``，避免页数变少时残留误导离线查看。
 - PIL 惰性导入（与 planning/schedule_image.py 同口径）：pillow 未安装或找不到可用中文字体
   时抛 RuntimeError，由调用方静默降级为纯文本。
 """
@@ -45,9 +48,21 @@ from core.render_kit import (
     TRACK,
     Canvas,
 )
-from planning.time_utils import format_day_minute
+from planning.time_utils import TimezoneManager, format_day_minute
 
 logger = logging.getLogger(__name__)
+
+
+def _contract_now() -> datetime:
+    """契约时区 Asia/Shanghai 的 tz-aware 当前时间（finding #5，2026-11-04）。
+
+    与 webui 查询端（planning/dashboard.py）同用 TimezoneManager，落实 DEV_GUIDE 时区
+    唯一真源；替代 naive ``datetime.now()``，避免宿主 OS 时区变更导致仪表盘日期/钟点
+    漂移。时区解析失败时 TimezoneManager 内部降级系统时间（不外抛）。本模块为纯函数、
+    不读配置，故取契约默认 Asia/Shanghai；调用方仍可经 ``now=`` 注入显式时刻。
+    """
+    return TimezoneManager("Asia/Shanghai").get_now()
+
 
 #: 区块标题（键 → 固定标题；顺序即展示顺序）
 _BLOCK_TITLES: Tuple[Tuple[str, str], ...] = (
@@ -192,7 +207,7 @@ def planning_block(schedule_query: Any, goal_manager: Any, *, enabled: bool,
     ``current`` 由拼好的字符串改为结构体后，``_planning_lines`` 负责拼回原文本，
     文字版输出**逐字不变**。
     """
-    now = now or datetime.now()
+    now = now or _contract_now()
     date = now.strftime("%Y-%m-%d")
     block: Dict[str, Any] = {
         "enabled": False, "date": date, "item_count": 0, "items": [], "items_full": [],
@@ -560,7 +575,7 @@ def render_dashboard_text(blocks: Any, *, now: Optional[datetime] = None) -> str
     planning 区块用 items_full 展开今日完整日程（不截断），并逐行带上「今日日程 N 项 /
     当前活动 / 今日约定」——被删 /lbm_mai_schedule 命令的信息面在文本档保留。
     """
-    now = now or datetime.now()
+    now = now or _contract_now()
     weekday = "一二三四五六日"[now.weekday()]
     lines = [f"属于麦麦的生活 状态总览 {now.strftime('%Y-%m-%d')} 周{weekday}"]
     for title, body in _block_lines(blocks, full_items=True):
@@ -658,7 +673,7 @@ def build_dashboard_view(blocks: Any, *, now: Optional[datetime] = None) -> Dict
     ``_BLOCK_BODY`` 拼好的整行字符串；文字版 ``render_dashboard_text`` 走另一条路径。
     """
     data = _dict(blocks)
-    now = now or datetime.now()
+    now = now or _contract_now()
     planning = _dict(data.get("planning"))
     companion = _dict(data.get("companion"))
     emotion = _dict(data.get("emotion"))
@@ -1525,6 +1540,11 @@ def _measure_dashboard(view: Dict[str, Any], Image: Any, ImageDraw: Any,
             p.line([DIVIDER_X, DIVIDER_TOP, DIVIDER_X, body_bottom], HAIR, 1)
 
         footer_top = body_bottom + FOOTER_GAP
+        # finding #6（2026-11-04）：病态单节超高的页高红线兜底。正常数据恒 ≤4096
+        # （分页预算已扣除页眉/页脚），此钳制为 no-op、不改正常输出；仅当超预算单节
+        # 独占一页时把 footer 钳到红线内，使页高 ≤ _MAX_HEIGHT、内存有界（Canvas 不钳
+        # 高度，见 core/render_kit）。超高内容在红线处裁切，边界已在模块 docstring 明示。
+        footer_top = min(footer_top, float(_MAX_HEIGHT - FOOTER_H))
         p.line([MARGIN_X, footer_top, TEXT_RIGHT, footer_top], INK, 2)
         baseline = footer_top + 14 + probe.ascent(p.font(14))
         left_footer = view["footer"]["left"]
@@ -1623,6 +1643,17 @@ def render_dashboard_image(title: str, blocks: Any, *, output_dir: Optional[Path
         measured = _measure_dashboard(view, Image, ImageDraw, ImageFont, loader)
         save_dir = Path(output_dir) if output_dir else Path(tempfile.gettempdir())
         save_dir.mkdir(parents=True, exist_ok=True)
+
+        # finding #6（2026-11-04）：渲染前清理上次遗留的分页文件（dashboard_today_pN.jpg）——
+        # 本次页数变少时旧 pN 不再被覆盖，残留会误导离线查看。仅匹配本仪表盘分页命名
+        # （数字页号），不动首文件 dashboard_today.jpg（本次即覆盖）与其他文件；单个删除
+        # 失败不中断渲染（防御式）。首文件契约不变：返回值恒为第一页。
+        for stale in save_dir.glob("dashboard_today_p*.jpg"):
+            if re.fullmatch(r"dashboard_today_p\d+\.jpg", stale.name):
+                try:
+                    stale.unlink()
+                except OSError as exc:
+                    logger.warning("清理旧状态总览分页文件失败 %s: %s", stale, exc)
 
         first_path: Optional[Path] = None
         first_b64 = ""

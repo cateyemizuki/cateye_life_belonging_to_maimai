@@ -24,11 +24,19 @@ from typing import Any, ClassVar, Dict, List, Literal
 import pydantic
 from maibot_sdk import Field, PluginConfigBase
 
+from .event_catalog_config import EventCatalogFields
+
 from core.i18n import ui_i18n as _ui_i18n
+from core.internal_tuning import tuning_value as _tuning_value
 
 #: 名单模式的取值（新名单系统）：blacklist = 名单内不生效；whitelist = 只对名单内生效
 LIST_MODE_BLACKLIST = "blacklist"
 LIST_MODE_WHITELIST = "whitelist"
+
+#: H 类内部节拍常数（2026-11-04 配置精简轮）：状态机 tick 轮询粒度。
+#: 生产现值=默认 300 已获 evidence 证实；「间隔粒度非时刻锚点」口径（方案 §1 规则2，
+#: 若复核采广义时钟口径应回退 keep）。旧 TOML 键经 LEGACY_ROUTE_KEYS 入口 pop。
+LIFE_TICK_SECONDS = 300
 
 
 # ---------------------------------------------------------------------------
@@ -36,12 +44,12 @@ LIST_MODE_WHITELIST = "whitelist"
 # ---------------------------------------------------------------------------
 
 
-class ScheduleSectionConfig(PluginConfigBase):
+class ScheduleSectionConfig(EventCatalogFields):
     """设置每日作息、活动偏好和日程生成方式。"""
 
     __ui_label__ = "日程系统"
     __ui_icon__ = "calendar"
-    __ui_order__ = 3
+    __ui_order__ = 4
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Schedule", "description": "Daily routine generation, injection and holiday awareness."}
     }
@@ -91,62 +99,8 @@ class ScheduleSectionConfig(PluginConfigBase):
     )
 
     # ── 定时生成 ─────────────────────────────────────────────
-    auto_generate_enabled: bool = Field(
-        default=True,
-        description="每天自动用 LLM 生成当日日程（当天已有日程则跳过）",
-        json_schema_extra={
-            "label": "自动生成日程",
-            "hint": "关 = 只能手动 /plan regenerate；已有日程时不会重复生成",
-            **_ui_i18n("Auto generate"),
-        },
-    )
-    auto_generate_after_last_end_minutes: int = Field(
-        default=90,
-        ge=0,
-        description="生成时刻（相对锚点）：当天最后一个非睡眠日程条目结束后 N 分钟生成新一天日程；"
-                    "当天没有日程时以「入睡时间」为基准。硬约束：不晚于「起床时间」前 30 分钟",
-        json_schema_extra={
-            "label": "生成延迟（最后日程结束后）",
-            "hint": "分钟；默认 90 = 入睡锚点 23:00 时 00:30 生成",
-            **_ui_i18n("Delay after last activity", "Minutes after the last non-sleep activity ends."),
-        },
-    )
 
     # ── 生成结果口径 ─────────────────────────────────────────
-    min_activities: int = Field(
-        default=6,
-        ge=1,
-        le=20,
-        description="每天生成的最少活动数",
-        json_schema_extra={
-            "label": "最少活动数",
-            "hint": "太少会显得一天很空；建议 5-8",
-            **_ui_i18n("Min activities"),
-        },
-    )
-    max_activities: int = Field(
-        default=12,
-        ge=1,
-        le=25,
-        description="每天生成的最多活动数",
-        json_schema_extra={
-            "label": "最多活动数",
-            "hint": "太多会碎片化；建议 10-15",
-            **_ui_i18n("Max activities"),
-        },
-    )
-    custom_prompt: str = Field(
-        default="",
-        description="当前生活阶段 / 长期状态：角色的持续设定（如「正在环游世界」「备考研究生」），"
-                    "日程生成会延续这一方向",
-        json_schema_extra={
-            "label": "当前生活阶段 / 长期状态",
-            "hint": "留空使用默认风格；这是让日程贴合角色主线最有效的一项",
-            "rows": 3,
-            "placeholder": "（留空使用默认风格）",
-            **_ui_i18n("Life stage / long-term state", "Persistent life-stage hint merged into the generation prompt."),
-        },
-    )
     enable_detailed_description: bool = Field(
         default=True,
         description="活动描述开关：关闭后生成、注入、命令展示都不再显示长描述（省 token）",
@@ -178,17 +132,6 @@ class ScheduleSectionConfig(PluginConfigBase):
             **_ui_i18n("Inject into replyer"),
         },
     )
-    inject_scope: Literal["all", "target_private"] = Field(
-        default="all",
-        description="注入范围：all = 所有会话（群聊、私聊都注入日程）；"
-                    "target_private = 只给目标陪伴私聊注入",
-        json_schema_extra={
-            "label": "注入范围",
-            "hint": "默认 all（所有会话都有日程感）；选 target_private 则只有陪伴对象私聊能看到日程",
-            **_ui_i18n("Injection scope",
-                       "all = every chat; target_private = only the companion private chat."),
-        },
-    )
 
     # ── 真实节假日 ───────────────────────────────────────────
     holiday_inject_enabled: bool = Field(
@@ -216,85 +159,77 @@ class ScheduleSectionConfig(PluginConfigBase):
     # R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
     # D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
     # PR8 3.0.0：``spine_mode`` 开关键已退役（依据 = 用户 2026-10-27 授权直接清理 +
-    # 逐符号审定清单 WP3）——spine 为唯一生成路线，本组 spine_* 键无条件参与判定。
-    spine_min_intentions: int = Field(
+    # 逐符号审定清单 WP3）——日意图 为唯一生成路线，本组 spine_* 键无条件参与判定。
+    min_intentions: int = Field(
         default=3,
         ge=1,
-        description="spine 模式每天生成的最少意图数",
+        description="每天生成的日意图最少意图数",
         json_schema_extra={
-            "label": "spine 最少意图数",
-            **_ui_i18n("Spine min intentions"),
+            "label": "最少日意图数",
+            **_ui_i18n("Daily intentions: min intentions"),
         },
     )
-    spine_max_intentions: int = Field(
+    max_intentions: int = Field(
         default=6,
         ge=1,
-        description="spine 模式每天生成的最多意图数",
+        description="每天生成的日意图最多意图数",
         json_schema_extra={
-            "label": "spine 最多意图数",
-            **_ui_i18n("Spine max intentions"),
+            "label": "最多日意图数",
+            **_ui_i18n("Daily intentions: max intentions"),
         },
     )
-    spine_max_described_intents: int = Field(
+    max_described_intents: int = Field(
         default=1,
         ge=0,
-        description="spine 模式最多给几条重要意图写一句 note（15-25 字）；0 = 全部不写 note",
+        description="最多附说明的日意图条数，0表示不附说明",
         json_schema_extra={
-            "label": "spine 带描述意图数",
-            **_ui_i18n("Spine described intents"),
+            "label": "带说明的日意图数",
+            **_ui_i18n("Daily intentions: described intents"),
         },
     )
-    spine_recent_days: int = Field(
-        default=2,
-        ge=0,
-        description="spine 模式生成时回看最近 N 天日程（只取名称/时间防重复）；0 = 不回看",
-        json_schema_extra={
-            "label": "spine 回看天数",
-            **_ui_i18n("Spine recent days"),
-        },
-    )
-    spine_history_messages: int = Field(
-        default=12,
-        ge=0,
-        description="spine 模式生成时回读各会话最近 N 条聊天消息作为灵感；0 = 禁用",
-        json_schema_extra={
-            "label": "spine 历史消息条数",
-            **_ui_i18n("Spine history messages"),
-        },
-    )
-    spine_knowledge_limit: int = Field(
-        default=3,
-        ge=0,
-        description="spine 模式生成时检索知识库的最大条数；0 = 禁用",
-        json_schema_extra={
-            "label": "spine 知识库条数",
-            **_ui_i18n("Spine knowledge limit"),
-        },
-    )
+    # 2026-11-04 配置精简轮（J 类）：spine_recent_days / spine_history_messages /
+    # spine_knowledge_limit 移入 mappings/internal_tuning.json[schedule]（内部上下文
+    # 容量）。旧 TOML 键经 migrate_internal_tuning 值搬运；同名只读 property 见类尾。
 
-    spine_use_multi_round: bool = Field(
+    intention_multi_round: bool = Field(
         default=False,
-        description="spine 模式多轮生成：默认单轮 + 结构校验（不强制重试，质量差一点可以接受）",
+        description="日意图生成失败时最多再尝试一轮",
         json_schema_extra={
-            "label": "spine 多轮生成",
-            **_ui_i18n("Spine multi-round"),
+            "label": "多轮生成日意图",
+            **_ui_i18n("Daily intentions: multi-round"),
         },
     )
-    spine_generate_at: str = Field(
+    generate_at: str = Field(
         default="00:30",
-        description="每天生成日意图（spine）的固定时刻（HH:MM），无条件生效；"
+        description="每天生成日意图的固定时刻（HH:MM），无条件生效；"
                     "留空或非法值固定回落 00:30",
         json_schema_extra={
-            "label": "spine 生成时刻",
+            "label": "日意图生成时刻",
             "hint": "HH:MM；留空/非法 = 回落 00:30（设计 §9.1：勿用稀疏意图的最后 end 触发，会过早生成次日）",
             "pattern": r"^\d{2}:\d{2}$",
-            **_ui_i18n("Spine generate at",
-                       "Fixed daily HH:MM for spine generation; empty/invalid falls back to 00:30."),
+            **_ui_i18n("Daily intentions: generate at",
+                       "Fixed daily HH:MM for 日意图 generation; empty/invalid falls back to 00:30."),
         },
     )
     # PR8 3.0.0：``planning_daily_token_budget`` 预留键位已退役（自述「熔断策略本阶段
     # 未启用」的自造预留键；依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP3）。
     # 2026-10-29：事件库输出长度与Token额度也交回宿主，旧键只忽略。
+
+    # ── J 类内部调参（只读桥接 → mappings/internal_tuning.json[schedule]）─────
+    @property
+    def spine_recent_days(self) -> int:
+        """日意图 生成回看天数；0 = 不回看。"""
+        return int(_tuning_value("schedule", "spine_recent_days"))
+
+    @property
+    def spine_history_messages(self) -> int:
+        """日意图 生成回读消息条数；0 = 禁用。"""
+        return int(_tuning_value("schedule", "spine_history_messages"))
+
+    @property
+    def spine_knowledge_limit(self) -> int:
+        """日意图 生成知识库检索条数；0 = 禁用。"""
+        return int(_tuning_value("schedule", "spine_knowledge_limit"))
 
 
 # ---------------------------------------------------------------------------
@@ -307,108 +242,18 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
 
     __ui_label__ = "日程系统·高级设置"
     __ui_icon__ = "sliders"
-    __ui_order__ = 4
+    __ui_order__ = 5
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Schedule · Advanced",
                "description": "Deep tuning for generation, role judge, rendering, caches and cleanup."}
     }
 
     # ── 多轮生成 ─────────────────────────────────────────────
-    use_multi_round: bool = Field(
-        default=True,
-        description="多轮生成：首轮质量不达标时按反馈重试（提升日程质量，增加 token 成本）",
-        json_schema_extra={
-            "label": "多轮生成",
-            "hint": "关 = 只生成一轮（省成本、质量波动大）",
-            **_ui_i18n("Multi-round generation"),
-        },
-    )
-    max_rounds: int = Field(
-        default=2,
-        ge=1,
-        le=5,
-        description="多轮生成最大轮数（1-5，推荐 2；越多越费 token）",
-        json_schema_extra={
-            "label": "最大轮数",
-            **_ui_i18n("Max rounds"),
-        },
-    )
-    quality_threshold: float = Field(
-        default=0.85,
-        ge=0.0,
-        le=1.0,
-        description="质量阈值：达到该分立即停止重试（0.80-0.90 推荐 0.85）",
-        json_schema_extra={
-            "label": "质量阈值",
-            "step": 0.05,
-            "hint": "调高 = 更容易触发重试、成本更高",
-            **_ui_i18n("Quality threshold"),
-        },
-    )
-
-    generation_timeout: float = Field(
-        default=180.0,
-        ge=10.0,
-        description="日程生成 LLM 调用超时（秒），推荐 120-300；会换算为宿主超时，避免被默认 30 秒截断",
-        json_schema_extra={
-            "label": "生成超时(秒)",
-            **_ui_i18n("Generation timeout (s)"),
-        },
-    )
-    recent_schedule_days: int = Field(
-        default=3,
-        ge=1,
-        le=14,
-        description="生成新日程时回看最近 N 天的日程作为去重参考（3-5 防交替式重复）",
-        json_schema_extra={
-            "label": "回看天数",
-            **_ui_i18n("Recent days lookback"),
-        },
-    )
-    history_message_limit: int = Field(
-        default=30,
-        ge=0,
-        description="生成日程时回读各会话当天最近 N 条聊天消息作为灵感。0 = 禁用",
-        json_schema_extra={
-            "label": "历史消息条数",
-            **_ui_i18n("History message limit"),
-        },
-    )
-    knowledge_search_limit: int = Field(
-        default=5,
-        ge=0,
-        description="生成日程时检索知识库的最大条数。0 = 禁用",
-        json_schema_extra={
-            "label": "知识库条数",
-            **_ui_i18n("Knowledge search limit"),
-        },
-    )
-    cross_day_activity: bool = Field(
-        default=True,
-        description="跨天活动：允许 time_window 跨夜写法，并在注入时回读昨日跨夜活动",
-        json_schema_extra={
-            "label": "跨天活动",
-            **_ui_i18n("Cross-day activity"),
-        },
-    )
-    min_description_length: int = Field(
-        default=20,
-        ge=5,
-        description="活动描述最小字符数（20-30 较合理，过短易模糊）",
-        json_schema_extra={
-            "label": "描述最少字数",
-            **_ui_i18n("Min description length"),
-        },
-    )
-    max_description_length: int = Field(
-        default=50,
-        ge=5,
-        description="活动描述最大字符数（50-100 较合理，过长占 token）",
-        json_schema_extra={
-            "label": "描述最多字数",
-            **_ui_i18n("Max description length"),
-        },
-    )
+    # 2026-11-04 配置精简轮（J 类）：max_rounds / quality_threshold / generation_timeout /
+    # recent_schedule_days / history_message_limit / knowledge_search_limit 移入
+    # mappings/internal_tuning.json[schedule_advanced]（内部调参；本段生产现值未证实，
+    # 走值搬运不硬编码）。同名只读 property 见类尾。
+    # J 类：min_description_length / max_description_length → internal_tuning.json（类尾 property）。
     timezone: str = Field(
         default="Asia/Shanghai",
         description="时区设置（IANA 命名，如 Asia/Shanghai、UTC、America/New_York）：日程日期、"
@@ -435,18 +280,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
                        "it is only picked up if today's schedule is regenerated."),
         },
     )
-    role_judge_temperature: float = Field(
-        default=0.3,
-        ge=0.0,
-        le=2.0,
-        description="角色裁判温度：越低越保守（更容易拒绝离谱请求），越高越随和",
-        json_schema_extra={
-            "label": "裁判温度",
-            "step": 0.1,
-            "hint": "默认 0.3；判定要稳定结论，一般不用动",
-            **_ui_i18n("Judge temperature"),
-        },
-    )
+    # J 类：role_judge_temperature → internal_tuning.json（采样温度，类尾 property）。
 
     # ── 命令展示 ────────────────────────────────────────────
     list_draw_image: bool = Field(
@@ -458,35 +292,9 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
             **_ui_i18n("Draw list image"),
         },
     )
-    image_timeout_seconds: float = Field(
-        default=15.0,
-        ge=1.0,
-        description="日程图片绘制超时（秒）；超时 /lbm_plan list 静默降级为纯文字（不提示失败）",
-        json_schema_extra={
-            "label": "绘制超时(秒)",
-            **_ui_i18n("Image timeout (s)"),
-        },
-    )
+    # J 类：image_timeout_seconds → internal_tuning.json（渲染超时护栏，类尾 property）。
 
     # ── 智能注入调优（原 [inject] 段）────────────────────────
-    enable_intent_classification: bool = Field(
-        default=True,
-        description="意图分类：识别用户消息属于问当前 / 问未来 / 闲聊 / 技术问答，决定注入的详细程度与是否注入",
-        json_schema_extra={
-            "label": "启用意图分类",
-            "hint": "关 = 所有消息按同一口径注入，可能在不相关的问答里也带日程",
-            **_ui_i18n("Intent classification"),
-        },
-    )
-    enable_inject_optimization: bool = Field(
-        default=True,
-        description="注入优化器：防止重复注入和无效打扰（planner / replyer 共用冷却）",
-        json_schema_extra={
-            "label": "启用注入优化",
-            "hint": "关 = 每轮都可能重复注入日程，消息更啰嗦",
-            **_ui_i18n("Injection optimizer"),
-        },
-    )
     casual_chat_inject_probability: float = Field(
         default=0.5,
         ge=0.0,
@@ -499,55 +307,10 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
             **_ui_i18n("Casual inject probability"),
         },
     )
-    context_max_turns: int = Field(
-        default=3,
-        ge=1,
-        description="对话上下文保留轮数（用于判断是否在连续讨论日程话题）",
-        json_schema_extra={
-            "label": "上下文轮数",
-            **_ui_i18n("Context turns"),
-        },
-    )
-    context_ttl: int = Field(
-        default=600,
-        ge=60,
-        description="对话上下文过期时间（秒），超时后认为是新会话",
-        json_schema_extra={
-            "label": "上下文过期(秒)",
-            **_ui_i18n("Context TTL (s)"),
-        },
-    )
+    # J 类：context_max_turns / context_ttl → internal_tuning.json（类尾 property）。
 
     # ── 性能与缓存 ───────────────────────────────────────────
-    inject_cache_minutes: int = Field(
-        default=15,
-        ge=1,
-        le=60,
-        description="当前活动查询的时间窗口缓存（分钟）",
-        json_schema_extra={
-            "label": "活动缓存(分钟)",
-            "hint": "越小越实时、查库越频繁；一般不用动",
-            **_ui_i18n("Activity cache (min)"),
-        },
-    )
-    cache_ttl: int = Field(
-        default=300,
-        ge=10,
-        description="日程注入缓存有效期（秒，默认 5 分钟）；过期后重查数据库",
-        json_schema_extra={
-            "label": "缓存有效期(秒)",
-            **_ui_i18n("Cache TTL (s)"),
-        },
-    )
-    cache_max_size: int = Field(
-        default=100,
-        ge=10,
-        description="注入缓存最大条目数（LRU 策略，超出按最近最少使用淘汰）",
-        json_schema_extra={
-            "label": "缓存最大条数",
-            **_ui_i18n("Cache max entries"),
-        },
-    )
+    # J 类：inject_cache_minutes / cache_ttl / cache_max_size → internal_tuning.json（类尾 property）。
     max_future_activities: int = Field(
         default=3,
         ge=0,
@@ -604,16 +367,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     )
 
     # ── 后台清理（原 [planning_cleanup] 段）──────────────────
-    cleanup_interval: int = Field(
-        default=3600,
-        ge=60,
-        description="后台清理循环间隔（秒，默认 1 小时）",
-        json_schema_extra={
-            "label": "清理间隔(秒)",
-            "hint": "后台删除过期日程/目标/约定的频率",
-            **_ui_i18n("Cleanup interval (s)"),
-        },
-    )
+    # J 类：cleanup_interval → internal_tuning.json（后台清理节拍，类尾 property）。
     cleanup_old_goals_days: int = Field(
         default=30,
         ge=1,
@@ -625,16 +379,89 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     )
 
     # ── 兼容字段（隐藏，不占界面）────────────────────────────
-    auto_generate_time: str = Field(
-        default="00:30",
-        description="兼容的每日生成时间（HH:MM）；仅在生成延迟未自定义时生效。",
-        json_schema_extra={
-            "label": "生成时刻（已废弃）",
-            "placeholder": "00:30",
-            "hidden": True,
-            **_ui_i18n("Generate at (deprecated)"),
-        },
-    )
+
+    # ── J 类内部调参（只读桥接 → mappings/internal_tuning.json[schedule_advanced]）──
+    # 2026-11-04 配置精简轮：16 个内部调参键撤出 TOML/WebUI；旧键值经
+    # migrate_internal_tuning 在 SDK merge 前搬入用户表（只补缺失键，不覆盖现场微调）。
+    @property
+    def max_rounds(self) -> int:
+        """多轮生成最大轮数。"""
+        return int(_tuning_value("schedule_advanced", "max_rounds"))
+
+    @property
+    def quality_threshold(self) -> float:
+        """质量阈值：达到该分立即停止重试。"""
+        return float(_tuning_value("schedule_advanced", "quality_threshold"))
+
+    @property
+    def generation_timeout(self) -> float:
+        """日程生成 LLM 调用超时（秒）。"""
+        return float(_tuning_value("schedule_advanced", "generation_timeout"))
+
+    @property
+    def recent_schedule_days(self) -> int:
+        """生成去重回看天数。"""
+        return int(_tuning_value("schedule_advanced", "recent_schedule_days"))
+
+    @property
+    def history_message_limit(self) -> int:
+        """生成灵感回读消息条数；0 = 禁用。"""
+        return int(_tuning_value("schedule_advanced", "history_message_limit"))
+
+    @property
+    def knowledge_search_limit(self) -> int:
+        """生成知识库检索条数；0 = 禁用。"""
+        return int(_tuning_value("schedule_advanced", "knowledge_search_limit"))
+
+    @property
+    def min_description_length(self) -> int:
+        """活动描述最小字符数。"""
+        return int(_tuning_value("schedule_advanced", "min_description_length"))
+
+    @property
+    def max_description_length(self) -> int:
+        """活动描述最大字符数。"""
+        return int(_tuning_value("schedule_advanced", "max_description_length"))
+
+    @property
+    def role_judge_temperature(self) -> float:
+        """角色裁判采样温度。"""
+        return float(_tuning_value("schedule_advanced", "role_judge_temperature"))
+
+    @property
+    def image_timeout_seconds(self) -> float:
+        """日程图片绘制超时（秒）；超时静默降级纯文字。"""
+        return float(_tuning_value("schedule_advanced", "image_timeout_seconds"))
+
+    @property
+    def context_max_turns(self) -> int:
+        """意图判定对话上下文保留轮数。"""
+        return int(_tuning_value("schedule_advanced", "context_max_turns"))
+
+    @property
+    def context_ttl(self) -> int:
+        """对话上下文过期时间（秒）。"""
+        return int(_tuning_value("schedule_advanced", "context_ttl"))
+
+    @property
+    def inject_cache_minutes(self) -> int:
+        """当前活动查询时间窗口缓存（分钟）。"""
+        return int(_tuning_value("schedule_advanced", "inject_cache_minutes"))
+
+    @property
+    def cache_ttl(self) -> int:
+        """日程注入缓存有效期（秒）。"""
+        return int(_tuning_value("schedule_advanced", "cache_ttl"))
+
+    @property
+    def cache_max_size(self) -> int:
+        """注入缓存最大条目数（LRU）。"""
+        return int(_tuning_value("schedule_advanced", "cache_max_size"))
+
+    @property
+    def cleanup_interval(self) -> int:
+        """后台清理循环间隔（秒）。"""
+        return int(_tuning_value("schedule_advanced", "cleanup_interval"))
 
 
 # ---------------------------------------------------------------------------
@@ -643,14 +470,18 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
 
 
 class PlanningProactiveSectionConfig(PluginConfigBase):
-    """设置早晚安问候、发送时间和群聊或私聊名单；日常主动聊天与想念在陪伴模块设置。"""
+    """设置早/午/晚安问候、发送时间和群聊或私聊名单；想念在陪伴模块设置。
+
+    2026-11-04 主动行为重写新增两个用户可感知字段：``greeting_morning_latest``
+    （早安有界上限时刻）与 ``greeting_noon_enabled``（中午问好开关，仅目标陪伴私聊）。
+    """
 
     __ui_label__ = "日程主动行为"
     __ui_icon__ = "notifications_active"
-    __ui_order__ = 5
+    __ui_order__ = 6
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Schedule Proactive",
-               "description": "Morning and evening greetings, send timing and group/private chat lists."}
+               "description": "Morning/noon/evening greetings, send timing and group/private chat lists."}
     }
 
     # ── 活动频率调控 ─────────────────────────────────────────
@@ -759,6 +590,20 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
                        "the first schedule item; 0 disables."),
         },
     )
+    greeting_morning_latest: str = Field(
+        default="10:00",
+        description="早安最晚时刻（HH:MM，本地时区）：超过该时刻不再发送早安（三流同口径）。"
+                    "生效上限 = 本时刻与「起床后 2 小时」取早；晚醒导致起床已过上限时当日不发早安。"
+                    "空值或非法格式回退默认 10:00（不放宽）",
+        json_schema_extra={
+            "label": "早安最晚时刻",
+            "hint": "HH:MM；过了这个点就不道早安了（与醒后2小时取早）；默认 10:00",
+            "pattern": r"^\d{1,2}:\d{2}$",
+            **_ui_i18n("Morning greeting latest",
+                       "HH:MM cap for morning greetings (earlier of this and wake+2h); "
+                       "empty/invalid falls back to 10:00."),
+        },
+    )
     greeting_night_enabled: bool = Field(
         default=True,
         description="在入睡时间前的随机漂移窗口，向符合条件的会话发送晚安；日程缺失时使用配置作息。",
@@ -766,6 +611,17 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
             "label": "启用晚安",
             "hint": "关 = 完全不发晚安（含目标私聊与群聊）",
             **_ui_i18n("Night greeting", "Off: no night greetings anywhere."),
+        },
+    )
+    greeting_noon_enabled: bool = Field(
+        default=True,
+        description="每天本地12:00–13:00向陪伴目标私聊问候一次；睡眠期间暂缓，窗口结束后跳过。",
+        json_schema_extra={
+            "label": "启用中午问好",
+            "hint": "开 = 每天中午在陪伴对象私聊问一声午安（仅目标私聊，每日一次）；关 = 不发",
+            **_ui_i18n("Noon greeting",
+                       "On: one daily noon greeting in the companion target private chat "
+                       "(12:00-13:00 window, budget-exempt, deduplicated)."),
         },
     )
     morning_drift: str = Field(
@@ -971,33 +827,18 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
 class LifeStateSectionConfig(PluginConfigBase):
     """设置精力、饥饿、专注、压力、社交状态及睡眠恢复。"""
 
-    __ui_label__ = "生活状态（滚动化）"
+    __ui_label__ = "生活状态"
     __ui_icon__ = "activity"
-    __ui_order__ = 6
+    __ui_order__ = 8
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Life State (rolling)",
                "description": "Energy/hunger/focus/stress drives and the rolling planner."}
     }
 
-    tick_seconds: int = Field(
-        default=300,
-        ge=30,
-        description="状态 tick 间隔（秒，默认 300 = 5 分钟）",
-        json_schema_extra={
-            "label": "tick 间隔(秒)",
-            **_ui_i18n("Tick interval (s)"),
-        },
-    )
-    horizon_minutes: int = Field(
-        default=90,
-        ge=30,
-        le=180,
-        description="滚动窗口长度（分钟）：只规划「现在 + 未来 N 分钟」",
-        json_schema_extra={
-            "label": "滚动窗口(分钟)",
-            **_ui_i18n("Horizon (min)"),
-        },
-    )
+    # 2026-11-04 配置精简轮（H 类）：tick_seconds 固化为模块常量 LIFE_TICK_SECONDS=300
+    # （生产现值=默认已证实；内部轮询粒度非时刻锚点）。旧 TOML 键经 LEGACY_ROUTE_KEYS
+    # 入口 pop（只 pop 不搬运，无值可丢）。
+    # J 类：horizon_minutes → internal_tuning.json[life_state]（类尾 property）。
     replan_cooldown_minutes: int = Field(
         default=20,
         ge=5,
@@ -1036,90 +877,15 @@ class LifeStateSectionConfig(PluginConfigBase):
             **_ui_i18n("Random events per day"),
         },
     )
-    resume_pool_size: int = Field(
-        default=3,
-        ge=0,
-        description="恢复池容量：被打断且可恢复的活动最多保留几条；0 = 不恢复",
-        json_schema_extra={
-            "label": "恢复池容量",
-            **_ui_i18n("Resume pool size"),
-        },
-    )
-    resume_expire_minutes: int = Field(
-        default=240,
-        ge=30,
-        description="恢复池条目过期时间（分钟），过期即放弃",
-        json_schema_extra={
-            "label": "恢复池过期(分钟)",
-            **_ui_i18n("Resume expire (min)"),
-        },
-    )
-    low_energy_threshold: float = Field(
-        default=0.30,
-        ge=0.0,
-        le=1.0,
-        description="低精力阈值：低于该值时偏好休息/低强度活动",
-        json_schema_extra={
-            "label": "低精力阈值",
-            "step": 0.05,
-            **_ui_i18n("Low energy threshold"),
-        },
-    )
-    high_hunger_threshold: float = Field(
-        default=0.70,
-        ge=0.0,
-        le=1.0,
-        description="高饥饿阈值：高于该值时优先安排吃饭/加餐",
-        json_schema_extra={
-            "label": "高饥饿阈值",
-            "step": 0.05,
-            **_ui_i18n("High hunger threshold"),
-        },
-    )
-    high_stress_threshold: float = Field(
-        default=0.80,
-        ge=0.0,
-        le=1.0,
-        description="高压力阈值：高于该值时触发减压类重规划",
-        json_schema_extra={
-            "label": "高压力阈值",
-            "step": 0.05,
-            **_ui_i18n("High stress threshold"),
-        },
-    )
-    brief_attention_progress: float = Field(
-        default=0.30,
-        ge=0.0,
-        le=1.0,
-        description="简短回复进度阈值：低可中断活动进度超过该值时回复转简短（brief）",
-        json_schema_extra={
-            "label": "简短回复进度阈值",
-            "step": 0.05,
-            **_ui_i18n("Brief attention progress"),
-        },
-    )
-    late_attention_progress: float = Field(
-        default=0.70,
-        ge=0.0,
-        le=1.0,
-        description="稍后细说进度阈值：进度超过该值时回复更短（later，仅语气提示，不扣消息）",
-        json_schema_extra={
-            "label": "稍后细说进度阈值",
-            "step": 0.05,
-            **_ui_i18n("Late attention progress"),
-        },
-    )
+    # J 类：resume_pool_size / resume_expire_minutes / low_energy_threshold /
+    # high_hunger_threshold / high_stress_threshold / brief_attention_progress /
+    # late_attention_progress → internal_tuning.json[life_state]（类尾 property）。
     # PR8 3.0.0：``profile_path`` 死键已退役（画像装载固定走
     # activity_profiles.load_and_apply(root_dir) → mappings 链，表位置固定；
     # 依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP3）。
-    state_file: str = Field(
-        default="life_state.json",
-        description="状态持久化文件名（相对插件数据目录；损坏时重置默认）",
-        json_schema_extra={
-            "label": "状态文件名",
-            **_ui_i18n("State file"),
-        },
-    )
+    # H 类（2026-11-04）：state_file 固化为 planning.life_state.STATE_FILE_NAME
+    # （逐字 'life_state.json'——改名即丢生产状态；生产现值=默认已证实）。
+    # 旧 TOML 键经 LEGACY_ROUTE_KEYS 入口 pop。
     keep_episode_days: int = Field(
         default=14,
         ge=1,
@@ -1135,19 +901,36 @@ class LifeStateSectionConfig(PluginConfigBase):
     # VAD 经 EMA/中性死区折算五项 rise/fall 速率增益（系数表
     # mappings/emotion_life_modulation.json，经种子链装载、缺失/坏表按内置默认=定稿表，
     # 不设路径键——学习 profile_path 死键教训，表位置固定走 mappings 链）。
-    emotion_modulation_enabled: bool = Field(
-        default=False,
-        description="情绪调制生活状态开关：开启后精力/饥饿/专注/压力/社交电量的自然速率随生效情绪小幅起伏（默认关）",
+    # 生活状态结算模型开关（2026-11-03 优化方案 §3/§5 + 实施硬要求 1；R7 依据 = 用户
+    # 2026-11-03 直派【生活状态结算模型实现】）。"v1"（默认）= 既有线性速率结算逐字不变；
+    # "v2" = 目标趋近模型（纯函数层 planning.settlement_v2，参数版本化）。新旧模型
+    # 互斥：同一状态同一时刻只走其一；v2 下情绪调制不消费（modulation 强制 None）。
+    # 档位热重载即生效（下一拍结算切换），不重置/不改写历史状态数值；启用前应先跑
+    # union/work/20261103_state_balance/verify_v2.py 离线回放（方案 §5.2/§5.3）。
+    # v2 参数覆盖（实施硬要求 2/7：候选参数集中且版本化；开发文档 §5.6 dict 字段
+    # 推荐「字符串 + json.loads」）。空 = 内置默认 planning.settlement_v2.V2_PARAMS
+    # （版本 20261103.1，含方案 §3 候选：休息精力目标 0.82、睡眠目标 0.92、
+    # 进食后饥饿 0.15 等）；JSON 对象仅收已知键（未知键丢弃并告警），activity
+    # 子表按 画像 → 轴 → [目标(0~1), 时间常数(分钟)] 逐项合并。
+    settlement_params_json: str = Field(
+        default="",
+        description="覆盖生活状态结算参数的JSON对象；留空使用内置值，未知键忽略。",
         json_schema_extra={
-            "label": "情绪调制生活状态",
-            "hint": "关 = 生活状态按固定速率自然变化，与情绪无关",
-            **_ui_i18n("Emotion modulation", "Off = life states drift at fixed rates, independent of mood."),
+            "label": "结算参数(JSON)",
+            "hint": '例：{"sleep_energy_target": 0.90, "activity": {"rest": {"energy": [0.85, 60]}}}',
+            **_ui_i18n("Settlement params (JSON)",
+                       "JSON object overriding planning.settlement_v2.V2_PARAMS; empty = built-in defaults."),
         },
     )
     # PR3 SleepEngine（2026-10-26，定稿 §4.2 + 附录 B.6.3；R7 依据 = 用户直派
     # 【日程系统二期 PR3】）：睡眠键组全部出厂值。PR8 3.0.0：``sleep_engine_enabled``
     # 开关键已退役（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP1/WP3）
     # ——睡眠引擎随 ``[schedule].enabled`` 唯一总开关生效或停摆。
+    sleep_drift_max_minutes: int = Field(
+        default=45, ge=0, le=90,
+        description="动态睡眠下自然入睡和起床可偏离作息时间的最大分钟数。",
+        json_schema_extra={"label": "作息浮动上限（分钟）", **_ui_i18n("Sleep drift limit (minutes)")},
+    )
     wake_energy_threshold: float = Field(
         default=0.75,
         ge=0.0,
@@ -1170,25 +953,11 @@ class LifeStateSectionConfig(PluginConfigBase):
             **_ui_i18n("Oversleep starts (h)"),
         },
     )
-    sleep_interrupt_min_minutes: int = Field(
-        default=5,
-        ge=0,
-        le=120,
-        description="打断确认阈值（分钟）：确认清醒达到该时长才把连续睡眠段归零（默认 5）",
-        json_schema_extra={
-            "label": "打断确认(分钟)",
-            **_ui_i18n("Interrupt confirm (min)"),
-        },
-    )
-    sleep_wake_check_seconds: int = Field(
-        default=300,
-        ge=30,
-        description="觉醒阈值复检间隔（秒，默认 300 = 每 5 分钟；到点/硬约定不受此限制）",
-        json_schema_extra={
-            "label": "觉醒复检(秒)",
-            **_ui_i18n("Wake re-check (s)"),
-        },
-    )
+    # J 类：sleep_interrupt_min_minutes → internal_tuning.json[life_state]（打断确认
+    # 去抖阈值，内部机制非锚点；类尾 property）。
+    # H 类（2026-11-04）：sleep_wake_check_seconds 固化为 planning.sleep_engine.
+    # DEFAULT_WAKE_CHECK_SECONDS=300（生产现值=默认已证实；到点/硬约定明确豁免此
+    # 复检粒度，无语义风险）。旧 TOML 键经 LEGACY_ROUTE_KEYS 入口 pop。
     sleep_hard_commitment_lead_minutes: int = Field(
         default=30,
         ge=0,
@@ -1209,6 +978,52 @@ class LifeStateSectionConfig(PluginConfigBase):
                        "Off = oversleep only drains energy."),
         },
     )
+
+    # ── J 类内部调参（只读桥接 → mappings/internal_tuning.json[life_state]）────
+    @property
+    def horizon_minutes(self) -> int:
+        """滚动规划窗长（分钟）。"""
+        return int(_tuning_value("life_state", "horizon_minutes"))
+
+    @property
+    def resume_pool_size(self) -> int:
+        """恢复池容量；0 = 不恢复。"""
+        return int(_tuning_value("life_state", "resume_pool_size"))
+
+    @property
+    def resume_expire_minutes(self) -> int:
+        """恢复池条目过期时间（分钟）。"""
+        return int(_tuning_value("life_state", "resume_expire_minutes"))
+
+    @property
+    def low_energy_threshold(self) -> float:
+        """低精力阈值。"""
+        return float(_tuning_value("life_state", "low_energy_threshold"))
+
+    @property
+    def high_hunger_threshold(self) -> float:
+        """高饥饿阈值。"""
+        return float(_tuning_value("life_state", "high_hunger_threshold"))
+
+    @property
+    def high_stress_threshold(self) -> float:
+        """高压力阈值。"""
+        return float(_tuning_value("life_state", "high_stress_threshold"))
+
+    @property
+    def brief_attention_progress(self) -> float:
+        """简短回复进度阈值。"""
+        return float(_tuning_value("life_state", "brief_attention_progress"))
+
+    @property
+    def late_attention_progress(self) -> float:
+        """稍后细说进度阈值。"""
+        return float(_tuning_value("life_state", "late_attention_progress"))
+
+    @property
+    def sleep_interrupt_min_minutes(self) -> int:
+        """打断确认去抖阈值（分钟）。"""
+        return int(_tuning_value("life_state", "sleep_interrupt_min_minutes"))
 
 
 # ---------------------------------------------------------------------------

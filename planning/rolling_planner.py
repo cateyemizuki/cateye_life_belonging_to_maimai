@@ -46,8 +46,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.time_utils import minutes_of_now
 
 from . import activity_profiles
+from .circadian import nap_reason
 from .sleep_engine import resolve_hard_commitment_start
-from .schedule_items import is_night_sleep_item
+from .schedule_items import is_named_nap, is_night_sleep_item
 from .time_utils import (DAY_MINUTES, TimezoneManager, is_in_sleep_ring,
                          normalize_day_minutes, ring_minutes_ahead)
 
@@ -136,33 +137,9 @@ SLEEP_INTERRUPTIBILITY = 0.05
 _SKIP_SLEEP_TYPES = {SLEEP_GOAL_TYPE}
 
 # ── 随机事件池（附录 A.7 表逐条；模板 1 句描述、0 LLM）────────────────────
-RANDOM_EVENT_POOL: Tuple[Dict[str, Any], ...] = (
-    {"key": "find_thing", "name": "找东西", "min_minutes": 5, "max_minutes": 15,
-     "interruptibility": 0.95, "goal_type": "daily_routine",
-     "state_deltas": {"focus": -0.05, "stress": 0.02},
-     "templates": ("突然想不起来东西放哪了，翻了一会儿", "在找一件小东西，把抽屉翻了个遍")},
-    {"key": "phone_call", "name": "接电话", "min_minutes": 5, "max_minutes": 20,
-     "interruptibility": 0.90, "goal_type": "daily_routine",
-     "state_deltas": {"social_battery": -0.05},
-     "templates": ("来了个电话，接了一会儿", "接了个电话，说了几句")},
-    {"key": "package", "name": "拿快递", "min_minutes": 5, "max_minutes": 5,
-     "interruptibility": 0.95, "goal_type": "daily_routine",
-     "state_deltas": {"energy": -0.01},
-     "templates": ("快递到了，下去拿了一趟", "去门口取了个快递")},
-    {"key": "friend_msg", "name": "朋友消息", "min_minutes": 5, "max_minutes": 10,
-     "interruptibility": 0.95, "goal_type": "social",
-     "state_deltas": {"social_battery": 0.05, "stress": -0.02},
-     "templates": ("朋友发来消息，聊了几句", "回了朋友一条消息，闲聊了一会儿")},
-    {"key": "errand", "name": "临时差事", "min_minutes": 15, "max_minutes": 30,
-     "interruptibility": 0.80, "goal_type": "daily_routine",
-     "state_deltas": {"energy": -0.03, "stress": 0.03},
-     "templates": ("临时有件小事要处理一下", "被喊去搭了把手，花了些时间")},
-    # 2026-11-01 B 计划（§5）：回退池同口径补「刷视频」（catalog 未装配时的逐字回退路径）
-    {"key": "watch_bili", "name": "刷视频", "min_minutes": 10, "max_minutes": 25,
-     "interruptibility": 0.90, "goal_type": "entertainment",
-     "state_deltas": {"stress": -0.04, "focus": -0.02},
-     "templates": ("窝在椅子上刷了会儿B站视频", "翻了翻待看的视频，挑了一个看起来还不错的")},
-)
+from .small_events import builtin_events
+RANDOM_EVENT_POOL: Tuple[Dict[str, Any], ...] = tuple(builtin_events())
+
 #: 同一事件 4 小时内不重复（A.7）
 RANDOM_EVENT_DEDUP_MINUTES = 240
 
@@ -348,6 +325,9 @@ class RollingPlanner:
         self._idle_roll_pending: bool = True
         #: 上一次 tick 观察到的日期（跨日重置当日计数）
         self._last_date: str = ""
+        self._nap_skipped_date: str = ""
+        self._nap_date = ""
+        self._nap_reason = ""
 
     # ── 配置读取（段缺失 → 附录 B.4.1 默认值）────────────────────────────
     def _cfg_section(self) -> Any:
@@ -389,14 +369,15 @@ class RollingPlanner:
             return False
         return bool(getattr(getattr(cfg, "schedule", None), "enabled", False))
 
-    def _emotion_modulation_enabled(self) -> bool:
-        """``[life_state].emotion_modulation_enabled``（新调制开关；默认 False）。"""
-        return bool(getattr(self._cfg_section(), "emotion_modulation_enabled", False))
 
     # ── 睡眠引擎接线（PR3，2026-10-26）─────────────────────────────────
     def set_sleep_engine(self, engine: Any) -> None:
         """后注入睡眠引擎（plugin 先建 planner 再建 engine 时用；幂等）。"""
         self._sleep_engine = engine
+
+    @property
+    def dynamic_sleep(self) -> bool:
+        return bool(getattr(self._sleep_engine, "dynamic_enabled", False))
 
     def _engine_enabled(self) -> bool:
         engine = self._sleep_engine
@@ -438,6 +419,9 @@ class RollingPlanner:
         current = self._now(now)
         frame = self._date_of(current)
         dates = [frame]
+        dynamic = self.dynamic_sleep
+        if dynamic:
+            dates.insert(0, self._date_of(current - timedelta(days=1)))
         try:
             dates.append((datetime.strptime(frame, "%Y-%m-%d") + timedelta(days=1))
                          .strftime("%Y-%m-%d"))
@@ -445,8 +429,12 @@ class RollingPlanner:
             pass
         best: Optional[datetime] = None
         for date in dates:
+            intents = self._spine_intents_cached(date)
+            if dynamic:
+                intents = [{**item, "goal_type": "rest"} if is_named_nap(item) else item
+                           for item in intents]
             resolved = resolve_hard_commitment_start(
-                self._spine_intents_cached(date), date, current, include_active=True)
+                intents, date, current, include_active=True, allow_midnight=dynamic)
             if resolved is not None and (best is None or resolved < best):
                 best = resolved
         return best
@@ -746,7 +734,13 @@ class RollingPlanner:
         # 步 3：硬约定 / 吃饭 / 睡觉锚点
         self._handle_commitments(date, cur, now, snapshot, report)
         current = self._safe_active_episode()
-        if current is None and self._in_sleep_ring(cur):
+        dynamic = self.dynamic_sleep
+        if dynamic:
+            if self._try_dynamic_sleep(date, cur, now, snapshot, current, report):
+                return
+            if self._roll_nap(date, cur, now, snapshot, current, report):
+                return
+        elif current is None and self._in_sleep_ring(cur):
             self._start_sleep_episode(date, cur, now, snapshot, report)
             return  # 睡眠环内不安排任何其他活动（验收：睡眠窗内不安排主动活动）
 
@@ -757,7 +751,7 @@ class RollingPlanner:
 
         # 步 5：无当前 → 候选六源 → 打分 → softmax 采样 → 步 6/7 写 episode 与发布
         current = self._safe_active_episode()
-        if current is None and not self._in_sleep_ring(cur):
+        if current is None and (dynamic or not self._in_sleep_ring(cur)):
             self._select_and_start_next(date, cur, now, snapshot, report,
                                         just_transition=report["actions"] != [])
         report["active_episode_id"] = (self._safe_active_episode() or {}).get("episode_id")
@@ -883,26 +877,34 @@ class RollingPlanner:
         meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         if meta.get("close_active_handled"):
             return  # 已补发布过（幂等保护，防同对 (被挤行, 新行) 重放重复发事件）
-        # 随机事件 deltas：按标记补应用一次；补写持久标记
-        # （state_deltas_applied=防双应用沿用 PR1 0.4 口径；close_active_handled=本路径幂等）
+        # 随机事件 deltas：按标记补应用一次；**先应用后补写持久标记**
+        # （state_deltas_applied=防双应用沿用 PR1 0.4 口径；close_active_handled=本路径幂等）。
+        # 2026-11-04 修复（评估问题6 同款顺序隐患）：原实现先写标记后应用，
+        # apply_episode 抛错即永久漏记——现应用成功后才盖 state_deltas_applied，
+        # 失败留 warning 不盖增量标记（close_active_handled 照常写，事件发布幂等不变）。
         deltas = self._random_event_deltas(meta, self._event_catalog)
-        try:
-            marks: Dict[str, Any] = {"close_active_handled": True}
-            if deltas is not None:
-                marks["state_deltas_applied"] = True
-            self._db.update_episode_metadata(eid, marks)
-        except Exception:
-            pass
         # 状态回写：interrupted 不盖 last_meal_at/last_break_at（apply_episode 既有语义），
         # 只做 state_deltas 加法与 clamp/落盘
+        applied = False
         try:
-            episode_payload: Dict[str, Any] = {"goal_type": row.get("goal_type"),
+            episode_payload: Dict[str, Any] = {"episode_id": eid, "goal_type": row.get("goal_type"),
                                                "status": "interrupted"}
             if deltas:
                 episode_payload["state_deltas"] = deltas
             self._life.apply_episode(episode_payload, now=now)
-        except Exception:
-            pass
+            applied = True
+        except Exception as exc:
+            logger.warning("rolling_planner: 被挤行状态入账失败（episode=%s）：%s", eid, exc)
+        marks: Dict[str, Any] = {"close_active_handled": True}
+        if deltas is not None and applied:
+            marks["state_deltas_applied"] = True
+        try:
+            self._db.update_episode_metadata(eid, marks)
+        except Exception as exc:
+            logger.warning("rolling_planner: 被挤行标记写回失败（episode=%s）：%s", eid, exc)
+        if deltas is not None and not applied:
+            logger.warning("rolling_planner: 被挤行随机事件增量未应用（episode=%s, deltas=%s），"
+                           "未盖 state_deltas_applied 标记", eid, deltas)
         payload: Dict[str, Any] = {
             "episode_id": eid, "name": row.get("name"),
             "goal_type": row.get("goal_type"), "interrupted_by": "close_active",
@@ -914,9 +916,26 @@ class RollingPlanner:
         if duration is not None:
             payload["duration_minutes"] = duration
         self._publish(EVENT_EPISODE_INTERRUPTED, **payload)
+        self._finish_event_claim(row, 'interrupted', reason='close_active')
         self._log("rolling.episode_closed_active", episode_id=eid,
                   interrupted_by="close_active",
                   close_reason=str(meta.get("close_reason") or ""))
+
+    def _finish_event_claim(self, episode: Dict[str, Any], status: str, *, reason: str = '') -> None:
+        """Attach the outcome to this generation's receipt without returning it to a pool."""
+        meta = episode.get('metadata') or {}
+        if not isinstance(meta, dict) or meta.get('event_pool_kind') != 'one_shot':
+            return
+        catalog = getattr(self, '_event_catalog', None)
+        if catalog is None:
+            return
+        try:
+            catalog.finish_claim({'pool_kind': 'one_shot',
+                                  'event_id': meta.get('event_id') or meta.get('event_key'),
+                                  'generation_id': meta.get('event_generation_id')},
+                                 status, str(episode.get('episode_id') or ''), reason=reason)
+        except Exception:
+            logger.warning('随机事件结果未补记，已消费事件不返池', exc_info=True)
 
     def _finish_episode(self, episode: Dict[str, Any], now: datetime,
                         snapshot: Any, *, actual_end_minute: Optional[int] = None,
@@ -927,26 +946,40 @@ class RollingPlanner:
             end = episode.get("actual_end_minute") or episode.get("planned_end_minute")
         # PR1 P0 修复（2026-10-26），计划书 §三十四/定稿 §2 0.4：随机事件行按
         # metadata.event_key 取 state_deltas，随关闭一并交 LifeState.apply_episode
-        # （事件结束后五项 ± 增量）；应用过即写 metadata.state_deltas_applied 持久
-        # 标记，重复关闭路径不会二次应用
+        # （事件结束后五项 ± 增量）；应用成功后才写 metadata.state_deltas_applied
+        # 持久标记，重复关闭路径不会二次应用。
+        # 2026-11-04 修复（评估问题6）：原实现把标记随 finish 先落库、apply_episode
+        # 在 except-pass 内——应用抛错即永久漏记且无日志。现改为**先应用后标记**，
+        # 应用失败留 warning 且不盖标记（后续回放路径仍有机会补应用）。
         deltas = self._random_event_deltas(episode.get("metadata"), self._event_catalog)
         extra_meta: Optional[Dict[str, Any]] = {"close_reason": reason} if reason else None
-        if deltas is not None:
-            extra_meta = dict(extra_meta or {})
-            extra_meta["state_deltas_applied"] = True
         if not self._db.finish(eid, actual_end_minute=end, metadata=extra_meta):
             return
+        self._finish_event_claim(episode, 'completed', reason=reason)
         # 吃饭/休息完成 → 盖 last_meal_at / last_break_at（时长内变化由 tick 速率记账，不重复）
+        applied = False
         try:
-            payload: Dict[str, Any] = {"goal_type": episode.get("goal_type"),
+            payload: Dict[str, Any] = {"episode_id": eid, "goal_type": episode.get("goal_type"),
                                        "status": "completed"}
             if deltas:
                 payload["state_deltas"] = deltas
             self._life.apply_episode(payload, now=now)
-        except Exception:
-            pass
+            applied = True
+        except Exception as exc:
+            logger.warning("rolling_planner: episode 关闭状态入账失败（episode=%s）：%s", eid, exc)
+        if deltas is not None:
+            if applied:
+                try:
+                    self._db.update_episode_metadata(eid, {"state_deltas_applied": True})
+                except Exception as exc:
+                    logger.warning("rolling_planner: 增量已应用但标记写回失败"
+                                   "（episode=%s，回放可能重复应用）：%s", eid, exc)
+            else:
+                logger.warning("rolling_planner: 随机事件增量未应用（episode=%s, deltas=%s），"
+                               "未盖 state_deltas_applied 标记", eid, deltas)
         self._publish(EVENT_EPISODE_COMPLETED, episode_id=eid,
                       name=episode.get("name"), goal_type=episode.get("goal_type"),
+                      event_key=(episode.get("metadata") or {}).get("event_key"),
                       progress=episode.get("progress"),
                       actual_start_minute=episode.get("actual_start_minute"),
                       actual_end_minute=end)
@@ -963,6 +996,7 @@ class RollingPlanner:
         if not self._db.pause(eid, actual_end_minute=minutes_of_now(now),
                               metadata={"pause_reason": reason}):
             return None
+        self._finish_event_claim(episode, 'interrupted', reason=reason)
         # PR2.5 修复（2026-10-26），交接 §五.18 D6：interrupted 事件补 duration_minutes
         # （actual_end-actual_start 跨午夜按同一 24h 环折算，走 planning/time_utils；
         # 任一端缺失不虚构——反馈侧对打断形态即可设时长门槛）
@@ -1009,7 +1043,8 @@ class RollingPlanner:
     def _handle_commitments(self, date: str, cur: int, now: datetime,
                             snapshot: Any, report: Dict[str, Any]) -> None:
         intents = self._spine_intents_cached(date)
-        commitments = [i for i in intents if i["hardness"] == "hard"]
+        commitments = [i for i in intents if i["hardness"] == "hard"
+                       and not (self.dynamic_sleep and is_night_sleep_item(i) and not is_named_nap(i))]
         if not commitments:
             return
         recorded = self._commitment_recorded_ids(date)
@@ -1040,6 +1075,10 @@ class RollingPlanner:
                             # 不走 plugin._sleep_commit 的 woke 分支，必须在此同步
                             # 真实醒来时刻（否则 cycle_start 漏记）。
                             self._note_actual_wake(now)
+                    elif self.dynamic_sleep and (current.get("metadata") or {}).get("kind") == "nap":
+                        self._finish_episode(current, now, snapshot,
+                                             actual_end_minute=self._episode_frame_minute(current, now),
+                                             reason="nap_hard_commitment")
                     else:
                         self._pause_episode(current, now, reason="hard_commitment_preempt")
                 self._start_commitment(c, date, cur, now, snapshot, report)
@@ -1093,6 +1132,8 @@ class RollingPlanner:
                           now: datetime, snapshot: Any, report: Dict[str, Any]) -> None:
         """硬约定到点开播：时间固定（window 原样）、不采样覆盖（红线 2）。"""
         ws, we = intent["start_minute"], intent["end_minute"]
+        if self.dynamic_sleep and is_named_nap(intent):
+            intent = {**intent, "goal_type": "rest"}
         # PR2.5 修复（2026-10-26），交接 §五.18 D1：开播前抓当前 active——上方抢占
         # pause 失败的兜底场景下本行会被 close-active 挤掉，补发布与状态回写
         pre_active = self._safe_active_episode()
@@ -1119,7 +1160,8 @@ class RollingPlanner:
 
     # ── 睡觉锚点 ─────────────────────────────────────────────────────────
     def _start_sleep_episode(self, date: str, cur: int, now: datetime,
-                             snapshot: Any, report: Dict[str, Any]) -> None:
+                             snapshot: Any, report: Dict[str, Any], *,
+                             dynamic: Optional[Dict[str, Any]] = None) -> bool:
         """睡眠环内无当前 episode → 开一条 sleep episode（锚点，不采样覆盖）。
 
         PR3（2026-10-26，定稿 §4.2.3）：
@@ -1129,7 +1171,7 @@ class RollingPlanner:
           早于 wake 锚点醒来后仍处原睡眠环）→ 不再开新 episode，避免每拍重开/重复结算。
         """
         if not self._engine_allows_sleep_start(now):
-            return
+            return False
         sleep_min, wake_min = self._sleep_anchors()
         engine_on = self._engine_enabled()
         planned_end = self._planned_sleep_end(cur, wake_min, self._lie_in_cap_minute(),
@@ -1138,6 +1180,11 @@ class RollingPlanner:
                                     "sleep_ring": f"{sleep_min}-{wake_min}"}
         if engine_on:
             metadata["sleep_engine"] = True
+        if dynamic:
+            latest = datetime.fromisoformat(dynamic["latest_wake"])
+            planned_end = (latest.date() - now.date()).days * DAY_MINUTES + minutes_of_now(latest)
+            metadata["dynamic_sleep"] = dynamic
+            metadata["trigger"] = dynamic["onset_reason"]
         eid = self._db.start_episode(
             schedule_date=date, name="睡觉", goal_type=SLEEP_GOAL_TYPE, source="rolling",
             planned_start_minute=cur, planned_end_minute=planned_end,
@@ -1149,9 +1196,89 @@ class RollingPlanner:
             self._publish(EVENT_EPISODE_STARTED, episode_id=eid, name="睡觉",
                           goal_type=SLEEP_GOAL_TYPE, planned_start_minute=cur,
                           planned_end_minute=planned_end, source="rolling")
+            if dynamic:
+                self._sleep_engine.prepare_tick(
+                    now, sleep_episode={"episode_id": eid, "goal_type": SLEEP_GOAL_TYPE,
+                                        "planned_end_minute": planned_end, "metadata": metadata})
             self._log("rolling.sleep_started", episode_id=eid,
-                      planned_minutes=max(0, planned_end - cur))
+                      planned_minutes=max(0, planned_end - cur),
+                      **({"dynamic": dynamic} if dynamic else {}))
             report["actions"].append("sleep_started")
+        return bool(eid)
+
+    def _try_dynamic_sleep(self, date, cur, now, snapshot, current, report, *, manual=False):
+        if self._engine_owns_sleep(current):
+            return False
+        interruptibility = _as_number((current or {}).get("interruptibility"), 1.0)
+        engagement = _as_number((current or {}).get("switch_cost"), .5) if current else 0
+        blocked = bool(current and (current.get("source") == "commitment" or interruptibility < .65))
+        decision = self._sleep_engine.evaluate_onset(
+            now, snapshot, hard_start=self.sleep_hard_commitment_start(now),
+            interruptibility=interruptibility, engagement=engagement, blocked=blocked, manual=manual)
+        if not decision:
+            return False
+        if current and not self._pause_episode(current, now, reason="dynamic_sleep"):
+            return False
+        return self._start_sleep_episode(date, cur, now, snapshot, report, dynamic=decision)
+
+    def force_sleep(self, now: Optional[datetime] = None) -> bool:
+        """Administrator request, bounded by the same night and commitment guards."""
+        if not self.dynamic_sleep:
+            return False
+        now = self._now(now)
+        return self._try_dynamic_sleep(self._date_of(now), minutes_of_now(now), now,
+                                       self._life.snapshot(), self._safe_active_episode(),
+                                       {"actions": []}, manual=True)
+
+    def _roll_nap(self, date, cur, now, snapshot, current, report) -> bool:
+        if cur < 13 * 60 or self._nap_skipped_date == date:
+            return False
+        if self._nap_date != date:
+            self._nap_date, self._nap_reason = date, ""
+        rows = self._db.episodes_today(date)
+        if any(is_named_nap(row)
+               and row.get("actual_start_minute") is not None for row in rows):
+            self._nap_skipped_date = date
+            self._nap_reason = "taken"
+            self._sleep_engine.record_nap(date, "taken")
+            return False
+        if cur > 15 * 60 + 15:
+            self._nap_skipped_date = date
+            reason = self._nap_reason or "window_closed"
+            self._sleep_engine.record_nap(date, reason)
+            self._log("rolling.nap_skipped", reason=reason)
+            return False
+        reason = nap_reason(now, self._sleep_engine.actual_wake_today(now),
+                            snapshot.get("energy"), snapshot.get("sleep_debt"))
+        hard = self.sleep_hard_commitment_start(now)
+        remaining = 15 * 60 + 30 - cur
+        if hard:
+            remaining = min(remaining, int((hard.timestamp() - now.timestamp()) // 60))
+        if remaining < 15:
+            reason = "hard_commitment"
+        elif current and (current.get("goal_type") != "idle" or current.get("source") == "commitment"):
+            reason = "busy"
+        self._nap_reason = reason
+        self._sleep_engine.record_nap(date, reason)
+        if reason != "ready":
+            return False
+        if current:
+            self._finish_episode(current, now, snapshot,
+                                 actual_end_minute=self._episode_frame_minute(current, now),
+                                 reason="nap_start")
+            if self._safe_active_episode() is not None:
+                return False
+        candidate = {"kind": "nap", "name": "午休", "goal_type": "rest",
+                     "profile_key": "rest", "interruptibility": .9}
+        self._start_episode_for_candidate(candidate, min(20, remaining), date, cur, now,
+                                          snapshot, [], self._day_rng(date), report)
+        if (self._safe_active_episode() or {}).get("goal_type") == "rest":
+            self._nap_reason = "taken"
+            self._nap_skipped_date = date
+            self._sleep_engine.record_nap(date, "taken")
+            self._log("rolling.nap_started", minutes=min(20, remaining))
+            return True
+        return False
 
     # ── 重规划节流（§5.7：冷却 20 分钟 + 每小时 ≤2 次）────────────────────
     def _replan_allowed(self, now: datetime) -> bool:
@@ -1224,7 +1351,14 @@ class RollingPlanner:
                 if ws > cur:
                     candidates.append(ws - cur)
         sleep_min, _wake = self._sleep_anchors()
-        d = (normalize_day_minutes(sleep_min) - normalize_day_minutes(cur)) % DAY_MINUTES
+        if self.dynamic_sleep:
+            midnight = datetime.fromisoformat(date)
+            now = self._now(midnight + timedelta(minutes=cur))
+            window = self._sleep_engine.dynamic_window(now)
+            boundary = window.start if now < window.start else window.latest_start
+            d = int((boundary - now).total_seconds() // 60)
+        else:
+            d = (normalize_day_minutes(sleep_min) - normalize_day_minutes(cur)) % DAY_MINUTES
         if 0 < d < DAY_MINUTES:
             candidates.append(d)
         return min(candidates) if candidates else None
@@ -1239,6 +1373,8 @@ class RollingPlanner:
         # 源 1：硬约定临近（start ∈ (cur, cur+horizon] 的提前入围；到点开播在 tick 步 3）
         for c in intents:
             if c["hardness"] != "hard" or str(c.get("day_offset")) == "1":
+                continue
+            if self.dynamic_sleep and is_night_sleep_item(c) and not is_named_nap(c):
                 continue
             if cur < c["start_minute"] <= cur + horizon:
                 candidates.append(self._candidate_from_intent(c, kind="commitment"))
@@ -1263,6 +1399,8 @@ class RollingPlanner:
         for c in intents:
             if c["hardness"] == "hard":
                 continue
+            if self.dynamic_sleep and (is_named_nap(c) or is_night_sleep_item(c)):
+                continue
             ws, we = c["start_minute"], c["end_minute"]
             if we <= ws:
                 continue
@@ -1275,10 +1413,21 @@ class RollingPlanner:
             intersects = ws <= cur + horizon and we > cur
             if not intersects:
                 continue
-            candidates.append(self._candidate_from_intent(c, kind="intent"))
+            candidate = self._candidate_from_intent(c, kind="intent")
+            if self.dynamic_sleep and c["priority"] == "low" and c["goal_type"] in {"work", "study"}:
+                energy = _as_number(snapshot.get("energy"), 1.0)
+                profile_min = math.ceil(activity_profiles.get_profile(c["goal_type"]).min_block)
+                short_block = max(c["min_minutes"], profile_min, 20)
+                if energy < .35 and ws + 15 + short_block <= we:
+                    if cur < ws + 15:
+                        continue
+                    candidate["max_minutes"] = min(c["max_minutes"] or short_block, short_block)
+            candidates.append(candidate)
 
         # 源 4：恢复池
         for row in self.resume_pool():
+            if self.dynamic_sleep and (is_named_nap(row) or is_night_sleep_item(row)):
+                continue
             candidates.append({
                 "kind": "resume", "name": row.get("name"), "goal_type": row.get("goal_type"),
                 "priority_score": _as_number(row.get("priority_score"), 0.5) or 0.5,
@@ -1423,8 +1572,6 @@ class RollingPlanner:
         优先级不变（前者由 tick 步 3/5 直接返回，后者在步 3 已抢占当前 episode，
         这里再防御性让位）；``emotion_modulation_enabled=false`` 恒返回 None = 旧行为。
         """
-        if not self._emotion_modulation_enabled():
-            return None
         hunger = _as_number(snapshot.get("hunger") if isinstance(snapshot, dict) else None, 0.0)
         if hunger is None or hunger <= HIGH_HUNGER_MEAL_GUARD:
             return None
@@ -1669,6 +1816,8 @@ class RollingPlanner:
             age_minutes = int((now - updated).total_seconds() / 60.0) if updated else expire + 1
             progress = _as_number(row.get("progress"), 0.0) or 0.0
             meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            if meta.get('event_pool_kind') == 'one_shot':
+                continue  # a consumed one-shot never enters a recovery pool
             priority = PRIORITY_SCORES.get(str((meta or {}).get("priority") or "medium"),
                                            PRIORITY_SCORES["medium"])
             profile = activity_profiles.get_profile(str(row.get("goal_type") or "daily_routine"))
@@ -1739,8 +1888,8 @@ class RollingPlanner:
         """转场/空闲掷骰；命中且约束全过 → 开一条随机事件 episode。返回是否插入。
 
         取池（PR4 共享接线，2026-10-27）：装配了事件库服务 → ``catalog.pick_event``
-        （加权抽样 + 4h 去重 + 时长采样，0 LLM）；未装配/选不出 → **逐字回退**旧
-        :data:`RANDOM_EVENT_POOL` 路径。日上限 / 转场门 / 低可中断语义不变。
+        （加权抽样 + 4h 去重 + 时长采样，0 LLM）；仅未装配时使用内置池。
+        选不出时不绕过服务门控。日上限 / 转场门 / 低可中断语义不变。
         创建时把 ``metadata.state_deltas`` + ``event_id`` + ``event_catalog_version``
         快照进 episode（库替换后仍按快照结算；见 :meth:`_random_event_deltas`）。
         """
@@ -1758,8 +1907,10 @@ class RollingPlanner:
                     rng, self._state_brief(snapshot), self._random_last,
                     now=now, context=context)
             except Exception as exc:
-                logger.warning("事件库取池失败（回退内置池）：%s", exc)
+                logger.warning("事件库取池失败（本次跳过）：%s", exc)
                 event = None
+            if not isinstance(event, dict) or not event.get('name'):
+                return False  # do not bypass catalog cooldown/module gates via an unfiltered fallback
         if isinstance(event, dict) and event.get("name"):
             event_key = str(event.get("event_id") or event.get("key") or "")
             templates = [str(t) for t in (event.get("templates") or ()) if str(t or "").strip()]
@@ -1773,13 +1924,17 @@ class RollingPlanner:
             try:
                 metadata = catalog.metadata_for_event(event, description=template)
             except Exception:
-                metadata = {}
+                logger.warning('随机事件快照失败，本次不执行', exc_info=True)
+                return False
+            if not isinstance(metadata, dict) or (event.get('pool_kind') == 'one_shot'
+                    and not metadata.get('event_generation_id')):
+                return False
             metadata.update({"trigger": "random_event", "event_key": event_key,
                              "description": template})
             event = dict(event)
             event["key"] = event_key or event.get("key", "")
         else:
-            # 旧路径（catalog 未装配 / 取不出）：内置池 + 4h 去重 + 时长采样，逐字保留
+            # 服务未装配：内置池 + 4h 去重 + 时长采样。
             eligible = [e for e in RANDOM_EVENT_POOL
                         if e["key"] not in self._random_last
                         or (now - self._random_last[e["key"]]).total_seconds()
@@ -1794,13 +1949,26 @@ class RollingPlanner:
             metadata = {"trigger": "random_event", "event_key": event_key,
                         "description": template}
         profile = activity_profiles.get_profile(event["goal_type"])
-        eid = self._db.start_episode(
-            schedule_date=date, name=event["name"], goal_type=event["goal_type"],
-            source="random", planned_start_minute=cur, planned_end_minute=cur + int(duration),
-            interruptibility=event["interruptibility"], switch_cost=profile.switch_cost,
-            attention_mode="now", state_before=self._state_brief(snapshot),
-            metadata=metadata,
-        )
+        once = event.get('pool_kind') == 'one_shot'
+        if once and (catalog is None or not catalog.claim_event(event, now=now)):
+            self._log('rolling.random_event_not_claimed', event_key=event_key)
+            return False
+        try:
+            eid = self._db.start_episode(
+                schedule_date=date, name=event["name"], goal_type=event["goal_type"],
+                source="random", planned_start_minute=cur, planned_end_minute=cur + int(duration),
+                interruptibility=event["interruptibility"], switch_cost=profile.switch_cost,
+                attention_mode="now", state_before=self._state_brief(snapshot),
+                metadata=metadata,
+            )
+        except Exception:
+            if once:
+                catalog.finish_claim(event, 'start_failed', reason='episode_start_error')
+            logger.warning('随机事件启动失败，本次抽选不返池', exc_info=True)
+            return False
+        if once:
+            catalog.finish_claim(event, 'started' if eid else 'start_failed', str(eid or ''),
+                                 reason='' if eid else 'episode_start_rejected')
         if not eid:
             return False
         self._random_used += 1

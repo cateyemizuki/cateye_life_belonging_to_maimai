@@ -1,9 +1,17 @@
-"""主动巡检调度器（来源：虚拟陪伴插件 scheduler.py，判定链完整对齐）。
+"""主动巡检调度器（来源：虚拟陪伴插件 scheduler.py；2026-11-04 主动行为重写）。
 
 单条 asyncio 循环（可打断睡眠：wait_for(stop_event.wait(), timeout)），每轮按优先级判定：
-日切 → 静默(fail-safe) → 非夜预算 → 早晚安状态检查 →
-想念（沉默阈值每轮随机采样 + 概率 + LLM 把关）→
-日程巡检（活动分享 / 日常搭话，受「启用日程巡检」开关与概率控制）。
+日切 → 静默(fail-safe) → 非夜预算 → 早晚安状态观察 →
+想念（**生活状态 × 情绪 × 好感**驱动的概率触发 + LLM 把关）。
+
+**2026-11-04 重写（用户直派规格）**：旧「沉默阈值想念」与「日程巡检（活动分享/日常
+搭话）」两条路径合并重写为一条状态驱动想念触发——概率公式与各因子见
+:mod:`companion.miss_trigger`（显式可审计、全部有界）；日程相关的主动巡检触发路径
+（activity/daily 分支与 ``_trigger_activity``/``_trigger_daily`` 等）**整条删除**，
+reactive 日程注入不受影响（planning/inject* 他人负责）。想念不再要求用户沉默超阈值、
+不再每日一次闸门（``miss_sent_today`` 降为观察标记，面板继续消费）；每日预算 5、
+最小间隔、用户冷却、静默/午休闸与 LLM 把关逐字保留。沉默事件
+（``relation.silence_detected``，M3）独立保留，阈值仍读 ``miss_silence_hours``。
 
 **静默窗口径（2026-10-20 用户指示，N5「留空跟随」收官；2026-10-21 §24.2 任务B 真实化）**：
 静默窗恒复用作息锚点——**插件实例路径优先真实睡眠环**（schedule.db 夜晚睡条目经
@@ -19,26 +27,32 @@ planning 的 L2 漂移机制（[planning_proactive]）。本巡检器**从不**�
 写进决策行的独立字段 ``greeting_observation``（2026-10-11 裁决 A-17：不占
 SKIP_PRIORITY、不盖掉真实归因），**不构成去重闸门**（patrol 本就没有问候
 触发路径，标记置位与否不改变本侧行为）——两模块不会各发一条，靠的是 planning
-自查 + affection 已发标记闭环。patrol 自身可发的只有
-想念 / 日程分享 / 日常搭话三类；早/晚安/问候一律不占陪伴侧预算。
+自查 + affection 已发标记闭环。patrol 自身可发的只有**想念**一类
+（2026-11-04 重写后；日程分享/日常搭话已删除）；早/午/晚安问候一律不占陪伴侧预算。
 
-**预算口径**：``[patrol].daily_max_speak`` 即上限（不再有独立上限字段），
-只统计发往目标陪伴私聊的「日程巡检 + 想念」两类触发；早/晚安免预算。
+**预算口径**：``[patrol].daily_max_speak`` 即上限（不再有独立上限字段）。
+实际拦截闸门 = bus 主动打扰预算（ProactiveBudget，1/次，含 patrol/planning/emotion/
+video/harass_report 各渠道，仅目标陪伴私聊；早/晚安免预算）；本巡检器另维护 affection
+发言计数（0.5/次、仅 patrol 触发）作候选门控。F4（2026-11-04）起决策行 budget_used/
+budget_limit 改显 bus 口径（budget_basis 注明），affection 计数保留为 speak_count_affection。
 
 所有触发统一走 ctx.maisaka.proactive.trigger（人格化主动回合，不直发文本），
 计 0.5 发言数；replyer 真实回复后由 Hook 补计 0.5（credit_reply_half）。
 
 决策日志每轮恰好一条：SKIP_PRIORITY 决定多原因时保留哪个；
+整轮异常时节流补一条 tick_error 决策行 + warning（F5，至多 10 分钟一次）；
 触发前先看一眼陪伴对象电脑（cateye_client），屏幕旁白发布到 ScreenContextStore
 （尾随锚点注入由 components 的请求 Hook 完成），触发未入队则撤掉旁白。
 
-日程一律消费 planning 子模块：当前活动/未来活动经 planning.schedule_query.ScheduleQuery。
-提示词一律读 suite_prompts（[prompts] 配置段 or 出厂默认）。
+日程查询（planning.schedule_query.ScheduleQuery）现仅服务午休静默判定与静默窗真实
+锚点解析；想念触发不再读当前活动（防日程 priming）。想念文案在 companion.miss_trigger
+（模块内常量，不进 [prompts] 段）；屏幕旁白文案仍读 suite_prompts。
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -53,10 +67,6 @@ from planning.schedule_items import is_night_sleep_item
 from planning.schedule_query import ScheduleQuery
 from planning.time_utils import is_in_day_frame, is_in_time_window
 from suite_prompts import (
-    COMPANION_ACTIVITY_REASON_DEFAULT,
-    COMPANION_DAILY_REASON_DEFAULT,
-    COMPANION_MISS_CONFIRM_DEFAULT,
-    COMPANION_MISS_REASON_DEFAULT,
     SCREEN_NARRATION_DEFAULT,
     SCREEN_NARRATION_FAILED_DEFAULT,
     SCREEN_NARRATION_OFFLINE_DEFAULT,
@@ -64,20 +74,20 @@ from suite_prompts import (
     render,
 )
 
+from .initiative_profile import InitiativeMemory, evaluate_miss
+from . import miss_trigger
 from .affection import AffectionManager
 from .cateye_client import PEEK_OFFLINE
 from .screen_context import ScreenContextStore, format_narration
 
+logger = logging.getLogger(__name__)
+
 # 想念被 LLM 驳回后，多久之内不再重复发起把关判断（分钟）
-MISS_REJECT_COOLDOWN_MINUTES = 30.0
+
 
 #: 沉默事件（relation.silence_detected，M3/B1）频控：每日 ≤2 次、间隔 ≥4 小时（§4.2 / §6.2 A）
-SILENCE_EVENT_MAX_PER_DAY = 2
-SILENCE_EVENT_MIN_INTERVAL_HOURS = 4.0
 
-#: mood_effect 乘数夹取范围（附录 C：全部 clamp [0.7, 1.3]）
-MOOD_MULTIPLIER_MIN = 0.7
-MOOD_MULTIPLIER_MAX = 1.3
+
 
 #: 情绪不可得时的恒等 mood_effect（emotion 关闭/缺失 → 乘数恒 1.0，§八.2 可空降级）
 NEUTRAL_MOOD_EFFECT: dict[str, Any] = {
@@ -287,7 +297,17 @@ def nap_item_matches(item: Any) -> bool:
     return str(item.get("goal_type") or "") == "rest"
 
 
-def nap_intent_matches_now(items: Any, now: datetime) -> bool:
+def actual_nap_item_matches(item: Any) -> bool:
+    """Actual nap identity; ordinary rest/daydreaming is not a nap."""
+    if not isinstance(item, dict) or is_night_sleep_item(item):
+        return False
+    meta = item.get('metadata')
+    if isinstance(meta, dict) and meta.get('kind') == 'nap':
+        return True
+    return any(word in str(item.get('name') or '') for word in NAP_NAME_KEYWORDS)
+
+
+def nap_intent_matches_now(items: Any, now: datetime, *, dynamic: bool = False) -> bool:
     """午休静默的 spine 意图时间窗匹配（UQ-4，用户 2026-10-27 批）。
 
     RollingPlanner 开出 episode 前存在 ≤tick 周期的静默空窗：允许 nap_quiet 判定
@@ -302,6 +322,7 @@ def nap_intent_matches_now(items: Any, now: datetime) -> bool:
     """
     try:
         from planning.rolling_planner import extract_spine_intents
+        from planning.schedule_items import is_named_nap
 
         intents = extract_spine_intents(items or [])
     except Exception:
@@ -311,6 +332,8 @@ def nap_intent_matches_now(items: Any, now: datetime) -> bool:
     cur = now.hour * 60 + now.minute
     for intent in intents:
         if not isinstance(intent, dict) or str(intent.get("day_offset")) == "1":
+            continue
+        if dynamic and intent.get("hardness") != "hard" and is_named_nap(intent):
             continue
         if not nap_item_matches(intent):
             continue
@@ -386,7 +409,6 @@ SKIP_PRIORITY: dict[str, int] = {
     "disabled": 96,
     "daily_max_zero": 96,
     "silence": 95,
-    "activity_disabled": 94,
     #: 午休静默（裁决⑦ 2026-10-11）：午休条目进行中整轮跳过主动开口（默认关）
     "nap_quiet": 93,
     "planner_trigger_failed": 85,
@@ -395,10 +417,8 @@ SKIP_PRIORITY: dict[str, int] = {
     "budget": 60,
     "llm_rejected": 50,
     "dice": 40,
-    "miss_duration": 25,
-    #: 想念当日已发（真闸门：挡住想念候选本身；2026-10-11 起与早/晚安的纯观察
-    #: ``greeting_observation`` 字段区分开，不再共用 already_sent_today 词汇）
-    "miss_already_sent": 20,
+    #: 2026-11-04 重写：activity_disabled / miss_duration / miss_already_sent 随
+    #: 日程巡检与沉默阈值闸门删除（想念改状态驱动概率，无每日一次闸门）。
     "no_user_message": 10,
     "no_candidate": 0,
 }
@@ -424,6 +444,7 @@ class PatrolService:
     ) -> None:
         self._ctx = ctx
         self._config = config  # plugin 引用：运行时动态读 plugin.config.patrol
+        self._initiative_memory = InitiativeMemory(getattr(config, "_data_dir", None))
         self._affection = affection
         self._schedule = schedule_query  # planning.ScheduleQuery，可能为 None（降级）
         self._llm = llm
@@ -441,15 +462,12 @@ class PatrolService:
         self._target_display_name = ""
         self._last_trigger_time: Optional[datetime] = None
         self._last_trigger_intent = ""
-        self._miss_last_reject_at: Optional[datetime] = None
-        self._miss_threshold_hours: Optional[float] = None  # 本轮随机阈值（沉默越久越易过）
         self._last_tick_at: Optional[datetime] = None
         # M3 沉默事件频控（内存态，进程重启即清零；§4.2：每日 ≤2 次、间隔 ≥4h、仅 target）
-        self._silence_pub_date = ""
-        self._silence_pub_count = 0
-        self._silence_last_pub_at: Optional[datetime] = None
         # 非法时间窗口配置的告警节流：配置项 -> 已告警过的原始值
         self._invalid_time_warned: dict[str, str] = {}
+        # F5（2026-11-04）：整轮异常节流留痕的上次告警时刻（None = 从未告警）
+        self._tick_error_warned_at: Optional[datetime] = None
 
     # ---- 事件总线（M0；self._config 可能是 plugin 或配置对象，均可空降级）----
     def _event_bus(self) -> Any:
@@ -515,6 +533,9 @@ class PatrolService:
         self._last_trigger_time = None
         self._last_trigger_intent = ""
 
+    async def initialize_disposition(self, *, force: bool = False) -> dict:
+        return await self._initiative_memory.initialize(self._personality, self._llm, force=force)
+
     # ---- 生命周期 ----
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -536,12 +557,28 @@ class PatrolService:
             try:
                 await self._tick()
             except Exception:
-                pass  # 单轮失败不影响循环
+                # 单轮失败不影响循环；F5（2026-11-04）：不再整轮静默——节流留痕
+                self._warn_tick_error()
             interval = max(1, int(getattr(self._patrol_cfg(), "check_interval_minutes", 10))) * 60
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 continue
+
+    def _warn_tick_error(self) -> None:
+        """整轮巡检异常的节流留痕（F5）：warning(exc_info) + 一条决策行，至多 10 分钟一次。
+
+        修复「_tick 在 finish() 前抛异常 → 该轮完全无痕」与「决策日志每轮恰好一条」
+        承诺的矛盾；持续故障（如配置字段类型异常）不会刷屏，但排障不再盲区。
+        """
+        now = datetime.now()
+        last = self._tick_error_warned_at
+        if last is not None and (now - last).total_seconds() < 600:
+            return
+        self._tick_error_warned_at = now
+        logger.warning("巡检单轮异常（节流留痕，至多 10 分钟一次）", exc_info=True)
+        self._log_decision(action=ACTION_SKIP, reason="tick_error", trigger_type="patrol",
+                           detail="巡检单轮异常，本轮未完成判定（详情见日志，节流留痕）")
 
     def credit_reply_half(self) -> bool:
         """replyer 真实回复后补计 0.5 发言数（触发后 90 秒窗口内才计，只计一次）。"""
@@ -555,338 +592,84 @@ class PatrolService:
     # 单轮巡检：完整判定链（每轮恰好写一条决策日志）
     # ------------------------------------------------------------------
     async def _tick(self) -> None:
-        patrol = self._patrol_cfg()
-        if not bool(getattr(patrol, 'enabled', True)):
-            return  # 模块独立总开关：停用期间巡检不作任何触发
+        cfg = self._patrol_cfg()
         now = datetime.now()
-        current_hhmm = f"{now.hour:02d}:{now.minute:02d}"
         self._last_tick_at = now
-
-        # M4（§6.2 C）：概率掷骰前读 mood_effect（emotion 关闭/缺失/异常 → 恒 1.0，可空降级）；
-        # activity_trigger_rate/default_speak_rate × proactive_rate，乘后概率落 decision_logs。
-        mood = self._mood_effect()
-        proactive_rate = self._mood_multiplier(
-            mood.get("proactive_rate"), 1.0, lo=MOOD_MULTIPLIER_MIN, hi=MOOD_MULTIPLIER_MAX)
-        mood_intent_hint = str(mood.get("intent_hint") or "").strip()
-        activity_rate = (
-            self._to_float(getattr(patrol, "activity_trigger_rate", 1.0), 1.0) * proactive_rate
-        )
-        default_rate = (
-            self._to_float(getattr(patrol, "default_speak_rate", 1.0), 1.0) * proactive_rate
-        )
-
-        # 1) 日切（保留 last_speak_time：跨午夜间隔约束仍生效）
-        if self._affection.today_date() != now.strftime("%Y-%m-%d"):
-            self._affection.reset_daily(now.strftime("%Y-%m-%d"))
-            # M1 日衰减（§5.5）：score 向 baseline 回归 + baseline 缓慢漂移，每自然日一次
+        fields: dict[str, Any] = {}
+        def done(reason: str, action: str = ACTION_SKIP, detail: str = "") -> None:
+            self._log_decision(action=action, reason=reason, trigger_type="miss", detail=detail, **fields)
+        if not bool(getattr(cfg, 'enabled', True)) or not cfg.proactive_trigger_enabled or not cfg.miss_enabled:
+            done('disabled')
+            return
+        if self._affection.today_date() != now.strftime('%Y-%m-%d'):
+            self._affection.reset_daily(now.strftime('%Y-%m-%d'))
             self._affection.apply_daily_decay()
-
-        daily_max_speak = int(patrol.daily_max_speak)
-        # 预算口径（2026-10-10 配置整理轮）：每日预算即上限，只统计巡检与想念；
-        # 早/晚安由 planning 漂移机制驱动且免预算，不再为其预留配额。
-        non_night_budget = daily_max_speak
-
-        # 最小间隔 / 时间配置校验（早/晚安始终豁免本限制，且不由本巡检器触发）
-        minutes_since_last_speak = self._minutes_since_last_speak(now)
-        min_interval = max(0, int(getattr(patrol, "min_trigger_interval_minutes", 0)))
-        interval_blocked = (
-            min_interval > 0
-            and minutes_since_last_speak is not None
-            and minutes_since_last_speak < min_interval
-        )
-        interval_desc = (
-            f"距上次主动发言 {minutes_since_last_speak:.0f} 分钟 < 最小间隔 {min_interval} 分钟"
-            if interval_blocked
-            else ""
-        )
-        silence_window = self._effective_silence_window()  # N5：留空跟随日程作息锚点
-        invalid_time_keys = self._collect_invalid_time_keys(silence_window)
-
-        # 本轮判定（每轮恰好写一条；真的发言后，后续门控的"跳过"不再覆盖它）
-        decision: dict[str, str] = {
-            "action": ACTION_SKIP,
-            "reason": "no_candidate",
-            "trigger_type": "",
-            "detail": "本轮没有满足条件的触发",
-        }
-        base_fields: dict[str, Any] = {
-            "minutes_since_last_speak": (
-                None if minutes_since_last_speak is None else round(minutes_since_last_speak, 1)
-            ),
-            "min_interval_minutes": min_interval,
-            "cooldown_minutes": int(patrol.user_cooldown_minutes),
-            "budget_used": round(self._affection.today_speak_count(), 2),
-            "budget_limit": non_night_budget,
-            # M4（§6.2 C / §6.3-7）：情绪乘数与乘后概率留痕（中性时逐值为 1.0）
-            "mood_proactive_rate": round(proactive_rate, 4),
-            "activity_trigger_rate_effective": round(activity_rate, 4),
-            "default_speak_rate_effective": round(default_rate, 4),
-        }
-        if mood_intent_hint:
-            base_fields["mood_intent_hint"] = mood_intent_hint
-        if invalid_time_keys:
-            base_fields["invalid_time_config"] = ",".join(invalid_time_keys)
-
-        def mark_skip(reason: str, trigger_type: str = "", detail: str = "") -> None:
-            """记录"本轮跳过"；多原因时只保留优先级更高的（同优先级保留先出现的）。"""
-            if decision["action"] == ACTION_TRIGGER:
-                return
-            if decision["reason"] != "no_candidate" and (
-                SKIP_PRIORITY.get(reason, 0) <= SKIP_PRIORITY.get(decision["reason"], 0)
-            ):
-                return
-            decision.update(action=ACTION_SKIP, reason=reason, trigger_type=trigger_type, detail=detail)
-
-        def mark_trigger(trigger_type: str, detail: str = "") -> None:
-            decision.update(
-                action=ACTION_TRIGGER,
-                reason=f"{trigger_type}_trigger",
-                trigger_type=trigger_type,
-                detail=detail,
-            )
-
-        def finish() -> None:
-            self._log_decision(**decision, **base_fields)
-
-        # 总开关 / 每日上限
-        if not patrol.proactive_trigger_enabled:
-            mark_skip("disabled", detail="主动触发开关（proactive_trigger_enabled）已关闭")
-            finish()
+        # Persona initialization is once per fingerprint; no Y/N request per candidate.
+        profile = await self.initialize_disposition()
+        last = self._affection.last_user_msg_time()
+        cycle = self._initiative_memory.cycle(self._target_qq, last, now)
+        if cycle is None or last is None:
+            done('no_user_message')
             return
-        if daily_max_speak <= 0:
-            mark_skip("daily_max_zero", detail="每日发言上限为 0（完全静音）")
-            finish()
-            return
-
-        # PR3 复核（2026-10-27）：晚于旧 wake 锚点仍在真实睡眠（引擎权威）→ 照样静默。
-        # 日程端点在**醒来时**才写回真实醒点，晚醒区间内窗口还写着 07:00；若只看窗口会
-        # 在 07:00 后提前开口/巡检。引擎不表态(None)/已醒 → 不改旧窗口判定。
-        if sleep_engine_asleep(self._config, now):
-            mark_skip("silence", detail="睡眠引擎判定仍在睡（真实睡眠环，晚醒未写回前）")
-            finish()
-            return
-
-        # 静默时段（fail-safe：配置非法视为静默，宁可不发；N5：留空 = 跟随日程作息锚点）
-        if is_in_time_window(silence_window.start, silence_window.end, current_hhmm, invalid_result=True):
-            if invalid_time_keys:
-                mark_skip(
-                    "invalid_time_config",
-                    detail=f"静默窗配置非法（{','.join(invalid_time_keys)}），按静默处理（fail-safe）",
-                )
-            else:
-                mark_skip("silence", detail=f"处于静默时段 {silence_window.describe()}")
-            finish()
-            return
-
-        # ---- 午休静默（裁决⑦ 2026-10-11：[patrol].nap_quiet_enabled，默认关 = 现状）----
-        if self._nap_quiet_enabled() and self._nap_in_progress(now):
-            mark_skip("nap_quiet", detail="陪伴对象午休/小睡中（[patrol] nap_quiet_enabled）")
-            finish()
-            return
-
-        # ---- 早安 / 晚安的状态检查（patrol 从不触发问候；已发标记仅记录观察）----
-        # 唯一驱动链 = planning 的 L2 漂移机制（[planning_proactive] 的漂移区间 + 开关）。
-        # 旧的 [patrol] morning_start/end、night_start/end 四个窗口字段已于 2026-10-10
-        # 配置整理轮**删除**（问候时刻一律用 [schedule].wake_time/sleep_time + 漂移）。
-        # planning 触发成功后写入 affection 的 morning_sent/night_sent；这里见已发只写一条
-        # **独立观察字段** ``greeting_observation``（2026-10-11 裁决 A-17：不再占用
-        # SKIP_PRIORITY 归因，避免盖掉本轮真实的 no_user_message/no_candidate 归因）——
-        # 两模块不会各发一条，靠的是 planning 自查 + affection 已发标记闭环。
-        if self._affection.morning_sent():
-            base_fields["greeting_observation"] = "already_sent_today(morning)"
-        if self._affection.night_sent():
-            prev = base_fields.get("greeting_observation")
-            base_fields["greeting_observation"] = (
-                f"{prev},already_sent_today(night)" if prev else "already_sent_today(night)")
-
-        # ---- A 级：想念 / 沉默事件 ----
-        # M3（B1）：沉默超过 miss_hours_min 时发布 relation.silence_detected（独立于
-        # 想念触发本身；每日 ≤2 次、间隔 ≥4h 的内存频控在 _maybe_publish_silence 内）。
+        hours = hours_between(now, last)
+        energy, social, valence, _tier, _count = self._miss_state_inputs()
+        decision = evaluate_miss(hours, float(profile.get('anchor_hours', 6)),
+                                 float(profile.get('loneliness', .5)), energy, social, valence)
+        fields.update(silence_hours=round(hours, 3), anchor_hours=profile.get('anchor_hours'),
+                      loneliness=profile.get('loneliness'), motivation=round(decision.motivation,4),
+                      capacity=round(decision.capacity,4), miss_probability=round(decision.probability,4),
+                      cycle_status=dict(cycle.get('claims') or {}), profile_source=profile.get('source'))
+        # Same anchor for the silence fact and missing candidate; each has its own receipt.
         await self._maybe_publish_silence(now)
-        miss_speak_rate = float(patrol.miss_speak_rate)
-        if not patrol.miss_enabled:
-            pass  # 开关关闭：整段跳过（记 no_candidate）
-        elif self._affection.miss_sent_today():
-            mark_skip("miss_already_sent", "miss", "今天已经发过想念")
-        else:
-            last_msg = self._affection.last_user_msg_time()
-            if last_msg is None:
-                # 用户从未发过消息 → 不触发想念（避免首次启动就喊想你了）
-                mark_skip("no_user_message", "miss", "还没有用户消息记录，不触发想念")
-            else:
-                hours_since_last = hours_between(now, last_msg)
-                # M4（附录 B/C，§7 M4 行）：阈值 = 区间随机采样 × 情绪系数 × affection 档位系数
-                # （双系数；emotion 关闭/档位不可得 → 各自恒 1.0，可空降级）
-                mood_miss_mult, tier_miss_mult = self._miss_threshold_factors(mood)
-                miss_threshold = self._sample_miss_threshold(
-                    mood_mult=mood_miss_mult, tier_mult=tier_miss_mult)
-                base_fields.update(
-                    miss_threshold_hours=round(miss_threshold, 2),
-                    mood_miss_threshold=round(mood_miss_mult, 4),
-                    tier_miss_factor=round(tier_miss_mult, 4),
-                )
-                if hours_since_last <= miss_threshold:
-                    mark_skip(
-                        "miss_duration",
-                        "miss",
-                        f"用户沉默 {hours_since_last:.1f}h ≤ 本轮随机阈值 {miss_threshold:.1f}h"
-                        f"（区间 {self._miss_range_text()}h"
-                        f"×情绪 {mood_miss_mult:.2f}×档位 {tier_miss_mult:.2f}）",
-                    )
-                elif self._affection.today_speak_count() >= non_night_budget:
-                    mark_skip(
-                        "budget",
-                        "miss",
-                        f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}",
-                    )
-                elif interval_blocked:
-                    # 想念不豁免最小间隔（2026-10-10 口径：早/晚安豁免，想念照旧受控）
-                    mark_skip("min_interval", "miss", interval_desc)
-                elif self._is_in_cooldown(now):
-                    mark_skip(
-                        "cooldown",
-                        "miss",
-                        f"处于用户冷却期（{int(patrol.user_cooldown_minutes)} 分钟）内",
-                    )
-                elif random.random() >= miss_speak_rate:
-                    mark_skip("dice", "miss", f"想念概率未通过（miss_speak_rate={miss_speak_rate}）")
-                elif self._miss_llm_check_enabled() and not await self._confirm_missing_with_llm(
-                    hours_since_last, now
-                ):
-                    mark_skip("llm_rejected", "miss", "LLM 把关驳回（30 分钟内不重复判断）")
-                elif await self._trigger_missing(hours_since_last):
-                    mark_trigger("miss", f"想念触发已入队（用户沉默 {hours_since_last:.1f}h"
-                                         f" > 阈值 {miss_threshold:.1f}h）")
-                else:
-                    mark_skip("planner_trigger_failed", "miss", "触发未入队（stream_id 缺失或触发开关关闭）")
+        if 'miss' in cycle.get('claims', {}):
+            done('silence_cycle_consumed')
+            return
+        if not decision.eligible:
+            done(decision.reason)
+            return
+        coordinator = getattr(self._config, '_optional_actions', None)
+        allowed, denial = coordinator.permission() if coordinator is not None else (False, 'not_assembled')
+        if not allowed:
+            done(denial)
+            return
+        if random.random() >= decision.probability:
+            done('dice')
+            return
+        if not self._initiative_memory.claim(self._target_qq, last, now, 'miss'):
+            done('recovery_or_cycle_claim')
+            return
+        key = 'miss:' + str(cycle['anchor'])
+        success = await self._trigger_missing(hours, key=key)
+        self._initiative_memory.receipt(self._target_qq, 'miss', 'enqueued' if success else 'not_enqueued_or_unknown')
+        done('miss_trigger' if success else 'planner_not_enqueued', ACTION_TRIGGER if success else ACTION_SKIP)
 
-        # ---- B 级：日程巡检（活动分享 / 日常搭话；受「启用日程巡检」开关控制）----
-        activity = self._find_current_activity(now)
-        if not self._patrol_activity_enabled():
-            mark_skip("activity_disabled", detail="日程巡检开关（patrol_activity_enabled）已关闭")
-        elif activity is not None:
-            if interval_blocked:
-                mark_skip("min_interval", "activity", interval_desc)
-            elif self._is_in_cooldown(now):
-                mark_skip(
-                    "cooldown",
-                    "activity",
-                    f"处于用户冷却期（{int(patrol.user_cooldown_minutes)} 分钟）内",
-                )
-            elif self._affection.today_speak_count() >= non_night_budget:
-                mark_skip(
-                    "budget",
-                    "activity",
-                    f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}",
-                )
-            elif random.random() >= activity_rate:
-                mark_skip(
-                    "dice",
-                    "activity",
-                    f"日程巡检概率未通过（activity_trigger_rate={patrol.activity_trigger_rate}"
-                    f"×情绪 {proactive_rate:.2f} = {activity_rate:.3f}）",
-                )
-            elif await self._trigger_activity(activity):
-                mark_trigger("activity", f"日程节点触发已入队：{activity.get('name', '')}")
-            else:
-                mark_skip("planner_trigger_failed", "activity", "触发未入队（stream_id 缺失或触发开关关闭）")
-        else:
-            if interval_blocked:
-                mark_skip("min_interval", "daily", interval_desc)
-            elif self._is_in_cooldown(now):
-                mark_skip(
-                    "cooldown",
-                    "daily",
-                    f"处于用户冷却期（{int(patrol.user_cooldown_minutes)} 分钟）内",
-                )
-            elif self._affection.today_speak_count() >= non_night_budget:
-                mark_skip(
-                    "budget",
-                    "daily",
-                    f"当日预算已用 {self._affection.today_speak_count():.1f}/{non_night_budget}",
-                )
-            elif random.random() >= default_rate:
-                mark_skip(
-                    "dice",
-                    "daily",
-                    f"日常搭话概率未通过（default_speak_rate={patrol.default_speak_rate}"
-                    f"×情绪 {proactive_rate:.2f} = {default_rate:.3f}）",
-                )
-            elif await self._trigger_daily():
-                mark_trigger("daily", "日常巡检触发已入队")
-            else:
-                mark_skip("planner_trigger_failed", "daily", "触发未入队（stream_id 缺失或触发开关关闭）")
-
-        finish()
 
     # ------------------------------------------------------------------
     # 各类触发（屏幕感知统一在 _trigger_planner 里先取）
     # ------------------------------------------------------------------
-    async def _trigger_missing(self, hours_since_last: float) -> bool:
-        reason = self._format_miss_reason(hours_since_last)
-        success = await self._trigger_planner("missing", reason)
-        if success:
+    async def _trigger_missing(self, hours_since_last: float, *, key: str = "") -> bool:
+        result = await self._trigger_planner('missing', self._format_miss_reason(hours_since_last), key=key)
+        if result:
             self._affection.set_miss_sent()
-        return success
+        return result
 
-    async def _trigger_activity(self, activity: dict[str, Any]) -> bool:
-        label = str(activity.get("name") or "")
-        template = prompt(self._config, "companion_activity_reason")
-        reason = render(
-            template,
-            fallback=COMPANION_ACTIVITY_REASON_DEFAULT,
-            lover_name=self._lover_name,
-            activity=label,
-        )
-        return await self._trigger_planner("activity", reason)
 
-    async def _trigger_daily(self) -> bool:
-        template = prompt(self._config, "companion_daily_reason")
-        reason = render(template, fallback=COMPANION_DAILY_REASON_DEFAULT,
-                        lover_name=self._lover_name)
-        return await self._trigger_planner("daily", reason)
+    # 注（2026-11-04 主动行为重写）：_trigger_activity / _trigger_daily（日程巡检的
+    # 活动分享/日常搭话触发）已整条删除——patrol 侧不再有任何日程意图主动发言。
 
-    async def _trigger_planner(self, intent: str, reason: str) -> bool:
-        """统一触发 planner：主动打扰预算（仅目标陪伴私聊）查询 → proactive.used → 看电脑 → proactive.trigger。
-
-        M0 预算接线（§六.2 H）：五类触发都走本入口，触发前先查主动打扰预算，
-        超额直接放弃；入队失败/异常时把刚发布的旁白撤掉，避免它被之后某轮普通对话锚上。
-        M11（附录 II §3.3）：预算只对**发往目标陪伴私聊**的主动打扰计数——本入口的
-        ``self._stream_id``（``plugin._apply_target`` 注入的目标流）按 stream 维度传参，
-        非目标流不查计数、不入账（自身 ``daily_max_speak`` 与 miss/daily 频控不变）。
-
-        M4（§6.2 C）：reason 在此追加情绪 ``intent_hint``（低分辨成语义行，如
-        「你今天有点低落，语气可以软一点」）；零新 Hook，情绪不可得时原样透传。
-        """
-        if not self._stream_id or not self._patrol_cfg().proactive_trigger_enabled:
+    async def _trigger_planner(self, intent: str, reason: str, *, key: str = "") -> bool:
+        action = getattr(self._config, 'optional_action', None)
+        if not callable(action) or not self._stream_id:
             return False
-        reason = self._append_intent_hint(reason)
-        bus = self._event_bus()
-        if bus is not None:
-            if not bus.allow_proactive("patrol", str(intent or ""), stream_id=self._stream_id):
-                return False
-            try:
-                await bus.publish("proactive.used", source="companion",
-                                  channel="patrol", intent=str(intent or ""),
-                                  stream_id=self._stream_id)
-            except Exception as exc:
-                self._ctx.logger.warning("proactive.used 发布失败（预算记账可能缺失）：%s", exc)
-        await self._publish_screen_narration()
-        try:
-            result = await self._ctx.maisaka.proactive.trigger(
-                stream_id=self._stream_id, intent=intent, reason=reason
-            )
-        except Exception:
-            # 判定结论由 _tick 的 finish() 统一落一条日志，这里只负责撤旁白
+        result = await action(key, intent, self._append_intent_hint(reason), before=self._publish_screen_narration)
+        if result.get('status') != 'enqueued':
             self._discard_screen_narration()
             return False
-        if isinstance(result, dict) and result.get("success") is False:
-            self._discard_screen_narration()
-            return False
-        self._affection.increment_speak(0.5)  # 先计 0.5，replyer 回复后由 Hook 补 0.5
+        self._affection.increment_speak(.5)
         self._last_trigger_time = datetime.now()
-        self._last_trigger_intent = str(intent or "")
+        self._last_trigger_intent = str(intent)
         return True
+
 
     # ------------------------------------------------------------------
     # 屏幕感知（v2.6.0「先看屏幕，再叫醒 planner」）
@@ -936,52 +719,26 @@ class PatrolService:
     # 想念机制辅助 / 沉默事件发布（M3，B1；§4.2 / §6.2 A）
     # ------------------------------------------------------------------
     async def _maybe_publish_silence(self, now: datetime) -> None:
-        """last_user_msg_time 超过 miss_hours_min → 发布 ``relation.silence_detected``。
-
-        频控（内存态，§4.2）：每日 ≤ :data:`SILENCE_EVENT_MAX_PER_DAY` 次、间隔 ≥
-        :data:`SILENCE_EVENT_MIN_INTERVAL_HOURS` 小时；仅 target——巡检只服务目标私聊流
-        （``has_target()`` 为假时不发布）。payload：``hours``（沉默时长）与
-        ``target_bonus``（档位加算加成，留痕用；emotion 侧桥按同一公式重算 K，
-        单一事实来源仍是 affection 档位 + 情绪服务的 ``target_bonus_step()``——M12/D7：
-        该值含「JSON 覆盖 > config > 默认」三层合并，服务不可得时回退 config 直读）。
-
-        本方法只发布事件，不参与想念触发判定；任何异常都静默吞掉，绝不影响巡检判定链。
-        """
+        if not self.has_target():
+            return
+        last = self._affection.last_user_msg_time()
+        if last is None:
+            return
+        hours = hours_between(now, last)
+        if hours < float(self._initiative_memory.profile().get('anchor_hours', 6)):
+            return
+        bus = self._event_bus()
+        if bus is None or not self._initiative_memory.claim(self._target_qq, last, now, 'silence'):
+            return
         try:
-            if not self.has_target():
-                return
-            bus = self._event_bus()
-            if bus is None:
-                return
-            last_msg = self._affection.last_user_msg_time()
-            if last_msg is None:
-                return
-            hours = hours_between(now, last_msg)
-            if hours <= self._miss_hours_min():
-                return
-            if not self._silence_rate_ok(now):
-                return
-            await bus.publish("relation.silence_detected", source="companion",
-                              hours=round(hours, 2),
-                              target_bonus=round(self._silence_target_bonus(), 4))
-            self._silence_pub_count += 1
-            self._silence_last_pub_at = now
+            await bus.publish('relation.silence_detected', source='companion',
+                              hours=round(hours, 2), target_bonus=round(self._silence_target_bonus(), 4))
+            self._initiative_memory.receipt(self._target_qq, 'silence', 'published')
         except Exception:
-            pass
+            self._initiative_memory.receipt(self._target_qq, 'silence', 'unknown')
+            logger.warning('沉默事实发布失败，本周期不重复发布', exc_info=True)
 
-    def _silence_rate_ok(self, now: datetime) -> bool:
-        """沉默事件频控检查（按日计数跨天清零 + 最小间隔；满足即放行）。"""
-        today = now.strftime("%Y-%m-%d")
-        if self._silence_pub_date != today:
-            self._silence_pub_date = today
-            self._silence_pub_count = 0
-        if self._silence_pub_count >= SILENCE_EVENT_MAX_PER_DAY:
-            return False
-        if self._silence_last_pub_at is not None:
-            elapsed_hours = (now - self._silence_last_pub_at).total_seconds() / 3600.0
-            if elapsed_hours < SILENCE_EVENT_MIN_INTERVAL_HOURS:
-                return False
-        return True
+
 
     def _silence_target_bonus(self) -> float:
         """当前档位的 target 加算加成 = step × (档位相对位置 × 4 + 1)（§5.3 / §6.2 A；读不到按 0）。
@@ -1066,16 +823,56 @@ class PatrolService:
             return dict(NEUTRAL_MOOD_EFFECT)
         return raw if isinstance(raw, dict) else dict(NEUTRAL_MOOD_EFFECT)
 
-    @staticmethod
-    def _to_float(value: Any, default: float) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return float(default)
+    def _miss_state_inputs(self) -> tuple[Any, Any, Any, Any, Any]:
+        """想念概率公式的五路输入：``(energy, social_battery, valence, tier, tier_count)``。
 
-    def _mood_multiplier(self, value: Any, default: float, *, lo: float, hi: float) -> float:
-        """mood_effect 系数的防御性夹取（附录 C 范围；非法值取默认）。"""
-        return max(lo, min(hi, self._to_float(value, default)))
+        全部只读、可空降级（任一模块缺失/停用/异常 → 对应输入 None → 公式因子恒 1.0，
+        §八.2 口径）：生活状态读 ``plugin._life_state.snapshot()``（runtime 权威，不读
+        配置不读表）；情绪读 ``EmotionService.effective_valence()``（先判 is_enabled）；
+        好感读 affection 状态层 tier + 生效预设档位数（先判 is_enabled）。
+        """
+        energy = social = valence = tier = tier_count = None
+        life = getattr(self._config, "_life_state", None)
+        if life is None:
+            life = getattr(getattr(self._config, "config", None), "_life_state", None)
+        snapshot_getter = getattr(life, "snapshot", None)
+        if callable(snapshot_getter):
+            try:
+                snap = snapshot_getter()
+                if isinstance(snap, dict):
+                    energy = snap.get("energy")
+                    social = snap.get("social_battery")
+            except Exception:
+                pass
+        emotion = self._emotion_service()
+        emotion_ok = True
+        enabled = getattr(emotion, "is_enabled", None)
+        if callable(enabled):
+            try:
+                emotion_ok = bool(enabled())
+            except Exception:
+                emotion_ok = False
+        if emotion_ok:
+            getter = getattr(emotion, "effective_valence", None)
+            if callable(getter):
+                try:
+                    valence = getter()
+                except Exception:
+                    valence = None
+        affection_ok = True
+        aff_enabled = getattr(self._affection, "is_enabled", None)
+        if callable(aff_enabled):
+            try:
+                affection_ok = bool(aff_enabled())
+            except Exception:
+                affection_ok = False
+        if affection_ok:
+            try:
+                tier = int(self._affection.tier())
+                tier_count = int(getattr(self._affection.preset(), "size", 5))
+            except Exception:
+                tier = tier_count = None
+        return energy, social, valence, tier, tier_count
 
     def _append_intent_hint(self, reason: str) -> str:
         """M4（§6.2 C）：proactive intent 的 reason 追加情绪 ``intent_hint``。
@@ -1088,178 +885,46 @@ class PatrolService:
         base = str(reason or "").strip()
         return f"{base}。{hint}" if base else hint
 
-    def _affection_tier_miss_factor(self) -> float:
-        """affection 档位 → miss 阈值系数（附录 B；读不到恒 1.0，可空降级）。
+    # 注（2026-11-04 主动行为重写）：旧沉默阈值机制（_affection_tier_miss_factor /
+    # _miss_threshold_factors / _sample_miss_threshold / _miss_range_text）与日程巡检
+    # 开关（_patrol_activity_enabled）已删除——想念改状态驱动概率（miss_trigger 公式）。
+    # miss_silence_hours 区间保留，仅服务沉默事件（relation.silence_detected）门槛。
 
-        档位读 affection 状态层（``tier()``），系数读当前关系档案
-        （``RelationProfile.miss_factor_for_tier``，M1 已存数据）；任一不可得/异常回退 1.0。
-        """
-        tier_getter = getattr(self._affection, "tier", None)
-        if not callable(tier_getter):
-            return 1.0
-        try:
-            tier = int(tier_getter())
-        except Exception:
-            return 1.0
-        # 档位数随生效预设（1~5 档，2026-10-17 §19）；RelationProfile.miss_factor_for_tier
-        # 内部已按 ratio 折算，此处只需防负数
-        tier = max(0, tier)
-        factor_getter = getattr(getattr(self, "_relation", None), "miss_factor_for_tier", None)
-        if not callable(factor_getter):
-            return 1.0
-        try:
-            factor = float(factor_getter(tier))
-        except Exception:
-            return 1.0
-        return factor if factor > 0 else 1.0
 
-    def _miss_threshold_factors(self, mood_effect: Optional[dict[str, Any]] = None) -> tuple[float, float]:
-        """M4 双系数（附录 B/C）：(情绪系数, affection 档位系数)，各自不可得恒 1.0。"""
-        mood = mood_effect if isinstance(mood_effect, dict) else self._mood_effect()
-        mood_mult = self._mood_multiplier(mood.get("miss_threshold"), 1.0,
-                                          lo=MOOD_MULTIPLIER_MIN, hi=MOOD_MULTIPLIER_MAX)
-        return mood_mult, self._affection_tier_miss_factor()
 
-    def _miss_hours_range(self) -> tuple[float, float]:
-        """想念阈值区间（小时）：``[patrol].miss_silence_hours``（``"4-8"`` 或单数字 ``8`` = 0~8）。
-
-        2026-10-10 阈值合并轮：旧 ``miss_hours_min`` / ``miss_hours_max`` 两字段合为一个
-        区间字符串（配置层的迁移器已把旧值搬过来）；非法值一律回退 4~8。
-        """
-        return parse_hours_range(getattr(self._patrol_cfg(), "miss_silence_hours", "4-8"), (4.0, 8.0))
-
-    def _miss_range_text(self) -> str:
-        """阈值区间的展示文本（决策日志用）。"""
-        low, high = self._miss_hours_range()
-        return f"{low:g}-{high:g}"
-
-    def _miss_hours_min(self) -> float:
-        """想念阈值下限（小时）：沉默事件（relation.silence_detected）的触发门槛。"""
-        return self._miss_hours_range()[0]
-
-    def _sample_miss_threshold(self, *, mood_mult: float = 1.0, tier_mult: float = 1.0) -> float:
-        """在配置区间内随机取本轮想念阈值（小时）。
-
-        M4（§7 M4 行）：采样值再 × ``mood_effect.miss_threshold`` × affection 档位系数
-        （双系数；调用方缺省 1.0 时退化为旧行为）。
-        """
-        low, high = self._miss_hours_range()
-        return max(0.0, random.uniform(low, high) * float(mood_mult) * float(tier_mult))
-
-    def _patrol_activity_enabled(self) -> bool:
-        """日程巡检开关（``[patrol].patrol_activity_enabled``，取不到按开）。"""
-        return bool(getattr(self._patrol_cfg(), "patrol_activity_enabled", True))
-
-    def _miss_llm_check_enabled(self) -> bool:
-        if self._llm is None:
-            return False
-        return bool(getattr(self._patrol_cfg(), "miss_llm_check_enabled", False))
 
     def _relation_word(self) -> str:
         """当前关系称谓（relation profile 未注入时回退「恋人」）。"""
         return getattr(self._relation, "word", None) or "恋人"
 
     def _format_miss_reason(self, hours_since_last: float) -> str:
-        """想念触发的 reason（模板可配置；占位符坏掉回退出厂文案）。
+        """想念触发的 reason（2026-11-04 重写：文案在 companion.miss_trigger，模块内常量）。
 
-        2026-10-10：模板首行自带「【触发原因·想念】」标注（用户要求：注入上下文要
-        标明为什么触发），文案同时做了精简。
+        自然想念表达、不引导汇报日程；可携带一句关系记忆（用户习惯）作可选语境。
+        首行保留「【触发原因·想念】」标注（注入上下文要标明为什么触发）。
         """
-        template = prompt(self._config, "companion_miss_reason")
+        try:
+            memory = miss_trigger.memory_line(self._affection.habits())
+        except Exception:
+            memory = ""
         return render(
-            template,
-            fallback=COMPANION_MISS_REASON_DEFAULT,
+            miss_trigger.MISS_REASON_DEFAULT,
+            fallback=miss_trigger.MISS_REASON_DEFAULT,
             lover_name=self._lover_name,
             hours=f"{hours_since_last:.1f}",
             relation=self._relation_word(),
+            memory_line=memory,
         )
 
-    async def _confirm_missing_with_llm(self, hours_since_last: float, now: datetime) -> bool:
-        """想念触发前的 LLM 把关：Y=放行，N/空/无法解析=驳回（30 分钟冷却）。"""
-        if self._miss_recently_rejected(now):
-            return False
-        template = prompt(self._config, "companion_miss_confirm")
-        activity = self._find_current_activity(now)
-        activity_line = self._format_activity_line(activity, now) if activity else ""
-        if activity is not None:
-            activity_context = f"你当前的活动：{activity_line}。"
-        elif not self._schedule_enabled():
-            # PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，规则 6）：
-            # 日程关断时如实「日程未启用」，不再冒充「没有安排中的活动」。
-            activity_context = "日程未启用，暂不清楚当前的安排。"
-        else:
-            activity_context = "你现在没有安排中的活动。"
-        prompt_text = render(
-            template,
-            fallback=COMPANION_MISS_CONFIRM_DEFAULT,
-            lover_name=self._lover_name,
-            relation=self._relation_word(),
-            personality=self._personality or "（未配置人设）",
-            current_time=now.strftime("%H:%M"),
-            hours=f"{hours_since_last:.1f}",
-            activity_context=activity_context,
-        )
-        # mai-love v2.6.3：判定参数（模型/max_tokens/温度）集中在 [llm] 配置段（原 [judge]）——
-        # 此前与日程共用 LLM 任务且 max_tokens 写死 16，任务切到思考型模型后
-        # reasoning 吃满预算、正文恒空、把关整批失败；现可在 WebUI 单独指定。
-        response = await self._llm.judge(prompt_text, module="companion", event="miss_confirm")
-        verdict = self._parse_missing_confirm(response)
-        if verdict is True:
-            return True
-        self._miss_last_reject_at = now  # 只在新鲜驳回时记录，冷却可自然过期
-        return False
 
-    def _miss_recently_rejected(self, now: datetime) -> bool:
-        if self._miss_last_reject_at is None:
-            return False
-        elapsed = (now - self._miss_last_reject_at).total_seconds() / 60
-        return elapsed < MISS_REJECT_COOLDOWN_MINUTES
 
-    @staticmethod
-    def _parse_missing_confirm(response: str) -> Optional[bool]:
-        """解析 LLM 把关回复：Y=放行，N/空/无法解析=驳回。"""
-        text = str(response or "").strip()
-        if not text:
-            return None
-        upper = text.upper()
-        for ch in upper:
-            if ch == "Y":
-                return True
-            if ch == "N":
-                return False
-        if any(kw in text for kw in ("不", "否", "拒绝", "驳回")):
-            return False
-        if any(kw in text for kw in ("是", "可以", "自然", "合适")):
-            return True
-        return None
 
     # ------------------------------------------------------------------
     # 通用小工具
     # ------------------------------------------------------------------
-    def _find_current_activity(self, now: datetime) -> Optional[dict[str, Any]]:
-        """当前日程活动（runtime-only；PR8 3.0.0 W4：ScheduleQuery 未装配/日程未启用/
-        空闲/异常 → None 如实降级，不读计划表时间窗编造）。"""
-        if self._schedule is None:
-            return None
-        try:
-            return self._schedule.find_current_activity(now.strftime("%Y-%m-%d"), now)
-        except Exception:
-            return None
-
-    def _schedule_enabled(self) -> bool:
-        """``[schedule].enabled``（PR8 3.0.0 唯一日程总开关；读不到/异常 → False）。"""
-        try:
-            return bool(getattr(_config_section(self._config, "schedule"), "enabled", False))
-        except Exception:
-            return False
-
-    def _format_activity_line(self, activity: dict[str, Any], now: datetime) -> str:
-        if self._schedule is None:
-            return str(activity.get("name") or "")
-        try:
-            return self._schedule.format_activity_line(activity, now)
-        except Exception:
-            return str(activity.get("name") or "")
+    # 注（2026-11-04 主动行为重写）：_find_current_activity / _schedule_enabled /
+    # _format_activity_line 已删除——patrol 不再读当前活动（日程巡检触发路径与想念
+    # 把关的日程语境一并移除）。self._schedule 仅余午休静默（_nap_in_progress）消费。
 
     def _minutes_since_last_speak(self, now: datetime) -> Optional[float]:
         last_speak = self._affection.last_speak_time()
@@ -1267,18 +932,6 @@ class PatrolService:
             return None
         return max(0.0, (now - last_speak).total_seconds() / 60)
 
-    def _is_in_cooldown(self, now: datetime) -> bool:
-        """用户冷却：自己或对方最近一次发言在冷却期内（早晚安不受控）。"""
-        cooldown_minutes = int(self._patrol_cfg().user_cooldown_minutes)
-        recent_times = [
-            value
-            for value in (self._affection.last_speak_time(), self._affection.last_user_msg_time())
-            if value is not None
-        ]
-        if not recent_times:
-            return False
-        elapsed = (now - max(recent_times)).total_seconds() / 60
-        return elapsed < cooldown_minutes
 
     def _effective_silence_window(self) -> SilenceWindow:
         """本轮**生效**的静默窗（N5：留空跟随 [schedule] 作息锚点，非空 = 显式覆盖）。
@@ -1287,36 +940,7 @@ class PatrolService:
         """
         return resolve_silence_window(self._config)
 
-    def _nap_quiet_enabled(self) -> bool:
-        """午休静默开关（``[patrol].nap_quiet_enabled``，缺省 False = 现状：午休照常巡检；
-        2026-10-20 用户指示后开启时同样约束空间发帖/评论监听——qzone 判定链同源判定）。"""
-        section = getattr(self._config, "patrol", None) if self._config is not None else None
-        return bool(getattr(section, "nap_quiet_enabled", False))
 
-    def _nap_in_progress(self, now: datetime) -> bool:
-        """当前是否处于午休/小睡条目中（runtime episode 优先；查询不可用/异常 → False
-        可空降级）。
-
-        识别口径经 :func:`nap_item_matches`（与 qzone 空间静默同源）。UQ-4（用户
-        2026-10-27 批）：episode 未开出（≤tick 周期）时允许只读计划表 spine 意图行按
-        时间窗匹配提前静默（:func:`nap_intent_matches_now`）——**仅静默用途**，命中
-        结果不对外伪装「当前活动」。
-        """
-        query = self._schedule
-        if query is None:
-            return False
-        today = now.strftime("%Y-%m-%d")
-        try:
-            item = query.find_current_activity(today, now, include_sleep=True)
-        except Exception:
-            item = None
-        if nap_item_matches(item):
-            return True
-        # UQ-4：spine 意图时间窗兜底（仅静默用途）
-        try:
-            return nap_intent_matches_now(query.get_day_schedule(today), now)
-        except Exception:
-            return False
 
     def _collect_invalid_time_keys(self, window: Optional[SilenceWindow] = None) -> list[str]:
         """收集**生效**静默窗里格式非法的（HH:MM）来源配置项，并对每个非法值告警一次。

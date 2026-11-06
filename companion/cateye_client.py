@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from companion.config import target_qq_of
+from companion.screen_config import screen_config_of
 from core.diag import LLMCallLogger
 from core.llm_utils import LLMService, purpose_task
 from suite_prompts import prompt as prompt_of
@@ -86,13 +87,14 @@ class CateyeClient:
         self._call_logger = call_logger
         self._connected_cache: Optional[bool] = None
         self._connected_cached_at: float = 0.0
+        self._peek_lock = asyncio.Lock()
 
     # ------------------------------------------------------------
     # 配置（运行时动态读，热重载即时生效）
     # ------------------------------------------------------------
     def _screen_cfg(self) -> Any:
         """屏幕感知配置（2026-10-10 起在 [patrol] 段，字段前缀 screen_*）。"""
-        section = getattr(self._plugin.config, "patrol", None) or getattr(self._plugin.config, "cateye", None)
+        section = screen_config_of(self._plugin.config)
         return section
 
     def _target_qq(self) -> str:
@@ -110,7 +112,7 @@ class CateyeClient:
             value = getattr(cfg, "enabled", False)   # 旧 [cateye].enabled 兜底
         return bool(value)
 
-    async def peek_screen(self, now: datetime) -> Optional[ScreenPeek]:
+    async def peek_screen(self, now: datetime, *, manual: bool = False) -> Optional[ScreenPeek]:
         """看一眼陪伴对象电脑。
 
         Returns:
@@ -118,13 +120,17 @@ class CateyeClient:
             功能关闭、整体超时或调用异常 → ``None``（本轮不注入任何屏幕内容）。
             超时不降级成 failed：按"这轮别提电脑"处理。
         """
-        if not self.is_enabled():
+        permitted = bool(getattr(self._screen_cfg(), "tool_enabled", False)) if manual else self.is_enabled()
+        if not permitted or self._peek_lock.locked():
             return None
         try:
             cfg = self._screen_cfg()
             timeout = float(getattr(cfg, "screen_timeout_seconds", None)
                             or getattr(cfg, "timeout_seconds", 20.0))
-            return await asyncio.wait_for(self._peek(now), timeout=max(5.0, timeout))
+            async with self._peek_lock:
+                if manual:
+                    self._connected_cache = None  # 按需查看使用当前连接事实。
+                return await asyncio.wait_for(self._peek(now), timeout=max(5.0, timeout))
         except asyncio.TimeoutError:
             self._ctx.logger.info("查看陪伴对象电脑超时，本轮不注入屏幕感知")
             return None
@@ -190,8 +196,8 @@ class CateyeClient:
         单屏客户端行为与改造前一致。
         """
         cfg = self._screen_cfg()
-        blur = int(getattr(cfg, "screen_blur", None)
-                   if getattr(cfg, "screen_blur", None) is not None
+        blur = int(getattr(cfg, "blur", getattr(cfg, "screen_blur", None))
+                   if getattr(cfg, "blur", getattr(cfg, "screen_blur", None)) is not None
                    else (getattr(cfg, "screenshot_blur", 0) or 0))
         user_id = self._target_qq()
         try:
@@ -219,7 +225,7 @@ class CateyeClient:
     def _screen_scope(self) -> str:
         """屏幕范围取值（screen_scope；非法值一律回退 main，绝不因配置炸掉巡检）。"""
         cfg = self._screen_cfg()
-        value = getattr(cfg, "screen_scope", "main")
+        value = getattr(cfg, "scope", getattr(cfg, "screen_scope", "main"))
         return value if value in ("main", "all") else "main"
 
     def _select_screens(self, screens: list) -> list:

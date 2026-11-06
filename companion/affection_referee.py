@@ -240,8 +240,9 @@ async def evaluate_conversation_delta(
     task_name: str = "utils",
     plugin: Any = None,
 ) -> Optional[Tuple[str, float, str]]:
-    """会话采样裁判：返回 ``(event ≤30 字, delta ∈ [-2, +2.5], tag)``；失败/垃圾输出返回 None。
+    """会话采样裁判：返回 ``(event ≤30 字, delta ∈ [-4, +5], tag)``；失败/垃圾输出返回 None。
 
+    区间为 0~200 标度（2026-10-17 §19.1 起等比 ×2，常量 REVIEW_DELTA_MIN/MAX）。
     prompt 只见档位描述与低分辨率情绪描述（LLM 隔离铁律），返回的 delta 经代码层二次限幅。
     """
     if llm is None:
@@ -297,7 +298,7 @@ async def run_daily_review(
 ) -> Optional[Dict[str, Any]]:
     """关系日结裁判：返回 ``{"delta_score", "impressions", "tone", "reason"}``；失败返回 None。
 
-    - ``delta_score`` 代码层二次限幅到 [-2, +2]；
+    - ``delta_score`` 代码层二次限幅到 [-4, +4]（0~200 标度，常量 DAILY_DELTA_MIN/MAX）；
     - ``impressions`` 代码层裁剪：≤3 条、每条 ≤80 字、由代码打上被日结日期；
     - prompt 只见档位描述（LLM 隔离铁律），不见 score / baseline。
     """

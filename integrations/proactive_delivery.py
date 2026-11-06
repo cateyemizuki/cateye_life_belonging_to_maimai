@@ -21,7 +21,12 @@ class ProactiveDelivery(EventBus):
         return self._budget
 
     def allow_proactive(self, channel: str = '', intent: str = '', stream_id: str = '') -> bool:
-        return self._budget is None or self._budget.allow_proactive(channel, intent, stream_id)
+        # fail-closed（2026-11-04 模块评估 P2-01）：预算未安装时拒绝，与链上其余
+        # 门控同口径（video_companion 预算 None 保守拒绝）；装配经
+        # install_proactive_budget 注入，测试注入路径不变。
+        if self._budget is None:
+            return False
+        return self._budget.allow_proactive(channel, intent, stream_id)
 
     def stop_budget(self) -> None:
         if self._budget_unsubscribe is not None:

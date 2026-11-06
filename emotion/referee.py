@@ -126,17 +126,25 @@ def _parse_json_loose(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _delta_from(data: Any, limit: float) -> VADState:
-    """从 JSON 片段提取 ΔVAD 并做二次限幅（LLM 数值失真兜底）。"""
+def _delta_from(data: Any, limit: float) -> Optional[VADState]:
+    """从 JSON 片段提取 ΔVAD 并做二次限幅（LLM 数值失真兜底）。
+
+    F1（2026-11-04 模块评估 P1-10）：数值位 float 转换加 try 防护——可解析但数值位
+    非法（如 ``"valence":"abc"``）时返回 None，整份回执按"无有效结构化结果"处理，
+    走调用方既有的失败计次（睡眠裁判侧即 D10 重试上限/退避），不再抛 ValueError
+    冒泡到循环被静默吞掉、绕过重试上限。非 dict 载荷的零向量回退语义逐字不变。
+    """
     data = data or {}
     if not isinstance(data, dict):
         return VADState()
     inner = data.get("delta_vad") if isinstance(data.get("delta_vad"), dict) else data
-    return VADState(
-        _clip(float(inner.get("valence") or 0.0), -limit, limit),
-        _clip(float(inner.get("arousal") or 0.0), -limit, limit),
-        _clip(float(inner.get("dominance") or 0.0), -limit, limit),
-    )
+    axes = []
+    for key in ("valence", "arousal", "dominance"):
+        try:
+            axes.append(_clip(float(inner.get(key) or 0.0), -limit, limit))
+        except (TypeError, ValueError):
+            return None
+    return VADState(*axes)
 
 
 async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_log_text: str,
@@ -187,7 +195,10 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
         "arousal": str(data.get("reason_arousal") or "")[:300],
         "dominance": str(data.get("reason_dominance") or "")[:300],
     }
-    return _delta_from(data, limit), reasons
+    delta = _delta_from(data, limit)
+    if delta is None:          # F1：数值位非法 → 与解析失败同口径（调用方计次重试）
+        return None
+    return delta, reasons
 
 
 async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str,
@@ -264,4 +275,7 @@ async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_na
     if data is None:
         return None
     event = str(data.get("event") or "")[:60]
-    return event, _delta_from(data, 0.5)
+    delta = _delta_from(data, 0.5)
+    if delta is None:          # F1：数值位非法 → 按评估失败处理（返回 None）
+        return None
+    return event, delta

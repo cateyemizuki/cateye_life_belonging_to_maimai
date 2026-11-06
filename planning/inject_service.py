@@ -40,6 +40,22 @@ D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改
   ``_get_current_schedule`` 快照链改读 runtime episode/ReadModel 视图（与注入同
   口径），原 GoalManager 今日/昨日合成时间窗 + 15 分钟缓存编造路径删除；运行态
   未就绪一律如实（不读残留快照冒充当前活动）。
+
+2026-11-04 双通道意图门控 + 实况瘦身（根因取证：union/20261104_主动行为与视频排查/
+计划提及根因排查.md——群日程提及 = 注入 priming，planner 实况块与 replyer
+next_line 是两条已证实泄漏通道）：
+
+- 目标陪伴私聊（``session_id == plugin._stream_id``）保留全量注入（投诉集中在群）；
+- 其余会话（群聊/非目标私聊/会话缺失）实况内容按当前用户消息意图门控：
+  问当前/问未来（query_current/query_future，IntentClassifier 调优路径）→ 全量
+  实况（当前活动+接下来+状态+刚完成）；闲聊/未知 → 瘦身仅「当前活动实况」一行
+  （不含接下来/状态/刚完成），replyer 状态块不携带 next_line（接下来 X 要 Y）。
+  分类不确定（空消息 UNKNOWN/无匹配闲聊兜底）天然落在保守侧——宁可少说不漏说；
+- 门控只决定「实况给多少」，不改变注入时机决策（optimizer/上下文缓存照旧）；
+  与 23:50 批次的空活动兜底（现在行，非 life_lines）及优化器规则2移除正交，
+  兜底照常送达闲聊，防编造成果不受影响。非目标私聊同走门控的理由：replyer
+  next_line priming 机制群/私聊同效，且真实询问在任何会话都能解锁全量实况，
+  问日程的回答能力不丢失。
 """
 
 from __future__ import annotations
@@ -78,12 +94,11 @@ from suite_prompts import (
 
 logger = logging.getLogger(__name__)
 
-#: 无当前活动兜底文案（2026-10-10 N1-2：空档期不再静默早退）。
-#: 首选 ``[prompts].inject_no_activity``（suite_prompts 侧新增键）；键未落地/取不到时
-#: 用本默认——保证「无活动也给一句兜底」在任何配置版本下都成立。
-#: （PR8 3.0.0：原 core/inject.py 同类实现 build_activity_prompt / build_replyer_prompt
-#: 已删，注入文本实装以本文件为准。）
-_INJECT_NO_ACTIVITY_DEFAULT = "现在没有安排中的活动（可能在休息）。"
+#: 无当前活动兜底文案统一经 ``suite_prompts.prompt(plugin, "inject_no_activity")``：
+#: 该键属 INTERNAL_PROMPT_NAMES（不在 PromptsSectionConfig 字段面），恒返
+#: suite_prompts.INJECT_NO_ACTIVITY_DEFAULT，不接受配置覆盖、不会为空。
+#: （2026-11-04 评估问题8：原本地死常量 _INJECT_NO_ACTIVITY_DEFAULT 全文件零引用
+#: 且文案与实际默认不同，已删除。）
 
 #: replyer 复用本轮 planner 意图的最大年龄（秒，N6-1）。
 #: planner → replyer 同一轮内相隔仅数秒；超过该年龄说明不是同一轮，回落旧口径（闲聊）。
@@ -132,14 +147,10 @@ class InjectService:
         adv = section_or_default(plugin, "schedule_advanced", ScheduleAdvancedSectionConfig)
         self._tz_manager: TimezoneManager = TimezoneManager(adv.timezone)
 
-        self._intent_classifier = IntentClassifier() if adv.enable_intent_classification else None
-        self._inject_optimizer = (
-            InjectOptimizer(
-                cache_ttl=adv.cache_ttl,
-                casual_inject_probability=adv.casual_chat_inject_probability,
-            )
-            if adv.enable_inject_optimization
-            else None
+        self._intent_classifier = IntentClassifier(tuning_enabled=True)
+        self._inject_optimizer = InjectOptimizer(
+            cache_ttl=adv.cache_ttl,
+            casual_inject_probability=adv.casual_chat_inject_probability,
         )
         self._context_cache = ConversationContextCache(
             max_turns=adv.context_max_turns,
@@ -148,7 +159,7 @@ class InjectService:
         logger.debug(
             "InjectService 初始化完成（cache_max=%d, cache_ttl=%d, intent=%s, optimizer=%s）",
             adv.cache_max_size, adv.cache_ttl,
-            adv.enable_intent_classification, adv.enable_inject_optimization,
+            True, True,
         )
 
     # ------------------------------------------------------------
@@ -169,13 +180,6 @@ class InjectService:
         """会话准入：插件启用 + inject_scope（target_private=仅目标私聊）+ 叠加白名单。"""
         if not self._plugin_enabled():
             return False
-        cfg = self._schedule_cfg()
-        if getattr(cfg, "inject_scope", "all") != "all":
-            # 只注入目标陪伴私聊：目标流 = plugin._stream_id（plugin 解析 target_qq 得到，
-            # 随热重载更新；2026-10-10 修正——此前误读不存在的 plugin._patrol）
-            target_stream = str(getattr(self._plugin, "_stream_id", "") or "")
-            if not target_stream or session_id != target_stream:
-                return False
         # admin 段若挂载了 allowed_streams 则叠加限制（留空 = 不限制）
         admin = getattr(self._plugin.config, "admin", None)
         allowed = list(getattr(admin, "allowed_streams", None) or []) if admin else []
@@ -184,6 +188,28 @@ class InjectService:
             if not is_stream_allowed(session_id, allowed):
                 return False
         return True
+
+    def _is_target_private_session(self, session_id: str) -> bool:
+        """目标陪伴私聊判定（2026-11-04 群/私聊差异门控）。
+
+        目标流 = ``plugin._stream_id``（plugin 解析 target_qq 得到，随热重载更新，
+        与 ``inject_scope=target_private`` 准入同源）。仅目标陪伴私聊保留全量实况
+        注入；其余会话（群聊/非目标私聊/session 缺失）一律走意图门控 + 实况瘦身。
+        ``inject_scope`` 语义不变：``target_private`` 时只有目标私聊能进注入，
+        且其恰为全量口径；``all`` 时目标私聊全量、其余门控。
+        """
+        target_stream = str(getattr(self._plugin, "_stream_id", "") or "")
+        sid = str(session_id or "")
+        return bool(target_stream) and sid == target_stream
+
+    @staticmethod
+    def _is_schedule_query_intent(intent: "UserIntent") -> bool:
+        """实况门控解锁判定：仅「问当前 / 问未来」算日程询问意图。
+
+        闲聊/未知/技术/命令一律走瘦身侧；分类器的不确定兜底（空消息
+        UNKNOWN/0.0、无匹配闲聊/0.40）天然落在保守侧——宁可少说不漏说。
+        """
+        return intent in (UserIntent.QUERY_CURRENT, UserIntent.QUERY_FUTURE)
 
     async def _date_header(self) -> str:
         """日期/节假日头部（2026-10-10 由陪伴模块迁入日程注入）。
@@ -274,6 +300,20 @@ class InjectService:
             # （拿不到时才回落 CASUAL_CHAT/0.5，与修复前逐字一致）。
             intent, confidence = self._resolve_replyer_intent(user_id, kwargs)
 
+            # 2026-11-04 双通道门控（replyer 通道）：非目标私聊且非询问意图 →
+            # 状态块不携带「接下来 X 要 Y」（排查 E4/E5 逐字泄漏口：该行位于生成前
+            # 倒数第 2 条消息，priming 最直接）；当前活动 state_line 保留以维持角色
+            # 连续性。目标陪伴私聊保持旧口径（全量）。意图取不到时回落闲聊 → 保守
+            # 不携带接下来条目。
+            allow_next_line = (
+                self._is_target_private_session(session_id)
+                or self._is_schedule_query_intent(intent)
+            )
+            if not allow_next_line:
+                logger.debug(
+                    "replyer 实况门控: intent=%s 非询问，next_line 不携带", intent.value,
+                )
+
             # N6-2：optimizer 记录键按通道命名空间化，replyer 与 planner 互不占冷却。
             # 无当前活动统一用 ""（而不是 None）参与冷却比较，保证空活动轮次也能自节流。
             scope_key = f"{user_id}:replyer"
@@ -310,15 +350,18 @@ class InjectService:
                 activity_prompt = self._build_replyer_extra_prompt(
                     current_activity=current_activity,
                     description=current_description or "",
-                    future_activities=future_activities,
+                    future_activities=future_activities if allow_next_line else [],
                     remaining_minutes=remaining_minutes,
                 )
                 logger.info(f"replyer 注入: {current_activity}")
             else:
                 # N1-2：无当前活动不静默早退——空活动变体（兜底文案见 [prompts].inject_no_activity）
-                activity_prompt = self._build_replyer_no_activity_prompt(future_activities)
+                # 门控同口径：非询问意图不携带接下来条目（兜底行本身不受门控影响）
+                activity_prompt = self._build_replyer_no_activity_prompt(
+                    future_activities if allow_next_line else [])
                 if not activity_prompt:
-                    # 文案被显式关空（旧行为：无活动即不注入）
+                    # 防御守卫：内部键 inject_no_activity 恒返非空默认，本分支正常
+                    # 不可达（2026-11-04 评估问题8：原「文案被显式关空」口径已订正）
                     return {"action": "continue"}
                 logger.info("replyer 注入: 无当前活动（空活动变体）")
 
@@ -415,6 +458,11 @@ class InjectService:
             life_view = self._life_runtime_view()
             life_lines: List[str] = []
             remaining_override: Optional[int] = None
+            # 2026-11-04 双通道门控（planner 通道）：非目标私聊预备瘦身实况变体
+            # （仅「当前活动实况」一行），意图分类后由 _build_inject_text 按
+            # 「问当前/问未来 → 全量；闲聊/未知 → 瘦身」选用。目标私聊不门控。
+            live_gate_enabled = not self._is_target_private_session(session_id)
+            life_lines_slim: Optional[List[str]] = None
             if life_view is not None:
                 life_ov = self._life_override_from_view(life_view)
                 current_activity = life_ov["name"]
@@ -424,11 +472,13 @@ class InjectService:
                     all_future_activities = life_ov["future"]
                 remaining_override = life_ov["remaining"]
                 life_lines = self._life_block_lines(life_view, life_ov)
+                if live_gate_enabled:
+                    life_lines_slim = self._life_block_lines(life_view, life_ov, slim=True)
 
             # 无当前活动不再静默早退（N1-2）：照常走「分类 → 决策 → 模板路由」，
-            # 模板侧自动切到空活动变体（兜底文案见 [prompts].inject_no_activity）。
-            # 决策仍由 optimizer 把关——空活动时它只放行「问当前/问未来/上下文延续」，
-            # 闲聊继续按概率与冷却节流，不会变成空档期刷屏。
+            # 模板侧自动切到空活动变体（兜底文案 = suite_prompts 内部键 inject_no_activity）。
+            # 决策仍由 optimizer 把关——2026-11-03 规则2移除后空活动对闲聊亦放行，
+            # 仅按闲聊概率（默认 50%）与冷却节流，不会变成空档期刷屏。
             inject_content, injected, detected_intent = self._build_inject_text(
                 user_message=user_message,
                 current_activity=current_activity,
@@ -440,6 +490,8 @@ class InjectService:
                 user_id=user_id,
                 remaining_override=remaining_override,
                 life_lines=life_lines,
+                life_lines_slim=life_lines_slim,
+                live_gate_enabled=live_gate_enabled,
             )
 
             # 记录到上下文缓存
@@ -636,16 +688,25 @@ class InjectService:
         user_id: str,
         remaining_override: Optional[int] = None,
         life_lines: Optional[List[str]] = None,
+        life_lines_slim: Optional[List[str]] = None,
+        live_gate_enabled: bool = False,
     ) -> Tuple[Optional[str], bool, Optional[str]]:
         """分类 → 决策 → 模板路由。user_id 实际是会话维度 scope ID（session_id）。
 
         ``current_activity`` 允许为空（2026-10-10 N1-2）：空活动不再是「静默早退」，
         而是走同一决策管道 + 空活动文案变体；决策权仍交给 optimizer/上下文延续
-        （空活动时 optimizer 只放行问当前/问未来，闲聊维持节流）。
+        （2026-11-03 规则2移除后空活动对闲聊亦放行，仅按概率与冷却节流）。
 
         R7：``remaining_override``（runtime episode 剩余分钟）与 ``life_lines``
         （runtime 实况追加行）由调用方在 runtime 视图就绪时传入；
         缺省 None = 未就绪口径（既有调用点与测试桩零变化）。
+
+        2026-11-04 双通道门控：``live_gate_enabled=True``（非目标私聊会话）且
+        意图非询问（query_current/query_future 之外）→ 实况追加行改用
+        ``life_lines_slim``（仅「当前活动实况」一行，无接下来/状态/刚完成）；
+        询问意图 → 保留 ``life_lines`` 全量。缺省 False = 旧行为逐字（既有调用点
+        与测试桩零变化）。门控只改实况内容详略，不改注入时机决策；空活动兜底
+        （现在行）不在 life_lines 内，不受门控影响（23:50 防编造成果保留）。
 
         Returns:
             (inject_content, injected, detected_intent)。``inject_content`` 为 None
@@ -660,6 +721,15 @@ class InjectService:
             intent, confidence = UserIntent.CASUAL_CHAT, 0.5
 
         detected_intent = intent.value
+
+        # 1.5 实况门控（2026-11-04）：非目标会话且非询问意图 → 实况瘦身。
+        # 不确定兜底（UNKNOWN/闲聊低分）落在保守侧——宁可少说不漏说。
+        effective_life_lines = life_lines
+        if live_gate_enabled and not self._is_schedule_query_intent(intent):
+            effective_life_lines = life_lines_slim
+            logger.debug(
+                "planner 实况门控: intent=%s 非询问，实况瘦身（仅当前活动）", detected_intent,
+            )
 
         # 2. 决策
         if context_continue_inject:
@@ -710,7 +780,7 @@ class InjectService:
             proactive_hit=proactive_hit,
             context_continue_inject=context_continue_inject,
             context_reason=context_reason,
-            life_lines=life_lines,
+            life_lines=effective_life_lines,
         )
         if inject_content is None:
             return None, False, detected_intent
@@ -745,10 +815,11 @@ class InjectService:
         不得出现两套矛盾的「精神状态」）；情绪不可得时省略该行，不再使用已删除的
         inject/state_analyzer 静态模板。
 
-        ``current_activity`` 为空（2026-10-10 N1-2）：当前行换成
-        ``[prompts].inject_no_activity`` 兜底文案（默认「现在没有安排中的活动（可能在
-        休息）。」，与 core/inject.py 同类实现同口径）；文案被显式关空时返回 None
-        （回退旧行为：空活动不注入）。
+        ``current_activity`` 为空（2026-10-10 N1-2）：当前行换成内部键
+        ``inject_no_activity`` 兜底文案（suite_prompts.INJECT_NO_ACTIVITY_DEFAULT，
+        恒非空、不接受配置覆盖）。2026-11-04 评估问题8：原「文案被显式关空→返回
+        None」分支不可达（该键不在 PromptsSectionConfig 字段面，prompt() 恒返默认），
+        已随死代码清理移除。
         """
         if intent in (UserIntent.TECH_QUESTION, UserIntent.COMMAND_EXECUTION):
             return None
@@ -765,10 +836,8 @@ class InjectService:
             remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
 
         if not current_activity:
-            # 空活动变体：兜底文案（空串 = 显式关闭 → 维持旧行为：本轮不注入）
+            # 空活动变体：兜底文案（内部键恒返非空默认，无「显式关空」路径）
             current_line = self._no_activity_text()
-            if not current_line:
-                return None
         elif enable_detailed and current_description:
             current_line = render(
                 prompt(self._plugin, "inject_schedule_current_line"),
@@ -784,6 +853,14 @@ class InjectService:
                 activity=current_activity, description="", remaining_hint=remaining_hint,
             )
             current_line = current_line.replace("（）", "").replace("()", "").strip()
+
+        engine = getattr(self._plugin, "_sleep_engine", None)
+        if getattr(engine, "dynamic_enabled", False):
+            band = engine.dynamic_status(now).get("band")
+            cue = {"drowsy": "有点困", "winding_down": "困了，准备休息",
+                   "waking": "刚醒，还在缓神"}.get(band)
+            if cue:
+                current_line += f"（{cue}）"
 
         lines: List[str] = [
             prompt(self._plugin, "inject_schedule_header"),
@@ -826,7 +903,11 @@ class InjectService:
 
         lines.extend(["", "---", ""])
         # R7 runtime 实况追加行（runtime 视图就绪时由调用方传入；未就绪 → None
-        # = 追加块缺席）。位置：引导行之后、分隔线之前。
+        # = 追加块缺席）。位置：引导行之后、文本末尾。
+        # 2026-11-04 双通道门控：内容详略已在上游 _build_inject_text 按会话类型 +
+        # 意图选好（目标私聊/询问意图 = 全量；其余会话闲聊/未知 = 仅当前活动实况
+        # 一行），此处照单追加。与 23:50 空活动兜底正交：兜底是上方「现在行」，
+        # 不在 life_lines 内，门控不影响其送达。
         if life_lines:
             lines.append("")
             lines.extend(life_lines)
@@ -863,15 +944,14 @@ class InjectService:
         return self._render_replyer_status_block(state_line, future_activities)
 
     def _build_replyer_no_activity_prompt(self, future_activities: List[Tuple[str, str]]) -> str:
-        """replyer extra_prompt 的空活动变体（2026-10-10 N1-2；参考 core/inject.py）。
+        """replyer extra_prompt 的空活动变体（2026-10-10 N1-2）。
 
         与有活动版本共用 ``[prompts]`` 模板：``state_line`` 换成「无当前活动」兜底行
-        （``inject_no_activity``），能量行 / 下一条活动行 / 不主动提及提示照常。
-        文案被显式关空时返回空串（调用方维持旧行为：不注入）。
+        （内部键 ``inject_no_activity``，恒非空、不接受配置覆盖），能量行 / 下一条
+        活动行 / 不主动提及提示照常。2026-11-04 评估问题8：原「文案被显式关空→
+        返回空串」分支不可达，已随死代码清理移除。
         """
         state_line = self._no_activity_text()
-        if not state_line:
-            return ""
         return self._render_replyer_status_block(state_line, future_activities)
 
     def _replyer_energy_desc(self) -> str:
@@ -1135,11 +1215,17 @@ class InjectService:
 
     @staticmethod
     def _life_block_lines(view: Optional[Dict[str, Any]],
-                          override: Optional[Dict[str, Any]]) -> List[str]:
+                          override: Optional[Dict[str, Any]],
+                          slim: bool = False) -> List[str]:
         """runtime 实况追加行（主设计 §3.3 注入清单；零 emoji）。
 
         current（名称/已进行/进度/注意力/剩余）+ next ≤2 + 状态行 + recent ≤2
         （completed_today 尾部实际发生）。视图为空 → 空列表（不追加任何行）。
+
+        2026-11-04 实况瘦身：``slim=True`` 仅输出「当前活动实况」一行（不含
+        接下来/状态/刚完成）——供非目标私聊会话的非询问意图使用，移除未来计划
+        与刚完成语料（排查 E4/E5/E6 泄漏主源），保留当前活动维持角色连续性。
+        缺省 False = 全量逐字（既有调用点与测试桩零变化）。
         """
         if not isinstance(view, dict):
             return []
@@ -1175,6 +1261,10 @@ class InjectService:
             head = str(current.get("name") or "").strip() or "当前活动"
             if segs:
                 lines.append(f"当前活动实况：{head}，" + "，".join(segs))
+        if slim:
+            # 瘦身口径：仅当前活动实况一行；接下来/状态/刚完成不输出
+            # （无当前活动时 lines 为空 → 不追加任何行，空活动兜底走现在行）
+            return lines
         nxt_parts: List[str] = []
         for item in (view.get("next") or [])[:2]:
             if not isinstance(item, dict):

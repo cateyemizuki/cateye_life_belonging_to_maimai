@@ -13,7 +13,9 @@
 **上限 = ``patrol.daily_max_speak``（每日预算即上限；2026-10-10 配置整理轮移除独立的
 ``proactive_target_daily_cap`` / 旧键 ``global_proactive_cap``，不再叠加 +2 余量）**。
 计数口径 = **按发送流身份计数**：发往目标陪伴私聊的主动打扰都计入（发布方不限——
-陪伴侧巡检/想念、日程侧非问候主动行为、emotion 赖床提醒都发 ``proactive.used``）；
+陪伴侧巡检/想念、日程侧非问候主动行为、emotion 赖床提醒都发 ``proactive.used``；
+2026-11-04 F1 起告状工具回退到陪伴目标私聊的发送同样经 ``allow_proactive`` 闸门
+并以渠道 ``harass_report`` 发 ``proactive.used`` 入账）；
 早/晚安免预算（planning 侧闸门与计数一起跳），活动切换开口在目标流已解析时不占。
 
 计数范围（M11，附录 II §3.2/§3.3；2026-10-10 口径复核）：**只统计「发往目标陪伴私聊」的主动打扰**——各扣费点
@@ -243,13 +245,16 @@ class ProactiveBudget:
         return max(0, daily_int)
 
     def used_today(self) -> int:
-        self._roll_date()
-        return self._used
+        # F8（2026-11-04）：查询/记账与预留/提交统一持锁（RLock 可重入，嵌套调用安全）。
+        with self._lock:
+            self._roll_date()
+            return self._used
 
     def channel_counts(self) -> Dict[str, int]:
         """当日各渠道计数快照（诊断用）。"""
-        self._roll_date()
-        return dict(self._channels)
+        with self._lock:
+            self._roll_date()
+            return dict(self._channels)
 
     def allow_proactive(self, channel: str = "", intent: str = "",
                         stream_id: str = "") -> bool:
@@ -257,14 +262,22 @@ class ProactiveBudget:
 
         ``stream_id`` 非目标陪伴私聊 → 直接放行（不查计数、不留痕；§3.3）。
         """
-        if not self._is_target_stream(stream_id):
-            return True
-        self._roll_date()
-        limit = self.cap()
-        if self._used + len(self._reservations) < limit:
-            return True
-        self._log_blocked(channel, intent, limit)
-        return False
+        with self._lock:
+            if not self._is_target_stream(stream_id):
+                return True
+            self._roll_date()
+            limit = self.cap()
+            if self._used + len(self._reservations) < limit:
+                return True
+            self._log_blocked(channel, intent, limit)
+            return False
+
+    def _count_one(self, channel: str) -> None:
+        """入账一次并落盘（调用方须持锁；**不重查流身份**——身份判定在入口完成）。"""
+        self._used += 1
+        key = str(channel or "unknown")
+        self._channels[key] = self._channels.get(key, 0) + 1
+        self._save()
 
     def record_used(self, channel: str = "", intent: str = "",
                     stream_id: str = "") -> None:
@@ -272,13 +285,11 @@ class ProactiveBudget:
 
         ``stream_id`` 非目标陪伴私聊 → **不入账**（§3.3：只有发往目标私聊的主动打扰计数）。
         """
-        if not self._is_target_stream(stream_id):
-            return
-        self._roll_date()
-        self._used += 1
-        key = str(channel or "unknown")
-        self._channels[key] = self._channels.get(key, 0) + 1
-        self._save()
+        with self._lock:
+            if not self._is_target_stream(stream_id):
+                return
+            self._roll_date()
+            self._count_one(channel)
 
     async def on_proactive_used(self, payload: Dict[str, Any]) -> None:
         """``proactive.used`` 订阅者（M0 唯一实际订阅者）：按 payload 的 stream 身份入账。"""
@@ -313,13 +324,18 @@ class ProactiveBudget:
             return token
 
     def commit_reservation(self, token: str) -> bool:
-        """Convert a reserved slot to one successful send, at most once."""
+        """Convert a reserved slot to one successful send, at most once.
+
+        F8（2026-11-04）：按**预留内记录的 stream** 直接入账，不再重查当前目标流——
+        reserve 时已校验目标身份；若 reserve→commit 之间热重载重建了目标流
+        （同一用户新 stream_id），旧式重查会把已发送的分享弹出预留却不计数（边缘性少计）。
+        """
         with self._lock:
             self._roll_date()
             entry = self._reservations.pop(str(token), None)
             if entry is None:
                 return False
-            self.record_used(entry["channel"], "share", entry["stream_id"])
+            self._count_one(str(entry.get("channel") or ""))
             return True
 
     def release_reservation(self, token: str) -> bool:

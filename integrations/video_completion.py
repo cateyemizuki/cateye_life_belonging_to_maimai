@@ -62,6 +62,10 @@ class CompletionOutbox:
                 row["state"] = "dispatching";self._save()
                 try:
                     response = await asyncio.wait_for(notify(row["task_id"], row["stream_id"], receipt), 20)
+                    if isinstance(response, dict) and response.get("deferred") is True:
+                        # 睡眠门控暂缓投递（2026-11-04 修复4）：保留 pending、不落 finished_at，
+                        # 下一次 flush（醒沿/completion tick）重检再投；不丢通知、不重复投递。
+                        row["state"] = "pending";self._save();continue
                     row["state"] = ("enqueued" if isinstance(response, dict) and response.get("success") is True
                                     else "rejected" if isinstance(response, dict) and response.get("success") is False else "unknown")
                 except asyncio.CancelledError:

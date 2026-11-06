@@ -165,12 +165,13 @@ class InjectOptimizer:
     ) -> Tuple[bool, Optional[str]]:
         """判断是否应该注入日程信息
 
-        决策逻辑：
+        决策逻辑（2026-11-04 评估问题8：docstring 与正文同步——原规则2
+        「无当前活动且非询问意图→不注入」已于 2026-11-03 移除，见下方注释）：
         1. 技术问答/命令执行 → 不注入
-        2. 无当前活动且非询问意图 → 不注入
-        3. 短时间内重复注入 → 不注入
-        4. 闲聊意图 → 概率性注入
-        5. 其他 → 注入
+        2. 短时间内重复注入（同活动同意图，query_future 豁免）→ 不注入
+        3. 闲聊意图 → 概率性注入
+        4. 低置信度（<0.4）→ 不注入
+        5. 其他（含空活动的询问/闲聊）→ 注入
 
         Args:
             user_id: 用户ID
@@ -197,14 +198,9 @@ class InjectOptimizer:
             logger.debug(f"注入决策: user={user_id}, 拒绝, 原因={reason}")
             return False, reason
 
-        # 规则2：无当前活动且非询问意图 → 不注入
-        if not current_activity and intent not in [
-            UserIntent.QUERY_CURRENT,
-            UserIntent.QUERY_FUTURE
-        ]:
-            reason = "无当前活动且非询问意图"
-            logger.debug(f"注入决策: user={user_id}, 拒绝, 原因={reason}")
-            return False, reason
+        # 规则2（2026-11-03 用户直派移除）：原"无当前活动且非询问意图→不注入"会
+        # 把空活动兜底（"你现在没有进行中的活动…"）挡在闲聊之外，bot 收不到"现在没
+        # 活动"的显式告知而易编造。现放行，让兜底送达；重复仍由规则3冷却节流。
 
         # 规则3：检查注入历史，防止短时间重复
         if user_id in self.inject_history:

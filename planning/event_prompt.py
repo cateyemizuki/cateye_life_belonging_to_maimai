@@ -84,6 +84,7 @@ def _names_text(names: Iterable[Any], limit: int) -> Tuple[str, bool]:
 def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any] = (),
                        existing_event_names: Sequence[Any] = (),
                        count: int = DEFAULT_MAX_GENERATED_EVENTS,
+                       pool_kind: str = 'reusable', min_count: int = DEFAULT_MIN_GENERATED_EVENTS,
                        max_chars: int = PROMPT_MAX_CHARS) -> PromptBuildResult:
     """构造生成 prompt（≤ ``max_chars`` 字符，含 system）。
 
@@ -94,7 +95,10 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
         count_int = int(count)
     except (TypeError, ValueError):
         count_int = DEFAULT_MAX_GENERATED_EVENTS
-    count_int = max(DEFAULT_MIN_GENERATED_EVENTS,
+    minimum = max(1, min(int(min_count), DEFAULT_MAX_GENERATED_EVENTS))
+    if pool_kind not in ('reusable', 'one_shot'):
+        raise ValueError('unknown generated pool kind')
+    count_int = max(minimum,
                     min(DEFAULT_MAX_GENERATED_EVENTS, count_int))
     max_chars = max(600, int(max_chars or PROMPT_MAX_CHARS))
     truncated = False
@@ -107,8 +111,11 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
     truncated = truncated or cut
 
     def compose(p: str, r: str, e: str) -> str:
-        lines = [f"为角色生成 {DEFAULT_MIN_GENERATED_EVENTS}-{count_int} 条日常小事件，"
+        lines = [f"为角色生成 {minimum}-{count_int} 条日常小事件，"
                  "用作空闲或转场时的 filler。"]
+        lines.append('本次生成：周期内可复用小事件，可在间隔后再次发生。' if pool_kind == 'reusable' else
+                     '本次生成：一次性小事件，在本次生成周期内抽中即移除。每条有具体可完成的小目标；'
+                     '不要生成反复休息、发呆或转场，goal_type不要使用rest/idle/transition。')
         if p:
             lines.append(f"人设：{p}")
         if r:

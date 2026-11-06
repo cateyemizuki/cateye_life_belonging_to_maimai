@@ -16,8 +16,10 @@ items 注入遵循**宿主的真实校验**（MaiBot ``ContextItemMeta`` 与
 
 另含 mai-love v2.6.2 合并的「过期宿主主动任务块剥离」（without_stale_proactive_blocks）：
 宿主 enqueue_proactive_task 把 <plugin_proactive_task> 块持久化进聊天历史且从不清理，
-planner/replyer 请求 Hook 按块内 id 尾段 epoch 判龄，把入队超过 30 分钟的块从
-请求载荷剥离（只改本次请求，不回写宿主历史）。
+planner/replyer 请求 Hook 按块内 id 尾段 epoch 判龄，把入队超过 30 分钟**且 id 的
+plugin_id 段与本插件一致**的块从请求载荷剥离（只改本次请求，不回写宿主历史）。
+F2 修复（2026-11-04）：此前 plugin_id 参数未参与比对，会误剥其他插件的过期块；
+现在仅剥离本插件块，其他插件的块原样保留。
 
 PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：M9 赖床提醒块剥离
 （is_consumed_ephemeral_proactive_block / NAP_BLOCK_KIND / NAP_BLOCK_LINGER_SECONDS）
@@ -85,13 +87,17 @@ def _proactive_block_parts(text: str) -> Optional[Tuple[str, int]]:
         return None
 
 
-def is_stale_proactive_block(item: Any, now_ms: float) -> bool:
+def is_stale_proactive_block(item: Any, now_ms: float,
+                             plugin_id: Optional[str] = None) -> bool:
     """该条目是否为"入队超过 30 分钟"的宿主主动任务块。
 
     判据（全部满足才算）：UserMessageItem、首段文本以 ``<plugin_proactive_task``
     开头、能从 ``id="proactive:...:数字"`` 里解析出 epoch 毫秒、且
     ``now_ms - epoch > PROACTIVE_BLOCK_STALE_MS``。任何一步拿不准都返回
     False（宁多勿丢——误删本轮任务块会让 planner 失去触发上下文）。
+
+    ``plugin_id`` 非空时追加归属判据：块 id 解析出的 plugin_id 段必须与之相等，
+    只判本插件的块（F2，2026-11-04）；None/空 = 不限归属（旧口径，兼容直接调用方）。
     """
     if not isinstance(item, dict):
         return False
@@ -103,6 +109,8 @@ def is_stale_proactive_block(item: Any, now_ms: float) -> bool:
     parts = _proactive_block_parts(text)
     if parts is None:
         return False
+    if plugin_id and parts[0] != plugin_id:
+        return False
     return now_ms - parts[1] > PROACTIVE_BLOCK_STALE_MS
 
 
@@ -112,12 +120,14 @@ def without_stale_proactive_blocks(kwargs: Dict[str, Any],
 
     只改**本次请求载荷**（与 filter-assistant 同思路，不回写宿主历史）：
     :func:`is_stale_proactive_block` 判定入队超过 :data:`PROACTIVE_BLOCK_STALE_MS`
-    （30 分钟）的块一律剥离（既有规则）。
+    （30 分钟）**且块 id 的 plugin_id 段与 ``plugin_id`` 一致**的块剥离。
+    （F2 修复，2026-11-04：此前 plugin_id 为死参数、任何插件的过期块都会被剥离；
+    现在只剥离本插件块，与 :data:`CATEYE_PLUGIN_ID` 处注释声明的比对一致。）
     （PR8 3.0.0：原 M9 赖床提醒块剥离判定 is_consumed_ephemeral_proactive_block
     已随赖床提醒链删除；30 分钟过期规则原样保留。）
 
-    本轮正要用的新块（年龄几分钟内）与解析失败的条目一律保留。只处理 items 投影
-    （1.2.x 快照；旧 messages 投影的宿主已不再使用，原样保留）。
+    本轮正要用的新块（年龄几分钟内）、解析失败的条目与其他插件的块一律保留。
+    只处理 items 投影（1.2.x 快照；旧 messages 投影的宿主已不再使用，原样保留）。
 
     Returns:
         替换过 items 的新 kwargs；没有可剥离内容时 None（调用方保持原载荷）。
@@ -129,14 +139,14 @@ def without_stale_proactive_blocks(kwargs: Dict[str, Any],
     kept: List[Any] = []
     removed = 0
     for item in items:
-        if is_stale_proactive_block(item, now_ms):
+        if is_stale_proactive_block(item, now_ms, plugin_id=plugin_id):
             removed += 1
             continue
         kept.append(item)
     if removed == 0:
         return None
-    logger.debug("已从请求载荷剥离 %d 个过期的宿主主动任务块（保留 %d 条）",
-                 removed, len(kept))
+    logger.debug("已从请求载荷剥离 %d 个插件 %s 的过期主动任务块（保留 %d 条）",
+                 removed, plugin_id, len(kept))
     return {**kwargs, "items": kept}
 
 

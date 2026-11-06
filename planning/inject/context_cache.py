@@ -11,8 +11,19 @@ import time
 
 from dataclasses import dataclass
 
+from .intent_classifier import UserIntent
+
 
 logger = logging.getLogger(__name__)
+
+
+#: 「用户在询问日程」的意图证据集合（2026-11-04 反馈环修复）：只有用户消息的
+#: 意图分类结果（query_current/query_future）才算话题证据。注入历史
+#: （ConversationTurn.injected）是 bot 自身行为记录，不得反推「用户在追问」。
+_SCHEDULE_QUERY_INTENT_VALUES = frozenset({
+    UserIntent.QUERY_CURRENT.value,
+    UserIntent.QUERY_FUTURE.value,
+})
 
 
 @dataclass
@@ -135,39 +146,53 @@ class ConversationContextCache:
     def is_schedule_topic_ongoing(self, user_id: str) -> bool:
         """判断用户是否在连续讨论日程话题
 
-        规则：
-        1. 最近2轮中至少有1轮注入了日程
-        2. 最近1轮的消息在60秒内
+        规则（2026-11-04 反馈环修复）：
+        1. 最近2轮中至少有1轮的用户意图被分类为询问日程
+           （query_current / query_future）——只有用户消息意图算话题证据；
+        2. 最近1轮的消息在60秒内（对话仍活跃）。
+
+        旧版以「最近2轮是否注入过日程」为判据、却把 reason 标成「用户在追问
+        日程相关内容」：bot 上一轮自己被注入/提了日程，下一轮就被误判成用户在
+        追问，绕过闲聊概率直接强制再注入，形成「注入→误判追问→再注入」的自我
+        强化环（生产转储 E1/E6 两次实测命中该假 reason）。注入历史是 bot 自身
+        行为记录，不得作为用户意图证据；现改为要求近期轮次确有询问意图。
 
         Args:
             user_id: 用户ID
 
         Returns:
-            True表示正在连续讨论日程，False表示不是
+            True表示用户近期询问过日程且对话仍活跃，False表示不是
 
         Examples:
-            >>> cache.add_turn("user1", "你在干嘛？", injected=True)
-            >>> cache.add_turn("user1", "学什么呢？")
+            >>> cache.add_turn("user1", "你在干嘛？", intent="query_current", injected=True)
+            >>> cache.add_turn("user1", "学什么呢？", intent="query_current")
             >>> cache.is_schedule_topic_ongoing("user1")
-            True  # 上一轮注入了，这轮可能是追问
+            True  # 近期轮次确有询问意图
+            >>> cache.add_turn("user1", "哈哈", intent="casual_chat")
+            >>> cache.add_turn("user1", "不错", intent="casual_chat", injected=True)
+            >>> cache.is_schedule_topic_ongoing("user1")
+            False  # 注入历史不算追问证据
         """
         recent_turns = self.get_recent_turns(user_id, count=2)
 
         if not recent_turns:
             return False
 
-        # 检查最近1轮是否在60秒内
+        # 检查最近1轮是否在60秒内（对话仍活跃）
         current_time = time.time()
         if current_time - recent_turns[-1].timestamp > 60:
             return False
 
-        # 检查最近2轮是否有注入
-        injected_count = sum(1 for turn in recent_turns if turn.injected)
+        # 话题证据 = 近期轮次的用户意图为询问日程；injected 标志不参与判定
+        query_count = sum(
+            1 for turn in recent_turns
+            if turn.intent in _SCHEDULE_QUERY_INTENT_VALUES
+        )
 
-        if injected_count > 0:
+        if query_count > 0:
             logger.debug(
                 f"检测到连续日程话题: user={user_id}, "
-                f"最近{len(recent_turns)}轮中{injected_count}轮注入"
+                f"最近{len(recent_turns)}轮中{query_count}轮为询问意图"
             )
             return True
 
@@ -197,7 +222,7 @@ class ConversationContextCache:
         """判断是否应该在连续对话中继续注入
 
         决策逻辑：
-        1. 如果在连续讨论日程话题 → 继续注入
+        1. 如果用户近期询问过日程（意图证据，非注入历史）且对话活跃 → 继续注入
         2. 如果活动发生了变化 → 注入新活动
         3. 其他情况 → 交给常规决策
 
@@ -208,9 +233,10 @@ class ConversationContextCache:
         Returns:
             (是否继续注入, 原因说明)
         """
-        # 规则1：连续讨论日程话题
+        # 规则1：连续讨论日程话题（2026-11-04 起以用户询问意图为证据，
+        # reason 文案与判据一致——不再把「上轮注入过」谎称为「用户在追问」）
         if self.is_schedule_topic_ongoing(user_id):
-            return True, "连续对话：用户在追问日程相关内容"
+            return True, "连续对话：用户近期询问过日程相关内容"
 
         # 规则2：活动发生变化
         last_activity = self.get_last_activity(user_id)

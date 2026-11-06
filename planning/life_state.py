@@ -31,12 +31,19 @@
 
 纯离线零 LLM：本模块不调用任何 LLM 任务（红线 1）；不发布事件、不触碰主动消息链
 （纪律 5：不新增任何主动开口入口）——事件发布（``life.*``）由接线阶段在 tick 消费侧做。
+
+目标趋近结算为唯一模型，纯函数见 planning.settlement_v2。恢复型轴按闭式趋近
+积分，消耗型轴按画像速率积分，不叠加旧线性漂移或情绪速率调制，不使用逐拍限幅。
+睡眠五轴持续积分，醒来仅结算债务与会话字段，不按时长三档覆盖。诊断记录基础、活动、
+睡眠和显式事件贡献；episode回执与状态同文件原子保存，防止重复应用。
+
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -53,6 +60,18 @@ logger = logging.getLogger(__name__)
 STATE_VERSION = 1
 #: 状态文件名（B.4.1：state_file 相对 plugin._data_dir）
 STATE_FILE_NAME = "life_state.json"
+#: ``settlement_diag`` 装载侧保留条数上限（与 planning.settlement_v2 内置
+#: ``diag_max_entries`` 默认一致；环形最新优先，防历史膨胀）
+SETTLEMENT_DIAG_MAX = 8
+
+
+def _diag_cap_of(params: Any) -> int:
+    """生效参数里的 ``diag_max_entries``（坏值回退 8；0 = 关闭诊断；负值非法回退 8）。"""
+    try:
+        cap = int((params or {}).get("diag_max_entries", 8))
+    except (TypeError, ValueError, AttributeError):
+        return SETTLEMENT_DIAG_MAX
+    return cap if cap >= 0 else SETTLEMENT_DIAG_MAX
 
 
 def resolve_state_file_path(data_dir: Any, configured: Any = "") -> Path:
@@ -84,41 +103,8 @@ DEFAULT_STATE: Dict[str, float] = {
 #: 睡眠债上限（小时；B.2「sleep_debt 0–12h」）
 SLEEP_DEBT_MAX = 12.0
 #: 清醒被动漂移速率（每分钟；B.6.1）
-DRIFT_ENERGY_PER_MIN = -0.00005
-DRIFT_HUNGER_PER_MIN = 0.00035
-DRIFT_FOCUS_PER_MIN = -0.00015
-DRIFT_STRESS_PER_MIN = -0.00005
 #: 单次 tick 最大推进量 = 24h（B.6.1「dt 钳 0~24*60」；常量取 time_utils 唯一真源）
 DT_MAX_MINUTES = float(DAY_MINUTES)
-#: 睡眠三档（B.2 默认值表「睡醒 7–8h」「睡醒 <5h」两行 + §6.3「sleep_debt +1.5h」；
-#: 5~7h 档 B.2 无现成行，取两档之间偏保守的固定中值——裁量登记于模块落码 notes）
-SLEEP_TIERS: Dict[str, Dict[str, float]] = {
-    # <5h：低恢复 + 睡眠债 +1.5h
-    "short": {"energy": 0.42, "hunger": 0.40, "focus": 0.50,
-              "stress": 0.35, "social_battery": 0.50, "debt_add": 1.5, "debt_reset": 0.0},
-    # 5~7h：两档之间的保守中值 + 睡眠债小幅 +0.5h
-    "mid": {"energy": 0.62, "hunger": 0.37, "focus": 0.64,
-            "stress": 0.28, "social_battery": 0.55, "debt_add": 0.5, "debt_reset": 0.0},
-    # >=7h：充分恢复 + 睡眠债清零（B.2「睡醒 7–8h」行 sleep_debt=0.0）
-    "full": {"energy": 0.80, "hunger": 0.35, "focus": 0.75,
-             "stress": 0.20, "social_battery": 0.60, "debt_add": 0.0, "debt_reset": 1.0},
-}
-#: 睡眠质量修调幅度（quality∈[0,1]，0.5 = 无修调；保守小系数，避免盖过档位语义）
-QUALITY_ENERGY_SPAN = 0.10   # energy ±0.05
-QUALITY_FOCUS_SPAN = 0.10    # focus ±0.05
-
-# ── 稳定性护栏（PR2.5 修复（2026-10-26），定稿 §4.1.3「必须实现」/交接 §五.18 D2；
-#    仅调制路径（modulation 非 None）生效，开关关/modulation=None 零影响）────────
-#: homeostatic override：精力 < 此值 → energy 的 rise gain 抬到 ≥1.0、fall gain 压到 ≤0.5
-HOMEOSTATIC_ENERGY_FLOOR = 0.2
-#: homeostatic override：精力见底时 energy fall gain 的上限（下降减半，防情绪加速耗竭）
-HOMEOSTATIC_ENERGY_FALL_MAX = 0.5
-#: homeostatic override：饥饿 > 此值 → hunger 的 fall gain 抬到 ≥1.0（不因情绪抑制食欲）
-HOMEOSTATIC_HUNGER_CEIL = 0.85
-#: 每 tick 单状态变化量上限（定稿 §4.1.3「每 tick 状态 delta 上限（如 0.03）」）
-TICK_DELTA_CAP = 0.03
-
-
 class LifeStateService:
     """生活状态服务：tick 推进 + 事件应用 + 睡眠处理 + 持久化 + 描述生成（0 LLM）。
 
@@ -133,7 +119,8 @@ class LifeStateService:
 
     def __init__(self, state_path: Any, *, timezone_str: str = "Asia/Shanghai",
                  timezone_manager: Optional[TimezoneManager] = None,
-                 decision_logger: Any = None) -> None:
+                 decision_logger: Any = None,
+                 settlement_params: Optional[Dict[str, Any]] = None) -> None:
         path = Path(state_path)
         if path.is_dir():
             path = path / STATE_FILE_NAME
@@ -171,9 +158,17 @@ class LifeStateService:
         #: 维持既有备份与重建语义）。分类与结算由编排方经
         #: ``planning.offline_sleep.plan_offline_settlement`` 用原始值做。
         self._pending_offline_gap_seconds: Optional[float] = None
+        self._episode_receipts: dict[str, str] = {}
         # A graceful stop is an observed-alive checkpoint, not a state integration tick.
         self._last_observed_at: Optional[datetime] = None
         self._pending_awake_before_offline_seconds: float = 0.0
+        #: v2 参数覆盖（None/空 = 内置 V2_PARAMS；合并见 :meth:`_settlement_params_v2`，
+        #: 编排方热重载时整体替换）
+        self._settlement_params: Optional[Dict[str, Any]] = (
+            dict(settlement_params) if isinstance(settlement_params, dict) else None)
+        #: 最近结算来源分解诊断（硬要求 6；仅 v2 路径写入，落盘键
+        #: settlement_diag 为最近的结算来源诊断。
+        self._settlement_diag: list = []
         self._history = LifeStateHistory(path.with_name(f"{path.stem}_history.json"),
                                          decision_logger=decision_logger)
         self._load()
@@ -322,6 +317,14 @@ class LifeStateService:
         self._last_wake_reason = str(reason) if isinstance(reason, str) and reason else None
         self._sleep_wake_target = self._parse_ts(raw.get("sleep_wake_target"))
         self._sleep_lie_in_cap = self._parse_ts(raw.get("sleep_lie_in_cap"))
+        # v2 结算诊断（可选键；旧文件缺键 → 空；坏条目单独丢弃，不整体作废）
+        receipts = raw.get('episode_receipts')
+        if isinstance(receipts, dict):
+            self._episode_receipts = {str(k): str(v) for k,v in list(receipts.items())[-4096:]}
+        diag = raw.get("settlement_diag")
+        if isinstance(diag, list):
+            self._settlement_diag = [dict(entry) for entry in diag
+                                     if isinstance(entry, dict)][-SETTLEMENT_DIAG_MAX:]
 
     # ── 推进与钳制 ─────────────────────────────────────────────────────────
     def _dt_minutes(self, now: datetime) -> float:
@@ -354,88 +357,8 @@ class LifeStateService:
             return None  # 时钟回拨（last_tick_at 在未来）→ 不补全
         return seconds
 
-    def _apply_drift(self, dt_min: float, rates: Optional[Dict[str, float]],
-                     modulation: Optional[Dict[str, Dict[str, float]]] = None) -> None:
-        """被动漂移 +（可选）活动画像速率积分（每分钟；B.6.1）。
 
-        PR2（2026-10-26），计划书 §三十四/定稿 §4.1.1：``modulation`` 非 None 时，
-        每个状态的**基础 delta**（被动漂移 + 画像速率）按符号乘 rise/fall gain
-        （delta > 0 取 rise、< 0 取 fall；不乘当前状态值；缺项/坏值按 1.0 = 不调制）；
-        ``None`` = 不调制，保持与 2.1.0/PR1 逐字一致（加法次序不变）。
-        """
-        if modulation is None:
-            self._state["energy"] += DRIFT_ENERGY_PER_MIN * dt_min
-            self._state["hunger"] += DRIFT_HUNGER_PER_MIN * dt_min
-            self._state["focus"] += DRIFT_FOCUS_PER_MIN * dt_min
-            self._state["stress"] += DRIFT_STRESS_PER_MIN * dt_min
-            if rates:
-                for key in STATE_FIELDS:
-                    rate = rates.get(f"{key}_rate")
-                    if isinstance(rate, (int, float)) and not isinstance(rate, bool):
-                        self._state[key] += float(rate) * dt_min
-            return
-        # 调制路径：先合成每状态基础 delta，再按符号乘 gain（状态 clamp 仍由
-        # _clamp_all 统一做；gain = {state: {"rise": float, "fall": float}}，见
-        # planning/life_modulation.LifeModulationService.compute）
-        for key in STATE_FIELDS:
-            spec = modulation.get(key) if isinstance(modulation.get(key), dict) else None
-            gain_pair = spec or {}
-            delta = 0.0
-            if key == "energy":
-                delta += DRIFT_ENERGY_PER_MIN * dt_min
-            elif key == "hunger":
-                delta += DRIFT_HUNGER_PER_MIN * dt_min
-            elif key == "focus":
-                delta += DRIFT_FOCUS_PER_MIN * dt_min
-            elif key == "stress":
-                delta += DRIFT_STRESS_PER_MIN * dt_min
-            if rates:
-                rate = rates.get(f"{key}_rate")
-                if isinstance(rate, (int, float)) and not isinstance(rate, bool):
-                    delta += float(rate) * dt_min
-            if delta > 0:
-                gain = self._modulation_gain(gain_pair.get("rise"))
-                # PR2.5 修复（2026-10-26），定稿 §4.1.3 homeostatic override：精力见底时
-                # 上升方向不吃情绪抑制（rise gain 抬到 ≥1.0），保证能恢复
-                if key == "energy" and self._state["energy"] < HOMEOSTATIC_ENERGY_FLOOR:
-                    gain = max(gain, 1.0)
-                delta *= gain
-            elif delta < 0:
-                gain = self._modulation_gain(gain_pair.get("fall"))
-                if key == "energy" and self._state["energy"] < HOMEOSTATIC_ENERGY_FLOOR:
-                    # PR2.5 修复（2026-10-26），定稿 §4.1.3：精力见底时下降压到 ≤0.5
-                    # （耗竭减半，防情绪低落加速掏空）
-                    gain = min(gain, HOMEOSTATIC_ENERGY_FALL_MAX)
-                elif key == "hunger" and self._state["hunger"] > HOMEOSTATIC_HUNGER_CEIL:
-                    # PR2.5 修复（2026-10-26），定稿 §4.1.3：极饿时食欲恢复不被情绪抑制
-                    # （hunger 下降方向 gain 不低于 1.0）
-                    gain = max(gain, 1.0)
-                delta *= gain
-            self._state[key] += delta
 
-    def _cap_tick_delta(self, before: Dict[str, float]) -> None:
-        """每 tick 单状态变化量上限（PR2.5 修复（2026-10-26），定稿 §4.1.3 /交接
-        §五.18 D2 ②；仅调制路径调用——``modulation=None`` 时不裁，逐字旧行为）。
-
-        对五项状态把本拍积分后的值夹回 ``before ± TICK_DELTA_CAP``（clamp 仍由
-        :meth:`_clamp_all` 统一做在后）。
-        """
-        for key in STATE_FIELDS:
-            delta = self._state[key] - before[key]
-            if delta > TICK_DELTA_CAP:
-                self._state[key] = before[key] + TICK_DELTA_CAP
-            elif delta < -TICK_DELTA_CAP:
-                self._state[key] = before[key] - TICK_DELTA_CAP
-
-    @staticmethod
-    def _modulation_gain(value: Any) -> float:
-        """调制 gain 宽松解析（bool/NaN/缺省一律 1.0 = 该项不调制；PR2 定稿 §4.1.1）。"""
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return 1.0
-        number = float(value)
-        if number != number:  # NaN 防御
-            return 1.0
-        return number
 
     def _clamp_all(self) -> None:
         """全部 0~1 clamp；睡眠债 clamp [0, 12]（B.6.1「所有值 clamp」原文）。"""
@@ -471,65 +394,253 @@ class LifeStateService:
             logger.debug("活动画像速率解析失败（按纯被动漂移处理）：%s", exc)
             return None
 
-    # ── 对外接口（B.5.1）───────────────────────────────────────────────────
-    def _apply_sleep_rates(self, dt_min: float, sleep_rates: Dict[str, float]) -> None:
-        """睡眠期积分（PR3，2026-10-26，定稿 §3.1 步 3）：只用引擎给的 ``sleep_rates``。
+    # ── 唯一目标趋近结算模型 ───────────────────────────────────────
 
-        睡眠期**不再叠加清醒被动漂移**、不乘 VAD 调制 gain、不裁单拍 delta
-        （曲线本身已有界：精力/专注 |rate| ≤ 0.02/min）；未知/坏速率按 0。
+    @property
+    def settlement_params(self) -> Optional[Dict[str, Any]]:
+        """v2 参数覆盖（**已合并**的生效参数 dict 或 None = 内置默认；编排方热重载时整体替换）。"""
+        return self._settlement_params
+
+    @settlement_params.setter
+    def settlement_params(self, value: Any) -> None:
+        self._settlement_params = dict(value) if isinstance(value, dict) else None
+
+
+    def _settlement_params_v2(self) -> Dict[str, Any]:
+        """生效 v2 参数（内置默认 ← 用户覆盖合并；每次结算时合并，热更即生效）。"""
+        from . import settlement_v2
+        overrides = self._settlement_params
+        if not isinstance(overrides, dict) or not overrides:
+            return settlement_v2.V2_PARAMS
+        try:
+            return settlement_v2.merge_params(overrides, logger)
+        except Exception:
+            logger.debug("v2 参数合并失败（回退内置默认）", exc_info=True)
+            return settlement_v2.default_params()
+
+    @staticmethod
+    def _v2_profile_key(active_profile: Any) -> Optional[str]:
+        """当前活动的画像键（v2 target/tau 查表键）：str 原样；对象取 ``.key``；
+        dict 取 ``key/profile/goal_type``；解析不出 → None（该拍无画像 target）。"""
+        if isinstance(active_profile, str):
+            key = active_profile.strip().lower()
+            return key or None
+        if isinstance(active_profile, dict):
+            for candidate in ("key", "profile", "goal_type"):
+                value = active_profile.get(candidate)
+                if isinstance(value, str) and value.strip():
+                    return value.strip().lower()
+            return None
+        key = getattr(active_profile, "key", None)
+        if isinstance(key, str) and key.strip():
+            return key.strip().lower()
+        return None
+
+    def _clamp_all_with_loss(self) -> Dict[str, float]:
+        """``_clamp_all`` + 逐轴丢失量（v2 诊断专用；clamp 行为与其完全一致）。"""
+        before = {key: float(self._state[key]) for key in STATE_FIELDS}
+        self._clamp_all()
+        return {key: round(before[key] - float(self._state[key]), 8)
+                for key in STATE_FIELDS
+                if abs(before[key] - float(self._state[key])) > 1e-12}
+
+    def _settlement_entry(self, kind: str, dt_min: float, profile: Optional[str],
+                          now: Optional[datetime], result: Optional[Dict[str, Any]],
+                          loss: Dict[str, float],
+                          applied: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        """单条结算诊断（硬要求 6：来源分解 + target/tau + dt + clamp 丢失量）。"""
+        from . import settlement_v2
+        contrib = settlement_v2.empty_contrib()
+        target: Dict[str, Any] = {}
+        tau: Dict[str, Any] = {}
+        if isinstance(result, dict):
+            source = result.get("source") if isinstance(result.get("source"), dict) else {}
+            for axis, value in (result.get("delta") or {}).items():
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if abs(number) < 1e-12:
+                    continue
+                contrib[str(source.get(axis, "activity"))][str(axis)] = round(number, 6)
+            for axis, value in (result.get("target") or {}).items():
+                if value is not None:
+                    try:
+                        target[str(axis)] = round(float(value), 6)
+                    except (TypeError, ValueError):
+                        pass
+            for axis, value in (result.get("tau_min") or {}).items():
+                if value is not None:
+                    try:
+                        tau[str(axis)] = round(float(value), 4)
+                    except (TypeError, ValueError):
+                        pass
+        if applied:
+            # 来源分解口径（方案 §4）：整段睡眠增量（含离线结算 offline_sleep）归
+            # sleep 桶；其余显式加法（随机事件等）归 event 桶——评审 2026-11-03 修复
+            bucket = "sleep" if str(kind) in ("sleep", "offline_sleep") else "event"
+            contrib[bucket] = {str(k): round(float(v), 6) for k, v in applied.items()}
+        return {
+            "version": settlement_v2.V2_PARAMS_VERSION,
+            "kind": str(kind),
+            "at": self._fmt_ts(now) if now is not None else None,
+            "dt_min": round(float(dt_min), 4),
+            "profile": profile,
+            "sleep_debt": round(float(self._sleep_debt), 4),
+            "target": target,
+            "tau_min": tau,
+            "contrib": contrib,
+            "clamp_loss": loss,
+        }
+
+    def _append_settlement_diag(self, entry: Dict[str, Any],
+                                cap: Optional[int] = None) -> None:
+        """诊断环形缓冲（最新优先；上限 = 生效 v2 参数 ``diag_max_entries``——
+        用户经 ``settlement_params_json`` 的覆盖在此生效，评审 2026-11-03 修复：
+        不再固定读模块默认）。"""
+        if cap is None:
+            try:
+                cap = int(self._settlement_params_v2().get("diag_max_entries", 8))
+            except Exception:
+                cap = 8
+        try:
+            cap = int(cap)
+        except (TypeError, ValueError):
+            cap = 8
+        if cap <= 0:
+            return
+        self._settlement_diag.append(entry)
+        if len(self._settlement_diag) > cap:
+            del self._settlement_diag[:-cap]
+
+    def _apply_awake_v2(self, dt_min: float, active_profile: Any,
+                        now: Optional[datetime]) -> None:
+        """v2 清醒段：目标趋近/画像速率积分 + clamp + 来源分解诊断。
+
+        不叠加情绪速率调制或另一条清醒积分路径。
         """
+        from . import settlement_v2
+        profile_key = self._v2_profile_key(active_profile)
+        rates = self._profile_rates(active_profile)
+        params = self._settlement_params_v2()
+        result = settlement_v2.integrate_awake(self._state, dt_min, profile_key,
+                                               rates, params, self._sleep_debt)
         for key in STATE_FIELDS:
-            rate = sleep_rates.get(f"{key}_rate")
-            if isinstance(rate, (int, float)) and not isinstance(rate, bool):
-                number = float(rate)
-                if number == number:  # NaN 防御
-                    self._state[key] += number * dt_min
+            self._state[key] += result["delta"].get(key, 0.0)
+        loss = self._clamp_all_with_loss()
+        self._append_settlement_diag(
+            self._settlement_entry("awake", dt_min, profile_key, now, result, loss),
+            cap=_diag_cap_of(params))
 
-    def tick(self, now: Optional[datetime] = None,
-             active_profile: Any = None,
-             modulation: Optional[Dict[str, Dict[str, float]]] = None,
-             sleep_rates: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
-        """唯一推进入口：被动漂移 + 当前活动画像速率积分，钳制后落盘。
+    def _apply_sleep_v2(self, dt_min: float, now: Optional[datetime]) -> None:
+        """v2 睡眠段：五轴目标趋近（替代曲线速率）+ clamp + 诊断。
 
-        ``now`` 缺省取配置时区当前时间；``active_profile`` 支持
-        :class:`~planning.activity_profiles.ActivityProfile` / 同构 dict /
-        画像类型 id 字符串（str 经 ``activity_profiles.get_profile`` 解析）。
-        ``modulation``（PR2，2026-10-26，定稿 §4.1.1；可选参数，缺省 None 逐字旧行为）：
-        五项 rise/fall 增益（形态见 :meth:`planning.life_modulation.LifeModulationService.compute`），
-        对每个状态的基础 delta 按符号相乘后走同一 clamp；None = 不调制。
-        ``sleep_rates``（PR3，2026-10-26，定稿 §3.1 步 3；可选参数，缺省 None = 逐字旧
-        行为）：睡眠引擎给的每分钟速率（``<state>_rate``），非 None 时**只**用它积分、
-        不再叠加清醒被动漂移、不乘 ``modulation``、不裁 TICK_DELTA_CAP——连续曲线
-        跨分段积分由引擎按区间平均值给出，本方法只做一次乘法，保证 tick 不重复恢复。
-        返回 :meth:`snapshot`。落盘失败仅告警不阻塞（B.5.1「失败静默回退」）。
+        编排方传入的 ``sleep_rates`` 只作「处于睡眠期」信号，不消费其数值（曲线收益被目标趋近替代，
+        防「曲线 + 趋近」双记账）；债仍由引擎 ``_close_session`` →
+        :meth:`apply_sleep_settlement` 一次性结算，本方法不写债。
         """
+        from . import settlement_v2
+        params = self._settlement_params_v2()
+        result = settlement_v2.integrate_sleep(self._state, dt_min, params,
+                                               self._sleep_debt)
+        for key in STATE_FIELDS:
+            self._state[key] += result["delta"].get(key, 0.0)
+        loss = self._clamp_all_with_loss()
+        self._append_settlement_diag(
+            self._settlement_entry("sleep", dt_min, None, now, result, loss),
+            cap=_diag_cap_of(params))
+
+    def apply_offline_awake(self, dt_min: float) -> Dict[str, Any]:
+        """Advance an offline awake interval with the sole target-approach model."""
+        try:
+            minutes = float(dt_min)
+        except (TypeError, ValueError):
+            return self.snapshot()
+        if not math.isfinite(minutes) or minutes <= 0:
+            return self.snapshot()
+        self._apply_awake_v2(minutes, None, None)
+        return self.snapshot()
+
+
+    def settlement_diagnostics(self) -> list:
+        """最近结算来源分解（只读副本；后端诊断字段，未接 WebUI）。"""
+        return [dict(entry) for entry in self._settlement_diag]
+
+    def meal_scheduling_hint(self) -> Dict[str, Any]:
+        """用餐强度建议（调度侧只读接口，硬要求 4；**不改变调度行为**）。
+
+        只读接口；参数不可得时按正餐兜底。
+        """
+        try:
+            from . import settlement_v2
+            return settlement_v2.meal_scheduling_hint(self._state,
+                                                      self._settlement_params_v2())
+        except Exception:
+            return {"hunger": float(self._state.get("hunger", 0.0)), "mode": "full",
+                    "duration_scale": 1.0, "satiety_target": 0.15,
+                    "note": "结算 v2 不可用，按正餐处理"}
+
+    # ── 对外接口（B.5.1）───────────────────────────────────────────────────
+
+    def tick(self, now: Optional[datetime] = None, active_profile: Any = None,
+             sleep_rates: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        """Integrate exactly one awake/sleep interval, then persist and sample.
+
+        The engine supplies elapsed_sleep_minutes, so a boundary/interruption
+        packet cannot turn its awake portion into recovery. Numerical legacy
+        rates are never applied. State and clock roll back if persistence fails.
+        """
+        from copy import deepcopy
         now = self._now(now)
         dt_min = self._dt_minutes(now)
-        if sleep_rates is not None:
+        previous = {key: deepcopy(getattr(self, key)) for key in
+                    ('_state', '_sleep_debt', '_last_tick_at', '_updated_at', '_settlement_diag')}
+        try:
             if dt_min > 0:
-                self._apply_sleep_rates(dt_min, sleep_rates)
+                if sleep_rates is not None:
+                    raw_span = sleep_rates.get('elapsed_sleep_minutes', dt_min)
+                    span = (float(raw_span) if isinstance(raw_span, (int, float))
+                            and not isinstance(raw_span, bool) and math.isfinite(raw_span) else 0.0)
+                    asleep = max(0.0, min(dt_min, span))
+                    if dt_min > asleep:
+                        self._apply_awake_v2(dt_min - asleep, active_profile, now)
+                    if asleep:
+                        self._apply_sleep_v2(asleep, now)
+                else:
+                    self._apply_awake_v2(dt_min, active_profile, now)
             self._last_tick_at = now
             self._updated_at = now
             self._clamp_all()
-            self.save()
-            self._capture_history("sleep")
-            return self.snapshot()
-        # PR2.5 修复（2026-10-26），定稿 §4.1.3：仅调制路径记录本拍前值，供
-        # _cap_tick_delta 做单拍变化量上限（modulation=None 零额外动作）
-        before = dict(self._state) if modulation is not None else None
-        if dt_min > 0:
-            self._apply_drift(dt_min, rates=self._profile_rates(active_profile),
-                              modulation=modulation)
-        if before is not None:
-            self._cap_tick_delta(before)
-        self._last_tick_at = now
-        self._updated_at = now
-        self._clamp_all()
-        self.save()
-        self._capture_history("tick")
+            if not self.save():
+                raise OSError('life tick persistence failed')
+        except Exception:
+            for key, value in previous.items():
+                setattr(self, key, value)
+            raise
+        self._capture_history("sleep" if sleep_rates is not None else "tick")
         return self.snapshot()
 
+
     def apply_episode(self, episode: Any, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """Persist explicit event deltas and their receipt in the same JSON transaction."""
+        from copy import deepcopy
+        eid = str(episode.get('episode_id') or '') if isinstance(episode, dict) else ''
+        receipts = getattr(self, '_episode_receipts', {})
+        if eid and eid in receipts:
+            return self.snapshot()
+        names = ('_state', '_last_meal_at', '_last_break_at', '_updated_at', '_settlement_diag', '_episode_receipts')
+        previous = {key: deepcopy(getattr(self, key, {})) for key in names}
+        if eid:
+            self._episode_receipts[eid] = self._now(now).isoformat()
+            self._episode_receipts = dict(list(self._episode_receipts.items())[-4096:])
+        try:
+            return self._apply_episode_once(episode, now)
+        except Exception:
+            for key, value in previous.items():
+                setattr(self, key, value)
+            raise
+
+    def _apply_episode_once(self, episode: Any, now: Optional[datetime] = None) -> Dict[str, Any]:
         """应用 episode 事件（吃饭/休息时间戳 + 可选显式状态增量；不重复积分时长）。
 
         - ``episode`` 为 dict；``profile``（或 ``goal_type``）命中 ``meal`` 且
@@ -538,9 +649,12 @@ class LifeStateService:
           :meth:`tick` 按画像速率积分，这里不重复算，避免双重记账）；
         - ``state_deltas``（可选 dict）：对五项字段做显式加法增量后统一 clamp
           （随机小事件的状态影响走这里，附录 A.7）；
+        - 实际应用增量时追加 settlement_diag；kind/diag_dt_min 由受控调用者提供，
+          默认事件类型，不改变已有活动历史。
         - 非 dict / 解析失败 → 原样返回 snapshot（不抛异常、不阻塞）。
         """
         now = self._now(now)
+        applied: Dict[str, float] = {}
         if isinstance(episode, dict):
             ptype = str(episode.get("profile") or episode.get("goal_type") or "").strip().lower()
             status = str(episode.get("status") or episode.get("event") or "completed").strip().lower()
@@ -554,52 +668,40 @@ class LifeStateService:
                 for key in STATE_FIELDS:
                     value = deltas.get(key)
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        self._state[key] += float(value)
+                        number = float(value)
+                        if not math.isfinite(number):
+                            continue
+                        self._state[key] += number
+                        applied[key] = number
+        if applied:
+            pre_clamp = {key: float(self._state[key]) for key in STATE_FIELDS}
+            self._updated_at = now
+            self._clamp_all()
+            loss = {key: round(pre_clamp[key] - float(self._state[key]), 8)
+                    for key in STATE_FIELDS
+                    if abs(pre_clamp[key] - float(self._state[key])) > 1e-12}
+            kind = "episode"
+            diag_dt = None
+            if isinstance(episode, dict):
+                kind = str(episode.get("settlement_kind") or "episode")
+                raw_dt = episode.get("diag_dt_min")
+                if isinstance(raw_dt, (int, float)) and not isinstance(raw_dt, bool) \
+                        and raw_dt == raw_dt and raw_dt >= 0:
+                    diag_dt = float(raw_dt)
+            self._append_settlement_diag(self._settlement_entry(
+                kind, diag_dt if diag_dt is not None else 0.0, None, now, None, loss,
+                applied=applied), cap=_diag_cap_of(self._settlement_params_v2()))
+            if not self.save():
+                raise OSError("episode state persistence failed")
+            self._capture_history("episode", force=True)
+            return self.snapshot()
         self._updated_at = now
         self._clamp_all()
-        self.save()
+        if not self.save():
+            raise OSError("episode state persistence failed")
         self._capture_history("episode", force=True)
         return self.snapshot()
 
-    def handle_sleep(self, hours: Any, quality: Any = 0.5,
-                     now: Optional[datetime] = None) -> Dict[str, Any]:
-        """睡眠事件：按时长三档 + 质量小幅修调重置状态（B.2 默认值表 / §6.3）。
-
-        - ``hours``：睡眠时长（小时）；非数值或 <=0 → 不做任何变更原样返回；
-          ``<5`` → short 档（睡眠债 +1.5h）；``<7`` → mid 档（+0.5h）；
-          ``>=7`` → full 档（睡眠债清零）；
-        - ``quality``：睡眠质量 [0,1]（0.5 = 无修调）；越界钳入 [0,1]；
-          energy/focus 按 ``(quality - 0.5) × 0.05`` 幅度修调；
-        - 睡眠期间不做被动漂移：``last_tick_at`` 直接盖为 ``now``；
-        - ``last_sleep_at`` 盖为 ``now``；落盘 best-effort；返回 :meth:`snapshot`。
-        """
-        now = self._now(now)
-        if not isinstance(hours, (int, float)) or isinstance(hours, bool) \
-                or not float(hours) > 0:
-            logger.warning("handle_sleep 收到非法时长 %r，忽略本次睡眠事件", hours)
-            return self.snapshot()
-        if not isinstance(quality, (int, float)) or isinstance(quality, bool) \
-                or quality != quality:  # NaN 防御
-            quality = 0.5
-        quality = max(0.0, min(1.0, float(quality)))
-        h = float(hours)
-        tier = SLEEP_TIERS["short"] if h < 5.0 else (SLEEP_TIERS["mid"] if h < 7.0
-                                                     else SLEEP_TIERS["full"])
-        for key in STATE_FIELDS:
-            self._state[key] = tier[key]
-        self._state["energy"] += (quality - 0.5) * QUALITY_ENERGY_SPAN
-        self._state["focus"] += (quality - 0.5) * QUALITY_FOCUS_SPAN
-        if tier["debt_reset"]:
-            self._sleep_debt = 0.0
-        else:
-            self._sleep_debt += tier["debt_add"]
-        self._last_sleep_at = now
-        self._last_tick_at = now
-        self._updated_at = now
-        self._clamp_all()
-        self.save()
-        self._capture_history("sleep_settlement", force=True)
-        return self.snapshot()
 
     def apply_sleep_fields(self, fields: Any) -> Dict[str, Any]:
         """睡眠连续段字段落盘（PR3，2026-10-26，附录 B.2.1；每拍由引擎推入）。
@@ -633,14 +735,8 @@ class LifeStateService:
     def apply_sleep_settlement(self, payload: Any) -> Dict[str, Any]:
         """**一次性**睡眠结算公共口（PR3，2026-10-26；引擎醒来时恰调一次）。
 
-        与旧 :meth:`handle_sleep` 的区别（防双记账）：
-
-        - ``handle_sleep`` = 旧三档整段覆盖（历史调用/兼容路径保留，逐字不变）；
-        - 本方法 = 连续曲线已在睡眠期逐拍积分完成，这里**只**写会话结束事实：
-          ``sleep_debt``（引擎按 B.2.2 公式算好，权威值）、``last_sleep_at``、
-          ``sleep_started_at/continuous_sleep_minutes/sleep_segment_started_at/
-          sleep_interrupted/last_wake_reason/sleep_wake_target/sleep_lie_in_cap``；
-          **绝不覆盖 energy/focus**（否则「整段持续恢复 + 醒来三档覆盖」= 双记账）。
+        五轴已在睡眠期持续积分，这里只写sleep_debt权威值、last_sleep_at和会话结束
+        字段；不覆盖五轴，避免整段恢复与醒沿重复记账。
         """
         if not isinstance(payload, dict):
             return self.snapshot()
@@ -815,8 +911,12 @@ class LifeStateService:
 
     # ── 持久化（core.storage.save_json_atomic；失败告警不阻塞）────────────
     def _document(self) -> Dict[str, Any]:
-        """规范状态文档（**键结构唯一真源**：``save()`` 与默认文档共用本方法）。"""
-        return {
+        """规范状态文档（**键结构唯一真源**：``save()`` 与默认文档共用本方法）。
+
+        settlement_diag仅在非空时写入；episode_receipts与状态同文件原子保存。
+        旧版状态文件缺附加字段时按空记录装载，不重置已有数值。
+        """
+        document: Dict[str, Any] = {
             "version": STATE_VERSION,
             **{key: float(self._state[key]) for key in STATE_FIELDS},
             "sleep_debt": float(self._sleep_debt),
@@ -835,6 +935,11 @@ class LifeStateService:
             "sleep_wake_target": self._fmt_ts(self._sleep_wake_target),
             "sleep_lie_in_cap": self._fmt_ts(self._sleep_lie_in_cap),
         }
+        if self._settlement_diag:
+            document["settlement_diag"] = self._settlement_diag
+        if getattr(self, "_episode_receipts", None):
+            document["episode_receipts"] = self._episode_receipts
+        return document
 
     def save(self) -> bool:
         """原子写状态文件（B.2「原子写」原文）；失败仅告警返回 False。
@@ -877,4 +982,5 @@ def default_state_document() -> Dict[str, Any]:
     service._last_wake_reason = None
     service._sleep_wake_target = None
     service._sleep_lie_in_cap = None
+    service._settlement_diag = []
     return service._document()

@@ -80,8 +80,6 @@ class EmotionServices:
             # 是独立功能设置（不因它缺失而放宽日程开关，反之亦然）。
             desired = bool(
                 schedule is not None and bool(getattr(schedule, "enabled", False))
-                and section is not None
-                and bool(getattr(section, "emotion_modulation_enabled", False))
                 and self.is_enabled())
         except Exception:
             desired = False

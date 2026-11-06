@@ -32,7 +32,13 @@ class CompanionSilenceGate:
         """日程 spine 意图行按时间窗是否命中午休（纯判定）。"""
         from .patrol import nap_intent_matches_now
 
-        return nap_intent_matches_now(day_schedule, now)
+        engine = getattr(self._plugin, "_sleep_engine", None)
+        return nap_intent_matches_now(day_schedule, now,
+                                      dynamic=bool(getattr(engine, "dynamic_enabled", False)))
+
+    def actual_nap_item_matches(self, activity: Any) -> bool:
+        from .patrol import actual_nap_item_matches
+        return actual_nap_item_matches(activity)
 
     def sleep_engine_asleep(self, now: Any = None) -> bool:
         """睡眠引擎是否判定仍在睡（异常/未装配 False，与 patrol 同语义）。"""

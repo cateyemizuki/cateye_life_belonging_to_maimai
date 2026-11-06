@@ -20,7 +20,7 @@
 planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
 **config_version 与迁移保障（2026-10-10 第二版，已订正；3.0.0 起版本随 PR8 递增）**：
-开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `3.0.0`（2026-10-27 PR8 清理版；2.2.0 为 2026-10-27 二期 PR7 开发版、2.1.0 于 2026-10-21 归档发布）；
+开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `3.1.0`（2026-11-04 配置精简版；3.0.0 为 2026-10-27 PR8 清理版、2.2.0 为 2026-10-27 二期 PR7 开发版、2.1.0 于 2026-10-21 归档发布）；
 迁移保障改由 **plugin.py 的「磁盘旧文件抢救」**（`CateyeSuitePlugin.normalize_plugin_config` 先读尚未被
 宿主覆写的磁盘 `config.toml`，把用户值并回输入）＋ 下面的 `mode="before"` 一次性迁移器共同承担。
 **旧口径（已作废）如下，仅留作教训**：宿主 Runner 在「配置版本号变化」时会
@@ -52,6 +52,35 @@ planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 plugin.py ``normalize_plugin_config`` 对原始输入与磁盘抢救结果各做一次同一组 raw pop
 （在 SDK merge 出厂默认之前生效），聚合校验器入口 pop 对离线 ``model_validate`` 路径兜底。
 
+**3.1.0 迁移记录（2026-11-04 配置精简轮，用户「全量推进」裁决；方案 =
+union/20261104_全量推进/配置精简方案.md）**：224 叶子字段 → 179（keep 179 / json 40 /
+hardcode 5）。① **J 类 40 项**内部调参键移入 ``mappings/internal_tuning.json``（表层
+用户表）+ ``default_mappings/internal_tuning.json``（种子）：旧 TOML 键由
+:func:`core.config_migration.migrate_internal_tuning` 纯内存摘出，plugin.py
+``normalize_plugin_config`` 在 SDK merge 出厂默认**之前**把捕获值落盘（只补用户表
+缺失键，幂等不覆盖现场微调）；各 section 以同名只读 property 桥接 JSON 读取，
+全部既有消费点零改动。② **H 类 5 项**固化为代码常量（生产现值=默认已获 evidence
+证实）：``[life_state].tick_seconds``/``sleep_wake_check_seconds``（=300 内部节拍）、
+``state_file``（逐字 'life_state.json'）、``[event_catalog].temperature``（锁定 0.9，
+resolve_config 本就不读配置）、``max_events``（兼容死键，migrate_legacy_event_catalog
+继续 pop）——旧键登记 :data:`LEGACY_ROUTE_KEYS` 入口 pop（只 pop 不搬运）。
+③ ``CURRENT_LAYOUT_VERSION`` **不换新标记**（C-12 教训）：J 类落盘走独立磁盘捕获
+通道（不受布局哨兵门控），不重跑 2026-10-10 值搬运体。④ 睡眠锚点/时钟/预算上限/
+settlement_model/名单/凭据等 179 项 keep 逐字不动；4 个 evidence 未列段
+（affection/schedule_advanced/prompts/dashboard_display）一律不 hardcode。
+
+**3.2.0 迁移记录（2026-11-04 主动行为重写，用户直派规格；设计 =
+union/20261104_主动行为与视频排查/主动行为重写设计.md）**：179 → **177 叶子字段**
+（删 4 增 2）。① 删 ``[patrol]`` 四键（:data:`LEGACY_PATROL_RETIRED_KEYS`：
+patrol_activity_enabled / activity_trigger_rate / default_speak_rate / miss_speak_rate）——
+日程巡检触发路径整条删除、想念改状态驱动概率公式（companion.miss_trigger 内部常量），
+旧键纯 pop 丢弃并登记（入口两分支共经 + plugin.normalize raw pop，无值搬运）。
+② 增 ``[planning_proactive]`` 两个用户可感知字段：``greeting_morning_latest``
+（早安有界上限时刻，默认 "10:00"）与 ``greeting_noon_enabled``（中午问好开关，默认 true，
+仅目标陪伴私聊）。③ 按 R6 递增 SUPPORTED_CONFIG_VERSION=3.2.0；**_manifest.json 不在
+本任务文件边界内，部署批须同步 version=3.2.0**。④ ``CURRENT_LAYOUT_VERSION`` 不换新
+（C-12）；睡眠锚点/时钟/每日预算 5 红线逐字不动；磁盘抢救通道保住 keep 键用户值。
+
 **迁移映射**（旧 → 新，全部在 :meth:`CateyeSuiteConfig._migrate_legacy_sections`）：- ``[target].target_qq`` → ``[patrol].target_qq``；
 - ``[cateye].*`` → ``[patrol].screen_*`` / ``[llm].vlm_task`` / ``[prompts].screen_*``；
 - ``[judge].*`` → ``[llm].judge_*``；
@@ -70,7 +99,7 @@ plugin.py ``normalize_plugin_config`` 对原始输入与磁盘抢救结果各做
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, Dict, List
+from typing import Any, ClassVar, Dict, List, Literal
 
 import pydantic
 from maibot_sdk import Field, PluginConfigBase
@@ -81,6 +110,7 @@ from companion.config import (
     migrate_legacy_cateye,
     migrate_legacy_patrol,
 )
+from companion.screen_config import ScreenSectionConfig, migrate_screen_config
 from emotion.config import EmotionSectionConfig
 from planning.config import (
     LifeStateSectionConfig,
@@ -94,11 +124,11 @@ from planning.event_catalog_config import (
 )
 from qzone.config import QzoneSectionConfig
 from video_watch.config import VideoWatchSectionConfig
-from core.config_migration import migrate_display_config
+from core.config_migration import migrate_display_config, migrate_internal_tuning, migrate_release_config
 from core.i18n import ui_i18n as _ui_i18n
+from core.internal_tuning import tuning_value as _tuning_value
 
 from suite_prompts import (
-    COMPANION_MISS_CONFIRM_DEFAULT,
     COMPANION_MISS_REASON_DEFAULT,
     PromptsSectionConfig,
 )
@@ -108,7 +138,10 @@ from suite_prompts import (
 # 重建设置文件（丢弃跨段旧键）。因此递增本值必须同时具备"磁盘旧文件抢救"（plugin.py 的
 # normalize_plugin_config：把尚未被覆写的磁盘 config.toml 里的用户值并回输入），
 # 否则跨段/改名键的用户值会在插件看到它们之前被丢弃 —— 见模块 docstring 的教训段。
-SUPPORTED_CONFIG_VERSION = "3.0.0"
+# 3.2.0（2026-11-04 主动行为重写）：删 4 个 [patrol] Field（日程巡检三键 + miss_speak_rate）
+# 按 R6 递增本值；_manifest.json 不在本任务文件边界内，**部署批须同步递增至 3.2.0**
+# （见设计文档 §配置治理）。磁盘抢救 + 入口纯 pop 保证旧值不丢、退役键不落盘。
+SUPPORTED_CONFIG_VERSION = "3.6.1"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -131,6 +164,20 @@ LEGACY_SILENCE_KEYS = {
     "patrol": ("silence_start", "silence_end"),
     # post_blocked_activities 随「发空间不再按活动判定」移除（2026-10-20 用户指示）
     "qzone": ("silence_start", "silence_end", "post_blocked_activities"),
+}
+
+#: 3.2.0（2026-11-04 主动行为重写，用户直派规格）：日程巡检整条删除后退役的 [patrol] 键。
+#: patrol_activity_enabled / activity_trigger_rate / default_speak_rate = 日程巡检开关与
+#: 两类概率（触发路径已删，无新语义可搬运）；miss_speak_rate = 旧想念掷点概率（想念改
+#: 状态驱动公式，概率为 companion.miss_trigger 内部常量）。四键纯 pop 丢弃并登记
+#: （§9.7 口径：不 setdefault、不做值搬运）；入口两分支共经 + plugin.normalize raw pop。
+LEGACY_PATROL_RETIRED_KEYS = {
+    "patrol": (
+        "patrol_activity_enabled",
+        "activity_trigger_rate",
+        "default_speak_rate",
+        "miss_speak_rate",
+    ),
 }
 
 #: 日程主动行为整条移除（2026-10-20 用户指示）后已删除的 ``[planning_proactive]`` 键：
@@ -164,9 +211,16 @@ LEGACY_ROUTE_KEYS = {
     "schedule": ("spine_mode", "planning_daily_token_budget", "max_tokens", "spine_max_tokens"),
     "schedule_advanced": ("max_tokens",),
     "llm": ("judge_max_tokens", "max_tokens"),
-    "event_catalog": ("max_tokens", "daily_token_budget"),
+    # 3.1.0（2026-11-04 配置精简轮 H 类）：temperature 锁定 0.9（resolve_config 恒返回
+    # DEFAULT_TEMPERATURE，配置值本就不生效）——删隐藏 Field 消除死键，只 pop 不搬运。
+    # max_events 兼容死键不在此登记：由 migrate_legacy_event_catalog 继续消费（搬进
+    # 规范键 max_generated_events 后 pop，保留旧值语义）。
+    "event_catalog": ("max_tokens", "daily_token_budget", "temperature"),
     "judge": ("max_tokens",),
-    "life_state": ("enabled", "sleep_engine_enabled", "profile_path"),
+    # 3.1.0 H 类：tick_seconds / sleep_wake_check_seconds（=300 内部节拍常量）、
+    # state_file（逐字 'life_state.json' 常量）——生产现值=默认已证实，只 pop 不搬运。
+    "life_state": ("enabled", "sleep_engine_enabled", "profile_path",
+                   "tick_seconds", "sleep_wake_check_seconds", "state_file"),
     # 2026-11-01 U 计划（§4.2）：入口不再搬进面板标题栏，「面板内麦麦尺寸」随之退役——
     # 详情展开以原入口为原点的粘连气泡替代（入口原位保留）。只 pop、不做值搬运。
     "maimai_interaction": ("detail_fish_size_px",),
@@ -309,7 +363,12 @@ class LlmSectionConfig(PluginConfigBase):
 
     __ui_label__ = "LLM 调用"
     __ui_icon__ = "cpu"
-    __ui_order__ = 8
+    __ui_order__ = 11
+    prompt_optimization_enabled: bool = Field(
+        default=True,
+        description="短任务出现多余思考输出后，后续请求追加一次直接输出提示；不增加重试或延长超时。",
+        json_schema_extra={"label": "自动约束短任务输出"},
+    )
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "LLM Calls",
                "description": "Model routing for every LLM call the plugin makes (task names and judge parameters)."}
@@ -339,18 +398,8 @@ class LlmSectionConfig(PluginConfigBase):
         },
     )
 
-    judge_temperature: float = Field(
-        default=0.2,
-        ge=0.0,
-        le=2.0,
-        description="判断调用的采样温度：越低结论越稳定（判定不需要创意）",
-        json_schema_extra={
-            "label": "判断温度",
-            "step": 0.1,
-            "hint": "默认 0.2，一般不用动",
-            **_ui_i18n("Judge temperature"),
-        },
-    )
+    # 2026-11-04 配置精简轮（J 类）：judge_temperature 移入
+    # mappings/internal_tuning.json[llm]（内部采样温度）；同名只读 property 见类尾。
     review_task_name: str = Field(
         default="utils",
         description="好感裁判任务名：会话采样评估与关系日结使用（建议便宜、非思考型）",
@@ -417,11 +466,17 @@ class LlmSectionConfig(PluginConfigBase):
         },
     )
 
+    # ── J 类内部调参（只读桥接 → mappings/internal_tuning.json[llm]）──────────
+    @property
+    def judge_temperature(self) -> float:
+        """判断调用采样温度（越低结论越稳定）。"""
+        return float(_tuning_value("llm", "judge_temperature"))
+
 
 class LifeStateSuiteSectionConfig(LifeStateSectionConfig):
     """设置精力、饥饿、专注、压力、社交状态及睡眠恢复。"""
 
-    __ui_order__ = 11
+    __ui_order__ = 8
 
 
 class AdminSectionConfig(PluginConfigBase):
@@ -429,7 +484,7 @@ class AdminSectionConfig(PluginConfigBase):
 
     __ui_label__ = "管理与日志"
     __ui_icon__ = "shield"
-    __ui_order__ = 10
+    __ui_order__ = 13
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Admin & Logs", "description": "Command permissions and diagnostic logs."}
     }
@@ -509,7 +564,7 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
 
     __ui_label__ = "麦麦互动"
     __ui_icon__ = "heart"
-    __ui_order__ = 13
+    __ui_order__ = 15
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Maimai Interaction",
                "description": "Corner mascot and fullscreen detail look & feel (display-only)."}
@@ -524,84 +579,47 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
             **_ui_i18n("Mascot enabled", "Hides the corner mascot; detail entries stay."),
         },
     )
+    preset: Literal["fish", "human"] = Field(
+        default="human",
+        description="fish=萨卡班麦麦；human=麦麦",
+        json_schema_extra={"label": "形象预设", "hint": "fish=萨卡班麦麦；human=麦麦",
+                           **_ui_i18n("Mascot preset", "fish = Sakabamai; human = Maimai.")},
+    )
     mascot_size_px: int = Field(
         default=144, ge=48, le=192,
-        description="常驻麦麦的基准尺寸（像素）。",
-        json_schema_extra={"label": "常驻麦麦尺寸", "step": 1, **_ui_i18n("Mascot size (px)")},
+        description="形象基准尺寸（像素）；萨卡班麦麦与麦麦两个形象共用",
+        json_schema_extra={"label": "形象尺寸（共用）", "step": 1, **_ui_i18n("Mascot size (px)")},
     )
-    peek_angle_deg: int = Field(
-        default=12, ge=0, le=90,
-        description="收起时的头部倾斜角（度）。",
-        json_schema_extra={"label": "冒头角度", "step": 1, **_ui_i18n("Peek angle (deg)")},
-    )
-    hover_out_px: int = Field(
-        default=200, ge=60, le=320,
-        description="指针离左下角交互区域多远后自动收起（像素；进入阈值更小，进出不同阈值防抖）",
-        json_schema_extra={"label": "收起距离", "step": 1, **_ui_i18n("Retreat distance (px)")},
-    )
-    hover_out_ms: int = Field(
-        default=240, ge=80, le=600,
-        description="收起动画时长（毫秒）",
-        json_schema_extra={"label": "收起时长", "step": 10, **_ui_i18n("Retreat duration (ms)")},
-    )
-    press_squash_x: float = Field(
-        default=1.20, ge=0.8, le=1.6,
-        description="按住时的横向扩张系数",
-        json_schema_extra={"label": "按压横向扩张", "step": 0.05, **_ui_i18n("Press squash X")},
-    )
-    press_squash_y: float = Field(
-        default=0.50, ge=0.2, le=1.0,
-        description="按住时的纵向压扁系数",
-        json_schema_extra={"label": "按压纵向压扁", "step": 0.05, **_ui_i18n("Press squash Y")},
-    )
-    bounce_ms: int = Field(
-        default=774, ge=200, le=3000,
-        description="一次回弹动画周期（毫秒）",
-        json_schema_extra={"label": "回弹周期", "step": 10, **_ui_i18n("Bounce duration (ms)")},
-    )
-    bounce_easing: str = Field(
-        default="cubic-bezier(.34,1.56,.64,1)",
-        description="回弹缓动曲线（CSS easing；无法识别时前端回退为 overshoot）",
-        json_schema_extra={"label": "回弹缓动", **_ui_i18n("Bounce easing")},
-    )
-    detail_blur_px: int = Field(
-        default=3, ge=0, le=40,
-        description="详情展开时的背景模糊半径（像素）；0表示不模糊。",
-        json_schema_extra={"label": "详情背景模糊", "step": 1, **_ui_i18n("Detail blur (px)")},
-    )
-    detail_fade_ms: int = Field(
-        default=220, ge=80, le=600,
-        description="详情进入/退出动画时长（毫秒）",
-        json_schema_extra={"label": "详情动画时长", "step": 10, **_ui_i18n("Detail fade (ms)")},
-    )
-    detail_scale_from: float = Field(
-        default=0.6, ge=0.4, le=1.0,
-        description="详情从入口展开时的初始缩放比例。",
-        json_schema_extra={"label": "详情初始缩放", "step": 0.01, **_ui_i18n("Detail scale from")},
-    )
+    # 旧形象（萨卡班麦麦）具体参数已于 2026-11-03 撤出配置，按小主机当时配置现值
+    # （angle 12 / hover_out 200/240ms / squash 1.2·0.5 / bounce 774ms 默认缓动 /
+    #  detail 3px·220ms·0.6）固化为前端常量，见 webui/source/maimai.js。
 
 
 class DashboardDisplaySectionConfig(PluginConfigBase):
     """设置历史明细的条数和变化显示阈值。"""
     __ui_label__ = "数据展示"
     __ui_icon__ = "chart-line"
-    __ui_order__ = 15
+    __ui_order__ = 14
 
     history_changes_limit: int = Field(
         default=30, ge=5, le=30,
         description="详情「最近变化」最大条数（5–30）",
         json_schema_extra={"label": "最近变化条数", "step": 1, **_ui_i18n("Recent changes limit")},
     )
-    history_state_epsilon: float = Field(
-        default=0.01, ge=0.001, le=0.1,
-        description="状态变化记录阈值（占比 0.001–0.1）",
-        json_schema_extra={"label": "状态变化阈值", "step": 0.001, **_ui_i18n("State epsilon")},
-    )
-    history_debt_epsilon: float = Field(
-        default=0.1, ge=0.01, le=1.0,
-        description="睡眠债变化记录阈值（小时）",
-        json_schema_extra={"label": "睡眠债阈值", "step": 0.01, **_ui_i18n("Debt epsilon (h)")},
-    )
+    # 2026-11-04 配置精简轮（J 类）：history_state_epsilon / history_debt_epsilon 移入
+    # mappings/internal_tuning.json[dashboard_display]（内部记录阈值；本段生产现值未证实，
+    # 走值搬运不硬编码）。面板投影 _maimai_view 经下方同名 property 读到 JSON 生效值，
+    # 前端 fish.js 的 pick 兜底口径不变。
+
+    @property
+    def history_state_epsilon(self) -> float:
+        """状态变化记录阈值（占比）。"""
+        return float(_tuning_value("dashboard_display", "history_state_epsilon"))
+
+    @property
+    def history_debt_epsilon(self) -> float:
+        """睡眠债变化记录阈值（小时）。"""
+        return float(_tuning_value("dashboard_display", "history_debt_epsilon"))
 
 
 class CateyeSuiteConfig(PluginConfigBase):
@@ -612,33 +630,28 @@ class CateyeSuiteConfig(PluginConfigBase):
     """
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
-    # 陪伴模块（companion/config.py；含目标用户与屏幕感知）
     patrol: PatrolSectionConfig = Field(default_factory=PatrolSectionConfig)
+    screen: ScreenSectionConfig = Field(default_factory=ScreenSectionConfig)
     affection: AffectionSectionConfig = Field(default_factory=AffectionSectionConfig)
-    # 日程（planning/config.py）
     schedule: ScheduleSectionConfig = Field(default_factory=ScheduleSectionConfig)
     schedule_advanced: ScheduleAdvancedSectionConfig = Field(default_factory=ScheduleAdvancedSectionConfig)
     planning_proactive: PlanningProactiveSectionConfig = Field(default_factory=PlanningProactiveSectionConfig)
-    # 生活状态（滚动化，2026-10-25 新增段；默认关——enabled=false 时插件行为与 2.1.0 一致）
+    emotion: EmotionSectionConfig = Field(default_factory=EmotionSectionConfig)
     life_state: LifeStateSuiteSectionConfig = Field(default_factory=LifeStateSuiteSectionConfig)
-    # 事件库（PR4，2026-10-26 新增段；默认 mode=off——连生成库都不读，只用内置池）。
-    # 段类定义在 planning/event_catalog_config.py（与运行期只读视图同源）。
-    event_catalog: EventCatalogSectionConfig = Field(default_factory=EventCatalogSectionConfig)
-    # LLM 调用集中段（本文件）与提示词集中段（suite_prompts.py）
+    qzone: QzoneSectionConfig = Field(default_factory=QzoneSectionConfig)
+    video_watch: VideoWatchSectionConfig = Field(default_factory=VideoWatchSectionConfig)
     llm: LlmSectionConfig = Field(default_factory=LlmSectionConfig)
     prompts: PromptsSectionConfig = Field(default_factory=PromptsSectionConfig)
-    dashboard_display: DashboardDisplaySectionConfig = Field(default_factory=DashboardDisplaySectionConfig)
-    # 管理与日志（本文件）
     admin: AdminSectionConfig = Field(default_factory=AdminSectionConfig)
-    # QQ 空间（qzone/config.py）
-    qzone: QzoneSectionConfig = Field(default_factory=QzoneSectionConfig)
-    # 情绪系统（emotion/config.py）
-    emotion: EmotionSectionConfig = Field(default_factory=EmotionSectionConfig)
-    # 视频观看（video_watch/config.py，2026-11-01 B 线内置模块）
-    video_watch: VideoWatchSectionConfig = Field(default_factory=VideoWatchSectionConfig)
-    # 麦麦互动（本文件，2026-10-30 交互改造新增）：放在最后一个字段，
-    # 保证 config.toml 的最后一节就是 [maimai_interaction]（主计划第三章口径）。
+    dashboard_display: DashboardDisplaySectionConfig = Field(default_factory=DashboardDisplaySectionConfig)
     maimai_interaction: MaimaiInteractionSectionConfig = Field(default_factory=MaimaiInteractionSectionConfig)
+
+    @property
+    def event_catalog(self) -> EventCatalogSectionConfig:
+        """Typed service view; only schedule.event_catalog_* is serialized."""
+        from core.config_migration import EVENT_CATALOG_FIELDS
+        return EventCatalogSectionConfig.model_validate({
+            key: getattr(self.schedule, "event_catalog_" + key) for key in EVENT_CATALOG_FIELDS})
 
     @pydantic.model_validator(mode="before")
     @classmethod
@@ -682,7 +695,16 @@ class CateyeSuiteConfig(PluginConfigBase):
             # 出厂默认路径（无参构造 / 空输入）：不写布局标记，也不放哨兵
             return data
         migrated = dict(data)
-        migrated = migrate_display_config(migrated)
+        migrated = migrate_screen_config(migrate_display_config(migrated))
+        # 0-t) 3.1.0 配置精简轮 J 类：40 个内部调参旧键在此显式 pop（两分支共经）。
+        #      捕获值的落盘由 plugin.normalize_plugin_config 在 SDK merge 之前完成
+        #      （core.internal_tuning.merge_captured，只补用户表缺失键）；本处 pop 保证
+        #      离线 model_validate 路径也不会把已删键写回 TOML。须在 migrate_display_config
+        #      之后（旧 [maimai_interaction] 的 history_*_epsilon 先搬进本段再被摘出）。
+        migrated, _tuning_captured = migrate_internal_tuning(migrated)
+        # Preserve canonical explicit defaults before the ancient layout cleaner
+        # strips default-valued keys; legacy aliases must already be gone then.
+        migrated = migrate_release_config(migrated)
         # 0a) [event_catalog] 旧键 max_events → 规范字段 max_generated_events（2026-10-27 用户裁定）。
         #     必须发生在「默认值填充之前」：宿主/SDK 先 merge 出厂默认，之后 pydantic 的
         #     model_fields_set 会把每个字段都当显式值，段级 resolve_config 的「规范字段优先」
@@ -705,6 +727,15 @@ class CateyeSuiteConfig(PluginConfigBase):
         #    2026-10-20：[patrol]/[qzone] 的 silence_start/silence_end 同口径显式 pop
         #    （静默窗恒复用 [schedule] 作息，显式覆盖能力已移除）。
         for section_name, stale_keys in LEGACY_SILENCE_KEYS.items():
+            section_data = migrated.get(section_name)
+            if isinstance(section_data, dict):
+                section_data = dict(section_data)
+                for stale_key in stale_keys:
+                    section_data.pop(stale_key, None)
+                migrated[section_name] = section_data
+        #    3.2.0 主动行为重写：日程巡检三键 + miss_speak_rate 退役（纯 pop，两分支共经；
+        #    生产存量配置已带 layout 标记，必须在 already_migrated 分支之前清理）。
+        for section_name, stale_keys in LEGACY_PATROL_RETIRED_KEYS.items():
             section_data = migrated.get(section_name)
             if isinstance(section_data, dict):
                 section_data = dict(section_data)
@@ -755,7 +786,7 @@ class CateyeSuiteConfig(PluginConfigBase):
             for stale in LEGACY_SECTIONS:
                 migrated.pop(stale, None)
             migrated["plugin"] = plugin_section
-            return migrated
+            return migrate_release_config(migrated)
 
         # 值搬运前先剔除"仍等于出厂默认"的键（把 merge 了默认的输入还原成用户显式值视图；
         # 否则下面的 setdefault 永远命中不到缺失分支，旧值被静默丢弃——见 _strip_factory_defaults）
@@ -817,19 +848,19 @@ class CateyeSuiteConfig(PluginConfigBase):
         else:
             qzone_data.pop("llm_task_name", None)
 
-        # 3b) [patrol] 的两个可编提示词（1.0.0 的 miss_reason_prompt / miss_confirm_prompt）
-        #     → [prompts] companion_miss_reason / companion_miss_confirm（**仅非出厂值才搬**，
-        #     与 [cateye] 提示词同口径；T3 问题表 #3 用户裁决 A：不搬会静默回退出厂文案）
-        for old_key, new_key, factory_texts in (
-            ("miss_reason_prompt", "companion_miss_reason",
-             (_LEGACY_MISS_REASON_PROMPT_DEFAULT, COMPANION_MISS_REASON_DEFAULT)),
-            ("miss_confirm_prompt", "companion_miss_confirm",
-             (COMPANION_MISS_CONFIRM_DEFAULT,)),
-        ):
-            legacy_text = patrol_data.pop(old_key, None)
-            if (isinstance(legacy_text, str) and legacy_text.strip()
-                    and legacy_text not in factory_texts):
-                prompts_data.setdefault(new_key, legacy_text)
+        # 3b) [patrol] 的 miss_reason_prompt（1.0.0）→ [prompts].companion_miss_reason
+        #     （**仅非出厂值才搬**，与 [cateye] 提示词同口径；T3 问题表 #3 用户裁决 A：
+        #     不搬会静默回退出厂文案）。
+        #     miss_confirm_prompt 只 pop 清退、不再搬运（2026-11-04 评估 F4）：
+        #     companion_miss_confirm 属 INTERNAL_PROMPT_NAMES（数值把关协议，prompt()
+        #     恒返回出厂默认，_ignore_internal_overrides 会滤掉该键）——旧分支把它搬进
+        #     [prompts] 等于没搬，与内部化裁定自相矛盾，故删除该无效迁移分支。
+        patrol_data.pop("miss_confirm_prompt", None)
+        legacy_text = patrol_data.pop("miss_reason_prompt", None)
+        if (isinstance(legacy_text, str) and legacy_text.strip()
+                and legacy_text not in (_LEGACY_MISS_REASON_PROMPT_DEFAULT,
+                                        COMPANION_MISS_REASON_DEFAULT)):
+            prompts_data.setdefault("companion_miss_reason", legacy_text)
 
         # 5) [schedule] 深水字段 → [schedule_advanced]（键名不变；2026-10-10 段拆分）
         advanced_data = dict(migrated.get("schedule_advanced") or {})
@@ -855,4 +886,15 @@ class CateyeSuiteConfig(PluginConfigBase):
         migrated["emotion"] = emotion_data
         migrated["qzone"] = qzone_data
         migrated["schedule_advanced"] = advanced_data
-        return migrated
+        # 3.1.0 J 类二次捕获：上面的古老段搬迁可能把值搬进 J 类新键
+        # （[cateye].context_ttl_minutes → patrol.screen_context_ttl_minutes、
+        # [judge].temperature → llm.judge_temperature、[inject]/[planning_cleanup]
+        # 的缓存键 → schedule_advanced）——入口 pop 发生在搬迁之前，这里再摘一次。
+        # 校验器保持无 IO：捕获值入队，由 plugin.normalize_plugin_config 在校验成功
+        # 后统一落盘（只补用户表缺失键）；纯离线 model_validate 不写任何文件。
+        migrated = migrate_screen_config(migrated)
+        migrated, _late_tuning_captured = migrate_internal_tuning(migrated)
+        if _late_tuning_captured:
+            from core.internal_tuning import stage_captured
+            stage_captured(_late_tuning_captured)
+        return migrate_release_config(migrated)

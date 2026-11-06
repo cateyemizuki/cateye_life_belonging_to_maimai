@@ -52,6 +52,45 @@ def _row(row: Any) -> dict[str, Any]:
     return result
 
 
+def _schedule_pools(planning: Any, model: Any, now: datetime, read: Any) -> dict[str, Any]:
+    """Read the existing pools without rolling, refreshing or exposing raw metadata."""
+    from .rolling_planner import RANDOM_EVENT_POOL
+
+    def events(rows: Any) -> list[dict[str, Any]]:
+        return [
+            {'name': str(row['name'])[:160], 'goal_type': str(row.get('goal_type') or '')[:40],
+             'min_minutes': _number(row.get('min_minutes')),
+             'max_minutes': _number(row.get('max_minutes')),
+             'event_id': str(row.get('event_id') or row.get('key') or '')[:80],
+             'pool_kind': str(row.get('pool_kind') or 'reusable')[:20],
+             'generation_id': str(row.get('generation_id') or '')[:96],
+             'consumption_status': str((row.get('consumption') or {}).get('status') or '')[:24],
+             'consumed_at': str((row.get('consumption') or {}).get('picked_at') or '')[:48]}
+            for row in rows[:40] if isinstance(row, dict) and row.get('name')
+        ]
+
+    catalog = getattr(planning, 'event_catalog', None)
+    snapshot = read('小事件库暂不可读', lambda: catalog.store.snapshot, None) if catalog else None
+    resume = getattr(model, 'resume_candidates', None)
+    paused = read('恢复池暂不可读', lambda: resume(now), []) if callable(resume) else []
+    return {
+        'recovery': [
+            {'name': str(row['name'])[:160], 'goal_type': str(row.get('goal_type') or '')[:40],
+             'schedule_date': str(row.get('schedule_date') or '')[:10],
+             'progress': _number(row.get('progress'))}
+            for row in paused[:20] if isinstance(row, dict) and row.get('name')
+        ],
+        'builtin': events(snapshot.builtin_events if snapshot else RANDOM_EVENT_POOL),
+        'generated': events(snapshot.reusable_events) if snapshot else [],
+        'one_shot': events(snapshot.one_shot_events) if snapshot else [],
+        'consumed': events(snapshot.consumed_events) if snapshot else [],
+        'generation_id': str(snapshot.generation_id)[:96] if snapshot else '',
+        'one_shot_total': len(snapshot.one_shot_events) + len(snapshot.consumed_events) if snapshot else 0,
+        'generated_at': str(snapshot.generated_at)[:48] if snapshot and snapshot.generated_at else None,
+        'next_update_at': str(snapshot.next_update_at)[:48] if snapshot and snapshot.next_update_at else None,
+    }
+
+
 #: day 路径单日序列点上限（5 分钟采样 × 1440 分钟 = 288；结果体量守卫前的装配上限）。
 DAY_POINT_CAP = 288
 
@@ -470,22 +509,13 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
     return view
 
 
-#: maimai 互动白名单投影字段（2026-10-30 交互改造）：字段名 → (类型, 出厂默认, 下限, 上限)。
+#: maimai 互动白名单投影字段（2026-10-30 交互改造；2026-11-03 收敛）：
+#: 字段名 → (类型, 出厂默认, 下限, 上限)。
 #: 只含展示/交互参数；整份配置绝不下发前端（前端默认值沿本表同值兜底，不另造第二套语义）。
+#: 2026-11-03 起 old 形象具体参数撤出配置（前端按生产现值固化常量），白名单只留
+#: 两形象共用的 mascot_size_px 与 history_* 展示参数。
 _MAIMAI_PROJECTION: dict[str, tuple[type, Any, float, float]] = {
-    # 2026-11-01 目检修正：mascot_size_px 96→128（探头更大更清晰）
     'mascot_size_px': (int, 144, 48, 192),
-    'peek_angle_deg': (int, 12, 0, 90),
-    # 2026-11-01 U 计划：hover_out_* 语义改为「远离左下角交互区域的收起阈值/时长」；
-    # detail_fish_size_px 随「入口搬标题栏」退役（键已从配置模型清退）。
-    'hover_out_px': (int, 200, 60, 320),
-    'hover_out_ms': (int, 240, 80, 600),
-    'press_squash_x': (float, 1.20, 0.8, 1.6),
-    'press_squash_y': (float, 0.50, 0.2, 1.0),
-    'bounce_ms': (int, 774, 200, 3000),
-    'detail_blur_px': (int, 3, 0, 40),
-    'detail_fade_ms': (int, 220, 80, 600),
-    'detail_scale_from': (float, 0.6, 0.4, 1.0),
     'history_changes_limit': (int, 30, 5, 30),
     'history_state_epsilon': (float, 0.01, 0.001, 0.1),
     'history_debt_epsilon': (float, 0.1, 0.01, 1.0),
@@ -495,10 +525,9 @@ _MAIMAI_PROJECTION: dict[str, tuple[type, Any, float, float]] = {
 def _maimai_view(cfg: Any) -> dict[str, Any]:
     """``[maimai_interaction]`` → 面板 ``maimai`` 只读投影（白名单 + 范围钳制）。
 
-    ``bounce_easing`` 是自由字符串，投影视图里原样携带，由前端按 CSS easing
-    白名单形态校验后使用，无法识别时回退 overshoot（后端不做语法裁决）。
-    配置段缺失（防御路径，正常构造下恒存在）时按白名单出厂默认出全量视图，
-    与前端 CSS 同值兜底口径一致，不另造「关闭」歧义。
+    2026-11-03 起 old 形象具体参数不再投影（前端按生产现值固化常量）；
+    ``preset`` 为固定枚举原样携带。配置段缺失（防御路径，正常构造下恒存在）
+    时按白名单出厂默认出全量视图，与前端 CSS 同值兜底口径一致。
     """
     section = getattr(cfg, 'maimai_interaction', None)
     view: dict[str, Any] = {'enabled': bool(getattr(section, 'enabled', True))}
@@ -511,9 +540,8 @@ def _maimai_view(cfg: Any) -> dict[str, Any]:
             raw = default
         value = min(high, max(low, float(raw)))
         view[name] = int(round(value)) if kind is int else round(value, 4)
-    easing = getattr(section, 'bounce_easing', None)
-    view['bounce_easing'] = str(easing)[:80] if isinstance(easing, str) and easing.strip() \
-        else 'cubic-bezier(.34,1.56,.64,1)'
+    preset = getattr(section, 'preset', None)
+    view['preset'] = {'old': 'fish', 'new': 'human'}.get(preset, preset) if preset in ('old', 'new', 'fish', 'human') else 'human'
     return view
 
 
@@ -595,6 +623,8 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
         safe_sleep = {key: sleep_live.get(key) for key in
                       ('asleep', 'wake_reason', 'continuous_minutes', 'interruption_count',
                        'wake_at', 'lie_in_cap', 'closed_at')}
+    dynamic_sleep = (read('动态睡眠状态暂不可读', lambda: engine.dynamic_status(now), None)
+                     if getattr(engine, "dynamic_enabled", False) else None)
     companion = read('陪伴状态暂不可读', lambda: _companion_summary(plugin, date=date), {'available': False})
     observations = []
     if safe_state['focus'] is not None and safe_state['focus'] < .3:
@@ -617,6 +647,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
         'state_age_seconds': age, 'stale': age is None or age > 900 or future_state,
         'history': history,
         'schedule': {'enabled': enabled, 'runtime_ready': ready, 'date': date,
+                     'pools': _schedule_pools(ctx.planning, model, now, read) if ready else {},
                      'current': _row(current) if current else None,
                      'intents': [_row(row) for row in today.get('intents', [])[:80]],
                      'episodes': [_row(row) for row in today.get('episodes', [])[-120:]],
@@ -628,6 +659,11 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
         'companion': companion, 'observations': observations, 'warnings': list(dict.fromkeys(warnings))[:8],
     }
     result['maimai'] = _maimai_view(cfg)
+    if isinstance(dynamic_sleep, dict):
+        result['sleep']['dynamic'] = {key: dynamic_sleep[key] for key in (
+            'band', 'pressure', 'circadian', 'debt', 'schedule', 'activity', 'score',
+            'window_start', 'window_end', 'earliest_wake', 'latest_wake', 'phase_minutes',
+            'onset_reason', 'decision', 'nap_reason', 'interruption') if key in dynamic_sleep}
     result.update(_extension_summary(plugin, now, hours, usage_hours,
                                      usage_rows_limit, usage_rows_offset))
     if future_state:

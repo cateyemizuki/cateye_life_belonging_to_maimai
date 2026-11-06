@@ -18,11 +18,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
+import random
 import threading
 import time
+import uuid
 from datetime import date
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -48,6 +51,18 @@ SURF_MAX_GAP_SESSIONS = 2
 SURF_MAX_DEDICATED_SESSIONS = 2
 #: gap 两场启动的最小间隔（秒）；60 分钟（计划书 §3.2 建议）
 GAP_MIN_INTERVAL_SECONDS = 3600
+
+# ── 2026-11-04 刷视频功能批：空隙冲浪（gap）触发与候选准备（内部常量）──────
+#: 空闲拍触发 gap 冲浪的概率（当前状态.md 遗留「空隙10%触发」；每冷却窗掷一次）
+GAP_TRIGGER_PROBABILITY = 0.10
+#: 两次 gap 掷点/重试的最小间隔（秒；防每拍刷屏掷点，与额度 60 分钟门叠加）
+GAP_ROLL_COOLDOWN_SECONDS = 1800
+#: gap 单场入账时长（分钟；比 dedicated 的 20 分钟短——空隙看看口径）
+GAP_SESSION_MINUTES = 10.0
+#: 候选准备（兴趣检查+公开接口抓取）总超时（秒；单飞 sync 内异步执行）
+CANDIDATE_PREPARE_TIMEOUT_SECONDS = 120.0
+#: 未提交成功的 gap 条目最大存活（秒；超龄收尾，防链接库滞留）
+GAP_ENTRY_MAX_AGE_SECONDS = 3600
 
 ApiCaller = Callable[..., Awaitable[Dict[str, Any]]]
 EpisodeLookup = Callable[[str], Optional[Dict[str, Any]]]
@@ -187,6 +202,14 @@ class SurfQuotaLedger:
             field = self._KIND_FIELD[claim["kind"]]
             doc[field] = max(0, doc[field] - 1)
             doc["minutes_used"] = max(0.0, doc["minutes_used"] - claim["minutes"])
+            # 2026-11-04 模块评估问题5：退款还原启动间隔锚点（claim 已记录
+            # previous_start），gap 60 分钟门不再从被退款的申请时刻起算。
+            # 保守守卫：若退款前已有更晚的真实启动（last_start_epoch 晚于本
+            # claim 的登记时刻），不覆盖那次启动的锚点。
+            started = claim.get("started_at")
+            last = doc.get("last_start_epoch")
+            if started is None or last is None or _as_float(last) <= _as_float(started):
+                doc["last_start_epoch"] = claim.get("previous_start")
             claim["state"] = "not_started"
             _atomic_write(self._path, doc)
             return True
@@ -240,7 +263,10 @@ class VideoWatchCoordinator:
                  get_episode: EpisodeLookup,
                  logger: Any = None,
                  *, attention: Any = None, quota: Any = None,
-                 share_recorder: Any = None) -> None:
+                 share_recorder: Any = None,
+                 candidate_preparer: Optional[Callable[[], Awaitable[Any]]] = None,
+                 frequency_refresh: Optional[Callable[[], None]] = None,
+                 rng: Optional[random.Random] = None) -> None:
         self._links_path = Path(store_dir) / "video_watch_links.json"
         self._api = api_caller
         #: S1b（冲浪计划书 §4.2/§3.3）注入的注意力租约/额度账本；None = 门控直放行，
@@ -249,6 +275,15 @@ class VideoWatchCoordinator:
         self._quota = quota
         #: S3（冲浪计划书 §7）：观看完成结果 → 分享候选（装配根注入；None=不生成）
         self._share_recorder = share_recorder
+        #: 2026-11-04 刷视频功能批：候选准备器（兴趣 TTL 检查 + 公开排行榜抓取，
+        #: 异步；在 next_candidate 同步 pick 之前执行）。None = 不准备（旧口径）
+        self._candidate_preparer = candidate_preparer
+        #: 联动状态变化后的回复倍率刷新回调（装配根 → proactive 频率链；
+        #: 事件结束/收尾即恢复原倍率，不依赖任务终态单一触发源）
+        self._frequency_refresh = frequency_refresh
+        self._rng = rng or random.Random()
+        #: 最近一次 gap 掷点/重试时刻（进程内；重载保守重置，额度门仍持久化把关）
+        self._gap_last_attempt = 0.0
 
         self._get_active_episode = get_active_episode
         self._get_episode = get_episode
@@ -288,6 +323,8 @@ class VideoWatchCoordinator:
         for episode_id, entry in list(links.items()):
             if entry.get("closed") or episode_id == active_id:
                 continue
+            if entry.get("scenario") == "gap":
+                continue  # gap 伪 episode 无日程行，收尾由下方 gap 专属轮询负责
             row = self._get_episode(episode_id) or {}
             status = str(row.get("status") or "")
             if status in ("active", "planned", ""):
@@ -340,11 +377,49 @@ class VideoWatchCoordinator:
                     progressed = True  # 租约撤销即收尾：本拍必须落账（否则 stage 丢）
                 changed = changed or progressed
 
+        # 3.5) gap 冲浪条目轮询（2026-11-04 刷视频功能批）：日程恢复即收尾；
+        #      否则与 dedicated 同口径核对租约/状态，终态存档并释放租约
+        for gap_id, entry in list(links.items()):
+            if not (isinstance(entry, dict) and entry.get("scenario") == "gap"
+                    and entry.get("task_id") and not entry.get("closed")):
+                continue
+            if active_id:
+                try:
+                    receipt = await self._api(action="cancel", task_id=str(entry["task_id"]),
+                                              owner=f"schedule:{gap_id}")
+                    entry["cancel_receipt"] = {"status": receipt.get("status"),
+                                               "already_terminal": bool(receipt.get("already_terminal")),
+                                               "released": bool(receipt.get("released"))}
+                except Exception as exc:
+                    entry["cancel_receipt"] = {"error": str(exc)[:200]}
+                entry["closed"] = True
+                entry["closed_reason"] = "schedule_resumed"
+                self._release_surf(gap_id, entry)
+                await self._archive_if_completed(entry, str(entry["task_id"]), episode_id=gap_id)
+                changed = True
+                continue
+            progressed = await self._poll_status(gap_id, entry)
+            if entry.get("closed"):
+                progressed = True
+            changed = changed or progressed
+
+        # 3.6) 空闲 gap 触发（无活动 episode 才掷点；概率/冷却/额度三重门）
+        if not active_id:
+            changed = await self._maybe_gap_surf(links) or changed
+
         # 4) 链接库收口（有界）
         if changed:
             self._compact(links)
             links_doc["links"] = links
             self._save_links(links_doc)
+            # 状态变化（含事件收尾/租约释放）→ 刷新回复倍率：刷视频期间下调，
+            # 结束/切走即恢复当前活动原有倍率（proactive 频率链重解析，不写回 1.0）
+            if self._frequency_refresh is not None:
+                try:
+                    self._frequency_refresh()
+                except Exception as exc:
+                    if self._log:
+                        self._log.warning("刷视频联动后的频率刷新失败（忽略）：%s", exc)
 
     # ------------------------------------------------------------------
     def _release_surf(self, episode_id: str, entry: Dict[str, Any]) -> None:
@@ -352,8 +427,12 @@ class VideoWatchCoordinator:
             self._attention.release(f"schedule:{episode_id}")
         entry.pop("lease", None)
 
-    async def _start_watching(self, episode_id: str, entry: Dict[str, Any]) -> None:
+    async def _start_watching(self, episode_id: str, entry: Dict[str, Any],
+                              kind: str = "dedicated") -> None:
         entry.setdefault("started_at", time.time())
+        # 场景标记（S2 频率倍率读 entry["scenario"]：dedicated=0.45 / gap=0.70；
+        # 2026-11-04 前此处未写标记，dedicated 曾被误读成 gap 倍率）
+        entry["scenario"] = "gap" if kind == "gap" else "dedicated"
         reserved = False
         accepted = False
         phase = "candidate"
@@ -366,27 +445,44 @@ class VideoWatchCoordinator:
                     entry.update(stage="skipped", reason="聊天占用或覆盖面未确立，不开始自动观看")
                     return
                 entry["lease"] = lease
+            # 候选准备（兴趣 TTL 检查 + 公开排行榜抓取；失败不阻断——next_candidate
+            # 会如实返回 no_candidate 原因，绝不编造 BV 号）
+            if self._candidate_preparer is not None:
+                try:
+                    await asyncio.wait_for(self._candidate_preparer(),
+                                           timeout=CANDIDATE_PREPARE_TIMEOUT_SECONDS)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if self._log:
+                        self._log.warning("候选准备失败（按无候选如实处理）：%s", exc)
             pick = await self._api(action="next_candidate")
             candidate = pick.get("candidate") if isinstance(pick, dict) else None
             if not candidate:
-                entry.update(stage="skipped", reason="无真实候选，不编造 BV 号")
+                reason = str(pick.get("reason") or "") if isinstance(pick, dict) else ""
+                entry.update(stage="skipped",
+                             reason=("无真实候选，不编造 BV 号"
+                                     + (f"（{reason}）" if reason else "")))
                 return
             if self._attention is not None and not self._attention.lease_valid(entry.get("lease")):
                 entry.update(stage="skipped", reason="选片期间聊天开始")
                 return
             if self._quota is not None:
                 snap = self._quota.snapshot()
-                minutes = min(20.0, max(0.0, SURF_MAX_TOTAL_MINUTES - float(snap["minutes_used"])))
+                session_minutes = GAP_SESSION_MINUTES if kind == "gap" else 20.0
+                minutes = min(session_minutes,
+                              max(0.0, SURF_MAX_TOTAL_MINUTES - float(snap["minutes_used"])))
                 reserve = getattr(self._quota, "reserve_once", None)
-                reserved = (reserve(episode_id, "dedicated", minutes) if callable(reserve)
-                            else self._quota.try_consume("dedicated", minutes))
+                reserved = (reserve(episode_id, kind, minutes) if callable(reserve)
+                            else self._quota.try_consume(kind, minutes))
                 if not reserved:
                     entry.update(stage="skipped", reason="自动观看额度不足或本事件已申请")
                     return
                 entry["reserved_minutes"] = minutes
             phase = "submit"
             receipt = await self._api(action="submit", video=str(candidate["bvid"]),
-                                      purpose="日程刷视频", episode_id=episode_id)
+                                      purpose=("空隙刷视频" if kind == "gap" else "日程刷视频"),
+                                      episode_id=episode_id)
             if receipt.get("success") and receipt.get("cached"):
                 # 旧观看记忆不是新任务，不登记分享、不伪造task_id、不占观看额度。
                 if reserved and hasattr(self._quota, "refund_unstarted"):
@@ -412,6 +508,66 @@ class VideoWatchCoordinator:
             if not accepted:
                 entry["closed"] = not retryable
                 self._release_surf(episode_id, entry)
+
+    # ------------------------------------------------------------------
+    # gap 冲浪（2026-11-04 刷视频功能批：SurfQuotaLedger gap 类型消费接线）
+    # ------------------------------------------------------------------
+    def open_gap_entry(self) -> Dict[str, Any]:
+        """当前进行中的 gap 关联只读快照（供回复倍率链读租约/任务；无 → {}）。"""
+        links = self._load_links().get("links") or {}
+        for gap_id, entry in links.items():
+            if (isinstance(entry, dict) and entry.get("scenario") == "gap"
+                    and entry.get("task_id") and not entry.get("closed")):
+                out = dict(entry)
+                out["episode_id"] = gap_id
+                return out
+        return {}
+
+    async def _maybe_gap_surf(self, links: Dict[str, Any]) -> bool:
+        """空闲拍尝试 gap 冲浪：返回链接库是否变化（调用方已确认无活动 episode）。
+
+        门序：已有进行中 gap → 不动；未提交成功的旧 gap 条目 → 冷却后重试
+        （超龄收尾）；否则冷却窗内掷点一次（10%）→ 命中才建链。额度/注意力/
+        候选门在 _start_watching 内与 dedicated 同口径（kind="gap"）。
+        """
+        now = time.time()
+        changed = False
+        has_running = False
+        retryable: list = []
+        for gap_id, entry in links.items():
+            if not (isinstance(entry, dict) and entry.get("scenario") == "gap"
+                    and not entry.get("closed")):
+                continue
+            if entry.get("task_id"):
+                has_running = True
+            else:
+                retryable.append((gap_id, entry))
+        if has_running:
+            return False
+        for gap_id, entry in retryable:
+            if now - float(entry.get("started_at") or now) > GAP_ENTRY_MAX_AGE_SECONDS:
+                entry["closed"] = True
+                entry["closed_reason"] = "gap_expired"
+                changed = True
+        retryable = [(gid, e) for gid, e in retryable if not e.get("closed")]
+        if now - self._gap_last_attempt < GAP_ROLL_COOLDOWN_SECONDS:
+            return changed
+        self._gap_last_attempt = now
+        if retryable:
+            gap_id, entry = retryable[0]
+            await self._start_watching(gap_id, entry, kind="gap")
+            return True
+        try:
+            hit = self._rng.random() < GAP_TRIGGER_PROBABILITY
+        except Exception:
+            hit = False
+        if not hit:
+            return changed
+        gap_id = f"gap-{uuid.uuid4().hex[:12]}"
+        entry = {"scenario": "gap"}
+        links[gap_id] = entry
+        await self._start_watching(gap_id, entry, kind="gap")
+        return True
 
     async def _poll_status(self, episode_id: str, entry: Dict[str, Any]) -> bool:
         """有界状态轮询；S1b 起每次先核对 SURF 租约（撤销即取消任务并收尾）。"""

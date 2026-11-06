@@ -299,6 +299,9 @@ class LLMService:
                 model_name=getattr(self, "_model_name", ""),
                 call_logger=getattr(self, "_call_logger", None),
                 usage_tracker=getattr(self, "_usage_tracker", None),
+                optimization_enabled_provider=lambda: bool(getattr(
+                    _llm_section(self._config_provider()) if self._config_provider else None,
+                    "prompt_optimization_enabled", True)),
             )
             self._llm_gateway = gateway
         return gateway

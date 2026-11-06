@@ -10,7 +10,8 @@ list_3 楼中楼），配合 emotion_cgi_re_feeds 的 commentId/commentUin 字�
 cookie 获取（多级降级，与 Maizone 相同思路）：
 1. 适配器 API：adapter.napcat.account.get_cookies（domain=user.qzone.qq.com，
    官方 SnowLuma/NapCat 适配器均暴露；影子适配器可走 action.call 透传）；
-2. NapCat HTTP 服务器 POST /get_cookies（备选，需在 NapCat 开 http server）；
+2. NapCat HTTP 服务器 POST /get_cookies（备选，需在 NapCat 开 http server；
+   http 明文且携带 Bearer token，**仅限回环地址**，勿指向局域网/公网）；
 3. 本地 cookies.json 文件回退。
 刷新节流：1 小时内不重复拉取（内存时间戳 + 文件回退）。
 
@@ -23,6 +24,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -161,9 +163,20 @@ class QzoneCookieManager:
 
     def _save_local(self, cookies: Dict[str, str]) -> None:
         try:
-            save_json_atomic(self._path, cookies)
+            saved = save_json_atomic(self._path, cookies)
         except OSError as exc:
             logger.warning("QQ 空间 cookie 本地保存失败（忽略，当前会话继续）：%s", exc)
+            return
+        if not saved:
+            logger.warning("QQ 空间 cookie 本地保存失败（忽略，当前会话继续）")
+            return
+        # 问题6（凭据卫生）：含 skey/p_skey 的凭据文件权限收紧为仅属主可读写。
+        # Windows 上 os.chmod 仅影响只读位，收紧效果有限（尽力而为，不引入 ACL 依赖）；
+        # POSIX 上生效 0600。失败不影响当前会话。
+        try:
+            os.chmod(self._path, 0o600)
+        except OSError:
+            pass
 
     # ---- 对外 ----
     async def get_cookies(self, force: bool = False) -> Optional[Dict[str, str]]:
@@ -245,6 +258,34 @@ class QzoneWebClient:
         if expired and self._on_auth_expired:
             self._on_auth_expired()
 
+    def _log_request_failure(self, op: str, *, response: Any = None,
+                             exc: Optional[Exception] = None) -> None:
+        """请求级失败留脱敏诊断（问题7）：操作名 + HTTP 状态 + code/ret + message 摘要。
+
+        脱敏口径：网络异常**只记异常类名**——httpx 异常文本可能携带含 g_tk/uin 的
+        完整请求 URL，不落日志；不输出 cookie、请求体、说说/评论正文。message 为
+        服务端错误文案，截 120 字。留痕自身异常静默（诊断不得反过来杀死业务）。
+        """
+        try:
+            if exc is not None:
+                logger.warning("QQ 空间 CGI %s 网络异常（%s）", op, type(exc).__name__)
+                return
+            status = getattr(response, "status_code", None)
+            code = None
+            message = ""
+            try:
+                payload = self._parse_jsonp(response.text)
+                code = payload.get("code")
+                if code is None:
+                    code = payload.get("ret")  # 上传端点用 ret
+                message = str(payload.get("message") or payload.get("msg") or "")
+            except (ValueError, TypeError, AttributeError):
+                pass
+            logger.warning("QQ 空间 CGI %s 失败：http=%s code=%s message=%s",
+                           op, status, code, message[:120])
+        except Exception:
+            pass
+
     # ---- 响应解析 ----
     @staticmethod
     def _parse_jsonp(text: str) -> Dict[str, Any]:
@@ -290,19 +331,23 @@ class QzoneWebClient:
             "need_comment": 1, "need_private_comment": 1,
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, trust_env=False) as client:
                 res = await client.get(self.LIST_URL, params=params,
                                        headers=self._headers(str(target_qq)), cookies=self.cookies)
-        except Exception:
+        except Exception as exc:
+            self._log_request_failure("get_list", exc=exc)
             return []
         self._observe_response(res)
         if res.status_code != 200:
+            self._log_request_failure("get_list", response=res)
             return []
         try:
             data = self._parse_jsonp(res.text)
         except (ValueError, json.JSONDecodeError):
+            self._log_request_failure("get_list", response=res)
             return []
         if data.get("code") != 0:
+            self._log_request_failure("get_list", response=res)
             return []
         feeds: List[Dict[str, Any]] = []
         for msg in data.get("msglist") or []:
@@ -364,18 +409,24 @@ class QzoneWebClient:
             "picfile": base64.b64encode(bytes(image)).decode("ascii"),
         }
         try:
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, trust_env=False) as client:
                 res = await client.post(self.UPLOAD_URL, data=data,
                                         headers=self._headers(self.uin), cookies=self.cookies)
-        except Exception:
+        except Exception as exc:
+            self._log_request_failure("upload_image", exc=exc)
             return None
         self._observe_response(res)
         if res.status_code != 200:
+            self._log_request_failure("upload_image", response=res)
             return None
         try:
-            return self._parse_jsonp(res.text)
+            payload = self._parse_jsonp(res.text)
         except (ValueError, json.JSONDecodeError):
+            self._log_request_failure("upload_image", response=res)
             return None
+        if isinstance(payload, dict) and payload.get("ret") not in (0, None):
+            self._log_request_failure("upload_image", response=res)
+        return payload
 
     @staticmethod
     def get_picbo_and_richval(upload_result: Any) -> Tuple[Optional[str], Optional[str]]:
@@ -402,17 +453,26 @@ class QzoneWebClient:
         return picbo, richval
 
     # ---- 发说说 / 评论 / 回评 / 点赞 ----
-    async def publish(self, content: str, images: Optional[List[bytes]] = None) -> Optional[str]:
+    async def publish(self, content: str, images: Optional[List[bytes]] = None,
+                      *, visibility: int = 1) -> Optional[str]:
         """发表说说（可带图），成功返回 tid。
+
+        ``visibility``（P1-13）：透传调用方可见性到 ``ugc_right``，不再硬编码公开。
+        仅支持无需名单参数的取值 1/4/64；16/128 需要 target_uins 名单、本端点调用
+        无法表达 → **分发前拒绝**（返回 None 并留日志），绝不静默降级为公开帖。
 
         带图：逐张走 :meth:`upload_image`，**单张失败跳过该图**，有成功的才拼
         ``pic_bo``（逗号连接）/ ``richtype=1`` / ``richval``（tab 连接）——三个细节错一
         个图就挂不上；全部失败 → 纯文本发出（配图失败永不阻断发布）。
         """
+        if visibility not in (1, 4, 64):
+            logger.warning("QQ 空间 CGI 发布拒绝：可见性 ugc_right=%s 需名单参数，CGI 通道不支持（未分发）",
+                           visibility)
+            return None
         data = {
             "syn_tweet_verson": "1", "paramstr": "1", "who": "1",
             "con": content, "feedversion": "1", "ver": "1",
-            "ugc_right": "1", "to_sign": "0", "hostuin": self.uin,
+            "ugc_right": str(int(visibility)), "to_sign": "0", "hostuin": self.uin,
             "code_version": "1", "format": "json",
             "qzreferrer": f"https://user.qzone.qq.com/{self.uin}",
         }
@@ -431,17 +491,20 @@ class QzoneWebClient:
             data["richtype"] = "1"
             data["richval"] = "\t".join(richvals)
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, trust_env=False) as client:
                 res = await client.post(self.PUBLISH_URL, params={"g_tk": self.gtk, "uin": self.uin},
                                         data=data, headers=self._headers(self.uin), cookies=self.cookies)
-        except Exception:
+        except Exception as exc:
+            self._log_request_failure("publish", exc=exc)
             return None
         self._observe_response(res)
         if res.status_code != 200 or self._extract_code(res.text) != 0:
+            self._log_request_failure("publish", response=res)
             return None
         try:
             return str(self._parse_jsonp(res.text).get("tid") or "") or None
         except (ValueError, json.JSONDecodeError):
+            self._log_request_failure("publish", response=res)
             return None
 
     async def comment(self, fid: str, target_qq: str, content: str) -> bool:
@@ -453,13 +516,17 @@ class QzoneWebClient:
             "ref": "feeds", "content": content,
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, trust_env=False) as client:
                 res = await client.post(self.COMMENT_URL, params={"g_tk": self.gtk},
                                         data=data, headers=self._headers(self.uin), cookies=self.cookies)
-        except Exception:
+        except Exception as exc:
+            self._log_request_failure("comment", exc=exc)
             return False
         self._observe_response(res)
-        return res.status_code == 200 and self._extract_code(res.text) == 0
+        ok = res.status_code == 200 and self._extract_code(res.text) == 0
+        if not ok:
+            self._log_request_failure("comment", response=res)
+        return ok
 
     async def reply_comment(self, fid: str, target_qq: str, nickname: str,
                             comment_qq: str, content: str, comment_tid: int | str) -> bool:
@@ -479,13 +546,17 @@ class QzoneWebClient:
             "richtype": "", "richval": "", "paramstr": "1",
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, trust_env=False) as client:
                 res = await client.post(self.COMMENT_URL, params={"g_tk": self.gtk},
                                         data=data, headers=self._headers(self.uin), cookies=self.cookies)
-        except Exception:
+        except Exception as exc:
+            self._log_request_failure("reply_comment", exc=exc)
             return False
         self._observe_response(res)
-        return res.status_code == 200 and self._extract_code(res.text) == 0
+        ok = res.status_code == 200 and self._extract_code(res.text) == 0
+        if not ok:
+            self._log_request_failure("reply_comment", response=res)
+        return ok
 
     async def like(self, fid: str, target_qq: str) -> bool:
         """点赞 target_qq 空间的一条说说（appid=311=说说）。"""
@@ -497,10 +568,14 @@ class QzoneWebClient:
             "fid": str(fid), "active": 0, "format": "json", "fupdate": 1,
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, trust_env=False) as client:
                 res = await client.post(self.LIKE_URL, params={"g_tk": self.gtk},
                                         data=data, headers=self._headers(self.uin), cookies=self.cookies)
-        except Exception:
+        except Exception as exc:
+            self._log_request_failure("like", exc=exc)
             return False
         self._observe_response(res)
-        return res.status_code == 200 and self._extract_code(res.text) == 0
+        ok = res.status_code == 200 and self._extract_code(res.text) == 0
+        if not ok:
+            self._log_request_failure("like", response=res)
+        return ok

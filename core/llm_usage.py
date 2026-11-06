@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -139,7 +141,9 @@ def entry_module(entry: Any) -> str:
 
 
 USAGE_TERMS = {
-    "calls": {"label": "调用次数", "description": "收到宿主响应的请求数，包含失败响应；未收到响应的本地异常不计入。"},
+    # F1 口径对齐（2026-11-04）：Gateway 异常路径（超时/断连/取消/回退首尝异常）
+    # 补记 abandoned/degraded 行后，calls 同时包含这些「已发出未收到响应」的调用。
+    "calls": {"label": "调用次数", "description": "收到宿主响应的请求数（含失败响应），加上已发出但因本地异常（超时/断连/取消）未收到响应的已放弃调用；后者只计次数，不推算 token。"},
     "tokens": {"label": "Token 消耗", "description": "宿主回传的文本处理量；缺失时只计调用，不推算。"},
     "prompt_tokens": {"label": "输入 Token", "description": "宿主回传的输入（prompt）Token 总量，仅统计明确回传的记录。"},
     "completion_tokens": {"label": "输出 Token", "description": "宿主回传的输出（completion）Token 总量，仅统计明确回传的记录。"},
@@ -149,8 +153,12 @@ USAGE_TERMS = {
     "host_reported": {"label": "正常回传", "description": "宿主返回成功响应及可识别的完整用量。"},
     "success_no_usage": {"label": "成功但无用量", "description": "success=true，但宿主未回传完整usage。"},
     "failed": {"label": "失败调用", "description": "宿主响应的success不为true。"},
-    "legacy": {"label": "旧记录", "description": "升级前缺少success和usage_present标记的记录，保留原始记录不补写。"},
-    "abandoned": {"label": "已放弃", "description": "插件主动放弃但宿主可能已完成并计费的调用；token 缺失时只计次数。"},
+    # F4 口径对齐（2026-11-04）：legacy 桶按**字段**判定（缺 success/usage_present），
+    # 与「schema=1 旧格式行数」是两套口径——带标记的 v1 行归正常桶，legacy 桶可为 0；
+    # schema 口径另见 summary 的 schema1_calls 并列展示，避免面板被读成「没有旧记录」。
+    "legacy": {"label": "旧记录", "description": "缺少 success 和 usage_present 标记的记录（字段口径，不回填不补写）；带标记的 v1 旧行按成败/用量归入正常桶，故本桶可为 0。schema 口径见 schema1_calls。"},
+    "schema1_calls": {"label": "旧schema记录", "description": "schema=1（升级前格式）的行数，与四桶 legacy（字段口径）并列的另一套口径；带 success/usage_present 标记的旧行同时计入本项与正常桶。"},
+    "abandoned": {"label": "已放弃", "description": "插件主动放弃但宿主可能已完成并计费的调用（含超时/断连/取消等未收到响应的异常路径）；token 缺失时只计次数。"},
 }
 
 
@@ -343,9 +351,22 @@ class LLMUsageTracker:
                         changed = True
             if not changed:
                 return
-            tmp = path.with_suffix(".jsonl.tmp")
-            tmp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
-            tmp.replace(path)
+            # F3（2026-11-04）：tmp 名加进程号+随机后缀，避免重载重叠期两个进程
+            # 写同一个固定 .tmp 互相覆盖（理论丢行窗口）；失败时清理残 tmp。
+            tmp = path.with_name(
+                f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+            try:
+                tmp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+                tmp.replace(path)
+            except Exception:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    # 门禁修复（2026-11-04，P2-08 静默失败守卫）：残 tmp 清理失败
+                    # 不再静默 pass——落 debug 痕（best-effort 语义不变，随后照旧
+                    # raise 交外层记录裁剪失败）；至多遗留一个带 pid/随机后缀的 tmp。
+                    logger.debug("LLM 用量裁剪残留 tmp 清理失败（忽略）：%s", tmp, exc_info=True)
+                raise
         except Exception:
             logger.debug("LLM 用量记录裁剪失败（忽略）", exc_info=True)
 
@@ -360,8 +381,12 @@ class LLMUsageTracker:
         新增：``window_hours`` / ``prompt_tokens`` / ``completion_tokens`` /
         ``cache_hit_tokens`` / ``cache_miss_tokens`` / ``module_calls`` /
         ``matrix``（模块 × 模型，值为 ``{calls,tokens}``）/ ``abandoned_calls`` /
-        ``unknown_module_calls`` / ``rows``（逐笔明细；仅 ``include_rows=True``
-        时收集，避免首屏 payload 膨胀）。文件缺失/损坏 → 空账本（不抛异常）。
+        ``unknown_module_calls`` / ``schema1_calls``（F4：schema=1 旧格式行数，
+        与四桶 legacy 的字段口径并列展示）/ ``rows``（逐笔明细；仅 ``include_rows=True``
+        时收集，避免首屏 payload 膨胀）；W-09 只增：``prompt_reported_calls`` /
+        ``completion_reported_calls`` / ``cache_reported_calls`` /
+        ``split_tokens`` / ``split_coverage``（拆分覆盖率，tokens=0 时为 None）。
+        文件缺失/损坏 → 空账本（不抛异常）。
         """
         window_hours = max(1, int(hours or DEFAULT_USAGE_WINDOW_HOURS))
         clock = now or datetime.now()
@@ -369,9 +394,13 @@ class LLMUsageTracker:
         calls = 0
         tokens = 0
         prompt_total = completion_total = cache_hit_total = cache_miss_total = 0
+        # W-09（2026-11-03）只增字段：有多少行宿主明确回传了输入/输出拆分与缓存字段。
+        # 没有它，"总量 ≠ 输入+输出"与"缓存命中 0"会被读成数据错误或真 0。
+        prompt_reported = completion_reported = cache_reported = 0
         missing_calls = 0
         abandoned_calls = 0
         unknown_module_calls = 0
+        schema1_calls = 0  # F4：schema 口径的旧格式行数（区别于字段口径的 legacy 桶）
         buckets = empty_buckets()
         models: Dict[str, int] = {}
         model_calls: Dict[str, int] = {}
@@ -414,12 +443,18 @@ class LLMUsageTracker:
                             continue
                         if row.abandoned:
                             abandoned_calls += 1
+                        if row.schema < 2:
+                            schema1_calls += 1
                         if row.module == MODULE_UNKNOWN:
                             unknown_module_calls += 1
                         if row.prompt is not None:
                             prompt_total += row.prompt
+                            prompt_reported += 1
                         if row.completion is not None:
                             completion_total += row.completion
+                            completion_reported += 1
+                        if row.cache_hit is not None or row.cache_miss is not None:
+                            cache_reported += 1
                         if row.cache_hit is not None:
                             cache_hit_total += row.cache_hit
                         if row.cache_miss is not None:
@@ -458,11 +493,21 @@ class LLMUsageTracker:
             "completion_tokens": completion_total,
             "cache_hit_tokens": cache_hit_total,
             "cache_miss_tokens": cache_miss_total,
+            # W-09 只增字段（不改 tokens 原语义）：拆分覆盖率 = (输入+输出)/宿主总量，
+            # tokens=0 或无可比口径时为 None；前端据此把"未回传拆分"与真 0 分开。
+            "prompt_reported_calls": prompt_reported,
+            "completion_reported_calls": completion_reported,
+            "cache_reported_calls": cache_reported,
+            "split_tokens": prompt_total + completion_total,
+            "split_coverage": (
+                round((prompt_total + completion_total) / tokens, 4) if tokens > 0 else None
+            ),
             "module_calls": module_calls,
             "model_calls": model_calls,
             "matrix": matrix,
             "abandoned_calls": abandoned_calls,
             "unknown_module_calls": unknown_module_calls,
+            "schema1_calls": schema1_calls,
             "rows": rows,
         }
 

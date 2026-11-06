@@ -23,7 +23,8 @@
 分值参数为用户显式配置过的**不迁移**（CHANGELOG 明示）。
 
 v1 字段原地保留（§5.3）：``habits``（memory_manager 的底层存储）、``last_user_msg_time``、
-``last_speak_time``、``today_speak_count``、``today_date``、``morning/night/miss_sent_today``。
+``last_speak_time``、``today_speak_count``、``today_date``、``morning/night/noon/miss_sent_today``
+（noon 为 2026-11-04 主动行为重写新增的中午问好按天标记）。
 注意 ``today_speak_count`` 只是巡检「预算计数」，与好感分完全无关（§5.4/§5.6），
 ``increment_speak()`` 等预算方法语义不变。
 
@@ -217,6 +218,7 @@ def _build_state(raw: Any, *, now: Optional[datetime] = None) -> Tuple[dict, boo
         "today_date": str(src.get("today_date", "") or ""),
         "morning_sent_today": bool(src.get("morning_sent_today", False)),
         "night_sent_today": bool(src.get("night_sent_today", False)),
+        "noon_sent_today": bool(src.get("noon_sent_today", False)),
         "miss_sent_today": bool(src.get("miss_sent_today", False)),
         "last_user_msg_time": src.get("last_user_msg_time"),
         "last_speak_time": src.get("last_speak_time"),
@@ -636,6 +638,10 @@ class AffectionManager:
     def night_sent(self) -> bool:
         return bool(self._state.get("night_sent_today", False))
 
+    def noon_sent(self) -> bool:
+        """中午问好按天标记（2026-11-04 主动行为重写；旧档案缺键 → False）。"""
+        return bool(self._state.get("noon_sent_today", False))
+
     def miss_sent_today(self) -> bool:
         return bool(self._state.get("miss_sent_today", False))
 
@@ -1004,6 +1010,7 @@ class AffectionManager:
         self._state["today_speak_count"] = 0.0
         self._state["morning_sent_today"] = False
         self._state["night_sent_today"] = False
+        self._state["noon_sent_today"] = False
         self._state["miss_sent_today"] = False
         self._state["daily_delta"] = {"date": self._state["today_date"], "positive": 0.0, "negative": 0.0}
         self._state["event_log"] = []
@@ -1020,12 +1027,38 @@ class AffectionManager:
         self._state["last_speak_time"] = datetime.now().isoformat()
         self._mark_dirty()
 
+    def note_greeting_spoke(self) -> None:
+        """问候（早/午/晚安）成功开口 → 仅刷新 ``last_speak_time``（**免预算**：不增
+        ``today_speak_count``，问候豁免口径不变）。
+
+        2026-11-05 双发修复（路径互斥）：问候与想念是两条独立主动路径。问候免预算、
+        原先只置按天标记不写 ``last_speak_time``，导致巡检想念的最小间隔/冷却闸读到
+        陈旧发言时间（实例：08:54 早安后 08:55 想念仍判「距上次发言 708.7 分钟」而
+        放行，planner 在晨间语境里重复同一句早安）。这里把问候登记为一次「已发言」
+        （只刷时间戳、不占预算），patrol 既有 min_interval/cooldown 闸在问候后自然
+        抑制想念，两路径不再紧贴双发。消费方：patrol._minutes_since_last_speak /
+        _is_in_cooldown、affection_events.note_user_message（问候后对方接话不再误判
+        user_initiated）。
+        """
+        self._state["last_speak_time"] = datetime.now().isoformat()
+        self._mark_dirty()
+
+    def note_optional_spoke(self, now: Optional[datetime] = None) -> None:
+        """Record an accepted optional turn without a second budget charge."""
+        self._state["last_speak_time"] = (now or datetime.now()).isoformat()
+        self._mark_dirty()
+
     def set_morning_sent(self) -> None:
         self._state["morning_sent_today"] = True
         self._mark_dirty()
 
     def set_night_sent(self) -> None:
         self._state["night_sent_today"] = True
+        self._mark_dirty()
+
+    def set_noon_sent(self) -> None:
+        """中午问好触发成功 → 置按天标记（2026-11-04；日切由 _reset_daily_fields 清零）。"""
+        self._state["noon_sent_today"] = True
         self._mark_dirty()
 
     def set_miss_sent(self) -> None:

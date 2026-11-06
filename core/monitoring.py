@@ -28,12 +28,16 @@ def usage_summary(data_dir,now,hours=24):
 
     与 :meth:`core.llm_usage.LLMUsageTracker.summary` 保持同口径；这里额外保留
     宿主日志的 ``truncated`` 有界读取标记。v2 行优先读 ``module`` 字段，旧行回退
-    event 映射。
+    event 映射。W-09 只增拆分覆盖率字段（``*_reported_calls`` / ``split_tokens`` /
+    ``split_coverage``），不改 ``tokens`` 原语义。
     """
     rows,truncated=tail_records(Path(data_dir)/'llm_usage_events.jsonl',2*1024*1024)
     models={};model_calls={};modules={};module_calls={};matrix={}
     calls=unknown=0;tokens=verified_tokens=unverified_tokens=0
     prompt_total=completion_total=cache_hit_total=cache_miss_total=0
+    # W-09（2026-11-03）只增字段：与 LLMUsageTracker.summary 同口径，记录多少行
+    # 明确回传了输入/输出拆分与缓存字段；缺拆分时"总量≠输入+输出"才可解释。
+    prompt_reported=completion_reported=cache_reported=0
     abandoned_calls=unknown_module_calls=0
     from .llm_usage import (module_of_event,usage_bucket_of,missing_usage_source,
                             empty_buckets,reported_token_count,USAGE_TERMS,MODULE_UNKNOWN)
@@ -65,8 +69,9 @@ def usage_summary(data_dir,now,hours=24):
             completion=_usage_count(row.get('completion'))
             cache_hit=_usage_count(row.get('cache_hit'))
             cache_miss=_usage_count(row.get('cache_miss'))
-            if prompt is not None:prompt_total+=prompt
-            if completion is not None:completion_total+=completion
+            if prompt is not None:prompt_total+=prompt;prompt_reported+=1
+            if completion is not None:completion_total+=completion;completion_reported+=1
+            if cache_hit is not None or cache_miss is not None:cache_reported+=1
             if cache_hit is not None:cache_hit_total+=cache_hit
             if cache_miss is not None:cache_miss_total+=cache_miss
             if row.get('abandoned') is True:abandoned_calls+=1
@@ -78,6 +83,11 @@ def usage_summary(data_dir,now,hours=24):
             'buckets':buckets,
             'prompt_tokens':prompt_total,'completion_tokens':completion_total,
             'cache_hit_tokens':cache_hit_total,'cache_miss_tokens':cache_miss_total,
+            # W-09 只增字段（不改 tokens 原语义）：split_coverage=拆分/总量，tokens=0 时 None。
+            'prompt_reported_calls':prompt_reported,'completion_reported_calls':completion_reported,
+            'cache_reported_calls':cache_reported,
+            'split_tokens':prompt_total+completion_total,
+            'split_coverage':(round((prompt_total+completion_total)/tokens,4) if tokens>0 else None),
             'model_calls':model_calls,'module_calls':module_calls,'matrix':matrix,
             'abandoned_calls':abandoned_calls,'unknown_module_calls':unknown_module_calls,
             'terms':USAGE_TERMS,
@@ -97,7 +107,11 @@ def _log_time(value,now):
     return at.isoformat()
 
 def runtime_health(plugin,now):
-    result={'scope':'bounded_recent_log_tail','plugin_errors':0,'external_errors':0,'reloads':0,'last_reload':None,'truncated':False}
+    result={'scope':'bounded_recent_log_tail','plugin_errors':0,'external_errors':0,'reloads':0,'last_reload':None,'truncated':False,
+            # W-17 只增字段（2026-11-03）：最近一次 error/critical 的时间与归属
+            # （'plugin'/'external'）。只给时间戳与范围，不透传异常正文或日志内容；
+            # 时间解析失败保持 None，不造假时间。计数值的口径不变（有界日志尾片段）。
+            'last_error_at':None,'last_error_scope':None}
     root=getattr(plugin,'_plugin_root',None)
     if not root:return result
     try:
@@ -116,6 +130,12 @@ def runtime_health(plugin,now):
                                for part in origins.split())
                 key='plugin_errors' if not host_owned and 'life_belonging_to_maimai' in serialized else 'external_errors'
                 result[key]+=1
+                # W-17：日志尾片段按时间顺序遍历，逐条覆盖即得「最近一次」；
+                # 与 last_reload 同用 _log_time（混合 UTC ISO 与本地时间行，统一导出 ISO）。
+                error_at=_log_time(row.get('timestamp'),now)
+                if error_at:
+                    result['last_error_at']=error_at
+                    result['last_error_scope']='plugin' if key=='plugin_errors' else 'external'
             if 'Supervisor 已重启完成: file_watcher' in serialized:
                 result['reloads']+=1;result['last_reload']=_log_time(row.get('timestamp'),now)
     except OSError:pass

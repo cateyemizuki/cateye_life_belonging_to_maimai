@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def load_json(path: Path, default: Any = None) -> Any:
@@ -14,7 +17,12 @@ def load_json(path: Path, default: Any = None) -> Any:
             return json.load(f)
     except FileNotFoundError:
         return default
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError:
+        # F6（2026-11-04）：损坏文件留痕——否则下次原子写会用默认值静默覆盖，
+        # 数据丢失不可观测。回退 default 的既有行为不变；只记路径不记内容。
+        logger.warning("JSON 文件损坏，回退默认值: %s", path)
+        return default
+    except OSError:
         return default
 
 

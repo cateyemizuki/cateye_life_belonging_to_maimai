@@ -38,9 +38,21 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .cycle_state import REASON_LEGACY
-from .time_utils import DAY_MINUTES
+from .time_utils import DAY_MINUTES, TimezoneManager
 
 logger = logging.getLogger(__name__)
+
+#: 写库时间戳统一 aware ISO（Asia/Shanghai；评估 P5 修复，2026-11-04，DEV_GUIDE
+#: 时区契约）。旧行 naive 本地 ISO 保持原状（不回改历史）；读取侧均已双兼容
+#: （rolling_planner._parse_ts / sleep_engine._restore_clock / time_utils.strip_tz
+#: 对 naive 按 tz 补齐或剥 tz 比较）。时区解析失败时 TimezoneManager 回退系统
+#: 时间（与全插件同一降级链）。调用方自带的 datetime 值仍按原样序列化，不改写。
+_TZ = TimezoneManager("Asia/Shanghai")
+
+
+def _now_iso() -> str:
+    """本模块写库时间戳唯一出口（aware ISO；替代各处 naive datetime.now()）。"""
+    return _TZ.get_now().isoformat()
 
 _CORRUPTION_KEYWORDS = ("malformed", "not a database", "encrypted", "corrupt")
 
@@ -128,6 +140,15 @@ _SLEEP_SESSION_UPDATE_COLUMNS = (
     "continuous_minutes", "interruption_count", "energy_start", "energy_end",
     "sleep_debt_before", "sleep_debt_after", "quality",
 )
+
+#: ``update_goal`` 允许更新的列白名单（评估 P5 修复，2026-11-04：kwargs 键不再
+#: 直接拼 SQL 列名）。``goal_id`` 主键与 ``updated_at`` 自动戳不可经 kwargs 改写；
+#: 白名单外键告警跳过（fail-safe，与写路径「告警不抛」纪律一致）。
+_GOAL_UPDATE_COLUMNS = frozenset({
+    "name", "description", "goal_type", "priority", "creator_id", "chat_id",
+    "status", "created_at", "deadline", "interval_seconds", "conditions",
+    "parameters", "progress", "last_executed_at", "execution_count",
+})
 
 
 class ScheduleDB:
@@ -271,8 +292,16 @@ class ScheduleDB:
             with self._lock:
                 self._conn = self._connect()
                 self._conn.executescript(self.SCHEMA)
-                self._migrate_schema_v5()
-                self._migrate_schema_v6()
+                # 评估 P5 修复（2026-11-04）：重建路径与正常路径同口径写
+                # schema_version（旧实现重建后 metadata 无版本行，诊断口径缺失）。
+                # 全新 SCHEMA 已含 v3/v4 列，基线为 4；v5/v6 迁移失败同款降级。
+                v5_ok = self._migrate_schema_v5()
+                v6_ok = self._migrate_schema_v6() if v5_ok else False
+                version = "6" if v6_ok else ("5" if v5_ok else "4")
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
+                    (version,),
+                )
                 self._conn.commit()
 
     def _migrate_schema_v3(self) -> None:
@@ -457,7 +486,7 @@ class ScheduleDB:
         ``max(end)`` 本地兜底。进账前先把同日旧行整体归档进 ``schedule_archive``
         （行快照 + cycle 戳 + reason + 归档时刻；**失效时机不变，归档是纯新增**）。
         """
-        now = datetime.now().isoformat()
+        now = _now_iso()
         stamps = self._cycle_stamps_of(items)
         start_stamp = int(cycle_start_ts) if cycle_start_ts is not None else stamps[0]
         end_stamp = int(cycle_end_ts) if cycle_end_ts is not None else stamps[1]
@@ -544,7 +573,7 @@ class ScheduleDB:
         with self._lock, self._conn:
             if archive_reason:
                 self._archive_day_rows_locked(schedule_date, archive_reason,
-                                              datetime.now().isoformat())
+                                              _now_iso())
             cur = self._conn.execute("DELETE FROM schedule_items WHERE schedule_date = ?", (schedule_date,))
             return cur.rowcount
 
@@ -594,7 +623,7 @@ class ScheduleDB:
     ) -> str:
         """创建目标（goal_id 已存在时抛 sqlite3.IntegrityError）。"""
         if created_at is None:
-            created_at = datetime.now()
+            created_at = _TZ.get_now()
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO goals ("
@@ -620,7 +649,7 @@ class ScheduleDB:
                     progress,
                     last_executed_at.isoformat() if last_executed_at else None,
                     execution_count,
-                    datetime.now().isoformat(),
+                    _now_iso(),
                 ),
             )
         return goal_id
@@ -658,12 +687,19 @@ class ScheduleDB:
         return [self._goal_row(r) for r in rows]
 
     def update_goal(self, goal_id: str, **kwargs: Any) -> bool:
-        """更新目标字段（conditions/parameters 自动 JSON 序列化，datetime 转 ISO）。"""
+        """更新目标字段（conditions/parameters 自动 JSON 序列化，datetime 转 ISO）。
+
+        列名白名单 ``_GOAL_UPDATE_COLUMNS``（评估 P5 修复，2026-11-04）：白名单外
+        键告警跳过、绝不拼入 SQL；过滤后无可更新列 → False。
+        """
         if not kwargs:
             return False
         set_clauses = []
         params: List[Any] = []
         for key, value in kwargs.items():
+            if key not in _GOAL_UPDATE_COLUMNS:
+                logger.warning("schedule_db: update_goal 忽略白名单外字段：%s", key)
+                continue
             if key in ("conditions", "parameters") and value is not None:
                 set_clauses.append(f"{key} = ?")
                 params.append(json.dumps(value, ensure_ascii=False))
@@ -673,8 +709,10 @@ class ScheduleDB:
             else:
                 set_clauses.append(f"{key} = ?")
                 params.append(value)
+        if not set_clauses:
+            return False
         set_clauses.append("updated_at = ?")
-        params.append(datetime.now().isoformat())
+        params.append(_now_iso())
         params.append(goal_id)
         with self._lock, self._conn:
             cur = self._conn.execute(
@@ -873,7 +911,7 @@ class ScheduleDB:
         依据（top3 候选/分数/随机种子/放弃原因等，由调用方给）。
         """
         eid = str(episode_id or uuid.uuid4().hex)
-        now = datetime.now().isoformat()
+        now = _now_iso()
         actual_start = planned_start_minute if actual_start_minute is None else int(actual_start_minute)
         try:
             with self._lock, self._conn:
@@ -920,7 +958,7 @@ class ScheduleDB:
         planned 行为对象——本方法补齐 Create 面，字段与 start_episode 全同、status='planned'。
         """
         eid = str(episode_id or uuid.uuid4().hex)
-        now = datetime.now().isoformat()
+        now = _now_iso()
         try:
             with self._lock, self._conn:
                 self._insert_episode_locked(
@@ -961,7 +999,7 @@ class ScheduleDB:
         离散活动且 allow_full_on_discrete 才 1.0），不可计算 → 保留原 progress。
         state_after/metadata 未传 → 保留原值；metadata 传则与旧行 JSON 合并。
         """
-        now = datetime.now().isoformat()
+        now = _now_iso()
         try:
             with self._lock, self._conn:
                 row = self._conn.execute(
@@ -1064,7 +1102,7 @@ class ScheduleDB:
         """
         if cur_minute is None and attention_mode is None:
             return None
-        now = datetime.now().isoformat()
+        now = _now_iso()
         new_progress: Optional[float] = None
         try:
             with self._lock, self._conn:
@@ -1121,7 +1159,7 @@ class ScheduleDB:
         返回新 episode_id；写失败/不合法 → None（告警不抛）。
         """
         new_id = uuid.uuid4().hex
-        now = datetime.now().isoformat()
+        now = _now_iso()
         try:
             with self._lock, self._conn:
                 row = self._conn.execute(
@@ -1205,7 +1243,7 @@ class ScheduleDB:
         """
         if not updates:
             return False
-        now = datetime.now().isoformat()
+        now = _now_iso()
         try:
             with self._lock, self._conn:
                 row = self._conn.execute(
@@ -1327,7 +1365,7 @@ class ScheduleDB:
             logger.warning("schedule_db: sleep_sessions 行解析失败（不抛）：%s", e)
             return False
         try:
-            now = datetime.now().isoformat()
+            now = _now_iso()
             metadata = row.get("metadata")
             if isinstance(metadata, dict):
                 metadata = json.dumps(metadata, ensure_ascii=False)
@@ -1377,7 +1415,7 @@ class ScheduleDB:
                     updates.append("metadata = ?")
                     params.append(merged)
                 updates.append("updated_at = ?")
-                params.append(datetime.now().isoformat())
+                params.append(_now_iso())
                 params.append(session_id)
                 cur = self._conn.execute(
                     f"UPDATE sleep_sessions SET {', '.join(updates)}"
@@ -1389,13 +1427,22 @@ class ScheduleDB:
 
     def query_sleep_sessions(self, schedule_date: Optional[str] = None,
                              limit: int = 50) -> List[Dict[str, Any]]:
-        """按日期查睡眠会话（缺省最近 ``limit`` 条；planned_start 升序）。"""
+        """按日期查睡眠会话。
+
+        缺省（无日期）= **最近** ``limit`` 条（``schedule_date DESC,
+        planned_start_minute DESC``）；给定日期 = 该日 planned_start 升序（原行为）。
+        评估 P1 修复（2026-11-04）：旧实现缺省 ASC+LIMIT 返回**最旧** N 条，与
+        docstring 矛盾——会话数 > limit 时重启抑制门 ``_recently_woke(limit=5)``
+        读不到本夜会话恒失效；改 DESC 后最近会话恒在窗口内。
+        """
         query = "SELECT * FROM sleep_sessions"
         params: List[Any] = []
         if schedule_date:
             query += " WHERE schedule_date = ?"
             params.append(str(schedule_date))
-        query += " ORDER BY schedule_date ASC, planned_start_minute ASC LIMIT ?"
+            query += " ORDER BY schedule_date ASC, planned_start_minute ASC LIMIT ?"
+        else:
+            query += " ORDER BY schedule_date DESC, planned_start_minute DESC LIMIT ?"
         params.append(max(1, int(limit)))
         try:
             with self._lock:

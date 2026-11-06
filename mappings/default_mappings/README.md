@@ -24,7 +24,7 @@
 
 ## 一、这个文件夹是什么
 
-### 7 张表各自管什么
+### 8 张表各自管什么（3.1.0 起新增第八张 internal_tuning）
 
 | 文件 | 管什么 | 读它的代码 |
 |---|---|---|
@@ -35,8 +35,9 @@
 | `schedule_properties.json` | **日程属性表**（2026-10-21 新增第五张）：每个日程「属性」的回复率调控倍率、属性关键词词表与展示标签/颜色 | `planning/activity_properties.py` |
 | `activity_profiles.json` | **活动画像表**（2026-10-25 新增第六张）：每种活动「类型」的时长采样分布、最小块、可中断性/切走成本、五项状态速率（生活状态层与滚动规划用） | `planning/activity_profiles.py` |
 | `emotion_life_modulation.json` | **情绪-生活调制表**（2026-10-26 新增第七张）：生活事件对情绪的有界反馈增量与日上限（`feedback` 节，已生效），以及 VAD 对生活状态的五项调制系数（`gains` 节，消费方属后续版本，当前只播种） | `emotion/life_feedback.py` |
+| `internal_tuning.json` | **内部调参表**（2026-11-04 配置精简 3.1.0 新增第八张）：40 个原 TOML 内部调参键（阈值/权重/容量/缓存/超时/采样温度），按段命名空间（patrol/affection/schedule/schedule_advanced/life_state/event_catalog/llm/dashboard_display/emotion/video_watch）。旧 config.toml 里的显式值在升级首次加载时自动搬入本表（只补缺失键、不覆盖你的微调）；改完下一拍读取即生效，无需重启 | `core/internal_tuning.py`（各 config section 同名 property 桥接） |
 
-七张表互相独立：改一张不会影响另外六张（按表的键联动的地方见各节说明）。
+各表互相独立：改一张不会影响其他表（按表的键联动的地方见各节说明）。`internal_tuning.json` 的键值等于出厂默认时行为与精简前逐字一致；坏键/坏表按出厂默认兜底且不覆盖你的文件（红线同其余各表）。
 
 ### 改了多久生效
 

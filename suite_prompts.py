@@ -90,38 +90,12 @@ INJECT_PROACTIVE_TURN_RULE_DEFAULT = (
     "\n- reply 的 msg_id 只能选对方发送的消息。"
 )
 
-#: Tool schema is part of the planner prompt even when it supplies the text
-#: directly (in which case the optional generator below is never called).
-TOOL_SEND_MESSAGE_DESCRIPTION = (
-    "向配置好的固定关系对象发送一条私聊消息（关系类型与口吻取自配置），"
-    "不是给当前群友或当前会话回复。仅当本轮确实要联系该配置对象时调用；"
-    "不能把群友的昵称、爱人设定或兴趣当成收件人身份，身份不确定时不要调用。"
-    "群聊冷场或没有别的事做，不单独构成转去私聊的理由。"
-    "可以自然主动联系，但内容须让收件人独立看懂，不照搬无关群聊语境，"
-    "不凭空推断对方正在做什么或是否该睡觉。message可直接传正文，留空才自动生成。"
-)
-TOOL_SEND_MESSAGE_TEXT_DESCRIPTION = (
-    "发给配置中固定关系对象的私聊正文（可选，留空自动生成）。"
-    "直接传入后不会再经文案生成或润色。只使用明确属于该对象的事实；"
-    "引用群聊话题时先确认与收件人有关，并补足必要背景。"
-    "一次只表达一个轻量想法，问句克制，不拼接通用问候、近况连问和作息叮嘱；"
-    "没有时间与作息依据时，不说‘这么晚了’‘别太晚睡’或假定对方忙闲。"
-)
-#: 工具主动发消息的生成提示词（占位符：{style_word} / {relation_word}）
-TOOL_SEND_MESSAGE_DEFAULT = (
-    "请用{style_word}的口吻，自然地向配置中固定的{relation_word}开启一句私聊（20-40字）。"
-    "一次只表达一个轻量想法，不必凑成问候，也不必每次提问；最多一个轻问句。"
-    "没有提供对方近况、当前时间或共同经历时，不补写这些事实，不编造自己刚经历的小事。"
-    "不从其他群友的昵称、兴趣或关系设定推定收件人的身份。"
-    "不套用‘今天过得好吗’再接‘别太晚睡’的组合，不无依据劝睡或假定对方正在忙。"
-    "只输出要发送的正文。"
-)
-#: 工具主动发消息的 system prompt（占位符：{name} / {self_desc} / {relation_word}）
-TOOL_SEND_MESSAGE_SYSTEM_DEFAULT = (
-    "你是「{name}」（{self_desc}），准备私聊配置中固定的{relation_word}。"
-    "主动性来自真实的联系意愿，不代表需要替对方安排作息。"
-    "保持自然口吻，让没有看过其他群聊天的人也能理解这句话；不要声称掌握未提供的近况。"
-)
+#: 2026-11-04 评估 F4 清理：主动私信工具（lbm_mai_lover_send_message）已整条移除
+#: （companion/components.py 仅存移除说明注释，全仓无注册点），原
+#: TOOL_SEND_MESSAGE_DESCRIPTION / TOOL_SEND_MESSAGE_TEXT_DESCRIPTION /
+#: TOOL_SEND_MESSAGE_DEFAULT / TOOL_SEND_MESSAGE_SYSTEM_DEFAULT 四常量与
+#: [prompts].tool_send_message 可编辑字段、PROMPT_FALLBACKS 两条目一并删除。
+#: 旧配置里的 tool_send_message 值由 _ignore_internal_overrides 静默滤掉（死键无行为）。
 
 #: 会话采样好感裁判提示词（占位符：{lover_name} / {target_label} / {persona} /
 #: {tier_label} / {tier_desc} / {mood_text} / {recent_messages}）
@@ -206,17 +180,23 @@ INJECT_HINT_CURRENT_DEFAULT = "提示：用户直接询问当前状态，请如�
 INJECT_HINT_CONTINUE_DEFAULT = (
     "提示：对话延续中（{reason}）。当前活动只是背景信息：用户不问就不要说；"
     "只有当话题确实接不上、需要找新话题时，才可以用一句当前活动自然开启新话题。"
+    "不要主动汇报日程、接下来的安排或刚完成的事。"
 )
 #: 主动碎碎念时的引导行（占位符：无；2026-10-20 用户指示：不再引导 bot 无问自答提日程）
 INJECT_HINT_PROACTIVE_DEFAULT = (
     "提示：不要主动提及你正在日程里做什么。只有当对方问起你在做什么、"
     "或你确实需要引出新话题时，才简要带一句当前活动。"
+    "群冷场时优先等待或结束本轮，不要为填补空白而主动起话题或汇报日程/接下来安排。"
 )
-#: 闲聊时的引导行（占位符：无）
-INJECT_HINT_IDLE_DEFAULT = "提示：仅供参考；不相关请完全忽略，不要刻意提及。"
+#: 闲聊时的引导行（占位符：无；2026-11-04 强化：补充「闲聊不主动提自己日程、
+#: 除非对方问起」语义——软约束已被生产证伪不能单靠它，此处仅作双通道门控的辅助）
+INJECT_HINT_IDLE_DEFAULT = (
+    "提示：仅供参考；不相关请完全忽略，不要刻意提及。"
+    "闲聊时不主动提及自己的日程安排，除非对方问起；也不要主动汇报接下来安排或刚完成的事。"
+)
 #: 无当前活动时的兜底文案（占位符：无；2026-10-10 N1-2：
 #: 日程空档期不静默早退，改注入这一句；留空 = 不注入无活动兜底）
-INJECT_NO_ACTIVITY_DEFAULT = "现在没有安排中的活动（可能在休息）。"
+INJECT_NO_ACTIVITY_DEFAULT = "你现在没有进行中的活动，处于空闲状态；不要声称正在做某事，也不要汇报不存在的活动或日程。"
 #: replyer 状态注入模板（占位符：{state_line} / {energy} / {next_line}；{next_line} 为空时整行省略）
 INJECT_REPLYER_STATUS_DEFAULT = (
     "【角色当前状态】\n{state_line}\n精神：{energy}。\n{next_line}"
@@ -518,7 +498,7 @@ class PromptsSectionConfig(PluginConfigBase):
 
     __ui_label__ = "提示词（高级）"
     __ui_icon__ = "message-square"
-    __ui_order__ = 9
+    __ui_order__ = 12
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Prompts (Advanced)",
                "description": "Customize wording and additional schedule preferences; internal protocols are maintained by the plugin."}
@@ -554,12 +534,7 @@ class PromptsSectionConfig(PluginConfigBase):
         description="看清屏幕时的旁白（占位符：{date} {time} {user_name} {description}）",
         json_schema_extra={"label": "屏幕旁白", "rows": 2, **_ui_i18n("Screen narration")},
     )
-    tool_send_message: str = Field(
-        default=TOOL_SEND_MESSAGE_DEFAULT,
-        description="工具主动发消息的生成提示词（占位符：{style_word} {relation_word}）",
-        json_schema_extra={"label": "工具·主动发言提示词", "rows": 3,
-                           **_ui_i18n("Tool send-message prompt")},
-    )
+    # tool_send_message 字段已随主动私信工具移除删除（2026-11-04 评估 F4；见上方常量区注释）
 
     # ── 日程模块 ─────────────────────────────────────────────
     schedule_generation_extra: str = Field(
@@ -628,8 +603,6 @@ PROMPT_FALLBACKS: Dict[str, str] = {
     'screen_narration_failed': SCREEN_NARRATION_FAILED_DEFAULT,
     'inject_affection_block': INJECT_AFFECTION_BLOCK_DEFAULT,
     'inject_proactive_turn_rule': INJECT_PROACTIVE_TURN_RULE_DEFAULT,
-    'tool_send_message': TOOL_SEND_MESSAGE_DEFAULT,
-    'tool_send_message_system': TOOL_SEND_MESSAGE_SYSTEM_DEFAULT,
     'affection_conversation_review': AFFECTION_CONVERSATION_REVIEW_DEFAULT,
     'affection_daily_review': AFFECTION_DAILY_REVIEW_DEFAULT,
     'inject_schedule_header': INJECT_SCHEDULE_HEADER_DEFAULT,

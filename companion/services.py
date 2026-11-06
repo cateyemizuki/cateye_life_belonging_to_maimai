@@ -36,6 +36,7 @@ from .memory_manager import MemoryManager
 from .message_service import MessageService
 from .patrol import PatrolService
 from .screen_context import ScreenContextStore
+from .screen_config import screen_config_of
 from .sender_identity import SenderCache, SessionKindCache
 
 logger = logging.getLogger(__name__)
@@ -169,7 +170,7 @@ class CompanionServices:
         # T3 #5 收尾（第四轮）：构造期与热重载同源——`or 0` 让显式 0（不限时）在首次加载即生效
         # （旧 `or 90` 把 0 折成 90，只有保存一次配置后才恢复）；缺失属性仍回退缺省 90
         self.screen_store = ScreenContextStore(
-            ttl_minutes=float(getattr(cfg.patrol, "screen_context_ttl_minutes", 90) or 0)
+            ttl_minutes=float(getattr(screen_config_of(cfg), "screen_context_ttl_minutes", 90) or 0)
         )
         #: 陪伴对象电脑联动客户端（connect-hub 跨插件 API）
         self.cateye = CateyeClient(plugin, llm=self.llm, call_logger=self.llm_logger)
@@ -245,7 +246,7 @@ class CompanionServices:
         # 现与构造期同源：读 [patrol].screen_context_ttl_minutes。
         try:
             self.screen_store.ttl_seconds = (
-                max(0.0, float(getattr(cfg.patrol, "screen_context_ttl_minutes", 90) or 0)) * 60.0
+                max(0.0, float(getattr(screen_config_of(cfg), "screen_context_ttl_minutes", 90) or 0)) * 60.0
             )
         except Exception:
             pass

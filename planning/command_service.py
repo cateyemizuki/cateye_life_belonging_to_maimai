@@ -151,6 +151,11 @@ class CommandService:
             return await self._handle_delete(stream_id, parts)
         elif subcommand == "clear":
             await self._handle_clear(stream_id, parts)
+        elif subcommand == "sleep":
+            planner = getattr(self._plugin, "_rolling_planner", None)
+            started = bool(planner and planner.force_sleep())
+            await self._send(stream_id, "已进入睡眠。" if started else
+                             "暂时无法入睡。请检查动态睡眠开关、入睡窗口和当前约定。")
         elif subcommand == "help":
             await self._show_help(stream_id)
         else:
@@ -515,6 +520,7 @@ class CommandService:
 /lbm_plan regenerate [额外要求] - 重新生成今日日程（先删今天再重生，可附加临时要求）
 /lbm_plan delete <goal_id或序号> - 删除指定目标
 /lbm_plan clear - 清理昨天及更早的旧日程
+/lbm_plan sleep - 在动态睡眠的允许窗口内立即入睡
 /lbm_plan help - 显示此帮助
 
 使用方式:

@@ -368,6 +368,14 @@ def render_rolling(host: Any, args: str) -> str:
                 out.append(f"醒因：{wake_reason or '（无）'}"
                            f"｜最早醒沿 {info.get('wake_at') or '（无）'}"
                            f"｜赖床上限 {info.get('lie_in_cap') or '（无）'}")
+                dynamic = info.get("dynamic")
+                if dynamic:
+                    out.append("动态睡眠：" + "｜".join(
+                        f"{key}={dynamic[key]}" for key in (
+                            "band", "decision", "score", "pressure", "circadian", "debt",
+                            "schedule", "activity", "phase_minutes", "window_start", "window_end",
+                            "earliest_wake", "latest_wake", "nap_reason", "interruption")
+                        if key in dynamic and dynamic[key] is not None))
             if life is not None:
                 try:
                     snap = dict(life.sleep_status() or {})

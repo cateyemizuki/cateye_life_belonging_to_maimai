@@ -16,8 +16,9 @@
 6. 音频 = not_attempted：无音轨转写通道，不编造对白/音乐。
 
 进度协议：progress.json（stage/detail）；结果协议：result.json（status
-completed/failed + 结构化结果）。所有网络请求有超时；无第三方依赖
-（ffmpeg 为可选外部依赖，缺席只降级画面采样）。
+completed/failed + 结构化结果）。所有网络请求有超时；worker 主体仅标准库，
+拼图路径经 video_watch.sampling 依赖 Pillow（_manifest.json 已声明；缺席时
+画面采样如实降级）；ffmpeg 为可选外部依赖，缺席只降级画面采样。
 """
 
 from __future__ import annotations
@@ -114,6 +115,8 @@ def _fetch_metadata(bvid: str) -> dict:
         "title": str(data.get("title") or ""),
         "uploader": str((data.get("owner") or {}).get("name") or ""),
         "desc": str(data.get("desc") or ""),
+        # 公开封面图 URL（卡片分享 picUrl 用；非播放鉴权直链，不进文字缓存）
+        "pic": str(data.get("pic") or ""),
         "url": f"https://www.bilibili.com/video/{data.get('bvid') or bvid}",
         "published_at_ts": int(data.get("pubdate") or 0),
     }
@@ -288,7 +291,7 @@ def _sample_visual_legacy(spec: dict, video: dict, job_dir: Path,
     return {"status": "completed", "capability": VISUAL_CAPABILITY,
             "frames": frames, "sampled_seconds": sampled_seconds,
             "frame_interval_seconds": interval,
-            "note": f"按目标时间点间隔 {interval}s 定点采样 {len(frames)} 帧（非逐帧观看）"}
+            "note": f"按目标时间点间隔 {interval}s 定点采样 {len(frames)} 帧"}
 
 
 def _sample_visual(spec: dict, video: dict, job_dir: Path, deadline_epoch: float) -> dict:
@@ -327,14 +330,19 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path, deadline_epoch: float
         if source_mode == "download":
             _download_bounded(direct, media, max(4, min(1024, int(cfg.get("max_download_mb") or 256))) * 1024 * 1024, deadline_epoch)
             source = str(media)
+        # 采样韧性（2026-11-04 视频链路补充修复1）：单点超时/读取失败先重试一次，仍失败
+        # 则跳过该点继续其余采样点——部分拼图优于全无；仅当全部采样点都失败才降级
+        # text_sources。到达任务总截止即停止采样并用已取得的帧出图（不突破时限/下载
+        # 限额，也不自动改成全片下载）。
+        ok_paths, ok_times = [], []
         for index, at in enumerate(plan["timestamps"]):
             if sampling_mode == "paced":
                 wait = started + at - time.monotonic()
                 if wait > 0:
-                    if time.time() + wait >= deadline_epoch:raise LookupError("paced采样到达任务总截止")
+                    if time.time() + wait >= deadline_epoch:break
                     time.sleep(wait)
             remaining = deadline_epoch - time.time()
-            if remaining <= 0:raise LookupError("画面采样到达任务总截止")
+            if remaining <= 0:break
             path = folder / f"sample_{index:04d}.jpg";paths.append(path)
             command = [decoder, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                        "-threads", "1", "-filter_threads", "1"]
@@ -345,17 +353,28 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path, deadline_epoch: float
             command += ["-ss", str(at), "-i", source, "-an", "-sn", "-vf", "scale=480:-2",
                         "-frames:v", "1", "-threads", "1", "-q:v", "7", str(path)]
             flags = (subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS if sys.platform == "win32" else 0)
-            try:process = subprocess.run(command, capture_output=True, timeout=min(30, remaining), creationflags=flags)
-            except subprocess.TimeoutExpired:raise LookupError("单个采样点超时；不自动下载全片")
-            if process.returncode or not path.exists() or not 0 < path.stat().st_size <= _FRAME_BYTES_LIMIT:
-                raise LookupError(f"{source_mode}采样点{index+1}/{plan['frame_count']}读取失败；不自动改成全片下载")
-            _write_progress(job_dir, "visual_frames", f"{index+1}/{plan['frame_count']}")
-        frames = pack_montages(paths, plan["timestamps"])
+            got = False
+            for _attempt in range(2):  # 首次 + 至多一次重试
+                remaining = deadline_epoch - time.time()
+                if remaining <= 0:break
+                try:process = subprocess.run(command, capture_output=True, timeout=min(30, remaining), creationflags=flags)
+                except subprocess.TimeoutExpired:continue
+                if process.returncode or not path.exists() or not 0 < path.stat().st_size <= _FRAME_BYTES_LIMIT:
+                    continue
+                got = True;break
+            if got:
+                ok_paths.append(path);ok_times.append(at)
+                _write_progress(job_dir, "visual_frames", f"{index+1}/{plan['frame_count']}")
+        if not ok_paths:
+            raise LookupError(f"全部{plan['frame_count']}个采样点均未取得有效帧；不自动改成全片下载")
+        frames = pack_montages(ok_paths, ok_times)
+        partial = ("" if len(ok_paths) == plan["frame_count"] else
+                   f"（计划{plan['frame_count']}个采样点，实际取得{len(ok_paths)}帧）")
         return {"status": "completed", "capability": cap, "frames": frames,
-                "sampled_seconds": plan["timestamps"], "frame_count": plan["frame_count"],
+                "sampled_seconds": ok_times, "frame_count": len(ok_paths),
                 "montage_count": len(frames), "source_mode": source_mode, "sampling_mode": sampling_mode,
                 "frame_interval_seconds": int(cfg.get("interval_seconds") or 25),
-                "note": f"实际采样{len(paths)}帧，合为{len(frames)}张4×4拼图；非逐帧观看，未转写音频"}
+                "note": f"实际采样{len(ok_paths)}帧，合为{len(frames)}张4×4拼图{partial}"}
     except Exception as exc:
         reason = str(exc) if isinstance(exc, (LookupError, ValueError)) else f"采样失败（{type(exc).__name__}），未发送原始媒体地址"
         return {"status": "failed", "reason": reason[:350], "capability": cap,
@@ -417,8 +436,8 @@ def run(spec: dict, result_path: Path) -> None:
     if visual_completed:
         observations.append(f"画面采样：{len(visual.get('frames') or [])} 帧"
                             f"（{visual.get('note') or ''}）")
-    elif visual.get("status") == "failed":
-        observations.append(f"画面采样失败：{visual.get('reason') or ''}")
+    # 采样失败/未尝试只留在内部诊断（visual.status/reason），不写进 observations，
+    # 避免“画面采样失败”类声明经观后感/描述提示词外泄（2026-11-04 措辞修复）。
 
     source_detail = ("实际读取标题/简介与公开CC字幕文本" if subtitle.get("status") == "available"
                      else "实际读取标题/简介；公开CC字幕未取得")
@@ -431,8 +450,8 @@ def run(spec: dict, result_path: Path) -> None:
         "watched_range": {
             "mode": "sampled_frames" if visual_completed else "text_sources",
             "detail": (source_detail + "，并做等间隔画面采样"
-                       "（非逐帧观看，未转写音频）" if visual_completed
-                       else source_detail + "；未逐帧观看画面，未转写音频"),
+                       "（非逐帧观看）" if visual_completed
+                       else source_detail + "；未逐帧观看画面"),
         },
         "sources": {"metadata": "bilibili 公开 view API", "subtitle": subtitle.get("status")},
         "visual": visual,

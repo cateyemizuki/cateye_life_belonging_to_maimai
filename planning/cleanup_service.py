@@ -38,7 +38,7 @@ class CleanupService:
     # ------------------------------------------------------------
 
     async def run_cleanup_loop(self) -> None:
-        """定期清理过期日程与旧目标（间隔由 planning_cleanup.cleanup_interval 控制）。"""
+        """定期清理过期日程与旧目标（间隔由 schedule_advanced.cleanup_interval 控制）。"""
         logger.info("日程清理循环已启动")
         try:
             while not self._stop_event.is_set():
@@ -47,7 +47,10 @@ class CleanupService:
                 except Exception as exc:
                     logger.error(f"清理目标异常: {exc}", exc_info=True)
 
-                cleanup_cfg = section_or_default(self._plugin, "planning_cleanup", ScheduleAdvancedSectionConfig)
+                # 2026-11-04 修复（评估问题2/P1-05）：planning_cleanup 段已退役
+                # （suite_config LEGACY_SECTIONS），改读现行挂载段 schedule_advanced，
+                # 用户自定义 cleanup_interval 才生效（原恒返回出厂默认）。
+                cleanup_cfg = section_or_default(self._plugin, "schedule_advanced", ScheduleAdvancedSectionConfig)
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=float(cleanup_cfg.cleanup_interval))
                     break
@@ -69,7 +72,7 @@ class CleanupService:
             logger.info(f"清理了 {expired_schedules} 个过期日程（3 天前）")
 
         # 2. 清理已完成 / 已取消的旧目标（保留 cleanup_old_goals_days 天）
-        cleanup_cfg = section_or_default(self._plugin, "planning_cleanup", ScheduleAdvancedSectionConfig)
+        cleanup_cfg = section_or_default(self._plugin, "schedule_advanced", ScheduleAdvancedSectionConfig)
         cleaned_count = goal_manager.cleanup_old_goals(days=cleanup_cfg.cleanup_old_goals_days)
         if cleaned_count > 0:
             logger.info(f"清理了 {cleaned_count} 个旧目标（{cleanup_cfg.cleanup_old_goals_days} 天前）")

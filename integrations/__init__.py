@@ -2,5 +2,7 @@
 
 每个完整生命周期的联动场景一个独立文件：载荷转换、订阅与取消放在一起。
 本包内模块只经注入的契约/端口调用各业务模块，不直接导入其他业务模块的
-具体实现（依赖方向纪律见计划 §3.1）。
+具体实现（依赖方向纪律见计划 §3.1）。登记在案的装配边界例外：
+``proactive_delivery.py`` 导入 ``companion.proactive_budget`` 构造预算唯一
+所有者（守卫白名单 ALLOWED_INTEGRATIONS_EDGES，scratch/test_backend_boundaries.py）。
 """

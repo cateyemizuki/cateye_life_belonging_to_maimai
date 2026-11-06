@@ -32,13 +32,6 @@ _COMPLETED = "completed"
 _FAILED = "failed"
 _CANCELLED = "cancelled"
 
-#: 已知失败分类（结果契约 §4.2：排队、失败、超时、取消不伪装成功）
-ERROR_CLASSES = {
-    "invalid_input", "unsupported_video", "network", "timeout",
-    "cancelled", "queue_full", "worker_error", "interrupted_by_restart",
-    "not_found",
-}
-
 
 class WatchTaskManager:
     """任务台账 + worker 子进程编排。SDK 无关（worker 命令可注入以便测试）。"""
@@ -69,6 +62,9 @@ class WatchTaskManager:
         self._task_guard: Optional[Callable[[Dict[str, Any]], bool]] = None
         self._closed = False
         self._state_listener: Optional[Callable[[], None]] = None
+        # 2026-11-04 刷视频功能批：自动候选提供器（装配根注入 integrations 兴趣
+        # 候选源的同步 pick 面；None = 未接入，next_candidate 如实 no_candidate_source）
+        self._candidate_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self._recover()
 
     def set_task_guard(self, guard: Callable[[Dict[str, Any]], bool]) -> None:
@@ -84,6 +80,25 @@ class WatchTaskManager:
     def set_impression_hook(self, hook: Optional[Callable[[Dict[str, Any]], Any]]) -> None:
         """注入观后感生成回调（插件侧经宿主 LLM 文本任务实现；失败须如实降级）。"""
         self._impression_hook = hook
+
+    def set_candidate_provider(self, provider: Optional[Callable[[], Dict[str, Any]]]) -> None:
+        """注入自动候选提供器（同步面；异步准备由 integrations 协调器先行完成）。
+
+        提供器返回 ``{"candidate": {...}|None, "reason": str}``；候选须含真实
+        bvid（来自公开接口），无合适结果时如实返回 None，绝不编造 BV 号。
+        """
+        self._candidate_provider = provider
+
+    def excluded_bvids(self) -> set:
+        """候选去重集合（只读）：已看历史 ∪ 文字缓存 ∪ 活跃（非终态）任务。"""
+        excluded = {b for b in self._store.watched_bvids() if b}
+        excluded.update(self._store.cached_bvids())
+        for task in self._store.load_tasks():
+            if not self._store.is_terminal(str(task.get("status"))):
+                bvid = str(task.get("bvid") or "")
+                if bvid:
+                    excluded.add(bvid)
+        return excluded
 
     # ------------------------------------------------------------------
     # 画面采样：spec注入与运行任务能力标记
@@ -141,11 +156,13 @@ class WatchTaskManager:
                     "result": {"status": _COMPLETED, "cached_text": cached["text"],
                                "video": {"bvid": bvid}}}
         owner = str(owner or "").strip()
-        # 进行中去重：同 BV 只关联一个任务；S0 所有权——本次调用者登记为该任务的
-        # 引用持有者之一（cancel 非 force 只撤销自己的引用，不误杀其他调用者）
+        # 进行中去重：同 BV 只关联一个任务（2026-11-04 模块评估问题6：去重键
+        # 仅按 bvid，不含 cache_mode——配置热更改变采样能力时不产生同 BV 并行
+        # 任务；能力差异只记录在任务台账，不影响去重）；S0 所有权——本次调用者
+        # 登记为该任务的引用持有者之一（cancel 非 force 只撤销自己的引用，
+        # 不误杀其他调用者）
         for task in self._store.load_tasks():
             if (task.get("bvid") == bvid
-                    and task.get("cache_mode", WatchStore.DEFAULT_CACHE_MODE) == requested_mode
                     and not self._store.is_terminal(str(task.get("status")))):
                 if owner:
                     owners = [str(o) for o in (task.get("owners") or [])]
@@ -301,8 +318,37 @@ class WatchTaskManager:
                 pass
 
     def next_candidate(self) -> Dict[str, Any]:
-        """当前未接入自动候选来源，日程正常跳过；用户仍可直接点播。"""
-        return {"success": True, "candidate": None, "reason": "no_candidate_source"}
+        """自动候选（兴趣驱动；2026-11-04 刷视频功能批）。
+
+        提供器未注入 → 如实 ``no_candidate_source``（旧口径）；注入后由其
+        同步 pick 面返回真实候选（异步兴趣检查/抓取由协调器先 prepare）。
+        提供器异常/非法候选一律降级 no_candidate，不编造 BV 号。
+        """
+        provider = self._candidate_provider
+        if provider is None:
+            return {"success": True, "candidate": None, "reason": "no_candidate_source"}
+        try:
+            receipt = provider()
+        except Exception as exc:
+            if self._log:
+                self._log.warning("自动候选提供器异常（降级 no_candidate）：%s", exc)
+            return {"success": True, "candidate": None, "reason": "candidate_error"}
+        if not isinstance(receipt, dict):
+            return {"success": True, "candidate": None, "reason": "candidate_error"}
+        candidate = receipt.get("candidate")
+        if isinstance(candidate, dict):
+            from .bv import normalize_video_ref
+            bvid = normalize_video_ref(str(candidate.get("bvid") or ""))
+            if not bvid:
+                if self._log:
+                    self._log.warning("自动候选缺少合法BV（如实丢弃，不编造）")
+                return {"success": True, "candidate": None, "reason": "candidate_invalid"}
+            candidate = dict(candidate)
+            candidate["bvid"] = bvid
+            return {"success": True, "candidate": candidate,
+                    "reason": str(receipt.get("reason") or "")}
+        return {"success": True, "candidate": None,
+                "reason": str(receipt.get("reason") or "no_candidate")}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -511,6 +557,13 @@ class WatchTaskManager:
                     result["completeness"] = "partial"
                 else:
                     result["completeness"] = "visual"
+            # 2026-11-04 刷视频功能批（前批遗留修复）：impression_error 只作内部
+            # 诊断——result_text 会把 impression_error 兜底成对外「观后感」，导致
+            # processing 错误文案外泄；改名 impression_diag（仍留 result.json/
+            # history 供追溯），对外文本诚实回落「暂无观后感」，不带错误细节。
+            impression_diag = result.pop("impression_error", None)
+            if impression_diag:
+                result["impression_diag"] = str(impression_diag)[:400]
             task["status"] = _COMPLETED
             task["result_cache_mode"] = self._result_mode_token(result)
             try:

@@ -14,7 +14,7 @@ class QzoneSectionConfig(PluginConfigBase):
 
     __ui_label__ = "QQ 空间"
     __ui_icon__ = "cloud"
-    __ui_order__ = 6
+    __ui_order__ = 9
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "QQ Zone", "description": "Post moments by schedule, auto reply to comments."}
     }
@@ -155,7 +155,8 @@ class QzoneSectionConfig(PluginConfigBase):
     # 旧配置里的显式值由迁移器丢弃并登记。
     napcat_http_host: str = Field(
         default="",
-        description="备选：NapCat HTTP 服务器地址（cookie 获取降级通道 2，如 127.0.0.1）",
+        description="备选：NapCat HTTP 服务器地址（cookie 获取降级通道 2，如 127.0.0.1）。"
+                    "该通道为 http 明文且携带 Bearer token，仅限回环地址（127.0.0.1/localhost），勿填局域网或公网地址",
         json_schema_extra={"label": "NapCat HTTP 地址", "placeholder": "127.0.0.1", **_ui_i18n("NapCat HTTP host")},
     )
     napcat_http_port: str = Field(

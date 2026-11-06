@@ -3,11 +3,15 @@
 职责边界（计划书 §8 末行 integrations/video_companion.py）：
 - 只做「真实观看完成结果 → 分享候选 → 条件投递」的适配，不复制视频任务、
   日程或主动预算的权威状态；
-- 本模块**零业务导入**（只标准库 + typing）：陪伴对象/预算/发送能力一律经
-  ``ShareDelivery`` 注入的可调用对象提供，装配侧在 plugin.py 接线
-  （结构守卫 scratch/test_backend_boundaries.py 的 integrations 白名单不新增违规）；
+- 本模块**零业务导入**（只标准库 + typing + core.coerce）：陪伴对象/预算/
+  发送能力一律经 ``ShareDelivery`` 注入的可调用对象提供，装配侧在 plugin.py
+  接线（结构守卫 scratch/test_backend_boundaries.py 的 integrations 白名单
+  不新增违规）；
 - 候选生成是条件式的，不是「看完必发」：仅视觉理解成功且有可用摘要、
   且有观后感时入候选（计划书 §6 末段、§7.1）；
+- **2026-11-04 卡片分享改造：视频分享一律发 B 站卡片**（经注入的
+  ``card_sender``，构造见 integrations/video_card.py 与取证文档）；
+  纯文本链接兜底已删除——卡片通道未装配或卡片生成失败则不发送并留诊断；
 - 发送节流：每日最多 1 条、最小间隔 6 小时、并计入现有每日主动 5 次
   （``budget_remaining`` 为调用方给出的剩余主动额度；None=不可得则保守拒绝，
   计划书 §7.2）；忙时最多保留 1 条 pending 候选，TTL 2 小时；
@@ -19,8 +23,8 @@
 
     {
       "version": 1,
-      "candidates": [ {share_id, bvid, title, summary, impression, episode_id,
-                       created_at, expire_at, status, ...} ],
+      "candidates": [ {share_id, bvid, title, summary, impression, cover_url,
+                       episode_id, created_at, expire_at, status, ...} ],
       "daily": {"date": "YYYY-MM-DD", "sent_count": 0, "last_sent_epoch": null}
     }
 """
@@ -45,8 +49,9 @@ SHARE_CANDIDATE_TTL_SECONDS = 7200
 SHARE_DAILY_MAX = 1
 #: 自动分享最小间隔（秒）：6 小时（计划书 §7.2）
 SHARE_MIN_INTERVAL_SECONDS = 21600
-#: 规范视频链接模板（计划书 §7.1：规范 BV/视频链接）
-SHARE_LINK_TEMPLATE = "https://www.bilibili.com/video/{bvid}"
+# 2026-11-04 卡片分享改造：旧 SHARE_LINK_TEMPLATE/build_share_text（纯文本
+# 链接分享）已删除——视频分享一律卡片，规范跳转链由 integrations/video_card.py
+# 在卡片 jumpUrl 中构造；卡片生成失败不发送、不回退文本。
 
 #: 摘要/观后感入候选的长度上限（计划书 §6：有界摘要）
 _SHARE_TEXT_MAX = 300
@@ -74,6 +79,9 @@ _UNCERTAIN_ERROR_CLASSES = frozenset({
 
 DeliverCallable = Callable[[str], Awaitable[Dict[str, Any]]]
 BudgetCallable = Callable[[], Optional[int]]
+#: 卡片发送面：接收 build_card_payload 的载荷，返回回执 dict
+#: （success=True 成功；uncertain=True 结果不确定；装配侧接 video_card 服务）
+CardSenderCallable = Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
 
 
 # ----------------------------------------------------------------------
@@ -162,31 +170,31 @@ def _ensure_period(text: str) -> str:
     return text + "。"
 
 
-def build_share_text(candidate: Dict[str, Any]) -> str:
-    """生成分享文本（计划书 §7.1）：1–2 句口语理由 + 规范 BV 链接。
+def build_card_payload(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """候选 → 卡片发送载荷（2026-11-04 卡片分享改造，取代旧文本链接构造）。
 
-    - 理由只来自候选里真实落盘的标题/观后感/画面摘要，不声称看完全部、
-      不虚构共同经历、不写「任务已完成」式模板；
-    - 其他 URL/凭据/原始帧名不会外发；链接只由合法 BV 号拼出；
-    - 无合法 BV 号或没有任何可用理由 → 返回 ""（调用方按「不分享」处理，
-      绝不编造链接或理由）。
+    - 仅在有合法 BV 号且有真实理由（观后感/画面摘要）时返回载荷，否则
+      None（调用方按「不分享」处理，绝不编造链接或理由）；
+    - title/desc 经出站清洗（URL/凭据/原始帧名不外发）；desc 承载口语理由
+      （有界），缺失时由 video_card 服务用默认分享文案；
+    - pic_url 为候选入库时记录的公开封面图 URL（可空，由 QQ 服务器决定是否
+      接受；生成失败则不发送）；规范跳转链由 video_card 按 BV 构造。
     """
     cand = candidate if isinstance(candidate, dict) else {}
     bvid = _normalize_bvid(cand.get("bvid")) or _extract_bvid(cand.get("url"))
     if not bvid:
-        return ""
+        return None
     title = _clean_outbound(cand.get("title"), 60)
     impression = _clean_outbound(cand.get("impression"), 200)
     summary = _clean_outbound(cand.get("summary"), 160)
     reason = impression or summary
     if not reason:
-        return ""
-    body = f"刚刷到《{title or bvid}》，{_ensure_period(reason)}"
-    # 观后感之外补一句画面摘要（仍来自真实视觉理解，最多凑成 2 句理由）
-    if impression and summary and summary not in impression:
-        body += f" 画面里大概是{_ensure_period(summary)}"
-    link = SHARE_LINK_TEMPLATE.format(bvid=bvid)
-    return f"{body} {link}"[:500]
+        return None
+    cover = str(cand.get("cover_url") or "").strip()
+    if cover and not re.match(r"^https?://", cover, re.IGNORECASE):
+        cover = ""
+    return {"bvid": bvid, "title": title or bvid,
+            "desc": _ensure_period(reason)[:120], "pic_url": cover[:1000]}
 
 
 # ----------------------------------------------------------------------
@@ -309,6 +317,11 @@ class ShareCandidateStore:
         if not bvid:
             return None  # 不编视频 ID（计划书 §6）
         title = _clean_source(video.get("title") or result.get("title"), 120) or bvid
+        # 卡片分享改造：记录公开封面图 URL（worker 元信息 pic 字段）供卡片
+        # picUrl 使用；仅接受 http(s) 形态，缺失留空（不编造封面）。
+        cover = str(video.get("pic") or video.get("cover") or "").strip()
+        if not re.match(r"^https?://", cover, re.IGNORECASE):
+            cover = ""
 
         with self._lock:
             doc = self._load()
@@ -326,6 +339,7 @@ class ShareCandidateStore:
                 "title": title,
                 "summary": summary,
                 "impression": impression,
+                "cover_url": cover[:1000],
                 "episode_id": episode,
                 "target_stream": str(target_stream),
                 "created_at": at,
@@ -419,6 +433,17 @@ class ShareCandidateStore:
             doc["daily"] = daily
             self._save(doc, at)
             return dict(target)
+
+    def mark_offered(self, share_id: str, receipt: Any) -> None:
+        """Offered to planner is terminal for this candidate, never 'sent'."""
+        with self._lock:
+            doc = self._load()
+            for cand in doc['candidates']:
+                if cand.get('share_id') == share_id and cand.get('status') == 'sending':
+                    cand.update(status='offered', planner_receipt=_json_safe(receipt))
+                    # Keep the daily attempt slot even if planner elects to stay quiet.
+                    self._save(doc, self._now())
+                    return
 
     def mark_dropped(self, share_id: str, reason: str, *, uncertain: bool = False) -> Optional[Dict[str, Any]]:
         """丢弃候选（失败/不确定都不盲重试）：status="dropped" + 原因。"""
@@ -531,23 +556,31 @@ class ShareCandidateStore:
 
 # ----------------------------------------------------------------------
 class ShareDelivery:
-    """候选投递门面：发送能力与预算面均由装配侧注入（计划书 §7.2/§8）。
+    """候选投递门面：卡片发送能力与预算面均由装配侧注入（计划书 §7.2/§8）。
 
-    ``deliver`` 接收最终文本、返回回执 dict（``receipt.success`` 为真=成功）；
-    ``budget_remaining`` 返回当前每日主动消息剩余额度（None=不可得）。
-    本类不导入陪伴/规划/观看模块，也不自行决定收件人。
+    2026-11-04 卡片分享改造：视频分享一律卡片——``card_sender`` 接收
+    ``build_card_payload`` 载荷、返回回执 dict（``receipt.success`` 为真=成功，
+    ``uncertain``=结果不确定）；``budget_remaining`` 返回当前每日主动消息
+    剩余额度（None=不可得，保守拒绝）。旧 ``deliver``（文本发送）参数仅为
+    兼容未更新的装配签名而保留，**不再被调用**——卡片通道未装配时不发送
+    并留诊断，绝不回退纯文本链接。本类不导入陪伴/规划/观看模块，也不自行
+    决定收件人。
     """
 
     def __init__(self, store: ShareCandidateStore, *,
-                 deliver: DeliverCallable,
+                 deliver: Optional[DeliverCallable] = None,
                  budget_remaining: BudgetCallable,
                  preflight: Optional[Callable[[], tuple]] = None,
-                 target_provider: Optional[Callable[[], str]] = None) -> None:
+                 target_provider: Optional[Callable[[], str]] = None,
+                 card_sender: Optional[CardSenderCallable] = None,
+                 optional_dispatch: Optional[Callable[..., Any]] = None) -> None:
         self._store = store
-        self._deliver = deliver
+        self._deliver = deliver  # 已退役（文本兜底删除）：保留签名兼容，不调用
         self._budget_remaining = budget_remaining
         self._preflight = preflight
         self._target_provider = target_provider
+        self._card_sender = card_sender
+        self._optional_dispatch = optional_dispatch
         self._delivery_lock = asyncio.Lock()
 
     @staticmethod
@@ -602,14 +635,35 @@ class ShareDelivery:
             target = str(self._target_provider() or "")
             if not target or target != candidate.get("target_stream"):
                 return self._drop(candidate, "候选对象未知或已变化，不转投其他联系人", False)
-        text = build_share_text(candidate)
-        if not text:
-            return self._drop(candidate, "候选缺少有效 BV 号/可用理由", False)
+        payload = build_card_payload(candidate)
+        if not payload:
+            return self._drop(candidate, "候选缺少有效 BV 号/可用理由，不构造卡片", False)
+        if self._optional_dispatch is not None:
+            share_id = str(candidate['share_id'])
+            if not self._store.claim_delivery(share_id, at):
+                return {'sent': False, 'reason': '候选已处理'}
+            try:
+                receipt = await self._optional_dispatch(candidate)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return self._drop(candidate, '主动回合受理结果未知，不追发', True)
+            if receipt.get('status') == 'blocked':
+                self._store.defer_claim(share_id)
+                return {'sent': False, 'deferred': True, 'reason': receipt.get('reason')}
+            self._store.mark_offered(share_id, receipt)
+            return {'sent': False, 'offered': receipt.get('status') == 'enqueued',
+                    'share_id': share_id, 'planner_status': receipt.get('status')}
+        if self._card_sender is None:
+            # 卡片通道未装配：按契约不发送（无纯文本链接兜底）；不领取候选，
+            # 保持 pending 至 TTL 过期，留诊断待装配侧接线。
+            return {"sent": False, "deferred": True,
+                    "reason": "卡片分享通道未装配：视频分享一律卡片，不回退纯文本链接"}
         share_id = str(candidate["share_id"])
         if not self._store.claim_delivery(share_id, at):
             return {"sent": False, "reason": "候选已被领取或门控已变化"}
         try:
-            receipt = await self._deliver(text)
+            receipt = await self._card_sender(payload)
         except asyncio.CancelledError:
             raise  # A durable sending intent is deliberately not retried after reload.
         except Exception as exc:
@@ -619,7 +673,7 @@ class ShareDelivery:
             return {"sent": False, "deferred": True, "reason": receipt.get("error")}
         if isinstance(receipt, dict) and receipt.get("success") is True and not receipt.get("uncertain"):
             sent = self._store.mark_sent(share_id, receipt)
-            return {"sent": True, "share_id": share_id, "text": text,
+            return {"sent": True, "share_id": share_id, "card": True,
                     "receipt": receipt, "candidate": sent}
         uncertain = self._receipt_uncertain(receipt)
         prefix = "投递结果不确定（保守防重）：" if uncertain else "投递失败："

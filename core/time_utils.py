@@ -23,7 +23,10 @@ def parse_hhmm(value: str, default_minutes: int = 0) -> int:
 
 
 def minutes_of_now(now: datetime | None = None) -> int:
-    return (now or datetime.now()).hour * 60 + (now or datetime.now()).minute
+    # F5（2026-11-04）：只取一次时刻，避免缺省路径两次独立 now() 跨分钟边界
+    # 得到错误的小时/分钟组合。
+    now = now or datetime.now()
+    return now.hour * 60 + now.minute
 
 
 def hours_between(later: datetime, earlier: datetime) -> float:

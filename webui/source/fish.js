@@ -35,10 +35,10 @@ const SectionFish=(()=>{
  };
  const finishMs=()=>{const raw=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--maimai-detail-fade-ms'));return Number.isFinite(raw)&&raw>0?raw:220};
  // 「最近变化」：前端从 history.points / schedule.episodes / sleep.sessions 派生，不改 API。
- const CHANGES_KIND={current:'episode',companion:'none',state:'state',history:'state',sleep:'sleep',schedule:'episode',mood:'vad',sharing:'none',usage:'none',health:null};
+ const CHANGES_KIND={current:'episode',companion:'none',state:'state',history:'state',sleep:'sleep',mood:'vad',sharing:'none',health:null};
  const CHANGE_REASONS={start:'启动观察',tick:'生活采样',sleep:'睡眠采样',episode:'活动边界',wake:'醒来结算',sleep_settlement:'睡眠结算',estimated_gap_fill:'估算'};
  const CHANGE_LABELS={...labels,mental_state:'精神状态'};
- const WAKE_REASONS={energy_threshold:'精力达标',lie_in_cap:'赖床上限',hard_commitment:'硬约定唤醒',interrupted_awake:'被暂时打断',manual:'手动唤醒',no_sleep_mode:'免睡模式',offline_reconnect:'离线补眠估算'};
+ const WAKE_REASONS={energy_threshold:'精力达标',lie_in_cap:'赖床上限',wake_window_end:'作息窗口结束',hard_commitment:'硬约定唤醒',interrupted_awake:'被暂时打断',manual:'手动唤醒',no_sleep_mode:'免睡模式',offline_reconnect:'离线补眠估算'};
  const changeEps=()=>{const m=data&&typeof data==='object'?data.maimai||{}:{};
   const pick=(key,fall)=>typeof m[key]==='number'&&Number.isFinite(m[key])&&m[key]>0?m[key]:fall;
   return {state:pick('history_state_epsilon',.01),debt:pick('history_debt_epsilon',.1),
@@ -86,8 +86,11 @@ const SectionFish=(()=>{
  function buildSleepChanges(eps){
   const out=[];
   for(const row of data?.sleep?.sessions||[]){
-   const endMinute=num(row.actual_end_minute)??num(row.actual_start_minute);
+   // W-08：跨午夜会话（结束分钟早于开始分钟）结算时间戳补次日，排序贴近真实醒来时刻。
+   let endMinute=num(row.actual_end_minute)??num(row.actual_start_minute);
    if(endMinute===null)continue;
+   const startMinute=num(row.actual_start_minute);
+   if(startMinute!==null&&endMinute<startMinute)endMinute+=1440;
    let at;try{at=new Date(zonedMidnight(row.schedule_date)+endMinute*60000).toISOString()}catch{continue}
    const why='醒来结算 · '+(WAKE_REASONS[row.wake_reason]||row.wake_reason||'未记录');
    const debtBefore=num(row.sleep_debt_before),debtAfter=num(row.sleep_debt_after);
@@ -126,7 +129,9 @@ const SectionFish=(()=>{
    return row;
   }));
  }
- function redraw(){requestAnimationFrame(()=>{if(data){drawHistory();renderSleep();renderModules()}})}
+ // W-15：详情打开/尺寸变化时只重渲染当前激活 tab 的内容（drawHistory/renderSleep/
+ // renderMood/renderUsage 已由 renderActiveTab 按 tab 调度；详情只在其所属 tab 可达）。
+ function redraw(){requestAnimationFrame(()=>{if(data){computePoints();renderActiveTab()}})}
  // 入口原位保留 + 提升到清晰交互层（U 计划 §4.2）：卡片自带 backdrop-filter 层叠
  // 上下文，单靠 z-index 升不到遮罩之上——portal **同一个元素**，占位标记保持原屏幕
  // 坐标（绝对定位按钮不参与布局流，视觉不搬家），关闭时原位归还。
@@ -140,6 +145,8 @@ const SectionFish=(()=>{
  }
  function floatEntry(entry){
   if(entry.floated)return;
+  // 入口是绝对定位的小鱼按钮，不参与布局流：占位标记保持原屏幕坐标，
+  // 关闭时原位归还（占位隐藏、不吃指针、不参与 Tab 序）。
   entry.home=el('span','section-fish-button fish-peek-home');
   entry.home.setAttribute('aria-hidden','true');
   entry.button.replaceWith(entry.home);
@@ -157,6 +164,9 @@ const SectionFish=(()=>{
  // 面板高度确定后贴到入口旁：上/下贴附 + 三角缺口对准入入口（随滚动/缩放重校准）。
  function snapPanel(entry){
   if(!current)return;
+  if(entry.key==='usage'&&pinnedOpen){
+   panel.style.top='12px';panel.style.bottom='auto';tip.hidden=true;return;
+  }
   const b=entry.button.getBoundingClientRect(),vh=innerHeight;
   const pRect=panel.getBoundingClientRect();
   const below=panel.dataset.side==='below';
@@ -186,8 +196,9 @@ const SectionFish=(()=>{
   const old=current,wasPinned=pinnedOpen;current=null;pinnedOpen=false;
   clearTimeout(closeTimer);clearTimeout(hoverTimer);
   unfloatEntry(old);old.element.classList.remove('fish-open');old.button.setAttribute('aria-expanded','false');
+  if(old.key==='schedule')body.insertBefore(metadata,details);
   for(const group of old.groups)store.append(group);
-  tip.hidden=true;panel.style.transformOrigin='';panel.style.left='';panel.style.top='';panel.style.maxHeight='';panel.style.maxHeight='';
+  tip.hidden=true;panel.style.transformOrigin='';panel.style.left='';panel.style.top='';panel.style.maxHeight='';
   const finish=()=>{
    overlay.hidden=true;overlay.classList.remove('is-open','is-closing');overlay.removeAttribute('data-section');delete overlay.dataset.align;
    unlockScroll();
@@ -204,17 +215,18 @@ const SectionFish=(()=>{
  // 连接边/气泡尾随后按实际位置绘制（drawTail 取最近边）。
  function placePanel(entry){
   const b=entry.button.getBoundingClientRect(),vh=innerHeight,vw=innerWidth,pad=12;
+  const usagePinned=entry.key==='usage'&&pinnedOpen;
   const freeAbove=b.top,freeBelow=vh-b.bottom;
   const putBelow=freeBelow>=freeAbove;
   overlay.dataset.align=putBelow?'bottom':'top';
   panel.dataset.side=putBelow?'below':'above';
   const free=Math.max(putBelow?freeBelow:freeAbove,240)-24;
-  panel.style.maxHeight=`${Math.min(Math.round(free),Math.round(vh*0.9))}px`;
+  panel.style.maxHeight=`${usagePinned?vh-pad*2:Math.min(Math.round(free),Math.round(vh*0.9))}px`;
   // 水平：面板左缘靠近入口（长内容向右铺开），不居中漂移；宽度显式设定
   // （absolute 子元素的百分比宽按 overlay 的 padding-box 解析，须自行钳制在视口内）
   const panelW=Math.min(1040,vw-pad*2);
   panel.style.width=`${Math.round(panelW)}px`;
-  panel.style.left=`${Math.round(Math.min(Math.max(b.left+b.width/2-140,pad),Math.max(pad,vw-pad-panelW)))}px`;
+  panel.style.left=`${Math.round(usagePinned?(vw-panelW)/2:Math.min(Math.max(b.left+b.width/2-140,pad),Math.max(pad,vw-pad-panelW)))}px`;
   const p=panel.getBoundingClientRect();
   panel.style.transformOrigin=
    `${Math.min(Math.max(b.left+b.width/2-p.left,0),p.width)}px ${Math.min(Math.max(b.top+b.height/2-p.top,0),p.height)}px`;
@@ -223,6 +235,7 @@ const SectionFish=(()=>{
   if(!current||pinnedOpen)return;
   pinnedOpen=true;
   lockScroll();                                         // 固定后才启用滚动锁（补偿滚动条宽度）
+  if(current.key==='usage'){placePanel(current);snapPanel(current)}
   closeButton.focus({preventScroll:true});
  }
  function open(entry,pinned=false){
@@ -230,7 +243,8 @@ const SectionFish=(()=>{
   if(current)close(false);
   clearTimeout(closeTimer);clearTimeout(hoverTimer);overlay.classList.remove('is-closing');
   current=entry;lastTrigger=entry.button;pinnedOpen=pinned;
-  for(const group of entry.groups){group.open=true;details.append(group)}  // 折叠默认展开（0425 目检：详情内不再折叠）
+  for(const group of entry.groups){if(group.tagName==='DETAILS')group.open=true;details.append(group)}  // 折叠默认展开（0425 目检：详情内不再折叠）
+  if(entry.key==='schedule')$('schedule-recovery').before(metadata);
   floatEntry(entry);
   overlay.hidden=false;overlay.dataset.section=entry.key;
   placePanel(entry);
@@ -271,15 +285,16 @@ const SectionFish=(()=>{
  });
  overlay.addEventListener('pointerdown',e=>{if(e.target===overlay)e.preventDefault()});
  overlay.addEventListener('click',e=>{if(e.target===overlay)close(true)});
- overlay.addEventListener('toggle',e=>{if(e.target.tagName==='DETAILS'&&e.target.open)redraw()},true);
+ overlay.addEventListener('toggle',e=>{if(e.target.tagName==='DETAILS'&&e.target.open&&!e.target.closest('#usage-detail'))redraw()},true);
  // 从小麦麦移到气泡正文保持展开；离开连接区域与气泡才延迟收起（未固定时）。
  const previewCloseDelay=()=>{clearTimeout(hoverTimer);hoverTimer=setTimeout(()=>{if(current&&!pinnedOpen)close(false)},160)};
  panel.addEventListener('pointerenter',()=>clearTimeout(hoverTimer));
  panel.addEventListener('pointerleave',()=>{if(current&&!pinnedOpen)previewCloseDelay()});
- window.addEventListener('resize',()=>{recalibrate();if(current)redraw()});
+ window.addEventListener('resize',()=>{if(current?.key==='usage'&&pinnedOpen)placePanel(current);recalibrate();if(current)redraw()});
  function metadataRow(label,value,explanation){const row=el('div','fish-meta-row'),caption=el('span','note',label);if(explanation)caption.append(infoTip(explanation));row.append(caption,el('span','',value??'暂无记录'));return row}
- function refresh(){if(!current)return;const e=current,d=data||{};title.textContent=e.title+'详情';summary.textContent=e.summary(d);
-  const rows=[['更新时间',d.generated_at?clock(d.generated_at,true):'暂无记录',fullClock(d.generated_at)],['数据来源',imported?'导入快照':'生活引擎实时记录',''],...(e.meta?.(d)||[])];
+ function refresh(){if(!current)return;const e=current,d=data||{},schedule=e.key==='schedule'?schedulePageInfo():null;
+  title.textContent=(schedule?.label||e.title)+'详情';summary.textContent=e.summary(d);
+  const rows=e.key==='usage'||(schedule&&schedule.key!=='record')?[]:[['更新时间',d.generated_at?clock(d.generated_at,true):'暂无记录',fullClock(d.generated_at)],['数据来源',imported?'导入快照':'生活引擎实时记录',''],...(e.meta?.(d)||[])];
   // Reconcile in place: a timer refresh must not remove the focused explanation.
   rows.forEach(([label,value,explanation],i)=>{let row=metadata.children[i];if(!row){row=metadataRow(label,value,explanation);metadata.append(row)}else{row.firstElementChild.firstChild.textContent=label;row.lastElementChild.textContent=value??'暂无记录';const tip=row.querySelector('.info-tooltip');if(tip)tip.textContent=explanation||'暂无说明'}});while(metadata.children.length>rows.length)metadata.lastElementChild.remove();
   renderChanges(e);
@@ -289,6 +304,8 @@ const SectionFish=(()=>{
   else{group=el('details');group.append(el('summary','',label),...list)}group.classList.add('fish-fold');store.append(group);return group
  }
  function mount(key,titleText,element,summaryFn,metaFn=()=>[],groups=[],gridClasses=[]){if(!element)return;const content=el('div','fish-content');while(element.firstChild)content.append(element.firstChild);for(const cls of gridClasses){element.classList.remove(cls);content.classList.add(cls)}element.append(content);element.classList.add('fish-section');element.dataset.fishSection=key;
+  // 详情入口＝板块左下角探头小鱼（必须保留的设计）：点击固定详情气泡，hover 预览，
+  // 再点收起。portal/焦点/滚动锁机制都挂在这颗按钮上，aria-controls 指向详情面板。
   const button=el('button','section-fish-button');button.type='button';button.id='fish-'+key;button.setAttribute('aria-label','查看'+titleText+'详情 · 麦麦');button.setAttribute('aria-controls',overlay.id);button.setAttribute('aria-expanded','false');button.title='查看'+titleText+'详情 · 麦麦';const clip=el('span','fish-peek');clip.setAttribute('aria-hidden','true');clip.append($('section-fish-art').content.cloneNode(true));button.append(clip);element.append(button);
   const allGroups=groups.filter(Boolean);
   const kind=CHANGES_KIND[key];
@@ -326,21 +343,38 @@ const SectionFish=(()=>{
   }
  }
  const safeTime=(value)=>value?clock(value,true):'暂无记录';
- mount('current','当前活动',$('hero-scene'),d=>d.schedule?.current?.name||'暂无正在进行的活动',d=>[['活动来源',source(d.schedule?.current?.source),'只显示实际处于进行状态的活动，计划意图不等于已发生。'],['状态时间',safeTime(d.state?.updated_at),fullClock(d.state?.updated_at)]]);
+ mount('current','当前活动',$('hero-scene'),d=>d.schedule?.current?.name||'暂无正在进行的活动',d=>[['活动来源',source(d.schedule?.current?.source),'只显示实际处于进行状态的活动，计划意图不等于已发生。'],['计划时段',d.schedule?.current?.time_label||'暂无记录','后端给出的本轮计划起止（time_label）；跨午夜段已标「次日」，与时间线「计划」行同口径。'],['进度基准','按本轮活动计划','进度由生活引擎按本轮计划时长与已用时计算；日意图时段可能不同，两者不一致时以本卡片口径为准。'],['状态时间',safeTime(d.state?.updated_at),fullClock(d.state?.updated_at)]]);
  const companionCard=$('tier').closest('article');mount('companion','陪伴',companionCard,d=>d.companion?.available?`${d.companion.tier_label||'关系记录'} · 今日主动 ${count(d.companion.speak_count)} / ${count(d.companion.daily_limit)}`:'暂无陪伴记录',d=>[['巡检时间',safeTime(d.companion?.last_tick_at),fullClock(d.companion?.last_tick_at)],['今日主动','巡检与想念合并统计','早安、晚安单独展示。']]);
  mount('state','身心状态',$('metrics'),d=>d.state_available?'五项状态反映当前快照；饥饿与压力越高，需求越明显。':'暂无生活状态记录',d=>[['采样间隔','约 5 分钟','正常tick每5分钟至多采样一次，另保留活动和醒沿观察。'],['更新时间',safeTime(d.state?.updated_at),fullClock(d.state?.updated_at)],['精神状态',num(d.state?.mental_state)===null?'暂无记录':pct(d.state.mental_state)+'%','由精力×专注×(1−压力)得到；专注为0表示注意力涣散，压力为0表示放松。']],[],['grid','metrics']);
- const historyCard=$('history-chart').closest('section');const sampleGroup=fold('采样明细',[$('samples-toggle'),$('samples')]);
- mount('history','状态变化',historyCard,()=>selectedDay?selectedDay+'的真实记录与估算':'最近'+hours+'小时的状态变化',d=>[['保留期','最近 7 天','最多2304个真实观察点；达到上限淘汰最旧点。'],['真实点',points.filter(p=>!p.estimated).length+' 个','这些值来自实际采样，不包括中间估算点。'],['估算点',points.filter(p=>p.estimated).length+' 个','仅两端有真实记录、且中间缺口不超过2小时才线性估算；虚线不计入真实点数。'],['起始时间',safeTime(lifeSeries().started_at||points[0]?.at),fullClock(lifeSeries().started_at||points[0]?.at)]],[sampleGroup]);
+ const historyCard=$('history-chart').closest('section');
+ // W-01：采样明细入口（按钮+表格）留在主页面 chartfoot 内联折叠，不再移入详情 store；
+ // 详情层只保留「最近变化」等派生内容。
+ mount('history','状态变化',historyCard,()=>selectedDay?selectedDay+'的真实记录与估算':'最近'+hours+'小时的状态变化',d=>[['保留期','最近 7 天','最多2304个真实观察点；达到上限淘汰最旧点。'],['真实点',points.filter(p=>!p.estimated).length+' 个','这些值来自实际采样，不包括中间估算点。'],['估算点',points.filter(p=>p.estimated).length+' 个','仅两端有真实记录、且中间缺口不超过2小时才线性估算；虚线不计入真实点数。'],['起始时间',safeTime(lifeSeries().started_at||points[0]?.at),fullClock(lifeSeries().started_at||points[0]?.at)]],[]);
+ function dynamicSleepRows(info){
+  if(!info)return [];
+  const bands={awake:'清醒',drowsy:'有点困',winding_down:'准备休息',asleep:'睡眠中',waking:'刚醒'};
+  const naps={taken:'已安排午休',late_wake:'起床太晚',not_sleepy:'还不困',busy:'活动进行中',hard_commitment:'临近约定',no_wake:'暂无今日醒来记录',window_closed:'已过午休窗口',ready:'可以安排'};
+  const decisions={score:'困倦达到入睡条件',anchor_bound:'入睡窗口到点',manual:'管理员请求',hard_commitment:'临近约定',busy:'当前活动优先',waiting:'继续观察'};
+  return [
+   ['动态睡眠',bands[info.band]||'等待评估',decisions[info.decision]||'按当前状态和日程滚动评估。'],
+   ['入睡评分',info.score??'暂无记录',['pressure','circadian','debt','schedule','activity'].map((k,i)=>['精力','节律','睡眠债','日程','活动'][i]+' '+(info[k]??'—')).join(' · ')],
+   ['入睡窗口',safeTime(info.window_start)+' → '+safeTime(info.window_end),fullClock(info.window_start)+' → '+fullClock(info.window_end)],
+   ['起床窗口',safeTime(info.earliest_wake)+' → '+safeTime(info.latest_wake),fullClock(info.earliest_wake)+' → '+fullClock(info.latest_wake)],
+   ['节律调整',info.phase_minutes==null?'暂无记录':info.phase_minutes+' 分钟','只根据已记录的自然夜缓慢调整。'],
+   ['午休',naps[info.nap_reason]||'等待午休窗口','清醒满三小时且确有困意时才安排。']
+  ];
+ }
  const sleepCard=document.querySelector('.sleep-combined');const archive=sleepCard.querySelector('.sleep-archive');const sleepGroups=[fold('睡眠债的变化',[$('debt-chart')]),fold('作息与会话说明',[$('sleep-anchors')]),fold('最近睡眠会话',[archive])];
- mount('sleep','睡眠与恢复',sleepCard,d=>d.sleep?.current?.asleep?'正在休息，恢复以真实会话记录为准。':'当前没有进行中的睡眠会话。',d=>[['睡眠债',fix(d.state?.sleep_debt)+' 小时','这是尚未补足的休息时长记录，范围0–12小时；正式醒来时按规则结算。'],['连续睡眠',fix(d.sleep?.current?.asleep?d.sleep.current.continuous_minutes:(d.state?.continuous_sleep_minutes??0),0)+' 分钟','连续段可能因已确认的打断重置，不代表本夜总时长。'],['来源','睡眠引擎会话','离线补全会明确标记；没有采样依据的段不会变成真实点。']],sleepGroups);
- const scheduleLists=document.querySelector('.schedulegrid');const scheduleGroup=fold('实际足迹与计划明细',[scheduleLists]);
- mount('schedule','当日行程',$('panel-schedule'),d=>`${selectedDay||d.schedule?.date||'当日'} · 计划与实际可以不同`,d=>[['来源','日意图与实际活动记录','计划与实际分列展示；中断、未完成、已清理的计划如实显示。'],['计划记录',dayView()?.intent?.plans_available===false?'已超过保留期':'查看下方明细',dayView()?.intent?.note||'当前计划最多80条、实际足迹最多120条；日视图每序列最多288点。']],[scheduleGroup]);
+ mount('sleep','睡眠与恢复',sleepCard,d=>d.sleep?.current?.asleep?'正在休息，恢复以真实会话记录为准。':'当前没有进行中的睡眠会话。',d=>[['睡眠债',fix(d.state?.sleep_debt)+' 小时','这是尚未补足的休息时长记录，范围0–12小时；正式醒来时按规则结算。'],['连续睡眠',fix(d.sleep?.current?.asleep?d.sleep.current.continuous_minutes:(d.state?.continuous_sleep_minutes??0),0)+' 分钟','连续段可能因已确认的打断重置，不代表本夜总时长。'],['来源','睡眠引擎会话','离线补全会明确标记；没有采样依据的段不会变成真实点。']].concat(dynamicSleepRows(d.sleep?.dynamic)),sleepGroups);
+ const scheduleDetail=$('schedule-detail'),poolDetail=$('schedule-pool-detail');store.append(scheduleDetail,poolDetail);
+ mount('schedule','行程记录',$('panel-schedule'),d=>schedulePageInfo().key==='record'?
+  selectedDay||d.schedule?.date||'当日':schedulePageInfo().note,()=>[],[scheduleDetail,poolDetail]);
  const moodCard=$('vad-chart').closest('article'),vadLegend=moodCard.querySelector('.legend');const moodGroups=[fold('心情的变化',[vadLegend,$('vad-chart')]),fold('睡眠调整记录',[$('referee-health')])];
  mount('mood','当前情绪',moodCard,d=>d.emotion?.available?(d.emotion.label||'心情平稳'):'暂无心情记录',d=>[['当前状态',d.emotion?.frozen?'睡眠冻结中':'自然变化中','睡眠期间暂停自然变化，醒后按真实睡眠会话进行调整。'],['最近调整',safeTime(d.emotion?.referee?.last_success_at),fullClock(d.emotion?.referee?.last_success_at)]],moodGroups);
  const qzoneCard=$('qzone-summary').closest('article');const qzoneGroups=[fold('最近发送记录',[$('delivery-list')]),fold('本地草稿预览',[qzoneCard.querySelector('.draft-preview')])];
  mount('sharing','空间与分享',qzoneCard,d=>d.qzone?.available?`今日分享 ${d.qzone.posts_today??0}/${d.qzone.daily_max_posts??0}`:'暂无分享记录',d=>[['最近状态获取',safeTime(d.qzone?.cookie_health?.last_success_at),fullClock(d.qzone?.cookie_health?.last_success_at)],['最近失败',safeTime(d.qzone?.cookie_health?.last_failure_at),fullClock(d.qzone?.cookie_health?.last_failure_at)],['发送结果','以确认记录为准','结果未知时不会自动重复发送。']],qzoneGroups);
- const usageCard=$('usage-metrics').closest('section'),usageGroup=fold('调用构成与模型明细',[usageCard.querySelector('.usage-details')]);
- mount('usage','模型调用',usageCard,d=>`最近 ${d.usage?.window_hours||720} 小时 · ${d.usage?.calls??0} 次调用`,d=>[['调用次数',d.usage?.calls??'暂无记录',usageTerms().calls],['Token 总量',d.usage?.tokens??'暂无记录',usageTerms().tokens],['输入 / 输出',(d.usage?.prompt_tokens??'—')+' / '+(d.usage?.completion_tokens??'—'),usageTerms().prompt_tokens],['缓存命中 / 未命中',(d.usage?.cache_hit_tokens??'—')+' / '+(d.usage?.cache_miss_tokens??'—'),usageTerms().cache_hit_tokens],['缺用量来源调用',d.usage?.missing_usage_source_calls??'暂无记录',usageTerms().missing_usage_source_calls]],[usageGroup]);
+ const usageCard=$('usage-metrics').closest('section'),usageDetail=$('usage-detail');store.append(usageDetail);
+ mount('usage','模型调用',usageCard,()=>'',()=>[],[usageDetail]);
  const healthGroup=fold('数据来源与运行明细',[$('health-data'),$('warnings')]);
  mount('health','数据与运行说明',$('health-section'),d=>d.warnings?.length?`${d.warnings.length} 项数据提示`:'随真实记录更新',d=>[['新鲜度',d.stale?'状态快照可能已过期':'查看顶部更新状态','独立计时超过45秒提示可能过期，120秒提示陈旧。'],['刷新方式',imported?'离线快照':'约30秒读取一次','页面隐藏时暂停轮询；失败保留上次快照，8秒超时后可重试。']],[healthGroup]);
  return {close,refresh};

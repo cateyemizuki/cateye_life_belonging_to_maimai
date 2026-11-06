@@ -15,10 +15,12 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   - maisaka.replyer.before_model_request  过期主动任务块剥离 + 仅屏幕旁白注入
                                        （BLOCKING/NORMAL）
   - maisaka.replyer.after_response     90 秒窗口补计 0.5 发言数 + spoken 回执（OBSERVE/LATE）
-- Tools ×3：lbm_mai_lover_send_message / lbm_mai_lover_affection /
+- Tools ×2：lbm_mai_lover_affection（F3 2026-11-04：is_enabled + 目标私聊 scope 校验，
+  决策痕带调用者身份）/
   lbm_report_harassment（2026-10-24 告状：受骚扰时转达维护者；纯逻辑见
   companion/harass_report.py，``[admin].harass_report_enabled=false`` 时不注册——
-  过滤在 plugin.get_components override）
+  过滤在 plugin.get_components override；F1 2026-11-04：目标私聊主动打扰口径纳入
+  proactive_budget 记账、冷却落盘持久化、回执结构化判定）
   （原 current_activity / status / schedule 三工具已随 T6 注册面收口移除：
   当前活动与日程查询见 lbm_get_schedule_info，状态总览见 /lbm_dashboard）
 - Commands ×4：/lbm_mai_affection（鉴权：target_qq 白名单 + 本机控制台，
@@ -28,7 +30,9 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   （M7 聚合总览：四模块状态图 + 纯文本降级，文本档展开完整日程并附配置摘要；
   鉴权同 admin 判定；渲染失败/超时静默降级为纯文本）
   （原 /mai_status、/mai_schedule、/mai_config、/mai_test 四条命令已移除：状态/日程
-  信息面并入 dashboard 文本档，配置摘要同源，测试消息可由 /mai_lover_send_message 替）
+  信息面并入 dashboard 文本档，配置摘要同源。2026-11-03 主动私信工具
+  lbm_mai_lover_send_message 已移除：直发绕过主动预算/冷却的缺口关闭，
+  主动发言统一经巡检→proactive.trigger 受预算守卫）
 - APIs ×3：companion_get_current_activity / companion_get_schedule /
   companion_get_affection_level（源插件 get_* 与 planning 子模块撞名，故加前缀）
 
@@ -50,6 +54,8 @@ from maibot_sdk import API, Command, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from companion.config import target_qq_of
+from companion.screen_config import screen_config_of
+from companion.screen_tools import ScreenToolsMixin
 from companion.harass_report import (
     HARASS_TOOL_NAME,
     TRIGGER_TYPE,
@@ -57,13 +63,14 @@ from companion.harass_report import (
     cooldown_check,
     cooldown_hint,
     decision_fields,
-    monotonic_now,
+    epoch_now,
     resolve_maintainer_qq,
 )
 from companion.patrol import resolve_silence_window
 from .rolling_diag import render_rolling
 from .streams_diag import build_streams_records
 from core.diag import DecisionLogger
+from core.storage import load_json, save_json_atomic
 from core.inject import pick_payload_key, project_injection, without_stale_proactive_blocks
 # §31.3 B3 修复（R7 = 用户 2026-10-23 第二轮直派，A-22 bug③）：读取渲染面时间一律
 # 经 time_utils.format_day_minute（禁手写 //60/%60；day_offset=1 行带「次日」标注），
@@ -73,10 +80,6 @@ from planning.schedule_query import SKIP_TYPES as _SCHEDULE_SKIP_TYPES
 from planning.time_utils import DAY_MINUTES, format_day_minute
 from suite_prompts import (
     INJECT_AFFECTION_BLOCK_DEFAULT,
-    TOOL_SEND_MESSAGE_DEFAULT,
-    TOOL_SEND_MESSAGE_DESCRIPTION,
-    TOOL_SEND_MESSAGE_TEXT_DESCRIPTION,
-    TOOL_SEND_MESSAGE_SYSTEM_DEFAULT,
     prompt,
     render,
 )
@@ -236,7 +239,7 @@ def _shrink_payload_for_injection(payload: list[Any]) -> tuple[Optional[list[Any
     return items, omitted
 
 
-class CompanionComponentsMixin:
+class CompanionComponentsMixin(ScreenToolsMixin):
     """虚拟陪伴组件面（Hooks/Tools/Commands/APIs），挂在整合插件主类上。"""
 
     # ==================================================================
@@ -320,6 +323,53 @@ class CompanionComponentsMixin:
     # ==================================================================
     # Hooks
     # ==================================================================
+
+    def _mai_reply_target_guard(self):
+        from integrations.proactive_reply_target import ProactiveReplyTargets
+        guard = getattr(self, "_proactive_reply_targets", None)
+        if guard is None:
+            guard = ProactiveReplyTargets()
+            self._proactive_reply_targets = guard
+        return guard
+
+    def _mai_reply_target_stream(self) -> str:
+        plugin_cfg = getattr(getattr(self, "config", None), "plugin", None)
+        if not getattr(plugin_cfg, "enabled", True) or not self._mai_patrol_enabled():
+            return ""
+        return self._mai_target_stream_id()
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="mai_lover_proactive_reply_target",
+        description="为陪伴私聊的本插件主动任务指定上下文中用户最后来信的回复目标",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def mai_hook_proactive_reply_target(self, **kwargs: Any) -> dict[str, Any]:
+        modified = self._mai_reply_target_guard().before(
+            kwargs, stream_id=self._mai_reply_target_stream(),
+            target_user=target_qq_of(self.config),
+            mode=getattr(getattr(self.config, "patrol", None), "proactive_reply_target_mode", "浅处理"))
+        return {"action": "continue", **({"modified_kwargs": modified} if modified is not None else {})}
+
+    @HookHandler(
+        "maisaka.planner.after_response",
+        name="mai_lover_proactive_reply_target_rewrite",
+        description="深度处理：仅将本插件陪伴主动回合的reply目标改为本轮用户最后来信",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def mai_hook_proactive_reply_target_rewrite(self, **kwargs: Any) -> dict[str, Any]:
+        modified, count = self._mai_reply_target_guard().after(
+            kwargs, stream_id=self._mai_reply_target_stream(),
+            target_user=target_qq_of(self.config))
+        if count:
+            self.ctx.logger.info("陪伴主动回复目标深度处理：已纠正%d个reply调用", count)
+        return {"action": "continue", **({"modified_kwargs": modified} if modified is not None else {})}
 
     @HookHandler(
         "chat.receive.before_process",
@@ -595,6 +645,10 @@ class CompanionComponentsMixin:
         与 _trigger_planner 的 0.5 配合：回复成功总计 1.0，未回复总计 0.5。
         仅在最近 90 秒内有 proactive trigger 时生效；补计后清除待确认触发，
         因此与顶层 speak_counter 钩子共存时不会重复计数。
+
+        F6（2026-11-04）：补计前比对回复流与目标流——宿主 after_response 携带
+        ``session_id``（=回复所在流）；窗口内无关流（群聊/其他用户）的回复不补计、
+        不消费待确认触发，spoken 归因不再失真。
         """
         _tracker = getattr(self, "_attention_tracker", None)
         if _tracker is not None:
@@ -610,6 +664,10 @@ class CompanionComponentsMixin:
         elapsed = (now - last_trigger).total_seconds()
         if elapsed >= 90:
             return
+        reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
+        target_stream = str(patrol.patrol_status().get("stream_id") or "").strip()
+        if target_stream and reply_stream != target_stream:
+            return  # 非目标流的回复不算主动发言确认（保留待确认触发给正确的流）
         trigger_type = patrol.get_last_trigger_intent()
         companion.affection.increment_speak(0.5)
         patrol.clear_last_trigger_time()
@@ -799,73 +857,10 @@ class CompanionComponentsMixin:
     # ==================================================================
 
     @Tool(
-        "lbm_mai_lover_send_message",
-        description=TOOL_SEND_MESSAGE_DESCRIPTION,
-        parameters={
-            "message": {
-                "type": "string",
-                "description": TOOL_SEND_MESSAGE_TEXT_DESCRIPTION,
-                "required": False,
-            },
-        },
-    )
-    async def mai_tool_send_message(self, message: str = "", **kwargs: Any) -> str:
-        """LLM Tool: 主动向陪伴对象发送消息（带情绪后缀；成功计 1 次发言数并记决策日志）。"""
-        if not self._mai_patrol_enabled():
-            return "陪伴模块未启用（[patrol].enabled=false）。"   # T3 #4：工具按文档返回未启用提示
-        companion = self._mai_companion()
-        if companion is None:
-            return "陪伴服务未初始化。"
-        stream_id = self._mai_target_stream_id()
-        name = self._mai_lover_name()
-        if not stream_id:
-            return f"{name}还没有连接到目标用户，请稍后再试。"
-
-        if not str(message or "").strip():
-            relation = getattr(companion, "relation", None)
-            relation_word = getattr(relation, "word", None) or "恋人"
-            style_word = getattr(relation, "style_word", None) or "温柔亲昵的陪伴者"
-            self_desc = getattr(relation, "self_desc", None) or "一个温柔体贴的虚拟陪伴者"
-            fallback = ("想你了呢~在忙什么呀？" if relation_word == "恋人"
-                        else "在忙什么呀？最近怎么样？~")
-            message = await companion.llm.generate_or_fallback(
-                prompt=render(
-                    prompt(self.config, "tool_send_message"),
-                    fallback=TOOL_SEND_MESSAGE_DEFAULT,
-                    style_word=style_word, relation_word=relation_word,
-                ),
-                fallback=fallback,
-                system_prompt=render(
-                    prompt(self.config, "tool_send_message_system"),
-                    fallback=TOOL_SEND_MESSAGE_SYSTEM_DEFAULT,
-                    name=name, self_desc=self_desc, relation_word=relation_word,
-                ),
-                temperature=0.8,
-                module="companion",
-                event="tool_send_message",
-            )
-
-        final_text = companion.message.append_affection_suffix(str(message))
-        try:
-            result = await self.ctx.send.text(text=final_text, stream_id=stream_id)
-        except Exception as e:
-            self.ctx.logger.error(f"[lbm_mai_lover_send_message] 发送异常: {e}")
-            return f"消息发送异常: {e}"
-        if result:
-            companion.affection.increment_speak()
-            self._mai_log_proactive_event(
-                action="trigger",
-                reason="tool_send_message",
-                trigger_type="tool",
-                detail=f"planner 通过 Tool 主动发了一条消息：{final_text[:40]}",
-            )
-            return f"消息已发送: {final_text[:60]}..."
-        return "消息发送失败: 发送返回 False"
-
-    @Tool(
         "lbm_mai_lover_affection",
         description="调整与关系对象的好感度：把 score 移动到指定档位的区间中值并重估档位"
-                    "（档位数 1~5 随好感度预设表变化，档位名称如恋人=生疏/熟悉/亲密/热恋/挚爱）",
+                    "（档位数 1~5 随好感度预设表变化，档位名称如恋人=生疏/熟悉/亲密/热恋/挚爱；"
+                    "仅限陪伴目标私聊会话使用）",
         parameters={
             "tier": {
                 "type": "integer",
@@ -875,10 +870,35 @@ class CompanionComponentsMixin:
         },
     )
     async def mai_tool_affection(self, tier: int = 1, **kwargs: Any) -> str:
-        """LLM Tool：把 score 移到指定档（1~N，1 起计数）的区间中值（管理员兜底，跳过迟滞）。"""
+        """LLM Tool：把 score 移到指定档（1~N，1 起计数）的区间中值（管理员兜底，跳过迟滞）。
+
+        F3（2026-11-04，与命令面鉴权契约对齐）：
+        - ``[affection].enabled=false`` → 拒绝写入（关=分数/档位不再变化）；
+        - 调用会话限**目标陪伴私聊**：stream 精确匹配目标流；或非群聊且调用者本人
+          通过命令面 target 白名单（``_is_authorized_command_user`` 同口径）；
+          会话/身份不可核验时默认拒绝（防群聊话术诱导改档）；
+        - 决策痕：``set_tier`` 的 reason 携带调用者身份（进入 affection.tier_set 留痕）。
+        """
         companion = self._mai_companion()
         if companion is None:
             return "好感度管理器未初始化。"
+        if not companion.affection.is_enabled():
+            return "好感度系统已停用（[affection].enabled=false），不能调整档位。"
+        caller_stream = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
+        caller_user = str(kwargs.get("user_id") or "").strip()
+        caller_group = str(kwargs.get("group_id") or "").strip()
+        target_stream = self._mai_target_stream_id()
+        allowed = bool(target_stream and caller_stream and caller_stream == target_stream)
+        if not allowed and not caller_group:
+            # 私聊兜底：stream 重建但调用者确为目标用户本人（命令面白名单机制同口径）
+            allowed = bool(caller_stream) and self._is_authorized_command_user(
+                caller_user, bool(kwargs.get("is_local_operator", False)))
+        if not allowed:
+            self._mai_log_proactive_event(
+                action="skip", reason="tool_scope_denied", trigger_type="affection",
+                detail="好感度 Tool 调用会话非目标陪伴私聊（或身份不可核验），已拒绝",
+                caller_user=caller_user, caller_stream=caller_stream, caller_group=caller_group)
+            return "此工具仅限与陪伴目标的私聊会话中使用。"
         preset = companion.affection.preset()
         tier_count = preset.size
         labels = "、".join(f"{i + 1}={label}" for i, label in enumerate(preset.labels()))
@@ -888,7 +908,9 @@ class CompanionComponentsMixin:
             return f"档位必须是 1~{tier_count} 的整数，收到的是 {tier!r}。"
         if not 1 <= requested <= tier_count:
             return f"档位只能填 1~{tier_count}（当前预设档位：{labels}），收到的是 {requested}。"
-        companion.affection.set_tier(requested - 1)
+        companion.affection.set_tier(
+            requested - 1,
+            reason=f"tool user={caller_user or '-'} stream={caller_stream or '-'}")
         self.ctx.logger.info(f"好感度已通过 Tool 调整到第 {requested} 档（score 移至对应区间中值）")
         return f"好感度已更新：{self._mai_affection_state_line()}"
 
@@ -896,13 +918,49 @@ class CompanionComponentsMixin:
     # 告状工具（2026-10-24 用户直派，需求3）
     # ==================================================================
 
+    def _harass_state_path(self) -> Optional[Path]:
+        """告状冷却落盘路径（F1）：``<data_dir>/harass_report_state.json``；取不到目录 → None（纯内存态）。"""
+        data_dir = getattr(self, "_data_dir", None)
+        if not data_dir:
+            data_dir = getattr(self._mai_companion(), "_data_dir", None)
+        if not data_dir:
+            return None
+        return Path(data_dir) / "harass_report_state.json"
+
     def _harass_state(self) -> dict:
-        """进程内缓存：告状冷却时间戳 + 维护者解析结果（键 = 解析所用 QQ；热重载重建实例即清零）。"""
+        """告状冷却时间戳 + 维护者解析结果缓存。
+
+        F1（2026-11-04）：``last_ts`` 为 **epoch 秒**并从落盘状态装载——热重载重建
+        实例不再清零冷却；损坏/非法时间戳按从未告状处理。维护者解析结果
+        （QQ/stream）仍留进程内（热重载后流可能重建，重解析无害）。
+        """
         state = getattr(self, "_harass_cache", None)
         if state is None:
             state = {"last_ts": 0.0, "resolved_qq": "", "resolved_stream": ""}
+            path = self._harass_state_path()
+            if path is not None:
+                raw = load_json(path, None)
+                if isinstance(raw, dict):
+                    ts = raw.get("last_report_ts")
+                    if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0:
+                        state["last_ts"] = float(ts)
             self._harass_cache = state
         return state
+
+    def _harass_persist(self, state: dict) -> None:
+        """冷却时间戳原子落盘（F1）；失败降级进程内冷却并单次告警，不阻断告状流程。"""
+        path = self._harass_state_path()
+        if path is None:
+            return
+        if save_json_atomic(path, {"last_report_ts": float(state.get("last_ts", 0.0))}):
+            self._harass_persist_warned = False
+            return
+        if not getattr(self, "_harass_persist_warned", False):
+            self._harass_persist_warned = True
+            try:
+                self.ctx.logger.warning("告状冷却落盘失败，降级为进程内冷却（热重载将清零）：%s", path)
+            except Exception:
+                pass
 
     def _harass_log(self, *, action: str, reason: str, detail: str = "",
                     maintainer_qq: str = "", location: str = "") -> None:
@@ -982,7 +1040,12 @@ class CompanionComponentsMixin:
         },
     )
     async def mai_tool_report_harassment(self, description: str = "", **kwargs: Any) -> str:
-        """LLM Tool: 受骚扰时向维护者告状（运维消息，不带情绪后缀；冷却与维护者解析进程内缓存）。"""
+        """LLM Tool: 受骚扰时向维护者告状（运维消息，不带情绪后缀）。
+
+        F1/F2（2026-11-04）：冷却时间戳落盘（热重载不清零）；回退陪伴目标私聊的发送
+        受主动打扰预算闸门并以 ``harass_report`` 渠道入账；回执按结构化 ``success is True``
+        判定（与 MessageService 同契约）。维护者解析结果仍为进程内缓存。
+        """
         cfg = getattr(self, "config", None)
         admin = getattr(cfg, "admin", None)
         # 双保险：正常情况本工具在 harass_report_enabled=false 时已被 get_components 剔除不注册，
@@ -1002,7 +1065,7 @@ class CompanionComponentsMixin:
 
         state = self._harass_state()
         cooldown_minutes = max(0, int(getattr(admin, "harass_report_cooldown_minutes", 30) or 0))
-        now_ts = monotonic_now()
+        now_ts = epoch_now()
         allowed, remaining = cooldown_check(now_ts, state.get("last_ts", 0.0), cooldown_minutes)
         if not allowed:
             self._harass_log(action="skip", reason="cooldown_skip",
@@ -1022,6 +1085,16 @@ class CompanionComponentsMixin:
                              maintainer_qq=maintainer_qq, location=location)
             return "告状失败：暂时联系不上维护者（私聊流解析失败），稍后再试。"
 
+        # F1（2026-11-04）：纳入主动打扰预算——按 M11 口径仅「发往目标陪伴私聊」受闸/入账
+        # （allow_proactive 对非目标流直接放行）；生产未显式配置告状对象时回退陪伴目标，
+        # 该直发路径自此与巡检/想念同闸，不再构成预算外例外。
+        bus = getattr(self, "_bus", None)
+        if bus is not None and not bus.allow_proactive("harass_report", "告状", stream_id=stream_id):
+            self._harass_log(action="skip", reason="budget_blocked",
+                             detail="当日主动打扰预算已用完，告状未发送",
+                             maintainer_qq=maintainer_qq, location=location)
+            return "告状未发送：今日主动消息预算已用完，请明天再试。"
+
         final_text = build_report_text(text, location)
         try:
             result = await self.ctx.send.text(text=final_text, stream_id=stream_id)
@@ -1031,16 +1104,32 @@ class CompanionComponentsMixin:
                              detail=f"发送异常: {e}", maintainer_qq=maintainer_qq,
                              location=location)
             return f"告状发送异常: {e}"
-        if result:
+        # F2（2026-11-04）：结构化回执判定（与 MessageService/视频分享同契约）——
+        # 不得用非空失败字典的真值冒充成功；仅 success is True 才置冷却/记账。
+        receipt = (dict(result) if isinstance(result, dict) else
+                   {"success": result} if isinstance(result, bool) else
+                   {"success": False, "uncertain": True})
+        if receipt.get("success") is True:
             state["last_ts"] = now_ts
+            self._harass_persist(state)
+            if bus is not None:
+                try:
+                    await bus.publish("proactive.used", source="companion",
+                                      channel="harass_report", intent="告状",
+                                      stream_id=stream_id)
+                except Exception as exc:
+                    self.ctx.logger.warning(
+                        f"[{HARASS_TOOL_NAME}] proactive.used 发布失败（预算记账可能缺失）: {exc}")
             self._harass_log(action="trigger", reason="reported",
                              detail=f"bot 告状：{text[:40]}", maintainer_qq=maintainer_qq,
                              location=location)
             return f"告状已发送: {final_text[:60]}..."
+        detail = ("发送回执不确定（无结构化 success）" if receipt.get("uncertain")
+                  else "发送返回失败回执")
         self._harass_log(action="info", reason="send_failed",
-                         detail="发送返回 False", maintainer_qq=maintainer_qq,
+                         detail=detail, maintainer_qq=maintainer_qq,
                          location=location)
-        return "告状发送失败: 发送返回 False"
+        return "告状发送失败: 发送未返回成功回执"
 
     # ==================================================================
     # Commands
@@ -1886,53 +1975,19 @@ class CompanionComponentsMixin:
         return (f"好感度: score {score:.1f}/baseline {baseline:.1f}/"
                 f"档位 {tier}·{label}")
 
-    def _mai_config_summary(self, multiline: bool) -> str:
-        """配置摘要（单行紧凑版给状态总览文本降级路径；多行版保留完整排版，当前无命令入口）。
-
-        T6 注册面收口后 /lbm_mai_config 命令已移除：单行版仍由
-        /lbm_dashboard 的纯文本档末行消费，多行版仅供离线测试与后续入口复用。
-
-        静默行显示**生效值 + 来源**（N5：``[patrol].silence_*`` 留空 = 跟随 ``[schedule]``
-        作息锚点）——与巡检静默闸 / 晚安期限共用 ``resolve_silence_window``（唯一真源），
-        不再回显原始配置（留空会显示成「静默 ~」）。
-        """
-        patrol = self.config.patrol
-        silence = resolve_silence_window(self.config)
-        miss_llm = "开" if getattr(patrol, "miss_llm_check_enabled", False) else "关"
-        screen = "开" if getattr(patrol, "screen_enabled", False) else "关"
-        patrol_activity = "开" if getattr(patrol, "patrol_activity_enabled", True) else "关"
-        group_inject = "开" if getattr(patrol, "inject_affection_in_group", True) else "关"
-        if multiline:
-            return (
-                "麦麦陪伴配置摘要\n"
-                f"调度: 巡检间隔 {patrol.check_interval_minutes}min | "
-                f"每日预算 {patrol.daily_max_speak} 条（只计巡检与想念，早晚安免预算） | "
-                f"最小间隔 {patrol.min_trigger_interval_minutes}min（早/晚安始终豁免） | "
-                f"冷却 {patrol.user_cooldown_minutes}min | "
-                f"触发开关 {'开启' if patrol.proactive_trigger_enabled else '关闭'}\n"
-                f"时间: 静默 {silence.describe()}（早/晚安时刻由日程模块漂移驱动） | "
-                f"想念阈值 {getattr(patrol, 'miss_silence_hours', '4-8')}h（LLM把关{miss_llm}）\n"
-                f"概率: 日常 {patrol.default_speak_rate} | "
-                f"想念 {patrol.miss_speak_rate} | "
-                f"日程巡检 {patrol.activity_trigger_rate}（开关{patrol_activity}）\n"
-                f"{self._mai_config_affection_line()} | "
-                f"好感度注入: 目标私聊恒定 / 群聊{group_inject} | "
-                f"屏幕感知: {screen} | "
-                f"日志: {self._mai_patrol_status_line() or '（巡检未初始化）'}"
-            )
-        return (
-            f"麦麦陪伴配置: 巡检间隔 {patrol.check_interval_minutes}min | "
-            f"每日预算 {patrol.daily_max_speak} 条 | "
-            f"最小间隔 {patrol.min_trigger_interval_minutes}min | "
-            f"冷却 {patrol.user_cooldown_minutes}min | "
-            f"触发开关 {'开' if patrol.proactive_trigger_enabled else '关'} | "
-            f"想念 {getattr(patrol, 'miss_silence_hours', '4-8')}h（LLM把关{miss_llm}） | "
-            f"日常概率 {patrol.default_speak_rate} | "
-            f"想念概率 {patrol.miss_speak_rate} | "
-            f"巡检概率 {patrol.activity_trigger_rate} | "
-            f"{self._mai_config_affection_line()} | "
-            f"屏幕感知 {screen}"
-        )
+    def _mai_config_summary(self, multiline: bool = False) -> str:
+        cfg = self.config.patrol
+        companion = getattr(self, '_companion', None)
+        patrol = getattr(companion, 'patrol', None)
+        memory = getattr(patrol, '_initiative_memory', None)
+        profile = memory.profile() if memory is not None else {}
+        items = ["麦麦陪伴配置摘要", f"动机评估间隔 {cfg.check_interval_minutes} 分钟",
+                 f"每日主动预算 {cfg.daily_max_speak} 次",
+                 f"想念锚点 {profile.get('anchor_hours', 6)} 小时",
+                 f"联系敏感度 {profile.get('loneliness', .5)}",
+                 "同一来信沉默周期最多一次想念，planner可自主跳过",
+                 self._mai_config_affection_line()]
+        return ('\n' if multiline else ' | ').join(items)
 
     @staticmethod
     def _mai_build_llm_log_records(entries: list[dict[str, Any]], retention_days: int) -> list[dict[str, Any]]:

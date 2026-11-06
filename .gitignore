@@ -19,6 +19,8 @@ ISSUE_SUBMISSION.md
 # ---- 宿主安装回执与更新备份（发布安装模式写入，勿提交）----
 .maibot-release.json
 .update_backups/
+# WebUI 改版前的本地备份快照，不随包分发
+webui/source/_p2_backup/
 
 # ---- 映射表层 = 用户数据区（§29.2 2026-10-23 直派）----
 # 表层 mappings/*.json 与 mappings/README.md 退出随包（退出仓库跟踪）：表层 = 用户数据区

@@ -9,11 +9,18 @@ def result_text(result: dict) -> str:
     video = result.get("video") or {}
     description = str(result.get("content_description") or "").strip()
     if not description:
-        brief = str(video.get("desc") or video.get("description") or "").strip()
-        description = ("未生成独立内容描述；视频简介：" + brief if brief else
-                       "未生成独立内容描述，现有资料不足，不能补造内容。")
-        if result.get("content_description_error"):
-            description += "（" + str(result["content_description_error"]) + "）"
+        # 2026-11-04 措辞修复：父侧加工超时/失败时，已完成的画面采样理解
+        # （visual.summary）尽量纳入记忆文本；outward 用内容聚焦的中性引导，
+        # 不主动声明“非连续观看/资料不足”（诚实约束保留在生成提示词与内部诊断，
+        # content_description_error 仍落 result.json，不再拼进对外文本）。
+        visual = result.get("visual") if isinstance(result.get("visual"), dict) else {}
+        visual_summary = str((visual or {}).get("summary") or "").strip()
+        if visual_summary and (visual or {}).get("understanding_status") in (None, "completed"):
+            description = "以下是基于已有信息的画面内容概括：" + visual_summary
+        else:
+            brief = str(video.get("desc") or video.get("description") or "").strip()
+            description = ("视频简介：" + brief if brief else
+                           "可基于视频标题与UP主信息了解该视频的主题与背景。")
     impression = str(result.get("impression") or "").strip()
     if not impression:
         impression = str(result.get("impression_error") or result.get("error") or "暂无观后感")

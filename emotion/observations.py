@@ -1,8 +1,10 @@
 """Bounded VAD observations; no chat, prompts, identities or retrospective reconstruction."""
-import json,math,shutil
+import json,logging,math,shutil
 from datetime import datetime,timedelta
 from pathlib import Path
 from core.storage import save_json_atomic
+
+logger=logging.getLogger(__name__)
 
 class EmotionObservations:
     def __init__(self,path):
@@ -11,7 +13,8 @@ class EmotionObservations:
             if self.path.exists():
                 if self.path.stat().st_size>1024*1024:raise ValueError('oversized observations')
                 raw=json.loads(self.path.read_text(encoding='utf-8'))
-                if raw.get('version')!=1:self.writable=False;return
+                # F6 (2026-11-04 audit): version drift used to stop sampling silently; leave one trace per load.
+                if raw.get('version')!=1:self.writable=False;logger.warning('observations version!=1, sampling disabled: %s',self.path);return
                 for row in raw.get('points',[])[-2304:]:
                     if not isinstance(row,dict):continue
                     stamp=datetime.fromisoformat(str(row.get('at','')))
@@ -21,9 +24,10 @@ class EmotionObservations:
                 self.points.sort(key=lambda r:datetime.fromisoformat(r['at']).timestamp())
         except Exception:
             self.persisted=False
+            logger.warning('observations load failed (backup then rebuild): %s',self.path,exc_info=True)
             try:
                 if self.path.exists():shutil.copy2(self.path,self.path.with_name(self.path.name+'.corrupt-'+datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.bak'))
-            except OSError:self.writable=False
+            except OSError:self.writable=False;logger.warning('observations corrupt and backup failed, sampling disabled: %s',self.path)
     def sample(self,now,vad,frozen=False):
         if not self.writable or now.tzinfo is None:return
         if self.points and (now-datetime.fromisoformat(self.points[-1]['at'])).total_seconds()<300:return

@@ -16,7 +16,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
+
+from core.contracts import PLUGIN_ATTR_CONTRACT
+
+logger = logging.getLogger(__name__)
 
 
 class PluginContext:
@@ -30,6 +35,10 @@ class PluginContext:
     def get(self, name: str, default: Any = None) -> Any:
         """按契约名（可带/不带前导下划线）读取，缺失回退 ``default``。"""
         key = "_" + str(name).lstrip("_")
+        if key not in PLUGIN_ATTR_CONTRACT:
+            # F7（2026-11-04）：白名单外的键留 debug 线索（漂移可观测）；
+            # 不改变既有 getattr 回退 default 的降级语义。
+            logger.debug("PluginContext.get(%r) 不在 PLUGIN_ATTR_CONTRACT 白名单内", key)
         return getattr(self._plugin, key, default)
 
     @property

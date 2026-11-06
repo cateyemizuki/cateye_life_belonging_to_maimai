@@ -16,8 +16,8 @@
     "sha256": "b1dc4cb2518a49f7d706577e3ec5da7de7050c4d14bcfd8c487c9be92f8c7367"
   },
   "bg_offline.webp": {
-    "bytes": 121612,
-    "sha256": "d94bc4c2182432993cded4bb8b9995a6a8e76533eb321daa1502d6696b6fda6d"
+    "bytes": 39680,
+    "sha256": "97dd69adbbe9b5c9c5dd816f63e339a160a7647796707337487353fe2065798b"
   },
   "bg_schedule_empty.webp": {
     "bytes": 70170,
@@ -38,5 +38,13 @@
   "fish_official.svg": {
     "bytes": 2210,
     "sha256": "966780e3d539a7136aced201dfa795a3a5bb1ea9eaf7cc9f772ff1bad308e238"
+  },
+  "maimai_bear.webp": {
+    "bytes": 17960,
+    "sha256": "dc1faf059b2f5250a5500fe7b6e2551c04bd90a32a9a0cf2da4ca2718cb6cd57"
+  },
+  "maimai_bubble.webp": {
+    "bytes": 10058,
+    "sha256": "afb64b0e74dab300b95e3913b07780b34f4a58826b642575652251771de541a6"
   }
 }

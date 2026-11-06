@@ -92,6 +92,10 @@ class _PatrolGateShim:
 
         return nap_item_matches(activity)
 
+    def actual_nap_item_matches(self, activity: Any) -> bool:
+        from companion.patrol import actual_nap_item_matches
+        return actual_nap_item_matches(activity)
+
     def nap_intent_matches_now(self, day_schedule: Any, now: Any = None) -> bool:
         from companion.patrol import nap_intent_matches_now
 
@@ -152,6 +156,11 @@ QZONE_REPLY_PROMPT = QZONE_REPLY_DEFAULT
 # 已处理记录的容量上限（LRU，参考 Maizone processed_list 设计）
 _MAX_PROCESSED_FEEDS = 200
 _MAX_PROCESSED_COMMENTS = 200
+
+#: P1-12：单轮自动回评的尝试总量上限（每条尝试 = 1 次 LLM 生成 + 至多 1 次楼中楼发送，
+#: 另含 3~4s 拟人间隔）。理论读面为 reply_number(≤20) 条说说 × 各 100 条评论，不设上限
+#: 时极端评论涌入会让单轮成本与时长不可控；超限评论留待下轮，不标记已处理。
+_MAX_REPLIES_PER_ROUND = 5
 
 #: mood_effect.post_rate 的上限（附录 C：post_rate 允许 0~1.2；乘到配置发帖率后按概率语义夹到 1.0）
 MOOD_POST_RATE_MAX = 1.2
@@ -355,15 +364,23 @@ class QzoneService:
         if ok and result is None:
             self._send_ambiguous = True
         if result is None and not self._send_ambiguous and self._cookie_manager is not None:
-            # 动作通道失败 → Web CGI 直连（发布端点相同，cookie/g_tk 与 SnowLuma 同源）
-            client = await self._cookie_manager.get_client()
-            if client is not None:
-                tid = await client.publish(text.strip(), images=image_list or None)
-                result = {"tid": tid, "time": ""} if tid else None
-                if result is None:
-                    # CGI may have accepted the post before its response was lost.
-                    self._send_ambiguous = True
-                    err = f"{err}; CGI 直连也失败"
+            if params["ugc_right"] not in (1, 4, 64):
+                # P1-13：16/128 需要指定名单参数（target_uins），CGI 回退无法表达——
+                # 拒绝回退并如实报错，绝不把非公开帖静默改成公开。未分发任何请求，
+                # 不置 _send_ambiguous（结果确定未发出，走既有 retry_wait 语义）。
+                err = f"{err}; 可见性 {params['ugc_right']} 不支持 CGI 回退（未回退，防静默改公开）"
+            else:
+                # 动作通道失败 → Web CGI 直连（发布端点相同，cookie/g_tk 与 SnowLuma 同源）
+                client = await self._cookie_manager.get_client()
+                if client is not None:
+                    # P1-13：透传调用方可见性，不再硬编码公开
+                    tid = await client.publish(text.strip(), images=image_list or None,
+                                               visibility=int(params["ugc_right"]))
+                    result = {"tid": tid, "time": ""} if tid else None
+                    if result is None:
+                        # CGI may have accepted the post before its response was lost.
+                        self._send_ambiguous = True
+                        err = f"{err}; CGI 直连也失败"
         self._log("trigger" if result else "skip", trigger_type="qzone_post",
                   reason=("发说说成功（含 %d 张配图）" % len(image_list)) if result and image_list
                   else ("发说说成功" if result else f"发说说失败: {err}"))
@@ -564,9 +581,8 @@ class QzoneService:
         # 闸 2：午休静默（2026-10-20 用户指示：nap_quiet_enabled 由陪伴巡检扩展到空间——
         # 午休/小睡条目中不发说说、不监听评论；判定与 companion.patrol 同源——D3 起经
         # 组合根公共门面，不导入 companion）
-        if self._nap_quiet_enabled() and self._companion_gate().nap_item_matches(activity):
-            self._record_decision("skip", gate="nap_quiet",
-                                  reason="午休/小睡中（[patrol] nap_quiet_enabled，跨模块静默）")
+        if self._actual_nap(now):
+            self._record_decision('skip', gate='nap_quiet', reason='实际午休/小睡中，空间静默')
             return False
         activity_name = str(activity.get("name") or activity.get("description") or "活动")
         # 闸 3：冷却（锚点只在发送成功后更新；失败不重置）
@@ -595,16 +611,71 @@ class QzoneService:
                               reason=f"判定链通过（{activity_name}）")
         return True
 
-    def _nap_quiet_enabled(self) -> bool:
-        """午休静默开关（``[patrol].nap_quiet_enabled``，缺省 False；2026-10-20 用户指示
-        该开关由陪伴巡检扩展到空间——开启后空间判定链同样在午休/小睡时段静默）。
+    async def check_post_gates(self, now: Optional[datetime] = None) -> Tuple[bool, str]:
+        """Tool/命令直发路径的闸门复检（P1-14：与 _tick/_post_gate_chain 同口径）。
 
-        配置读取兼容两种形态（与 :func:`_sleep_silence_window` 同款）：配置对象本身（含
-        ``patrol`` 段）或 plugin 实例（各段挂在 ``.config``）。"""
-        patrol = getattr(self._plugin, "patrol", None)
-        if patrol is None:
-            patrol = getattr(getattr(self._plugin, "config", None), "patrol", None)
-        return bool(getattr(patrol, "nap_quiet_enabled", False))
+        强制 2026-10-20 用户指示「整夜不发说说」：睡眠引擎 → 静默窗 → 午休静默
+        （nap_quiet_enabled 开启时，含意图行提前静默，与 _tick 同布局）→ 冷却 →
+        LLM 严判（可关）。**不查**「无活动」与掷骰上限（直发允许空闲时段人工裁量，
+        内容质量仍由 LLM 严判把关）；每日额度由调用方先行检查。
+
+        每道闸拒绝都写决策历史与决策账（与自动路径同痕迹口径）。
+        返回 ``(放行?, 拒绝原因)``；放行时原因为空串。
+        """
+        now = now or datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        # 闸 0a：睡眠引擎判定仍在睡（晚醒真实状态；与判定链同口径，异常时由静默窗兜底）
+        try:
+            if self._companion_gate().sleep_engine_asleep(now):
+                reason = "睡眠引擎判定仍在睡"
+                self._record_decision("skip", gate="silence", reason=reason)
+                return False, reason
+        except Exception:
+            pass
+        # 闸 0：静默窗（恒复用 [schedule] 作息，与陪伴静默同一真源）
+        silence_start, silence_end = _sleep_silence_window(self._plugin)
+        if is_in_time_window(silence_start, silence_end,
+                             now.strftime("%H:%M"), invalid_result=True):
+            reason = "静默时段（跟随日程作息，整夜不发说说）"
+            self._record_decision("skip", gate="silence", reason=reason)
+            return False, reason
+        # 午休静默（与 _tick 同口径：条目命中 + 意图行时间窗提前静默）
+        if self._actual_nap(now):
+            self._record_decision('skip', gate='nap_quiet', reason='实际午休/小睡中，空间静默')
+            return False, "实际午休/小睡中"
+        # 冷却（锚点只在发送成功后更新；与判定链闸 3 同口径）
+        remain_minutes = self._cooldown_remain_minutes(now)
+        if remain_minutes > 0:
+            reason = f"冷却中（剩余约 {remain_minutes} 分钟）"
+            self._record_decision("skip", gate="cooldown", reason=reason)
+            return False, reason
+        # LLM 严判（可关；与判定链闸 4 同口径，调用异常保守按不发）
+        cfg = self._qzone_cfg()
+        if bool(getattr(cfg, "post_llm_gate_enabled", True)):
+            try:
+                activity = self._schedule.find_current_activity(today, now)
+            except Exception:
+                activity = None
+            allowed, llm_reason, answer = await self._llm_post_gate(activity, now)
+            if not allowed:
+                reason = f"LLM 严判不发（{llm_reason or '未说明'}）"
+                self._record_decision("skip", gate="llm", reason=reason, llm_answer=answer)
+                return False, reason
+            self._record_decision("pass", gate="llm",
+                                  reason=f"LLM 严判通过（{llm_reason or '未说明'}）", llm_answer=answer)
+        return True, ""
+
+    def _actual_nap(self, now: datetime) -> bool:
+        """Qzone alone is quiet during an actual nap, never a skipped intention."""
+        if not self._schedule_enabled():
+            return False
+        db = getattr(self._plugin, '_db', None)
+        try:
+            active = db.active_episode() if db is not None else None
+            return bool(active and self._companion_gate().actual_nap_item_matches(active))
+        except Exception:
+            logger.warning('QQ空间午休事实读取失败，本轮不发布', exc_info=True)
+            return True
 
     def _schedule_enabled(self) -> bool:
         """``[schedule].enabled``（PR8 3.0.0 唯一日程总开关；读不到/异常 → False=如实关断）。"""
@@ -739,7 +810,11 @@ class QzoneService:
         """自动回评主路径（Web CGI 直连，路线参考麦麦空间 Maizone）。
 
         读自己最近 N 条说说的评论（CGI 原始响应自带 commentlist+楼中楼）→
-        过滤自己的评论与已处理评论 → LLM 生成回复 → 楼中楼回评 → 立即标记去重。
+        过滤自己的评论与已处理评论 → LLM 生成回复 → 楼中楼回评 → 标记去重。
+
+        标记策略（P1-12）：发送后无论成败都标记（防重复打扰）；**生成失败（空串、
+        未发送）不标记**，保留下轮重试机会。单轮尝试总量受 ``_MAX_REPLIES_PER_ROUND``
+        约束，超限评论留待下轮。
 
         返回回评条数；cookie 不可用返回 -1（调用方应回退到 poll_comments 基线提醒）。
         """
@@ -757,6 +832,8 @@ class QzoneService:
             self._log("skip", trigger_type="qzone_reply", reason="CGI 读取自己的说说列表为空")
             return 0
         reply_count = 0
+        attempts = 0
+        capped = False
         for feed in feeds:
             fid = str(feed.get("tid") or "")
             if not fid:
@@ -770,7 +847,12 @@ class QzoneService:
                 if comment_qq == client.uin:
                     continue  # 自己的评论不回
                 if self._is_processed(fid, comment_tid):
-                    continue  # 已处理过（无论成败都标记，防重复打扰）
+                    continue  # 已处理过（发送成败都标记，防重复打扰；生成失败不标记见下）
+                # P1-12：单轮尝试总量上限——超限评论本轮不触达（不标记），留待下轮
+                if attempts >= _MAX_REPLIES_PER_ROUND:
+                    capped = True
+                    break
+                attempts += 1
                 # M0 事件：收到新评论（楼中楼路径可读正文）→ emotion（附录 A ★）
                 await self._publish(
                     "qzone.comment_received", tid=fid,
@@ -801,10 +883,14 @@ class QzoneService:
                     event="qzone_reply",
                 )
                 reply_text = reply_text.strip()
-                ok = False
-                if reply_text:
-                    ok = await client.reply_comment(fid, client.uin, comment.get("nickname") or "好友",
-                                                    comment_qq, reply_text, comment_tid)
+                if not reply_text:
+                    # P1-12：LLM 生成失败（空串、什么都没发）不标记已处理，保留下轮
+                    # 重试机会；重试成本由单轮尝试上限约束。发送失败仍按既有策略标记。
+                    self._log("skip", trigger_type="qzone_reply",
+                              reason=f"回评文案生成失败（未发送、不标记，下轮重试）tid={fid} comment={comment_tid}")
+                    continue
+                ok = await client.reply_comment(fid, client.uin, comment.get("nickname") or "好友",
+                                                comment_qq, reply_text, comment_tid)
                 if ok:
                     reply_count += 1
                     self._log("trigger", trigger_type="qzone_reply",
@@ -815,8 +901,14 @@ class QzoneService:
                         nickname=str(comment.get("nickname") or "好友"),
                         summary=str(reply_text)[:40], nested=True,
                     )
-                # 无论成败立即标记（Maizone 同策略：防下一轮重复回复同一条评论）
+                # 发送后无论成败立即标记（Maizone 同策略：防下一轮重复回复同一条评论）；
+                # 生成失败已在上方 continue，不标记（P1-12）
                 self._mark_processed(fid, int(comment_tid))
+            if capped:
+                break
+        if capped:
+            self._log("skip", trigger_type="qzone_reply",
+                      reason=f"单轮自动回评尝试已达上限（{_MAX_REPLIES_PER_ROUND} 条），剩余评论下轮处理")
         return reply_count
 
     def _is_processed(self, fid: str, comment_tid: int) -> bool:
@@ -985,9 +1077,23 @@ class QzoneService:
         while not self._stop_event.is_set():
             try:
                 await self._tick()
+            except Exception as exc:
+                # P1-11：捕获必留痕（logger + 决策账），不再静默吞掉整轮故障；
+                # 留痕自身失败也不允许杀死循环任务。
+                try:
+                    logger = getattr(self._ctx, "logger", None)
+                    if logger is not None:
+                        logger.warning(f"QQ 空间巡检轮异常（本轮中止，下轮继续）: {exc}")
+                    self._log("skip", trigger_type="qzone_post",
+                              reason=f"巡检轮异常（本轮中止，下轮继续）: {exc}")
+                except Exception:
+                    pass
+            # P1-11：interval 计算纳入保护——配置段不可读/非法时回退默认 30 分钟，
+            # 循环任务不得因此永久退出。
+            try:
+                interval = max(5, int(self._qzone_cfg().check_interval_minutes)) * 60
             except Exception:
-                pass
-            interval = max(5, int(self._qzone_cfg().check_interval_minutes)) * 60
+                interval = 30 * 60
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:
@@ -1028,22 +1134,9 @@ class QzoneService:
         # 午休静默（2026-10-20 用户指示：[patrol] nap_quiet_enabled 跨模块——命中午休/小睡
         # 条目时整轮 silent 早退，发说说与评论监听都不；与外层静默闸同布局。
         # 判定链内另有同口径闸 2，保证手动/链路直接调用时留 gate=nap_quiet 痕迹）
-        if self._nap_quiet_enabled():
-            nap_item = None
-            try:
-                nap_item = self._schedule.find_current_activity(today, now, include_sleep=True)
-            except Exception as nap_exc:
-                self.ctx.logger.warning(f"午休静默判定读日程失败（按非午休继续本轮）: {nap_exc}")
-            if self._companion_gate().nap_item_matches(nap_item):
-                return
-            # UQ-4（用户 2026-10-27 批）：episode 未开出（≤tick 周期）时只读计划表 spine
-            # 意图行按时间窗匹配提前静默——仅静默用途，不对外伪装「当前活动」。
-            try:
-                if self._companion_gate().nap_intent_matches_now(
-                        self._schedule.get_day_schedule(today), now):
-                    return
-            except Exception:
-                pass
+        if self._actual_nap(now):
+            self._record_decision('skip', gate='nap_quiet', reason='实际午休/小睡中，空间静默')
+            return
         await self._process_delivery_queue(now)
         # 按日程发说说
         if cfg.daily_max_posts > 0 and self.posts_today() < cfg.daily_max_posts and cfg.post_by_schedule:

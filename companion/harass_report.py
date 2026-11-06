@@ -87,7 +87,8 @@ def decision_fields(*, result: str, maintainer_qq: str = "", location: str = "",
                     detail: str = "") -> dict[str, Any]:
     """决策日志 ``admin.harass_report`` 留痕字段（三形态共用 trigger_type）。
 
-    ``result`` ∈ ``success`` / ``failed`` / ``cooldown_skip``（组件层传入）。
+    ``result`` ∈ ``success`` / ``failed`` / ``cooldown_skip`` / ``budget_blocked``
+    （组件层传入；budget_blocked 为 F1 2026-11-04 纳入预算闸门后的新形态）。
     """
     return {
         "result": result,
@@ -98,5 +99,17 @@ def decision_fields(*, result: str, maintainer_qq: str = "", location: str = "",
 
 
 def monotonic_now() -> float:
-    """冷却时间戳取值（独立成函数便于测试注入/打桩）。"""
+    """单调钟冷却时间戳取值（独立成函数便于测试注入/打桩）。
+
+    F1（2026-11-04）起组件层冷却改用 :func:`epoch_now`（落盘时间戳须跨热重载/重启
+    可比）；本函数保留兼容旧纯函数测试，不再用于持久化冷却。
+    """
     return time.monotonic()
+
+
+def epoch_now() -> float:
+    """持久化冷却的墙钟时间戳（epoch 秒）：跨 file_watcher 热重载与进程重启可比。
+
+    单调钟零点随进程重置，落盘后不可比，故持久化冷却一律用墙钟（F1，2026-11-04）。
+    """
+    return time.time()

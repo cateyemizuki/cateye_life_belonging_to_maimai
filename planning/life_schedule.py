@@ -171,13 +171,13 @@ class LifeScheduleReadModel:
                                row.get("planned_end_minute") or 0, cur):
                 return self._episode_as_item(row)
         # 3) 恢复池可恢复 paused（B.6.3 门槛：progress ≥ 0.2、未过期、加成 > 0.25）
-        for row in self._resume_candidates(now):
+        for row in self.resume_candidates(now):
             if not include_sleep and self._is_sleep(row):
                 continue
             return self._episode_as_item(row, paused=True)
         return None
 
-    def _resume_candidates(self, now: datetime) -> List[Dict[str, Any]]:
+    def resume_candidates(self, now: datetime) -> List[Dict[str, Any]]:
         """恢复池可恢复行（planner 可用时复用其排序与衰减，否则本地按 B.6.3 判定）。"""
         if self._planner is not None:
             try:
@@ -246,7 +246,7 @@ class LifeScheduleReadModel:
                 continue
             add(self._episode_as_item(row), tier=0)
         # 源 2：恢复池（可恢复的 paused）
-        for row in self._resume_candidates(now)[:2]:
+        for row in self.resume_candidates(now)[:2]:
             add(self._episode_as_item(row, paused=True), tier=1)
         # 源 3：planner 预演（只读；补足空位）
         planner = self._planner

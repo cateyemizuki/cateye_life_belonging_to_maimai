@@ -13,6 +13,7 @@ from pydantic import model_validator
 from maibot_sdk import Field, PluginConfigBase
 
 from core.i18n import ui_i18n as _ui_i18n
+from core.internal_tuning import tuning_value as _tuning_value
 
 #: 旧独立插件配置节名 → 新分组名的映射（suite_config 迁移器读取）
 LEGACY_SECTION_NAME = "bili_watch"
@@ -23,7 +24,7 @@ class VideoWatchSectionConfig(PluginConfigBase):
 
     __ui_label__ = "视频观看"
     __ui_icon__ = "video"
-    __ui_order__ = 14
+    __ui_order__ = 10
 
     @model_validator(mode="before")
     @classmethod
@@ -57,16 +58,9 @@ class VideoWatchSectionConfig(PluginConfigBase):
         description="是否启用内置视频观看模块（关闭时工具如实返回未启用，日程跳过）",
         json_schema_extra={"label": "启用视频观看", **_ui_i18n("Enable video watching")},
     )
-    queue_capacity: int = Field(
-        default=3, ge=1, le=8,
-        description="观看队列容量（超出如实拒绝 queue_full）",
-        json_schema_extra={"label": "队列容量", **_ui_i18n("Queue capacity")},
-    )
-    task_deadline_seconds: int = Field(
-        default=10800, ge=60, le=21600,
-        description="单任务总时限（秒），超时终止 worker 并如实标 failed/timeout",
-        json_schema_extra={"label": "任务总时限(秒)", **_ui_i18n("Task deadline (s)")},
-    )
+    # 2026-11-04 配置精简轮（J 类）：queue_capacity / task_deadline_seconds 移入
+    # mappings/internal_tuning.json[video_watch]（内部容量/依赖片长网络的时限）；
+    # 同名只读 property 见类尾。
     summary_impression: bool = Field(
         default=True,
         description="观看完成后用宿主 LLM 生成简短观后感（失败如实降级）",
@@ -92,3 +86,14 @@ class VideoWatchSectionConfig(PluginConfigBase):
         description="仅download模式的媒体下载保护值（MiB）；stream不先整片下载，不按此值拒绝长视频",
         json_schema_extra={"label": "download下载保护值（MiB）", **_ui_i18n("Media budget (MB)")},
     )
+
+    # ── J 类内部调参（只读桥接 → mappings/internal_tuning.json[video_watch]）────
+    @property
+    def queue_capacity(self) -> int:
+        """观看队列容量（超出如实拒绝 queue_full）。"""
+        return int(_tuning_value("video_watch", "queue_capacity"))
+
+    @property
+    def task_deadline_seconds(self) -> int:
+        """单任务总时限（秒），超时终止 worker 并如实标 failed/timeout。"""
+        return int(_tuning_value("video_watch", "task_deadline_seconds"))

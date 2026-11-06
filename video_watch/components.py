@@ -26,6 +26,26 @@ TOOL_WATCH_DESCRIPTION = (
 class VideoWatchComponentsMixin:
     """watch_bili_video 工具注册面（宿主 AI 经此提交/查询观看任务）。"""
 
+    @Tool("lbm_share_recent_video",
+        description=("从自己近期真实看过的视频中抽取一条，向当前聊天发送B站视频卡片。"
+                     "可选填近期看过的BV，不填则抽取一条；不能指定其他聊天。返回本次分享的BV和标题；"
+                     "如需要谈内容，再按返回BV调用lbm_watch_bili_video读取观看缓存。"
+                     "同轮只调用一次，结果不确定不要补发。"), parameters={
+                         'bvid': {'type': 'string', 'description': '可选；仅能指定近期真实看过的BV号', 'default': ''}})
+    async def tool_watch_share_recent_video(self, **kwargs: Any) -> Any:
+        if not (self.config.plugin.enabled and self.config.video_watch.enabled):
+            return {"success": False, "content": "视频观看模块未启用，不分享。"}
+        stream = str(kwargs.get("stream_id") or kwargs.get("session_id") or kwargs.get("chat_id") or "")
+        context_chat = str(kwargs.get("chat_id") or "")
+        if not context_chat or stream != context_chat:
+            return {"success": False, "content": "当前聊天上下文不一致，不发送。"}
+        try:
+            return await self._recent_video_share_service().share(
+                stream, str(kwargs.get("tool_call_id") or kwargs.get("call_id") or ""),
+                preferred_bvid=str(kwargs.get('bvid') or '').strip())
+        except Exception:
+            return {"success": False, "content": "视频分享未取得确定回执，不重复发送。", "stop_after_execution": False}
+
     @Tool(
         # 身份前缀纪律（smoke 前缀探测/T3）：本插件工具统一 lbm_ 前缀；
         # B 计划 §5 的 watch_bili_video 语义不变，仅加身份前缀。

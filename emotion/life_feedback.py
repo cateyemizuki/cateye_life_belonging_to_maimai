@@ -133,77 +133,8 @@ def _tz_now() -> datetime:
 
 
 def _builtin_table() -> Dict[str, Any]:
-    """内置默认表（与深层种子 ``emotion_life_modulation.json`` 同内容；种子损坏/缺失时兜底）。
-
-    系数来源：定稿 §4.1.1（gains，本 PR 只播种不应用）+ §4.1.2（feedback，本模块消费）。
-    """
-    return {
-        "version": 1,
-        "smoothing_minutes": 15,
-        "dead_zone": 0.12,
-        "gain_min": 0.70,
-        "gain_max": 1.30,
-        "gains": {
-            "energy": {
-                "rise": {"low_mood": -0.25, "tension": -0.10},
-                "rise_floor": 0.75,
-                "fall": {"activation": 0.25, "low_mood": 0.15},
-            },
-            "hunger": {
-                "rise": {"low_mood": 0.20, "activation": -0.10},
-                "fall": {"low_mood": -0.10, "activation": 0.05},
-            },
-            "focus": {
-                "rise": {"activation_center": 0.35, "activation_penalty": 1.2,
-                         "low_mood": -0.25},
-                "rise_floor": 0.60,
-                "fall_same_as_rise": True,
-            },
-            "stress": {
-                "rise": {"tension": 0.35, "low_mood": 0.15},
-                "fall": {"low_mood": -0.10},
-                "fall_floor": 0.80,
-            },
-            "social_battery": {
-                "rise": {"low_mood": -0.15},
-                "rise_floor": 0.80,
-                "fall": {"low_mood": 0.20, "tension": 0.15},
-            },
-        },
-        "feedback": {
-            "deep_work_done": {
-                "match": {"event": "completed", "goal_types": ["work", "study"],
-                          "min_duration_minutes": 25},
-                "delta": {"valence": 0.02, "arousal": 0.0, "dominance": 0.01},
-                "daily_cap": {"valence": 0.06},
-            },
-            "work_interrupted": {
-                "match": {"event": "interrupted", "goal_types": ["work", "study"]},
-                "delta": {"valence": -0.03, "arousal": 0.02, "dominance": -0.02},
-                "daily_cap": {"valence": -0.08},
-            },
-            "rest_done": {
-                "match": {"event": "completed", "goal_types": ["rest", "exercise"]},
-                "delta": {"valence": 0.02, "arousal": -0.02, "dominance": 0.0},
-                "daily_cap": {"valence": 0.06},
-            },
-            "meal_done": {
-                "match": {"event": "completed", "goal_types": ["meal"]},
-                "delta": {"valence": 0.01, "arousal": 0.0, "dominance": 0.0},
-                "daily_cap": {"valence": 0.03},
-            },
-            "high_pressure_long_block": {
-                "match": {"event": "completed", "goal_types": ["work", "study"],
-                          "min_duration_minutes": 240},
-                "delta": {"valence": -0.02, "arousal": 0.02, "dominance": -0.01},
-                "daily_cap": {"valence": -0.06},
-            },
-            "random_minor_event": {
-                "match": {"event": "random"},
-                "delta": {"valence": 0.0, "arousal": 0.0, "dominance": 0.0},
-            },
-        },
-    }
+    """Activity-to-emotion feedback only; legacy rate gains are retired."""
+    return {'version': 1, 'feedback': {'deep_work_done': {'match': {'event': 'completed', 'goal_types': ['work', 'study'], 'min_duration_minutes': 25}, 'delta': {'valence': 0.02, 'arousal': 0.0, 'dominance': 0.01}, 'daily_cap': {'valence': 0.06}}, 'work_interrupted': {'match': {'event': 'interrupted', 'goal_types': ['work', 'study']}, 'delta': {'valence': -0.03, 'arousal': 0.02, 'dominance': -0.02}, 'daily_cap': {'valence': -0.08}}, 'rest_done': {'match': {'event': 'completed', 'goal_types': ['rest', 'exercise']}, 'delta': {'valence': 0.02, 'arousal': -0.02, 'dominance': 0.0}, 'daily_cap': {'valence': 0.06}}, 'meal_done': {'match': {'event': 'completed', 'goal_types': ['meal']}, 'delta': {'valence': 0.01, 'arousal': 0.0, 'dominance': 0.0}, 'daily_cap': {'valence': 0.03}}, 'high_pressure_long_block': {'match': {'event': 'completed', 'goal_types': ['work', 'study'], 'min_duration_minutes': 240}, 'delta': {'valence': -0.02, 'arousal': 0.02, 'dominance': -0.01}, 'daily_cap': {'valence': -0.06}}, 'random_minor_event': {'match': {'event': 'random'}, 'delta': {'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0}}, 'small_daydream': {'match': {'event': 'completed', 'event_keys': ['daydream']}, 'delta': {'valence': 0.008, 'arousal': -0.008}, 'daily_cap': {'valence': 0.04}}, 'small_lie_down': {'match': {'event': 'completed', 'event_keys': ['lie_down']}, 'delta': {'valence': 0.012, 'arousal': -0.012}, 'daily_cap': {'valence': 0.04}}, 'small_snack': {'match': {'event': 'completed', 'event_keys': ['snack']}, 'delta': {'valence': 0.01}, 'daily_cap': {'valence': 0.04}}}}
 
 
 def _axis_dict(state: Any) -> Dict[str, float]:
@@ -214,7 +145,7 @@ def _axis_dict(state: Any) -> Dict[str, float]:
 
 
 def _match_entries(feedback: Any, event_kind: str, goal_type: str,
-                   duration_minutes: Optional[float]) -> List[Tuple[str, Dict[str, Any]]]:
+                   duration_minutes: Optional[float], event_key: str = "") -> List[Tuple[str, Dict[str, Any]]]:
     """按事件类型/goal_type/时长筛出命中的 feedback 条目（保持表内声明序）。
 
     - ``match.event`` 缺省按 ``completed`` 处理（写全更清晰，容错旧手写条目）；
@@ -233,6 +164,11 @@ def _match_entries(feedback: Any, event_kind: str, goal_type: str,
         if not isinstance(match, dict):
             continue
         if str(match.get("event") or "completed") != event_kind:
+            continue
+        event_keys = match.get('event_keys')
+        if isinstance(event_keys, list) and event_key not in event_keys:
+            continue
+        if event_key in ('daydream', 'lie_down', 'snack') and not isinstance(event_keys, list):
             continue
         goal_types = match.get("goal_types")
         if isinstance(goal_types, list):
@@ -304,11 +240,8 @@ class LifeFeedbackService:
         # 「默认 ⊕ 覆盖」合并（与好感度预设表/活动画像表同款语义）：feedback 逐规则名、
         # gains 逐状态名覆盖内置，其余条目保留内置——用户只写想改的条目，不会丢默认。
         builtin = _builtin_table()
-        merged = {**builtin, **raw}
+        merged = {"version": 1}
         merged["feedback"] = {**builtin["feedback"], **raw["feedback"]}
-        raw_gains = raw.get("gains")
-        merged["gains"] = {**builtin["gains"],
-                           **(raw_gains if isinstance(raw_gains, dict) else {})}
         return merged
 
     # ── 开关门控（注册时与每条事件各判一次；任一关 → 零动作）──
@@ -318,9 +251,6 @@ class LifeFeedbackService:
             # PR8 3.0.0：``schedule.enabled`` 是唯一日程总开关（旧 ``[life_state].enabled``
             # 退役）；``emotion_modulation_enabled`` 独立保留（裁定 3）。
             if not bool(getattr(getattr(cfg, "schedule", None), "enabled", False)):
-                return False
-            if not bool(getattr(getattr(cfg, "life_state", None),
-                                "emotion_modulation_enabled", False)):
                 return False
         except Exception:
             return False
@@ -420,7 +350,7 @@ class LifeFeedbackService:
             episode_id = str(payload.get("episode_id") or "").strip()
             duration = self._episode_duration_minutes(payload)
             matched = _match_entries(self.table.get("feedback"), event_kind, goal_type,
-                                     duration)
+                                     duration, str(payload.get("event_key") or ""))
             if not matched:
                 return  # 随机小事件等未命中任何条目 → 零动作零可观测
             today = _tz_now().strftime("%Y-%m-%d")  # PR2.5 D4：配置时区日界（原系统本地）

@@ -33,8 +33,8 @@ class QzoneComponentsMixin:
     # Tools
     # ============================================================
     @Tool("lbm_life_qzone",
-          description="QQ空间运营：action=post 发说说（message 留空自动按当前活动生成文案，受每日上限限制；"
-                      "按配置自动配图/表情包）| "
+          description="QQ空间运营：action=post 发说说（message 留空自动按当前活动生成文案，受每日上限与"
+                      "静默窗/睡眠/冷却/LLM严判闸限制，整夜不发；按配置自动配图/表情包）| "
                       "action=moments 查最近发表的说说（内容摘要、评论数、发表时间）。",
           parameters={
               "action": {"type": "string", "description": "操作：post=发说说 | moments=查最近说说", "required": True},
@@ -53,6 +53,11 @@ class QzoneComponentsMixin:
                 return {"success": False, "content": "QQ 空间模块未启用"}
             if self._qz_posts_left_today() <= 0:
                 return {"success": False, "content": "今日说说额度已用完"}
+            # P1-14：Tool 由宿主 LLM 自主调用，直发前与自动路径同口径过闸
+            # （静默窗/睡眠/午休/冷却/LLM 严判），强制「整夜不发说说」用户指示。
+            allowed, gate_reason = await qz.check_post_gates()
+            if not allowed:
+                return {"success": False, "content": f"当前不宜发说说：{gate_reason}"}
             text = str(message or "").strip()
             if not text:
                 now = datetime.now()
@@ -218,6 +223,11 @@ class QzoneComponentsMixin:
             text = (rest[0].strip() if rest else "")
             if not text:
                 return "用法：/lbm_life qzone post <说说内容>"
+            # P1-14：命令直发同样过闸——「整夜不发说说」是用户指示，管理员路径
+            # 不豁免时段/冷却/严判闸（与 Tool、自动路径同口径）。
+            allowed, gate_reason = await qz.check_post_gates()
+            if not allowed:
+                return f"当前不宜发说说：{gate_reason}"
             # 2026-10-14 用户指示：手动路径同样按 [qzone].image_mode 配图（跟随 Maizone 行为；
             # off/取图失败 → 纯文本，配图永不阻断发布）
             images = await qz.collect_moment_images(text)

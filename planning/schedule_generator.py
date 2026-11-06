@@ -337,19 +337,19 @@ class ScheduleGenerator:
                 return default
             return value if value >= lo else default
 
-        max_intentions = _int("spine_max_intentions", 6, 1)
-        min_intentions = _int("spine_min_intentions", 3, 1)
+        max_intentions = _int("max_intentions", 6, 1)
+        min_intentions = _int("min_intentions", 3, 1)
         if min_intentions > max_intentions:
             min_intentions = max_intentions
         return {
             "min_intentions": min_intentions,
             "max_intentions": max_intentions,
-            "max_described": _int("spine_max_described_intents", 1, 0),
+            "max_described": _int("max_described_intents", 1, 0),
             "recent_days": _int("spine_recent_days", 2, 0),
             "history_messages": _int("spine_history_messages", 12, 0),
             "knowledge_limit": _int("spine_knowledge_limit", 3, 0),
 
-            "use_multi_round": bool(getattr(cfg, "spine_use_multi_round", False)),
+            "use_multi_round": bool(getattr(cfg, "intention_multi_round", False)),
         }
 
     async def _generate_spine_schedule(
@@ -413,7 +413,7 @@ class ScheduleGenerator:
 
         rows: List[Dict[str, Any]] = []
         last_error: Optional[Exception] = None
-        # spine_use_multi_round=true 时最多 2 次同提示重试（结构校验：拿到可用意图即收），
+        # intention_multi_round=true 时最多 2 次同提示重试（结构校验：拿到可用意图即收），
         # 不带反馈重试、不跑质量评分（设计 §4.2：单轮、结构校验、不强制重试）
         for _ in range(2 if params["use_multi_round"] else 1):
             try:

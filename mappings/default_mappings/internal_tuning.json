@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "patrol": {
+    "screen_timeout_seconds": 20.0,
+    "screen_context_ttl_minutes": 90
+  },
+  "affection": {
+    "tier_hysteresis": 6.0
+  },
+  "schedule": {
+    "spine_recent_days": 2,
+    "spine_history_messages": 12,
+    "spine_knowledge_limit": 3
+  },
+  "schedule_advanced": {
+    "max_rounds": 2,
+    "quality_threshold": 0.85,
+    "generation_timeout": 180.0,
+    "recent_schedule_days": 3,
+    "history_message_limit": 30,
+    "knowledge_search_limit": 5,
+    "min_description_length": 20,
+    "max_description_length": 50,
+    "role_judge_temperature": 0.3,
+    "image_timeout_seconds": 15.0,
+    "context_max_turns": 3,
+    "context_ttl": 600,
+    "inject_cache_minutes": 15,
+    "cache_ttl": 300,
+    "cache_max_size": 100,
+    "cleanup_interval": 3600
+  },
+  "life_state": {
+    "horizon_minutes": 90,
+    "resume_pool_size": 3,
+    "resume_expire_minutes": 240,
+    "low_energy_threshold": 0.3,
+    "high_hunger_threshold": 0.7,
+    "high_stress_threshold": 0.8,
+    "brief_attention_progress": 0.3,
+    "late_attention_progress": 0.7,
+    "sleep_interrupt_min_minutes": 5
+  },
+  "dynamic_sleep": {
+    "pressure_weight": 0.5,
+    "circadian_weight": 0.3,
+    "debt_weight": 0.2,
+    "awakening_sensitivity": 0.3,
+    "chronotype_offset_minutes": 0,
+    "weekday_phase_minutes": 0,
+    "weekend_phase_minutes": 15
+  },
+  "event_catalog": {
+    "max_pool_events": 12
+  },
+  "llm": {
+    "judge_temperature": 0.2
+  },
+  "dashboard_display": {
+    "history_state_epsilon": 0.01,
+    "history_debt_epsilon": 0.1
+  },
+  "emotion": {
+    "episode_idle_minutes": 10,
+    "target_bonus_step": 0.1,
+    "dedup_window_seconds": 180
+  },
+  "video_watch": {
+    "queue_capacity": 3,
+    "task_deadline_seconds": 10800
+  }
+}
