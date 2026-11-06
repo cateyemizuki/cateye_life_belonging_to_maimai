@@ -1,4 +1,8 @@
-"""最近观看事实到当前聊天的被动分享。独立回执，不持观看或主动额度。"""
+"""Legacy 3.6.1 isolated compatibility; not used by the current plugin.
+
+The current ManualVideoShares uses the shared SQLite ledger and raw card sender.
+The old JSON receipts below are migration inputs; send.custom is not a live path.
+"""
 from __future__ import annotations
 
 import asyncio

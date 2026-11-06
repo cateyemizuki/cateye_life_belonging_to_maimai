@@ -20,7 +20,7 @@
 planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
 **config_version 与迁移保障（2026-10-10 第二版，已订正；3.0.0 起版本随 PR8 递增）**：
-开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值 = `3.1.0`（2026-11-04 配置精简版；3.0.0 为 2026-10-27 PR8 清理版、2.2.0 为 2026-10-27 二期 PR7 开发版、2.1.0 于 2026-10-21 归档发布）；
+开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值随插件版本递增（当前 `3.7.1`；历史：3.1.0 为 2026-11-04 配置精简版、3.0.0 为 2026-10-27 PR8 清理版、2.2.0 为 2026-10-27 二期 PR7 开发版、2.1.0 于 2026-10-21 归档发布）；
 迁移保障改由 **plugin.py 的「磁盘旧文件抢救」**（`CateyeSuitePlugin.normalize_plugin_config` 先读尚未被
 宿主覆写的磁盘 `config.toml`，把用户值并回输入）＋ 下面的 `mode="before"` 一次性迁移器共同承担。
 **旧口径（已作废）如下，仅留作教训**：宿主 Runner 在「配置版本号变化」时会
@@ -124,6 +124,7 @@ from planning.event_catalog_config import (
 )
 from qzone.config import QzoneSectionConfig
 from video_watch.config import VideoWatchSectionConfig
+from video_watch.share_config import VideoShareSectionConfig
 from core.config_migration import migrate_display_config, migrate_internal_tuning, migrate_release_config
 from core.i18n import ui_i18n as _ui_i18n
 from core.internal_tuning import tuning_value as _tuning_value
@@ -141,7 +142,7 @@ from suite_prompts import (
 # 3.2.0（2026-11-04 主动行为重写）：删 4 个 [patrol] Field（日程巡检三键 + miss_speak_rate）
 # 按 R6 递增本值；_manifest.json 不在本任务文件边界内，**部署批须同步递增至 3.2.0**
 # （见设计文档 §配置治理）。磁盘抢救 + 入口纯 pop 保证旧值不丢、退役键不落盘。
-SUPPORTED_CONFIG_VERSION = "3.6.1"
+SUPPORTED_CONFIG_VERSION = "3.7.1"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -640,6 +641,7 @@ class CateyeSuiteConfig(PluginConfigBase):
     life_state: LifeStateSuiteSectionConfig = Field(default_factory=LifeStateSuiteSectionConfig)
     qzone: QzoneSectionConfig = Field(default_factory=QzoneSectionConfig)
     video_watch: VideoWatchSectionConfig = Field(default_factory=VideoWatchSectionConfig)
+    video_share: VideoShareSectionConfig = Field(default_factory=VideoShareSectionConfig)
     llm: LlmSectionConfig = Field(default_factory=LlmSectionConfig)
     prompts: PromptsSectionConfig = Field(default_factory=PromptsSectionConfig)
     admin: AdminSectionConfig = Field(default_factory=AdminSectionConfig)

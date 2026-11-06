@@ -80,7 +80,6 @@ from planning.services import PlanningServices
 from integrations.video_schedule import SurfQuotaLedger, VideoWatchCoordinator
 from integrations.video_card import VideoCardService
 from integrations.video_completion import CompletionOutbox
-from integrations.video_companion import ShareCandidateStore, ShareDelivery
 from suite_offline_settlement import OfflineSettlementService
 from qzone.cgi import QzoneCookieManager
 from qzone.components import QzoneComponentsMixin
@@ -506,14 +505,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 服务只经 ctx.api.call 透传（_manifest capabilities 已含 api.call），不拥有
         # 预算状态；预算/注意力由装配侧按 companion 同口径接线（_send_share_card）。
         self._video_card = VideoCardService(api_caller=self.ctx.api.call, logger=self.ctx.logger)
-        self._share_store = ShareCandidateStore(data_dir / "video_watch", day_provider=self._surf_day)
-        self._share_delivery = ShareDelivery(
-            self._share_store,
-            budget_remaining=self._share_budget_remaining,
-            preflight=self._share_preflight,
-            target_provider=lambda: str(getattr(self, "_stream_id", "") or ""),
-            card_sender=self._send_share_card,
-            optional_dispatch=self._offer_video_share)
+        self._video_social = self._build_video_social(data_dir)
         from integrations.optional_action import OptionalActionCoordinator
         self._optional_actions = OptionalActionCoordinator(
             data_dir, self._optional_action_facts,
@@ -521,8 +513,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self.ctx.maisaka.proactive.trigger)
         from integrations.small_event_actions import SmallEventActions
         self._small_event_actions = SmallEventActions(self._db.update_episode_metadata, self.optional_action)
-        self._share_recorder = lambda result, episode_id: self._share_store.record_from_result(
-            result, episode_id, target_stream=str(getattr(self, "_stream_id", "") or ""))
+        self._share_recorder = lambda result, episode_id: (
+            self._video_social.record_from_result(result,episode_id) if self._video_social is not None else False)
         # 2026-11-04 刷视频功能批：小事件池「刷B站」随 video_watch.enabled 门控
         # （启用 = 进入可 roll 池；闸动态读配置，热重载无需重新接线）
         catalog = getattr(self._planning, "event_catalog", None)
@@ -1494,14 +1486,103 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     def _recent_video_share_service(self) -> Any:
         service = getattr(self, "_recent_video_share", None)
         if service is None:
-            from integrations.video_recent_share import RecentVideoShare, send_card_json
-            async def send(stream: str, ark: str, description: str) -> Any:
-                return await send_card_json(self.ctx.send, stream, ark, description)
-            service = RecentVideoShare(self._data_dir,
-                recent_provider=self._video_watch.recent_videos,
-                card_generator=self._video_card.generate_ark, send_json=send)
+            from integrations.video_share_scheduler import ManualVideoShares
+            if self._video_social is None:raise RuntimeError('独立分享回执不可用')
+            service = ManualVideoShares(self._video_social,recent_provider=self._video_watch.recent_videos,
+                clock=lambda:self._surf_now().timestamp(),day=self._surf_day)
             self._recent_video_share = service
         return service
+
+    def _build_video_social(self, data_dir: Path) -> Any:
+        from integrations.video_share_ledger import ShareLedger
+        from integrations.video_audience import AudienceProfiles
+        from integrations.video_share_evaluator import ShareEvaluator
+        from integrations.video_share_scheduler import VideoSocialService
+        try:
+            ledger=ShareLedger(data_dir/'video_watch/video_social.sqlite3')
+            ledger.import_legacy(data_dir,self._surf_now().timestamp())
+            profiles=AudienceProfiles(ledger,
+                stream_reader=lambda:self.ctx.chat.get_all_streams(platform='qq'),
+                message_reader=self.ctx.message.get_by_time_in_chat,
+                config_provider=lambda:self.config.video_share,
+                target_provider=lambda:{'stream_id':str(getattr(self,'_stream_id','') or ''),
+                    'user_id':target_qq_of(self.config) if self.config.patrol.enabled else ''})
+            evaluator=ShareEvaluator(lambda *a,**kw:self._llm.generate_detailed(*a,module='video',**kw),
+                persona_provider=lambda:str(getattr(self,'_personality','') or ''),
+                state_provider=self._social_state,
+                task_provider=lambda:self.config.video_share.decision_task_name)
+            return VideoSocialService(ledger,profiles,evaluator,config_provider=lambda:self.config.video_share,
+                clock=lambda:self._surf_now().timestamp(),day=self._surf_day,
+                prepare_card=self._video_card.generate_ark,send_card=self._send_social_ark,
+                preflight=self._social_preflight,reserve=self._social_reserve,
+                commit=self._social_commit,release=self._social_release,append_context=self._append_social_fact)
+        except Exception as exc:
+            self.ctx.logger.warning('独立视频分享初始化失败，保守停用发送：%s',type(exc).__name__)
+            return None
+
+    def _social_state(self) -> dict:
+        state={'as_of':self._surf_now().isoformat()}
+        try:
+            life=getattr(self._planning,'life_state',None)
+            snapshot=life.snapshot() if life is not None else {}
+            state['life']={k:v for k,v in snapshot.items() if k in ('energy','hunger','stress','focus','social_need','sleep_debt_hours')}
+            active=self._db.active_episode() or {}
+            state['activity']=str(active.get('name') or active.get('event_name') or '')[:120]
+        except Exception:state['state_available']=False
+        return state
+
+    def _social_preflight(self, route: dict | None, *, budget_reserved: bool = False,
+                          own_holder: str = '') -> tuple[bool,str]:
+        allowed,reason=self._autonomous_context()
+        if not allowed:return allowed,reason
+        lease=self._attention.current()
+        if lease and lease.get('kind')=='chat' and lease.get('holder')!=own_holder:return False,'聊天占用中'
+        if route is not None and route.get('kind')=='private' and route.get('user_id')==target_qq_of(self.config):
+            if not (self.config.patrol.enabled and self.config.patrol.proactive_trigger_enabled):return False,'陪伴主动功能未启用'
+            if route.get('stream_id')!=str(getattr(self,'_stream_id','') or ''):return False,'陪伴流已变化'
+            if not budget_reserved and self._proactive_budget.remaining()<=0:return False,'目标私聊主动预算不足'
+            last=self._companion.affection.last_speak_time()
+            if last is not None and 0<=self._surf_now().timestamp()-last.timestamp()<300:
+                return False,'刚刚主动开口'
+        return True,''
+
+    def _social_reserve(self, route: dict) -> str | None:
+        if route.get('kind')=='private' and route.get('user_id')==target_qq_of(self.config):
+            return self._proactive_budget.reserve('video_share',route['stream_id'])
+        return 'exempt'  # Non-companion routes still consume the social ledger's global/stream limits.
+
+    def _social_commit(self, token: str) -> bool:
+        if token=='exempt':return True
+        return self._proactive_budget.commit_reservation(token)
+
+    def _social_release(self, token: str) -> bool:
+        return True if token=='exempt' else self._proactive_budget.release_reservation(token)
+
+    async def _send_social_ark(self, route: dict, ark: str, *, manual: bool = False) -> dict:
+        holder='video-social:'+route['stream_id']
+        if not manual:
+            allowed,reason=self._social_preflight(route,budget_reserved=True)
+            if not allowed:return {'success':False,'not_sent':True,'error_class':'gate_changed','error':reason}
+            self._attention.acquire_chat(holder)
+            self._video_watch.revoke_automatic()
+        try:
+            def final_gate():
+                if manual:return True,''
+                if self.config.video_share.mode!='自动分享':return False,'自动分享已关闭'
+                return self._social_preflight(route,budget_reserved=True,own_holder=holder)
+            receipt=await self._video_card.send_ark(route,ark,before_send=final_gate)
+            if receipt.get('success') is True and route['stream_id']==str(getattr(self,'_stream_id','') or ''):
+                try:self._companion.affection.note_optional_spoke(self._surf_now())
+                except Exception:self.ctx.logger.warning('视频卡片已受理，但共享开口时间更新失败')
+            return receipt
+        finally:
+            if not manual:self._attention.release(holder)
+
+    async def _append_social_fact(self, stream: str, text: str, attempt: str) -> Any:
+        return await self.ctx.maisaka.context.append(stream_id=stream,
+            segments=[{'type':'text','data':text}],visible_text=text,
+            source_kind='plugin:cateye.life_belonging_to_maimai:video_share_fact',
+            message_id='video_share_fact:'+attempt,replyable=False)
 
     def _bind_video_candidate_provider(self) -> None:
         """把候选源同步 pick 面绑到观看 manager（幂等；未启用不绑）。"""
@@ -1582,12 +1663,21 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
     def _kick_share_delivery(self) -> None:
         """S3 分享投递单飞调度（无候选/不满足条件时静默，不拖挂生活 tick）。"""
+        service=getattr(self,'_video_social',None)
+        if service is None:return
+        if self._surf_now().timestamp()<getattr(self,'_social_retry_after',0):return
         pending = getattr(self, "_share_delivery_task", None)
         if pending is not None and not pending.done():
             return
         try:
+            async def run_social():
+                try:await service.tick()
+                except asyncio.CancelledError:raise
+                except Exception as exc:
+                    self._social_retry_after=self._surf_now().timestamp()+300
+                    self.ctx.logger.warning('独立视频分享本拍失败，5分钟后再检查：%s',type(exc).__name__)
             self._share_delivery_task = asyncio.get_running_loop().create_task(
-                self._share_delivery.deliver_due())
+                run_social())
         except Exception as exc:
             try:
                 self.ctx.logger.warning("分享投递调度失败（忽略）：%s", exc)
@@ -1742,14 +1832,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def _initialize_companion_disposition(self, *, force: bool = False) -> dict:
         return await self._companion.patrol.initialize_disposition(force=force)
 
-    async def _offer_video_share(self, candidate: dict) -> dict:
-        return await self.optional_action('video_share:' + str(candidate.get('share_id') or ''),
-            'optional_video_share',
-            '【可选动机·视频】你最近确实看过《' + str(candidate.get('title') or '')[:160]
-            + '》，BV号为' + str(candidate.get('bvid') or '') + '。'
-            + '你的观后感：' + str(candidate.get('impression') or '')[:300]
-            + '。如果你自然地想分享，可以使用最近视频分享工具并传该BV；'
-            + '不想分享就不调用任何工具，不必为插件交差。')
 
     def _autonomous_context(self) -> tuple[bool, str]:
         """One fail-closed busy/sleep gate for watching and unsolicited sharing."""
@@ -1793,66 +1875,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         return (active.get("episode_id") == episode_id
                 and (active.get("metadata") or {}).get("event_key") == "watch_bili")
 
-    def _share_preflight(self) -> tuple[bool, str]:
-        allowed, reason = self._autonomous_context()
-        if not allowed:
-            return allowed, reason
-        if not self.config.patrol.enabled or not str(getattr(self, "_stream_id", "") or ""):
-            return False, "陪伴对象或主动功能尚未就绪"
-        lease = self._attention.current()
-        if lease and lease.get("kind") == "chat":
-            return False, "聊天占用中"
-        return True, ""
 
-    def _share_budget_remaining(self) -> Any:
-        budget = getattr(self, "_proactive_budget", None)
-        if budget is None:
-            return None
-        return budget.remaining()
 
-    async def _send_share_card(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """卡片分享投递（2026-11-04 卡片化：ShareDelivery.card_sender 注入面）。
-
-        预算/注意力与旧文本投递同口径（companion 同口径：仅目标私聊主动打扰经
-        proactive_budget reserve/commit 计数，video_card 服务不拥有预算状态）：
-        Reserve the existing budget before I/O; unknown delivery remains held.
-        发送改经 VideoCardService（两步透传各自带 30s 超时，总有界；生成失败=
-        确定性失败、发送异常=uncertain 保守防重），**无纯文本链接兜底**。
-        """
-        allowed, reason = self._share_preflight()
-        if not allowed:
-            return {"success": False, "deferred": True, "error": reason}
-        stream_id = str(self._stream_id)
-        budget = self._proactive_budget
-        token = budget.reserve("video_share", stream_id)
-        if token is None:
-            return {"success": False, "deferred": True, "error_class": "budget"}
-        holder = "video_share"
-        self._attention.acquire_chat(holder)
-        self._video_watch.revoke_automatic()
-        try:
-            receipt = await self._video_card.send_video_card(
-                user_id=target_qq_of(self.config),
-                bvid=str(payload.get("bvid") or ""),
-                title=str(payload.get("title") or ""),
-                desc=str(payload.get("desc") or ""),
-                pic_url=str(payload.get("pic_url") or ""))
-            if receipt.get("success") is True and not receipt.get("uncertain"):
-                budget.commit_reservation(token)
-                # Keep the existing event visible; the idempotent reservation is already committed.
-                await self._bus.publish("proactive.used", channel="video_share", intent="share",
-                                        stream_id=stream_id, reservation_id=token)
-                return receipt
-            if not receipt.get("uncertain"):
-                budget.release_reservation(token)
-            return receipt
-        except asyncio.CancelledError:
-            raise  # Persisted reservation and sending intent prevent a blind retry.
-        except Exception as exc:
-            return {"success": False, "uncertain": True, "error_class": "unknown",
-                    "error": str(exc)[:200]}
-        finally:
-            self._attention.release(holder)
 
     def _kick_video_watch_sync(self) -> None:
         """单飞调度：上一拍联动未结束时不再叠加（有界；异常只告警）。"""

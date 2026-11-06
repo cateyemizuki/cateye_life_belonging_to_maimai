@@ -80,7 +80,7 @@ def _extract_ark(data: Any) -> Optional[Dict[str, Any]]:
 
 
 class VideoCardService:
-    """B站视频卡片生成 + 私聊投递（透传两步；无文本兜底、无预算状态）。"""
+    """B站卡片生成及已核验群/私聊路由；不拥有授权、额度或防重状态。"""
 
     def __init__(self, api_caller: ApiCaller, logger: Any = None,
                  call_timeout_seconds: float = _CALL_TIMEOUT_SECONDS) -> None:
@@ -158,26 +158,68 @@ class VideoCardService:
         generated = await self.generate_ark(bvid=bvid, title=title, desc=desc, pic_url=pic_url)
         if not generated.get("success"):
             return generated
-        params = {
-            "user_id": int(user),
-            "message": [{"type": "json", "data": {"data": generated["ark_json"]}}],
-        }
+        receipt=await self.send_ark({'kind':'private','user_id':user},generated['ark_json'])
+        return {**receipt,'bvid':bvid}
+
+    async def send_ark(self, route: Dict[str, Any], ark_json: str, *, before_send: Any = None) -> Dict[str, Any]:
+        """Send exactly one raw card; accepted is never a delivery assertion."""
+        kind=route.get('kind');field='group_id' if kind=='group' else 'user_id'
+        identifier=str(route.get(field) or '')
+        if kind not in ('group','private') or not _QQ_RE.fullmatch(identifier):
+            return {'success':False,'not_sent':True,'error_class':'invalid_target'}
+        try:
+            card=json.loads(ark_json)
+            if not isinstance(card,dict) or not ('meta' in card or 'app' in card):raise ValueError()
+        except (TypeError,ValueError):
+            return {'success':False,'not_sent':True,'error_class':'invalid_card'}
+        # The adapter API is bound to one account and has no account selector.
+        # Verify registered-route ownership instead of silently sending from a
+        # different logged-in bot when the host contains multiple accounts.
+        account=str(route.get('account_id') or '')
+        if account:
+            try:
+                identity=await asyncio.wait_for(self._api(PASSTHROUGH_API,
+                    action_name='get_login_info',params={}),timeout=self._timeout)
+                actual=''
+                for _ in range(6):
+                    if not isinstance(identity,dict):break
+                    if identity.get('success') is False or identity.get('status')=='failed':break
+                    if type(identity.get('retcode')) is int and identity['retcode']!=0:break
+                    if identity.get('user_id') is not None:
+                        actual=str(identity['user_id']);break
+                    identity=identity.get('data')
+                if not actual or actual!=account:
+                    return {'success':False,'not_sent':True,'error_class':'route_account_unverified'}
+            except asyncio.CancelledError:raise
+            except Exception:
+                return {'success':False,'not_sent':True,'error_class':'route_account_unverified'}
+        if before_send is not None:
+            allowed,_reason=before_send()
+            if not allowed:return {'success':False,'not_sent':True,'error_class':'gate_changed'}
+        action='send_group_msg' if kind=='group' else 'send_private_msg'
+        params={field:int(identifier),'message':[{'type':'json','data':{'data':ark_json}}]}
         try:
             resp = await asyncio.wait_for(
-                self._api(PASSTHROUGH_API, action_name="send_private_msg", params=params),
+                self._api(PASSTHROUGH_API, action_name=action, params=params),
                 timeout=self._timeout)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._warn(f"视频卡片发送结果不确定（{bvid} → {user}，保守防重不盲重试）：{exc}")
             return {"success": False, "uncertain": True, "error_class": "unknown",
-                    "error": f"send_private_msg 结果不确定：{str(exc)[:200]}"}
-        ok, data, err = _unwrap(resp)
-        if not ok:
-            self._warn(f"视频卡片发送被拒绝（{bvid} → {user}）：{err}")
-            return {"success": False, "error_class": "send_rejected",
-                    "error": f"send_private_msg 回执失败：{err}"}
-        receipt: Dict[str, Any] = {"success": True, "channel": "video_card", "bvid": bvid}
-        if isinstance(data, dict) and data.get("message_id") is not None:
-            receipt["message_id"] = data["message_id"]
-        return receipt
+                    "error": f"{action} 结果不确定：{type(exc).__name__}"}
+        accepted=False;message_id=None;current=resp
+        for _ in range(6):
+            if not isinstance(current,dict):break
+            ret=current.get('retcode')
+            if current.get('status')=='failed' or (type(ret) is int and ret!=0):
+                return {'success':False,'not_sent':True,'error_class':'send_rejected'}
+            if current.get('success') is False:
+                return {'success':False,'uncertain':True,'error_class':'unknown'}
+            accepted=accepted or current.get('status')=='ok' or type(ret) is int and ret==0 or current.get('sent') is True
+            mid=current.get('message_id')
+            if isinstance(mid,(str,int)) and not isinstance(mid,bool):message_id=mid
+            if current.get('success') is True and isinstance(current.get('data'),dict) and current['data'].get('message_id') is not None:
+                accepted=True
+            current=current.get('data')
+        if not accepted:return {'success':False,'uncertain':True,'error_class':'unknown'}
+        return {'success':True,'channel':'video_card','delivery_state':'accepted','message_id':message_id}

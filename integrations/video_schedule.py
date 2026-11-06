@@ -620,7 +620,7 @@ class VideoWatchCoordinator:
             receipt = await self._api(action="result", task_id=task_id)
         except Exception:
             return
-        # S3：真实完成结果交分享候选记录器（门在模块内：仅视觉理解成功且有摘要才成候选）
+        # 真实观看事实交独立分享准入；视觉或公开字幕可评估，不唤起分享Planner。
         recorder = self._share_recorder
         if callable(recorder) and isinstance(receipt, dict) and receipt.get("success")                 and isinstance(receipt.get("result"), dict):
             try:

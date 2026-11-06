@@ -1,4 +1,10 @@
-"""video_companion —— 观看事实 → 陪伴分享候选的适配与投递（冲浪计划书 §6/§7/§8，S3）。
+"""Legacy 3.6.1 compatibility: no longer assembled by the current plugin.
+
+Current delivery is integrations/video_share_scheduler.py; this module preserves
+old isolated contracts only. Its JSON is read once by the new ledger migration.
+下文为旧S3契约，不代表当前自动分享策略。
+
+video_companion —— 观看事实 → 陪伴分享候选的适配与投递（冲浪计划书 §6/§7/§8，S3）。
 
 职责边界（计划书 §8 末行 integrations/video_companion.py）：
 - 只做「真实观看完成结果 → 分享候选 → 条件投递」的适配，不复制视频任务、
