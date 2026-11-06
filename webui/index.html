@@ -663,15 +663,17 @@ function chart(target,rows,keys,max=1,height=260,min=0){
  root.append(svg('line',{x1:l,x2:l,y1:top,y2:height-bottom,stroke:'var(--maibot-border)'}),svg('line',{x1:l,x2:w-r,y1:height-bottom,y2:height-bottom,stroke:'var(--maibot-border)'}));
  const ticks=w<600?4:7;for(let i=0;i<ticks;i++){const at=t0+span*i/(ticks-1),xx=x(at),yy=height-bottom+15;root.append(svg('text',{x:xx,y:yy,transform:`rotate(-35 ${xx} ${yy})`,'text-anchor':'end',fill:'var(--maibot-muted)','font-size':11},clock(new Date(at).toISOString(),!selectedDay&&hours>24)))}
  const curves=svg('g',{'clip-path':`url(#${clipId})`});
- for(const key of keys){let real=[],estimated=[],segment=[],kind=false;const flush=()=>{if(segment.length)(kind?estimated:real).push(smoothPath(segment,step&&!kind));segment=[]};let prev=null;
-  for(const p of rows){const at=Number(date(p.at));if(num(p[key])===null){flush();prev=null;continue}
-   if(!prev){segment=[[x(at),y(p[key])]];kind=!!p.estimated;prev=p;continue}
-   const downsampled=target.id==='vad-chart'?vadSeries().downsampled:lifeSeries().downsampled;
-   const gap=(p.gap_before&&!prev.estimated)||(!downsampled&&at-Number(date(prev.at))>900000),edgeEstimated=!!(p.estimated||prev.estimated);
-   if(gap){flush();segment=[[x(at),y(p[key])]];kind=!!p.estimated}
-   else if(edgeEstimated!==kind){const last=segment.at(-1);flush();kind=edgeEstimated;segment=[last,[x(at),y(p[key])]]}
-   else segment.push([x(at),y(p[key])]);prev=p;
-  }flush();
+ const downsampled=target.id==='vad-chart'?vadSeries().downsampled:lifeSeries().downsampled;
+ for(const key of keys){
+  // 实线只连真实观察点、虚线只连估算填充点：抽稀后两者交错时，旧逻辑把任一端点
+  // 为估算的边画成虚线，连真实观察也被画成虚线（历史按日首屏全虚线）。分开构建后
+  // 真实观察恒为实线；估算填充按原始索引相邻成段，不跨真实区域连接不同缺口。
+  const build=estimated=>{const paths=[];let segment=[],prev=null,prevIndex=-1;const flush=()=>{if(segment.length)paths.push(smoothPath(segment,step&&!estimated));segment=[]};
+   for(let i=0;i<rows.length;i++){const p=rows[i];if(!!p.estimated!==estimated)continue;const at=Number(date(p.at));if(num(p[key])===null){flush();prev=null;prevIndex=-1;continue}
+    if(prev){const separated=estimated?(i!==prevIndex+1):(p.gap_before||(!downsampled&&at-Number(date(prev.at))>900000));if(separated)flush()}
+    segment.push([x(at),y(p[key])]);prev=p;prevIndex=i;
+   }flush();return paths};
+  const real=build(false),estimated=build(true);
   if(real.length)curves.append(svg('path',{d:real.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':key==='stress'?3:(step?3:2),'stroke-linejoin':'round','stroke-linecap':'round','data-series':key}));
   if(estimated.length)curves.append(svg('path',{d:estimated.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':2,'stroke-dasharray':'5 5',class:'estimated-line','data-series':key}));
   if(rows.length===1&&num(rows[0][key])!==null)curves.append(svg('circle',{cx:x(Number(date(rows[0].at))),cy:y(rows[0][key]),r:3,fill:`var(${colors[key]})`}))
@@ -1249,7 +1251,7 @@ function updateDateLabel(){
 function renderExtras(){
  const today=dayText(data.generated_at);$('history-day').max=today;
  updateDateLabel();
- $('date-today').setAttribute('aria-pressed',String(selectedDay===today));$('date-yesterday').setAttribute('aria-pressed',String(selectedDay===shiftDay(today,-1)));
+ $('date-today').setAttribute('aria-pressed',String(selectedDay===today));$('date-yesterday').setAttribute('aria-pressed',String(selectedDay===shiftDay(today,-1)));$('date-range').setAttribute('aria-pressed',String(!selectedDay));
  $('hero-scene').classList.toggle('sleeping',!!data.sleep?.current?.asleep);$('panel-mood').classList.toggle('empty-mood',!data.emotion?.available);
  if(!$('delivery-list').hasChildNodes())$('delivery-list').append(el('p','note','暂无记录'));
  const dayInfo=$('history-day-summary');dayInfo.replaceChildren();const view=dayView();if(view){for(const [key,label]of [['episode_count','活动记录'],['completed_count','完成'],['interrupted_count','中断'],['sleep_session_count','睡眠会话']])dayInfo.append(el('span','',`${label} ${view.summary?.[key]??'—'}`));for(const row of view.sleep?.sessions||[])dayInfo.append(el('span','',`睡眠 ${minute(row.actual_start_minute)} → ${minute(spanEnd(row.actual_start_minute,row.actual_end_minute))}${row.wake_reason==='offline_reconnect'?' · 离线补全':''}`))}
