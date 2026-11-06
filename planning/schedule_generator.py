@@ -30,7 +30,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from core.llm_utils import LLMService
+from core.llm_utils import LLMService, over_limit_trim_enabled as _over_limit_trim
 from core.time_utils import parse_hhmm
 from suite_prompts import (
     SCHEDULE_HOLIDAY_CONTEXT_DEFAULT,
@@ -350,6 +350,7 @@ class ScheduleGenerator:
             "knowledge_limit": _int("spine_knowledge_limit", 3, 0),
 
             "use_multi_round": bool(getattr(cfg, "intention_multi_round", False)),
+            "over_limit_auto_trim": _over_limit_trim(self._plugin),
         }
 
     async def _generate_spine_schedule(
@@ -512,9 +513,17 @@ class ScheduleGenerator:
             row = cls._spine_intention_to_row(raw, date)
             if row is not None:
                 rows.append(row)
-        if len(rows) > int(params.get("max_intentions", 6)):
-            rows = rows[: int(params.get("max_intentions", 6))]
-        rows.sort(key=lambda it: int(it["start_minute"]))
+        max_int = int(params.get("max_intentions", 6))
+        if params.get("over_limit_auto_trim", True):
+            # 保尾裁剪：先按时间排序，超量时保留最晚的 N 条，晚间计划不被裁掉
+            # （避免「晚上永不出现计划」）；睡眠锚点若被裁掉由后续护栏补回。
+            rows.sort(key=lambda it: int(it["start_minute"]))
+            if len(rows) > max_int:
+                rows = rows[-max_int:]
+        else:
+            if len(rows) > max_int:
+                rows = rows[:max_int]
+            rows.sort(key=lambda it: int(it["start_minute"]))
         return rows
 
     @staticmethod

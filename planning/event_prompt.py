@@ -43,7 +43,8 @@ _RULES = """规则：
 5 state_deltas 仅 energy/hunger/focus/stress/social_battery，单项绝对值<=0.08；
 6 templates 2-3 条，每条 10-40 字；
 7 只做空闲/转场时的日常小事；禁止硬约定、危险/违法/性/自伤/医疗/金融/法律内容、真实联系方式/地址/URL；
-8 不得与已有事件重名。
+8 不得与已有事件重名；
+9 events 数组长度必须恰好等于本次任务要求的条数，禁止多于或少于。
 只输出 JSON：{"events":[{"event_id":"llm_...","name":"...","goal_type":"daily_routine","min_minutes":5,"max_minutes":10,"interruptibility":0.9,"weight":0.5,"state_deltas":{"focus":-0.02},"templates":["...","..."]}]}"""
 
 
@@ -113,25 +114,26 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
     truncated = truncated or cut
 
     def compose(p: str, r: str, e: str) -> str:
-        lines = [f"为角色生成 {minimum}-{count_int} 条日常小事件，"
-                 "用作空闲或转场时的 filler。"]
+        # 前缀缓存友好：稳定规则+JSON 示例置顶（跨请求/跨时段复用前缀），
+        # 每次变化的任务规格（条数/时段/人设/名称）置后。
+        lines = [_RULES]
         if time_slot:
             from .event_slots import SLOT_WINDOW_TEXT, SLOT_GUIDANCE
-            lines.append(f"时段：{SLOT_WINDOW_TEXT.get(time_slot, time_slot)}。"
-                         f"{SLOT_GUIDANCE.get(time_slot, '')}")
+            lines.append(f"本次任务：为角色恰好生成 {count_int} 条日常小事件（用作空闲/转场 filler，禁止多于或少于），"
+                         f"时段 {SLOT_WINDOW_TEXT.get(time_slot, time_slot)}。{SLOT_GUIDANCE.get(time_slot, '')}")
             lines.append('本批次含可复用与一次性小事件（pool_kind 由服务端分配）；每条有具体可完成的小目标，'
                          'goal_type 不要使用 rest/idle/transition。只生成该时段普遍适合开展的活动。')
         else:
-            lines.append('本次生成：周期内可复用小事件，可在间隔后再次发生。' if pool_kind == 'reusable' else
+            pool_line = ('本次生成：周期内可复用小事件，可在间隔后再次发生。' if pool_kind == 'reusable' else
                          '本次生成：一次性小事件，在本次生成周期内抽中即移除。每条有具体可完成的小目标；'
                          '不要生成反复休息、发呆或转场，goal_type不要使用rest/idle/transition。')
+            lines.append(f"本次任务：为角色恰好生成 {count_int} 条日常小事件（用作空闲/转场 filler，禁止多于或少于）。" + pool_line)
         if p:
             lines.append(f"人设：{p}")
         if r:
             lines.append(f"最近日程名称：{r}")
         if e:
             lines.append(f"已有事件名（不得重复）：{e}")
-        lines.append(_RULES)
         return "\n".join(lines)
 
     prompt = compose(persona_text, recent_text, existing_text)

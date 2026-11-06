@@ -20,7 +20,7 @@
 planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
 **config_version 与迁移保障（2026-10-10 第二版，已订正；3.0.0 起版本随 PR8 递增）**：
-开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值随插件版本递增（当前 `3.9.0`；历史：3.1.0 为 2026-11-04 配置精简版、3.0.0 为 2026-10-27 PR8 清理版、2.2.0 为 2026-10-27 二期 PR7 开发版、2.1.0 于 2026-10-21 归档发布）；
+开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值随插件版本递增（当前 `3.9.1`；历史：3.1.0 为 2026-11-04 配置精简版、3.0.0 为 2026-10-27 PR8 清理版、2.2.0 为 2026-10-27 二期 PR7 开发版、2.1.0 于 2026-10-21 归档发布）；
 迁移保障改由 **plugin.py 的「磁盘旧文件抢救」**（`CateyeSuitePlugin.normalize_plugin_config` 先读尚未被
 宿主覆写的磁盘 `config.toml`，把用户值并回输入）＋ 下面的 `mode="before"` 一次性迁移器共同承担。
 **旧口径（已作废）如下，仅留作教训**：宿主 Runner 在「配置版本号变化」时会
@@ -142,7 +142,7 @@ from suite_prompts import (
 # 3.2.0（2026-11-04 主动行为重写）：删 4 个 [patrol] Field（日程巡检三键 + miss_speak_rate）
 # 按 R6 递增本值；_manifest.json 不在本任务文件边界内，**部署批须同步递增至 3.2.0**
 # （见设计文档 §配置治理）。磁盘抢救 + 入口纯 pop 保证旧值不丢、退役键不落盘。
-SUPPORTED_CONFIG_VERSION = "3.9.0"
+SUPPORTED_CONFIG_VERSION = "3.9.1"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -369,6 +369,12 @@ class LlmSectionConfig(PluginConfigBase):
         default=True,
         description="短任务出现多余思考输出后，后续请求追加一次直接输出提示；不增加重试或延长超时。",
         json_schema_extra={"label": "自动约束短任务输出"},
+    )
+    over_limit_auto_trim: bool = Field(
+        default=True,
+        description="生成结果超出条数上限时自动裁剪兜底（默认开）：小事件取前N条避免整批作废；日程按时间排序后保留末尾，晚间计划不被裁掉。关闭则小事件超量整批拒绝、日程沿用旧的输出序截断。",
+        json_schema_extra={"label": "超限自动裁剪",
+                           **_ui_i18n("Auto-trim over-limit", "Gracefully trim over-limit generation results instead of failing; schedule keeps the tail (evening).")},
     )
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "LLM Calls",

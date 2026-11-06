@@ -237,6 +237,7 @@ class PlanningServices:
                 plugin_root=self._ctx.plugin_root,
                 data_dir=self._ctx.data_dir,
                 llm=self._ctx.llm,
+                config=self._ctx.config,
                 config_provider=self._event_catalog_section,
                 tz=timezone_str,
                 # 清醒/非睡眠/无硬约定闸：**必须**注入（服务本身 fail-closed）

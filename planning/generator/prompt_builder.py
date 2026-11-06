@@ -182,12 +182,71 @@ class PromptBuilder:
             persona_line = ""
         style_block = f"\n\n【表达风格】\n{reply_style}" if reply_style else ""
         prompt_header = persona_line + style_block if persona_line else style_block.lstrip()
-        prompt = f"""{prompt_header}
 
-今天是{date_str} {weekday}{"（周末）" if is_weekend else ""}
-""" if prompt_header else f"""今天是{date_str} {weekday}{"（周末）" if is_weekend else ""}
+        # 半稳定任务规则组件先算（仅随配置变化）
+        if _to_int(max_described, 0) >= 1:
+            described_note = render(
+                prompt_of(self._plugin_ref(), "schedule_spine_described_note"),
+                fallback=SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT,
+                max_described=_to_int(max_described, 1),
+            )
+        else:
+            described_note = render(
+                prompt_of(self._plugin_ref(), "schedule_spine_no_described_note"),
+                fallback=SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT,
+            )
+        if no_sleep_mode:
+            no_sleep_line = render(
+                prompt_of(self._plugin_ref(), "schedule_spine_no_sleep_line"),
+                fallback=SCHEDULE_SPINE_NO_SLEEP_LINE_DEFAULT,
+                sleep_text=sleep_text, wake_text=wake_text,
+            )
+        else:
+            no_sleep_line = render(
+                prompt_of(self._plugin_ref(), "schedule_spine_sleep_line"),
+                fallback=SCHEDULE_SPINE_SLEEP_LINE_DEFAULT,
+                sleep_text=sleep_text, wake_text=wake_text,
+            )
+
+        # 前缀缓存友好：稳定前缀（人设/风格 + 任务规则 + Schema，仅随配置变化）置顶，
+        # 每次请求变化的日期与上下文置后，最大化可缓存前缀。
+        prompt = (prompt_header + "\n") if prompt_header else ""
+        prompt += "\n" + render(
+            prompt_of(self._plugin_ref(), "schedule_spine_task"),
+            fallback=SCHEDULE_SPINE_TASK_DEFAULT,
+            min_intentions=_to_int(min_intentions, 3),
+            max_intentions=_to_int(max_intentions, 6),
+            wake_text=wake_text,
+            sleep_text=sleep_text,
+            no_sleep_line=no_sleep_line,
+            described_note=described_note,
+        ) + "\n"
+
+        if schema:
+            import json
+            min_i = _to_int(min_intentions, 3)
+            max_i = _to_int(max_intentions, 6)
+            note_rule = (
+                f"- note：可选，最多给 {_to_int(max_described, 1)} 条重要意图写一句 15-25 字"
+                if _to_int(max_described, 0) >= 1
+                else "- 不要输出 note 字段"
+            )
+            prompt += f"""
+【Schema要求】
+- {min_i}-{max_i} 条意图（必须）
+- 必填：name(2-20字), goal_type, window, min_minutes, max_minutes, priority, hardness, interruptibility
+{note_rule}
+- window：["HH:MM", "HH:MM"] 两元素数组
+- min_minutes / max_minutes：5-720 整数，max >= min
+- interruptibility：0-1 小数
+
+Schema: {json.dumps(schema, ensure_ascii=False)}
 """
 
+        # 变量后缀：日期 + 上下文（每次请求变化，置于稳定前缀之后）
+        prompt += f"""
+今天是{date_str} {weekday}{"（周末）" if is_weekend else ""}
+"""
         yesterday_text = yesterday_context or "最近几天没有具体记录"
         prompt += f"""
 【最近几天日程参考】
@@ -250,40 +309,6 @@ class PromptBuilder:
         if holiday_context:
             prompt += "\n" + str(holiday_context).strip() + "\n"
 
-        if _to_int(max_described, 0) >= 1:
-            described_note = render(
-                prompt_of(self._plugin_ref(), "schedule_spine_described_note"),
-                fallback=SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT,
-                max_described=_to_int(max_described, 1),
-            )
-        else:
-            described_note = render(
-                prompt_of(self._plugin_ref(), "schedule_spine_no_described_note"),
-                fallback=SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT,
-            )
-        if no_sleep_mode:
-            no_sleep_line = render(
-                prompt_of(self._plugin_ref(), "schedule_spine_no_sleep_line"),
-                fallback=SCHEDULE_SPINE_NO_SLEEP_LINE_DEFAULT,
-                sleep_text=sleep_text, wake_text=wake_text,
-            )
-        else:
-            no_sleep_line = render(
-                prompt_of(self._plugin_ref(), "schedule_spine_sleep_line"),
-                fallback=SCHEDULE_SPINE_SLEEP_LINE_DEFAULT,
-                sleep_text=sleep_text, wake_text=wake_text,
-            )
-
-        prompt += "\n" + render(
-            prompt_of(self._plugin_ref(), "schedule_spine_task"),
-            fallback=SCHEDULE_SPINE_TASK_DEFAULT,
-            min_intentions=_to_int(min_intentions, 3),
-            max_intentions=_to_int(max_intentions, 6),
-            wake_text=wake_text,
-            sleep_text=sleep_text,
-            no_sleep_line=no_sleep_line,
-            described_note=described_note,
-        ) + "\n"
         prompt += f"\n兴趣偏好：{interest if interest else '日常生活'}\n"
 
         # [prompts].schedule_generation_extra：用户的自由追加指令（留空不追加；与 daily 同键）
@@ -291,24 +316,4 @@ class PromptBuilder:
         if extra.strip() and extra.strip() != SCHEDULE_GENERATION_EXTRA_DEFAULT.strip():
             prompt += "\n" + extra.strip() + "\n"
 
-        if schema:
-            import json
-            min_i = _to_int(min_intentions, 3)
-            max_i = _to_int(max_intentions, 6)
-            note_rule = (
-                f"- note：可选，最多给 {_to_int(max_described, 1)} 条重要意图写一句 15-25 字"
-                if _to_int(max_described, 0) >= 1
-                else "- 不要输出 note 字段"
-            )
-            prompt += f"""
-【Schema要求】
-- {min_i}-{max_i} 条意图（必须）
-- 必填：name(2-20字), goal_type, window, min_minutes, max_minutes, priority, hardness, interruptibility
-{note_rule}
-- window：["HH:MM", "HH:MM"] 两元素数组
-- min_minutes / max_minutes：5-720 整数，max >= min
-- interruptibility：0-1 小数
-
-Schema: {json.dumps(schema, ensure_ascii=False)}
-"""
         return prompt

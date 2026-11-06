@@ -207,6 +207,12 @@ def _llm_section(config_or_plugin: Any) -> Any:
     return getattr(getattr(config_or_plugin, "config", None), "llm", None)
 
 
+def over_limit_trim_enabled(config_or_plugin: Any) -> bool:
+    """``[llm].over_limit_auto_trim``（默认 True）：超限生成结果自动裁剪兜底开关。"""
+    section = _llm_section(config_or_plugin)
+    return bool(getattr(section, "over_limit_auto_trim", True))
+
+
 def llm_task_name_of(config_or_plugin: Any) -> str:
     """主模型任务名（``[llm].task_name``；旧 ``[schedule].llm_task_name`` 兜底，最后 replyer）。"""
     section = _llm_section(config_or_plugin)

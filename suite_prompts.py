@@ -99,9 +99,20 @@ INJECT_PROACTIVE_TURN_RULE_DEFAULT = (
 
 #: 会话采样好感裁判提示词（占位符：{lover_name} / {target_label} / {persona} /
 #: {tier_label} / {tier_desc} / {mood_text} / {recent_messages}）
-AFFECTION_CONVERSATION_REVIEW_DEFAULT = """你是 AI 角色「{lover_name}」与{target_label}之间关系的会话观察裁判。
-你不参与对话，只看下面给出的材料，给这段相处评估一个**有界的好感度增量**。
+AFFECTION_CONVERSATION_REVIEW_DEFAULT = """你不参与对话，只看下面给出的材料，给这段相处评估一个**有界的好感度增量**。
 你看不到任何好感度数值，也看不到分数与基线，只看到关系所处的阶段描述——不要猜测具体数值。
+
+【判定标准】
+1. event：用不超过 30 字概括这段相处里最值得记住的一件事；没有就写「日常闲聊」；
+2. delta：好感度增量，范围 [-4, +5]——
+   - 阿谀奉承、无意义刷屏、单方面索取：不给正分（0 或负）；
+   - 真诚的关心、共同完成一件事、化解了一次矛盾：才给正分；
+   - 明显的争吵、冒犯、被冷落：给负分；
+   - 平淡的日常闲聊：接近 0；
+3. tag 只能是 normal / conflict / apology / sweet 之一；
+4. 只输出 JSON：{{"event": "...", "delta": 0.0, "tag": "normal"}}
+
+你是 AI 角色「{lover_name}」与{target_label}之间关系的会话观察裁判。
 
 【角色人设（判断真心程度的依据）】
 {persona}
@@ -113,22 +124,25 @@ AFFECTION_CONVERSATION_REVIEW_DEFAULT = """你是 AI 角色「{lover_name}」与
 {mood_text}
 
 【最近对方发来的消息（按时间从旧到新，只有对方一侧）】
-{recent_messages}
-
-【判定标准】
-1. event：用不超过 30 字概括这段相处里最值得记住的一件事；没有就写「日常闲聊」；
-2. delta：好感度增量，范围 [-4, +5]——
-   - 阿谀奉承、无意义刷屏、单方面索取：不给正分（0 或负）；
-   - 真诚的关心、共同完成一件事、化解了一次矛盾：才给正分；
-   - 明显的争吵、冒犯、被冷落：给负分；
-   - 平淡的日常闲聊：接近 0；
-3. tag 只能是 normal / conflict / apology / sweet 之一；
-4. 只输出 JSON：{{"event": "...", "delta": 0.0, "tag": "normal"}}"""
+{recent_messages}"""
 
 #: 关系日结裁判提示词（占位符：{lover_name} / {target_label} / {date} / {persona} /
 #: {tier_label} / {tier_desc} / {stats} / {event_log} / {impressions}）
-AFFECTION_DAILY_REVIEW_DEFAULT = """你是 AI 角色「{lover_name}」与{target_label}之间关系的日结裁判。
-你看不到任何好感度数值，也看不到分数与基线，只看到关系所处的阶段描述——不要猜测具体数值。
+AFFECTION_DAILY_REVIEW_DEFAULT = """你看不到任何好感度数值，也看不到分数与基线，只看到关系所处的阶段描述——不要猜测具体数值。
+
+【判定标准】
+1. delta_score：这一天对关系的影响，范围 [-4, +4]——
+   - 真诚的关心、共同完成一件事、化解矛盾：正分；
+   - 阿谀奉承、无意义刷屏：不给正分；
+   - 争吵、冒犯、被冷落、整天没有互动：负分；
+   - 平淡无事：接近 0；
+2. impressions：0~3 条，每条一句话（不超过 40 字）记下今天值得记住的事；
+   只写事实与感受，不写分数、不写评价性标签、不编造没有发生的事；
+3. tone：一句话概括今天的关系温度（不超过 30 字）；
+4. reason：必须直接引用下面事件日志或对方原话的片段作为依据，禁止脑补不存在的事；
+5. 只输出 JSON：{{"delta_score": 0.0, "impressions": ["..."], "tone": "...", "reason": "..."}}
+
+你是 AI 角色「{lover_name}」与{target_label}之间关系的日结裁判。
 任务：根据 {date} 这一天的相处记录，给这一天对关系的影响做一个有界的总结。
 
 【角色人设】
@@ -144,19 +158,7 @@ AFFECTION_DAILY_REVIEW_DEFAULT = """你是 AI 角色「{lover_name}」与{target
 {event_log}
 
 【最近积累的相处印象（旧→新）】
-{impressions}
-
-【判定标准】
-1. delta_score：这一天对关系的影响，范围 [-4, +4]——
-   - 真诚的关心、共同完成一件事、化解矛盾：正分；
-   - 阿谀奉承、无意义刷屏：不给正分；
-   - 争吵、冒犯、被冷落、整天没有互动：负分；
-   - 平淡无事：接近 0；
-2. impressions：0~3 条，每条一句话（不超过 40 字）记下今天值得记住的事；
-   只写事实与感受，不写分数、不写评价性标签、不编造没有发生的事；
-3. tone：一句话概括今天的关系温度（不超过 30 字）；
-4. reason：必须直接引用上面事件日志或对方原话的片段作为依据，禁止脑补不存在的事；
-5. 只输出 JSON：{{"delta_score": 0.0, "impressions": ["..."], "tone": "...", "reason": "..."}}"""
+{impressions}"""
 
 
 # ===========================================================================
@@ -282,10 +284,6 @@ SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT = (
 SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT = "- 所有意图都不要写 note 字段\n"
 #: 角色裁判提示词（占位符：{persona} / {today_str} / {weekday} / {current_text} / {description}）
 SCHEDULE_ROLE_JUDGE_DEFAULT = (
-    "【角色人设】\n{persona}\n\n"
-    "【日期信息】\n今天是 {today_str}（{weekday}）\n\n"
-    "【当前日程】\n{current_text}\n\n"
-    "【用户请求】\n{description}\n\n"
     "请扮演该角色，判断是否会接受这个日程相关请求。\n"
     "不要机械接受用户安排；如果不符合人设、时间冲突太强、语气像玩笑或没有明确计划，可以拒绝或不改日程。\n"
     "decision 只能是以下值之一：\n"
@@ -298,7 +296,11 @@ SCHEDULE_ROLE_JUDGE_DEFAULT = (
     '"time": "HH:MM 或空", "title": "简短标题", "notes": "备注", '
     '"reason": "角色判断理由", "raw_date": "用户原文中的日期描述"}}\n'
     "日期必须根据【日期信息】中的真实日期推断。\n"
-    "只输出 JSON，不要其他文字。"
+    "只输出 JSON，不要其他文字。\n\n"
+    "【角色人设】\n{persona}\n\n"
+    "【日期信息】\n今天是 {today_str}（{weekday}）\n\n"
+    "【当前日程】\n{current_text}\n\n"
+    "【用户请求】\n{description}"
 )
 
 #: 角色裁判无日程时的占位（占位符：无）
@@ -340,6 +342,18 @@ PROACTIVE_REASON_NIGHT_DEFAULT = "日程：入睡前的晚安问候"
 EMOTION_SLEEP_REFEREE_DEFAULT = """你是一个客观的情绪裁判系统，负责对 AI 角色的睡眠期情绪进行大修。
 你不参与对话，只依据下面的客观数据输出 JSON。
 
+【评分规则】
+1. 越靠近睡前的情绪事件，权重略微增加（近因效应）；强度大的事件影响更大。
+2. 睡眠时长影响恢复效果：<5 小时恢复极差（V 负向、A 升高）；6-9 小时恢复最佳（V 回升）；>10 小时睡懵（A 大幅降低）。
+3. 日程预期：评估前一日日程是"释怀"还是"反刍"，第二日日程是"期待"还是"焦虑"（第二天有考试/挑战 → A 升高、D 降低）。
+4. 必须结合人设性格做情绪过滤（如高神经质 → 焦虑更容易留存）。
+5. R_yesterday / E_tomorrow / 约定情况是代码层已计算的参考数值，最终增量仍需你综合人设与日志判断。
+6. 给出最终的 ΔVAD（增量，非绝对值），每一维范围必须在 [-{limit:.2f}, {limit:.2f}] 之间。
+7. reason 每条不超过 30 字，概括依据即可，不必逐字引用原文，禁止脑补不存在的事件。
+8. 内部思考控制在两三句以内，随后立即输出最终 JSON。
+
+只输出 JSON：{{"delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}, "reason_valence": "...", "reason_arousal": "...", "reason_dominance": "..."}}
+
 【Bot 人设】
 {persona}
 
@@ -366,19 +380,7 @@ V: {r_v:+.2f}, A: {r_a:+.2f}, D: {r_d:+.2f}
 【次日日程情感预期 E_tomorrow】（明日条目情感基调求和；考试/挑战 → V↓A↑D↓）
 V: {e_v:+.2f}, A: {e_a:+.2f}, D: {e_d:+.2f}
 
-【当日约定兑现情况】净兑现 {commitment_net:+.0f} 次（正=兑现多于违约，负=违约多于兑现）
-
-【评分规则】
-1. 越靠近睡前的情绪事件，权重略微增加（近因效应）；强度大的事件影响更大。
-2. 睡眠时长影响恢复效果：<5 小时恢复极差（V 负向、A 升高）；6-9 小时恢复最佳（V 回升）；>10 小时睡懵（A 大幅降低）。
-3. 日程预期：评估前一日日程是"释怀"还是"反刍"，第二日日程是"期待"还是"焦虑"（第二天有考试/挑战 → A 升高、D 降低）。
-4. 必须结合人设性格做情绪过滤（如高神经质 → 焦虑更容易留存）。
-5. R_yesterday / E_tomorrow / 约定情况是代码层已计算的参考数值，最终增量仍需你综合人设与日志判断。
-6. 给出最终的 ΔVAD（增量，非绝对值），每一维范围必须在 [-{limit:.2f}, {limit:.2f}] 之间。
-7. reason 每条不超过 30 字，概括依据即可，不必逐字引用原文，禁止脑补不存在的事件。
-8. 内部思考控制在两三句以内，随后立即输出最终 JSON。
-
-只输出 JSON：{{"delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}, "reason_valence": "...", "reason_arousal": "...", "reason_dominance": "..."}}"""
+【当日约定兑现情况】净兑现 {commitment_net:+.0f} 次（正=兑现多于违约，负=违约多于兑现）"""
 
 #: 人设 → VAD 参数初始化提示词（占位符：{emotion_table}）
 EMOTION_INIT_SYSTEM_DEFAULT = """你是一位情绪心理学专家，负责为 AI 角色建立 VAD（效价、唤醒度、支配感）三维情绪模型。
@@ -402,7 +404,14 @@ V 代表愉悦度，范围 -1.0 到 1.0，正值愉悦、负值痛苦；A 代表
   "reasons": {{"anchor": "...", "offset": "...", "multiplier": "..."}}}}"""
 
 #: 回复/事件 ΔVAD 增量评估提示词（占位符：{lover_name} / {persona} / {user_context} / {reply_text}）
-EMOTION_EVALUATE_DEFAULT = """你是 AI 角色「{lover_name}」的情绪增量评估器。你看不到角色当前的绝对情绪数值，只根据下面这段交流内容，评估"这轮交流/这件事"给角色情绪带来的变化量 ΔVAD。
+EMOTION_EVALUATE_DEFAULT = """你看不到角色当前的绝对情绪数值，只根据下面这段交流内容，评估"这轮交流/这件事"给角色情绪带来的变化量 ΔVAD。
+
+【要求】
+1. event 用不超过 30 字概括「这轮交流发生了什么」（谁说了什么、发生了什么、结果如何），不要笼统写"日常对话"；
+2. ΔV/ΔA/ΔD 每一维范围 [-0.5, 0.5]；没有明显情绪波动时全部接近 0；
+3. 只输出 JSON：{{"event": "...", "delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}}}
+
+你是 AI 角色「{lover_name}」的情绪增量评估器。
 
 【角色人设（情绪过滤依据）】
 {persona}
@@ -411,12 +420,7 @@ EMOTION_EVALUATE_DEFAULT = """你是 AI 角色「{lover_name}」的情绪增量�
 {user_context}
 
 【AI 的回复内容 / 待评估的交流内容】
-{reply_text}
-
-【要求】
-1. event 用不超过 30 字概括「这轮交流发生了什么」（谁说了什么、发生了什么、结果如何），不要笼统写"日常对话"；
-2. ΔV/ΔA/ΔD 每一维范围 [-0.5, 0.5]；没有明显情绪波动时全部接近 0；
-3. 只输出 JSON：{{"event": "...", "delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}}}"""
+{reply_text}"""
 
 #: 情绪底色注入文本（占位符：{mood}）——planner/replyer 双通道共用
 EMOTION_INJECTION_DEFAULT = (
@@ -441,25 +445,24 @@ EMOTION_NIGHT_HINT_DEFAULT = (
 
 #: 说说文案提示词（占位符：{lover_name} / {personality} / {date} / {time} / {activity}）
 QZONE_POST_DEFAULT = (
+    "请以第一人称发一条 QQ 空间说说，记录此刻的生活。"
+    "要求：口语化、像真人发的、20~60 字、不要话题标签、不要引号、只输出说说正文。\n"
     "你是「{lover_name}」，人设：{personality}\n"
-    "现在是 {date} {time}，你正在：{activity}。请以第一人称发一条 QQ 空间说说，"
-    "记录此刻的生活。要求：口语化、像真人发的、20~60 字、不要话题标签、不要引号、只输出说说正文。"
+    "现在是 {date} {time}，你正在：{activity}。"
 )
 #: 评论回复提示词（占位符：{lover_name} / {personality} / {moment} / {nickname} / {time} /
 #: {comment} / {impression}）
 QZONE_REPLY_DEFAULT = (
+    "请写一条自然的回复（10~40 字，口语化，只输出回复正文）。\n"
     "你是「{lover_name}」，人设：{personality}\n"
     "你在 QQ 空间发了这条说说：\n「{moment}」\n"
     "好友「{nickname}」（{time}）评论了：「{comment}」\n{impression}"
-    "请写一条自然的回复（10~40 字，口语化，只输出回复正文）。"
 )
 #: 评论提醒主动 intent（占位符：{excerpt} / {added}）
 QZONE_COMMENT_REMINDER_DEFAULT = "你刚发的说说「{excerpt}」收到了 {added} 条新评论，可以在聊天里自然地提到这件事"
 #: 发帖前 LLM 严判提示词（占位符：{lover_name} / {personality} / {current_time} / {activity}；
 #: 2026-10-14 §18.4 判定链移植自 MaiTrace v3.1：正反例 + 强烈压制「是」+ 首字符应答格式）
 QZONE_POST_GATE_DEFAULT = (
-    "你是「{lover_name}」，人设：{personality}。\n"
-    "现在是 {current_time}，你正在：{activity}。\n\n"
     "请判断你现在是否会自然地发一条 QQ 空间说说。\n\n"
     "【基本不会的情况】\n"
     "- 正在专注做事（工作 / 学习 / 会议 / 写代码 / 审阅）\n"
@@ -477,7 +480,9 @@ QZONE_POST_GATE_DEFAULT = (
     "  是|<不超过 20 字的简短理由>\n"
     "  或\n"
     "  否|<不超过 20 字的简短理由>\n"
-    "第一个字符必须是「是」或「否」。"
+    "第一个字符必须是「是」或「否」。\n\n"
+    "你是「{lover_name}」，人设：{personality}。\n"
+    "现在是 {current_time}，你正在：{activity}。"
 )
 
 

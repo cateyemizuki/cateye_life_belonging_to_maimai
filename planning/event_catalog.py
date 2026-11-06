@@ -613,6 +613,7 @@ class EventCatalogStore:
 
     @staticmethod
     def _normalize_builtin(items: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        from .event_slots import TIME_SLOTS
         output: List[Dict[str, Any]] = []
         for raw in items:
             eid = str(raw.get("event_id") or raw.get("key") or "")
@@ -630,6 +631,7 @@ class EventCatalogStore:
                 "enabled": True,
                 "source": "builtin",
                 "pool_kind": "builtin",
+                "allowed_slots": list(raw.get("allowed_slots") or TIME_SLOTS),
             })
         return output
 
@@ -1439,6 +1441,8 @@ class EventCatalogService:
         events, hashes, models, failures = [], [], [], []
         charged = 0
         model_calls = 0
+        from core.llm_utils import over_limit_trim_enabled
+        trim = over_limit_trim_enabled(self._config)
         for slot_index, slot in enumerate(TIME_SLOTS):
             requested = int(period_limits[slot_index])
             if requested <= 0:
@@ -1462,9 +1466,15 @@ class EventCatalogService:
                     failures.append(f'{slot}: 模型未返回可用事件（{chosen.category}）')
                     continue
                 rows = parse_events_response(chosen.text)
-                if not 1 <= len(rows) <= requested:
-                    failures.append(f'{slot}: 返回条数不在1-{requested}内')
+                if len(rows) < 1:
+                    failures.append(f'{slot}: 模型未返回事件')
                     continue
+                if len(rows) > requested:
+                    if trim:
+                        rows = rows[:requested]  # 超量裁剪兜底：取前N条，维持按索引分池语义
+                    else:
+                        failures.append(f'{slot}: 返回条数不在1-{requested}内')
+                        continue
                 for i, row in enumerate(rows):
                     item = _normalize_event(row)
                     item['pool_kind'] = 'reusable' if i < reusable_n else 'one_shot'
