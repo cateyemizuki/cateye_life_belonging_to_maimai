@@ -828,6 +828,13 @@ class QzoneService:
             last = datetime.fromisoformat(anchor)
         except ValueError:
             return 0
+        # PR-FIX-TZ（3.17.3）：锚点由 datetime.now().isoformat() 写入（naive 本地墙钟），
+        # 闸2 复检 now 为业务时区 aware → 统一 tz 后再相减，消除 TypeError 导致的
+        # 「门控复检异常（保守不发）」；冷却语义（回拨保守/损坏 fail-open）不变。
+        if last.tzinfo is None and now.tzinfo is not None:
+            last = last.replace(tzinfo=now.tzinfo)
+        elif last.tzinfo is not None and now.tzinfo is None:
+            last = last.astimezone().replace(tzinfo=None)
         elapsed = (now - last).total_seconds() / 60.0
         if elapsed < 0:
             return minutes

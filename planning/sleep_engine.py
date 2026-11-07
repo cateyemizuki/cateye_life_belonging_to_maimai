@@ -791,7 +791,7 @@ class SleepEngine:
         previous: Optional[int] = None
         for row in rows or []:
             session = row if isinstance(row, SleepSession) else SleepSession.from_row(row)
-            start = self._parse(session.metadata.get("sleep_started_at"))
+            start = self._aware(self._parse(session.metadata.get("sleep_started_at")), bedtime)
             dynamic = session.metadata.get("dynamic_sleep") or {}
             if (not session.closed or not start or session.wake_reason not in {
                     "energy_threshold", "lie_in_cap", "wake_window_end"}
@@ -823,10 +823,12 @@ class SleepEngine:
         query = getattr(self._store, "query_sleep_sessions", None)
         if not callable(query):
             return None
+        current = self._now(now)
         for row in query(limit=8) or []:
             session = row if isinstance(row, SleepSession) else SleepSession.from_row(row)
-            wake = self._parse(session.metadata.get("closed_at"))
-            if (session.closed and wake and wake.date() == now.date() and wake <= now
+            # PR-FIX-TZ：closed_at 存储可能 naive（本地墙钟）→ 规范化后再与 aware 比较
+            wake = self._aware(self._parse(session.metadata.get("closed_at")), current)
+            if (session.closed and wake and wake.date() == current.date() and wake <= current
                     and session.wake_reason != "offline_reconnect"
                     and (session.metadata.get("actual_sleep_hours") or 0) > 0):
                 return wake
@@ -839,6 +841,10 @@ class SleepEngine:
         """Only the planner starts an episode, after the engine has accepted its onset."""
         if not self.dynamic_enabled:
             return None
+        # PR-FIX-TZ：now/hard_start 统一 aware（naive 按引擎本地墙钟解释），
+        # 保证 window/hard_due 与 now 的全部比较同 tz；判定语义不变。
+        now = self._now(now)
+        hard_start = self._aware(hard_start, now)
         window = self.dynamic_window(now)
         sleep_min, _ = self._anchors()
         cfg = tuning_section("dynamic_sleep")
@@ -894,6 +900,19 @@ class SleepEngine:
             if tz is not None:
                 dt = dt.replace(tzinfo=tz)
         return dt
+
+    def _aware(self, dt: Optional[datetime],
+               ref: Optional[datetime] = None) -> Optional[datetime]:
+        """时区一致性规范化（PR-FIX-TZ 3.17.3）：naive → 附参照时区，aware/None 原样。
+
+        存储/恢复出来的 naive 时间戳一律按引擎本地墙钟时间解释（与 ``_restore_clock``
+        的 stamp 同口径）；只消除 naive/aware 混比，不改变任何时刻的墙钟语义。
+        ``ref`` 缺省取当前引擎时间；参照本身 naive（时区解析失败的降级态）则原样返回。
+        """
+        if dt is None or dt.tzinfo is not None:
+            return dt
+        tz = (ref if ref is not None else self._now()).tzinfo
+        return dt.replace(tzinfo=tz) if tz is not None else dt
 
     @staticmethod
     def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -1021,7 +1040,7 @@ class SleepEngine:
             return True
         if self.dynamic_enabled:
             return False
-        cap = session.lie_in_cap_at
+        cap = self._aware(session.lie_in_cap_at, current)
         if isinstance(cap, datetime) and current < cap:
             return False
         return None
@@ -1079,16 +1098,18 @@ class SleepEngine:
         if session is None or session.closed:
             return None
         current = self._now(now)
-        earliest = session.earliest_wake_at or next_occurrence(current, self._anchors()[1])
+        earliest = self._aware(session.earliest_wake_at, current) or next_occurrence(
+            current, self._anchors()[1])
         candidates: List[datetime] = []
-        cap = session.lie_in_cap_at or next_occurrence(earliest, self._lie_in_cap_minute())
+        cap = self._aware(session.lie_in_cap_at, current) or next_occurrence(
+            earliest, self._lie_in_cap_minute())
         candidates.append(cap)
         if cap <= current:
             return current  # 上限已过（回拨/长间隔）→ 调用方立即重检
-        hard_due = hard_commitment_deadline(
+        hard_due = self._aware(hard_commitment_deadline(
             self._resolve_hard_commitment(hard_commitment_start, session),
             self._cfg_float("sleep_hard_commitment_lead_minutes",
-                            DEFAULT_HARD_COMMITMENT_LEAD_MINUTES))
+                            DEFAULT_HARD_COMMITMENT_LEAD_MINUTES)), current)
         if hard_due is not None:
             if hard_due <= current:
                 return current  # 硬约定阈值已过（睡着跨过/临时新建）→ 立即正式起床
@@ -1121,27 +1142,32 @@ class SleepEngine:
                 return False
             if self._suppress_until(session.earliest_wake_at,
                                     session.actual_end_minute,
-                                    session.schedule_date) > current:
+                                    session.schedule_date, ref=current) > current:
                 return False
         if self._recently_woke(current):
             return False
         return True
 
-    @staticmethod
-    def _suppress_until(earliest_wake: Optional[datetime],
+    def _suppress_until(self, earliest_wake: Optional[datetime],
                         actual_end_minute: Optional[int],
-                        schedule_date: Optional[str]) -> datetime:
-        """醒来后「本周期不再新开睡眠」的抑制截止时刻（wake 锚点 +1h）。"""
+                        schedule_date: Optional[str], *,
+                        ref: Optional[datetime] = None) -> datetime:
+        """醒来后「本周期不再新开睡眠」的抑制截止时刻（wake 锚点 +1h）。
+
+        PR-FIX-TZ（3.17.3）：返回值一律 aware（naive 输入按引擎本地墙钟解释），
+        消除跨日已闭合会话与 aware ``current`` 混比抛 TypeError；抑制窗语义不变。
+        """
+        current = self._now(ref)
         if isinstance(earliest_wake, datetime):
-            return earliest_wake + timedelta(hours=1)
+            return self._aware(earliest_wake, current) + timedelta(hours=1)
         if actual_end_minute is not None and schedule_date:
             try:
-                wake_dt = datetime.strptime(schedule_date, "%Y-%m-%d") + timedelta(
-                    minutes=int(actual_end_minute))
+                wake_dt = datetime.strptime(schedule_date, "%Y-%m-%d").replace(
+                    tzinfo=current.tzinfo) + timedelta(minutes=int(actual_end_minute))
                 return wake_dt + timedelta(hours=1)
             except (TypeError, ValueError):
                 pass
-        return datetime.min
+        return datetime.min.replace(tzinfo=current.tzinfo)
 
     def _recently_woke(self, current: datetime) -> bool:
         """DB 最近会话行：本夜已醒且仍在抑制窗 → True（重启/热重载同口径）。"""
@@ -1166,7 +1192,7 @@ class SleepEngine:
             if earliest is None:
                 earliest = self._parse(session.metadata.get("earliest_wake_at"))
             if self._suppress_until(earliest, session.actual_end_minute,
-                                    session.schedule_date) > current:
+                                    session.schedule_date, ref=current) > current:
                 return True
         return False
 
@@ -1209,8 +1235,8 @@ class SleepEngine:
         cap = next_occurrence(earliest_wake, self._lie_in_cap_minute())
         dynamic = ((episode or {}).get("metadata") or {}).get("dynamic_sleep")
         if isinstance(dynamic, dict):
-            early = self._parse(dynamic.get("earliest_wake"))
-            late = self._parse(dynamic.get("latest_wake"))
+            early = self._aware(self._parse(dynamic.get("earliest_wake")), now)
+            late = self._aware(self._parse(dynamic.get("latest_wake")), now)
             if early and late and now < early <= late:
                 earliest_wake, cap = early, late
             else:
@@ -1405,7 +1431,7 @@ class SleepEngine:
                 for row in query(schedule_date=date, limit=50) or []:
                     candidate = row if isinstance(row, SleepSession) else SleepSession.from_row(row)
                     if candidate.closed and candidate.lie_in_cap_at is not None \
-                            and current < candidate.lie_in_cap_at:
+                            and current < self._aware(candidate.lie_in_cap_at, current):
                         candidates.append(candidate)
         except Exception:
             return None
@@ -1421,8 +1447,8 @@ class SleepEngine:
         if session.closed:
             return
         fields = self._snapshot()
-        started = self._parse(session.metadata.get("sleep_started_at"))
-        settled = self._parse(fields.get("last_sleep_at"))
+        started = self._aware(self._parse(session.metadata.get("sleep_started_at")), current)
+        settled = self._aware(self._parse(fields.get("last_sleep_at")), current)
         try:
             if started is None or settled is None or not started <= settled <= current:
                 return
@@ -1585,7 +1611,7 @@ class SleepEngine:
         else:
             h_before = min(float(self._last_continuous_hours or 0.0), h_after)
         self._last_continuous_hours = h_after
-        started_at = self._parse(session.metadata.get("sleep_started_at"))
+        started_at = self._aware(self._parse(session.metadata.get("sleep_started_at")), current)
         total_session_minutes = 0.0
         if started_at is not None and current > started_at:
             total_session_minutes = (current - started_at).total_seconds() / 60.0
@@ -1616,7 +1642,8 @@ class SleepEngine:
                 "social_battery_rate": 0.0,
             }
         # 阈值复检节流（到点/硬约定不受影响）
-        earliest = session.earliest_wake_at or next_occurrence(current, self._anchors()[1])
+        earliest = self._aware(session.earliest_wake_at, current) or next_occurrence(
+            current, self._anchors()[1])
         check_seconds = self._wake_check_seconds()
         check_due = True
         if current >= earliest:
@@ -1625,7 +1652,8 @@ class SleepEngine:
                 check_due = False
             else:
                 self._last_threshold_check_at = current
-        effective_hard = self._resolve_hard_commitment(hard_commitment_start, session)
+        effective_hard = self._aware(
+            self._resolve_hard_commitment(hard_commitment_start, session), current)
         dynamic = session.metadata.get("dynamic_sleep") or {}
         threshold = self._wake_threshold()
         if dynamic:
@@ -1633,7 +1661,7 @@ class SleepEngine:
             threshold = bounded(threshold + .06 * (rhythm / 50 - 1), 0, 1)
         decision = wake_decision(
             current, energy=self._energy_now(energy), earliest_wake=earliest,
-            lie_in_cap=session.lie_in_cap_at or
+            lie_in_cap=self._aware(session.lie_in_cap_at, current) or
             next_occurrence(earliest, self._lie_in_cap_minute()),
             hard_commitment_start=effective_hard,
             hard_commitment_lead_minutes=self._cfg_float(
@@ -1715,7 +1743,7 @@ class SleepEngine:
         if session.closed:
             return {"committed": True, "woke": False, "reason": "already_closed",
                     "session_id": session.session_id}
-        started_at = self._parse(session.metadata.get("sleep_started_at")) or now
+        started_at = self._aware(self._parse(session.metadata.get("sleep_started_at")), now) or now
         total_window_minutes = max(0.0, (now - started_at).total_seconds() / 60.0)
         interrupted = self._clock.record.total_interrupted_minutes(now)
         actual_sleep_minutes = max(0.0, total_window_minutes - interrupted)
@@ -1815,7 +1843,8 @@ class SleepEngine:
                   continuous_minutes=session.continuous_minutes)
         self._prepared = None
         dynamic = session.metadata.get("dynamic_sleep") or {}
-        earliest = self._parse(dynamic.get("wake_anchor")) or session.earliest_wake_at
+        earliest = self._aware(self._parse(dynamic.get("wake_anchor"))
+                               or session.earliest_wake_at, now)
         wake_delay = 0.0
         if isinstance(earliest, datetime) and now > earliest:
             wake_delay = (now - earliest).total_seconds() / 60.0

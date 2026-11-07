@@ -1,5 +1,13 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.3（2026-11-08）
+
+- PR-FIX-TZ 紧急修复跨日 sleep_engine naive/aware datetime 比较异常（真机生产 bug：监视 dwfrun-a22c4ef0 轮17–20，跨日 00:15 起每拍 `rolling_planner tick 异常（本拍跳过）：can't compare offset-naive and offset-aware datetimes`，栈指 `planning/rolling_planner.py:795 _try_dynamic_sleep`；bot 调度停摆、qzone 视频帖闸2「门控复检异常（保守不发）」持续 defer）。
+- **根因**：跨日后存在已闭合睡眠会话（`earliest_wake_at` None/naive + `actual_end_minute` + `schedule_date`）时，`_suppress_until` 返回 naive（strptime 回退无 tzinfo / `datetime.min` 兜底 / naive earliest+1h），与 aware `current` 混比抛 TypeError → `evaluate_onset` → `_try_dynamic_sleep` → 整拍跳过。
+- **睡眠引擎（`planning/sleep_engine.py`）**：新增内部助手 `_aware(dt, ref)`（naive 按引擎本地墙钟附参照 tz，aware/None 原样，与 `_restore_clock.stamp` 同口径）；`_suppress_until` 改实例方法、三分支返回一律 aware（含 `datetime.min` 兜底）；`should_start_sleep_episode`/`_recently_woke`/`actual_wake_today`/`evaluate_onset`（now 与 hard_start）/`_adapt_phase`/`is_asleep`/`next_wake_boundary`/`prepare_tick`/`_close_session`/`_start_session`/`_restore_recent_closed`/`_reconcile_recorded_wake` 比较点统一规范化。**抑制窗/wake 锚点/硬约定语义逐字不变**（naive 与 aware 同墙钟 → 同判定）。
+- **qzone 闸2 独立崩溃点（`qzone/service.py:_cooldown_remain_minutes`）**：冷却锚点 `last_post_at` 由 `datetime.now().isoformat()` 写入为 naive，闸2 复检 now 为业务时区 aware（`plugin._surf_now`）→ `now - last` 抛 TypeError → bridge「门控复检异常（保守不发）」。比较前统一 tz（naive 锚点附 now.tzinfo；反向 naive now 按系统本地折算）；回拨保守/损坏 fail-open/冷却关语义不变。
+- 红线：不重构睡眠引擎，只修时区一致性；不牺牲事实边界。配置：无新增字段（schema 不变，18 段 202 叶子）。版本双号 3.17.3（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round：3.17.3；test_prompt_identity_audit 双号断言顺延）。新增专项 `scratch/test_sleep_tz_crossday.py` 16/16（修前最小复现 `_tz_crossday_repro.py` 10/11 红、栈与真机一致，修后 11/11 绿）；回归 test_sleep_consistency_c3 / test_dynamic_sleep / test_sleep_anchor_380 / test_midnight_meal / test_qzone_video_a0–a3 不回归；七门禁 7/7。边界：本批不部署、不 git commit、不碰主机、不切 mode；部署后需观察跨日 tick 恢复正常 + 视频帖过闸2。
+
 ## 3.17.2（2026-11-07）
 
 - PR-PROACTIVE-REPLY 陪伴目标私聊主动激活轮的 reply 目标指令改写。背景：即使深处理改写了 planner 回复的 msg_id，宿主 replyer 仍从该 msg_id 渲染「你想要回复的消息是 … msg_id为 …」（自己消息则「你想要补充说明你自己…」），bot 被过时目标指令干扰。
