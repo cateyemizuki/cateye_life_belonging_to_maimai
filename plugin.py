@@ -1539,6 +1539,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 persona_provider=lambda: str(getattr(self, "_personality", "") or ""),
                 name_provider=lambda: str(getattr(self, "_lover_name", "") or "麦麦"),
                 schedule_provider=self._interest_schedule_summary,
+                # PR-C2：真实观看证据只读来源（B1 索引 watched_video）+ 两键
+                # 动态读 [video_watch]（热重载即时生效；读失败服务侧保守降级）
+                watch_evidence_provider=self._interest_watch_evidence_rows,
+                feedback_enabled_provider=self._interest_watch_feedback_enabled,
+                half_life_days_provider=self._interest_watch_half_life_days,
                 logger=self.ctx.logger)
             source = BiliCandidateSource(
                 interest, excluded_bvids=self._video_excluded_bvids, logger=self.ctx.logger)
@@ -1549,6 +1554,33 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         """候选去重集合（历史∪缓存∪活跃任务）；异常上抛由候选源保守降级。"""
         manager = self._video_watch.start()
         return manager.excluded_bvids() if manager is not None else set()
+
+    # ── PR-C2：真实观看 → 兴趣证据（B1 索引只读消费；纯旁路空降级）────────────
+    def _interest_watch_evidence_rows(self) -> list[dict]:
+        """B1 recent watched_video ≤20 行（反馈增量用；提示词只取前 5）。
+        索引缺失/经历开关关闭/失败 → []（兴趣服务空降级，绝不拖挂主业务）。"""
+        index = getattr(self, '_experience_index', None)
+        if index is None or not self._experience_enabled():
+            return []
+        try:
+            return index.recent(kinds=['watched_video'], limit=20,
+                                now=self._surf_now().timestamp())
+        except Exception:
+            return []
+
+    def _interest_watch_feedback_enabled(self) -> bool:
+        try:
+            return bool(getattr(self.config.video_watch,
+                                'interest_watch_feedback_enabled', True))
+        except Exception:
+            return False  # 配置不可读保守停用反馈（兴趣退回纯人设基线）
+
+    def _interest_watch_half_life_days(self) -> int:
+        try:
+            return int(getattr(self.config.video_watch,
+                               'interest_watch_half_life_days', 7) or 7)
+        except Exception:
+            return 7
 
     def _recent_video_share_service(self) -> Any:
         service = getattr(self, "_recent_video_share", None)
@@ -1650,6 +1682,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         返回值保持旧口径 = 聊天分享路是否记录了候选；空间路只留痕不影响返回值。
         PR-B1：第三路并列写经历索引（observed/watched_video）——证据等级沿用
         watched_facts 闸（无证据不记），失败只告警不影响前两路与返回值。
+        PR-C2：第四路并列增量更新兴趣证据层（真实观看驱动；幂等，开关关闭/
+        B1 缺失零影响），失败只告警不影响前三路与返回值。
         """
         recorded = False
         if self._video_social is not None:
@@ -1672,6 +1706,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 index.record_watched_video(facts, episode_id, task_id=task_id, now=now)
             except Exception as exc:
                 self.ctx.logger.warning('经历索引观看记录失败（忽略）：%s', exc)
+        try:
+            self._video_candidate_source().sync_watch_feedback(
+                now=self._surf_now().timestamp())
+        except Exception as exc:
+            self.ctx.logger.warning('观看兴趣证据增量更新失败（忽略）：%s', exc)
         return recorded
 
     def _qzone_video_assets_spec(self, data_dir: Path) -> Any:

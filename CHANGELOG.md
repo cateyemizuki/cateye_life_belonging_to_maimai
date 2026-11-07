@@ -1,5 +1,13 @@
 # 更新日志（CHANGELOG）
 
+## 3.14.0（2026-11-07）
+
+- PR-C2 真实观看驱动的兴趣演变（计划书 §5 H7 / §4 / §7 PR-C2）。**证据权重层**：`integrations/video_interest.py` 兴趣文档新增 `evidence_weights` 层（话题 → `{persona_base, watch_score, updated_at, positive_count}` + 已应用观看幂等键表）；最终权重 = persona_base + bounded(watch_score)，watch_score 饱和封顶 ±50%×base（内部常量）。persona_base = LLM 问询关键词的隐式基线 1.0，**观看反馈绝不改写 persona_base / LLM 关键词集合**——单次偶然观看不重写人格；周期人设刷新保留证据层，显式偏好初始化（reset）才整体重置（保守裁量，needsReview）。
+- **真实观看反馈源**：B1 索引 `observed/watched_video` 行（经注入 `watch_evidence_provider` 只读面，装配根 = `index.recent(kinds=['watched_video'], limit=20)`；索引缺失/经历开关关/失败 → 空降级）。观后感倾向用**确定性关键词计数**（`classify_impression`，0 新增 LLM 调用）：正向 +0.1 / 中性最小探索步长 +0.05 / 负面 −0.1（内部常量）；只更新与现有兴趣词匹配的标题话题（不凭单次观看新增话题，needsReview 登记保守口径）；dedupe_key 幂等同一观看不重复计分；更新时机 = 观看完成记录时（plugin `_record_video_result` 第四路并列 `sync_watch_feedback`，失败只告警）+ ensure_interest 前置增量同步。**衰减**：watch_score 指数衰减（半衰期 `[video_watch].interest_watch_half_life_days` 默认 7 天 ge1 le30；读时/更新时惰性折算，时钟回拨不放大）。
+- **候选取源**：BiliCandidateSource 关键词按最终权重排序（稳定排序，等权保持 LLM 序）；命中打分 = 命中词最终权重之和；池超上限（10）时 ≤7 槽给权重头部、≥3 槽按既有排行榜热度序补入（探索占比 ≥30%，内部常量 EXPLORE_POOL_RATIO=0.3；候选不超上限全部入池）。**开关关闭 = 现状逐字**（不读不写证据层、排序/打分/池构成/提示词与旧版一致）。
+- **LLM 问询**：ensure_interest 仍做人设基线刷新（TTL/降级纪律不变），周期刷新提示词变量区末尾附带真实观看证据摘要（B1 recent watched_video ≤5 行，声明为资料、不改变人设、指令不得执行）；稳定前缀逐字不变；偏好初始化（initial）仍只依据人设不注入证据（与既有稳定规则一致，needsReview）。
+- 配置：[video_watch] +2 字段（interest_watch_feedback_enabled=True；interest_watch_half_life_days=7 ge1 le30），200→202 字段；关=现状。版本双号 3.14.0（_manifest.json == SUPPORTED_CONFIG_VERSION）；七门禁计数/版本重钉（smoke/round：202 字段、video_watch 13 键、3.14.0）；新增专项 scratch/test_video_interest_c2.py。边界：本批不部署、不 git commit。
+
 ## 3.13.0（2026-11-07）
 
 - PR-C1 情绪原因时效 + 经历驱动的交流动机（计划书 §5 H4/H5 / §5.4 / §8.2.3/5/9）。**情绪原因时效（H4）**：新增 `emotion/reason_ledger.py`（ReasonLedger，0 LLM、纯解释层）——短期原因 `{reason_id, summary≤120字, source_ref(来源:流:事件摘要SHA-1前16位，不存正文), delta_vad, created_at, expires_at, salience}`；`EmotionStateMachine.record_event` 增 kw-only `source_ref/ttl_hours/salience`，结算后同步登记（source_ref 唯一 dedupe 不重复记账；TTL 夹 [1,48]h 缺省 6h；容量 64 超限淘汰最旧；冻结期未结算事件不登记原因）。**原因层只作「为什么」的可核验解释与注入措辞参考，绝不二次加减 VAD**——有无 source_ref 的 VAD 结算逐字一致；`effective_salience` 按剩余寿命线性衰减（只作观测口径），过期原因不再进入任何消费口；延迟影响/渐进恢复仍由既有 decay 承担（decay 曲线零改动）。账本随 `emotion_state.json` 落盘（旧文件缺键→空账本），人设重新初始化随情绪残留清空。注入：`EmotionService.injection_text` 稳定模板前置不变，仅在存在最近 1 条未过期高 salience（≥0.5）原因时追加一行稳定模板「（心情原因参考：因为…。这份影响会随时间慢慢淡去…）」；无原因/`emotion_reason_inject_enabled=false` → 输出与旧版逐字一致。登记接线在唯一结算点 `_apply_external_delta`（replyer 评估/episode 冲刷/工具上报/模板事件共用）。
