@@ -12,8 +12,9 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
                                        主动回合软约束（BLOCKING/NORMAL；
                                        items 强 schema 协议 + messages 双投影 +
                                        modified_kwargs 全量回传 + >8MB 载荷收缩）
-  - maisaka.replyer.before_model_request  过期主动任务块剥离 + 仅屏幕旁白注入
-                                       （BLOCKING/NORMAL）
+  - maisaka.replyer.before_model_request  过期主动任务块剥离 + 屏幕旁白注入 +
+                                       陪伴私聊主动激活轮宿主目标指令改写
+                                       （PR-PROACTIVE-REPLY 3.17.2；BLOCKING/NORMAL）
   - maisaka.replyer.after_response     90 秒窗口补计 0.5 发言数 + spoken 回执（OBSERVE/LATE）
 - Tools ×2：lbm_mai_lover_affection（F3 2026-11-04：is_enabled + 目标私聊 scope 校验，
   决策痕带调用者身份）/
@@ -603,17 +604,22 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     @HookHandler(
         "maisaka.replyer.before_model_request",
         name="mai_lover_replyer_screen_inject",
-        description="把屏幕旁白以尾随锚点方式插进 replyer 的模型请求上下文",
+        description="把屏幕旁白以尾随锚点方式插进 replyer 的模型请求上下文；陪伴私聊主动激活轮把宿主目标指令改写为主动激活文案",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
         timeout_ms=3000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def mai_hook_replyer_model_inject(self, **kwargs: Any) -> dict[str, Any]:
-        """replyer 通道只做屏幕旁白注入，不碰 extra_prompt 等其他入参。
+        """replyer 通道：屏幕旁白注入 + 主动激活轮目标指令改写，不碰 extra_prompt 等其他入参。
 
         replyer 的上下文与 planner 不一定相同，所以旁白的锚点在两个通道里
         分开识别、分开失效（见 screen_context）。
+
+        PR-PROACTIVE-REPLY（3.17.2）：陪伴目标私聊 + 插件主动激活轮（active_task
+        命中或巡检触发窗口内）时，把宿主渲染的「你想要回复的消息是…」/「你想要
+        补充说明你自己…」目标指令整段替换为主动激活文案；未匹配到时保守追加
+        尾随锚点并留诊断。非主动轮（用户真实来信回复）逐字不变。
         """
         # mai-love v2.6.2：replyer 的上下文同样携带宿主主动任务块，一并剥离过期块
         _tracker = getattr(self, "_attention_tracker", None)
@@ -630,10 +636,90 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         companion = self._mai_companion()
         if companion is None:
             return {"action": "continue"}
+        changed = False
         modified = self._mai_apply_screen_narration(kwargs, CHANNEL_REPLYER)
-        if modified is None:
+        if modified is not None:
+            kwargs = modified
+            changed = True
+        rewritten = self._mai_apply_proactive_reply_rewrite(kwargs)
+        if rewritten is not None:
+            kwargs = rewritten
+            changed = True
+        if not changed:
             return {"action": "continue"}
-        return {"action": "continue", "modified_kwargs": modified}
+        return {"action": "continue", "modified_kwargs": kwargs}
+
+    def _mai_proactive_replyer_active(self, payload_key: str, payload: list[Any]) -> bool:
+        """replyer 主动激活轮判定（仅由 _mai_apply_proactive_reply_rewrite 在目标私聊内调用）。
+
+        与 planner 侧同口径：active_task(items) 命中，或巡检触发时间仍在
+        ``_PROACTIVE_RULE_WINDOW_SECONDS`` 窗口内。窗口路径额外保守让位：
+        上下文里最后一条真实来信比触发时间更新 → 按用户真实来信回复轮处理
+        （红线：真实来信轮逐字不变）；来信时间戳不可解析时同样让位。
+        """
+        import time as _time
+        from integrations.proactive_reply_target import active_task, latest_incoming_timestamp
+        items = payload if payload_key == "items" else []
+        if active_task(items, _time.time() * 1000) is not None:
+            return True
+        companion = self._mai_companion()
+        if companion is None:
+            return False
+        last_trigger = companion.patrol.get_last_trigger_time()
+        if last_trigger is None:
+            return False
+        if (datetime.now() - last_trigger).total_seconds() > _PROACTIVE_RULE_WINDOW_SECONDS:
+            return False
+        has_incoming, latest = latest_incoming_timestamp(items)
+        if has_incoming:
+            if latest is None:
+                return False  # 来信时间戳不可解析 → 无法排除真实来信轮，保守让位
+            if latest.tzinfo is not None:
+                latest = latest.astimezone().replace(tzinfo=None)
+            trigger = last_trigger
+            if trigger.tzinfo is not None:
+                trigger = trigger.astimezone().replace(tzinfo=None)
+            if latest > trigger:
+                return False
+        return True
+
+    def _mai_apply_proactive_reply_rewrite(self, kwargs: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """陪伴目标私聊 + 主动激活轮：替换 replyer 宿主目标指令；失败保守追加+诊断。
+
+        只改提示词文本，不触碰预算/静默/好感/隐私门控；非目标流/非主动轮返回
+        None（调用方原样继续）。
+        """
+        from integrations.proactive_reply_target import (
+            append_proactive_notice,
+            payload_has_proactive_notice,
+            rewrite_replyer_payload,
+        )
+        stream = self._mai_reply_target_stream()
+        session_id = str(kwargs.get("session_id") or "")
+        if not stream or session_id != stream:
+            return None
+        if self._mai_companion() is None:
+            return None
+        payload_key, payload = pick_payload_key(kwargs)
+        if not payload_key or not isinstance(payload, list):
+            return None
+        if not self._mai_proactive_replyer_active(payload_key, payload):
+            return None
+        updated, replaced = rewrite_replyer_payload(payload_key, payload)
+        if replaced:
+            self.ctx.logger.info(
+                f"陪伴主动激活轮：已把 replyer 宿主目标指令替换为主动激活文案（{replaced} 段）")
+            return {**kwargs, payload_key: updated}
+        if payload_has_proactive_notice(payload_key, payload):
+            return None  # 已含主动激活文案（重试/重复钩子）：幂等，不二次追加
+        appended = append_proactive_notice(payload_key, payload)
+        if appended is None:
+            self.ctx.logger.warning(
+                "陪伴主动激活轮：replyer 载荷无可追加文本条目，主动激活文案未注入")
+            return None
+        self.ctx.logger.warning(
+            "陪伴主动激活轮：未匹配到宿主目标指令段，已保守追加主动激活文案作为尾随锚点")
+        return {**kwargs, payload_key: appended}
 
     @HookHandler(
         "maisaka.replyer.after_response",
@@ -846,7 +932,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         return "\n".join(lines)
 
     def _mai_build_proactive_target_rule(self) -> str:
-        """主动发言回合给 planner 的回复目标约束（软约束，宿主无法强制目标）。"""
+        """主动发言回合给 planner 的主动激活引导（软约束；3.17.2 起不再指认过时消息）。"""
         companion = self._mai_companion()
         if companion is None:
             return ""

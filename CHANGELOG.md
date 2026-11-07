@@ -1,5 +1,13 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.2（2026-11-07）
+
+- PR-PROACTIVE-REPLY 陪伴目标私聊主动激活轮的 reply 目标指令改写。背景：即使深处理改写了 planner 回复的 msg_id，宿主 replyer 仍从该 msg_id 渲染「你想要回复的消息是 … msg_id为 …」（自己消息则「你想要补充说明你自己…」），bot 被过时目标指令干扰。
+- **replyer 侧（核心）**：`companion/components.py:mai_hook_replyer_model_inject` 在陪伴目标私聊（`_mai_reply_target_stream` 精确匹配）+ 主动激活轮（`active_task(items)` 命中或巡检触发 90 秒窗口内；窗口路径若上下文最后一条真实来信比触发更新则保守让位）时，把宿主目标指令整段（前缀行 + 后续「- quote=/- 发言内容/- 你之前的发言内容」明细行）替换为「本轮回复为插件主动激活，你需要根据上方planner传回的状况概括，结合你此刻的状态进行回复，不需要特地回复某个信息」。只触碰「当前时间：」起始的宿主最终用户消息文本，历史消息/旁白/参考文本不碰；未匹配到 → 保守追加尾随锚点 + warning 诊断；已含文案幂等不二次追加。纯函数在 `integrations/proactive_reply_target.py`（rewrite_host_target_text / rewrite_replyer_payload / append_proactive_notice / latest_incoming_timestamp）。
+- **planner 侧对齐**：`_target_prompt` 主动轮不再指认具体 msg_id，改为主动激活语义（保留「msg_id 只能选对方发送的消息」有效性约束与不回复选择）；`INJECT_PROACTIVE_TURN_RULE_DEFAULT` 去掉「优先回应对方最后一条发言」，改主动激活引导（仍经 prompt() 回退表读取）；深处理 `ProactiveReplyTargets.after` 主动轮跳过强制 msg_id（rewrite_reply_calls 保留为 utility），目标指令改写统一由 replyer 钩子完成。
+- 红线：仅陪伴目标私聊 + 主动激活轮生效；非主动轮（用户真实来信回复）逐字不变；预算/静默/好感/隐私门控不触碰；不新增命令/工具。
+- 配置：无新增字段（schema 不变，18 段 202 叶子）；`proactive_reply_target_mode` 字段保留、描述更新为 3.17.2 语义（浅/深均提示-only）。版本双号 3.17.2（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round：3.17.2；test_prompt_identity_audit 双号断言顺延）。新增专项 `scratch/test_proactive_reply_rewrite.py`；既有 `test_proactive_reply_target.py` 中断言旧「指认 msg_id/深处理强制改写」行为的用例按规格更新为主动激活语义预期。边界：本批不部署、不 git commit、不碰主机、不切 mode；部署后需真机主动触发验证 replyer 快照实际生效。
+
 ## 3.17.0（2026-11-07）
 
 - PR-WATCH `/lbm_plan watch` 改为强制 debug 命令（与当前日程并行触发，绕过 attention_revoked 注意力门控）。背景：监视发现 19:53 的 `/lbm_plan watch` 周期 `gap-cmd-8f86ec3641d4` 以 `failed_submit/attention_revoked`（「当前没有有效的自动观看注意力，不启动任务」）关闭，整条链路零步未跑。

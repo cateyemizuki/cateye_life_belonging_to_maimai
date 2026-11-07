@@ -144,11 +144,12 @@ class PatrolSectionConfig(PluginConfigBase):
     # ── 巡检循环 ─────────────────────────────────────────────
     proactive_reply_target_mode: Literal["浅处理", "深度处理"] = Field(
         default="浅处理",
-        description="陪伴私聊的插件主动任务如何选择回复目标：浅处理提示planner使用用户最后一条来信；深度处理还会在执行reply前改写目标消息ID。",
+        description="陪伴私聊的插件主动任务的回复目标处理方式（3.17.2 起两种模式都只做主动激活提示，不再在执行reply前强制改写目标消息ID；"
+                    "replyer 侧会自动把宿主目标指令改写为主动激活文案）。保留不回复的选择，不影响普通来信回合。",
         json_schema_extra={
             "label": "主动回复目标处理",
-            "hint": "默认只加提示；深度处理仅改本轮reply的目标ID，保留不回复的选择，不影响普通来信回合。",
-            **_ui_i18n("Proactive reply target", "Prompt only by default; deep mode also corrects the reply target before execution."),
+            "hint": "3.17.2 起浅/深处理均只加主动激活提示；replyer 目标指令由钩子自动改写，普通来信回合逐字不变。",
+            **_ui_i18n("Proactive reply target", "Since 3.17.2 both modes are prompt-only; the replyer hook rewrites the host target instruction on proactive turns."),
         },
     )
 

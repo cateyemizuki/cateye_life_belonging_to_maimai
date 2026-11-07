@@ -20,7 +20,7 @@
 planning_proactive/admin/qzone/emotion）里的同名键，值会照旧保留。
 
 **config_version 与迁移保障（2026-10-10 第二版，已订正；3.0.0 起版本随 PR8 递增）**：
-开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值随插件版本递增（当前 `3.17.1`；历史：3.1.0 为 2026-11-04 配置精简版、3.0.0 为 2026-10-27 PR8 清理版、2.2.0 为 2026-10-27 二期 PR7 开发版、2.1.0 于 2026-10-21 归档发布）；
+开发规范（红线 R6）要求 `config_version` **与 `_manifest.json` 的插件版本同步**，故本值随插件版本递增（当前 `3.17.2`；历史：3.1.0 为 2026-11-04 配置精简版、3.0.0 为 2026-10-27 PR8 清理版、2.2.0 为 2026-10-27 二期 PR7 开发版、2.1.0 于 2026-10-21 归档发布）；
 迁移保障改由 **plugin.py 的「磁盘旧文件抢救」**（`CateyeSuitePlugin.normalize_plugin_config` 先读尚未被
 宿主覆写的磁盘 `config.toml`，把用户值并回输入）＋ 下面的 `mode="before"` 一次性迁移器共同承担。
 **旧口径（已作废）如下，仅留作教训**：宿主 Runner 在「配置版本号变化」时会
@@ -182,7 +182,11 @@ from suite_prompts import (
 # （schema 不变，18 段 202 叶子）；QZONE_VIDEO_POLICY 输出 Schema 增 asset_ids 与
 # available_assets 选择规则、publish 资产闸增确定性回退选择，均不新增配置键，按 R6
 # 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.1"
+# 3.17.2（2026-11-07 PR-PROACTIVE-REPLY 主动激活轮 reply 目标指令改写）：无新增配置
+# 字段（schema 不变，18 段 202 叶子）；INJECT_PROACTIVE_TURN_RULE_DEFAULT 默认模板
+# 主动语义化、proactive_reply_target_mode 描述更新（字段面/类型/默认值不变），
+# 不新增配置键，按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.2"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
