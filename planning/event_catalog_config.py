@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """Small-event configuration and the flattened schedule fields.
 
-Reusable and one-shot requests share a total capacity. After the five builtins,
-remaining slots split evenly (odd slot to reusable), each capped by the user's
-per-pool generation limit. Legacy event_catalog input is migrated by the root.
+v3.9.2：三时段配额按「可复用 / 一次性」分开配置（reusable_* / one_shot_*），
+每时段请求条数 = 两者之和；默认合计生成 24 条（可复用 10 + 一次性 14），
+总池 = 内置 5 + 生成 24 = 29，上限 32。更新周期默认 7–10 天（用户自定义
+范围仍按 1–365 夹取，不锁死默认值）。Legacy event_catalog input is migrated
+by the root；旧 period_limit_* 三键退役（纯 pop，不搬运）。
 """
 
 from __future__ import annotations
@@ -18,18 +20,26 @@ from core.internal_tuning import tuning_value as _tuning_value
 
 #: 代码默认（定稿 §1 #6：部署灰度先 manual，代码默认 off）
 DEFAULT_MODE = "off"
-DEFAULT_MIN_INTERVAL_DAYS = 5
-DEFAULT_MAX_INTERVAL_DAYS = 15
-#: 定稿 §4.3.1 / 附录 B.6.3：生成条数上限
+#: v3.9.2 用户裁定：更新周期默认 7–10 天；自定义范围仍按 1–365 夹取
+DEFAULT_MIN_INTERVAL_DAYS = 7
+DEFAULT_MAX_INTERVAL_DAYS = 10
+#: 定稿 §4.3.1 / 附录 B.6.3：生成条数上限（旧单池口径，v3.9.2 起双池条数由时段配额决定）
 DEFAULT_MAX_GENERATED_EVENTS = 8
 DEFAULT_MIN_GENERATED_EVENTS = 1
-#: v3.9.0 三时段独立生成上限（00-08 / 08-16 / 16-24），合计默认 7（=总池12-内置5）
-DEFAULT_PERIOD_LIMIT_00_08 = 1
-DEFAULT_PERIOD_LIMIT_08_16 = 3
-DEFAULT_PERIOD_LIMIT_16_24 = 3
-PERIOD_LIMIT_MAX = 8
-#: 附录 B.1.3：active_events 总池上限（用户已裁定规范字段默认 12）
-DEFAULT_MAX_POOL_EVENTS = 12
+#: v3.9.2 三时段「可复用 / 一次性」独立配额（00-08 / 08-16 / 16-24）：
+#: 可复用默认 1/5/4（合计 10），一次性默认 3/6/5（合计 14），总计生成 24 条。
+DEFAULT_REUSABLE_00_08 = 1
+DEFAULT_REUSABLE_08_16 = 5
+DEFAULT_REUSABLE_16_24 = 4
+DEFAULT_ONE_SHOT_00_08 = 3
+DEFAULT_ONE_SHOT_08_16 = 6
+DEFAULT_ONE_SHOT_16_24 = 5
+#: 单项配额上限（每时段每池 0–12）
+EVENT_QUOTA_MAX = 12
+#: v3.9.2 总池扩容：内置 5 + 生成 24 = 29，上限 32（internal_tuning.json 同钉）
+DEFAULT_MAX_POOL_EVENTS = 32
+#: NO Puzzle 开关默认开：生成提示词追加反套路引导（避免拼图/十字绣等滥用活动）
+DEFAULT_NO_PUZZLE = True
 DEFAULT_TASK_NAME = "utils"
 DEFAULT_TEMPERATURE = 0.9
 #: 自动检查节拍（秒）；每天最多真正生成一次，检查本身不消耗 LLM
@@ -69,37 +79,56 @@ class EventCatalogSectionConfig(PluginConfigBase):
         default=DEFAULT_MIN_INTERVAL_DAYS,
         ge=1,
         le=365,
-        description="生成周期下限（天，建议 5）",
+        description="生成周期下限（天，建议 7）",
         json_schema_extra={"label": "生成周期下限(天)", **_i18n("Min interval (days)")},
     )
     max_interval_days: int = Field(
         default=DEFAULT_MAX_INTERVAL_DAYS,
         ge=1,
         le=365,
-        description="生成周期上限（天，建议 15）",
+        description="生成周期上限（天，建议 10）",
         json_schema_extra={"label": "生成周期上限(天)", **_i18n("Max interval (days)")},
     )
     max_generated_events: int = Field(
         default=DEFAULT_MAX_GENERATED_EVENTS,
         ge=DEFAULT_MIN_GENERATED_EVENTS,
         le=DEFAULT_MAX_GENERATED_EVENTS,
-        description="每个生成池的条数上限（1至8）；两池平分扣除内置事件后的总容量。",
-        json_schema_extra={"label": "每池生成上限", "hint":"默认总容量12：内置5、可复用最多4、一次性最多3；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
+        description="每个生成池的条数上限（1至8，旧单池口径）；v3.9.2 起双池条数由三时段可复用/一次性配额决定。",
+        json_schema_extra={"label": "每池生成上限", "hint":"默认总容量32：内置5+生成24；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
     )
-    period_limit_00_08: int = Field(
-        default=DEFAULT_PERIOD_LIMIT_00_08, ge=0, le=PERIOD_LIMIT_MAX,
-        description="00:00–08:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。深夜清晨低干扰活动。",
-        json_schema_extra={"label": "00-08时段生成上限", **_i18n("00-08 slot limit")},
+    reusable_00_08: int = Field(
+        default=DEFAULT_REUSABLE_00_08, ge=0, le=EVENT_QUOTA_MAX,
+        description="00:00–08:00 时段可复用小事件生成配额（0=该时段该池不生成）。深夜清晨低干扰活动。",
+        json_schema_extra={"label": "00-08可复用生成配额", **_i18n("00-08 reusable quota")},
     )
-    period_limit_08_16: int = Field(
-        default=DEFAULT_PERIOD_LIMIT_08_16, ge=0, le=PERIOD_LIMIT_MAX,
-        description="08:00–16:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。日间家务/照料/学习。",
-        json_schema_extra={"label": "08-16时段生成上限", **_i18n("08-16 slot limit")},
+    reusable_08_16: int = Field(
+        default=DEFAULT_REUSABLE_08_16, ge=0, le=EVENT_QUOTA_MAX,
+        description="08:00–16:00 时段可复用小事件生成配额（0=该时段该池不生成）。日间家务/照料/学习。",
+        json_schema_extra={"label": "08-16可复用生成配额", **_i18n("08-16 reusable quota")},
     )
-    period_limit_16_24: int = Field(
-        default=DEFAULT_PERIOD_LIMIT_16_24, ge=0, le=PERIOD_LIMIT_MAX,
-        description="16:00–24:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。傍晚夜晚温和休闲。",
-        json_schema_extra={"label": "16-24时段生成上限", **_i18n("16-24 slot limit")},
+    reusable_16_24: int = Field(
+        default=DEFAULT_REUSABLE_16_24, ge=0, le=EVENT_QUOTA_MAX,
+        description="16:00–24:00 时段可复用小事件生成配额（0=该时段该池不生成）。傍晚夜晚温和休闲。",
+        json_schema_extra={"label": "16-24可复用生成配额", **_i18n("16-24 reusable quota")},
+    )
+    one_shot_00_08: int = Field(
+        default=DEFAULT_ONE_SHOT_00_08, ge=0, le=EVENT_QUOTA_MAX,
+        description="00:00–08:00 时段一次性小事件生成配额（抽中后本周期不再出现）。深夜清晨低干扰活动。",
+        json_schema_extra={"label": "00-08一次性生成配额", **_i18n("00-08 one-shot quota")},
+    )
+    one_shot_08_16: int = Field(
+        default=DEFAULT_ONE_SHOT_08_16, ge=0, le=EVENT_QUOTA_MAX,
+        description="08:00–16:00 时段一次性小事件生成配额（抽中后本周期不再出现）。日间家务/照料/学习。",
+        json_schema_extra={"label": "08-16一次性生成配额", **_i18n("08-16 one-shot quota")},
+    )
+    one_shot_16_24: int = Field(
+        default=DEFAULT_ONE_SHOT_16_24, ge=0, le=EVENT_QUOTA_MAX,
+        description="16:00–24:00 时段一次性小事件生成配额（抽中后本周期不再出现）。傍晚夜晚温和休闲。",
+        json_schema_extra={"label": "16-24一次性生成配额", **_i18n("16-24 one-shot quota")},
+    )
+    no_puzzle: bool = Field(
+        default=DEFAULT_NO_PUZZLE,
+        json_schema_extra={"label": "NO Puzzle"},
     )
     # 2026-11-04 配置精简轮（J 类）：max_pool_events 移入
     # mappings/internal_tuning.json[event_catalog]（内部容量）；同名只读 property 见下。
@@ -134,9 +163,10 @@ class EventCatalogConfig:
     min_interval_days: int = DEFAULT_MIN_INTERVAL_DAYS
     max_interval_days: int = DEFAULT_MAX_INTERVAL_DAYS
     max_generated_events: int = DEFAULT_MAX_GENERATED_EVENTS
-    period_limit_00_08: int = DEFAULT_PERIOD_LIMIT_00_08
-    period_limit_08_16: int = DEFAULT_PERIOD_LIMIT_08_16
-    period_limit_16_24: int = DEFAULT_PERIOD_LIMIT_16_24
+    #: 三时段配额（顺序对齐 event_slots.TIME_SLOTS）：可复用 / 一次性分开
+    reusable_limits: tuple = (DEFAULT_REUSABLE_00_08, DEFAULT_REUSABLE_08_16, DEFAULT_REUSABLE_16_24)
+    one_shot_limits: tuple = (DEFAULT_ONE_SHOT_00_08, DEFAULT_ONE_SHOT_08_16, DEFAULT_ONE_SHOT_16_24)
+    no_puzzle: bool = DEFAULT_NO_PUZZLE
     max_pool_events: int = DEFAULT_MAX_POOL_EVENTS
     enforce_pool_cap: bool = True
     task_name: str = DEFAULT_TASK_NAME
@@ -147,8 +177,8 @@ class EventCatalogConfig:
 
     @property
     def period_limits(self) -> tuple:
-        """三时段生成上限，顺序对齐 event_slots.TIME_SLOTS。"""
-        return (self.period_limit_00_08, self.period_limit_08_16, self.period_limit_16_24)
+        """三时段合计请求条数（可复用+一次性），顺序对齐 event_slots.TIME_SLOTS。"""
+        return tuple(int(r) + int(o) for r, o in zip(self.reusable_limits, self.one_shot_limits))
 
     @property
     def period_limit_total(self) -> int:
@@ -197,9 +227,9 @@ def resolve_config(source: Any) -> EventCatalogConfig:
     2. 仅旧键 ``max_events`` 显式给出 → 按生成条数兼容接管；
     3. 都没有 → 规范字段默认 8。
 
-    总池上限读 ``max_pool_events``（规范字段，默认 12）、生成上限读
-    ``max_generated_events``（规范字段，默认 8）；``max_events`` 仅作旧读法兜底。
-    用户已裁定合并总池 <=12，故 ``enforce_pool_cap`` 默认 True；保留该参数仅为
+    总池上限读 ``max_pool_events``（规范字段，v3.9.2 默认 32）、生成上限读
+    ``max_generated_events``（规范字段，默认 8，旧单池口径）；``max_events`` 仅作旧读法兜底。
+    用户已裁定合并总池 <=32，故 ``enforce_pool_cap`` 默认 True；保留该参数仅为
     兼容旧测试/显式放宽。
     """
     if source is None:
@@ -229,24 +259,28 @@ def resolve_config(source: Any) -> EventCatalogConfig:
                               DEFAULT_MAX_INTERVAL_DAYS))
     if min_days > max_days:
         min_days, max_days = max_days, min_days
-    # 定稿 §4.3 / 附录 B.1.5：周期 5~15 天；配置越界按边界夹取
-    min_days = max(DEFAULT_MIN_INTERVAL_DAYS, min(DEFAULT_MAX_INTERVAL_DAYS, min_days))
-    max_days = max(DEFAULT_MIN_INTERVAL_DAYS, min(DEFAULT_MAX_INTERVAL_DAYS, max_days))
+    # v3.9.2：周期默认 7–10 天，但用户自定义范围不锁死默认值——只按 Field 边界 1–365 夹取
+    min_days = max(1, min(365, min_days))
+    max_days = max(1, min(365, max_days))
     if min_days > max_days:
         min_days, max_days = max_days, min_days
     # 用户锁定 temperature=0.9（固定协议）：不读配置，避免出现「可编辑但永不生效」的死键。
     # 字段仍在 section 上（隐藏、默认 0.9）以便配置文件自洽；想改只能改本模块常量。
     temperature = DEFAULT_TEMPERATURE
-    def _period(name: str, default: int) -> int:
-        return max(0, min(PERIOD_LIMIT_MAX, _as_int(_attr(source, name, default), default)))
+    def _quota(name: str, default: int) -> int:
+        return max(0, min(EVENT_QUOTA_MAX, _as_int(_attr(source, name, default), default)))
     return EventCatalogConfig(
         mode=mode,
         min_interval_days=min_days,
         max_interval_days=max_days,
         max_generated_events=generated,
-        period_limit_00_08=_period("period_limit_00_08", DEFAULT_PERIOD_LIMIT_00_08),
-        period_limit_08_16=_period("period_limit_08_16", DEFAULT_PERIOD_LIMIT_08_16),
-        period_limit_16_24=_period("period_limit_16_24", DEFAULT_PERIOD_LIMIT_16_24),
+        reusable_limits=(_quota("reusable_00_08", DEFAULT_REUSABLE_00_08),
+                         _quota("reusable_08_16", DEFAULT_REUSABLE_08_16),
+                         _quota("reusable_16_24", DEFAULT_REUSABLE_16_24)),
+        one_shot_limits=(_quota("one_shot_00_08", DEFAULT_ONE_SHOT_00_08),
+                         _quota("one_shot_08_16", DEFAULT_ONE_SHOT_08_16),
+                         _quota("one_shot_16_24", DEFAULT_ONE_SHOT_16_24)),
+        no_puzzle=bool(_attr(source, "no_puzzle", DEFAULT_NO_PUZZLE)),
         max_pool_events=max(1, _as_int(_attr(source, "max_pool_events", DEFAULT_MAX_POOL_EVENTS),
                                        DEFAULT_MAX_POOL_EVENTS)),
         enforce_pool_cap=bool(_attr(source, "enforce_pool_cap", True)),
@@ -320,37 +354,56 @@ class EventCatalogFields(PluginConfigBase):
         default=DEFAULT_MIN_INTERVAL_DAYS,
         ge=1,
         le=365,
-        description="生成周期下限（天，建议 5）",
+        description="生成周期下限（天，建议 7）",
         json_schema_extra={"label": "生成周期下限(天)", **_i18n("Min interval (days)")},
     )
     event_catalog_max_interval_days: int = Field(
         default=DEFAULT_MAX_INTERVAL_DAYS,
         ge=1,
         le=365,
-        description="生成周期上限（天，建议 15）",
+        description="生成周期上限（天，建议 10）",
         json_schema_extra={"label": "生成周期上限(天)", **_i18n("Max interval (days)")},
     )
     event_catalog_max_generated_events: int = Field(
         default=DEFAULT_MAX_GENERATED_EVENTS,
         ge=DEFAULT_MIN_GENERATED_EVENTS,
         le=DEFAULT_MAX_GENERATED_EVENTS,
-        description="每个生成池的条数上限（1至8）；两池平分扣除内置事件后的总容量。",
-        json_schema_extra={"label": "每池生成上限", "hint":"默认总容量12：内置5、可复用最多4、一次性最多3；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
+        description="每个生成池的条数上限（1至8，旧单池口径）；v3.9.2 起双池条数由三时段可复用/一次性配额决定。",
+        json_schema_extra={"label": "每池生成上限", "hint":"默认总容量32：内置5+生成24；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
     )
-    event_catalog_period_limit_00_08: int = Field(
-        default=DEFAULT_PERIOD_LIMIT_00_08, ge=0, le=PERIOD_LIMIT_MAX,
-        description="00:00–08:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。",
-        json_schema_extra={"label": "00-08时段生成上限", **_i18n("00-08 slot limit")},
+    event_catalog_reusable_00_08: int = Field(
+        default=DEFAULT_REUSABLE_00_08, ge=0, le=EVENT_QUOTA_MAX,
+        description="00:00–08:00 时段可复用小事件生成配额（0=该时段该池不生成）。",
+        json_schema_extra={"label": "00-08可复用生成配额", **_i18n("00-08 reusable quota")},
     )
-    event_catalog_period_limit_08_16: int = Field(
-        default=DEFAULT_PERIOD_LIMIT_08_16, ge=0, le=PERIOD_LIMIT_MAX,
-        description="08:00–16:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。",
-        json_schema_extra={"label": "08-16时段生成上限", **_i18n("08-16 slot limit")},
+    event_catalog_reusable_08_16: int = Field(
+        default=DEFAULT_REUSABLE_08_16, ge=0, le=EVENT_QUOTA_MAX,
+        description="08:00–16:00 时段可复用小事件生成配额（0=该时段该池不生成）。",
+        json_schema_extra={"label": "08-16可复用生成配额", **_i18n("08-16 reusable quota")},
     )
-    event_catalog_period_limit_16_24: int = Field(
-        default=DEFAULT_PERIOD_LIMIT_16_24, ge=0, le=PERIOD_LIMIT_MAX,
-        description="16:00–24:00 时段每个生成周期的候选库生成上限（0=该时段不调用LLM）。",
-        json_schema_extra={"label": "16-24时段生成上限", **_i18n("16-24 slot limit")},
+    event_catalog_reusable_16_24: int = Field(
+        default=DEFAULT_REUSABLE_16_24, ge=0, le=EVENT_QUOTA_MAX,
+        description="16:00–24:00 时段可复用小事件生成配额（0=该时段该池不生成）。",
+        json_schema_extra={"label": "16-24可复用生成配额", **_i18n("16-24 reusable quota")},
+    )
+    event_catalog_one_shot_00_08: int = Field(
+        default=DEFAULT_ONE_SHOT_00_08, ge=0, le=EVENT_QUOTA_MAX,
+        description="00:00–08:00 时段一次性小事件生成配额（抽中后本周期不再出现）。",
+        json_schema_extra={"label": "00-08一次性生成配额", **_i18n("00-08 one-shot quota")},
+    )
+    event_catalog_one_shot_08_16: int = Field(
+        default=DEFAULT_ONE_SHOT_08_16, ge=0, le=EVENT_QUOTA_MAX,
+        description="08:00–16:00 时段一次性小事件生成配额（抽中后本周期不再出现）。",
+        json_schema_extra={"label": "08-16一次性生成配额", **_i18n("08-16 one-shot quota")},
+    )
+    event_catalog_one_shot_16_24: int = Field(
+        default=DEFAULT_ONE_SHOT_16_24, ge=0, le=EVENT_QUOTA_MAX,
+        description="16:00–24:00 时段一次性小事件生成配额（抽中后本周期不再出现）。",
+        json_schema_extra={"label": "16-24一次性生成配额", **_i18n("16-24 one-shot quota")},
+    )
+    event_catalog_no_puzzle: bool = Field(
+        default=DEFAULT_NO_PUZZLE,
+        json_schema_extra={"label": "NO Puzzle"},
     )
     event_catalog_task_name: str = Field(
         default=DEFAULT_TASK_NAME,

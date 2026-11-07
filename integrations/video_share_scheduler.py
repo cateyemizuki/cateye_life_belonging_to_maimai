@@ -295,48 +295,61 @@ class ManualVideoShares:
         self._choose = chooser
         self._lock = asyncio.Lock()
 
-    async def share(self, stream_id: str, request_id: str = '', *, preferred_bvid: str = '') -> dict:
+    async def share(self, stream_id: str, request_id: str = '', *, video: str = '',
+                    to_companion: bool = False) -> dict:
+        """两参数手动分享：①video=BV号或视频链接（解析真实BV）；②to_companion。
+
+        to_companion=true → 转发陪伴目标私聊（配置取流并核验身份）；false/不传 →
+        发送到当前聊天（工具调用所在流）。目标不由 bot 指定任意 stream_id。防重/
+        回执/账号核验/未知不补发等安全边界与自动分享共用同一台账，保持不变。
+        """
         async with self._lock:
             ledger = self.social.ledger
-            routes = await self.social.profiles.routes(manual_stream=stream_id)
+            # 参数①：工具层已把 BV/链接/短链解析为真实BV（复用 video_watch.bv）；
+            # 此处只接受形态合法的BV，非法/未解析诚实不发送（integrations 不反向依赖 video_watch）。
+            bvid = str(video or '').strip()
+            if not BV.fullmatch(bvid):
+                return {'success': False, 'error_class': 'invalid_video',
+                        'content': '未解析到真实BV号（仅支持B站视频BV/页面链接/b23.tv短链/分享文字），不搜索、不编造、不发送。'}
+            # 参数②：陪伴目标私聊或当前聊天；去掉任意指定聊天流参数。
+            target = self.social.profiles.companion_target() if to_companion else {}
+            send_stream = (target.get('stream_id') or '') if to_companion else str(stream_id or '')
+            if to_companion and not send_stream:
+                return {'success': False, 'error_class': 'companion_unavailable',
+                        'content': '陪伴目标私聊不可核验，不发送。'}
+            routes = await self.social.profiles.routes(manual_stream=send_stream)
             if len(routes) != 1:
                 return {'success': False, 'error_class': 'unknown_current_stream',
-                        'content': '当前聊天路由不可核验，不发送。'}
-            key = hashlib.sha256((stream_id + '|' + request_id).encode()).hexdigest() if request_id else ''
+                        'content': '目标聊天路由不可核验，不发送。'}
+            if to_companion and (routes[0].get('kind') != 'private'
+                                 or routes[0].get('user_id') != target.get('user_id')):
+                return {'success': False, 'error_class': 'companion_route_mismatch',
+                        'content': '陪伴目标私聊路由已变化，不发送。'}
+            key = hashlib.sha256((send_stream + '|' + request_id).encode()).hexdigest() if request_id else ''
             now = self._now()
             prior = await asyncio.to_thread(ledger.request_receipt, key)
             if prior is None:
-                prior = await asyncio.to_thread(ledger.recent_stream_receipt, stream_id, now)
+                prior = await asyncio.to_thread(ledger.recent_stream_receipt, send_stream, now)
             if prior:
                 return attempt_result(prior, duplicate=True)
-            seen = set()
-            pool = []
+            recent = {}
             for raw in self._recent() or []:
                 if not isinstance(raw, dict):
                     continue
-                bvid = str(raw.get('bvid') or '')
+                row_bvid = str(raw.get('bvid') or '')
                 title = clean(raw.get('title'), 200)
-                if BV.fullmatch(bvid) and title and bvid not in seen:
-                    seen.add(bvid)
-                    pool.append({'bvid': bvid, 'title': title})
-            if preferred_bvid:
-                prior = await asyncio.to_thread(ledger.pair_receipt, preferred_bvid, stream_id, now, manual=True)
-                if prior:
-                    return attempt_result(prior, duplicate=True)
-                pool = [r for r in pool if r['bvid'] == preferred_bvid]
-            else:
-                filtered = []
-                for r in pool:
-                    if await asyncio.to_thread(ledger.pair_receipt, r['bvid'], stream_id, now, manual=True) is None:
-                        filtered.append(r)
-                pool = filtered
-            if not pool:
+                if BV.fullmatch(row_bvid) and title and row_bvid not in recent:
+                    recent[row_bvid] = {'bvid': row_bvid, 'title': title}
+            selected = recent.get(bvid)
+            if selected is None:
                 return {'success': False, 'error_class': 'no_recent_video',
                         'content': '近期观看记忆中没有这个可分享视频，不搜索、不编造。'}
-            selected = self._choose(pool)
+            prior = await asyncio.to_thread(ledger.pair_receipt, bvid, send_stream, now, manual=True)
+            if prior:
+                return attempt_result(prior, duplicate=True)
             await asyncio.to_thread(ledger.ensure_manual, selected, now)
             claim = await asyncio.to_thread(
-                ledger.claim, selected['bvid'], stream_id, 'manual', key, now, self._day(), {}, preparing=True)
+                ledger.claim, selected['bvid'], send_stream, 'manual', key, now, self._day(), {}, preparing=True)
             if claim['status'] == 'duplicate':
                 return attempt_result(claim['attempt'], duplicate=True)
             if claim['status'] != 'claimed':
@@ -354,7 +367,7 @@ class ManualVideoShares:
                 await asyncio.to_thread(ledger.finish, attempt, 'rejected', reason='card_generation_failed')
                 return {'success': False, 'error_class': 'card_generation_failed', 'content': '卡片生成失败，未发送。'}
             try:
-                refreshed = await self.social.profiles.routes(manual_stream=stream_id)
+                refreshed = await self.social.profiles.routes(manual_stream=send_stream)
             except BaseException:
                 await asyncio.to_thread(ledger.finish, attempt, 'rejected', reason='route_unavailable_no_send')
                 raise

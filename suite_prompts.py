@@ -97,8 +97,9 @@ INJECT_PROACTIVE_TURN_RULE_DEFAULT = (
 #: [prompts].tool_send_message 可编辑字段、PROMPT_FALLBACKS 两条目一并删除。
 #: 旧配置里的 tool_send_message 值由 _ignore_internal_overrides 静默滤掉（死键无行为）。
 
-#: 会话采样好感裁判提示词（占位符：{lover_name} / {target_label} / {persona} /
-#: {tier_label} / {tier_desc} / {mood_text} / {recent_messages}）
+#: 会话采样好感裁判提示词（占位符：{lover_name} / {target_label} /
+#: {tier_label} / {tier_desc} / {mood_text} / {recent_messages}；人设经 LLMService
+#: with_identity 注入 system_prompt，{persona} 占位已移除，渲染方传空兼容旧定制模板）
 AFFECTION_CONVERSATION_REVIEW_DEFAULT = """你不参与对话，只看下面给出的材料，给这段相处评估一个**有界的好感度增量**。
 你看不到任何好感度数值，也看不到分数与基线，只看到关系所处的阶段描述——不要猜测具体数值。
 
@@ -114,9 +115,6 @@ AFFECTION_CONVERSATION_REVIEW_DEFAULT = """你不参与对话，只看下面给�
 
 你是 AI 角色「{lover_name}」与{target_label}之间关系的会话观察裁判。
 
-【角色人设（判断真心程度的依据）】
-{persona}
-
 【双方关系所处的阶段】
 {tier_label}：{tier_desc}
 
@@ -126,8 +124,9 @@ AFFECTION_CONVERSATION_REVIEW_DEFAULT = """你不参与对话，只看下面给�
 【最近对方发来的消息（按时间从旧到新，只有对方一侧）】
 {recent_messages}"""
 
-#: 关系日结裁判提示词（占位符：{lover_name} / {target_label} / {date} / {persona} /
-#: {tier_label} / {tier_desc} / {stats} / {event_log} / {impressions}）
+#: 关系日结裁判提示词（占位符：{lover_name} / {target_label} / {date} /
+#: {tier_label} / {tier_desc} / {stats} / {event_log} / {impressions}；人设经 LLMService
+#: with_identity 注入 system_prompt，{persona} 占位已移除，渲染方传空兼容旧定制模板）
 AFFECTION_DAILY_REVIEW_DEFAULT = """你看不到任何好感度数值，也看不到分数与基线，只看到关系所处的阶段描述——不要猜测具体数值。
 
 【判定标准】
@@ -144,9 +143,6 @@ AFFECTION_DAILY_REVIEW_DEFAULT = """你看不到任何好感度数值，也看�
 
 你是 AI 角色「{lover_name}」与{target_label}之间关系的日结裁判。
 任务：根据 {date} 这一天的相处记录，给这一天对关系的影响做一个有界的总结。
-
-【角色人设】
-{persona}
 
 【双方关系所处的阶段】
 {tier_label}：{tier_desc}
@@ -282,7 +278,9 @@ SCHEDULE_SPINE_DESCRIBED_NOTE_DEFAULT = (
 )
 #: spine 模式描述行（全部不写）
 SCHEDULE_SPINE_NO_DESCRIBED_NOTE_DEFAULT = "- 所有意图都不要写 note 字段\n"
-#: 角色裁判提示词（占位符：{persona} / {today_str} / {weekday} / {current_text} / {description}）
+#: 角色裁判提示词（占位符：{today_str} / {weekday} / {current_text} / {description}；
+#: 人设经 LLMService with_identity 注入 system_prompt，{persona} 占位已移除，
+#: 渲染方传空兼容旧定制模板）
 SCHEDULE_ROLE_JUDGE_DEFAULT = (
     "请扮演该角色，判断是否会接受这个日程相关请求。\n"
     "不要机械接受用户安排；如果不符合人设、时间冲突太强、语气像玩笑或没有明确计划，可以拒绝或不改日程。\n"
@@ -297,7 +295,6 @@ SCHEDULE_ROLE_JUDGE_DEFAULT = (
     '"reason": "角色判断理由", "raw_date": "用户原文中的日期描述"}}\n'
     "日期必须根据【日期信息】中的真实日期推断。\n"
     "只输出 JSON，不要其他文字。\n\n"
-    "【角色人设】\n{persona}\n\n"
     "【日期信息】\n今天是 {today_str}（{weekday}）\n\n"
     "【当前日程】\n{current_text}\n\n"
     "【用户请求】\n{description}"
@@ -338,7 +335,9 @@ PROACTIVE_REASON_NIGHT_DEFAULT = "日程：入睡前的晚安问候"
 # 三、情绪模块提示词
 # ===========================================================================
 
-#: 睡眠期情绪大修裁判提示词（占位符：见 emotion/referee.py 组装点）
+#: 睡眠期情绪大修裁判提示词（占位符：见 emotion/referee.py 组装点；
+#: 人设经 LLMService with_identity 注入 system_prompt，{persona} 占位已移除，
+#: 渲染方传空兼容旧定制模板）
 EMOTION_SLEEP_REFEREE_DEFAULT = """你是一个客观的情绪裁判系统，负责对 AI 角色的睡眠期情绪进行大修。
 你不参与对话，只依据下面的客观数据输出 JSON。
 
@@ -353,9 +352,6 @@ EMOTION_SLEEP_REFEREE_DEFAULT = """你是一个客观的情绪裁判系统，负
 8. 内部思考控制在两三句以内，随后立即输出最终 JSON。
 
 只输出 JSON：{{"delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}, "reason_valence": "...", "reason_arousal": "...", "reason_dominance": "..."}}
-
-【Bot 人设】
-{persona}
 
 【当前 VAD 绝对数值】
 V: {v:+.2f}, A: {a:+.2f}, D: {d:+.2f}
@@ -403,7 +399,9 @@ V 代表愉悦度，范围 -1.0 到 1.0，正值愉悦、负值痛苦；A 代表
   "positive_gain": 1.0, "negative_decay": 1.0,
   "reasons": {{"anchor": "...", "offset": "...", "multiplier": "..."}}}}"""
 
-#: 回复/事件 ΔVAD 增量评估提示词（占位符：{lover_name} / {persona} / {user_context} / {reply_text}）
+#: 回复/事件 ΔVAD 增量评估提示词（占位符：{lover_name} / {user_context} / {reply_text}；
+#: 人设经 LLMService with_identity 注入 system_prompt，{persona} 占位已移除，
+#: 渲染方传空兼容旧定制模板）
 EMOTION_EVALUATE_DEFAULT = """你看不到角色当前的绝对情绪数值，只根据下面这段交流内容，评估"这轮交流/这件事"给角色情绪带来的变化量 ΔVAD。
 
 【要求】
@@ -412,9 +410,6 @@ EMOTION_EVALUATE_DEFAULT = """你看不到角色当前的绝对情绪数值，�
 3. 只输出 JSON：{{"event": "...", "delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}}}
 
 你是 AI 角色「{lover_name}」的情绪增量评估器。
-
-【角色人设（情绪过滤依据）】
-{persona}
 
 【用户侧最后一条消息（对话上下文；可能为空）】
 {user_context}
@@ -443,18 +438,19 @@ EMOTION_NIGHT_HINT_DEFAULT = (
 # 四、QQ 空间提示词
 # ===========================================================================
 
-#: 说说文案提示词（占位符：{lover_name} / {personality} / {date} / {time} / {activity}）
+#: 说说文案提示词（占位符：{date} / {time} / {activity}；人设经 LLMService
+#: with_identity 注入 system_prompt，{lover_name}/{personality} 占位已移除，
+#: 渲染方传空兼容旧定制模板）
 QZONE_POST_DEFAULT = (
     "请以第一人称发一条 QQ 空间说说，记录此刻的生活。"
     "要求：口语化、像真人发的、20~60 字、不要话题标签、不要引号、只输出说说正文。\n"
-    "你是「{lover_name}」，人设：{personality}\n"
     "现在是 {date} {time}，你正在：{activity}。"
 )
-#: 评论回复提示词（占位符：{lover_name} / {personality} / {moment} / {nickname} / {time} /
-#: {comment} / {impression}）
+#: 评论回复提示词（占位符：{moment} / {nickname} / {time} / {comment} / {impression}；
+#: 人设经 LLMService with_identity 注入 system_prompt，{lover_name}/{personality}
+#: 占位已移除，渲染方传空兼容旧定制模板）
 QZONE_REPLY_DEFAULT = (
     "请写一条自然的回复（10~40 字，口语化，只输出回复正文）。\n"
-    "你是「{lover_name}」，人设：{personality}\n"
     "你在 QQ 空间发了这条说说：\n「{moment}」\n"
     "好友「{nickname}」（{time}）评论了：「{comment}」\n{impression}"
 )

@@ -70,9 +70,18 @@ class AudienceProfiles:
             identity=(route['kind'],route.get('group_id',route.get('user_id')))
             companion=(getattr(cfg,'include_companion',True) and route['kind']=='private'
                        and route['stream_id']==target.get('stream_id') and route.get('user_id')==target.get('user_id'))
-            if companion or (allow_all and route['kind']=='group') or identity in extra:allowed.append(route)
+            # 自动候选只含：陪伴目标私聊 + 群（allow_all_groups 或 allowed_chats 的 group:）。
+            # 非陪伴目标私聊始终不主动发视频——即使 allowed_chats 写了 private:非陪伴QQ 也不纳入。
+            # bot 用手动工具指定发送走 routes(manual_stream=...) 提前返回，不受此限。
+            if companion:allowed.append(route)
+            elif route['kind']=='group' and (allow_all or identity in extra):allowed.append(route)
         await asyncio.to_thread(self.ledger.restrict_profiles, [r['stream_id'] for r in allowed])
         return allowed
+
+    def companion_target(self) -> dict:
+        """陪伴目标路由身份（stream_id/user_id）；手动转发到陪伴私聊时核验用。"""
+        target=self._target() or {}
+        return {'stream_id':str(target.get('stream_id') or ''),'user_id':str(target.get('user_id') or '')}
 
     async def collect(self,now:float)->list[dict]:
         routes=await self.routes();out=[]

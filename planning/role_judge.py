@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Optional
 from suite_prompts import (
     SCHEDULE_ROLE_JUDGE_DEFAULT,
     SCHEDULE_ROLE_JUDGE_NO_ACTIVITY_DEFAULT,
-    SCHEDULE_ROLE_JUDGE_NO_PERSONA_DEFAULT,
     prompt as prompt_of,
     render,
 )
@@ -128,7 +127,12 @@ def _build_judge_prompt(
     current_activities: List[Dict[str, Any]],
     description: str,
 ) -> str:
-    """构造角色裁判 prompt（模板读 ``[prompts].schedule_role_judge``，可深度定制）。"""
+    """构造角色裁判 prompt（模板读 ``[prompts].schedule_role_judge``，可深度定制）。
+
+    人设不再进用户提示词：由 LLMService ``with_identity=True`` 以宿主同款人设开头
+    注入 system_prompt。``persona`` 形参保留兼容旧调用方，渲染时传空（防旧定制模板
+    残留 ``{persona}`` 占位触发 KeyError 回退）。
+    """
     if current_activities:
         lines = []
         for act in current_activities:
@@ -140,12 +144,10 @@ def _build_judge_prompt(
         current_text = prompt_of(plugin, "schedule_role_judge_no_activity") or \
             SCHEDULE_ROLE_JUDGE_NO_ACTIVITY_DEFAULT
 
-    persona_text = persona or (
-        prompt_of(plugin, "schedule_role_judge_no_persona") or SCHEDULE_ROLE_JUDGE_NO_PERSONA_DEFAULT)
     return render(
         prompt_of(plugin, "schedule_role_judge"),
         fallback=SCHEDULE_ROLE_JUDGE_DEFAULT,
-        persona=persona_text,
+        persona="",
         today_str=today_str,
         weekday=weekday,
         current_text=current_text,
@@ -173,7 +175,7 @@ async def judge_schedule_request(
         plugin: 当前插件实例（取 ``plugin._llm`` 兜底；配置读取也走它）。
         description: 用户的日程相关请求文本。
         current_activities: 今日日程活动列表（每项含 ``time`` / ``name``）。
-        persona: 角色人设文本。
+        persona: 角色人设文本（保留兼容；人设实际经 with_identity 走 system_prompt）。
         today_str: 今日日期（``YYYY-MM-DD``）。
         weekday: 今日星期标签。
         task_name: 模型任务名（走宿主任务路由）。
@@ -208,6 +210,7 @@ async def judge_schedule_request(
         timeout_ms=int(timeout_ms) if (timeout_ms is not None and timeout_ms > 0) else None,
         module="planning",
         event="role_judge",
+        with_identity=True,
     )
     if not response_text:
         return None

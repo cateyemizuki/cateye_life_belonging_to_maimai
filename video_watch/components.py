@@ -13,6 +13,7 @@ from typing import Any
 from maibot_sdk import Tool, HookHandler
 from maibot_sdk.types import HookMode, HookOrder, ErrorPolicy
 from core.inject import pick_payload_key, project_injection
+import asyncio
 import json
 
 TOOL_WATCH_DESCRIPTION = (
@@ -65,11 +66,14 @@ class VideoWatchComponentsMixin:
         return {'action':'continue',**({'modified_kwargs':modified} if modified else {})}
 
     @Tool("lbm_share_recent_video",
-        description=("从自己近期真实看过的视频中抽取一条，向当前聊天发送B站视频卡片。"
-                     "可选填近期看过的BV，不填则抽取一条；不能指定其他聊天。返回本次分享的BV和标题；"
-                     "如需要谈内容，再按返回BV调用lbm_watch_bili_video读取观看缓存。"
-                     "同轮只调用一次，结果不确定不要补发。"), parameters={
-                         'bvid': {'type': 'string', 'description': '可选；仅能指定近期真实看过的BV号', 'default': ''}})
+        description=("向聊天发送自己近期真实看过的B站视频卡片，仅两个参数。"
+                     "video必填：BV号或视频链接（bilibili页面/b23.tv短链/小程序分享文字），"
+                     "链接会先解析出真实BV，解析失败诚实返回不发送；视频必须在近期观看记忆中，不搜索、不编造。"
+                     "to_companion=true转发给陪伴目标私聊；false或不传发送到当前聊天（工具调用所在群/流）。"
+                     "不能指定其他聊天流。返回本次分享的BV和标题；如需要谈内容，再按返回BV调用"
+                     "lbm_watch_bili_video读取观看缓存。同轮只调用一次，结果不确定不要补发。"), parameters={
+                         'video': {'type': 'string', 'description': '必填；近期真实看过的BV号或B站视频链接（含b23.tv短链/分享文字）'},
+                         'to_companion': {'type': 'boolean', 'description': '可选；true=转发陪伴目标私聊，false/不传=发送到当前聊天', 'default': False}})
     async def tool_watch_share_recent_video(self, **kwargs: Any) -> Any:
         if not (self.config.plugin.enabled and self.config.video_watch.enabled):
             return {"success": False, "content": "视频观看模块未启用，不分享。"}
@@ -77,10 +81,22 @@ class VideoWatchComponentsMixin:
         context_chat = str(kwargs.get("chat_id") or "")
         if not context_chat or stream != context_chat:
             return {"success": False, "content": "当前聊天上下文不一致，不发送。"}
+        raw_flag = kwargs.get("to_companion")
+        to_companion = raw_flag is True or str(raw_flag or "").strip().lower() == "true"
+        # 参数①：BV号或视频链接 → 复用本模块 BV/短链解析；解析失败诚实返回不发送。
+        from .bv import normalize_video_ref
+        try:
+            bvid = await asyncio.to_thread(normalize_video_ref, str(kwargs.get('video') or kwargs.get('bvid') or ''))
+        except Exception:
+            bvid = None
+        if not bvid:
+            return {"success": False, "error_class": "invalid_video",
+                    "content": "未解析到真实BV号（请直接传近期看过的B站BV/原始链接/短链/分享文字），不搜索、不编造、不发送。",
+                    "stop_after_execution": False}
         try:
             return await self._recent_video_share_service().share(
                 stream, str(kwargs.get("tool_call_id") or kwargs.get("call_id") or ""),
-                preferred_bvid=str(kwargs.get('bvid') or '').strip())
+                video=bvid, to_companion=to_companion)
         except Exception:
             return {"success": False, "content": "视频分享未取得确定回执，不重复发送。", "stop_after_execution": False}
 

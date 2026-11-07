@@ -109,13 +109,13 @@ class PromptBuilder:
 
         if not personality:
             logger.error(
-                "错误：bot_profile.personality 未配置或为空 —— 生成的日程将无法贴合角色人设。"
-                "请在主程序 bot 配置中填写 personality.personality 字段。"
+                "错误：bot_profile.personality 未配置或为空 —— 人设现由宿主配置经 "
+                "with_identity 注入系统提示词，请确认主程序 personality.personality 字段已填写。"
             )
         if not bot_name:
             logger.error(
-                "错误：bot_profile.bot_name 未配置或为空 —— prompt 中将不出现角色名。"
-                "请在主程序 bot 配置中填写 bot.nickname 字段。"
+                "错误：bot_profile.bot_name 未配置或为空 —— 角色名现由宿主配置经 "
+                "with_identity 注入系统提示词，请确认主程序 bot.nickname 字段已填写。"
             )
         return personality, reply_style, interest, bot_name
 
@@ -160,7 +160,9 @@ class PromptBuilder:
         - Schema 为精简 8 字段意图卡（见 ``SchemaBuilder.build_spine_schema``）；
           只做结构校验、不强制重试（多轮与否由调用方决定）。
         """
-        personality, reply_style, interest, bot_name = self._get_cached_config()
+        # 人设不再进用户提示词：由 LLMService with_identity=True 以宿主同款
+        # 人设开头全文注入 system_prompt（共享前缀缓存）；这里只保留表达风格。
+        _personality, reply_style, interest, _bot_name = self._get_cached_config()
         custom_prompt = self.config.get('custom_prompt', '').strip()
         wake_min, sleep_min = self._resolve_schedule_bounds()
         wake_text = _fmt_minutes(wake_min)
@@ -172,16 +174,8 @@ class PromptBuilder:
         weekday = weekday_names[today.weekday()]
         is_weekend = today.weekday() >= 5
 
-        if bot_name and personality:
-            persona_line = f"你是{bot_name}，{personality}"
-        elif bot_name:
-            persona_line = f"你是{bot_name}"
-        elif personality:
-            persona_line = personality
-        else:
-            persona_line = ""
-        style_block = f"\n\n【表达风格】\n{reply_style}" if reply_style else ""
-        prompt_header = persona_line + style_block if persona_line else style_block.lstrip()
+        style_block = f"【表达风格】\n{reply_style}" if reply_style else ""
+        prompt_header = style_block
 
         # 半稳定任务规则组件先算（仅随配置变化）
         if _to_int(max_described, 0) >= 1:
@@ -208,7 +202,7 @@ class PromptBuilder:
                 sleep_text=sleep_text, wake_text=wake_text,
             )
 
-        # 前缀缓存友好：稳定前缀（人设/风格 + 任务规则 + Schema，仅随配置变化）置顶，
+        # 前缀缓存友好：稳定前缀（风格 + 任务规则 + Schema，仅随配置变化）置顶，
         # 每次请求变化的日期与上下文置后，最大化可缓存前缀。
         prompt = (prompt_header + "\n") if prompt_header else ""
         prompt += "\n" + render(

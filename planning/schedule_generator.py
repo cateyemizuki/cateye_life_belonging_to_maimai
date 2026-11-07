@@ -907,7 +907,8 @@ class ScheduleGenerator:
         ``schedule_spine``。PR8 3.0.0 清退旧 daily 生成链后本方法只剩 spine 唯一
         调用点（依据 = 用户 2026-10-27 授权直接清理），恒返回原始文本——解析由
         spine 自包含的 :meth:`_parse_spine_response` 承担（旧 ``parse`` 参数与
-        ``_parse_response`` 已随 daily 链删除）。
+        ``_parse_response`` 已随 daily 链删除）。人设经 ``with_identity=True``
+        以宿主同款开头注入 system_prompt（共享前缀缓存），用户提示词不再带人设。
         """
         task_name = gen_config.llm_task_name
         temperature = float(self._raw_of(gen_config).get("temperature", 0.85))
@@ -922,6 +923,7 @@ class ScheduleGenerator:
                 timeout_ms=timeout_ms,
                 module="planning",
                 event=event,
+                with_identity=True,
             ),
             timeout=float(gen_config.generation_timeout) + 15.0,
         )

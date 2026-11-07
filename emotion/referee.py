@@ -3,7 +3,7 @@
 三个独立请求都不携带对话历史：
 - 睡眠裁判：客观数据（当前 VAD、当天情绪日志、前后日日程、睡眠时长）→
   ΔVAD_sleep = ±(0.4+0.4×[schedule_advanced].emotion_influence)，缺省调用兼容 ±0.8；
-- 人设初始化：纯人设文本 → 锚点/静态偏移/乘数四组参数（带数值约束）；
+- 人设初始化：人设经 with_identity 全文注入 system_prompt → 锚点/静态偏移/乘数四组参数（带数值约束）；
 - 回复增量评估：该轮回复文本（+用户侧最后一条消息上下文，§4.2 行 2）→ 事件摘要 + ΔVAD（±0.5）。
 所有返回都经代码层二次校验与裁剪（LLM 数值感知失真的兜底，§十二.1）。
 """
@@ -176,7 +176,7 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
     prompt = render(
         prompt_of(plugin, "emotion_sleep_referee"),
         fallback=SLEEP_REFEREE_PROMPT,
-        persona=persona or "（暂无人设）", v=vad.valence, a=vad.arousal, d=vad.dominance,
+        persona="", v=vad.valence, a=vad.arousal, d=vad.dominance,
         emotion_log=emotion_log_text, yesterday_schedule=yesterday_schedule or "（没有记录）",
         tomorrow_schedule=tomorrow_schedule or "（没有记录）", long_term_status=long_term_status or "普通时期",
         sleep_hours=max(0.5, float(sleep_hours)), emotion_table=emotion_table_summary(),
@@ -185,8 +185,11 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
         commitment_net=net, limit=limit,
     )
     # 输出长度只使用宿主任务配置；插件只校验结构化结果。
+    # 人设经 with_identity 以宿主同款开头注入 system_prompt（共享前缀缓存），
+    # 用户提示词不再重复人设（persona 形参保留兼容，渲染传空防旧模板 KeyError）。
     response = await llm.generate(prompt, module="emotion", task_name=task_name,
-                                  temperature=0.4, event="emotion_sleep_referee")
+                                  temperature=0.4, event="emotion_sleep_referee",
+                                  with_identity=True)
     data = _parse_json_loose(response)
     if data is None or "delta_vad" not in data:
         return None
@@ -203,9 +206,15 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
 
 async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str,
                                      plugin: Any = None) -> Optional[EmotionParams]:
-    """人设初始化：人设文本 → 四组参数（校验+裁剪到约束区间）。"""
+    """人设初始化：人设文本 → 四组参数（校验+裁剪到约束区间）。
+
+    人设统一经 ``with_identity=True`` 以宿主同款开头全文注入 system_prompt
+    （共享前缀缓存，不再截断）；用户提示词只下达推导任务。``persona_text``
+    形参保留兼容（仅用于 persona_digest 落盘摘要）。
+    """
     response = await llm.generate(
-        prompt=str(persona_text or "")[:2000],
+        prompt="请根据系统提示词开头给出的人设全文，推导该角色的情绪锚点、静态偏移、"
+               "增益与衰减系数，并按约定输出严格 JSON。",
         system_prompt=render(
             prompt_of(plugin, "emotion_init_system"),
             fallback=INIT_SYSTEM_PROMPT,
@@ -213,6 +222,7 @@ async def derive_params_from_persona(llm: Any, persona_text: str, task_name: str
         ),
         module="emotion", task_name=task_name, temperature=0.4,
         event="emotion_init",
+        with_identity=True,
     )
     data = _parse_json_loose(response)
     if data is None or "anchor" not in data:
@@ -260,16 +270,19 @@ async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_na
     的往来（头部加省略标注），否则模型只看得到片段最旧的一段、最新交流被丢掉。
     """
     body = _clip_prompt_body(reply_text, reply_max_chars, reply_keep_recent)
+    # 人设经 with_identity 走 system_prompt（宿主同款开头，全文不截断）；
+    # persona 形参保留兼容，渲染传空防旧定制模板残留 {persona} 触发 KeyError。
     response = await llm.generate(
         prompt=render(
             prompt_of(plugin, "emotion_evaluate"),
             fallback=EVALUATE_PROMPT,
-            lover_name=lover_name, persona=(persona or "（暂无人设）")[:800],
+            lover_name=lover_name, persona="",
                                       user_context=(str(user_message or "").strip()[:300]
                                                     or "（未取到用户侧消息，仅按下面内容判断）"),
                                       reply_text=body),
         module="emotion", task_name=task_name, temperature=0.2,
         event="emotion_evaluate",
+        with_identity=True,
     )
     data = _parse_json_loose(response)
     if data is None:

@@ -3,7 +3,9 @@
 
 红线（定稿 §4.3.2 / 附录 B.7）：
 
-- 上下文只放「人设 + 最近 2-3 天日程名称 + 已有事件名」，**不接收聊天原文**；
+- 上下文只放「最近 2-3 天日程名称 + 已有事件名」，**不接收聊天原文**；
+  人设不再进用户提示词——由 LLMService ``with_identity=True`` 以宿主同款
+  人设开头全文注入 system_prompt（共享前缀缓存，不截断）；
 - prompt（system + user）总字符数 ≤ 1500；
 - 默认使用宿主 ``utils`` 任务，``temperature=0.9``；
 - 只要求 JSON，不要解释；响应解析容忍 markdown 围栏。
@@ -21,12 +23,16 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from .event_catalog_config import (DEFAULT_MAX_GENERATED_EVENTS,
                                    DEFAULT_MIN_GENERATED_EVENTS,
-                                   DEFAULT_TEMPERATURE)
+                                   DEFAULT_TEMPERATURE,
+                                   EVENT_QUOTA_MAX)
 
 #: prompt 上下文硬上限（system + user 字符数）
 PROMPT_MAX_CHARS = 1500
-#: 可选块裁剪上限（字符）
-_PERSONA_MAX = 240
+#: 单时段批次条数上界 = 可复用 + 一次性两项配额之和的最大值（v3.9.2，12+12）
+_BATCH_COUNT_MAX = 2 * EVENT_QUOTA_MAX
+#: NO Puzzle 开关（默认开）追加的反套路引导；稳定句，置于任务规格之后、人设之前
+NO_PUZZLE_GUIDANCE = "避免拼拼图、十字绣等被滥用的套路活动，优先多样化、具体、贴合人设的日常小事。"
+#: 可选块裁剪上限（字符）；人设走 system（with_identity），不再参与用户提示词裁剪
 _NAMES_MAX = 240
 _EXISTING_MAX = 240
 
@@ -86,13 +92,16 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
                        existing_event_names: Sequence[Any] = (),
                        count: int = DEFAULT_MAX_GENERATED_EVENTS,
                        pool_kind: str = 'reusable', min_count: int = DEFAULT_MIN_GENERATED_EVENTS,
-                       max_chars: int = PROMPT_MAX_CHARS, time_slot: str = "") -> PromptBuildResult:
+                       max_chars: int = PROMPT_MAX_CHARS, time_slot: str = "",
+                       no_puzzle: bool = True) -> PromptBuildResult:
     """构造生成 prompt（≤ ``max_chars`` 字符，含 system）。
 
     ``recent_schedule_names`` / ``existing_event_names`` 只接受名称字符串；
     调用方不得传聊天正文（本函数没有接收正文的参数）。
     ``time_slot`` 非空时按三时段批次生成（v3.9.0），注入时段窗口与场景约束；
     为空时沿用旧 reusable/one_shot 单池措辞（兼容）。
+    ``no_puzzle=True``（v3.9.2 默认）时在任务规格后追加反套路引导（稳定句，
+    前缀缓存友好：规则在前、变化内容在后）。
     """
     try:
         count_int = int(count)
@@ -102,11 +111,12 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
     if pool_kind not in ('reusable', 'one_shot'):
         raise ValueError('unknown generated pool kind')
     count_int = max(minimum,
-                    min(DEFAULT_MAX_GENERATED_EVENTS, count_int))
+                    min(_BATCH_COUNT_MAX, count_int))
     max_chars = max(600, int(max_chars or PROMPT_MAX_CHARS))
     truncated = False
 
-    persona_text, cut = _clip(persona, _PERSONA_MAX)
+    # 人设已由 with_identity 进 system；此处仅保留兼容裁剪（与名称块同上限）
+    persona_text, cut = _clip(persona, _NAMES_MAX)
     truncated = truncated or cut
     recent_text, cut = _names_text(recent_schedule_names, _NAMES_MAX)
     truncated = truncated or cut
@@ -128,6 +138,8 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
                          '本次生成：一次性小事件，在本次生成周期内抽中即移除。每条有具体可完成的小目标；'
                          '不要生成反复休息、发呆或转场，goal_type不要使用rest/idle/transition。')
             lines.append(f"本次任务：为角色恰好生成 {count_int} 条日常小事件（用作空闲/转场 filler，禁止多于或少于）。" + pool_line)
+        if no_puzzle:
+            lines.append(NO_PUZZLE_GUIDANCE)
         if p:
             lines.append(f"人设：{p}")
         if r:
@@ -168,7 +180,7 @@ def build_json_schema(count: int = DEFAULT_MAX_GENERATED_EVENTS) -> Dict[str, An
     except (TypeError, ValueError):
         count_int = DEFAULT_MAX_GENERATED_EVENTS
     count_int = max(DEFAULT_MIN_GENERATED_EVENTS,
-                    min(DEFAULT_MAX_GENERATED_EVENTS, count_int))
+                    min(_BATCH_COUNT_MAX, count_int))
     delta_props = {key: {"type": "number", "minimum": -0.08, "maximum": 0.08}
                    for key in ("energy", "hunger", "focus", "stress", "social_battery")}
     return {

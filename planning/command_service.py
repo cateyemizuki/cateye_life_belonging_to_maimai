@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .activity_properties import resolve_property
@@ -158,6 +158,8 @@ class CommandService:
             started = bool(planner and planner.force_sleep())
             await self._send(stream_id, "已进入睡眠。" if started else
                              "暂时无法入睡。请检查动态睡眠开关、入睡窗口和当前约定。")
+        elif subcommand == "watch":
+            await self._handle_watch(stream_id)
         elif subcommand == "help":
             await self._show_help(stream_id)
         else:
@@ -450,6 +452,72 @@ class CommandService:
             detail = "；".join(result.error_lines) if getattr(result, "error_lines", None) else str(result.reason)
             await self._send(stream_id, f"小事件库生成失败（旧库保留）：{detail}")
 
+    async def _handle_watch(self, stream_id: str) -> None:
+        """``/lbm_plan watch``：后台立即触发一次完整刷视频周期（抽卡测试可多次执行）。
+
+        防叠加：已有活跃观看任务或周期在跑 → 只展示当前任务/进度/预计结束时间，
+        不叠加新任务。空闲 → 复用既有 video_watch + video_share 链路启动一次周期
+        （候选→观看→完成→独立分享判断），即使决定不分享也写日志可验证。
+        """
+        plugin = self._plugin
+        try:
+            enabled = bool(plugin.config.plugin.enabled and plugin.config.video_watch.enabled)
+        except Exception:
+            enabled = False
+        if not enabled:
+            await self._send(stream_id, "视频观看模块未启用（[video_watch].enabled=false 或插件未启用），无法刷视频。")
+            return
+        try:
+            coord = plugin._video_coordinator()
+        except Exception as exc:
+            logger.warning(f"/lbm_plan watch 协调器不可用: {exc}")
+            await self._send(stream_id, "刷视频联动未装配，无法触发周期。")
+            return
+        try:
+            status = await coord.watch_status()
+        except Exception as exc:
+            logger.warning(f"/lbm_plan watch 状态读取失败: {exc}")
+            status = {"active": False}
+        if status.get("active"):
+            await self._send(stream_id, self._format_watch_busy(status))
+            return
+        social = getattr(self._plugin, "_video_social", None)
+        social_tick = getattr(social, "tick", None)
+        receipt = coord.start_manual_cycle(social_tick=social_tick if callable(social_tick) else None)
+        if not receipt.get("started"):
+            # 竞态：刚变为活跃 → 改展示状态，不叠加。
+            try:
+                status = await coord.watch_status()
+            except Exception:
+                status = {"active": True}
+            await self._send(stream_id, self._format_watch_busy(status))
+            return
+        await self._send(
+            stream_id,
+            "已在后台触发一次完整刷视频周期（候选→观看→完成→独立分享判断），完成后会写日志。\n"
+            "若当前处于聊天/睡眠/静默或额度不足，会如实跳过并记录原因。\n"
+            "进行中再次发送 /lbm_plan watch 只显示进度、不叠加；结束后可再次触发用于抽卡测试。",
+        )
+
+    def _format_watch_busy(self, status: Dict[str, Any]) -> str:
+        """把活跃观看状态渲染成防叠加提示（当前任务/进度/预计结束时间）。"""
+        lines = ["当前已在刷视频，不叠加新任务。"]
+        if status.get("task_id"):
+            lines.append(f"任务：{status.get('task_id')}（{status.get('bvid') or '未知BV'}）")
+        stage = status.get("stage") or ("启动中" if status.get("manual_cycle_running") else "进行中")
+        progress = status.get("progress")
+        lines.append(f"阶段：{stage}" + (f" / {progress}" if progress else ""))
+        if status.get("detail"):
+            lines.append(f"进度：{status.get('detail')}")
+        eta = status.get("eta_epoch")
+        if eta:
+            try:
+                lines.append("预计结束：" + datetime.fromtimestamp(float(eta)).strftime("%H:%M:%S"))
+            except (TypeError, ValueError, OSError):
+                pass
+        lines.append("结束后再发送 /lbm_plan watch 可重新触发。")
+        return "\n".join(lines)
+
     async def _handle_delete(self, stream_id: str, parts: List[str]) -> Tuple[bool, str, bool]:
         """``/lbm_plan delete <id|序号>``：删除目标（含合成视图的日程条目）。"""
         goal_manager = get_goal_manager()
@@ -552,6 +620,7 @@ class CommandService:
 /lbm_plan delete <goal_id或序号> - 删除指定目标
 /lbm_plan clear - 清理昨天及更早的旧日程
 /lbm_plan sleep - 在动态睡眠的允许窗口内立即入睡
+/lbm_plan watch - 后台立即触发一次完整刷视频周期（进行中只显示进度不叠加，可多次抽卡测试）
 /lbm_plan help - 显示此帮助
 
 使用方式:

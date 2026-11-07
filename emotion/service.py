@@ -471,7 +471,11 @@ class EmotionService:
             mood=self.emotion_description_text(channel),
         )
         if self.is_frozen():
-            text = f"{text}\n{prompt_of(self._plugin, 'emotion_night_hint')}"
+            # 冻结态按配置夜窗可能滞后于动态睡眠实际醒沿（如 07:45 已醒但夜窗到
+            # 08:30）；引擎明确判醒时不再注入深夜引导，避免清晨回复被误导成深夜。
+            # now 用服务统一时钟 datetime.now()（测试可注入；生产为本机生效时区）。
+            if self._in_sleep_period(datetime.now()):
+                text = f"{text}\n{prompt_of(self._plugin, 'emotion_night_hint')}"
         return text
 
     # ── 情绪 → 行为结构化系数（M4；§4.2 行 5 / §6.2 C/D，附录 C）──────

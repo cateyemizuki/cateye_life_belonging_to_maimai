@@ -19,14 +19,19 @@ RELEASE_RETIRED = {
     "patrol": ("miss_silence_hours", "miss_llm_check_enabled", "min_trigger_interval_minutes",
                "user_cooldown_minutes", "nap_quiet_enabled", "miss_hours_min", "miss_hours_max"),
     "schedule": ("auto_generate_enabled", "auto_generate_after_last_end_minutes", "min_activities",
-                 "max_activities", "custom_prompt", "inject_scope"),
+                 "max_activities", "custom_prompt", "inject_scope",
+                 # v3.9.2：旧三时段合并上限退役（纯 pop，不搬运；新配额为
+                 # event_catalog_reusable_* / event_catalog_one_shot_* 六键）
+                 "event_catalog_period_limit_00_08", "event_catalog_period_limit_08_16",
+                 "event_catalog_period_limit_16_24"),
     "schedule_advanced": ("cross_day_activity", "enable_intent_classification",
                           "enable_inject_optimization", "intent_tuning_enabled", "use_multi_round",
                           "auto_generate_time"),
     "life_state": ("settlement_model", "emotion_modulation_enabled", "dynamic_sleep_enabled"),
 }
 EVENT_CATALOG_FIELDS = ("mode", "min_interval_days", "max_interval_days", "max_generated_events", "task_name",
-                        "period_limit_00_08", "period_limit_08_16", "period_limit_16_24")
+                        "reusable_00_08", "reusable_08_16", "reusable_16_24",
+                        "one_shot_00_08", "one_shot_08_16", "one_shot_16_24", "no_puzzle")
 
 
 def migrate_release_config(value: Any) -> Any:

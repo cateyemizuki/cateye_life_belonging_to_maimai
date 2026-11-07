@@ -213,6 +213,20 @@ def over_limit_trim_enabled(config_or_plugin: Any) -> bool:
     return bool(getattr(section, "over_limit_auto_trim", True))
 
 
+def build_host_identity_prefix(bot_name: Any, alias_names: Any, personality: Any) -> str:
+    """组装与宿主 replyer ``_build_personality_prompt`` 逐字一致的人设开头。
+
+    宿主公式：``你的名字是{bot_name}{，也有人叫你{alias1,alias2}}。\n{personality}``
+    （personality 空则「是人类。」）。插件需要人设的请求以此作为 system_prompt 前缀，
+    与宿主 reply 系统提示词开头共享前缀缓存。人设全文注入，不再截断。
+    """
+    name = str(bot_name or "").strip() or "麦麦"
+    aliases = [str(a).strip() for a in (alias_names or []) if str(a or "").strip()]
+    bot_aliases = f"，也有人叫你{','.join(aliases)}" if aliases else ""
+    persona = str(personality or "").strip() or "是人类。"
+    return f"你的名字是{name}{bot_aliases}。\n{persona}"
+
+
 def llm_task_name_of(config_or_plugin: Any) -> str:
     """主模型任务名（``[llm].task_name``；旧 ``[schedule].llm_task_name`` 兜底，最后 replyer）。"""
     section = _llm_section(config_or_plugin)
@@ -331,20 +345,33 @@ class LLMService:
         event: str = "unspecified",
         model: str = "",
         strict_params: bool = False,
+        with_identity: bool = False,
     ) -> str:
         """生成文本；失败/异常统一返回空串（旧契约不变，统一入口在 Gateway）。
 
         ``module`` = 调用方业务模块（planning/emotion/qzone/companion/video/core）；
         缺失时 Gateway 记 ``unknown`` 并留 warning。``strict_params`` 仅给需要
         「单请求 + 参数不漂移」的调用方（事件库），语义与旧版逐字一致。
+        ``with_identity=True`` 时把宿主同款人设开头拼到 system_prompt 最前，共享前缀缓存。
         """
         result = await self.generate_detailed(
             prompt, module=module, system_prompt=system_prompt,
             task_name=task_name, temperature=temperature,
             timeout_ms=timeout_ms, event=event, model=model,
-            strict_params=strict_params,
+            strict_params=strict_params, with_identity=with_identity,
         )
         return result.text
+
+    async def _resolve_identity_prefix(self) -> str:
+        """读宿主 bot.nickname / bot.alias_names / personality.personality 组装人设开头。"""
+        try:
+            cfg = self._ctx.config
+            name = await cfg.get("bot.nickname", "")
+            aliases = await cfg.get("bot.alias_names", [])
+            persona = await cfg.get("personality.personality", "")
+        except Exception:
+            name, aliases, persona = "", [], ""
+        return build_host_identity_prefix(name, aliases, persona)
 
     async def generate_detailed(
         self,
@@ -358,12 +385,18 @@ class LLMService:
         event: str = "unspecified",
         model: str = "",
         strict_params: bool = False,
+        with_identity: bool = False,
     ) -> LLMResult:
         """生成文本并返回本次请求关联的详细结果（委托 tools.llm_gateway）。
 
         路由/降级/失败三态与旧实现逐字一致；新增 ``module`` 进入账本 v2，
         ``LLMResult.receipt`` 携带模块、缓存命中与耗时等对账字段。
+        ``with_identity=True``：system_prompt 前置宿主同款人设开头（名称+别名+全文人设），
+        与宿主 reply 系统提示词共享前缀缓存；人设不再截断。
         """
+        if with_identity:
+            identity = await self._resolve_identity_prefix()
+            system_prompt = identity + (f"\n\n{system_prompt}" if system_prompt else "")
         return await self._gateway().generate_detailed(
             prompt, module=module, system_prompt=system_prompt,
             task_name=task_name, temperature=temperature,

@@ -45,7 +45,7 @@ from core.llm_utils import LLMResult
 from core.mapping_dir import MappingReadError, mappings_path, read_json_text
 from core.storage import save_json_atomic
 
-from .event_catalog_config import EventCatalogConfig, resolve_config
+from .event_catalog_config import DEFAULT_MAX_POOL_EVENTS, EventCatalogConfig, resolve_config
 from .event_pools import POOL_VERSION, normalize_cycle, allocate_pools, catalog_write_guard
 from .event_prompt import (GENERATION_TEMPERATURE,
                            EventPromptError, build_event_prompt,
@@ -189,22 +189,37 @@ class EventCatalogValidator:
 
     def __init__(self, *, builtin_count: Optional[int] = None,
                  max_generated_events: int = MAX_GENERATED_EVENTS,
-                 max_pool_events: int = 12,
+                 max_pool_events: int = DEFAULT_MAX_POOL_EVENTS,
                  enforce_pool_cap: bool = True,
-                 period_limits: Optional[Sequence[int]] = None) -> None:
+                 period_limits: Optional[Sequence[int]] = None,
+                 reusable_limits: Optional[Sequence[int]] = None,
+                 one_shot_limits: Optional[Sequence[int]] = None) -> None:
         self.builtin_count = len(BUILTIN_EVENTS) if builtin_count is None else int(builtin_count)
         self.max_generated_events = max(1,
                                         min(MAX_GENERATED_EVENTS, int(max_generated_events)))
         self.max_pool_events = max(1, int(max_pool_events))
         self.enforce_pool_cap = bool(enforce_pool_cap)
         from .event_slots import TIME_SLOTS
-        from .event_catalog_config import (DEFAULT_PERIOD_LIMIT_00_08,
-                                           DEFAULT_PERIOD_LIMIT_08_16,
-                                           DEFAULT_PERIOD_LIMIT_16_24)
-        defaults = (DEFAULT_PERIOD_LIMIT_00_08, DEFAULT_PERIOD_LIMIT_08_16, DEFAULT_PERIOD_LIMIT_16_24)
-        limits = tuple(period_limits) if period_limits is not None else defaults
-        self.period_limits = {slot: max(0, int(limits[i] if i < len(limits) else defaults[i]))
-                              for i, slot in enumerate(TIME_SLOTS)}
+        from .event_catalog_config import (DEFAULT_REUSABLE_00_08, DEFAULT_REUSABLE_08_16,
+                                           DEFAULT_REUSABLE_16_24, DEFAULT_ONE_SHOT_00_08,
+                                           DEFAULT_ONE_SHOT_08_16, DEFAULT_ONE_SHOT_16_24)
+        reusable_defaults = (DEFAULT_REUSABLE_00_08, DEFAULT_REUSABLE_08_16, DEFAULT_REUSABLE_16_24)
+        one_shot_defaults = (DEFAULT_ONE_SHOT_00_08, DEFAULT_ONE_SHOT_08_16, DEFAULT_ONE_SHOT_16_24)
+
+        def _limits(raw: Optional[Sequence[int]], defaults: tuple) -> tuple:
+            values = tuple(raw) if raw is not None else defaults
+            return tuple(max(0, int(values[i] if i < len(values) else defaults[i]))
+                         for i in range(len(TIME_SLOTS)))
+
+        self.reusable_limits = _limits(reusable_limits, reusable_defaults)
+        self.one_shot_limits = _limits(one_shot_limits, one_shot_defaults)
+        # 每时段上限 = 可复用 + 一次性合计；兼容旧调用直接传合计 period_limits
+        if period_limits is not None:
+            totals = _limits(period_limits, tuple(r + o for r, o in
+                                                  zip(reusable_defaults, one_shot_defaults)))
+        else:
+            totals = tuple(r + o for r, o in zip(self.reusable_limits, self.one_shot_limits))
+        self.period_limits = {slot: totals[i] for i, slot in enumerate(TIME_SLOTS)}
 
     # ---- 单事件 ----
     def validate_event(self, event: Any, *, index: Optional[int] = None,
@@ -349,10 +364,11 @@ class EventCatalogValidator:
                 normalize_cycle(document)
             except ValueError as exc:
                 errors.append(ValidationError('E_SCHEMA', str(exc), 'consumed'))
-            for kind in ('reusable', 'one_shot'):
+            for kind, pool_cap in (('reusable', sum(self.reusable_limits)),
+                                   ('one_shot', sum(self.one_shot_limits))):
                 count = sum(isinstance(e, dict) and e.get('pool_kind') == kind for e in events)
-                if count > self.max_generated_events:
-                    errors.append(ValidationError('E_COUNT', f'{kind} 条数超过 {self.max_generated_events}', 'events'))
+                if count > pool_cap:
+                    errors.append(ValidationError('E_COUNT', f'{kind} 条数超过 {pool_cap}', 'events'))
             from .event_slots import TIME_SLOTS
             slot_counts = {slot: 0 for slot in TIME_SLOTS}
             for e in events:
@@ -561,7 +577,7 @@ class EventCatalogStore:
     def __init__(self, path: Any, *, builtin: Optional[Sequence[Mapping[str, Any]]] = None,
                  validator: Optional[EventCatalogValidator] = None,
                  max_generated_events: int = MAX_GENERATED_EVENTS,
-                 max_pool_events: int = 12,
+                 max_pool_events: int = DEFAULT_MAX_POOL_EVENTS,
                  enforce_pool_cap: bool = True,
                  tz: Optional[timezone] = None,
                  load_on_init: bool = True) -> None:
@@ -1060,7 +1076,9 @@ class EventCatalogService:
             builtin_count=len(builtin_events()),
             max_generated_events=cfg.max_generated_events,
             max_pool_events=cfg.max_pool_events,
-            enforce_pool_cap=cfg.enforce_pool_cap)
+            enforce_pool_cap=cfg.enforce_pool_cap,
+            reusable_limits=cfg.reusable_limits,
+            one_shot_limits=cfg.one_shot_limits)
         self._custom_validator = validator is not None
         self.store = store or EventCatalogStore(
             catalog_path, validator=self._validator,
@@ -1391,6 +1409,7 @@ class EventCatalogService:
                 module="planning",
                 event=LLM_EVENT_NAME,
                 strict_params=True,
+                with_identity=True,
             )
         # 兼容旧测试桩：只有字符串返回，无 usage/错误分类；失败一律保守记账。
         text = await self._llm.generate(
@@ -1401,6 +1420,7 @@ class EventCatalogService:
 
             module="planning",
             event=LLM_EVENT_NAME,
+            with_identity=True,
         )
         text = str(text or "").strip()
         return LLMResult(ok=bool(text), text=text,
@@ -1426,12 +1446,13 @@ class EventCatalogService:
         recent_events = self._names_of(self._recent_event_provider)
         builtin = self.store.snapshot.builtin_events
         from .event_slots import TIME_SLOTS
-        from .event_pools import slot_pool_split
-        period_limits = cfg.period_limits
+        reusable_limits = cfg.reusable_limits
+        one_shot_limits = cfg.one_shot_limits
+        requested_total = sum(reusable_limits) + sum(one_shot_limits)
         capacity = max(0, cfg.max_pool_events - len(builtin))
-        if sum(period_limits) > capacity:
+        if requested_total > capacity:
             return self._failed('E_CAPACITY',
-                                f'三时段上限之和 {sum(period_limits)} 超过可用容量 {capacity}，保留旧事件库',
+                                f'三时段配额之和 {requested_total} 超过可用容量 {capacity}，保留旧事件库',
                                 manual=manual)
         if self._llm is None or not (callable(getattr(self._llm, 'generate_detailed', None))
                                     or callable(getattr(self._llm, 'generate', None))):
@@ -1444,13 +1465,14 @@ class EventCatalogService:
         from core.llm_utils import over_limit_trim_enabled
         trim = over_limit_trim_enabled(self._config)
         for slot_index, slot in enumerate(TIME_SLOTS):
-            requested = int(period_limits[slot_index])
+            reusable_n = int(reusable_limits[slot_index])
+            one_shot_n = int(one_shot_limits[slot_index])
+            requested = reusable_n + one_shot_n
             if requested <= 0:
                 continue
-            reusable_n, _one_shot_n = slot_pool_split(slot_index, requested)
             prompt = build_event_prompt(persona=persona, recent_schedule_names=recent_schedule,
                 existing_event_names=reserved_names + [e.get('name', '') for e in events],
-                count=requested, min_count=1, time_slot=slot)
+                count=requested, min_count=1, time_slot=slot, no_puzzle=cfg.no_puzzle)
             try:
                 chosen, spent = await self._attempt_llm(prompt, task_name=cfg.task_name,
                     temperature=EVENT_GENERATION_TEMPERATURE, now=now)
@@ -1501,7 +1523,7 @@ class EventCatalogService:
         validator = self._validator if self._custom_validator else EventCatalogValidator(
             builtin_count=len(builtin), max_generated_events=cfg.max_generated_events,
             max_pool_events=cfg.max_pool_events, enforce_pool_cap=True,
-            period_limits=cfg.period_limits)
+            reusable_limits=cfg.reusable_limits, one_shot_limits=cfg.one_shot_limits)
         validation = validator.validate_document(document, reserved_ids=reserved_ids,
             reserved_names=reserved_names, recent_names=recent_events)
         if not validation.ok:

@@ -95,7 +95,7 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "weekend_phase_minutes": 15,
     },
     "event_catalog": {
-        "max_pool_events": 12,
+        "max_pool_events": 32,
     },
     "llm": {
         "judge_temperature": 0.2,

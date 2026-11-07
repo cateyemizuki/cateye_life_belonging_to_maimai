@@ -64,6 +64,13 @@ CANDIDATE_PREPARE_TIMEOUT_SECONDS = 120.0
 #: 未提交成功的 gap 条目最大存活（秒；超龄收尾，防链接库滞留）
 GAP_ENTRY_MAX_AGE_SECONDS = 3600
 
+#: 观看关联的终态阶段（手动周期防叠加/状态快照判定用；与协调器收尾口径一致）
+_TERMINAL_WATCH_STAGES = ("completed", "failed", "cancelled", "unavailable", "skipped",
+                          "failed_submit", "revoked_by_chat", "cached_completed")
+#: 管理员命令手动刷视频周期的轮询间隔/总等待上限余量（秒）
+_MANUAL_POLL_INTERVAL_SECONDS = 5.0
+_MANUAL_WAIT_MARGIN_SECONDS = 900.0
+
 ApiCaller = Callable[..., Awaitable[Dict[str, Any]]]
 EpisodeLookup = Callable[[str], Optional[Dict[str, Any]]]
 EpisodeIds = Callable[[], set]
@@ -284,6 +291,8 @@ class VideoWatchCoordinator:
         self._rng = rng or random.Random()
         #: 最近一次 gap 掷点/重试时刻（进程内；重载保守重置，额度门仍持久化把关）
         self._gap_last_attempt = 0.0
+        #: 管理员命令手动刷视频周期的单飞 task（防叠加；进程内，重载即释放）
+        self._manual_task: Optional[asyncio.Task] = None
 
         self._get_active_episode = get_active_episode
         self._get_episode = get_episode
@@ -302,6 +311,155 @@ class VideoWatchCoordinator:
         links = self._load_links().get("links") or {}
         entry = links.get(episode_id)
         return dict(entry) if isinstance(entry, dict) else {}
+
+    # ------------------------------------------------------------------
+    # 管理员命令：立即触发一次完整刷视频周期（候选→观看→完成→独立分享判断）
+    # 复用既有 gap 链路（注意力/额度/候选/防重/账号核验全部保留），只是把随机
+    # 掷点换成确定性触发；防叠加：已有活跃观看任务或周期在跑则不叠加。
+    # ------------------------------------------------------------------
+    def _active_watch_entry(self) -> Optional[tuple]:
+        """只读找出当前活跃（非终态、未收尾）观看关联；无 → None。"""
+        links = self._load_links().get("links") or {}
+        for episode_id, entry in links.items():
+            if not (isinstance(entry, dict) and entry.get("task_id") and not entry.get("closed")):
+                continue
+            if str(entry.get("stage") or "") in _TERMINAL_WATCH_STAGES:
+                continue
+            return episode_id, entry
+        return None
+
+    async def watch_status(self) -> Dict[str, Any]:
+        """刷视频相关状态快照（当前任务/进度/预计结束时间），供命令防叠加提示。"""
+        manual_running = self._manual_task is not None and not self._manual_task.done()
+        active = self._active_watch_entry()
+        if active is None and not manual_running:
+            return {"active": False}
+        out: Dict[str, Any] = {"active": True, "manual_cycle_running": manual_running}
+        if active is not None:
+            episode_id, entry = active
+            task_id = str(entry.get("task_id") or "")
+            started = float(entry.get("started_at") or 0)
+            minutes = float(entry.get("reserved_minutes")
+                            or (GAP_SESSION_MINUTES if entry.get("scenario") == "gap" else 20.0))
+            out.update(episode_id=episode_id, task_id=task_id, bvid=entry.get("bvid"),
+                       scenario=entry.get("scenario"), stage=entry.get("stage"))
+            if started:
+                out["eta_epoch"] = started + minutes * 60
+            try:
+                receipt = await self._api(action="status", task_id=task_id)
+                if isinstance(receipt, dict) and receipt.get("success"):
+                    out["stage"] = receipt.get("status") or out.get("stage")
+                    if receipt.get("stage"):
+                        out["progress"] = receipt.get("stage")
+                    if receipt.get("detail"):
+                        out["detail"] = str(receipt.get("detail"))[:120]
+            except Exception:
+                pass
+        return out
+
+    def start_manual_cycle(self, *, social_tick: Optional[Callable[[], Awaitable[Any]]] = None) -> Dict[str, Any]:
+        """命令入口（同步回执）：防叠加；空闲则后台启动一次完整周期。
+
+        返回 ``{"started": bool, "reason": str}``；started=False 时调用方应改用
+        :meth:`watch_status` 展示当前任务/进度/预计结束时间，不叠加新任务。
+        """
+        if self._manual_task is not None and not self._manual_task.done():
+            return {"started": False, "reason": "manual_cycle_running"}
+        if self._active_watch_entry() is not None:
+            return {"started": False, "reason": "watch_active"}
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return {"started": False, "reason": "no_event_loop"}
+        self._manual_task = loop.create_task(self._manual_cycle(social_tick))
+        return {"started": True, "reason": ""}
+
+    async def _manual_cycle(self, social_tick: Optional[Callable[[], Awaitable[Any]]]) -> None:
+        """后台推动一次完整刷视频周期；任何异常不外泄（与 sync 同口径）。"""
+        try:
+            await self._manual_cycle_inner(social_tick)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._log:
+                self._log.warning("手动刷视频周期失败（忽略，不影响其他日程）：%s", exc)
+
+    async def _manual_cycle_inner(self, social_tick: Optional[Callable[[], Awaitable[Any]]]) -> None:
+        links_doc = self._load_links()
+        links: Dict[str, Any] = links_doc.get("links") or {}
+        # gap- 前缀沿用空隙冲浪的注意力/空闲守卫；manual_command 标记便于诊断区分。
+        episode_id = f"gap-cmd-{uuid.uuid4().hex[:12]}"
+        entry: Dict[str, Any] = {"scenario": "gap", "manual_command": True}
+        links[episode_id] = entry
+        await self._start_watching(episode_id, entry, kind="gap")
+        task_id = str(entry.get("task_id") or "")
+        if not task_id:
+            # 手动周期是一次性的：无任务（注意力/额度/候选门跳过或缓存命中）即收尾，
+            # 不像随机 gap 留待重试，避免非终态条目在链接库滞留。
+            entry["closed"] = True
+            entry.setdefault("closed_reason", "manual_no_task")
+        links_doc["links"] = links
+        self._compact(links)
+        self._save_links(links_doc)
+        if self._log:
+            self._log.info("手动刷视频周期 %s 启动：stage=%s%s", episode_id, entry.get("stage"),
+                           f" reason={entry.get('reason')}" if entry.get("reason") else "")
+        if not task_id:
+            # 无任务：如实记录，仍推动一次分享判断（即使不分享也写日志可验证）。
+            if entry.get("cached") and isinstance(entry.get("result"), dict):
+                self._record_manual_share(entry["result"], episode_id)
+            await self._run_share_tick(social_tick, episode_id)
+            return
+        # 有界轮询直至终态（任务时长额度 + 余量）；与日程 sync 共用 links，收尾幂等。
+        minutes = float(entry.get("reserved_minutes") or GAP_SESSION_MINUTES)
+        deadline = time.time() + minutes * 60 + _MANUAL_WAIT_MARGIN_SECONDS
+        while time.time() < deadline:
+            await asyncio.sleep(_MANUAL_POLL_INTERVAL_SECONDS)
+            fresh = (self._load_links().get("links") or {}).get(episode_id)
+            if not isinstance(fresh, dict):
+                break
+            if fresh.get("closed") or str(fresh.get("stage") or "") in _TERMINAL_WATCH_STAGES:
+                entry = fresh
+                break
+            await self._poll_status(episode_id, fresh)
+            links_doc = self._load_links()
+            links_doc.setdefault("links", {})[episode_id] = fresh
+            self._save_links(links_doc)
+            entry = fresh
+            if entry.get("closed"):
+                break
+        if self._log:
+            self._log.info("手动刷视频周期 %s 观看收尾：stage=%s closed=%s",
+                           episode_id, entry.get("stage"), bool(entry.get("closed")))
+        # 完成→独立分享判断（即使决定不分享也写日志可验证）。
+        await self._run_share_tick(social_tick, episode_id)
+
+    def _record_manual_share(self, result: Dict[str, Any], episode_id: str) -> None:
+        recorder = self._share_recorder
+        if callable(recorder):
+            try:
+                recorder(result, episode_id)
+            except Exception as exc:
+                if self._log:
+                    self._log.warning("手动周期分享候选记录失败（忽略）：%s", exc)
+
+    async def _run_share_tick(self, social_tick: Optional[Callable[[], Awaitable[Any]]],
+                              episode_id: str) -> None:
+        if social_tick is None:
+            if self._log:
+                self._log.info("手动刷视频周期 %s：独立分享服务未装配，跳过分享判断", episode_id)
+            return
+        try:
+            result = await social_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._log:
+                self._log.warning("手动刷视频周期 %s 分享判断失败（忽略）：%s", episode_id, exc)
+            return
+        if self._log:
+            self._log.info("手动刷视频周期 %s 独立分享判断结果：%s", episode_id,
+                           json.dumps(result, ensure_ascii=False, default=str)[:400])
 
     # ------------------------------------------------------------------
     async def sync(self) -> None:
@@ -532,6 +690,9 @@ class VideoWatchCoordinator:
         """
         now = time.time()
         changed = False
+        # 手动刷视频周期在跑 → 不再随机掷点叠加（防叠加；周期自身已占观看链路）。
+        if self._manual_task is not None and not self._manual_task.done():
+            return False
         has_running = False
         retryable: list = []
         for gap_id, entry in links.items():
@@ -540,7 +701,8 @@ class VideoWatchCoordinator:
                 continue
             if entry.get("task_id"):
                 has_running = True
-            else:
+            elif not entry.get("manual_command"):
+                # 手动周期的候选准备条目由命令 task 独占，不当作随机 gap 重试。
                 retryable.append((gap_id, entry))
         if has_running:
             return False

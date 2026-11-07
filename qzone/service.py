@@ -785,8 +785,8 @@ class QzoneService:
         prompt = render(
             prompt_of(self._plugin, "qzone_post"),
             fallback=QZONE_POST_PROMPT,
-            lover_name=self._lover_name,
-            personality=self._personality or "（暂无人设）",
+            lover_name="",
+            personality="",
             date=date,
             time=now.strftime("%H:%M"),
             activity=activity_desc,
@@ -795,6 +795,8 @@ class QzoneService:
         mood_line = self._mood_line("请让这条说说的语气与心情保持一致")
         if mood_line:
             prompt = f"{prompt}\n{mood_line}"
+        # 人设经 with_identity 以宿主同款开头注入 system_prompt（共享前缀缓存）；
+        # lover_name/personality 渲染传空，兼容旧定制模板残留占位（防 KeyError 回退）。
         text = await self._llm.generate(
             prompt,
             task_name=purpose_task(self._plugin, "qzone", default="utils"),
@@ -802,6 +804,7 @@ class QzoneService:
 
             module="qzone",
             event="qzone_post",
+            with_identity=True,
         )
         return text.strip().strip('"“”')
 
@@ -863,8 +866,8 @@ class QzoneService:
                 prompt = render(
                     prompt_of(self._plugin, "qzone_reply"),
                     fallback=QZONE_REPLY_PROMPT,
-                    lover_name=self._lover_name,
-                    personality=self._personality or "（暂无人设）",
+                    lover_name="",
+                    personality="",
                     moment=moment_text[:200],
                     nickname=comment.get("nickname") or "好友",
                     comment=str(comment.get("content") or "")[:200],
@@ -881,6 +884,7 @@ class QzoneService:
                     temperature=0.8,
                     module="qzone",
                     event="qzone_reply",
+                    with_identity=True,
                 )
                 reply_text = reply_text.strip()
                 if not reply_text:
@@ -1010,7 +1014,7 @@ class QzoneService:
             prompt = render(
                 prompt_of(self._plugin, "qzone_reply"),
                 fallback=QZONE_REPLY_PROMPT,
-                lover_name=self._lover_name, personality=self._personality or "（暂无人设）",
+                lover_name="", personality="",
                 moment=content[:200], nickname=commenter, comment=comment_text[:200],
                 time="", impression="",
             )
@@ -1022,6 +1026,7 @@ class QzoneService:
                 prompt,
                 task_name=purpose_task(self._plugin, "qzone", default="utils"),
                 temperature=0.8,  module="qzone", event="qzone_reply",
+                with_identity=True,
             )
             reply_text = reply_text.strip()
             if reply_text and await self.comment_moment(tid, reply_text):

@@ -1,5 +1,13 @@
 # 更新日志（CHANGELOG）
 
+## 3.9.2（2026-11-07）
+
+- 小事件三时段配额改为「可复用 / 一次性」分开配置（event_catalog_reusable_00_08/08_16/16_24 默认 1/5/4，event_catalog_one_shot_00_08/08_16/16_24 默认 3/6/5，单项 0–12），合计生成 24 条；旧 event_catalog_period_limit_* 三键退役（纯 pop，不搬运）。
+- 更新周期默认改为 7–10 天（min_interval_days=7 / max_interval_days=10）；用户自定义范围仍按 1–365 夹取，不锁死默认值。
+- 总池扩容：内置 5 + 生成 24 = 29，max_pool_events 上限 32（internal_tuning.json 与出厂默认同钉）。
+- 新增 NO Puzzle 开关（event_catalog_no_puzzle，默认开，WebUI 标签即 "NO Puzzle"）：开启时生成提示词追加反套路引导，避免拼拼图、十字绣等被滥用的套路活动。
+- 周期结束不要求用完所有事件（纯权重抽取，现状保持）。版本双号 3.9.2，配置 17 段 182 字段（[schedule] +4）。
+
 ## 3.9.1（2026-11-07）
 
 - 超限自动裁剪兜底（新增 [llm].over_limit_auto_trim，默认开）：小事件生成超量时取前 N 条而非整批作废（修复模型多返导致刷新失败）；日程意图超量按时间排序后保留末尾 N 条，晚间计划不被裁掉（关闭则沿用旧截断）。

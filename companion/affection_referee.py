@@ -2,10 +2,12 @@
 
 结构镜像 ``emotion/referee.py``：
 
-- **会话采样裁判** :func:`evaluate_conversation_delta`：最近 ~10 条对话摘要 + 双方称呼与人设
+- **会话采样裁判** :func:`evaluate_conversation_delta`：最近 ~10 条对话摘要 + 双方称呼
   + 关系档位描述 + 当前情绪低分辨率描述 → ``(event, delta ∈ [-4, +5], tag)``；
 - **关系日结裁判** :func:`run_daily_review`：当日事件日志 + 互动统计 + 最近印象 + 档位描述
-  + 人设 → ``delta_score ∈ [-4, +4] + 0~3 条印象 + tone + reason``；
+  → ``delta_score ∈ [-4, +4] + 0~3 条印象 + tone + reason``；
+- 人设统一经 ``with_identity=True`` 以宿主同款开头注入 system_prompt（共享前缀缓存），
+  用户提示词不再重复人设片段；
 - 解析一律宽松（整段 → ```json 围栏 → 首个 {...} 块），代码层二次限幅（LLM 数值失真兜底）；
 - LLM 全部经 ``core/llm_utils.LLMService.generate`` 并带 ``event=`` 标识
   （``affection_review`` / ``affection_daily_review``），任务名用 ``[llm].review_task_name``；
@@ -252,16 +254,19 @@ async def evaluate_conversation_delta(
         fallback=CONVERSATION_REVIEW_PROMPT,
         lover_name=str(lover_name or "麦麦"),
         target_label=str(target_label or "重要的人"),
-        persona=str(persona or "（暂无人设）")[:800],
+        persona="",
         tier_label=str(tier_label or "（未知阶段）"),
         tier_desc=str(tier_desc or ""),
         mood_text=str(mood_text or "（情绪状态未知）"),
         recent_messages=_format_messages(recent_messages),
     )
     try:
+        # 人设经 with_identity 以宿主同款开头注入 system_prompt（共享前缀缓存）；
+        # persona 形参保留兼容，渲染传空防旧定制模板残留 {persona} 触发 KeyError。
         response = await llm.generate(prompt, task_name=task_name, temperature=0.3,
                                        module="companion",
-                                       event="affection_review")
+                                       event="affection_review",
+                                       with_identity=True)
     except Exception as exc:  # 宿主异常一律静默（失败哲学）
         logger.debug("会话采样裁判请求失败（跳过本轮）：%s", exc)
         return None
@@ -311,7 +316,7 @@ async def run_daily_review(
         lover_name=str(lover_name or "麦麦"),
         target_label=str(target_label or "重要的人"),
         date=day,
-        persona=str(persona or "（暂无人设）")[:800],
+        persona="",
         tier_label=str(tier_label or "（未知阶段）"),
         tier_desc=str(tier_desc or ""),
         stats=_format_stats(stats),
@@ -319,9 +324,11 @@ async def run_daily_review(
         impressions=_format_impressions(impressions),
     )
     try:
+        # 人设经 with_identity 走 system_prompt（与会话采样裁判同口径）。
         response = await llm.generate(prompt, task_name=task_name, temperature=0.3,
                                        module="companion",
-                                       event="affection_daily_review")
+                                       event="affection_daily_review",
+                                       with_identity=True)
     except Exception as exc:  # 宿主异常一律静默（失败哲学）
         logger.debug("关系日结裁判请求失败（跳过本轮）：%s", exc)
         return None
