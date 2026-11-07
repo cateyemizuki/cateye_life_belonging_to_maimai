@@ -72,13 +72,17 @@ class VideoWatchService:
                  config_provider: Optional[Callable[[], Any]] = None,
                  llm_generate_detailed: Optional[Callable[..., Awaitable[Any]]] = None,
                  automatic_guard: Optional[Callable[[str], bool]] = None,
-                 state_changed: Optional[Callable[[], None]] = None) -> None:
+                 state_changed: Optional[Callable[[], None]] = None,
+                 qzone_assets_provider: Optional[Callable[[], Optional[Dict[str, Any]]]] = None) -> None:
         self._data_dir = Path(data_dir)
         self._logger = logger
         self._config_provider = config_provider
         self._llm_generate_detailed = llm_generate_detailed
         self._automatic_guard = automatic_guard
         self._state_changed = state_changed
+        # PR-A1：空间高清截图提取参数提供器（装配根按 [qzone_video].mode=auto 且
+        # 空间启用时给绝对 asset_dir；None/空 = worker 零开销，不提取）
+        self._qzone_assets_provider = qzone_assets_provider
         self._manager: Optional[WatchTaskManager] = None
 
     # ---- 生命周期（on_load / on_unload 各一次；热重载 = 全量重载重建实例）----
@@ -112,6 +116,7 @@ class VideoWatchService:
             max_video_duration_seconds=0,
             visual_provider=visual_provider,
             cache_retention_days=self._int_of("cache_retention_days", 15),
+            qzone_assets_provider=self._qzone_assets_provider,
         )
         self._manager.set_impression_hook(self._make_result_hook())
         self._manager.set_task_guard(self._automatic_task_allowed)

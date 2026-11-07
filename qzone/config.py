@@ -173,7 +173,8 @@ class QzoneSectionConfig(PluginConfigBase):
 
 
 class QzoneVideoSectionConfig(PluginConfigBase):
-    """空间视频候选与影子判定（PR-A0：只记录与判定留痕，不发布）。"""
+    """空间视频候选与影子判定（PR-A0：只记录与判定留痕，不发布；
+    PR-A1：auto 模式额外提取高清非拼图截图资产，仍不发布）。"""
 
     __ui_label__ = "空间视频候选"
     __ui_icon__ = "video"
@@ -185,12 +186,12 @@ class QzoneVideoSectionConfig(PluginConfigBase):
 
     mode: str = Field(
         default="shadow",
-        description="off=不记录候选；shadow=记录候选并做影子判定（只留痕不发布）；"
-                    "auto 本批行为同 shadow（发布链路未接通，PR-A2）。非法值回退 shadow",
+        description="off=不记录候选；shadow=记录候选并做影子判定（只留痕不发布、不提取截图）；"
+                    "auto=额外提取高清非拼图截图资产（发布链路未接通 PR-A2，仍不发布）。非法值回退 shadow",
         json_schema_extra={
             "label": "运行模式",
-            "hint": "off / shadow / auto；auto 当前等同 shadow（不发布）",
-            **_ui_i18n("Mode", "off / shadow / auto; auto currently behaves as shadow"),
+            "hint": "off / shadow / auto；auto 提取截图资产但仍不发布（PR-A2 未接通）",
+            **_ui_i18n("Mode", "off / shadow / auto; auto extracts assets but never posts yet"),
         },
     )
     candidate_ttl_hours: int = Field(
@@ -217,6 +218,38 @@ class QzoneVideoSectionConfig(PluginConfigBase):
             "hint": "0 = 当天不做判定",
             **_ui_i18n("Daily decision limit"),
         },
+    )
+
+    # ── 高清截图资产（PR-A1，2026-11-07；仅 mode=auto 且空间启用时提取）──────────────
+    min_width: int = Field(
+        default=1280,
+        ge=320,
+        le=3840,
+        description="高清截图的真实像素宽度门槛：提取后实测 JPEG 尺寸，低于该值的帧如实弃用"
+                    "（标 hd_unavailable），绝不低清放大冒充",
+        json_schema_extra={"label": "截图最小宽度(px)", **_ui_i18n("Min asset width (px)")},
+    )
+    max_assets_per_video: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="单个视频最多保留几张高清非拼图截图（首/中/末分散选点，不默认第一帧）",
+        json_schema_extra={"label": "单视频截图上限", **_ui_i18n("Max assets per video")},
+    )
+    asset_ttl_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        description="截图资产有效期（小时）：到期未被发布引用的资产删除文件与索引",
+        json_schema_extra={"label": "截图有效期(小时)", **_ui_i18n("Asset TTL (hours)")},
+    )
+    asset_max_total_mb: int = Field(
+        default=200,
+        ge=16,
+        le=2048,
+        description="截图资产目录磁盘总量上限（MB）：超出时从最旧的 available 资产开始释放；"
+                    "claimed（发布中）资产不删",
+        json_schema_extra={"label": "截图总量上限(MB)", **_ui_i18n("Asset total cap (MB)")},
     )
 
     @pydantic.field_validator("mode", mode="before")

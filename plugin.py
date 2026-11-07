@@ -494,7 +494,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             llm_generate_detailed=lambda *args, **kwargs: self._llm.generate_detailed(
                 *args, module="video", **kwargs),
             automatic_guard=self._video_automation_allowed,
-            state_changed=self._video_state_changed)
+            state_changed=self._video_state_changed,
+            # PR-A1：仅 [qzone_video].mode=auto 且空间启用时给 worker 截图提取参数
+            qzone_assets_provider=lambda: self._qzone_video_assets_spec(data_dir))
         # F6（2026-11-04 评估）：plugin.enabled=false → 不构造观看 manager——工具面
         # 经 handle_action 如实回执「未启用」，与 [plugin] hint「关 = 全部模块停摆
         # （含命令与工具）」对齐；start 内部另查 [video_watch].enabled（旧口径不变）。
@@ -1544,11 +1546,33 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 self.ctx.logger.warning('空间视频候选记录失败（忽略）：%s', exc)
         return recorded
 
+    def _qzone_video_assets_spec(self, data_dir: Path) -> Any:
+        """PR-A1：观看 spec 的空间截图提取参数装配（父侧给绝对路径，worker 不读配置）。
+
+        仅 [qzone_video].mode=auto 且 qzone.enabled 时返回参数；shadow/off/空间关
+        返回 None（worker 零开销，不提取——计划书 §3.4 影子只记候选时间点）。
+        """
+        from pathlib import Path
+        try:
+            cfg = self.config.qzone_video
+            if str(getattr(cfg, 'mode', 'shadow') or 'shadow') != 'auto':
+                return None
+            if not bool(self.config.qzone.enabled):
+                return None
+            return {'min_width': int(cfg.min_width),
+                    'max_assets': int(cfg.max_assets_per_video),
+                    'asset_dir': str((Path(data_dir) / 'video_watch' / 'qzone_assets').resolve()),
+                    'ttl_hours': int(cfg.asset_ttl_hours)}
+        except Exception:
+            return None  # 配置异常保守不提取，不影响观看主链路
+
     def _build_qzone_video(self, data_dir: Path) -> Any:
-        """PR-A0：空间视频候选桥（影子模式）；仿 _build_video_social，异常保守停用。"""
+        """PR-A0：空间视频候选桥（影子模式）；仿 _build_video_social，异常保守停用。
+        PR-A1：ledger 同时持有截图资产受控目录（生命周期/启动恢复）。"""
         from integrations.qzone_video_bridge import QzoneVideoBridge, QzoneVideoLedger
         try:
-            ledger = QzoneVideoLedger(data_dir / 'video_watch/qzone_video.sqlite3')
+            ledger = QzoneVideoLedger(data_dir / 'video_watch/qzone_video.sqlite3',
+                                      asset_dir=data_dir / 'video_watch/qzone_assets')
             return QzoneVideoBridge(
                 ledger,
                 config_provider=lambda: self.config.qzone_video,

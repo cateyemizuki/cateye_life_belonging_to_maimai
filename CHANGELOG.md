@@ -1,5 +1,13 @@
 # 更新日志（CHANGELOG）
 
+## 3.10.1（2026-11-07）
+
+- PR-A1 高清非拼图截图资产：`video_watch/worker.py` 新增可选分支 `_fetch_playurl_hq`（公开 playurl qn=64 + platform=html5，**不携带任何登录态**；已实测未登录可得 720P，qn=32 反回落 360P 故不试）与 `_extract_qzone_assets`（VLM 拼图帧取得后、finally 清理前调用；按首/中/末分散选点最多 1–4 个，`-ss <t> -i <直链> -frames:v 1 -q:v 2` 抽**原生分辨率**单帧，**无 scale 滤镜**；读 JPEG SOF 实测宽度，低于 min_width 如实弃用标 `hd_unavailable`，绝不低清放大；Pillow 灰度方差查黑屏/纯色、sha256 去重；单帧 ≤8MiB、复用任务总截止）。资产写入受控绝对目录 `data/video_watch/qzone_assets/vframe_<uuid hex>.jpg`（resolve 限定根目录内、拒绝 symlink），result 顶层只挂 manifest 元数据（asset_id/bvid/cid/task_id/时间点/实测宽高/mime/sha256/bytes/status/created_at/expires_at，**不含播放直链**）与 `qzone_assets_diag`（≤350 字）；提取失败 try/except 隔离，不拖挂 VLM 主结果。VLM 低清拼图链路（scale=480:-2、q:v=7）逐字保持。
+- 资产生命周期：`QzoneVideoLedger` 新表 `assets`（reserved/available/claimed/released/expired）。`record_from_result`：候选被证据闸接纳 → reserved→available；候选被拒/去重 → 立即删 reserved 文件与行；证据闸拒绝/模式 off/空间关 → manifest 文件即删（不囤积）。`tick()`：过期删文件+行、总量超 asset_max_total_mb 从最旧 available 释放、off/空间关释放全部非 claimed；**claimed（A2/A3 发布中）永不删**。启动恢复：无候选引用的 reserved 一律删、有引用的提升 available、目录内无索引行的无主文件清除。资产不进聊天注入历史、不进 result_text 对外文案。
+- 接线：plugin.py `_qzone_video_assets_spec`（仅 `[qzone_video].mode=auto` 且 `qzone.enabled` 时给 spec 带 `qzone_assets={min_width,max_assets,asset_dir(绝对),ttl_hours}`；shadow/off 零开销不提取——计划书 §3.4 影子只记候选时间点）；VideoWatchService/WatchTaskManager 增 `qzone_assets_provider` 注入并在 submit 快照、_run_task 装配进 worker spec（worker 不读插件配置）；manager._finish 的 visual.pop("frames") 边界保持，manifest 元数据允许穿过；ledger 构造传 asset_dir。
+- 配置：[qzone_video] +4 字段（min_width=1280 ge320 le3840；max_assets_per_video=2 ge1 le4；asset_ttl_hours=24 ge1 le168；asset_max_total_mb=200 ge16 le2048），mode 描述更新（auto 提取资产但仍不发布，PR-A2 未接通）。schema 18 段 186 → 190 字段，迁移保持用户值（新键取默认）。
+- 版本双号 3.10.1（_manifest.json == SUPPORTED_CONFIG_VERSION）；七门禁计数/版本重钉（smoke/round：190 字段）；新增专项 scratch/test_qzone_video_a1.py。边界：只做资产提取/核验/生命周期，不发帖（A2）、不建发布回执（A3）。部署由主代理执行，本批不部署、不 git commit。
+
 ## 3.10.0（2026-11-07）
 
 - PR-A0 视频空间候选与权限边界（影子模式）：新增 `integrations/qzone_video_bridge.py`（QzoneVideoLedger + QzoneVideoBridge）。自主观看（自动日程 + /lbm_plan watch 手动周期）完成且证据闸通过（视觉 completed+summary 或 ≥40 字公开字幕，复用 video_share_policy.watched_facts）时记录空间视频候选；`data/video_watch/qzone_video.sqlite3` 落盘，UNIQUE(bvid,task_id) 幂等去重（同一次观看不重复建候选，同 bvid 不同次观看允许新候选）。用户点播工具链不经此记录器，权限边界保持现状。

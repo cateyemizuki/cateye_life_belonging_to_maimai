@@ -41,7 +41,8 @@ class WatchTaskManager:
                  max_video_duration_seconds: int = 1800,
                  worker_cmd: Optional[List[str]] = None,
                  visual_provider: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
-                 cache_retention_days: int = 15) -> None:
+                 cache_retention_days: int = 15,
+                 qzone_assets_provider: Optional[Callable[[], Optional[Dict[str, Any]]]] = None) -> None:
         self._store = WatchStore(Path(data_dir), cache_retention_days)
         self._dir = Path(data_dir)
         self._log = logger
@@ -53,6 +54,8 @@ class WatchTaskManager:
         self._worker_cmd = worker_cmd  # type: ignore[assignment]
         # 采样能力标记仍用于运行任务去重与历史口径；文字记忆按BV复用。
         self._visual_provider = visual_provider
+        # PR-A1：空间高清截图提取参数（None = 不提取，shadow/off 零开销）
+        self._qzone_assets_provider = qzone_assets_provider
         self._proc: Optional[Any] = None
         self._current_task_id: Optional[str] = None
         self._cancel_requested: set = set()
@@ -106,6 +109,18 @@ class WatchTaskManager:
     def _visual_spec(self) -> Optional[Dict[str, Any]]:
         """本次装配的画面采样参数（None = 纯文本来源流水线，行为与独立原型一致）。"""
         provider = self._visual_provider
+        if provider is None:
+            return None
+        try:
+            spec = provider()
+        except Exception:
+            return None
+        return spec if isinstance(spec, dict) and spec else None
+
+    def _qzone_assets_spec(self) -> Optional[Dict[str, Any]]:
+        """PR-A1：本次装配的空间截图提取参数（None = 不提取；worker 不读插件配置，
+        资产目录绝对路径由装配根经此注入 spec）。提供器异常保守视为不提取。"""
+        provider = self._qzone_assets_provider
         if provider is None:
             return None
         try:
@@ -186,6 +201,7 @@ class WatchTaskManager:
             "owners": [owner] if owner else [],
             "cache_mode": requested_mode,
             "visual_spec": self._visual_spec(),
+            "qzone_assets_spec": self._qzone_assets_spec(),
             "status": _QUEUED,
             "created_at": time.time(),
             "deadline_seconds": self._deadline_seconds,
@@ -431,6 +447,10 @@ class WatchTaskManager:
         if visual_spec:
             # B2：worker 侧有界抽帧参数（不可得/失败由 worker 如实降级，不影响文本来源）
             spec["visual"] = visual_spec
+        qzone_assets_spec = task.get("qzone_assets_spec", self._qzone_assets_spec())
+        if qzone_assets_spec:
+            # PR-A1：仅 auto+空间启用时装配根才给参数；worker 据此提取高清截图资产
+            spec["qzone_assets"] = qzone_assets_spec
         atomic_write_json(job_dir / "spec.json", spec)
         task["status"] = _RUNNING
         task["started_at"] = time.time()

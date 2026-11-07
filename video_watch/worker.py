@@ -24,11 +24,14 @@ completed/failed + 结构化结果）。所有网络请求有超时；worker 主
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import json
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any
 from pathlib import Path
 from urllib import parse as _urlparse
@@ -44,6 +47,11 @@ VISUAL_CAPABILITY = "frames-v2-page"
 _FRAME_BYTES_LIMIT = 96 * 1024
 #: 抽帧画面宽度（等比缩放；有界采样不是逐帧观看）
 _FRAME_WIDTH = 480
+
+#: PR-A1 空间高清截图：单帧字节上限（原生分辨率高质量 JPEG；超出如实弃用）
+_QZONE_FRAME_BYTES_LIMIT = 8 * 1024 * 1024
+#: PR-A1 黑屏/纯色判定：灰度缩略图像素标准差低于该值视为无内容帧
+_QZONE_BLANK_STDDEV = 2.0
 
 #: view API 错误码 → 面向结果契约的失败原因（如实归类，不虚构）
 _VIEW_API_ERRORS = {
@@ -176,6 +184,227 @@ def _fetch_playurl(bvid: str, cid: Any) -> str:
     if not direct:
         raise LookupError("playurl 未返回可用直链（可能为 DASH/需要更高权限的格式）")
     return direct
+
+
+def _fetch_playurl_hq(bvid: str, cid: Any) -> tuple:
+    """公开高清直链（playurl qn=64 + platform=html5，**不携带任何登录态**）。
+
+    已实测（2026-11-07，BV1bexB69Es7/cid43189536170，未登录 html5）：qn=64 →
+    quality=64（720P）；qn=32 反而回落 16（360P），qn=80 封顶 64——故直接请求 64，
+    不试 32。逐视频可用性不同，调用方必须实测帧尺寸兜底，不信请求参数。
+
+    Returns:
+        (direct_url, reported_qn)：直链与接口自报画质（仅诊断用，非尺寸依据）。
+    Raises:
+        LookupError: 接口拒绝/需登录/多分段等，带真实原因（不绕权限）。
+    """
+    url = ("https://api.bilibili.com/x/player/playurl?bvid="
+           + _urlparse.quote(bvid) + "&cid=" + _urlparse.quote(str(cid or ""))
+           + "&qn=64&platform=html5&type=mp4")
+    payload = _http_get_json(url)
+    code = payload.get("code")
+    if code != 0:
+        raise LookupError("hd_unavailable: " + _VIEW_API_ERRORS.get(code, f"playurl code={code}"))
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    durl = data.get("durl") if isinstance(data.get("durl"), list) else []
+    if len(durl) > 1:
+        raise LookupError("hd_unavailable: 媒体包含多个分段，不拼接分段提取截图")
+    first = durl[0] if durl and isinstance(durl[0], dict) else {}
+    direct = str(first.get("url") or "").strip()
+    if not direct:
+        raise LookupError("hd_unavailable: playurl 未返回可用直链（可能为 DASH/需要更高权限的格式）")
+    try:
+        reported_qn = int(data.get("quality") or 0)
+    except (TypeError, ValueError):
+        reported_qn = 0
+    return direct, reported_qn
+
+
+def _jpeg_dimensions(data: bytes) -> tuple:
+    """读 JPEG SOF 段取真实像素尺寸（不依赖解码器/请求参数）；读不出返回 None。"""
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                   0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+    index = 2
+    while index + 9 < len(data):
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        if marker == 0xFF:
+            index += 1
+            continue
+        if marker == 0xDA or marker == 0xD9:  # 扫描开始/结束仍未见 SOF
+            return None
+        if marker == 0x01 or 0xD0 <= marker <= 0xD8:  # 无长度段
+            index += 2
+            continue
+        length = int.from_bytes(data[index + 2:index + 4], "big")
+        if length < 2:
+            return None
+        if marker in sof_markers:
+            height = int.from_bytes(data[index + 5:index + 7], "big")
+            width = int.from_bytes(data[index + 7:index + 9], "big")
+            return (width, height) if width > 0 and height > 0 else None
+        index += 2 + length
+    return None
+
+
+def _frame_blank_reason(data: bytes) -> str:
+    """确定性黑屏/纯色检查（灰度缩略图像素标准差）；返回空串=通过。
+
+    Pillow 缺席或解码失败时如实返回不可用原因（调用方弃帧，不冒充已检查）。
+    """
+    try:
+        from PIL import Image, ImageStat
+    except ImportError:
+        return "质量检查不可用（缺 Pillow）"
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            gray = image.convert("L")
+            gray.thumbnail((64, 64))
+            stddev = ImageStat.Stat(gray).stddev[0]
+    except Exception:
+        return "帧解码失败"
+    return "" if stddev >= _QZONE_BLANK_STDDEV else "黑屏/纯色帧"
+
+
+def _pick_asset_times(ok_times: list, max_assets: int) -> list:
+    """从实际取得帧的时间点里选分散点位：中/末/首优先，不默认第一帧。"""
+    times = sorted({float(t) for t in ok_times
+                    if isinstance(t, (int, float)) and t >= 0})  # NaN>=0 为 False，自然排除
+    if not times:
+        return []
+    limit = max(1, int(max_assets))
+    if limit == 1 or len(times) == 1:
+        return [times[len(times) // 2]]
+    picks: list = []
+    for index in (len(times) // 2, len(times) - 1, 0):
+        if times[index] not in picks:
+            picks.append(times[index])
+    rest = [t for t in times if t not in picks]
+    while rest and len(picks) < limit:
+        picks.append(rest.pop(len(rest) // 2))
+    return sorted(picks[:limit])
+
+
+def _extract_qzone_assets(spec: dict, video: dict, job_dir: Path,
+                          deadline_epoch: float, ok_times: list) -> dict:
+    """PR-A1：高清非拼图截图资产提取（仅 spec 带 qzone_assets 时由调用方触发）。
+
+    原生分辨率单帧（无 scale 滤镜）+ 实测尺寸兜底；低清/黑屏/重复如实弃用；
+    写入父侧传入的受控绝对目录，产出 reserved manifest（不含播放直链）。
+    任何失败都返回 {"assets": [], "diag": 原因}，绝不抛出拖挂 VLM 主结果。
+    """
+    cfg = spec.get("qzone_assets") if isinstance(spec.get("qzone_assets"), dict) else {}
+    notes: list = []
+    measured: list = []
+    reported_qn: Any = None
+    tmp = job_dir / "hq_asset_tmp.jpg"
+    try:
+        try:
+            min_width = max(320, min(3840, int(cfg.get("min_width") or 1280)))
+            max_assets = max(1, min(4, int(cfg.get("max_assets") or 2)))
+            ttl_hours = max(1, min(168, int(cfg.get("ttl_hours") or 24)))
+        except (TypeError, ValueError):
+            raise LookupError("hd_unavailable: 截图参数非法")
+        root = Path(str(cfg.get("asset_dir") or ""))
+        if not str(cfg.get("asset_dir") or "") or not root.is_absolute() or root.is_symlink():
+            raise LookupError("hd_unavailable: 资产目录不可用（需绝对路径且非 symlink）")
+        root = root.resolve()
+        decoder = _decoder_executable(job_dir)
+        if not decoder:
+            raise LookupError("hd_unavailable: 本机无 ffmpeg，未提取空间截图")
+        times = _pick_asset_times(ok_times, max_assets)
+        if not times:
+            raise LookupError("hd_unavailable: 无可用采样时间点")
+        direct, reported_qn = _fetch_playurl_hq(str(video.get("bvid") or ""), video.get("cid"))
+        parsed = _urlparse.urlsplit(direct)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise LookupError("hd_unavailable: 媒体地址协议不可用")
+        root.mkdir(parents=True, exist_ok=True)
+        assets: list = []
+        seen_hashes: set = set()
+        flags = (subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+                 if sys.platform == "win32" else 0)
+        for at in times:
+            remaining = deadline_epoch - time.time()
+            if remaining <= 0:
+                notes.append("到达任务总截止，停止提取")
+                break
+            tmp.unlink(missing_ok=True)
+            # 原生分辨率单帧：无 -vf/scale（红线：禁止低清放大冒充高清）；
+            # 直链只进 ffmpeg 命令行，不落 result/manifest。
+            command = [decoder, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                       "-threads", "1", "-filter_threads", "1",
+                       "-rw_timeout", "15000000", "-user_agent", _UA,
+                       "-headers", "Referer: https://www.bilibili.com/\r\n",
+                       "-protocol_whitelist", "http,https,tcp,tls,crypto",
+                       "-ss", str(at), "-i", direct, "-an", "-sn",
+                       "-frames:v", "1", "-q:v", "2", str(tmp)]
+            try:
+                process = subprocess.run(command, capture_output=True,
+                                         timeout=min(30.0, remaining), creationflags=flags)
+            except subprocess.TimeoutExpired:
+                notes.append(f"t={at}s 抽帧超时")
+                continue
+            if process.returncode != 0 or not tmp.exists():
+                notes.append(f"t={at}s 抽帧失败")
+                continue
+            data = tmp.read_bytes()
+            tmp.unlink(missing_ok=True)
+            if not data or len(data) > _QZONE_FRAME_BYTES_LIMIT:
+                notes.append(f"t={at}s 帧字节超出上限")
+                continue
+            size = _jpeg_dimensions(data)
+            if size is None:
+                notes.append(f"t={at}s 无法读出 JPEG 尺寸")
+                continue
+            width, height = size
+            measured.append(f"{width}x{height}@{at}s")
+            if width < min_width:
+                notes.append(f"t={at}s 实测宽 {width}<{min_width}，低清弃用")
+                continue
+            blank = _frame_blank_reason(data)
+            if blank:
+                notes.append(f"t={at}s {blank}")
+                continue
+            digest = hashlib.sha256(data).hexdigest()
+            if digest in seen_hashes:
+                notes.append(f"t={at}s 重复帧（hash 相同）")
+                continue
+            asset_id = "vframe_" + uuid.uuid4().hex
+            final = root / (asset_id + ".jpg")
+            if final.is_symlink() or final.resolve().parent != root:
+                raise LookupError("hd_unavailable: 资产路径越出受控目录，拒绝写入")
+            with open(final, "xb") as handle:
+                handle.write(data)
+            seen_hashes.add(digest)
+            now = time.time()
+            assets.append({"asset_id": asset_id, "bvid": str(video.get("bvid") or ""),
+                           "cid": str(video.get("cid") or ""),
+                           "task_id": str(spec.get("task_id") or ""),
+                           "timestamp_seconds": float(at), "width": width, "height": height,
+                           "mime": "image/jpeg", "sha256": digest, "bytes": len(data),
+                           "status": "reserved", "created_at": now,
+                           "expires_at": now + ttl_hours * 3600})
+            if len(assets) >= max_assets:
+                break
+        if not assets:
+            detail = "；".join(notes) or "未取得合格帧"
+            raise LookupError(f"hd_unavailable: reported_qn={reported_qn}，"
+                              f"实测 {'/'.join(measured) or '无'}；{detail}")
+        return {"assets": assets, "diag": "；".join(notes)[:350]}
+    except LookupError as exc:
+        return {"assets": [], "diag": str(exc)[:350]}
+    except Exception as exc:  # 提取失败不拖挂 VLM 主结果，如实记录类型
+        return {"assets": [], "diag": f"hd_unavailable: 提取异常（{type(exc).__name__}）"[:350]}
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _download_bounded(url: str, target: Path, max_bytes: int,
@@ -370,11 +599,23 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path, deadline_epoch: float
         frames = pack_montages(ok_paths, ok_times)
         partial = ("" if len(ok_paths) == plan["frame_count"] else
                    f"（计划{plan['frame_count']}个采样点，实际取得{len(ok_paths)}帧）")
-        return {"status": "completed", "capability": cap, "frames": frames,
-                "sampled_seconds": ok_times, "frame_count": len(ok_paths),
-                "montage_count": len(frames), "source_mode": source_mode, "sampling_mode": sampling_mode,
-                "frame_interval_seconds": int(cfg.get("interval_seconds") or 25),
-                "note": f"实际采样{len(ok_paths)}帧，合为{len(frames)}张4×4拼图{partial}"}
+        completed = {"status": "completed", "capability": cap, "frames": frames,
+                     "sampled_seconds": ok_times, "frame_count": len(ok_paths),
+                     "montage_count": len(frames), "source_mode": source_mode, "sampling_mode": sampling_mode,
+                     "frame_interval_seconds": int(cfg.get("interval_seconds") or 25),
+                     "note": f"实际采样{len(ok_paths)}帧，合为{len(frames)}张4×4拼图{partial}"}
+        # PR-A1：VLM 帧已取得、finally 清理之前提取空间高清截图（仅 spec 带配置时；
+        # shadow/off 父侧不装配 qzone_assets → 此分支零开销）。失败隔离，不拖挂主结果。
+        if isinstance(spec.get("qzone_assets"), dict) and spec["qzone_assets"]:
+            try:
+                qzone = _extract_qzone_assets(spec, video, job_dir, deadline_epoch, ok_times)
+            except Exception as exc:
+                qzone = {"assets": [],
+                         "diag": f"空间截图提取异常（{type(exc).__name__}），不影响画面理解"[:350]}
+            completed["qzone_assets"] = qzone.get("assets") or []
+            if qzone.get("diag"):
+                completed["qzone_assets_diag"] = str(qzone["diag"])[:350]
+        return completed
     except Exception as exc:
         reason = str(exc) if isinstance(exc, (LookupError, ValueError)) else f"采样失败（{type(exc).__name__}），未发送原始媒体地址"
         return {"status": "failed", "reason": reason[:350], "capability": cap,
@@ -432,6 +673,10 @@ def run(spec: dict, result_path: Path) -> None:
 
     # B2 有界画面采样：任一步不可得都如实降级，不阻塞文本来源结果
     visual = _sample_visual(spec, video, job_dir, float(spec.get("deadline_epoch") or 0))
+    # PR-A1：manifest/诊断从 visual 提到 result 顶层（元数据，不含二进制与直链），
+    # 父侧 manager._finish 的 visual.pop("frames") 边界不受影响。
+    qzone_assets = visual.pop("qzone_assets", None)
+    qzone_assets_diag = visual.pop("qzone_assets_diag", None)
     visual_completed = visual.get("status") == "completed"
     if visual_completed:
         observations.append(f"画面采样：{len(visual.get('frames') or [])} 帧"
@@ -465,6 +710,10 @@ def run(spec: dict, result_path: Path) -> None:
         "finished_at": time.time(),
         "cached": False,
     }
+    if qzone_assets is not None:
+        result["qzone_assets"] = qzone_assets
+    if qzone_assets_diag:
+        result["qzone_assets_diag"] = str(qzone_assets_diag)[:350]
     result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
     _write_progress(job_dir, "done", "completed")
 
