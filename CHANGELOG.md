@@ -1,5 +1,10 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.11（2026-11-08）
+
+- PR-TABS-LEFT（栏目导航改左侧纵向栏，纯布局，不影响调度）：①模板在 notice/offline/snapshot 之后新增 `.panel-layout` 双列 grid 包裹层——左列 `nav.panel-tabs` 纵向 sticky（`flex-direction:column;top:12px`，右缘分隔线，实底 `var(--maibot-background)` 防透底），右列新增 `.panel-body` 包裹 datebar+5 个 tabpanel（闭合于 footer 之前）；mast（3.17.9 左列工具按钮+右列更新时间）仍在最上方不动。②5 个栏目按钮自上而下顺序调整为 此刻→日程→历史→心情与分享→系统（日常高频优先、日程近期改造重点前置）；按钮 ID/data-tab/aria-controls/aria-selected/tabindex 逐字不变，仅交换 HTML 中 history/schedule 两个 button 的位置。③CSS 采用级联尾部追加段（沿用 PR-TOOLBAR-LEFT 模式）压过 Panel v3 横条/窄屏横排/REFORGE 胶囊旧规则：桌面左栏 132px、按钮全宽左对齐（glyph+文字一行）；窄屏 <700px 左栏收窄 64px（glyph 上文字下、font-size:10px、触控 min-height:55px）保持纵向不回落横排；嵌入态左栏 96px（~500px iframe 内容区约 380px 可用）；暗色 sticky 背景同步实底覆盖 REFORGE 半透明规则。④键盘导航：原左右箭头循环切换基础上加上下箭头（Down=下一栏/Up=上一栏，左右保留兼容），Home/End 与 activateTab 切换逻辑不变。
+- **红线保留**：纯布局；tab ID/data-tab/aria/键盘可达不变；panel.js 切换逻辑不改（仅方向键语义一行）；各 panel 内容、3.17.9 工具按钮左列、3.17.10 横条全宽置顶不受影响；不影响调度。配置：无新增字段（schema 不变，18 段 203 叶子）。版本双号 3.17.11（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round 版本断言与打印、test_prompt_identity_audit / test_webui_timeline_3178 / test_toolbar_left_3179 / test_overview_fullwidth_31710 双号断言顺延，只改版本/计数；smoke R6 守卫读双号动态比对无需改字面量）。新增专项 `scratch/test_tabs_left_31711.py`；`python tools/build_webui.py` 重建 index.html。边界：本批不部署、不 git commit、不 push、不碰主机。
+
 ## 3.17.10（2026-11-08）
 
 - PR-OVERVIEW-FULLWIDTH（当日活动概括全宽缩放 + 日程顶部常驻，纯展示，不影响调度）：①`#activity-overview` 整段移出 `#schedule-page-content`（原在 `#schedule-record` 内，切到「小事件」页即不可见），置于 `#panel-schedule` 第一个子元素（翻页 caption 之上）——日程栏目顶部常驻，行程记录/小事件两页均可见；ID/内部结构（overview-track/overview-scale/overview-date/overview-note）不变。②去掉 `.overview-inner{min-width:560px}` 与 `.overview-scroll{overflow-x:auto}` 横滑，容器改 `width:100%`、`.overview-track` 宽度=卡片内容宽（100%）——横条撑满页面最大宽度，窄屏（<700px）段按比例缩小不横滑，刻度行随同缩放；`.overview-card` margin 调为 `0 0 12px` 与日程顶部间距协调。③`renderActivityOverview` 调用点由 `renderSchedule` 内移到 `renderSchedulePage` 顶部（翻页分支之前，`if(data)` 守卫沿用旧「有数据才渲染」语义），两页都渲染横条；数据源仍 `dayRows()`（selectedDay 历史日同样全宽置顶），`renderSchedule` 内原调用移除避免重复。

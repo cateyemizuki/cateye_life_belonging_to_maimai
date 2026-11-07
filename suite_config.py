@@ -216,7 +216,12 @@ from suite_prompts import (
 # 按比例缩放 + 渲染调用移 renderSchedulePage 顶部），24h 轴语义/颜色/浮窗/跨日
 # 逻辑不变，不影响调度，无新增配置字段（schema 不变，18 段 203 叶子），
 # 按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.10"
+# 3.17.11（2026-11-08 PR-TABS-LEFT 栏目导航改左侧纵向栏）：
+# 纯布局改动（panel-layout 双列 grid + panel-tabs 纵向 sticky + panel-body 包裹
+# datebar/5 tabpanel + 按钮顺序 此刻→日程→历史→心情与分享→系统 + 键盘加上下箭头），
+# tab ID/data-tab/aria/切换逻辑不变，不影响调度，无新增配置字段（schema 不变，
+# 18 段 203 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.11"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

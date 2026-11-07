@@ -441,3 +441,24 @@ body.fish-locked .fish-overlay[data-section=usage]{z-index:960}
 .connectionline{text-align:left;margin-top:0}
 .more-menu{left:calc(100% + 6px);right:auto;top:0;max-width:calc(100vw - 150px)}
 @media(max-width:700px){.mast{grid-template-columns:auto minmax(0,1fr);gap:12px}.toolbar{width:104px}.mast-side{gap:6px}}
+/* ── PR-TABS-LEFT（3.17.11）：栏目导航改左侧纵向栏 ─────────────────────────
+   纯布局：.shell 内新增 .panel-layout 双列 grid（左列=nav.panel-tabs 纵向 sticky，
+   右列=.panel-body 包裹 datebar+5 个 tabpanel）；mast（3.17.9 左列工具按钮）仍在最上方。
+   按钮顺序 此刻→日程→历史→心情与分享→系统；ID/data-tab/aria-controls/aria-selected 不变，
+   activateTab 切换逻辑不改（键盘另加上下箭头，左右保留兼容）。
+   本段位于级联尾部，压过 Panel v3 横条（:14）、窄屏横排（:40）与 REFORGE 胶囊（:252）；
+   sticky 背景用实底 var(--maibot-background) 防透底（含暗色覆盖 REFORGE 半透明规则）。
+   窄屏 <700px 左栏收窄 64px（glyph 上文字下）保持纵向不回落横排；嵌入态左栏 96px
+   （~500px iframe 内容区约 380px 可用，132px 偏宽，实施者裁定收窄并注释）。 */
+.panel-layout{display:grid;grid-template-columns:132px minmax(0,1fr);gap:18px;align-items:start}
+.panel-body{min-width:0}
+.panel-tabs{flex-direction:column;position:sticky;top:12px;z-index:30;gap:4px;margin:0;padding:0 10px 0 0;border:0;border-right:1px solid var(--maibot-border);border-radius:0;background:var(--maibot-background);backdrop-filter:none;box-shadow:none;justify-content:flex-start}
+.panel-tabs button{width:100%;min-width:0;flex:none;display:flex;align-items:center;justify-content:flex-start;text-align:left;padding:10px 12px;border-radius:10px;font-size:14px;line-height:1.4}
+[data-theme=dark] .panel-tabs{background:var(--maibot-background)}
+html[data-embedded=true] .panel-layout{grid-template-columns:96px minmax(0,1fr);gap:12px}
+@media(max-width:700px){
+ .panel-layout{grid-template-columns:64px minmax(0,1fr);gap:10px}
+ .panel-tabs{top:8px;padding:0 6px 0 0;border-right:1px solid var(--maibot-border);border-bottom:0;box-shadow:none}
+ .panel-tabs button{flex-direction:column;justify-content:center;gap:0;font-size:10px;padding:6px 2px;min-height:55px;border-radius:8px}
+ .panel-tabs .tab-glyph{display:block;font-size:18px;margin:0 0 2px}
+}
