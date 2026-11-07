@@ -197,7 +197,11 @@ from suite_prompts import (
 # [video_watch] +1 可见键 min_sample_count（默认 16，ge1 le256；按间隔切分不足
 # 此帧数时按此数平均抽样），18 段 202→203 叶子；sample_interval_seconds 默认
 # 25→10（ge5 le600 不变）；拼图上限拒绝保护与有界采样不变，按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.5"
+# 3.17.6（2026-11-08 PR-REMOVE-POOLCAP 移除独立总池配额 + E_LLM 截断修复）：
+# max_pool_events 本就非 schema Field（J 类 internal_tuning 键/只读属性），退役
+# 不改变 schema 字段数（18 段 203 叶子不变）；旧 TOML 键经 LEGACY_ROUTE_KEYS 纯
+# pop；事件生成 max_tokens 动态有界 override 为纯内部修补，按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.6"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -271,7 +275,10 @@ LEGACY_ROUTE_KEYS = {
     # DEFAULT_TEMPERATURE，配置值本就不生效）——删隐藏 Field 消除死键，只 pop 不搬运。
     # max_events 兼容死键不在此登记：由 migrate_legacy_event_catalog 继续消费（搬进
     # 规范键 max_generated_events 后 pop，保留旧值语义）。
-    "event_catalog": ("max_tokens", "daily_token_budget", "temperature"),
+    # 3.17.6（PR-REMOVE-POOLCAP）：max_pool_events/enforce_pool_cap 退役——独立总
+    # 配额移除，池上限派生自三时段配额和；旧键只 pop 不搬运（RELEASE_RETIRED 口径）。
+    "event_catalog": ("max_tokens", "daily_token_budget", "temperature",
+                      "max_pool_events", "enforce_pool_cap"),
     "judge": ("max_tokens",),
     # 3.1.0 H 类：tick_seconds / sleep_wake_check_seconds（=300 内部节拍常量）、
     # state_file（逐字 'life_state.json' 常量）——生产现值=默认已证实，只 pop 不搬运。

@@ -1,5 +1,14 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.6（2026-11-08）
+
+- PR-REMOVE-POOLCAP ①移除独立总池配额 `max_pool_events`（用户裁定：三时段配额是生成数量唯一权威，独立总上限冗余且与配额冲突 = `/lbm_plan events` E_CAPACITY 根因）；②修复小事件生成 E_LLM 截断（max_tokens 不足致 JSON 截断，全量验证 dwfrun-bebdbd00 定位）。
+- **①池上限派生**：`planning/event_catalog_config.py` 新增 `derive_pool_cap`（内置数 + 三时段六键配额和）；`EventCatalogConfig.max_pool_events`/`enforce_pool_cap` 字段移除，改同名只读属性（派生值/恒 True，诊断面兼容）；section 的 internal_tuning 桥接 property 移除；`resolve_config` 不再读旧键。`planning/event_catalog.py`：移除生成前「配额和 vs 独立总容量」E_CAPACITY 校验；validator/store 总量校验与 reload 截断改用派生上限（构造器 `max_pool_events=None` 缺省派生，旧调用方显式传值按 deprecated 覆盖尊重）；装配不再传独立上限。配额和变化上限随之变化，生成项数==配额和时不触发截断/拒绝。
+- **迁移**：`core/internal_tuning.py` INTERNAL_TUNING_DEFAULTS 退役 `event_catalog.max_pool_events`（47→46 键；旧注释「40 项」本已陈旧）；出厂种子 `mappings/default_mappings/internal_tuning.json` 同步移除；旧表层 JSON 该键由 `_validate_entries` 按未知键静默忽略（不报错、不覆盖用户文件）；旧 TOML 键经 `suite_config.LEGACY_ROUTE_KEYS[event_catalog]` 纯 pop 不搬运（+max_pool_events/enforce_pool_cap）。部署后主代理清理生产 internal_tuning.json 旧键（或加载自动忽略）。
+- **②E_LLM 截断修复**：根因 = `_call_llm_once` 调 `generate_detailed` 不传 max_tokens（由宿主任务配置决定），16-24 段 9 事件需 ~999 completion tokens，宿主 max_tokens 不足 → finish_reason=length → JSON 截断 → parse 抛 EventPromptError → E_LLM。已查清宿主链路支持显式 override（SDK `ctx.llm.generate(max_tokens=...)` → 宿主 `llm.generate` capability `args.get("max_tokens")` → `_resolve_effective_max_tokens` 显式值优先于任务/模型配置）。修复：`core/llm_utils.py`/`tools/llm_gateway.py` generate/generate_detailed 增 `max_tokens` 透传（None=旧语义不变）；事件生成按 requested 动态有界 override `min(6000, max(2000, requested*220))`（`event_generation_max_tokens`；单段上限 24 条 → 5280，不触顶、不无界放大）。
+- **截断诊断增强**：`LLMResult.finish_reason` 透传（宿主回传时；现行宿主 payload 无此字段则空串）；parse 失败/空响应时若 finish_reason=length 或 completion_tokens 触顶本次发送的 max_tokens → 错误明示「输出被 max_tokens 截断…需增大上限」，不再笼统 general_error/生成响应不可用。
+- **红线保留**：每段配额 le=12 边界不变；时段过滤/一次性 claim/校验语义不变；池总量仍由配额天然 bounded；不牺牲事件质量（提示词/温度/校验逐字不变）。配置：schema 字段数不变（max_pool_events 本就非 Field，18 段 203 叶子）。版本双号 3.17.6（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁重钉（round 版本、smoke LEGACY_ROUTE_KEYS 字面量、test_prompt_identity_audit 双号、test_event_slots_390 派生上限断言 32→29）。新增专项 `scratch/test_event_poolcap_derive.py`；回归 test_event_slots_390 / test_event_catalog_slot_load / test_qzone_video_a0–a3 不回归；七门禁 7/7。边界：本批不部署、不 git commit、不碰主机、不切 mode。
+
 ## 3.17.4（2026-11-08）
 
 - PR-FIX-SLOT 修复 `event_catalog.reload()` 丢失 time_slot 致生成小事件全被时段过滤（真机生产 bug：调查 dwfrun-86dc234f 高置信确认+生产复现——生成小事件库 7 个带 time_slot 的事件全天零选中，bot 日程反复发呆/待机）。

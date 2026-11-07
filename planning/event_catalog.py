@@ -45,7 +45,7 @@ from core.llm_utils import LLMResult
 from core.mapping_dir import MappingReadError, mappings_path, read_json_text
 from core.storage import save_json_atomic
 
-from .event_catalog_config import DEFAULT_MAX_POOL_EVENTS, EventCatalogConfig, resolve_config
+from .event_catalog_config import EventCatalogConfig, derive_pool_cap, resolve_config
 from .event_pools import POOL_VERSION, normalize_cycle, allocate_pools, catalog_write_guard
 from .event_prompt import (GENERATION_TEMPERATURE,
                            EventPromptError, build_event_prompt,
@@ -83,6 +83,43 @@ ALLOWED_GOAL_TYPES = frozenset({"daily_routine", "rest", "social", "entertainmen
 LLM_EVENT_NAME = "schedule_events"
 LLM_FALLBACK_TASK = "utils"
 EVENT_GENERATION_TEMPERATURE = GENERATION_TEMPERATURE
+#: 3.17.6（PR-REMOVE-POOLCAP §2.5 E_LLM 截断修复）：事件生成显式 override
+#: max_tokens——按本时段 requested 条数动态：下限 2000（全量验证 dwfrun-bebdbd00：
+#: 16-24 段 9 事件需 ~999 completion tokens，max_tokens=2000 5/5 全绿、800 截断），
+#: 每条 220 tokens，封顶 6000（有界不无界放大；单段请求上限 12+12=24 → 5280）。
+#: 宿主链路支持显式 override 且优先于任务/模型配置（SDK ctx.llm.generate →
+#: 宿主 llm.generate capability → _resolve_effective_max_tokens）。
+EVENT_LLM_MAX_TOKENS_FLOOR = 2000
+EVENT_LLM_TOKENS_PER_EVENT = 220
+EVENT_LLM_MAX_TOKENS_CAP = 6000
+
+
+def event_generation_max_tokens(requested: int) -> int:
+    """事件生成输出上限（有界）：min(6000, max(2000, requested*220))。"""
+    return min(EVENT_LLM_MAX_TOKENS_CAP,
+               max(EVENT_LLM_MAX_TOKENS_FLOOR,
+                   max(0, int(requested)) * EVENT_LLM_TOKENS_PER_EVENT))
+
+
+def _response_truncated(result: Any, max_tokens_sent: Optional[int]) -> bool:
+    """截断判定：finish_reason=length 明示优先；宿主不回传 finish_reason 时
+    以 completion_tokens 触顶（>= 本次发送的 max_tokens）启发式兜底。"""
+    if str(getattr(result, "finish_reason", "") or "").strip().lower() == "length":
+        return True
+    completion = getattr(result, "completion_tokens", None)
+    return bool(max_tokens_sent and completion is not None
+                and int(completion) >= int(max_tokens_sent))
+
+
+def _callable_accepts(fn: Any, name: str) -> bool:
+    """旧测试桩兼容：签名含 name 或 **kwargs 才传新参数（无法内省按支持处理）。"""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                                 for p in params.values())
 #: 备份保留数（.bak/.bak.2/.bak.3）
 BACKUP_KEEP = 3
 #: 旧展示用粗略换算（仅 estimate_tokens；预算已改用字节上界 + 真实 usage）
@@ -189,15 +226,17 @@ class EventCatalogValidator:
 
     def __init__(self, *, builtin_count: Optional[int] = None,
                  max_generated_events: int = MAX_GENERATED_EVENTS,
-                 max_pool_events: int = DEFAULT_MAX_POOL_EVENTS,
+                 max_pool_events: Optional[int] = None,
                  enforce_pool_cap: bool = True,
                  period_limits: Optional[Sequence[int]] = None,
                  reusable_limits: Optional[Sequence[int]] = None,
                  one_shot_limits: Optional[Sequence[int]] = None) -> None:
+        """``max_pool_events`` 已退役（3.17.6 PR-REMOVE-POOLCAP）：缺省 None =
+        派生上限（内置数 + 六键配额和）；旧调用方显式传值时按 deprecated 覆盖
+        尊重（仅兼容旧测试/旧装配，生产装配不再传）。"""
         self.builtin_count = len(BUILTIN_EVENTS) if builtin_count is None else int(builtin_count)
         self.max_generated_events = max(1,
                                         min(MAX_GENERATED_EVENTS, int(max_generated_events)))
-        self.max_pool_events = max(1, int(max_pool_events))
         self.enforce_pool_cap = bool(enforce_pool_cap)
         from .event_slots import TIME_SLOTS
         from .event_catalog_config import (DEFAULT_REUSABLE_00_08, DEFAULT_REUSABLE_08_16,
@@ -220,6 +259,14 @@ class EventCatalogValidator:
         else:
             totals = tuple(r + o for r, o in zip(self.reusable_limits, self.one_shot_limits))
         self.period_limits = {slot: totals[i] for i, slot in enumerate(TIME_SLOTS)}
+        # 3.17.6（PR-REMOVE-POOLCAP）：池上限默认派生 = 内置 + 六键配额和，
+        # 永远与配额自洽（生成项数==配额和时不触发总量拒绝）。显式传值 =
+        # deprecated 覆盖（旧测试/旧装配兼容），生产路径不再传。
+        if max_pool_events is None:
+            self.max_pool_events = derive_pool_cap(
+                self.builtin_count, self.reusable_limits, self.one_shot_limits)
+        else:
+            self.max_pool_events = max(1, int(max_pool_events))
 
     # ---- 单事件 ----
     def validate_event(self, event: Any, *, index: Optional[int] = None,
@@ -577,14 +624,16 @@ class EventCatalogStore:
     def __init__(self, path: Any, *, builtin: Optional[Sequence[Mapping[str, Any]]] = None,
                  validator: Optional[EventCatalogValidator] = None,
                  max_generated_events: int = MAX_GENERATED_EVENTS,
-                 max_pool_events: int = DEFAULT_MAX_POOL_EVENTS,
+                 max_pool_events: Optional[int] = None,
                  enforce_pool_cap: bool = True,
                  tz: Optional[timezone] = None,
                  load_on_init: bool = True) -> None:
+        """``max_pool_events`` 已退役（3.17.6）：None = 装载时按 validator 配额
+        派生上限；旧调用方显式传值按 deprecated 覆盖尊重（兼容旧测试）。"""
         self.path = Path(path)
         self._write_lock = threading.RLock()
         self._tz = tz
-        self._max_pool_events = max(1, int(max_pool_events))
+        self._pool_cap_override = None if max_pool_events is None else max(1, int(max_pool_events))
         self._enforce_pool_cap = bool(enforce_pool_cap)
         self._builtin = tuple(self._normalize_builtin(builtin) if builtin is not None
                               else builtin_events())
@@ -601,6 +650,14 @@ class EventCatalogStore:
         # 只保留内置池快照，用户文件既不删除也不改写；切到 manual/auto 时由 reload() 补读。
         if load_on_init:
             self.reload()
+
+    def _pool_cap(self) -> int:
+        """运行期池上限：deprecated 显式覆盖优先，否则派生（内置 + 六键配额和）。"""
+        if self._pool_cap_override is not None:
+            return self._pool_cap_override
+        return derive_pool_cap(len(self._builtin),
+                               self._validator.reusable_limits,
+                               self._validator.one_shot_limits)
 
     def set_event_gate(self, gate: Optional[Callable[[str], bool]]) -> None:
         """注入运行时事件门控（装配根用；pick 时逐事件询问，False = 不可 roll）。
@@ -742,12 +799,16 @@ class EventCatalogStore:
 
             pool_truncated = 0
             if self._enforce_pool_cap:
-                slots = max(0, self._max_pool_events - len(self._builtin))
+                # 3.17.6（PR-REMOVE-POOLCAP）：上限派生 = 内置 + validator 六键
+                # 配额和（装载时求值，随配额自洽）；合法生成项（==配额和）不再
+                # 被独立总上限截断。显式 deprecated 覆盖仅旧测试/旧装配使用。
+                pool_cap = self._pool_cap()
+                slots = max(0, pool_cap - len(self._builtin))
                 if len(valid) > slots:
                     pool_truncated = len(valid) - slots
                     logger.warning("event_catalog: 生成项 %d 条 + 内置 %d 条超过总池上限 %d，"
                                    "运行期保留前 %d 条生成项（文件不重写）",
-                                   len(valid), len(self._builtin), self._max_pool_events, slots)
+                                   len(valid), len(self._builtin), pool_cap, slots)
                     valid = valid[:slots]
 
             next_update_at = document.get("next_update_at")
@@ -1077,19 +1138,17 @@ class EventCatalogService:
             state_path = Path(data_dir) / CATALOG_STATE_FILE_NAME
         self._state_path = Path(state_path) if state_path is not None else None
         self._state = self._load_state()
+        # 3.17.6（PR-REMOVE-POOLCAP）：不再传独立总上限——validator/store 缺省
+        # 派生（内置 + 六键配额和），与三时段配额永远自洽。
         self._validator = validator or EventCatalogValidator(
             builtin_count=len(builtin_events()),
             max_generated_events=cfg.max_generated_events,
-            max_pool_events=cfg.max_pool_events,
-            enforce_pool_cap=cfg.enforce_pool_cap,
             reusable_limits=cfg.reusable_limits,
             one_shot_limits=cfg.one_shot_limits)
         self._custom_validator = validator is not None
         self.store = store or EventCatalogStore(
             catalog_path, validator=self._validator,
-            max_generated_events=cfg.max_generated_events,
-            max_pool_events=cfg.max_pool_events,
-            enforce_pool_cap=cfg.enforce_pool_cap, tz=self._tz,
+            max_generated_events=cfg.max_generated_events, tz=self._tz,
             # mode=off：构造期就不读生成库（off 只用内置池；不删不改用户文件）
             load_on_init=cfg.mode != "off")
         self._lock = asyncio.Lock()
@@ -1401,10 +1460,18 @@ class EventCatalogService:
         return result
 
     async def _call_llm_once(self, prompt: Any, *, task_name: str,
-                             temperature: float) -> LLMResult:
-        """发出恰好一次生成请求；详细结果可用时走同一响应的 LLMResult。"""
+                             temperature: float,
+                             max_tokens: Optional[int] = None) -> LLMResult:
+        """发出恰好一次生成请求；详细结果可用时走同一响应的 LLMResult。
+
+        3.17.6（E_LLM 截断修复）：max_tokens 显式 override（有界，调用方按
+        requested 计算）；旧测试桩签名不接受时不传（兼容，不改单次请求语义）。
+        """
         detailed = getattr(self._llm, "generate_detailed", None)
         if callable(detailed):
+            extra: Dict[str, Any] = {}
+            if max_tokens is not None and _callable_accepts(detailed, "max_tokens"):
+                extra["max_tokens"] = int(max_tokens)
             return await detailed(
                 prompt.prompt,
                 system_prompt=prompt.system_prompt,
@@ -1415,6 +1482,7 @@ class EventCatalogService:
                 event=LLM_EVENT_NAME,
                 strict_params=True,
                 with_identity=True,
+                **extra,
             )
         # 兼容旧测试桩：只有字符串返回，无 usage/错误分类；失败一律保守记账。
         text = await self._llm.generate(
@@ -1434,9 +1502,11 @@ class EventCatalogService:
                          attempts=1)
 
     async def _attempt_llm(self, prompt: Any, *, task_name: str,
-                           temperature: float, now: datetime) -> Tuple[LLMResult, int]:
+                           temperature: float, now: datetime,
+                           max_tokens: Optional[int] = None) -> Tuple[LLMResult, int]:
         """No plugin limit or precharge; accumulate only host-reported usage."""
-        result = await self._call_llm_once(prompt, task_name=task_name, temperature=temperature)
+        result = await self._call_llm_once(prompt, task_name=task_name, temperature=temperature,
+                                           max_tokens=max_tokens)
         spent = max(0, int(result.total_tokens)) if result.usage_available and result.total_tokens is not None else 0
         if result.usage_available:
             self._record_tokens(spent, now)
@@ -1453,12 +1523,9 @@ class EventCatalogService:
         from .event_slots import TIME_SLOTS
         reusable_limits = cfg.reusable_limits
         one_shot_limits = cfg.one_shot_limits
-        requested_total = sum(reusable_limits) + sum(one_shot_limits)
-        capacity = max(0, cfg.max_pool_events - len(builtin))
-        if requested_total > capacity:
-            return self._failed('E_CAPACITY',
-                                f'三时段配额之和 {requested_total} 超过可用容量 {capacity}，保留旧事件库',
-                                manual=manual)
+        # 3.17.6（PR-REMOVE-POOLCAP）：移除生成前「配额和 vs 独立总容量」的
+        # E_CAPACITY 校验——三时段配额各自合法（validator 逐段校验）即允许生成；
+        # 池上限派生自配额和，天然自洽，不再有独立总容量拒绝路径。
         if self._llm is None or not (callable(getattr(self._llm, 'generate_detailed', None))
                                     or callable(getattr(self._llm, 'generate', None))):
             return self._failed('E_LLM', 'LLMService不可用', manual=manual)
@@ -1478,21 +1545,41 @@ class EventCatalogService:
             prompt = build_event_prompt(persona=persona, recent_schedule_names=recent_schedule,
                 existing_event_names=reserved_names + [e.get('name', '') for e in events],
                 count=requested, min_count=1, time_slot=slot, no_puzzle=cfg.no_puzzle)
+            # 3.17.6（E_LLM 截断修复）：按本时段 requested 动态、有界地显式
+            # override max_tokens（宿主任务配置不足时不再截断 JSON）。
+            slot_max_tokens = event_generation_max_tokens(requested)
             try:
                 chosen, spent = await self._attempt_llm(prompt, task_name=cfg.task_name,
-                    temperature=EVENT_GENERATION_TEMPERATURE, now=now)
+                    temperature=EVENT_GENERATION_TEMPERATURE, now=now,
+                    max_tokens=slot_max_tokens)
                 charged += spent
                 model_calls += max(0, int(chosen.attempts or 0))
                 # A declared-but-missing task sent no model request; resolve its normal fallback.
                 if chosen.category == 'task_missing' and cfg.task_name != LLM_FALLBACK_TASK:
                     chosen, spent = await self._attempt_llm(prompt, task_name=LLM_FALLBACK_TASK,
-                        temperature=EVENT_GENERATION_TEMPERATURE, now=now)
+                        temperature=EVENT_GENERATION_TEMPERATURE, now=now,
+                        max_tokens=slot_max_tokens)
                     charged += spent
                     model_calls += max(0, int(chosen.attempts or 0))
                 if not chosen.ok or not str(chosen.text or '').strip():
-                    failures.append(f'{slot}: 模型未返回可用事件（{chosen.category}）')
+                    if _response_truncated(chosen, slot_max_tokens):
+                        failures.append(f'{slot}: 输出被 max_tokens 截断（finish_reason=length '
+                                        f'或 completion_tokens 触顶 {slot_max_tokens}），需增大上限')
+                    else:
+                        failures.append(f'{slot}: 模型未返回可用事件（{chosen.category}）')
                     continue
-                rows = parse_events_response(chosen.text)
+                try:
+                    rows = parse_events_response(chosen.text)
+                except EventPromptError as exc:
+                    # 3.17.6：截断诊断明示——finish_reason=length（宿主回传时）
+                    # 或 completion_tokens 触顶本次发送的 max_tokens → JSON 被截断。
+                    if _response_truncated(chosen, slot_max_tokens):
+                        failures.append(f'{slot}: 输出被 max_tokens 截断致 JSON 不可解析'
+                                        f'（finish_reason=length 或 completion_tokens 触顶 '
+                                        f'{slot_max_tokens}），需增大上限：{exc}')
+                    else:
+                        failures.append(f'{slot}: 生成响应不可用（{exc}）')
+                    continue
                 if len(rows) < 1:
                     failures.append(f'{slot}: 模型未返回事件')
                     continue
@@ -1527,7 +1614,6 @@ class EventCatalogService:
         }
         validator = self._validator if self._custom_validator else EventCatalogValidator(
             builtin_count=len(builtin), max_generated_events=cfg.max_generated_events,
-            max_pool_events=cfg.max_pool_events, enforce_pool_cap=True,
             reusable_limits=cfg.reusable_limits, one_shot_limits=cfg.one_shot_limits)
         validation = validator.validate_document(document, reserved_ids=reserved_ids,
             reserved_names=reserved_names, recent_names=recent_events)

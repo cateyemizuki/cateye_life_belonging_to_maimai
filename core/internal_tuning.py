@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""内部调参表（2026-11-04 配置精简轮，方案 J 类 40 项）。
+"""内部调参表（2026-11-04 配置精简轮，方案 J 类；3.17.6 起 46 键）。
 
 把「内部调参但可能需现场微调」的阈值/权重/容量/缓存/超时/采样温度从聚合
 TOML schema 移入 ``mappings/internal_tuning.json``（表层用户数据区）+
@@ -41,7 +41,8 @@ INTERNAL_TUNING_FILE_NAME = "internal_tuning.json"
 #: 表结构版本（顶层 version 必填 int 且等于本值）
 SUPPORTED_VERSION = 1
 
-#: 出厂默认单一真源：段 → 键 → 默认值（40 项，与配置精简方案 §3 的 J 类逐一对应；
+#: 出厂默认单一真源：段 → 键 → 默认值（3.17.6 起 46 键；历史注释「40 项」已陈旧，
+#: 后续批次有增键；3.17.6 退役 event_catalog.max_pool_events 一项，47→46；
 #: 数值逐字取自原 Field default）。种子 JSON 由本表生成，运行期内置兜底也用它。
 INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "patrol": {
@@ -94,9 +95,9 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "weekday_phase_minutes": 0,
         "weekend_phase_minutes": 15,
     },
-    "event_catalog": {
-        "max_pool_events": 32,
-    },
+    # 3.17.6（PR-REMOVE-POOLCAP）：event_catalog.max_pool_events 退役（纯 pop
+    # 不搬运）——池上限改由 planning.event_catalog_config.derive_pool_cap 派生。
+    # 旧表层 JSON 里的该键由 _validate_entries 按未知键静默忽略（不报错）。
     "llm": {
         "judge_temperature": 0.2,
     },
@@ -263,7 +264,7 @@ def merge_captured(captured: Dict[str, Dict[str, Any]], *, root_dir: Any = None)
 
     - 只补**缺失键**：用户表已有的键（含现场微调）绝不覆盖；
     - 表层缺表且有捕获值：先旧根迁移（用户旧资产优先），仍缺则直接生成
-      「内置默认 + 捕获值覆盖」完整表——**不复制纯默认种子**（种子 40 键全默认
+      「内置默认 + 捕获值覆盖」完整表——**不复制纯默认种子**（种子全键默认
       一旦占位，「只补缺失键」就再也补不进捕获值）；
     - 表层缺表且无捕获值：走既有种子链（旧根迁移 → 种子复制）补齐纯默认表；
     - 表层存在但解析失败：**不写不覆盖**（红线：解析错误不算缺失），返回 0；
@@ -277,7 +278,7 @@ def merge_captured(captured: Dict[str, Dict[str, Any]], *, root_dir: Any = None)
     except OSError:
         present = False
     if not present and clean:
-        # 有捕获值时**不复制纯默认种子**：种子 40 键全默认一旦占位，「只补缺失键」
+        # 有捕获值时**不复制纯默认种子**：种子全键默认一旦占位，「只补缺失键」
         # 就再也补不进捕获值（首轮离线复现抓到的丢值缺陷）。直接生成
         # 「内置默认 + 捕获值覆盖」完整表——与种子内容同源，仅捕获键不同。
         # 旧根资产优先口径不受影响：本表为 3.1.0 新增，旧根不可能有同名旧资产；

@@ -2,10 +2,12 @@
 """Small-event configuration and the flattened schedule fields.
 
 v3.9.2：三时段配额按「可复用 / 一次性」分开配置（reusable_* / one_shot_*），
-每时段请求条数 = 两者之和；默认合计生成 24 条（可复用 10 + 一次性 14），
-总池 = 内置 5 + 生成 24 = 29，上限 32。更新周期默认 7–10 天（用户自定义
-范围仍按 1–365 夹取，不锁死默认值）。Legacy event_catalog input is migrated
-by the root；旧 period_limit_* 三键退役（纯 pop，不搬运）。
+每时段请求条数 = 两者之和；默认合计生成 24 条（可复用 10 + 一次性 14）。
+3.17.6（PR-REMOVE-POOLCAP）：独立总配额 max_pool_events 退役——池上限改由
+``derive_pool_cap``（内置数 + 六键配额和）派生，配额是生成数量唯一权威。
+更新周期默认 7–10 天（用户自定义范围仍按 1–365 夹取，不锁死默认值）。
+Legacy event_catalog input is migrated by the root；旧 period_limit_* 三键
+退役（纯 pop，不搬运）。
 """
 
 from __future__ import annotations
@@ -16,7 +18,6 @@ from typing import Any, ClassVar, Dict, Literal, Mapping, Optional
 from maibot_sdk import Field, PluginConfigBase
 
 from core.coerce import as_int as _as_int
-from core.internal_tuning import tuning_value as _tuning_value
 
 #: 代码默认（定稿 §1 #6：部署灰度先 manual，代码默认 off）
 DEFAULT_MODE = "off"
@@ -36,8 +37,19 @@ DEFAULT_ONE_SHOT_08_16 = 6
 DEFAULT_ONE_SHOT_16_24 = 5
 #: 单项配额上限（每时段每池 0–12）
 EVENT_QUOTA_MAX = 12
-#: v3.9.2 总池扩容：内置 5 + 生成 24 = 29，上限 32（internal_tuning.json 同钉）
-DEFAULT_MAX_POOL_EVENTS = 32
+
+
+def derive_pool_cap(builtin_count: int, reusable_limits: Any, one_shot_limits: Any) -> int:
+    """池上限派生（3.17.6 PR-REMOVE-POOLCAP）：内置数 + 三时段六键配额和。
+
+    独立总配额 ``max_pool_events`` 已退役（用户裁定：三时段配额是生成数量的
+    唯一权威，独立总上限冗余且与配额冲突 = E_CAPACITY 根因）。派生值永远与
+    配额自洽：生成项数 == 配额和时不触发截断/拒绝；配额和变化上限随之变化。
+    有界保护仍在：每段配额 le=EVENT_QUOTA_MAX(12)，池总量天然 bounded。
+    """
+    return (max(0, int(builtin_count))
+            + sum(max(0, int(x)) for x in reusable_limits)
+            + sum(max(0, int(x)) for x in one_shot_limits))
 #: NO Puzzle 开关默认开：生成提示词追加反套路引导（避免拼图/十字绣等滥用活动）
 DEFAULT_NO_PUZZLE = True
 DEFAULT_TASK_NAME = "utils"
@@ -94,7 +106,7 @@ class EventCatalogSectionConfig(PluginConfigBase):
         ge=DEFAULT_MIN_GENERATED_EVENTS,
         le=DEFAULT_MAX_GENERATED_EVENTS,
         description="每个生成池的条数上限（1至8，旧单池口径）；v3.9.2 起双池条数由三时段可复用/一次性配额决定。",
-        json_schema_extra={"label": "每池生成上限", "hint":"默认总容量32：内置5+生成24；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
+        json_schema_extra={"label": "每池生成上限", "hint":"池上限=内置+三时段配额和（派生）；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
     )
     reusable_00_08: int = Field(
         default=DEFAULT_REUSABLE_00_08, ge=0, le=EVENT_QUOTA_MAX,
@@ -130,8 +142,9 @@ class EventCatalogSectionConfig(PluginConfigBase):
         default=DEFAULT_NO_PUZZLE,
         json_schema_extra={"label": "NO Puzzle"},
     )
-    # 2026-11-04 配置精简轮（J 类）：max_pool_events 移入
-    # mappings/internal_tuning.json[event_catalog]（内部容量）；同名只读 property 见下。
+    # 3.17.6（PR-REMOVE-POOLCAP）：max_pool_events 退役——2026-11-04 J 类曾移入
+    # internal_tuning.json[event_catalog]，现随独立总配额一并移除（纯 pop 不搬运）；
+    # 池上限由 derive_pool_cap（内置 + 三时段配额和）派生，不再有同名 property。
     task_name: str = Field(
         default=DEFAULT_TASK_NAME,
         description="生成小事件使用的宿主任务名，默认 utils；自定义任务不存在时使用 utils",
@@ -144,11 +157,6 @@ class EventCatalogSectionConfig(PluginConfigBase):
     #   resolve_config 对原始 dict 的旧读法兜底保留。
     # - ``temperature`` 隐藏 Field 已删：2026-10-27 用户锁定 0.9，resolve_config 恒返回
     #   DEFAULT_TEMPERATURE（配置值本就不生效）；旧 TOML 键经 LEGACY_ROUTE_KEYS 入口 pop。
-
-    @property
-    def max_pool_events(self) -> int:
-        """内置与生成事件合并后的总条数上限（J 类 → internal_tuning.json）。"""
-        return int(_tuning_value("event_catalog", "max_pool_events"))
 
     def normalized(self) -> "EventCatalogConfig":
         """Pydantic 段 → 服务只读视图（不做 IO）。"""
@@ -167,13 +175,26 @@ class EventCatalogConfig:
     reusable_limits: tuple = (DEFAULT_REUSABLE_00_08, DEFAULT_REUSABLE_08_16, DEFAULT_REUSABLE_16_24)
     one_shot_limits: tuple = (DEFAULT_ONE_SHOT_00_08, DEFAULT_ONE_SHOT_08_16, DEFAULT_ONE_SHOT_16_24)
     no_puzzle: bool = DEFAULT_NO_PUZZLE
-    max_pool_events: int = DEFAULT_MAX_POOL_EVENTS
-    enforce_pool_cap: bool = True
     task_name: str = DEFAULT_TASK_NAME
 
     temperature: float = DEFAULT_TEMPERATURE
 
     auto_check_seconds: int = DEFAULT_AUTO_CHECK_SECONDS
+
+    @property
+    def max_pool_events(self) -> int:
+        """派生池上限（3.17.6）：内置数 + 三时段六键配额和；不再是独立配置键。
+
+        保留同名只读属性仅为诊断面/旧消费点兼容（status 字典等）；值永远与
+        配额自洽。旧配置/旧 internal_tuning 里的 max_pool_events 一律忽略。
+        """
+        from .small_events import builtin_events
+        return derive_pool_cap(len(builtin_events()), self.reusable_limits, self.one_shot_limits)
+
+    @property
+    def enforce_pool_cap(self) -> bool:
+        """兼容旧消费点：恒 True——上限派生自配额，天然自洽、无需独立开关。"""
+        return True
 
     @property
     def period_limits(self) -> tuple:
@@ -227,10 +248,10 @@ def resolve_config(source: Any) -> EventCatalogConfig:
     2. 仅旧键 ``max_events`` 显式给出 → 按生成条数兼容接管；
     3. 都没有 → 规范字段默认 8。
 
-    总池上限读 ``max_pool_events``（规范字段，v3.9.2 默认 32）、生成上限读
-    ``max_generated_events``（规范字段，默认 8，旧单池口径）；``max_events`` 仅作旧读法兜底。
-    用户已裁定合并总池 <=32，故 ``enforce_pool_cap`` 默认 True；保留该参数仅为
-    兼容旧测试/显式放宽。
+    生成上限读 ``max_generated_events``（规范字段，默认 8，旧单池口径）；
+    ``max_events`` 仅作旧读法兜底。3.17.6（PR-REMOVE-POOLCAP）：独立总配额
+    ``max_pool_events`` / ``enforce_pool_cap`` 退役——源里的旧键一律忽略，
+    池上限由 ``EventCatalogConfig.max_pool_events`` 属性派生（内置 + 配额和）。
     """
     if source is None:
         return DEFAULT_CONFIG
@@ -281,9 +302,6 @@ def resolve_config(source: Any) -> EventCatalogConfig:
                          _quota("one_shot_08_16", DEFAULT_ONE_SHOT_08_16),
                          _quota("one_shot_16_24", DEFAULT_ONE_SHOT_16_24)),
         no_puzzle=bool(_attr(source, "no_puzzle", DEFAULT_NO_PUZZLE)),
-        max_pool_events=max(1, _as_int(_attr(source, "max_pool_events", DEFAULT_MAX_POOL_EVENTS),
-                                       DEFAULT_MAX_POOL_EVENTS)),
-        enforce_pool_cap=bool(_attr(source, "enforce_pool_cap", True)),
         task_name=str(_attr(source, "task_name", DEFAULT_TASK_NAME) or DEFAULT_TASK_NAME),
 
         temperature=temperature,
@@ -369,7 +387,7 @@ class EventCatalogFields(PluginConfigBase):
         ge=DEFAULT_MIN_GENERATED_EVENTS,
         le=DEFAULT_MAX_GENERATED_EVENTS,
         description="每个生成池的条数上限（1至8，旧单池口径）；v3.9.2 起双池条数由三时段可复用/一次性配额决定。",
-        json_schema_extra={"label": "每池生成上限", "hint":"默认总容量32：内置5+生成24；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
+        json_schema_extra={"label": "每池生成上限", "hint":"池上限=内置+三时段配额和（派生）；一次性抽中后本周期不再出现。", **_i18n("Generated events per pool")},
     )
     event_catalog_reusable_00_08: int = Field(
         default=DEFAULT_REUSABLE_00_08, ge=0, le=EVENT_QUOTA_MAX,

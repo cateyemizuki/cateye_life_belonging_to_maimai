@@ -128,7 +128,8 @@ def migrate_display_config(value: Any) -> Any:
 
 
 def migrate_internal_tuning(value: Any) -> Tuple[Any, Dict[str, Dict[str, Any]]]:
-    """J 类内部调参键（2026-11-04 配置精简轮，40 项）：旧 TOML 键摘出 + 显式 pop。
+    """J 类内部调参键（2026-11-04 配置精简轮；3.17.6 起 46 键，
+    event_catalog.max_pool_events 退役改由 LEGACY_ROUTE_KEYS 纯 pop）：旧 TOML 键摘出 + 显式 pop。
 
     纯内存、不读写文件（本模块契约）：从各段 dict 摘出
     :data:`core.internal_tuning.INTERNAL_TUNING_DEFAULTS` 登记的键，返回

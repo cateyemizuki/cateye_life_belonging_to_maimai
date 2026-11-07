@@ -121,6 +121,10 @@ class LLMResult:
     cache_miss_tokens: Optional[int] = None
     duration_ms: int = 0
     receipt: Optional[Any] = None
+    #: 3.17.6（PR-REMOVE-POOLCAP E_LLM 诊断）：宿主若回传 finish_reason 则透传
+    #: （现行宿主 capability payload 无此字段 → 空串；截断诊断另有 completion_tokens
+    #: 触顶启发式兜底）。只读诊断，不参与业务判断。
+    finish_reason: str = ""
 
 
 def extract_cache_usage(result: Any) -> tuple[Optional[int], Optional[int]]:
@@ -346,6 +350,7 @@ class LLMService:
         model: str = "",
         strict_params: bool = False,
         with_identity: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """生成文本；失败/异常统一返回空串（旧契约不变，统一入口在 Gateway）。
 
@@ -353,12 +358,15 @@ class LLMService:
         缺失时 Gateway 记 ``unknown`` 并留 warning。``strict_params`` 仅给需要
         「单请求 + 参数不漂移」的调用方（事件库），语义与旧版逐字一致。
         ``with_identity=True`` 时把宿主同款人设开头拼到 system_prompt 最前，共享前缀缓存。
+        ``max_tokens``（3.17.6）：显式输出上限 override；None = 沿用宿主任务/模型
+        配置（旧语义）。调用方负责有界夹取，Gateway 只透传。
         """
         result = await self.generate_detailed(
             prompt, module=module, system_prompt=system_prompt,
             task_name=task_name, temperature=temperature,
             timeout_ms=timeout_ms, event=event, model=model,
             strict_params=strict_params, with_identity=with_identity,
+            max_tokens=max_tokens,
         )
         return result.text
 
@@ -386,6 +394,7 @@ class LLMService:
         model: str = "",
         strict_params: bool = False,
         with_identity: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> LLMResult:
         """生成文本并返回本次请求关联的详细结果（委托 tools.llm_gateway）。
 
@@ -393,6 +402,8 @@ class LLMService:
         ``LLMResult.receipt`` 携带模块、缓存命中与耗时等对账字段。
         ``with_identity=True``：system_prompt 前置宿主同款人设开头（名称+别名+全文人设），
         与宿主 reply 系统提示词共享前缀缓存；人设不再截断。
+        ``max_tokens``（3.17.6）：显式输出上限 override（宿主 SDK/能力层支持，
+        显式值优先于任务/模型配置）；None = 旧语义。调用方负责有界夹取。
         """
         if with_identity:
             identity = await self._resolve_identity_prefix()
@@ -401,7 +412,7 @@ class LLMService:
             prompt, module=module, system_prompt=system_prompt,
             task_name=task_name, temperature=temperature,
             timeout_ms=timeout_ms, event=event, model=model,
-            strict_params=strict_params,
+            strict_params=strict_params, max_tokens=max_tokens,
         )
 
     def _exception_result(self, exc: BaseException, *, event: str, task: str,

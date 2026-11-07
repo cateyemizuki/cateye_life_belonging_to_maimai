@@ -147,12 +147,13 @@ class LLMGateway:
         event: str = "unspecified",
         model: str = "",
         strict_params: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> str:
         result = await self.generate_detailed(
             prompt, module=module, system_prompt=system_prompt,
             task_name=task_name, temperature=temperature,
             timeout_ms=timeout_ms, event=event, model=model,
-            strict_params=strict_params,
+            strict_params=strict_params, max_tokens=max_tokens,
         )
         return result.text
 
@@ -168,8 +169,15 @@ class LLMGateway:
         event: str = "unspecified",
         model: str = "",
         strict_params: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> LLMResult:
-        """生成文本并返回详细结果；路由/回退优先级与旧 LLMService 逐字一致。"""
+        """生成文本并返回详细结果；路由/回退优先级与旧 LLMService 逐字一致。
+
+        ``max_tokens``（3.17.6 PR-REMOVE-POOLCAP E_LLM 修复）：显式输出上限
+        override，经宿主 SDK ``ctx.llm.generate`` 透传（宿主显式值优先于任务/
+        模型配置）；None = 不传、沿用宿主配置（旧语义逐字不变）。有界夹取由
+        调用方负责（事件库按 requested 动态、封顶），本网关只透传不放大。
+        """
         started = time.monotonic()
         module_name = self._validate_module(module)
         request_id = uuid.uuid4().hex
@@ -206,6 +214,8 @@ class LLMGateway:
                 kwargs["task_name"] = routed_task
             if timeout_ms:
                 kwargs["timeout_ms"] = int(timeout_ms)
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max(1, int(max_tokens))
             attempts = 1
             try:
                 result = await host_generate(**kwargs)
@@ -232,8 +242,11 @@ class LLMGateway:
         if override:
             attempts = 1
             try:
-                result = await host_generate(
-                    prompt=prompt_arg, model=override, temperature=temperature)
+                override_kwargs: dict[str, Any] = {
+                    "prompt": prompt_arg, "model": override, "temperature": temperature}
+                if max_tokens is not None:
+                    override_kwargs["max_tokens"] = max(1, int(max_tokens))
+                result = await host_generate(**override_kwargs)
             except asyncio.CancelledError:
                 self.record_abandoned(module=module_name, event=event, task=override,
                                       reason="cancelled")
@@ -258,6 +271,8 @@ class LLMGateway:
             "task_name": routed_task,
             "temperature": temperature,
         }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max(1, int(max_tokens))
         if self._model_name:
             # 指定具体模型：失败后降级为纯任务路由再试一次（旧语义）
             attempts = 1
@@ -421,6 +436,16 @@ class LLMGateway:
         if isinstance(result, dict):
             response_model = str(result.get("model") or result.get("model_name") or "")
         routed_model = response_model or requested_model
+        # 3.17.6（E_LLM 截断诊断）：宿主若回传 finish_reason 则透传（顶层或
+        # OpenAI 风格 choices[0]）；现行宿主 capability payload 无此字段 → 空串，
+        # 调用方另有 completion_tokens 触顶启发式兜底。只读诊断，不改路由/记账。
+        finish_reason = ""
+        if isinstance(result, dict):
+            finish_reason = str(result.get("finish_reason") or "")
+            if not finish_reason:
+                choices = result.get("choices")
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                    finish_reason = str(choices[0].get("finish_reason") or "")
         receipt = receipt_of(
             result, module=module, event=event, task=task,
             request_id=request_id, attempts=attempts, duration_ms=duration)
@@ -437,7 +462,7 @@ class LLMGateway:
                 consumed=consumed, attempts=attempts,
                 strict_params=strict_params, module=module, event=event,
                 cache_hit_tokens=cache_hit, cache_miss_tokens=cache_miss,
-                duration_ms=duration, receipt=receipt)
+                duration_ms=duration, receipt=receipt, finish_reason=finish_reason)
 
         if not isinstance(result, dict):
             detail = "宿主返回非字典结果"
