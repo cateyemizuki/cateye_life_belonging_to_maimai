@@ -1602,6 +1602,93 @@ class RollingPlanner:
                 score += ratio * max(score, 0.0)
         return score
 
+    # ── 抽取原因人话化（3.17.7 改进1：纯旁路展示，0 LLM，不改打分/选择）──
+    def _draw_reason_zh(self, c: Dict[str, Any], snapshot: Any, cur: int,
+                        date: str) -> str:
+        """把主导打分分量 + 候选 kind + motive_bonus 翻译成确定性中文短句。
+
+        只读重算与 :meth:`_score_candidate` 相同的分量（同公式同权重；
+        current_profile=None 与选择路径一致），取最大正分量映射人话；
+        并列时按固定顺序取第一个（确定性）。任何异常 → 兜底短句，
+        绝不阻塞开播（纯旁路：不参与打分、不改选择、不写状态）。
+        """
+        fallback = "按当前状态顺位选了这件事"
+        try:
+            kind = str(c.get("kind") or "")
+            goal_type = str(c.get("goal_type") or "")
+            state = snapshot if isinstance(snapshot, dict) else {}
+            energy = _as_number(state.get("energy"), 1.0)
+            hunger = _as_number(state.get("hunger"), 0.0) or 0.0
+            # kind / 状态直译（确定性优先，不走分量比较）
+            if kind == "idle":
+                return "没什么特别想做的，先待机"
+            if kind in ("resume", "continuation"):
+                return "刚才的事还没做完，接着做"
+            if kind == "commitment":
+                return "到约定的时间了，按计划去做"
+            if kind == "nap":
+                return "有点困了，先眯一会儿"
+            if goal_type == "meal" and hunger >= 0.5:
+                return "饿了，想找点吃的"
+            if goal_type == "rest" and energy <= 0.35:
+                return "精力有点低，想休息一下"
+            # 主导分量：与 _score_candidate 逐字同公式（只读重算）
+            focus = _as_number(state.get("focus"), 1.0)
+            profile = activity_profiles.get_profile(c["profile_key"])
+            boundary = self._next_boundary_minutes(
+                date, cur, self._spine_intents_cached(date))
+            counts = self._completed_counts_today(date)
+            priority = _clamp(c.get("priority_score", 0.5))
+            due = self._due_urgency(c, cur)
+            energy_fit = self._fit_curve(energy, ENERGY_DEMAND.get(goal_type, 0.5))
+            hunger_fit = hunger if goal_type == "meal" else 0.5 * (1.0 - hunger)
+            focus_fit = self._fit_curve(focus, FOCUS_DEMAND.get(goal_type, 0.4))
+            resume_bonus = _clamp(c.get("resume_bonus", 0.0))
+            novelty = 1.0 / (1.0 + counts.get(goal_type, 0))
+            overrun_risk = self._overrun_risk(c, profile, boundary)
+            base = (SCORE_WEIGHTS["priority"] * priority
+                    + SCORE_WEIGHTS["due"] * due
+                    + SCORE_WEIGHTS["energy"] * energy_fit
+                    + SCORE_WEIGHTS["hunger"] * hunger_fit
+                    + SCORE_WEIGHTS["focus"] * focus_fit
+                    + SCORE_WEIGHTS["resume"] * resume_bonus
+                    + SCORE_WEIGHTS["novelty"] * novelty
+                    - SCORE_WEIGHTS["overrun"] * overrun_risk)
+            motive_add = 0.0
+            store = self._motive_store
+            if store is not None:
+                try:
+                    ratio = max(0.0, min(MOTIVE_BONUS_RATIO, float(store.bonus_for(c))))
+                except Exception:
+                    ratio = 0.0
+                motive_add = ratio * max(base, 0.0)
+            # 固定顺序取最大（并列取先出现者 → 确定性）
+            components = [
+                ("priority", SCORE_WEIGHTS["priority"] * priority),
+                ("due", SCORE_WEIGHTS["due"] * due),
+                ("energy", SCORE_WEIGHTS["energy"] * energy_fit),
+                ("hunger", SCORE_WEIGHTS["hunger"] * hunger_fit),
+                ("focus", SCORE_WEIGHTS["focus"] * focus_fit),
+                ("resume", SCORE_WEIGHTS["resume"] * resume_bonus),
+                ("novelty", SCORE_WEIGHTS["novelty"] * novelty),
+                ("motive", motive_add),
+            ]
+            dominant = max(components, key=lambda pair: pair[1])[0]
+            phrases = {
+                "priority": "这件事优先级比较高，先做它",
+                "due": "这件事到该做的时间了",
+                "energy": "现在精力适合做这件事",
+                "hunger": ("到了吃饭的点，先吃饭" if goal_type == "meal"
+                           else "现在不饿，适合做点别的"),
+                "focus": "现在专注状态适合做这件事",
+                "resume": "刚才的事还没做完，接着做",
+                "novelty": "今天还没做过这类事，换换花样",
+                "motive": "对这类活动感兴趣，想多做一点",
+            }
+            return phrases.get(dominant, fallback)
+        except Exception:
+            return fallback
+
     @staticmethod
     def _fit_curve(value: float, demand: float) -> float:
         """状态贴合度：状态 ≥ 需求 → 1.0；不足则线性降（rest/idle 需求 0 → 恒 1.0）。"""
@@ -1821,7 +1908,10 @@ class RollingPlanner:
                 for s, c in scored[:3]]
         metadata: Dict[str, Any] = {"trigger": "rolling_tick", "top3": top3,
                                     "kind": cand["kind"],
-                                    "seed_date": self._rng_date}
+                                    "seed_date": self._rng_date,
+                                    # 3.17.7 改进1：人话化抽取原因（纯旁路展示字段）
+                                    "draw_reason_zh": self._draw_reason_zh(
+                                        cand, snapshot, cur, date)}
         if cand.get("intent_item_id"):
             metadata["intent_item_id"] = cand["intent_item_id"]
         if cand.get("note"):
@@ -1899,7 +1989,8 @@ class RollingPlanner:
                               planned_end_minute=cur + duration, source=source)
         if eid:
             self._log("rolling.episode_started", episode_id=eid, kind=cand["kind"],
-                      name=str(cand["name"]), duration_minutes=duration, top3=top3)
+                      name=str(cand["name"]), duration_minutes=duration, top3=top3,
+                      draw_reason_zh=metadata.get("draw_reason_zh"))
             report["actions"].append(f"started_{cand['kind']}")
         else:
             logger.warning("rolling_planner: episode 写入失败（本拍不开新块）")

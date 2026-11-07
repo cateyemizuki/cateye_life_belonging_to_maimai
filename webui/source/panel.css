@@ -373,6 +373,15 @@ body.fish-locked .fish-overlay[data-section=usage]{z-index:960}
 .schedule-page-actions button{min-width:36px;min-height:32px;padding:2px 8px;font-size:19px;line-height:1}
 .schedule-pool-list{list-style:none;padding:0;margin:0}
 .schedule-pool-row{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:4px 12px;padding:10px 0;border-top:1px solid var(--maibot-border);overflow-wrap:anywhere}
+/* 3.17.7 改进2：日程池行右侧时段 badge（沿用 rowbadge 风格，仅加时段语义） */
+.poolrowend{display:inline-flex;align-items:baseline;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.slotbadge{white-space:nowrap;font-variant-numeric:tabular-nums}
+/* 3.17.7 改进1：行程记录右侧抽取原因（小号灰色，沿用 note 风格） */
+.rowendcol{display:flex;flex-direction:column;align-items:flex-end;gap:4px;min-width:0}
+.rowendcol>.rowbadge{align-self:flex-end}
+.drawreason{font-size:11px;color:var(--maibot-muted);text-align:right;overflow-wrap:anywhere;max-width:200px}
+/* 3.17.7 改进3：仅「缓存命中」tooltip 右锚定向左展开，避免最右 chip 出框；不影响其他项 */
+.info-tooltip.info-tooltip-left{left:auto;right:0}
 .schedule-pool-detail h3{margin:0 0 8px;font-size:14px}
 #panel-schedule.fish-section{border-radius:0}
 .fish-overlay[data-section=schedule] .fish-records{min-width:0}
@@ -388,6 +397,8 @@ body.fish-locked .fish-overlay[data-section=usage]{z-index:960}
  .schedule-event-columns>.card{padding:10px}
  .schedule-event-columns.schedule-pool-detail>section+section{padding-inline-start:0;border-inline-start:0;border-top:1px solid var(--maibot-border);padding-top:12px}
  .schedule-event-columns .schedule-pool-row{align-items:flex-start;flex-direction:column;gap:3px}
+ /* 3.17.7 改进2：纵向堆叠时右侧信息组仍占满行宽，时段 badge 保持靠右 */
+ .schedule-event-columns .schedule-pool-row>.poolrowend{width:100%}
  .usage-card-range button,.schedule-page-actions button{min-height:44px}
  .usage-section{padding:10px}
  .usage-record{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}

@@ -1,5 +1,13 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.7（2026-11-08）
+
+- PR-UI 三改进（日程页可读性，纯旁路展示，不影响调度）：①rolling 抽取原因人话化 `draw_reason_zh` 显示在行程记录右侧；②日程池列表右侧时段 badge；③缓存命中 chip 的 tooltip 单独改左侧展开防出框。
+- **①抽取原因人话化**：`planning/rolling_planner.py` 新增 `_draw_reason_zh`（0 LLM，确定性中文短句）：kind/goal_type/状态直译优先，否则只读重算与 `_score_candidate` 同公式同权重的打分分量取主导项映射人话（并列按固定顺序取先出现者）；任何异常兜底短句，绝不阻塞开播。episode metadata 增 `draw_reason_zh` 展示字段并随 `rolling.episode_started` 日志透出；`planning/dashboard.py:_row` 只策展暴露该字段（截断 80 字符，其余 metadata 仍不上 UI）；`webui/source/panel.js` 行程记录右侧以小号灰色 `.drawreason` 显示（仅实际 episode 带该字段时），旧快照无字段不显示。
+- **②日程池时段 badge**：`planning/dashboard.py` 新增 `_event_slot_label` 只读投影（生成事件 → 自身 time_slot；内置 allowed_slots 覆盖全部三段 → 「全天」，收窄 → 以 / 连接；无信息 → 空），池列表行增 `time_slot` 字段；`webui/source/panel.js` 日程池/消耗记录行右侧信息组 `.poolrowend` 增 `.slotbadge`（recovery 池不显示），`panel.css` 沿用 rowbadge 风格并适配窄屏纵向堆叠保持靠右。
+- **③缓存命中 tooltip 左侧**：`webui/source/panel.js` `infoTip`/`usageMetric` 增 `tipLeft` 参数，仅「缓存命中」（主页最右 chip）加 `info-tooltip-left` 类右锚定向左展开（宽度钳制不出视口），其余 chip 逐字不变仍走右侧定位；`panel.css` 增 `.info-tooltip.info-tooltip-left{left:auto;right:0}`。`webui/index.html` 同步重建产物。
+- **红线保留**：三项均为纯旁路展示——不参与打分、不改选择、不写调度状态；打分公式/权重/时段过滤/配额/一次性 claim 语义逐字不变。配置：无新增字段（schema 不变，18 段 203 叶子）。版本双号 3.17.7（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round 版本断言与打印、test_prompt_identity_audit 双号断言顺延；smoke R6 守卫读双号动态比对无需改字面量）。七门禁 7/7。边界：本批不部署、不 git commit、不碰主机、不碰文档仓。
+
 ## 3.17.6（2026-11-08）
 
 - PR-REMOVE-POOLCAP ①移除独立总池配额 `max_pool_events`（用户裁定：三时段配额是生成数量唯一权威，独立总上限冗余且与配额冲突 = `/lbm_plan events` E_CAPACITY 根因）；②修复小事件生成 E_LLM 截断（max_tokens 不足致 JSON 截断，全量验证 dwfrun-bebdbd00 定位）。

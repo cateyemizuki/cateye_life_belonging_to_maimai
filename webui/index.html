@@ -373,6 +373,15 @@ body.fish-locked .fish-overlay[data-section=usage]{z-index:960}
 .schedule-page-actions button{min-width:36px;min-height:32px;padding:2px 8px;font-size:19px;line-height:1}
 .schedule-pool-list{list-style:none;padding:0;margin:0}
 .schedule-pool-row{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:4px 12px;padding:10px 0;border-top:1px solid var(--maibot-border);overflow-wrap:anywhere}
+/* 3.17.7 改进2：日程池行右侧时段 badge（沿用 rowbadge 风格，仅加时段语义） */
+.poolrowend{display:inline-flex;align-items:baseline;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.slotbadge{white-space:nowrap;font-variant-numeric:tabular-nums}
+/* 3.17.7 改进1：行程记录右侧抽取原因（小号灰色，沿用 note 风格） */
+.rowendcol{display:flex;flex-direction:column;align-items:flex-end;gap:4px;min-width:0}
+.rowendcol>.rowbadge{align-self:flex-end}
+.drawreason{font-size:11px;color:var(--maibot-muted);text-align:right;overflow-wrap:anywhere;max-width:200px}
+/* 3.17.7 改进3：仅「缓存命中」tooltip 右锚定向左展开，避免最右 chip 出框；不影响其他项 */
+.info-tooltip.info-tooltip-left{left:auto;right:0}
 .schedule-pool-detail h3{margin:0 0 8px;font-size:14px}
 #panel-schedule.fish-section{border-radius:0}
 .fish-overlay[data-section=schedule] .fish-records{min-width:0}
@@ -388,6 +397,8 @@ body.fish-locked .fish-overlay[data-section=usage]{z-index:960}
  .schedule-event-columns>.card{padding:10px}
  .schedule-event-columns.schedule-pool-detail>section+section{padding-inline-start:0;border-inline-start:0;border-top:1px solid var(--maibot-border);padding-top:12px}
  .schedule-event-columns .schedule-pool-row{align-items:flex-start;flex-direction:column;gap:3px}
+ /* 3.17.7 改进2：纵向堆叠时右侧信息组仍占满行宽，时段 badge 保持靠右 */
+ .schedule-event-columns .schedule-pool-row>.poolrowend{width:100%}
  .usage-card-range button,.schedule-page-actions button{min-height:44px}
  .usage-section{padding:10px}
  .usage-record{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
@@ -808,7 +819,11 @@ function renderSchedulePool(key){
    [item.schedule_date,num(item.progress)===null?'':'完成 '+pct(item.progress)+'%'].filter(Boolean).join(' · '):
    min===null?'时长未记录':max===null||min===max?min+' 分钟':min+'–'+max+' 分钟';
   row.append(el('strong','',name));
-  if(period)row.append(el('span','note',period));
+  // 3.17.7 改进2：右侧时段 badge（生成事件 time_slot；内置全时段=全天；旧快照无字段不显示）
+  const end=el('span','poolrowend');
+  if(period)end.append(el('span','note',period));
+  if(key!=='recovery'&&item.time_slot)end.append(el('span','rowbadge slotbadge',item.time_slot));
+  if(end.childNodes.length)row.append(end);
   target.append(row);
   if(origins){
    const origin=el('li','schedule-pool-row');
@@ -839,7 +854,9 @@ function renderConsumedEvents(){
   const status=({selected:'已抽中',started:'已开始',start_failed:'启动未成功',interrupted:'已中断',completed:'已完成'})[item.consumption_status]||'已消耗';
   const note=el('span','note',status+' · '+(date(item.consumed_at)?clock(item.consumed_at,true):'时间未记录'));
   note.title=fullClock(item.consumed_at)+'；本周期不会再抽到这条事件。';
-  row.append(el('strong','',item.name||'未命名条目'),note);target.append(row);
+  const end=el('span','poolrowend');end.append(note);
+  if(item.time_slot)end.append(el('span','rowbadge slotbadge',item.time_slot));
+  row.append(el('strong','',item.name||'未命名条目'),end);target.append(row);
  }
  if(!target.children.length)target.append(el('li','note',Array.isArray(rows)?'本周期暂无消耗记录':'当前快照未包含消耗记录'));
 }
@@ -909,7 +926,11 @@ function renderSchedule(){
     const changes=spec.filter(([k])=>num(row.state_before[k])!==null&&num(row.state_after[k])!==null&&Math.abs(row.state_after[k]-row.state_before[k])>=.01).slice(0,3).map(([k,l])=>l+' '+pct(row.state_before[k])+'→'+pct(row.state_after[k]));
     if(changes.length)center.append(el('div','statechange',changes.join(' · ')));
    }
-   box.append(el('i','trackdot'),center,el('span','rowbadge',actual?episodeLabel(row.status):(row.goal_type==='sleep'?'作息参考':row.hardness==='hard'?'硬约定':'意图')));target.append(box);
+   // 3.17.7 改进1：行程记录右侧小号灰色抽取原因（仅实际 episode 带该字段时显示）
+   const rowend=el('div','rowendcol');
+   if(actual&&row.draw_reason_zh)rowend.append(el('span','drawreason',row.draw_reason_zh));
+   rowend.append(el('span','rowbadge',actual?episodeLabel(row.status):(row.goal_type==='sleep'?'作息参考':row.hardness==='hard'?'硬约定':'意图')));
+   box.append(el('i','trackdot'),center,rowend);target.append(box);
   }
  }
  rows($('episodes'),scheduleFootprint(episodes,day).reverse(),true);
@@ -949,9 +970,9 @@ function usageWindow(usage){
 function reportedTokens(value,reported){
  return num(reported)===0||count(value)==='—'?'未回传':usageCount(value);
 }
-function usageMetric(tag,label,value,term){
+function usageMetric(tag,label,value,term,tipLeft){
  const item=el('div','usage-metric'),caption=el(tag,'note',label);
- if(term)caption.append(infoTip(term));
+ if(term)caption.append(infoTip(term,tipLeft));
  item.append(caption,el(tag==='dt'?'dd':'strong','usage-value',value));
  return item;
 }
@@ -1020,7 +1041,8 @@ function renderUsage(){
   ['缓存命中',reportedTokens(usage.cache_hit_tokens,usage.cache_reported_calls),'cache_hit_tokens'],
  ];
  replaceInfoChildren($('usage-metrics'),...metrics.map(([label,value,key])=>{
-  const box=usageMetric('span',label,value,usageTerms()[key]);return box;
+  // 3.17.7 改进3：仅「缓存命中」（主页最右 chip）详细描述改左侧防出框；其余 chip 保持右侧
+  const box=usageMetric('span',label,value,usageTerms()[key],key==='cache_hit_tokens');return box;
  }));
  renderUsageOverview(usage);renderUsageModules(usage);syncUsageRange();
  if(imported||!live)renderUsageRows();
@@ -1315,9 +1337,13 @@ function renderTimeline(){
 function usageTerms(){return {calls:'收到宿主响应的请求数，包含失败；未收到响应的本地异常不计入。',tokens:'宿主明确回传的文本处理量（含只有总量的调用）。缺失时只计调用，不推算。',prompt_tokens:'宿主回传的输入 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',completion_tokens:'宿主回传的输出 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',cache_hit_tokens:'宿主回传的 prompt 缓存命中 Token；「未回传」表示没有任何一行携带该字段，此时无法区分真 0 与未报。',split_coverage:'可拆分覆盖率 =（输入+输出）/ 宿主回报总量；覆盖率低说明较多调用未回传拆分字段，不代表数据出错。',missing_usage_source_calls:'缺少完整宿主用量或新标记的调用，可与失败重叠；它本身不代表失败。',host_reported:'宿主返回成功响应及完整usage。',success_no_usage:'success=true，但宿主未回传完整usage。',failed:'宿主返回失败响应。',legacy:'升级前没有success和usage_present标记的记录。'}}
 let infoSequence=0;
 function replaceInfoChildren(target,...nodes){const old=[...target.querySelectorAll('.info-button')],index=old.indexOf(document.activeElement),wasOpen=index>=0&&old[index].getAttribute('aria-expanded')==='true';target.replaceChildren(...nodes);if(index>=0){const next=target.querySelectorAll('.info-button')[index];if(next){next.focus({preventScroll:true});if(!wasOpen)next.onblur()}}}
-function infoTip(explanation){
- const wrap=el('span','info-wrap'),button=el('button','info-button','i'),tip=el('span','info-tooltip',explanation||'暂无说明');button.type='button';button.setAttribute('aria-label','查看说明');tip.id='info-explanation-'+(++infoSequence);button.setAttribute('aria-describedby',tip.id);button.setAttribute('aria-expanded','false');tip.setAttribute('role','tooltip');tip.hidden=true;
- const show=()=>{tip.hidden=false;button.setAttribute('aria-expanded','true');if(button.closest('.section-fish-popover')){const r=button.getBoundingClientRect(),width=Math.min(340,innerWidth-24),h=tip.getBoundingClientRect().height;tip.style.left=Math.max(12,Math.min(innerWidth-width-12,r.left-12))+'px';tip.style.right='auto';tip.style.width=width+'px';tip.style.bottom='auto';tip.style.top=Math.max(12,Math.min(innerHeight-h-12,r.bottom+6))+'px'}};
+function infoTip(explanation,tipLeft){
+ // tipLeft=true：仅该条 tooltip 右锚定向左展开（3.17.7 改进3，只影响带此类的项）
+ const wrap=el('span','info-wrap'),button=el('button','info-button','i'),tip=el('span','info-tooltip'+(tipLeft?' info-tooltip-left':''),explanation||'暂无说明');button.type='button';button.setAttribute('aria-label','查看说明');tip.id='info-explanation-'+(++infoSequence);button.setAttribute('aria-describedby',tip.id);button.setAttribute('aria-expanded','false');tip.setAttribute('role','tooltip');tip.hidden=true;
+ const show=()=>{tip.hidden=false;button.setAttribute('aria-expanded','true');if(button.closest('.section-fish-popover')){const r=button.getBoundingClientRect(),width=Math.min(340,innerWidth-24),h=tip.getBoundingClientRect().height;tip.style.left=Math.max(12,Math.min(innerWidth-width-12,r.left-12))+'px';tip.style.right='auto';tip.style.width=width+'px';tip.style.bottom='auto';tip.style.top=Math.max(12,Math.min(innerHeight-h-12,r.bottom+6))+'px'}else if(tip.classList.contains('info-tooltip-left')){
+  // 3.17.7 改进3：左侧 tooltip 右锚定按钮向左展开；窄屏折行到左列时钳制不出视口左缘。
+  // 仅作用于带 info-tooltip-left 的项（缓存命中），其他 chip 仍走纯 CSS 右侧定位。
+  const r=button.getBoundingClientRect(),wrapR=wrap.getBoundingClientRect(),width=Math.min(280,innerWidth-24);tip.style.width=width+'px';tip.style.left=(Math.max(12,Math.min(r.right-width,innerWidth-width-12))-wrapR.left)+'px';tip.style.right='auto'}};
  const hide=()=>{tip.hidden=true;button.setAttribute('aria-expanded','false')};button.onmouseenter=show;button.onmouseleave=()=>{if(document.activeElement!==button)hide()};button.onfocus=show;button.onblur=hide;button.onkeydown=e=>{if(e.key==='Escape'&&!tip.hidden){e.stopPropagation();hide()}};let pointerWasOpen=false;button.onpointerdown=()=>{pointerWasOpen=!tip.hidden};button.onclick=e=>{e.stopPropagation();pointerWasOpen?hide():show();pointerWasOpen=false};wrap.append(button,tip);return wrap
 }
 

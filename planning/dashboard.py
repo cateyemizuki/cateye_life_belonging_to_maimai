@@ -49,7 +49,30 @@ def _row(row: Any) -> dict[str, Any]:
         values = row.get(key)
         if isinstance(values, dict):
             result[key] = {field: _number(values.get(field)) for field in (*FIELDS, 'sleep_debt')}
+    # 3.17.7 改进1：只暴露人话化抽取原因这一个策展字段（其余 metadata 仍不上 UI）。
+    metadata = row.get('metadata')
+    if isinstance(metadata, dict):
+        reason = metadata.get('draw_reason_zh')
+        if isinstance(reason, str) and reason:
+            result['draw_reason_zh'] = reason[:80]
     return result
+
+
+def _event_slot_label(row: dict[str, Any]) -> str:
+    """事件时段展示标签（3.17.7 改进2，只读投影）：生成事件 → 自身 time_slot；
+    内置事件 allowed_slots 覆盖全部三段 → 『全天』，收窄 → 以 / 连接；无信息 → ''。"""
+    from .event_slots import TIME_SLOTS
+    slot = row.get('time_slot')
+    if isinstance(slot, str) and slot in TIME_SLOTS:
+        return slot
+    slots = row.get('allowed_slots')
+    if isinstance(slots, (list, tuple)):
+        valid = [s for s in TIME_SLOTS if s in slots]
+        if len(valid) == len(TIME_SLOTS):
+            return '全天'
+        if valid:
+            return '/'.join(valid)
+    return ''
 
 
 def _schedule_pools(planning: Any, model: Any, now: datetime, read: Any) -> dict[str, Any]:
@@ -65,7 +88,8 @@ def _schedule_pools(planning: Any, model: Any, now: datetime, read: Any) -> dict
              'pool_kind': str(row.get('pool_kind') or 'reusable')[:20],
              'generation_id': str(row.get('generation_id') or '')[:96],
              'consumption_status': str((row.get('consumption') or {}).get('status') or '')[:24],
-             'consumed_at': str((row.get('consumption') or {}).get('picked_at') or '')[:48]}
+             'consumed_at': str((row.get('consumption') or {}).get('picked_at') or '')[:48],
+             'time_slot': _event_slot_label(row)}
             for row in rows[:40] if isinstance(row, dict) and row.get('name')
         ]
 
