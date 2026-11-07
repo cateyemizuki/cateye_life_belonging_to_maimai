@@ -149,6 +149,7 @@ class PromptBuilder:
         low_mood_days: int = 0,
         holiday_context: Optional[str] = None,
         experience_context: str = "",
+        motive_context: str = "",
     ) -> str:
         """构建 spine 日意图提示词（设计 §4.2 精简口径）。
 
@@ -268,6 +269,16 @@ Schema: {json.dumps(schema, ensure_ascii=False)}
 【近期真实经历参考】
 以下是经历索引里已核实的生活事实摘要（observed=真实发生；simulated_activity=虚拟日程活动，不可当作现实操作），可作为今日意图灵感，不要直接复述：
 {experience_context}
+"""
+
+        # PR-B2（2026-11-07 持续动机消费点，规格 §2）：≤4 条动机摘要注入变量区
+        # （稳定规则前置不变）；只作倾向参考，不构成必须执行的任务——状态不佳
+        # 可以不做。空串=不注入（开关关闭/失败/为空一律空降级，旧行为逐字不变）。
+        if motive_context:
+            prompt += f"""
+【近期持续动机参考】
+以下是 bot 当前少量短中期动机（只作今日意图的灵感与倾向参考，不是必须执行的任务；状态不佳时可以不做）：
+{motive_context}
 """
 
         if pending_commitments:

@@ -921,6 +921,29 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 return apply_items(items, date, consume_commitments=False,
                                    reason=reason or "morning_wake_adjust")
 
+            # PR-B2（2026-11-07 跨日事务 + 持续动机）：MotiveStore 纯旁路装配——
+            # 2–4 条短中期动机只改候选权重与 spine 提示词变量区；装配失败保守停用
+            # （None → planner 动机分支整体旁路，旧行为逐字不变）。三键动态读
+            # [life_state]（热重载即时生效）；goals/experience 经只读 provider 注入。
+            motive_store = None
+            try:
+                from pathlib import Path
+                from planning.motives import MotiveStore
+                motive_store = MotiveStore(
+                    Path(self._data_dir) / 'motives.json',
+                    enabled_provider=lambda: bool(getattr(
+                        self.config.life_state, 'motives_enabled', True)),
+                    max_count_provider=lambda: int(getattr(
+                        self.config.life_state, 'motive_max_count', 4)),
+                    half_life_days_provider=lambda: int(getattr(
+                        self.config.life_state, 'motive_half_life_days', 3)),
+                    goals_provider=self._motive_goal_rows,
+                    experience_provider=self._motive_experience_rows,
+                    timezone_str=timezone_str)
+            except Exception as exc:
+                self.ctx.logger.warning('持续动机装配失败（纯旁路，忽略）：%s', type(exc).__name__)
+                motive_store = None
+            self._motive_store = motive_store
             planner = RollingPlanner(
                 self._db, life,
                 config_provider=lambda: self.config, event_bus=getattr(self, "_bus", None),
@@ -930,7 +953,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 wake_recorder=self._record_actual_wake_cycle,
                 # PR4 共享接线：随机事件优先从事件库取（单实例由 PlanningServices 持有；
                 # None = 事件库装配失败 → planner 逐字回退旧内置池路径）
-                event_catalog=getattr(getattr(self, "_planning", None), "event_catalog", None))
+                event_catalog=getattr(getattr(self, "_planning", None), "event_catalog", None),
+                # PR-B2：唯一目标表（GoalManager）注入——可能延续活动关联/创建长期
+                # 目标、跨日继续候选；None = 未装配 → 跨日事务分支整体旁路
+                goal_manager=getattr(getattr(self, "_planning", None), "goal_manager", None),
+                motive_store=motive_store)
             engine: SleepEngine | None = None
             restored: Any = None
             # PR8 3.0.0：睡眠引擎随 [schedule].enabled 装配（旧 sleep_engine_enabled
@@ -987,6 +1014,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self._rolling_planner = None
             self._life_model = None
             self._sleep_engine = None
+            self._motive_store = None
             try:
                 self._schedule_query.set_runtime_provider(None)
             except Exception:
@@ -1576,6 +1604,40 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                                 limit=max(1, min(5, int(limit))),
                                 now=self._surf_now().timestamp())
             return [f"- [{r.get('type', '')}] {r.get('summary', '')}" for r in rows]
+        except Exception:
+            return []
+
+    def _motive_goal_rows(self) -> list[dict]:
+        """PR-B2：动机/跨日事务的明确目标只读来源（goals 表，有界 ≤50 行）。
+        GoalManager 未装配/失败 → []（空降级，绝不拖挂主业务）。"""
+        gm = getattr(getattr(self, '_planning', None), 'goal_manager', None)
+        if gm is None:
+            return []
+        try:
+            return list(gm.db.get_all_goals(limit=50))
+        except Exception:
+            return []
+
+    def _motive_experience_rows(self) -> list[dict]:
+        """PR-B2：动机的真实观看/发布结果只读来源（B1 索引 observed/published；
+        inferred 由 MotiveStore 低权重封顶）。索引缺失/开关关闭/失败 → []。"""
+        index = getattr(self, '_experience_index', None)
+        if index is None or not self._experience_enabled():
+            return []
+        try:
+            return index.recent(kinds=['watched_video', 'qzone_posted'], limit=10,
+                                now=self._surf_now().timestamp())
+        except Exception:
+            return []
+
+    def motive_context_lines(self, limit: int = 4) -> list[str]:
+        """PR-B2：planning 有界只读消费端口——≤4 条动机摘要行（spine 提示词
+        变量区）。未装配/开关关闭/失败/为空 → []（调用方空降级不注入）。只读。"""
+        store = getattr(self, '_motive_store', None)
+        if store is None:
+            return []
+        try:
+            return store.summary_lines(limit=max(1, min(4, int(limit))))
         except Exception:
             return []
 

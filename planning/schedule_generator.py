@@ -403,6 +403,7 @@ class ScheduleGenerator:
         self._load_sync_contexts(base, gen_config, date)
         self._load_low_mood(base)
         self._load_experience_context(base)
+        self._load_motive_context(base)
         await self._load_holiday_context(base, date)
         await self._load_async_contexts(base, gen_config, date)
 
@@ -886,6 +887,22 @@ class ScheduleGenerator:
         except Exception as exc:
             base.experience_context = ""
             logger.debug("近期经历上下文装载失败（忽略）: %s", exc)
+
+    def _load_motive_context(self, base: BaseScheduleGenerator) -> None:
+        """PR-B2（2026-11-07 持续动机消费点，规格 §2）：经插件公开只读端口取
+        ≤4 条动机摘要行注入 spine 提示词变量区（稳定规则前置不变）。端口缺失/
+        开关关闭/失败/为空 → 空串不注入（空降级，旧行为逐字不变）；动机只作
+        倾向参考，不构成必须执行的任务，不穿透睡眠/硬约定/注意力/预算。"""
+        base.motive_context = ""
+        try:
+            getter = getattr(self._plugin, "motive_context_lines", None)
+            if not callable(getter):
+                return
+            lines = getter(limit=4) or []
+            base.motive_context = "\n".join(str(x) for x in list(lines)[:4])
+        except Exception as exc:
+            base.motive_context = ""
+            logger.debug("近期动机上下文装载失败（忽略）: %s", exc)
 
     async def _load_async_contexts(
         self, base: BaseScheduleGenerator, gen_config: ScheduleGeneratorConfig, date: str

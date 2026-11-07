@@ -917,6 +917,39 @@ class LifeStateSectionConfig(PluginConfigBase):
             **_ui_i18n("Experience TTL (days)"),
         },
     )
+    # PR-B2（2026-11-07 跨日事务 + 持续动机，计划书 §5 H3 / §5.3；规格 §3 +3 键）：
+    # 2–4 条短中期动机，只改候选权重（≤15% 基础分）与 spine 提示词变量区摘要，
+    # 不穿透睡眠/硬约定/注意力/社交预算；状态低允许不作为。planning/motives.py
+    # 为唯一实现；关 = 零影响（已有动机文件保留只读不删）。
+    motives_enabled: bool = Field(
+        default=True,
+        description="持续动机开关（2–4 条短中期动机只影响活动候选权重；关=零影响）",
+        json_schema_extra={
+            "label": "持续动机开关",
+            **_ui_i18n("Motives enabled",
+                       "2-4 short-term motives gently weight activity candidates only; off = no effect."),
+        },
+    )
+    motive_max_count: int = Field(
+        default=4,
+        ge=2,
+        le=4,
+        description="同时保留的动机条数上限（少而稳定）",
+        json_schema_extra={
+            "label": "动机条数上限",
+            **_ui_i18n("Max motives"),
+        },
+    )
+    motive_half_life_days: int = Field(
+        default=3,
+        ge=1,
+        le=14,
+        description="动机强度指数衰减半衰期（天）",
+        json_schema_extra={
+            "label": "动机半衰期(天)",
+            **_ui_i18n("Motive half-life (days)"),
+        },
+    )
     # PR2（2026-10-26），计划书 §三十四/定稿 §4.1.1（R7 依据 = 用户 2026-10-26 直派
     # 【日程系统二期 PR2 双向闭环·调制侧】）：情绪 → 生活状态调制开关。false（默认）
     # 时不读 emotion VAD、不构造调制服务、modulation=None（逐字旧行为）；true 时生效

@@ -47,6 +47,8 @@ from core.time_utils import minutes_of_now
 
 from . import activity_profiles
 from .circadian import nap_reason
+from .goal_manager import GoalStatus
+from .motives import MOTIVE_BONUS_RATIO
 from .sleep_engine import resolve_hard_commitment_start
 from .schedule_items import is_named_nap, is_night_sleep_item
 from .time_utils import (DAY_MINUTES, TimezoneManager, is_in_sleep_ring,
@@ -132,6 +134,50 @@ ATTENTION_MID_INTERRUPTIBLE = 0.45
 SLEEP_GOAL_TYPE = "sleep"
 #: 睡眠 episode 的可中断性（接近不可打断；A.3「开会/硬约定 0.05」同档）
 SLEEP_INTERRUPTIBILITY = 0.05
+
+# ── 活动三分类（PR-B2，2026-11-07；计划书 §5.1 / 规格 §1）────────────────
+#: 确定性规则先行，LLM 不参与分类；拿不准 → 无延续价值（保守）。
+#: 明确承诺（hardness=hard / source=commitment）由既有硬约定机制处理，不进分类器。
+#: 类型直判「无延续价值」：结束即结束（发呆/休息/吃饭/睡觉/转场/随手社交娱乐）。
+CONTINUITY_NONE_GOAL_TYPES = frozenset({
+    "rest", "idle", "meal", "sleep", "transition", "social", "entertainment",
+})
+#: 名称关键词直判「无延续价值」（优先于类型/延续关键词，保守否决）
+CONTINUITY_NONE_KEYWORDS = ("发呆", "零食", "刷QQ", "刷qq", "随手", "躺一会",
+                            "待机", "打盹", "闲逛")
+#: 类型直判「可能延续」：工作/学习天然有未完成价值
+CONTINUITY_TYPE_GOAL_TYPES = frozenset({"work", "study"})
+#: 名称关键词判「可能延续」（收拾收藏夹/研究新话题/整理图片等；可经注入补充）
+CONTINUITY_KEYWORDS = ("整理", "收拾", "收藏", "研究", "学习", "练习", "写作",
+                       "规划", "清理", "修复", "搭建", "阅读", "复盘", "准备",
+                       "剪辑", "写")
+
+
+def classify_activity_continuity(name: Any, goal_type: Any, *,
+                                 extra_keywords: Any = ()) -> str:
+    """活动三分类的确定性判定（PR-B2 规格 §1；返回 ``none`` / ``continuable``）。
+
+    判定顺序（确定性）：无延续价值关键词（保守否决）→ 延续关键词（规格 §1
+    例：研究新话题/收拾收藏夹，即使类型是娱乐/日常）→ 无延续价值类型 →
+    work/study 类型 → 其余拿不准 ``none``（保守缺省）。明确承诺不走本函数
+    （既有机制不动）。``extra_keywords``：可配置补充的延续关键词（注入式；
+    非法条目忽略）。
+    """
+    text = str(name or "")
+    gtype = str(goal_type or "").strip().lower()
+    if any(kw in text for kw in CONTINUITY_NONE_KEYWORDS):
+        return "none"
+    keywords = list(CONTINUITY_KEYWORDS)
+    for kw in extra_keywords or ():
+        if isinstance(kw, str) and kw.strip():
+            keywords.append(kw.strip())
+    if any(kw in text for kw in keywords):
+        return "continuable"
+    if gtype in CONTINUITY_NONE_GOAL_TYPES:
+        return "none"
+    if gtype in CONTINUITY_TYPE_GOAL_TYPES:
+        return "continuable"
+    return "none"
 
 #: 睡眠类型条目（与 schedule_query.SKIP_TYPES / schedule_items 夜间睡眠口径对齐）
 _SKIP_SLEEP_TYPES = {SLEEP_GOAL_TYPE}
@@ -292,7 +338,10 @@ class RollingPlanner:
                  sleep_engine: Any = None,
                  schedule_writer: Optional[Callable[..., Any]] = None,
                  event_catalog: Any = None,
-                 wake_recorder: Optional[Callable[..., Any]] = None) -> None:
+                 wake_recorder: Optional[Callable[..., Any]] = None,
+                 goal_manager: Any = None,
+                 motive_store: Any = None,
+                 continuity_keywords_provider: Optional[Callable[[], Any]] = None) -> None:
         self._db = db
         self._life = life_state
         self._config_provider = config_provider
@@ -303,6 +352,12 @@ class RollingPlanner:
         # PR4（2026-10-27 共享接线）：事件库服务（唯一实例由 PlanningServices 持有）。
         # None = 未装配/装配失败 → 随机事件逐字回退旧 RANDOM_EVENT_POOL 路径。
         self._event_catalog = event_catalog
+        # PR-B2（2026-11-07 跨日事务 + 持续动机）：GoalManager（唯一目标表，不造
+        # 第二个目标表）与 MotiveStore（只改候选权重）。None = 未装配 → 全部新分支
+        # 旁路，旧行为逐字不变。continuity_keywords_provider = 分类关键词可配置补充。
+        self._goal_manager = goal_manager
+        self._motive_store = motive_store
+        self._continuity_keywords_provider = continuity_keywords_provider
         # D9 晨间 spine 调整写回（插件注入 generator.apply_schedule_items 鸭子口；
         # 缺失 → 只返回调整结果不落库，旧行为零变化）
         self._schedule_writer = schedule_writer
@@ -878,6 +933,8 @@ class RollingPlanner:
         meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         if meta.get("close_active_handled"):
             return  # 已补发布过（幂等保护，防同对 (被挤行, 新行) 重放重复发事件）
+        # PR-B2：被挤掉 = 中断形态之一 → 父目标保留 paused（规格 §1）
+        self._settle_parent_goal(row, "interrupted", progress=row.get("progress"))
         # 随机事件 deltas：按标记补应用一次；**先应用后补写持久标记**
         # （state_deltas_applied=防双应用沿用 PR1 0.4 口径；close_active_handled=本路径幂等）。
         # 2026-11-04 修复（评估问题6 同款顺序隐患）：原实现先写标记后应用，
@@ -957,6 +1014,8 @@ class RollingPlanner:
         if not self._db.finish(eid, actual_end_minute=end, metadata=extra_meta):
             return
         self._finish_event_claim(episode, 'completed', reason=reason)
+        # PR-B2：活动完成 → 父目标完成（不长留待办）；无父目标零动作
+        self._settle_parent_goal(episode, "completed")
         # 吃饭/休息完成 → 盖 last_meal_at / last_break_at（时长内变化由 tick 速率记账，不重复）
         applied = False
         try:
@@ -998,6 +1057,8 @@ class RollingPlanner:
                               metadata={"pause_reason": reason}):
             return None
         self._finish_event_claim(episode, 'interrupted', reason=reason)
+        # PR-B2：活动中断 ≠ 目标消失——父目标保留 paused（规格 §1）
+        self._settle_parent_goal(episode, "paused", progress=episode.get("progress"))
         # PR2.5 修复（2026-10-26），交接 §五.18 D6：interrupted 事件补 duration_minutes
         # （actual_end-actual_start 跨午夜按同一 24h 环折算，走 planning/time_utils；
         # 任一端缺失不虚构——反馈侧对打断形态即可设时长门槛）
@@ -1467,6 +1528,13 @@ class RollingPlanner:
                 "note": "专注偏低，给自己一段恢复时间" if focus < 0.30 else "身心需要放缓节奏",
             })
 
+        # 源 4.5（PR-B2 规格 §1）：跨日继续候选——paused 且有延续价值的目标，
+        # 每日此类候选 ≤1（每次构建至多挑 1 条），energy 低时不出现；权重温和、
+        # 允许放弃（只是普通候选，不形成压力队列，不穿透睡眠/硬约定）。
+        continuation = self._continuation_candidate(date, cur, snapshot)
+        if continuation is not None:
+            candidates.append(continuation)
+
         # 源 5：idle 待机（永远存在的低优先候选——A.10.1 一等公民）
         idle_profile = activity_profiles.get_profile("idle")
         candidates.append({
@@ -1520,6 +1588,18 @@ class RollingPlanner:
                  + SCORE_WEIGHTS["novelty"] * novelty
                  - SCORE_WEIGHTS["switch"] * switch_cost
                  - SCORE_WEIGHTS["overrun"] * overrun_risk)
+        # PR-B2（规格 §2）：持续动机只改候选权重——motive_bonus ≤15% 基础分，
+        # 不匹配候选加成为 0（探索概率保留）；不穿透睡眠/硬约定/注意力/预算
+        # （那些判定在 tick 步 3/5 与本公式之外，动机无权触碰）。
+        store = self._motive_store
+        if store is not None:
+            try:
+                ratio = float(store.bonus_for(c))
+            except Exception:
+                ratio = 0.0
+            ratio = max(0.0, min(MOTIVE_BONUS_RATIO, ratio))
+            if ratio > 0.0:
+                score += ratio * max(score, 0.0)
         return score
 
     @staticmethod
@@ -1663,6 +1743,13 @@ class RollingPlanner:
         rng = self._day_rng(date)
         # 恢复池维护（过期/跨锚点/不了了之——先清理再候选）
         self._maintain_resume_pool(date, now, snapshot, report, rng)
+        # PR-B2：候选阶段刷新持续动机（衰减/到期/加强/新增；失败本拍跳过）。
+        # preview 是读态纯函数，不走此写入口。
+        if self._motive_store is not None:
+            try:
+                self._motive_store.refresh(now, state=snapshot)
+            except Exception as exc:
+                logger.debug("动机刷新失败（本拍跳过，不阻塞）：%s", exc)
         # 转场/空闲掷骰（§5.6：不在 tick 里每 5 分钟掷——每次进入空闲只掷一次）
         if self._idle_roll_pending or just_transition:
             self._idle_roll_pending = False
@@ -1717,7 +1804,8 @@ class RollingPlanner:
                                      report: Dict[str, Any]) -> None:
         profile = activity_profiles.get_profile(cand["profile_key"])
         source = {"commitment": "commitment", "intent": "rolling", "anchor_meal": "rolling",
-                  "resume": "resume", "idle": "rolling"}.get(cand["kind"], "rolling")
+                  "resume": "resume", "idle": "rolling",
+                  "continuation": "rolling"}.get(cand["kind"], "rolling")
         # PR2.5 修复（2026-10-26），交接 §五.18 D1：开播/恢复前抓当前 active 行，
         # 写入成功后若被 close-active 挤掉（interrupted 且 interrupted_by=新行 id）
         # 则补发布 life.episode_interrupted 与状态回写（原路径静默）
@@ -1752,6 +1840,13 @@ class RollingPlanner:
             # 2026-10-27 event-review F1：**未应用**时必须把整个结算快照随恢复行带走
             # （state_deltas / event_id / 版本），否则事件库替换移除旧 key 后 finish
             # 无法回查、增量整份漏记。``state_deltas_applied`` 本身绝不复制。
+            # PR-B2：恢复行透传父目标（episode 恢复 ≠ 新目标；paused 目标重新 active）
+            carried_goal = str(origin_meta.get("parent_goal_id") or "")
+            if carried_goal:
+                metadata["parent_goal_id"] = carried_goal
+                self._ensure_parent_goal(str(origin.get("name") or ""),
+                                         str(origin.get("goal_type") or ""),
+                                         existing_goal_id=carried_goal)
             if not origin_meta.get("state_deltas_applied"):
                 if origin_meta.get("event_key"):
                     metadata["event_key"] = str(origin_meta["event_key"])
@@ -1775,6 +1870,21 @@ class RollingPlanner:
                               resume_of=cand["resume_of"], name=origin.get("name"),
                               goal_type=origin.get("goal_type"))
         else:
+            # PR-B2（规格 §1）：「可能延续」类活动启动时关联/创建长期目标
+            # （确定性分类；拿不准 → 无延续价值，不建目标）。跨日继续候选自带
+            # parent_goal_id → 复用原目标。明确承诺（commitment）不走此路。
+            parent_goal_id: Optional[str] = None
+            if cand.get("parent_goal_id"):
+                parent_goal_id = self._ensure_parent_goal(
+                    str(cand["name"]), str(cand["goal_type"]),
+                    existing_goal_id=str(cand["parent_goal_id"]))
+            elif cand["kind"] != "commitment" and classify_activity_continuity(
+                    cand.get("name"), cand.get("goal_type"),
+                    extra_keywords=self._continuity_extra_keywords()) == "continuable":
+                parent_goal_id = self._ensure_parent_goal(
+                    str(cand["name"]), str(cand["goal_type"]))
+            if parent_goal_id:
+                metadata["parent_goal_id"] = parent_goal_id
             eid = self._db.start_episode(
                 schedule_date=date, name=str(cand["name"]), goal_type=str(cand["goal_type"]),
                 source=source, planned_start_minute=cur, planned_end_minute=cur + duration,
@@ -1793,6 +1903,145 @@ class RollingPlanner:
             report["actions"].append(f"started_{cand['kind']}")
         else:
             logger.warning("rolling_planner: episode 写入失败（本拍不开新块）")
+
+    # ── 跨日事务（PR-B2，2026-11-07；规格 §1 / 计划书 §5 H1 / §5.1）─────
+    def _continuity_extra_keywords(self) -> Any:
+        """分类关键词的可配置补充（注入式只读口；失败 → 空，保守缺省不变）。"""
+        provider = self._continuity_keywords_provider
+        if provider is None:
+            return ()
+        try:
+            return provider() or ()
+        except Exception:
+            return ()
+
+    def _ensure_parent_goal(self, name: str, goal_type: str, *,
+                            existing_goal_id: Optional[str] = None) -> Optional[str]:
+        """「可能延续」活动启动时关联/创建长期目标（复用 GoalManager.create_goal，
+        来源标 simulated_activity，不伪装现实经历；不造第二个目标表）。
+
+        已有目标（跨日继续/恢复透传）→ 复用并 resume；同名 simulated_activity
+        目标已存在 → 复用；都没有 → 新建。失败只告警：episode 照常启动、无父目标。
+        """
+        gm = self._goal_manager
+        if gm is None:
+            return None
+        try:
+            if existing_goal_id:
+                goal = gm.get_goal(str(existing_goal_id))
+                if goal is None:
+                    return None
+                status = getattr(goal.status, "value", goal.status)
+                if status not in ("active", "paused"):
+                    return None  # 已完成/已取消的目标不复活
+                if status == "paused":
+                    gm.resume_goal(goal.goal_id)
+                return goal.goal_id
+            for status in (GoalStatus.ACTIVE, GoalStatus.PAUSED):
+                for goal in gm.get_all_goals(status=status):
+                    params = goal.parameters or {}
+                    if params.get("source") == "simulated_activity" \
+                            and str(params.get("activity_name") or "") == name:
+                        if status == GoalStatus.PAUSED:
+                            gm.resume_goal(goal.goal_id)
+                        return goal.goal_id
+            goal = gm.create_goal(
+                name=name,
+                description=f"来自虚拟日程活动「{name}」（simulated_activity，非现实操作）",
+                goal_type=goal_type or "daily_routine",
+                creator_id="system", chat_id="global", priority="low",
+                parameters={"source": "simulated_activity", "activity_name": name},
+            )
+            self._log("rolling.parent_goal_created", goal_id=goal.goal_id, name=name)
+            return goal.goal_id
+        except Exception as exc:
+            logger.warning("rolling_planner: 父目标关联失败（episode 照常启动）：%s", exc)
+            return None
+
+    def _settle_parent_goal(self, episode: Dict[str, Any], outcome: str, *,
+                            progress: Any = None) -> None:
+        """episode 终结 → 父目标结算（best-effort）。
+
+        completed → 目标完成（活动做完了，不长留待办）；paused/interrupted/
+        abandoned → 目标保留 paused（**活动中断/放弃 ≠ 目标消失**，规格 §1），
+        进度按 episode 真实 progress 折算（上限 95，不虚构完成）。
+        """
+        gm = self._goal_manager
+        meta = episode.get("metadata") if isinstance(episode, dict) else None
+        gid = str((meta or {}).get("parent_goal_id") or "") \
+            if isinstance(meta, dict) else ""
+        if gm is None or not gid:
+            return
+        try:
+            if outcome == "completed":
+                gm.complete_goal(gid)
+            else:
+                gm.pause_goal(gid)
+                p = _as_number(progress, None)
+                if p is not None:
+                    gm.update_goal_progress(gid, min(95, max(0, int(round(p * 100)))))
+        except Exception as exc:
+            logger.warning("rolling_planner: 父目标结算失败（goal=%s）：%s", gid, exc)
+
+    def _continuation_candidate(self, date: str, cur: int,
+                                snapshot: Any) -> Optional[Dict[str, Any]]:
+        """跨日继续候选（规格 §1）：paused 且有延续价值的 simulated_activity 目标，
+        按精力/完成度/近期重复度加权挑 **至多 1 条**；energy 低于阈值不出现；
+        睡眠环内不出现（时间因素另由 _sample_block 的最小块/硬边界检查兜底）。
+        今日已继续过（同父目标 active/completed）的目标不再重复入围。
+        """
+        gm = self._goal_manager
+        if gm is None or self._in_sleep_ring(cur):
+            return None
+        energy = _as_number(snapshot.get("energy"), 1.0)
+        if energy is None:
+            energy = 1.0
+        if energy < self._cfg_float("low_energy_threshold", DEFAULT_LOW_ENERGY_THRESHOLD):
+            return None
+        try:
+            goals = gm.get_all_goals(status=GoalStatus.PAUSED)
+        except Exception as exc:
+            logger.debug("跨日目标读取失败（本拍无继续候选）：%s", exc)
+            return None
+        done_ids: set = set()
+        try:
+            for row in self._db.episodes_today(date):
+                meta = row.get("metadata")
+                if isinstance(meta, dict) and meta.get("parent_goal_id") \
+                        and row.get("status") in ("active", "completed"):
+                    done_ids.add(str(meta["parent_goal_id"]))
+        except Exception as exc:
+            logger.debug("今日 episode 读取失败（继续候选重复度按 0 处理）：%s", exc)
+        best: Any = None
+        best_weight = -1.0
+        for goal in goals:
+            params = goal.parameters or {}
+            if params.get("source") != "simulated_activity":
+                continue
+            if goal.goal_type in ("sleep", "meal", "pending_commitment"):
+                continue
+            if goal.goal_id in done_ids:
+                continue
+            progress = max(0.0, min(100.0, float(goal.progress or 0))) / 100.0
+            if progress >= 1.0:
+                continue
+            repeats = max(0, int(goal.execution_count or 0))
+            # 温和加权：精力贴合 + 完成度（快做完的优先收尾）+ 近期重复度惩罚
+            weight = 0.5 * energy + 0.3 * progress + 0.2 / (1.0 + repeats)
+            if weight > best_weight:
+                best, best_weight = goal, weight
+        if best is None:
+            return None
+        goal_type = str(best.goal_type or "daily_routine")
+        return {
+            "kind": "continuation", "name": f"继续{best.name}", "goal_type": goal_type,
+            "priority_score": _clamp(0.3 + 0.2 * best_weight, 0.0, 0.6),
+            "min_minutes": 0, "max_minutes": 0,
+            "interruptibility": 0.6, "profile_key": goal_type,
+            "window": None, "resume_of": None, "resume_bonus": 0.0,
+            "intent_item_id": None, "note": "之前没做完的事，今天接着试试",
+            "parent_goal_id": best.goal_id,
+        }
 
     # ── 恢复池维护（§5.5 / A.5 / B.6.3）─────────────────────────────────
     def resume_pool(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
@@ -1863,6 +2112,10 @@ class RollingPlanner:
                         reason = "give_up_low_progress"
             if reason:
                 if self._db.abandon(eid, reason=reason):
+                    # PR-B2（规格 §1）：resume_pool 的 abandon 只结束 episode，
+                    # 父目标保留 paused（活动中断/放弃 ≠ 目标消失）
+                    self._settle_parent_goal(row, "abandoned",
+                                             progress=row.get("progress"))
                     self._publish(EVENT_EPISODE_ABANDONED, episode_id=eid,
                                   name=row.get("name"), reason=reason,
                                   progress=row.get("progress"))
