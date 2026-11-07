@@ -1,5 +1,11 @@
 # 更新日志（CHANGELOG）
 
+## 3.9.3（2026-11-07）
+
+- 热修：日程注入统一模板 `_render_unified_prompt` 在动态睡眠开启时引用未定义局部变量 `now`（`engine.dynamic_status(now)` → NameError），导致该路径下日程注入整体失败（真机日志「注入日程信息失败: name 'now' is not defined」，inject_service.py:859）。改为 `engine.dynamic_status()` 缺省取引擎自身时区当前时间，与 sleep_engine 内部调用同口径。缺陷由 4a67ac7（3.5.0–3.6.1 工作树汇总）引入，仅动态睡眠开启时触发。
+- round 门禁新增回归检查 `check_inject_dynamic_band`：动态睡眠开启时统一模板必须渲染成功并追加困意提示（有点困/困了，准备休息/刚醒，还在缓神），关闭时不追加。
+- 版本双号 3.9.3，schema 不变（17 段 182 字段），纯修复递增，迁移保持用户值。
+
 ## 3.9.2（2026-11-07）
 
 - 小事件三时段配额改为「可复用 / 一次性」分开配置（event_catalog_reusable_00_08/08_16/16_24 默认 1/5/4，event_catalog_one_shot_00_08/08_16/16_24 默认 3/6/5，单项 0–12），合计生成 24 条；旧 event_catalog_period_limit_* 三键退役（纯 pop，不搬运）。

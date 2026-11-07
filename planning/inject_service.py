@@ -856,7 +856,9 @@ class InjectService:
 
         engine = getattr(self._plugin, "_sleep_engine", None)
         if getattr(engine, "dynamic_enabled", False):
-            band = engine.dynamic_status(now).get("band")
+            # 3.9.3 热修：此处无 now 局部变量（原写法 NameError 致日程注入整体失败）；
+            # dynamic_status() 缺省由引擎按自身时区取当前时间。
+            band = engine.dynamic_status().get("band")
             cue = {"drowsy": "有点困", "winding_down": "困了，准备休息",
                    "waking": "刚醒，还在缓神"}.get(band)
             if cue:
