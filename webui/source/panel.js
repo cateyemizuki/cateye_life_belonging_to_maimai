@@ -276,6 +276,8 @@ function renderConsumedEvents(){
  if(!target.children.length)target.append(el('li','note',Array.isArray(rows)?'本周期暂无消耗记录':'当前快照未包含消耗记录'));
 }
 function renderSchedulePage(){
+ // 3.17.10 PR-OVERVIEW-FULLWIDTH：横条置顶常驻（翻页内容之外），两页均渲染；数据源仍 dayRows()
+ if(data)renderActivityOverview(dayRows());
  const page=schedulePageInfo(),record=page.key==='record';
  $('schedule-record').hidden=!record;$('schedule-pool').hidden=record;
  $('schedule-detail').hidden=!record;$('schedule-pool-detail').hidden=record;
@@ -420,7 +422,6 @@ window.addEventListener('scroll',()=>{if(overviewTipOwner&&overviewTip&&!overvie
 window.addEventListener('resize',overviewHideTip);
 function renderSchedule(){
  const sch=dayRows(),episodes=Array.isArray(sch.episodes)?sch.episodes:[],intents=Array.isArray(sch.intents)?sch.intents:[],summary=sch.summary||{};
- renderActivityOverview(sch);
  const day=selectedDay||sch.date||dayText(data?.generated_at);
  const counts=[['completed_count','已完成'],['interrupted_count','已中断']].map(([k,l])=>l+' '+(summary[k]??'—'));
  text('episode-count',episodes.length+' 项记录');text('intent-count',intents.length+' 项意图');

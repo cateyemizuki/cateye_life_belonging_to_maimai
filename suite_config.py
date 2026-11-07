@@ -211,7 +211,12 @@ from suite_prompts import (
 # 纯布局改动（mast 双列 grid + toolbar 纵列 + 更多菜单右展开），不改按钮
 # ID/行为/事件绑定，不影响调度，无新增配置字段（schema 不变，18 段 203 叶子），
 # 按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.9"
+# 3.17.10（2026-11-08 PR-OVERVIEW-FULLWIDTH 当日活动概括全宽缩放 + 日程顶部常驻）：
+# 纯展示改动（横条移出翻页内容置 #panel-schedule 首子 + 去 min-width/横滑改全宽
+# 按比例缩放 + 渲染调用移 renderSchedulePage 顶部），24h 轴语义/颜色/浮窗/跨日
+# 逻辑不变，不影响调度，无新增配置字段（schema 不变，18 段 203 叶子），
+# 按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.10"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

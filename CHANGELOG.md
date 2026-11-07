@@ -1,5 +1,10 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.10（2026-11-08）
+
+- PR-OVERVIEW-FULLWIDTH（当日活动概括全宽缩放 + 日程顶部常驻，纯展示，不影响调度）：①`#activity-overview` 整段移出 `#schedule-page-content`（原在 `#schedule-record` 内，切到「小事件」页即不可见），置于 `#panel-schedule` 第一个子元素（翻页 caption 之上）——日程栏目顶部常驻，行程记录/小事件两页均可见；ID/内部结构（overview-track/overview-scale/overview-date/overview-note）不变。②去掉 `.overview-inner{min-width:560px}` 与 `.overview-scroll{overflow-x:auto}` 横滑，容器改 `width:100%`、`.overview-track` 宽度=卡片内容宽（100%）——横条撑满页面最大宽度，窄屏（<700px）段按比例缩小不横滑，刻度行随同缩放；`.overview-card` margin 调为 `0 0 12px` 与日程顶部间距协调。③`renderActivityOverview` 调用点由 `renderSchedule` 内移到 `renderSchedulePage` 顶部（翻页分支之前，`if(data)` 守卫沿用旧「有数据才渲染」语义），两页都渲染横条；数据源仍 `dayRows()`（selectedDay 历史日同样全宽置顶），`renderSchedule` 内原调用移除避免重复。
+- **红线保留**：24h 时间轴语义不变（全宽恒代表 1440 分钟，段 left/width 百分比定位逐字未动）；类型固定色/计划灰差集/浮窗钳制/跨日续段/空日降级逻辑不变；纯展示不触发任何调度/刷新副作用；按钮 ID 不变。配置：无新增字段（schema 不变，18 段 203 叶子）。版本双号 3.17.10（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round 版本断言与打印、test_prompt_identity_audit / test_webui_timeline_3178 / test_toolbar_left_3179 双号断言顺延，只改版本/计数；smoke R6 守卫读双号动态比对无需改字面量）。test_webui_timeline_3178 钉旧横滑行为的断言按新需求重钉（min-width:560/overflow-x:auto → 全宽无横滑；调用点 renderSchedule → renderSchedulePage 顶部），其余断言不动。新增专项 `scratch/test_overview_fullwidth_31710.py`；`python tools/build_webui.py` 重建 index.html。边界：本批不部署、不 git commit、不 push、不碰主机。
+
 ## 3.17.9（2026-11-08）
 
 - PR-TOOLBAR-LEFT（面板头部按钮改左侧自上而下纵向排列，纯展示布局，不影响调度/按钮行为）：`.mast` 由横向 flex 改双列 grid（`grid-template-columns:auto minmax(0,1fr)`）——左列为 `.toolbar` 纵向按钮组（`flex-direction:column;align-items:stretch;flex-wrap:nowrap;gap:6px`，列宽 112px/窄屏 104px，自上而下：实时连接 chip → 刷新 → 更多（嵌入）/导出快照+明暗（独立）），右列 `.mast-side` 放 brand（独立模式，嵌入仍由 W-04 隐藏）与 `#updated` 更新时间行（左对齐）。模板仅调整 mast 内部 DOM 顺序与包装类，所有按钮 ID/aria/事件绑定逐字节不变；`.more-menu` 改向右侧展开（`left:calc(100% + 6px);right:auto;top:0`）不覆盖纵列，`max-width:calc(100vw - 150px)` 纯 CSS 钳制窄屏不出视口（无需 JS 定位）；status chip 长文案（如「已连接 · 留意数据」）居中合理折行不溢出；窄屏 <700px 保持左列纵向不回落横向（按钮沿用全局 min-height:44 触控口径），shell 不横向溢出；复古主题 .mast 卡片化与深浅色规则不含 display，grid 直接兼容；栏目 tab 条全宽位置不动。
