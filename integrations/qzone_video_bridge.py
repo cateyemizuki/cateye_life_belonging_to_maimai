@@ -39,6 +39,11 @@ fact write-back retries are bounded (≤3 tick retries then ``fact_sync=failed``
 when the fact provider is absent it stays a no-op leaving ``pending`` (real
 bot-self stream wiring deferred to B1, see needsReview).
 
+PR-B1 (2026-11-07): fact write-back now prefers the injected ``record_published``
+provider (life experience index, published tier, dedupe ``qzone:{tid}``);
+``append_fact`` / the bot-self stream remain compatibility fallbacks only and
+are never required. No user-chat injection on either path.
+
 The ledger is a synchronous, thread-safe SQLite layer modeled on
 ``integrations/video_share_ledger.py`` (independent connection + transaction per
 operation). Async callers offload ledger work with ``asyncio.to_thread`` so a
@@ -819,7 +824,8 @@ class QzoneVideoBridge:
                  persona_provider, state_provider, task_provider, clock, day, logger,
                  post_moment=None, check_post_gates=None, posts_today=None,
                  daily_max_posts=None, list_my_moments=None, send_ambiguous=None,
-                 now_dt=None, append_fact=None, preview_key=None):
+                 now_dt=None, append_fact=None, preview_key=None,
+                 record_published=None):
         self.ledger = ledger
         self._config = config_provider
         self._qzone_enabled = qzone_enabled_provider
@@ -838,7 +844,12 @@ class QzoneVideoBridge:
         self._list_my_moments = list_my_moments     # async (num) -> list（文案防复读有界读取）
         self._send_ambiguous = send_ambiguous       # () -> bool（区分 uncertain vs 确定未发）
         self._now_dt = now_dt                       # () -> datetime（门控复检用业务时区现在）
-        self._append_fact = append_fact             # async (text, attempt) -> reply（仅 bot 自身上下文）
+        self._append_fact = append_fact             # async (text, attempt) -> reply（仅 bot 自身上下文；B1 起为兼容兜底）
+        # PR-B1（规格 §2.1）：经历索引事实回写 provider（同步 (candidate, tid) -> bool，
+        # 桥经 asyncio.to_thread 调用）。接线时优先于 append_fact——成功→fact_sync=ok，
+        # 失败留 pending 由 A3 有界重试；不再依赖未装配的 _qzone_video_self_stream，
+        # 绝不复用陪伴私聊流注入用户聊天。缺省 None → 保持 A3 旧路径（兼容裸桥/桩）。
+        self._record_published = record_published
         # PR-A3：preview key 计算端口（注入；integrations 不反向 import qzone，边界门禁口径）。
         # (text, images, visibility) -> str（=post_moment preview key）；缺省 None → request_key 留空，
         # 幂等仍由 UNIQUE(bvid,watched_generation,channel) 保证（生产装配恒注入真实 preview_post）。
@@ -1005,8 +1016,8 @@ class QzoneVideoBridge:
     async def _retry_fact_sync(self) -> dict:
         """有界重试事实回写（≤FACT_SYNC_MAX_ATTEMPTS 次）；仍失败留 failed 不再试。"""
         report = {'retried': 0, 'synced': 0, 'failed': 0}
-        if self._append_fact is None:
-            return report  # provider 缺省 no-op：留 pending，不烧重试次数（B1 接线前）
+        if self._append_fact is None and self._record_published is None:
+            return report  # provider 缺省 no-op：留 pending，不烧重试次数（裸桥/桩兼容）
         pending = await asyncio.to_thread(self.ledger.pending_fact_sync, FACT_SYNC_RETRY_PER_TICK)
         for candidate in pending:
             decision = candidate.get('decision') or {}
@@ -1311,10 +1322,22 @@ class QzoneVideoBridge:
         return text[:max_chars]
 
     async def _write_fact(self, candidate: dict, tid: str) -> str:
-        """发布成功后向 bot 自身上下文追加一条已发生行为事实（不进任何用户聊天注入）。
+        """发布成功后记一条已发生行为事实（不进任何用户聊天注入）。
 
-        失败/端口缺失 → fact_sync=pending（A3 完善重试）。返回 'ok'/'pending'。
+        PR-B1（规格 §2.1）：优先走经历索引 provider（record_published →
+        index.record_watched_video_published，published/qzone_posted，dedupe
+        qzone:{tid}）；幂等成功（含同 tid 已在账）→ 'ok'。索引端口缺省时保留
+        A2/A3 的 append_fact 旧路径（仅 bot 自身上下文，兼容裸桥/桩注入）。
+        失败/端口缺失 → fact_sync=pending（A3 有界重试）。返回 'ok'/'pending'。
         """
+        if self._record_published is not None:
+            try:
+                ok = await asyncio.to_thread(self._record_published, candidate, tid)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return 'pending'
+            return 'ok' if ok else 'pending'
         if self._append_fact is None:
             return 'pending'
         facts = candidate.get('facts') or {}

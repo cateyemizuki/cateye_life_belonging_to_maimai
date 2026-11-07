@@ -148,6 +148,7 @@ class PromptBuilder:
         knowledge_context: str = "",
         low_mood_days: int = 0,
         holiday_context: Optional[str] = None,
+        experience_context: str = "",
     ) -> str:
         """构建 spine 日意图提示词（设计 §4.2 精简口径）。
 
@@ -258,6 +259,15 @@ Schema: {json.dumps(schema, ensure_ascii=False)}
             prompt += f"""
 【相关记忆参考】
 {knowledge_context}
+"""
+
+        # PR-B1（2026-11-07 经历索引消费点）：近期真实经历摘要行（变量后置，稳定
+        # 前缀不动）；空串=不注入（失败/为空/开关关闭一律空降级，旧行为逐字不变）。
+        if experience_context:
+            prompt += f"""
+【近期真实经历参考】
+以下是经历索引里已核实的生活事实摘要（observed=真实发生；simulated_activity=虚拟日程活动，不可当作现实操作），可作为今日意图灵感，不要直接复述：
+{experience_context}
 """
 
         if pending_commitments:

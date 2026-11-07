@@ -895,6 +895,28 @@ class LifeStateSectionConfig(PluginConfigBase):
             **_ui_i18n("Keep episode days"),
         },
     )
+    # PR-B1（2026-11-07 生活经历索引，计划书 §4/§5.2/§6）：纯旁路事实层开关与
+    # TTL。false = 不记录不消费（已有数据保留只读，诊断仍可查）；索引失败绝不
+    # 拖挂主业务。core/life_experience_index.py 为唯一实现，主模块仍拥有执行权。
+    experience_index_enabled: bool = Field(
+        default=True,
+        description="生活经历索引开关（只存事实与引用；关=不记录不消费，已有数据保留只读）",
+        json_schema_extra={
+            "label": "经历索引开关",
+            **_ui_i18n("Experience index enabled",
+                       "Pure side-channel fact index; off = no recording/consumption, existing data kept read-only."),
+        },
+    )
+    experience_ttl_days: int = Field(
+        default=14,
+        ge=1,
+        le=90,
+        description="经历索引条目保留天数（到期清理）",
+        json_schema_extra={
+            "label": "经历保留天数",
+            **_ui_i18n("Experience TTL (days)"),
+        },
+    )
     # PR2（2026-10-26），计划书 §三十四/定稿 §4.1.1（R7 依据 = 用户 2026-10-26 直派
     # 【日程系统二期 PR2 双向闭环·调制侧】）：情绪 → 生活状态调制开关。false（默认）
     # 时不读 emotion VAD、不构造调制服务、modulation=None（逐字旧行为）；true 时生效

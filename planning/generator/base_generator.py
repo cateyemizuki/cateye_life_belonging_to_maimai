@@ -44,6 +44,9 @@ class BaseScheduleGenerator:
         #: 节假日上下文（2026-10-10：只有 [schedule] holiday_affects_schedule 开启时由
         #: ScheduleGenerator 装载；空串=不注入，行为与旧版逐字一致）
         self.holiday_context: str = ""
+        #: PR-B1（2026-11-07）：近期真实经历摘要行（经历索引有界只读端口装载；
+        #: 空串=不注入，行为与旧版逐字一致——失败/为空/开关关闭一律空降级）
+        self.experience_context: str = ""
         self.config: Dict[str, Any] = config or {}  # 保存配置
 
         # 初始化时区管理器
@@ -86,4 +89,5 @@ class BaseScheduleGenerator:
             knowledge_context=self.knowledge_context,
             low_mood_days=self.low_mood_days,
             holiday_context=self.holiday_context,
+            experience_context=self.experience_context,
         )

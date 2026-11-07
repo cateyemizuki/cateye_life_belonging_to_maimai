@@ -59,6 +59,7 @@ from suite_config import (
     factory_defaults,
 )
 from core.diag import DecisionLogger, LLMCallLogger
+from core.life_experience_index import LifeExperienceIndex
 from integrations.proactive_delivery import ProactiveDelivery, install_proactive_budget
 from core.llm_utils import LLMService, llm_task_name_of
 from emotion.components import EmotionComponentsMixin
@@ -444,6 +445,20 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 进程内事件总线（M0，MAINTENANCE_PLAN §三）：先于服务束构造（各服务束自读 plugin._bus），
         # 预算计数器在装配时装入（先于服务束启动；M0 实际订阅者仅它）
         self._bus = ProactiveDelivery(self._decision_logger)
+        # PR-B1（2026-11-07 生活经历索引）：纯旁路事实层——只存事实与引用，不承担
+        # 执行/副作用；装配失败保守停用（None），订阅 handler 异常由总线隔离，
+        # 索引失败绝不影响主业务。开关/TTL 动态读 [life_state]（热重载即时生效）。
+        self._experience_index: LifeExperienceIndex | None = None
+        try:
+            self._experience_index = LifeExperienceIndex(
+                data_dir / 'life_experience.sqlite3',
+                enabled_provider=self._experience_enabled,
+                ttl_days_provider=lambda: int(getattr(
+                    self.config.life_state, 'experience_ttl_days', 14) or 14))
+            self._experience_index.attach_bus(self._bus)
+        except Exception as exc:
+            self.ctx.logger.warning('生活经历索引装配失败（纯旁路，忽略）：%s', type(exc).__name__)
+            self._experience_index = None
         # S1（冲浪计划书 §4）：对话忙闲事实 + 自动注意力租约权威（单实例，装配根
         # 注入；hook 喂事实，integrations/video_schedule 门控消费；租约是运行态，
         # 重载即消失→自动冲浪保守恢复，额度窗口由 video_schedule 持久化）
@@ -675,6 +690,12 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 bus.stop_budget()
             except Exception as exc:
                 self._warn_quiet("预算计数器停机失败（忽略）：%s", exc)
+            # PR-B1：经历索订阅随停机注销（纯旁路，失败忽略）
+            try:
+                from core.life_experience_index import BUS_OWNER as _EXP_BUS_OWNER
+                bus.unsubscribe_all(_EXP_BUS_OWNER)
+            except Exception as exc:
+                self._warn_quiet("经历索引订阅注销失败（忽略）：%s", exc)
         # B3：观看服务停机（原型语义：不等待进行中任务，下次加载 recover() 如实标记中断）
         video_watch = getattr(self, "_video_watch", None)
         if video_watch is not None:
@@ -1535,10 +1556,35 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self.ctx.logger.warning('独立视频分享初始化失败，保守停用发送：%s',type(exc).__name__)
             return None
 
+    def _experience_enabled(self) -> bool:
+        """PR-B1：经历索引开关（[life_state].experience_index_enabled，默认开）。
+        配置不可读保守停记（纯旁路，绝不拖挂主业务）。"""
+        try:
+            return bool(getattr(self.config.life_state, 'experience_index_enabled', True))
+        except Exception:
+            return False
+
+    def experience_context_lines(self, limit: int = 5) -> list[str]:
+        """PR-B1：planning 有界只读消费端口——recent(kinds=['watched_video',
+        'activity_done'], limit≤5) 的摘要行。开关关闭/未装配/失败/为空 → []
+        （调用方空降级不注入）。只读，零副作用。"""
+        index = getattr(self, '_experience_index', None)
+        if index is None or not self._experience_enabled():
+            return []
+        try:
+            rows = index.recent(kinds=['watched_video', 'activity_done'],
+                                limit=max(1, min(5, int(limit))),
+                                now=self._surf_now().timestamp())
+            return [f"- [{r.get('type', '')}] {r.get('summary', '')}" for r in rows]
+        except Exception:
+            return []
+
     def _record_video_result(self, result: dict, episode_id: str) -> bool:
         """观看完成双路记录（PR-A0）：聊天分享候选 + 空间视频候选，互不拖累。
 
         返回值保持旧口径 = 聊天分享路是否记录了候选；空间路只留痕不影响返回值。
+        PR-B1：第三路并列写经历索引（observed/watched_video）——证据等级沿用
+        watched_facts 闸（无证据不记），失败只告警不影响前两路与返回值。
         """
         recorded = False
         if self._video_social is not None:
@@ -1551,6 +1597,16 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 self._qzone_video.record_from_result(result, episode_id)
             except Exception as exc:
                 self.ctx.logger.warning('空间视频候选记录失败（忽略）：%s', exc)
+        index = getattr(self, '_experience_index', None)
+        if index is not None:
+            try:
+                from integrations.video_share_policy import watched_facts
+                now = self._surf_now().timestamp()
+                facts = watched_facts(result, episode_id, now)
+                task_id = str((result or {}).get('task_id') or '')
+                index.record_watched_video(facts, episode_id, task_id=task_id, now=now)
+            except Exception as exc:
+                self.ctx.logger.warning('经历索引观看记录失败（忽略）：%s', exc)
         return recorded
 
     def _qzone_video_assets_spec(self, data_dir: Path) -> Any:
@@ -1603,6 +1659,14 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     'now_dt': self._surf_now,
                     'append_fact': self._append_qzone_video_fact,
                 }
+                # PR-B1（规格 §2.1）：事实回写 provider 接经历索引——成功→
+                # fact_sync=synced，失败留 pending 由 A3 有界重试；不再依赖未装配
+                # 的 _qzone_video_self_stream，绝不复用陪伴私聊流注入用户聊天。
+                index = getattr(self, '_experience_index', None)
+                if index is not None:
+                    ports['record_published'] = lambda candidate, tid, _idx=index: (
+                        _idx.record_watched_video_published(
+                            candidate, tid, now=self._surf_now().timestamp()))
             return QzoneVideoBridge(
                 ledger,
                 config_provider=lambda: self.config.qzone_video,

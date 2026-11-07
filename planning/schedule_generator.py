@@ -402,6 +402,7 @@ class ScheduleGenerator:
         base = BaseScheduleGenerator(self.goal_manager, gen_config.to_dict())
         self._load_sync_contexts(base, gen_config, date)
         self._load_low_mood(base)
+        self._load_experience_context(base)
         await self._load_holiday_context(base, date)
         await self._load_async_contexts(base, gen_config, date)
 
@@ -870,6 +871,21 @@ class ScheduleGenerator:
         except Exception as exc:
             base.low_mood_days = 0
             logger.debug("连续低迷状态装载失败（忽略）: %s", exc)
+
+    def _load_experience_context(self, base: BaseScheduleGenerator) -> None:
+        """PR-B1（2026-11-07 经历索引消费点）：经插件公开只读端口取近期真实经历
+        摘要行（watched_video/activity_done，≤5 条）。端口缺失/开关关闭/失败/为空
+        → 空串不注入（空降级，旧行为逐字不变）；不改兴趣权重/动机逻辑（B2/C2）。"""
+        base.experience_context = ""
+        try:
+            getter = getattr(self._plugin, "experience_context_lines", None)
+            if not callable(getter):
+                return
+            lines = getter(limit=5) or []
+            base.experience_context = "\n".join(str(x) for x in list(lines)[:5])
+        except Exception as exc:
+            base.experience_context = ""
+            logger.debug("近期经历上下文装载失败（忽略）: %s", exc)
 
     async def _load_async_contexts(
         self, base: BaseScheduleGenerator, gen_config: ScheduleGeneratorConfig, date: str

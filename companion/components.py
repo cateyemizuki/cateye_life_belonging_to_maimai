@@ -1293,6 +1293,14 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 return True,'诊断范围受限',True
             service=getattr(self,'_video_social',None)
             payload=service.snapshot() if service is not None else {'status':'unavailable'}
+            # PR-B1：经历索引 count/recent 只读诊断（挂既有 /lbm_diag video_share，
+            # 命令总数不变；开关关闭时已有数据仍保留只读）。失败空降级。
+            index=getattr(self,'_experience_index',None)
+            try:
+                payload['experience_index']=({'count':index.count(),'recent':index.recent(limit=5)}
+                                             if index is not None else {'status':'unavailable'})
+            except Exception:
+                payload['experience_index']={'status':'unavailable'}
             await self._diag_reply(stream_id,'视频独立分享诊断\n'+_json.dumps(payload,ensure_ascii=False,indent=1)[:10000])
             return True,'视频分享诊断已发送',True
         if sub == "llm":
