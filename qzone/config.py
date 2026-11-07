@@ -173,8 +173,8 @@ class QzoneSectionConfig(PluginConfigBase):
 
 
 class QzoneVideoSectionConfig(PluginConfigBase):
-    """空间视频候选与影子判定（PR-A0：只记录与判定留痕，不发布；
-    PR-A1：auto 模式额外提取高清非拼图截图资产，仍不发布）。"""
+    """空间视频候选与判定（PR-A0：记录与影子判定留痕；PR-A1：auto 额外提取高清非拼图
+    截图资产；PR-A2：auto 经完整门控发布来源可信的视频图文说说，shadow 仍只留痕）。"""
 
     __ui_label__ = "空间视频候选"
     __ui_icon__ = "video"
@@ -187,11 +187,12 @@ class QzoneVideoSectionConfig(PluginConfigBase):
     mode: str = Field(
         default="shadow",
         description="off=不记录候选；shadow=记录候选并做影子判定（只留痕不发布、不提取截图）；"
-                    "auto=额外提取高清非拼图截图资产（发布链路未接通 PR-A2，仍不发布）。非法值回退 shadow",
+                    "auto=提取高清非拼图截图资产，并经完整门控（睡眠/静默/冷却/LLM严判+共享每日额度）"
+                    "发布来源可信的视频图文说说（图片不可用则拒绝本次，绝不纯文本/随机配图）。非法值回退 shadow",
         json_schema_extra={
             "label": "运行模式",
-            "hint": "off / shadow / auto；auto 提取截图资产但仍不发布（PR-A2 未接通）",
-            **_ui_i18n("Mode", "off / shadow / auto; auto extracts assets but never posts yet"),
+            "hint": "off / shadow / auto；auto 经完整门控发布视频图文说说（默认仍 shadow，不发布）",
+            **_ui_i18n("Mode", "off / shadow / auto; auto posts gated video moments"),
         },
     )
     candidate_ttl_hours: int = Field(
@@ -250,6 +251,20 @@ class QzoneVideoSectionConfig(PluginConfigBase):
         description="截图资产目录磁盘总量上限（MB）：超出时从最旧的 available 资产开始释放；"
                     "claimed（发布中）资产不删",
         json_schema_extra={"label": "截图总量上限(MB)", **_ui_i18n("Asset total cap (MB)")},
+    )
+
+    # ── 发布文案（PR-A2，2026-11-07；mode=auto 经完整门控发布时生效）──────────────
+    caption_max_chars: int = Field(
+        default=500,
+        ge=50,
+        le=2000,
+        description="视频说说文案字数上限：独立文案调用只依据已核验事实生成纯文本，不超过该字数",
+        json_schema_extra={"label": "视频文案字数上限", **_ui_i18n("Video caption max chars")},
+    )
+    attach_source: bool = Field(
+        default=True,
+        description="视频说说帖文附来源署名（视频标题+UP主）；不附播放链接",
+        json_schema_extra={"label": "帖文附来源署名", **_ui_i18n("Attach video source")},
     )
 
     @pydantic.field_validator("mode", mode="before")

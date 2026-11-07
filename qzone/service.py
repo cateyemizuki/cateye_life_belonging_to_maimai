@@ -45,7 +45,7 @@ from suite_prompts import (
     prompt as prompt_of,
     render,
 )
-from .cgi import QzoneCookieManager
+from .cgi import QzoneCookieManager, QzoneImagesRequiredError
 from .decision import (
     DecisionHistory,
     parse_llm_decision,
@@ -318,11 +318,25 @@ class QzoneService:
 
     # ---- 说说读写 ----
     async def post_moment(self, text: str, *, images: Optional[List[bytes]] = None,
-                          ugc_right: int = 1) -> Optional[Dict[str, Any]]:
-        """Serialize publishing and persist intent before dispatch; never replay uncertainty."""
+                          ugc_right: int = 1, require_images: bool = False) -> Optional[Dict[str, Any]]:
+        """Serialize publishing and persist intent before dispatch; never replay uncertainty.
+
+        ``require_images``（PR-A2，默认 False 逐字保持普通说说基线）：True 时图片为硬性
+        要求——空图/图全挂确定未发（返回 None，不置 ``_send_ambiguous``），绝不退纯文本。
+        """
         if not str(text or "").strip():
             return None
         visibility = int(ugc_right) if ugc_right in (1, 4, 16, 64, 128) else 1
+        if require_images:
+            # PR-A2：空图确定未发——在回执账本 begin 之前早退，不留 image_count=0 的
+            # retry_wait 行（否则 _process_delivery_queue 会把它当纯文本重放，违反红线）。
+            valid = [img for img in (images or [])[:4]
+                     if isinstance(img, (bytes, bytearray)) and img]
+            if not valid:
+                self._send_ambiguous = False
+                self._log("skip", trigger_type="qzone_post",
+                          reason="require_images 但无有效图片（确定未发，不退纯文本）")
+                return None
         preview = preview_post(text, images, visibility)
         async with self._publish_lock:
             allowed, receipt = self._publish_ledger.begin(preview)
@@ -333,7 +347,8 @@ class QzoneService:
                           delivery_state=str(receipt.get("status") or "unknown"))
                 return None
             try:
-                result = await self._post_moment_once(text, images=images, ugc_right=visibility)
+                result = await self._post_moment_once(text, images=images, ugc_right=visibility,
+                                                      require_images=require_images)
             except BaseException:
                 self._publish_ledger.finish(preview["key"], "uncertain", error="interrupted")
                 raise
@@ -343,7 +358,7 @@ class QzoneService:
             return result
 
     async def _post_moment_once(self, text: str, *, images: Optional[List[bytes]] = None,
-                                ugc_right: int = 1) -> Optional[Dict[str, Any]]:
+                                ugc_right: int = 1, require_images: bool = False) -> Optional[Dict[str, Any]]:
         """发表说说（可带图）。优先 SnowLuma 动作通道（客户端持续维护），失败回退 Web CGI 直连。
 
         ``images`` 为收集层产出的 ``list[bytes]``（§18.1 契约：收集层只产出 bytes，与发布层解耦）：
@@ -351,7 +366,8 @@ class QzoneService:
         - CGI 回退通道直传 bytes（``QzoneWebClient.publish`` 内逐张上传 + 拼 pic_bo/richval）。
         配图失败（含超限跳过）**永不阻断发布**——单张失败跳过，全部失败发纯文本。
 
-        成功返回 {tid, time}（CGI 通道 time 为空串）。"""
+        ``require_images=True``（PR-A2）走独立分支：图片硬性要求，保守直走受控 CGI（见下），
+        默认 False 路径逐字保持。成功返回 {tid, time}（CGI 通道 time 为空串）。"""
         if not text.strip():
             return None
         image_list = [bytes(img) for img in (images or [])[:4]
@@ -359,6 +375,47 @@ class QzoneService:
         params: Dict[str, Any] = {"content": text.strip(), "ugc_right": int(ugc_right) if ugc_right in (1, 4, 16, 64, 128) else 1}
         if image_list:
             params["images"] = [f"base64://{base64.b64encode(img).decode('ascii')}" for img in image_list]
+        if require_images:
+            # PR-A2：图片硬性要求。实测 SnowLuma 适配器 send_qzone_msg 为纯透传
+            # （maibot-team_snowluma-adapter/apis/qzone.py 只 _call_napcat_action，不识别
+            # require_images、无法保证「图全挂拒发纯文本」）→ 保守直走受控 CGI 通道
+            # （自行上传、图全挂分发前拒绝），不经动作通道（规格 §2/§6：适配器不支持则走 CGI 或不发）。
+            self._send_ambiguous = False
+            params["require_images"] = True
+            result: Optional[Dict[str, Any]] = None
+            if not image_list:
+                err = "require_images 但无有效图片（确定未发，不退纯文本）"
+            elif params["ugc_right"] not in (1, 4, 64):
+                err = f"可见性 {params['ugc_right']} 不支持 CGI（未分发，防静默改公开）"
+            elif self._cookie_manager is None:
+                err = "require_images 需 CGI 受控通道，cookie 管理未启用（确定未发）"
+            else:
+                client = await self._cookie_manager.get_client()
+                if client is None:
+                    err = "require_images CGI 客户端不可用（确定未发）"
+                else:
+                    try:
+                        tid = await client.publish(text.strip(), images=image_list,
+                                                   visibility=int(params["ugc_right"]),
+                                                   require_images=True)
+                    except QzoneImagesRequiredError:
+                        tid = None
+                        err = "图片全部上传失败（确定未发，不退纯文本）"
+                    else:
+                        if tid:
+                            result = {"tid": tid, "time": ""}
+                        else:
+                            # 已分发但回执丢失/非零码 → 可能已发出，保守 uncertain（不自动重发）。
+                            self._send_ambiguous = True
+                            err = "CGI 直连失败（结果待核对）"
+            self._log("trigger" if result else "skip", trigger_type="qzone_post",
+                      reason=("发说说成功（含 %d 张配图）" % len(image_list)) if result
+                      else f"发说说失败: {err}")
+            if result:
+                self._count_post()
+                await self._publish("qzone.posted", tid=str(result.get("tid") or ""),
+                                    summary=str(text).strip()[:40])
+            return result
         ok, data, err = await self.call_action("send", params)
         result = data if ok and isinstance(data, dict) and data.get("tid") else None
         if ok and result is None:

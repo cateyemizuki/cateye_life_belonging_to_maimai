@@ -43,6 +43,14 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 #: 单张上传图的字节上限（缓冲有界；超大图跳过不阻断发布）
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 
+
+class QzoneImagesRequiredError(Exception):
+    """PR-A2：``require_images=True`` 但没有任何图片上传成功。
+
+    发布请求**尚未分发**（确定未发出，绝不退纯文本）——调用方据此走 retry_wait/
+    released 语义，不置 ``_send_ambiguous``。与「已分发但回执丢失」的 uncertain 严格区分。
+    """
+
 # get_cookies 的候选 API（与 qzone.py 的动作通道同思路：命中后缓存）
 _GET_COOKIES_APIS = (
     ("adapter_semantic", "adapter.napcat.account.get_cookies", False),
@@ -454,7 +462,7 @@ class QzoneWebClient:
 
     # ---- 发说说 / 评论 / 回评 / 点赞 ----
     async def publish(self, content: str, images: Optional[List[bytes]] = None,
-                      *, visibility: int = 1) -> Optional[str]:
+                      *, visibility: int = 1, require_images: bool = False) -> Optional[str]:
         """发表说说（可带图），成功返回 tid。
 
         ``visibility``（P1-13）：透传调用方可见性到 ``ugc_right``，不再硬编码公开。
@@ -464,6 +472,10 @@ class QzoneWebClient:
         带图：逐张走 :meth:`upload_image`，**单张失败跳过该图**，有成功的才拼
         ``pic_bo``（逗号连接）/ ``richtype=1`` / ``richval``（tab 连接）——三个细节错一
         个图就挂不上；全部失败 → 纯文本发出（配图失败永不阻断发布）。
+
+        ``require_images``（PR-A2，默认 False 逐字保持旧行为）：True 时图片是硬性要求——
+        没有任何一张上传成功（含 images 为空）→ **分发前**抛 :class:`QzoneImagesRequiredError`
+        （确定未发出，绝不退纯文本）；调用方据此走 released/retry_wait，不置 uncertain。
         """
         if visibility not in (1, 4, 64):
             logger.warning("QQ 空间 CGI 发布拒绝：可见性 ugc_right=%s 需名单参数，CGI 通道不支持（未分发）",
@@ -486,6 +498,10 @@ class QzoneWebClient:
             if picbo and richval:
                 pic_bos.append(picbo)
                 richvals.append(richval)
+        if require_images and not pic_bos:
+            # PR-A2：图全挂（含无图）→ 分发前拒绝，确定未发出，绝不退纯文本。
+            logger.warning("QQ 空间 CGI 发布拒绝：require_images 但图片全部上传失败（未分发，不退纯文本）")
+            raise QzoneImagesRequiredError("图片全部上传失败，require_images 发布未分发")
         if pic_bos:
             data["pic_bo"] = ",".join(pic_bos)
             data["richtype"] = "1"

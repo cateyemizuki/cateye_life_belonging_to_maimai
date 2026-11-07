@@ -1567,12 +1567,27 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             return None  # 配置异常保守不提取，不影响观看主链路
 
     def _build_qzone_video(self, data_dir: Path) -> Any:
-        """PR-A0：空间视频候选桥（影子模式）；仿 _build_video_social，异常保守停用。
-        PR-A1：ledger 同时持有截图资产受控目录（生命周期/启动恢复）。"""
+        """PR-A0：空间视频候选桥；仿 _build_video_social，异常保守停用。
+        PR-A1：ledger 同时持有截图资产受控目录（生命周期/启动恢复）。
+        PR-A2：注入发布端口（post_moment/门控复检/共享额度/文案防复读/事实回写）；
+        端口缺省（_qzone 未装配）时桥保持影子行为，绝不发布。"""
         from integrations.qzone_video_bridge import QzoneVideoBridge, QzoneVideoLedger
         try:
             ledger = QzoneVideoLedger(data_dir / 'video_watch/qzone_video.sqlite3',
                                       asset_dir=data_dir / 'video_watch/qzone_assets')
+            qzone = getattr(self, '_qzone', None)
+            ports: Dict[str, Any] = {}
+            if qzone is not None:
+                ports = {
+                    'post_moment': qzone.post_moment,
+                    'check_post_gates': qzone.check_post_gates,
+                    'posts_today': qzone.posts_today,
+                    'daily_max_posts': lambda: int(getattr(self.config.qzone, 'daily_max_posts', 0) or 0),
+                    'list_my_moments': qzone.list_my_moments,
+                    'send_ambiguous': lambda: bool(getattr(qzone, '_send_ambiguous', False)),
+                    'now_dt': self._surf_now,
+                    'append_fact': self._append_qzone_video_fact,
+                }
             return QzoneVideoBridge(
                 ledger,
                 config_provider=lambda: self.config.qzone_video,
@@ -1584,10 +1599,26 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 task_provider=lambda: '',
                 clock=lambda: self._surf_now().timestamp(),
                 day=self._surf_day,
-                logger=self.ctx.logger)
+                logger=self.ctx.logger,
+                **ports)
         except Exception as exc:
             self.ctx.logger.warning('空间视频候选初始化失败，保守停用：%s', type(exc).__name__)
             return None
+
+    async def _append_qzone_video_fact(self, text: str, attempt: str) -> Any:
+        """PR-A2：视频说说发布事实回写——参照 _append_social_fact 的成对 Hook 口径
+        （source_kind + message_id 配对、replyable=False），但**仅 bot 自身上下文**可用，
+        不进任何用户聊天注入（不经 send.text，不写入陪伴对象私聊流）。
+
+        bot 自身上下文流由宿主提供；不可得时如实返回失败 → 桥记 fact_sync=pending（A3 完善重试）。
+        """
+        stream = str(getattr(self, '_qzone_video_self_stream', '') or '')
+        if not stream:
+            return {'success': False, 'error': 'bot_self_stream_unavailable'}
+        return await self.ctx.maisaka.context.append(stream_id=stream,
+            segments=[{'type': 'text', 'data': text}], visible_text=text,
+            source_kind='plugin:cateye.life_belonging_to_maimai:qzone_video_fact',
+            message_id='qzone_video_fact:' + attempt, replyable=False)
 
     def _social_state(self) -> dict:
         state={'as_of':self._surf_now().isoformat()}
