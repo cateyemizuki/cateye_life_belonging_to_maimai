@@ -790,6 +790,8 @@ class QzoneService:
             prompt_of(self._plugin, "qzone_post_gate"),
             fallback=QZONE_POST_GATE_DEFAULT,
             lover_name=self._lover_name,
+            # PR-AUDIT（3.16.1 PR-2）：默认模板不再消费 {personality}（人设经
+            # with_identity 进 system）；仍传值兼容旧自定义模板（3.9.2 占位移除先例）。
             personality=self._personality or "（暂无人设）",
             current_time=now.strftime("%H:%M"),
             activity=activity_desc,
@@ -802,6 +804,7 @@ class QzoneService:
 
                 module="qzone",
                 event="qzone_post_gate",
+                with_identity=True,
             )
         except Exception:
             return False, "严判调用异常（保守按不发）", ""

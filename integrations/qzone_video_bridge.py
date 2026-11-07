@@ -949,8 +949,9 @@ class QzoneVideoBridge:
                     'delay_minutes': FALLBACK_DELAY_MINUTES, 'reason': '判定暂不可用'}
         state = self._state() if self._state is not None else {}
         state = state if isinstance(state, dict) else {}
-        body = {'persona': clean(self._persona(), 6000),
-                'state': {k: v for k, v in state.items() if k != 'recent_qzone_topics'},
+        # PR-AUDIT（3.16.1 PR-1）：人设由 LLMService with_identity=True 统一注入 system
+        # 前缀（生产接线 plugin.py），body 不再序列化 persona；persona_provider 保留兼容。
+        body = {'state': {k: v for k, v in state.items() if k != 'recent_qzone_topics'},
                 'video': candidate.get('facts') or {},
                 'recent_qzone_topics': state.get('recent_qzone_topics') or [],
                 'available_assets': available_assets or []}
@@ -1313,8 +1314,8 @@ class QzoneVideoBridge:
                 raise
             except Exception:
                 recent = []
-        body = {'persona': clean(self._persona(), 6000),
-                'video': {'title': facts.get('title', ''), 'uploader': facts.get('uploader', ''),
+        # PR-AUDIT（3.16.1 PR-1）：文案链路人设同经 with_identity 进 system；body 无 persona。
+        body = {'video': {'title': facts.get('title', ''), 'uploader': facts.get('uploader', ''),
                           'summary': facts.get('summary', ''), 'impression': facts.get('impression', ''),
                           'evidence': facts.get('evidence', '')},
                 'focus': decision.get('focus', ''), 'tone': decision.get('tone', ''),

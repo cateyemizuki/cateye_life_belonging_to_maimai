@@ -1606,7 +1606,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 config_provider=lambda:self.config.video_share,
                 target_provider=lambda:{'stream_id':str(getattr(self,'_stream_id','') or ''),
                     'user_id':target_qq_of(self.config) if self.config.patrol.enabled else ''})
-            evaluator=ShareEvaluator(lambda *a,**kw:self._llm.generate_detailed(*a,module='video',**kw),
+            # PR-AUDIT（3.16.1 PR-1）：人设经 with_identity 统一进 system 前缀（宿主同款开头，
+            # 共享前缀缓存）；评估 body 不再序列化 persona（对齐 affection/emotion/video_interest 口径）。
+            evaluator=ShareEvaluator(lambda *a,**kw:self._llm.generate_detailed(*a,module='video',with_identity=True,**kw),
                 persona_provider=lambda:str(getattr(self,'_personality','') or ''),
                 state_provider=self._social_state,
                 task_provider=lambda:self.config.video_share.decision_task_name)
@@ -1776,7 +1778,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 config_provider=lambda: self.config.qzone_video,
                 qzone_enabled_provider=lambda: bool(self.config.qzone.enabled),
                 # LLM 唯一入口：LLMService → tools/llm_gateway；module='qzone'（发布面归属）
-                generate=lambda *a, **kw: self._llm.generate_detailed(*a, module='qzone', **kw),
+                # PR-AUDIT（3.16.1 PR-1）：判定/文案两链路人设统一经 with_identity 进 system
+                # 前缀；body 不再序列化 persona（module='qzone' 发布面归属不变）。
+                generate=lambda *a, **kw: self._llm.generate_detailed(*a, module='qzone', with_identity=True, **kw),
                 persona_provider=lambda: str(getattr(self, '_personality', '') or ''),
                 state_provider=self._social_state,
                 task_provider=lambda: '',

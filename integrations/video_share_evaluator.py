@@ -27,8 +27,9 @@ class ShareEvaluator:
         fallback={'action':'defer','target_stream_id':'','delay_seconds':1800,
                   'reason':'分享判断暂不可用','profile_topics':{}}
         if not audiences:return {**fallback,'reason':'没有可核验的允许受众'}
-        body={'persona':clean(self._persona(),6000),'state':self._state(),
-              'video':facts,'allowed_audiences':audiences[:8]}
+        # PR-AUDIT（3.16.1 PR-1）：人设由 LLMService with_identity=True 统一注入 system
+        # 前缀（生产接线 plugin.py），body 不再序列化 persona；persona_provider 注入保留兼容。
+        body={'state':self._state(),'video':facts,'allowed_audiences':audiences[:8]}
         try:
             reply=await self._generate(POLICY+json.dumps(body,ensure_ascii=False),
                 task_name=self._task() or 'utils',temperature=0.3,strict_params=True,event='video_share_evaluation')

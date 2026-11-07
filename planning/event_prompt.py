@@ -30,9 +30,10 @@ from .event_catalog_config import (DEFAULT_MAX_GENERATED_EVENTS,
 PROMPT_MAX_CHARS = 1500
 #: 单时段批次条数上界 = 可复用 + 一次性两项配额之和的最大值（v3.9.2，12+12）
 _BATCH_COUNT_MAX = 2 * EVENT_QUOTA_MAX
-#: NO Puzzle 开关（默认开）追加的反套路引导；稳定句，置于任务规格之后、人设之前
+#: NO Puzzle 开关（默认开）追加的反套路引导；稳定句，置于任务规格之后
 NO_PUZZLE_GUIDANCE = "避免拼拼图、十字绣等被滥用的套路活动，优先多样化、具体、贴合人设的日常小事。"
-#: 可选块裁剪上限（字符）；人设走 system（with_identity），不再参与用户提示词裁剪
+#: 可选块裁剪上限（字符）；人设走 system（with_identity），不进用户提示词
+#: （PR-AUDIT 3.16.1 PR-3：原「人设：…」重复片段已清理，裁剪仅服务名称块）
 _NAMES_MAX = 240
 _EXISTING_MAX = 240
 
@@ -102,6 +103,9 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
     为空时沿用旧 reusable/one_shot 单池措辞（兼容）。
     ``no_puzzle=True``（v3.9.2 默认）时在任务规格后追加反套路引导（稳定句，
     前缀缓存友好：规则在前、变化内容在后）。
+    ``persona`` 参数保留签名兼容但不再消费（PR-AUDIT 3.16.1 PR-3）：人设已由
+    event_catalog ``with_identity=True`` 全文注入 system_prompt，用户提示词不再
+    重复「人设：…」片段。
     """
     try:
         count_int = int(count)
@@ -115,17 +119,16 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
     max_chars = max(600, int(max_chars or PROMPT_MAX_CHARS))
     truncated = False
 
-    # 人设已由 with_identity 进 system；此处仅保留兼容裁剪（与名称块同上限）
-    persona_text, cut = _clip(persona, _NAMES_MAX)
-    truncated = truncated or cut
+    # PR-AUDIT（3.16.1 PR-3）：人设已由 with_identity 进 system，用户提示词不再
+    # 重复「人设：…」片段；persona 入参保留签名兼容但不消费，裁剪仅服务名称块。
     recent_text, cut = _names_text(recent_schedule_names, _NAMES_MAX)
     truncated = truncated or cut
     existing_text, cut = _names_text(existing_event_names, _EXISTING_MAX)
     truncated = truncated or cut
 
-    def compose(p: str, r: str, e: str) -> str:
+    def compose(r: str, e: str) -> str:
         # 前缀缓存友好：稳定规则+JSON 示例置顶（跨请求/跨时段复用前缀），
-        # 每次变化的任务规格（条数/时段/人设/名称）置后。
+        # 每次变化的任务规格（条数/时段/名称）置后。
         lines = [_RULES]
         if time_slot:
             from .event_slots import SLOT_WINDOW_TEXT, SLOT_GUIDANCE
@@ -140,33 +143,26 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
             lines.append(f"本次任务：为角色恰好生成 {count_int} 条日常小事件（用作空闲/转场 filler，禁止多于或少于）。" + pool_line)
         if no_puzzle:
             lines.append(NO_PUZZLE_GUIDANCE)
-        if p:
-            lines.append(f"人设：{p}")
         if r:
             lines.append(f"最近日程名称：{r}")
         if e:
             lines.append(f"已有事件名（不得重复）：{e}")
         return "\n".join(lines)
 
-    prompt = compose(persona_text, recent_text, existing_text)
-    # 超限时按「人设 → 日程名 → 已有名」的顺序退让，规则/JSON 永不裁剪
+    prompt = compose(recent_text, existing_text)
+    # 超限时按「日程名 → 已有名」的顺序退让，规则/JSON 永不裁剪
+    # （PR-AUDIT 3.16.1 PR-3：人设片段已移除，原「兜底只截人设」级随之退役）
     if len(SYSTEM_PROMPT) + len(prompt) > max_chars:
         truncated = True
-        persona_text, _ = _clip(persona_text, 120)
         recent_text, _ = _clip(recent_text, 140)
         existing_text, _ = _clip(existing_text, 140)
-        prompt = compose(persona_text, recent_text, existing_text)
+        prompt = compose(recent_text, existing_text)
     if len(SYSTEM_PROMPT) + len(prompt) > max_chars:
         truncated = True
-        prompt = compose(persona_text, "", existing_text)
+        prompt = compose("", existing_text)
     if len(SYSTEM_PROMPT) + len(prompt) > max_chars:
         truncated = True
-        prompt = compose(persona_text, "", "")
-    if len(SYSTEM_PROMPT) + len(prompt) > max_chars:
-        # 理论上规则本身已 < max_chars；兜底只截人设，仍保留规则
-        truncated = True
-        persona_text, _ = _clip(persona_text, 20)
-        prompt = compose(persona_text, "", "")
+        prompt = compose("", "")
     digest = hashlib.sha256((SYSTEM_PROMPT + prompt).encode("utf-8")).hexdigest()[:16]
     return PromptBuildResult(system_prompt=SYSTEM_PROMPT, prompt=prompt,
                              char_count=len(SYSTEM_PROMPT) + len(prompt),

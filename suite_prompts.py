@@ -459,8 +459,10 @@ QZONE_REPLY_DEFAULT = (
 )
 #: 评论提醒主动 intent（占位符：{excerpt} / {added}）
 QZONE_COMMENT_REMINDER_DEFAULT = "你刚发的说说「{excerpt}」收到了 {added} 条新评论，可以在聊天里自然地提到这件事"
-#: 发帖前 LLM 严判提示词（占位符：{lover_name} / {personality} / {current_time} / {activity}；
-#: 2026-10-14 §18.4 判定链移植自 MaiTrace v3.1：正反例 + 强烈压制「是」+ 首字符应答格式）
+#: 发帖前 LLM 严判提示词（占位符：{lover_name} / {current_time} / {activity}；
+#: 2026-10-14 §18.4 判定链移植自 MaiTrace v3.1：正反例 + 强烈压制「是」+ 首字符应答格式。
+#: PR-AUDIT 3.16.1 PR-2：人设经 LLMService with_identity 注入 system_prompt，
+#: {personality} 占位已移除（渲染方仍传值兼容旧定制模板，3.9.2 先例）；严判规则原文不动）
 QZONE_POST_GATE_DEFAULT = (
     "请判断你现在是否会自然地发一条 QQ 空间说说。\n\n"
     "【基本不会的情况】\n"
@@ -480,7 +482,7 @@ QZONE_POST_GATE_DEFAULT = (
     "  或\n"
     "  否|<不超过 20 字的简短理由>\n"
     "第一个字符必须是「是」或「否」。\n\n"
-    "你是「{lover_name}」，人设：{personality}。\n"
+    "你是「{lover_name}」，依据系统人设判断。\n"
     "现在是 {current_time}，你正在：{activity}。"
 )
 
@@ -686,15 +688,27 @@ def prompt(plugin: Any, name: str) -> str:
     return text
 
 
+#: 已告警过「渲染失败回退」的模板文本（进程内去重：同一坏模板至多一条，防刷日志）
+_RENDER_FALLBACK_WARNED: Set[str] = set()
+
+
 def render(template: str, *, fallback: str, **values: Any) -> str:
     """渲染提示词模板；占位符写坏（KeyError/IndexError/ValueError）时回退默认模板。
 
     只做 ``str.format``，不做其它转义处理——模板里的字面花括号请写 ``{{`` / ``}}``
     （出厂默认已按此书写）。
+
+    PR-AUDIT（3.16.1 PR-2）：回退时留一条 warning 诊断（按模板文本进程内去重），
+    自定义模板占位符失效可观测；返回文本契约不变（回退默认模板）。
     """
     try:
         return str(template).format(**values)
-    except Exception:
+    except Exception as exc:
+        text = str(template)
+        if text not in _RENDER_FALLBACK_WARNED:
+            _RENDER_FALLBACK_WARNED.add(text)
+            logger.warning("提示词模板占位符渲染失败（%s: %s），回退出厂默认模板；请检查 [prompts] 自定义模板",
+                           type(exc).__name__, exc)
         try:
             return str(fallback).format(**values)
         except Exception:
