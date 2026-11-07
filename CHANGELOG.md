@@ -1,5 +1,12 @@
 # 更新日志（CHANGELOG）
 
+## 3.15.0（2026-11-07）
+
+- PR-C3 动态睡眠与硬意图一致性回归加固（计划书 H6 / §5.5 / §5.6 / §7 PR-C3）。**现状核查先行**：3.8.0 已落地 P1–P3（免睡不补睡眠意图、睡眠行 hardness 统一 hard、WebUI「作息参考」独立标注、commitment_hardness=hard 核验门槛、睡眠锚点不参与硬约定唤醒），§5.6 明确不重复开发——本批**零睡眠引擎行为改动**，以回归测试加固为主。
+- 新增专项 `scratch/test_sleep_consistency_c3.py`（14 例矩阵，规格 §1 逐条覆盖）：① 配置参考时间变化不关闭已入睡会话（会话 id/边界不变）；② 新日程睡眠锚点不直接关闭动态会话、不成为唤醒约定；③ LLM 新生成 hard 意图（无 commitment_hardness=hard 用户确认）不触发提前醒；④ 用户确认硬约定（pending_commitment + hardness=hard）经真实 apply_schedule_items 匹配链可提前醒（正例）；⑤ 跨午夜生成 sleep_time=01:00 时 00:30 日程帧分钟=1470 不折回（关联 test_midnight_meal 口径）；⑥ 生效时区非 Asia/Shanghai 时锚点/时段按插件时区墙钟；⑦ 关机恢复 reload 后状态连续（不重开/不丢/不重复结算）；⑧ 实际午休静默与意图行提前静默同口径（夜间睡眠两边排除）；⑨ 时钟回拨不产生负时长/不重复结算；⑩ 免睡模式正常生成/缺项补齐/LLM 失败模板三路径均不补睡眠意图；⑪ 睡眠锚点不参与硬约定唤醒（is_night_sleep_item 排除）；⑫ WebUI 睡眠条目 goal_type=sleep 标「作息参考」不随 hardness 误标（渲染逻辑断言，panel.js 与 index.html 双文件）；⑬ 07:58 剩余 2 分钟不启动需跨段的长活动（内置池/事件库两路径 + 08:00 正例对照）；⑭ 异常回退路径不绕过时段过滤（取池异常/非法事件/未装配降级三路）。
+- 矩阵全绿未发现需修复的行为性不一致（规格 §2 预期 0–2 处小修，实际 0 处）。裁量登记（needsReview）：restore() 后首拍前 sleep_status().continuous_minutes 为落盘缓存值（信息性字段，觉醒判定/结算均以恢复后的时钟为准，首拍即刷新）——测试按生产编排 restore→tick 断言，与 test_dynamic_sleep 既有口径一致，未改引擎。
+- 配置：无新增字段（18 段 202 叶子不变）。版本双号 3.15.0（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round：3.15.0）。边界：本批不部署、不 git commit。
+
 ## 3.14.0（2026-11-07）
 
 - PR-C2 真实观看驱动的兴趣演变（计划书 §5 H7 / §4 / §7 PR-C2）。**证据权重层**：`integrations/video_interest.py` 兴趣文档新增 `evidence_weights` 层（话题 → `{persona_base, watch_score, updated_at, positive_count}` + 已应用观看幂等键表）；最终权重 = persona_base + bounded(watch_score)，watch_score 饱和封顶 ±50%×base（内部常量）。persona_base = LLM 问询关键词的隐式基线 1.0，**观看反馈绝不改写 persona_base / LLM 关键词集合**——单次偶然观看不重写人格；周期人设刷新保留证据层，显式偏好初始化（reset）才整体重置（保守裁量，needsReview）。
