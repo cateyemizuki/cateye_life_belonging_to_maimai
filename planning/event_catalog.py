@@ -730,6 +730,11 @@ class EventCatalogStore:
                     "source": "llm",
                     "pool_kind": raw['pool_kind'],
                     "generation_id": document['generation_id'],
+                    # PR-FIX-SLOT（3.17.4）：装载必须携带时段标签，否则
+                    # event_allowed_in_slot 把生成项当无标签旧项全时段排除。
+                    # v3 validator 已校验必填+合法；raw.get 与校验口径一致，
+                    # v1 旧无标签项取 None 仍按既有语义排除（不改过滤语义）。
+                    "time_slot": raw.get("time_slot"),
                 }
                 reserved_ids.add(eid)
                 reserved_names.add(normalized["name"])

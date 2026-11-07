@@ -1,5 +1,13 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.4（2026-11-08）
+
+- PR-FIX-SLOT 修复 `event_catalog.reload()` 丢失 time_slot 致生成小事件全被时段过滤（真机生产 bug：调查 dwfrun-86dc234f 高置信确认+生产复现——生成小事件库 7 个带 time_slot 的事件全天零选中，bot 日程反复发呆/待机）。
+- **根因**：`planning/event_catalog.py` `EventCatalogStore.reload()` 的 normalized 字典复制 event_id/name/goal_type/时长/权重/pool_kind/generation_id 等，漏 `time_slot` → 装载后生成事件 time_slot=None；`pick_event` 经 `event_allowed_in_slot`（`planning/event_slots.py`）对非 builtin 要求 time_slot==当前时段，无标签即排除（「无标签不当全天项」）→ 7 个生成事件三时段全被滤，只剩 5 内置。3.9.0 引入时段过滤却没在 reload 携带 time_slot。
+- **修复**：reload() normalized 字典增 `"time_slot": raw.get("time_slot")`（v3 validator 已校验 time_slot 必填+合法时段，raw.get 与校验口径一致）。核查其它路径：`_normalize_builtin` 走 allowed_slots 不需 time_slot（不变）；生成写盘路径本就携带 time_slot（不变）；v1 旧无标签项取 None 仍按既有语义停止抽取（不改）。
+- **红线保留**：时段过滤语义不变（无标签排除是正确的，修的是装载丢标签）；内置 allowed_slots 分支不变；一次性 claim/配额/校验不变。
+- 配置：无新增字段（schema 不变，18 段 202 叶子）。版本双号 3.17.4（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round：3.17.4；test_prompt_identity_audit 双号断言顺延）。新增专项 `scratch/test_event_catalog_slot_load.py` 10/10（修前 6 红：装载丢标签/三时段 pick×30 全命中内置/跨时段/一次性/池上限/非法项；4 例语义守卫修前后均绿）；回归 test_event_slots_390 / test_qzone_video_a0–a3 / test_sleep_tz_crossday 不回归；七门禁 7/7。边界：本批不部署、不 git commit、不碰主机、不切 mode；部署后需观察 bot 日程出现生成小事件（傍晚读闲书/晚间理桌面等）而非纯发呆待机。
+
 ## 3.17.3（2026-11-08）
 
 - PR-FIX-TZ 紧急修复跨日 sleep_engine naive/aware datetime 比较异常（真机生产 bug：监视 dwfrun-a22c4ef0 轮17–20，跨日 00:15 起每拍 `rolling_planner tick 异常（本拍跳过）：can't compare offset-naive and offset-aware datetimes`，栈指 `planning/rolling_planner.py:795 _try_dynamic_sleep`；bot 调度停摆、qzone 视频帖闸2「门控复检异常（保守不发）」持续 defer）。
