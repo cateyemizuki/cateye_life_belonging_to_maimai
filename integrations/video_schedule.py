@@ -314,8 +314,9 @@ class VideoWatchCoordinator:
 
     # ------------------------------------------------------------------
     # 管理员命令：立即触发一次完整刷视频周期（候选→观看→完成→独立分享判断）
-    # 复用既有 gap 链路（注意力/额度/候选/防重/账号核验全部保留），只是把随机
-    # 掷点换成确定性触发；防叠加：已有活跃观看任务或周期在跑则不叠加。
+    # 复用既有 gap 链路，把随机掷点换成确定性触发；防叠加：已有活跃观看任务或
+    # 周期在跑则不叠加。PR-WATCH：/lbm_plan watch 以 force_debug=True 强制并行——
+    # 绕过注意力门控（不占聊天租约），额度/候选/防重/账号核验门仍全部保留。
     # ------------------------------------------------------------------
     def _active_watch_entry(self) -> Optional[tuple]:
         """只读找出当前活跃（非终态、未收尾）观看关联；无 → None。"""
@@ -357,11 +358,16 @@ class VideoWatchCoordinator:
                 pass
         return out
 
-    def start_manual_cycle(self, *, social_tick: Optional[Callable[[], Awaitable[Any]]] = None) -> Dict[str, Any]:
+    def start_manual_cycle(self, *, social_tick: Optional[Callable[[], Awaitable[Any]]] = None,
+                           force_debug: bool = False) -> Dict[str, Any]:
         """命令入口（同步回执）：防叠加；空闲则后台启动一次完整周期。
 
         返回 ``{"started": bool, "reason": str}``；started=False 时调用方应改用
         :meth:`watch_status` 展示当前任务/进度/预计结束时间，不叠加新任务。
+
+        PR-WATCH：``force_debug=True``（仅 /lbm_plan watch 调试命令路径置位）→
+        与当前日程并行强制启动，绕过注意力门控（不占聊天租约）；额度/候选/
+        证据/隐私/防重门不变。缺省 False = 旧语义（随机 gap/日程路径恒 False）。
         """
         if self._manual_task is not None and not self._manual_task.done():
             return {"started": False, "reason": "manual_cycle_running"}
@@ -371,33 +377,40 @@ class VideoWatchCoordinator:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return {"started": False, "reason": "no_event_loop"}
-        self._manual_task = loop.create_task(self._manual_cycle(social_tick))
+        self._manual_task = loop.create_task(self._manual_cycle(social_tick, force_debug))
         return {"started": True, "reason": ""}
 
-    async def _manual_cycle(self, social_tick: Optional[Callable[[], Awaitable[Any]]]) -> None:
+    async def _manual_cycle(self, social_tick: Optional[Callable[[], Awaitable[Any]]],
+                            force_debug: bool = False) -> None:
         """后台推动一次完整刷视频周期；任何异常不外泄（与 sync 同口径）。"""
         try:
-            await self._manual_cycle_inner(social_tick)
+            await self._manual_cycle_inner(social_tick, force_debug)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if self._log:
                 self._log.warning("手动刷视频周期失败（忽略，不影响其他日程）：%s", exc)
 
-    async def _manual_cycle_inner(self, social_tick: Optional[Callable[[], Awaitable[Any]]]) -> None:
+    async def _manual_cycle_inner(self, social_tick: Optional[Callable[[], Awaitable[Any]]],
+                                  force_debug: bool = False) -> None:
         links_doc = self._load_links()
         links: Dict[str, Any] = links_doc.get("links") or {}
-        # gap- 前缀沿用空隙冲浪的注意力/空闲守卫；manual_command 标记便于诊断区分。
+        # gap- 前缀沿用空隙冲浪链路；manual_command 标记便于诊断区分。
+        # PR-WATCH：force_debug 仅手动命令路径置位——跳过注意力租约、与日程并行；
+        # forced_debug 标记供收尾/诊断辨识（日程恢复不收回 debug 任务）。
         episode_id = f"gap-cmd-{uuid.uuid4().hex[:12]}"
         entry: Dict[str, Any] = {"scenario": "gap", "manual_command": True}
+        if force_debug:
+            entry["forced_debug"] = True
         links[episode_id] = entry
-        await self._start_watching(episode_id, entry, kind="gap")
+        await self._start_watching(episode_id, entry, kind="gap", force_debug=force_debug)
         task_id = str(entry.get("task_id") or "")
         if not task_id:
-            # 手动周期是一次性的：无任务（注意力/额度/候选门跳过或缓存命中）即收尾，
-            # 不像随机 gap 留待重试，避免非终态条目在链接库滞留。
+            # 手动周期是一次性的：无任务（额度/候选门跳过或缓存命中；debug 路径
+            # 不再因注意力跳过）即收尾，不像随机 gap 留待重试，避免非终态条目滞留。
             entry["closed"] = True
-            entry.setdefault("closed_reason", "manual_no_task")
+            entry.setdefault("closed_reason",
+                             "forced_debug_no_task" if force_debug else "manual_no_task")
         links_doc["links"] = links
         self._compact(links)
         self._save_links(links_doc)
@@ -541,7 +554,10 @@ class VideoWatchCoordinator:
             if not (isinstance(entry, dict) and entry.get("scenario") == "gap"
                     and entry.get("task_id") and not entry.get("closed")):
                 continue
-            if active_id:
+            # PR-WATCH：forced_debug（/lbm_plan watch）与日程并行——日程恢复不收回
+            # debug 任务（其引用身份为 debug:{episode_id}，schedule owner 也不匹配）；
+            # 照常轮询至终态存档。普通 gap 条目语义不变（日程恢复即收尾）。
+            if active_id and not entry.get("forced_debug"):
                 try:
                     receipt = await self._api(action="cancel", task_id=str(entry["task_id"]),
                                               owner=f"schedule:{gap_id}")
@@ -586,7 +602,7 @@ class VideoWatchCoordinator:
         entry.pop("lease", None)
 
     async def _start_watching(self, episode_id: str, entry: Dict[str, Any],
-                              kind: str = "dedicated") -> None:
+                              kind: str = "dedicated", *, force_debug: bool = False) -> None:
         entry.setdefault("started_at", time.time())
         # 场景标记（S2 频率倍率读 entry["scenario"]：dedicated=0.45 / gap=0.70；
         # 2026-11-04 前此处未写标记，dedicated 曾被误读成 gap 倍率）
@@ -596,7 +612,10 @@ class VideoWatchCoordinator:
         phase = "candidate"
         retryable = False
         try:
-            if self._attention is not None:
+            # PR-WATCH：force_debug（/lbm_plan watch 调试命令）不申请 SURF 租约——
+            # 与当前日程/聊天并行，不占注意力；无租约则收尾 _release_surf 空操作。
+            # 随机 gap/日程 dedicated 路径 force_debug 恒 False，注意力语义不变。
+            if self._attention is not None and not force_debug:
                 lease = self._attention.try_acquire_surf(f"schedule:{episode_id}")
                 if not lease:
                     retryable = True  # No side effect yet; a later quiet tick may try again.
@@ -622,7 +641,8 @@ class VideoWatchCoordinator:
                              reason=("无真实候选，不编造 BV 号"
                                      + (f"（{reason}）" if reason else "")))
                 return
-            if self._attention is not None and not self._attention.lease_valid(entry.get("lease")):
+            if (not force_debug and self._attention is not None
+                    and not self._attention.lease_valid(entry.get("lease"))):
                 entry.update(stage="skipped", reason="选片期间聊天开始")
                 return
             if self._quota is not None:
@@ -638,9 +658,12 @@ class VideoWatchCoordinator:
                     return
                 entry["reserved_minutes"] = minutes
             phase = "submit"
+            # PR-WATCH：debug 强制路径以 source="debug" 送达观看服务——submit 注意力闸
+            # 与运行期守卫因 source!="schedule" 自然放行；端口缺省仍 schedule（其余路径不变）。
             receipt = await self._api(action="submit", video=str(candidate["bvid"]),
                                       purpose=("空隙刷视频" if kind == "gap" else "日程刷视频"),
-                                      episode_id=episode_id)
+                                      episode_id=episode_id,
+                                      **({"source": "debug"} if force_debug else {}))
             if receipt.get("success") and receipt.get("cached"):
                 # 旧观看记忆不是新任务，不登记分享、不伪造task_id、不占观看额度。
                 if reserved and hasattr(self._quota, "refund_unstarted"):

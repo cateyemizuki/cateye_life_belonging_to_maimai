@@ -453,11 +453,14 @@ class CommandService:
             await self._send(stream_id, f"小事件库生成失败（旧库保留）：{detail}")
 
     async def _handle_watch(self, stream_id: str) -> None:
-        """``/lbm_plan watch``：后台立即触发一次完整刷视频周期（抽卡测试可多次执行）。
+        """``/lbm_plan watch``：debug 命令——后台强制触发一次完整刷视频周期。
 
-        防叠加：已有活跃观看任务或周期在跑 → 只展示当前任务/进度/预计结束时间，
-        不叠加新任务。空闲 → 复用既有 video_watch + video_share 链路启动一次周期
-        （候选→观看→完成→独立分享判断），即使决定不分享也写日志可验证。
+        PR-WATCH：除非插件已因日程启用观看后台任务，否则强制启用，与当前日程
+        并行触发（force_debug=True，绕过 attention_revoked 注意力门控，不占聊天
+        租约）；额度/候选/证据/隐私/防重门不变。防叠加：已有活跃观看任务或周期
+        在跑 → 只展示当前任务/进度/预计结束时间，不叠加新任务。复用既有
+        video_watch + video_share 链路（候选→观看→完成→独立分享判断），
+        即使决定不分享也写日志可验证。
         """
         plugin = self._plugin
         try:
@@ -483,7 +486,8 @@ class CommandService:
             return
         social = getattr(self._plugin, "_video_social", None)
         social_tick = getattr(social, "tick", None)
-        receipt = coord.start_manual_cycle(social_tick=social_tick if callable(social_tick) else None)
+        receipt = coord.start_manual_cycle(
+            social_tick=social_tick if callable(social_tick) else None, force_debug=True)
         if not receipt.get("started"):
             # 竞态：刚变为活跃 → 改展示状态，不叠加。
             try:
@@ -494,8 +498,8 @@ class CommandService:
             return
         await self._send(
             stream_id,
-            "已在后台触发一次完整刷视频周期（候选→观看→完成→独立分享判断），完成后会写日志。\n"
-            "若当前处于聊天/睡眠/静默或额度不足，会如实跳过并记录原因。\n"
+            "已在后台强制触发一次完整刷视频周期（debug 命令，与当前日程并行；候选→观看→完成→独立分享判断），完成后会写日志。\n"
+            "调试命令绕过聊天/睡眠/静默注意力门控；若额度不足或无真实候选，会如实跳过并记录原因。\n"
             "进行中再次发送 /lbm_plan watch 只显示进度、不叠加；结束后可再次触发用于抽卡测试。",
         )
 

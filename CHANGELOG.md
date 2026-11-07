@@ -1,5 +1,23 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.0（2026-11-07）
+
+- PR-WATCH `/lbm_plan watch` 改为强制 debug 命令（与当前日程并行触发，绕过 attention_revoked 注意力门控）。背景：监视发现 19:53 的 `/lbm_plan watch` 周期 `gap-cmd-8f86ec3641d4` 以 `failed_submit/attention_revoked`（「当前没有有效的自动观看注意力，不启动任务」）关闭，整条链路零步未跑。
+- **强制并行启动**：`planning/command_service.py:_handle_watch` 调 `coord.start_manual_cycle(..., force_debug=True)`（仅手动命令路径置位）。`integrations/video_schedule.py` 的 `start_manual_cycle/_manual_cycle/_manual_cycle_inner/_start_watching` 增 kw-only `force_debug`（缺省 False，随机 gap/日程 dedicated 路径恒 False、语义不变）：force_debug 时**跳过 SURF 租约申请**（`try_acquire_surf`）与选片期 `lease_valid` 复核——不占聊天注意力、与日程并行；entry 标 `forced_debug=True` 供诊断辨识；无任务收尾 `closed_reason=forced_debug_no_task`。防叠加守卫保留（`_manual_task` 未 done → `manual_cycle_running`；`_active_watch_entry()` 非 None → `watch_active`）。
+- **submit/运行期注意力闸绕过（source 方案）**：`plugin.py:_call_watch_api` 改 `source = kwargs.pop("source", "schedule")` 透传（缺省仍 schedule，其余调用方逐字不变）；debug 路径 submit 传 `source="debug"`。`video_watch/service.py:handle_action` 补 debug owner 分支 `owner=f"debug:{episode_id}"`（与 schedule 引用身份隔离，收尾只释放自己引用不误杀）；submit 闸（`source=="schedule"` 才查 `_automatic_task_allowed`）与运行期守卫（`source!="schedule"` 放行）因 source 自然跳过。manager 台账 source 归一为 tool，消息钩子 `revoke_automatic` 只摘 `schedule:` 引用，debug 任务与聊天并行存续。
+- **日程恢复不收回 debug 任务**：`_sync_inner` gap 轮询 `if active_id and not entry.get("forced_debug")` 才按 `schedule_resumed` 收尾；forced_debug 条目照常轮询至终态存档（普通 gap 语义不变）。
+- **红线保留**：只绕过注意力门控，**不绕**额度（quota）/候选（无真实候选不编造 BV）/证据/隐私/防重门；debug watch 完成仍喂分享记录器 + 空间候选（`_record_video_result` 第三路），产出 A 线视频帖样本；命令总数不变（不新增命令，仍 8 命令）。
+- 配置：无新增字段（18 段 202 叶子不变；debug 强制是命令固有语义，不新增配置键）。版本双号 3.17.0（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round：3.17.0；test_prompt_identity_audit 双号断言随版本顺延）。新增专项 `scratch/test_watch_debug_force.py`。边界：本批不部署、不 git commit、不碰主机、不切 mode。
+
+## 3.16.1（2026-11-07）
+
+- PR-AUDIT 提示词结构与缓存复用审计修补（依据 `union/MaiBot_v3.16.0_提示词结构与缓存复用审计报告.md` PR-1/2/3）：新视频社交链路人设统一经 `with_identity=True` 进 system 前缀（宿主同款开头，共享前缀缓存），清理动态 JSON/用户提示词中的重复人设。
+- PR-1：`plugin.py` ShareEvaluator（module=video）与 qzone_video（module=qzone）生成回调追加 `with_identity=True`；`video_share_evaluator` 与 `qzone_video_bridge` `_ask`/`_caption` body 移除重复 `persona` 键（persona_provider 保留兼容），POLICY 规则原文不动。
+- PR-2：`qzone/service.py:_llm_post_gate` generate 追加 `with_identity=True`；`QZONE_POST_GATE_DEFAULT` 将「人设：{personality}」改为「依据系统人设判断」（「绝大多数情况下回答否」严判保留）；render 仍传 personality kwarg 兼容旧自定义模板 + 回退诊断 warning。
+- PR-3：`planning/event_prompt.py` compose 去掉重复「人设：{p}」片段（人设已经 event_catalog with_identity 进 system），稳定规则/NO_PUZZLE/名称块/时段约束不变，签名保留兼容。
+- `companion/initiative_profile.py` 保守保持现状（llm 为 Any 类型、测试传非 LLMService 桩，审计 P3 不假定任意对象是 LLMService）。
+- 红线：event/module/task_name 与决策 JSON 契约逐字不变；动态材料后置、人设进 system 前缀；分享路由/隐私/防重/发帖严判与 shadow/auto 回退无漂移。版本双号 3.16.1，schema 不变（18 段 202）；新增 `scratch/test_prompt_identity_audit.py` 19/19，命名回归 224/224，七门禁 7/7。
+
 ## 3.16.0（2026-11-07）
 
 - PR-D1 空间多日主题延续与全链诊断（计划书 H9/H10 / §7 PR-D1 / §8.2.6，视频×空间拟人化升级计划最后一个 PR）。

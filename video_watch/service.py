@@ -155,6 +155,13 @@ class VideoWatchService:
                 owner, force = "tool", True
             elif source == "schedule" and episode_id:
                 owner = f"schedule:{episode_id}"
+            elif source == "debug" and episode_id:
+                # PR-WATCH：/lbm_plan watch 调试强制观看——引用身份与 schedule 隔离
+                # （收尾只释放自己的引用，不误杀日程/用户引用）；submit 注意力闸与
+                # 运行期守卫只约束 source=="schedule"，debug 自然放行（额度/候选/
+                # 防重门不变）。manager 台账 source 归一为 tool，消息钩子
+                # revoke_automatic 只摘 schedule: 引用，debug 任务与聊天并行存续。
+                owner = f"debug:{episode_id}"
         if action in ("submit", "resolve"):
             from .bv import normalize_video_ref
             normalized = await asyncio.to_thread(normalize_video_ref, video or "")

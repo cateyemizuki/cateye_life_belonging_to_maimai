@@ -1941,12 +1941,17 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         直接调本插件内部 video_watch 服务单实例（core.contracts.VideoWatchPort
         同构动作面），**不再跨插件** ``ctx.api.call("cateye.bili-watch.bili_watch")``；
         旧独立原型仓只读保留，不安装、不 import。
+
+        PR-WATCH：``source`` 透传（缺省仍 "schedule"，其余调用方语义不变）——
+        /lbm_plan watch 调试强制路径经协调器传 source="debug"，绕过观看服务的
+        注意力闸（submit 闸与运行期守卫均只约束 source=="schedule"）。
         """
         service = getattr(self, "_video_watch", None)
         if service is None:
             return {"success": False, "error_class": "unavailable",
                     "error": "视频观看模块未装配（[video_watch].enabled=false 或未加载）"}
-        return await service.handle_action(action, source="schedule", **kwargs)
+        source = str(kwargs.pop("source", "schedule") or "schedule")
+        return await service.handle_action(action, source=source, **kwargs)
 
     def _kick_share_delivery(self) -> None:
         """S3 分享投递单飞调度（无候选/不满足条件时静默，不拖挂生活 tick）。"""
