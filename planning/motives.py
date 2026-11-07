@@ -8,6 +8,13 @@ pending_commitment 除外——硬约定走既有机制，不重复成为动机�
 想放松、社交电量充足→想找人聊聊）。simulated_activity 经历不直接成为动机
 （它经 GoalManager 的 simulated_activity 目标间接进入）。
 
+PR-C1 H5（2026-11-07）：新增来源 ``experience_share``——「刚完成值得分享的事」
+（B1 published/observed 高 salience 且在近期窗内）→ 想找人聊聊的动机（强度封顶
+:data:`EXPERIENCE_SHARE_STRENGTH_CAP`）。同一经历只占一条动机（提升为 share 后
+不再重复派生 experience）。开关 ``[planning_proactive].experience_share_motives_enabled``
+关闭 = 现状（经历回落 B2 experience 来源）。消费点 = companion 巡检候选阶段的
+topic 参考与轻微概率加成（最终门控不变，默认可不联系）+ 既有 planner 候选权重。
+
 红线（计划书 §5.3，逐条落实）：
 - 动机**只改现有候选权重**：消费点 = rolling_planner 候选打分的 motive_bonus
   （≤15% 基础分，:data:`MOTIVE_BONUS_RATIO`）与 spine 提示词变量区 ≤4 条摘要；
@@ -71,8 +78,15 @@ STATE_REST_ENERGY_BELOW = 0.35
 STATE_RELAX_STRESS_ABOVE = 0.60
 STATE_SOCIAL_BATTERY_ABOVE = 0.70
 
-#: 合法来源类别（规格 §2：goal_id / experience_id / state 驱动）
-SOURCE_KINDS = ("goal", "experience", "state")
+#: PR-C1 H5：经历驱动交流动机（experience_share）——「刚完成值得分享的事」。
+#: 仅 B1 published/observed 且高 salience、且在近期窗内（保守固定值，规格未给定）；
+#: 强度封顶低于通用饱和上限（分享欲只是轻微倾向，不压过其他动机）。
+EXPERIENCE_SHARE_SALIENCE_MIN = 0.5
+EXPERIENCE_SHARE_RECENCY_HOURS = 24.0
+EXPERIENCE_SHARE_STRENGTH_CAP = 0.6
+
+#: 合法来源类别（规格 §2：goal_id / experience_id / state 驱动；PR-C1 +experience_share）
+SOURCE_KINDS = ("goal", "experience", "experience_share", "state")
 
 
 def _unit(value: Any, default: float = 0.0) -> float:
@@ -99,6 +113,8 @@ class MotiveStore:
         goals_provider: 返回 goals 表行 dict 列表（明确目标来源；None=无此来源）。
         experience_provider: 返回 B1 经历索引行 dict 列表（真实观看/发布来源；
             None=索引缺失，空降级——规格 §4 测试点）。
+        experience_share_enabled_provider: PR-C1 H5 开关只读回调
+            （[planning_proactive].experience_share_motives_enabled；None=默认 True）。
         timezone_str / timezone_manager: 时区真源（禁手写本地时间换算）。
     """
 
@@ -108,6 +124,7 @@ class MotiveStore:
                  half_life_days_provider: Optional[Callable[[], int]] = None,
                  goals_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None,
                  experience_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None,
+                 experience_share_enabled_provider: Optional[Callable[[], bool]] = None,
                  timezone_str: str = "Asia/Shanghai",
                  timezone_manager: Optional[TimezoneManager] = None) -> None:
         self._path = Path(path)
@@ -116,6 +133,9 @@ class MotiveStore:
         self._half_life_provider = half_life_days_provider
         self._goals_provider = goals_provider
         self._experience_provider = experience_provider
+        #: PR-C1 H5：[planning_proactive].experience_share_motives_enabled 只读回调
+        #: （None = 未注入按出厂默认 True；读失败保守停用该来源）
+        self._experience_share_enabled_provider = experience_share_enabled_provider
         self._tz = timezone_manager or TimezoneManager(timezone_str)
         self._motives: List[Dict[str, Any]] = []
         self._load()
@@ -146,6 +166,19 @@ class MotiveStore:
             except Exception:
                 value = MOTIVE_HALF_LIFE_DAYS_DEFAULT
         return max(MOTIVE_HALF_LIFE_MIN, min(MOTIVE_HALF_LIFE_MAX, value))
+
+    def _experience_share_enabled(self) -> bool:
+        """PR-C1 H5 开关（[planning_proactive].experience_share_motives_enabled）。
+
+        未注入 provider → 出厂默认 True；读失败 → False（保守：不产生分享动机）。
+        关闭 = 现状：经历仍按 B2 的 experience 来源派生，不产生 experience_share。
+        """
+        if self._experience_share_enabled_provider is None:
+            return True
+        try:
+            return bool(self._experience_share_enabled_provider())
+        except Exception:
+            return False
 
     # ── 时间助手 ─────────────────────────────────────────────────────────
     def _now(self, now: Optional[datetime] = None) -> datetime:
@@ -245,7 +278,7 @@ class MotiveStore:
             })
         return out
 
-    def _derive_from_experiences(self) -> List[Dict[str, Any]]:
+    def _derive_from_experiences(self, now: datetime) -> List[Dict[str, Any]]:
         if self._experience_provider is None:
             return []  # B1 索引缺失 → 空降级（规格 §4）
         try:
@@ -253,6 +286,7 @@ class MotiveStore:
         except Exception as exc:
             logger.debug("动机经历来源读取失败（空降级）：%s", exc)
             return []
+        share_enabled = self._experience_share_enabled()
         out: List[Dict[str, Any]] = []
         for row in list(rows)[:20]:
             if not isinstance(row, dict):
@@ -264,11 +298,26 @@ class MotiveStore:
             topic = _clip(row.get("summary"), 60)
             if not exp_id or not topic:
                 continue
+            salience = _unit(row.get("salience"), 0.5)
+            # PR-C1 H5：「刚完成值得分享的事」——published/observed 高 salience 且在
+            # 近期窗内 → 提升为 experience_share（想找人聊聊）；同一经历只占一条动机
+            # （不重复派生 experience + experience_share）。created_at 缺失/不可解析
+            # → 不视为「刚完成」（保守回落 B2 experience 来源）。开关关闭 = 现状。
+            if share_enabled and tier in ("observed", "published") \
+                    and salience >= EXPERIENCE_SHARE_SALIENCE_MIN \
+                    and self._is_recent_experience(row, now):
+                out.append({
+                    "topic": _clip("想找人聊聊：" + topic, 80),
+                    "source_kind": "experience_share", "source_ref": exp_id,
+                    "base_strength": min(EXPERIENCE_SHARE_STRENGTH_CAP,
+                                         0.3 + 0.3 * salience),
+                    "goal_types": ["social"], "keywords": ["聊"],
+                })
+                continue
             if tier == "inferred":
                 strength = INFERRED_STRENGTH_CAP  # inferred 只低权重（封顶）
             else:
-                strength = min(STRENGTH_SATURATION,
-                               0.4 + 0.3 * _unit(row.get("salience"), 0.5))
+                strength = min(STRENGTH_SATURATION, 0.4 + 0.3 * salience)
             out.append({
                 "topic": topic, "source_kind": "experience", "source_ref": exp_id,
                 "base_strength": strength,
@@ -276,6 +325,21 @@ class MotiveStore:
                 "goal_types": [], "keywords": [],
             })
         return out
+
+    @staticmethod
+    def _is_recent_experience(row: Dict[str, Any], now: datetime) -> bool:
+        """B1 经历 created_at（epoch 秒）是否在近期窗内；缺失/坏值/未来外推 → False。"""
+        try:
+            created = float(row.get("created_at"))
+        except (TypeError, ValueError):
+            return False
+        if created != created:  # NaN
+            return False
+        try:
+            age_hours = (now.timestamp() - created) / 3600.0
+        except (TypeError, ValueError, OSError):
+            return False
+        return 0.0 <= age_hours <= EXPERIENCE_SHARE_RECENCY_HOURS
 
     @staticmethod
     def _derive_from_state(state: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -307,14 +371,17 @@ class MotiveStore:
         if not self._enabled():
             return []
         now = self._now(now)
-        derived = (self._derive_from_goals() + self._derive_from_experiences()
+        derived = (self._derive_from_goals() + self._derive_from_experiences(now)
                    + self._derive_from_state(state))
+        share_enabled = self._experience_share_enabled()
         by_key: Dict[str, Dict[str, Any]] = {}
         kept: List[Dict[str, Any]] = []
         for motive in self._motives:
             expires = self._parse_ts(motive.get("expires_at"))
             if expires is not None and now >= expires:
                 continue  # 到期移除
+            if not share_enabled and motive.get("source_kind") == "experience_share":
+                continue  # PR-C1 H5 开关关闭 = 现状：分享动机不保留（B1 事实仍在，重开可再派生）
             if self._effective(motive, now) < STRENGTH_FLOOR:
                 continue  # 衰减殆尽
             key = f"{motive.get('source_kind')}:{motive.get('source_ref')}"
@@ -360,11 +427,14 @@ class MotiveStore:
         if not self._enabled():
             return []
         now = self._now(now)
+        share_enabled = self._experience_share_enabled()
         out: List[Dict[str, Any]] = []
         for motive in self._motives:
             expires = self._parse_ts(motive.get("expires_at"))
             if expires is not None and now >= expires:
                 continue
+            if not share_enabled and motive.get("source_kind") == "experience_share":
+                continue  # H5 开关关闭 = 现状（热重载后即时生效，不等 refresh）
             strength = self._effective(motive, now)
             if strength < STRENGTH_FLOOR:
                 continue
@@ -392,6 +462,7 @@ class MotiveStore:
         if not self._enabled() or not isinstance(candidate, dict):
             return 0.0
         now = self._now(now)
+        share_enabled = self._experience_share_enabled()
         goal_type = str(candidate.get("goal_type") or "")
         name = str(candidate.get("name") or "")
         best = 0.0
@@ -399,6 +470,8 @@ class MotiveStore:
             expires = self._parse_ts(motive.get("expires_at"))
             if expires is not None and now >= expires:
                 continue
+            if not share_enabled and motive.get("source_kind") == "experience_share":
+                continue  # H5 开关关闭 = 现状：分享动机不参与候选加成
             types = motive.get("goal_types") or []
             keywords = motive.get("keywords") or []
             matched = (goal_type and goal_type in types) or any(

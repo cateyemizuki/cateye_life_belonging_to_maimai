@@ -939,6 +939,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                         self.config.life_state, 'motive_half_life_days', 3)),
                     goals_provider=self._motive_goal_rows,
                     experience_provider=self._motive_experience_rows,
+                    # PR-C1 H5：经历分享动机开关（[planning_proactive]，热重载即时生效）
+                    experience_share_enabled_provider=lambda: bool(getattr(
+                        self.config.planning_proactive, 'experience_share_motives_enabled', True)),
                     timezone_str=timezone_str)
             except Exception as exc:
                 self.ctx.logger.warning('持续动机装配失败（纯旁路，忽略）：%s', type(exc).__name__)

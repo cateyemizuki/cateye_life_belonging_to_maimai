@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import tempfile
 import time
@@ -35,6 +36,10 @@ logger = logging.getLogger(__name__)
 
 #: 单事件增量硬限幅（§6.3-2：所有增量在代码层硬限幅；§6.2 A「单事件经 ±0.5 限幅」）
 EVENT_DELTA_CLAMP = 0.5
+#: PR-C1 H4：原因注入行的稳定模板（前缀/后缀逐字固定；summary ≤120 字夹在中间）。
+#: 无原因/开关关闭 → 不附行，injection_text 与加入前逐字一致。
+REASON_INJECTION_PREFIX = "（心情原因参考：因为"
+REASON_INJECTION_SUFFIX = "，心情受了些影响。这份影响会随时间慢慢淡去，不必反复提起。）"
 #: 用户侧最后一条消息的反查窗口（分钟）与拉取条数（§4.2 评估上下文增强）
 USER_MESSAGE_LOOKBACK_MINUTES = 20.0
 USER_MESSAGE_LOOKBACK_LIMIT = 10
@@ -470,6 +475,11 @@ class EmotionService:
             fallback=EMOTION_INJECTION_DEFAULT,
             mood=self.emotion_description_text(channel),
         )
+        # PR-C1 H4：稳定模板前置不变，仅在存在未过期高 salience 原因时追加一行
+        # 「因为…」（≤1 条；无原因/开关关闭 → 不附，输出与加入前逐字一致）。
+        reason_line = self._reason_injection_line()
+        if reason_line:
+            text = f"{text}\n{reason_line}"
         if self.is_frozen():
             # 冻结态按配置夜窗可能滞后于动态睡眠实际醒沿（如 07:45 已醒但夜窗到
             # 08:30）；引擎明确判醒时不再注入深夜引导，避免清晨回复被误导成深夜。
@@ -1117,6 +1127,50 @@ class EmotionService:
         except (TypeError, ValueError):
             return float(default)
 
+    # ── PR-C1 H4：短期原因（登记引用 / TTL / 注入行）─────────────────────
+    def _reason_ttl_hours(self) -> int:
+        """原因 TTL（小时）：[emotion].emotion_reason_ttl_hours，夹 [1, 48]，缺省 6。"""
+        try:
+            hours = int(self._emotion_cfg("emotion_reason_ttl_hours", 6))
+        except (TypeError, ValueError):
+            hours = 6
+        return max(1, min(48, hours))
+
+    @staticmethod
+    def _reason_source_ref(source: str, session_id: str, event_text: str) -> str:
+        """原因来源引用：``来源:流:事件摘要哈希``（不存正文；同事件同引用 → 账本 dedupe）。
+
+        事件摘要是评估器/模板产出的短语（≤200 字），此处再取 SHA-1 前 16 位作
+        稳定指纹——账本里只留引用，任何原始文本都不进原因层。
+        """
+        digest = hashlib.sha1(str(event_text or "").encode("utf-8")).hexdigest()[:16]
+        return f"{str(source or '').strip() or 'event'}:{str(session_id or '').strip() or '-'}:{digest}"
+
+    def _reason_injection_line(self) -> str:
+        """最近 1 条未过期高 salience 原因的注入行（稳定模板；无原因/开关关 → 空串）。
+
+        只读原因账本，绝不改 VAD；``emotion_reason_inject_enabled=false`` 或模块
+        停用 → 空串（injection_text 与加入前逐字一致 = 现状）。
+        """
+        if not self._enabled():
+            return ""
+        if not bool(self._emotion_cfg("emotion_reason_inject_enabled", True)):
+            return ""
+        ledger = getattr(self._machine, "reason_ledger", None)
+        getter = getattr(ledger, "latest_injectable", None)
+        if not callable(getter):
+            return ""
+        try:
+            entry = getter(datetime.now())
+        except Exception:
+            return ""
+        if not isinstance(entry, dict):
+            return ""
+        summary = str(entry.get("summary") or "").strip()
+        if not summary:
+            return ""
+        return f"{REASON_INJECTION_PREFIX}{summary}{REASON_INJECTION_SUFFIX}"
+
     def _merged_multiplier(self, name: str, default: float) -> float:
         """三层倍率取值：**JSON 合法覆盖 > config（含用户显式值）> 代码默认**。
 
@@ -1341,7 +1395,12 @@ class EmotionService:
             return skip
         global_mul, factor, scaled, applied, clipped = self._scaled_external_delta(
             delta, multiplier)
-        self._machine.record_event(event_text or "外部事件", applied)
+        # PR-C1 H4：结算点同步登记短期原因（source_ref=来源:流:事件摘要哈希，不存正文；
+        # 账本只作解释，不参与 VAD 数值——有无登记 VAD 结果逐字一致）。
+        self._machine.record_event(
+            event_text or "外部事件", applied,
+            source_ref=self._reason_source_ref(source, session_id, event_text),
+            ttl_hours=self._reason_ttl_hours())
         self._save_state()
         self._log_decision(
             "emotion.external_event", trigger_type="emotion", reason=str(event_text or "")[:120],

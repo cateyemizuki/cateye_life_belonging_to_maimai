@@ -624,6 +624,19 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
                        "(12:00-13:00 window, budget-exempt, deduplicated)."),
         },
     )
+    # ── PR-C1 H5（2026-11-07）：经历驱动的交流动机（消费在陪伴巡检候选阶段）──────
+    experience_share_motives_enabled: bool = Field(
+        default=True,
+        description="刚完成值得分享的事（真实看完视频/刚发空间等高重要度经历）时产生想找人聊聊的动机；"
+                    "只作话题参考与轻微权重加成，最终仍受统一预算/静默/注意力门控，默认可不联系",
+        json_schema_extra={
+            "label": "经历分享动机",
+            "hint": "关 = 不产生经历分享动机（既有想念/问候行为逐字不变）",
+            **_ui_i18n("Experience-share motives",
+                       "Recent noteworthy experiences may inspire an optional chat motive; "
+                       "all proactive gates still apply and contacting is never required."),
+        },
+    )
     morning_drift: str = Field(
         default="10-30",
         description="早安漂移区间（分钟，相对起床锚点）：填 \"a-b\" 或单数字 N（= 0~N 随机）；"

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from .reason_ledger import ReasonLedger
 from .vad import EmotionEvent, VADState, _clip
 
 
@@ -136,6 +137,8 @@ class EmotionStateMachine:
         self.decay_rate = max(0.01, min(0.3, float(decay_rate)))
         self.vad_raw = VADState.from_dict(self.params.anchor.to_dict())  # 初始化=回到锚点
         self.emotion_log: List[EmotionEvent] = []
+        # PR-C1 H4：短期原因账本（只作「为什么」的可核验解释，绝不二次加减 VAD）
+        self.reason_ledger = ReasonLedger()
         self.last_update = datetime.now()
         # M5 睡眠冻结（运行期状态，不落盘：热重载后由睡眠循环重新判定，避免复活陈旧冻结态）
         self.frozen = False
@@ -199,10 +202,18 @@ class EmotionStateMachine:
         self.last_update = now
         return factor
 
-    def record_event(self, event_description: str, delta: VADState, *, now: Optional[datetime] = None) -> VADState:
+    def record_event(self, event_description: str, delta: VADState, *, now: Optional[datetime] = None,
+                     source_ref: str = "", ttl_hours: Optional[float] = None,
+                     salience: Optional[float] = None) -> VADState:
         """记录一次情绪事件：衰减 → 原始 VAD 加增量（裁剪）→ 写入当天日志。
 
         冻结期（睡眠中）：事件**只入队** ``pending_events``，不衰减、不结算（§4.2）。
+
+        PR-C1 H4：``source_ref`` 非空时同步登记短期原因（``reason_ledger``，
+        source_ref 唯一 dedupe、TTL 到期不再注入）。原因层**只作解释**，
+        不参与任何 VAD 数值结算——有无 source_ref 的 VAD 结果逐字一致。
+        冻结期事件未结算 → 不登记原因（避免给从未入账的 ΔVAD 附「为什么」）。
+        旧调用方不传新参数即逐字保持原行为。
         """
         now = now or datetime.now()
         event = EmotionEvent(
@@ -225,6 +236,11 @@ class EmotionStateMachine:
         self.emotion_log.append(event)
         if len(self.emotion_log) > self.MAX_LOG:
             self.emotion_log = self.emotion_log[-self.MAX_LOG:]
+        if str(source_ref or "").strip():
+            # H4：登记发生在结算之后，只解释已入账的增量；dedupe/夹取在账本内
+            self.reason_ledger.record(summary=event.event_description, source_ref=source_ref,
+                                      delta_vad=delta, now=now, ttl_hours=ttl_hours,
+                                      salience=salience)
         return self.vad_raw
 
     def effective_vad(self) -> VADState:
@@ -354,6 +370,7 @@ class EmotionStateMachine:
         self.params = params
         self.vad_raw = VADState.from_dict(params.anchor.to_dict())
         self.emotion_log = []
+        self.reason_ledger.clear()   # H4：重新初始化清空情绪残留，短期原因一并清
         self.last_update = datetime.now()
 
     def reset_params(self) -> None:
@@ -367,6 +384,8 @@ class EmotionStateMachine:
             "last_update": self.last_update.isoformat(timespec="seconds"),
             "emotion_log": [e.to_dict() for e in self.emotion_log],
             "params": self.params.to_dict(),
+            # PR-C1 H4：短期原因账本（旧版本读到时忽略；旧状态文件缺键 → 空账本）
+            "reason_ledger": self.reason_ledger.to_list(),
             # M5 连续低迷日统计（旧版本读到时忽略；旧状态文件缺这些键 → 本文件默认值）
             "daily_v": {d: {"sum": round(float(v.get("sum") or 0.0), 4),
                             "count": int(v.get("count") or 0)}
@@ -385,6 +404,8 @@ class EmotionStateMachine:
             self.last_update = datetime.now()
         self.emotion_log = [EmotionEvent.from_dict(e) for e in (data.get("emotion_log") or [])][: self.MAX_LOG]
         self.params = EmotionParams.from_dict(data.get("params"))
+        # H4：短期原因账本（缺键/坏类型 → 空账本，绝不因旧状态文件启动失败）
+        self.reason_ledger.load_list(data.get("reason_ledger"))
         # 连续低迷日统计（缺键/类型异常 → 空默认，绝不因旧状态文件启动失败）
         raw_daily = data.get("daily_v")
         self.daily_v = {}

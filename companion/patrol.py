@@ -89,6 +89,15 @@ logger = logging.getLogger(__name__)
 
 
 
+#: PR-C1 H5：经历分享动机对想念候选概率的**轻微**加成比例（×strength，乘法只升不降；
+#: 与 planner 侧 MOTIVE_BONUS_RATIO 同量级）。概率封顶沿用 evaluate_miss 的 0.35
+#: （initiative_profile 孤独锚点机制不动，这里只消费其输出，不改其判定）。
+EXPERIENCE_SHARE_PROB_RATIO = 0.15
+EXPERIENCE_SHARE_PROB_CAP = 0.35
+#: 分享 topic 参考行（追加在想念 reason 后；可选话题，不要求提起）
+EXPERIENCE_SHARE_TOPIC_PREFIX = "\n最近经历参考（可选话题）："
+EXPERIENCE_SHARE_TOPIC_SUFFIX = "。可以自然地带一句，也可以选择不提。"
+
 #: 情绪不可得时的恒等 mood_effect（emotion 关闭/缺失 → 乘数恒 1.0，§八.2 可空降级）
 NEUTRAL_MOOD_EFFECT: dict[str, Any] = {
     "proactive_rate": 1.0,
@@ -632,14 +641,31 @@ class PatrolService:
         if not allowed:
             done(denial)
             return
-        if random.random() >= decision.probability:
+        # PR-C1 H5：候选阶段读经历分享动机——只作 topic 参考与轻微概率加成；
+        # 最终门控（上方 permission：预算/静默/注意力 + dispatch 内复检）不变，
+        # 孤独锚点判定（evaluate_miss）不动，动机存在 ≠ 必须联系（dice 仍可放弃）。
+        share = self._experience_share_motive()
+        probability = decision.probability
+        share_topic = ""
+        if share is not None:
+            share_topic = str(share.get('topic') or '')
+            try:
+                strength = max(0.0, min(1.0, float(share.get('strength') or 0.0)))
+            except (TypeError, ValueError):
+                strength = 0.0
+            probability = min(EXPERIENCE_SHARE_PROB_CAP,
+                              decision.probability * (1.0 + EXPERIENCE_SHARE_PROB_RATIO * strength))
+            fields.update(experience_share_ref=str((share.get('source') or {}).get('ref') or ''),
+                          experience_share_strength=round(strength, 4),
+                          miss_probability_boosted=round(probability, 4))
+        if random.random() >= probability:
             done('dice')
             return
         if not self._initiative_memory.claim(self._target_qq, last, now, 'miss'):
             done('recovery_or_cycle_claim')
             return
         key = 'miss:' + str(cycle['anchor'])
-        success = await self._trigger_missing(hours, key=key)
+        success = await self._trigger_missing(hours, key=key, share_topic=share_topic)
         self._initiative_memory.receipt(self._target_qq, 'miss', 'enqueued' if success else 'not_enqueued_or_unknown')
         done('miss_trigger' if success else 'planner_not_enqueued', ACTION_TRIGGER if success else ACTION_SKIP)
 
@@ -647,11 +673,47 @@ class PatrolService:
     # ------------------------------------------------------------------
     # 各类触发（屏幕感知统一在 _trigger_planner 里先取）
     # ------------------------------------------------------------------
-    async def _trigger_missing(self, hours_since_last: float, *, key: str = "") -> bool:
-        result = await self._trigger_planner('missing', self._format_miss_reason(hours_since_last), key=key)
+    async def _trigger_missing(self, hours_since_last: float, *, key: str = "",
+                               share_topic: str = "") -> bool:
+        reason = self._format_miss_reason(hours_since_last)
+        # PR-C1 H5：经历分享 topic 只作可选话题参考（不要求提起；空 = 逐字旧行为）
+        if str(share_topic or '').strip():
+            reason = (f"{reason}{EXPERIENCE_SHARE_TOPIC_PREFIX}{str(share_topic).strip()}"
+                      f"{EXPERIENCE_SHARE_TOPIC_SUFFIX}")
+        result = await self._trigger_planner('missing', reason, key=key)
         if result:
             self._affection.set_miss_sent()
         return result
+
+    def _experience_share_motive(self) -> Optional[dict[str, Any]]:
+        """PR-C1 H5：读 B2 动机表中当前最强的 experience_share 动机（只读、可空降级）。
+
+        真源 = ``plugin._motive_store``（MotiveStore；开关/衰减/到期在其只读口内
+        判定）。未装配/停用/无分享动机/任何异常 → None（候选阶段逐字旧行为）。
+        本方法不生成消息、不改任何门控——动机存在 ≠ 发消息。
+        """
+        store = getattr(self._config, '_motive_store', None)
+        if store is None:
+            store = getattr(getattr(self._config, 'config', None), '_motive_store', None)
+        active = getattr(store, 'active', None)
+        if not callable(active):
+            return None
+        try:
+            motives = active() or []
+        except Exception:
+            return None
+        best: Optional[dict[str, Any]] = None
+        try:
+            for motive in motives:
+                if not isinstance(motive, dict):
+                    continue
+                if str((motive.get('source') or {}).get('kind') or '') != 'experience_share':
+                    continue
+                if best is None or float(motive.get('strength') or 0.0) > float(best.get('strength') or 0.0):
+                    best = motive
+        except (TypeError, ValueError):
+            return None
+        return best
 
 
     # 注（2026-11-04 主动行为重写）：_trigger_activity / _trigger_daily（日程巡检的

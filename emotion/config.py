@@ -93,6 +93,25 @@ class EmotionSectionConfig(PluginConfigBase):
         description="把当前情绪底色（模糊化描述）注入 replyer 提示词，引导语气与情绪一致",
         json_schema_extra={"label": "情绪底色注入", **_ui_i18n("Mood injection")},
     )
+    # ── PR-C1 H4（2026-11-07）：短期情绪原因时效（只作解释，不二次加减 VAD）──────
+    emotion_reason_ttl_hours: int = Field(
+        default=6,
+        ge=1,
+        le=48,
+        description="短期情绪原因的有效期（小时）：事件登记的原因摘要到期后不再注入；"
+                    "原因只解释心情来源，情绪数值仍由既有衰减逐渐平复",
+        json_schema_extra={"label": "情绪原因有效期(小时)",
+                           **_ui_i18n("Emotion reason TTL (hours)",
+                                      "Short-term reason entries expire and stop being injected.")},
+    )
+    emotion_reason_inject_enabled: bool = Field(
+        default=True,
+        description="在情绪底色注入后附最近一条未过期的高重要度原因摘要（因为…）；"
+                    "关闭后注入文本与旧版逐字一致",
+        json_schema_extra={"label": "注入情绪原因",
+                           **_ui_i18n("Inject emotion reason",
+                                      "Append at most one fresh reason summary to the mood injection.")},
+    )
     # ── A3 跨来源去重（§2.4.6：自动评估 ⇄ 工具上报，同一流+窗口只计一次）──────
     dedup_enabled: bool = Field(
         default=True,
