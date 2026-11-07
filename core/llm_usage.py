@@ -44,6 +44,7 @@ EVENT_MODULE_MAP: Dict[str, str] = {
     "qzone_post": "qzone",
     "qzone_reply": "qzone",
     "qzone_post_gate": "qzone",
+    "qzone_video_decision": "qzone",  # 2026-11-07 PR-A0：空间视频候选影子判定（发布面归 qzone）
     "video_watch_visual": "video",
     "video_watch_description": "video",
     "video_watch_impression": "video",

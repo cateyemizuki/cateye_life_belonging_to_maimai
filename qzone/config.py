@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Dict
 
+import pydantic
 from maibot_sdk import Field, PluginConfigBase
 
 from core.i18n import ui_i18n as _ui_i18n
@@ -169,3 +170,57 @@ class QzoneSectionConfig(PluginConfigBase):
         description="备选：NapCat HTTP 服务器的 access token",
         json_schema_extra={"label": "NapCat HTTP Token", **_ui_i18n("NapCat HTTP token")},
     )
+
+
+class QzoneVideoSectionConfig(PluginConfigBase):
+    """空间视频候选与影子判定（PR-A0：只记录与判定留痕，不发布）。"""
+
+    __ui_label__ = "空间视频候选"
+    __ui_icon__ = "video"
+    __ui_order__ = 16
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "QZone video candidates",
+               "description": "Shadow-mode candidates from autonomous watching; no posting yet."}
+    }
+
+    mode: str = Field(
+        default="shadow",
+        description="off=不记录候选；shadow=记录候选并做影子判定（只留痕不发布）；"
+                    "auto 本批行为同 shadow（发布链路未接通，PR-A2）。非法值回退 shadow",
+        json_schema_extra={
+            "label": "运行模式",
+            "hint": "off / shadow / auto；auto 当前等同 shadow（不发布）",
+            **_ui_i18n("Mode", "off / shadow / auto; auto currently behaves as shadow"),
+        },
+    )
+    candidate_ttl_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        description="候选有效期（小时）：观看完成后超过该时长仍未判定/未发布的候选按过期放弃",
+        json_schema_extra={"label": "候选有效期(小时)", **_ui_i18n("Candidate TTL (hours)")},
+    )
+    max_evaluations: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="单个候选的 LLM 判定次数上限（含首评）；达到上限仍暂缓则判不发",
+        json_schema_extra={"label": "单候选判定上限", **_ui_i18n("Max evaluations per candidate")},
+    )
+    decision_daily_limit: int = Field(
+        default=6,
+        ge=0,
+        le=50,
+        description="每日 LLM 判定次数上限（按业务时区日切）；0=当天不判定，候选留待次日",
+        json_schema_extra={
+            "label": "每日判定上限",
+            "hint": "0 = 当天不做判定",
+            **_ui_i18n("Daily decision limit"),
+        },
+    )
+
+    @pydantic.field_validator("mode", mode="before")
+    @classmethod
+    def _normalize_mode(cls, value: object) -> str:
+        """三值收敛：off/shadow/auto 之外（含非字符串）一律回退 shadow（保守不放宽）。"""
+        return value if isinstance(value, str) and value in ("off", "shadow", "auto") else "shadow"

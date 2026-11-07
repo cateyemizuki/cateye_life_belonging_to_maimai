@@ -1,5 +1,13 @@
 # 更新日志（CHANGELOG）
 
+## 3.10.0（2026-11-07）
+
+- PR-A0 视频空间候选与权限边界（影子模式）：新增 `integrations/qzone_video_bridge.py`（QzoneVideoLedger + QzoneVideoBridge）。自主观看（自动日程 + /lbm_plan watch 手动周期）完成且证据闸通过（视觉 completed+summary 或 ≥40 字公开字幕，复用 video_share_policy.watched_facts）时记录空间视频候选；`data/video_watch/qzone_video.sqlite3` 落盘，UNIQUE(bvid,task_id) 幂等去重（同一次观看不重复建候选，同 bvid 不同次观看允许新候选）。用户点播工具链不经此记录器，权限边界保持现状。
+- 影子判定：稳定规则/JSON Schema 前置 + 人设/状态/视频事实/近期空间主题后置（3.9.1 前缀缓存口径），经 LLM 唯一入口 generate（module='qzone'，event='qzone_video_decision'，temperature=0.3，strict_params）；严解析 post/defer/do_not_post，非法/异常兜底 defer（判定暂不可用，30 分钟）；单候选判定含首评超限强制 do_not_post（重评超限）；每日判定额度按业务时区日切（0=当天不判，候选留待次日）；TTL 过期放弃；deferred 到点重评；单次 tick 有界 ≤3。**shadow/auto 本批都只写 ledger + 日志留痕，绝不发帖**（auto 日志注明发布链路未接通 PR-A2）；不提取截图资产（PR-A1）、不建发布回执账本（PR-A3），不改 video_watch/worker.py 与 qzone/service.py 既有行为。
+- 接线：plugin.py `_build_qzone_video`（仿 _build_video_social，异常 warning+None 保守停用）；`_share_recorder` 改双路并列（聊天分享 + 空间候选）各自 try/except 隔离，空间候选失败不影响聊天分享；bridge.tick 挂现有生活循环（与 video_social tick 同节拍，单飞），停机链取消 `_qzone_video_task`。core/llm_usage.py EVENT_MODULE_MAP += qzone_video_decision→qzone（17→18 键）。
+- 配置：新增 [qzone_video] 段 4 字段（mode=shadow，off/shadow/auto 非法回退 shadow；candidate_ttl_hours=24 ge1 le168；max_evaluations=3 ge1 le10；decision_daily_limit=6 ge0 le50），qzone/config.py 拥有（发布面），suite_config 注册；WebUI 中文 label。schema 17 段 182 字段 → 18 段 186 字段，迁移保持用户值（新段取默认）。
+- 版本双号 3.10.0（_manifest.json == SUPPORTED_CONFIG_VERSION）；七门禁计数/版本重钉（smoke/round/behavior：186 字段、18 段、EVENT_MODULE_MAP 18 键），新增专项 scratch/test_qzone_video_a0.py。部署由主代理执行，本批不部署、不 git commit。
+
 ## 3.9.3（2026-11-07）
 
 - 热修：日程注入统一模板 `_render_unified_prompt` 在动态睡眠开启时引用未定义局部变量 `now`（`engine.dynamic_status(now)` → NameError），导致该路径下日程注入整体失败（真机日志「注入日程信息失败: name 'now' is not defined」，inject_service.py:859）。改为 `engine.dynamic_status()` 缺省取引擎自身时区当前时间，与 sleep_engine 内部调用同口径。缺陷由 4a67ac7（3.5.0–3.6.1 工作树汇总）引入，仅动态睡眠开启时触发。

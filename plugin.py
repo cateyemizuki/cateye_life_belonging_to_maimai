@@ -506,6 +506,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 预算状态；预算/注意力由装配侧按 companion 同口径接线（_send_share_card）。
         self._video_card = VideoCardService(api_caller=self.ctx.api.call, logger=self.ctx.logger)
         self._video_social = self._build_video_social(data_dir)
+        # PR-A0（2026-11-07）：空间视频候选与影子判定（只记录+留痕，不发布；
+        # 发布链路 PR-A2 / 回执账本 PR-A3 尚未接通）。异常保守停用，不影响聊天分享。
+        self._qzone_video = self._build_qzone_video(data_dir)
         from integrations.optional_action import OptionalActionCoordinator
         self._optional_actions = OptionalActionCoordinator(
             data_dir, self._optional_action_facts,
@@ -513,8 +516,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self.ctx.maisaka.proactive.trigger)
         from integrations.small_event_actions import SmallEventActions
         self._small_event_actions = SmallEventActions(self._db.update_episode_metadata, self.optional_action)
-        self._share_recorder = lambda result, episode_id: (
-            self._video_social.record_from_result(result,episode_id) if self._video_social is not None else False)
+        # PR-A0：双路并列记录（聊天分享 + 空间候选），各自 try/except 隔离——
+        # 空间候选失败不得影响聊天分享，反之亦然（调用方 video_schedule 的 catch 之外再加一层）。
+        self._share_recorder = self._record_video_result
         # 2026-11-04 刷视频功能批：小事件池「刷B站」随 video_watch.enabled 门控
         # （启用 = 进入可 roll 池；闸动态读配置，热重载无需重新接线）
         catalog = getattr(self._planning, "event_catalog", None)
@@ -609,7 +613,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def _shutdown_chain(self) -> None:
         """串行停机链（F2：每步独立防御；总超时预算由 on_unload 的 wait_for 控制）。"""
         # Stop single-flight integration work before any service/database teardown.
-        for task_name in ("_video_watch_sync_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task"):
+        for task_name in ("_video_watch_sync_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task"):
             task = getattr(self, task_name, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -1404,6 +1408,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._kick_video_watch_sync()
         # S3：分享候选投递（有到期候选且预算/间隔满足才真正发送；单飞）
         self._kick_share_delivery()
+        # PR-A0：空间视频候选影子判定（与 video_social tick 同节拍；单飞，只留痕不发布）
+        self._kick_qzone_video_eval()
         date = str(report.get("date") or "")
         if not date or date == getattr(self, "_life_cleanup_date", ""):
             return
@@ -1518,6 +1524,45 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 commit=self._social_commit,release=self._social_release,append_context=self._append_social_fact)
         except Exception as exc:
             self.ctx.logger.warning('独立视频分享初始化失败，保守停用发送：%s',type(exc).__name__)
+            return None
+
+    def _record_video_result(self, result: dict, episode_id: str) -> bool:
+        """观看完成双路记录（PR-A0）：聊天分享候选 + 空间视频候选，互不拖累。
+
+        返回值保持旧口径 = 聊天分享路是否记录了候选；空间路只留痕不影响返回值。
+        """
+        recorded = False
+        if self._video_social is not None:
+            try:
+                recorded = bool(self._video_social.record_from_result(result, episode_id))
+            except Exception as exc:
+                self.ctx.logger.warning('聊天视频分享候选记录失败（忽略）：%s', exc)
+        if getattr(self, '_qzone_video', None) is not None:
+            try:
+                self._qzone_video.record_from_result(result, episode_id)
+            except Exception as exc:
+                self.ctx.logger.warning('空间视频候选记录失败（忽略）：%s', exc)
+        return recorded
+
+    def _build_qzone_video(self, data_dir: Path) -> Any:
+        """PR-A0：空间视频候选桥（影子模式）；仿 _build_video_social，异常保守停用。"""
+        from integrations.qzone_video_bridge import QzoneVideoBridge, QzoneVideoLedger
+        try:
+            ledger = QzoneVideoLedger(data_dir / 'video_watch/qzone_video.sqlite3')
+            return QzoneVideoBridge(
+                ledger,
+                config_provider=lambda: self.config.qzone_video,
+                qzone_enabled_provider=lambda: bool(self.config.qzone.enabled),
+                # LLM 唯一入口：LLMService → tools/llm_gateway；module='qzone'（发布面归属）
+                generate=lambda *a, **kw: self._llm.generate_detailed(*a, module='qzone', **kw),
+                persona_provider=lambda: str(getattr(self, '_personality', '') or ''),
+                state_provider=self._social_state,
+                task_provider=lambda: '',
+                clock=lambda: self._surf_now().timestamp(),
+                day=self._surf_day,
+                logger=self.ctx.logger)
+        except Exception as exc:
+            self.ctx.logger.warning('空间视频候选初始化失败，保守停用：%s', type(exc).__name__)
             return None
 
     def _social_state(self) -> dict:
@@ -1681,6 +1726,29 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception as exc:
             try:
                 self.ctx.logger.warning("分享投递调度失败（忽略）：%s", exc)
+            except Exception:
+                pass
+
+    def _kick_qzone_video_eval(self) -> None:
+        """PR-A0 空间视频候选影子判定单飞调度（无候选/额度用尽时静默，不拖挂生活 tick）。"""
+        service = getattr(self, '_qzone_video', None)
+        if service is None:
+            return
+        pending = getattr(self, '_qzone_video_task', None)
+        if pending is not None and not pending.done():
+            return
+        try:
+            async def run_qzone_video():
+                try:
+                    await service.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.ctx.logger.warning('空间视频候选影子判定本拍失败（忽略）：%s', type(exc).__name__)
+            self._qzone_video_task = asyncio.get_running_loop().create_task(run_qzone_video())
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning('空间视频候选调度失败（忽略）：%s', exc)
             except Exception:
                 pass
 
