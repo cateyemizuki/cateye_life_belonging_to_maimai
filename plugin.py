@@ -511,6 +511,13 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # PR-A0（2026-11-07）：空间视频候选与影子判定（只记录+留痕，不发布；
         # 发布链路 PR-A2 / 回执账本 PR-A3 尚未接通）。异常保守停用，不影响聊天分享。
         self._qzone_video = self._build_qzone_video(data_dir)
+        # PR-A3：装配后启动恢复（崩溃残留 sending/claimed→uncertain 不盲重发、claimed 素材
+        # 三态清理、过期复检），全部留痕；异常保守忽略，不影响后续装配与生活循环。
+        if self._qzone_video is not None:
+            try:
+                await self._qzone_video.on_start()
+            except Exception as exc:
+                self.ctx.logger.warning('空间视频启动恢复失败（忽略）：%s', type(exc).__name__)
         from integrations.optional_action import OptionalActionCoordinator
         self._optional_actions = OptionalActionCoordinator(
             data_dir, self._optional_action_facts,
@@ -1578,8 +1585,16 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             qzone = getattr(self, '_qzone', None)
             ports: Dict[str, Any] = {}
             if qzone is not None:
+                from qzone.publish_guard import preview_post
                 ports = {
-                    'post_moment': qzone.post_moment,
+                    # PR-A3：request_key 与 post_moment 内部防重同口径（装配根注入，
+                    # integrations 不反向 import qzone——边界门禁口径）。
+                    'preview_key': lambda text, images, visibility: preview_post(
+                        text, images, visibility)['key'],
+                    # PR-A3：视频自动发布路径经发布锁内共享额度复检（与日程普通说说同一把锁，
+                    # 并发不超额）；包装注入而非改桥端口签名，A2 裸桥/桩注入契约不变。
+                    'post_moment': lambda *a, _qz=qzone, **kw: _qz.post_moment(
+                        *a, enforce_daily_limit=True, **kw),
                     'check_post_gates': qzone.check_post_gates,
                     'posts_today': qzone.posts_today,
                     'daily_max_posts': lambda: int(getattr(self.config.qzone, 'daily_max_posts', 0) or 0),

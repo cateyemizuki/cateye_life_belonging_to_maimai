@@ -23,6 +23,22 @@ sent, un-claim, may defer once) / uncertain (no auto-replay, manual review).
 Publishing ports are injected; when absent the bridge stays shadow-only (A0/A1
 behavior preserved). Shadow mode never publishes.
 
+PR-A3 (2026-11-07): receipt idempotency + failure recovery. A dedicated
+``publish_attempts`` table (UNIQUE(bvid, watched_generation, channel)) is the
+"video→qzone" idempotency layer **on top of** ``QzoneService._publish_ledger``
+(both kept, neither replaces the other): a transactional claim refuses re-send
+when the same key is already sent/uncertain/sending; ``request_key`` (= the
+``post_moment`` preview key) is written before dispatch. ``on_start`` (called
+after assembly) recovers crash residue: sending/claimed attempts → uncertain
+(never blind replay), claimed assets triaged by candidate state (posted→released,
+uncertain→kept as evidence, rejected/expired→file deleted), pending/deferred
+expiry re-checked; every action logged + persisted. ``/lbm_life qzone_video
+status|clear`` offers read-only diagnosis and admin-verified manual clearance
+(reason=manual_verified_unsent, audit kept, no auto-resend). Posted-candidate
+fact write-back retries are bounded (≤3 tick retries then ``fact_sync=failed``);
+when the fact provider is absent it stays a no-op leaving ``pending`` (real
+bot-self stream wiring deferred to B1, see needsReview).
+
 The ledger is a synchronous, thread-safe SQLite layer modeled on
 ``integrations/video_share_ledger.py`` (independent connection + transaction per
 operation). Async callers offload ledger work with ``asyncio.to_thread`` so a
@@ -63,6 +79,17 @@ GATE_RETRY_SECONDS = 30 * 60
 RELEASE_RETRY_SECONDS = 30 * 60
 #: PR-A2 文案防复读：有界读取自己最近空间主题的条数
 CAPTION_RECENT_LIMIT = 5
+
+#: PR-A3 发布尝试账本容量上限（与 ShareLedger 同口径；满库保守拒收新尝试，不挤掉旧审计）
+ATTEMPT_CAPACITY = 2048
+#: PR-A3 事实回写 tick 重试上限（初次发布回写之外的有界重试；仍失败留 failed 不再试）
+FACT_SYNC_MAX_ATTEMPTS = 3
+#: PR-A3 单次 tick 最多重试事实回写的候选数（有界，不拖挂生活循环）
+FACT_SYNC_RETRY_PER_TICK = 3
+#: PR-A3 发布尝试合法状态（claimed=已认领未分发；sending=分发中；终态 sent/uncertain/rejected）
+ATTEMPT_STATUSES = ('claimed', 'sending', 'sent', 'uncertain', 'rejected')
+#: PR-A3 同键已存在这些状态 → 拒绝重发（claimed 保守视同在途，启动恢复统一置 uncertain）
+ATTEMPT_ACTIVE_STATUSES = ('claimed', 'sending', 'sent', 'uncertain')
 
 #: PR-A1 资产 ID 口径（worker 生成 vframe_+uuid hex）：索引/删文件前必须全匹配，
 #: 杜绝路径穿越；文件名恒为 <asset_id>.jpg，只落在受控资产根目录内。
@@ -130,6 +157,17 @@ class QzoneVideoLedger:
                 bytes INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'reserved',
                 created_at REAL NOT NULL,expires_at REAL NOT NULL);
               CREATE INDEX IF NOT EXISTS asset_status ON assets(status,created_at);
+              CREATE TABLE IF NOT EXISTS publish_attempts(
+                attempt_id TEXT PRIMARY KEY,candidate_id TEXT NOT NULL,
+                bvid TEXT NOT NULL,watched_generation TEXT NOT NULL,
+                channel TEXT NOT NULL DEFAULT 'qzone',
+                request_key TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'claimed',
+                receipt_tid TEXT NOT NULL DEFAULT '',reason TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,finished_at REAL);
+              CREATE UNIQUE INDEX IF NOT EXISTS attempt_identity
+                ON publish_attempts(bvid,watched_generation,channel);
+              CREATE INDEX IF NOT EXISTS attempt_status ON publish_attempts(status,created_at);
             ''')
             # PR-A2 加法式 schema 迁移：旧库（A0/A1）无 publish_after 列 → 补列（meta version 保持 '1'）。
             columns = {r['name'] for r in db.execute('PRAGMA table_info(candidates)')}
@@ -253,14 +291,28 @@ class QzoneVideoLedger:
             daily = json.loads(self._meta(db, 'decision_daily', '{}'))
             return int(daily.get('count', 0)) if daily.get('day') == day else 0
 
+    def get_candidate(self, candidate_id: str) -> dict | None:
+        """只读：按 id 取单个候选（含 facts/decision）；不存在返回 None。"""
+        with self._connection() as db:
+            row = db.execute('SELECT * FROM candidates WHERE candidate_id=?',
+                             (str(candidate_id),)).fetchone()
+            return self._candidate(row)
+
     def snapshot(self) -> dict:
         with self._connection() as db:
             counts = {r['status']: r['n'] for r in db.execute(
                 'SELECT status,count(*) n FROM candidates GROUP BY status')}
             candidates = [self._candidate(r) for r in db.execute(
                 'SELECT * FROM candidates ORDER BY created_at DESC LIMIT 8')]
+            attempts = {r['status']: r['n'] for r in db.execute(
+                'SELECT status,count(*) n FROM publish_attempts GROUP BY status')}
+            fact_sync: dict[str, int] = {}
+            for row in db.execute("SELECT decision_json FROM candidates WHERE status='posted'"):
+                state = str(json.loads(row['decision_json']).get('fact_sync') or 'pending')
+                fact_sync[state] = fact_sync.get(state, 0) + 1
             return {'candidate_states': counts, 'candidates': candidates,
-                    'decision_daily': json.loads(self._meta(db, 'decision_daily', '{}'))}
+                    'decision_daily': json.loads(self._meta(db, 'decision_daily', '{}')),
+                    'publish_attempts': attempts, 'fact_sync': fact_sync}
 
     # ------------------------------------------------------------------
     # PR-A2 发布相位（消费 evaluated+post 且 publish_after 到点的候选）
@@ -291,7 +343,8 @@ class QzoneVideoLedger:
         with self._transaction() as db:
             db.execute("UPDATE candidates SET status='posted',receipt_id=? WHERE candidate_id=?",
                        (str(tid), candidate_id))
-            self._patch_decision(db, candidate_id, {'posted_tid': str(tid), 'fact_sync': fact_sync})
+            self._patch_decision(db, candidate_id, {'posted_tid': str(tid), 'fact_sync': fact_sync,
+                                                    'fact_sync_attempts': 0})
 
     def record_uncertain(self, candidate_id: str, now: float, reason: str = '') -> None:
         with self._transaction() as db:
@@ -562,6 +615,202 @@ class QzoneVideoLedger:
             return db.execute(f"UPDATE assets SET status='released' WHERE asset_id IN ({marks}) "
                               "AND status='claimed'", ids).rowcount
 
+    # ------------------------------------------------------------------
+    # PR-A3 发布尝试幂等账本（视频→空间专用关联层；与 QzoneService._publish_ledger
+    # 两层都在，不互相替代）。UNIQUE(bvid,watched_generation,channel) 跨重启防重。
+    # ------------------------------------------------------------------
+    def claim_publish(self, candidate_id: str, bvid: str, watched_generation: str,
+                      now: float, *, channel: str = 'qzone') -> dict:
+        """事务认领一次发布尝试。同键已 sent/uncertain/sending（及保守视同在途的
+        claimed）→ 拒绝重发（duplicate）；rejected（确定未发/人工清除）→ 原地重置
+        为新 attempt（保留唯一键，不新建第二行）；无行 → 插入 claimed。满库保守拒收。
+        """
+        if not BV.fullmatch(str(bvid or '')) or not str(watched_generation or ''):
+            return {'status': 'blocked', 'reason': 'invalid_identity'}
+        with self._transaction() as db:
+            old = db.execute(
+                'SELECT * FROM publish_attempts WHERE bvid=? AND watched_generation=? AND channel=?',
+                (str(bvid), str(watched_generation), str(channel))).fetchone()
+            if old is not None:
+                if old['status'] in ATTEMPT_ACTIVE_STATUSES:
+                    return {'status': 'duplicate', 'attempt': dict(old)}
+                # rejected：确定未发（released/人工核验清除）→ 允许重新评估后再发一次
+                attempt_id = 'qva_' + uuid.uuid4().hex
+                db.execute(
+                    "UPDATE publish_attempts SET attempt_id=?,candidate_id=?,status='claimed',"
+                    "request_key='',receipt_tid='',reason='',created_at=?,finished_at=NULL "
+                    'WHERE bvid=? AND watched_generation=? AND channel=?',
+                    (attempt_id, str(candidate_id), now, str(bvid), str(watched_generation), str(channel)))
+                return {'status': 'claimed', 'attempt_id': attempt_id}
+            if db.execute('SELECT count(*) FROM publish_attempts').fetchone()[0] >= ATTEMPT_CAPACITY:
+                return {'status': 'blocked', 'reason': 'receipt_capacity'}
+            attempt_id = 'qva_' + uuid.uuid4().hex
+            db.execute(
+                'INSERT INTO publish_attempts(attempt_id,candidate_id,bvid,watched_generation,'
+                "channel,status,created_at) VALUES(?,?,?,?,?,'claimed',?)",
+                (attempt_id, str(candidate_id), str(bvid), str(watched_generation), str(channel), now))
+            return {'status': 'claimed', 'attempt_id': attempt_id}
+
+    def mark_attempt_sending(self, attempt_id: str, request_key: str, now: float) -> bool:
+        """分发前写 request_key（=post_moment preview key）并置 sending（仅 claimed→sending）。"""
+        with self._transaction() as db:
+            return db.execute(
+                "UPDATE publish_attempts SET status='sending',request_key=? "
+                "WHERE attempt_id=? AND status='claimed'",
+                (str(request_key or '')[:160], str(attempt_id))).rowcount == 1
+
+    def finish_attempt(self, attempt_id: str, status: str, now: float, *,
+                       receipt_tid: str = '', reason: str = '') -> bool:
+        """收尾一次尝试（仅 claimed/sending→终态；终态不被覆盖，幂等）。"""
+        if status not in ('sent', 'uncertain', 'rejected'):
+            raise ValueError('无效发布尝试终态')
+        with self._transaction() as db:
+            return db.execute(
+                'UPDATE publish_attempts SET status=?,receipt_tid=?,reason=?,finished_at=? '
+                "WHERE attempt_id=? AND status IN ('claimed','sending')",
+                (status, str(receipt_tid or '')[:160], clean(reason, 300), now, str(attempt_id))).rowcount == 1
+
+    def attempt_row(self, attempt_id: str) -> dict | None:
+        with self._connection() as db:
+            row = db.execute('SELECT * FROM publish_attempts WHERE attempt_id=?',
+                             (str(attempt_id),)).fetchone()
+            return dict(row) if row is not None else None
+
+    def attempts_overview(self) -> dict:
+        with self._connection() as db:
+            return {r['status']: r['n'] for r in db.execute(
+                'SELECT status,count(*) n FROM publish_attempts GROUP BY status')}
+
+    def interrupted_attempts(self) -> list[dict]:
+        """只读：崩溃残留的非终态尝试（claimed/sending），供启动恢复。"""
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM publish_attempts WHERE status IN ('claimed','sending') "
+                'ORDER BY created_at').fetchall()
+            return [dict(r) for r in rows]
+
+    def terminal_attempts(self) -> list[dict]:
+        """只读：终态尝试（sent/rejected），供启动恢复对账候选/资产（uncertain 由人工运维）。"""
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM publish_attempts WHERE status IN ('sent','rejected') "
+                'ORDER BY created_at').fetchall()
+            return [dict(r) for r in rows]
+
+    def uncertain_attempts(self, limit: int = 50) -> list[dict]:
+        """只读 uncertain 回执（附候选标题），供管理员诊断；绝不修改。"""
+        with self._connection() as db:
+            rows = db.execute(
+                'SELECT a.*, c.facts_json FROM publish_attempts a '
+                'LEFT JOIN candidates c ON c.candidate_id=a.candidate_id '
+                "WHERE a.status='uncertain' ORDER BY a.created_at DESC LIMIT ?",
+                (max(1, int(limit)),)).fetchall()
+            out = []
+            for row in rows:
+                item = dict(row)
+                facts_raw = item.pop('facts_json', None)
+                title = ''
+                try:
+                    title = str((json.loads(facts_raw) if facts_raw else {}).get('title') or '')
+                except (ValueError, TypeError):
+                    title = ''
+                item['title'] = clean(title, 120)
+                out.append(item)
+            return out
+
+    def resolve_uncertain_attempt(self, attempt_id: str, now: float) -> dict:
+        """管理员人工核验确未送达后清除一条 uncertain 回执。
+
+        标记 rejected（reason=manual_verified_unsent，保留审计行不删证据）；该代
+        claimed 资产 released；候选可重新评估一次（deferred，manual_cleared_once 防
+        无限再评；已清除过或已过期 → 终态）。**不自动恢复发送**（再发仍走完整门控）。
+        """
+        with self._transaction() as db:
+            row = db.execute('SELECT * FROM publish_attempts WHERE attempt_id=?',
+                             (str(attempt_id),)).fetchone()
+            if row is None:
+                return {'success': False, 'reason': 'not_found'}
+            if row['status'] != 'uncertain':
+                return {'success': False, 'reason': 'not_uncertain', 'status': row['status']}
+            db.execute("UPDATE publish_attempts SET status='rejected',reason='manual_verified_unsent',"
+                       'finished_at=? WHERE attempt_id=? AND status=\'uncertain\'', (now, str(attempt_id)))
+            db.execute("UPDATE assets SET status='released' WHERE task_id=? AND status='claimed'",
+                       (row['watched_generation'],))
+            cand = db.execute('SELECT * FROM candidates WHERE candidate_id=?',
+                              (row['candidate_id'],)).fetchone()
+            candidate_status = ''
+            if cand is not None and cand['status'] == 'uncertain':
+                decision = json.loads(cand['decision_json'])
+                if decision.get('manual_cleared_once') or cand['expires_at'] <= now:
+                    candidate_status = 'rejected' if decision.get('manual_cleared_once') else 'expired'
+                    db.execute('UPDATE candidates SET status=? WHERE candidate_id=?',
+                               (candidate_status, row['candidate_id']))
+                else:
+                    candidate_status = 'deferred'
+                    db.execute("UPDATE candidates SET status='deferred',next_eval_at=? WHERE candidate_id=?",
+                               (now, row['candidate_id']))
+                decision.update({'manual_cleared_once': True, 'manual_cleared_attempt': str(attempt_id),
+                                 'manual_clear_reason': 'manual_verified_unsent'})
+                db.execute('UPDATE candidates SET decision_json=? WHERE candidate_id=?',
+                           (json.dumps(decision, ensure_ascii=False), row['candidate_id']))
+            return {'success': True, 'bvid': row['bvid'], 'candidate_id': row['candidate_id'],
+                    'candidate_status': candidate_status}
+
+    def release_claimed_for_task(self, task_id: str) -> int:
+        """该代 claimed 资产 → released（发布成功/人工清除后消费）。"""
+        with self._transaction() as db:
+            return db.execute("UPDATE assets SET status='released' WHERE task_id=? AND status='claimed'",
+                              (str(task_id),)).rowcount
+
+    def unclaim_for_task(self, task_id: str) -> int:
+        """该代 claimed 资产 → available（确定未发，解除 claim 可再试）。"""
+        with self._transaction() as db:
+            return db.execute("UPDATE assets SET status='available' WHERE task_id=? AND status='claimed'",
+                              (str(task_id),)).rowcount
+
+    def claimed_assets_with_candidates(self) -> list[dict]:
+        """只读：claimed 资产连同其候选状态（启动恢复三态判定用）。"""
+        with self._connection() as db:
+            rows = db.execute(
+                'SELECT a.asset_id,a.task_id,c.status AS candidate_status '
+                "FROM assets a LEFT JOIN candidates c ON c.task_id=a.task_id "
+                "WHERE a.status='claimed' ORDER BY a.created_at").fetchall()
+            return [dict(r) for r in rows]
+
+    def delete_asset_row(self, asset_id: str) -> None:
+        """删一条资产行与文件（启动恢复：rejected/expired 候选的 claimed 证据清理）。"""
+        if not isinstance(asset_id, str) or not ASSET_ID.fullmatch(asset_id):
+            return
+        with self._transaction() as db:
+            db.execute('DELETE FROM assets WHERE asset_id=?', (asset_id,))
+        self._unlink_asset_file(asset_id)
+
+    # ---- PR-A3 事实回写有界重试 ----
+    def pending_fact_sync(self, limit: int = FACT_SYNC_RETRY_PER_TICK) -> list[dict]:
+        """只读：posted 且 fact_sync=pending、重试未超限的候选（有界扫描）。"""
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM candidates WHERE status='posted' ORDER BY created_at DESC LIMIT 64").fetchall()
+            out = []
+            for row in rows:
+                cand = self._candidate(row)
+                decision = cand.get('decision') or {}
+                if str(decision.get('fact_sync') or '') != 'pending':
+                    continue
+                if int(decision.get('fact_sync_attempts', 0)) >= FACT_SYNC_MAX_ATTEMPTS:
+                    continue
+                out.append(cand)
+                if len(out) >= max(1, int(limit)):
+                    break
+            return out
+
+    def record_fact_sync_result(self, candidate_id: str, state: str, attempts: int) -> None:
+        if state not in ('ok', 'pending', 'failed'):
+            raise ValueError('无效事实同步状态')
+        with self._transaction() as db:
+            self._patch_decision(db, candidate_id,
+                                 {'fact_sync': state, 'fact_sync_attempts': max(0, int(attempts))})
+
 
 class QzoneVideoBridge:
     """Candidate intake + shadow-only LLM decisions, with injected business ports."""
@@ -570,7 +819,7 @@ class QzoneVideoBridge:
                  persona_provider, state_provider, task_provider, clock, day, logger,
                  post_moment=None, check_post_gates=None, posts_today=None,
                  daily_max_posts=None, list_my_moments=None, send_ambiguous=None,
-                 now_dt=None, append_fact=None):
+                 now_dt=None, append_fact=None, preview_key=None):
         self.ledger = ledger
         self._config = config_provider
         self._qzone_enabled = qzone_enabled_provider
@@ -590,6 +839,10 @@ class QzoneVideoBridge:
         self._send_ambiguous = send_ambiguous       # () -> bool（区分 uncertain vs 确定未发）
         self._now_dt = now_dt                       # () -> datetime（门控复检用业务时区现在）
         self._append_fact = append_fact             # async (text, attempt) -> reply（仅 bot 自身上下文）
+        # PR-A3：preview key 计算端口（注入；integrations 不反向 import qzone，边界门禁口径）。
+        # (text, images, visibility) -> str（=post_moment preview key）；缺省 None → request_key 留空，
+        # 幂等仍由 UNIQUE(bvid,watched_generation,channel) 保证（生产装配恒注入真实 preview_post）。
+        self._preview_key = preview_key
         self._lock = asyncio.Lock()
 
     def _mode(self) -> str:
@@ -742,8 +995,103 @@ class QzoneVideoBridge:
                     if str((candidate.get('decision') or {}).get('action') or '') != 'post':
                         continue
                     published.append(await self.publish(candidate))
+            # PR-A3 事实回写有界重试：posted 且 fact_sync=pending 的候选 tick 重试 ≤3 次；
+            # provider 缺省 → no-op 留 pending（不烧重试次数；真实 bot 自身流接点留 B1）。
+            fact_sync = await self._retry_fact_sync()
             return {'status': 'ok', 'expired': expired, 'evaluated': evaluated,
-                    'actions': actions, 'assets': assets, 'published': published}
+                    'actions': actions, 'assets': assets, 'published': published,
+                    'fact_sync': fact_sync}
+
+    async def _retry_fact_sync(self) -> dict:
+        """有界重试事实回写（≤FACT_SYNC_MAX_ATTEMPTS 次）；仍失败留 failed 不再试。"""
+        report = {'retried': 0, 'synced': 0, 'failed': 0}
+        if self._append_fact is None:
+            return report  # provider 缺省 no-op：留 pending，不烧重试次数（B1 接线前）
+        pending = await asyncio.to_thread(self.ledger.pending_fact_sync, FACT_SYNC_RETRY_PER_TICK)
+        for candidate in pending:
+            decision = candidate.get('decision') or {}
+            tid = str(decision.get('posted_tid') or candidate.get('receipt_id') or '')
+            attempts = int(decision.get('fact_sync_attempts', 0)) + 1
+            report['retried'] += 1
+            state = await self._write_fact(candidate, tid)
+            cid = str(candidate.get('candidate_id') or '')
+            if state == 'ok':
+                await asyncio.to_thread(self.ledger.record_fact_sync_result, cid, 'ok', attempts)
+                report['synced'] += 1
+            elif attempts >= FACT_SYNC_MAX_ATTEMPTS:
+                await asyncio.to_thread(self.ledger.record_fact_sync_result, cid, 'failed', attempts)
+                report['failed'] += 1
+                if self._log is not None:
+                    self._log.warning('空间视频事实回写重试超限（留痕不再试）: candidate=%s tid=%s attempts=%s',
+                                      cid, tid, attempts)
+            else:
+                await asyncio.to_thread(self.ledger.record_fact_sync_result, cid, 'pending', attempts)
+        return report
+
+    async def on_start(self) -> dict:
+        """启动恢复（装配后调用）：崩溃残留不盲重发、素材不误删、全部留痕。
+
+        1) 终态尝试对账（sent→候选 posted+资产 released；rejected+候选 evaluated→解除 claim）；
+        2) 非终态尝试（claimed/sending）→ uncertain + 候选 uncertain（不盲重发，留人工核对）；
+        3) claimed 资产三态：候选 posted→released、uncertain→保持 claimed（保证据）、
+           rejected/expired→删文件（无候选引用的 claimed 保守保持并留痕）；
+        4) pending/deferred/evaluated 过期检查；reserved 无引用清理（A1 构造已做，此处复核）。
+        """
+        now = self._now()
+        report = {'reconciled': 0, 'uncertain': 0, 'assets_released': 0,
+                  'assets_kept': 0, 'assets_deleted': 0, 'expired': 0}
+        # 1) 终态对账（崩溃窗口：finish 已落盘但候选/资产未收尾）
+        for attempt in await asyncio.to_thread(self.ledger.terminal_attempts):
+            cid = str(attempt.get('candidate_id') or '')
+            task_id = str(attempt.get('watched_generation') or '')
+            cand = await asyncio.to_thread(self.ledger.get_candidate, cid)
+            if attempt.get('status') == 'sent':
+                if cand is not None and cand.get('status') != 'posted':
+                    tid = str(attempt.get('receipt_tid') or '')
+                    await asyncio.to_thread(self.ledger.release_claimed_for_task, task_id)
+                    await asyncio.to_thread(self.ledger.record_posted, cid, tid, now, fact_sync='pending')
+                    report['reconciled'] += 1
+                    self._log_gate_skip(cid, f'启动恢复：尝试已 sent（tid={tid}），对齐 posted')
+            elif attempt.get('status') == 'rejected':
+                if cand is not None and cand.get('status') == 'evaluated':
+                    released = await asyncio.to_thread(self.ledger.unclaim_for_task, task_id)
+                    if released:
+                        report['reconciled'] += 1
+                        self._log_gate_skip(cid, '启动恢复：尝试确定未发，解除资产 claim')
+        # 2) 非终态尝试 → uncertain（claimed 保守视同未知，不盲重发；规格 §1/§2）
+        for attempt in await asyncio.to_thread(self.ledger.interrupted_attempts):
+            cid = str(attempt.get('candidate_id') or '')
+            reason = ('startup_recovery_predispatch' if attempt.get('status') == 'claimed'
+                      else 'startup_recovery_sending')
+            await asyncio.to_thread(self.ledger.finish_attempt, str(attempt.get('attempt_id')),
+                                    'uncertain', now, reason=reason)
+            cand = await asyncio.to_thread(self.ledger.get_candidate, cid)
+            if cand is not None and cand.get('status') not in ('posted', 'rejected', 'expired'):
+                await asyncio.to_thread(self.ledger.record_uncertain, cid, now, '重启恢复：发布结果未知')
+            report['uncertain'] += 1
+            self._log_gate_skip(cid, f'启动恢复：尝试 {attempt.get("status")}→uncertain（不盲重发）')
+        # 3) claimed 资产三态（候选 posted/uncertain/rejected+expired）
+        for row in await asyncio.to_thread(self.ledger.claimed_assets_with_candidates):
+            state = str(row.get('candidate_status') or '')
+            aid = str(row.get('asset_id'))
+            if state == 'posted':
+                await asyncio.to_thread(self.ledger.release_claimed_for_task, str(row.get('task_id')))
+                report['assets_released'] += 1
+            elif state == 'uncertain':
+                report['assets_kept'] += 1  # 人工核对前保证据，绝不删
+            elif state in ('rejected', 'expired'):
+                await asyncio.to_thread(self.ledger.delete_asset_row, aid)
+                report['assets_deleted'] += 1
+                self._log_gate_skip(aid, f'启动恢复：候选 {state}，删除 claimed 素材')
+            else:
+                report['assets_kept'] += 1  # 无候选/异常引用：保守保持，留痕待核
+                self._log_gate_skip(aid, '启动恢复：claimed 素材无明确候选归属，保守保持')
+        # 4) 过期检查 + reserved 无引用复核（A1 构造已清理，此处幂等复核）
+        report['expired'] = await asyncio.to_thread(self.ledger.expire, now)
+        await asyncio.to_thread(self.ledger._recover_assets)
+        if self._log is not None:
+            self._log.info('空间视频启动恢复完成: %s', report)
+        return report
 
     # ---- PR-A2 发布（完整门控；图片硬性要求；三态结果；绝不绕既有门控/账本）----
     def _publish_ready(self) -> bool:
@@ -786,14 +1134,26 @@ class QzoneVideoBridge:
             await asyncio.to_thread(self.ledger.defer_publish, cid, now + GATE_RETRY_SECONDS)
             self._log_gate_skip(cid, reason)
             return {'status': 'gate_rejected', 'reason': reason}
-        # 闸 3：资产核验 + claim（任一缺失 → 拒绝本次视频帖，绝不纯文本/随机配图）
+        # 闸 3（PR-A3）：发布尝试事务认领——同键已 sent/uncertain/sending → 拒绝重发。
+        # 本账本是「视频→空间」专用幂等关联层，post_moment 内部防重仍保持（两层都在）。
         task_id = str(candidate.get('task_id') or '')
+        bvid = str(candidate.get('bvid') or '')
+        claim = await asyncio.to_thread(self.ledger.claim_publish, cid, bvid, task_id, now)
+        if claim.get('status') == 'duplicate':
+            return await self._align_duplicate(cid, task_id, claim.get('attempt') or {}, now)
+        if claim.get('status') != 'claimed':
+            await asyncio.to_thread(self.ledger.defer_publish, cid, now + GATE_RETRY_SECONDS)
+            self._log_gate_skip(cid, f"发布尝试认领被拒（{claim.get('reason')}）")
+            return {'status': 'gate_rejected', 'reason': str(claim.get('reason') or 'attempt_blocked')}
+        attempt_id = str(claim['attempt_id'])
+        # 闸 4：资产核验 + claim（任一缺失 → 拒绝本次视频帖，绝不纯文本/随机配图）
         max_assets = max(1, int(getattr(self._config(), 'max_assets_per_video', 2)))
         raw_ids = decision.get('asset_ids')
         asset_ids = [str(a) for a in raw_ids if isinstance(a, str) and ASSET_ID.fullmatch(a)] \
             if isinstance(raw_ids, list) else []
         asset_ids = list(dict.fromkeys(asset_ids))[:max_assets]
         if not asset_ids:
+            await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'rejected', now, reason='高清资产不可用')
             await asyncio.to_thread(self.ledger.record_publish_rejected, cid, now, '高清资产不可用')
             self._log_gate_skip(cid, '高清资产不可用（未选定资产）')
             return {'status': 'rejected', 'reason': '高清资产不可用'}
@@ -801,6 +1161,7 @@ class QzoneVideoBridge:
         for aid in asset_ids:
             row = rows.get(aid)
             if row is None or row.get('status') != 'available' or str(row.get('task_id')) != task_id:
+                await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'rejected', now, reason='高清资产不可用')
                 await asyncio.to_thread(self.ledger.record_publish_rejected, cid, now, '高清资产不可用')
                 self._log_gate_skip(cid, '高清资产不可用（缺失/状态不符）')
                 return {'status': 'rejected', 'reason': '高清资产不可用'}
@@ -808,6 +1169,7 @@ class QzoneVideoBridge:
         claimed = await asyncio.to_thread(self.ledger.claim_assets, asset_ids, task_id)
         if len(claimed) != len(asset_ids):
             await asyncio.to_thread(self.ledger.unclaim_assets, claimed)
+            await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'rejected', now, reason='高清资产不可用')
             await asyncio.to_thread(self.ledger.record_publish_rejected, cid, now, '高清资产不可用')
             self._log_gate_skip(cid, '高清资产不可用（claim 失败）')
             return {'status': 'rejected', 'reason': '高清资产不可用'}
@@ -820,17 +1182,33 @@ class QzoneVideoBridge:
                 data = b''
             if not data or hashlib.sha256(data).hexdigest() != str(rows[aid].get('sha256')):
                 await asyncio.to_thread(self.ledger.unclaim_assets, claimed)
+                await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'rejected', now, reason='高清资产不可用')
                 await asyncio.to_thread(self.ledger.record_publish_rejected, cid, now, '高清资产不可用')
                 self._log_gate_skip(cid, '高清资产不可用（文件缺失/校验不符）')
                 return {'status': 'rejected', 'reason': '高清资产不可用'}
             images.append(data)
-        # 闸 4：独立文案调用（仅已核验事实；失败 → 解除 claim 延后一次，不发空帖）
+        # 闸 5：独立文案调用（仅已核验事实；失败 → 解除 claim 延后一次，不发空帖）
         text = await self._caption(candidate, decision)
         if not text:
             await asyncio.to_thread(self.ledger.unclaim_assets, claimed)
+            await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'rejected', now, reason='caption_failed')
             outcome = await asyncio.to_thread(self.ledger.record_publish_deferred, cid, now, RELEASE_RETRY_SECONDS)
             self._log_gate_skip(cid, '文案生成失败（确定未发）')
             return {'status': 'released', 'reason': 'caption_failed', 'next': outcome}
+        # 分发前写 request_key（=post_moment preview key，经注入端口计算）并置 sending
+        # （崩溃残留 → 启动恢复 uncertain）。端口缺省留空：幂等仍由唯一键保证。
+        request_key = ''
+        if self._preview_key is not None:
+            try:
+                request_key = str(self._preview_key(text, images, 1) or '')
+            except Exception:
+                request_key = ''
+        if not await asyncio.to_thread(self.ledger.mark_attempt_sending, attempt_id, request_key, now):
+            await asyncio.to_thread(self.ledger.unclaim_assets, claimed)
+            await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'rejected', now, reason='attempt_state_changed')
+            outcome = await asyncio.to_thread(self.ledger.record_publish_deferred, cid, now, RELEASE_RETRY_SECONDS)
+            self._log_gate_skip(cid, '发布尝试状态已变化（确定未发）')
+            return {'status': 'released', 'reason': 'attempt_state_changed', 'next': outcome}
         # 发布：require_images=True（空图/图全挂确定未发，绝不纯文本）；可见性沿用默认公开 ugc_right=1
         try:
             result = await self._post_moment(text, images=images, require_images=True)
@@ -838,28 +1216,50 @@ class QzoneVideoBridge:
             raise
         except Exception:
             # 发布层异常：结果不可确认 → 保守 uncertain（不自动重发，留人工核对）
+            await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'uncertain', now, reason='发布调用异常')
             await asyncio.to_thread(self.ledger.record_uncertain, cid, now, '发布调用异常')
             self._log_gate_skip(cid, '发布调用异常（uncertain，不自动重发）')
             return {'status': 'uncertain'}
         if isinstance(result, dict) and result.get('tid'):
             tid = str(result['tid'])
+            await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'sent', now, receipt_tid=tid)
             await asyncio.to_thread(self.ledger.consume_assets, claimed)
             fact_sync = await self._write_fact(candidate, tid)
             await asyncio.to_thread(self.ledger.record_posted, cid, tid, now, fact_sync=fact_sync)
             if self._log is not None:
-                self._log.info('空间视频说说已发布: bvid=%s tid=%s fact_sync=%s（candidate=%s）',
-                               candidate.get('bvid', ''), tid, fact_sync, cid)
+                self._log.info('空间视频说说已发布: bvid=%s tid=%s fact_sync=%s（candidate=%s attempt=%s）',
+                               candidate.get('bvid', ''), tid, fact_sync, cid, attempt_id)
             return {'status': 'posted', 'tid': tid, 'fact_sync': fact_sync}
         # 返回 None：区分 uncertain（可能已发）vs 确定未发（released）
         ambiguous = bool(self._send_ambiguous()) if self._send_ambiguous is not None else True
         if ambiguous:
+            await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'uncertain', now, reason='发布结果待核对')
             await asyncio.to_thread(self.ledger.record_uncertain, cid, now, '发布结果待核对')
             self._log_gate_skip(cid, '发布结果待核对（uncertain，不自动重发）')
             return {'status': 'uncertain'}
+        await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'rejected', now, reason='确定未发')
         await asyncio.to_thread(self.ledger.unclaim_assets, claimed)
         outcome = await asyncio.to_thread(self.ledger.record_publish_deferred, cid, now, RELEASE_RETRY_SECONDS)
         self._log_gate_skip(cid, '确定未发（released，资产解除 claim）')
         return {'status': 'released', 'next': outcome}
+
+    async def _align_duplicate(self, cid: str, task_id: str, existing: dict, now: float) -> dict:
+        """同键尝试已存在 → 绝不重发；按既有终态保守对齐候选（崩溃窗口对账）。"""
+        state = str(existing.get('status') or '')
+        if state == 'sent':
+            tid = str(existing.get('receipt_tid') or '')
+            await asyncio.to_thread(self.ledger.release_claimed_for_task, task_id)
+            await asyncio.to_thread(self.ledger.record_posted, cid, tid, now, fact_sync='pending')
+            self._log_gate_skip(cid, f'幂等账本已 sent（tid={tid}），对齐 posted，不重发')
+            return {'status': 'posted', 'tid': tid, 'fact_sync': 'pending', 'recovered': True}
+        if state == 'uncertain':
+            await asyncio.to_thread(self.ledger.record_uncertain, cid, now, '幂等账本已存在 uncertain 回执')
+            self._log_gate_skip(cid, '幂等账本已 uncertain，不重发（留人工核对）')
+            return {'status': 'uncertain'}
+        # claimed/sending：另一发布在途 → 延后复检，不触碰其资产/状态
+        await asyncio.to_thread(self.ledger.defer_publish, cid, now + GATE_RETRY_SECONDS)
+        self._log_gate_skip(cid, f'幂等账本在途（{state}），延后复检不重发')
+        return {'status': 'duplicate', 'reason': 'in_flight'}
 
     def _log_gate_skip(self, candidate_id: str, reason: str) -> None:
         if self._log is not None:

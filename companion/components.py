@@ -69,6 +69,7 @@ from companion.harass_report import (
 from companion.patrol import resolve_silence_window
 from .rolling_diag import render_rolling
 from integrations.video_share_diag import render_share
+from integrations.qzone_video_diag import render_qzone_video
 from .streams_diag import build_streams_records
 from core.diag import DecisionLogger
 from core.storage import load_json, save_json_atomic
@@ -2214,3 +2215,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     def _lbm_life_share(self, args: str) -> str:
         """`/lbm_life share` 视频分享运维主体；实现见 integrations/video_share_diag.py。"""
         return render_share(self, args)
+
+    def _lbm_life_qzone_video(self, args: str) -> str:
+        """`/lbm_life qzone_video` 空间视频运维主体（PR-A3）；实现见 integrations/qzone_video_diag.py。"""
+        return render_qzone_video(self, args)

@@ -318,11 +318,17 @@ class QzoneService:
 
     # ---- 说说读写 ----
     async def post_moment(self, text: str, *, images: Optional[List[bytes]] = None,
-                          ugc_right: int = 1, require_images: bool = False) -> Optional[Dict[str, Any]]:
+                          ugc_right: int = 1, require_images: bool = False,
+                          enforce_daily_limit: bool = False) -> Optional[Dict[str, Any]]:
         """Serialize publishing and persist intent before dispatch; never replay uncertainty.
 
         ``require_images``（PR-A2，默认 False 逐字保持普通说说基线）：True 时图片为硬性
         要求——空图/图全挂确定未发（返回 None，不置 ``_send_ambiguous``），绝不退纯文本。
+
+        ``enforce_daily_limit``（PR-A3，默认 False 逐字保持手动/命令直发基线）：True 时
+        在发布锁内复检共享每日额度——两套自动触发器（日程普通说说 + 视频候选）共用同一
+        把 ``_publish_lock`` 串行分发，锁内复检消除「先查额度后分发」的 TOCTOU 竞争，
+        保证并发不超额（计划书 §8.1.7）。额度已用尽 → 确定未发（None，不置 ambiguous）。
         """
         if not str(text or "").strip():
             return None
@@ -339,6 +345,15 @@ class QzoneService:
                 return None
         preview = preview_post(text, images, visibility)
         async with self._publish_lock:
+            if enforce_daily_limit:
+                # PR-A3：锁内复检共享额度（分发串行点），并发触发器不抢额度、不超额。
+                cfg = self._qzone_cfg()
+                limit = int(getattr(cfg, "daily_max_posts", 0) or 0)
+                if limit > 0 and self.posts_today() >= limit:
+                    self._send_ambiguous = False
+                    self._log("skip", trigger_type="qzone_post",
+                              reason="共享每日额度已用尽（发布锁内复检，确定未发）")
+                    return None
             allowed, receipt = self._publish_ledger.begin(preview)
             if not allowed:
                 if receipt.get("status") == "sent":
@@ -591,7 +606,8 @@ class QzoneService:
             self._record_decision("skip", gate="generate", reason="文案生成失败")
             return False
         images = await self.collect_moment_images(text)
-        result = bool(await self.post_moment(text, images=images))
+        # PR-A3：自动日程路径与视频候选共享每日额度，锁内复检防并发超额（§8.1.7）。
+        result = bool(await self.post_moment(text, images=images, enforce_daily_limit=True))
         self._decision_history.add(
             action="send" if result else "skip", gate="post",
             reason=f"发表{'成功' if result else '失败'}（配图 {len(images)} 张）",

@@ -133,6 +133,11 @@ class QzoneComponentsMixin:
             # 实现集中在 integrations/video_share_diag.py，本分发表只加这一行。
             reply = (self._lbm_life_share(rest[0].strip() if rest else "") if admin
                      else "权限不足：仅管理员可用 /lbm_life share。")
+        elif sub == "qzone_video":
+            # PR-A3 空间视频运维：status 只读诊断，clear 经管理员显式确认清除 uncertain 回执。
+            # 实现集中在 integrations/qzone_video_diag.py，本分发表只加这一行（命令总数不变）。
+            reply = (self._lbm_life_qzone_video(rest[0].strip() if rest else "") if admin
+                     else "权限不足：仅管理员可用 /lbm_life qzone_video。")
         else:
             reply = f"未知子命令：{sub}\n{self._qz_help_text()}"
         await self.ctx.send.text(reply, stream_id)  # 命令回复必须显式发送
@@ -158,6 +163,7 @@ class QzoneComponentsMixin:
             "/lbm_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /lbm_diag life，行为相同\n"
             "/lbm_life rolling [status|state|episodes|spine|sleep|preview] - 滚动日程调试（管理员；纯只读）\n"
             "/lbm_life share [status|clear <id> confirm] - 视频分享运维（管理员；status 只读，clear 需核验确未送达）\n"
+            "/lbm_life qzone_video [status|clear <id> confirm] - 空间视频运维（管理员；status 只读，clear 需核验确未送达）\n"
             "/lbm_life help - 本帮助；日程与陪伴功能另有 /lbm_plan 与 /lbm_mai_* 命令"
         )
 
