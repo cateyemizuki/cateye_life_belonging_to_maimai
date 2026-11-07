@@ -406,3 +406,21 @@ body.fish-locked .fish-overlay[data-section=usage]{z-index:960}
  .usage-record-tokens{grid-column:1/-1;grid-row:3}
  .usage-record-outcome{grid-column:2;grid-row:1;align-items:flex-end}
 }
+/* ── 1B 当日活动概括横条（PR-WEBUI-TIMELINE，3.17.8）─────────────────────
+   容器宽度恒定代表 1440 分钟；段 left/width 由 JS 按 1440 比例定位，CSS 不改比例。
+   窄屏最小宽度保护：外层横滑（overflow-x:auto），内层 min-width 恒定。 */
+:root{--overview-planned:#c6ccd2}
+:root[data-theme=dark]{--overview-planned:#4a525a}
+.overview-card{margin-bottom:16px}
+.overview-scroll{overflow-x:auto}
+.overview-inner{min-width:560px}
+.overview-track{position:relative;height:30px;border:1px solid var(--maibot-border);border-radius:8px;background:var(--maibot-soft);overflow:hidden}
+.overview-track.overview-empty{background:var(--maibot-soft)}
+.overview-seg{position:absolute;top:0;bottom:0;min-height:0;min-width:0;padding:0;border:0;border-radius:0;cursor:pointer}
+.overview-seg:hover,.overview-seg:focus-visible{filter:brightness(1.12);outline:2px solid var(--maibot-primary);outline-offset:-2px;z-index:2}
+.overview-scale{display:flex;justify-content:space-between;font:10px var(--maibot-font-mono);color:var(--maibot-muted);margin-top:4px}
+#overview-note{margin-top:6px}
+/* 浮窗 position:fixed 挂 body（卡片 overflow:hidden 不裁剪），跟随段位、JS 钳制不出视口 */
+.overview-tooltip{position:fixed;z-index:90;max-width:min(280px,80vw);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);color:var(--maibot-foreground);border:1px solid var(--maibot-border);box-shadow:0 5px 20px #0003;border-radius:12px;padding:9px 11px;font-size:11px;line-height:1.7;pointer-events:none;overflow-wrap:anywhere}
+/* 1A 跨日标注 badge：沿用 rowbadge/vtime-badge 风格，虚线边框区分展示性标记 */
+.crossdaybadge{border:1px dashed var(--maibot-border);background:transparent}

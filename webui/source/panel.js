@@ -179,7 +179,9 @@ function scheduleFootprint(rows, day){
  const sorted=[...rows].sort((a,b)=>(num(a.actual_start_minute)??num(a.planned_start_minute)??Infinity)-(num(b.actual_start_minute)??num(b.planned_start_minute)??Infinity));
  const result=[];
  const validStart=row=>Number.isInteger(row.actual_start_minute)&&row.actual_start_minute>=0&&row.actual_start_minute<1440;
- const validEnd=row=>Number.isInteger(row.actual_end_minute)&&row.actual_end_minute>=row.actual_start_minute&&row.actual_end_minute<1440;
+ // 1A（3.17.8）：放宽到 <2880 让跨午夜 idle 条参与合并；合并仍要求同 schedule_date
+ // （sameDay 判定），跨日续段 schedule_date=前一日，不会与今日行合并。
+ const validEnd=row=>Number.isInteger(row.actual_end_minute)&&row.actual_end_minute>=row.actual_start_minute&&row.actual_end_minute<2880;
  for(const row of sorted){
   const run=result.at(-1), prev=run?.idleSegments?.at(-1)??run;
   const gap=prev&&validEnd(prev)&&validStart(row)?row.actual_start_minute-prev.actual_end_minute:null;
@@ -314,8 +316,111 @@ async function moveSchedulePage(step){
 }
 $('schedule-prev').onclick=()=>moveSchedulePage(-1);
 $('schedule-next').onclick=()=>moveSchedulePage(1);
+// ── 1B 当日活动概括横条（PR-WEBUI-TIMELINE，3.17.8）──────────────────────
+// 纯展示：固定 24h（容器宽度恒定代表 1440 分钟，不按活动量缩放）；类型固定色
+// （写死常量，确定性映射，不随机）；未滚动计划段=意图区间对当日 episode 区间求
+// 差集后染计划灰；真实空闲如实留白不伪造；不触发任何调度/刷新副作用。
+const OVERVIEW_COLORS={sleep:'#5b6ee1',rest:'#8a9df0',idle:'#9aa5b1',meal:'#e8a13c',work:'#3d8bfd',exercise:'#2fbf71',entertainment:'#e05fa0',daily_routine:'#4fb8c9',social:'#8f6fe8',free_time:'#67c98f',watch:'#c9a227',game:'#ef7d3a',leisure:'#58b89a',social_maintenance:'#b085e0',activity:'#4a90d9',transition:'#8a8f98'};
+// 中文旧值归一（生产历史脏值）；未知 goal_type 走兜底固定色。
+const OVERVIEW_ALIASES={'放松':'rest','休息':'rest','娱乐':'entertainment','日常吃饭':'meal'};
+const OVERVIEW_FALLBACK='#7a8288';
+const overviewColor=goal=>OVERVIEW_COLORS[OVERVIEW_ALIASES[goal]||goal]||OVERVIEW_FALLBACK;
+// 「此刻」分钟：data.generated_at 在快照时区的当日分钟（钳制 ≤1440）；active
+// episode end=None 时渲染到此刻；无法解析 → null（该段不渲染，不伪造）。
+function snapshotMinute(){const d=date(data?.generated_at);if(!d)return null;try{const parts=new Intl.DateTimeFormat('en-GB',{timeZone:data?.timezone||'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(d);const h=Number(parts.find(p=>p.type==='hour').value),m=Number(parts.find(p=>p.type==='minute').value);return Number.isFinite(h)&&Number.isFinite(m)?Math.max(0,Math.min(1440,h*60+m)):null}catch{return null}}
+// 区间差集：[a,b] 减去若干覆盖区间（覆盖区间可重叠/乱序），返回剩余子区间。
+function overviewUncovered(a,b,covered){let parts=[[a,b]];for(const[ca,cb]of covered){const next=[];for(const[pa,pb]of parts){if(cb<=pa||ca>=pb){next.push([pa,pb]);continue}if(ca>pa)next.push([pa,ca]);if(cb<pb)next.push([cb,pb])}parts=next;if(!parts.length)break}return parts}
+let overviewTip=null,overviewTipOwner=null;
+function overviewHideTip(){if(overviewTip)overviewTip.hidden=true;overviewTipOwner=null}
+// 浮窗跟随段位、不出视口（position:fixed，独立于 infoTip 实现）。
+function overviewPlaceTip(node){
+ const r=node.getBoundingClientRect(),width=Math.min(280,innerWidth-24);
+ overviewTip.style.width=width+'px';
+ const height=overviewTip.getBoundingClientRect().height;
+ overviewTip.style.left=Math.max(12,Math.min(innerWidth-width-12,r.left+r.width/2-width/2))+'px';
+ let top=r.bottom+8;if(top+height>innerHeight-12)top=Math.max(12,r.top-height-8);
+ overviewTip.style.top=top+'px';
+}
+function overviewShowTip(node,lines){
+ if(!overviewTip){overviewTip=el('div','overview-tooltip');overviewTip.setAttribute('role','tooltip');document.body.append(overviewTip)}
+ overviewTip.replaceChildren(...lines.map(line=>el('div','',line)));
+ overviewTip.hidden=false;overviewTipOwner=node;
+ overviewPlaceTip(node);
+}
+function overviewTipLines(seg){
+ const row=seg.row;
+ if(seg.kind==='planned')return[row.name||'未命名意图',minute(seg.a)+' → '+minute(seg.b),'计划 · 未滚动'];
+ const start=num(row.actual_start_minute)??num(row.planned_start_minute);
+ const rawEnd=num(row.actual_end_minute);
+ const endText=row.status==='active'&&rawEnd===null?'此刻':minute(spanEnd(start,rawEnd??num(row.planned_end_minute)));
+ const lines=[row.name||'未命名活动',minute(start)+' → '+endText,source(row.source)+' · '+episodeLabel(row.status)];
+ if(row.cross_day_continuation)lines.push('跨日续段 · 原属 '+(row.schedule_date||'前一日'));
+ else if(row.crosses_midnight)lines.push('跨日');
+ return lines;
+}
+function renderActivityOverview(sch){
+ const box=$('activity-overview');if(!box)return;
+ overviewHideTip();
+ const day=selectedDay||sch.date||dayText(data?.generated_at);
+ text('overview-date',day);
+ const track=$('overview-track'),note=$('overview-note');
+ track.replaceChildren();
+ const episodes=Array.isArray(sch.episodes)?sch.episodes:[],intents=Array.isArray(sch.intents)?sch.intents:[];
+ const clamp=v=>Math.max(0,Math.min(1440,v)),nowMinute=snapshotMinute();
+ const segs=[];
+ for(const row of episodes){
+  const start=num(row.actual_start_minute)??num(row.planned_start_minute);
+  if(start===null)continue;
+  let end=num(row.actual_end_minute);
+  if(end===null&&row.status==='active')end=nowMinute;
+  if(end===null)end=num(row.planned_end_minute);
+  if(end===null)continue;
+  end=spanEnd(start,end)??end;
+  // 跨午夜原行当日段截到 1440；续段后端已投影为 0 起。left/width 恒按 1440 比例。
+  const a=clamp(start),b=clamp(end);
+  if(b>a)segs.push({a,b,row,kind:'episode'});
+ }
+ const covered=segs.map(seg=>[seg.a,seg.b]);
+ for(const row of intents){
+  const start=num(row.start_minute),rawEnd=num(row.end_minute);
+  if(start===null||rawEnd===null)continue;
+  const end=spanEnd(start,rawEnd)??rawEnd,a=clamp(start),b=clamp(end);
+  if(b<=a)continue;
+  for(const[pa,pb]of overviewUncovered(a,b,covered))segs.push({a:pa,b:pb,row,kind:'planned'});
+ }
+ // 计划灰在底层、实际色段覆盖其上；同层按 start 排序（重叠续段与今日行正常并列，不去重伪造）。
+ segs.sort((x,y)=>(x.kind==='planned'?0:1)-(y.kind==='planned'?0:1)||x.a-y.a);
+ for(const seg of segs){
+  const node=el('button','overview-seg '+seg.kind);node.type='button';
+  node.style.left=(seg.a/1440*100)+'%';
+  node.style.width=((seg.b-seg.a)/1440*100)+'%';
+  node.style.background=seg.kind==='planned'?'var(--overview-planned)':overviewColor(seg.row.goal_type);
+  const lines=overviewTipLines(seg);
+  node.setAttribute('aria-label',lines.join(' · '));
+  node.onmouseenter=()=>overviewShowTip(node,lines);
+  node.onmouseleave=overviewHideTip;
+  node.onfocus=()=>overviewShowTip(node,lines);
+  node.onblur=overviewHideTip;
+  // 移动端点按切换；桌面点击同样可固定/收起浮窗。沿用 infoTip 的 pointerdown 快照
+  // 口径：触屏 tap 会先派发兼容 mouseenter（已把浮窗弹出），若 click 再按「当前是否
+  // 打开」翻转会把第一次点按立刻收掉——故以 pointerdown 时刻的开关状态为准。
+  let pointerWasOpen=false;
+  node.onpointerdown=()=>{pointerWasOpen=Boolean(overviewTip&&!overviewTip.hidden&&overviewTipOwner===node)};
+  node.onclick=e=>{e.stopPropagation();pointerWasOpen?overviewHideTip():overviewShowTip(node,lines);pointerWasOpen=false};
+  node.onkeydown=e=>{if(e.key==='Escape'){overviewHideTip();node.blur()}};
+  track.append(node);
+ }
+ track.classList.toggle('overview-empty',!segs.length);
+ text('overview-note',segs.length?'':'暂无活动记录');
+}
+document.addEventListener('click',e=>{if(overviewTipOwner&&!overviewTipOwner.contains(e.target))overviewHideTip()});
+// 滚动时浮窗跟随段位重新定位（而非直接隐藏——hover 触发的伴随滚动会把刚弹出的
+// 浮窗立刻收掉）；段位已随重渲染移除则收起。
+window.addEventListener('scroll',()=>{if(overviewTipOwner&&overviewTip&&!overviewTip.hidden){overviewTipOwner.isConnected?overviewPlaceTip(overviewTipOwner):overviewHideTip()}},true);
+window.addEventListener('resize',overviewHideTip);
 function renderSchedule(){
  const sch=dayRows(),episodes=Array.isArray(sch.episodes)?sch.episodes:[],intents=Array.isArray(sch.intents)?sch.intents:[],summary=sch.summary||{};
+ renderActivityOverview(sch);
  const day=selectedDay||sch.date||dayText(data?.generated_at);
  const counts=[['completed_count','已完成'],['interrupted_count','已中断']].map(([k,l])=>l+' '+(summary[k]??'—'));
  text('episode-count',episodes.length+' 项记录');text('intent-count',intents.length+' 项意图');
@@ -343,6 +448,9 @@ function renderSchedule(){
    const rowend=el('div','rowendcol');
    if(actual&&row.draw_reason_zh)rowend.append(el('span','drawreason',row.draw_reason_zh));
    rowend.append(el('span','rowbadge',actual?episodeLabel(row.status):(row.goal_type==='sleep'?'作息参考':row.hardness==='hard'?'硬约定':'意图')));
+   // 1A（3.17.8）：跨日续段（前日溢出投影，00:00 起）/跨午夜原行（结束保留「次日」口径）标注。
+   if(actual&&row.cross_day_continuation)rowend.append(el('span','rowbadge crossdaybadge','跨日续段'));
+   else if(actual&&row.crosses_midnight)rowend.append(el('span','rowbadge crossdaybadge','跨日'));
    box.append(el('i','trackdot'),center,rowend);target.append(box);
   }
  }
@@ -734,6 +842,10 @@ function renderTimeline(){
   node.setAttribute('role','listitem');
   const body=el('div','vtime-body'),head=el('div','vtime-head');
   head.append(el('h3','',row.name||'未命名活动'),el('span','vtime-badge',fixed?(row.goal_type==='sleep'?'作息参考':'固定意图'):episodeLabel(row.status)));
+  // 1A（3.17.8）：续段时间显示 00:00→HH:MM（投影已 0 起），来源沿用 source()；
+  // 跨午夜原行结束时间保留 minute() 的「次日 HH:MM」口径，另加「跨日」badge。
+  if(!fixed&&row.cross_day_continuation)head.append(el('span','vtime-badge crossdaybadge','跨日续段'));
+  else if(!fixed&&row.crosses_midnight)head.append(el('span','vtime-badge crossdaybadge','跨日'));
   const origin=fixed?(row.origin==='archived'?'历史计划归档':'日计划'):source(row.source);
   body.append(head,el('p','note',minute(start)+separator+(active?'此刻':end===null?'待定':minute(end))+' · '+origin));
   if(row.idleSegments)body.append(idleRunDetails(row,open));

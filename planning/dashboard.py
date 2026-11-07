@@ -58,6 +58,53 @@ def _row(row: Any) -> dict[str, Any]:
     return result
 
 
+def _episode_view(row: Any) -> dict[str, Any]:
+    """episode 只读投影 + 跨午夜标记（PR-WEBUI-TIMELINE 1A，3.17.8）。
+
+    ``actual_end_minute>1440`` 的行附 ``crosses_midnight:True``——纯展示标记，
+    分钟值逐字不改（前端 minute() 对 >1440 已显示「次日 HH:MM」）。
+    """
+    view = _row(row)
+    end = view.get('actual_end_minute')
+    if isinstance(end, (int, float)) and end > 1440:
+        view['crosses_midnight'] = True
+    return view
+
+
+#: 单日跨日续段硬上限（1A 体量守卫，实施者择一：续段 ≤8 条硬上限）。续段只是
+#: 前一日行的展示投影，8 条足以覆盖真实跨午夜场景；与当日行合并后仍统一按 120 截断。
+CROSSDAY_CONTINUATION_CAP = 8
+
+
+def _crossday_continuations(db: Any, *, prev_day: str, read: Any) -> list[dict[str, Any]]:
+    """前一日跨午夜 episode → 当日溢出续段（只读投影；不改归属、不填真实 gap）。
+
+    只取 ``actual_end_minute>1440`` 且 ``actual_start_minute<1440`` 的行
+    （active 且 end=None 不算溢出）；投影为 0 起、end-1440 止，``schedule_date``
+    保留原日期（前端 idle 合并要求同 schedule_date，续段不会与今日行合并），
+    附 ``cross_day_continuation:True``。读失败走既有 read() 降级（warnings+空，不抛）。
+    """
+    rows = read('前日跨日活动暂不可读', lambda: db.episodes_today(prev_day), [])
+    continuations: list[dict[str, Any]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        start, end = row.get('actual_start_minute'), row.get('actual_end_minute')
+        if not (type(start) in (int, float) and type(end) in (int, float)):
+            continue
+        if not (end > 1440 and start < 1440):
+            continue
+        view = _row(row)
+        view.update(actual_start_minute=0, actual_end_minute=_number(end - 1440),
+                    planned_start_minute=0, planned_end_minute=_number(end - 1440),
+                    schedule_date=str(row.get('schedule_date') or prev_day)[:10],
+                    cross_day_continuation=True)
+        view['time_label'] = ' — '.join(format_day_minute(int(v)) for v in (0, end - 1440))
+        continuations.append(view)
+    continuations.sort(key=lambda item: item['actual_end_minute'])
+    return continuations[:CROSSDAY_CONTINUATION_CAP]
+
+
 def _event_slot_label(row: dict[str, Any]) -> str:
     """事件时段展示标签（3.17.7 改进2，只读投影）：生成事件 → 自身 time_slot；
     内置事件 allowed_slots 覆盖全部三段 → 『全天』，收窄 → 以 / 连接；无信息 → ''。"""
@@ -373,11 +420,18 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
     if not isinstance(episode_rows, list):
         episode_rows = []
     episode_total = len(episode_rows)
+    # 1A（3.17.8）：前一日跨午夜溢出续段插头部（start=0 自然在前）；续段计入
+    # 120 体量口径（先合并再截断），自身另有 ≤8 条硬上限（见 _crossday_continuations）。
+    # summary.episode_count 仍按当日真实行计（续段是展示投影，不进 KPI）。
+    prev_day = (day_date - timedelta(days=1)).isoformat()
+    continuations = _crossday_continuations(db, prev_day=prev_day, read=read) if ready else []
+    merged_episodes = continuations + [_episode_view(row) for row in episode_rows[:120]]
+    display_total = episode_total + len(continuations)
     keep_raw = getattr(getattr(cfg, 'life_state', None), 'keep_episode_days', 14)
     keep_days = keep_raw if type(keep_raw) is int and not isinstance(keep_raw, bool) and keep_raw > 0 else 14
     footprint = {
-        'episodes': [_row(row) for row in episode_rows[:120]],
-        'total': episode_total, 'truncated': episode_total > 120,
+        'episodes': merged_episodes[:120],
+        'total': display_total, 'truncated': display_total > 120,
         'retention_days': keep_days,
         'retention_expired': day_date < today - timedelta(days=keep_days),
     }
@@ -665,6 +719,13 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
         observations.append('睡眠债仍在，后续完整睡眠会逐步偿还。')
     if enabled and not ready:
         warnings.append('日程运行态尚未就绪')
+    # 1A（3.17.8）：今日快照路径与 day 视图同口径——跨午夜原行带 crosses_midnight，
+    # 前一日（now.date()-1）溢出续段插头部，合并后按 120 截断（续段 ≤8 硬上限）。
+    today_episodes = [_episode_view(row) for row in today.get('episodes', [])[-120:]]
+    if ready and db:
+        prev_day = (now.date() - timedelta(days=1)).isoformat()
+        today_episodes = (_crossday_continuations(db, prev_day=prev_day, read=read)
+                          + today_episodes)[:120]
     result = {
         'schema_version': 1, 'generated_at': now.isoformat(), 'timezone': tz_name,
         'window_hours': hours, 'state': safe_state, 'state_available': bool(state),
@@ -674,7 +735,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
                      'pools': _schedule_pools(ctx.planning, model, now, read) if ready else {},
                      'current': _row(current) if current else None,
                      'intents': [_row(row) for row in today.get('intents', [])[:80]],
-                     'episodes': [_row(row) for row in today.get('episodes', [])[-120:]],
+                     'episodes': today_episodes,
                      'summary': {key: _number(today.get('summary', {}).get(key)) for key in
                                  ('intent_count', 'episode_count', 'completed_count', 'interrupted_count', 'abandoned_count')}},
         'sleep': {'current': safe_sleep, 'sessions': sessions[:8],

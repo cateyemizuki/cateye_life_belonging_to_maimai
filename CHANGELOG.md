@@ -1,5 +1,12 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.8（2026-11-08）
+
+- PR-WEBUI-TIMELINE（日程 WebUI 改进计划书第一步 1A+1B，纯展示层，不影响调度/滚动/门控）：①跨午夜 episode 渲染修复；②当日活动概括横条。
+- **①跨午夜渲染修复（1A）**：`planning/dashboard.py` 新增 `_episode_view`（`actual_end_minute>1440` 附 `crosses_midnight:True` 只读标记，分钟值不改）与 `_crossday_continuations`（读前一日 `episodes_today`，筛 end>1440 且 start<1440 的行投影为 0 起续段：`actual/planned_start=0`、`end-1440` 止、保留原 `schedule_date`、附 `cross_day_continuation:True`；active end=None 不算溢出；读失败走既有 read() 降级 warnings+空不抛）；day 视图与今日快照路径同口径追加续段到 episodes 头部，续段 ≤8 条硬上限且计入 120 体量口径（先合并再截断；KPI 仍按当日真实行计）。不改 schedule_db 查询语义、不改 episode 归属、不填真实 gap（生产 00:02–01:02 时区 bug 残留 gap 如实留白）。前端 `panel.js` `scheduleFootprint` validEnd 放宽 `<2880`（合并仍要求同 schedule_date，续段不与今日行合并）；行程记录/垂直时间线对续段显示「跨日续段」badge（00:00→HH:MM，来源沿用 source()）、跨午夜原行追加「跨日」badge（结束保留「次日 HH:MM」口径）；续段与今日行重叠按 start 排序正常并列不去重。
+- **②当日活动概括横条（1B）**：日程页顶部新增 `#activity-overview`（index.template.html + panel.js + panel.css）：固定 24h 时间轴（容器宽度恒定代表 1440 分钟，段 left=start/1440、width=(end-start)/1440，钳制 [0,1440]，跨午夜原行当日段截到 1440），下方刻度 00/06/12/18/24；goal_type 确定性固定色常量表 `OVERVIEW_COLORS`（16 规范类型各一色）+ 中文别名归一 `OVERVIEW_ALIASES`（放松/休息→rest、娱乐→entertainment、日常吃饭→meal）+ 未知兜底固定色；intents 未滚动段按分钟区间对当日 episodes（含续段）求差集染计划灰 `--overview-planned`（底层），实际色段覆盖其上；active end=None 渲染到「此刻」（generated_at 当日分钟钳制 ≤1440）；空日浅灰底+「暂无活动记录」不伪造；悬停/点按浮窗（el() 纯文本构造，跟随段位不出视口，移动端点按切换）；窄屏最小宽度横滑（overflow-x:auto，段宽比例不变）；随 renderSchedule 重渲染，旧快照无 episodes/intents 降级空条，validateSnapshot 新字段可选不拒绝旧快照。
+- **红线保留**：纯展示不触发任何调度/刷新副作用；颜色映射确定性写死不随机；真实空闲如实留白不伪造。配置：无新增字段（schema 不变，18 段 203 叶子）。版本双号 3.17.8（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round 版本断言与打印、test_prompt_identity_audit 双号断言顺延；smoke R6 守卫读双号动态比对无需改字面量）。新增专项 `scratch/test_webui_timeline_3178.py`；`python tools/build_webui.py` 重建 index.html。边界：本批不部署、不 git commit、不碰主机、不切 mode。
+
 ## 3.17.7（2026-11-08）
 
 - PR-UI 三改进（日程页可读性，纯旁路展示，不影响调度）：①rolling 抽取原因人话化 `draw_reason_zh` 显示在行程记录右侧；②日程池列表右侧时段 badge；③缓存命中 chip 的 tooltip 单独改左侧展开防出框。
@@ -16,6 +23,12 @@
 - **②E_LLM 截断修复**：根因 = `_call_llm_once` 调 `generate_detailed` 不传 max_tokens（由宿主任务配置决定），16-24 段 9 事件需 ~999 completion tokens，宿主 max_tokens 不足 → finish_reason=length → JSON 截断 → parse 抛 EventPromptError → E_LLM。已查清宿主链路支持显式 override（SDK `ctx.llm.generate(max_tokens=...)` → 宿主 `llm.generate` capability `args.get("max_tokens")` → `_resolve_effective_max_tokens` 显式值优先于任务/模型配置）。修复：`core/llm_utils.py`/`tools/llm_gateway.py` generate/generate_detailed 增 `max_tokens` 透传（None=旧语义不变）；事件生成按 requested 动态有界 override `min(6000, max(2000, requested*220))`（`event_generation_max_tokens`；单段上限 24 条 → 5280，不触顶、不无界放大）。
 - **截断诊断增强**：`LLMResult.finish_reason` 透传（宿主回传时；现行宿主 payload 无此字段则空串）；parse 失败/空响应时若 finish_reason=length 或 completion_tokens 触顶本次发送的 max_tokens → 错误明示「输出被 max_tokens 截断…需增大上限」，不再笼统 general_error/生成响应不可用。
 - **红线保留**：每段配额 le=12 边界不变；时段过滤/一次性 claim/校验语义不变；池总量仍由配额天然 bounded；不牺牲事件质量（提示词/温度/校验逐字不变）。配置：schema 字段数不变（max_pool_events 本就非 Field，18 段 203 叶子）。版本双号 3.17.6（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁重钉（round 版本、smoke LEGACY_ROUTE_KEYS 字面量、test_prompt_identity_audit 双号、test_event_slots_390 派生上限断言 32→29）。新增专项 `scratch/test_event_poolcap_derive.py`；回归 test_event_slots_390 / test_event_catalog_slot_load / test_qzone_video_a0–a3 不回归；七门禁 7/7。边界：本批不部署、不 git commit、不碰主机、不切 mode。
+
+## 3.17.5（2026-11-08）
+
+- PR-MINSAMPLE 视频最小采样数 + 默认采样间隔改 10（用户需求：间隔切分不足最小采样数时按最小采样数平均抽样，保底短视频采样密度）。
+- `video_watch/config.py`：`sample_interval_seconds` 默认 25→10（ge5 le600 不变）；新增 `min_sample_count`（默认 16，ge1 le256，label「最小采样数」）。`video_watch/sampling.py`：`sample_plan(duration, interval=10, max_montages=16, min_samples=16)`，`count=max(ceil(duration/interval), min_samples)`（仍 ≥1）；超拼图上限仍拒绝并说明所需张数；timestamps 平均抽样口径不变；`capability(spec)` 哈希增 `min_sample_count`（采样几何变化→能力标记变化）。`service.py` visual spec 增 `min_sample_count`、interval 缺省同步 10；`worker.py` 透传 `min_samples`、缺省回退 10/16。旧 spec 缺字段缺省兼容。
+- 红线：不静默稀释采样；超拼图上限仍拒绝；采样几何确定性；不牺牲有界保护。配置：18 段 202→203 叶子（[video_watch]+1）。版本双号 3.17.5；门禁重钉（round/字段数 203/video_watch 段+1/test_prompt_identity_audit 双号）。新增专项 `scratch/test_video_min_sample.py`；回归 test_video_social / test_video_interest_offline / test_qzone_video_a1 / test_video_memory 不回归；七门禁 7/7。部署后主代理同步生产 config（sample_interval_seconds=10、min_sample_count=16）。
 
 ## 3.17.4（2026-11-08）
 
@@ -40,6 +53,13 @@
 - **planner 侧对齐**：`_target_prompt` 主动轮不再指认具体 msg_id，改为主动激活语义（保留「msg_id 只能选对方发送的消息」有效性约束与不回复选择）；`INJECT_PROACTIVE_TURN_RULE_DEFAULT` 去掉「优先回应对方最后一条发言」，改主动激活引导（仍经 prompt() 回退表读取）；深处理 `ProactiveReplyTargets.after` 主动轮跳过强制 msg_id（rewrite_reply_calls 保留为 utility），目标指令改写统一由 replyer 钩子完成。
 - 红线：仅陪伴目标私聊 + 主动激活轮生效；非主动轮（用户真实来信回复）逐字不变；预算/静默/好感/隐私门控不触碰；不新增命令/工具。
 - 配置：无新增字段（schema 不变，18 段 202 叶子）；`proactive_reply_target_mode` 字段保留、描述更新为 3.17.2 语义（浅/深均提示-only）。版本双号 3.17.2（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round：3.17.2；test_prompt_identity_audit 双号断言顺延）。新增专项 `scratch/test_proactive_reply_rewrite.py`；既有 `test_proactive_reply_target.py` 中断言旧「指认 msg_id/深处理强制改写」行为的用例按规格更新为主动激活语义预期。边界：本批不部署、不 git commit、不碰主机、不切 mode；部署后需真机主动触发验证 replyer 快照实际生效。
+
+## 3.17.1（2026-11-07）
+
+- PR-FIX-ASSET 修复空间视频判定 `asset_ids` 恒空（真机 bug：监视 dwfrun-0907a673 发现候选 qvc_504a 判定 action=post 但 asset_ids=[]，同 task 有 2 个 available 高清资产；额度重置后发布会因空 asset_ids 误拒「高清资产不可用」）。
+- **根因**：`QZONE_VIDEO_POLICY` 输出 Schema 写于 A0（资产功能之前），PR-A2 加了 asset_ids 解析却没更新提示词 → 模型从不输出 asset_ids → 恒空。
+- **修复**：`integrations/qzone_video_bridge.py` QZONE_VIDEO_POLICY 增 asset_ids 选择指令（只从 available 清单选、给出选择依据）；publish 路径增确定性回退选择（decision asset_ids 为空时按 available 资产确定性救活已判定候选，不编造资产）。
+- 红线：资产只从 available 清单选；require_images 硬性不变；uncertain 不自动重发。配置：无新增字段（schema 不变）。版本双号 3.17.1；门禁版本重钉。回归 test_qzone_video_a0–a3 不回归；七门禁 7/7。部署后待额度重置自然验证首条真实视频图文说说。
 
 ## 3.17.0（2026-11-07）
 
