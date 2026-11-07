@@ -32,6 +32,67 @@ def _host_now(host: Any) -> float:
     return time.time()
 
 
+def qzone_video_diag_payload(host: Any) -> dict:
+    """PR-D1（H10）：``/lbm_diag qzone_video`` 全链只读诊断投影。
+
+    零 LLM、零发送、零落盘：只读 ledger 快照/资产清单（id/尺寸/TTL，无路径）/
+    发布回执（含 uncertain）/事实同步状态，并复用 qzone DecisionHistory 聚合
+    「门控拒绝原因」（为什么发/不发）。未装配/读取失败如实降级，不编造数据。
+    """
+    service = getattr(host, '_qzone_video', None)
+    if service is None:
+        return {'available': False, 'reason': 'not_assembled'}
+    try:
+        ledger = service.ledger
+        snap = ledger.snapshot()
+        recent = []
+        for cand in (snap.get('candidates') or [])[:8]:
+            decision = cand.get('decision') or {}
+            recent.append({
+                'candidate_id': str(cand.get('candidate_id') or ''),
+                'bvid': str(cand.get('bvid') or ''),
+                'status': str(cand.get('status') or ''),
+                'action': str(decision.get('action') or ''),
+                'reason': str(decision.get('reason') or ''),
+                'evaluations': int(cand.get('evaluations') or 0),
+                'fact_sync': str(decision.get('fact_sync') or ''),
+            })
+        assets = ledger.assets_overview()
+        cfg = getattr(getattr(host, 'config', None), 'qzone_video', None)
+        payload = {
+            'available': True,
+            'mode': str(getattr(cfg, 'mode', 'shadow') or 'shadow'),
+            'candidate_states': snap.get('candidate_states', {}),
+            'recent_decisions': recent,
+            'assets': {'asset_states': assets.get('asset_states', {}),
+                       'total_bytes': assets.get('total_bytes', 0),
+                       'manifest': ledger.asset_manifest(20)},
+            'publish_attempts': snap.get('publish_attempts', {}),
+            'recent_receipts': ledger.recent_attempts(10),
+            'uncertain': [{'attempt_id': str(row.get('attempt_id') or ''),
+                           'bvid': str(row.get('bvid') or ''),
+                           'title': str(row.get('title') or ''),
+                           'created_at': row.get('created_at')}
+                          for row in ledger.uncertain_attempts(20)],
+            'fact_sync': snap.get('fact_sync', {}),
+        }
+    except Exception:
+        return {'available': False, 'reason': 'projection_unavailable'}
+    # 门控拒绝聚合（复用 qzone DecisionHistory；进程内 deque，热重载清零如实为空）
+    history = getattr(getattr(host, '_qzone', None), '_decision_history', None)
+    if history is not None and hasattr(history, 'rejection_summary'):
+        try:
+            payload['gate_rejections'] = history.rejection_summary()
+            payload['recent_gate_decisions'] = history.entries()[:5]
+        except Exception:
+            payload['gate_rejections'] = {}
+            payload['recent_gate_decisions'] = []
+    else:
+        payload['gate_rejections'] = {}
+        payload['recent_gate_decisions'] = []
+    return payload
+
+
 def render_qzone_video(host: Any, args: str) -> str:
     usage = (
         "用法: /lbm_life qzone_video <status|clear>（管理员）\n"

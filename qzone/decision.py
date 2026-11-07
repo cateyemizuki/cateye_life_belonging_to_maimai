@@ -106,6 +106,25 @@ class DecisionHistory:
         """最近一条记录；无记录返回 ``None``。"""
         return self._entries[0] if self._entries else None
 
+    def rejection_summary(self) -> Dict[str, Dict[str, Any]]:
+        """PR-D1（H10）：门控拒绝原因聚合（只读，零副作用）。
+
+        只统计 ``action='skip'`` 的判定，按 ``gate`` 计数；每闸附最近一次拒绝的
+        原因与时间（历史最新在前，首个命中即最近）。空 gate 归 ``unknown``。
+        供 /lbm_diag qzone_video 展示「为什么没发」；不修改历史。
+        """
+        summary: Dict[str, Dict[str, Any]] = {}
+        for entry in self._entries:
+            if str(entry.get("action") or "") != "skip":
+                continue
+            gate = str(entry.get("gate") or "") or "unknown"
+            row = summary.setdefault(gate, {"count": 0, "last_reason": "", "last_time": ""})
+            row["count"] += 1
+            if not row["last_reason"]:
+                row["last_reason"] = str(entry.get("reason") or "")[:200]
+                row["last_time"] = str(entry.get("time") or "")
+        return summary
+
     def format_text(self, limit: int = 10) -> str:
         """调试文本：每行 ``[HH:MM:SS] action｜闸=..｜活动=..｜原因｜LLM=..｜结果=..``。
 

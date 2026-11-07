@@ -48,9 +48,22 @@ function renderActiveTab(){
  if(activeTab==='history'){renderHistoryView();return}
  if(activeTab==='schedule'){renderSchedulePage();return}
  if(activeTab==='mood'){renderMood();return}
- if(activeTab==='system'){renderUsage();renderHealth();return}
+ if(activeTab==='system'){renderUsage();renderHealth();renderQzoneVideoChips();return}
  renderSleep();
 }
+// PR-D1（H10）：系统板块「空间视频候选/资产/回执」计数芯片——只读投影 data.qzone_video
+// （planning/dashboard._extension_summary），沿用既有 summarychips 组件风格，不重构页面；
+// 未装配/不可用 → 整块隐藏（不造假 0）。计数口径与 ledger snapshot/assets_overview 一致。
+function renderQzoneVideoChips(){const box=$('qzone-video-chips');if(!box)return;const qv=data?.qzone_video;
+ if(!qv||!qv.available){box.hidden=true;box.replaceChildren();return}
+ const sum=o=>Object.values(o||{}).reduce((a,b)=>a+(num(b)??0),0);
+ const detail=o=>Object.entries(o||{}).map(([k,v])=>`${k} ${count(v)}`).join(' · ');
+ const mb=num(qv.asset_total_bytes);
+ const chips=[`空间视频候选 ${count(sum(qv.candidate_states))}${detail(qv.candidate_states)?'（'+detail(qv.candidate_states)+'）':''}`,
+  `截图资产 ${count(sum(qv.asset_states))} 张 · ${mb===null?'—':(mb/1048576).toFixed(1)} MB`,
+  `发布回执 ${count(sum(qv.publish_attempts))}${detail(qv.publish_attempts)?'（'+detail(qv.publish_attempts)+'）':''}`,
+  `事实同步 ${detail(qv.fact_sync)||'暂无'}`];
+ box.hidden=false;box.replaceChildren(...chips.map(s=>el('span','',s)))}
 function dayView(){return data?.day?.available&&data.day.date===selectedDay?data.day:null}
 function lifeSeries(){return selectedDay?(dayView()?.state_history||{}):(data?.history||{})}
 function vadSeries(){return selectedDay?(dayView()?.vad_history||{}):(data?.emotion?.history||{})}

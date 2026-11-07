@@ -54,6 +54,10 @@ class PluginContext:
         return self.get("qzone")
 
     @property
+    def qzone_video(self) -> Any:
+        return self.get("qzone_video")
+
+    @property
     def emotion(self) -> Any:
         return self.get("emotion")
 

@@ -562,6 +562,27 @@ class QzoneVideoLedger:
             total = int(db.execute('SELECT COALESCE(SUM(bytes),0) FROM assets').fetchone()[0])
             return {'asset_states': counts, 'total_bytes': total}
 
+    def asset_manifest(self, limit: int = 20) -> list[dict]:
+        """PR-D1（H10）只读：资产清单（id/尺寸/字节/TTL/状态，**无路径、无 sha**），
+        供诊断展示；新→旧有界（limit 夹取 1..100）。零副作用。"""
+        with self._connection() as db:
+            rows = db.execute(
+                'SELECT asset_id,bvid,width,height,bytes,status,created_at,expires_at '
+                'FROM assets ORDER BY created_at DESC,asset_id DESC LIMIT ?',
+                (max(1, min(100, int(limit))),)).fetchall()
+            return [dict(r) for r in rows]
+
+    def recent_attempts(self, limit: int = 10) -> list[dict]:
+        """PR-D1（H10）只读：最近发布回执（含 uncertain；无路径），新→旧有界
+        （limit 夹取 1..100）。与 uncertain_attempts 互补：这里覆盖全部状态。"""
+        with self._connection() as db:
+            rows = db.execute(
+                'SELECT attempt_id,candidate_id,bvid,status,receipt_tid,reason,'
+                'created_at,finished_at FROM publish_attempts '
+                'ORDER BY created_at DESC,attempt_id DESC LIMIT ?',
+                (max(1, min(100, int(limit))),)).fetchall()
+            return [dict(r) for r in rows]
+
     # ---- PR-A2 发布前资产选择/核验/claim ----
     def available_assets(self, task_id: str) -> list[dict]:
         """只读：该候选 task 的 available 资产清单（id/时间点/尺寸，**不含路径/sha**），供模型选。"""

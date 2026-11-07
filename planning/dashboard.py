@@ -723,7 +723,9 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
         else:
             # Independent projections must never trap the read handler in a size loop.
             result.update(emotion={'available': False, 'reason': 'payload_limit'},
-                          qzone={'available': False, 'reason': 'payload_limit'}, usage={}, health={})
+                          qzone={'available': False, 'reason': 'payload_limit'},
+                          qzone_video={'available': False, 'reason': 'payload_limit'},
+                          usage={}, health={})
             if result.get('day') is not None:
                 result['day'] = {'available': False, 'reason': 'payload_limit'}
             break
@@ -735,7 +737,7 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
                        usage_rows_offset: int = 0) -> dict[str, Any]:
     """Independent module projections; never propagate raw event descriptions/logs."""
     result: dict[str, Any] = {'emotion': {'available': False}, 'qzone': {'available': False},
-                              'usage': {}, 'health': {}}
+                              'qzone_video': {'available': False}, 'usage': {}, 'health': {}}
     ctx = PluginContext(plugin)
     try:
         service = getattr(ctx.emotion, 'service', None)
@@ -767,6 +769,25 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
                                  'cookie_health', 'delivery', 'last_post_at', 'cooldown_minutes')}}
     except Exception:
         result['qzone'] = {'available': False, 'reason': 'projection_unavailable'}
+    # PR-D1（H10）：空间视频候选/资产/回执计数投影（只读；系统板块计数芯片数据源）。
+    # 未装配/读取失败 → available=False 如实降级；只暴露计数与状态分布，不含路径/正文。
+    try:
+        bridge = ctx.qzone_video
+        if bridge is not None:
+            snap = bridge.ledger.snapshot()
+            assets = bridge.ledger.assets_overview()
+            cfg = getattr(getattr(plugin, 'config', None), 'qzone_video', None)
+            result['qzone_video'] = {
+                'available': True,
+                'mode': str(getattr(cfg, 'mode', 'shadow') or 'shadow'),
+                'candidate_states': snap.get('candidate_states', {}),
+                'publish_attempts': snap.get('publish_attempts', {}),
+                'fact_sync': snap.get('fact_sync', {}),
+                'asset_states': assets.get('asset_states', {}),
+                'asset_total_bytes': assets.get('total_bytes', 0),
+            }
+    except Exception:
+        result['qzone_video'] = {'available': False, 'reason': 'projection_unavailable'}
     try:
         from core.monitoring import usage_summary, runtime_health
         data_dir = ctx.data_dir

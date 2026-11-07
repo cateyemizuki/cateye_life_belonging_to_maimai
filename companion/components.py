@@ -69,7 +69,7 @@ from companion.harass_report import (
 from companion.patrol import resolve_silence_window
 from .rolling_diag import render_rolling
 from integrations.video_share_diag import render_share
-from integrations.qzone_video_diag import render_qzone_video
+from integrations.qzone_video_diag import render_qzone_video, qzone_video_diag_payload
 from .streams_diag import build_streams_records
 from core.diag import DecisionLogger
 from core.storage import load_json, save_json_atomic
@@ -131,15 +131,17 @@ _DIAG_REASON_LABELS: dict[str, str] = {
     "tool_send_message": "planner 通过 Tool 主动发消息",
 }
 
-#: /lbm_diag 用法帮助（无参数或未知子命令时原样回复；五行，含旧名别名对应关系）。
+#: /lbm_diag 用法帮助（无参数或未知子命令时原样回复；含旧名别名对应关系）。
+#: PR-D1（H10）：追加 qzone_video 只读子输出（命令总数不变，仍是同一个 /lbm_diag）。
 _DIAG_USAGE_TEXT = (
-    "用法: /lbm_diag <llm|decision|life|streams|video_share> [天数]（管理员）\n"
+    "用法: /lbm_diag <llm|decision|life|streams|video_share|qzone_video> [天数]（管理员）\n"
     "  llm [天数]      — LLM 调用日志，合并转发（1~30 天；旧名 /lbm_mai_llm_log）\n"
     "  decision [天数] — 主动行为决策日志，合并转发（1~30 天；旧名 /lbm_mai_diag）\n"
     "  life [天数]     — 决策日志紧凑文本（1~7 天；旧名 /lbm_life diag）\n"
     "  streams [序号]  — 主动候选流与名单状态；带序号只看该流早/晚安触发状态"
     "（今日最后一条非命令消息时间）\n"
-    "  video_share     — 视频分享决策、发送回执与事实同步状态（仅目标私聊或本地）"
+    "  video_share     — 视频分享决策、发送回执与事实同步状态（仅目标私聊或本地）\n"
+    "  qzone_video     — 空间视频全链只读诊断：候选状态/最近决策及原因/资产清单/发布回执（含 uncertain）/事实同步/门控拒绝聚合"
 )
 
 #: 注入作用域（2026-10-10 注入矩阵：目标私聊 / 含陪伴用户的群聊 / 跳过）
@@ -1254,11 +1256,12 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         pattern=r"(?<!\S)/lbm_diag(?:\s+(?P<diag_args>.*?))?\s*$"
                 r"|(?<!\S)(?P<legacy_llm>/lbm_mai_llm_log)(?:\s+(?P<llm_days>\S+))?\s*$"
                 r"|(?<!\S)(?P<legacy_decision>/lbm_mai_diag)(?:\s+(?P<mai_days>\S+))?\s*$",
-        description="排障诊断合一：/lbm_diag [llm|decision|life|streams|video_share] [天数]"
+        description="排障诊断合一：/lbm_diag [llm|decision|life|streams|video_share|qzone_video] [天数]"
                     "（旧名 mai_llm_log/mai_diag/life diag 保留为别名）",
     )
     async def mai_cmd_diag(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        """A5 排障四合一：llm / decision / life / streams 子命令 + 旧命令名别名直达。
+        """A5 排障合一：llm / decision / life / streams / video_share / qzone_video
+        子命令 + 旧命令名别名直达（qzone_video 为 PR-D1 H10 只读子输出，命令总数不变）。
 
         输出与旧三件套完全同构（llm = 旧 /lbm_mai_llm_log、decision = 旧
         /lbm_mai_diag、life = 旧 /lbm_life diag 紧凑文本）；旧名由
@@ -1303,6 +1306,14 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 payload['experience_index']={'status':'unavailable'}
             await self._diag_reply(stream_id,'视频独立分享诊断\n'+_json.dumps(payload,ensure_ascii=False,indent=1)[:10000])
             return True,'视频分享诊断已发送',True
+        if sub == 'qzone_video':
+            # PR-D1（H10）：既有 /lbm_diag 挂只读子输出（命令总数不变）——候选状态
+            # 分布/最近决策及原因/资产清单（id/尺寸/TTL，无路径）/发布回执（含
+            # uncertain）/事实同步/门控拒绝聚合。零 LLM、零发送、零落盘；鉴权沿用
+            # 顶部 admin 判定（与 /lbm_life qzone_video status 同口径，无聊天正文）。
+            payload = qzone_video_diag_payload(self)
+            await self._diag_reply(stream_id,'空间视频全链诊断（只读）\n'+_json.dumps(payload,ensure_ascii=False,indent=1)[:10000])
+            return True,'空间视频诊断已发送',True
         if sub == "llm":
             return await self._diag_llm_log(stream_id, self._diag_parse_days_arg(raw_days))
         if sub == "decision":

@@ -173,6 +173,25 @@ NEUTRAL_MOOD_EFFECT: Dict[str, Any] = {
     "intent_hint": "",
 }
 
+#: PR-D1（H9）：主题记忆有界读取——B1 索引 published/qzone_posted recent ≤5
+#: （与 A2 文案防复读 CAPTION_RECENT_LIMIT 同口径）；不新建表，复用 B1。
+THEME_RECENT_LIMIT = 5
+#: PR-D1：主题摘要合并去重后的总行数上限（索引 ≤5 + 自己说说 ≤5，有界不拖挂 prompt）
+THEME_BLOCK_MAX_LINES = 8
+#: PR-D1：公开/私密分域防御过滤——含这些标记的摘要绝不进空间公开 prompt
+#: （B1 正常不存聊天正文；此为写入方失守时的第二道闸，保守宁缺毋滥）。
+_PRIVATE_MARKERS = ("私聊", "群聊")
+#: PR-D1：主题块稳定规则前缀（规则前置、事实变量后置；3.9.1 前缀缓存口径）。
+#: 红线措辞：记得自己发过 ≠ 别人看过/点赞过；跨渠道独立表达不混淆接收者。
+QZONE_THEME_BLOCK_HEADER = (
+    "【近期自己的空间主题】以下是你自己已在空间公开发布的内容事实"
+    "（记得自己发过≠别人看过或点赞过，不要声称任何人的浏览/点赞/评论反馈）。\n"
+    "避免自我复读：不重复同样的措辞与内容；允许主题自然延续——"
+    "连续几天对同一兴趣可以递进出新角度、新进展，而不是原样重发。\n"
+    "这里只面向空间公开读者：不提及私聊/群聊里的人与内容；"
+    "聊天里分享过什么与空间发过什么是两回事，各自独立表达、不混淆接收者。"
+)
+
 
 class QzoneService:
     def __init__(
@@ -849,6 +868,56 @@ class QzoneService:
                       reason=f"配图收集为空（{mode.strip().lower()}），发纯文本")
         return images
 
+    async def _recent_theme_lines(self) -> List[str]:
+        """PR-D1（H9）：近期自己空间主题的只读摘要行（稳定顺序：索引新→旧，再说说列表序）。
+
+        来源只有两处（跨渠道分域）：
+        - B1 经历索引 ``published/qzone_posted`` recent ≤5（空间发布事实；不消费
+          watched_video/聊天分享等其它渠道事实，不混淆接收者）；
+        - 既有 ``list_my_moments`` 有界读取 ≤5（A2 已接的同源端口；``is_private``
+          的仅自己可见合并不进公开 prompt）。
+        隐私红线：含私聊/群聊标记的摘要一律过滤（第二道闸）。索引缺失/开关关闭/
+        读取失败/说说列表失败 → 对应来源空降级，绝不拖挂文案生成。零副作用。
+        """
+        lines: List[str] = []
+        seen: set = set()
+
+        def _add(text: Any) -> None:
+            summary = str(text or "").strip()[:120]
+            if not summary or summary in seen:
+                return
+            if any(marker in summary for marker in _PRIVATE_MARKERS):
+                return
+            seen.add(summary)
+            lines.append(summary)
+
+        index = getattr(self._plugin, "_experience_index", None)
+        if index is not None:
+            enabled = True
+            checker = getattr(self._plugin, "_experience_enabled", None)
+            if callable(checker):
+                try:
+                    enabled = bool(checker())
+                except Exception:
+                    enabled = False  # 开关不可读保守不消费（与 B1 消费口同口径）
+            if enabled:
+                try:
+                    rows = index.recent(kinds=["qzone_posted"], limit=THEME_RECENT_LIMIT)
+                except Exception:
+                    rows = []
+                for row in rows or []:
+                    # 防御复核：只认 published 层（平台明确成功回执），其它真伪层不进。
+                    if isinstance(row, dict) and str(row.get("type") or "") == "published":
+                        _add(row.get("summary"))
+        try:
+            moments = await self.list_my_moments(num=THEME_RECENT_LIMIT)
+        except Exception:
+            moments = []
+        for moment in moments or []:
+            if isinstance(moment, dict) and not moment.get("is_private"):
+                _add(moment.get("content"))
+        return lines[:THEME_BLOCK_MAX_LINES]
+
     async def generate_moment_text(self, date: str, now: datetime) -> str:
         activity = self._schedule.find_current_activity(date, now)
         # PR8 3.0.0（规则 6）：find_current_activity runtime-only——日程关断时占位描述
@@ -868,6 +937,13 @@ class QzoneService:
         mood_line = self._mood_line("请让这条说说的语气与心情保持一致")
         if mood_line:
             prompt = f"{prompt}\n{mood_line}"
+        # PR-D1（H9）：近期自己空间主题摘要（变量区末尾追加；稳定规则前缀 + 事实行后置）。
+        # 空索引/空说说 → 不注入，prompt 与旧行为一致（空降级）；防复读/自然延续规则
+        # 同时写在 QZONE_POST_DEFAULT 稳定模板里，定制模板丢占位也不丢规则底线。
+        theme_lines = await self._recent_theme_lines()
+        if theme_lines:
+            prompt = (f"{prompt}\n{QZONE_THEME_BLOCK_HEADER}\n"
+                      + "\n".join(f"- {line}" for line in theme_lines))
         # 人设经 with_identity 以宿主同款开头注入 system_prompt（共享前缀缓存）；
         # lover_name/personality 渲染传空，兼容旧定制模板残留占位（防 KeyError 回退）。
         text = await self._llm.generate(

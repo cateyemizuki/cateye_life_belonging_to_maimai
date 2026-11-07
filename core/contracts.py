@@ -156,4 +156,5 @@ PLUGIN_ATTR_CONTRACT = frozenset({
     "_personality",       # 陪伴对象人设
     "_plugin_root",       # 插件根目录
     "_attention",         # 注意力租约/忙闲观测
+    "_qzone_video",       # 空间视频候选桥（PR-D1 H10：面板只读计数投影）
 })

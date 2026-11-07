@@ -1,5 +1,13 @@
 # 更新日志（CHANGELOG）
 
+## 3.16.0（2026-11-07）
+
+- PR-D1 空间多日主题延续与全链诊断（计划书 H9/H10 / §7 PR-D1 / §8.2.6，视频×空间拟人化升级计划最后一个 PR）。
+- **多日主题延续（H9）**：`qzone/service.py` 日程发帖文案 `generate_moment_text` 变量区末尾注入「近期自己的空间主题」摘要块——来源仅两处且跨渠道分域：B1 经历索引 `published/qzone_posted` recent ≤5（不新建表；防御复核只认 published 层）+ 既有 `list_my_moments` 有界读取 ≤5（`is_private` 仅自己可见合并不进公开 prompt）；合并去重、单行 ≤120 字、总行数 ≤8（THEME_BLOCK_MAX_LINES，保守裁量 needsReview）；含「私聊/群聊」标记的摘要第二道闸过滤。规则双保险：防复读/自然递进延续/不泄露私聊/「记得自己发过≠别人看过或点赞过」写进 `QZONE_POST_DEFAULT` 稳定模板，主题块头（QZONE_THEME_BLOCK_HEADER）重申规则后才列事实行（稳定前缀逐字不变、变量后置）。空索引/未装配/开关关闭/读取失败 → 不注入，prompt 与旧行为逐字一致；聊天分享事实（video_social）与观看事实不进空间主题。
+- **全链诊断（H10）**：既有 `/lbm_diag` 挂 `qzone_video` 只读子输出（命令总数不变）——候选状态分布、最近决策及原因（为什么发/不发）、资产清单（id/尺寸/字节/TTL，无路径无 sha）、发布回执（含 uncertain）、事实同步状态、门控拒绝原因聚合（新增 `DecisionHistory.rejection_summary()`，复用既有判定历史；进程内 deque 热重载清零如实为空）。实现：`integrations/qzone_video_diag.py` 新增 `qzone_video_diag_payload`（零 LLM/零发送/零落盘，未装配/失败如实降级）；`QzoneVideoLedger` 新增只读端口 `asset_manifest`/`recent_attempts`（有界 1..100）。
+- **WebUI 系统板块**：候选/资产/回执/事实同步计数芯片（沿用既有 summarychips 组件风格，不重构页面）——`planning/dashboard.py` 新增 `qzone_video` 只读投影（只暴露计数与状态分布，不含路径/正文；payload_limit 兜底同步降级），`webui/source/panel.js` + `index.template.html` 加 `qzone-video-chips` 并经 `tools/build_webui.py` 重建 `webui/index.html`；不可用整块隐藏不造假 0。组合根契约登记 `_qzone_video`（core/contracts.py + PluginContext 具名属性，守卫 #8 口径）。
+- 配置：无新增字段（18 段 202 叶子不变）。版本双号 3.16.0（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁重钉（round：3.16.0；behavior：/lbm_diag 用法帮助 6→7 行 + qzone_video 路由/降级断言）。新增专项 `scratch/test_qzone_theme_d1.py`（18 例：稳定前缀/规则在 prompt/私密过滤/跨渠道独立/空降级/有界去重/开关关闭/published 复核/诊断只读零副作用/uncertain 展示/资产无路径/门控聚合/决策可解释/事实同步/降级/WebUI 计数与 ledger 一致/前端与命令接线）。七门禁 7/7 + 专项 18 例 + 回归 a0/a1/a2/a3/b1/b2/c1/c2/c3 全绿。边界：本批不部署、不 git commit。
+
 ## 3.15.0（2026-11-07）
 
 - PR-C3 动态睡眠与硬意图一致性回归加固（计划书 H6 / §5.5 / §5.6 / §7 PR-C3）。**现状核查先行**：3.8.0 已落地 P1–P3（免睡不补睡眠意图、睡眠行 hardness 统一 hard、WebUI「作息参考」独立标注、commitment_hardness=hard 核验门槛、睡眠锚点不参与硬约定唤醒），§5.6 明确不重复开发——本批**零睡眠引擎行为改动**，以回归测试加固为主。
