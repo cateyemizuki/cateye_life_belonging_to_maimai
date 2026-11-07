@@ -43,10 +43,13 @@ class VideoWatchSectionConfig(PluginConfigBase):
         default="seek", description="seek：尽快按时间点抽帧；paced：按真实播放时间逐点采样。两者均单任务、低优先级、单解码线程。",
         json_schema_extra={"label": "采样节奏"})
     sample_interval_seconds: int = Field(
-        default=25, ge=5, le=600, description="每隔多少秒取一帧；不静默稀释采样。预计帧数=向上取整(视频秒数/间隔)，每16帧拼一张图片。",
+        default=10, ge=5, le=600, description="每隔多少秒取一帧；不静默稀释采样。预计帧数=向上取整(视频秒数/间隔)与最小采样数取较大值，每16帧拼一张图片。",
         json_schema_extra={"label": "采样间隔（秒）"})
+    min_sample_count: int = Field(
+        default=16, ge=1, le=256, description="按间隔切分不足此帧数时，按此数平均抽样（短视频/短间隔保底采样密度）；不超过拼图上限容量",
+        json_schema_extra={"label": "最小采样数"})
     visual_max_montages: int = Field(
-        default=16, ge=1, le=32, description="最终最多向视觉模型提交多少张拼图（每张4×4帧）；超出先拒绝并说明所需张数。默认25秒间隔、16张可容纳约106分钟。只记录实际Token，不推算或限制输出Token。",
+        default=16, ge=1, le=32, description="最终最多向视觉模型提交多少张拼图（每张4×4帧）；超出先拒绝并说明所需张数。默认10秒间隔、16张可容纳约42分钟。只记录实际Token，不推算或限制输出Token。",
         json_schema_extra={"label": "最多提交拼图数"})
 
     cache_retention_days: int = Field(

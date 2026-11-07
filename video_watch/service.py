@@ -103,7 +103,8 @@ class VideoWatchService:
                 spec = {
                     "source_mode": str(getattr(self._config(), "source_mode", "stream")),
                     "sampling_mode": str(getattr(self._config(), "sampling_mode", "seek")),
-                    "interval_seconds": self._int_of("sample_interval_seconds", 25),
+                    "interval_seconds": self._int_of("sample_interval_seconds", 10),
+                    "min_sample_count": self._int_of("min_sample_count", 16),
                     "max_montages": self._int_of("visual_max_montages", 16),
                     "max_download_mb": self._int_of("visual_max_download_mb", 256),
                 }

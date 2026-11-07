@@ -12,19 +12,26 @@ TILES_PER_IMAGE = 16
 MAX_IMAGE_BYTES = 256 * 1024
 
 
-def sample_plan(duration: float, interval: int = 25, max_montages: int = 16) -> dict:
-    if not math.isfinite(float(duration)) or duration <= 0 or interval <= 0 or max_montages <= 0:
+def sample_plan(duration: float, interval: int = 10, max_montages: int = 16,
+                min_samples: int = 16) -> dict:
+    if (not math.isfinite(float(duration)) or duration <= 0 or interval <= 0
+            or max_montages <= 0 or min_samples <= 0):
         raise ValueError("视频时长或采样配置无效")
-    count = max(1, math.ceil(duration / interval))
+    # 3.17.5 PR-MINSAMPLE：按间隔切分不足最小采样数时，按最小采样数平均抽样
+    # （保底采样密度，不静默稀释）；timestamps 仍为确定性均匀时间点。
+    count = max(1, math.ceil(duration / interval), min_samples)
     images = math.ceil(count / TILES_PER_IMAGE)
     if images > max_montages:
-        raise ValueError(f"按每{interval}秒采样需{count}帧、{images}张拼图，超过{max_montages}张上限；可明确调大采样间隔或拼图上限")
+        raise ValueError(f"按每{interval}秒采样、最小采样数{min_samples}需{count}帧、{images}张拼图，"
+                         f"超过{max_montages}张上限；可明确调大采样间隔、调小最小采样数或调大拼图上限")
     return {"frame_count": count, "montage_count": images,
             "timestamps": [round(duration * (i + .5) / count, 3) for i in range(count)]}
 
 
 def capability(spec: dict) -> str:
-    params = {k: spec.get(k) for k in ("source_mode", "sampling_mode", "interval_seconds", "max_montages")}
+    # 3.17.5 PR-MINSAMPLE：min_sample_count 改变采样几何 → 纳入能力标记哈希。
+    params = {k: spec.get(k) for k in ("source_mode", "sampling_mode", "interval_seconds",
+                                       "max_montages", "min_sample_count")}
     return "montage-v3-" + hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:10]
 
 

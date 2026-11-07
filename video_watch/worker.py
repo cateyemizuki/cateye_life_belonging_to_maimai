@@ -538,8 +538,9 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path, deadline_epoch: float
         return {"status": "failed", "reason": "未知媒体读取/采样模式", "capability": cap}
     try:
         plan = sample_plan(float(video.get("duration_seconds") or 0),
-                           int(cfg.get("interval_seconds") or 25),
-                           min(32, max(1, int(cfg.get("max_montages") or 16))))
+                           int(cfg.get("interval_seconds") or 10),
+                           min(32, max(1, int(cfg.get("max_montages") or 16))),
+                           min_samples=int(cfg.get("min_sample_count") or 16))
     except ValueError as exc:
         return {"status": "failed", "reason": str(exc), "capability": cap, "error_class": "montage_limit"}
     folder = job_dir / "frames"
@@ -602,7 +603,7 @@ def _sample_visual(spec: dict, video: dict, job_dir: Path, deadline_epoch: float
         completed = {"status": "completed", "capability": cap, "frames": frames,
                      "sampled_seconds": ok_times, "frame_count": len(ok_paths),
                      "montage_count": len(frames), "source_mode": source_mode, "sampling_mode": sampling_mode,
-                     "frame_interval_seconds": int(cfg.get("interval_seconds") or 25),
+                     "frame_interval_seconds": int(cfg.get("interval_seconds") or 10),
                      "note": f"实际采样{len(ok_paths)}帧，合为{len(frames)}张4×4拼图{partial}"}
         # PR-A1：VLM 帧已取得、finally 清理之前提取空间高清截图（仅 spec 带配置时；
         # shadow/off 父侧不装配 qzone_assets → 此分支零开销）。失败隔离，不拖挂主结果。
