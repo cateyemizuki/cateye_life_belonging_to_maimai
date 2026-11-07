@@ -1,5 +1,10 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.9（2026-11-08）
+
+- PR-TOOLBAR-LEFT（面板头部按钮改左侧自上而下纵向排列，纯展示布局，不影响调度/按钮行为）：`.mast` 由横向 flex 改双列 grid（`grid-template-columns:auto minmax(0,1fr)`）——左列为 `.toolbar` 纵向按钮组（`flex-direction:column;align-items:stretch;flex-wrap:nowrap;gap:6px`，列宽 112px/窄屏 104px，自上而下：实时连接 chip → 刷新 → 更多（嵌入）/导出快照+明暗（独立）），右列 `.mast-side` 放 brand（独立模式，嵌入仍由 W-04 隐藏）与 `#updated` 更新时间行（左对齐）。模板仅调整 mast 内部 DOM 顺序与包装类，所有按钮 ID/aria/事件绑定逐字节不变；`.more-menu` 改向右侧展开（`left:calc(100% + 6px);right:auto;top:0`）不覆盖纵列，`max-width:calc(100vw - 150px)` 纯 CSS 钳制窄屏不出视口（无需 JS 定位）；status chip 长文案（如「已连接 · 留意数据」）居中合理折行不溢出；窄屏 <700px 保持左列纵向不回落横向（按钮沿用全局 min-height:44 触控口径），shell 不横向溢出；复古主题 .mast 卡片化与深浅色规则不含 display，grid 直接兼容；栏目 tab 条全宽位置不动。
+- **红线保留**：纯布局不改任何按钮 ID/行为/事件绑定；不影响调度；旧快照兼容（未动数据路径）。配置：无新增字段（schema 不变，18 段 203 叶子）。版本双号 3.17.9（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉（round 版本断言与打印、test_prompt_identity_audit 与 test_webui_timeline_3178 双号断言顺延，只改版本/计数；smoke R6 守卫读双号动态比对无需改字面量）。新增专项 `scratch/test_toolbar_left_3179.py`；`python tools/build_webui.py` 重建 index.html。边界：本批不部署、不 git commit、不碰主机。
+
 ## 3.17.8（2026-11-08）
 
 - PR-WEBUI-TIMELINE（日程 WebUI 改进计划书第一步 1A+1B，纯展示层，不影响调度/滚动/门控）：①跨午夜 episode 渲染修复；②当日活动概括横条。

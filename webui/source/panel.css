@@ -165,7 +165,7 @@ html[data-embedded=true] .mark,html[data-embedded=true] .brandtext{display:none}
 html[data-embedded=true] #export{display:none}
 .more-wrap{display:none;position:relative}
 html[data-embedded=true] .more-wrap{display:inline-block}
-.more-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:70;min-width:150px;display:flex;flex-direction:column;gap:2px;padding:6px;border:1px solid var(--maibot-border);border-radius:var(--maibot-radius);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);box-shadow:0 10px 35px #0003}
+.more-menu{position:absolute;z-index:70;min-width:150px;display:flex;flex-direction:column;gap:2px;padding:6px;border:1px solid var(--maibot-border);border-radius:var(--maibot-radius);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);box-shadow:0 10px 35px #0003}
 .more-menu button{border:0;background:transparent;min-height:40px;padding:8px 10px;font-size:13px;text-align:left}
 .more-menu button:hover{background:var(--maibot-soft)}
 /* W-01 摘要回填（2026-11-03）：主卡保留最小趋势/最近记录的微型预览元素；
@@ -424,3 +424,19 @@ body.fish-locked .fish-overlay[data-section=usage]{z-index:960}
 .overview-tooltip{position:fixed;z-index:90;max-width:min(280px,80vw);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);color:var(--maibot-foreground);border:1px solid var(--maibot-border);box-shadow:0 5px 20px #0003;border-radius:12px;padding:9px 11px;font-size:11px;line-height:1.7;pointer-events:none;overflow-wrap:anywhere}
 /* 1A 跨日标注 badge：沿用 rowbadge/vtime-badge 风格，虚线边框区分展示性标记 */
 .crossdaybadge{border:1px dashed var(--maibot-border);background:transparent}
+/* ── PR-TOOLBAR-LEFT（3.17.9）：面板头部按钮改左侧自上而下纵向列 ─────────────
+   纯布局：.mast 改双列 grid（左列=toolbar 纵向按钮组，右列=.mast-side 品牌+更新时间）。
+   按钮 ID/事件/aria 一律不变；更多菜单改向右侧展开不覆盖纵列，max-width 钳制窄屏不出视口。
+   嵌入模式品牌被 W-04 隐藏后右列只剩 #updated；独立模式 brand 在右列上方。
+   复古主题 .mast 卡片化（padding/border）与深浅色规则不含 display，grid 直接兼容。 */
+.mast{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:16px}
+.toolbar{flex-direction:column;align-items:stretch;justify-content:flex-start;flex-wrap:nowrap;gap:6px;width:112px}
+.toolbar button{white-space:nowrap}
+.toolbar .more-wrap{width:100%}
+.toolbar .more-wrap>button{width:100%}
+.toolbar .status{justify-content:center;text-align:center;border-radius:12px}
+.toolbar .status #connection-label{overflow-wrap:anywhere}
+.mast-side{display:flex;flex-direction:column;align-items:flex-start;gap:8px;min-width:0}
+.connectionline{text-align:left;margin-top:0}
+.more-menu{left:calc(100% + 6px);right:auto;top:0;max-width:calc(100vw - 150px)}
+@media(max-width:700px){.mast{grid-template-columns:auto minmax(0,1fr);gap:12px}.toolbar{width:104px}.mast-side{gap:6px}}

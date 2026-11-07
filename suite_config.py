@@ -207,7 +207,11 @@ from suite_prompts import (
 # 3.17.8（2026-11-08 PR-WEBUI-TIMELINE 跨午夜渲染修复 + 当日活动概括横条）：
 # 纯展示层改动（dashboard 只读投影 + WebUI），不影响调度/滚动/门控，无新增配置
 # 字段（schema 不变，18 段 203 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.8"
+# 3.17.9（2026-11-08 PR-TOOLBAR-LEFT 面板头部按钮改左侧纵向排列）：
+# 纯布局改动（mast 双列 grid + toolbar 纵列 + 更多菜单右展开），不改按钮
+# ID/行为/事件绑定，不影响调度，无新增配置字段（schema 不变，18 段 203 叶子），
+# 按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.9"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
