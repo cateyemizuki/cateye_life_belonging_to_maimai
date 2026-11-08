@@ -836,8 +836,18 @@ class InjectService:
             remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
 
         if not current_activity:
-            # 空活动变体：兜底文案（内部键恒返非空默认，无「显式关空」路径）
-            current_line = self._no_activity_text()
+            # P1：引擎确认已睡即使 episode 缺失也表达睡眠中，不降为「空闲」兜底文案。
+            engine0 = getattr(self._plugin, "_sleep_engine", None)
+            try:
+                asleep0 = engine0.is_asleep() if engine0 is not None else None
+            except Exception:
+                asleep0 = None
+            if asleep0 is True:
+                current_line = ("你现在已经入睡（睡眠中）；收到消息可自然短回复，"
+                                "不要声称正在活动、待机或正准备睡。")
+            else:
+                # 空活动变体：兜底文案（内部键恒返非空默认，无「显式关空」路径）
+                current_line = self._no_activity_text()
         elif enable_detailed and current_description:
             current_line = render(
                 prompt(self._plugin, "inject_schedule_current_line"),
@@ -855,7 +865,15 @@ class InjectService:
             current_line = current_line.replace("（）", "").replace("()", "").strip()
 
         engine = getattr(self._plugin, "_sleep_engine", None)
-        if getattr(engine, "dynamic_enabled", False):
+        try:
+            asleep_now = engine.is_asleep() if engine is not None else None
+        except Exception:
+            asleep_now = None
+        if asleep_now is True:
+            # P1：已睡优先级高于旧的 winding_down 缓存与精力/情绪措辞。
+            if "已入睡" not in current_line:
+                current_line += "（已入睡）"
+        elif getattr(engine, "dynamic_enabled", False):
             # 3.9.3 热修：此处无 now 局部变量（原写法 NameError 致日程注入整体失败）；
             # dynamic_status() 缺省由引擎按自身时区取当前时间。
             band = engine.dynamic_status().get("band")
@@ -1151,7 +1169,9 @@ class InjectService:
             return None
         try:
             now = self._tz_manager.get_now()
-            current = model.current(now) or None
+            # P1（2026-11-09 睡眠注入修复）：仅注入调用处显式包含睡眠，不全局改读模型
+            # 默认（其他消费者有意排除睡眠的行为保留）。过滤后的空值不再被误当真实空闲。
+            current = model.current(now, include_sleep=True) or None
             nxt = list(model.next(now, limit=2) or [])
             try:
                 state_line = str(model.state_line(now, max_items=2) or "").strip()
@@ -1164,10 +1184,59 @@ class InjectService:
             completed = [row for row in (today.get("completed") or [])
                          if isinstance(row, dict)][-2:]
             return {"current": current, "next": nxt, "state_line": state_line,
-                    "completed": completed, "now": now}
+                    "completed": completed, "now": now,
+                    "sleep": self._sleep_presentation(now)}
         except Exception as exc:
             logger.debug("life runtime 注入视图读取失败（回退旧路径）：%s", exc)
             return None
+
+    def _sleep_presentation(self, now) -> Dict[str, Any]:
+        """P1 权威睡眠表现态：SleepEngine 会话优先，episode 仅名称/时间佐证。
+
+        区分 asleep/awake/drowsy/winding_down/waking/unknown；引擎确认已睡即使 episode
+        缺失也表达睡眠中；引擎确认已醒而 episode 残留睡觉按醒态并记不一致；引擎不表态
+        且有可信 active sleep 保守表达睡眠；证据不足表达 unknown（不伪造空闲）。
+        """
+        out: Dict[str, Any] = {"state": "unknown", "started_at": None, "source": None}
+        engine = getattr(self._plugin, "_sleep_engine", None)
+        try:
+            asleep = engine.is_asleep(now) if engine is not None else None
+        except Exception:
+            asleep = None
+        started = None
+        try:
+            sess = getattr(engine, "_session", None)
+            if sess is not None:
+                started = (getattr(sess, "metadata", None) or {}).get("sleep_started_at")
+        except Exception:
+            started = None
+        ep_sleep = False
+        try:
+            model = self._life_read_model()
+            cur = model.current(now, include_sleep=True) if model is not None else None
+            ep_sleep = bool(cur) and str(cur.get("goal_type") or "") == "sleep"
+        except Exception:
+            ep_sleep = False
+        if asleep is True:
+            out.update(state="asleep", started_at=started, source="engine")
+            return out
+        if asleep is False and ep_sleep:
+            logger.debug("sleep presentation: 引擎已醒但 sleep episode 残留（按醒态表达）")
+            out.update(state="awake", source="engine_episode_conflict")
+            return out
+        if asleep is None and ep_sleep:
+            out.update(state="asleep", started_at=started, source="episode_conservative")
+            return out
+        # 尚未入睡：困倦/准备休息/刚醒 仅在此分支使用（已睡优先级更高，上面已返回）
+        try:
+            band = engine.dynamic_status().get("band") if engine is not None else None
+        except Exception:
+            band = None
+        if band in ("drowsy", "winding_down", "waking"):
+            out.update(state=band, source="engine_band")
+        else:
+            out.update(state="awake", source="engine" if asleep is False else None)
+        return out
 
     @staticmethod
     def _life_override_from_view(view: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1268,7 +1337,10 @@ class InjectService:
             # （无当前活动时 lines 为空 → 不追加任何行，空活动兜底走现在行）
             return lines
         nxt_parts: List[str] = []
-        for item in (view.get("next") or [])[:2]:
+        # P1：已睡时不附「接下来…（预演）」等易被误读为正在行动的内容；未来计划保留在查询/页面。
+        _next_items = [] if (view.get("sleep") or {}).get("state") == "asleep" \
+            else (view.get("next") or [])[:2]
+        for item in _next_items:
             if not isinstance(item, dict):
                 continue
             try:

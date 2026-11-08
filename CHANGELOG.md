@@ -1,5 +1,10 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.26（2026-11-09）
+
+- 动态睡眠状态注入与晚安漏发修复（依 `union/20261109_动态睡眠状态注入与晚安漏发修复计划书.md` P1–P3；生产取证 11-09 00:15 真实入睡却注入"空闲"、00:30 周期轮换吞掉 00:46 旧晚安）。**P1 状态注入**：`inject_service._life_runtime_view()` 仅注入调用处显式 `include_sleep=True`（不全局改读模型默认）；新增 `_sleep_presentation()` 权威睡眠表现态（SleepEngine 会话优先：已睡/已醒/困倦/准备休息/刚醒/暂不确定；引擎已睡即使 episode 缺失仍表达睡眠中；引擎已醒而 episode 残留按醒态记不一致；引擎不表态+可信 active sleep 保守表达睡眠；证据不足不伪造空闲）；空活动分支引擎已睡改注入"已入睡"事实而非空闲兜底；已睡优先级高于 winding_down  cue；睡眠期不附"接下来（预演）"；`emotion/service` 冻结态引擎已睡改注入"已于本夜入睡"事实。**P2 动态晚安**：`sleep_engine.goodnight_reference()` 只读参考目标+来源（高债窗口起点/引擎准备入睡/常规 bedtime，不承诺实际入睡）；`proactive_service._greeting_frames` 晚安期限跟随参考目标（不再唯一依赖计划锚点）；目标更新复用已抽漂移偏移重算未发触发点（已执行/拒绝/未知不重抽不重发）；突发入睡 2 分钟有界衔接一次（不延迟睡眠、门控不绕过、超窗记错过不补）。**P3 跨周期与持久**：晚安任务保存自身周期窗/night_id/漂移/触发/截止；`_process_greetings` 推进 current 轮换后仍有效的旧周期晚安（用其自身窗门控）；`greeting_rolls.json` 持久化 pending 任务（热重载/重启恢复同漂移，fired/abandoned 不恢复、防重由 marks 承担）。
+- **红线保留**：睡眠开始/打扰/醒沿/冻结/解冻/结算仍由 SleepEngine 管理；不新增债务写入点；私聊可正常回复、不重置 sleep_started_at/不造醒沿；不改睡眠债公式/补觉目标/入睡评分/起床条件；不重做 WebUI；schema 不变（18 段 202 叶子）。版本双号 3.17.26；门禁版本重钉；新增专项 `scratch/test_sleep_greeting_31726.py`（13 例）；既有 148 热重载用例按 P3 新口径更新（恢复 pending 同漂移、fired 不恢复）。自然夜样本（提前入睡/入睡时私聊/跨午夜生成/原定重启/实际醒来）待验，离线通过不替代真实送达。
+
 ## 3.17.25（2026-11-09）
 
 - PR-DETAIL-TWOCOL（详情弹层改回双列窄宽）：用户澄清原意——保留**双列**但整体宽度调窄，使每列内部（标签—值之间）不再有大片空白；3.17.21 误改单列后 meta 行 `grid-column:1/-1` 撑满整行反而拉大中间空白。修复（纯 CSS，弹层宽度保持窄 720px）：`.fish-popup-body` 改回 `grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 26px`；`.fish-meta-row` 去掉 `grid-column:1/-1` 使各占一列（实测半宽 330px、标签—值间隔紧凑）；新增 `.fish-popup-body>.fish-section{grid-column:1/-1}` 让摘要/区块跨双列保持可读（折叠组既有 1/-1 保留）；移动端 ≤700px/hover:none 单列全宽适配逐字保留。**逐页目检**（playwright 1600×1000，`scratch/probe_detail_twocol_31725.py`，截图 `_31725_evidence/detail-*.png`）：current/state/mood/sleep/health/companion/schedule/history/videorecent/sharing/usage 共 11 详情弹层依次确认——双列紧凑、无横向溢出、观感干净（usage/schedule 为跨双列整宽区块+内部卡片/意图网格，合理）。

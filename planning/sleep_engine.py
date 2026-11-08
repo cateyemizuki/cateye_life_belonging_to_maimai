@@ -855,6 +855,34 @@ class SleepEngine:
         window = self.dynamic_window(current)
         return next((point for point in (window.start, window.latest_start) if point > current), None)
 
+    def goodnight_reference(self, now: Optional[datetime] = None):
+        """P2（2026-11-09）本夜只读晚安参考目标 + 来源，供问候侧统一消费。
+
+        返回 ``(datetime, source)`` 或 ``None``（引擎不启用/已睡/无动态窗）。来源区分：
+        high_debt_window_start（高债恢复策略采用允许窗口起点）/ engine_winding（引擎
+        准备入睡的更早有效目标）/ bedtime（常规本夜采用 bedtime）。**不承诺实际入睡时间**
+        （next_onset_boundary 的窗口边界不在此冒充承诺）；已睡时返回 None 交由入睡衔接。
+        """
+        if not self.enabled or not self.dynamic_enabled:
+            return None
+        current = self._now(now)
+        if self.is_asleep(current):
+            return None
+        try:
+            window = self.dynamic_window(current)
+        except Exception:
+            return None
+        if window is None:
+            return None
+        debt = self._debt_now()
+        debt_trigger = bounded(self._cfg_float("debt_trigger", 6.0), 0, 12, 6.0)
+        if debt >= debt_trigger and window.start <= current <= window.latest_start:
+            return window.start, "high_debt_window_start"
+        band = (self.dynamic_status(current) or {}).get("band")
+        if band == "winding_down":
+            return window.start, "engine_winding"
+        return window.bedtime, "bedtime"
+
     def actual_wake_today(self, now: datetime) -> Optional[datetime]:
         query = getattr(self._store, "query_sleep_sessions", None)
         if not callable(query):

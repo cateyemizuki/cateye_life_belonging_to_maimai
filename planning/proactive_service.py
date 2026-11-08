@@ -70,6 +70,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import random
@@ -287,6 +288,10 @@ class ProactiveService:
         # 纯内存、不落盘——热重载后允许重掷；周期键                          = 闸门矩阵的 cycle 身份，
         # 旧按 (stream, date_str, kind) 掷点日键随 §31.1 删除（date_str 只保留为档案字段）。
         self._greeting_rolls: Dict[Tuple[str, float, str], Dict[str, Any]] = {}
+        # P3（2026-11-09）：热重载/重启恢复同一漂移与状态（不重抽、不补造历史）。
+        self._load_greeting_rolls()
+        # P2 突发入睡衔接：每睡眠会话只衔接一次（有界 2 分钟窗口）。
+        self._onset_linkage_done: set = set()
         # 群聊硬闸/necessity 拒绝的决策日志节流（§31.1：硬闸不过 = 跳过 + 决策日志留痕，
         # 但 60s 轮询不能逐 tick 刷屏）：{(stream_id, kind, cycle_start): True}（每周期一条）
         self._greeting_gate_logged: Dict[Tuple[str, str, float], bool] = {}
@@ -894,6 +899,17 @@ class ProactiveService:
                 deadline = min(deadline, cap)
         else:
             deadline = cur_end if cur_end > cur_start else 0.0
+            # P2（2026-11-09）：晚安跟随动态睡眠本夜参考目标（高债窗口起点/引擎准备入睡
+            # 更早目标/常规 bedtime），不再唯一依赖计划锚点 current_cycle_end。
+            engine = getattr(self._plugin, "_sleep_engine", None)
+            try:
+                ref = engine.goodnight_reference() if engine is not None else None
+            except Exception:
+                ref = None
+            if ref is not None:
+                ref_ts = float(ref[0].timestamp())
+                if ref_ts > cur_start:
+                    deadline = ref_ts
         return cur_start, deadline
 
     async def _messages_in_window(self, stream_id: str, start_ts: Any, end_ts: Any,
@@ -1120,6 +1136,19 @@ class ProactiveService:
         key = (stream_id, cycle_key, kind)
         entry = self._greeting_rolls.get(key)
         if entry is not None:
+            # P2（2026-11-09）：本夜目标更新时复用已抽漂移量重算尚未发出的触发点；
+            # 已执行/被拒绝/结果未知的任务不重抽、不重发。
+            if kind == GREETING_NIGHT and entry.get("status") == GREETING_STATUS_PENDING:
+                _b, new_deadline = self._greeting_frames(kind, cycle)
+                old_deadline = float(entry.get("deadline") or 0)
+                if new_deadline > 0 and abs(new_deadline - old_deadline) > 1:
+                    offset = old_deadline - float(entry.get("fire_at") or old_deadline)
+                    entry["deadline"] = new_deadline
+                    entry["fire_at"] = new_deadline - offset
+                    entry["observe_from"] = min(float(entry.get("baseline") or new_deadline),
+                                                entry["fire_at"])
+                    entry["observe_until"] = max(new_deadline, entry["fire_at"])
+                    self._save_greeting_rolls()
             return entry
 
         drift = self._greeting_drift(kind)
@@ -1142,6 +1171,12 @@ class ProactiveService:
             "kind": kind,
             "cycle": cycle_key,
             "date": date_str,
+            # P3：任务保存自身所属周期窗与本夜标识，建立后固定；current 轮换不改读新窗。
+            "prev_start": float(cycle.previous_cycle_start or 0.0),
+            "cycle_start": cycle_key,
+            "cycle_end": float(cycle.current_cycle_end or 0.0),
+            "night_id": (epoch_to_local(deadline_ts, tzinfo_of(self._greeting_tz_name()))
+                         or now).strftime("%Y-%m-%d"),
             "drift": drift,
             "rolled": True,
             "baseline": baseline_ts,
@@ -1169,7 +1204,45 @@ class ProactiveService:
                 f"observe_until={int(observe_until)}"
             )
         self._greeting_rolls[key] = entry
+        self._save_greeting_rolls()
         return entry
+
+    def _greeting_rolls_path(self):
+        data_dir = getattr(self._plugin, "_data_dir", None)
+        if not data_dir:
+            return None
+        return Path(data_dir) / "greeting_rolls.json"
+
+    def _save_greeting_rolls(self) -> None:
+        """P3 持久化问候任务（单飞认领/漂移/回执跨热重载恢复）；失败静默不拖挂。"""
+        path = self._greeting_rolls_path()
+        if path is None:
+            return
+        try:
+            payload = [{"key": [k[0], k[1], k[2]], "entry": v}
+                       for k, v in self._greeting_rolls.items()]
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            logger.debug("greeting_rolls 落盘失败（忽略）：%s", exc)
+
+    def _load_greeting_rolls(self) -> None:
+        """P3 热重载/重启恢复**未终结**任务的同一漂移与状态（不重抽）；已 fired/abandoned
+        不恢复（其防重由持久化 marks/回执承担，避免两份账），旧格式/损坏忽略不补造。"""
+        path = self._greeting_rolls_path()
+        if path is None or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            for item in payload if isinstance(payload, list) else []:
+                k = item.get("key") or []
+                v = item.get("entry") or {}
+                if len(k) == 3 and isinstance(v, dict) \
+                        and v.get("status") == GREETING_STATUS_PENDING:
+                    self._greeting_rolls[(str(k[0]), float(k[1]), str(k[2]))] = v
+        except Exception as exc:
+            logger.debug("greeting_rolls 读取失败（按空恢复）：%s", exc)
 
     def _greeting_kind_enabled(self, kind: str) -> bool:
         """早/晚安总开关（2026-10-10 起由两个开关统一控制，取代原三类会话开关矩阵）。"""
@@ -1393,6 +1466,30 @@ class ProactiveService:
         cycle = self._cycle_ctx(now)
         cycle_key = float(cycle.current_cycle_start or 0.0)
         date_str = self._cycle_day_str(cycle)
+        # P2（2026-11-09）突发提前入睡有界衔接：真实入睡确认后 2 分钟内，把本夜尚未发出
+        # 的晚安候选触发点提前到当前拍（一次/会话），交由既有门控与推进路径投递；不等待
+        # 模型/网络、不延迟睡眠、不新建唤醒会话；超窗记错过不补发。planner 事实经 P1 已为
+        # 「已进入睡眠」，不会伪称准备睡。
+        engine = getattr(self._plugin, "_sleep_engine", None)
+        try:
+            if engine is not None and engine.is_asleep(now):
+                sess = getattr(engine, "_session", None)
+                started_iso = (getattr(sess, "metadata", None) or {}).get("sleep_started_at")
+                if started_iso and started_iso not in self._onset_linkage_done:
+                    started_ts = datetime.fromisoformat(started_iso).timestamp()
+                    if 0 <= now_ts - started_ts <= 120:
+                        night_date = datetime.fromisoformat(started_iso).strftime("%Y-%m-%d")
+                        for _k, _e in self._greeting_rolls.items():
+                            if _e.get("kind") == GREETING_NIGHT \
+                                    and _e.get("status") == GREETING_STATUS_PENDING \
+                                    and _e.get("night_id") == night_date:
+                                _e["fire_at"] = min(float(_e.get("fire_at") or now_ts), now_ts)
+                                _e["observe_until"] = max(float(_e.get("observe_until") or 0), now_ts)
+                                _e["onset_linkage"] = True
+                        self._onset_linkage_done.add(started_iso)
+                        self._save_greeting_rolls()
+        except Exception as exc:
+            logger.debug("入睡衔接检查失败（忽略，不延迟睡眠）：%s", exc)
         candidates = await self._resolve_greeting_candidates(cfg_p, now=now, date_str=date_str)
         for stream_id, category in candidates:
             for kind in (GREETING_MORNING, GREETING_NIGHT):
@@ -1402,12 +1499,29 @@ class ProactiveService:
                                               now, now_ts, date_str, cfg_p, cycle=cycle)
         # 中午问好（2026-11-04 主动行为重写）：仅目标私聊、无掷点、窗内首 tick 触发
         await self._process_noon_greeting(now, cycle)
+        # P3（2026-11-09）：current 轮换后仍推进本夜有效的旧周期晚安任务（截止未过），
+        # 门控/统计窗用任务自身保存的周期窗，不套用新 current；新周期未来任务不抢占。
+        for key, entry in list(self._greeting_rolls.items()):
+            if key[1] == cycle_key or entry.get("kind") != GREETING_NIGHT:
+                continue
+            if entry.get("status") != GREETING_STATUS_PENDING:
+                continue
+            if now_ts > float(entry.get("observe_until", 0) or 0):
+                continue
+            old_cycle = CycleState(previous_cycle_start=entry.get("prev_start"),
+                                   current_cycle_start=entry.get("cycle_start", key[1]),
+                                   current_cycle_end=entry.get("cycle_end"))
+            await self._evaluate_greeting(entry.get("stream_id", key[0]),
+                                          entry.get("category", ""), GREETING_NIGHT,
+                                          now, now_ts, entry.get("date", date_str),
+                                          cfg_p, cycle=old_cycle)
         for key, entry in list(self._greeting_rolls.items()):
             if key[1] == cycle_key:
                 continue
             terminated = entry.get("status") in (GREETING_STATUS_FIRED, GREETING_STATUS_ABANDONED)
             if terminated or now_ts > float(entry.get("observe_until", 0) or 0):
                 self._greeting_rolls.pop(key, None)
+        self._save_greeting_rolls()
         # 剩余内存缓存按周期清（闸门拒绝日志节流表；marks 连锁桶唯一值不按周期清）。
         for gkey in [k for k in self._greeting_gate_logged if k[2] != cycle_key]:
             self._greeting_gate_logged.pop(gkey, None)

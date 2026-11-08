@@ -485,7 +485,13 @@ class EmotionService:
             # 08:30）；引擎明确判醒时不再注入深夜引导，避免清晨回复被误导成深夜。
             # now 用服务统一时钟 datetime.now()（测试可注入；生产为本机生效时区）。
             if self._in_sleep_period(datetime.now()):
-                text = f"{text}\n{prompt_of(self._plugin, 'emotion_night_hint')}"
+                # P1（2026-11-09）：引擎确认已睡时表达「已经入睡」事实，而非仅「本该在睡觉」；
+                # 引擎不表态/未睡仍走配置夜窗引导（白天字节不变）。
+                if self._engine_asleep(datetime.now()) is True:
+                    text = (f"{text}\n（你已于本夜入睡、现在仍在睡眠中。回复尽量短、慢、软一些；"
+                            "不要主动开启新话题；不要提及本提示。）")
+                else:
+                    text = f"{text}\n{prompt_of(self._plugin, 'emotion_night_hint')}"
         return text
 
     # ── 情绪 → 行为结构化系数（M4；§4.2 行 5 / §6.2 C/D，附录 C）──────
