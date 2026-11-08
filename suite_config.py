@@ -247,7 +247,11 @@ from suite_prompts import (
 # 字段；[qzone_video].attach_source 退役（署名拼接不自然，文案改纯 LLM 自然分享，
 # 提示词禁元信息），18 段 203→202 叶子；旧 TOML 键经 LEGACY_ROUTE_KEYS 纯 pop
 # （RELEASE_RETIRED 口径，生产旧值自动清除），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.17"
+# 3.17.18（2026-11-08 PR-RESPONSIVE-MAST mast 自适应收缩 + 时间戳 ellipsis 防溢出）：
+# 纯 CSS 展示层修复（panel.css 级联尾部追加段：mast/mast-side 收缩约束 + #updated
+# 单行省略号 + 嵌入态右距）+ panel.js render() 时间戳 title 全文；不新增配置字段
+# （schema 不变，18 段 202 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.18"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

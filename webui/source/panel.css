@@ -541,3 +541,24 @@ footer{flex:none}
 @media(max-width:900px){
  .now-duo{grid-template-columns:1fr}
 }
+/* ── PR-RESPONSIVE-MAST（3.17.18）：mast 自适应收缩 + 时间戳 ellipsis 防溢出 ──────
+   纯布局：级联尾部追加段压过 3.17.12 段（:475/:480）flex 横排的收缩口径。
+   根因（规格§0 复核）：.mast-side 作为 flex 项 flex-basis auto=max-content 无显式收缩
+   约束，#updated 无 ellipsis/overflow 保护（修复前实测 overflow:visible/text-overflow:clip）；
+   嵌入态 mast padding:0（:301）时间戳贴右缘（修复前实测 slack=0，规格§2 要求 ≥8px）。
+   ①.mast width:100%+min-width:0 撑满 shell 内容宽，圆角框与下方 panel-layout 左缘对齐；
+   ②.toolbar/.mast-side 显式 flex:0 1 auto+min-width:0 可收缩（按钮 flex-wrap 已有 :476）；
+   ③#updated/.connectionline 空间不足单行省略号截断，绝不溢出圆角框；title 全文由
+   panel.js render() 调用处设置（核实 text() 本身不设 title，规格§1 授权补全）；
+   ④独立模式 brand flex:none 品牌不截断、时间戳让位；窄屏 <700px 保持 ellipsis+title
+   （实施者择一：mast flex-wrap :482 已有，时间戳折行整行后仍受 max-width:100% 约束）；
+   ⑤嵌入态 mast-side 右距 10px（mast padding:0 无圆角框内距，保 #updated.right<=mast.right-8）。
+   shell max-width 不改（设计居中留白保留，生效 1360px :246）；.panel-layout/.panel-tabs
+   不动（纵向栏目/固定框架保留）。按钮 ID/事件/aria 不变；复古主题卡片化 padding/border
+   与深浅色规则不含收缩属性，直接兼容。 */
+.mast{width:100%;min-width:0}
+.toolbar{flex:0 1 auto;min-width:0}
+.mast-side{flex:0 1 auto;min-width:0;justify-content:flex-end;overflow:hidden}
+#updated,.connectionline{min-width:0;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mast-side .brand{flex:none}
+html[data-embedded=true] .mast-side{padding-right:10px}

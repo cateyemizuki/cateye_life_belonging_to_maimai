@@ -541,6 +541,27 @@ footer{flex:none}
 @media(max-width:900px){
  .now-duo{grid-template-columns:1fr}
 }
+/* ── PR-RESPONSIVE-MAST（3.17.18）：mast 自适应收缩 + 时间戳 ellipsis 防溢出 ──────
+   纯布局：级联尾部追加段压过 3.17.12 段（:475/:480）flex 横排的收缩口径。
+   根因（规格§0 复核）：.mast-side 作为 flex 项 flex-basis auto=max-content 无显式收缩
+   约束，#updated 无 ellipsis/overflow 保护（修复前实测 overflow:visible/text-overflow:clip）；
+   嵌入态 mast padding:0（:301）时间戳贴右缘（修复前实测 slack=0，规格§2 要求 ≥8px）。
+   ①.mast width:100%+min-width:0 撑满 shell 内容宽，圆角框与下方 panel-layout 左缘对齐；
+   ②.toolbar/.mast-side 显式 flex:0 1 auto+min-width:0 可收缩（按钮 flex-wrap 已有 :476）；
+   ③#updated/.connectionline 空间不足单行省略号截断，绝不溢出圆角框；title 全文由
+   panel.js render() 调用处设置（核实 text() 本身不设 title，规格§1 授权补全）；
+   ④独立模式 brand flex:none 品牌不截断、时间戳让位；窄屏 <700px 保持 ellipsis+title
+   （实施者择一：mast flex-wrap :482 已有，时间戳折行整行后仍受 max-width:100% 约束）；
+   ⑤嵌入态 mast-side 右距 10px（mast padding:0 无圆角框内距，保 #updated.right<=mast.right-8）。
+   shell max-width 不改（设计居中留白保留，生效 1360px :246）；.panel-layout/.panel-tabs
+   不动（纵向栏目/固定框架保留）。按钮 ID/事件/aria 不变；复古主题卡片化 padding/border
+   与深浅色规则不含收缩属性，直接兼容。 */
+.mast{width:100%;min-width:0}
+.toolbar{flex:0 1 auto;min-width:0}
+.mast-side{flex:0 1 auto;min-width:0;justify-content:flex-end;overflow:hidden}
+#updated,.connectionline{min-width:0;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mast-side .brand{flex:none}
+html[data-embedded=true] .mast-side{padding-right:10px}
 
 /* Fullscreen detail layer (2026-11-01 U plan): entries stay in place and lift above the
    backdrop; the backdrop keeps a light blur (2–4px) with a low-strength veil, and a curved
@@ -754,7 +775,7 @@ for(const[key,label,direction,code]of spec){const card=el('article','card maibot
 // 趋势 chip：取当前序列最后两个真实观察点之差（百分点），估算点不参与；不足两点隐藏。
 function trendFor(key){const rows=(lifeSeries().points||[]).filter(p=>!p.estimated&&num(p[key])!==null);if(rows.length<2)return null;const a=rows[rows.length-2],b=rows[rows.length-1];return {d:num(b[key])-num(a[key]),at:b.at}}
 function assess(key,value){if(num(value)===null)return '状态暂不可用';const levels={energy:[[.15,'精疲力竭'],[.35,'有些疲惫'],[.65,'精力尚可'],[.85,'精力充沛'],[2,'活力十足']],hunger:[[.25,'不太饿'],[.5,'稍有饥饿'],[.7,'有些饿了'],[.85,'很饿'],[2,'需要进食']],focus:[[.15,'注意力涣散'],[.35,'难以集中'],[.6,'专注一般'],[.85,'专注良好'],[2,'高度专注']],stress:[[.15,'很放松'],[.35,'比较平静'],[.6,'有些紧绷'],[.8,'压力较高'],[2,'压力很高']],social_battery:[[.15,'更想独处'],[.35,'社交电量偏低'],[.65,'愿意交流'],[.85,'社交电量充足'],[2,'交流意愿很高']]};return levels[key].find(([limit])=>Math.max(0,Math.min(1,value))<limit)[1]}
-function render(){const s=data.state||{},sch=data.schedule||{},cur=sch.current,co=data.companion||{};connection(imported?'离线快照':data.stale||data.warnings?.length?'已连接 · 留意数据':'实时连接',imported||data.stale||data.warnings?.length?'warn':'live');text('updated',(imported?'快照时间 ':'更新于 ')+clock(data.generated_at,true)+' · '+(data.timezone||''));
+function render(){const s=data.state||{},sch=data.schedule||{},cur=sch.current,co=data.companion||{};connection(imported?'离线快照':data.stale||data.warnings?.length?'已连接 · 留意数据':'实时连接',imported||data.stale||data.warnings?.length?'warn':'live');const updatedLabel=(imported?'快照时间 ':'更新于 ')+clock(data.generated_at,true)+' · '+(data.timezone||'');text('updated',updatedLabel);$('updated').title=updatedLabel;
 text('current-kind',cur?(cur.goal_type==='sleep'?(data.sleep?.current?.asleep?'睡眠中':'准备入睡'):'进行中'):sch.enabled?(sch.runtime_ready?'空闲':'未就绪'):'未启用');text('current-name',cur?.name||(sch.enabled?(sch.runtime_ready?'此刻空闲':'生活日程正在准备'):'日程未启用'));const meta=$('current-meta');meta.replaceChildren();if(cur){
  // W-08 时间语义（2026-11-03）：计划结束时间消费后端 planned_end_minute（跨午夜由
  // spanEnd 补次日；后端 _row 另给 time_label 供详情层展示），进度基准注明「按本轮
