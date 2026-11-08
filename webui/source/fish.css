@@ -44,9 +44,12 @@ body.fish-locked{overflow:hidden}
 .fish-close{font-size:11px;min-height:30px;padding:4px 8px}
 /* PR-UI-DETAIL（3.17.21）§1A：720px 窄弹层内双列拥挤，正文改单列堆叠（原 1fr 1fr）；
    子项原有的 grid-column:1/-1 声明在单列下语义不变。 */
-.fish-popup-body{overflow:auto;overscroll-behavior:contain;padding:14px 16px 18px;scrollbar-width:thin;min-height:0;display:grid;grid-template-columns:minmax(0,1fr);gap:2px;align-items:start}
+.fish-popup-body{overflow:auto;overscroll-behavior:contain;padding:14px 16px 18px;scrollbar-width:thin;min-height:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 26px;align-items:start}
+/* PR-DETAIL-TWOCOL（3.17.25）：用户裁定保留双列+窄宽（720px），meta 行各占一列以压缩
+   标签—值中间空白（3.17.21 单列反而拉大空白）；摘要/折叠组/区块跨双列保持可读。 */
+.fish-popup-body>.fish-section{grid-column:1/-1}
 .fish-popup-summary{font-size:14px;line-height:1.8;margin:0 0 12px;overflow-wrap:anywhere;grid-column:1/-1}
-.fish-meta-row{display:grid;grid-template-columns:minmax(100px,.9fr) minmax(0,1.2fr);align-items:start;gap:8px;padding:8px 0;border-bottom:1px solid var(--maibot-border);font-size:12.5px;overflow-wrap:anywhere;grid-column:1/-1}
+.fish-meta-row{display:grid;grid-template-columns:minmax(100px,.9fr) minmax(0,1.2fr);align-items:start;gap:8px;padding:8px 0;border-bottom:1px solid var(--maibot-border);font-size:12.5px;overflow-wrap:anywhere}
 .fish-meta-row>span:last-child{text-align:right}
 .fish-meta-row .note{font-size:11px;color:var(--maibot-muted)}
 .fish-fold{margin:12px 0 0;border-top:1px solid var(--maibot-border);padding-top:2px;grid-column:1/-1}

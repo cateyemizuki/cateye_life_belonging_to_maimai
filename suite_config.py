@@ -282,7 +282,11 @@ from suite_prompts import (
 # ≥1600px 追加 .panel-tabs{align-self:start} 恢复内容高+sticky 固定，右栏 body
 # 仍 stretch 保持纵向填充。纯展示，不新增用户可见配置字段（schema 不变，
 # 18 段 202 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.24"
+# 3.17.25（2026-11-09 PR-DETAIL-TWOCOL 详情弹层改回双列窄宽）：用户裁定保留双列+
+# 窄宽（720px），meta 行各占一列压缩标签—值中间空白（3.17.21 单列反而拉大空白）；
+# 摘要/折叠组/区块跨双列。逐页目检 11 详情弹层观感确认。纯展示，不新增用户可见
+# 配置字段（schema 不变，18 段 202 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.25"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

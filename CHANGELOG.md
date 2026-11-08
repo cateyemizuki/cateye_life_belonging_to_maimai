@@ -1,5 +1,10 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.25（2026-11-09）
+
+- PR-DETAIL-TWOCOL（详情弹层改回双列窄宽）：用户澄清原意——保留**双列**但整体宽度调窄，使每列内部（标签—值之间）不再有大片空白；3.17.21 误改单列后 meta 行 `grid-column:1/-1` 撑满整行反而拉大中间空白。修复（纯 CSS，弹层宽度保持窄 720px）：`.fish-popup-body` 改回 `grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 26px`；`.fish-meta-row` 去掉 `grid-column:1/-1` 使各占一列（实测半宽 330px、标签—值间隔紧凑）；新增 `.fish-popup-body>.fish-section{grid-column:1/-1}` 让摘要/区块跨双列保持可读（折叠组既有 1/-1 保留）；移动端 ≤700px/hover:none 单列全宽适配逐字保留。**逐页目检**（playwright 1600×1000，`scratch/probe_detail_twocol_31725.py`，截图 `_31725_evidence/detail-*.png`）：current/state/mood/sleep/health/companion/schedule/history/videorecent/sharing/usage 共 11 详情弹层依次确认——双列紧凑、无横向溢出、观感干净（usage/schedule 为跨双列整宽区块+内部卡片/意图网格，合理）。
+- **红线保留**：纯展示；按钮 ID/行为不变；心情详情仍无重复 VAD 曲线（3.17.21）；历史心情稀疏修复不变；固定框架/左栏 sticky（3.17.24）/纵向填充（3.17.23）不受影响。schema 不变（18 段 202 叶子）。版本双号 3.17.25（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉；3.17.21 专项列断言与 render check 按新双列口径更新。新增专项 `scratch/test_detail_twocol_31725.py`。`python tools/build_webui.py` 重建 index.html。边界：本批不部署、不 git commit、不 push、不碰主机、不改生产配置。
+
 ## 3.17.24（2026-11-09）
 
 - PR-TABS-STICKY（宽屏左栏固定回归修复）：用户反馈左侧栏目按钮（此刻/日程/历史/娱乐/系统）又不固定、随内容滚动。根因（playwright 真机尺寸探针 `scratch/probe_tabs_sticky_31724.py` before 确证）：3.17.23 为纵向填充加的 `.panel-layout{align-items:stretch}` 把 `position:sticky` 的左栏 `.panel-tabs` 也拉伸到滚动容器满高（实测 tabsH 1103px、alignSelf=auto），sticky 元素被撑满后失去吸附余量 → 随内容滚动（滚动后 tabsTop 119.98→104.98）。修复：≥1600px 追加单独 media 块 `.panel-tabs{align-self:start}`，左栏恢复内容高（实测 228px）+sticky 固定（滚动后 tabsTop 不变 tabsMoved=false）；右栏 `.panel-body` 仍继承 stretch 保持 3.17.23 纵向填充（emptyInsidePL 仍 0）。新块置于 mast 段之前、不改 3.17.23 被断言原串（FILL_RULE 逐字保留）。
