@@ -221,7 +221,12 @@ from suite_prompts import (
 # datebar/5 tabpanel + 按钮顺序 此刻→日程→历史→心情与分享→系统 + 键盘加上下箭头），
 # tab ID/data-tab/aria/切换逻辑不变，不影响调度，无新增配置字段（schema 不变，
 # 18 段 203 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.11"
+# 3.17.12（2026-11-08 PR-TOPBAR-ROW 刷新/更多恢复顶部横排，内容紧接其下）：
+# 纯布局改动（mast 恢复 flex 横排 + toolbar row 可折行 + more-menu 向下展开，
+# 级联尾部追加段压过 3.17.9 纵列段），按钮 ID/行为/事件绑定不变，3.17.11 纵向栏目
+# 与 3.17.10 横条全宽保留，不影响调度，无新增配置字段（schema 不变，18 段 203
+# 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.12"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

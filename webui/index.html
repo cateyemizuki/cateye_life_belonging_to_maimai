@@ -462,6 +462,24 @@ html[data-embedded=true] .panel-layout{grid-template-columns:96px minmax(0,1fr);
  .panel-tabs button{flex-direction:column;justify-content:center;gap:0;font-size:10px;padding:6px 2px;min-height:55px;border-radius:8px}
  .panel-tabs .tab-glyph{display:block;font-size:18px;margin:0 0 2px}
 }
+/* ── PR-TOPBAR-ROW（3.17.12）：刷新/更多恢复顶部水平一排，内容紧接其下 ────────
+   纯布局：级联尾部追加段压过 3.17.9 段（双列 grid/toolbar 纵列/菜单右展开）。
+   .mast 恢复 flex 横排（左=toolbar：连接 chip/刷新/更多；右=.mast-side：brand+updated
+   横排）；主规则显式 flex-direction:row 压过 Panel v3 窄屏 .mast{flex-direction:column}
+   （同特异性按源码顺序后者胜）。按钮 ID/事件/aria 一律不变。
+   .more-menu 恢复向下展开（top:calc(100% + 6px);right:0）——按钮在顶部横排，菜单向下
+   不覆盖按钮排；窄屏 max-width 钳制保留。.panel-layout（3.17.11 纵向栏目+右内容）不动，
+   整体在 mast 之下自然紧接开始（收回 3.17.9 纵列占用的左侧纵向空间）。
+   窄屏 <700px：toolbar 横排可折行（flex-wrap）不纵列回落；mast 允许 wrap 防溢出。
+   复古主题 .mast 卡片化（padding/border）与深浅色规则不含 display，flex 直接兼容。 */
+.mast{display:flex;flex-direction:row;align-items:center;justify-content:space-between;gap:12px}
+.toolbar{flex-direction:row;align-items:center;width:auto;flex-wrap:wrap;gap:7px}
+.toolbar .more-wrap{width:auto}
+.toolbar .more-wrap>button{width:auto}
+.toolbar .status{justify-content:flex-start;text-align:left;border-radius:999px}
+.mast-side{flex-direction:row;align-items:center;gap:12px}
+.more-menu{top:calc(100% + 6px);left:auto;right:0;max-width:calc(100vw - 150px)}
+@media(max-width:700px){.mast{flex-wrap:wrap;gap:12px}.toolbar{width:auto;flex-wrap:wrap}.mast-side{gap:6px}}
 
 /* Fullscreen detail layer (2026-11-01 U plan): entries stay in place and lift above the
    backdrop; the backdrop keeps a light blur (2–4px) with a low-strength veil, and a curved
