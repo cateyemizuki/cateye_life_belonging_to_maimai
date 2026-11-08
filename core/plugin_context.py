@@ -58,6 +58,12 @@ class PluginContext:
         return self.get("qzone_video")
 
     @property
+    def video_watch(self) -> Any:
+        # PR-ENTERTAINMENT（3.17.13）：娱乐面板最近观看只读投影消费；
+        # 缺失按 None（未装配降级语义不变）。
+        return self.get("video_watch")
+
+    @property
     def emotion(self) -> Any:
         return self.get("emotion")
 

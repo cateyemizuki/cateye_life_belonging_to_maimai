@@ -29,7 +29,7 @@ body:before{content:"";position:fixed;inset:0;z-index:-1;background:url('{{BG_TE
 .vtime-body .note{margin:0;overflow-wrap:anywhere}
 .vtime-change{font-size:11px;color:var(--maibot-muted);margin:4px 0 0;overflow-wrap:anywhere}
 .vtime-badge{align-self:start;font-size:11px;border-radius:6px;padding:2px 6px;background:var(--maibot-soft);color:var(--maibot-muted);white-space:nowrap}
-.vtime-item.interrupted .vtime-badge{color:var(--maibot-danger)}.empty{border-radius:12px;background-position:center;background-size:cover;position:relative;isolation:isolate}.empty:before{content:"";position:absolute;inset:0;background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);opacity:.9;z-index:-1}.empty strong,.empty span{max-width:90%}#history-chart>.empty,#vad-chart>.empty{background-image:url('{{BG_HISTORY_EMPTY}}')}#episodes>.empty,#intents>.empty{background-image:url('{{BG_SCHEDULE_EMPTY}}')}#panel-mood.empty-mood{background-image:linear-gradient(var(--maibot-background),transparent),url('{{BG_EMOTION_EMPTY}}');background-size:cover}.offlinehint{background-image:linear-gradient(90deg,var(--maibot-background),transparent),url('{{BG_OFFLINE}}');background-size:cover}.chart svg{touch-action:pan-y}.chart .estimated-line{stroke-dasharray:5 5;stroke-width:2.4;opacity:.9}.health{margin-top:16px}.heading-icon{color:var(--maibot-muted)}
+.vtime-item.interrupted .vtime-badge{color:var(--maibot-danger)}.empty{border-radius:12px;background-position:center;background-size:cover;position:relative;isolation:isolate}.empty:before{content:"";position:absolute;inset:0;background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);opacity:.9;z-index:-1}.empty strong,.empty span{max-width:90%}#history-chart>.empty,#vad-chart>.empty{background-image:url('{{BG_HISTORY_EMPTY}}')}#episodes>.empty,#intents>.empty{background-image:url('{{BG_SCHEDULE_EMPTY}}')}#panel-mood.empty-mood,#emotion-card.empty-mood{background-image:linear-gradient(var(--maibot-background),transparent),url('{{BG_EMOTION_EMPTY}}');background-size:cover}.offlinehint{background-image:linear-gradient(90deg,var(--maibot-background),transparent),url('{{BG_OFFLINE}}');background-size:cover}.chart svg{touch-action:pan-y}.chart .estimated-line{stroke-dasharray:5 5;stroke-width:2.4;opacity:.9}.health{margin-top:16px}.heading-icon{color:var(--maibot-muted)}
 @keyframes panel-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 @media(min-width:1100px){#panel-now .sleepstats{grid-template-columns:repeat(3,1fr)}#panel-now .sleep-combined{max-height:260px}.sleep-combined .chart{min-height:0}.sleep-combined .chart svg{max-height:120px}}
 /* W-10 断点（2026-11-03）：指标 5→4→3→2 列梯度。此规则必须位于下方
@@ -480,3 +480,25 @@ html[data-embedded=true] .panel-layout{grid-template-columns:96px minmax(0,1fr);
 .mast-side{flex-direction:row;align-items:center;gap:12px}
 .more-menu{top:calc(100% + 6px);left:auto;right:0;max-width:calc(100vw - 150px)}
 @media(max-width:700px){.mast{flex-wrap:wrap;gap:12px}.toolbar{width:auto;flex-wrap:wrap}.mast-side{gap:6px}}
+/* ── PR-ENTERTAINMENT（3.17.13）：心情与分享→娱乐重做 + 情绪并此刻 + 翻页符号居中 ──
+   只读投影展示层：不影响调度/情绪引擎/视频观看运行态。
+   ①翻页 ‹ › 居中：原 :373 规则 padding:2px 8px + 行内基线导致符号视觉偏下；
+   尾部同特异性规则改 display:grid;place-items:center;padding:0（line-height:1
+   继承 :373），符号行盒在按钮内水平垂直居中；窄屏 :402 min-height:44px 不受影响。
+   ②情绪卡并入「此刻」（#emotion-card，生活状态之后、睡眠之前）：empty-mood 视觉态
+   随迁——背景规则在 Panel v3 层（:32）扩展选择器 #emotion-card.empty-mood（资产
+   token 留在原处，尾部段不含 token，3.17.12 产物逐字断言不受影响）；类不再挂
+   panel-mood（旧选择器保留为历史层）。
+   ③娱乐面板：最近观看/兴趣话题双卡 + 空间与分享全宽卡（qzone IDs 不动）。 */
+.schedule-page-actions button{display:grid;place-items:center;padding:0}
+.emotion-now{margin-top:16px}
+#panel-mood>.qzone-card{margin-top:16px}
+.videorrow{align-items:flex-start}
+.videorrow>div{min-width:0}
+.videorrow strong{overflow-wrap:anywhere}
+.videorrow>.note{white-space:nowrap;flex:none}
+.interestrow{padding:9px 0;border-bottom:1px solid var(--maibot-border)}
+.interestrow:last-child{border:0}
+.interesthead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:6px;font-size:12px}
+.interesthead strong{font-weight:550;overflow-wrap:anywhere}
+.interestrow .meter{margin-bottom:0}

@@ -810,6 +810,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
             result.update(emotion={'available': False, 'reason': 'payload_limit'},
                           qzone={'available': False, 'reason': 'payload_limit'},
                           qzone_video={'available': False, 'reason': 'payload_limit'},
+                          video={'available': False, 'reason': 'payload_limit'},
                           usage={}, health={})
             if result.get('day') is not None:
                 result['day'] = {'available': False, 'reason': 'payload_limit'}
@@ -873,6 +874,65 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
             }
     except Exception:
         result['qzone_video'] = {'available': False, 'reason': 'projection_unavailable'}
+    # PR-ENTERTAINMENT（3.17.13）：娱乐面板视频信息投影（只读；零模型调用，不触发
+    # 兴趣刷新/观看运行态）。recent=VideoWatchService.recent_videos(10)（真实完成
+    # ≤15 天且文字缓存有效，service.py 口径）；interests=兴趣文档 keywords 按最终
+    # 权重（persona_base + clamp(watch_score, ±50%×base)）排序 top8。文档实际路径
+    # data_dir/video_watch/video_interest.json（plugin.py 装配 store_dir=data_dir/
+    # "video_watch"；规格 §0 写的 data_dir 直下为笔误，已按代码核实）。读盘经
+    # VideoInterestService.load() 公开只读面（损坏/非法→None，不改写用户文件）；
+    # 展示口径不做半衰期衰减（衰减属候选排序口径 effective_weights，此处如实展示
+    # 落盘分值）。服务缺失/读失败/文档损坏 → 该源降级空；任一源可读 available=True。
+    # 只暴露公开视频标题/BV/观看时间与话题权重，不含路径/私聊正文。
+    video: dict[str, Any] = {'available': False, 'recent': [], 'interests': []}
+    recent_ok = False
+    try:
+        watch = getattr(plugin, '_video_watch', None)
+        if watch is not None:
+            rows = watch.recent_videos(10)
+            video['recent'] = [
+                {'bvid': str(row.get('bvid') or '')[:20],
+                 'title': str(row.get('title') or '')[:120],
+                 'watched_at': _number(row.get('watched_at'))}
+                for row in (rows or [])[:10] if isinstance(row, dict)]
+            recent_ok = True
+    except Exception:
+        video['recent'] = []
+    interests_ok = False
+    try:
+        data_dir = ctx.data_dir
+        if data_dir:
+            from pathlib import Path
+            from integrations.video_interest import (
+                PERSONA_BASE_WEIGHT, WATCH_SCORE_CAP_RATIO, VideoInterestService)
+            doc = VideoInterestService(Path(data_dir) / 'video_watch').load()
+            if doc is not None:
+                terms = (doc.get('evidence_weights') or {}).get('terms') or {}
+                scored = []
+                for keyword in doc.get('keywords') or []:
+                    entry = terms.get(str(keyword).lower())
+                    entry = entry if isinstance(entry, dict) else None
+                    base = entry['persona_base'] if entry else PERSONA_BASE_WEIGHT
+                    score = entry['watch_score'] if entry else 0.0
+                    # 评审修复（3.17.13）：损坏文档可能含 Infinity/溢出巨值（json.loads
+                    # 默认接受 Infinity 字面量），非有限值退默认，避免 inf 权重穿过
+                    # json.dumps(allow_nan=False) 炸掉整个 dashboard。
+                    if not isinstance(base, (int, float)) or not math.isfinite(base) or base <= 0:
+                        base = PERSONA_BASE_WEIGHT
+                    if not isinstance(score, (int, float)) or not math.isfinite(score):
+                        score = 0.0
+                    cap = base * WATCH_SCORE_CAP_RATIO
+                    weight = _number(round(base + max(-cap, min(cap, score)), 3))
+                    if weight is None:
+                        continue
+                    scored.append({'topic': str(keyword)[:40], 'weight': weight})
+                scored.sort(key=lambda row: (-row['weight'], row['topic']))
+                video['interests'] = scored[:8]
+                interests_ok = True
+    except Exception:
+        video['interests'] = []
+    video['available'] = bool(recent_ok or interests_ok)
+    result['video'] = video
     try:
         from core.monitoring import usage_summary, runtime_health
         data_dir = ctx.data_dir
