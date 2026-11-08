@@ -94,6 +94,7 @@ from .config import (
     section_or_default,
 )
 from core.storage import load_json, save_json_atomic
+from tools.proactive_turn import register_turn
 
 from .activity_properties import resolve_property
 from .cycle_state import (CycleState, anchored_state, day_cycle_epochs,
@@ -1974,6 +1975,7 @@ class ProactiveService:
             reason=PROACTIVE_REASON_NOON_DEFAULT,
             priority="normal",
             exempt_budget=True,
+            kind="noon_greeting",
         )
         if not ok:
             return
@@ -2014,6 +2016,7 @@ class ProactiveService:
             reason=reason,
             priority="normal",
             exempt_budget=True,
+            kind=("morning_greeting" if kind == GREETING_MORNING else "night_greeting"),
         )
 
     # ------------------------------------------------------------
@@ -3013,6 +3016,8 @@ class ProactiveService:
         reason: str,
         priority: str = "normal",
         exempt_budget: bool = False,
+        *,
+        kind: str = "other",
     ) -> bool:
         """调用宿主 maisaka.proactive.trigger（带 priority 时失败则降级不带重试）。
 
@@ -3024,6 +3029,10 @@ class ProactiveService:
         任何流的开口都会查计数与被拦截（沿用旧语义，判据见 ``core/event_bus._is_target_stream``）。
         2026-11-04 修复（评估问题4/P1-04）：非豁免路径 bus=None 时 **fail-closed**
         （跳过并告警），不再无预算直接触发；问候豁免策略不变。
+
+        PR-PROACTIVE-GATE（3.17.14）：kw-only ``kind`` = 发起原因（问候调用点传
+        morning/noon/night_greeting），成功触发后经 tools.proactive_turn 统一登记；
+        登记只做事实记录与文案分类，不触碰预算/计数/豁免口径。
         """
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "maisaka"):
@@ -3080,6 +3089,9 @@ class ProactiveService:
         if isinstance(result, dict) and not result.get("success", False):
             logger.warning(f"主动发起被拒: stream={stream_id}, reason={result.get('error')}")
             return False
+        # PR-PROACTIVE-GATE（3.17.14）：成功触发后经统一入口登记（chat_type×kind），
+        # 供 replyer 钩子定制改写；registry 缺失/异常静默降级，不影响触发与门控。
+        register_turn(self._plugin, stream_id, kind, reason)
         return True
 
     # 注（2026-10-20 用户指示）：原 _trigger_proactive（活动切换/约定主动开口的指令模板组装

@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.diag import DecisionLogger
 from core.llm_utils import LLMService, purpose_task
+from tools.proactive_turn import register_turn
 from suite_prompts import QZONE_POST_DEFAULT, QZONE_REPLY_DEFAULT
 from suite_prompts import (
     QZONE_COMMENT_REMINDER_DEFAULT,
@@ -1136,7 +1137,7 @@ class QzoneService:
                 # 不再发预算记账事件；空间侧约束仍是既有 qzone.daily_max_posts/reply_number，
                 # 预算耗尽也不得拦掉本条提醒。
                 try:
-                    await self._ctx.maisaka.proactive.trigger(
+                    reply = await self._ctx.maisaka.proactive.trigger(
                         stream_id=self._target_stream_id,
                         intent="qzone_comment",
                         reason=render(
@@ -1145,6 +1146,12 @@ class QzoneService:
                             excerpt=excerpt, added=added,
                         ),
                     )
+                    # PR-PROACTIVE-GATE（3.17.14）：空间评论提醒直接经宿主 trigger
+                    # 激活 planner（全仓 grep 核定的第四处宿主调用点）→ 统一登记
+                    # other（目标私聊兜底文案）；免预算口径不变，登记不计数。
+                    if (isinstance(reply, dict) and reply.get("success") is True) or reply is True:
+                        register_turn(self._plugin, self._target_stream_id, "other",
+                                      f"qzone_comment:{tid[:12]}")
                 except Exception:
                     pass
                 self._log("trigger", trigger_type="qzone_comment",

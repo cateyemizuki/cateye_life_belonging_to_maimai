@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import threading
 from collections import deque as _deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -106,6 +107,9 @@ from .sender_identity import (
 _MAX_INJECT_PAYLOAD_BYTES = 8 * 1024 * 1024
 #: 距离上次 proactive trigger 多久内，认为当前 planner 回合是主动发言回合。
 _PROACTIVE_RULE_WINDOW_SECONDS = 90.0
+#: PR-PROACTIVE-GATE（3.17.14）：登记簿惰性单例装配锁（评审修复：并发首次装配
+#: 可能构造两个实例，内存态独立且 _save 共用同一 .tmp 互相覆盖 → 丢登记/consumed）。
+_PROACTIVE_TURNS_ASSEMBLY_LOCK = threading.Lock()
 #: 省略图片时替换成的文本占位符（不能直接删 part，否则 item 可能没有 part）。
 _IMAGE_OMITTED_PLACEHOLDER = "[图片已省略：为控制上下文体积]"
 
@@ -343,6 +347,82 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if not getattr(plugin_cfg, "enabled", True) or not self._mai_patrol_enabled():
             return ""
         return self._mai_target_stream_id()
+
+    def _mai_proactive_turns(self):
+        """PR-PROACTIVE-GATE（3.17.14）：主动激活统一登记簿（惰性单例）。
+
+        data_dir 不可得（裸测试桩/装配前窗口）或构造异常 → None，调用方静默
+        降级走 3.17.2 旧判定；登记簿本身损坏降级空（见 tools.proactive_turn）。
+        """
+        registry = getattr(self, "_proactive_turn_registry", None)
+        if registry is not None:
+            return registry
+        data_dir = getattr(self, "_data_dir", None)
+        if data_dir is None:
+            return None
+        # 双重检查加锁：并发首次装配只构造一个实例（实例内另有 threading.Lock）。
+        with _PROACTIVE_TURNS_ASSEMBLY_LOCK:
+            registry = getattr(self, "_proactive_turn_registry", None)
+            if registry is not None:
+                return registry
+            try:
+                from tools.proactive_turn import ProactiveTurnRegistry
+                registry = ProactiveTurnRegistry(self, data_dir)
+            except Exception:
+                log = getattr(getattr(self, "ctx", None), "logger", None)
+                if log is not None:
+                    log.debug("主动激活登记簿装配失败（降级旧判定路径）", exc_info=True)
+                return None
+            self._proactive_turn_registry = registry
+            return registry
+
+    def _mai_consume_proactive_turn(self, registry: Any, turn: dict[str, Any]) -> None:
+        """改写完成后一次性消费登记；消费失败仅记诊断（窗口兜底防重复改写）。"""
+        try:
+            registry.consume(turn.get("turn_id"))
+        except Exception:
+            self.ctx.logger.debug("主动激活登记消费失败（忽略）", exc_info=True)
+
+    def _mai_proactive_turn_yields_to_incoming(self, turn: dict[str, Any],
+                                               payload_key: str, payload: list[Any]) -> bool:
+        """红线让位：上下文最后真实来信比登记时间更新 → 按真实来信轮处理（不改写）。
+
+        items 形态用 meta.timestamp（存在但不可解析 → 保守让位，与旧窗口路径同
+        口径）；messages 形态无可解析来信时间戳 → 陪伴目标私聊再核对
+        affection.last_user_msg_time（比登记新 → 让位），两信号皆无 → 信任登记
+        （问候轮 bug 修复点：问候链 bypass patrol，messages 形态照样改写）。
+        **group/其他私聊的 messages 形态**：无 items 时间戳、也无 affection 信号
+        （affection 只跟踪目标私聊），来信时序不可核验 → 保守让位不改写（评审
+        修复：宁可漏改写，绝不错改真实来信轮；登记保留不消费，真正的主动轮若
+        以 items 形态到来仍可改写）。
+        """
+        from integrations.proactive_reply_target import latest_incoming_timestamp
+        created = float(turn.get("created_at") or 0.0)
+        items = payload if payload_key == "items" else []
+        has_incoming, latest = latest_incoming_timestamp(items)
+        if has_incoming:
+            if latest is None:
+                return True
+            if latest.timestamp() > created:
+                return True
+        chat_type = str(turn.get("chat_type") or "")
+        if payload_key != "items" and chat_type != "private_target":
+            return True  # 来信时序不可核验 → 保守让位（红线优先于覆盖率）
+        if chat_type == "private_target":
+            affection = getattr(self._mai_companion(), "affection", None)
+            getter = getattr(affection, "last_user_msg_time", None)
+            if callable(getter):
+                try:
+                    last_user = getter()
+                except Exception:
+                    last_user = None
+                if last_user is not None:
+                    try:
+                        if last_user.timestamp() > created:
+                            return True
+                    except (AttributeError, TypeError, ValueError, OSError):
+                        return True  # 时间不可核验 → 保守让位
+        return False
 
     @HookHandler(
         "maisaka.planner.before_request",
@@ -684,24 +764,67 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         return True
 
     def _mai_apply_proactive_reply_rewrite(self, kwargs: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """陪伴目标私聊 + 主动激活轮：替换 replyer 宿主目标指令；失败保守追加+诊断。
+        """主动激活轮：替换 replyer 宿主目标指令；失败保守追加+诊断。
 
-        只改提示词文本，不触碰预算/静默/好感/隐私门控；非目标流/非主动轮返回
-        None（调用方原样继续）。
+        PR-PROACTIVE-GATE（3.17.14）：优先消费统一登记簿——所有 chat_type
+        （群聊/其他私聊/陪伴目标私聊）× kind（发起原因）按矩阵定制文案，改写后
+        一次性消费；真实来信比登记更新 → 让位（红线：逐字不变）。registry 未
+        命中时保留 3.17.2 旧判定作 fallback（active_task + patrol 窗，仅陪伴目标
+        私聊、兜底文案），兼容未登记路径与旧快照降级。只改提示词文本，不触碰
+        预算/静默/好感/隐私门控；非主动轮返回 None（调用方原样继续）。
         """
         from integrations.proactive_reply_target import (
             append_proactive_notice,
             payload_has_proactive_notice,
             rewrite_replyer_payload,
         )
-        stream = self._mai_reply_target_stream()
+        from tools.proactive_turn import known_notice_texts, rewrite_notice_for
         session_id = str(kwargs.get("session_id") or "")
+        payload_key, payload = pick_payload_key(kwargs)
+        if not payload_key or not isinstance(payload, list):
+            return None
+        registry = self._mai_proactive_turns()
+        turn = None
+        if registry is not None and session_id:
+            try:
+                turn = registry.active_for(session_id)
+            except Exception:
+                self.ctx.logger.debug("主动激活登记簿读取失败（降级旧判定路径）", exc_info=True)
+                turn = None
+        if turn is not None:
+            if self._mai_proactive_turn_yields_to_incoming(turn, payload_key, payload):
+                return None  # 红线：触发后真实来信更新的轮逐字不变
+            notice = rewrite_notice_for(turn.get("chat_type"), turn.get("kind"))
+            updated, replaced = rewrite_replyer_payload(payload_key, payload, notice)
+            if replaced:
+                self._mai_consume_proactive_turn(registry, turn)
+                self.ctx.logger.info(
+                    f"主动激活轮（kind={turn.get('kind')} chat_type={turn.get('chat_type')}）："
+                    f"已把 replyer 宿主目标指令替换为定制文案（{replaced} 段）")
+                return {**kwargs, payload_key: updated}
+            if any(payload_has_proactive_notice(payload_key, payload, text)
+                   for text in known_notice_texts()):
+                self._mai_consume_proactive_turn(registry, turn)
+                return None  # 已含主动激活文案（重试/重复钩子）：幂等，不二次追加
+            appended = append_proactive_notice(payload_key, payload, notice)
+            if appended is None:
+                # 评审修复：注入失败同样一次性消费——否则登记在窗内持续 active，
+                # 后续任何 replyer 轮（含真实来信轮）都会再次尝试改写。
+                self._mai_consume_proactive_turn(registry, turn)
+                self.ctx.logger.warning(
+                    f"主动激活轮（kind={turn.get('kind')} chat_type={turn.get('chat_type')}）："
+                    "replyer 载荷无可追加文本条目，定制文案未注入（登记已消费）")
+                return None
+            self._mai_consume_proactive_turn(registry, turn)
+            self.ctx.logger.warning(
+                f"主动激活轮（kind={turn.get('kind')} chat_type={turn.get('chat_type')}）："
+                "未匹配到宿主目标指令段，已保守追加定制文案作为尾随锚点")
+            return {**kwargs, payload_key: appended}
+        # ---- 3.17.2 旧路径 fallback（registry 未命中：未登记路径/旧快照降级）----
+        stream = self._mai_reply_target_stream()
         if not stream or session_id != stream:
             return None
         if self._mai_companion() is None:
-            return None
-        payload_key, payload = pick_payload_key(kwargs)
-        if not payload_key or not isinstance(payload, list):
             return None
         if not self._mai_proactive_replyer_active(payload_key, payload):
             return None

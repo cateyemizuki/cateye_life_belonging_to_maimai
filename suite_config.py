@@ -231,7 +231,11 @@ from suite_prompts import (
 # 最近观看+兴趣话题 video 投影、空间与分享保留、翻页 ‹ › grid 居中），情绪功能
 # 本身零改动（仅展示位置迁移），不影响调度/情绪引擎/视频观看运行态，无新增配置
 # 字段（schema 不变，18 段 203 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.13"
+# 3.17.14（2026-11-08 PR-PROACTIVE-GATE 主动激活统一入口 + 分类定制提示词）：
+# 纯后端改动（tools/proactive_turn.py 登记簿 + 触发点登记 + replyer 钩子按
+# chat_type×kind 定制改写 + 问候轮改写失效 bug 修复），不触碰预算/静默/好感
+# 门控与计数口径，无新增配置字段（schema 不变，18 段 203 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.14"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

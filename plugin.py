@@ -61,6 +61,7 @@ from suite_config import (
 from core.diag import DecisionLogger, LLMCallLogger
 from core.life_experience_index import LifeExperienceIndex
 from integrations.proactive_delivery import ProactiveDelivery, install_proactive_budget
+from tools.proactive_turn import register_turn
 from core.llm_utils import LLMService, llm_task_name_of
 from emotion.components import EmotionComponentsMixin
 from emotion.services import EmotionServices
@@ -2062,9 +2063,14 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                   "请自然回复这次点播的实际结果，聚焦视频画面与内容本身，不要重新提交、不要调用status/result。"
                   "自然分享视频内容，聚焦内容本身，不主动强调观看方式或画面/声音/字幕缺失；不编造未获取到的细节，被直接问及时诚实简短回应；自然回复即可，无需追问对方未回应的细节；不要转发给其他聊天。\n"
                   + summary)
-        return await self.ctx.maisaka.proactive.trigger(
+        reply = await self.ctx.maisaka.proactive.trigger(
             stream_id=stream_id, intent=intent, reason="video_watch_completion",
             metadata={"task_id": task_id, "delivery_kind": "requested_tool_result"})
+        # PR-PROACTIVE-GATE（3.17.14）：点播完成通知直接经宿主 trigger 激活 planner
+        # （全仓 grep 核定的第三处宿主调用点）→ 统一登记 video_share；失败不登记。
+        if (isinstance(reply, dict) and reply.get("success") is True) or reply is True:
+            register_turn(self, stream_id, "video_share", "video_watch_completion")
+        return reply
 
     def _video_completion_sleep_gate(self) -> bool:
         """点播完成通知的睡眠闸：与 ``_autonomous_context`` 的睡眠口径同源。
@@ -2142,6 +2148,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         if result.get('status') == 'enqueued':
             # Share one collision timestamp with greetings and other optional channels.
             self._affection.note_optional_spoke(self._surf_now())
+            # PR-PROACTIVE-GATE（3.17.14）：刷QQ随口联系（SmallEventActions →
+            # optional_contact）不经过 patrol._trigger_planner，在装配根统一登记
+            # surf_chitchat；patrol 的 missing/patrol_chat 已由 patrol 侧登记，不重复。
+            if str(intent) == 'optional_contact':
+                register_turn(self, getattr(self, '_stream_id', ''), 'surf_chitchat', reason)
         return result
 
     async def _initialize_companion_disposition(self, *, force: bool = False) -> dict:

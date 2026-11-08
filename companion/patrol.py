@@ -73,6 +73,7 @@ from suite_prompts import (
     prompt,
     render,
 )
+from tools.proactive_turn import register_turn
 
 from .initiative_profile import InitiativeMemory, evaluate_miss
 from . import miss_trigger
@@ -730,6 +731,10 @@ class PatrolService:
         self._affection.increment_speak(.5)
         self._last_trigger_time = datetime.now()
         self._last_trigger_intent = str(intent)
+        # PR-PROACTIVE-GATE（3.17.14）：成功入队后经统一入口登记（miss/patrol_chat）。
+        # 登记不计数——increment_speak 口径（触发 0.5 + 回复确认 0.5）逐字不变。
+        register_turn(self._config, self._stream_id,
+                      'miss' if intent == 'missing' else 'patrol_chat', reason)
         return True
 
 

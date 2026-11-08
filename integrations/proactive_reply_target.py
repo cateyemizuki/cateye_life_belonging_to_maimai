@@ -218,12 +218,13 @@ def latest_incoming_timestamp(items: list[Any]) -> tuple[bool, datetime | None]:
     return False, None
 
 
-def rewrite_host_target_text(text: str) -> tuple[str, int]:
+def rewrite_host_target_text(text: str, notice: str = PROACTIVE_REPLY_NOTICE) -> tuple[str, int]:
     """把宿主目标指令整段（前缀行 + 后续「- 」明细行）替换为主动激活文案。
 
     段边界：明细行以「-」起始（quote=/发言内容/你之前的发言内容等），遇空行或
     非明细行即止——不吞并后续 section。前缀匹配容忍宿主措辞微调。无命中时
-    原样返回 (text, 0)。
+    原样返回 (text, 0)。``notice`` 缺省 = 3.17.2 原文；PR-PROACTIVE-GATE
+    （3.17.14）起 replyer 钩子按 chat_type×kind 传入定制文案。
     """
     lines = text.split("\n")
     out: list[str] = []
@@ -235,7 +236,7 @@ def rewrite_host_target_text(text: str) -> tuple[str, int]:
             end = index + 1
             while end < len(lines) and lines[end].lstrip().startswith("-"):
                 end += 1
-            out.append(PROACTIVE_REPLY_NOTICE)
+            out.append(notice)
             count += 1
             index = end
         else:
@@ -248,8 +249,12 @@ def _is_final_user_text(text: Any) -> bool:
     return isinstance(text, str) and text.lstrip().startswith(_FINAL_USER_PREFIX)
 
 
-def payload_has_proactive_notice(payload_key: str, payload: list[Any]) -> bool:
-    """载荷里是否已含主动激活文案（幂等守卫：避免重试/重复钩子二次追加）。"""
+def payload_has_proactive_notice(payload_key: str, payload: list[Any],
+                                 notice: str = PROACTIVE_REPLY_NOTICE) -> bool:
+    """载荷里是否已含主动激活文案（幂等守卫：避免重试/重复钩子二次追加）。
+
+    ``notice`` 缺省 = 3.17.2 原文；定制文案轮由调用方逐个已知文案检查。
+    """
     for entry in payload:
         if not isinstance(entry, dict):
             continue
@@ -261,16 +266,18 @@ def payload_has_proactive_notice(payload_key: str, payload: list[Any]) -> bool:
                      if isinstance(part, dict) and part.get("type") == "text"]
         else:
             texts = [entry.get("content")]
-        if any(isinstance(text, str) and PROACTIVE_REPLY_NOTICE in text for text in texts):
+        if any(isinstance(text, str) and notice in text for text in texts):
             return True
     return False
 
 
-def rewrite_replyer_payload(payload_key: str, payload: list[Any]) -> tuple[list[Any], int]:
+def rewrite_replyer_payload(payload_key: str, payload: list[Any],
+                            notice: str = PROACTIVE_REPLY_NOTICE) -> tuple[list[Any], int]:
     """Copy-on-write 改写 replyer 载荷里的宿主目标指令段。
 
     只触碰宿主最终用户消息（「当前时间：」起始的文本）；历史消息（<message> 头）、
     旁白、planner 参考文本一律不碰。返回 (新载荷, 替换段数)；无命中原样返回。
+    ``notice`` 缺省 = 3.17.2 原文（3.17.14 起可按 chat_type×kind 定制）。
     """
     updated = list(payload)
     total = 0
@@ -287,7 +294,7 @@ def rewrite_replyer_payload(payload_key: str, payload: list[Any]) -> tuple[list[
                     continue
                 if not _is_final_user_text(part.get("text")):
                     continue
-                new_text, count = rewrite_host_target_text(part["text"])
+                new_text, count = rewrite_host_target_text(part["text"], notice)
                 if count:
                     if new_parts is None:
                         new_parts = list(parts)
@@ -299,17 +306,19 @@ def rewrite_replyer_payload(payload_key: str, payload: list[Any]) -> tuple[list[
             content = entry.get("content")
             if not _is_final_user_text(content):
                 continue
-            new_text, count = rewrite_host_target_text(content)
+            new_text, count = rewrite_host_target_text(content, notice)
             if count:
                 updated[index] = {**entry, "content": new_text}
                 total += count
     return (updated, total) if total else (payload, 0)
 
 
-def append_proactive_notice(payload_key: str, payload: list[Any]) -> list[Any] | None:
+def append_proactive_notice(payload_key: str, payload: list[Any],
+                            notice: str = PROACTIVE_REPLY_NOTICE) -> list[Any] | None:
     """替换失败/未找到时的保守尾随锚点：把主动激活文案追加到最后一条文本末尾。
 
     不破坏原 prompt（copy-on-write）；载荷没有可追加的文本条目时返回 None。
+    ``notice`` 缺省 = 3.17.2 原文（3.17.14 起可按 chat_type×kind 定制）。
     """
     for index in range(len(payload) - 1, -1, -1):
         entry = payload[index]
@@ -324,7 +333,7 @@ def append_proactive_notice(payload_key: str, payload: list[Any]) -> list[Any] |
                 if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
                     new_parts = list(parts)
                     new_parts[part_index] = {
-                        **part, "text": part["text"].rstrip() + "\n\n" + PROACTIVE_REPLY_NOTICE,
+                        **part, "text": part["text"].rstrip() + "\n\n" + notice,
                     }
                     updated = list(payload)
                     updated[index] = {**entry, "parts": new_parts}
@@ -333,7 +342,7 @@ def append_proactive_notice(payload_key: str, payload: list[Any]) -> list[Any] |
             content = entry.get("content")
             if isinstance(content, str):
                 updated = list(payload)
-                updated[index] = {**entry, "content": content.rstrip() + "\n\n" + PROACTIVE_REPLY_NOTICE}
+                updated[index] = {**entry, "content": content.rstrip() + "\n\n" + notice}
                 return updated
     return None
 
