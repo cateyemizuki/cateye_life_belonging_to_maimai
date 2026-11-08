@@ -94,6 +94,10 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "chronotype_offset_minutes": 0,
         "weekday_phase_minutes": 0,
         "weekend_phase_minutes": 15,
+        # PR-SLEEP-RECOVERY（3.17.19，规格 §1B）：高债提前睡触发阈值（小时）
+        # 与夜间恢复目标最大加成（小时）。内部调参，不新增用户可见 schema 键。
+        "debt_trigger": 6.0,
+        "target_max_bonus": 1.0,
     },
     # 3.17.6（PR-REMOVE-POOLCAP）：event_catalog.max_pool_events 退役（纯 pop
     # 不搬运）——池上限改由 planning.event_catalog_config.derive_pool_cap 派生。

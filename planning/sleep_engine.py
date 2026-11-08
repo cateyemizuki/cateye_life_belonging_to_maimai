@@ -224,6 +224,18 @@ def settle_sleep_debt(debt_before: Any, actual_hours: Any) -> float:
     return max(0.0, min(SLEEP_DEBT_MAX, before + sleep_debt_delta(actual_hours)))
 
 
+def sleep_recovery_target(debt_at_sleep: Any, *, max_bonus: Any = 1.0) -> float:
+    """夜间恢复目标（PR-SLEEP-RECOVERY 3.17.19，规格 §1A）：
+
+    ``8.0 + min(1.0, debt/12) * max_bonus``（债 0 → 8h，债 12 → 8+bonus；线性有界）。
+    债钳 [0, 12]、bonus 钳 [0, 4]（非法回退默认），纯函数无 IO。只作觉醒保护
+    目标，不参与债结算（债仍按真实有效时长公式，不伪算还债）。
+    """
+    debt = _clamp(debt_at_sleep, 0.0, SLEEP_DEBT_MAX, 0.0)
+    bonus = _clamp(max_bonus, 0.0, 4.0, 1.0)
+    return 8.0 + bonus * min(1.0, debt / SLEEP_DEBT_MAX)
+
+
 def next_occurrence(after: datetime, minute_of_day: Any, *,
                     inclusive: bool = False) -> datetime:
     """``after`` 之后（默认严格晚于）最近的钟点时刻（跨午夜/非默认作息通用）。"""
@@ -272,7 +284,9 @@ def wake_decision(now: datetime, *, energy: Any, earliest_wake: datetime,
                   DEFAULT_HARD_COMMITMENT_LEAD_MINUTES,
                   wake_energy_threshold: float = DEFAULT_WAKE_ENERGY_THRESHOLD,
                   check_due: bool = True,
-                  no_sleep_mode: bool = False) -> WakeDecision:
+                  no_sleep_mode: bool = False,
+                  effective_sleep_hours: Any = 0.0,
+                  min_effective_hours: Optional[float] = None) -> WakeDecision:
     """纯觉醒判定（附录 B.2.3 + 定稿 §4.2.1 优先级）。
 
     顺序（最早截止优先，硬约定与上限都比阈值优先，**且都不被最早起床分支屏蔽**）：
@@ -285,6 +299,12 @@ def wake_decision(now: datetime, *, energy: Any, earliest_wake: datetime,
     4. 阈值判定只在 ``check_due`` 为真时做（``sleep_wake_check_seconds`` 复检节流，
        到点/硬约定不受该节流影响）；
     5. ``energy >= wake_energy_threshold`` → ``energy_threshold``。
+
+    最小有效睡眠保护（PR-SLEEP-RECOVERY 3.17.19，规格 §1C）：
+    ``min_effective_hours`` 非 None 时，第 5 步阈值醒额外要求
+    ``effective_sleep_hours >= min_effective_hours``（未达标继续睡）；
+    **lie_in_cap / 硬约定分支不受影响**（仍在最前，优先于一切）。
+    ``min_effective_hours=None``（缺省）= 旧行为逐字不变。
     """
     if no_sleep_mode:
         return WakeDecision(False, None, None, disabled=True)
@@ -300,10 +320,13 @@ def wake_decision(now: datetime, *, energy: Any, earliest_wake: datetime,
     # 2) 最早起床前不因阈值醒（硬约定/上限已在上方先行判定）
     if now < earliest_wake:
         return WakeDecision(False, None, None)
-    # 3) 阈值（按复检节流）
+    # 3) 阈值（按复检节流）；最小有效睡眠保护只 gate 本分支（规格 §1C）
     if check_due and _clamp(energy, 0.0, 1.0, 0.0) >= _clamp(
             wake_energy_threshold, 0.0, 1.0, DEFAULT_WAKE_ENERGY_THRESHOLD):
-        return WakeDecision(True, "energy_threshold", earliest_wake)
+        if min_effective_hours is None or _clamp(
+                effective_sleep_hours, 0.0, 240.0, 0.0) >= _clamp(
+                min_effective_hours, 0.0, 240.0, 0.0):
+            return WakeDecision(True, "energy_threshold", earliest_wake)
     return WakeDecision(False, None, None)
 
 
@@ -526,6 +549,11 @@ class SleepSession:
     earliest_wake_at: Optional[datetime] = None
     lie_in_cap_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
+    # PR-SLEEP-RECOVERY（3.17.19，规格 §1A）：夜间恢复目标 + 有效睡眠累计。
+    # 同随 metadata 往返（to_row/from_row 经 sync_runtime_fields 持久化，schema
+    # 不变）；旧行缺省 → 目标 8.0 / 累计 0.0；热重载恢复不重置。
+    recovery_target_hours: float = 8.0
+    effective_sleep_hours: float = 0.0
 
     @property
     def closed(self) -> bool:
@@ -585,6 +613,11 @@ class SleepSession:
         session.earliest_wake_at = cls._parse_meta_dt(meta.get("earliest_wake_at"))
         session.lie_in_cap_at = cls._parse_meta_dt(meta.get("lie_in_cap_at"))
         session.closed_at = cls._parse_meta_dt(meta.get("closed_at"))
+        # PR-SLEEP-RECOVERY：旧行无恢复目标字段 → 缺省 8.0（兼容，不重置既有会话）
+        session.recovery_target_hours = _clamp(
+            meta.get("recovery_target_hours"), 8.0, 12.0, 8.0)
+        session.effective_sleep_hours = _clamp(
+            meta.get("effective_sleep_hours"), 0.0, 240.0, 0.0)
         return session
 
     @staticmethod
@@ -604,6 +637,9 @@ class SleepSession:
             self.metadata["lie_in_cap_at"] = self.lie_in_cap_at.isoformat()
         if self.closed_at is not None:
             self.metadata["closed_at"] = self.closed_at.isoformat()
+        # PR-SLEEP-RECOVERY：恢复目标/有效睡眠累计随 metadata 落盘（热重载不重置）
+        self.metadata["recovery_target_hours"] = float(self.recovery_target_hours)
+        self.metadata["effective_sleep_hours"] = float(self.effective_sleep_hours)
 
 
 class MemorySleepSessionStore:
@@ -864,10 +900,18 @@ class SleepEngine:
         hard_due = hard_commitment_deadline(hard_start, lead)
         bonus = 12 if hard_due and now < hard_due < window.wake else 0
         energy = self._energy_now(snapshot.get("energy"))
-        parts = sleep_score(energy, self._debt_now(), now.hour * 60 + now.minute, peak,
+        debt = self._debt_now()
+        parts = sleep_score(energy, debt, now.hour * 60 + now.minute, peak,
                             bonus, interruptibility, engagement=engagement, weights=weights)
         previous = self._dynamic_view.get("band") if self._dynamic_view.get("bedtime") == window.bedtime.isoformat() else "awake"
         band = onset_band(parts["score"], previous) if window.start - timedelta(minutes=90) <= now <= window.latest_start else "awake"
+        # PR-SLEEP-RECOVERY（规格 §1B）：高债提前睡——债 ≥ 阈值且已在允许入睡
+        # 窗口内（≥window_start）→ 直接 winding_down（绕过评分阈值）；窗口外不
+        # 提前，债 < 阈值评分路径逐字不变。外层 hard_due/blocked/should_start 闸
+        # 不受影响（硬约定仍优先）。
+        debt_trigger = bounded(cfg.get("debt_trigger", 6.0), 0, 12, 6.0)
+        if debt >= debt_trigger and window.start <= now <= window.latest_start:
+            band = "winding_down"
         within = window.start <= now <= window.latest_start + timedelta(minutes=5)
         due = hard_due is not None and hard_due <= now + timedelta(minutes=15)
         reason = None
@@ -1251,6 +1295,7 @@ class SleepEngine:
         if planned_end <= planned_start:
             while planned_end <= planned_start:
                 planned_end += DAY_MINUTES
+        debt_before = self._debt_now()
         session = SleepSession(
             session_id=f"sleep:{frame_date}:{planned_start}",
             schedule_date=frame_date,
@@ -1259,13 +1304,17 @@ class SleepEngine:
             created_at=now.isoformat(),
             actual_start_minute=planned_start,
             energy_start=self._energy_now(energy),
-            sleep_debt_before=self._debt_now(),
+            sleep_debt_before=debt_before,
             metadata={"sleep_min": sleep_min, "wake_min": wake_min,
                       "sleep_ring": f"{sleep_min}-{wake_min}", "emitted": [],
                       "episode_id": str((episode or {}).get("episode_id") or "")},
             earliest_wake_at=earliest_wake,
             lie_in_cap_at=cap,
         )
+        # PR-SLEEP-RECOVERY（规格 §1A）：会话启动时一次性计算夜间恢复目标并持久化
+        session.recovery_target_hours = sleep_recovery_target(
+            debt_before, max_bonus=tuning_section("dynamic_sleep").get(
+                "target_max_bonus", 1.0))
         session.metadata["sleep_started_at"] = now.isoformat()
         if dynamic:
             session.metadata["dynamic_sleep"] = dict(dynamic)
@@ -1535,6 +1584,11 @@ class SleepEngine:
         session.metadata["sleep_segment_started_at"] = self._iso(
             self._parse(fields.get("sleep_segment_started_at")) or started)
         session.continuous_minutes = int(continuous_value)
+        # PR-SLEEP-RECOVERY：LifeState 兜底恢复的会话同样带恢复目标（未结算，
+        # 当前债即入睡债口径）；DB 行恢复走 from_row 保留原目标，不在此重置。
+        session.recovery_target_hours = sleep_recovery_target(
+            session.sleep_debt_before,
+            max_bonus=tuning_section("dynamic_sleep").get("target_max_bonus", 1.0))
         session.sync_runtime_fields()
         self._session = session
         self._clock = SleepClock()
@@ -1616,6 +1670,10 @@ class SleepEngine:
         if started_at is not None and current > started_at:
             total_session_minutes = (current - started_at).total_seconds() / 60.0
         quality = sleep_quality(advance.interrupted_minutes, total_session_minutes)
+        # PR-SLEEP-RECOVERY（规格 §1A/C）：有效睡眠累计 = 会话总时长 − 打断扣除
+        # （既有打断口径不变），供最小有效睡眠保护判定；随 _save_session 落盘。
+        session.effective_sleep_hours = max(
+            0.0, total_session_minutes - advance.interrupted_minutes) / 60.0
         rates: Optional[Dict[str, float]] = None
         if not no_sleep_mode:
             gains = integrate_sleep_gains(
@@ -1668,7 +1726,11 @@ class SleepEngine:
                 "sleep_hard_commitment_lead_minutes",
                 DEFAULT_HARD_COMMITMENT_LEAD_MINUTES),
             wake_energy_threshold=threshold,
-            check_due=check_due, no_sleep_mode=no_sleep_mode)
+            check_due=check_due, no_sleep_mode=no_sleep_mode,
+            # PR-SLEEP-RECOVERY（规格 §1C）：最小有效睡眠保护——阈值醒须累计
+            # 有效睡眠达本会话恢复目标；lie_in_cap/硬约定分支不受影响。
+            effective_sleep_hours=session.effective_sleep_hours,
+            min_effective_hours=session.recovery_target_hours)
         if dynamic and decision.reason == "lie_in_cap" and dynamic.get("window_sets_cap"):
             decision = WakeDecision(True, "wake_window_end", decision.deadline)
         # 硬约定 lead 诊断（临时新建 < 提前量 → 立即醒 + 可诊断，**不**倒填准时）
@@ -1766,6 +1828,14 @@ class SleepEngine:
         session.metadata["interrupted_minutes"] = round(interrupted, 1)
         session.metadata["total_window_minutes"] = round(total_window_minutes, 1)
         session.metadata["wake_minute"] = int(session.actual_end_minute)
+        # PR-SLEEP-RECOVERY（规格 §1C）：边界冲突（上限/窗口末端/硬约定强制醒）
+        # 睡不够恢复目标 → 如实记录未满足需求；**不扣债不假算**——债结算仍按
+        # 上方真实有效时长公式（settle_sleep_debt），此处只写诊断 metadata。
+        session.effective_sleep_hours = round(actual_hours, 4)
+        if (reason in {"lie_in_cap", "wake_window_end", "hard_commitment"}
+                and actual_hours < session.recovery_target_hours):
+            session.metadata["recovery_unmet_hours"] = round(
+                session.recovery_target_hours - actual_hours, 4)
         self._save_session()
         finish = getattr(self._store, "finish_sleep_session", None)
         if callable(finish):

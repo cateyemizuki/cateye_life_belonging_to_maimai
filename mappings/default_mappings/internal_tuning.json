@@ -48,7 +48,9 @@
     "awakening_sensitivity": 0.3,
     "chronotype_offset_minutes": 0,
     "weekday_phase_minutes": 0,
-    "weekend_phase_minutes": 15
+    "weekend_phase_minutes": 15,
+    "debt_trigger": 6.0,
+    "target_max_bonus": 1.0
   },
   "llm": {
     "judge_temperature": 0.2

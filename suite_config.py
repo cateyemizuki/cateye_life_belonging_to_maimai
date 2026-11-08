@@ -251,7 +251,12 @@ from suite_prompts import (
 # 纯 CSS 展示层修复（panel.css 级联尾部追加段：mast/mast-side 收缩约束 + #updated
 # 单行省略号 + 嵌入态右距）+ panel.js render() 时间戳 title 全文；不新增配置字段
 # （schema 不变，18 段 202 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.18"
+# 3.17.19（2026-11-08 PR-SLEEP-RECOVERY 睡眠债补偿性恢复目标）：
+# 纯后端睡眠引擎改动（会话级夜间恢复目标 8+min(1,债/12) 持久化 + 高债≥6h 窗口内
+# 提前睡 + 阈值醒最小有效睡眠保护 + 边界冲突如实记 recovery_unmet_hours）；调参
+# 走 internal_tuning dynamic_sleep 段（debt_trigger/target_max_bonus），不新增
+# 用户可见配置字段（schema 不变，18 段 202 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.19"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
