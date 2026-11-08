@@ -224,7 +224,9 @@ const SectionFish=(()=>{
   panel.style.maxHeight=`${usagePinned?vh-pad*2:Math.min(Math.round(free),Math.round(vh*0.9))}px`;
   // 水平：面板左缘靠近入口（长内容向右铺开），不居中漂移；宽度显式设定
   // （absolute 子元素的百分比宽按 overlay 的 padding-box 解析，须自行钳制在视口内）
-  const panelW=Math.min(1040,vw-pad*2);
+  // PR-UI-DETAIL（3.17.21）§1A：详情弹层整体调窄 1040→720px（−30.8%），所有 section
+  // 统一生效；窄弹层内正文改单列堆叠（fish.css .fish-popup-body）；视口钳制沿用。
+  const panelW=Math.min(720,vw-pad*2);
   panel.style.width=`${Math.round(panelW)}px`;
   panel.style.left=`${Math.round(usagePinned?(vw-panelW)/2:Math.min(Math.max(b.left+b.width/2-140,pad),Math.max(pad,vw-pad-panelW)))}px`;
   const p=panel.getBoundingClientRect();
@@ -369,7 +371,11 @@ const SectionFish=(()=>{
  const scheduleDetail=$('schedule-detail'),poolDetail=$('schedule-pool-detail');store.append(scheduleDetail,poolDetail);
  mount('schedule','行程记录',$('panel-schedule'),d=>schedulePageInfo().key==='record'?
   selectedDay||d.schedule?.date||'当日':schedulePageInfo().note,()=>[],[scheduleDetail,poolDetail]);
- const moodCard=$('vad-chart').closest('article'),vadLegend=moodCard.querySelector('.legend');const moodGroups=[fold('心情的变化',[vadLegend,$('vad-chart')]),fold('睡眠调整记录',[$('referee-health')])];
+ // PR-UI-DETAIL（3.17.21）§1B：心情曲线已在历史页独立呈现（#emotion-history-chart），
+ // 详情不再重复——「心情的变化」折叠组（vadLegend+vad-chart）移除；两个节点留隐藏
+ // store（ID 保留、renderEmotion 仍写隐藏节点，「此刻」页布局零变化）。详情保留
+ // 心情标签/三维数值/裁判健康等非曲线信息。
+ const moodCard=$('vad-chart').closest('article'),vadLegend=moodCard.querySelector('.legend');store.append(vadLegend,$('vad-chart'));const moodGroups=[fold('睡眠调整记录',[$('referee-health')])];
  mount('mood','当前情绪',moodCard,d=>d.emotion?.available?(d.emotion.label||'心情平稳'):'暂无心情记录',d=>[['当前状态',d.emotion?.frozen?'睡眠冻结中':'自然变化中','睡眠期间暂停自然变化，醒后按真实睡眠会话进行调整。'],['最近调整',safeTime(d.emotion?.referee?.last_success_at),fullClock(d.emotion?.referee?.last_success_at)]],moodGroups);
  // PR-FIXED-CHROME（3.17.15）：最近观看卡左下角麦麦详情入口（复用 SectionFish 机制）；
  // 兴趣话题整块收进该详情弹层（#video-interests 由主页面隐藏包裹层移入 store）。

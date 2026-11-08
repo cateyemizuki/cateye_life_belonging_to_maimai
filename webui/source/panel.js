@@ -90,7 +90,9 @@ function chart(target,rows,keys,max=1,height=260,min=0){
  const t0=zoom?.[0]??dayBounds?.[0]??Number(date(rows[0]?.at)),t1=zoom?.[1]??dayBounds?.[1]??Number(date(rows.at(-1)?.at));
  const span=Math.max(300000,t1-t0),x=t=>l+(t-t0)/span*(w-l-r),y=v=>height-bottom-Math.max(0,Math.min(1,(v-min)/(max-min)))*(height-top-bottom),step=document.documentElement.dataset.dashboardStyle==='millennium';
  const root=svg('svg',{viewBox:`0 0 ${w} ${height}`,role:'img',tabindex:'0','aria-label':min<0?'情绪 VAD 趋势，纵轴 −1 到 1':max===1?'生活状态趋势，纵轴百分比，拖动或双指缩放；按 Escape 重置':'睡眠债趋势，纵轴小时'});
- root.style.userSelect='none';root.append(svg('title',{},'实线为真实观察；虚线为中间缺口估算；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。'));
+ // PR-UI-DETAIL（3.17.21）§1C：VAD（min<0）为事件驱动不规则采样，>15min 间隔是常态而非缺测。
+ const sparseVad=min<0;
+ root.style.userSelect='none';root.append(svg('title',{},sparseVad?'实线为真实观察；圆点为真实采样点；点线为采样缺口连线（两端真实，未插入估算点）；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':'实线为真实观察；虚线为中间缺口估算；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。'));
  const clipId=target.id+'-clip',hatchId=target.id+'-hatch',defs=svg('defs'),clip=svg('clipPath',{id:clipId});clip.append(svg('rect',{x:l,y:top,width:w-l-r,height:height-top-bottom}));defs.append(clip);
  const hatch=svg('pattern',{id:hatchId,patternUnits:'userSpaceOnUse',width:8,height:8,patternTransform:'rotate(45)'});hatch.append(svg('line',{x1:0,y1:0,x2:0,y2:8,stroke:'var(--focus)','stroke-width':2,opacity:.18}));defs.append(hatch);root.append(defs);
  const under=svg('g',{'clip-path':`url(#${clipId})`});
@@ -115,7 +117,21 @@ function chart(target,rows,keys,max=1,height=260,min=0){
   const real=build(false),estimated=build(true);
   if(real.length)curves.append(svg('path',{d:real.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':key==='stress'?3:(step?3:2),'stroke-linejoin':'round','stroke-linecap':'round','data-series':key}));
   if(estimated.length)curves.append(svg('path',{d:estimated.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':2,'stroke-dasharray':'5 5',class:'estimated-line','data-series':key}));
-  if(rows.length===1&&num(rows[0][key])!==null)curves.append(svg('circle',{cx:x(Number(date(rows[0].at))),cy:y(rows[0][key]),r:3,fill:`var(${colors[key]})`}))
+  if(sparseVad){
+   // PR-UI-DETAIL（3.17.21）§1C 根因修复：VAD 事件驱动稀疏采样（生产约 22min/点），
+   // >15min 间隔标 gap_before——旧逻辑据此断线，单点段 smoothPath 只产出 "M x y"
+   // （无绘制命令）→ 孤立真实点完全不可见，曲线碎裂似几乎全部缺失。现在：
+   // ①每个真实点画圆点（孤立点也可见）；②跨缺口的相邻真实点补「缺口桥」点线
+   // （两端均为真实观察，未插入估算点、不计入真实统计），与估算虚线（5 5）区分。
+   // 估算填充点（按日 _fill_small_gaps）沿用原虚线口径，不混入真实连线。
+   const edges=[];let prevP=null;
+   for(const p of rows){if(p.estimated||num(p[key])===null){prevP=null;continue}
+    if(prevP&&(p.gap_before||(!downsampled&&Number(date(p.at))-Number(date(prevP.at))>900000)))edges.push(`M${x(Number(date(prevP.at)))} ${y(prevP[key])}L${x(Number(date(p.at)))} ${y(p[key])}`);
+    prevP=p}
+   if(edges.length){const bridge=svg('path',{d:edges.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':1.5,'stroke-dasharray':'2 4',opacity:.6,'data-gap-bridge':key});bridge.append(svg('title',{},'采样缺口连线：两端均为真实观察，未插入估算点'));curves.append(bridge)}
+   for(const p of rows){if(p.estimated||num(p[key])===null)continue;const dot=svg('circle',{cx:x(Number(date(p.at))),cy:y(p[key]),r:2.5,fill:`var(${colors[key]})`,'data-real-point':key});dot.append(svg('title',{},clock(p.at,true)+' · 真实观察'));curves.append(dot)}
+  }
+  if(!sparseVad&&rows.length===1&&num(rows[0][key])!==null)curves.append(svg('circle',{cx:x(Number(date(rows[0].at))),cy:y(rows[0][key]),r:3,fill:`var(${colors[key]})`}))
  }
  root.append(curves);
  // A bounded set of actual episode boundaries, using their own calendar date.
@@ -160,13 +176,17 @@ function emotionHistoryPoints(){const series=vadSeries(),all=Array.isArray(serie
 function renderEmotionHistory(){const target=$('emotion-history-chart');if(!target)return;const {rows,downsampled}=emotionHistoryPoints();
  if(!rows.length){empty(target,'暂无心情记录','情绪记录就绪后，愉悦/唤醒/掌控曲线会在这里展开。');text('emotion-history-info','暂无心情记录');renderEmotionSamples([]);return}
  chart(target,rows,['valence','arousal','dominance'],1,260,-1);
- text('emotion-history-info',`${rows.length} 个心情采样点${downsampled?' · 已抽样显示':''} · 量程 −1 到 1`);renderEmotionSamples(rows)}
+ // PR-UI-DETAIL（3.17.21）§1C：真实/估算口径分开陈述（按日视图含 _fill_small_gaps
+ // 估算填充），估算不计入真实采样点数——沿用既有 estimated 口径，不造假点。
+ const realCount=rows.filter(p=>!p.estimated).length,estCount=rows.length-realCount;
+ text('emotion-history-info',`${realCount} 个真实心情采样点${estCount?` · ${estCount} 个估算点（不计入真实）`:''}${downsampled?' · 已抽样显示':''} · 量程 −1 到 1`);renderEmotionSamples(rows)}
 function renderEmotionSamples(rows){const wrap=$('emotion-history-samples');if(!wrap)return;
  if(!rows.length){empty(wrap,'暂无心情采样','这里只显示实际记录。');return}
  const colh=t=>{const h=el('th','',t);h.setAttribute('scope','col');return h};
  const table=el('table','maibot-table'),head=el('tr'),thead=el('thead'),body=el('tbody');
  for(const label of['采样时间','愉悦','唤醒','掌控'])head.append(colh(label));thead.append(head);
- for(const p of rows.slice(-60).reverse()){const row=el('tr');row.append(el('td','',clock(p.at,true)),el('td','',fix(p.valence,2)),el('td','',fix(p.arousal,2)),el('td','',fix(p.dominance,2)));body.append(row)}
+ // PR-UI-DETAIL（3.17.21）§1C：估算填充行在时间列显式标注「估算」，不冒充真实记录。
+ for(const p of rows.slice(-60).reverse()){const row=el('tr');row.append(el('td','',clock(p.at,true)+(p.estimated?' · 估算':'')),el('td','',fix(p.valence,2)),el('td','',fix(p.arousal,2)),el('td','',fix(p.dominance,2)));body.append(row)}
  table.append(thead,body);wrap.replaceChildren(el('p','note',`显示最近 60 条 · 当前范围共 ${rows.length} 点`),table)}
 // 睡眠债迷你曲线（W-01 主卡微型预览，48–64px）：只呈现趋势、无数值轴（数值在三项统计里）；
 // 全量交互曲线 #debt-chart 仍在详情层（D4：摘要+微型预览+详情全量），两者不共享 DOM。

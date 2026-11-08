@@ -263,7 +263,11 @@ from suite_prompts import (
 # 放宽 1760px；调参走 internal_tuning life_state 段（chat_social_drain_per_reply/
 # debt_stress_per_h），不新增用户可见配置字段（schema 不变，18 段 202 叶子），
 # 按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.20"
+# 3.17.21（2026-11-08 PR-UI-DETAIL 详情弹层调窄 + 心情详情曲线移除 + 历史心情修复）：
+# 详情弹层 1040→720px 单列堆叠；心情详情不再重复 VAD 曲线（历史页独立呈现）；
+# 历史心情稀疏采样断线修复（真实点圆点可见 + 缺口桥点线，不插入估算点）。
+# 纯展示，不新增用户可见配置字段（schema 不变，18 段 202 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.21"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
