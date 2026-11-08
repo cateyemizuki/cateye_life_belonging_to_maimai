@@ -236,7 +236,10 @@ def integrate_awake(state: Mapping[str, Any], dt_min: float,
     - ``hunger``：用餐画像 → 向饱腹 target 趋近（替代 v1 −0.0180/min 线性）；
       其余 → 基础代谢时钟向 1.0 趋近，画像 ``hunger_rate`` 折算活动强度合成 tau；
     - ``focus`` / ``stress``：画像配了 target → 趋近；否则画像线性速率
-      （无则取 ``no_profile_focus/stress_drain_per_min`` 基础分量）；
+      （无则取 ``no_profile_focus/stress_drain_per_min`` 基础分量）。
+      stress 额外受睡眠债基线下限（3.17.20 §1B）：趋近 target 取
+      ``max(activity_target, debt_stress_per_h × debt)``，线性分支结果不低于
+      该 floor（债0 → floor 0 → 与旧数学逐字一致）；
     - ``social_battery``：画像 ``social_rate < 0``（真实交流）→ 线性消耗；否则
       安静回充向 1.0 趋近（tau 以小时计，接近满电自然减慢）。
     """
@@ -289,11 +292,20 @@ def integrate_awake(state: Mapping[str, Any], dt_min: float,
         source["hunger"] = "basal"
 
     # focus / stress：画像 target 趋近 / 线性速率（无速率 → 基础分量）
+    # PR-REALISM-TUNING（3.17.20 §1B）：睡眠债抬升压力基线——有效 stress target =
+    # max(activity_target, debt_stress_floor)，floor = debt_stress_per_h × debt
+    # （默认 0.01/h，经 internal_tuning 注入 params；债0 → floor 0 → 数学逐字不变）；
+    # 线性速率分支结果 likewise 不低于 floor。睡眠期 integrate_sleep 不受影响。
+    debt_stress_floor = _clamp01(
+        max(0.0, _finite(params.get("debt_stress_per_h"), 0.01)) * debt)
     for axis in ("focus", "stress"):
         pair = _activity_axis(params, profile_key, axis)
         if pair is not None:
-            target[axis], tau[axis] = pair
-            new_value = approach_value(state.get(axis, 0.0), pair[0], pair[1], dt)
+            axis_target = pair[0]
+            if axis == "stress" and debt_stress_floor > axis_target:
+                axis_target = debt_stress_floor
+            target[axis], tau[axis] = axis_target, pair[1]
+            new_value = approach_value(state.get(axis, 0.0), axis_target, pair[1], dt)
             delta[axis] = new_value - float(state.get(axis, 0.0))
         else:
             rate = _finite(rates.get(f"{axis}_rate"), 0.0)
@@ -302,6 +314,10 @@ def integrate_awake(state: Mapping[str, Any], dt_min: float,
                                -0.00015 if axis == "focus" else -0.00005)
                 source[axis] = "basal"
             delta[axis] = rate * dt
+            if axis == "stress" and debt_stress_floor > 0.0:
+                new_value = float(state.get(axis, 0.0)) + delta[axis]
+                if new_value < debt_stress_floor:
+                    delta[axis] = debt_stress_floor - float(state.get(axis, 0.0))
 
     # social_battery：真实交流线性消耗 / 安静回充趋近
     social_rate = _finite(rates.get("social_battery_rate"), 0.0)

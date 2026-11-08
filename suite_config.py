@@ -256,7 +256,14 @@ from suite_prompts import (
 # 提前睡 + 阈值醒最小有效睡眠保护 + 边界冲突如实记 recovery_unmet_hours）；调参
 # 走 internal_tuning dynamic_sleep 段（debt_trigger/target_max_bonus），不新增
 # 用户可见配置字段（schema 不变，18 段 202 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.19"
+# 3.17.20（2026-11-08 PR-REALISM-TUNING 社交/压力拟人化补全 + 宽屏填充）：
+# 真实聊天消耗社交电量（replyer after_response 目标私聊真实回复 -0.015/次，
+# 既有 apply_episode 显式增量门，diag event 桶 kind=chat）+ 睡眠债抬升压力基线
+# （settlement_v2 stress floor = debt_stress_per_h × debt）+ ≥1600px 宽屏 shell
+# 放宽 1760px；调参走 internal_tuning life_state 段（chat_social_drain_per_reply/
+# debt_stress_per_h），不新增用户可见配置字段（schema 不变，18 段 202 叶子），
+# 按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.20"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

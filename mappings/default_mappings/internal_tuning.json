@@ -39,7 +39,9 @@
     "high_stress_threshold": 0.8,
     "brief_attention_progress": 0.3,
     "late_attention_progress": 0.7,
-    "sleep_interrupt_min_minutes": 5
+    "sleep_interrupt_min_minutes": 5,
+    "chat_social_drain_per_reply": 0.015,
+    "debt_stress_per_h": 0.01
   },
   "dynamic_sleep": {
     "pressure_weight": 0.5,

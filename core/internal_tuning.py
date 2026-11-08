@@ -85,6 +85,12 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "brief_attention_progress": 0.30,
         "late_attention_progress": 0.70,
         "sleep_interrupt_min_minutes": 5,
+        # PR-REALISM-TUNING（3.17.20，规格 §1A/§1B）：真实回复社交电量消耗
+        # （夹取 ≥0）与睡眠债每小时抬升的压力基线下限。内部调参，不新增
+        # 用户可见 schema 键；debt_stress_per_h 经 life_state._settlement_params_v2
+        # 注入结算 params（纯函数层不读盘）。
+        "chat_social_drain_per_reply": 0.015,
+        "debt_stress_per_h": 0.01,
     },
     "dynamic_sleep": {
         "pressure_weight": 0.5,

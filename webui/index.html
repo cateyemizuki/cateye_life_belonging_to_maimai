@@ -541,6 +541,13 @@ footer{flex:none}
 @media(max-width:900px){
  .now-duo{grid-template-columns:1fr}
 }
+/* ── PR-REALISM-TUNING（3.17.20 §1C）：宽屏填充 ─────────────────────────────
+   根因（规格§0 复核）：REFORGE 段 .shell max-width:1360px（:246）压过先前
+   1420/1440，≥1600px 视口两侧留白过大。≥1600px 放宽至 1760px，居中（margin:auto）
+   与 padding 保留；<1600px 逐字保持现状。本段是级联中最后一条 .shell max-width
+   声明（3.17.18 mast 段不触 .shell）；置于 3.17.18 段之前以保全该段红线断言
+   （其尾块不得含 .shell 规则）。固定框架/栏目/娱乐布局与 mast 自适应不受影响。 */
+@media(min-width:1600px){.shell{max-width:1760px}}
 /* ── PR-RESPONSIVE-MAST（3.17.18）：mast 自适应收缩 + 时间戳 ellipsis 防溢出 ──────
    纯布局：级联尾部追加段压过 3.17.12 段（:475/:480）flex 横排的收缩口径。
    根因（规格§0 复核）：.mast-side 作为 flex 项 flex-basis auto=max-content 无显式收缩

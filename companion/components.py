@@ -15,7 +15,9 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   - maisaka.replyer.before_model_request  过期主动任务块剥离 + 屏幕旁白注入 +
                                        陪伴私聊主动激活轮宿主目标指令改写
                                        （PR-PROACTIVE-REPLY 3.17.2；BLOCKING/NORMAL）
-  - maisaka.replyer.after_response     90 秒窗口补计 0.5 发言数 + spoken 回执（OBSERVE/LATE）
+  - maisaka.replyer.after_response     90 秒窗口补计 0.5 发言数 + spoken 回执 +
+                                       目标私聊真实回复社交电量小幅消耗
+                                       （PR-REALISM-TUNING 3.17.20；OBSERVE/LATE）
 - Tools ×2：lbm_mai_lover_affection（F3 2026-11-04：is_enabled + 目标私聊 scope 校验，
   决策痕带调用者身份）/
   lbm_report_harassment（2026-10-24 告状：受骚扰时转达维护者；纯逻辑见
@@ -863,6 +865,10 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         F6（2026-11-04）：补计前比对回复流与目标流——宿主 after_response 携带
         ``session_id``（=回复所在流）；窗口内无关流（群聊/其他用户）的回复不补计、
         不消费待确认触发，spoken 归因不再失真。
+
+        PR-REALISM-TUNING（3.17.20 §1A）：同钩子先对陪伴目标私聊的**真实回复**
+        施加社交电量小幅消耗（主动轮按 90 秒窗口同口径排除；见
+        :meth:`_mai_chat_social_drain`），再走既有补计逻辑（逐字不变）。
         """
         _tracker = getattr(self, "_attention_tracker", None)
         if _tracker is not None:
@@ -870,6 +876,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         companion = self._mai_companion()
         if companion is None:
             return
+        self._mai_chat_social_drain(kwargs, companion)
         patrol = companion.patrol
         last_trigger = patrol.get_last_trigger_time()
         if last_trigger is None:
@@ -891,6 +898,77 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             trigger_type=trigger_type,
             detail=f"planner 已生成回复并发送（距触发 {elapsed:.0f} 秒）｜触发类型={trigger_type or '未知'}",
         )
+
+    #: PR-REALISM-TUNING（3.17.20 §1A）：真实回复社交消耗去重窗（秒）。宿主可能对
+    #: 同一回复重试/重复派发 after_response；同 (流, 回复指纹) 窗内只施加一次。
+    #: 窗外合法重复的同文案回复不受影响（episode 回执 id 带单调时间戳逐次唯一）。
+    _CHAT_SOCIAL_DRAIN_DEDUP_SECONDS = 10.0
+
+    def _mai_chat_social_drain(self, kwargs: dict[str, Any], companion: Any) -> None:
+        """陪伴目标私聊真实回复消耗社交电量（PR-REALISM-TUNING 3.17.20 §1A）。
+
+        - 仅陪伴目标私聊：回复流 == 巡检目标流（F6 同口径；群聊/其他私聊流 id
+          不同，天然排除）；流 id 缺失 → 不施加；
+        - 主动轮不计：90 秒窗内有 proactive trigger（既有 0.5 补计同口径）→ 跳过；
+        - 消耗量 = internal_tuning[life_state].chat_social_drain_per_reply（默认
+          0.015，夹取 ≥0；≤0 → 不施加）。经既有 :meth:`LifeStateService.apply_episode`
+          显式增量门施加（统一 clamp [0,1]、diag contrib 归 event 桶 kind=chat、
+          回执与状态同文件原子保存）——不新增结算通路；
+        - 每回复恰一次：同 (流, 回复指纹) 短窗去重（钩子幂等）；
+        - 空闲时 settlement 安静回充仍生效 → 电量随聊天节奏波动而非钉满；
+        - 任何异常静默降级（OBSERVE 钩子不拖挂回复链）。
+        """
+        life = getattr(self, "_life_state", None)
+        if life is None:
+            return
+        try:
+            reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
+            if not reply_stream:
+                return
+            target_stream = str(companion.patrol.patrol_status().get("stream_id") or "").strip()
+            if not target_stream or reply_stream != target_stream:
+                return  # 仅陪伴目标私聊（群聊/其他私聊不计，F6 同口径）
+            last_trigger = companion.patrol.get_last_trigger_time()
+            if last_trigger is not None and (datetime.now() - last_trigger).total_seconds() < 90:
+                return  # 主动轮（既有补计同窗口口径）：不消耗
+            import hashlib
+            import time as _time
+            from core.internal_tuning import tuning_value
+            try:
+                drain = float(tuning_value("life_state", "chat_social_drain_per_reply"))
+            except Exception:
+                drain = 0.015
+            if drain != drain or drain in (float("inf"), float("-inf")):
+                drain = 0.015
+            drain = max(0.0, drain)  # 夹取 ≥0（负值调参 → 不消耗）
+            if drain <= 0.0:
+                return
+            fingerprint = hashlib.sha1(
+                str(kwargs.get("response") or "").encode("utf-8", "replace")).hexdigest()[:16]
+            key = (reply_stream, fingerprint)
+            now_mono = _time.monotonic()
+            recent = getattr(self, "_mai_chat_drain_recent", None)
+            if recent is None:
+                recent = self._mai_chat_drain_recent = {}
+            for old_key in [k for k, stamp in recent.items()
+                            if now_mono - stamp > self._CHAT_SOCIAL_DRAIN_DEDUP_SECONDS]:
+                del recent[old_key]
+            if key in recent:
+                return  # 同一回复重复派发（钩子重试）：幂等跳过
+            life.apply_episode({
+                "episode_id": f"chat_social_drain:{reply_stream}:{fingerprint}:{now_mono:.6f}",
+                "state_deltas": {"social_battery": -drain},
+                "settlement_kind": "chat",
+            })
+            recent[key] = now_mono  # 施加成功才记去重戳（失败不挡重试）
+            if len(recent) > 64:
+                for old_key in sorted(recent, key=recent.get)[:len(recent) - 64]:
+                    del recent[old_key]
+        except Exception:
+            try:
+                self.ctx.logger.debug("聊天社交电量消耗施加失败（忽略）", exc_info=True)
+            except Exception:
+                pass
 
     # ---- 注入辅助（屏幕旁白 / 作用域 / 文案）----
 

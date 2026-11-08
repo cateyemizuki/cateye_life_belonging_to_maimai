@@ -407,16 +407,31 @@ class LifeStateService:
 
 
     def _settlement_params_v2(self) -> Dict[str, Any]:
-        """生效 v2 参数（内置默认 ← 用户覆盖合并；每次结算时合并，热更即生效）。"""
+        """生效 v2 参数（内置默认 ← 用户覆盖合并；每次结算时合并，热更即生效）。
+
+        PR-REALISM-TUNING（3.17.20 §1B）：``debt_stress_per_h`` 自 internal_tuning
+        （J 类，mappings/internal_tuning.json[life_state]）注入——纯函数层不读盘，
+        注入点在服务侧；不占用 V2_PARAMS 键集/用户可见 schema。读取失败 → 不注入
+        （integrate_awake 按内置默认 0.01/h）。
+        """
         from . import settlement_v2
         overrides = self._settlement_params
         if not isinstance(overrides, dict) or not overrides:
-            return settlement_v2.V2_PARAMS
+            params = dict(settlement_v2.V2_PARAMS)
+        else:
+            try:
+                params = settlement_v2.merge_params(overrides, logger)
+            except Exception:
+                logger.debug("v2 参数合并失败（回退内置默认）", exc_info=True)
+                params = settlement_v2.default_params()
         try:
-            return settlement_v2.merge_params(overrides, logger)
+            from core.internal_tuning import tuning_value
+            value = float(tuning_value("life_state", "debt_stress_per_h"))
+            if math.isfinite(value):
+                params["debt_stress_per_h"] = value
         except Exception:
-            logger.debug("v2 参数合并失败（回退内置默认）", exc_info=True)
-            return settlement_v2.default_params()
+            logger.debug("debt_stress_per_h 读取失败（按纯函数内置默认）", exc_info=True)
+        return params
 
     @staticmethod
     def _v2_profile_key(active_profile: Any) -> Optional[str]:
