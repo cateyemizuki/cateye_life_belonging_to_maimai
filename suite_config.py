@@ -277,7 +277,12 @@ from suite_prompts import (
 # 184→16px、panel-layout align-items:stretch、此刻页 flex 列 + now-duo flexGrow 填满
 # 剩余高度，消除固定框架下底部空白带；纯展示，不新增用户可见配置字段
 # （schema 不变，18 段 202 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.23"
+# 3.17.24（2026-11-09 PR-TABS-STICKY 宽屏左栏固定回归修复）：3.17.23 的
+# panel-layout align-items:stretch 把 sticky 左栏撑满滚动容器致其随内容滚动；
+# ≥1600px 追加 .panel-tabs{align-self:start} 恢复内容高+sticky 固定，右栏 body
+# 仍 stretch 保持纵向填充。纯展示，不新增用户可见配置字段（schema 不变，
+# 18 段 202 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.24"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

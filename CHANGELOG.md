@@ -1,5 +1,10 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.24（2026-11-09）
+
+- PR-TABS-STICKY（宽屏左栏固定回归修复）：用户反馈左侧栏目按钮（此刻/日程/历史/娱乐/系统）又不固定、随内容滚动。根因（playwright 真机尺寸探针 `scratch/probe_tabs_sticky_31724.py` before 确证）：3.17.23 为纵向填充加的 `.panel-layout{align-items:stretch}` 把 `position:sticky` 的左栏 `.panel-tabs` 也拉伸到滚动容器满高（实测 tabsH 1103px、alignSelf=auto），sticky 元素被撑满后失去吸附余量 → 随内容滚动（滚动后 tabsTop 119.98→104.98）。修复：≥1600px 追加单独 media 块 `.panel-tabs{align-self:start}`，左栏恢复内容高（实测 228px）+sticky 固定（滚动后 tabsTop 不变 tabsMoved=false）；右栏 `.panel-body` 仍继承 stretch 保持 3.17.23 纵向填充（emptyInsidePL 仍 0）。新块置于 mast 段之前、不改 3.17.23 被断言原串（FILL_RULE 逐字保留）。
+- **红线保留**：纯展示；按钮 ID/行为/事件绑定不变；固定框架/纵向填充不破坏；<1600px 逐字现状。schema 不变（18 段 202 叶子）。版本双号 3.17.24（_manifest.json == SUPPORTED_CONFIG_VERSION）；门禁版本重钉。新增专项 `scratch/test_tabs_sticky_31724.py`。`python tools/build_webui.py` 重建 index.html。边界：本批不部署、不 git commit、不 push、不碰主机、不改生产配置。
+
 ## 3.17.23（2026-11-08）
 
 - PR-VERTICAL-FILL（宽屏纵向填充）：用户真机宽屏（2298×1262 暗色）反馈此刻页底部仍大片空白——3.17.20 宽屏填充只处理横向 shell max-width，纵向未处理。根因（playwright 真机尺寸探针 `scratch/probe_vertical_fill_31723.py` before/after 量化）：①固定框架（3.17.15）`.shell{display:flex;height:100dvh}` 钳视口高，但旧 `padding-bottom:184px` 在滚动容器之外留永久空白带（主因，184px）；②`.panel-layout` 为 flex:1 滚动容器但 `align-items:start`，此刻页内容矮于容器 → 容器内再留空（实测 81px）。修复（纯 CSS，仅 ≥1600px 生效）：新增 media 块 `.shell{padding-bottom:16px}`（收回底部预留）+`.panel-layout{align-items:stretch}`（拉伸网格行）+`#panel-now{display:flex;flex-direction:column;min-height:100%}`+`.now-duo{flex:1 1 auto;align-items:stretch}`（心情/睡眠双卡 flexGrow 填满剩余高度）。探针 after：shellPadBottom 184→16、panel-layout 底 1040→1208、emptyInsidePL 81→0、now-duo 314→543px 填满；目检双卡背景铺满至视口底、空白带消失。新块置于 3.17.18 mast 段之前（保全「mast 尾块不得含 .shell」红线），不改任何被断言原串（WIDE_RULE/固定框架 shell/panel-layout 逐字保留）。

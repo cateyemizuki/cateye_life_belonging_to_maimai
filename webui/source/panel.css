@@ -553,6 +553,10 @@ footer{flex:none}
    下方留空。此块置于 mast 段之前（保全 3.17.18「mast 尾块不得含 .shell」红线），仅 ≥1600px
    生效：收回底部预留、拉伸网格行与此刻页、now-duo  flexGrow 填满剩余高度。 */
 @media(min-width:1600px){.shell{padding-bottom:16px}.panel-layout{align-items:stretch}#panel-now{display:flex;flex-direction:column;min-height:100%}.now-duo{flex:1 1 auto;align-items:stretch}}
+/* PR-TABS-STICKY（3.17.24）：3.17.23 的 align-items:stretch 把 sticky 左栏也撑满滚动容器
+   致其失去吸附余量而随内容滚动。左栏单独 align-self:start 恢复内容高+sticky 固定；
+   右栏 body 仍 stretch 保持纵向填充。仅 ≥1600px，置于 mast 段之前。 */
+@media(min-width:1600px){.panel-tabs{align-self:start}}
 /* ── PR-RESPONSIVE-MAST（3.17.18）：mast 自适应收缩 + 时间戳 ellipsis 防溢出 ──────
    纯布局：级联尾部追加段压过 3.17.12 段（:475/:480）flex 横排的收缩口径。
    根因（规格§0 复核）：.mast-side 作为 flex 项 flex-basis auto=max-content 无显式收缩
