@@ -376,13 +376,6 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             self._proactive_turn_registry = registry
             return registry
 
-    def _mai_consume_proactive_turn(self, registry: Any, turn: dict[str, Any]) -> None:
-        """改写完成后一次性消费登记；消费失败仅记诊断（窗口兜底防重复改写）。"""
-        try:
-            registry.consume(turn.get("turn_id"))
-        except Exception:
-            self.ctx.logger.debug("主动激活登记消费失败（忽略）", exc_info=True)
-
     def _mai_proactive_turn_yields_to_incoming(self, turn: dict[str, Any],
                                                payload_key: str, payload: list[Any]) -> bool:
         """红线让位：上下文最后真实来信比登记时间更新 → 按真实来信轮处理（不改写）。
@@ -767,11 +760,13 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         """主动激活轮：替换 replyer 宿主目标指令；失败保守追加+诊断。
 
         PR-PROACTIVE-GATE（3.17.14）：优先消费统一登记簿——所有 chat_type
-        （群聊/其他私聊/陪伴目标私聊）× kind（发起原因）按矩阵定制文案，改写后
-        一次性消费；真实来信比登记更新 → 让位（红线：逐字不变）。registry 未
-        命中时保留 3.17.2 旧判定作 fallback（active_task + patrol 窗，仅陪伴目标
-        私聊、兜底文案），兼容未登记路径与旧快照降级。只改提示词文本，不触碰
-        预算/静默/好感/隐私门控；非主动轮返回 None（调用方原样继续）。
+        （群聊/其他私聊/陪伴目标私聊）× kind（发起原因）按矩阵定制文案。
+        PR-RELIABILITY（3.17.17 §1A）：改用 claim 单锁原子领取（查+消费一步，
+        并发 replyer 仅一个命中），改写无需再 consume；真实来信比登记更新 →
+        让位并 release 回滚领取（红线：逐字不变，登记保留给真正主动轮）。
+        registry 未命中时保留 3.17.2 旧判定作 fallback（active_task + patrol 窗，
+        仅陪伴目标私聊、兜底文案），兼容未登记路径与旧快照降级。只改提示词
+        文本，不触碰预算/静默/好感/隐私门控；非主动轮返回 None（调用方原样继续）。
         """
         from integrations.proactive_reply_target import (
             append_proactive_notice,
@@ -787,35 +782,40 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         turn = None
         if registry is not None and session_id:
             try:
-                turn = registry.active_for(session_id)
+                # PR-RELIABILITY（3.17.17 §1A）：原子领取——单锁内查+消费一步完成，
+                # 并发 replyer 只有一个能拿到同一登记（旧 active_for+consume 两步竞态）。
+                turn = registry.claim(session_id)
             except Exception:
                 self.ctx.logger.debug("主动激活登记簿读取失败（降级旧判定路径）", exc_info=True)
                 turn = None
         if turn is not None:
             if self._mai_proactive_turn_yields_to_incoming(turn, payload_key, payload):
-                return None  # 红线：触发后真实来信更新的轮逐字不变
+                # 红线：触发后真实来信更新的轮逐字不变。release 回滚本轮领取
+                # （claimant 标识防误恢复），登记保留给真正的主动轮。
+                try:
+                    registry.release(turn.get("turn_id"), turn.get("claimed_by"))
+                except Exception:
+                    self.ctx.logger.debug("主动激活登记让位回滚失败（忽略）", exc_info=True)
+                return None
             notice = rewrite_notice_for(turn.get("chat_type"), turn.get("kind"))
             updated, replaced = rewrite_replyer_payload(payload_key, payload, notice)
             if replaced:
-                self._mai_consume_proactive_turn(registry, turn)
+                # claim 已原子消费，无需再 consume。
                 self.ctx.logger.info(
                     f"主动激活轮（kind={turn.get('kind')} chat_type={turn.get('chat_type')}）："
                     f"已把 replyer 宿主目标指令替换为定制文案（{replaced} 段）")
                 return {**kwargs, payload_key: updated}
             if any(payload_has_proactive_notice(payload_key, payload, text)
                    for text in known_notice_texts()):
-                self._mai_consume_proactive_turn(registry, turn)
-                return None  # 已含主动激活文案（重试/重复钩子）：幂等，不二次追加
+                return None  # 已含主动激活文案（重试/重复钩子）：幂等，不二次追加（claim 已消费）
             appended = append_proactive_notice(payload_key, payload, notice)
             if appended is None:
-                # 评审修复：注入失败同样一次性消费——否则登记在窗内持续 active，
-                # 后续任何 replyer 轮（含真实来信轮）都会再次尝试改写。
-                self._mai_consume_proactive_turn(registry, turn)
+                # 评审修复：注入失败同样一次性消费（claim 已消费）——否则登记在窗内
+                # 持续 active，后续任何 replyer 轮（含真实来信轮）都会再次尝试改写。
                 self.ctx.logger.warning(
                     f"主动激活轮（kind={turn.get('kind')} chat_type={turn.get('chat_type')}）："
                     "replyer 载荷无可追加文本条目，定制文案未注入（登记已消费）")
                 return None
-            self._mai_consume_proactive_turn(registry, turn)
             self.ctx.logger.warning(
                 f"主动激活轮（kind={turn.get('kind')} chat_type={turn.get('chat_type')}）："
                 "未匹配到宿主目标指令段，已保守追加定制文案作为尾随锚点")

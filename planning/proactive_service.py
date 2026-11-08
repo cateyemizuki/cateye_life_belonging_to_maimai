@@ -94,7 +94,7 @@ from .config import (
     section_or_default,
 )
 from core.storage import load_json, save_json_atomic
-from tools.proactive_turn import register_turn
+from tools.proactive_turn import discard_turn, register_turn
 
 from .activity_properties import resolve_property
 from .cycle_state import (CycleState, anchored_state, day_cycle_epochs,
@@ -3031,8 +3031,9 @@ class ProactiveService:
         （跳过并告警），不再无预算直接触发；问候豁免策略不变。
 
         PR-PROACTIVE-GATE（3.17.14）：kw-only ``kind`` = 发起原因（问候调用点传
-        morning/noon/night_greeting），成功触发后经 tools.proactive_turn 统一登记；
+        morning/noon/night_greeting），经 tools.proactive_turn 统一登记；
         登记只做事实记录与文案分类，不触碰预算/计数/豁免口径。
+        PR-RELIABILITY（3.17.17 §1A）：登记前置到 trigger 调用前，失败 discard。
         """
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "maisaka"):
@@ -3097,6 +3098,8 @@ class ProactiveService:
             except Exception:
                 logger.debug("proactive.used 发布失败", exc_info=True)
 
+        # 3.17.17 登记前置，失败 discard。
+        turn_id = register_turn(self._plugin, stream_id, kind, reason)
         result = None
         if priority and priority != "normal":
             try:
@@ -3108,16 +3111,15 @@ class ProactiveService:
                 result = await trigger(stream_id=stream_id, intent=intent_prompt, reason=reason)
             except Exception as exc:
                 logger.warning(f"主动触发异常: stream={stream_id}, {exc}")
+                discard_turn(self._plugin, turn_id)
                 _discard_screen_narration()
                 return False
 
         if isinstance(result, dict) and not result.get("success", False):
             logger.warning(f"主动发起被拒: stream={stream_id}, reason={result.get('error')}")
+            discard_turn(self._plugin, turn_id)
             _discard_screen_narration()
             return False
-        # PR-PROACTIVE-GATE（3.17.14）：成功触发后经统一入口登记（chat_type×kind），
-        # 供 replyer 钩子定制改写；registry 缺失/异常静默降级，不影响触发与门控。
-        register_turn(self._plugin, stream_id, kind, reason)
         return True
 
     def _is_companion_target_stream(self, stream_id: str) -> bool:

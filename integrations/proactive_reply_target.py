@@ -315,9 +315,12 @@ def rewrite_replyer_payload(payload_key: str, payload: list[Any],
 
 def append_proactive_notice(payload_key: str, payload: list[Any],
                             notice: str = PROACTIVE_REPLY_NOTICE) -> list[Any] | None:
-    """替换失败/未找到时的保守尾随锚点：把主动激活文案追加到最后一条文本末尾。
+    """替换失败/未找到时的保守尾随锚点：把主动激活文案追加到最后一条用户文本末尾。
 
-    不破坏原 prompt（copy-on-write）；载荷没有可追加的文本条目时返回 None。
+    PR-RELIABILITY（3.17.17 §1B）：限定角色——messages 形态仅 ``role=="user"``
+    条目、items 形态仅 ``item_type=="UserMessageItem"`` 条目可追加；末条是
+    assistant/历史/系统文本时不再误关联污染。不破坏原 prompt（copy-on-write）；
+    载荷没有符合条件的文本条目时返回 None（载荷原样，hook 侧 warning+消费）。
     ``notice`` 缺省 = 3.17.2 原文（3.17.14 起可按 chat_type×kind 定制）。
     """
     for index in range(len(payload) - 1, -1, -1):
@@ -325,6 +328,8 @@ def append_proactive_notice(payload_key: str, payload: list[Any],
         if not isinstance(entry, dict):
             continue
         if payload_key == "items":
+            if entry.get("item_type") != "UserMessageItem":
+                continue
             parts = entry.get("parts")
             if not isinstance(parts, list):
                 continue
@@ -339,6 +344,8 @@ def append_proactive_notice(payload_key: str, payload: list[Any],
                     updated[index] = {**entry, "parts": new_parts}
                     return updated
         elif payload_key == "messages":
+            if entry.get("role") != "user":
+                continue
             content = entry.get("content")
             if isinstance(content, str):
                 updated = list(payload)

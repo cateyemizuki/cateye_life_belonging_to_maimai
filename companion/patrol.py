@@ -67,7 +67,7 @@ from planning.schedule_items import is_night_sleep_item
 from planning.schedule_query import ScheduleQuery
 from planning.time_utils import is_in_day_frame, is_in_time_window
 from suite_prompts import render
-from tools.proactive_turn import register_turn
+from tools.proactive_turn import discard_turn, register_turn
 
 from .initiative_profile import InitiativeMemory, evaluate_miss
 from . import miss_trigger
@@ -717,17 +717,20 @@ class PatrolService:
         action = getattr(self._config, 'optional_action', None)
         if not callable(action) or not self._stream_id:
             return False
+        # PR-RELIABILITY（3.17.17 §1A）：登记前置到触发调用前——dispatch 内含
+        # before 屏幕旁白与宿主 trigger 的 await，宿主可能先构建 replyer；
+        # 非 enqueued（blocked/duplicate/rejected/unknown）→ discard 撤登记。
+        # 登记不计数——increment_speak 口径（触发 0.5 + 回复确认 0.5）逐字不变。
+        turn_id = register_turn(self._config, self._stream_id,
+                      'miss' if intent == 'missing' else 'patrol_chat', reason)
         result = await action(key, intent, self._append_intent_hint(reason), before=self._publish_screen_narration)
         if result.get('status') != 'enqueued':
+            discard_turn(self._config, turn_id)
             self._discard_screen_narration()
             return False
         self._affection.increment_speak(.5)
         self._last_trigger_time = datetime.now()
         self._last_trigger_intent = str(intent)
-        # PR-PROACTIVE-GATE（3.17.14）：成功入队后经统一入口登记（miss/patrol_chat）。
-        # 登记不计数——increment_speak 口径（触发 0.5 + 回复确认 0.5）逐字不变。
-        register_turn(self._config, self._stream_id,
-                      'miss' if intent == 'missing' else 'patrol_chat', reason)
         return True
 
 

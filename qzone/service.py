@@ -30,15 +30,17 @@ from .publish_guard import PublishLedger, preview_post, definitely_unavailable
 
 import asyncio
 import base64
+import logging
 import math
 import random
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.diag import DecisionLogger
 from core.llm_utils import LLMService, purpose_task
-from tools.proactive_turn import register_turn
+from tools.proactive_turn import discard_turn, register_turn
 from suite_prompts import QZONE_POST_DEFAULT, QZONE_REPLY_DEFAULT
 from suite_prompts import (
     QZONE_COMMENT_REMINDER_DEFAULT,
@@ -55,6 +57,8 @@ from .image_sources import collect_images
 from planning.schedule_query import ScheduleQuery
 from core.storage import load_json, save_json_atomic
 from planning.time_utils import is_in_time_window
+
+logger = logging.getLogger(__name__)
 
 
 def _companion_gate_of(plugin: Any) -> Any:
@@ -224,6 +228,8 @@ class QzoneService:
         self._state: Dict[str, Any] = {}
         self._target_stream_id = ""
         self._channel_cache: Dict[str, str] = {}  # 动作 -> 命中的通道描述
+        #: PR-RELIABILITY（3.17.17 §1E）：评论提醒触发异常告警节流（tid → 上次告警 epoch 秒）
+        self._comment_trigger_warn_at: Dict[str, float] = {}
         self._publish_ledger = PublishLedger()
         self._publish_lock = asyncio.Lock()
         self._send_ambiguous = False
@@ -1136,7 +1142,14 @@ class QzoneService:
                 # M11（附录 II §3.3）：空间侧评论提醒**不计入**主动打扰预算——不再查闸门、
                 # 不再发预算记账事件；空间侧约束仍是既有 qzone.daily_max_posts/reply_number，
                 # 预算耗尽也不得拦掉本条提醒。
+                turn_id = None
                 try:
+                    # PR-RELIABILITY（3.17.17 §1A）：登记前置到 trigger 调用前——
+                    # 空间评论提醒直接经宿主 trigger 激活 planner（全仓 grep 核定的
+                    # 第四处宿主调用点）→ 统一登记 other（目标私聊兜底文案）；
+                    # 免预算口径不变，登记不计数；失败/异常 → discard 撤登记。
+                    turn_id = register_turn(self._plugin, self._target_stream_id, "other",
+                                  f"qzone_comment:{tid[:12]}")
                     reply = await self._ctx.maisaka.proactive.trigger(
                         stream_id=self._target_stream_id,
                         intent="qzone_comment",
@@ -1146,14 +1159,22 @@ class QzoneService:
                             excerpt=excerpt, added=added,
                         ),
                     )
-                    # PR-PROACTIVE-GATE（3.17.14）：空间评论提醒直接经宿主 trigger
-                    # 激活 planner（全仓 grep 核定的第四处宿主调用点）→ 统一登记
-                    # other（目标私聊兜底文案）；免预算口径不变，登记不计数。
-                    if (isinstance(reply, dict) and reply.get("success") is True) or reply is True:
-                        register_turn(self._plugin, self._target_stream_id, "other",
-                                      f"qzone_comment:{tid[:12]}")
-                except Exception:
-                    pass
+                    if not ((isinstance(reply, dict) and reply.get("success") is True) or reply is True):
+                        discard_turn(self._plugin, turn_id)
+                except Exception as exc:
+                    discard_turn(self._plugin, turn_id)
+                    # PR-RELIABILITY（3.17.17 §1E）：异常留痕替代静默吞——节流
+                    # warning（同 tid 60s 内不重复），只记 tid 前缀+异常类名，
+                    # 不记隐私正文；提醒失败不阻断基线轮询（降级 resilient 不变）。
+                    now = time.time()
+                    if now - self._comment_trigger_warn_at.get(tid, 0.0) >= 60.0:
+                        self._comment_trigger_warn_at[tid] = now
+                        if len(self._comment_trigger_warn_at) > 128:
+                            oldest = min(self._comment_trigger_warn_at,
+                                         key=self._comment_trigger_warn_at.get)
+                            self._comment_trigger_warn_at.pop(oldest, None)
+                        logger.warning("空间评论提醒触发异常 tid=%s…: %s",
+                                       tid[:12], type(exc).__name__)
                 self._log("trigger", trigger_type="qzone_comment",
                           reason=f"说说 {tid[:12]}… 新增 {added} 条评论（共 {total_new}）")
         return new_comments

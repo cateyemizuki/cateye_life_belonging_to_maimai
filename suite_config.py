@@ -241,7 +241,13 @@ from suite_prompts import (
 # ScreenPerceptionService 抽取 patrol 旁白逻辑；问候触发前对目标私聊 peek），屏幕键
 # 仍在原 section、数据文件路径不变，无新增配置字段（schema 不变，18 段 203 叶子），
 # 按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.16"
+# 3.17.17（2026-11-08 PR-RELIABILITY 外部评估可靠性修复 + 视频说说文案自然化）：
+# 五项后端可靠性修复（registry 原子领取+登记前置 / append 限 user / optional_action
+# 保存失败回滚 / save_json_atomic 唯一 tmp / qzone 评论触发异常留痕）均不新增配置
+# 字段；[qzone_video].attach_source 退役（署名拼接不自然，文案改纯 LLM 自然分享，
+# 提示词禁元信息），18 段 203→202 叶子；旧 TOML 键经 LEGACY_ROUTE_KEYS 纯 pop
+# （RELEASE_RETIRED 口径，生产旧值自动清除），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.17"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -327,6 +333,10 @@ LEGACY_ROUTE_KEYS = {
     # 2026-11-01 U 计划（§4.2）：入口不再搬进面板标题栏，「面板内麦麦尺寸」随之退役——
     # 详情展开以原入口为原点的粘连气泡替代（入口原位保留）。只 pop、不做值搬运。
     "maimai_interaction": ("detail_fish_size_px",),
+    # 3.17.17（PR-RELIABILITY §1G）：attach_source 退役——视频说说确定性署名拼接
+    # （视频：标题｜UP：…）不自然，文案改纯 LLM 自然分享（提示词禁元信息）。
+    # 旧键只 pop 不搬运（RELEASE_RETIRED 口径），生产旧值自动清除。
+    "qzone_video": ("attach_source",),
 }
 
 #: 1.0.0（配置整理轮之前）[patrol] 「想念触发说明」的出厂文案——仅用于迁移时判断「用户改过没有」。

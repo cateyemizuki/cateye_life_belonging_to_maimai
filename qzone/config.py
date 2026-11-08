@@ -261,11 +261,9 @@ class QzoneVideoSectionConfig(PluginConfigBase):
         description="视频说说文案字数上限：独立文案调用只依据已核验事实生成纯文本，不超过该字数",
         json_schema_extra={"label": "视频文案字数上限", **_ui_i18n("Video caption max chars")},
     )
-    attach_source: bool = Field(
-        default=True,
-        description="视频说说帖文附来源署名（视频标题+UP主）；不附播放链接",
-        json_schema_extra={"label": "帖文附来源署名", **_ui_i18n("Attach video source")},
-    )
+    # PR-RELIABILITY（3.17.17 §1G）：attach_source 退役——署名拼接（视频：标题｜UP：…）
+    # 不自然，文案改纯 LLM 自然分享（提示词禁元信息）；旧 TOML 键经
+    # suite_config.LEGACY_ROUTE_KEYS[qzone_video] 纯 pop（RELEASE_RETIRED 口径）。
 
     @pydantic.field_validator("mode", mode="before")
     @classmethod

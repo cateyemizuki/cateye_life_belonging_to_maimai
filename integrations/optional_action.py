@@ -95,7 +95,14 @@ class OptionalActionCoordinator:
             for old in terminal[:-128]:
                 self._attempts.pop(old, None)
             if not self._save():
-                budget.release_reservation(token)
+                # PR-RELIABILITY（3.17.17 §1C）：保存失败回滚内存 entry——否则
+                # 残留 reserved 回执使同 key 后续误判 duplicate（预算已释放却
+                # 再也发不出）。预算释放失败留 warning 不阻断（三态收敛）。
+                self._attempts.pop(scoped, None)
+                try:
+                    budget.release_reservation(token)
+                except Exception:
+                    logger.warning('可选主动回合预算释放失败（不阻断）', exc_info=True)
                 return {'status': 'blocked', 'reason': 'receipt_persist_failed'}
             try:
                 if before is not None:

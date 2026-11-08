@@ -7,6 +7,12 @@
 **chat_type（群聊 / 其他私聊 / 陪伴目标私聊）× kind（发起原因）** 取
 :data:`REWRITE_MATRIX` 定制文案改写宿主目标指令。
 
+PR-RELIABILITY（3.17.17 §1A）：①登记前置——各触发点先 register 再调用宿主
+trigger（宿主可能在 trigger 返回前就构建 replyer），触发失败经 :func:`discard_turn`
+撤登记；②replyer 改用 :meth:`ProactiveTurnRegistry.claim` 单锁原子领取（查+消费
+一步完成），让位时 :meth:`~ProactiveTurnRegistry.release` 带 claimant 标识回滚，
+消除 active_for()+consume() 两步竞态双改写。active_for/consume 保留兼容。
+
 宿主触发调用点全仓 grep 核定（2026-11-08，optional_action / proactive.trigger /
 trigger_proactive）：
 1. planning/proactive_service._call_proactive_trigger —— 早安/晚安（_trigger_greeting）
@@ -256,7 +262,12 @@ class ProactiveTurnRegistry:
         return None
 
     def consume(self, turn_id: Any) -> bool:
-        """标记 consumed（replyer 改写后一次性消费）；命中返回 True。"""
+        """标记 consumed（兼容旧路径的一次性消费）；命中返回 True。
+
+        PR-RELIABILITY（3.17.17）：replyer 新路径改用 :meth:`claim` 原子领取；
+        本方法保留兼容（fallback/旧调用方）。消费时清除 claimant 标识——
+        此后 :meth:`release` 不得把「非领取态的消费」误恢复为未消费。
+        """
         tid = str(turn_id or "")
         if not tid:
             return False
@@ -266,8 +277,78 @@ class ProactiveTurnRegistry:
                     if turn.get("consumed"):
                         return False
                     turn["consumed"] = True
+                    turn.pop("claimed_by", None)
                     self._save()
                     return True
+        return False
+
+    def claim(self, stream_id: Any, window_seconds: float = 120.0) -> Optional[dict[str, Any]]:
+        """原子领取（PR-RELIABILITY 3.17.17 §1A）：单锁内查最新未消费窗内记录
+        并立即标记 consumed 返回副本——并发 replyer 只有一个能领取成功，
+        消除 active_for()+consume() 两步各自加锁的双改写竞态。
+
+        返回副本含 ``claimed_by``（本轮领取标识），供 :meth:`release` 让位回滚
+        时防误恢复；无符合记录返回 None。
+        """
+        sid = str(stream_id or "").strip()
+        if not sid:
+            return None
+        now = self._clock()
+        token = "cl-" + uuid.uuid4().hex[:12]
+        with self._lock:
+            for turn in reversed(self._turns):
+                if turn.get("stream_id") != sid or turn.get("consumed"):
+                    continue
+                age = now - float(turn.get("created_at", 0))
+                if 0 <= age <= float(window_seconds):
+                    turn["consumed"] = True
+                    turn["claimed_by"] = token
+                    self._save()
+                    return dict(turn)
+        return None
+
+    def release(self, turn_id: Any, claim_token: Any = None) -> bool:
+        """让位回滚（PR-RELIABILITY 3.17.17 §1A）：仅当记录仍 consumed 且消费态
+        为 claim 领取（带 claimed_by 标识）时恢复未消费，登记保留给真正主动轮。
+
+        ``claim_token`` 给定时必须与记录上的领取标识一致（防他轮领取后被旧副本
+        误恢复）；consume() 造成的消费无标识，绝不恢复。命中恢复返回 True。
+        """
+        tid = str(turn_id or "")
+        if not tid:
+            return False
+        with self._lock:
+            for turn in self._turns:
+                if turn.get("turn_id") != tid:
+                    continue
+                claimed_by = turn.get("claimed_by")
+                if not turn.get("consumed") or not claimed_by:
+                    return False
+                if claim_token is not None and str(claim_token) != str(claimed_by):
+                    return False
+                turn["consumed"] = False
+                turn.pop("claimed_by", None)
+                self._save()
+                return True
+        return False
+
+    def discard(self, turn_id: Any) -> bool:
+        """触发失败撤登记（PR-RELIABILITY 3.17.17 §1A 登记前置配套）：仅删除
+        仍未消费（未被 replyer 领取）的记录；已领取/已消费的不碰（replyer 可能
+        已据其改写，保守保留消费态）。命中删除返回 True。
+        """
+        tid = str(turn_id or "")
+        if not tid:
+            return False
+        with self._lock:
+            for index, turn in enumerate(self._turns):
+                if turn.get("turn_id") != tid:
+                    continue
+                if turn.get("consumed"):
+                    return False
+                del self._turns[index]
+                self._save()
+                return True
         return False
 
 
@@ -287,3 +368,20 @@ def register_turn(plugin: Any, stream_id: Any, kind: Any, reason: Any,
     except Exception:
         logger.debug("主动激活登记失败（忽略，触发行为不受影响）", exc_info=True)
         return None
+
+
+def discard_turn(plugin: Any, turn_id: Any) -> bool:
+    """触发失败撤登记入口（PR-RELIABILITY 3.17.17 §1A）：与 register_turn 同口径
+    静默降级——registry 缺失/异常/turn_id 空 → False，绝不影响触发失败处理本身。
+    """
+    try:
+        if not turn_id:
+            return False
+        getter = getattr(plugin, "_mai_proactive_turns", None)
+        registry = getter() if callable(getter) else None
+        if registry is None:
+            return False
+        return registry.discard(turn_id)
+    except Exception:
+        logger.debug("主动激活登记撤销失败（忽略）", exc_info=True)
+        return False
