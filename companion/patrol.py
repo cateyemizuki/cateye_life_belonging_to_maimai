@@ -66,20 +66,13 @@ from planning.schedule_anchors import (SOURCE_REAL_SCHEDULE, RealAnchors,
 from planning.schedule_items import is_night_sleep_item
 from planning.schedule_query import ScheduleQuery
 from planning.time_utils import is_in_day_frame, is_in_time_window
-from suite_prompts import (
-    SCREEN_NARRATION_DEFAULT,
-    SCREEN_NARRATION_FAILED_DEFAULT,
-    SCREEN_NARRATION_OFFLINE_DEFAULT,
-    prompt,
-    render,
-)
+from suite_prompts import render
 from tools.proactive_turn import register_turn
 
 from .initiative_profile import InitiativeMemory, evaluate_miss
 from . import miss_trigger
 from .affection import AffectionManager
-from .cateye_client import PEEK_OFFLINE
-from .screen_context import ScreenContextStore, format_narration
+from .screen_context import ScreenContextStore
 
 logger = logging.getLogger(__name__)
 
@@ -742,44 +735,31 @@ class PatrolService:
     # 屏幕感知（v2.6.0「先看屏幕，再叫醒 planner」）
     # ------------------------------------------------------------------
     async def _publish_screen_narration(self) -> None:
-        """看一眼陪伴对象电脑，把屏幕旁白发布到注入缓存。
+        """触发前看一眼陪伴对象电脑（before hook，签名不变）。
 
-        三种结果对应 [cateye] 的三个模板，模板留空 = 该情况不注入；
-        功能关闭 / 整体超时 / 任何异常 → 不注入，绝不阻塞主动触发。
+        PR-LINKAGE-SCREEN（3.17.16）：peek/旁白实现已抽取到 linkage 屏幕感知服务
+        （ScreenPerceptionService，适配器 cateye_screen），patrol 不再持有 peek 实现，
+        仅委托服务对目标流发布旁白；服务缺失（未装配）→ 不注入，绝不阻塞触发。
         """
-        try:
-            if self._screen_store is None or self._cateye is None:
-                return
-            now = datetime.now()
-            peek = await self._cateye.peek_screen(now)
-            if peek is None:
-                return
-            if peek.ok:
-                template = prompt(self._config, "screen_narration")
-                default_template = SCREEN_NARRATION_DEFAULT
-            elif peek.status == PEEK_OFFLINE:
-                template = prompt(self._config, "screen_narration_offline")
-                default_template = SCREEN_NARRATION_OFFLINE_DEFAULT
-            else:
-                template = prompt(self._config, "screen_narration_failed")
-                default_template = SCREEN_NARRATION_FAILED_DEFAULT
-            if not template.strip():
-                return
-            text = format_narration(
-                template,
-                now=now,
-                user_name=self._target_display_name,
-                description=peek.description,
-                default_template=default_template,
-            )
-            if self._screen_store.publish(self._stream_id, text):
-                self._ctx.logger.info("屏幕旁白已挂入注入缓存（stream=%s，%s）：%s",
-                                      self._stream_id, peek.status, text)
-        except Exception as e:  # 锦上添花，绝不阻塞触发
-            self._ctx.logger.warning(f"发布屏幕旁白失败（忽略）: {e}")
+        service = getattr(self._config, "_screen_perception", None)
+        if service is None:
+            return
+        # 评审修复（3.17.16）：仅真实发布才标记，触发失败 discard 不误删他轮旁白
+        self._screen_published = bool(await service.publish_narration(self._stream_id))
 
     def _discard_screen_narration(self) -> None:
-        if self._screen_store is not None:
+        """触发未入队则撤掉旁白（委托 linkage 屏幕感知服务；服务缺失回退直清缓存）。
+
+        评审修复（3.17.16）：本轮 peek 为 no-op（未真实发布）时不 discard——
+        避免误删同流上他轮（如问候）尚未消费的待注入旁白。
+        """
+        if not getattr(self, "_screen_published", False):
+            return
+        self._screen_published = False
+        service = getattr(self._config, "_screen_perception", None)
+        if service is not None:
+            service.discard(self._stream_id)
+        elif self._screen_store is not None:
             self._screen_store.discard(self._stream_id)
 
     # ------------------------------------------------------------------

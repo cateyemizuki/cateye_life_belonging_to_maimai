@@ -31,7 +31,6 @@ from planning.schedule_query import ScheduleQuery
 from .affection import AffectionManager
 from .affection_events import record_rule_event
 from .affection_referee import AffectionReviewer
-from .cateye_client import CateyeClient
 from .memory_manager import MemoryManager
 from .message_service import MessageService
 from .patrol import PatrolService
@@ -172,6 +171,11 @@ class CompanionServices:
         self.screen_store = ScreenContextStore(
             ttl_minutes=float(getattr(screen_config_of(cfg), "screen_context_ttl_minutes", 90) or 0)
         )
+        # PR-LINKAGE-SCREEN（3.17.16）：联动层装配期惰性 import（非 shim）——避免
+        # linkage↔companion 模块级环（linkage.screen.cateye_client 绝对导入 companion.config，
+        # 若本束模块级 import linkage 则 companion/__init__ 经 services 回环 linkage _partial）。
+        # 与既有 plugin.on_load / services._resolve_relation 的装配期惰性 import 同模式。
+        from linkage.screen import CateyeClient, ScreenPerceptionService
         #: 陪伴对象电脑联动客户端（connect-hub 跨插件 API）
         self.cateye = CateyeClient(plugin, llm=self.llm, call_logger=self.llm_logger)
         #: 本地记忆库（用户习惯）
@@ -188,6 +192,14 @@ class CompanionServices:
             self.decision_logger, cateye=self.cateye, screen_store=self.screen_store,
         )
         self.patrol.set_relation(self.relation)
+        #: 屏幕感知联动服务（PR-LINKAGE-SCREEN，3.17.16；linkage 首个适配器 cateye_screen）。
+        # patrol 与 planning 问候链统一委托它发布/丢弃旁白；持有同一 cateye/screen_store
+        # 实例（手动屏幕工具与请求 Hook 仍消费 companion.cateye / companion.screen_store）。
+        # 显示名经惰性提供者取 patrol 的目标显示名（与旧 patrol 旁白同源，热重载即时生效）。
+        self.screen_perception = ScreenPerceptionService(
+            plugin, cateye=self.cateye, screen_store=self.screen_store,
+            user_name_provider=lambda: getattr(self.patrol, "_target_display_name", ""),
+        )
         #: M2 好感 LLM 裁判编排器（会话采样 + 关系日结；总线可空降级）
         self.reviews = AffectionReviewer(
             plugin, self.affection, self.llm, bus=self.bus,

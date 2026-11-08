@@ -48,6 +48,7 @@ from companion.config import target_qq_of
 from companion.harass_report import HARASS_TOOL_NAME
 from companion.services import CompanionServices
 from companion.attention import ConversationActivityTracker, SurfLeaseAuthority
+from linkage import register_adapter
 from suite_config import (
     CURRENT_LAYOUT_VERSION,
     LEGACY_PATROL_RETIRED_KEYS,
@@ -479,6 +480,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # （core.contracts.EmotionValenceSource；_emotion 在本行之后才装配，调用时才解析）
         self._companion = CompanionServices(
             self, emotion_valence_provider=lambda: getattr(self, "_emotion", None))
+        # PR-LINKAGE-SCREEN（3.17.16）：屏幕感知联动服务挂组合根具名契约
+        # （_screen_perception；patrol 与 planning 问候链经 getattr/PluginContext 委托），
+        # 并登记为 linkage 首个适配器 cateye_screen。服务束内部已构造，这里只装配引用。
+        self._screen_perception = self._companion.screen_perception
+        register_adapter(self._screen_perception)
         self._qzone_cookies = QzoneCookieManager(
             self.ctx, data_dir,
             napcat_http_host=cfg.qzone.napcat_http_host,

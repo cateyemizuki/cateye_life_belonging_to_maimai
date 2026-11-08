@@ -131,6 +131,12 @@ class PluginContext:
     def attention(self) -> Any:
         return self.get("attention")
 
+    @property
+    def screen_perception(self) -> Any:
+        # PR-LINKAGE-SCREEN（3.17.16）：屏幕感知联动服务（适配器 cateye_screen）；
+        # 缺失按 None（未装配降级语义不变，patrol/问候链不阻塞触发）。
+        return self.get("screen_perception")
+
     # 公开属性（无前导下划线）与宿主门面
     @property
     def config(self) -> Any:

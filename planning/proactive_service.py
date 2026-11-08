@@ -3046,6 +3046,28 @@ class ProactiveService:
             logger.warning("宿主未提供 maisaka.proactive.trigger 能力，主动发起跳过")
             return False
 
+        # PR-LINKAGE-SCREEN（3.17.16）：问候主动轮触发前看一眼陪伴对象电脑屏幕。
+        # 根因修复——旧路径直接 trigger 无 before/无屏幕旁白，问候轮 planner/replyer
+        # 拿不到屏幕上下文（patrol 想念链经 before hook 看屏幕，问候链 bypass 了它）。
+        # 隐私红线：仅陪伴目标私聊 peek（群聊/其他私聊一律不 peek）；服务缺失/失败
+        # 降级不阻断触发。触发失败（含预算拦截）则 discard 撤掉旁白（与 patrol 未入队同口径）。
+        screen_service = getattr(self._plugin, "_screen_perception", None)
+        screen_peeked = False
+        if screen_service is not None and self._is_companion_target_stream(stream_id):
+            try:
+                # 评审修复（3.17.16）：仅真实挂入缓存才标记，触发失败 discard
+                # 不误删同流上 patrol 等他轮尚未消费的待注入旁白。
+                screen_peeked = bool(await screen_service.publish_narration(stream_id))
+            except Exception:
+                logger.debug("问候屏幕旁白发布失败（忽略，不阻断触发）", exc_info=True)
+
+        def _discard_screen_narration() -> None:
+            if screen_peeked and screen_service is not None:
+                try:
+                    screen_service.discard(stream_id)
+                except Exception:
+                    logger.debug("问候屏幕旁白丢弃失败（忽略）", exc_info=True)
+
         # M0 预算接线（§六.2 H）：查询主动打扰预算 → 发布 proactive.used → 执行触发。
         # 例行问候经本调用处（活动切换主动开口链已于 2026-10-20 整条删除）。
         # M11（附录 II §3.3）：预算计数身份 = **目标陪伴私聊**——按 stream 维度传参。
@@ -3063,9 +3085,11 @@ class ProactiveService:
                 logger.warning("事件总线未装配，主动打扰预算不可用：fail-closed 跳过主动发起 "
                                "stream=%s reason=%s", stream_id,
                                str(reason or intent_prompt or "proactive"))
+                _discard_screen_narration()
                 return False
             label = str(reason or intent_prompt or "proactive")
             if not bus.allow_proactive("planning", label, stream_id=stream_id):
+                _discard_screen_narration()
                 return False
             try:
                 await bus.publish("proactive.used", source="planning",
@@ -3084,15 +3108,28 @@ class ProactiveService:
                 result = await trigger(stream_id=stream_id, intent=intent_prompt, reason=reason)
             except Exception as exc:
                 logger.warning(f"主动触发异常: stream={stream_id}, {exc}")
+                _discard_screen_narration()
                 return False
 
         if isinstance(result, dict) and not result.get("success", False):
             logger.warning(f"主动发起被拒: stream={stream_id}, reason={result.get('error')}")
+            _discard_screen_narration()
             return False
         # PR-PROACTIVE-GATE（3.17.14）：成功触发后经统一入口登记（chat_type×kind），
         # 供 replyer 钩子定制改写；registry 缺失/异常静默降级，不影响触发与门控。
         register_turn(self._plugin, stream_id, kind, reason)
         return True
+
+    def _is_companion_target_stream(self, stream_id: str) -> bool:
+        """是否陪伴目标私聊流（屏幕感知 peek 的唯一作用域；群聊/其他私聊返回 False）。
+
+        目标流 id 取组合根 ``plugin._stream_id``（_resolve_target_stream 解析的陪伴对象
+        私聊，与 components._mai_target_stream_id / proactive 诊断同源）；未解析/空 → False
+        （宁可漏 peek，绝不对群聊或其他私聊泄露屏幕内容，隐私红线）。
+        """
+        target = str(getattr(self._plugin, "_stream_id", "") or "").strip()
+        sid = str(stream_id or "").strip()
+        return bool(target) and sid == target
 
     # 注（2026-10-20 用户指示）：原 _trigger_proactive（活动切换/约定主动开口的指令模板组装
     # 与触发，'commitment_due' / 'activity_switch' 两类 trigger_type）已删除；
