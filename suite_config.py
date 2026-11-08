@@ -235,7 +235,7 @@ from suite_prompts import (
 # 纯后端改动（tools/proactive_turn.py 登记簿 + 触发点登记 + replyer 钩子按
 # chat_type×kind 定制改写 + 问候轮改写失效 bug 修复），不触碰预算/静默/好感
 # 门控与计数口径，无新增配置字段（schema 不变，18 段 203 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.14"
+SUPPORTED_CONFIG_VERSION = "3.17.15"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

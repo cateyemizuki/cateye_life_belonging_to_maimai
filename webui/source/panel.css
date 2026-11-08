@@ -502,3 +502,42 @@ html[data-embedded=true] .panel-layout{grid-template-columns:96px minmax(0,1fr);
 .interesthead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:6px;font-size:12px}
 .interesthead strong{font-weight:550;overflow-wrap:anywhere}
 .interestrow .meter{margin-bottom:0}
+/* ── PR-FIXED-CHROME（3.17.15）：固定框架 + 翻页SVG + 娱乐重排 + 此刻双列 + 历史心情 ──
+   只读投影展示层：不影响调度/情绪引擎/视频观看/空间发布运行态；按钮 ID/行为不变。
+   ①固定框架（规格§1 方案②）：.shell 改 flex 列布局并钳到视口高（100vh/100dvh），
+   mast 与 footer flex:none 天然不动；.panel-layout 成为唯一滚动容器（flex:1 +
+   min-height:0 + overflow-y:auto），栏目栏 .panel-tabs 在其内 sticky top:0——滚动只
+   发生在内容容器，mast/tabs 视觉固定。flex 自适应 mast 高度（窄屏折行无需像素估算），
+   嵌入态 100vh=iframe 视口。mast 另加 position:sticky;top:0 实底兜底（规格§1 首条），
+   嵌入态原 transparent 规则由尾部同选择器覆盖防透底。复古主题卡片化 border/padding/
+   shadow 不含在本段，兼容保留。 */
+.shell{display:flex;flex-direction:column;height:100vh;height:100dvh}
+.mast{position:sticky;top:0;z-index:40;background:var(--maibot-background);flex:none}
+html[data-embedded=true] .mast{background:var(--maibot-background)}
+.panel-layout{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
+.panel-tabs{top:0}
+footer{flex:none}
+/* ②翻页 SVG（规格§1D）：chevron 块级确定性居中，不依赖字体 em-box 度量；
+   3.17.13 的 grid place-items:center 保留，SVG display:block 消除行内基线偏移。 */
+.schedule-page-actions button svg{display:block}
+/* ③娱乐重排（规格§1E）：最近观看（左）+空间与分享（右）同行双列（复用 .grid.two）；
+   兴趣话题整块收进最近观看详情弹层（#video-interests-detail 主页面隐藏）；空间右列
+   改显最近动态（#qzone-recent-posts），发送回执/草稿预览 UI 已移除。 */
+.qzone-post{align-items:flex-start}
+.qzone-post>div{min-width:0}
+.qzone-post strong{overflow-wrap:anywhere;font-weight:550}
+.qzone-post .postsource{flex:none;align-self:flex-start}
+/* ④此刻双列（规格§1F）：心情卡与睡眠与恢复卡同行等宽双列；窄屏 <700px 回落单列。
+   两卡结构/IDs 不变，仅外包 .now-duo 布局容器。 */
+.now-duo{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start;margin-top:16px}
+.now-duo>.emotion-now{margin-top:0}
+.now-duo>.sleep-combined{margin-top:0}
+/* ⑤历史心情变化（规格§1G）：状态变化卡之后新增心情变化卡，VAD 曲线+采样表复用
+   既有 chart/legend/samplewrap/maibot-table 样式；跟随历史 range/zoom。 */
+#emotion-history-card{margin-top:16px}
+#emotion-history-chart{min-height:260px}
+/* 评审修复（3.17.15）：中宽段 701–828px 双列会挤压睡眠卡内层 grid（最小 262px），
+   单列断点提高到 900px 覆盖该带。 */
+@media(max-width:900px){
+ .now-duo{grid-template-columns:1fr}
+}

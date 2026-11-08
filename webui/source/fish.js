@@ -371,7 +371,15 @@ const SectionFish=(()=>{
   selectedDay||d.schedule?.date||'当日':schedulePageInfo().note,()=>[],[scheduleDetail,poolDetail]);
  const moodCard=$('vad-chart').closest('article'),vadLegend=moodCard.querySelector('.legend');const moodGroups=[fold('心情的变化',[vadLegend,$('vad-chart')]),fold('睡眠调整记录',[$('referee-health')])];
  mount('mood','当前情绪',moodCard,d=>d.emotion?.available?(d.emotion.label||'心情平稳'):'暂无心情记录',d=>[['当前状态',d.emotion?.frozen?'睡眠冻结中':'自然变化中','睡眠期间暂停自然变化，醒后按真实睡眠会话进行调整。'],['最近调整',safeTime(d.emotion?.referee?.last_success_at),fullClock(d.emotion?.referee?.last_success_at)]],moodGroups);
- const qzoneCard=$('qzone-summary').closest('article');const qzoneGroups=[fold('最近发送记录',[$('delivery-list')]),fold('本地草稿预览',[qzoneCard.querySelector('.draft-preview')])];
+ // PR-FIXED-CHROME（3.17.15）：最近观看卡左下角麦麦详情入口（复用 SectionFish 机制）；
+ // 兴趣话题整块收进该详情弹层（#video-interests 由主页面隐藏包裹层移入 store）。
+ const videoRecentCard=$('video-recent').closest('article');
+ const videoGroups=[fold('兴趣话题',[$('video-interests')])];
+ mount('videorecent','最近观看',videoRecentCard,d=>{const v=d.video||{};const n=Array.isArray(v.recent)?v.recent.length:0;return v.available?`最近看完 ${n} 条视频`:'暂无最近观看记录'},d=>[['数据来源','视频观看模块','只读展示真实看完且文字记忆仍有效的视频；兴趣话题为兴趣文档最终权重 top8。']],videoGroups);
+ const qzoneCard=$('qzone-summary').closest('article');
+ // 3.17.15：发送回执/草稿预览 UI 已移除（delivery-list/draft-preview 不再存在），
+ // 空间详情只保留头部额度与登录状态元信息；最近动态在主页面右列展示。
+ const qzoneGroups=[];
  mount('sharing','空间与分享',qzoneCard,d=>d.qzone?.available?`今日分享 ${d.qzone.posts_today??0}/${d.qzone.daily_max_posts??0}`:'暂无分享记录',d=>[['最近状态获取',safeTime(d.qzone?.cookie_health?.last_success_at),fullClock(d.qzone?.cookie_health?.last_success_at)],['最近失败',safeTime(d.qzone?.cookie_health?.last_failure_at),fullClock(d.qzone?.cookie_health?.last_failure_at)],['发送结果','以确认记录为准','结果未知时不会自动重复发送。']],qzoneGroups);
  const usageCard=$('usage-metrics').closest('section'),usageDetail=$('usage-detail');store.append(usageDetail);
  mount('usage','模型调用',usageCard,()=>'',()=>[],[usageDetail]);

@@ -818,6 +818,47 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
     return result
 
 
+def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]]:
+    """PR-FIXED-CHROME（3.17.15）：空间「最近动态」只读投影（≤5 条已确认发送）。
+
+    数据源 ``PublishLedger.recent_sent(5)``（status=sent 按 created_at 降序，content
+    截 120 字/created_at/tid/image_count）。来源判定：tid 命中空间视频发布回执
+    （``QzoneVideoLedger.recent_attempts(100)`` 的 receipt_tid 集合，既有公开只读面）
+    →「视频分享」，否则「日程说说」；视频桥接缺失/读取失败 → 全部「日程说说」降级。
+    服务缺失/ledger 异常 → ``[]`` 降级，不抛到读端。只读，不含路径/私聊正文。
+    """
+    try:
+        ledger = getattr(service, '_publish_ledger', None)
+        if ledger is None or not hasattr(ledger, 'recent_sent'):
+            return []
+        rows = ledger.recent_sent(5)
+        if not isinstance(rows, list):
+            return []
+    except Exception:
+        return []
+    video_tids: set[str] = set()
+    try:
+        bridge = ctx.qzone_video
+        if bridge is not None:
+            for attempt in bridge.ledger.recent_attempts(100):
+                tid = str(attempt.get('receipt_tid') or '') if isinstance(attempt, dict) else ''
+                if tid:
+                    video_tids.add(tid)
+    except Exception:
+        video_tids = set()
+    out: list[dict[str, Any]] = []
+    for row in rows[:5]:
+        if not isinstance(row, dict):
+            continue
+        tid = str(row.get('tid') or '')
+        out.append({'content': str(row.get('content', ''))[:120],
+                    'created_at': row.get('created_at'),
+                    'tid': tid,
+                    'image_count': row.get('image_count', 0),
+                    'source': '视频分享' if tid and tid in video_tids else '日程说说'})
+    return out
+
+
 def _extension_summary(plugin: Any, now: datetime, hours: int,
                        usage_hours: int = 720, usage_rows_limit: int = 0,
                        usage_rows_offset: int = 0) -> dict[str, Any]:
@@ -853,6 +894,9 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
             result['qzone'] = {'available': True, **{key: raw.get(key) for key in
                                 ('enabled', 'posts_today', 'daily_max_posts', 'reply_comments_enabled',
                                  'cookie_health', 'delivery', 'last_post_at', 'cooldown_minutes')}}
+            # PR-FIXED-CHROME（3.17.15）：娱乐面板「最近动态」只读投影（≤5 条已确认
+            # 发送）。独立 try 降级——recent_posts 读取失败不影响 qzone 头部额度芯片。
+            result['qzone']['recent_posts'] = _qzone_recent_posts(service, ctx)
     except Exception:
         result['qzone'] = {'available': False, 'reason': 'projection_unavailable'}
     # PR-D1（H10）：空间视频候选/资产/回执计数投影（只读；系统板块计数芯片数据源）。
