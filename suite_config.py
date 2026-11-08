@@ -273,7 +273,11 @@ from suite_prompts import (
 # （internal_tuning planned_social_drain_cap_per_min=0.006/min）软化一次触底，
 # 不改用户画像表层映射；与真实聊天消耗来源分离。不新增用户可见配置字段
 # （schema 不变，18 段 202 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.22"
+# 3.17.23（2026-11-08 PR-VERTICAL-FILL 宽屏纵向填充）：≥1600px 收回 shell 底部预留
+# 184→16px、panel-layout align-items:stretch、此刻页 flex 列 + now-duo flexGrow 填满
+# 剩余高度，消除固定框架下底部空白带；纯展示，不新增用户可见配置字段
+# （schema 不变，18 段 202 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.23"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

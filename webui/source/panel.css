@@ -548,6 +548,11 @@ footer{flex:none}
    声明（3.17.18 mast 段不触 .shell）；置于 3.17.18 段之前以保全该段红线断言
    （其尾块不得含 .shell 规则）。固定框架/栏目/娱乐布局与 mast 自适应不受影响。 */
 @media(min-width:1600px){.shell{max-width:1760px}}
+/* PR-VERTICAL-FILL（3.17.23）：宽屏纵向填充。固定框架下 shell 钳视口高，旧 padding-bottom
+   184px 在滚动容器之外留永久空白带；panel-layout align-items:start 又使矮内容（此刻页）
+   下方留空。此块置于 mast 段之前（保全 3.17.18「mast 尾块不得含 .shell」红线），仅 ≥1600px
+   生效：收回底部预留、拉伸网格行与此刻页、now-duo  flexGrow 填满剩余高度。 */
+@media(min-width:1600px){.shell{padding-bottom:16px}.panel-layout{align-items:stretch}#panel-now{display:flex;flex-direction:column;min-height:100%}.now-duo{flex:1 1 auto;align-items:stretch}}
 /* ── PR-RESPONSIVE-MAST（3.17.18）：mast 自适应收缩 + 时间戳 ellipsis 防溢出 ──────
    纯布局：级联尾部追加段压过 3.17.12 段（:475/:480）flex 横排的收缩口径。
    根因（规格§0 复核）：.mast-side 作为 flex 项 flex-basis auto=max-content 无显式收缩
