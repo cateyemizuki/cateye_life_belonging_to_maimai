@@ -91,6 +91,10 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         # 注入结算 params（纯函数层不读盘）。
         "chat_social_drain_per_reply": 0.015,
         "debt_stress_per_h": 0.01,
+        # PR-STATE-CONTRACT（3.17.22 P1-C）：计划社交活动消耗幅度上限（/min，夹取 ≥0）。
+        # 软化旧默认画像 -0.02/min 的一次触底；经 _settlement_params_v2 注入结算，
+        # 不改用户画像表层映射。内部调参，不新增用户可见 schema 键。
+        "planned_social_drain_cap_per_min": 0.006,
     },
     "dynamic_sleep": {
         "pressure_weight": 0.5,

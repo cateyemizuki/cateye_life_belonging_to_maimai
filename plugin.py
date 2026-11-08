@@ -1819,7 +1819,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         try:
             life=getattr(self._planning,'life_state',None)
             snapshot=life.snapshot() if life is not None else {}
-            state['life']={k:v for k,v in snapshot.items() if k in ('energy','hunger','stress','focus','social_need','sleep_debt_hours')}
+            # PR-STATE-CONTRACT（3.17.22 P0-A）：过滤键须与 LifeState.snapshot() 实际
+            # 字段一致（social_battery/sleep_debt）；旧名 social_need/sleep_debt_hours
+            # 从不存在的，恒被滤掉致视频社交/空间视频决策拿不到社交电量与睡眠债。
+            state['life']={k:v for k,v in snapshot.items() if k in ('energy','hunger','stress','focus','social_battery','sleep_debt')}
             active=self._db.active_episode() or {}
             state['activity']=str(active.get('name') or active.get('event_name') or '')[:120]
         except Exception:state['state_available']=False

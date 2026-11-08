@@ -322,6 +322,12 @@ def integrate_awake(state: Mapping[str, Any], dt_min: float,
     # social_battery：真实交流线性消耗 / 安静回充趋近
     social_rate = _finite(rates.get("social_battery_rate"), 0.0)
     if social_rate < 0.0:
+        # PR-STATE-CONTRACT（3.17.22 P1-C）：计划社交消耗幅度有界上限（internal_tuning
+        # planned_social_drain_cap_per_min，默认 0.006/min）——旧默认画像 -0.02/min 使
+        # 40min 社交一次触底；上限经参数注入生效于生产，不改用户画像表层映射。与真实
+        # 聊天每回复消耗（3.17.20，event 桶 kind=chat）来源分离、各自有界，diag 可区分。
+        cap = max(0.0, _finite(params.get("planned_social_drain_cap_per_min"), 0.006))
+        social_rate = max(social_rate, -cap)
         delta["social_battery"] = social_rate * dt
     else:
         target["social_battery"] = _clamp01(

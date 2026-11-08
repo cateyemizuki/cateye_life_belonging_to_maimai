@@ -109,7 +109,7 @@
       "hunger_rate": 0.0003,
       "focus_rate": -0.0005,
       "stress_rate": -0.0020,
-      "social_rate": -0.0200,
+      "social_rate": -0.0060,
       "resume_bias": 0.1,
       "spontaneous_weight": 0.3
     },

@@ -267,7 +267,13 @@ from suite_prompts import (
 # 详情弹层 1040→720px 单列堆叠；心情详情不再重复 VAD 曲线（历史页独立呈现）；
 # 历史心情稀疏采样断线修复（真实点圆点可见 + 缺口桥点线，不插入估算点）。
 # 纯展示，不新增用户可见配置字段（schema 不变，18 段 202 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.21"
+# 3.17.22（2026-11-08 PR-STATE-CONTRACT 状态字段契约修复 + 社交消耗平衡）：
+# _social_state() 过滤键改与 LifeState.snapshot() 一致（social_battery/sleep_debt），
+# 视频社交/空间视频决策拿到社交电量与睡眠债；计划社交消耗幅度有界上限
+# （internal_tuning planned_social_drain_cap_per_min=0.006/min）软化一次触底，
+# 不改用户画像表层映射；与真实聊天消耗来源分离。不新增用户可见配置字段
+# （schema 不变，18 段 202 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.22"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

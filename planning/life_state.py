@@ -429,6 +429,10 @@ class LifeStateService:
             value = float(tuning_value("life_state", "debt_stress_per_h"))
             if math.isfinite(value):
                 params["debt_stress_per_h"] = value
+            # PR-STATE-CONTRACT（3.17.22 P1-C）：计划社交消耗幅度上限同口径注入。
+            cap = float(tuning_value("life_state", "planned_social_drain_cap_per_min"))
+            if math.isfinite(cap):
+                params["planned_social_drain_cap_per_min"] = cap
         except Exception:
             logger.debug("debt_stress_per_h 读取失败（按纯函数内置默认）", exc_info=True)
         return params

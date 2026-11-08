@@ -223,7 +223,7 @@ BUILTIN_PROFILES: Tuple[Tuple[str, ActivityProfile], ...] = (
                               min_minutes=15.0, max_minutes=90.0),
         min_block=15.0, interruptibility=0.90, switch_cost=0.2,
         energy_rate=-0.0008, hunger_rate=0.0003, focus_rate=-0.0005,
-        stress_rate=-0.0020, social_rate=-0.0200,
+        stress_rate=-0.0020, social_rate=-0.0060,
         resume_bias=0.1, spontaneous_weight=0.3)),
     ("idle", ActivityProfile(
         key="idle", label="待机",
