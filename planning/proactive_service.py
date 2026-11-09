@@ -655,9 +655,16 @@ class ProactiveService:
         await self._publish_activity_transition(activity_info)
 
         # 1. 频率调控（每个 stream 独立，因子不变则跳过；不发送消息、无打扰面）
-        if cfg_p.enable_frequency_modulation and activity_info is not None:
-            _name, goal_type = activity_info[0], activity_info[1]
-            await self._apply_frequency(streams, goal_type, name=_name)
+        # 复核 P0-3：睡眠期 runtime_current 默认不返回 sleep 项 → activity_info=None
+        # 致整段跳过、sleep reply_factor=0.05 永不生效。频率链单独补查 include_sleep；
+        # 活动切换事件（_publish_activity_transition）仍用原口径，不改事件语义。
+        if cfg_p.enable_frequency_modulation:
+            freq_info = activity_info
+            if freq_info is None:
+                freq_info = self._find_current_activity(include_sleep=True)
+            if freq_info is not None:
+                _name, goal_type = freq_info[0], freq_info[1]
+                await self._apply_frequency(streams, goal_type, name=_name)
 
         # 2. L2 早晚安漂移（§3.2/§3.3；2026-10-22 §27.1 分支闸门）：
         #    掷点复用 → 候选硬门槛 → 分支判定（目标激活强制/群聊必要性/其他阈值）→ 触发/推迟/放弃
@@ -2751,7 +2758,8 @@ class ProactiveService:
             "kinds": kinds,
         }
 
-    def _find_current_activity(self) -> Optional[Tuple[str, str, int, int, Dict[str, Any]]]:
+    def _find_current_activity(self, *, include_sleep: bool = False
+                               ) -> Optional[Tuple[str, str, int, int, Dict[str, Any]]]:
         """当前正在进行的活动（**runtime-only**；PR8 3.0.0 W4 消费者语义收口）。
 
         依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 W4/裁定 5：当前活动只从
@@ -2764,7 +2772,7 @@ class ProactiveService:
         Returns:
             ``(name, goal_type, start_minutes, end_minutes, parameters)``；没找到时为 None。
         """
-        model_current = self._runtime_current_item()
+        model_current = self._runtime_current_item(include_sleep=include_sleep)
         if model_current is None:
             return None  # 日程查询未装配 / runtime 未就绪或空闲：如实返回（不按表编造）
         try:
@@ -2781,19 +2789,22 @@ class ProactiveService:
             dict(params) if isinstance(params, dict) else {},
         )
 
-    def _runtime_current_item(self) -> Optional[Dict[str, Any]]:
+    def _runtime_current_item(self, *, include_sleep: bool = False) -> Optional[Dict[str, Any]]:
         """当前 runtime episode 的原始 dict 视图（只读；未就绪/空闲/异常 → None）。
 
         与 :meth:`_find_current_activity` 同源（``ScheduleQuery.runtime_current``），
         但保留 dict 形态：S2 需要 ``episode_id`` 与 ``metadata.event_key``，而
         :meth:`_find_current_activity` 的元组契约（既有消费者依赖）不承载这两个键。
+
+        复核 P0-3：``include_sleep`` 透传宿主查询（默认 False 保持 S2 冲浪等既有
+        消费者语义）；频率调控链显式传 True，使睡眠期能取到 sleep 项并应用 0.05 降频。
         """
         query = getattr(self._plugin, "_schedule_query", None)
         reader = getattr(query, "runtime_current", None)
         if not callable(reader):
             return None
         try:
-            item = reader(self._tz_manager.get_now())
+            item = reader(self._tz_manager.get_now(), include_sleep=include_sleep)
         except Exception as exc:
             logger.debug(f"runtime current 读取失败（如实返回 None）: {exc}")
             return None
@@ -2930,7 +2941,8 @@ class ProactiveService:
         """Refresh only frequency after an attention transition; never send a greeting."""
         if not self._proactive_cfg().enable_frequency_modulation:
             return
-        activity = self._find_current_activity()
+        # 复核 P0-3：注意力迁移后的频率刷新同样要识别睡眠（原睡眠期落 free_time 兜底）
+        activity = self._find_current_activity(include_sleep=True)
         name, goal_type = (activity[0], activity[1]) if activity else ("空闲", "free_time")
         await self._apply_frequency(await self._resolve_target_streams_readonly(), goal_type, name=name)
 

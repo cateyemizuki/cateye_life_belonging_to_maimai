@@ -784,6 +784,16 @@ class EmotionService:
         """
         if not self._enabled():
             return
+        # 复核 P0-3：睡眠冻结期非目标流（群聊等）不评估——增量只入 pending、
+        # 醒来即丢弃（防双重记账的有意设计），评估纯耗每日配额致白天停摆。
+        # 目标私聊夜间打扰另走 note_night_reply/settle_night_interrupts 补偿路径。
+        if self.is_frozen() and not self.is_target_session(session_id):
+            self._log_decision(
+                "emotion.frozen_skip", trigger_type="emotion",
+                reason="frozen：睡眠冻结期非目标流不评估（保护日配额）",
+                mode="per_reply", stream=str(session_id or ""),
+            )
+            return
         if self._dedup_skip_result("replyer", session_id, reply_text) is not None:
             return
         if not self._llm_interval_ok():
@@ -984,6 +994,17 @@ class EmotionService:
         ts = current.timestamp()
         flush_reason = str(reason or "")
         pending_seconds = self._pending_seconds(stream)
+        # 复核 P0-3：睡眠冻结期非目标流不评估、不预占配额（增量醒来即丢弃，
+        # 夜间群聊评估纯浪费）；水位照推丢弃该段，与日上限分支同口径，
+        # 避免醒来后拿陈旧夜间上下文补评再耗配额。醒沿 wake 冲刷同样受此门保护。
+        if self.is_frozen() and not self.is_target_session(stream):
+            self._advance_watermark(stream, ts)
+            self._log_decision(
+                "emotion.frozen_skip", trigger_type="emotion",
+                reason="frozen：睡眠冻结期非目标流不评估（保护日配额）",
+                stream=stream, flush_reason=flush_reason,
+            )
+            return False
         # F2（2026-11-04 模块评估 P1-09）：日配额改为**在途预占**（与 per_reply Q3 同构）——
         # 判定与预占同一同步区：总线回调（_on_schedule_generated → flush_all_episodes）
         # 与情绪循环任务并发冲刷**不同流**时，不再双双通过 used=cap-1 的判定各 +1
