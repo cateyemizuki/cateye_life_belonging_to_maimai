@@ -2165,22 +2165,15 @@ class EmotionService:
         if delta_v <= 0:
             return None
         description = f"夜间被重要的人打扰 {count} 次（净正合计）"
-        # 护栏（F6）：入账经 record_external_event → _apply_external_delta → _save_state，而
-        # `_save_state` 只写状态机 + episode —— 会把醒沿刚写入的 `applied_sleep_date` 冲掉。
-        # 先留一份、入账后原值补回（本函数不改该键的值，只是不让自己的入账把它抹掉；否则同一夜
-        # 会因"本周期已结算"落盘护栏失效而被重新冻结 + 重复跑裁判）。
-        guard = (load_json(self._state_path, {}) or {}).get("applied_sleep_date")
+        # 复核 P2-4d：删除冗余 guard——_save_state 的 build_document(previous=盘上文档)
+        # 已覆盖式保留 applied_sleep_date（state_store.py 实测），顺序执行下补写永不触发；
+        # 保留反而可能在 await 期间用陈旧值覆盖并发写入。注释见 _save_state docstring。
         # 入账经既有外部事件入口：K 实参 = target 档（被打扰唯一归属 target），全局倍率在
         # record_external_event/_apply_external_delta 内既有逻辑里乘一次（三层倍率同源）。
         outcome = await self.record_external_event(
             source="sleep_interrupt", description=description,
             delta=VADState(delta_v, 0.0, 0.0), multiplier=self.target_multiplier(True),
             session_id=str(segments[-1].get("stream_id") or ""))
-        if guard is not None:
-            state = load_json(self._state_path, {}) or {}
-            if state.get("applied_sleep_date") != guard:
-                state["applied_sleep_date"] = guard
-                save_json_atomic(self._state_path, state)
         before = outcome.get("delta_before")
         scaled = outcome.get("delta_scaled")
         applied_delta = outcome.get("delta")
