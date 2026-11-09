@@ -486,7 +486,17 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 if sid:
                     text = str(message.get("raw_message") or message.get("plain_message") or "")
                     lover = str(getattr(self, "_lover_name", "") or "")
-                    direct = (grp is False) or (bool(grp) and ("@" in text or (bool(lover) and lover in text)))
+                    # 复核 P0-5：群聊仅当 Bot 自身被 @/点名才算直接消息。
+                    # 优先宿主结构化 is_mentioned/is_at（宿主语义=Bot 被提及，
+                    # 含 @组件目标核对与昵称/别名扫描）；缺失时回退「Bot 昵称
+                    # 出现在文本」。不再用任意 "@"——群友互@、邮箱地址都会误判，
+                    # 当场撤销后台看视频并锁 busy 3 分钟。lover 即 Bot 自身昵称
+                    # （plugin 装配注入），该文本分支保留。
+                    _mentioned = message.get("is_mentioned")
+                    _at_bot = message.get("is_at")
+                    _structured = bool(_mentioned) or bool(_at_bot)
+                    _named = bool(lover) and lover in text
+                    direct = (grp is False) or (bool(grp) and (_structured or _named))
                     tracker.note_incoming(str(sid), direct=direct)
                     if direct:
                         service = getattr(self, "_video_watch", None)
