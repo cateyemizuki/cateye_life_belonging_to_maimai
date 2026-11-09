@@ -13,12 +13,20 @@ sys.path 含宿主 src 与兄弟插件目录，顶层通用名会被抢占（见
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Optional
 
 from planning.life_state import DT_MAX_MINUTES
 from planning.offline_sleep import plan_offline_settlement
+
 from planning.sleep_engine import EVENT_SLEEP_WOKE, SleepEngine
+
+
+def offline_episode_id(plan: dict, *, now: datetime | None = None) -> str:
+    """复核 P2-4c：离线结算幂等键（日期+有效分钟）。"""
+    day = (now or datetime.now()).strftime("%Y-%m-%d")
+    minutes = int(float(plan.get("effective_minutes") or 0.0))
+    return f"offline:{day}:{minutes}"
 
 
 class OfflineSettlementService:
@@ -193,11 +201,16 @@ class OfflineSettlementService:
                 else self._settlement_v2.V2_PARAMS,
                 float(plan.get("sleep_debt_before") or 0.0)))
             payload = {"state_deltas": gains, "settlement_kind": "offline_sleep",
-                       "diag_dt_min": float(plan.get("effective_minutes") or 0.0)}
+                       "diag_dt_min": float(plan.get("effective_minutes") or 0.0),
+                       # 复核 P2-4c：补幂等键——life.apply_episode 的空 eid 不登记回执，
+                       # 绕开 _episode_receipts 保护；稳定 id 提供纵深防御（恰好一次仍
+                       # 由 pending gap 一次性消费保证）。
+                       "episode_id": offline_episode_id(plan)}
         except Exception as exc:
             # Never mix legacy rate integration into current state accounting.
             self._warn("离线睡眠增量计算失败（仅结算睡眠债）：%s", exc)
-            payload = {"state_deltas": {}, "settlement_kind": "offline_sleep"}
+            payload = {"state_deltas": {}, "settlement_kind": "offline_sleep",
+                       "episode_id": offline_episode_id(plan)}
         after = life.apply_episode(payload)
         life.apply_sleep_settlement({
             "sleep_debt": plan.get("sleep_debt_after"),
