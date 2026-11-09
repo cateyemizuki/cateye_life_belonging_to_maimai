@@ -30,12 +30,14 @@ __all__ = [
 def parse_llm_decision(answer: Any) -> Tuple[bool, str]:
     """解析 LLM 的「是/否|理由」回答，返回 ``(是否同意, 理由)``。
 
-    最严解析（移植自 MaiTrace）：先去空白与首尾的 `` ` ' " `` 引号；空串 → ``(False, "")``；
+    最严解析（移植自 MaiTrace）：先去空白与首尾的 `` ` ' " `` 引号及「」/“”/加粗 ``*``
+    （复核 P1-13：提示词要求首字符「是/否」，LLM 常连引号/加粗一起输出，旧实现误拒 YES）；
+    空串 → ``(False, "")``；
     只认首个字符——``是`` → ``True``，``否`` → ``False``，其余一律 ``False``（保守拒绝）。
     理由 = ``|`` 或全角 ``｜`` 之后的部分（截 80 字），无分隔符时为空串；
     格式异常时理由以 ``格式异常: `` 开头（截 30 字）。任何入参都不抛异常。
     """
-    clean = str(answer or "").strip().strip("`'\"").strip()
+    clean = str(answer or "").strip().strip("`'\"「」“”*").strip()
     if not clean:
         return False, ""
     reason = ""
