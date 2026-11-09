@@ -257,16 +257,54 @@ function openedIdleRuns(root){
 const episodeLabel=status=>({active:'进行中',completed:'已完成',paused:'暂停',interrupted:'已中断',abandoned:'已放下',skipped:'已跳过',planned:'未开始'}[status]||status||'已记录');
 const schedulePages=[
  {key:'record',label:'行程记录'},
- {key:'events',label:'小事件',note:'内置与可复用事件按间隔参与；一次性事件抽中即移除。这是当前生成周期的池子，不随查看日期回退。'},
+ {key:'events',label:'小事件',note:'初始池（代码联动+JSON 状态）与生成池事件作为正常候选参与滚动选取；一次性事件抽中即移除。查看/翻页不消耗事件。这是当前生成周期的池子，不随查看日期回退。'},
 ];
 let schedulePage=0,schedulePageAnimating=false;
 function schedulePageInfo(){return schedulePages[schedulePage]}
+// P4（2026-11-09 §8）：来源类型（与 pool_kind 分开）。初始列区分代码联动/JSON 状态；
+// 旧快照无 origin_kind → 历史来源未记录（不猜它来自今天的 JSON）。
+function poolOriginLabel(item,key){
+ if(key==='recovery')return '';
+ if(key==='generated')return '模型生成 · 周期内可复用';
+ if(key==='one_shot')return '模型生成 · 一次性小目标';
+ if(key==='consumed')return '模型生成 · 已消耗';
+ const ok=item.origin_kind;
+ if(ok==='code_builtin'||(!ok&&(item.event_id==='watch_bili'||item.event_id==='browse_qq')))return '代码内置 · 模块联动';
+ if(ok==='json_file')return 'JSON · 状态调节';
+ if(!ok)return '历史来源未记录';
+ return '初始小事件';
+}
+function poolStateEffect(item){
+ const d=item.state_deltas||{},names={energy:'精力',hunger:'饥饿',focus:'专注',stress:'压力',social_battery:'社交余量'};
+ return Object.keys(d).filter(k=>num(d[k])!==null&&num(d[k])!==0)
+  .map(k=>(names[k]||k)+(num(d[k])>0?'↑':'↓')).join(' ');
+}
 function renderSchedulePool(key){
  const pools=data?.schedule?.pools,items=Array.isArray(pools?.[key])?pools[key]:[];
  const target=$('schedule-'+key+'-items'),origins=$('schedule-'+key+'-sources');
  target.replaceChildren();origins?.replaceChildren();
- if(key!=='recovery')text('schedule-'+key+'-count',!Array.isArray(pools?.[key])?'未提供':
-  key==='one_shot'?'剩余 '+items.length+' / '+(num(pools.one_shot_total)??items.length)+' 项':items.length+' 项');
+ // P4：每列明确总数与截断（超 POOL_ROW_CAP 显示“其余略”，不悄悄隐藏却报错误数量）
+ const totalKey={builtin:'builtin_total',generated:'generated_total',consumed:'consumed_total'}[key];
+ const total=num(pools?.[totalKey]);
+ if(key!=='recovery'){
+  let countLabel;
+  if(!Array.isArray(pools?.[key]))countLabel='未提供';
+  else if(key==='one_shot')countLabel='剩余 '+items.length+' / '+(num(pools.one_shot_total)??items.length)+' 项';
+  else if(total!==null&&total>items.length)countLabel=items.length+' / '+total+' 项（其余略）';
+  else countLabel=(total??items.length)+' 项';
+  text('schedule-'+key+'-count',countLabel);
+ }
+ // P4：初始池加载状态（部分跳过原因 / 无可用状态事件）
+ if(key==='builtin'&&pools?.initial_events){
+  const ie=pools.initial_events;
+  if(ie.skipped&&ie.skipped.length){
+   const warn=el('li','note','初始事件库 '+ie.skipped.length+' 份被跳过：'+ie.skipped.map(s=>s.file).join('、'));
+   warn.title=ie.skipped.map(s=>s.file+'：'+s.reason).join('\n');
+   target.append(warn);
+  }else if(ie.dir_exists&&ie.accepted===0){
+   target.append(el('li','note','无可用 JSON 状态事件（代码联动事件与主日程照常）'));
+  }
+ }
  for(const item of items){
   const row=el('li','schedule-pool-row'),name=item.name||'未命名条目';
   const min=num(item.min_minutes),max=num(item.max_minutes);
@@ -274,22 +312,34 @@ function renderSchedulePool(key){
    [item.schedule_date,num(item.progress)===null?'':'完成 '+pct(item.progress)+'%'].filter(Boolean).join(' · '):
    min===null?'时长未记录':max===null||min===max?min+' 分钟':min+'–'+max+' 分钟';
   row.append(el('strong','',name));
-  // 3.17.7 改进2：右侧时段 badge（生成事件 time_slot；内置全时段=全天；旧快照无字段不显示）
+  // 3.17.7 改进2：右侧时段 badge；P4：来源 badge + 偏好 badge
   const end=el('span','poolrowend');
   if(period)end.append(el('span','note',period));
   if(key!=='recovery'&&item.time_slot)end.append(el('span','rowbadge slotbadge',item.time_slot));
+  const ol=poolOriginLabel(item,key);
+  if(ol)end.append(el('span','rowbadge originbadge',ol));
+  if(item.preference&&item.preference.label)end.append(el('span','rowbadge prefbadge','偏好：'+item.preference.label));
   if(end.childNodes.length)row.append(end);
   target.append(row);
   if(origins){
    const origin=el('li','schedule-pool-row');
-   const label=key==='builtin'?'插件内置事件库':key==='one_shot'?'模型生成 · 一次性小目标':'模型生成 · 周期内可复用';
-   const source=el('span','note',label);
-   if(key!=='builtin')source.append(document.createTextNode(
-    (date(pools.generated_at)?' · 生成于 '+clock(pools.generated_at,true):' · 生成时间未记录')+
-    (date(pools.next_update_at)?' · 下次更新 '+clock(pools.next_update_at,true):'')));
-   source.title=key==='builtin'?'随插件提供的日常小事件':
-    '生成时间：'+fullClock(pools.generated_at)+'；下次更新：'+fullClock(pools.next_update_at)+
-    (key==='one_shot'?'；最终抽中即消耗，启动失败或被打断也不返池。':'；遵守原有去重间隔，可在周期内再次发生。');
+   const source=el('span','note',ol);
+   const details=[];
+   if(item.source_file)details.push('文件：'+item.source_file);
+   if(item.definition_version)details.push('定义版本：'+item.definition_version);
+   if(num(item.cooldown_minutes)>0)details.push('冷却：'+item.cooldown_minutes+' 分钟');
+   const eff=poolStateEffect(item);if(eff)details.push('状态作用：'+eff);
+   if(item.preference)details.push('偏好：'+item.preference.label+'（'+item.preference.source+(item.preference.evaluated?'·已评估':'·待评估')+'）');
+   if(key==='generated'||key==='one_shot'||key==='consumed'){
+    source.append(document.createTextNode(
+     (date(pools.generated_at)?' · 生成于 '+clock(pools.generated_at,true):' · 生成时间未记录')+
+     (date(pools.next_update_at)?' · 下次更新 '+clock(pools.next_update_at,true):'')));
+   }
+   if(details.length)source.append(el('span','note',' · '+details.join(' · ')));
+   source.title=(ol?ol+'；':'')+(item.source_file?'文件 '+item.source_file+'；':'')+
+    (key==='one_shot'?'最终抽中即消耗，启动失败或被打断也不返池。':
+     key==='generated'?'遵守原有去重间隔，可在周期内再次发生。':
+     key==='builtin'?'初始池：代码联动项关联对应模块与独立预算；JSON 项为状态调节。事件描述是虚拟日程，不是真实聊天或外部操作。':'');
    origin.append(el('strong','',name),source);
    origins.append(origin);
   }

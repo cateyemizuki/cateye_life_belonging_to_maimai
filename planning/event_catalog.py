@@ -63,8 +63,11 @@ EVENT_ID_RE = re.compile(r"^llm_[a-z0-9_]{2,48}$")
 RANDOM_EVENT_DEDUP_MINUTES = 240
 MIN_GENERATED_EVENTS = 3
 MAX_GENERATED_EVENTS = 8
-MIN_DURATION_MINUTES = 5
-MAX_DURATION_MINUTES = 30
+# P4（2026-11-09 滚动日程计划 §4/§7.2）：生成时长从 5–30 扩到自然区间 3–120
+# （与初始 JSON 库同口径；默认内容仍主要 5–60，由提示词引导）。提示/schema/
+# 校验/采样/展示同步——不再把读书/听音乐等长放松压短。生成数量与刷新周期不变。
+MIN_DURATION_MINUTES = 3
+MAX_DURATION_MINUTES = 120
 MIN_TEMPLATE_CHARS = 10
 MAX_TEMPLATE_CHARS = 40
 MAX_NAME_CHARS = 10
@@ -314,9 +317,11 @@ class EventCatalogValidator:
             add("E_DURATION", "min_minutes/max_minutes 必须是整数", "min_minutes")
         else:
             if not (MIN_DURATION_MINUTES <= min_minutes <= MAX_DURATION_MINUTES):
-                add("E_DURATION", "min_minutes 需在 5-30", "min_minutes")
+                add("E_DURATION", f"min_minutes 需在 {MIN_DURATION_MINUTES}-{MAX_DURATION_MINUTES}",
+                    "min_minutes")
             if not (MIN_DURATION_MINUTES <= max_minutes <= MAX_DURATION_MINUTES):
-                add("E_DURATION", "max_minutes 需在 5-30", "max_minutes")
+                add("E_DURATION", f"max_minutes 需在 {MIN_DURATION_MINUTES}-{MAX_DURATION_MINUTES}",
+                    "max_minutes")
             if max_minutes < min_minutes:
                 add("E_DURATION", "max_minutes 必须 >= min_minutes", "max_minutes")
 

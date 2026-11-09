@@ -137,6 +137,12 @@ class PluginContext:
         # 缺失按 None（未装配降级语义不变，patrol/问候链不阻塞触发）。
         return self.get("screen_perception")
 
+    @property
+    def activity_preferences(self) -> Any:
+        # P3（3.17.27）：日程偏好服务；缺失按 None（未装配 → 面板偏好标签不显示，
+        # 纯读降级，不阻塞池投影）。
+        return self.get("activity_preferences")
+
     # 公开属性（无前导下划线）与宿主门面
     @property
     def config(self) -> Any:

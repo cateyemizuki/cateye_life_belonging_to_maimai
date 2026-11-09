@@ -122,28 +122,92 @@ def _event_slot_label(row: dict[str, Any]) -> str:
     return ''
 
 
-def _schedule_pools(planning: Any, model: Any, now: datetime, read: Any) -> dict[str, Any]:
-    """Read the existing pools without rolling, refreshing or exposing raw metadata."""
+#: P4（2026-11-09 §8）：每列展示行上限（超出明确总数与截断标记，不悄悄隐藏）。
+POOL_ROW_CAP = 40
+
+
+def _schedule_pools(planning: Any, model: Any, now: datetime, read: Any,
+                    plugin: Any = None) -> dict[str, Any]:
+    """Read the existing pools without rolling, refreshing or exposing raw metadata.
+
+    P4（2026-11-09 滚动日程计划 §8/§14.8）：每行带来源标记（origin_kind/source_file/
+    definition_version 与 pool_kind 分开）、冷却/时段/状态作用、偏好标签；初始池
+    加载失败/部分跳过有简短状态与原因；每列超 POOL_ROW_CAP 明确总数与截断标记。
+    纯读统一 Catalog 快照与偏好缓存——查看/hover/翻页不抽选、不消耗、不发请求。
+    """
     from .rolling_planner import RANDOM_EVENT_POOL
 
+    prefs = getattr(plugin, '_activity_preferences', None) if plugin is not None else None
+
+    def preference(row: dict) -> Any:
+        if prefs is None:
+            return None
+        try:
+            p = prefs.preference_for(row)
+        except Exception:
+            return None
+        aff = _number(p.get('affinity')) or 0.0
+        src = str(p.get('source') or '')
+        if not p.get('evaluated') and src in ('neutral', 'persona_changed', 'cache_corrupt'):
+            label = '待评估' if src == 'neutral' else '未记录'
+        elif aff >= 0.35:
+            label = '喜欢'
+        elif aff <= -0.35:
+            label = '不太想做'
+        else:
+            label = '一般'
+        return {'label': label, 'source': src[:24], 'evaluated': bool(p.get('evaluated'))}
+
     def events(rows: Any) -> list[dict[str, Any]]:
-        return [
-            {'name': str(row['name'])[:160], 'goal_type': str(row.get('goal_type') or '')[:40],
-             'min_minutes': _number(row.get('min_minutes')),
-             'max_minutes': _number(row.get('max_minutes')),
-             'event_id': str(row.get('event_id') or row.get('key') or '')[:80],
-             'pool_kind': str(row.get('pool_kind') or 'reusable')[:20],
-             'generation_id': str(row.get('generation_id') or '')[:96],
-             'consumption_status': str((row.get('consumption') or {}).get('status') or '')[:24],
-             'consumed_at': str((row.get('consumption') or {}).get('picked_at') or '')[:48],
-             'time_slot': _event_slot_label(row)}
-            for row in rows[:40] if isinstance(row, dict) and row.get('name')
-        ]
+        out: list[dict[str, Any]] = []
+        for row in rows[:POOL_ROW_CAP]:
+            if not isinstance(row, dict) or not row.get('name'):
+                continue
+            deltas = row.get('state_deltas') or {}
+            item = {
+                'name': str(row['name'])[:160], 'goal_type': str(row.get('goal_type') or '')[:40],
+                'min_minutes': _number(row.get('min_minutes')),
+                'max_minutes': _number(row.get('max_minutes')),
+                'event_id': str(row.get('event_id') or row.get('key') or '')[:80],
+                'pool_kind': str(row.get('pool_kind') or 'reusable')[:20],
+                'origin_kind': str(row.get('origin_kind') or '')[:20],
+                'source_file': str(row.get('source_file') or '')[:80],
+                'definition_version': str(row.get('definition_version') or '')[:24],
+                'cooldown_minutes': _number(row.get('cooldown_minutes')),
+                'interruptibility': _number(row.get('interruptibility')),
+                'tags': [str(t)[:20] for t in (row.get('tags') or [])][:3],
+                'state_deltas': {str(k)[:20]: _number(v) for k, v in deltas.items()
+                                 if _number(v) is not None} if isinstance(deltas, dict) else {},
+                'generation_id': str(row.get('generation_id') or '')[:96],
+                'consumption_status': str((row.get('consumption') or {}).get('status') or '')[:24],
+                'consumed_at': str((row.get('consumption') or {}).get('picked_at') or '')[:48],
+                'time_slot': _event_slot_label(row)}
+            pref = preference(row)
+            if pref is not None:
+                item['preference'] = pref
+            out.append(item)
+        return out
+
+    def total(rows: Any) -> int:
+        return sum(1 for r in rows if isinstance(r, dict) and r.get('name'))
 
     catalog = getattr(planning, 'event_catalog', None)
     snapshot = read('小事件库暂不可读', lambda: catalog.store.snapshot, None) if catalog else None
     resume = getattr(model, 'resume_candidates', None)
     paused = read('恢复池暂不可读', lambda: resume(now), []) if callable(resume) else []
+    builtin_rows = snapshot.builtin_events if snapshot else RANDOM_EVENT_POOL
+    generated_rows = snapshot.reusable_events if snapshot else []
+    one_shot_rows = snapshot.one_shot_events if snapshot else []
+    consumed_rows = snapshot.consumed_events if snapshot else []
+    initial = getattr(catalog, 'initial_events_result', None)
+    initial_status = None
+    if initial is not None:
+        initial_status = {
+            'accepted': len(initial.events), 'files_seen': initial.files_seen,
+            'disabled': initial.disabled_count, 'dir_exists': initial.dir_exists,
+            'content_version': initial.content_version,
+            'skipped': [{'file': str(n)[:80], 'reason': str(r)[:120]}
+                        for n, r in initial.skipped[:10]]}
     return {
         'recovery': [
             {'name': str(row['name'])[:160], 'goal_type': str(row.get('goal_type') or '')[:40],
@@ -151,10 +215,17 @@ def _schedule_pools(planning: Any, model: Any, now: datetime, read: Any) -> dict
              'progress': _number(row.get('progress'))}
             for row in paused[:20] if isinstance(row, dict) and row.get('name')
         ],
-        'builtin': events(snapshot.builtin_events if snapshot else RANDOM_EVENT_POOL),
-        'generated': events(snapshot.reusable_events) if snapshot else [],
-        'one_shot': events(snapshot.one_shot_events) if snapshot else [],
-        'consumed': events(snapshot.consumed_events) if snapshot else [],
+        'builtin': events(builtin_rows),
+        'generated': events(generated_rows),
+        'one_shot': events(one_shot_rows),
+        'consumed': events(consumed_rows),
+        'builtin_total': total(builtin_rows),
+        'generated_total': total(generated_rows),
+        'consumed_total': total(consumed_rows),
+        'pool_row_cap': POOL_ROW_CAP,
+        'pools_truncated': any(total(r) > POOL_ROW_CAP
+                               for r in (builtin_rows, generated_rows, one_shot_rows, consumed_rows)),
+        'initial_events': initial_status,
         'generation_id': str(snapshot.generation_id)[:96] if snapshot else '',
         'one_shot_total': len(snapshot.one_shot_events) + len(snapshot.consumed_events) if snapshot else 0,
         'generated_at': str(snapshot.generated_at)[:48] if snapshot and snapshot.generated_at else None,
@@ -732,7 +803,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
         'state_age_seconds': age, 'stale': age is None or age > 900 or future_state,
         'history': history,
         'schedule': {'enabled': enabled, 'runtime_ready': ready, 'date': date,
-                     'pools': _schedule_pools(ctx.planning, model, now, read) if ready else {},
+                     'pools': _schedule_pools(ctx.planning, model, now, read, plugin) if ready else {},
                      'current': _row(current) if current else None,
                      'intents': [_row(row) for row in today.get('intents', [])[:80]],
                      'episodes': today_episodes,
@@ -805,6 +876,16 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
             day_intent = result['day']['intent']
             day_intent['items'] = day_intent['items'][:len(day_intent['items'])//2]
             day_intent['truncated'] = True
+        elif any(len(result.get('schedule', {}).get('pools', {}).get(k, [])) > 8
+                 for k in ('builtin', 'generated', 'one_shot', 'consumed')):
+            # P4（2026-11-09 §8）：新增来源/偏好字段进入现有裁剪链——池行减半，
+            # 总数/截断标记保留（前端据此显示“其余 N 项”不悄悄隐藏）。
+            pools = result['schedule']['pools']
+            for k in ('builtin', 'generated', 'one_shot', 'consumed'):
+                rows = pools.get(k, [])
+                if len(rows) > 8:
+                    pools[k] = rows[:max(8, len(rows)//2)]
+            pools['pools_truncated'] = True
         else:
             # Independent projections must never trap the read handler in a size loop.
             result.update(emotion={'available': False, 'reason': 'payload_limit'},

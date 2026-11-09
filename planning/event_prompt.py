@@ -45,7 +45,7 @@ SYSTEM_PROMPT = "你是生活小事件设计助手。只输出 JSON，不要解�
 _RULES = """规则：
 1 event_id 必须以 llm_ 开头（小写字母/数字/下划线）；
 2 name 2-10 字；goal_type 仅 daily_routine/rest/social/entertainment/exercise/idle/transition；
-3 min_minutes/max_minutes 取 5-30，且 max>=min；
+3 min_minutes/max_minutes 取 3-120，且 max>=min；按活动自然时长设定——多数日常小事 5-30，读书/听音乐/散步等放松可 20-60 甚至更长，不要一律压短；
 4 interruptibility 取 0-1，weight 取 0.1-1；
 5 state_deltas 仅 energy/hunger/focus/stress/social_battery，单项绝对值<=0.08；
 6 templates 2-3 条，每条 10-40 字；
@@ -198,8 +198,8 @@ def build_json_schema(count: int = DEFAULT_MAX_GENERATED_EVENTS) -> Dict[str, An
                         "event_id": {"type": "string", "pattern": "^llm_[a-z0-9_]+$"},
                         "name": {"type": "string", "minLength": 2, "maxLength": 10},
                         "goal_type": {"type": "string", "enum": list(_ALLOWED_GOAL_TYPES)},
-                        "min_minutes": {"type": "integer", "minimum": 5, "maximum": 30},
-                        "max_minutes": {"type": "integer", "minimum": 5, "maximum": 30},
+                        "min_minutes": {"type": "integer", "minimum": 3, "maximum": 120},
+                        "max_minutes": {"type": "integer", "minimum": 3, "maximum": 120},
                         "interruptibility": {"type": "number", "minimum": 0, "maximum": 1},
                         "weight": {"type": "number", "minimum": 0.1, "maximum": 1.0},
                         "state_deltas": {"type": "object", "properties": delta_props,

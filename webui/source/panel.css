@@ -376,6 +376,9 @@ body.fish-locked .fish-overlay[data-section=usage]{z-index:960}
 /* 3.17.7 改进2：日程池行右侧时段 badge（沿用 rowbadge 风格，仅加时段语义） */
 .poolrowend{display:inline-flex;align-items:baseline;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .slotbadge{white-space:nowrap;font-variant-numeric:tabular-nums}
+/* P4（2026-11-09 §8）：来源/偏好 badge（沿用 rowbadge 风格；来源虚线边框、偏好主色淡底） */
+.originbadge{white-space:nowrap;border:1px dashed var(--maibot-border);background:transparent}
+.prefbadge{white-space:nowrap;color:var(--maibot-primary);background:var(--maibot-soft)}
 /* 3.17.7 改进1：行程记录右侧抽取原因（小号灰色，沿用 note 风格） */
 .rowendcol{display:flex;flex-direction:column;align-items:flex-end;gap:4px;min-width:0}
 .rowendcol>.rowbadge{align-self:flex-end}
