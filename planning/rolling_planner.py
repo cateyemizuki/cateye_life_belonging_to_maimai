@@ -141,6 +141,10 @@ IDLE_PENALTY_MAX = 0.9
 PREFERENCE_SOFT_KINDS = frozenset({"intent", "event", "resume", "continuation", "anchor_rest"})
 #: P3 §14.6：普通候选约 10% 受控探索（在合法替代项中；不绕过时间/状态/次数限制）。
 EXPLORATION_RATE = 0.10
+#: 复核 P2-2：探索只在 top 之后至多 5 个替代项中抽（scored[3:8]），避免盲抽长尾劣质项。
+EXPLORATION_WINDOW = 5
+#: 复核 P2-2：探索候选与 top1 分差不得超过该值，否则视为劣质替代不参与探索。
+EXPLORATION_SCORE_GAP = 0.25
 #: P3 §14.6：偏好时长微调——采样中心移动不超过区间宽度的 15%（不扩展 min/max）。
 PREFERENCE_DURATION_SHIFT_RATIO = 0.15
 #: 各类型精力需求位（energy_fit 用：精力低于需求 → 降分；rest/idle/meal 需求最低）
@@ -2097,9 +2101,15 @@ class RollingPlanner:
             return guarded[1], guarded[0], [guarded]
         # P3 §14.6：约 10% 受控探索——在合法替代项（已过可行性过滤）中探索；
         # 启动循环仍逐项核窗口/最小块，探索不绕过时间/状态/次数限制。
+        # 复核 P2-2：只在 top 之后至多 EXPLORATION_WINDOW 个、且与 top1 分差
+        # ≤ EXPLORATION_SCORE_GAP 的替代项中抽；无合格项则回落 softmax，不盲抽长尾。
         if len(scored) > 3 and rng.random() < EXPLORATION_RATE:
-            pick_score, pick_cand = rng.choice(scored[3:])
-            return pick_cand, pick_score, scored[:3]
+            top_score = scored[0][0]
+            pool = [(s, c) for s, c in scored[3:3 + EXPLORATION_WINDOW]
+                    if s >= top_score - EXPLORATION_SCORE_GAP]
+            if pool:
+                pick_score, pick_cand = rng.choice(pool)
+                return pick_cand, pick_score, scored[:3]
         temperature = max(0.01, self._cfg_float("sampling_temperature",
                                                 DEFAULT_SAMPLING_TEMPERATURE))
         # top2-3 softmax 加权采样（不是 argmax）；选中候选不可启（min_block 不足 /
