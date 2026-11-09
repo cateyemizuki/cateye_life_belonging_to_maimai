@@ -203,8 +203,8 @@ def classify_activity_continuity(name: Any, goal_type: Any, *,
 #: 睡眠类型条目（与 schedule_query.SKIP_TYPES / schedule_items 夜间睡眠口径对齐）
 _SKIP_SLEEP_TYPES = {SLEEP_GOAL_TYPE}
 
-# ── 随机事件池（附录 A.7 表逐条；模板 1 句描述、0 LLM）────────────────────
-from .small_events import builtin_events
+# ── 随机事件池（P2 起仅代码联动两项；普通状态事件在 mappings/initial_events/）──
+from .small_events import LEGACY_STATE_EVENTS, builtin_events
 RANDOM_EVENT_POOL: Tuple[Dict[str, Any], ...] = tuple(builtin_events())
 
 #: 同一事件 4 小时内不重复（A.7）
@@ -888,8 +888,9 @@ class RollingPlanner:
         event_key = str(metadata.get("event_key") or metadata.get("event_id") or "")
         if not event_key:
             return None
-        for event in RANDOM_EVENT_POOL:
-            if event["key"] == event_key:
+        # P2：回查链含历史纯状态内置项档案（三项已迁 JSON，旧 episode 语义连续）。
+        for event in (*RANDOM_EVENT_POOL, *LEGACY_STATE_EVENTS):
+            if str(event.get("key") or event.get("event_id") or "") == event_key:
                 deltas = event.get("state_deltas")
                 return dict(deltas) if isinstance(deltas, dict) else None
         lookup = getattr(event_catalog, "get_state_deltas", None) if event_catalog is not None else None

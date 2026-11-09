@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "event": {
+    "event_id": "local_drink",
+    "name": "泡杯饮品",
+    "enabled": true,
+    "goal_type": "daily_routine",
+    "min_minutes": 8,
+    "max_minutes": 15,
+    "interruptibility": 0.9,
+    "weight": 0.6,
+    "cooldown_minutes": 60,
+    "allowed_slots": ["08-16", "16-24"],
+    "state_deltas": {"stress": -0.01},
+    "templates": ["麦麦给自己泡了杯热饮，捧着杯子小口小口地喝，享受这一小段安静的停顿。"],
+    "tags": ["饮品", "小憩"]
+  }
+}

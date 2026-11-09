@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "event": {
+    "event_id": "local_journal",
+    "name": "写几行随记",
+    "enabled": true,
+    "goal_type": "daily_routine",
+    "min_minutes": 10,
+    "max_minutes": 25,
+    "interruptibility": 0.85,
+    "weight": 0.5,
+    "cooldown_minutes": 180,
+    "allowed_slots": ["08-16", "16-24"],
+    "state_deltas": {"focus": -0.01, "stress": -0.01},
+    "templates": ["麦麦翻开随记本写了几行今天的小事和想法，把思绪理了理，心里踏实了一些。"],
+    "tags": ["随记", "整理思绪"]
+  }
+}

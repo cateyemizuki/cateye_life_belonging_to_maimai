@@ -131,7 +131,7 @@ BUILTIN_WEIGHT = 1.0
 #: roll 到（装配根经 set_event_gate 注入动态配置闸；热重载即时生效）。
 VIDEO_WATCH_EVENT_KEY = "watch_bili"
 
-from .small_events import BUILTIN_EVENTS, builtin_events
+from .small_events import BUILTIN_EVENTS, LEGACY_STATE_EVENTS, builtin_events
 
 #: 安全关键词（模板 / 名称；宁可保守，命中即 E_SAFETY）
 _SAFETY_TERMS: Tuple[str, ...] = (
@@ -570,7 +570,10 @@ def resolve_state_deltas(metadata: Any,
     event_key = str(metadata.get("event_key") or metadata.get("event_id") or "")
     if not event_key:
         return None
-    for event in (builtin if builtin is not None else BUILTIN_EVENTS):
+    # P2：旧 episode 无快照回查链含历史纯状态内置项档案（daydream/lie_down/snack
+    # 已迁 JSON，历史语义连续）；显式 builtin 覆盖时尊重调用方。
+    pool = builtin if builtin is not None else (*BUILTIN_EVENTS, *LEGACY_STATE_EVENTS)
+    for event in pool:
         eid = str(event.get("event_id") or event.get("key") or "")
         if eid == event_key:
             deltas = event.get("state_deltas")
@@ -686,11 +689,23 @@ class EventCatalogStore:
 
     @staticmethod
     def _normalize_builtin(items: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        """初始池规范化（代码联动 + JSON 状态事件）。
+
+        P2（2026-11-09 §6.2/§13）：保留经校验的 JSON 新字段（cooldown_minutes/
+        tags/origin_kind/source_file/definition_version），不再一律重设
+        enabled/source——「池类型」（pool_kind=初始列）与「来源类型」（source/
+        origin_kind=代码或 JSON 文件）分开；禁用项由 loader 先行剔除，此处对
+        显式 enabled=False 仍保守排除。代码联动项缺省口径逐字不变。
+        """
         from .event_slots import TIME_SLOTS
         output: List[Dict[str, Any]] = []
         for raw in items:
             eid = str(raw.get("event_id") or raw.get("key") or "")
-            output.append({
+            if raw.get("enabled", True) is False:
+                continue
+            origin = str(raw.get("origin_kind")
+                         or ("json_file" if raw.get("source") == "json_file" else "code_builtin"))
+            entry = {
                 "event_id": eid,
                 "key": eid,
                 "name": str(raw.get("name") or ""),
@@ -702,10 +717,15 @@ class EventCatalogStore:
                 "state_deltas": dict(raw.get("state_deltas") or {}),
                 "templates": [str(x) for x in (raw.get("templates") or ())],
                 "enabled": True,
-                "source": "builtin",
-                "pool_kind": "builtin",
+                "source": str(raw.get("source") or "builtin"),
+                "pool_kind": str(raw.get("pool_kind") or "builtin"),
+                "origin_kind": origin,
                 "allowed_slots": list(raw.get("allowed_slots") or TIME_SLOTS),
-            })
+            }
+            for key in ("cooldown_minutes", "tags", "source_file", "definition_version"):
+                if raw.get(key) is not None:
+                    entry[key] = raw[key]
+            output.append(entry)
         return output
 
     # ---- 装载 ----
@@ -1116,7 +1136,8 @@ class EventCatalogService:
                  recent_schedule_names_provider: Any = None,
                  recent_event_names_provider: Any = None,
                  auto_gate: Optional[Callable[[datetime], Any]] = None,
-                 allow_ungated_auto: bool = False) -> None:
+                 allow_ungated_auto: bool = False,
+                 initial_events: Optional[Sequence[Mapping[str, Any]]] = None) -> None:
         self._tz = _tzinfo(tz) or datetime.now().astimezone().tzinfo
         self._config = config
         self._config_provider = config_provider
@@ -1138,18 +1159,32 @@ class EventCatalogService:
             state_path = Path(data_dir) / CATALOG_STATE_FILE_NAME
         self._state_path = Path(state_path) if state_path is not None else None
         self._state = self._load_state()
+        # P2（2026-11-09 §6/§13）：统一初始池 = 代码联动两项 + 有效 JSON 状态事件。
+        # 先装配初始池，再把实际有效数量用于 store/validator（容量派生不残留硬编码）；
+        # 不造平行池。JSON 装载失败 → 状态事件池为空，代码联动与主日程照常。
+        self.initial_events_result: Any = None
+        if initial_events is None and plugin_root is not None:
+            try:
+                from .initial_events import ensure_initial_events_dir, load_initial_events
+                ensure_initial_events_dir(plugin_root)
+                self.initial_events_result = load_initial_events(plugin_root)
+                initial_events = self.initial_events_result.events
+            except Exception as exc:
+                logger.warning("初始事件库装配失败（状态事件池按空处理）：%s", exc)
+                initial_events = []
+        combined_builtin = [*builtin_events(), *list(initial_events or [])]
         # 3.17.6（PR-REMOVE-POOLCAP）：不再传独立总上限——validator/store 缺省
-        # 派生（内置 + 六键配额和），与三时段配额永远自洽。
+        # 派生（实际初始池数 + 六键配额和），与三时段配额永远自洽。
         self._validator = validator or EventCatalogValidator(
-            builtin_count=len(builtin_events()),
+            builtin_count=len(combined_builtin),
             max_generated_events=cfg.max_generated_events,
             reusable_limits=cfg.reusable_limits,
             one_shot_limits=cfg.one_shot_limits)
         self._custom_validator = validator is not None
         self.store = store or EventCatalogStore(
-            catalog_path, validator=self._validator,
+            catalog_path, builtin=combined_builtin, validator=self._validator,
             max_generated_events=cfg.max_generated_events, tz=self._tz,
-            # mode=off：构造期就不读生成库（off 只用内置池；不删不改用户文件）
+            # mode=off：构造期就不读生成库（off 只用初始池；不删不改用户文件）
             load_on_init=cfg.mode != "off")
         self._lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
@@ -1352,6 +1387,16 @@ class EventCatalogService:
             "generation_id": snap.generation_id,
             "builtin_events": len(snap.builtin_events),
             "active_events": len(snap.active_events),
+            # P2：初始池来源诊断（代码联动/JSON 状态；加载失败/部分跳过原因）
+            "initial_events": (None if self.initial_events_result is None else {
+                "accepted": len(self.initial_events_result.events),
+                "files_seen": self.initial_events_result.files_seen,
+                "disabled": self.initial_events_result.disabled_count,
+                "content_version": self.initial_events_result.content_version,
+                "dir_exists": self.initial_events_result.dir_exists,
+                "skipped": [{"file": n, "reason": r}
+                            for n, r in self.initial_events_result.skipped],
+            }),
             "invalid_count": snap.invalid_count,
             "pool_truncated": snap.pool_truncated,
             "generated_at": snap.generated_at,

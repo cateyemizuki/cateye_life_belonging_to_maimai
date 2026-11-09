@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "event": {
+    "event_id": "local_read_book",
+    "name": "读一会闲书",
+    "enabled": true,
+    "goal_type": "entertainment",
+    "min_minutes": 25,
+    "max_minutes": 60,
+    "interruptibility": 0.85,
+    "weight": 0.65,
+    "cooldown_minutes": 120,
+    "allowed_slots": ["08-16", "16-24"],
+    "state_deltas": {"focus": -0.02, "stress": -0.02},
+    "templates": ["麦麦捧起一本喜欢的闲书读了一会，沉浸在故事里，整个人都放松了下来。"],
+    "tags": ["阅读", "兴趣"]
+  }
+}

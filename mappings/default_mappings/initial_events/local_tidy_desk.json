@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "event": {
+    "event_id": "local_tidy_desk",
+    "name": "收拾桌面",
+    "enabled": true,
+    "goal_type": "daily_routine",
+    "min_minutes": 10,
+    "max_minutes": 25,
+    "interruptibility": 0.85,
+    "weight": 0.5,
+    "cooldown_minutes": 180,
+    "allowed_slots": ["08-16", "16-24"],
+    "state_deltas": {"stress": -0.01, "energy": -0.01},
+    "templates": ["麦麦把桌面上的东西归拢了一下，擦了擦灰，看着整洁的桌面心情也清爽了些。"],
+    "tags": ["整理", "日常"]
+  }
+}

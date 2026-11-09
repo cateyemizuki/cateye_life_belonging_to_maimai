@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "event": {
+    "event_id": "local_organize",
+    "name": "简单收纳",
+    "enabled": true,
+    "goal_type": "daily_routine",
+    "min_minutes": 15,
+    "max_minutes": 30,
+    "interruptibility": 0.85,
+    "weight": 0.45,
+    "cooldown_minutes": 240,
+    "allowed_slots": ["08-16", "16-24"],
+    "state_deltas": {"energy": -0.01},
+    "templates": ["麦麦把零散的小物件分类收进盒子里，顺手换了换摆放的位置，屋里看着整齐多了。"],
+    "tags": ["收纳", "日常"]
+  }
+}

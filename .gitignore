@@ -30,6 +30,9 @@ webui/source/_p2_backup/
 # 不匹配深层 ``mappings/default_mappings/README.md``。
 /mappings/*.json
 mappings/README.md
+# P2（2026-11-09）：初始小事件运行目录 = 用户数据区（首次从种子复制后可编辑）；
+# 出厂种子 mappings/default_mappings/initial_events/ 仍随包（含中段斜杠不匹配）。
+/mappings/initial_events/
 
 # ---- Python 缓存 / 构建产物 / 虚拟环境 ----
 __pycache__/

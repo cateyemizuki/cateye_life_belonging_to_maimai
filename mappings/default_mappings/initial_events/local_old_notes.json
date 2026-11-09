@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "event": {
+    "event_id": "local_old_notes",
+    "name": "翻翻旧笔记",
+    "enabled": true,
+    "goal_type": "entertainment",
+    "min_minutes": 15,
+    "max_minutes": 35,
+    "interruptibility": 0.9,
+    "weight": 0.6,
+    "cooldown_minutes": 240,
+    "allowed_slots": ["08-16", "16-24"],
+    "state_deltas": {"focus": -0.01},
+    "templates": ["麦麦翻出以前的旧笔记慢慢看着，想起当时记下它们的情景，觉得挺有意思的。"],
+    "tags": ["回顾", "兴趣"]
+  }
+}
