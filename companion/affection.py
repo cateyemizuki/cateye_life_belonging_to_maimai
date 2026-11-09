@@ -567,6 +567,34 @@ class AffectionManager:
         """当日事件日志（副本；M2 日结裁判的输入）。"""
         return [dict(item) for item in (self._state.get("event_log", []) or []) if isinstance(item, dict)]
 
+    def prev_day_event_log(self) -> dict:
+        """复核 P0-2：上一自然日事件日志归档 ``{"date", "entries"}``（副本；无归档返回 {}）。"""
+        data = self._state.get("prev_day_event_log")
+        if not isinstance(data, dict):
+            return {}
+        return {"date": str(data.get("date") or ""),
+                "entries": [dict(e) for e in (data.get("entries") or []) if isinstance(e, dict)]}
+
+    def clear_prev_day_event_log(self) -> None:
+        """日结成功消费归档后清除（防次日凌晨重试重复并入）。"""
+        if self._state.pop("prev_day_event_log", None) is not None:
+            self._mark_dirty()
+
+    # ---- 复核 P0-2：作息周期累计轮数（与抽样游标分离，持久化，仅日结结算后清零）----
+    def cycle_rounds(self) -> int:
+        return _to_int(self._state.get("cycle_rounds"), 0)
+
+    def bump_cycle_rounds(self) -> int:
+        n = self.cycle_rounds() + 1
+        self._state["cycle_rounds"] = n
+        self._mark_dirty()
+        return n
+
+    def reset_cycle_rounds(self) -> None:
+        if self.cycle_rounds():
+            self._state["cycle_rounds"] = 0
+            self._mark_dirty()
+
     # ---- 读：M2 滚动印象 / 关系温度 / 裁判计数 ----
     def impressions(self) -> list[dict]:
         """滚动印象列表（§5.3 v2 schema：``{"date", "text"}``，由关系日结裁判产出）。"""
@@ -1006,7 +1034,17 @@ class AffectionManager:
         return True
 
     def _reset_daily_fields(self, date: str) -> None:
-        self._state["today_date"] = str(date or datetime.now().strftime("%Y-%m-%d"))
+        new_date = str(date or datetime.now().strftime("%Y-%m-%d"))
+        # 复核 P0-2：清空前归档上一自然日事件日志——跨零点入睡（01:00）的日结
+        # 在 00:00 日切之后执行，原实现读到已被洗空的 event_log，误判「今日 0 轮
+        # 互动」并污染次日印象。reset_daily 与 sync_daily 兜底都走本方法，归档挂
+        # 在清空之前即覆盖两条日切路径。日结成功后由裁判消费并清除归档。
+        old_date = str(self._state.get("today_date") or "")
+        if old_date and old_date != new_date:
+            old_log = [dict(e) for e in (self._state.get("event_log") or [])
+                       if isinstance(e, dict)]
+            self._state["prev_day_event_log"] = {"date": old_date, "entries": old_log}
+        self._state["today_date"] = new_date
         self._state["today_speak_count"] = 0.0
         self._state["morning_sent_today"] = False
         self._state["night_sent_today"] = False

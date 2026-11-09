@@ -34,7 +34,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core.coerce import to_float as _to_float, to_int as _to_int
@@ -386,8 +386,10 @@ class AffectionReviewer:
         self._relation_getter = relation_getter
         #: 最近对方消息滚动缓冲（会话裁判输入；不落盘）
         self._recent_messages: List[str] = []
-        #: 本轮采样窗口内对方消息轮数（重启后从 0 起；跨天自动清零）
-        self._rounds_today = 0
+        #: 复核 P0-2：抽样游标与周期累计轮数拆分——游标只管「每 N 轮抽样一次」，
+        #: 跨天/抽样后清零；周期累计（affection.cycle_rounds）持久化、跨零点不清，
+        #: 仅日结成功后结算清零。原 _rounds_today 双职责致日结轮数恒被洗空。
+        self._sample_counter = 0
         self._rounds_date = ""
         #: 后台任务（采样请求 / 延迟日结）；close() 统一取消
         self._pending: set = set()
@@ -539,13 +541,14 @@ class AffectionReviewer:
 
         if self._rounds_date != today:
             self._rounds_date = today
-            self._rounds_today = 0
-        self._rounds_today += 1
+            self._sample_counter = 0
+        self._sample_counter += 1
+        rounds = self._affection.bump_cycle_rounds()
 
         state = self._affection.review_state(now=now)
         samples = _to_int(state.get("samples"), 0)
         result: Dict[str, Any] = {"sampled": False, "reason": "rounds",
-                                  "rounds": self._rounds_today, "samples": samples}
+                                  "rounds": rounds, "samples": samples}
         if not self._review_enabled() or not self._patrol_enabled():
             result["reason"] = "disabled"
             return result
@@ -555,10 +558,10 @@ class AffectionReviewer:
         if samples >= self._max_per_day():
             result["reason"] = "daily_cap"
             return result
-        if self._rounds_today < self._sample_every():
+        if self._sample_counter < self._sample_every():
             return result
 
-        self._rounds_today = 0
+        self._sample_counter = 0
         state = self._affection.update_review_state(samples=samples + 1)
         task = self._spawn(self._run_sample_review(now=now))
         result.update(sampled=task is not None,
@@ -642,13 +645,28 @@ class AffectionReviewer:
         except Exception as exc:
             logger.debug("关系日结延迟执行失败（忽略）：%s", exc)
 
+    def _review_event_log(self, *, now: Optional[datetime] = None) -> list:
+        """复核 P0-2：日结输入的事件日志——凌晨（00:00–05:00）入睡日结并入上一
+        自然日归档（跨零点作息周期），其余时点只用当日日志（归档属已结算周期）。
+        """
+        now = now or datetime.now()
+        log = self._affection.event_log()
+        if now.hour < 5:
+            prev = self._affection.prev_day_event_log()
+            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            entries = prev.get("entries") or []
+            if prev and str(prev.get("date") or "") == yesterday and entries:
+                return list(entries) + log
+        return log
+
     def _build_stats(self, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         """互动统计（§5.4）：从既有计数能取多少取多少，取不到的字段不写入（prompt 侧省略）。"""
         now = now or datetime.now()
         affection = self._affection
-        stats: Dict[str, Any] = {"rounds": int(self._rounds_today)}
+        # 复核 P0-2：轮数用持久化的作息周期累计（跨零点不被日切洗空）
+        stats: Dict[str, Any] = {"rounds": int(affection.cycle_rounds())}
         try:
-            log = affection.event_log()
+            log = self._review_event_log(now=now)
             stats["user_initiated"] = sum(1 for e in log if e.get("kind") == "user_initiated")
             stats["commitments_kept"] = sum(1 for e in log if e.get("kind") == "commitment_kept")
             stats["commitments_broken"] = sum(1 for e in log if e.get("kind") == "commitment_broken")
@@ -690,7 +708,7 @@ class AffectionReviewer:
         try:
             parsed = await run_daily_review(
                 llm,
-                event_log=self._affection.event_log(),
+                event_log=self._review_event_log(now=now),
                 stats=self._build_stats(now=now),
                 impressions=self._affection.impressions(),
                 date=day, lover_name=self._lover_name(), target_label=self._target_label(),
@@ -720,8 +738,11 @@ class AffectionReviewer:
                 date=day, tone=parsed["tone"], delta=parsed["delta_score"], now=now)
         except Exception as exc:
             logger.debug("周结大事记记录失败（忽略）：%s", exc)
-        # 3) 清空当日 event_log
+        # 3) 清空当日 event_log；复核 P0-2：结算成功同时消费上一日归档并清零
+        #    作息周期累计轮数（失败不落，下个 sleep 边沿重试仍能读到完整周期）
         removed = self._affection.clear_event_log()
+        self._affection.clear_prev_day_event_log()
+        self._affection.reset_cycle_rounds()
         # 4) 仅成功（JSON 解析成功并已入账）才落「当日已日结」；失败保持未落，
         #    以便下个 sleep 边沿重试（宿主验证日实证：失败即落 date 会静默吞掉第二次边沿）
         self._affection.update_review_state(daily_reviewed_date=day)
