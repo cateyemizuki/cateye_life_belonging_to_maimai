@@ -699,7 +699,10 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         # mai-love v2.6.2：replyer 的上下文同样携带宿主主动任务块，一并剥离过期块
         _tracker = getattr(self, "_attention_tracker", None)
         if _tracker is not None:
-            _tracker.note_reply_start()
+            # 复核 P0-6：传真实流 id——空参时 key 恒 "-"，与 _last_direct 的真实
+            # session_id 永不匹配，待答判定失效。
+            _sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or "")
+            _tracker.note_reply_start(_sid)
             service = getattr(self, "_video_watch", None)
             if service is not None:
                 if service.revoke_automatic():
@@ -872,7 +875,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         """
         _tracker = getattr(self, "_attention_tracker", None)
         if _tracker is not None:
-            _tracker.note_reply_end()
+            # 复核 P0-6：与 note_reply_start 同口径传真实流 id，保证配对清计数。
+            _sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or "")
+            _tracker.note_reply_end(_sid)
         companion = self._mai_companion()
         if companion is None:
             return

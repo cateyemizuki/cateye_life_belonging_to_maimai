@@ -93,8 +93,15 @@ class ConversationActivityTracker:
         """忙闲快照（只读；不确定/暖机期 coverage=partial，消费方不得启动自动观看）。"""
         now = _now(self._clock) if ts is None else float(ts)
         with self._lock:
-            inflight = {k: v for k, v in self._reply_inflight.items()
-                        if now - v <= REPLY_INFLIGHT_TTL_SECONDS}
+            # 复核 P0-6：end hook 丢失的在途记录超过 TTL 即清理残留计数——
+            # 原实现只过滤局部副本，_reply_counts 残留使 stale_reply 恒真，
+            # coverage 永久 partial 且后续正常回复也不自愈，主动/冲浪被锁死。
+            stale_keys = [k for k, v in self._reply_inflight.items()
+                          if now - v > REPLY_INFLIGHT_TTL_SECONDS]
+            for k in stale_keys:
+                self._reply_inflight.pop(k, None)
+                self._reply_counts.pop(k, None)
+            inflight = dict(self._reply_inflight)
             reasons: list = []
             if inflight:
                 reasons.append("reply_in_flight")
@@ -108,9 +115,9 @@ class ConversationActivityTracker:
                     break
             if self._last_participation and now - self._last_participation < CHAT_SILENCE_SECONDS:
                 reasons.append("recent_participation")
-            # A lost end hook is unknown, not proof that an old request finished.
-            stale_reply = len(inflight) != len(self._reply_inflight)
-            coverage = "ok" if self._last_event and not stale_reply else "partial"
+            # 复核 P0-6：TTL 内的丢失 end 仍属未知（inflight 在列即 partial 语义
+            # 由 busy 承担）；超 TTL 已在上面清理，coverage 只看暖机与否。
+            coverage = "ok" if self._last_event else "partial"
             return {
                 "busy": bool(reasons),
                 "reasons": reasons,
