@@ -1,5 +1,10 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.31（2026-11-09）
+
+- D 批小项（依 `union/20261109_两份审查报告_独立复核结论.md` 低优先/纵深防御项）。**P2-1**：`patrol._tick` 跨日好感重置/衰减前置于 `miss_enabled` 门——关闭想念主动搭话不再连带跳过每日衰减。**P1-6**：`settlement_v2` idle 的 focus 回归靶心 0.35→0.60（与 rest 0.62 同带），弱化「待机→专注更低→选不上工作→继续待机」螺旋。**P2-4c**：离线结算 `apply_episode` 补 `episode_id`（`offline:日期:有效分钟`，`offline_episode_id` 统一生成），不再绕过 `_episode_receipts` 幂等门（恰好一次仍由 pending gap 一次性消费保证）。**P2-4d**：删除 `settle_night_interrupts` 中已被 `_save_state` 覆盖式合并取代的冗余 guard（原补写分支顺序执行永不触发，且可能用陈旧值覆盖并发写入）。**P2-5 前半**：视频桥判定提示词「post=值得发（当前仅影子留痕，不真正发布）」改为真实发布口径；解析器放行 post 的 delay_minutes（原只对 defer 保留，decide() 的 post 延迟分支成死代码）。
+- **红线保留**：无新增用户可见配置字段（schema 不变 18 段 202 叶子）；每日主动 5 次等限额不变；睡眠/硬约定/生理锚点权限不变；状态结算唯一链不变。版本双号 3.17.31；门禁/前批版本断言重钉 8 文件；新增专项 `scratch/test_review_d_31731.py`（5 例）；全套件 357/357；七门禁干净副本 7/7。**部署**：插件文件原子部署（8 文件）并核验加载。
+
 ## 3.17.30（2026-11-09）
 
 - B 批陪伴行为（依 `union/20261109_两份审查报告_独立复核结论.md` 坐实项）。**P1-2**：`_minutes_since_last_speak` 原为死代码（全仓无调用方），问候后 cooldown 闸已不存在——12:01 午安连发后 12:21 又因 miss 私聊。现 `_tick` 在沉默事实发布后、miss 候选前判定：距上次 Bot 主动开口（含问候）不足 `max(60, anchor_hours*30)` 分钟且用户尚未接话 → `done('recent_bot_spoke')` 不触发；用户已来信则不拦。**P1-3**：experience_share 含相对时间词（今天/明天/刚/今晚…）时 `ttl_hours=18`（`_motive_expires_at` 统一计算），防「明天约了…」跨日原样注入；注入前剥离 topic 已有「想找人聊聊：」前缀；`_append_intent_hint` 拼接前 rstrip 句末标点消「。。」。**P1-5**：`AffectionManager.note_bot_replied` 被动回复成功也刷新 `last_speak_time`（不占预算），replyer.after_response 对陪伴目标私聊（流 id 同 F6 口径）调用——解除 `user_initiated` 的 `prev_user>last_speak` 恒真误判；`chat_round` 按流 60s 最小间隔节流（`_chat_round_allowed`，滚动刷新，进程内），19 条连发不再 2 分钟刷满全天 +2.0。**P1-7**：`adjust_miss_probability` 在 patrol 消费侧接入好感档位（0..4 → ×0.9..1.1）与情绪 `proactive_rate`（0.8~1.2），钳 [0,1]；evaluate_miss 孤独锚点判定契约不动；决策日志增 affinity_tier/mood_proactive_rate；分享动机加成改为在调节后概率上叠加。

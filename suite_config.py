@@ -317,7 +317,12 @@ from suite_prompts import (
 # + chat_round 60s/流节流；P1-7 想念概率接入好感档位(×0.9~1.1)与情绪 proactive_rate
 # （evaluate_miss 判定契约不动）。不新增用户可见配置字段（schema 不变，18 段 202
 # 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.30"
+# 3.17.31（2026-11-09 D 批小项）：P2-1 跨日维护前置于 miss_enabled 门；P1-6 idle
+# focus 靶心 0.35→0.60（突破待机低专注螺旋）；P2-4c 离线结算补 episode_id 幂等键；
+# P2-4d 删除 settle_night_interrupts 冗余 guard；P2-5 前半视频桥影子文案改为
+# 真实发布口径、post 延迟不再被解析器清零。不新增用户可见配置字段（schema 不变
+# 18 段 202 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.31"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
