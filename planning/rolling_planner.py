@@ -40,7 +40,9 @@ from __future__ import annotations
 import logging
 import math
 import random
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.time_utils import minutes_of_now
@@ -118,6 +120,22 @@ MEAL_REPEAT_GUARD_MINUTES = 180
 #: P0（2026-11-09）：软意图有限提前弹性（分钟）。horizon 仅用于前瞻/预告/冲突判断，
 #: 不默认授权把晚些时候的意图提前整段执行；确需弹性提前仅在此有限窗内。
 SOFT_INTENT_EARLY_MINUTES = 10
+#: P1（2026-11-09 滚动日程计划 §5/§7）：代码内置·模块联动事件——只有装配层登记的
+#: 这两项能触发模块能力；仍走 _maybe_random_event 的转场掷骰+独立日预算路径。
+MODULE_LINKED_EVENT_IDS: Tuple[str, ...] = ("watch_bili", "browse_qq")
+#: P1 §5.2 来源组平衡：同一来源/用途组内第 k 个候选的递减因子（防 30 个近义 JSON
+#: 项挤满 top3 饿死日意图）；组间基础权重见 EVENT_ORIGIN_PRIORS。
+EVENT_GROUP_PRESENCE_DECAY = 0.85
+#: P1 §5.2：来源组基础先验（初始 JSON 状态事件 / 生成池）。低于日意图 medium=0.5
+#: 的满权重 1.0 口径，保证临近且可执行的日意图保留合理优势；一次性另乘 pacing。
+EVENT_ORIGIN_PRIORS: Dict[str, float] = {
+    "json_file": 0.85, "code_builtin": 0.85, "llm_generated": 0.80,
+}
+#: P1 §5.3：存在可行非 idle 候选时，累计待机超过此分钟后开始递增降权 idle。
+IDLE_PENALTY_START_MINUTES = 10.0
+#: 每多待机 5 分钟追加的降权（线性递增，上限 IDLE_PENALTY_MAX）。
+IDLE_PENALTY_PER_5_MIN = 0.15
+IDLE_PENALTY_MAX = 0.9
 #: 各类型精力需求位（energy_fit 用：精力低于需求 → 降分；rest/idle/meal 需求最低）
 ENERGY_DEMAND: Dict[str, float] = {
     "work": 0.7, "study": 0.7, "exercise": 0.6, "entertainment": 0.4,
@@ -344,9 +362,12 @@ class RollingPlanner:
                  wake_recorder: Optional[Callable[..., Any]] = None,
                  goal_manager: Any = None,
                  motive_store: Any = None,
-                 continuity_keywords_provider: Optional[Callable[[], Any]] = None) -> None:
+                 continuity_keywords_provider: Optional[Callable[[], Any]] = None,
+                 data_dir: Any = None) -> None:
         self._db = db
         self._life = life_state
+        # P1（2026-11-09）：事件冷却/当日用量持久目录（None = 仅进程内，测试桩口径）
+        self._data_dir = data_dir
         self._config_provider = config_provider
         self._bus = event_bus
         self._decision_logger = decision_logger
@@ -1439,6 +1460,230 @@ class RollingPlanner:
                 continue
         return False
 
+    def _event_usage_path(self):
+        data_dir = getattr(self, "_data_dir", None)
+        if not data_dir:
+            return None
+        return Path(data_dir) / "rolling_event_usage.json"
+
+    def _load_event_usage(self) -> None:
+        """P1：冷却/当日用量从持久记录恢复（热重载不重置）；损坏忽略不补造。
+
+        同一文件兼存模块联动事件的当日计数/最近发生（linked_*），供热重载恢复。
+        """
+        self._event_last_used = {}
+        self._event_day_counts = {}
+        self._event_usage_date = ""
+        self._linked_usage_restored = False
+        path = self._event_usage_path()
+        if path is None or not path.exists():
+            return
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            self._event_last_used = dict(doc.get("last_used") or {})
+            self._event_usage_date = str(doc.get("date") or "")
+            self._event_day_counts = dict(doc.get("day_counts") or {})
+            if str(doc.get("linked_date") or "") == self._random_date:
+                self._random_used = max(0, int(doc.get("linked_used") or 0))
+                self._random_last = {}
+                for key, raw in (doc.get("linked_last") or {}).items():
+                    parsed = self._parse_ts(raw, getattr(self._tz, "_tz", None))
+                    if parsed is not None:
+                        self._random_last[str(key)] = parsed
+                self._linked_usage_restored = True
+        except Exception as exc:
+            logger.debug("rolling_event_usage 读取失败（按空恢复）：%s", exc)
+
+    def _save_event_usage(self, date: str) -> None:
+        path = self._event_usage_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({
+                "date": date, "last_used": self._event_last_used,
+                "day_counts": self._event_day_counts,
+                "linked_date": self._random_date, "linked_used": self._random_used,
+                "linked_last": {k: v.isoformat() for k, v in self._random_last.items()},
+            }, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            logger.debug("rolling_event_usage 落盘失败（忽略）：%s", exc)
+
+    def _catalog_active_events(self) -> List[Dict[str, Any]]:
+        """只读当前活跃事件（初始+生成，未消耗）。兼容服务/store/测试桩三种形态。"""
+        catalog = getattr(self, "_event_catalog", None)
+        if catalog is None:
+            return []
+        for holder in (getattr(catalog, "store", None), catalog):
+            if holder is None:
+                continue
+            try:
+                events = holder.active_events
+                if callable(events):
+                    events = events()
+                return [dict(e) for e in (events or []) if isinstance(e, dict)]
+            except Exception:
+                continue
+        return []
+
+    def _one_shot_pacing(self, events: List[Dict[str, Any]], now: datetime) -> float:
+        """P1 §5.2：一次性按剩余条目/刷新剩余天数温和分散（不首日耗尽、不追加生成）。"""
+        remaining = sum(1 for e in events if e.get("pool_kind") == "one_shot")
+        if remaining <= 0:
+            return 1.0
+        days_left = 7.0
+        catalog = getattr(self, "_event_catalog", None)
+        for holder in (getattr(catalog, "store", None), catalog):
+            raw = getattr(holder, "next_update_at", None) if holder is not None else None
+            parsed = self._parse_ts(raw, getattr(self._tz, "_tz", None))
+            if parsed is not None:
+                days_left = max(1.0, (parsed - now).total_seconds() / 86400.0)
+                break
+        return _clamp(0.5 + 0.5 * min(1.0, remaining / days_left), 0.5, 1.0)
+
+    def _event_candidates(self, date: str, cur: int, snapshot: Any) -> List[Dict[str, Any]]:
+        """P1 只读可行事件候选：初始 JSON/生成池普通事件进入主选取器；评分/预览不消耗
+        一次性。代码联动事件（watch_bili/browse_qq）不在此（走模块预算路径）。
+
+        过滤原因计数落 ``self._last_event_filter_stats`` 供决策诊断（§5.5）；
+        来源组平衡（§5.2）：组内按 权重×状态适配×当日新颖度 排序后逐项递减，
+        防止近义项挤满 top3；一次性另乘剩余量/刷新期 pacing。
+        """
+        self._last_event_filter_stats = {"before": 0, "after": 0, "excluded": {}}
+        catalog = getattr(self, "_event_catalog", None)
+        if catalog is None:
+            return []
+        if not hasattr(self, "_event_last_used"):
+            self._load_event_usage()
+        if self._event_usage_date != date:
+            self._event_day_counts = {}
+            self._event_usage_date = date
+        from .event_slots import time_slot_of, event_allowed_in_slot
+        from .event_catalog import state_affinity
+        now = self._now(datetime.fromisoformat(date) + timedelta(minutes=cur))
+        slot = time_slot_of(now, getattr(self._tz, "_tz", None))
+        events = self._catalog_active_events()
+        stats = self._last_event_filter_stats
+        stats["before"] = len(events)
+
+        def exclude(reason: str) -> None:
+            stats["excluded"][reason] = stats["excluded"].get(reason, 0) + 1
+
+        eligible: List[Tuple[float, Dict[str, Any]]] = []
+        for ev in events:
+            eid = str(ev.get("event_id") or ev.get("key") or "")
+            if not eid:
+                exclude("no_event_id")
+                continue
+            if eid in MODULE_LINKED_EVENT_IDS:
+                exclude("module_linked_path")
+                continue  # 联动事件走模块预算路径
+            if ev.get("enabled") is False:
+                exclude("disabled")
+                continue
+            if not event_allowed_in_slot(ev, slot):
+                exclude("slot_mismatch")
+                continue
+            cooldown = _as_number(ev.get("cooldown_minutes"), 0.0) or 0.0
+            last = self._event_last_used.get(eid)
+            if cooldown > 0 and last is not None:
+                try:
+                    if (now.timestamp() - float(last)) / 60.0 < cooldown:
+                        exclude("cooldown")
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            lo = int(_as_number(ev.get("min_minutes"), 0.0) or 0)
+            hi = int(_as_number(ev.get("max_minutes"), 0.0) or 0)
+            if lo <= 0 or hi < lo:
+                exclude("bad_duration_contract")
+                continue
+            weight = _clamp(_as_number(ev.get("weight"), 0.5) or 0.5)
+            used = int(self._event_day_counts.get(eid, 0) or 0)
+            novelty = 1.0 / (1.0 + used)
+            attract = weight * novelty * state_affinity(ev, self._state_brief(snapshot))
+            eligible.append((attract, ev))
+        # 组内按吸引度降序 → 同来源组第 k 项递减（文件遍历顺序不影响结果）
+        eligible.sort(key=lambda pair: (-pair[0], str(pair[1].get("event_id") or "")))
+        pacing = self._one_shot_pacing(events, now)
+        group_seen: Dict[str, int] = {}
+        out: List[Dict[str, Any]] = []
+        for attract, ev in eligible:
+            eid = str(ev.get("event_id") or ev.get("key") or "")
+            origin = str(ev.get("origin_kind")
+                         or ("code_builtin" if ev.get("source") == "builtin" else "llm_generated"))
+            pool_kind = str(ev.get("pool_kind") or "reusable")
+            group = f"{origin}:{'one_shot' if pool_kind == 'one_shot' else 'normal'}"
+            k = group_seen.get(group, 0)
+            group_seen[group] = k + 1
+            prior = EVENT_ORIGIN_PRIORS.get(origin, 0.8)
+            factor = prior * (EVENT_GROUP_PRESENCE_DECAY ** k)
+            if pool_kind == "one_shot":
+                factor *= pacing
+            goal = str(ev.get("goal_type") or "daily_routine")
+            out.append({
+                "kind": "event", "name": ev.get("name"), "goal_type": goal,
+                "priority_score": _clamp(attract * factor),
+                "min_minutes": int(ev.get("min_minutes") or 0),
+                "max_minutes": int(ev.get("max_minutes") or 0),
+                "interruptibility": _as_number(ev.get("interruptibility"), 0.7),
+                "profile_key": goal, "window": None, "resume_of": None,
+                "resume_bonus": 0.0, "intent_item_id": None,
+                "event_id": eid, "pool_kind": pool_kind, "origin_kind": origin,
+                "note": str(ev.get("name") or ""),
+                "_event_def": ev,
+            })
+        stats["after"] = len(out)
+        return out
+
+    def _idle_score_context(self, candidates: List[Dict[str, Any]], date: str,
+                            cur: int) -> Dict[str, Any]:
+        """P1 §5.3：idle 降权只在确有可行非 idle 候选时生效（窗口未到/不可执行不算）；
+        选取与 preview 共用同一口径。"""
+        def _feasible_nonidle(c: Dict[str, Any]) -> bool:
+            if c["kind"] == "idle":
+                return False
+            if c["kind"] == "commitment" and c.get("window") and c["window"][0] > cur:
+                return False
+            if c["kind"] == "intent" and c.get("window") \
+                    and cur < c["window"][0] - SOFT_INTENT_EARLY_MINUTES:
+                return False
+            return True
+        return {"_nonidle_feasible": any(_feasible_nonidle(c) for c in candidates),
+                "_idle_minutes": self._idle_minutes_today(date, cur)}
+
+    def _idle_minutes_today(self, date: str, cur: int) -> float:
+        """P1 §5.3：当日累计待机分钟（已结束按实际区间，进行中按 cur 折算）。"""
+        total = 0.0
+        try:
+            rows = self._db.episodes_today(date)
+        except Exception:
+            return 0.0
+        for row in rows:
+            if str(row.get("goal_type") or "") != "idle":
+                continue
+            start = row.get("actual_start_minute")
+            if start is None:
+                start = row.get("planned_start_minute")
+            if start is None:
+                continue
+            end = row.get("actual_end_minute")
+            status = str(row.get("status") or "")
+            if end is None:
+                end = cur if status in ("active", "paused") else row.get("planned_end_minute")
+            if end is None:
+                continue
+            try:
+                span = ring_minutes_ahead(int(end), int(start))
+                if status in ("active", "paused"):
+                    span = min(span, max(0, cur - int(start)))
+                total += max(0.0, float(span))
+            except (TypeError, ValueError):
+                continue
+        return total
+
     def _next_boundary_minutes(self, date: str, cur: int, intents: List[Dict[str, Any]]) -> Optional[int]:
         """距下一个硬边界（硬约定开始 / 睡眠环起点）的分钟数；无 → None。"""
         candidates: List[int] = []
@@ -1462,7 +1707,8 @@ class RollingPlanner:
 
     def _build_candidates(self, date: str, cur: int, snapshot: Any,
                           current_profile: Optional[Any]) -> List[Dict[str, Any]]:
-        """候选六源（§5.1）；返回未打分的候选 dict 列表（随机事件不走此路——转场掷骰）。"""
+        """候选多源（§5.1）；返回未打分的候选 dict 列表。P1 起普通小事件经
+        ``_event_candidates`` 进入统一候选；仅模块联动两项仍走转场掷骰独立预算。"""
         horizon = max(15, self._cfg_int("horizon_minutes", DEFAULT_HORIZON_MINUTES))
         intents = self._spine_intents_cached(date)
         candidates: List[Dict[str, Any]] = []
@@ -1570,6 +1816,11 @@ class RollingPlanner:
         if continuation is not None:
             candidates.append(continuation)
 
+        # 源 4.6（P1，2026-11-09 滚动日程计划）：普通小事件（JSON 状态 + 生成池）提升为
+        # 正常滚动候选，统一评分/抽样/认领；不再依赖 8% 转场掷骰填充日常。代码联动事件
+        # （watch_bili/browse_qq）仍走 _maybe_random_event 的模块预算路径，不在此重复。
+        candidates.extend(self._event_candidates(date, cur, snapshot))
+
         # 源 5：idle 待机（永远存在的低优先候选——A.10.1 一等公民）
         idle_profile = activity_profiles.get_profile("idle")
         candidates.append({
@@ -1611,6 +1862,12 @@ class RollingPlanner:
         focus_fit = self._fit_curve(focus, FOCUS_DEMAND.get(goal_type, 0.4))
         resume_bonus = _clamp(c.get("resume_bonus", 0.0))
         novelty = 1.0 / (1.0 + counts.get(goal_type, 0))
+        # P1 §5.2：事件新颖度按 event_id 当日已启动次数（持久用量），不只按
+        # goal_type 粗分——"看视频"和"吃零食"不因同属 entertainment 互相视为重复。
+        if c.get("kind") == "event":
+            used = int((getattr(self, "_event_day_counts", None) or {})
+                       .get(str(c.get("event_id") or ""), 0) or 0)
+            novelty = 1.0 / (1.0 + used)
         switch_cost = self._switch_cost(current_profile)
         overrun_risk = self._overrun_risk(c, profile, boundary)
 
@@ -1623,6 +1880,13 @@ class RollingPlanner:
                  + SCORE_WEIGHTS["novelty"] * novelty
                  - SCORE_WEIGHTS["switch"] * switch_cost
                  - SCORE_WEIGHTS["overrun"] * overrun_risk)
+        # P1 §5.3：确有可行非 idle 候选时，累计待机 10 分钟后递增降权 idle；
+        # 无可行候选/临近硬边界时不罚（等待是真实兜底，不造事凑占比）。
+        if c.get("kind") == "idle" and counts.get("_nonidle_feasible"):
+            idle_min = float(counts.get("_idle_minutes", 0) or 0)
+            if idle_min >= IDLE_PENALTY_START_MINUTES:
+                steps = (idle_min - IDLE_PENALTY_START_MINUTES) / 5.0 + 1.0
+                score -= min(IDLE_PENALTY_MAX, IDLE_PENALTY_PER_5_MIN * steps)
         # PR-B2（规格 §2）：持续动机只改候选权重——motive_bonus ≤15% 基础分，
         # 不匹配候选加成为 0（探索概率保留）；不穿透睡眠/硬约定/注意力/预算
         # （那些判定在 tick 步 3/5 与本公式之外，动机无权触碰）。
@@ -1680,6 +1944,10 @@ class RollingPlanner:
             focus_fit = self._fit_curve(focus, FOCUS_DEMAND.get(goal_type, 0.4))
             resume_bonus = _clamp(c.get("resume_bonus", 0.0))
             novelty = 1.0 / (1.0 + counts.get(goal_type, 0))
+            if c.get("kind") == "event":
+                used = int((getattr(self, "_event_day_counts", None) or {})
+                           .get(str(c.get("event_id") or ""), 0) or 0)
+                novelty = 1.0 / (1.0 + used)
             overrun_risk = self._overrun_risk(c, profile, boundary)
             base = (SCORE_WEIGHTS["priority"] * priority
                     + SCORE_WEIGHTS["due"] * due
@@ -1833,6 +2101,18 @@ class RollingPlanner:
         window = None
         if boundary is not None:
             window = max(0, boundary)
+        # P1：事件按自身 min/max 契约采样（不盲用 goal_type 画像 min_block，避免 5–12
+        # 分钟零食被娱乐 15 / 运动 20 最小块拒绝）；画像仍提供状态/注意力属性。
+        if c["kind"] == "event":
+            lo = int(c.get("min_minutes") or 0) or 3
+            hi = int(c.get("max_minutes") or 0) or max(lo, 30)
+            hi = max(hi, lo)
+            duration = rng.randint(lo, hi)
+            if window is not None:
+                duration = min(duration, window)
+            if duration < lo:
+                return None  # 剩余不足事件最小块：换候选，不硬塞
+            return int(duration)
         if c["kind"] == "resume" and c.get("resume_of"):
             # 恢复时长 = 剩余时长，不再重新采样完整块（§5.3 原文）
             row = self._db.get_episode(str(c["resume_of"]))
@@ -1882,6 +2162,7 @@ class RollingPlanner:
         if not candidates:
             return
         counts = self._completed_counts_today(date)
+        counts.update(self._idle_score_context(candidates, date, cur))
         scored: List[Tuple[float, Dict[str, Any]]] = []
         for cand in candidates:
             score = self._score_candidate(cand, snapshot, cur, boundary, counts, None)
@@ -1889,6 +2170,21 @@ class RollingPlanner:
             scored.append((score, cand))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         chosen, _score, top = self._choose_candidate(scored, snapshot, cur, rng)
+        # P1 §5.5：每个真实决策边界记录一次来源过滤/抽中/等待诊断（只记 ID 与
+        # 分量，不复制提示词；preview 读态不走此写入口）。
+        source_counts: Dict[str, int] = {}
+        for cand in candidates:
+            key = str(cand.get("kind") or "?")
+            source_counts[key] = source_counts.get(key, 0) + 1
+        self._log("rolling.decision", date=date, minute=cur,
+                  sources=source_counts,
+                  event_filter=getattr(self, "_last_event_filter_stats", None),
+                  chosen=str(chosen.get("name") or ""), chosen_kind=chosen.get("kind"),
+                  chosen_event_id=chosen.get("event_id"),
+                  top3=[{"name": c.get("name"), "kind": c.get("kind"),
+                         "score": round(s, 4)} for s, c in top],
+                  boundary_minutes=boundary,
+                  idle_minutes_today=round(float(counts["_idle_minutes"]), 1))
         top_ids = {id(c) for _s, c in top}
         # P0（2026-11-09 滚动日程计划）：有效抽中项必须排启动首位，确实无法启动才进入
         # 有序后备（修复抽样结果被按分数头部忽略的确定缺陷）。
@@ -1913,11 +2209,13 @@ class RollingPlanner:
             duration = self._sample_block(cand, snapshot, cur, boundary, rng)
             if duration is None:
                 continue
-            self._start_episode_for_candidate(cand, duration, date, cur, now, snapshot,
-                                              scored, rng, report)
-            return
+            # P1：启动失败（一次性认领失败/写库失败）→ 换有序后备，不静默吞掉本拍。
+            if self._start_episode_for_candidate(cand, duration, date, cur, now, snapshot,
+                                                 scored, rng, report):
+                return
         self._log("rolling.no_block_started", reason="min_block_insufficient",
-                  candidates=len(scored))
+                  candidates=len(scored),
+                  event_filter=getattr(self, "_last_event_filter_stats", None))
         report["actions"].append("no_block_started")
 
     def _completed_counts_today(self, date: str) -> Dict[str, int]:
@@ -1934,10 +2232,11 @@ class RollingPlanner:
     def _start_episode_for_candidate(self, cand: Dict[str, Any], duration: int,
                                      date: str, cur: int, now: datetime, snapshot: Any,
                                      scored: List[Tuple[float, Dict[str, Any]]], rng: random.Random,
-                                     report: Dict[str, Any]) -> None:
+                                     report: Dict[str, Any]) -> bool:
+        """启动成功返回 True；认领失败/写库失败返回 False（调用方换有序后备）。"""
         profile = activity_profiles.get_profile(cand["profile_key"])
         source = {"commitment": "commitment", "intent": "rolling", "anchor_meal": "rolling",
-                  "resume": "resume", "idle": "rolling",
+                  "resume": "resume", "idle": "rolling", "event": "rolling",
                   "continuation": "rolling"}.get(cand["kind"], "rolling")
         # PR2.5 修复（2026-10-26），交接 §五.18 D1：开播/恢复前抓当前 active 行，
         # 写入成功后若被 close-active 挤掉（interrupted 且 interrupted_by=新行 id）
@@ -1963,7 +2262,13 @@ class RollingPlanner:
         if cand.get("note"):
             metadata["note"] = cand["note"]
         eid: Optional[str] = None
-        if cand["kind"] == "resume" and cand.get("resume_of"):
+        if cand["kind"] == "event":
+            # P1 统一入口（§5.1 步5/6）：先持久认领一次性，再启动；定义快照随
+            # episode（库替换后仍按快照结算）；启动失败/被打断不返池。普通短事件
+            # 完成即结束——不建长期父目标。
+            eid = self._start_event_episode(cand, duration, date, cur, now, snapshot,
+                                            metadata, attention, profile, rng, pre_active)
+        elif cand["kind"] == "resume" and cand.get("resume_of"):
             # PR1 P0 修复（2026-10-26），计划书 §三十四/定稿 §2 0.4：恢复行透传原
             # 随机事件 event_key——被抢占的随机事件恢复后再关闭时仍能按 key 取
             # state_deltas（一次性应用由 metadata.state_deltas_applied 标记保证）
@@ -2038,8 +2343,82 @@ class RollingPlanner:
                       name=str(cand["name"]), duration_minutes=duration, top3=top3,
                       draw_reason_zh=metadata.get("draw_reason_zh"))
             report["actions"].append(f"started_{cand['kind']}")
-        else:
-            logger.warning("rolling_planner: episode 写入失败（本拍不开新块）")
+            return True
+        logger.warning("rolling_planner: episode 启动失败（换后备候选）")
+        return False
+
+    def _start_event_episode(self, cand: Dict[str, Any], duration: int, date: str,
+                             cur: int, now: datetime, snapshot: Any,
+                             metadata: Dict[str, Any], attention: str, profile: Any,
+                             rng: random.Random, pre_active: Optional[Dict[str, Any]]
+                             ) -> Optional[str]:
+        """P1：统一入口的事件启动——时段复核 → 一次性持久认领 → 快照写库 →
+        认领回执 → 冷却/当日用量落盘。任一步失败返回 None（不返池、不伪造成功）。"""
+        ev = cand.get("_event_def") or {}
+        catalog = getattr(self, "_event_catalog", None)
+        if catalog is None or not ev:
+            return None
+        event_key = str(cand.get("event_id") or ev.get("event_id") or ev.get("key") or "")
+        templates = [str(t) for t in (ev.get("templates") or ()) if str(t or "").strip()]
+        template = rng.choice(templates) if templates else str(ev.get("name") or "")
+        try:
+            snap_meta = catalog.metadata_for_event(ev, trigger="rolling_event",
+                                                   description=template)
+        except Exception:
+            logger.warning("事件快照失败，本次不执行", exc_info=True)
+            return None
+        if not isinstance(snap_meta, dict) or not snap_meta:
+            return None
+        once = str(ev.get("pool_kind") or "") == "one_shot"
+        if once and not snap_meta.get("event_generation_id"):
+            return None
+        # 抽选与开始之间可能跨时段边界/热重载：启动前再核一次（认领必须在核后）。
+        from .event_slots import time_slot_of, slot_remaining_minutes, event_allowed_in_slot
+        _tz = getattr(self._tz, "_tz", None)
+        if not event_allowed_in_slot(ev, time_slot_of(now, _tz)):
+            return None
+        if int(duration) > slot_remaining_minutes(now, _tz):
+            return None
+        if once and not catalog.claim_event(ev, now=now):
+            self._log("rolling.event_not_claimed", event_id=event_key)
+            return None
+        metadata.update(snap_meta)
+        metadata["origin_kind"] = str(cand.get("origin_kind") or "")
+        for key in ("source_file", "definition_version", "tags"):
+            if ev.get(key) is not None:
+                metadata[key] = ev[key]
+        try:
+            eid = self._db.start_episode(
+                schedule_date=date, name=str(cand["name"]), goal_type=str(cand["goal_type"]),
+                source="rolling", planned_start_minute=cur, planned_end_minute=cur + int(duration),
+                interruptibility=cand["interruptibility"], switch_cost=profile.switch_cost,
+                attention_mode=attention, state_before=self._state_brief(snapshot),
+                metadata=metadata,
+            )
+        except Exception:
+            if once:
+                catalog.finish_claim(ev, "start_failed", reason="episode_start_error")
+            logger.warning("事件启动失败，本次抽选不返池", exc_info=True)
+            return None
+        if once:
+            catalog.finish_claim(ev, "started" if eid else "start_failed", str(eid or ""),
+                                 reason="" if eid else "episode_start_rejected")
+        if not eid:
+            return None
+        # 冷却/当日用量：启动即记（中断不返还），持久化跨热重载。
+        if not hasattr(self, "_event_last_used"):
+            self._load_event_usage()
+        self._event_last_used[event_key] = now.timestamp()
+        self._event_day_counts[event_key] = int(self._event_day_counts.get(event_key, 0) or 0) + 1
+        self._save_event_usage(date)
+        self._handle_squeezed_active(pre_active, now, eid)
+        self._publish(EVENT_EPISODE_STARTED, episode_id=eid, name=cand["name"],
+                      goal_type=cand["goal_type"], planned_start_minute=cur,
+                      planned_end_minute=cur + int(duration), source="rolling")
+        self._log("rolling.event_started", episode_id=eid, event_id=event_key,
+                  origin_kind=cand.get("origin_kind"), pool_kind=ev.get("pool_kind"),
+                  duration_minutes=int(duration))
+        return str(eid)
 
     # ── 跨日事务（PR-B2，2026-11-07；规格 §1 / 计划书 §5 H1 / §5.1）─────
     def _continuity_extra_keywords(self) -> Any:
@@ -2276,11 +2655,12 @@ class RollingPlanner:
     def _maybe_random_event(self, date: str, cur: int, now: datetime, snapshot: Any,
                             report: Dict[str, Any], rng: random.Random,
                             context: Optional[str] = None) -> bool:
-        """转场/空闲掷骰；命中且约束全过 → 开一条随机事件 episode。返回是否插入。
+        """转场/空闲掷骰；命中且约束全过 → 开一条联动事件 episode。返回是否插入。
 
-        取池（PR4 共享接线，2026-10-27）：装配了事件库服务 → ``catalog.pick_event``
-        （加权抽样 + 4h 去重 + 时长采样，0 LLM）；仅未装配时使用内置池。
-        选不出时不绕过服务门控。日上限 / 转场门 / 低可中断语义不变。
+        P1（2026-11-09 §7.2）：本入口只保留代码内置·模块联动两项（watch_bili/
+        browse_qq）——普通状态/生成事件已提升为主候选（_event_candidates），不再
+        走 8% 稀有事件骰。``max_random_events_per_day`` 语义迁为联动事件合计日上限
+        （默认 3，0 真正禁用）；计数/4h 去重从持久记录恢复，热重载不重置。
         创建时把 ``metadata.state_deltas`` + ``event_id`` + ``event_catalog_version``
         快照进 episode（库替换后仍按快照结算；见 :meth:`_random_event_deltas`）。
         """
@@ -2294,10 +2674,16 @@ class RollingPlanner:
         catalog = getattr(self, "_event_catalog", None)
         event: Optional[Dict[str, Any]] = None
         if catalog is not None:
+            # P1：只从联动两项取池；模块门控/时段/冷却仍由 pick_event 内部把关。
+            linked = [e for e in self._catalog_active_events()
+                      if str(e.get("event_id") or e.get("key") or "")
+                      in MODULE_LINKED_EVENT_IDS]
+            if not linked:
+                return False
             try:
                 event = catalog.pick_event(
                     rng, self._state_brief(snapshot), self._random_last,
-                    now=now, context=context)
+                    now=now, context=context, events=linked)
             except Exception as exc:
                 logger.warning("事件库取池失败（本次跳过）：%s", exc)
                 event = None
@@ -2332,7 +2718,8 @@ class RollingPlanner:
             slot = time_slot_of(now, _tz)
             remaining = slot_remaining_minutes(now, _tz)
             eligible = [e for e in RANDOM_EVENT_POOL
-                        if event_allowed_in_slot(e, slot)
+                        if str(e.get("key") or "") in MODULE_LINKED_EVENT_IDS
+                        and event_allowed_in_slot(e, slot)
                         and int(e.get("min_minutes", 5)) <= remaining
                         and (e["key"] not in self._random_last
                              or (now - self._random_last[e["key"]]).total_seconds()
@@ -2380,6 +2767,8 @@ class RollingPlanner:
             return False
         self._random_used += 1
         self._random_last[event_key] = now
+        # P1：联动日配额/4h 去重持久化（热重载不重置当天配额）。
+        self._save_event_usage(date)
         self._publish(EVENT_RANDOM_EVENT, name=event["name"], duration_minutes=duration,
                       source="random", description=template)
         self._publish(EVENT_EPISODE_STARTED, episode_id=eid, name=event["name"],
@@ -2395,6 +2784,20 @@ class RollingPlanner:
             self._random_date = date
             self._random_used = 0
             self._random_last = {}
+            # P1 §7.2：联动日配额/4h 去重从持久记录恢复（重载/跨日不重置当天配额；
+            # 文件日期不是当天 → 按 0 起算，不沿用昨日计数）。
+            path = self._event_usage_path()
+            if path is not None and path.exists():
+                try:
+                    doc = json.loads(path.read_text(encoding="utf-8"))
+                    if str(doc.get("linked_date") or "") == date:
+                        self._random_used = max(0, int(doc.get("linked_used") or 0))
+                        for key, raw in (doc.get("linked_last") or {}).items():
+                            parsed = self._parse_ts(raw, getattr(self._tz, "_tz", None))
+                            if parsed is not None:
+                                self._random_last[str(key)] = parsed
+                except Exception as exc:
+                    logger.debug("联动配额持久恢复失败（按 0 起算）：%s", exc)
         if date != self._last_date:
             self._last_date = date
             self._idle_roll_pending = True
@@ -2465,6 +2868,7 @@ class RollingPlanner:
         boundary = self._next_boundary_minutes(date, cur, self._spine_intents_cached(date))
         candidates = self._build_candidates(date, cur, snapshot, None)
         counts = self._completed_counts_today(date)
+        counts.update(self._idle_score_context(candidates, date, cur))
         rng = random.Random(f"{date}|preview|{cur}")
         scored = []
         for cand in candidates:

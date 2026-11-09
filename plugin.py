@@ -961,13 +961,15 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 timezone_str=timezone_str, schedule_writer=_write_schedule_items,
                 # 硬约定正式起床在 planner 内 force_wake：回调同步真实醒来到周期四变量
                 wake_recorder=self._record_actual_wake_cycle,
-                # PR4 共享接线：随机事件优先从事件库取（单实例由 PlanningServices 持有；
-                # None = 事件库装配失败 → planner 逐字回退旧内置池路径）
+                # PR4 共享接线：事件库单实例由 PlanningServices 持有；P1 起普通事件
+                # 走统一候选，联动两项走独立预算（None = 装配失败 → 内置联动池降级）
                 event_catalog=getattr(getattr(self, "_planning", None), "event_catalog", None),
                 # PR-B2：唯一目标表（GoalManager）注入——可能延续活动关联/创建长期
                 # 目标、跨日继续候选；None = 未装配 → 跨日事务分支整体旁路
                 goal_manager=getattr(getattr(self, "_planning", None), "goal_manager", None),
-                motive_store=motive_store)
+                motive_store=motive_store,
+                # P1（2026-11-09 滚动日程计划）：事件冷却/当日用量/联动配额持久目录
+                data_dir=self._data_dir)
             engine: SleepEngine | None = None
             restored: Any = None
             # PR8 3.0.0：睡眠引擎随 [schedule].enabled 装配（旧 sleep_engine_enabled

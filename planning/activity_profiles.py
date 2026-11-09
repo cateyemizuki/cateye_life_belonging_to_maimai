@@ -225,11 +225,14 @@ BUILTIN_PROFILES: Tuple[Tuple[str, ActivityProfile], ...] = (
         energy_rate=-0.0008, hunger_rate=0.0003, focus_rate=-0.0005,
         stress_rate=-0.0020, social_rate=-0.0060,
         resume_bias=0.1, spontaneous_weight=0.3)),
+    # P1（2026-11-09 滚动日程计划 §5.3）：待机出厂改短 3–8 分钟、最小块 2 分钟——
+    # 待机是短暂停留/真实兜底；长时间有意识放松由音乐/闲书/躺一会等明确活动承担。
+    # 存量用户文件按 migrate_legacy_idle 的明确迁移清单更新，自定义不静默覆盖。
     ("idle", ActivityProfile(
         key="idle", label="待机",
-        duration=DurationSpec("normal", mean=20.0, sigma=10.0,
-                              min_minutes=10.0, max_minutes=40.0),
-        min_block=10.0, interruptibility=1.0, switch_cost=0.05,
+        duration=DurationSpec("normal", mean=5.5, sigma=2.0,
+                              min_minutes=3.0, max_minutes=8.0),
+        min_block=2.0, interruptibility=1.0, switch_cost=0.05,
         energy_rate=0.0004, hunger_rate=0.0003, focus_rate=-0.0010,
         stress_rate=-0.0002, social_rate=0.0000,
         resume_bias=0.0, spontaneous_weight=1.0)),
@@ -638,9 +641,89 @@ def sample_duration(profile: ActivityProfile, state: Any,
     return max(profile.min_block, round(minutes))
 
 
+# ── P1 idle 迁移（2026-11-09 滚动日程计划 §5.3/§7.2）─────────────────────
+#: 旧出厂 idle 时长分布/最小块（迁移清单的唯一匹配基准；任一数值不同 = 用户自定义）。
+LEGACY_IDLE_FACTORY_DURATION: Dict[str, Any] = {
+    "dist": "normal", "mean": 20.0, "sigma": 10.0, "min": 10.0, "max": 40.0}
+LEGACY_IDLE_FACTORY_MIN_BLOCK = 10.0
+#: 新出厂值（与 BUILTIN_PROFILES idle 逐字一致）。
+NEW_IDLE_FACTORY_DURATION: Dict[str, Any] = {
+    "dist": "normal", "mean": 5.5, "sigma": 2.0, "min": 3.0, "max": 8.0}
+NEW_IDLE_FACTORY_MIN_BLOCK = 2.0
+#: 迁移备份后缀（保留原文件供回滚；只写一次，不覆盖既有备份）。
+IDLE_MIGRATION_BACKUP_SUFFIX = ".pre-31727.bak"
+
+
+def _duration_matches_legacy(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    for key, want in LEGACY_IDLE_FACTORY_DURATION.items():
+        got = raw.get(key)
+        if key == "dist":
+            if got != want:
+                return False
+        elif not _is_finite_number(got) or float(got) != float(want):
+            return False
+    return True
+
+
+def migrate_legacy_idle(*, root_dir: Any = None, decision_logger: Any = None) -> bool:
+    """存量 idle 画像一次性迁移：仍是旧出厂值 → 按清单更新为新出厂值（先备份原件）；
+    用户自定义（任一数值差异）→ 不动。幂等：迁移后不再匹配旧值。返回是否写入。
+
+    纪律：不碰其他画像条目；解析失败不算缺失（绝不覆盖坏文件）；失败仅告警。
+    """
+    if root_dir is None:
+        return False
+    import json as _json
+    from core.mapping_dir import mappings_path
+
+    path = mappings_path(Path(root_dir), PROFILES_FILE_NAME)
+    try:
+        if not path.exists():
+            return False
+        original = path.read_text(encoding="utf-8-sig")
+        doc = _json.loads(original)
+        idle = (doc.get("profiles") or {}).get("idle") if isinstance(doc, dict) else None
+        if not isinstance(idle, dict):
+            return False
+        min_block = idle.get("min_block")
+        if not (_duration_matches_legacy(idle.get("duration"))
+                and _is_finite_number(min_block)
+                and float(min_block) == LEGACY_IDLE_FACTORY_MIN_BLOCK):
+            return False  # 用户自定义或已迁移 → 不静默覆盖
+        backup = path.with_name(path.name + IDLE_MIGRATION_BACKUP_SUFFIX)
+        if not backup.exists():
+            backup.write_text(original, encoding="utf-8")
+        idle["duration"] = dict(NEW_IDLE_FACTORY_DURATION)
+        idle["min_block"] = NEW_IDLE_FACTORY_MIN_BLOCK
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps(doc, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:
+        logger.warning("idle 画像迁移失败（保留原文件，忽略）：%s", exc)
+        return False
+    logger.info("idle 画像已按 3.17.27 迁移清单更新为 3–8 分钟/最小块 2（备份：%s）",
+                backup.name)
+    if decision_logger is not None:
+        try:
+            decision_logger.record(
+                action="planning.profiles_idle_migrated", severity="info",
+                old={"duration": LEGACY_IDLE_FACTORY_DURATION,
+                     "min_block": LEGACY_IDLE_FACTORY_MIN_BLOCK},
+                new={"duration": NEW_IDLE_FACTORY_DURATION,
+                     "min_block": NEW_IDLE_FACTORY_MIN_BLOCK},
+                backup=backup.name)
+        except Exception:
+            pass
+    return True
+
+
 def load_and_apply(*, root_dir: Any = None,
                    decision_logger: Any = None) -> ProfilesLoadResult:
     """装载 + 合并 + 重绑生效位（插件装配链的单次调用入口）。"""
+    migrate_legacy_idle(root_dir=root_dir, decision_logger=decision_logger)
     result, merged = load_profiles(root_dir=root_dir, decision_logger=decision_logger)
     apply_profiles(merged)
     return result

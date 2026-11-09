@@ -77,10 +77,16 @@ def event_allowed_in_slot(event: Mapping[str, Any], slot: str) -> bool:
     Generated events carry a single authoritative ``time_slot``; builtin events
     carry an ``allowed_slots`` list. Events with no recognised slot tag (legacy
     v1/v2 data) are NOT treated as all-day — they are excluded until regenerated.
+
+    P1/P2（2026-11-09 滚动日程计划 §6.2/§13）：JSON 初始池事件（origin_kind=
+    json_file / pool_kind=initial）与内置初始池同口径走 ``allowed_slots``——
+    来源类型与池类型分开后，时段过滤仍识别初始池，不误当无时段生成项排除。
     """
     if not isinstance(event, Mapping) or slot not in TIME_SLOTS:
         return False
-    if event.get("pool_kind") == "builtin" or event.get("source") == "builtin":
+    if (event.get("pool_kind") in ("builtin", "initial")
+            or event.get("source") == "builtin"
+            or event.get("origin_kind") == "json_file"):
         allowed = event.get("allowed_slots")
         return isinstance(allowed, (list, tuple)) and slot in allowed
     return event.get("time_slot") == slot
