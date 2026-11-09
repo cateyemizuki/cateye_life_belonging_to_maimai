@@ -944,8 +944,10 @@ class QzoneService:
         prompt = render(
             prompt_of(self._plugin, "qzone_post"),
             fallback=QZONE_POST_PROMPT,
-            lover_name="",
-            personality="",
+            # 复核 P0-7：传真实身份——存量旧定制模板含 {lover_name}/{personality}
+            # 占位，传空会渲染出「你是「」，人设：」；新默认模板无占位不受影响。
+            lover_name=self._lover_name,
+            personality=self._personality,
             date=date,
             time=now.strftime("%H:%M"),
             activity=activity_desc,
@@ -962,7 +964,8 @@ class QzoneService:
             prompt = (f"{prompt}\n{QZONE_THEME_BLOCK_HEADER}\n"
                       + "\n".join(f"- {line}" for line in theme_lines))
         # 人设经 with_identity 以宿主同款开头注入 system_prompt（共享前缀缓存）；
-        # lover_name/personality 渲染传空，兼容旧定制模板残留占位（防 KeyError 回退）。
+        # 复核 P0-7：lover_name/personality 同时传真实值渲染，存量旧定制模板的
+        # 残留占位不再渲染为空（新默认模板无占位，行为不变）。
         text = await self._llm.generate(
             prompt,
             task_name=purpose_task(self._plugin, "qzone", default="utils"),
@@ -1032,8 +1035,8 @@ class QzoneService:
                 prompt = render(
                     prompt_of(self._plugin, "qzone_reply"),
                     fallback=QZONE_REPLY_PROMPT,
-                    lover_name="",
-                    personality="",
+                    lover_name=self._lover_name,   # 复核 P0-7：真实身份（同上）
+                    personality=self._personality,
                     moment=moment_text[:200],
                     nickname=comment.get("nickname") or "好友",
                     comment=str(comment.get("content") or "")[:200],
@@ -1201,7 +1204,7 @@ class QzoneService:
             prompt = render(
                 prompt_of(self._plugin, "qzone_reply"),
                 fallback=QZONE_REPLY_PROMPT,
-                lover_name="", personality="",
+                lover_name=self._lover_name, personality=self._personality,  # 复核 P0-7
                 moment=content[:200], nickname=commenter, comment=comment_text[:200],
                 time="", impression="",
             )

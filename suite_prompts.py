@@ -463,6 +463,21 @@ QZONE_REPLY_DEFAULT = (
 )
 #: 评论提醒主动 intent（占位符：{excerpt} / {added}）
 QZONE_COMMENT_REMINDER_DEFAULT = "你刚发的说说「{excerpt}」收到了 {added} 条新评论，可以在聊天里自然地提到这件事"
+
+#: 复核 P0-7：历史出厂默认模板特征集（6f3aa19/adce1d9 引入、a74c457/3efd0cc
+#: 移除前的原文）。_merge_disk_values 把「磁盘值 != 新默认」一律当用户定制保留，
+#: 致代码升级默认后存量用户永卡旧模板（渲染空身份）。磁盘值精确命中本集合 =
+#: 旧出厂默认而非用户定制 → 不保留，让新默认生效；用户改过一个字就不命中。
+LEGACY_FACTORY_PROMPT_VALUES = frozenset({
+    ("请以第一人称发一条 QQ 空间说说，记录此刻的生活。"
+     "要求：口语化、像真人发的、20~60 字、不要话题标签、不要引号、只输出说说正文。\n"
+     "你是「{lover_name}」，人设：{personality}\n"
+     "现在是 {date} {time}，你正在：{activity}。"),
+    ("请写一条自然的回复（10~40 字，口语化，只输出回复正文）。\n"
+     "你是「{lover_name}」，人设：{personality}\n"
+     "你在 QQ 空间发了这条说说：\n「{moment}」\n"
+     "好友「{nickname}」（{time}）评论了：「{comment}」\n{impression}"),
+})
 #: 发帖前 LLM 严判提示词（占位符：{lover_name} / {current_time} / {activity}；
 #: 2026-10-14 §18.4 判定链移植自 MaiTrace v3.1：正反例 + 强烈压制「是」+ 首字符应答格式。
 #: PR-AUDIT 3.16.1 PR-2：人设经 LLMService with_identity 注入 system_prompt，
@@ -523,14 +538,14 @@ class PromptsSectionConfig(PluginConfigBase):
     )
     companion_activity_reason: str = Field(
         default=COMPANION_ACTIVITY_REASON_DEFAULT,
-        description="日程巡检分享的触发说明（占位符：{lover_name} {activity}）",
-        json_schema_extra={"label": "巡检·日程分享", "rows": 2,
+        description="【已停用】旧日程巡检分享触发说明，现版本无消费方；保留字段仅为兼容存量配置（复核 P0-7 标注）",
+        json_schema_extra={"label": "巡检·日程分享（已停用）", "rows": 2,
                            **_ui_i18n("Activity patrol reason")},
     )
     companion_daily_reason: str = Field(
         default=COMPANION_DAILY_REASON_DEFAULT,
-        description="日常搭话的触发说明（占位符：{lover_name}）",
-        json_schema_extra={"label": "巡检·日常搭话", "rows": 2,
+        description="【已停用】旧日常搭话触发说明，现版本无消费方；保留字段仅为兼容存量配置（复核 P0-7 标注）",
+        json_schema_extra={"label": "巡检·日常搭话（已停用）", "rows": 2,
                            **_ui_i18n("Daily patrol reason")},
     )
     screen_describe: str = Field(
@@ -580,13 +595,13 @@ class PromptsSectionConfig(PluginConfigBase):
     # ── QQ 空间 ─────────────────────────────────────────────
     qzone_post: str = Field(
         default=QZONE_POST_DEFAULT,
-        description="说说文案提示词（占位符：{lover_name} {personality} {date} {time} {activity}）",
+        description="说说文案提示词（占位符：{lover_name} {personality} {date} {time} {activity}；身份另经 system 注入，占位渲染真实昵称/人设）",
         json_schema_extra={"label": "空间·说说文案", "rows": 4, **_ui_i18n("Qzone post prompt")},
     )
     qzone_reply: str = Field(
         default=QZONE_REPLY_DEFAULT,
         description="评论回复提示词（占位符：{lover_name} {personality} {moment} {nickname} "
-                    "{time} {comment} {impression}）",
+                    "{time} {comment} {impression}；身份另经 system 注入，占位渲染真实昵称/人设）",
         json_schema_extra={"label": "空间·评论回复", "rows": 6, **_ui_i18n("Qzone reply prompt")},
     )
     qzone_comment_reminder: str = Field(

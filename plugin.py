@@ -168,6 +168,10 @@ def _merge_disk_values(incoming: dict, disk: dict, defaults: dict) -> tuple[dict
             out[name] = copy.deepcopy(disk[name])
             changed = True
 
+    # 复核 P0-7：历史出厂默认模板特征集（局部导入避免模块环）——精确命中者
+    # 视为旧出厂值而非用户定制，不保留，让升级后的新默认生效。
+    from suite_prompts import LEGACY_FACTORY_PROMPT_VALUES
+
     for section, disk_section in disk.items():
         if section in LEGACY_SECTIONS or not isinstance(disk_section, dict):
             continue
@@ -190,6 +194,8 @@ def _merge_disk_values(incoming: dict, disk: dict, defaults: dict) -> tuple[dict
                 changed = True
             elif (reference is not _MISSING and value != reference
                   and target_section.get(key) == reference):
+                if isinstance(value, str) and value in LEGACY_FACTORY_PROMPT_VALUES:
+                    continue  # 旧出厂默认：不保留（用户改过一个字即不命中，仍保留）
                 target_section[key] = copy.deepcopy(value)
                 changed = True
     return out, changed
