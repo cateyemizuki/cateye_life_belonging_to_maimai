@@ -101,6 +101,28 @@ def strip_experience_share_prefix(topic: Any) -> str:
             return value[len(prefix):].strip()
     return value
 
+
+def adjust_miss_probability(base: Any, tier: Any, mood_rate: Any = 1.0) -> float:
+    """复核 P1-7：想念概率接入好感档位（0..4 → ×0.9..1.1）与情绪 proactive_rate。
+
+    ``evaluate_miss`` 的孤独锚点判定保持不可变契约（复核结论：上层视为不可变），
+    调节只在 patrol 消费侧进行；结果钳 [0,1]。非 target/无档位 → 0 档（×0.9），
+    非法乘数 → 1.0，异常不抛。
+    """
+    try:
+        value = float(base)
+    except (TypeError, ValueError):
+        return 0.0
+    try:
+        tier_value = max(0, min(4, int(tier)))
+    except (TypeError, ValueError):
+        tier_value = 0
+    try:
+        rate = float(mood_rate)
+    except (TypeError, ValueError):
+        rate = 1.0
+    return max(0.0, min(1.0, value * (0.9 + 0.05 * tier_value) * rate))
+
 #: 情绪不可得时的恒等 mood_effect（emotion 关闭/缺失 → 乘数恒 1.0，§八.2 可空降级）
 NEUTRAL_MOOD_EFFECT: dict[str, Any] = {
     "proactive_rate": 1.0,
@@ -627,9 +649,18 @@ class PatrolService:
         energy, social, valence, _tier, _count = self._miss_state_inputs()
         decision = evaluate_miss(hours, float(profile.get('anchor_hours', 6)),
                                  float(profile.get('loneliness', .5)), energy, social, valence)
+        # 复核 P1-7：好感档位（_tier）与情绪 proactive_rate 接入想念概率——
+        # 原实现 tier/count 被丢弃、mood_effect 两乘数全仓无消费，关系生疏与挚爱
+        # 曲线完全相同。判定契约不动，只在消费侧调节。
+        try:
+            mood_rate = float(self._mood_effect().get('proactive_rate') or 1.0)
+        except Exception:
+            mood_rate = 1.0
+        probability = adjust_miss_probability(decision.probability, _tier, mood_rate)
         fields.update(silence_hours=round(hours, 3), anchor_hours=profile.get('anchor_hours'),
                       loneliness=profile.get('loneliness'), motivation=round(decision.motivation,4),
-                      capacity=round(decision.capacity,4), miss_probability=round(decision.probability,4),
+                      capacity=round(decision.capacity,4), miss_probability=round(probability,4),
+                      affinity_tier=_tier, mood_proactive_rate=round(mood_rate, 4),
                       cycle_status=dict(cycle.get('claims') or {}), profile_source=profile.get('source'))
         # Same anchor for the silence fact and missing candidate; each has its own receipt.
         await self._maybe_publish_silence(now)
@@ -655,7 +686,6 @@ class PatrolService:
         # 最终门控（上方 permission：预算/静默/注意力 + dispatch 内复检）不变，
         # 孤独锚点判定（evaluate_miss）不动，动机存在 ≠ 必须联系（dice 仍可放弃）。
         share = self._experience_share_motive()
-        probability = decision.probability
         share_topic = ""
         if share is not None:
             share_topic = strip_experience_share_prefix(share.get('topic'))
@@ -664,7 +694,7 @@ class PatrolService:
             except (TypeError, ValueError):
                 strength = 0.0
             probability = min(EXPERIENCE_SHARE_PROB_CAP,
-                              decision.probability * (1.0 + EXPERIENCE_SHARE_PROB_RATIO * strength))
+                              probability * (1.0 + EXPERIENCE_SHARE_PROB_RATIO * strength))
             fields.update(experience_share_ref=str((share.get('source') or {}).get('ref') or ''),
                           experience_share_strength=round(strength, 4),
                           miss_probability_boosted=round(probability, 4))
