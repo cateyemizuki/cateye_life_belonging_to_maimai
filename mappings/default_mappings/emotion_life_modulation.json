@@ -12,8 +12,8 @@
       },
       "delta": {
         "valence": 0.02,
-        "arousal": 0.0,
-        "dominance": 0.01
+        "arousal": 0.01,
+        "dominance": 0.02
       },
       "daily_cap": {
         "valence": 0.06
@@ -46,8 +46,8 @@
       },
       "delta": {
         "valence": 0.02,
-        "arousal": -0.02,
-        "dominance": 0.0
+        "arousal": -0.015,
+        "dominance": 0.01
       },
       "daily_cap": {
         "valence": 0.06
@@ -61,12 +61,12 @@
         ]
       },
       "delta": {
-        "valence": 0.01,
-        "arousal": 0.0,
-        "dominance": 0.0
+        "valence": 0.015,
+        "arousal": 0.01,
+        "dominance": 0.01
       },
       "daily_cap": {
-        "valence": 0.03
+        "valence": 0.04
       }
     },
     "high_pressure_long_block": {
@@ -106,7 +106,8 @@
       },
       "delta": {
         "valence": 0.008,
-        "arousal": -0.008
+        "arousal": -0.008,
+        "dominance": -0.005
       },
       "daily_cap": {
         "valence": 0.04
@@ -121,7 +122,8 @@
       },
       "delta": {
         "valence": 0.012,
-        "arousal": -0.012
+        "arousal": -0.015,
+        "dominance": -0.005
       },
       "daily_cap": {
         "valence": 0.04
@@ -135,7 +137,9 @@
         ]
       },
       "delta": {
-        "valence": 0.01
+        "valence": 0.012,
+        "arousal": 0.005,
+        "dominance": 0.0
       },
       "daily_cap": {
         "valence": 0.04
