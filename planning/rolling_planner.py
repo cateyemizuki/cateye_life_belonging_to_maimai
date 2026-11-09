@@ -2395,7 +2395,9 @@ class RollingPlanner:
                       draw_reason_zh=metadata.get("draw_reason_zh"))
             report["actions"].append(f"started_{cand['kind']}")
             return True
-        logger.warning("rolling_planner: episode 启动失败（换后备候选）")
+        # 启动失败换后备是正常取舍（时段临界/最小块不足/认领失败）——debug 级，
+        # 决策诊断已落 rolling.decision / no_block_started，不刷 warning。
+        logger.debug("rolling_planner: episode 启动失败（换后备候选 kind=%s）", cand.get("kind"))
         return False
 
     def _start_event_episode(self, cand: Dict[str, Any], duration: int, date: str,
