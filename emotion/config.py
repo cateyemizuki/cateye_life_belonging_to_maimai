@@ -105,9 +105,10 @@ class EmotionSectionConfig(PluginConfigBase):
                                       "Short-term reason entries expire and stop being injected.")},
     )
     emotion_reason_inject_enabled: bool = Field(
-        default=True,
+        default=False,
         description="在情绪底色注入后附最近一条未过期的高重要度原因摘要（因为…）；"
-                    "关闭后注入文本与旧版逐字一致",
+                    "3.17.29 起默认关闭（复核 VAD-4.6：普通闲聊不再每轮携带具体原因，"
+                    "避免把背景心情重新变成话题；需要时可在面板开启）",
         json_schema_extra={"label": "注入情绪原因",
                            **_ui_i18n("Inject emotion reason",
                                       "Append at most one fresh reason summary to the mood injection.")},

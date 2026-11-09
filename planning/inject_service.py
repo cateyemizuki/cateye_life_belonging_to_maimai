@@ -903,10 +903,9 @@ class InjectService:
             prompt(self._plugin, "inject_schedule_header"),
             current_line,
         ]
-        mood = self._emotion_mood_line()
-        if mood:
-            lines.append(f"精神状态：{mood}")
-
+        # 3.17.29（复核 VAD-4.2/P1-11）：日程块不再重复注入心情行——planner 的
+        # 情绪底色由 emotion Hook 统一承载（injection_enabled 开关同源），日程块
+        # 只负责日程事实。原实现另走 mood_text 摘要（含百分比）且绕过注入开关。
         if intent == UserIntent.QUERY_FUTURE and future_activities and max_show > 0:
             lines.append(prompt(self._plugin, "inject_schedule_future_title"))
             for time_str, name in future_activities[:max_show]:
@@ -1118,34 +1117,8 @@ class InjectService:
             logger.debug("计算活动辅助信息失败: %s", exc)
         return None
 
-    def _emotion_mood_line(self) -> str:
-        """M4（§4.2 行 8）：planner 精神状态行读 emotion 的情绪描述（F5 双人称·第三人称）。
-
-        2026-10-11 起（F5 用户口径）：该行由「标签(百分比)+三维约值」改为**详细文字描述**，
-        与情绪注入条目同源（emotion.emotion_description_text("planner")）；emotion 未提供
-        描述方法（旧形态/桩）→ 回退 mood_text，保持可空降级。
-        """
-        emotion = getattr(self._plugin, "_emotion", None)
-        enabled = getattr(emotion, "is_enabled", None)
-        if callable(enabled):
-            try:
-                if not enabled():
-                    return ""
-            except Exception:
-                return ""
-        described = getattr(emotion, "emotion_description_text", None)
-        if callable(described):
-            try:
-                return str(described("planner") or "").strip()
-            except Exception:
-                pass
-        getter = getattr(emotion, "mood_text", None)
-        if not callable(getter):
-            return ""
-        try:
-            return str(getter() or "").strip()
-        except Exception:
-            return ""
+    # 3.17.29（复核 VAD-4.2/P1-11）：删除原 `_emotion_mood_line`——日程块与情绪
+    # Hook 重复注入且绕过 injection_enabled；planner 情绪底色统一由 Hook 承载。
 
     # ------------------------------------------------------------
     # R7 runtime 注入视图（runtime 视图；未就绪/缺失/异常一律旁路）
