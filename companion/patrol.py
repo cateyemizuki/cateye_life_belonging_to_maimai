@@ -624,6 +624,13 @@ class PatrolService:
                       cycle_status=dict(cycle.get('claims') or {}), profile_source=profile.get('source'))
         # Same anchor for the silence fact and missing candidate; each has its own receipt.
         await self._maybe_publish_silence(now)
+        # 复核 P1-2：问候/主动发言后的冷却闸（原 _minutes_since_last_speak 全仓无调用方
+        # = 死代码，致 12:01 午安连发后 12:21 又因 miss 私聊轰炸）。用户已接话则不拦。
+        if self._miss_suppressed_by_recent_speak(
+                now, last, float(profile.get('anchor_hours', 6))):
+            done('recent_bot_spoke',
+                 detail=f'{(self._minutes_since_last_speak(now) or 0):.0f}min since last speak')
+            return
         if 'miss' in cycle.get('claims', {}):
             done('silence_cycle_consumed')
             return
@@ -981,6 +988,26 @@ class PatrolService:
         if last_speak is None:
             return None
         return max(0.0, (now - last_speak).total_seconds() / 60)
+
+    def _miss_suppressed_by_recent_speak(self, now: datetime, last_user: Optional[datetime],
+                                         anchor_hours: float) -> bool:
+        """复核 P1-2：距 Bot 上次主动开口（含早中晚问候）不足 ``max(60, anchor*30)``
+        分钟且用户尚未接话 → 抑制 miss 触发。
+
+        用户在上次 Bot 发言后已来信（``last_user > last_speak``）→ 不拦（真实来信
+        优先的既有口径）；无发言记录 → 不拦（首次触发不受影响）。
+        """
+        last_speak = self._affection.last_speak_time()
+        since = self._minutes_since_last_speak(now)
+        if last_speak is None or since is None:
+            return False
+        if last_user is not None and last_user > last_speak:
+            return False
+        try:
+            threshold = max(60.0, float(anchor_hours) * 30.0)
+        except (TypeError, ValueError):
+            threshold = 60.0
+        return since < threshold
 
 
     def _effective_silence_window(self) -> SilenceWindow:
