@@ -632,12 +632,14 @@ class PatrolService:
         fields: dict[str, Any] = {}
         def done(reason: str, action: str = ACTION_SKIP, detail: str = "") -> None:
             self._log_decision(action=action, reason=reason, trigger_type="miss", detail=detail, **fields)
-        if not bool(getattr(cfg, 'enabled', True)) or not cfg.proactive_trigger_enabled or not cfg.miss_enabled:
-            done('disabled')
-            return
+        # 复核 P2-1：跨日维护前置于 miss_enabled 门——原顺序下关闭想念主动搭话会连带
+        # 跳过好感跨日重置与自然衰减（sync_daily 仅在当天有规则事件时兜底）。
         if self._affection.today_date() != now.strftime('%Y-%m-%d'):
             self._affection.reset_daily(now.strftime('%Y-%m-%d'))
             self._affection.apply_daily_decay()
+        if not bool(getattr(cfg, 'enabled', True)) or not cfg.proactive_trigger_enabled or not cfg.miss_enabled:
+            done('disabled')
+            return
         # Persona initialization is once per fingerprint; no Y/N request per candidate.
         profile = await self.initialize_disposition()
         last = self._affection.last_user_msg_time()
