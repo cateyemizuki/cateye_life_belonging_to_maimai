@@ -92,6 +92,15 @@ EXPERIENCE_SHARE_PROB_CAP = 0.35
 EXPERIENCE_SHARE_TOPIC_PREFIX = "\n最近经历参考（可选话题）："
 EXPERIENCE_SHARE_TOPIC_SUFFIX = "。可以自然地带一句，也可以选择不提。"
 
+
+def strip_experience_share_prefix(topic: Any) -> str:
+    """复核 P1-3：动机 topic 已带「想找人聊聊：」前缀，注入前剥离防叠床架屋。"""
+    value = str(topic or "").strip()
+    for prefix in ("想找人聊聊：", "想找人聊聊:"):
+        if value.startswith(prefix):
+            return value[len(prefix):].strip()
+    return value
+
 #: 情绪不可得时的恒等 mood_effect（emotion 关闭/缺失 → 乘数恒 1.0，§八.2 可空降级）
 NEUTRAL_MOOD_EFFECT: dict[str, Any] = {
     "proactive_rate": 1.0,
@@ -649,7 +658,7 @@ class PatrolService:
         probability = decision.probability
         share_topic = ""
         if share is not None:
-            share_topic = str(share.get('topic') or '')
+            share_topic = strip_experience_share_prefix(share.get('topic'))
             try:
                 strength = max(0.0, min(1.0, float(share.get('strength') or 0.0)))
             except (TypeError, ValueError):
@@ -939,7 +948,9 @@ class PatrolService:
         hint = str(self._mood_effect().get("intent_hint") or "").strip()
         if not hint:
             return reason
-        base = str(reason or "").strip()
+        # 复核 P1-3：base 可能已以句号结尾（如「可以自然地带一句，也可以选择不提。」）
+        # → 拼接前剥掉句末标点，消除「。。」双句号。
+        base = str(reason or "").strip().rstrip("。.．")
         return f"{base}。{hint}" if base else hint
 
     # 注（2026-11-04 主动行为重写）：旧沉默阈值机制（_affection_tier_miss_factor /

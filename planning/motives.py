@@ -84,6 +84,30 @@ STATE_SOCIAL_BATTERY_ABOVE = 0.70
 EXPERIENCE_SHARE_SALIENCE_MIN = 0.5
 EXPERIENCE_SHARE_RECENCY_HOURS = 24.0
 EXPERIENCE_SHARE_STRENGTH_CAP = 0.6
+#: 复核 P1-3：含相对时间词（今天/明天/刚…）的即时分享最长存活 18h——
+#: 跨自然日后原样注入会让模型把历史文本里的「明天」当成今天的明天。
+EXPERIENCE_SHARE_RELATIVE_TTL_HOURS = 18.0
+
+#: 相对时间词（保守集合：只拦明显会随日期失真的词）
+_RELATIVE_TIME_WORDS = (
+    "今天", "明天", "昨天", "后天", "前天", "今晚", "明晚", "昨晚",
+    "明早", "今早", "刚", "刚才", "刚刚", "待会", "等下", "一会儿",
+    "这周末", "下周", "下个月",
+)
+
+
+def _has_relative_time_words(text: Any) -> bool:
+    """文本是否含相对时间词（复核 P1-3：用于缩短体验分享动机 TTL）。"""
+    value = str(text or "")
+    return any(word in value for word in _RELATIVE_TIME_WORDS)
+
+
+def _motive_expires_at(created: datetime, seed: Dict[str, Any], half_life_days: float) -> datetime:
+    """动机到期时间：seed 显式 ttl_hours 优先（相对时间词分享 18h），否则默认 3 倍半衰期。"""
+    ttl = seed.get("ttl_hours")
+    if isinstance(ttl, (int, float)) and float(ttl) > 0:
+        return created + timedelta(hours=float(ttl))
+    return created + timedelta(days=EXPIRE_HALF_LIVES * half_life_days)
 
 #: 合法来源类别（规格 §2：goal_id / experience_id / state 驱动；PR-C1 +experience_share）
 SOURCE_KINDS = ("goal", "experience", "experience_share", "state")
@@ -312,6 +336,10 @@ class MotiveStore:
                     "base_strength": min(EXPERIENCE_SHARE_STRENGTH_CAP,
                                          0.3 + 0.3 * salience),
                     "goal_types": ["social"], "keywords": ["聊"],
+                    # 复核 P1-3：含相对时间词的即时感受只活到当晚/18h，防止
+                    # 「明天约了…」跨日原样注入造成时空错乱。
+                    "ttl_hours": (EXPERIENCE_SHARE_RELATIVE_TTL_HOURS
+                                  if _has_relative_time_words(topic) else None),
                 })
                 continue
             if tier == "inferred":
@@ -409,8 +437,8 @@ class MotiveStore:
                 "keywords": list(seed.get("keywords") or []),
                 "created_at": created.isoformat(),
                 "reinforced_at": created.isoformat(),
-                "expires_at": (created + timedelta(
-                    days=EXPIRE_HALF_LIVES * self._half_life_days())).isoformat(),
+                "expires_at": _motive_expires_at(
+                    created, seed, self._half_life_days()).isoformat(),
             }
             by_key[key] = motive
             kept.append(motive)
