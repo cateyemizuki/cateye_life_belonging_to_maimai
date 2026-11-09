@@ -125,7 +125,22 @@ class InjectService:
         re.compile(r"^请简短的回复[，,]"),
         # planner 尾部的最终提醒（宿主模板：你需要输出对{bot_name}发言的分析…）
         re.compile(r"^你需要输出对\S*发言的分析"),
+        # 复核 P0-1：Maisaka 宿主现行尾指令（chat_loop_service.py 三种模式）——
+        # 普通 maisaka_chat 模式恒用「请你进行分析…」，passive 模式用「需要信息
+        # 或操作时调用工具…」；旧正则只覆盖 focus 模式，致意图分类 100% 误判。
+        re.compile(r"^请你进行分析[，,]"),
+        re.compile(r"^需要信息或操作时调用工具"),
+        # replyer 通道尾指令（cateye_better_post-processing 默认改写文案）
+        re.compile(r"^像平常在群里接一句话"),
+        # 宿主主动任务块与上下文摘要（插件指令，不是用户发言）
+        re.compile(r"^<plugin_proactive_task\b"),
+        re.compile(r"^【上下文状态摘要-内部参考】"),
     ]
+
+    #: 复核 P0-1：Bot 自身历史发言也被宿主包装为 UserMessageItem，前缀带
+    #: is_self_message="true"（planner_messages.py 渲染）——提取用户文本时跳过。
+    _SELF_MESSAGE_PREFIX_PATTERN: re.Pattern = re.compile(
+        r"^<message\s+[^>]*is_self_message=[\"']true[\"']")
 
     # 主程序 build_planner_prefix 会给 chat history 里每条 user 消息加
     # ``<message msg_id="..." time="..." user="...">\n真实文本`` 前缀。
@@ -604,6 +619,8 @@ class InjectService:
                     continue  # 空文本 → 找上一条 user
                 if cls._is_metadata_user_message(text):
                     continue  # 元数据消息/part → 跳过
+                if cls._SELF_MESSAGE_PREFIX_PATTERN.match(text):
+                    continue  # 复核 P0-1：Bot 自身历史发言（宿主包装为 user）→ 跳过
                 stripped = cls._strip_planner_prefix(text)
                 if cls._is_metadata_user_message(stripped.strip()):
                     continue
