@@ -70,7 +70,8 @@ class OfflineSettlementService:
 
     def settle_offline_gap(self, life: Any, planner: Any, *,
                            engine_claimed: bool,
-                           plan_settlement_fn: Optional[Callable[..., Any]] = None) -> None:
+                           plan_settlement_fn: Optional[Callable[..., Any]] = None,
+                           baseline_hours: float = 8.0) -> None:
         """冷启动离线 gap 收口（离线睡眠补全 A2 编排，2026-10-29；本方法不抛异常）。
 
         步序（指令 ①）：LifeState 冷启动已把原始离线 gap 暂存为 pending（A1）→
@@ -111,7 +112,12 @@ class OfflineSettlementService:
         # scratch 回归经 plugin 模块名补丁策略函数的接缝可用。
         plan_fn = plan_settlement_fn if callable(plan_settlement_fn) else plan_offline_settlement
         try:
-            plan = plan_fn(gap, debt_before)
+            # 复核 P0-4：基准非默认时透传（默认 8.0 保持旧二元调用，兼容回归
+            # 用例注入的旧签名策略函数）
+            if float(baseline_hours) != 8.0:
+                plan = plan_fn(gap, debt_before, baseline_hours=float(baseline_hours))
+            else:
+                plan = plan_fn(gap, debt_before)
         except Exception as exc:
             self._warn("离线结算计划生成失败（回退旧冷启动漂移）：%s", exc)
         if not isinstance(plan, dict) or not plan.get("settle"):

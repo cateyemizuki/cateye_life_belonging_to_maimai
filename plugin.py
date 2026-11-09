@@ -1115,9 +1115,21 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         （_phase2/_phase4）都经此入口调用。策略函数在**调用期**从本模块全局解析
         后注入（回归用例经 plugin_mod.plan_offline_settlement 补丁失效注入）。
         """
+        # 复核 P0-4：离线结债基准与在线同口径 = min(8.0, 配置作息窗口环长)；
+        # 读取失败回退 8.0 旧口径（不拖挂装配链）。
+        try:
+            from core.time_utils import parse_hhmm
+            from planning.sleep_engine import debt_baseline_hours
+            schedule = getattr(self.config, "schedule", None)
+            sleep_min = parse_hhmm(str(getattr(schedule, "sleep_time", "") or ""), 23 * 60)
+            wake_min = parse_hhmm(str(getattr(schedule, "wake_time", "") or ""), 7 * 60)
+            baseline = debt_baseline_hours(sleep_min, wake_min)
+        except Exception:
+            baseline = 8.0
         self._offline_settlement_service().settle_offline_gap(
             life, planner, engine_claimed=engine_claimed,
-            plan_settlement_fn=plan_offline_settlement)
+            plan_settlement_fn=plan_offline_settlement,
+            baseline_hours=baseline)
 
     def _apply_offline_settlement(self, life: Any, planner: Any, plan: Dict[str, Any]) -> None:
         """应用一次离线睡眠结算（薄委托；调用方保证恰好一次，编排体见 suite_offline_settlement）。"""

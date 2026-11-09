@@ -212,16 +212,57 @@ def sleep_quality(interrupted_minutes: Any, total_sleep_minutes: Any) -> float:
     return max(0.0, min(1.0, 1.0 - interrupted / total))
 
 
-def sleep_debt_delta(actual_hours: Any) -> float:
-    """单次睡眠的债务增量（附录 B.2.2 原式；不 clamp，clamp 在 :func:`settle_sleep_debt`）。"""
+def sleep_debt_delta(actual_hours: Any, baseline_hours: Any = 8.0) -> float:
+    """单次睡眠的债务增量（附录 B.2.2 原式；不 clamp，clamp 在 :func:`settle_sleep_debt`）。
+
+    复核 P0-4：零债基准参数化（默认 8.0 保持旧行为）——用户配置窗口短于 8h
+    （如 01:00–08:30=7.5h）时以窗口长为基准，睡满配置窗口不再净增债。
+    """
     hours = _clamp(actual_hours, 0.0, 240.0, 0.0)
-    return max(0.0, 8.0 - hours) * 0.5 - min(1.0, max(0.0, hours - 8.0))
+    baseline = _clamp(baseline_hours, 4.0, 12.0, 8.0)
+    return max(0.0, baseline - hours) * 0.5 - min(1.0, max(0.0, hours - baseline))
 
 
-def settle_sleep_debt(debt_before: Any, actual_hours: Any) -> float:
+def settle_sleep_debt(debt_before: Any, actual_hours: Any,
+                      baseline_hours: Any = 8.0) -> float:
     """一次性睡眠债结算：``clamp(before + delta, 0, 12)``（只应在会话结束时调用）。"""
     before = _clamp(debt_before, 0.0, SLEEP_DEBT_MAX, 0.0)
-    return max(0.0, min(SLEEP_DEBT_MAX, before + sleep_debt_delta(actual_hours)))
+    return max(0.0, min(SLEEP_DEBT_MAX,
+                        before + sleep_debt_delta(actual_hours, baseline_hours)))
+
+
+def debt_baseline_hours(sleep_minute: Any, wake_minute: Any) -> float:
+    """复核 P0-4：零债基准 = min(8.0, 配置作息窗口环长)。
+
+    窗口环长取 ``(wake - sleep) mod 1440``（跨午夜通用）；非法/零长回退 8.0，
+    下限 4.0 防病态配置把基准压到 nap 量级。长窗口用户基准仍为 8.0（不多还）。
+    """
+    try:
+        span = (int(wake_minute) - int(sleep_minute)) % DAY_MINUTES
+    except (TypeError, ValueError):
+        return 8.0
+    if span <= 0:
+        return 8.0
+    return min(8.0, max(4.0, span / 60.0))
+
+
+#: 复核 P0-4：高债恢复期 latest_wake 顺延——债 >4h 起每 1h 债顺延 15min，封顶 90min。
+DEBT_WAKE_EXTENSION_START = 4.0
+DEBT_WAKE_EXTENSION_PER_HOUR = 15.0
+DEBT_WAKE_EXTENSION_MAX_MINUTES = 90.0
+
+
+def debt_wake_extension_minutes(debt: Any) -> float:
+    """复核 P0-4：恢复期觉醒上限顺延量（分钟）。
+
+    原 latest_wake=wake+drift 截死补觉空间：短窗口+晚入睡时数学上永远不可能
+    还债。债 ≤4 不顺延（日常不扰醒锚），高债线性顺延且仍受 lie_in_cap 约束。
+    """
+    d = _clamp(debt, 0.0, SLEEP_DEBT_MAX, 0.0)
+    if d <= DEBT_WAKE_EXTENSION_START:
+        return 0.0
+    return min(DEBT_WAKE_EXTENSION_MAX_MINUTES,
+               (d - DEBT_WAKE_EXTENSION_START) * DEBT_WAKE_EXTENSION_PER_HOUR)
 
 
 def sleep_recovery_target(debt_at_sleep: Any, *, max_bonus: Any = 1.0) -> float:
@@ -952,14 +993,19 @@ class SleepEngine:
             elif band == "winding_down" and now <= window.latest_start:
                 reason = "score"
         cfg_cap = next_occurrence(window.wake, self._lie_in_cap_minute())
-        latest = min(window.latest_wake, cfg_cap)
+        # 复核 P0-4：高债恢复期 latest_wake 按债补偿顺延（封顶 90min，仍受
+        # lie_in_cap 约束）——原 wake+drift 截死使短窗口+晚入睡数学上永无法还债。
+        # 顺延经 dynamic_sleep.latest_wake 传入会话 lie_in_cap_at，觉醒判定同口径。
+        extended_latest = window.latest_wake + timedelta(
+            minutes=debt_wake_extension_minutes(debt))
+        latest = min(extended_latest, cfg_cap)
         self._dynamic_view = {
             **parts, "band": band, "bedtime": window.bedtime.isoformat(),
             "window_start": window.start.isoformat(), "window_end": window.latest_start.isoformat(),
             "earliest_wake": window.earliest_wake.isoformat(), "latest_wake": latest.isoformat(),
             "wake_anchor": window.wake.isoformat(), "phase_minutes": phase,
             "peak_minute": peak, "onset_reason": reason,
-            "window_sets_cap": window.latest_wake <= cfg_cap,
+            "window_sets_cap": extended_latest <= cfg_cap,
             "decision": reason or ("hard_commitment" if due else "busy" if blocked else "waiting"),
         }
         return dict(self._dynamic_view) if reason else None
@@ -1841,7 +1887,12 @@ class SleepEngine:
         quality = sleep_quality(interrupted, total_window_minutes)
         debt_before = (session.sleep_debt_before if session.sleep_debt_before is not None
                        else self._debt_now())
-        debt_after = settle_sleep_debt(debt_before, actual_hours)
+        # 复核 P0-4：零债基准对齐配置作息窗口（会话 metadata 携带 sleep_min/wake_min），
+        # 短窗口用户睡满配置时长不再净增债；缺元数据回退 8.0 旧口径。
+        baseline = debt_baseline_hours(session.metadata.get("sleep_min"),
+                                       session.metadata.get("wake_min"))
+        debt_after = settle_sleep_debt(debt_before, actual_hours, baseline_hours=baseline)
+        session.metadata["debt_baseline_hours"] = round(baseline, 4)
         session.actual_end_minute = self._frame_minutes(now, session.schedule_date)
         session.wake_reason = reason
         session.continuous_minutes = int(round(

@@ -83,12 +83,16 @@ def classify_offline_gap(seconds: Any) -> str:
     return "overlong"
 
 
-def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0) -> Dict[str, Any]:
+def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0,
+                            *, baseline_hours: Any = 8.0) -> Dict[str, Any]:
     """按分级生成一次离线睡眠结算计划（纯函数；不触状态/不落盘/不发事件）。
 
     Args:
         gap_seconds: 原始离线 gap 秒数（未钳制；非法/负数按 grace 处理）。
         sleep_debt_before: 结算前睡眠债（小时，0~12；非法按 0）。
+        baseline_hours: 复核 P0-4：零债基准（与在线 settle 同口径，默认 8.0）——
+            短窗口用户离线睡满配置时长（≥基准）即按整晚规则结算，不再被 8h
+            硬门槛完全拒结。
 
     Returns:
         计划 dict（编排方据此落库/应用，键集固定）：
@@ -136,14 +140,24 @@ def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0) -> D
     effective_hours = effective_seconds / 3600.0
     unrecorded_seconds = max(0.0, gap - effective_seconds)
 
+    # 复核 P0-4：基准与在线 settle 同源（钳 [4,12]，非法回退 8.0）；long 的
+    # 结债门槛取 min(8h, 基准)，短窗口睡满配置时长即可结算（按比例公式）。
+    try:
+        baseline = max(4.0, min(12.0, float(baseline_hours)))
+    except (TypeError, ValueError):
+        baseline = 8.0
+    if baseline != baseline:  # NaN 防御
+        baseline = 8.0
     debt_settled = False
     sleep_debt_after = debt_before
-    if category == "long" and effective_hours >= DEBT_SETTLE_MIN_HOURS:
-        sleep_debt_after = settle_sleep_debt(debt_before, effective_hours)
+    if category == "long" and effective_hours >= min(DEBT_SETTLE_MIN_HOURS, baseline):
+        sleep_debt_after = settle_sleep_debt(debt_before, effective_hours,
+                                             baseline_hours=baseline)
         debt_settled = True
     elif category == "overlong":
-        # 有效时长恒 = 10h ≥ 8h：同 long 按整晚规则、按 10h 口径结算
-        sleep_debt_after = settle_sleep_debt(debt_before, effective_hours)
+        # 有效时长恒 = 10h：同 long 按整晚规则、按 10h 口径结算
+        sleep_debt_after = settle_sleep_debt(debt_before, effective_hours,
+                                             baseline_hours=baseline)
         debt_settled = True
 
     gains = integrate_sleep_gains(
