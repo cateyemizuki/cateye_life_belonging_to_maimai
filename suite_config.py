@@ -311,8 +311,13 @@ from suite_prompts import (
 # （描述去行为化/原型平静接管日常/生活反馈平衡）；代码默认与通用兜底逐字同步新种子；
 # BOM 容忍读；外层注入模板改轻量背景参考（去「保持一致」强制表演指令）；拆除日程块
 # 重复心情行（情绪底色统一由 Hook 承载、遵守 injection_enabled）；原因摘要默认不注入。
-# 不新增用户可见配置字段（schema 不变，18 段 202 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.29"
+# 3.17.30（2026-11-09 B 批陪伴行为）：P1-2 复活问候/主动发言后 miss 冷却闸
+# （max(60, anchor*30) 分钟内用户未接话不触发）；P1-3 含相对时间词的即时分享
+# TTL≤18h + 前缀剥离 + 双句号；P1-5 被动回复登记已发言（解 user_initiated 漏计）
+# + chat_round 60s/流节流；P1-7 想念概率接入好感档位(×0.9~1.1)与情绪 proactive_rate
+# （evaluate_miss 判定契约不动）。不新增用户可见配置字段（schema 不变，18 段 202
+# 叶子），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.30"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

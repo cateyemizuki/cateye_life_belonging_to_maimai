@@ -1,5 +1,10 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.30（2026-11-09）
+
+- B 批陪伴行为（依 `union/20261109_两份审查报告_独立复核结论.md` 坐实项）。**P1-2**：`_minutes_since_last_speak` 原为死代码（全仓无调用方），问候后 cooldown 闸已不存在——12:01 午安连发后 12:21 又因 miss 私聊。现 `_tick` 在沉默事实发布后、miss 候选前判定：距上次 Bot 主动开口（含问候）不足 `max(60, anchor_hours*30)` 分钟且用户尚未接话 → `done('recent_bot_spoke')` 不触发；用户已来信则不拦。**P1-3**：experience_share 含相对时间词（今天/明天/刚/今晚…）时 `ttl_hours=18`（`_motive_expires_at` 统一计算），防「明天约了…」跨日原样注入；注入前剥离 topic 已有「想找人聊聊：」前缀；`_append_intent_hint` 拼接前 rstrip 句末标点消「。。」。**P1-5**：`AffectionManager.note_bot_replied` 被动回复成功也刷新 `last_speak_time`（不占预算），replyer.after_response 对陪伴目标私聊（流 id 同 F6 口径）调用——解除 `user_initiated` 的 `prev_user>last_speak` 恒真误判；`chat_round` 按流 60s 最小间隔节流（`_chat_round_allowed`，滚动刷新，进程内），19 条连发不再 2 分钟刷满全天 +2.0。**P1-7**：`adjust_miss_probability` 在 patrol 消费侧接入好感档位（0..4 → ×0.9..1.1）与情绪 `proactive_rate`（0.8~1.2），钳 [0,1]；evaluate_miss 孤独锚点判定契约不动；决策日志增 affinity_tier/mood_proactive_rate；分享动机加成改为在调节后概率上叠加。
+- **红线保留**：无新增用户可见配置字段（schema 不变 18 段 202 叶子）；每日主动 5 次等限额不变；睡眠/硬约定/生理锚点权限不变；状态结算唯一链不变。版本双号 3.17.30；门禁/前批版本断言重钉 8 文件；新增专项 `scratch/test_review_b_31730.py`（14 例）；全套件 352/352；七门禁干净副本 7/7。**部署待授权**。
+
 ## 3.17.29（2026-11-09）
 
 - C 批 VAD 表达层第一批（依 `union/20261109_VAD轻量情绪注入_代码审查与修正建议.md` §6；种子来源=`default_mappings/EMOTION_OPTIMIZATION_REPORT.md` 并行会话定稿，此前仅存工作树未提交）。**种子三件**：`emotion_descriptions.json` 去行为化回归纯语感滤镜（25 标签+复杂难名全部重写）；`emotion_mapping.json` 平静接管日常中枢、怀旧收敛低唤醒、期待/好奇下放唤醒下限；`emotion_life_modulation.json` 平衡动力学（meal/deep_work 微增唤醒与支配、零食微活泼），四个 `4.1/4.2/4.4/4.5/4.6` 坐实项对应修复。**代码默认一致性**：`emotion/descriptions.py` DEFAULT_EMOTION_DESCRIPTIONS 25 标签+通用兜底逐字同步新种子（专项断言同源）；`generic_description` 改轻量背景心境口径；描述表读取改 `core.mapping_dir.read_json_text`（BOM 容忍，坏表/缺键回退不再回旧强文案）。**表达层**：`EMOTION_INJECTION_DEFAULT` 由「要求：语气、措辞、节奏与该情绪保持一致」改为「轻微心境参考——仅可轻微影响语气，以人设和当前对话为准，不据此添加话题/改变回复任务」；`{mood}` 自带句号、模板不再追加（消双句号）；删除 `InjectService._emotion_mood_line` 与日程块「精神状态：」行（原实现经 mood_text 兜底把百分比带进 planner 且绕过 injection_enabled），planner 情绪底色统一由 emotion Hook 承载；`emotion_reason_inject_enabled` 默认 True→False（普通闲聊不再每轮附加原因摘要，需要时面板开启）。
