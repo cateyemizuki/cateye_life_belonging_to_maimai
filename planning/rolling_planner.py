@@ -115,6 +115,9 @@ MEAL_WINDOWS: Tuple[Tuple[int, int], ...] = (
     (6 * 60 + 30, 9 * 60 + 30), (11 * 60 + 30, 13 * 60 + 30), (17 * 60 + 30, 19 * 60 + 30))
 #: 同窗已有用餐 episode 的判定窗（餐后 N 分钟内不再排正餐）
 MEAL_REPEAT_GUARD_MINUTES = 180
+#: P0（2026-11-09）：软意图有限提前弹性（分钟）。horizon 仅用于前瞻/预告/冲突判断，
+#: 不默认授权把晚些时候的意图提前整段执行；确需弹性提前仅在此有限窗内。
+SOFT_INTENT_EARLY_MINUTES = 10
 #: 各类型精力需求位（energy_fit 用：精力低于需求 → 降分；rest/idle/meal 需求最低）
 ENERGY_DEMAND: Dict[str, float] = {
     "work": 0.7, "study": 0.7, "exercise": 0.6, "entertainment": 0.4,
@@ -1098,7 +1101,9 @@ class RollingPlanner:
         if not self._replan_allowed(now):
             return
         self._note_replan(now)
-        self._finish_episode(current, now, snapshot, reason="hunger_threshold")
+        # P0：提前收尾写当时的实际终点（cur），不回退计划终点造成与下一条重叠/记到未来。
+        self._finish_episode(current, now, snapshot, actual_end_minute=cur,
+                             reason="hunger_threshold")
         report["actions"].append("force_break_hunger")
 
     # ── 步 3：硬约定（提前 15 分钟预警 / 到点抢占 / 错过如实登记）─────────
@@ -1399,6 +1404,36 @@ class RollingPlanner:
                 end = row.get("planned_end_minute")
             try:
                 if end is not None and 0 <= cur - int(end) <= MEAL_REPEAT_GUARD_MINUTES:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def _meal_intent_satisfied(self, date: str, cur: int, cand: Dict[str, Any]) -> bool:
+        """P0（2026-11-09）：跨来源餐食语义去重——近期已用餐，或同餐次（早/午/晚）已有
+        用餐 episode（anchor 或意图）完成/进行中，则不再排该 meal 意图（已吃早餐不被后续
+        早餐意图强制再吃）；紧急饥饿保护仍由状态阈值链保留，不在此绕过。"""
+        if self._recent_meal_today(date, cur):
+            return True
+
+        def part(m: int) -> int:
+            return 0 if m < 600 else (1 if m < 900 else 2)
+
+        ws = int((cand.get("window") or (0, 0))[0])
+        try:
+            rows = self._db.episodes_today(date)
+        except Exception:
+            return False
+        for row in rows:
+            if str(row.get("goal_type")) != "meal":
+                continue
+            if row.get("status") not in ("completed", "active"):
+                continue
+            start = row.get("actual_start_minute")
+            if start is None:
+                start = row.get("planned_start_minute")
+            try:
+                if start is not None and part(int(start)) == part(ws):
                     return True
             except (TypeError, ValueError):
                 continue
@@ -1855,8 +1890,11 @@ class RollingPlanner:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         chosen, _score, top = self._choose_candidate(scored, snapshot, cur, rng)
         top_ids = {id(c) for _s, c in top}
-        order: List[Dict[str, Any]] = [c for _s, c in top]
-        order += [c for _s, c in scored if id(c) not in top_ids]
+        # P0（2026-11-09 滚动日程计划）：有效抽中项必须排启动首位，确实无法启动才进入
+        # 有序后备（修复抽样结果被按分数头部忽略的确定缺陷）。
+        order: List[Dict[str, Any]] = [chosen] if chosen is not None else []
+        order += [c for _s, c in top if id(c) != id(chosen)]
+        order += [c for _s, c in scored if id(c) not in top_ids and id(c) != id(chosen)]
         seen_ids: set = set()
         for cand in order:
             if id(cand) in seen_ids:
@@ -1864,6 +1902,14 @@ class RollingPlanner:
             seen_ids.add(id(cand))
             if cand["kind"] == "commitment" and cand["window"] and cand["window"][0] > cur:
                 continue  # 硬约定时间固定：不到点不开播（tick 步 3 到点处理，红线 2）
+            # P0：软意图前瞻入围但不到可执行窗（仅有限弹性）→ 不提前消耗晚些时候的内容。
+            if cand["kind"] == "intent" and cand.get("window") \
+                    and cur < cand["window"][0] - SOFT_INTENT_EARLY_MINUTES:
+                continue
+            # P0：跨来源餐食去重——近期已用餐/同餐次已满足则不再排该 meal 意图。
+            if cand["kind"] == "intent" and str(cand.get("goal_type")) == "meal" \
+                    and self._meal_intent_satisfied(date, cur, cand):
+                continue
             duration = self._sample_block(cand, snapshot, cur, boundary, rng)
             if duration is None:
                 continue
@@ -2241,8 +2287,9 @@ class RollingPlanner:
         rate = self._cfg_float("random_event_rate", DEFAULT_RANDOM_EVENT_RATE)
         if rate <= 0 or rng.random() >= rate:
             return False
-        if self._random_used >= max(1, self._cfg_int("max_random_events_per_day",
-                                                     DEFAULT_MAX_RANDOM_EVENTS_PER_DAY)):
+        # P0：0 必须真正禁用（原 max(1,…) 使 0 仍触发一次）；旧值 0 的禁用意图保留。
+        limit = self._cfg_int("max_random_events_per_day", DEFAULT_MAX_RANDOM_EVENTS_PER_DAY)
+        if limit <= 0 or self._random_used >= limit:
             return False
         catalog = getattr(self, "_event_catalog", None)
         event: Optional[Dict[str, Any]] = None
