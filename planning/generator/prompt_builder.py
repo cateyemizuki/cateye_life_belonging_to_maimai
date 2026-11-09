@@ -150,6 +150,7 @@ class PromptBuilder:
         holiday_context: Optional[str] = None,
         experience_context: str = "",
         motive_context: str = "",
+        preference_context: str = "",
     ) -> str:
         """构建 spine 日意图提示词（设计 §4.2 精简口径）。
 
@@ -279,6 +280,15 @@ Schema: {json.dumps(schema, ensure_ascii=False)}
 【近期持续动机参考】
 以下是 bot 当前少量短中期动机（只作今日意图的灵感与倾向参考，不是必须执行的任务；状态不佳时可以不做）：
 {motive_context}
+"""
+
+        # P3（2026-11-09 §14.8）：少量稳定口味摘要注入变量区，帮助生成符合口味
+        # 的日意图；复用现有生成请求，不另跑请求、不重复整份人设。空串=不注入。
+        if preference_context:
+            prompt += f"""
+【稳定口味参考】
+{preference_context}
+（只作倾向参考，据此安排更贴合 bot 口味的意图；不构成必须执行的任务，也不改变约定与生理锚点。）
 """
 
         if pending_commitments:

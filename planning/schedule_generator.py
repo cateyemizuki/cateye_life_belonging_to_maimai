@@ -404,6 +404,7 @@ class ScheduleGenerator:
         self._load_low_mood(base)
         self._load_experience_context(base)
         self._load_motive_context(base)
+        self._load_preference_context(base)
         await self._load_holiday_context(base, date)
         await self._load_async_contexts(base, gen_config, date)
 
@@ -459,6 +460,14 @@ class ScheduleGenerator:
         else:
             self._replace_with_entry(date, rows, entry_reason)
         logger.info("spine 日意图生成完成：%s 共 %d 条", date, len(rows))
+        # P3（2026-11-09 §14.4）：日意图成功更新 → 合并安排偏好增量批次（fire-and-
+        # forget，非阻塞；受每日 ≤4/退避/忙闲门控；普通滚动 tick 不走此入口）。
+        refresher = getattr(self._plugin, "schedule_preference_refresh", None)
+        if callable(refresher):
+            try:
+                refresher()
+            except Exception:
+                logger.debug("日程偏好增量刷新触发失败（忽略）", exc_info=True)
         await self._publish("schedule.generated", date=date, items=len(rows))
         return rows
 
@@ -903,6 +912,20 @@ class ScheduleGenerator:
         except Exception as exc:
             base.motive_context = ""
             logger.debug("近期动机上下文装载失败（忽略）: %s", exc)
+
+    def _load_preference_context(self, base: BaseScheduleGenerator) -> None:
+        """P3（2026-11-09 §14.8）：经插件公开只读端口取稳定口味摘要注入 spine
+        变量区。纯读缓存——不触发评估请求；端口缺失/关闭/失败/为空 → 空串不注入
+        （空降级，旧行为逐字不变）。复用现有生成请求，不另跑请求。"""
+        base.preference_context = ""
+        try:
+            getter = getattr(self._plugin, "preference_context_summary", None)
+            if not callable(getter):
+                return
+            base.preference_context = str(getter() or "")
+        except Exception as exc:
+            base.preference_context = ""
+            logger.debug("稳定口味上下文装载失败（忽略）: %s", exc)
 
     async def _load_async_contexts(
         self, base: BaseScheduleGenerator, gen_config: ScheduleGeneratorConfig, date: str

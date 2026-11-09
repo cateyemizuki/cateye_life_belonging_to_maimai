@@ -954,6 +954,55 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 self.ctx.logger.warning('持续动机装配失败（纯旁路，忽略）：%s', type(exc).__name__)
                 motive_store = None
             self._motive_store = motive_store
+            # P3（2026-11-09 §14）：日程偏好纯旁路装配——稳定人设倾向 + 逐活动喜好
+            # 只改软候选权重与 spine 变量区；装配失败保守停用（None → planner 偏好
+            # 分支整体旁路，旧行为逐字不变）。人设真源 = 宿主 personality（与 LLM
+            # 身份前缀同源）；普通滚动/页面纯读缓存不发请求；请求只在初始化/显式
+            # 重建/定义更新时合并安排（每本地日 ≤4、单批 ≤24、退避 ≥30min）。
+            activity_prefs = None
+            try:
+                from planning.activity_preferences import ActivityPreferencesService
+
+                def _pref_definitions() -> list:
+                    defs: list = []
+                    cat = getattr(getattr(self, "_planning", None), "event_catalog", None)
+                    if cat is not None:
+                        try:
+                            store = getattr(cat, "store", cat)
+                            defs.extend(dict(e) for e in (store.active_events or [])
+                                        if isinstance(e, dict))
+                        except Exception:
+                            pass
+                    rp = getattr(self, "_rolling_planner", None)
+                    if rp is not None:
+                        try:
+                            day = rp._date_of(rp._now())
+                            defs.extend(dict(c) for c in rp._spine_intents_cached(day))
+                        except Exception:
+                            pass
+                    return defs
+
+                def _pref_busy() -> bool:
+                    engine = getattr(self, "_sleep_engine", None)
+                    try:
+                        if engine is not None and engine.is_asleep() is True:
+                            return True
+                    except Exception:
+                        return True  # 忙闲未知 → 保守推迟自动增量
+                    return False
+
+                activity_prefs = ActivityPreferencesService(
+                    self._data_dir,
+                    persona_provider=lambda: str(getattr(self, "_personality", "") or ""),
+                    llm=self._llm,
+                    definitions_provider=_pref_definitions,
+                    enabled_provider=lambda: bool(getattr(self.config.schedule, "enabled", False)),
+                    busy_provider=_pref_busy,
+                    decision_logger=getattr(self, "_decision_logger", None))
+            except Exception as exc:
+                self.ctx.logger.warning('日程偏好装配失败（纯旁路，忽略）：%s', type(exc).__name__)
+                activity_prefs = None
+            self._activity_preferences = activity_prefs
             planner = RollingPlanner(
                 self._db, life,
                 config_provider=lambda: self.config, event_bus=getattr(self, "_bus", None),
@@ -969,7 +1018,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 goal_manager=getattr(getattr(self, "_planning", None), "goal_manager", None),
                 motive_store=motive_store,
                 # P1（2026-11-09 滚动日程计划）：事件冷却/当日用量/联动配额持久目录
-                data_dir=self._data_dir)
+                data_dir=self._data_dir,
+                # P3（2026-11-09 §14）：日程偏好只读端口（None = 偏好分支整体旁路）
+                activity_preferences=activity_prefs)
             engine: SleepEngine | None = None
             restored: Any = None
             # PR8 3.0.0：睡眠引擎随 [schedule].enabled 装配（旧 sleep_engine_enabled
@@ -1686,6 +1737,74 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             return store.summary_lines(limit=max(1, min(4, int(limit))))
         except Exception:
             return []
+
+    def preference_context_summary(self) -> str:
+        """P3（2026-11-09 §14.8）：planning 有界只读消费端口——稳定口味摘要
+        （spine 提示词变量区）。纯读缓存，不触发评估请求；未装配/关闭/失败/为空
+        → 空串（调用方空降级不注入）。"""
+        prefs = getattr(self, '_activity_preferences', None)
+        if prefs is None:
+            return ""
+        try:
+            return str(prefs.summary_for_prompt() or "")
+        except Exception:
+            return ""
+
+    def activity_preferences_status(self) -> Dict[str, Any]:
+        """P3：只读诊断（人设/定义版本、命中/降级/待评估数量、实际 Token/次数）。
+        查看诊断不清空计数、不重建偏好、不发请求。"""
+        prefs = getattr(self, '_activity_preferences', None)
+        if prefs is None:
+            return {"enabled": False, "assembled": False}
+        try:
+            return prefs.status()
+        except Exception as exc:
+            return {"enabled": False, "error": type(exc).__name__}
+
+    async def _initialize_activity_preferences(self, *, force: bool = False) -> Dict[str, Any]:
+        """P3（§14.8）：初始化/管理员重建入口（InitService 偏好阶段调用）。
+
+        默认命中缓存（force=False）；明确重建（force=True）才换本人人设画像。
+        不顺带清空视频兴趣、陪伴联系倾向或历史回执。未装配 → unavailable。
+        """
+        prefs = getattr(self, '_activity_preferences', None)
+        if prefs is None:
+            return {"status": "unavailable"}
+        try:
+            return await prefs.ensure_evaluated(force=force)
+        except Exception as exc:
+            self.ctx.logger.warning('日程偏好初始化失败（中性降级）：%s', type(exc).__name__)
+            return {"status": "failed", "error": type(exc).__name__}
+
+    def schedule_preference_refresh(self) -> None:
+        """P3（§14.4）：日意图/事件库成功更新后合并安排增量批次（fire-and-forget）。
+
+        非阻塞、单飞（服务内 asyncio.Lock）；受每日 ≤4/退避/忙闲门控约束，普通
+        滚动 tick 与页面读取绝不调用此入口。无运行中事件循环 → 静默跳过。
+        """
+        prefs = getattr(self, '_activity_preferences', None)
+        if prefs is None:
+            return
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        except Exception:
+            return
+
+        async def _run() -> None:
+            try:
+                await prefs.ensure_evaluated()
+            except Exception as exc:
+                try:
+                    self.ctx.logger.debug('日程偏好增量评估失败（忽略）：%s', type(exc).__name__)
+                except Exception:
+                    pass
+        try:
+            loop.create_task(_run())
+        except Exception:
+            pass
 
     def _record_video_result(self, result: dict, episode_id: str) -> bool:
         """观看完成双路记录（PR-A0）：聊天分享候选 + 空间视频候选，互不拖累。

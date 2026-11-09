@@ -62,7 +62,9 @@ SUMMARY_VERSION = 1
 SUMMARY_HISTORY_LIMIT = 5
 
 #: 业务阶段顺序（preflight / summary 为框架阶段，不计入四阶段 DoD）
-STAGE_ORDER: Tuple[str, ...] = ("emotion", "events", "state_sleep", "frequency", "video_interest", "companion_disposition")
+#: P3（2026-11-09 §14.8）：activity_preferences 可独立标记成功/降级/失败，
+#: 先失败不阻塞情绪/日程整个初始化（_execute 逐阶段捕获异常继续）。
+STAGE_ORDER: Tuple[str, ...] = ("emotion", "events", "state_sleep", "frequency", "video_interest", "companion_disposition", "activity_preferences")
 
 #: 当前 ``life_state.json`` 的完整字段及缺失时的最小默认值。
 #: **唯一真源 = planning.life_state.default_state_document()**（与服务 save() 共用
@@ -324,6 +326,7 @@ def _stage_label(name: str) -> str:
         "frequency": "目标频率",
         "video_interest": "刷视频偏好",
         "companion_disposition": "联系倾向",
+        "activity_preferences": "日程偏好",
         "summary": "汇总",
     }.get(name, name or "阶段")
 
@@ -1472,6 +1475,32 @@ class InitService:
                                                     'anchor_hours': profile.get('anchor_hours'),
                                                     'loneliness': profile.get('loneliness')})
                     plan.append(('companion_disposition', disposition_stage))
+
+            # P3（2026-11-09 §14.8）：日程偏好阶段——可独立标记成功/降级/失败；
+            # 初始画像可先供日意图生成，活动定义就绪后补逐项评估。先失败不阻塞
+            # 情绪/日程整个初始化（下方逐阶段捕获异常继续）。默认命中缓存，
+            # 明确重建（manual）才换本人人设画像。
+            if command == "full":
+                pref_initializer = getattr(self._plugin, '_initialize_activity_preferences', None)
+                if callable(pref_initializer):
+                    async def preferences_stage() -> StageResult:
+                        result = await pref_initializer(force=bool(manual))
+                        state = str(result.get('status') or 'unavailable')
+                        ok_states = ('ok', 'partial', 'cached')
+                        stage_state = ('success' if state in ok_states
+                                       else 'skipped' if state in ('disabled', 'no_llm', 'deferred_busy')
+                                       else 'failed')
+                        return StageResult('activity_preferences', stage_state,
+                                           message=(f"日程偏好就绪（评估 {result.get('evaluated', 0)} 项）"
+                                                    if stage_state == 'success'
+                                                    else '日程偏好未启用或暂缓（中性降级，不阻塞日程）'
+                                                    if stage_state == 'skipped'
+                                                    else '日程偏好评估失败（中性降级，旧有效画像保留）'),
+                                           reason=state,
+                                           details={'evaluated': result.get('evaluated', 0),
+                                                    'traits': result.get('traits', False),
+                                                    'tokens': result.get('tokens', 0)})
+                    plan.append(('activity_preferences', preferences_stage))
 
             cancelled_stage = ""
             for name, factory in plan:

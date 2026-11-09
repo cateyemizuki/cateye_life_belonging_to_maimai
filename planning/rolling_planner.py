@@ -48,6 +48,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.time_utils import minutes_of_now
 
 from . import activity_profiles
+from .activity_preferences import interest_bonus
 from .circadian import nap_reason
 from .goal_manager import GoalStatus
 from .motives import MOTIVE_BONUS_RATIO
@@ -136,6 +137,12 @@ IDLE_PENALTY_START_MINUTES = 10.0
 #: 每多待机 5 分钟追加的降权（线性递增，上限 IDLE_PENALTY_MAX）。
 IDLE_PENALTY_PER_5_MIN = 0.15
 IDLE_PENALTY_MAX = 0.9
+#: P3 §14.6：偏好只施加给可行软候选（硬约定/生理锚点/睡眠/idle 不参与偏好竞争）。
+PREFERENCE_SOFT_KINDS = frozenset({"intent", "event", "resume", "continuation", "anchor_rest"})
+#: P3 §14.6：普通候选约 10% 受控探索（在合法替代项中；不绕过时间/状态/次数限制）。
+EXPLORATION_RATE = 0.10
+#: P3 §14.6：偏好时长微调——采样中心移动不超过区间宽度的 15%（不扩展 min/max）。
+PREFERENCE_DURATION_SHIFT_RATIO = 0.15
 #: 各类型精力需求位（energy_fit 用：精力低于需求 → 降分；rest/idle/meal 需求最低）
 ENERGY_DEMAND: Dict[str, float] = {
     "work": 0.7, "study": 0.7, "exercise": 0.6, "entertainment": 0.4,
@@ -363,11 +370,15 @@ class RollingPlanner:
                  goal_manager: Any = None,
                  motive_store: Any = None,
                  continuity_keywords_provider: Optional[Callable[[], Any]] = None,
-                 data_dir: Any = None) -> None:
+                 data_dir: Any = None,
+                 activity_preferences: Any = None) -> None:
         self._db = db
         self._life = life_state
         # P1（2026-11-09）：事件冷却/当日用量持久目录（None = 仅进程内，测试桩口径）
         self._data_dir = data_dir
+        # P3（2026-11-09 §14）：日程偏好只读端口（None = 未装配 → 偏好分支整体
+        # 旁路，旧行为逐字不变）；planner 绝不通过它发请求。
+        self._activity_preferences = activity_preferences
         self._config_provider = config_provider
         self._bus = event_bus
         self._decision_logger = decision_logger
@@ -1888,9 +1899,11 @@ class RollingPlanner:
             if idle_min >= IDLE_PENALTY_START_MINUTES:
                 steps = (idle_min - IDLE_PENALTY_START_MINUTES) / 5.0 + 1.0
                 score -= min(IDLE_PENALTY_MAX, IDLE_PENALTY_PER_5_MIN * steps)
-        # PR-B2（规格 §2）：持续动机只改候选权重——motive_bonus ≤15% 基础分，
-        # 不匹配候选加成为 0（探索概率保留）；不穿透睡眠/硬约定/注意力/预算
-        # （那些判定在 tick 步 3/5 与本公式之外，动机无权触碰）。
+        # PR-B2（规格 §2）+ P3（§14.6）：持续动机与稳定偏好只改候选权重，受联合
+        # 上限约束；状态适配已在 base 算一次，不重复奖励。偏好只施加给通过门控
+        # 的可行软候选——硬约定/正式睡眠/紧急生理保护不受偏好竞争；不穿透
+        # 睡眠/硬约定/注意力/预算（那些判定在 tick 步 3/5 与本公式之外）。
+        motive_add = 0.0
         store = self._motive_store
         if store is not None:
             try:
@@ -1898,8 +1911,23 @@ class RollingPlanner:
             except Exception:
                 ratio = 0.0
             ratio = max(0.0, min(MOTIVE_BONUS_RATIO, ratio))
-            if ratio > 0.0:
-                score += ratio * max(score, 0.0)
+            motive_add = ratio * max(score, 0.0)
+        pref_affinity = 0.0
+        prefs = getattr(self, "_activity_preferences", None)
+        if prefs is not None and c.get("kind") in PREFERENCE_SOFT_KINDS:
+            try:
+                pref_affinity = _clamp(float(prefs.preference_for(c).get("affinity", 0.0)),
+                                       -1.0, 1.0)
+            except Exception:
+                pref_affinity = 0.0
+        if motive_add > 0.0 or pref_affinity != 0.0:
+            score += interest_bonus(pref_affinity, motive_add)
+        # P3 §14.6：最近重复项逐步降权（做得多不等于更喜欢；冷却仍是独立硬限制）。
+        if c.get("kind") == "event":
+            used = int((getattr(self, "_event_day_counts", None) or {})
+                       .get(str(c.get("event_id") or ""), 0) or 0)
+            if used > 1:
+                score -= min(0.20, 0.05 * (used - 1))
         return score
 
     # ── 抽取原因人话化（3.17.7 改进1：纯旁路展示，0 LLM，不改打分/选择）──
@@ -2067,6 +2095,11 @@ class RollingPlanner:
         guarded = self._meal_priority_candidate(scored, snapshot, cur)
         if guarded is not None:
             return guarded[1], guarded[0], [guarded]
+        # P3 §14.6：约 10% 受控探索——在合法替代项（已过可行性过滤）中探索；
+        # 启动循环仍逐项核窗口/最小块，探索不绕过时间/状态/次数限制。
+        if len(scored) > 3 and rng.random() < EXPLORATION_RATE:
+            pick_score, pick_cand = rng.choice(scored[3:])
+            return pick_cand, pick_score, scored[:3]
         temperature = max(0.01, self._cfg_float("sampling_temperature",
                                                 DEFAULT_SAMPLING_TEMPERATURE))
         # top2-3 softmax 加权采样（不是 argmax）；选中候选不可启（min_block 不足 /
@@ -2108,7 +2141,24 @@ class RollingPlanner:
             lo = int(c.get("min_minutes") or 0) or 3
             hi = int(c.get("max_minutes") or 0) or max(lo, 30)
             hi = max(hi, lo)
-            duration = rng.randint(lo, hi)
+            # P3 §14.6：偏好在同一事件合法时长区间内温和偏向长/短端——采样中心
+            # 移动 ≤ 区间宽度 15%；不扩展 min/max、不推迟硬约定或睡眠。
+            shift = 0.0
+            prefs = getattr(self, "_activity_preferences", None)
+            if prefs is not None and hi > lo:
+                try:
+                    pref = prefs.preference_for(c)
+                    if pref.get("source") in ("llm", "rule_fallback"):
+                        shift = (_clamp(float(pref.get("affinity", 0.0)), -1.0, 1.0)
+                                 * PREFERENCE_DURATION_SHIFT_RATIO * (hi - lo))
+                except Exception:
+                    shift = 0.0
+            if shift != 0.0:
+                center = (lo + hi) / 2.0 + shift
+                duration = int(round(rng.gauss(center, max(1.0, (hi - lo) / 4.0))))
+                duration = max(lo, min(hi, duration))
+            else:
+                duration = rng.randint(lo, hi)
             if window is not None:
                 duration = min(duration, window)
             if duration < lo:

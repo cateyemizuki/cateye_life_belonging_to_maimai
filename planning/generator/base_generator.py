@@ -50,6 +50,8 @@ class BaseScheduleGenerator:
         #: PR-B2（2026-11-07）：≤4 条持续动机摘要行（MotiveStore 有界只读端口装载；
         #: 空串=不注入，行为与旧版逐字一致——失败/为空/开关关闭一律空降级）
         self.motive_context: str = ""
+        #: P3（2026-11-09 §14.8）：稳定口味摘要（偏好服务只读端口装载；空串=不注入）
+        self.preference_context: str = ""
         self.config: Dict[str, Any] = config or {}  # 保存配置
 
         # 初始化时区管理器
@@ -94,4 +96,5 @@ class BaseScheduleGenerator:
             holiday_context=self.holiday_context,
             experience_context=self.experience_context,
             motive_context=self.motive_context,
+            preference_context=self.preference_context,
         )
