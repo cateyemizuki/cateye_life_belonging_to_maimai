@@ -1065,6 +1065,16 @@ class AffectionManager:
         self._state["last_speak_time"] = datetime.now().isoformat()
         self._mark_dirty()
 
+    def note_bot_replied(self, now: Optional[datetime] = None) -> None:
+        """复核 P1-5：被动回复成功也登记为「已发言」（只刷时间戳、不占预算）。
+
+        原实现仅主动回合（increment_speak/note_greeting_spoke/note_optional_spoke）
+        写 last_speak_time；被动聊天后 ``user_initiated`` 的
+        ``prev_user > last_speak`` 恒真被判 already_answered，沉默后再开口永远漏计。
+        """
+        self._state["last_speak_time"] = (now or datetime.now()).isoformat()
+        self._mark_dirty()
+
     def note_greeting_spoke(self) -> None:
         """问候（早/午/晚安）成功开口 → 仅刷新 ``last_speak_time``（**免预算**：不增
         ``today_speak_count``，问候豁免口径不变）。

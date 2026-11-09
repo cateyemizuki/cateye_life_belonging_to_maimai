@@ -556,8 +556,12 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                                                      stream_kind=stream_kind)
             if is_target and stream_kind != "group":
                 # 会话类型未知时按私聊兜底（与旧实现一致：group_info 缺失视为私聊）
-                companion.affection.update_last_user_msg_time(datetime.now())
-                companion.affection.record_rule_event("chat_round", None, "与 target 一问一答")
+                now = datetime.now()
+                companion.affection.update_last_user_msg_time(now)
+                # 复核 P1-5：chat_round 加 60s/流节流——原实现每条消息直接计数，
+                # 19 条连发 2 分钟即刷满全天 +2.0；现静默 60s 后的问答才计一次。
+                if self._chat_round_allowed(str(_session_id or ""), now):
+                    companion.affection.record_rule_event("chat_round", None, "与 target 一问一答")
                 self._mai_note_review_round(companion, message)
         except Exception:
             pass
@@ -892,6 +896,15 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if companion is None:
             return
         self._mai_chat_social_drain(kwargs, companion)
+        # 复核 P1-5：陪伴目标私聊的被动回复也登记「已发言」——原实现只在主动回合
+        # 刷 last_speak_time，致 user_initiated 的 prev_user>last_speak 恒真被判
+        # already_answered（沉默后再开口永久漏计）。
+        _reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
+        _target_stream = str(companion.patrol.patrol_status().get("stream_id") or "").strip()
+        if _reply_stream and _target_stream and _reply_stream == _target_stream:
+            _notify = getattr(companion.affection, "note_bot_replied", None)
+            if callable(_notify):
+                _notify(datetime.now())
         patrol = companion.patrol
         last_trigger = patrol.get_last_trigger_time()
         if last_trigger is None:
@@ -918,6 +931,20 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     #: 同一回复重试/重复派发 after_response；同 (流, 回复指纹) 窗内只施加一次。
     #: 窗外合法重复的同文案回复不受影响（episode 回执 id 带单调时间戳逐次唯一）。
     _CHAT_SOCIAL_DRAIN_DEDUP_SECONDS = 10.0
+
+    def _chat_round_allowed(self, stream_id: str, now: datetime) -> bool:
+        """复核 P1-5：chat_round 每流 60s 最小间隔（进程内节流，重启从头计）。
+
+        返回 True = 本次允许记一轮；无论允许与否都刷新该流时间戳（滚动节流）。
+        """
+        throttle = getattr(self, "_chat_round_last", None)
+        if not isinstance(throttle, dict):
+            throttle = {}
+            self._chat_round_last = throttle
+        key = str(stream_id or "")
+        prev = throttle.get(key)
+        throttle[key] = now
+        return prev is None or (now - prev).total_seconds() >= 60.0
 
     def _mai_chat_social_drain(self, kwargs: dict[str, Any], companion: Any) -> None:
         """陪伴目标私聊真实回复消耗社交电量（PR-REALISM-TUNING 3.17.20 §1A）。
