@@ -90,7 +90,7 @@ class EmotionSectionConfig(PluginConfigBase):
     # emotion_mapping.json 的 multipliers 覆盖优先级不变，见 _merged_multiplier）。
     injection_enabled: bool = Field(
         default=True,
-        description="把当前情绪底色（模糊化描述）注入 replyer 提示词，引导语气与情绪一致",
+        description="把当前情绪底色（模糊化描述）作为轻微心境参考注入提示词，不强制语气与情绪一致",
         json_schema_extra={"label": "情绪底色注入", **_ui_i18n("Mood injection")},
     )
     # ── PR-C1 H4（2026-11-07）：短期情绪原因时效（只作解释，不二次加减 VAD）──────

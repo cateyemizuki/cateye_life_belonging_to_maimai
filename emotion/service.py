@@ -2134,9 +2134,9 @@ class EmotionService:
         - ``n == 0``（含 no_sleep_mode 静默/未被吵醒的夜）→ **不入账、不落 settled 日志**，
           返回 None；
         - **零 LLM**（模板直记）：整条路径没有模型调用；
-        - **不破坏落盘护栏**：入账会把 ``emotion_state.json`` 重写（``_save_state`` 只写状态机 +
-          episode），故本方法先留 ``applied_sleep_date`` 原值、入账后补回（F6「同周期不重复结算」
-          的落盘护栏语义不变；不新增任何状态字段）。
+        - **不破坏落盘护栏**：入账会把 ``emotion_state.json`` 重写；P2-4d 起
+          ``_save_state`` 覆盖式合并读盘并保留 ``applied_sleep_date``（冗余的
+          「先留原值、入账后补回」guard 已删），「同周期不重复结算」语义不变。
 
         Args:
             now: 结算时刻（醒沿）。
