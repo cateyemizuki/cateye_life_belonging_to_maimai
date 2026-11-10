@@ -86,6 +86,8 @@ EXPERIENCE_SHARE_RECENCY_HOURS = 24.0
 EXPERIENCE_SHARE_STRENGTH_CAP = 0.6
 #: 复核 P1-3：含相对时间词（今天/明天/刚…）的即时分享最长存活 18h——
 #: 跨自然日后原样注入会让模型把历史文本里的「明天」当成今天的明天。
+#: 复核 CF-3（E 批）：该 18h 必须锚定**经历 created_at**，且相对时间词经历超过
+#: 18h 不再参与派生——否则 18h 到期后仍可在 24h 经历窗内重生同一 seed（最长≈36h）。
 EXPERIENCE_SHARE_RELATIVE_TTL_HOURS = 18.0
 
 #: 相对时间词（保守集合：只拦明显会随日期失真的词）
@@ -103,10 +105,26 @@ def _has_relative_time_words(text: Any) -> bool:
 
 
 def _motive_expires_at(created: datetime, seed: Dict[str, Any], half_life_days: float) -> datetime:
-    """动机到期时间：seed 显式 ttl_hours 优先（相对时间词分享 18h），否则默认 3 倍半衰期。"""
+    """动机到期时间：seed 显式 ttl_hours 优先（相对时间词分享 18h），否则默认 3 倍半衰期。
+
+    CF-3：seed 可带 ``ttl_anchor_ts``（来源经历的 created_at，epoch 秒）——TTL 从
+    经历创建时刻起算，而不是从动机派生时刻起算；否则 18h 到期后重新派生会重置
+    起点，同一经历最长可活 ≈36h。锚点缺失/非法 → 仍按动机 created 起算（旧契约）。
+    """
     ttl = seed.get("ttl_hours")
-    if isinstance(ttl, (int, float)) and float(ttl) > 0:
-        return created + timedelta(hours=float(ttl))
+    if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and float(ttl) > 0:
+        anchor = created
+        raw_anchor = seed.get("ttl_anchor_ts")
+        if isinstance(raw_anchor, (int, float)) and not isinstance(raw_anchor, bool):
+            try:
+                anchor_ts = float(raw_anchor)
+                if math.isfinite(anchor_ts):
+                    candidate = datetime.fromtimestamp(anchor_ts, tz=created.tzinfo)
+                    if candidate < anchor:
+                        anchor = candidate  # 只提前、不延长（防御时钟回拨/未来值）
+            except (OverflowError, OSError, ValueError):
+                pass
+        return anchor + timedelta(hours=float(ttl))
     return created + timedelta(days=EXPIRE_HALF_LIVES * half_life_days)
 
 #: 合法来源类别（规格 §2：goal_id / experience_id / state 驱动；PR-C1 +experience_share）
@@ -302,7 +320,14 @@ class MotiveStore:
             })
         return out
 
-    def _derive_from_experiences(self, now: datetime) -> List[Dict[str, Any]]:
+    def _derive_from_experiences(self, now: datetime,
+                                 share_deadlines: Optional[Dict[str, datetime]] = None
+                                 ) -> List[Dict[str, Any]]:
+        """经历来源派生；``share_deadlines`` 非 None 时回填相对词分享的到期上限。
+
+        CF-3：上限 = 经历 created_at + 18h（source_ref → datetime），供 refresh 一并
+        钳制**旧版落盘**的 experience_share 动机，保证其不会活过经历 18h。
+        """
         if self._experience_provider is None:
             return []  # B1 索引缺失 → 空降级（规格 §4）
         try:
@@ -323,25 +348,55 @@ class MotiveStore:
             if not exp_id or not topic:
                 continue
             salience = _unit(row.get("salience"), 0.5)
+            relative = _has_relative_time_words(topic)
+            if relative and tier in ("observed", "published") \
+                    and share_deadlines is not None:
+                # CF-3：先登记到期上限（不依赖 recency/salience 是否仍达标），
+                # 让旧版已落盘的 18h 动机也能被钳制到经历 created_at + 18h。
+                created_ts = self._experience_created_ts(row)
+                if created_ts is not None:
+                    try:
+                        share_deadlines[exp_id] = datetime.fromtimestamp(
+                            created_ts, tz=now.tzinfo) + timedelta(
+                                hours=EXPERIENCE_SHARE_RELATIVE_TTL_HOURS)
+                    except (OverflowError, OSError, ValueError):
+                        pass
             # PR-C1 H5：「刚完成值得分享的事」——published/observed 高 salience 且在
             # 近期窗内 → 提升为 experience_share（想找人聊聊）；同一经历只占一条动机
             # （不重复派生 experience + experience_share）。created_at 缺失/不可解析
             # → 不视为「刚完成」（保守回落 B2 experience 来源）。开关关闭 = 现状。
+            # CF-3：相对时间词的分享用 18h 窗（与非相对 24h 窗分开），超窗不再派生；
+            # 且到期锚定经历 created_at + 18h（见 _motive_expires_at）。
             if share_enabled and tier in ("observed", "published") \
-                    and salience >= EXPERIENCE_SHARE_SALIENCE_MIN \
-                    and self._is_recent_experience(row, now):
-                out.append({
-                    "topic": _clip("想找人聊聊：" + topic, 80),
-                    "source_kind": "experience_share", "source_ref": exp_id,
-                    "base_strength": min(EXPERIENCE_SHARE_STRENGTH_CAP,
-                                         0.3 + 0.3 * salience),
-                    "goal_types": ["social"], "keywords": ["聊"],
-                    # 复核 P1-3：含相对时间词的即时感受只活到当晚/18h，防止
-                    # 「明天约了…」跨日原样注入造成时空错乱。
-                    "ttl_hours": (EXPERIENCE_SHARE_RELATIVE_TTL_HOURS
-                                  if _has_relative_time_words(topic) else None),
-                })
-                continue
+                    and salience >= EXPERIENCE_SHARE_SALIENCE_MIN:
+                window_hours = (EXPERIENCE_SHARE_RELATIVE_TTL_HOURS if relative
+                                else EXPERIENCE_SHARE_RECENCY_HOURS)
+                age_hours = self._experience_age_hours(row, now)
+                if relative and age_hours is not None \
+                        and age_hours > EXPERIENCE_SHARE_RELATIVE_TTL_HOURS:
+                    # CF-3：相对时间词经历**已知**超过 18h 后不再参与派生
+                    # （旧 24h 窗会让 18h 到期的同一 seed 重生，最长≈36h 跨日）。
+                    # created_at 缺失/坏值仍按既有契约保守回落 B2 experience。
+                    continue
+                if self._is_recent_experience(row, now, window_hours):
+                    seed = {
+                        "topic": _clip("想找人聊聊：" + topic, 80),
+                        "source_kind": "experience_share", "source_ref": exp_id,
+                        "base_strength": min(EXPERIENCE_SHARE_STRENGTH_CAP,
+                                             0.3 + 0.3 * salience),
+                        "goal_types": ["social"], "keywords": ["聊"],
+                        # 复核 P1-3：含相对时间词的即时感受只活到当晚/18h，防止
+                        # 「明天约了…」跨日原样注入造成时空错乱。
+                    }
+                    if relative:
+                        seed["ttl_hours"] = EXPERIENCE_SHARE_RELATIVE_TTL_HOURS
+                        # 到期从经历创建时刻起算（不是本次派生时刻）：经历 17h 龄
+                        # 派生 → 只剩 1h，经历满 18h 即到期，不因重复派生续命。
+                        created_ts = self._experience_created_ts(row)
+                        if created_ts is not None:
+                            seed["ttl_anchor_ts"] = created_ts
+                    out.append(seed)
+                    continue
             if tier == "inferred":
                 strength = INFERRED_STRENGTH_CAP  # inferred 只低权重（封顶）
             else:
@@ -355,19 +410,40 @@ class MotiveStore:
         return out
 
     @staticmethod
-    def _is_recent_experience(row: Dict[str, Any], now: datetime) -> bool:
-        """B1 经历 created_at（epoch 秒）是否在近期窗内；缺失/坏值/未来外推 → False。"""
+    def _experience_created_ts(row: Dict[str, Any]) -> Optional[float]:
+        """B1 经历 created_at（epoch 秒）→ float；缺失/坏值/NaN/inf → None。"""
         try:
             created = float(row.get("created_at"))
         except (TypeError, ValueError):
-            return False
-        if created != created:  # NaN
-            return False
+            return None
+        if not math.isfinite(created):
+            return None
+        return created
+
+    @classmethod
+    def _experience_age_hours(cls, row: Dict[str, Any],
+                              now: datetime) -> Optional[float]:
+        """B1 经历年龄（小时）；created_at 缺失/坏值/无法换算 → None。"""
+        created = cls._experience_created_ts(row)
+        if created is None:
+            return None
         try:
-            age_hours = (now.timestamp() - created) / 3600.0
+            return (now.timestamp() - created) / 3600.0
         except (TypeError, ValueError, OSError):
+            return None
+
+    @classmethod
+    def _is_recent_experience(cls, row: Dict[str, Any], now: datetime,
+                              window_hours: float = EXPERIENCE_SHARE_RECENCY_HOURS) -> bool:
+        """B1 经历 created_at（epoch 秒）是否在近期窗内；缺失/坏值/未来外推 → False。
+
+        CF-3：``window_hours`` 由调用方按经历文本是否含相对时间词选择——相对词
+        分享用 18h（与 TTL 同口径），非相对分享保持 24h。
+        """
+        age_hours = cls._experience_age_hours(row, now)
+        if age_hours is None:
             return False
-        return 0.0 <= age_hours <= EXPERIENCE_SHARE_RECENCY_HOURS
+        return 0.0 <= age_hours <= float(window_hours)
 
     @staticmethod
     def _derive_from_state(state: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -399,13 +475,24 @@ class MotiveStore:
         if not self._enabled():
             return []
         now = self._now(now)
-        derived = (self._derive_from_goals() + self._derive_from_experiences(now)
+        share_deadlines: Dict[str, datetime] = {}
+        derived = (self._derive_from_goals()
+                   + self._derive_from_experiences(now, share_deadlines)
                    + self._derive_from_state(state))
         share_enabled = self._experience_share_enabled()
         by_key: Dict[str, Dict[str, Any]] = {}
         kept: List[Dict[str, Any]] = []
         for motive in self._motives:
             expires = self._parse_ts(motive.get("expires_at"))
+            if motive.get("source_kind") == "experience_share":
+                # CF-3：相对时间词分享动机的硬上限 = 经历 created_at + 18h。旧版
+                # 落盘动机（动机 created+18h，可能活到经历 36h）在此被向下钳制，
+                # 保证任何来源的分享动机都不越过经历 18h。
+                deadline = share_deadlines.get(
+                    _clip(motive.get("source_ref"), 160))
+                if deadline is not None and (expires is None or deadline < expires):
+                    motive["expires_at"] = deadline.isoformat()
+                    expires = deadline
             if expires is not None and now >= expires:
                 continue  # 到期移除
             if not share_enabled and motive.get("source_kind") == "experience_share":
@@ -426,6 +513,12 @@ class MotiveStore:
                 existing["reinforced_at"] = now.isoformat()
                 continue
             created = now
+            expires = _motive_expires_at(created, seed, self._half_life_days())
+            if expires <= created:
+                # CF-3：相对时间词经历已到 18h 边界（TTL 锚定经历 created_at），
+                # 派生出来也立即过期——不再造一条僵尸动机，避免下一轮 refresh 前
+                # 短暂可见/落盘。
+                continue
             motive = {
                 "motive_id": "motive_" + uuid.uuid4().hex[:16],
                 "topic": seed["topic"],
@@ -437,8 +530,7 @@ class MotiveStore:
                 "keywords": list(seed.get("keywords") or []),
                 "created_at": created.isoformat(),
                 "reinforced_at": created.isoformat(),
-                "expires_at": _motive_expires_at(
-                    created, seed, self._half_life_days()).isoformat(),
+                "expires_at": expires.isoformat(),
             }
             by_key[key] = motive
             kept.append(motive)
