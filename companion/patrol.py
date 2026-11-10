@@ -33,11 +33,15 @@ SKIP_PRIORITY、不盖掉真实归因），**不构成去重闸门**（patrol �
 **预算口径**：``[patrol].daily_max_speak`` 即上限（不再有独立上限字段）。
 实际拦截闸门 = bus 主动打扰预算（ProactiveBudget，1/次，含 patrol/planning/emotion/
 video/harass_report 各渠道，仅目标陪伴私聊；早/晚安免预算）；本巡检器另维护 affection
-发言计数（0.5/次、仅 patrol 触发）作候选门控。F4（2026-11-04）起决策行 budget_used/
-budget_limit 改显 bus 口径（budget_basis 注明），affection 计数保留为 speak_count_affection。
+发言计数（仅实际发言 1.0/次、仅 patrol 触发）作候选门控。F4（2026-11-04）起决策行
+budget_used/budget_limit 改显 bus 口径（budget_basis 注明），affection 计数保留为
+speak_count_affection。
 
-所有触发统一走 ctx.maisaka.proactive.trigger（人格化主动回合，不直发文本），
-计 0.5 发言数；replyer 真实回复后由 Hook 补计 0.5（credit_reply_half）。
+所有触发统一走 ctx.maisaka.proactive.trigger（人格化主动回合，不直发文本）。
+P1-8（2026-11-10）起**入队不预扣**：dispatch 只占预算预留并记 pending_reply，
+replyer.after_response 在 90 秒关联窗内确认实际发言后提交预算并计 1.0；未回复的
+回执由本巡检每轮 ``reconcile_pending`` 在 180 秒后释放并退回 miss claim。宿主没有
+可靠的「实际发送」回调，确认只能依赖 after_response + 超时兜底（不声称更强）。
 
 决策日志每轮恰好一条：SKIP_PRIORITY 决定多原因时保留哪个；
 整轮异常时节流补一条 tick_error 决策行 + warning（F5，至多 10 分钟一次）；
@@ -491,6 +495,10 @@ SKIP_PRIORITY: dict[str, int] = {
 ACTION_TRIGGER = "trigger"
 ACTION_SKIP = "skip"
 
+#: dispatch 明确未入队的回执状态：可以安全退回本周期 claim。``unknown`` 不在其中
+#: （交付态不明时保留占用，防重复开口——InitiativeMemory 的既有契约）。
+_DEFINITE_NOT_ENQUEUED = frozenset({'blocked', 'duplicate', 'rejected', 'not_assembled'})
+
 
 class PatrolService:
     """巡检调度引擎（判定链与源插件 scheduler.py 逐条对齐）。"""
@@ -527,6 +535,8 @@ class PatrolService:
         self._target_display_name = ""
         self._last_trigger_time: Optional[datetime] = None
         self._last_trigger_intent = ""
+        #: 最近一次 optional_action dispatch 的状态（definite not-enqueued 才退回 claim）
+        self._last_trigger_status = ""
         self._last_tick_at: Optional[datetime] = None
         # M3 沉默事件频控（内存态，进程重启即清零；§4.2：每日 ≤2 次、间隔 ≥4h、仅 target）
         # 非法时间窗口配置的告警节流：配置项 -> 已告警过的原始值
@@ -594,7 +604,7 @@ class PatrolService:
         return self._last_trigger_intent
 
     def clear_last_trigger_time(self) -> None:
-        """清除待确认触发（replyer Hook 补计后调用，保证 0.5 只补一次）。"""
+        """清除待确认触发（replyer 确认实际发言后调用，保证 1.0 只计一次）。"""
         self._last_trigger_time = None
         self._last_trigger_intent = ""
 
@@ -645,13 +655,52 @@ class PatrolService:
         self._log_decision(action=ACTION_SKIP, reason="tick_error", trigger_type="patrol",
                            detail="巡检单轮异常，本轮未完成判定（详情见日志，节流留痕）")
 
-    def credit_reply_half(self) -> bool:
-        """replyer 真实回复后补计 0.5 发言数（触发后 90 秒窗口内才计，只计一次）。"""
-        if self._last_trigger_time and (datetime.now() - self._last_trigger_time).total_seconds() <= 90:
-            self._affection.increment_speak(0.5)
-            self.clear_last_trigger_time()
-            return True
-        return False
+    def mark_miss_spoken(self) -> bool:
+        """P1-8：确认主动回复后把本周期 miss claim 标 ``spoken``（仅一次）。"""
+        if not self._target_qq:
+            return False
+        return self._initiative_memory.receipt(self._target_qq, 'miss', 'spoken')
+
+    def _current_cycle_key(self) -> str:
+        """当前沉默周期的 miss dispatch key（``miss:{anchor}``）；无周期 → 空串。"""
+        memory = getattr(self, '_initiative_memory', None)
+        if memory is None:
+            return ''
+        row = memory.doc.get('cycles', {}).get(self._target_qq)
+        if isinstance(row, dict) and row.get('anchor') is not None:
+            return 'miss:' + str(row.get('anchor'))
+        return ''
+
+    async def _reconcile_stale_optional_actions(self) -> int:
+        """P1-8：回收超时未回复的可选主动回合，并退回对应周期 claim。
+
+        预算预留由 ``OptionalActionCoordinator.reconcile_pending`` 释放；此处只把
+        intent=missing 的过期回执映射回 **同一沉默周期** 的 miss claim（未回复 →
+        本周期可重新判定）。用户已发新消息进入下一周期时，上一周期的过期回执
+        不得退回新周期的 claim（否则会解除新一轮的占用）。
+        """
+        config = getattr(self, '_config', None)
+        coordinator = getattr(config, '_optional_actions', None)
+        reconcile = getattr(coordinator, 'reconcile_pending', None)
+        if not callable(reconcile):
+            return 0
+        try:
+            result = await reconcile()
+        except Exception:
+            logger.warning('可选主动回合超时回收失败（不影响巡检）', exc_info=True)
+            return 0
+        expired = result.get('expired') if isinstance(result, dict) else None
+        if not isinstance(expired, list):
+            return 0
+        current_key = self._current_cycle_key()
+        for row in expired:
+            if not isinstance(row, dict) or str(row.get('intent') or '') != 'missing':
+                continue
+            expired_key = str(row.get('key') or '')
+            if expired_key and current_key and expired_key != current_key:
+                continue  # 旧沉默周期的回执：不得退回新周期 claim
+            self._initiative_memory.release(self._target_qq, 'miss')
+        return len(expired)
 
     # ------------------------------------------------------------------
     # 单轮巡检：完整判定链（每轮恰好写一条决策日志）
@@ -668,6 +717,11 @@ class PatrolService:
         if self._affection.today_date() != now.strftime('%Y-%m-%d'):
             self._affection.reset_daily(now.strftime('%Y-%m-%d'))
             self._affection.apply_daily_decay()
+        # P1-8：先回收上一轮未回复的可选主动回合（超时释放预算 + 退回 miss claim），
+        # 避免关闭主动开关/进程长期无回复时预算槽位泄漏。
+        expired_optional = await self._reconcile_stale_optional_actions()
+        if expired_optional:
+            fields['expired_optional_actions'] = expired_optional
         if not bool(getattr(cfg, 'enabled', True)) or not cfg.proactive_trigger_enabled or not cfg.miss_enabled:
             done('disabled')
             return
@@ -734,12 +788,22 @@ class PatrolService:
         if random.random() >= probability:
             done('dice')
             return
-        if not self._initiative_memory.claim(self._target_qq, last, now, 'miss'):
+        if not self._initiative_memory.claim(self._target_qq, last, now, 'miss',
+                                             status='pending_reply'):
             done('recovery_or_cycle_claim')
             return
         key = 'miss:' + str(cycle['anchor'])
         success = await self._trigger_missing(hours, key=key, share_topic=share_topic)
-        self._initiative_memory.receipt(self._target_qq, 'miss', 'enqueued' if success else 'not_enqueued_or_unknown')
+        if success:
+            # 入队只代表宿主受理；claim 保持 pending_reply，等 after_response 确认
+            # （mark_miss_spoken）或 _reconcile_stale_optional_actions 超时退回。
+            self._initiative_memory.receipt(self._target_qq, 'miss', 'pending_reply')
+        elif self._last_trigger_status in _DEFINITE_NOT_ENQUEUED:
+            # 明确未入队 → 本周期占用退回，下一次巡检可重新判定。
+            self._initiative_memory.release(self._target_qq, 'miss')
+        else:
+            # unknown 交付态保留占用（既有语义：不重复开口）。
+            self._initiative_memory.receipt(self._target_qq, 'miss', 'unknown')
         done('miss_trigger' if success else 'planner_not_enqueued', ACTION_TRIGGER if success else ACTION_SKIP)
 
 
@@ -795,19 +859,31 @@ class PatrolService:
     async def _trigger_planner(self, intent: str, reason: str, *, key: str = "") -> bool:
         action = getattr(self._config, 'optional_action', None)
         if not callable(action) or not self._stream_id:
+            self._last_trigger_status = 'not_assembled'
             return False
         # PR-RELIABILITY（3.17.17 §1A）：登记前置到触发调用前——dispatch 内含
         # before 屏幕旁白与宿主 trigger 的 await，宿主可能先构建 replyer；
         # 非 enqueued（blocked/duplicate/rejected/unknown）→ discard 撤登记。
-        # 登记不计数——increment_speak 口径（触发 0.5 + 回复确认 0.5）逐字不变。
+        # P1-8：入队不再预扣发言计数；预算/计数后移到 after_response 的实际发言确认。
         turn_id = register_turn(self._config, self._stream_id,
                       'miss' if intent == 'missing' else 'patrol_chat', reason)
-        result = await action(key, intent, self._append_intent_hint(reason), before=self._publish_screen_narration)
-        if result.get('status') != 'enqueued':
+        try:
+            result = await action(key, intent, self._append_intent_hint(reason), before=self._publish_screen_narration)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 交付态不明：保留登记与周期占用，等待超时回收/用户来信重置。
+            self._last_trigger_status = 'unknown'
+            discard_turn(self._config, turn_id)
+            self._discard_screen_narration()
+            logger.warning('主动回合触发异常（按未知交付处理）', exc_info=True)
+            return False
+        status = str(result.get('status') or '') if isinstance(result, dict) else ''
+        self._last_trigger_status = status
+        if status != 'enqueued':
             discard_turn(self._config, turn_id)
             self._discard_screen_narration()
             return False
-        self._affection.increment_speak(.5)
         self._last_trigger_time = datetime.now()
         self._last_trigger_intent = str(intent)
         return True

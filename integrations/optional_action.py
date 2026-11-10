@@ -8,12 +8,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from core.storage import save_json_atomic
 
 logger = logging.getLogger(__name__)
+
+#: 回执进入「已受理、等待真实发言确认」的中间态（P1-8）。宿主 trigger 的
+#: success/queued/enqueued 只代表任务已入队（runtime.enqueue_proactive_task 入队即
+#: 返回），不代表 replyer 真的开口；预算与计数因此后移到 after_response 确认或超时退回。
+PENDING_REPLY = 'pending_reply'
+#: after_response 与入队回执的关联窗（秒）。宿主没有「实际发送」回调，唯一的确认
+#: 信号是 replyer.after_response；超过该窗的回复不再归属本次可选回合。
+CONFIRM_WINDOW_SECONDS = 90.0
+#: 未确认回执的回收年龄（秒）。超时 → 释放预算预留并标 expired_no_reply。
+RECONCILE_MAX_AGE_SECONDS = 180.0
+#: 终态回执可被裁剪；pending/unknown 永不驱逐。
+_TERMINAL_STATUSES = ('rejected', 'enqueued', 'confirmed', 'expired_no_reply')
+
 OPTIONAL_PLANNER_POLICY = (
     '【插件触发的可选主动回合】这是一个可选的开口机会，不是用户的新指令。'
     '请结合你当前的状态、人设和已有聊天上下文，自行决定现在是否适合开口。'
@@ -84,6 +98,12 @@ class OptionalActionCoordinator:
             return False
 
     async def dispatch(self, key: str, intent: str, reason: str, *, before: Any = None) -> dict:
+        """登记一次可选主动回合；成功入队只记 pending_reply，不提交预算。
+
+        返回 ``status='enqueued'`` 表示宿主已受理（兼容既有调用方）；持久化回执的
+        ``status`` 是 :data:`PENDING_REPLY`，等 :meth:`confirm_reply` 确认真实发言后
+        才提交预算，或由 :meth:`reconcile_pending` 超时退回。
+        """
         async with self._lock:
             allowed, denial = self.permission()
             if not allowed:
@@ -97,15 +117,16 @@ class OptionalActionCoordinator:
             token = budget.reserve('optional_action', stream) if budget is not None else None
             if not token:
                 return {'status': 'blocked', 'reason': 'budget_reservation'}
-            entry = {'status': 'reserved', 'intent': str(intent), 'budget_token': token}
+            entry = {'status': PENDING_REPLY, 'intent': str(intent), 'budget_token': token,
+                     'stream': stream, 'key': str(key), 'pending_since': time.time()}
             self._attempts[scoped] = entry
             # Bound retained terminal receipts; in-flight/unknown receipts never evicted.
-            terminal = [k for k,v in self._attempts.items() if v.get('status') in ('rejected', 'enqueued')]
+            terminal = [k for k,v in self._attempts.items() if v.get('status') in _TERMINAL_STATUSES]
             for old in terminal[:-128]:
                 self._attempts.pop(old, None)
             if not self._save():
                 # PR-RELIABILITY（3.17.17 §1C）：保存失败回滚内存 entry——否则
-                # 残留 reserved 回执使同 key 后续误判 duplicate（预算已释放却
+                # 残留 pending 回执使同 key 后续误判 duplicate（预算已释放却
                 # 再也发不出）。预算释放失败留 warning 不阻断（三态收敛）。
                 self._attempts.pop(scoped, None)
                 try:
@@ -138,13 +159,111 @@ class OptionalActionCoordinator:
                 return {'status': 'unknown'}
             if isinstance(reply, dict) and (reply.get('success') is False
                     or reply.get('enqueued') is False or reply.get('queued') is False):
+                # Definite not-enqueued: give the slot back immediately.
                 budget.release_reservation(token)
                 entry['status'] = 'rejected'
             elif ((isinstance(reply, dict) and reply.get('success') is True)
                   or reply is True or getattr(reply, 'success', None) is True):
-                budget.commit_reservation(token)
-                entry['status'] = 'enqueued'
+                # Host accepted the task, but the replyer may still decline to speak.
+                # Keep the reservation until confirm_reply / reconcile_pending decides.
+                entry['status'] = PENDING_REPLY
             else:
                 entry['status'] = 'unknown'
             self._save()
+            if entry['status'] == PENDING_REPLY:
+                return {'status': 'enqueued', 'receipt_status': PENDING_REPLY}
             return {'status': entry['status']}
+
+    async def confirm_reply(self, stream_id: str, *,
+                            max_age: float = CONFIRM_WINDOW_SECONDS) -> dict:
+        """确认目标流上出现了一次真实发言，提交最近一笔 pending 回执的预算。
+
+        宿主没有可靠的「实际发送」回调；调用方（replyer.after_response）携带的
+        ``session_id`` 就是唯一关联信号。只确认确认窗（默认 90 秒）内最近一笔
+        pending 回执，避免把更早、已被放弃的回合算到本次发言上。
+
+        幂等：同一回执只提交一次；无 pending → ``{'status': 'no_pending'}``。
+        """
+        async with self._lock:
+            sid = str(stream_id or '').strip()
+            if not sid:
+                return {'status': 'no_pending'}
+            try:
+                limit = max(0.0, float(max_age))
+            except (TypeError, ValueError):
+                limit = CONFIRM_WINDOW_SECONDS
+            now = time.time()
+            candidates: list[tuple[str, dict]] = []
+            for scoped, row in self._attempts.items():
+                if not isinstance(row, dict) or row.get('status') != PENDING_REPLY:
+                    continue
+                if str(row.get('stream') or '') != sid:
+                    continue
+                try:
+                    since = float(row.get('pending_since'))
+                except (TypeError, ValueError):
+                    since = 0.0
+                if now - since > limit:
+                    continue
+                candidates.append((scoped, row))
+            if not candidates:
+                return {'status': 'no_pending'}
+            scoped, entry = max(candidates, key=lambda item: float(item[1].get('pending_since') or 0.0))
+            token = entry.get('budget_token')
+            committed = False
+            if token:
+                budget = self._budget()
+                if budget is not None:
+                    try:
+                        committed = bool(budget.commit_reservation(str(token)))
+                    except Exception:
+                        # 已发言但提交异常：保留预留（仍占一个槽位），不把预算悄悄退回。
+                        logger.warning('可选主动回合预算提交失败（保留预留）', exc_info=True)
+            entry['status'] = 'confirmed'
+            entry['confirmed_at'] = now
+            entry['budget_committed'] = committed
+            saved = self._save()
+            return {'status': 'confirmed', 'saved': saved, 'committed': committed,
+                    'scoped': scoped, 'intent': str(entry.get('intent') or ''),
+                    'key': str(entry.get('key') or '')}
+
+    async def reconcile_pending(self, max_age: float = RECONCILE_MAX_AGE_SECONDS) -> dict:
+        """回收超时未确认的 pending 回执：释放预算预留，标 ``expired_no_reply``。
+
+        只处理 :data:`PENDING_REPLY`；``unknown``（交付态不明）保持预留，与既有
+        「unknown delivery stays reserved」语义一致。返回被回收的回执摘要，供
+        patrol 同步退回对应周期的 claim。
+        """
+        async with self._lock:
+            try:
+                limit = max(0.0, float(max_age))
+            except (TypeError, ValueError):
+                limit = RECONCILE_MAX_AGE_SECONDS
+            now = time.time()
+            expired: list[dict] = []
+            for scoped, row in list(self._attempts.items()):
+                if not isinstance(row, dict) or row.get('status') != PENDING_REPLY:
+                    continue
+                try:
+                    since = float(row.get('pending_since'))
+                except (TypeError, ValueError):
+                    since = 0.0
+                if now - since < limit:
+                    continue
+                token = row.get('budget_token')
+                if token:
+                    budget = self._budget()
+                    if budget is not None:
+                        try:
+                            budget.release_reservation(str(token))
+                        except Exception:
+                            logger.warning('可选主动回合预算超时释放失败（不阻断）', exc_info=True)
+                row['status'] = 'expired_no_reply'
+                row['expired_at'] = now
+                expired.append({'scoped': scoped, 'intent': str(row.get('intent') or ''),
+                                'stream': str(row.get('stream') or ''),
+                                'key': str(row.get('key') or ''),
+                                'pending_since': since})
+            if expired:
+                self._save()
+            return {'status': 'ok', 'expired': expired, 'count': len(expired)}

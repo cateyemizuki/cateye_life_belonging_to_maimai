@@ -175,17 +175,41 @@ class InitiativeMemory:
             return None  # stale user timestamp must not resurrect an older cycle
         return row
 
-    def claim(self, target: str, last_message: Any, now: Any, kind: str) -> bool:
+    def claim(self, target: str, last_message: Any, now: Any, kind: str, *,
+              status: str = 'reserved') -> bool:
+        """登记一次周期占用；``status`` 供调用方标注交付阶段（P1-8: pending_reply）。"""
         row = self.cycle(target, last_message, now)
         if row is None or kind in row['claims']:
             return False
         if float(epoch(now) or 0) - float(row['observed_at']) < RECOVERY_GRACE_SECONDS:
             return False
-        row['claims'][kind] = 'reserved'
+        row['claims'][kind] = str(status)
         return self._save()
 
-    def receipt(self, target: str, kind: str, status: str) -> None:
+    def release(self, target: str, kind: str) -> bool:
+        """退回一次**仍未落定**的周期占用（P1-8：definite not-enqueued / 超时未回复）。
+
+        只释放 pending 类状态（``reserved`` / ``pending_reply``）；``spoken``、
+        ``published`` 与 unknown 终态绝不回滚——unknown 交付态保留占用的既有语义不变。
+        """
+        row = self.doc.get('cycles', {}).get(target)
+        if not isinstance(row, dict):
+            return False
+        claims = row.get('claims')
+        if not isinstance(claims, dict):
+            return False
+        previous = claims.get(kind)
+        if previous not in ('reserved', 'pending_reply'):
+            return False
+        del claims[kind]
+        if self._save():
+            return True
+        claims[kind] = previous  # 落盘失败恢复内存态，避免占用被静默丢掉
+        return False
+
+    def receipt(self, target: str, kind: str, status: str) -> bool:
         row = self.doc.get('cycles', {}).get(target)
         if isinstance(row, dict) and kind in row.get('claims', {}):
             row['claims'][kind] = str(status)
-            self._save()
+            return self._save()
+        return False

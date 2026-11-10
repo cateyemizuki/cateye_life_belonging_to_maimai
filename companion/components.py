@@ -15,9 +15,10 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   - maisaka.replyer.before_model_request  过期主动任务块剥离 + 屏幕旁白注入 +
                                        陪伴私聊主动激活轮宿主目标指令改写
                                        （PR-PROACTIVE-REPLY 3.17.2；BLOCKING/NORMAL）
-  - maisaka.replyer.after_response     90 秒窗口补计 0.5 发言数 + spoken 回执 +
+  - maisaka.replyer.after_response     确认真实发言：提交 pending 预算预留 +
+                                       计 1.0 发言数 + spoken 回执 +
                                        目标私聊真实回复社交电量小幅消耗
-                                       （PR-REALISM-TUNING 3.17.20；OBSERVE/LATE）
+                                       （P1-8 / PR-REALISM-TUNING 3.17.20；OBSERVE/LATE）
 - Tools ×2：lbm_mai_lover_affection（F3 2026-11-04：is_enabled + 目标私聊 scope 校验，
   决策痕带调用者身份）/
   lbm_report_harassment（2026-10-24 告状：受骚扰时转达维护者；纯逻辑见
@@ -863,20 +864,42 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             "陪伴主动激活轮：未匹配到宿主目标指令段，已保守追加主动激活文案作为尾随锚点")
         return {**kwargs, payload_key: appended}
 
+    async def _mai_confirm_optional_reply(self, reply_stream: str) -> dict[str, Any]:
+        """P1-8：把目标流上的真实回复回报给可选主动回合回执（提交预算预留）。
+
+        协调器缺失/未装配 → ``not_assembled``；异常静默降级为 ``error``，绝不让
+        OBSERVE 钩子拖挂回复链。回执只确认 90 秒窗内最近一笔 pending 回合。
+        """
+        coordinator = getattr(self, "_optional_actions", None)
+        confirm = getattr(coordinator, "confirm_reply", None)
+        if not callable(confirm):
+            return {"status": "not_assembled"}
+        try:
+            result = await confirm(reply_stream)
+            return result if isinstance(result, dict) else {"status": "unknown"}
+        except Exception:
+            self.ctx.logger.warning("可选主动回合预算确认失败（忽略）", exc_info=True)
+            return {"status": "error"}
+
     @HookHandler(
         "maisaka.replyer.after_response",
         name="mai_lover_replyer_speak_confirm",
-        description="巡检触发后 90 秒窗口内的真实回复补计 0.5 发言数，并记录 spoken 回执",
+        description="目标流真实回复时确认可选回合预算（提交预留）并计 1.0 发言数，记录 spoken 回执",
         mode=HookMode.OBSERVE,
         order=HookOrder.LATE,
         timeout_ms=1000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def mai_hook_replyer_after_response(self, **kwargs: Any) -> None:
-        """planner 实际生成回复时补计 0.5 触发数并记一条"确认发言"。
+        """replyer 实际生成回复时确认可选回合并补计 1.0 发言数。
 
-        与 _trigger_planner 的 0.5 配合：回复成功总计 1.0，未回复总计 0.5。
-        仅在最近 90 秒内有 proactive trigger 时生效；补计后清除待确认触发，
+        P1-8（2026-11-10）：入队不再预扣预算/计数。目标流出现真实回复时先调用
+        ``OptionalActionCoordinator.confirm_reply`` 提交最近一笔 pending 回执的
+        预算预留，再计 1.0 发言数（替代旧「入队 0.5 + 回复 0.5」）并把 miss claim
+        标 ``spoken``。未回复的回合由巡检 ``reconcile_pending`` 在 180 秒后释放，
+        因此**不会**出现「只入队也算一次」的旧账。
+
+        仅在最近 90 秒内有 proactive trigger 时计发言数；补计后清除待确认触发，
         因此与顶层 speak_counter 钩子共存时不会重复计数。
 
         F6（2026-11-04）：补计前比对回复流与目标流——宿主 after_response 携带
@@ -901,30 +924,52 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         # already_answered（沉默后再开口永久漏计）。
         _reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
         _target_stream = str(companion.patrol.patrol_status().get("stream_id") or "").strip()
+        confirmation: dict[str, Any] = {"status": "not_target"}
         if _reply_stream and _target_stream and _reply_stream == _target_stream:
             _notify = getattr(companion.affection, "note_bot_replied", None)
             if callable(_notify):
                 _notify(datetime.now())
+            # P1-8：目标流出现真实回复 → 提交最近一笔 pending 可选回合的预算预留。
+            # 宿主无「实际发送」回调；after_response 的 session_id 是唯一关联信号。
+            confirmation = await self._mai_confirm_optional_reply(_reply_stream)
         patrol = companion.patrol
         last_trigger = patrol.get_last_trigger_time()
-        if last_trigger is None:
-            return  # 没有待确认的 proactive trigger
         now = datetime.now()
-        elapsed = (now - last_trigger).total_seconds()
-        if elapsed >= 90:
-            return
-        reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
-        target_stream = str(patrol.patrol_status().get("stream_id") or "").strip()
-        if target_stream and reply_stream != target_stream:
-            return  # 非目标流的回复不算主动发言确认（保留待确认触发给正确的流）
-        trigger_type = patrol.get_last_trigger_intent()
-        companion.affection.increment_speak(0.5)
+        elapsed = (now - last_trigger).total_seconds() if last_trigger is not None else None
+        confirmed_status = (confirmation.get("status")
+                            if isinstance(confirmation, dict) else "")
+        confirmed_intent = (str(confirmation.get("intent") or "")
+                            if isinstance(confirmation, dict) else "")
+        # P1-8：命中 pending 回执的确认优先（进程重启后 _last_trigger_time 丢失，
+        # 仍能凭持久化回执把这次真实回复记进账）；否则退回既有 90 秒触发窗。
+        confirmed_patrol = (confirmed_status == "confirmed"
+                            and confirmed_intent in ("missing", "patrol_chat"))
+        if not confirmed_patrol:
+            if last_trigger is None:
+                return  # 没有待确认的 proactive trigger
+            if elapsed is None or elapsed >= 90:
+                return
+            reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
+            target_stream = str(patrol.patrol_status().get("stream_id") or "").strip()
+            if target_stream and reply_stream != target_stream:
+                return  # 非目标流的回复不算主动发言确认（保留待确认触发给正确的流）
+        trigger_type = patrol.get_last_trigger_intent() or confirmed_intent
+        # P1-8：确认实际开口才计 1.0（替代旧「入队 0.5 + 回复 0.5」两段）；
+        # 未回复的回合由 patrol._reconcile_stale_optional_actions 超时释放。
+        companion.affection.increment_speak(1.0)
+        claim_intent = confirmed_intent if confirmed_status == "confirmed" else trigger_type
+        if claim_intent == "missing":
+            mark_spoken = getattr(patrol, "mark_miss_spoken", None)
+            if callable(mark_spoken):
+                mark_spoken()
         patrol.clear_last_trigger_time()
+        elapsed_text = f"{elapsed:.0f}" if elapsed is not None else "未知"
         self._mai_log_proactive_event(
             action=_ACTION_SPOKEN,
             reason="reply_confirmed",
             trigger_type=trigger_type,
-            detail=f"planner 已生成回复并发送（距触发 {elapsed:.0f} 秒）｜触发类型={trigger_type or '未知'}",
+            detail=(f"planner 已生成回复并发送（距触发 {elapsed_text} 秒）｜触发类型={trigger_type or '未知'}"
+                    f"｜预算确认={confirmation.get('status') if isinstance(confirmation, dict) else 'unknown'}"),
         )
 
     #: PR-REALISM-TUNING（3.17.20 §1A）：真实回复社交消耗去重窗（秒）。宿主可能对
