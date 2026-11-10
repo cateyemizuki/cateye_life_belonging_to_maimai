@@ -23,9 +23,34 @@ from planning.sleep_engine import EVENT_SLEEP_WOKE, SleepEngine
 
 
 def offline_episode_id(plan: dict, *, now: datetime | None = None) -> str:
-    """复核 P2-4c：离线结算幂等键（日期+有效分钟）。"""
+    """复核 P2-4c / CF-6：离线结算幂等键。
+
+    优先用计划携带的 ``sleep_date``（入睡日历日）+ ``start_minute``（入睡时刻在
+    该日程日帧内的分钟，跨午夜 >1440）→ ``offline:{sleep_date}:{start_minute}``。
+    这两个字段由 :meth:`OfflineSettlementService.apply_offline_settlement` 按配置
+    时区与 ``gap_seconds`` 现算后注入到幂等键；键只由该日帧决定，不读本地墙钟
+    日期，也不受跨午夜/本地时区漂移影响。对已携带这两个字段的计划，``now`` 完全
+    不参与——同一计划在不同本地 ``now`` 下得到同一键。旧实现用
+    ``int(effective_minutes)`` 取整，同日不同起始分钟（或不同有效时长）的合法新段
+    会碰撞；新键按帧分钟区分，不再误拦。
+
+    仅在计划缺 ``sleep_date``/``start_minute``（含非法值）时回退旧实现（本地日期
+    + 有效分钟）；旧格式保持不变，供既有调用方/回归兼容。回退路径不抛异常。
+    """
+    sleep_date = str(plan.get("sleep_date") or "").strip()
+    start_minute = plan.get("start_minute")
+    if sleep_date and start_minute is not None and not isinstance(start_minute, bool):
+        try:
+            # 规范成 YYYY-MM-DD；非法日历日/格式 → 走旧键回退
+            normalized = datetime.strptime(sleep_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+            return f"offline:{normalized}:{int(start_minute)}"
+        except (TypeError, ValueError):
+            pass
     day = (now or datetime.now()).strftime("%Y-%m-%d")
-    minutes = int(float(plan.get("effective_minutes") or 0.0))
+    try:
+        minutes = int(float(plan.get("effective_minutes") or 0.0))
+    except (TypeError, ValueError):
+        minutes = 0
     return f"offline:{day}:{minutes}"
 
 
@@ -176,6 +201,11 @@ class OfflineSettlementService:
         start_minute = SleepEngine._frame_minutes(sleep_start, sleep_date)  # noqa: SLF001 - 与引擎写库同口径
         end_minute = SleepEngine._frame_minutes(wake_at, sleep_date)  # noqa: SLF001
         plan_meta = dict(plan.get("metadata") or {})
+        # 复核 CF-6：幂等键改用 (入睡日历日, 入睡帧分钟)，与上面的会话/episode 日帧
+        # 同源；不依赖本地墙钟日期与 int(effective_minutes) 取整（后者会让同日同
+        # 分钟的不同段互相误拦，并随跨午夜/本地时区漂移）。仅当 plan 缺这两个字段
+        # 时 offline_episode_id 才回退旧键——此处显式注入，保证真实结算路径不回落。
+        id_plan = {**plan, "sleep_date": sleep_date, "start_minute": start_minute}
         # 1) pre-offline active episode → interrupted（进度走 interrupt 默认口径：
         #    已用/计划、上限 0.95；actual_end = 入睡时刻）
         try:
@@ -202,15 +232,15 @@ class OfflineSettlementService:
                 float(plan.get("sleep_debt_before") or 0.0)))
             payload = {"state_deltas": gains, "settlement_kind": "offline_sleep",
                        "diag_dt_min": float(plan.get("effective_minutes") or 0.0),
-                       # 复核 P2-4c：补幂等键——life.apply_episode 的空 eid 不登记回执，
-                       # 绕开 _episode_receipts 保护；稳定 id 提供纵深防御（恰好一次仍
-                       # 由 pending gap 一次性消费保证）。
-                       "episode_id": offline_episode_id(plan)}
+                       # 复核 P2-4c/CF-6：补幂等键——life.apply_episode 的空 eid 不登记
+                       # 回执，绕开 _episode_receipts 保护；稳定 id 提供纵深防御（恰好
+                       # 一次仍由 pending gap 一次性消费保证）。键取入睡日帧，非墙钟日。
+                       "episode_id": offline_episode_id(id_plan)}
         except Exception as exc:
             # Never mix legacy rate integration into current state accounting.
             self._warn("离线睡眠增量计算失败（仅结算睡眠债）：%s", exc)
             payload = {"state_deltas": {}, "settlement_kind": "offline_sleep",
-                       "episode_id": offline_episode_id(plan)}
+                       "episode_id": offline_episode_id(id_plan)}
         after = life.apply_episode(payload)
         life.apply_sleep_settlement({
             "sleep_debt": plan.get("sleep_debt_after"),
