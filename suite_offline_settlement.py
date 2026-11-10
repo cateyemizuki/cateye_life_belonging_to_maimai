@@ -13,6 +13,7 @@ sys.path 含宿主 src 与兄弟插件目录，顶层通用名会被抢占（见
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Optional
 
@@ -43,13 +44,16 @@ def offline_episode_id(plan: dict, *, now: datetime | None = None) -> str:
         try:
             # 规范成 YYYY-MM-DD；非法日历日/格式 → 走旧键回退
             normalized = datetime.strptime(sleep_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-            return f"offline:{normalized}:{int(start_minute)}"
-        except (TypeError, ValueError):
+            sm = float(start_minute)
+            if math.isfinite(sm):
+                return f"offline:{normalized}:{int(sm)}"
+        except (TypeError, ValueError, OverflowError):
             pass
     day = (now or datetime.now()).strftime("%Y-%m-%d")
     try:
-        minutes = int(float(plan.get("effective_minutes") or 0.0))
-    except (TypeError, ValueError):
+        raw_minutes = float(plan.get("effective_minutes") or 0.0)
+        minutes = int(raw_minutes) if math.isfinite(raw_minutes) else 0
+    except (TypeError, ValueError, OverflowError):
         minutes = 0
     return f"offline:{day}:{minutes}"
 
@@ -171,6 +175,20 @@ class OfflineSettlementService:
             if awake_before > 0:
                 # This was observed running time, never inferred sleep.
                 life.apply_offline_awake(min(awake_before / 60.0, DT_MAX_MINUTES))
+            # CF-6：在计划生成时一次性钉住入睡日帧/wake_at，apply 只读计划，
+            # 不再在应用时刻用当前墙钟现算——同一 plan 重放在任何时刻得到同一键。
+            try:
+                tz_name = str(getattr(getattr(self._config_provider(), "schedule_advanced", None),
+                                      "timezone", "") or "Asia/Shanghai")
+                from planning.time_utils import TimezoneManager
+                wake_at = TimezoneManager(tz_name).get_now()
+                sleep_start = wake_at - timedelta(seconds=gap)
+                sleep_date = sleep_start.strftime("%Y-%m-%d")
+                start_minute = SleepEngine._frame_minutes(sleep_start, sleep_date)
+                plan = {**plan, "wake_at": wake_at.isoformat(),
+                        "sleep_date": sleep_date, "start_minute": start_minute}
+            except Exception as exc:
+                self._warn("离线结算计划日帧注入失败（apply 将回退现算）：%s", exc)
             self.apply_offline_settlement(life, planner, plan)
         except Exception as exc:
             self._warn("离线睡眠结算失败（已尽力应用，忽略继续启动）：%s", exc)
@@ -193,12 +211,40 @@ class OfflineSettlementService:
         tz_name = str(getattr(getattr(self._config_provider(), "schedule_advanced", None),
                               "timezone", "") or "Asia/Shanghai")
         from planning.time_utils import TimezoneManager
-        wake_at = TimezoneManager(tz_name).get_now()
+        # CF-6：优先读计划在生成时钉住的 wake_at / 入睡日帧；缺字段才回退现算。
+        # 这样同一 plan 在任何墙钟时刻重放都用同一 wake_at 与同一幂等键。
+        plan_wake = plan.get("wake_at")
+        wake_at = None
+        if isinstance(plan_wake, str) and plan_wake.strip():
+            try:
+                wake_at = datetime.fromisoformat(plan_wake.strip())
+            except ValueError:
+                wake_at = None
+        if wake_at is None:
+            wake_at = TimezoneManager(tz_name).get_now()
         gap = max(0.0, float(plan.get("gap_seconds") or 0.0))
-        sleep_start = wake_at - timedelta(seconds=gap)
-        # 日帧口径与引擎 sleep_sessions 写库完全一致（入睡日历日 + 跨午夜帧分钟 >1440）
-        sleep_date = sleep_start.strftime("%Y-%m-%d")
-        start_minute = SleepEngine._frame_minutes(sleep_start, sleep_date)  # noqa: SLF001 - 与引擎写库同口径
+        plan_sleep_date = str(plan.get("sleep_date") or "").strip()
+        plan_start_minute = plan.get("start_minute")
+        valid_plan_frame = False
+        if plan_sleep_date and plan_start_minute is not None \
+                and not isinstance(plan_start_minute, bool):
+            try:
+                datetime.strptime(plan_sleep_date, "%Y-%m-%d")
+                sm = float(plan_start_minute)
+                valid_plan_frame = math.isfinite(sm)
+            except (TypeError, ValueError, OverflowError):
+                valid_plan_frame = False
+        if valid_plan_frame:
+            sleep_date = plan_sleep_date
+            start_minute = int(float(plan_start_minute))
+            # 由钉住的入睡日帧反推 sleep_start（帧分钟 >1440 会自动滚到次日）；
+            # 仅用于会话 created_at 展示，不参与幂等键。
+            sleep_start = (datetime.strptime(sleep_date, "%Y-%m-%d")
+                           + timedelta(minutes=start_minute))
+        else:
+            sleep_start = wake_at - timedelta(seconds=gap)
+            sleep_date = sleep_start.strftime("%Y-%m-%d")
+            start_minute = SleepEngine._frame_minutes(sleep_start, sleep_date)  # noqa: SLF001 - 与引擎写库同口径
         end_minute = SleepEngine._frame_minutes(wake_at, sleep_date)  # noqa: SLF001
         plan_meta = dict(plan.get("metadata") or {})
         # 复核 CF-6：幂等键改用 (入睡日历日, 入睡帧分钟)，与上面的会话/episode 日帧
