@@ -1181,7 +1181,7 @@ class EmotionService:
         """
         if not self._enabled():
             return ""
-        if not bool(self._emotion_cfg("emotion_reason_inject_enabled", True)):
+        if not bool(self._emotion_cfg("emotion_reason_inject_enabled", False)):
             return ""
         ledger = getattr(self._machine, "reason_ledger", None)
         getter = getattr(ledger, "latest_injectable", None)
