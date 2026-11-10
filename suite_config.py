@@ -317,12 +317,17 @@ from suite_prompts import (
 # + chat_round 60s/流节流；P1-7 想念概率接入好感档位(×0.9~1.1)与情绪 proactive_rate
 # （evaluate_miss 判定契约不动）。不新增用户可见配置字段（schema 不变，18 段 202
 # 叶子），按 R6 双号同步递增。
+# 3.17.32（2026-11-10 E 批剩余项）：P1-8 预算/计数/claim 后移至实际发言确认；
+# CF-3 相对分享 TTL 锚定经历创建时刻；CF-4 分享 CAP 不再倒挂；CF-5 post delay=0
+# 立即发布；CF-6 幂等键改 (sleep_date,start_minute)；CF-7 V2 参数版本递增；
+# service.py 原因注入兜底 False。不新增用户可见配置字段（schema 不变 18 段 202
+# 叶子），按 R6 双号同步递增。
 # 3.17.31（2026-11-09 D 批小项）：P2-1 跨日维护前置于 miss_enabled 门；P1-6 idle
 # focus 靶心 0.35→0.60（突破待机低专注螺旋）；P2-4c 离线结算补 episode_id 幂等键；
 # P2-4d 删除 settle_night_interrupts 冗余 guard；P2-5 前半视频桥影子文案改为
 # 真实发布口径、post 延迟不再被解析器清零。不新增用户可见配置字段（schema 不变
 # 18 段 202 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.31"
+SUPPORTED_CONFIG_VERSION = "3.17.32"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

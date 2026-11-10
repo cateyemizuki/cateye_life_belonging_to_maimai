@@ -1,5 +1,12 @@
 # 更新日志（CHANGELOG）
 
+## 3.17.32（2026-11-10）
+
+E 批剩余项（依 `union/20261110_四批改动_独立审查结论.md` §五 CF-3~7 + §六 E 批，以及 `union/20261109_两份审查报告_独立复核结论.md` 的 P1-8 更正后口径）。**P1-8**：可选主动回合入队只占预算预留、不提交；`replyer.after_response` 凭 replyer 改写钩子留下的主动轮标记确认实际发言后才提交预算并计 1.0 发言数（替代旧「入队 0.5 + 回复 0.5」），未回复 300 秒由巡检回收并退回 miss claim；确认窗 240 秒 > 回收窗 300 秒，超时/明确拒绝的回执允许同 key 重试；被动回复不误提交预算。**CF-3**：相对时间词分享动机到期锚定经历 `created_at+18h`，旧版无 provider 时按动机 `created_at+18h` 保守钳制。**CF-4**：分享 boost 改为只升不降（`max(CAP, boosted)`），adjusted>0.35 不再被降回。**CF-5**：post 允许 `delay_minutes=0` 立即发布，defer 仍 5~1440，消除文案与解析器矛盾。**CF-6**：离线幂等键改 `offline:{sleep_date}:{start_minute}`，apply 读计划钉住的 `wake_at`/入睡日帧，跨墙钟重放稳定；inf 非法值回退不抛。**CF-7**：`V2_PARAMS_VERSION` 递增 `20261110.1`。**service.py**：原因注入 `getattr` 兜底 True→False，与 C 批代码默认对齐。微残留：`chat_round` 日累计注释 +1.0→+2.0、`emotion/config.py` UI 描述旧口径、`emotion/service.py` 陈旧 docstring。
+- **红线保留**：不 push/tag（本批）；未部署生产；不新增用户可见配置字段（schema 18 段 202 叶子）；每日主动 5 次等限额不变；睡眠/硬约定/生理锚点权限不变；状态结算唯一链不变。版本双号 3.17.32；版本断言重钉 8 文件 + `_config_round_checks.py` 历史链。
+- **测试**：新增 E 批专项 `test_e_cf3/cf4/cf5/cf6/cf7/svc/p18_31732.py`；七门禁干净副本 7/7；全套件 357/357（clean copy）；部署待授权。
+
+
 ## 3.17.31（2026-11-09）
 
 - D 批小项（依 `union/20261109_两份审查报告_独立复核结论.md` 低优先/纵深防御项）。**P2-1**：`patrol._tick` 跨日好感重置/衰减前置于 `miss_enabled` 门——关闭想念主动搭话不再连带跳过每日衰减。**P1-6**：`settlement_v2` idle 的 focus 回归靶心 0.35→0.60（与 rest 0.62 同带），弱化「待机→专注更低→选不上工作→继续待机」螺旋。**P2-4c**：离线结算 `apply_episode` 补 `episode_id`（`offline:日期:有效分钟`，`offline_episode_id` 统一生成），不再绕过 `_episode_receipts` 幂等门（恰好一次仍由 pending gap 一次性消费保证）。**P2-4d**：删除 `settle_night_interrupts` 中已被 `_save_state` 覆盖式合并取代的冗余 guard（原补写分支顺序执行永不触发，且可能用陈旧值覆盖并发写入）。**P2-5 前半**：视频桥判定提示词「post=值得发（当前仅影子留痕，不真正发布）」改为真实发布口径；解析器放行 post 的 delay_minutes（原只对 defer 保留，decide() 的 post 延迟分支成死代码）。
