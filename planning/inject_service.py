@@ -1045,8 +1045,19 @@ class InjectService:
         """
         view = self._life_runtime_view()
         if view is not None:
-            # 复核 P1-10：优先取无数值口语版；旧视图/异常回退原 state_line。
-            state_line = str(view.get("state_line_plain") or view.get("state_line") or "").strip()
+            # 复核 P1-10：replyer 走无数值口语版（planner 仍保留数值口径）；
+            # 直接从读模型取，runtime 视图键集不变。取不到再回退原 state_line。
+            now = view.get("now") or self._tz_manager.get_now()
+            state_line = ""
+            model = self._life_read_model()
+            if model is not None:
+                try:
+                    state_line = str(model.state_line(
+                        now, max_items=2, include_numbers=False) or "").strip()
+                except Exception:
+                    state_line = ""
+            if not state_line:
+                state_line = str(view.get("state_line") or "").strip()
             if state_line:
                 prefix = "状态："
                 return state_line[len(prefix):] if state_line.startswith(prefix) else state_line
@@ -1214,19 +1225,12 @@ class InjectService:
             except Exception:
                 state_line = ""
             try:
-                # 复核 P1-10：replyer 走无数值口语版（planner 仍保留数值口径）
-                state_line_plain = str(model.state_line(
-                    now, max_items=2, include_numbers=False) or "").strip()
-            except Exception:
-                state_line_plain = ""
-            try:
                 today = model.today(now) or {}
             except Exception:
                 today = {}
             completed = [row for row in (today.get("completed") or [])
                          if isinstance(row, dict)][-2:]
             return {"current": current, "next": nxt, "state_line": state_line,
-                    "state_line_plain": state_line_plain,
                     "completed": completed, "now": now,
                     "sleep": self._sleep_presentation(now)}
         except Exception as exc:
