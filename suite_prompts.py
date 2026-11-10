@@ -353,7 +353,6 @@ EMOTION_SLEEP_REFEREE_DEFAULT = """你是一个客观的情绪裁判系统，负
 5. R_yesterday / E_tomorrow / 约定情况是代码层已计算的参考数值，最终增量仍需你综合人设与日志判断。
 6. 给出最终的 ΔVAD（增量，非绝对值），每一维范围必须在 [-{limit:.2f}, {limit:.2f}] 之间。
 7. reason 每条不超过 30 字，概括依据即可，不必逐字引用原文，禁止脑补不存在的事件。
-8. 内部思考控制在两三句以内，随后立即输出最终 JSON。
 
 只输出 JSON：{{"delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}, "reason_valence": "...", "reason_arousal": "...", "reason_dominance": "..."}}
 

@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from core.json_payload import extract_json_payload
 from core.storage import save_json_atomic
 
 logger = logging.getLogger(__name__)
@@ -131,7 +132,7 @@ class InitiativeMemory:
                         'loneliness表示对缺少联系的敏感度，不是当前心情。'
                         '内向不等于孤独、没有精力不等于想联系。只输出JSON，不输出思考。\n人设：'
                         + str(personality)[:5000], task_name='utils', module='companion', event='companion_disposition')
-                    raw = json.loads(str(text).strip().removeprefix('```json').removesuffix('```').strip())
+                    raw = extract_json_payload(text)
                     h, l = raw['anchor_hours'], raw['loneliness']
                     if isinstance(h, bool) or isinstance(l, bool):
                         raise ValueError('boolean disposition')

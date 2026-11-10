@@ -1,6 +1,6 @@
 """Pure normalization shared by the independent video social pipeline."""
 from __future__ import annotations
-import json, math, re
+import math, re
 from typing import Any
 
 BV = re.compile(r"^BV[A-Za-z0-9]{10}$")
@@ -57,7 +57,9 @@ def watched_facts(result: Any, source: str, now: float) -> dict | None:
 
 
 def strict_json(text: str) -> Any:
-    text = str(text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
-    return json.loads(text, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    """复核 P1-12：统一提取（think/围栏大小写/前导+），无 dict 载荷抛 ValueError 走调用方兜底。"""
+    from core.json_payload import extract_json_payload
+    data = extract_json_payload(text)
+    if data is None:
+        raise ValueError("no JSON object payload")
+    return data
