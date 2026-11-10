@@ -94,6 +94,14 @@ from suite_prompts import (
 
 logger = logging.getLogger(__name__)
 
+#: 复核 P1-10：attention_mode（now/brief/later）→ 自然中文口语（未知值不注入）。
+_ATTENTION_MODE_TEXT = {
+    "now": "现在能随时搭话",
+    "brief": "可以简短聊两句",
+    "later": "这时不太方便分心",
+}
+
+
 #: 无当前活动兜底文案统一经 ``suite_prompts.prompt(plugin, "inject_no_activity")``：
 #: 该键属 INTERNAL_PROMPT_NAMES（不在 PromptsSectionConfig 字段面），恒返
 #: suite_prompts.INJECT_NO_ACTIVITY_DEFAULT，不接受配置覆盖、不会为空。
@@ -1000,7 +1008,8 @@ class InjectService:
         """
         view = self._life_runtime_view()
         if view is not None:
-            state_line = str(view.get("state_line") or "").strip()
+            # 复核 P1-10：优先取无数值口语版；旧视图/异常回退原 state_line。
+            state_line = str(view.get("state_line_plain") or view.get("state_line") or "").strip()
             if state_line:
                 prefix = "状态："
                 return state_line[len(prefix):] if state_line.startswith(prefix) else state_line
@@ -1168,12 +1177,19 @@ class InjectService:
             except Exception:
                 state_line = ""
             try:
+                # 复核 P1-10：replyer 走无数值口语版（planner 仍保留数值口径）
+                state_line_plain = str(model.state_line(
+                    now, max_items=2, include_numbers=False) or "").strip()
+            except Exception:
+                state_line_plain = ""
+            try:
                 today = model.today(now) or {}
             except Exception:
                 today = {}
             completed = [row for row in (today.get("completed") or [])
                          if isinstance(row, dict)][-2:]
             return {"current": current, "next": nxt, "state_line": state_line,
+                    "state_line_plain": state_line_plain,
                     "completed": completed, "now": now,
                     "sleep": self._sleep_presentation(now)}
         except Exception as exc:
@@ -1309,13 +1325,12 @@ class InjectService:
                 elapsed = ring_minutes_ahead(cur_min, start)
                 if elapsed > 0:
                     segs.append(f"已进行 {elapsed} 分钟")
-            progress = current.get("progress")
-            if isinstance(progress, (int, float)) and not isinstance(progress, bool):
-                pct = int(round(max(0.0, min(1.0, float(progress))) * 100))
-                segs.append(f"进度 {pct}%")
-            mode = str(current.get("attention_mode") or "").strip()
-            if mode:
-                segs.append(f"注意力 {mode}")
+            # 复核 P1-10：进度百分比不进 planner 文本；注意力档位换自然中文，
+            # 未知值直接略过（不再把 now/brief/later 英文枚举直出给模型）。
+            attention = _ATTENTION_MODE_TEXT.get(
+                str(current.get("attention_mode") or "").strip().lower())
+            if attention:
+                segs.append(attention)
             remaining = (override or {}).get("remaining")
             if isinstance(remaining, int) and remaining > 0:
                 segs.append(f"约还剩 {remaining} 分钟")
@@ -1327,7 +1342,7 @@ class InjectService:
             # （无当前活动时 lines 为空 → 不追加任何行，空活动兜底走现在行）
             return lines
         nxt_parts: List[str] = []
-        # P1：已睡时不附「接下来…（预演）」等易被误读为正在行动的内容；未来计划保留在查询/页面。
+        # P1：已睡时不附「接下来…（可能）」等易被误读为正在行动的内容；未来计划保留在查询/页面。
         _next_items = [] if (view.get("sleep") or {}).get("state") == "asleep" \
             else (view.get("next") or [])[:2]
         for item in _next_items:
@@ -1344,9 +1359,9 @@ class InjectService:
             if item.get("paused"):
                 mark = "（可恢复）"
             elif item.get("is_preview"):
-                mark = "（预演）"
+                mark = "（可能）"
             elif item.get("is_spine_intent"):
-                mark = "（意图）"
+                mark = "（打算）"
             nxt_parts.append(f"{format_day_minute(start)} {item_name}{mark}")
         if nxt_parts:
             lines.append("接下来：" + "；".join(nxt_parts))

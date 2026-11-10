@@ -336,7 +336,8 @@ class LifeScheduleReadModel:
     # ================================================================
     # state_line（LifeStateService.describe；缺失 → 空串回退静态能量）
     # ================================================================
-    def state_line(self, now: Optional[datetime] = None, max_items: int = 2) -> str:
+    def state_line(self, now: Optional[datetime] = None, max_items: int = 2, *,
+                   include_numbers: bool = True) -> str:
         """一行生活状态（如「状态：有点累（精力 0.38），有点饿（饥饿 0.72）」）。
 
         LifeState 缺失/异常 → 空串（调用方回退 ``time_utils.describe_energy`` 静态曲线
@@ -345,7 +346,8 @@ class LifeScheduleReadModel:
         if self._life is None:
             return ""
         try:
-            return str(self._life.describe(self._now(now), max_items=max_items) or "")
+            return str(self._life.describe(self._now(now), max_items=max_items,
+                                           include_numbers=include_numbers) or "")
         except Exception as exc:
             logger.warning("life_schedule: state_line 生成失败（回退静态能量）：%s", exc)
             return ""

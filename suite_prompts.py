@@ -201,7 +201,7 @@ INJECT_HINT_IDLE_DEFAULT = (
 INJECT_NO_ACTIVITY_DEFAULT = "你现在没有进行中的活动，处于空闲状态；不要声称正在做某事，也不要汇报不存在的活动或日程。"
 #: replyer 状态注入模板（占位符：{state_line} / {energy} / {next_line}；{next_line} 为空时整行省略）
 INJECT_REPLYER_STATUS_DEFAULT = (
-    "【角色当前状态】\n{state_line}\n精神：{energy}。\n{next_line}"
+    "【角色当前状态】\n{state_line}\n身体与精神状态：{energy}。\n{next_line}"
     "注意：不要主动提及；仅在用户问到 / 强相关时自然带过。"
 )
 #: replyer 状态行模板（占位符：{activity} / {description} / {remaining_hint}）

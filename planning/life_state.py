@@ -876,11 +876,14 @@ class LifeStateService:
         }
 
     # ── 描述（最显著 1~2 项；零 emoji）─────────────────────────────────────
-    def describe(self, now: Optional[datetime] = None, max_items: int = 2) -> str:
+    def describe(self, now: Optional[datetime] = None, max_items: int = 2, *,
+                 include_numbers: bool = True) -> str:
         """取最显著的状态项拼一行（附录 B.2/§6.4 口径，如
         「状态：有点累（精力 0.38），有点饿（饥饿 0.72）」；无显著项 →「状态：平稳」）。
 
         ``max_items`` 钳 [1, 3]；显著性 = 偏离中性带的距离（越偏越靠前）。
+        ``include_numbers=False`` 出无数值口语版（复核 P1-10：replyer「精神：有点饿
+        （饥饿 0.72）」既病句又泄漏浮点；口语版只留「有点累」「有点饿」）。
         """
         max_items = max(1, min(3, int(max_items))) if isinstance(max_items, (int, float)) \
             and not isinstance(max_items, bool) else 2
@@ -891,38 +894,41 @@ class LifeStateService:
             if sev > 0:
                 items.append((sev, text))
 
+        def detail(label: str, value: float) -> str:
+            return f"（{label} {value:.2f}）" if include_numbers else ""
+
         energy, hunger = s["energy"], s["hunger"]
         focus, stress, social = s["focus"], s["stress"], s["social_battery"]
         if energy < 0.15:
-            add(0.40 + (0.15 - energy), f"快撑不住（精力 {energy:.2f}）")
+            add(0.40 + (0.15 - energy), f"快撑不住{detail('精力', energy)}")
         elif energy < 0.40:
-            add(0.40 - energy, f"有点累（精力 {energy:.2f}）")
+            add(0.40 - energy, f"有点累{detail('精力', energy)}")
         elif energy >= 0.85:
-            add(energy - 0.85, f"精力充沛（精力 {energy:.2f}）")
+            add(energy - 0.85, f"精力充沛{detail('精力', energy)}")
         elif energy >= 0.72:
-            add(energy - 0.72, f"精神不错（精力 {energy:.2f}）")
+            add(energy - 0.72, f"精神不错{detail('精力', energy)}")
         if hunger >= 0.85:
-            add(0.10 + (hunger - 0.85), f"很饿（饥饿 {hunger:.2f}）")
+            add(0.10 + (hunger - 0.85), f"很饿{detail('饥饿', hunger)}")
         elif hunger >= 0.60:
-            add(hunger - 0.60, f"有点饿（饥饿 {hunger:.2f}）")
+            add(hunger - 0.60, f"有点饿{detail('饥饿', hunger)}")
         if focus < 0.30:
-            add(0.25 + (0.30 - focus), f"注意力涣散（专注 {focus:.2f}）")
+            add(0.25 + (0.30 - focus), f"注意力涣散{detail('专注', focus)}")
         elif focus < 0.50:
-            add(0.50 - focus, f"注意力一般（专注 {focus:.2f}）")
+            add(0.50 - focus, f"注意力一般{detail('专注', focus)}")
         elif focus >= 0.80:
-            add(focus - 0.80, f"注意力集中（专注 {focus:.2f}）")
+            add(focus - 0.80, f"注意力集中{detail('专注', focus)}")
         if stress >= 0.80:
-            add(0.10 + (stress - 0.80), f"压力很大（压力 {stress:.2f}）")
+            add(0.10 + (stress - 0.80), f"压力很大{detail('压力', stress)}")
         elif stress >= 0.60:
-            add(stress - 0.60, f"有点紧张（压力 {stress:.2f}）")
+            add(stress - 0.60, f"有点紧张{detail('压力', stress)}")
         if social < 0.20:
-            add(0.20 - social, f"不太想说话（社交电量 {social:.2f}）")
+            add(0.20 - social, f"不太想说话{detail('社交电量', social)}")
         if self._sleep_debt >= 6.0:
             add(self._sleep_debt / SLEEP_DEBT_MAX + 0.10,
-                f"缺觉明显（睡眠欠账 {self._sleep_debt:.1f}h）")
+                "缺觉明显" + (f"（睡眠欠账 {self._sleep_debt:.1f}h）" if include_numbers else ""))
         elif self._sleep_debt >= 3.0:
             add(self._sleep_debt / SLEEP_DEBT_MAX,
-                f"有点缺觉（睡眠欠账 {self._sleep_debt:.1f}h）")
+                "有点缺觉" + (f"（睡眠欠账 {self._sleep_debt:.1f}h）" if include_numbers else ""))
         if not items:
             return "状态：平稳"
         items.sort(key=lambda pair: pair[0], reverse=True)
