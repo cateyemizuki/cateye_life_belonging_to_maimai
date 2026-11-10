@@ -36,7 +36,9 @@ import math
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 #: v2 参数版本（结构/默认值变更时递增；随 ``settlement_diag.version`` 落盘可追溯）
-V2_PARAMS_VERSION = "20261103.1"
+#: 20261110.1：P1-6 复核把 idle 的 focus 靶心 0.35→0.60（见 ``activity.idle``）；
+#: 默认参数变更必须同步递增版本，否则 ``settlement_diag.version`` 追溯失真（CF-7）。
+V2_PARAMS_VERSION = "20261110.1"
 
 #: v2 结算内置参数（唯一真源；键集固定，未知覆盖键在 :func:`merge_params` 丢弃）
 V2_PARAMS: Dict[str, Any] = {
