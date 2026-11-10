@@ -88,7 +88,8 @@ REWRITE_MATRIX: dict[tuple[str, str], str] = {
     (CHAT_TYPE_PRIVATE_TARGET, KIND_NIGHT_GREETING):
         PRIVATE_TARGET_FALLBACK_NOTICE + "。现在是晚上，这次是主动向对方道晚安，语气自然不机械",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_MISS):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。这次是因为想对方了主动开口，自然地把这份想念说出来",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。这次是因为你想对方了主动开口；"
+        "顺着你已经定下的方向自然说，不必刻意强调想念",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_VIDEO_SHARE):
         PRIVATE_TARGET_FALLBACK_NOTICE + "。刚看完视频想分享，自然地聊聊视频里的内容",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_SURF_CHITCHAT):

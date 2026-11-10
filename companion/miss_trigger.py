@@ -31,10 +31,10 @@ def memory_line(habits: Any) -> str:
     return f"你记得TA的一些习惯：{text}。可以自然地带一句，不要逐条汇报。"
 
 MISS_REASON_DEFAULT = (
-    "【可选动机·想念】距离陪伴目标上次来信约{hours}小时，可能有一点想联系TA。"
-    "这只是插件提出的候选，不代表你已经想念或必须关心对方。"
-    "请依据当前状态和上下文自行决定是否交流；不合适就不输出任何工具调用，"
-    "不必解释拒绝，也不要重复刚刚的问候。{memory_line}"
+    "【可选动机·想念】距离陪伴目标上次来信约{hours}小时，你有一点想联系TA。"
+    "这只是插件给出的一个念头，不代表你必须立刻开口；是否说话、说什么，"
+    "由你按当前状态和上下文决定。不合适就不输出任何工具调用，"
+    "不必解释，也不要重复刚刚的问候。{memory_line}"
 )
 
 def state_words(energy: Any, social_battery: Any, valence: Any = None) -> str:

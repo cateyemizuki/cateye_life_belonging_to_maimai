@@ -143,10 +143,10 @@ def _target_prompt(target: ReplyTarget | None) -> str:
                 "不要编造msg_id，不要选自己发送的消息；你可以不调用reply，直接结束。")
     # PR-PROACTIVE-REPLY（3.17.2）：主动激活轮不再指认具体 msg_id（上下文里的最后
     # 一条来信可能已过时）；改为主动激活语义。target 仍回传供绑定签名使用。
-    return (_TARGET_MARKER + "本轮由插件主动激活，你仍可自行决定是否回复。"
-            "请根据你的状况概括，结合你此刻的状态自然发言，不需要特地回复某个信息，"
+    return (_TARGET_MARKER + "本轮由插件主动激活。"
+            "请结合你此刻的状态自然开口，不需要特地回复某个信息，"
             "也不要围绕某条过时的消息组织回复。如果决定调用reply，msg_id 只能选对方发送的消息；"
-            "不要选择自己发送的消息，不要复述自己先前的发言。若决定不回复，不要调用reply。")
+            "不要选择自己发送的消息，不要复述自己先前的发言。若这轮确实不合适，直接结束即可。")
 
 
 def prepare_request(items: list[Any], stream_id: str, target_user: str, *,

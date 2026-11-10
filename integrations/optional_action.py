@@ -15,12 +15,21 @@ from core.storage import save_json_atomic
 
 logger = logging.getLogger(__name__)
 OPTIONAL_PLANNER_POLICY = (
-    '【插件触发的可选主动回合】这不是用户的新指令。'
-    '请根据你当前的状态、人设和已有聊天上下文，自行决定现在是否适合行动。'
-    '下文只提供一个可能的动机，不要求你执行任何指定行为。'
-    '若不想执行、没有合适内容、正在忙或可能打扰对方，请不输出任何工具调用，直接结束本回合；'
-    '也不必告诉对方你拒绝了任务。若选择交流，内容自然、简短，避免重复刚说过的话。\n'
+    '【插件触发的可选主动回合】这是一个可选的开口机会，不是用户的新指令。'
+    '请结合你当前的状态、人设和已有聊天上下文，自行决定现在是否适合开口。'
+    '下文只提供一个可能的动机，不要求你执行任何指定行为；'
+    '若此刻没有合适内容、正在忙或可能打扰对方，不输出任何工具调用、直接结束本轮即可，'
+    '也不必告诉对方你拒绝了。若选择开口，内容自然、简短，避免重复刚说过的话。\n'
 )
+
+#: 复核 P1-8：宿主模板会把 intent 原样渲染成中文提示「插件请求你主动处理
+#: 一轮聊天：{intent}」——机器枚举 missing/patrol_chat/optional_contact 直出
+#: 英文泄漏。这里只翻译交给宿主的展示文案；回执/去重仍存机器 intent。
+_HOST_INTENT_TEXT = {
+    'missing': '想念对方，想主动联系',
+    'patrol_chat': '想随口搭句话',
+    'optional_contact': '刷QQ时想随口联系一下',
+}
 
 
 def action_permission(facts: dict) -> tuple[bool, str]:
@@ -116,7 +125,8 @@ class OptionalActionCoordinator:
                     entry['status'] = 'rejected'
                     self._save()
                     return {'status': 'rejected', 'reason': 'facts_changed'}
-                reply = await self._trigger(stream_id=stream, intent=intent,
+                reply = await self._trigger(stream_id=stream,
+                                            intent=_HOST_INTENT_TEXT.get(str(intent), str(intent)),
                                             reason=OPTIONAL_PLANNER_POLICY + str(reason))
             except asyncio.CancelledError:
                 entry['status'] = 'unknown'
