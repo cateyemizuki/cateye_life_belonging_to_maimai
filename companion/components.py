@@ -49,6 +49,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import threading
+import time
 from collections import deque as _deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -525,7 +526,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         （is_target 判定结果 / source=auto / stream_kind；私聊 target 判定复用
         sender_identity 既有链路；群聊里非 target 的发言不上报，避免群流水刷日志）；
         target 私聊（会话类型未知时按私聊兜底）再经 affection_events 记一条
-        ``chat_round`` 规则事件（日累计 ≤ +1.0），并刷新 last_user_msg_time
+        ``chat_round`` 规则事件（日累计 ≤ +2.0），并刷新 last_user_msg_time
         （顺带触发 ``user_initiated`` 检测，§5.4）。``is_notify`` 消息只按
         target 私聊口径刷新 last_user_msg_time，不落入其余链路（TEST_PROCEDURE §二）。
         """
@@ -817,6 +818,10 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 except Exception:
                     self.ctx.logger.debug("主动激活登记让位回滚失败（忽略）", exc_info=True)
                 return None
+            # P1-8：本 turn 已确认是主动轮；给 after_response 留进程内标记，
+            # 只用于确认预算/发言数，避免把确认窗内的被动回复误算到主动回合。
+            self._mai_proactive_reply_marker = {"stream": session_id,
+                                                "at": time.time()}
             notice = rewrite_notice_for(turn.get("chat_type"), turn.get("kind"))
             updated, replaced = rewrite_replyer_payload(payload_key, payload, notice)
             if replaced:
@@ -848,6 +853,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             return None
         if not self._mai_proactive_replyer_active(payload_key, payload):
             return None
+        # P1-8：旧路径（registry 未命中）同样标记为主动轮，供 after_response 确认。
+        self._mai_proactive_reply_marker = {"stream": session_id,
+                                            "at": time.time()}
         updated, replaced = rewrite_replyer_payload(payload_key, payload)
         if replaced:
             self.ctx.logger.info(
@@ -924,14 +932,23 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         # already_answered（沉默后再开口永久漏计）。
         _reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
         _target_stream = str(companion.patrol.patrol_status().get("stream_id") or "").strip()
+        # P1-8：只有 replyer.before_request 的主动轮改写钩子留下的标记，才能证明
+        # 这次 after_response 属于主动回合；否则窗内的被动回复会误提交预算/误计发言。
+        marker = getattr(self, "_mai_proactive_reply_marker", None)
+        marker_ok = (isinstance(marker, dict)
+                     and str(marker.get("stream") or "") == _reply_stream
+                     and time.time() - float(marker.get("at") or 0.0) <= 300.0)
+        if marker_ok:
+            self._mai_proactive_reply_marker = None
         confirmation: dict[str, Any] = {"status": "not_target"}
         if _reply_stream and _target_stream and _reply_stream == _target_stream:
             _notify = getattr(companion.affection, "note_bot_replied", None)
             if callable(_notify):
                 _notify(datetime.now())
-            # P1-8：目标流出现真实回复 → 提交最近一笔 pending 可选回合的预算预留。
-            # 宿主无「实际发送」回调；after_response 的 session_id 是唯一关联信号。
-            confirmation = await self._mai_confirm_optional_reply(_reply_stream)
+            # P1-8：目标流的**主动轮**真实回复 → 提交最近一笔 pending 可选回合的
+            # 预算预留。被动回复（无 marker）只刷 last_speak_time，不动预算。
+            if marker_ok:
+                confirmation = await self._mai_confirm_optional_reply(_reply_stream)
         patrol = companion.patrol
         last_trigger = patrol.get_last_trigger_time()
         now = datetime.now()
@@ -945,6 +962,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         confirmed_patrol = (confirmed_status == "confirmed"
                             and confirmed_intent in ("missing", "patrol_chat"))
         if not confirmed_patrol:
+            if not marker_ok:
+                return  # 无主动轮标记 = 被动回复，不补计发言数、不清待确认触发
             if last_trigger is None:
                 return  # 没有待确认的 proactive trigger
             if elapsed is None or elapsed >= 90:

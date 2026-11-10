@@ -497,7 +497,9 @@ ACTION_SKIP = "skip"
 
 #: dispatch 明确未入队的回执状态：可以安全退回本周期 claim。``unknown`` 不在其中
 #: （交付态不明时保留占用，防重复开口——InitiativeMemory 的既有契约）。
-_DEFINITE_NOT_ENQUEUED = frozenset({'blocked', 'duplicate', 'rejected', 'not_assembled'})
+#: ``duplicate`` 也不在其中：它表示同一 key 已有 pending/confirmed 回执，claim
+#: 应继续保持占用；退回后下一轮会 claim→duplicate→release 死循环（复核 finding）。
+_DEFINITE_NOT_ENQUEUED = frozenset({'blocked', 'rejected', 'not_assembled'})
 
 
 class PatrolService:

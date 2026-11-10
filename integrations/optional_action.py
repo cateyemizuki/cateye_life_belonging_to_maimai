@@ -22,11 +22,17 @@ logger = logging.getLogger(__name__)
 PENDING_REPLY = 'pending_reply'
 #: after_response 与入队回执的关联窗（秒）。宿主没有「实际发送」回调，唯一的确认
 #: 信号是 replyer.after_response；超过该窗的回复不再归属本次可选回合。
-CONFIRM_WINDOW_SECONDS = 90.0
+#: 必须**短于** RECONCILE_MAX_AGE_SECONDS：否则回执先被超时回收，真实回复再也
+#: 无法确认（复核 finding：90s 窗 < 180s 回收，90–180s 的回复两边都不认）。
+CONFIRM_WINDOW_SECONDS = 240.0
 #: 未确认回执的回收年龄（秒）。超时 → 释放预算预留并标 expired_no_reply。
-RECONCILE_MAX_AGE_SECONDS = 180.0
+#: 取大于确认窗的值，保证确认窗内的回复仍有机会先提交预算。
+RECONCILE_MAX_AGE_SECONDS = 300.0
 #: 终态回执可被裁剪；pending/unknown 永不驱逐。
 _TERMINAL_STATUSES = ('rejected', 'enqueued', 'confirmed', 'expired_no_reply')
+#: 可安全重试的状态：明确未入队/超时未回复。下一次 dispatch 允许覆盖同一
+#: ``stream:key`` 回执；pending/confirmed/unknown 仍按 duplicate 防重复开口。
+_RETRYABLE_STATUSES = frozenset({'rejected', 'expired_no_reply'})
 
 OPTIONAL_PLANNER_POLICY = (
     '【插件触发的可选主动回合】这是一个可选的开口机会，不是用户的新指令。'
@@ -111,14 +117,16 @@ class OptionalActionCoordinator:
             facts = self._facts()
             stream = str(facts['target_stream'])
             scoped = stream + ':' + str(key)
-            if not key or scoped in self._attempts:
+            existing = self._attempts.get(scoped)
+            if not key or (isinstance(existing, dict)
+                           and str(existing.get('status')) not in _RETRYABLE_STATUSES):
                 return {'status': 'duplicate'}
             budget = self._budget()
             token = budget.reserve('optional_action', stream) if budget is not None else None
             if not token:
                 return {'status': 'blocked', 'reason': 'budget_reservation'}
             entry = {'status': PENDING_REPLY, 'intent': str(intent), 'budget_token': token,
-                     'stream': stream, 'key': str(key), 'pending_since': time.time()}
+                     'stream': stream, 'key': str(key), 'pending_since': 0.0}
             self._attempts[scoped] = entry
             # Bound retained terminal receipts; in-flight/unknown receipts never evicted.
             terminal = [k for k,v in self._attempts.items() if v.get('status') in _TERMINAL_STATUSES]
@@ -167,6 +175,9 @@ class OptionalActionCoordinator:
                 # Host accepted the task, but the replyer may still decline to speak.
                 # Keep the reservation until confirm_reply / reconcile_pending decides.
                 entry['status'] = PENDING_REPLY
+                # 关联窗从宿主**受理之后**开始计时（before()/trigger 的耗时不算在
+                # 玩家的回复窗里；旧实现从 entry 创建时打点，慢 trigger 会吃掉窗口）。
+                entry['pending_since'] = time.time()
             else:
                 entry['status'] = 'unknown'
             self._save()
@@ -179,7 +190,7 @@ class OptionalActionCoordinator:
         """确认目标流上出现了一次真实发言，提交最近一笔 pending 回执的预算。
 
         宿主没有可靠的「实际发送」回调；调用方（replyer.after_response）携带的
-        ``session_id`` 就是唯一关联信号。只确认确认窗（默认 90 秒）内最近一笔
+        ``session_id`` 就是唯一关联信号。只确认确认窗（默认 240 秒）内最近一笔
         pending 回执，避免把更早、已被放弃的回合算到本次发言上。
 
         幂等：同一回执只提交一次；无 pending → ``{'status': 'no_pending'}``。
