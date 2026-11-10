@@ -61,6 +61,7 @@ next_line 是两条已证实泄漏通道）：
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -100,6 +101,19 @@ _ATTENTION_MODE_TEXT = {
     "brief": "可以简短聊两句",
     "later": "这时不太方便分心",
 }
+
+#: 复核 P1-9：主动分享回合的运行时豁免——只追加在本次注入文本末尾，不新增
+#: ``[prompts]`` 可配键（schema 18 段 202 叶子不变）。
+_INJECT_PROACTIVE_SHARE_HINT = (
+    "（本轮是你主动分享近况/视频的回合：可以自然说出要分享的内容；"
+    "上面『不主动提日程 / 刚完成的事』只约束背景信息，不限制本轮分享动机。）"
+)
+_INJECT_PROACTIVE_SHARE_REPLYER = (
+    "（本轮是你主动开口的回合：可以自然说出本轮想分享/想说的内容；"
+    "上面的『不要主动提及』只约束日程背景，不限制本轮主动动机。）"
+)
+_PROACTIVE_SHARE_KINDS = frozenset({"video_share", "surf_chitchat"})
+_EXPERIENCE_SHARE_MARKER = "最近经历参考（可选话题）"
 
 
 #: 无当前活动兜底文案统一经 ``suite_prompts.prompt(plugin, "inject_no_activity")``：
@@ -314,6 +328,13 @@ class InjectService:
         try:
             chat_id = session_id or "global"
             user_id = session_id or "unknown"
+            # 复核 P1-9：主动分享轮判定（登记簿未消费 → kind/reason；已消费 →
+            # 载荷里的分享定制文案/经历话题标记）。
+            _payload = kwargs.get("items")
+            if not isinstance(_payload, list):
+                _payload = kwargs.get("messages")
+            proactive_share = self._proactive_share_turn(
+                session_id, _payload if isinstance(_payload, list) else None)
 
             current_activity, current_description, future_activities, activity_type = (
                 await self._get_current_schedule(chat_id)
@@ -388,6 +409,11 @@ class InjectService:
                     return {"action": "continue"}
                 logger.info("replyer 注入: 无当前活动（空活动变体）")
 
+            if proactive_share:
+                # 复核 P1-9：分享/主动开口轮给「不要主动提及」一句运行时豁免，
+                # 避免状态块与 replyer 改写文案（想念/视频分享）互相抵消。
+                activity_prompt = f"{activity_prompt}\n{_INJECT_PROACTIVE_SHARE_REPLYER}"
+
             if self._inject_optimizer is not None:
                 self._inject_optimizer.record_injection(
                     scope_key, activity_key, activity_prompt, intent,
@@ -435,6 +461,10 @@ class InjectService:
 
         if not payload:
             return {"action": "continue"}
+
+        # 复核 P1-9：主动分享轮（miss+经历话题 / 视频分享 / 刷QQ闲聊）——
+        # 「不主动提日程」的引导行会与分享动机互搏，本轮给 planner 追加豁免。
+        proactive_share = self._proactive_share_turn(session_id, payload)
 
         cfg = self._schedule_cfg()
         if not self._plugin_enabled() or not cfg.inject_into_planner:
@@ -515,6 +545,7 @@ class InjectService:
                 life_lines=life_lines,
                 life_lines_slim=life_lines_slim,
                 live_gate_enabled=live_gate_enabled,
+                proactive_share=proactive_share,
             )
 
             # 记录到上下文缓存
@@ -715,6 +746,7 @@ class InjectService:
         life_lines: Optional[List[str]] = None,
         life_lines_slim: Optional[List[str]] = None,
         live_gate_enabled: bool = False,
+        proactive_share: bool = False,
     ) -> Tuple[Optional[str], bool, Optional[str]]:
         """分类 → 决策 → 模板路由。user_id 实际是会话维度 scope ID（session_id）。
 
@@ -806,6 +838,7 @@ class InjectService:
             context_continue_inject=context_continue_inject,
             context_reason=context_reason,
             life_lines=effective_life_lines,
+            proactive_share=proactive_share,
         )
         if inject_content is None:
             return None, False, detected_intent
@@ -833,6 +866,7 @@ class InjectService:
         context_continue_inject: bool,
         context_reason: Optional[str],
         life_lines: Optional[List[str]] = None,
+        proactive_share: bool = False,
     ) -> Optional[str]:
         """按 intent 路由统一模板（详略与语气随意图变化；TECH/COMMAND 返回 None）。
 
@@ -944,6 +978,9 @@ class InjectService:
                 lines.extend(["", prompt(self._plugin, "inject_hint_proactive")])
             else:
                 lines.extend(["", prompt(self._plugin, "inject_hint_idle")])
+            if proactive_share:
+                # 复核 P1-9：主动分享轮追加运行时豁免（代码层，不改模板/schema）。
+                lines.append(_INJECT_PROACTIVE_SHARE_HINT)
 
         lines.extend(["", "---", ""])
         # R7 runtime 实况追加行（runtime 视图就绪时由调用方传入；未就绪 → None
@@ -1195,6 +1232,49 @@ class InjectService:
         except Exception as exc:
             logger.debug("life runtime 注入视图读取失败（回退旧路径）：%s", exc)
             return None
+
+    def _proactive_share_turn(self, session_id: str, payload: Any = None) -> bool:
+        """复核 P1-9：本轮是否为需要分享近况/视频的主动回合。
+
+        判定顺序（全程可空降级，异常一律按 False = 旧行为）：
+        1. 主动激活登记簿：kind ∈ {video_share, surf_chitchat}，或 miss 的 reason
+           带经历分享话题（``最近经历参考（可选话题）``）；
+        2. 登记已被 replyer 改写钩子消费时，从载荷文本反推：经历分享标记，
+           或 ``REWRITE_MATRIX`` 的分享类定制文案。
+
+        只用于给 planner/replyer 的「不主动提日程」加一句运行时豁免，
+        不触碰预算/静默/好感/发送门控。
+        """
+        getter = getattr(self._plugin, "_mai_proactive_turns", None)
+        if callable(getter) and session_id:
+            try:
+                registry = getter()
+                turn = registry.active_for(session_id) if registry is not None else None
+            except Exception:
+                turn = None
+            if turn:
+                kind = str(turn.get("kind") or "")
+                reason = str(turn.get("reason") or "")
+                if kind in _PROACTIVE_SHARE_KINDS or _EXPERIENCE_SHARE_MARKER in reason:
+                    return True
+        if payload:
+            try:
+                blob = json.dumps(payload, ensure_ascii=False, default=str)
+            except Exception:
+                blob = str(payload)
+            if _EXPERIENCE_SHARE_MARKER in blob:
+                return True
+            try:
+                from tools.proactive_turn import (
+                    CHAT_TYPE_PRIVATE_TARGET,
+                    rewrite_notice_for,
+                )
+                for kind in ("video_share", "surf_chitchat"):
+                    if rewrite_notice_for(CHAT_TYPE_PRIVATE_TARGET, kind) in blob:
+                        return True
+            except Exception:
+                logger.debug("主动分享轮判定：定制文案探测失败（降级 False）", exc_info=True)
+        return False
 
     def _sleep_presentation(self, now) -> Dict[str, Any]:
         """P1 权威睡眠表现态：SleepEngine 会话优先，episode 仅名称/时间佐证。
