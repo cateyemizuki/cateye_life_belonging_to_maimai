@@ -490,6 +490,14 @@ class MotiveStore:
                 # 保证任何来源的分享动机都不越过经历 18h。
                 deadline = share_deadlines.get(
                     _clip(motive.get("source_ref"), 160))
+                if deadline is None and _has_relative_time_words(motive.get("topic")):
+                    # 复核 finding：provider 只取 recent(limit=10)，经历被截断/读取失败
+                    # 时 share_deadlines 无该项。旧版落盘动机没有 ttl_anchor_ts，退回
+                    # 「动机 created_at + 18h」的保守上限（最坏也不越过动机自身 18h）。
+                    created_dt = self._parse_ts(motive.get("created_at"))
+                    if created_dt is not None:
+                        deadline = created_dt + timedelta(
+                            hours=EXPERIENCE_SHARE_RELATIVE_TTL_HOURS)
                 if deadline is not None and (expires is None or deadline < expires):
                     motive["expires_at"] = deadline.isoformat()
                     expires = deadline
