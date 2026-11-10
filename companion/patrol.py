@@ -84,8 +84,11 @@ logger = logging.getLogger(__name__)
 
 
 #: PR-C1 H5：经历分享动机对想念候选概率的**轻微**加成比例（×strength，乘法只升不降；
-#: 与 planner 侧 MOTIVE_BONUS_RATIO 同量级）。概率封顶沿用 evaluate_miss 的 0.35
-#: （initiative_profile 孤独锚点机制不动，这里只消费其输出，不改其判定）。
+#: 与 planner 侧 MOTIVE_BONUS_RATIO 同量级）。封顶沿用 evaluate_miss 的 0.35，但
+#: 该上限**不得低于**已按好感/情绪调整后的概率（CF-4：:func:`adjust_miss_probability`
+#: 可把 0.35 推到最坏 0.462，若仍以 0.35 硬封顶，加成会倒挂成降概率）。见
+#: :func:`apply_experience_share_boost`；initiative_profile 孤独锚点机制不动，
+#: 这里只消费其输出，不改其判定。
 EXPERIENCE_SHARE_PROB_RATIO = 0.15
 EXPERIENCE_SHARE_PROB_CAP = 0.35
 #: 分享 topic 参考行（追加在想念 reason 后；可选话题，不要求提起）
@@ -122,6 +125,34 @@ def adjust_miss_probability(base: Any, tier: Any, mood_rate: Any = 1.0) -> float
     except (TypeError, ValueError):
         rate = 1.0
     return max(0.0, min(1.0, value * (0.9 + 0.05 * tier_value) * rate))
+
+
+def apply_experience_share_boost(probability: Any, strength: Any) -> float:
+    """CF-4：经历分享动机的轻微加成——**只升不降**，上界 1.0。
+
+    旧实现在 :func:`adjust_miss_probability` 之后仍用
+    ``min(EXPERIENCE_SHARE_PROB_CAP, p * (1 + ratio * strength))``：调整后的概率
+    一旦超过 CAP（0.35，最坏 0.462），加成反而把概率降回 0.35，与「只升不降」矛盾。
+    现把 CAP 视为「不低于调整后值」的上限基线 ``cap = max(CAP, p)``，再与加成值取小：
+
+    - ``p <= CAP``：与旧行为逐字一致（0.2 → 0.23）；
+    - ``p > CAP``：保持 ``p``（0.4 → 0.4），绝不回落，也不再强行抬高；
+    - 结果恒钳 [0, 1]；非法/负数 ``strength`` 按 0 处理，非法 ``probability`` → 0。
+    """
+    try:
+        value = float(probability)
+    except (TypeError, ValueError):
+        return 0.0
+    if not value > 0.0:  # NaN/0/负数 → 无加成可言
+        return 0.0
+    try:
+        level = max(0.0, min(1.0, float(strength)))
+    except (TypeError, ValueError):
+        level = 0.0
+    cap = max(EXPERIENCE_SHARE_PROB_CAP, value)
+    boosted = value * (1.0 + EXPERIENCE_SHARE_PROB_RATIO * level)
+    return max(0.0, min(1.0, min(cap, boosted)))
+
 
 #: 情绪不可得时的恒等 mood_effect（emotion 关闭/缺失 → 乘数恒 1.0，§八.2 可空降级）
 NEUTRAL_MOOD_EFFECT: dict[str, Any] = {
@@ -695,8 +726,8 @@ class PatrolService:
                 strength = max(0.0, min(1.0, float(share.get('strength') or 0.0)))
             except (TypeError, ValueError):
                 strength = 0.0
-            probability = min(EXPERIENCE_SHARE_PROB_CAP,
-                              probability * (1.0 + EXPERIENCE_SHARE_PROB_RATIO * strength))
+            # CF-4：boost 只升不降（旧 min(CAP, …) 在 adjusted>CAP 时反降概率）。
+            probability = apply_experience_share_boost(probability, strength)
             fields.update(experience_share_ref=str((share.get('source') or {}).get('ref') or ''),
                           experience_share_strength=round(strength, 4),
                           miss_probability_boosted=round(probability, 4))
