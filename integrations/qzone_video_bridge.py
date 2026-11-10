@@ -75,6 +75,8 @@ FALLBACK_DELAY_MINUTES = 30
 #: defer 延迟夹取区间（分钟）：防 0 分钟忙循环与超长挂起；规格未给区间，保守取值
 DELAY_MIN_MINUTES = 5
 DELAY_MAX_MINUTES = 1440
+#: post 延迟下限（分钟）：0=立即发（CF-5，与提示词「delay_minutes=0 立即发」一致）
+POST_DELAY_MIN_MINUTES = 0
 
 #: PR-A2 单次 tick 最多发布的候选数（保守取 1；真正的上限是共享每日额度/冷却）
 TICK_PUBLISH_LIMIT = 1
@@ -101,6 +103,20 @@ ATTEMPT_ACTIVE_STATUSES = ('claimed', 'sending', 'sent', 'uncertain')
 ASSET_ID = re.compile(r"^vframe_[0-9a-f]{32}$")
 #: 资产合法状态（claimed/released 供 PR-A2/A3 使用，本批只写 reserved/available）
 ASSET_STATUSES = ('reserved', 'available', 'claimed', 'released', 'expired')
+
+
+def clamp_delay_minutes(action: Any, value: Any,
+                        default: float = FALLBACK_DELAY_MINUTES) -> float:
+    """按动作夹取延迟分钟数（CF-5，3.17.32）。
+
+    post 允许 0（立即发）~1440；defer 仍 5~1440；do_not_post 不使用延迟恒 0。
+    缺失/非法（非数值、bool、NaN/inf）走既有 fallback=``FALLBACK_DELAY_MINUTES``；
+    数值越界按边界夹取。纯函数、无 I/O，便于单测与复现。
+    """
+    if action not in ('post', 'defer'):
+        return 0.0
+    low = POST_DELAY_MIN_MINUTES if action == 'post' else DELAY_MIN_MINUTES
+    return max(low, min(DELAY_MAX_MINUTES, number(value, default)))
 
 
 def spread_asset_ids(available: list[dict], max_assets: int) -> list[str]:
@@ -290,17 +306,17 @@ class QzoneVideoLedger:
         Status mapping: post→evaluated（A2 发布相位消费）,
         defer→deferred（next_eval_at 后移）, do_not_post→rejected.
         PR-A2：写 post 时按 decision.delay_minutes 设 publish_after（到点才可发布）。
+        CF-5（3.17.32）：post 允许 0（立即发）~1440，publish_after=now+delay*60（0 即 now）；
+        defer 仍 5~1440；非法/缺失走既有 fallback。
         posted/uncertain 由 A2 发布结果写入；claimed 是资产状态（非候选状态）。
         """
         action = decision.get('action')
         if action not in ('post', 'defer', 'do_not_post'):
             raise ValueError('无效空间视频判定')
         status = 'evaluated' if action == 'post' else 'deferred' if action == 'defer' else 'rejected'
-        delay = max(DELAY_MIN_MINUTES, min(DELAY_MAX_MINUTES, number(decision.get('delay_minutes'),
-                                                                      FALLBACK_DELAY_MINUTES)))
+        delay = clamp_delay_minutes(action, decision.get('delay_minutes'))
         next_at = now + delay * 60 if action == 'defer' else now
-        publish_after = (now + max(0.0, number(decision.get('delay_minutes'), 0.0)) * 60
-                         if action == 'post' else 0.0)
+        publish_after = now + delay * 60 if action == 'post' else 0.0
         with self._transaction() as db:
             db.execute(
                 'UPDATE candidates SET status=?,decision_json=?,evaluations=evaluations+1,'
@@ -1020,7 +1036,9 @@ class QzoneVideoBridge:
                     'focus': clean(doc.get('focus'), 200),
                     'tone': clean(doc.get('tone'), 200),
                       # 复核 P2-5：post 也接受延迟（原实现只对 defer 保留，decide() 的 post 延迟分支成死代码）
-                    'delay_minutes': (max(DELAY_MIN_MINUTES, min(DELAY_MAX_MINUTES, delay))
+                      # CF-5（3.17.32）：post 允许 0（立即发）~1440，与提示词「delay_minutes=0 立即发」一致；
+                      # defer 仍 5~1440；<0/缺失/非数已在上方走 fallback。
+                    'delay_minutes': (clamp_delay_minutes(doc['action'], delay)
                                       if doc['action'] in ('defer', 'post') else 0),
                     'asset_ids': selected,
                     'reason': clean(doc.get('reason'), 300) or '未提供具体理由'}
