@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core.storage import save_json_atomic
+from tools.proactive_turn import (
+    MISS_REASON_STAGE4_SUFFIX,
+    append_stage4_miss_prompt,
+    clean_stage4_prompt,
+    strip_stage4_suffix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +47,32 @@ OPTIONAL_PLANNER_POLICY = (
     '若此刻没有合适内容、正在忙或可能打扰对方，不输出任何工具调用、直接结束本轮即可，'
     '也不必告诉对方你拒绝了。若选择开口，内容自然、简短，避免重复刚说过的话。\n'
 )
+
+#: 阶段 4（目标私聊清醒沉默 >120h）专属前导政策（设计 §3.1）。
+#: 与 OPTIONAL_PLANNER_POLICY 互斥替换：**取消“可以静默放弃”的免责**，
+#: 要求把日常分享与“人去哪了/还在不在”的追问融合发出。阶段 0~3 仍用原政策。
+STAGE4_PLANNER_POLICY = (
+    '【插件触发的日常伴随想念回合（失联阶段4）】对方已超过5天未回复，'
+    '本轮必须将日常分享与深度询问融合发给对方。'
+    '请不要直接退出或放弃发言，务必结合日常动作，自然而沉闷地追问对方人去哪了、是否还在。\n'
+)
+#: 阶段 4 尾缀标题（幂等标记）：reason 里已有该标记时不再二次拼接
+#: （调用方/装配根可能已先拼过一次，避免双拼）。
+_STAGE4_SUFFIX_MARK = MISS_REASON_STAGE4_SUFFIX.strip().split('（', 1)[0]
+
+
+def _miss_stage_from_facts(facts: dict) -> int:
+    """facts 里的阶段号（宽松读取；仅 4 有行为差异，非法/缺失 → 0）。"""
+    if not isinstance(facts, dict):
+        return 0
+    raw = facts.get('miss_stage')
+    if isinstance(raw, bool):
+        return 0
+    try:
+        stage = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return stage if 0 <= stage <= 4 else 0
 
 #: 复核 P1-8：宿主模板会把 intent 原样渲染成中文提示「插件请求你主动处理
 #: 一轮聊天：{intent}」——机器枚举 missing/patrol_chat/optional_contact 直出
@@ -154,9 +186,36 @@ class OptionalActionCoordinator:
                     entry['status'] = 'rejected'
                     self._save()
                     return {'status': 'rejected', 'reason': 'facts_changed'}
+                # 四阶段渗透（设计 §3.1）：阶段 4 用强覆盖政策替换“可静默放弃”前导，
+                # 并在 reason 末尾拼接阶段 4 尾缀（单一 owner = 本处；标题标记幂等防双拼）。
+                # 复核 finding：facts 已透出 miss_stage 时以 facts 为准（用户刚回信 →
+                # stage 0 时不得被旧 reason 的标题标记拉回阶段 4）；marker 只兼容
+                # 尚未透出该字段的旧装配根。
+                stage = _miss_stage_from_facts(current)
+                if (stage != 4 and 'miss_stage' not in current
+                        and _STAGE4_SUFFIX_MARK in str(reason)):
+                    stage = 4
+                if stage == 4:
+                    reason_text = str(reason)
+                    if STAGE4_PLANNER_POLICY not in reason_text:
+                        reason_text = STAGE4_PLANNER_POLICY + reason_text
+                    if _STAGE4_SUFFIX_MARK not in reason_text:
+                        reason_text = append_stage4_miss_prompt(
+                            reason_text,
+                            hours=current.get('miss_silence_hours') or 0.0,
+                            relation=str(current.get('relation') or '恋人'),
+                        )
+                    else:
+                        # 调用方已拼好尾缀：仍清洗一次互斥短语（装配根可能未覆盖
+                        # small_event/miss 模板里的“也可以什么都不说”等句式）。
+                        reason_text = clean_stage4_prompt(reason_text)
+                else:
+                    # facts 明确回到 stage 0：调用方若已拼过阶段 4 尾缀，剥掉残留
+                    # （否则会出现「普通政策 + 追问尾缀」的自相矛盾文本）。
+                    reason_text = OPTIONAL_PLANNER_POLICY + strip_stage4_suffix(reason)
                 reply = await self._trigger(stream_id=stream,
                                             intent=_HOST_INTENT_TEXT.get(str(intent), str(intent)),
-                                            reason=OPTIONAL_PLANNER_POLICY + str(reason))
+                                            reason=reason_text)
             except asyncio.CancelledError:
                 entry['status'] = 'unknown'
                 self._save()

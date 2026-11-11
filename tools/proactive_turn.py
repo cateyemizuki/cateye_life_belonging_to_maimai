@@ -43,6 +43,18 @@ from typing import Any, Callable, Optional
 
 from core.storage import save_json_atomic
 from integrations.proactive_reply_target import PROACTIVE_REPLY_NOTICE
+# 阶段 4 文案/清洗规则单一 owner = core.stage4_prompt（纯文本模块；companion
+# .miss_trigger 与 plugin 也转发同一份实现）。避免 tools 依赖 companion 包
+# 造成的循环导入，也避免两份表漂移（复核 finding）。
+# 本模块只做转发：常量直接复用，append 保留 tools 侧「拿不到精确小时数 → 120+」口径。
+from core.stage4_prompt import (
+    MISS_REASON_STAGE4_SUFFIX,
+    MISS_REASON_STAGE4_VIDEO_SUFFIX,
+    STAGE4_SUPPRESSED_PHRASES,
+    append_stage4_miss_prompt as _append_stage4_miss_prompt,
+    clean_stage4_prompt as _clean_stage4_prompt,
+    strip_stage4_suffix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,13 +114,116 @@ _CHAT_TYPE_FALLBACKS = {
     CHAT_TYPE_PRIVATE_TARGET: PRIVATE_TARGET_FALLBACK_NOTICE,
 }
 
+# ---- 阶段感知改写（2026-11-11 阶梯想念 / 四阶段渗透 §2.3） ----
+#: 阶段 1~3 的独立想念文案。仍以 :data:`PRIVATE_TARGET_FALLBACK_NOTICE` 开头：
+#: ①旧路径（components 904 起 fallback）按默认文案判重时能识别；②幂等守卫
+#: （known_notice_texts）与既有 startswith 断言不破。
+STAGE1_MISS_NOTICE = (
+    PRIVATE_TARGET_FALLBACK_NOTICE
+    + "。这次是你主动想找对方搭话；不要直接说“想你了”，结合你们的关系随口问问TA在干嘛"
+      "或怎么没理你，简短自然"
+)
+STAGE2_MISS_NOTICE = (
+    PRIVATE_TARGET_FALLBACK_NOTICE
+    + "。对方已经一整天没回你了，语气里带出一点等待和在意，顺便找个话题试探TA是不是"
+      "在忙或没看到消息"
+)
+STAGE3_MISS_NOTICE = (
+    PRIVATE_TARGET_FALLBACK_NOTICE
+    + "。对方已经两三天没音讯了，这次直接表达失落或焦急，明确追问对方人去哪了、"
+      "怎么一直不回消息，不要客气敷衍"
+)
+#: 阶段 4（>120h 失联）每日主动任务强覆盖：明确剥离原问候/晚安里的
+#: “不要追问/轻松寒暄”限制，先完成日常动作、再转入沉默追问。
+STAGE4_DAILY_OVERLAY_NOTICE = (
+    PRIVATE_TARGET_FALLBACK_NOTICE
+    + "。本轮为失联第4阶段下的日常主动交互。虽然原本的任务是完成上方planner里的日常动作"
+      "（如问候或分享/分析视频），但对方已失联超过5天。请先简短带出你的日常事/视频感想，"
+      "随后语气转入沉默低落，反复确认对方到底去哪了、人是否还在。忽略任何“不要追问”或"
+      "“轻松寒暄”的限制，语气真实克制又带着执拗的等待感"
+)
+_STAGE_MISS_NOTICES: dict[int, str] = {
+    1: STAGE1_MISS_NOTICE,
+    2: STAGE2_MISS_NOTICE,
+    3: STAGE3_MISS_NOTICE,
+}
 
-def rewrite_notice_for(chat_type: Any, kind: Any) -> str:
-    """(chat_type, kind) → 改写文案；未登记组合按 chat_type 兜底。
+# ---- 阶段 4 Planner 侧统一尾缀（设计 §2.2；供问候/刷QQ/视频等派发点复用） ----
+# 文案与清洗表见 companion.miss_trigger（单一 owner；本模块 import 时已转发）。
+#: 兼容旧名（内部/测试既有引用）。
+_STAGE4_SUPPRESSED_PHRASES = STAGE4_SUPPRESSED_PHRASES
+#: 阶段 4 早/午/晚安轻量任务骨架：绕开 [prompts] 自定义模板与默认文案里
+#: “不要追问 / 轻松关心 / 不要开新话题”等互斥指令（设计 §3.2 推荐骨架替换）。
+STAGE4_GREETING_INTENT_SKELETONS: dict[str, str] = {
+    KIND_MORNING_GREETING: "Bot 刚睡醒，新的一天开始了，准备像往常一样发消息",
+    KIND_NOON_GREETING: "现在是中午，习惯性想发条消息",
+    KIND_NIGHT_GREETING: "夜深了，准备睡觉前习惯性发条消息",
+}
+
+
+def _normalize_miss_stage(value: Any) -> int:
+    """阶段号宽松归一：仅接受 0~4，其余（bool/字符串/越界）→ 0。"""
+    if isinstance(value, bool):
+        return 0
+    try:
+        stage = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return stage if 0 <= stage <= 4 else 0
+
+
+def stage4_intent_for_kind(kind: Any, fallback: Any = "") -> str:
+    """阶段 4 问候 intent：早/午/晚安替换为无互斥指令的轻量骨架，其余 kind 保留原文。"""
+    skeleton = STAGE4_GREETING_INTENT_SKELETONS.get(str(kind or ""))
+    return skeleton if skeleton is not None else str(fallback or "")
+
+
+def clean_stage4_prompt(text: str) -> str:
+    """公开的互斥短语清洗（转发 companion.miss_trigger 单一 owner）。"""
+    return _clean_stage4_prompt(text)
+
+
+def append_stage4_miss_prompt(
+    base_prompt: str,
+    *,
+    hours: Any,
+    relation: str = "恋人",
+    memory_line: str = "",
+    is_video: bool = False,
+) -> str:
+    """在每日主动任务提示词后拼接 Stage 4 深度想念文案（转发单一 owner）。
+
+    tools 侧保留「调用方拿不到精确小时数时不编造 0.0」的 ``120+`` 口径；
+    清洗规则与 companion 版完全相同。
+
+    幂等：调用方应保证同一 base 只拼一次（dispatch 侧会按
+    :data:`MISS_REASON_STAGE4_SUFFIX` 的标题标记判重）。
+    """
+    return _append_stage4_miss_prompt(
+        base_prompt, hours=hours, relation=relation,
+        memory_line=memory_line, is_video=is_video,
+        nonpositive_hours_text="120+",
+    )
+
+
+def rewrite_notice_for(chat_type: Any, kind: Any, *, miss_stage: int = 0) -> str:
+    """(chat_type, kind, miss_stage) → 改写文案；未登记组合按 chat_type 兜底。
+
+    - ``CHAT_TYPE_PRIVATE_TARGET`` + ``KIND_MISS``：阶段 1/2/3 各注入对应追问强度；
+    - ``CHAT_TYPE_PRIVATE_TARGET`` 任意 kind：阶段 4 强制覆盖（剥离“不追问/轻松
+      寒暄”限制，先日常后沉默追问）；
+    - 阶段 0 / 其他 chat_type：逐字沿用 :data:`REWRITE_MATRIX` 与三态兜底
+      （群聊/其他私聊绝不因阶段号被染色）。
 
     未知 chat_type 保守按其他私聊兜底（绝不把非目标流当陪伴目标私聊）。
     """
     ct = str(chat_type or "")
+    stage = _normalize_miss_stage(miss_stage)
+    if ct == CHAT_TYPE_PRIVATE_TARGET:
+        if stage == 4:
+            return STAGE4_DAILY_OVERLAY_NOTICE
+        if stage in _STAGE_MISS_NOTICES and str(kind or "") == KIND_MISS:
+            return _STAGE_MISS_NOTICES[stage]
     text = REWRITE_MATRIX.get((ct, str(kind or "")))
     if text is not None:
         return text
@@ -116,8 +231,13 @@ def rewrite_notice_for(chat_type: Any, kind: Any) -> str:
 
 
 def known_notice_texts() -> tuple[str, ...]:
-    """全部可能注入的文案（矩阵 + 三态兜底），供 replyer 幂等守卫去重。"""
-    return tuple(dict.fromkeys((*REWRITE_MATRIX.values(), *_CHAT_TYPE_FALLBACKS.values())))
+    """全部可能注入的文案（矩阵 + 阶段 1~4 变体 + 三态兜底），供幂等守卫去重。"""
+    return tuple(dict.fromkeys((
+        *REWRITE_MATRIX.values(),
+        *_STAGE_MISS_NOTICES.values(),
+        STAGE4_DAILY_OVERLAY_NOTICE,
+        *_CHAT_TYPE_FALLBACKS.values(),
+    )))
 
 
 def classify_stream(plugin: Any, stream_id: Any) -> str:
@@ -200,6 +320,9 @@ class ProactiveTurnRegistry:
                         and isinstance(row.get("created_at"), (int, float))
                         and isinstance(row.get("consumed"), bool)):
                     raise ValueError("bad proactive turn fields")
+                # 阶段号宽松兼容：旧快照无 miss_stage / 非法值 → 0，绝不因新字段
+                # 让整簿降级为空（登记簿仍须为旧版本可用）。
+                row["miss_stage"] = _normalize_miss_stage(row.get("miss_stage", 0))
                 valid.append(row)
             self._turns = valid
             self._prune()
@@ -222,8 +345,13 @@ class ProactiveTurnRegistry:
         self._turns = fresh[-self.MAX_TURNS:]
 
     # ---- 登记 / 查询 / 消费 ----
-    def register(self, stream_id: Any, kind: Any, reason: Any, summary: str = "") -> str:
-        """登记一次主动激活；返回 turn_id。分类失败保守按 private_other。"""
+    def register(self, stream_id: Any, kind: Any, reason: Any, summary: str = "", *,
+                 miss_stage: int = 0) -> str:
+        """登记一次主动激活；返回 turn_id。分类失败保守按 private_other。
+
+        ``miss_stage``（kw-only，默认 0）：阶梯想念/四阶段渗透的阶段号（0~4），
+        随 turn 落盘供 replyer 钩子改写文案；旧调用不传 = 既有行为逐字不变。
+        """
         sid = str(stream_id or "").strip()
         try:
             chat_type = classify_stream(self._plugin, sid)
@@ -238,6 +366,7 @@ class ProactiveTurnRegistry:
             "kind": str(kind or KIND_OTHER),
             "reason": str(reason or ""),
             "summary": str(summary or ""),
+            "miss_stage": _normalize_miss_stage(miss_stage),
             "created_at": float(self._clock()),
             "consumed": False,
         }
@@ -354,18 +483,21 @@ class ProactiveTurnRegistry:
 
 
 def register_turn(plugin: Any, stream_id: Any, kind: Any, reason: Any,
-                  summary: str = "") -> Optional[str]:
+                  summary: str = "", *, miss_stage: int = 0) -> Optional[str]:
     """触发点统一登记入口：registry 缺失/异常 → 静默降级（返回 None），绝不影响触发。
 
     plugin 侧装配口 = CompanionComponentsMixin._mai_proactive_turns()（惰性单例）。
     本函数不做任何计数（increment_speak 口径不变）、不查任何门控。
+    ``miss_stage``（kw-only，默认 0）随 turn 落盘，供 replyer 阶段感知改写；
+    既有 4 参调用逐字兼容。
     """
     try:
         getter = getattr(plugin, "_mai_proactive_turns", None)
         registry = getter() if callable(getter) else None
         if registry is None:
             return None
-        return registry.register(stream_id, kind, reason, summary)
+        return registry.register(stream_id, kind, reason, summary,
+                                 miss_stage=miss_stage)
     except Exception:
         logger.debug("主动激活登记失败（忽略，触发行为不受影响）", exc_info=True)
         return None

@@ -13,6 +13,18 @@ reactive 日程注入不受影响（planning/inject* 他人负责）。想念不
 最小间隔、用户冷却、静默/午休闸与 LLM 把关逐字保留。沉默事件
 （``relation.silence_detected``，M3）独立保留，阈值仍读 ``miss_silence_hours``。
 
+**2026-11-11 P0-ACT-1 阶梯想念**：沉默周期不再「一开口就整段消耗」。阶段 1/2/3
+（6–20h / 20–48h / 48–120h 清醒沉默）各占一次独立 claim（``miss:s1``…``miss:s3``），
+前一段开口后后一段仍可受理；单拍概率按 10 分钟巡检平滑在 ``[0.05, 0.12]``；
+短回复（<3 字/纯表情）只把周期起点顺延 1.5h（半衰期上限），真实长回复才重置周期。
+``[patrol].miss_stage_escalation_enabled`` 默认开；关 = 旧单次 ``miss`` 行为逐字恢复。
+
+**2026-11-11 四阶段（gemini3.8flash）**：``> 120h`` 为阶段 4——独立 ``miss`` 停发
+（``evaluate_miss`` 返回 ``stage4_delegated_to_daily_tasks``，不写 claim），本巡检只写
+一条 ``stage4_delegated`` 诊断并把状态交给每日主动任务；只读出口
+:meth:`PatrolService.current_target_miss_stage` 供派发点查询。阶段 4 仍只按
+``last_user_msg_time`` 计时，短回复只顺延不清零，真实长回复重建周期回阶段 0。
+
 **静默窗口径（2026-10-20 用户指示，N5「留空跟随」收官；2026-10-21 §24.2 任务B 真实化）**：
 静默窗恒复用作息锚点——**插件实例路径优先真实睡眠环**（schedule.db 夜晚睡条目经
 ``planning/schedule_anchors`` 解析，读取即解析；赖床顺延后锚点随移），日程不可用时回退
@@ -57,6 +69,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -73,7 +86,11 @@ from planning.time_utils import is_in_day_frame, is_in_time_window
 from suite_prompts import render
 from tools.proactive_turn import discard_turn, register_turn
 
-from .initiative_profile import InitiativeMemory, evaluate_miss
+from .initiative_profile import (DEFAULT_ANCHOR_HOURS, MISS_STAGE_PROB_MAX,
+                                 MISS_STAGE_PROB_MIN, SHORT_REPLY_DEFER_HOURS,
+                                 SHORT_REPLY_HALF_LIFE, InitiativeMemory, cycle_defer_hours,
+                                 effective_anchor_epoch, epoch, evaluate_miss, miss_stage,
+                                 open_miss_claim_kinds, stage_claim_kind)
 from . import miss_trigger
 from .affection import AffectionManager
 from .screen_context import ScreenContextStore
@@ -88,9 +105,10 @@ logger = logging.getLogger(__name__)
 
 
 #: PR-C1 H5：经历分享动机对想念候选概率的**轻微**加成比例（×strength，乘法只升不降；
-#: 与 planner 侧 MOTIVE_BONUS_RATIO 同量级）。封顶沿用 evaluate_miss 的 0.35，但
-#: 该上限**不得低于**已按好感/情绪调整后的概率（CF-4：:func:`adjust_miss_probability`
-#: 可把 0.35 推到最坏 0.462，若仍以 0.35 硬封顶，加成会倒挂成降概率）。见
+#: 与 planner 侧 MOTIVE_BONUS_RATIO 同量级）。旧路径封顶沿用 evaluate_miss 的 0.35，
+#: 但该上限**不得低于**已按好感/情绪调整后的概率（CF-4：:func:`adjust_miss_probability`
+#: 可把 0.35 推到最坏 0.462，若仍以 0.35 硬封顶，加成会倒挂成降概率）。
+#: P0-ACT-1 阶梯路径（``band``）下把加成上限压到 0.12，保持单拍概率带。见
 #: :func:`apply_experience_share_boost`；initiative_profile 孤独锚点机制不动，
 #: 这里只消费其输出，不改其判定。
 EXPERIENCE_SHARE_PROB_RATIO = 0.15
@@ -109,12 +127,16 @@ def strip_experience_share_prefix(topic: Any) -> str:
     return value
 
 
-def adjust_miss_probability(base: Any, tier: Any, mood_rate: Any = 1.0) -> float:
+def adjust_miss_probability(base: Any, tier: Any, mood_rate: Any = 1.0,
+                            *, band: Optional[Tuple[float, float]] = None) -> float:
     """复核 P1-7：想念概率接入好感档位（0..4 → ×0.9..1.1）与情绪 proactive_rate。
 
     ``evaluate_miss`` 的孤独锚点判定保持不可变契约（复核结论：上层视为不可变），
     调节只在 patrol 消费侧进行；结果钳 [0,1]。非 target/无档位 → 0 档（×0.9），
     非法乘数 → 1.0，异常不抛。
+
+    ``band``（P0-ACT-1 阶梯想念）：给出 ``(min, max)`` 时，档位/情绪只做**带内**微调，
+    结果钳在带内——单拍概率不会因好感或情绪越过 0.12。缺省 ``None`` = 旧契约逐字不变。
     """
     try:
         value = float(base)
@@ -128,10 +150,15 @@ def adjust_miss_probability(base: Any, tier: Any, mood_rate: Any = 1.0) -> float
         rate = float(mood_rate)
     except (TypeError, ValueError):
         rate = 1.0
-    return max(0.0, min(1.0, value * (0.9 + 0.05 * tier_value) * rate))
+    adjusted = max(0.0, min(1.0, value * (0.9 + 0.05 * tier_value) * rate))
+    if band is not None:
+        low, high = float(band[0]), float(band[1])
+        return max(low, min(high, adjusted))
+    return adjusted
 
 
-def apply_experience_share_boost(probability: Any, strength: Any) -> float:
+def apply_experience_share_boost(probability: Any, strength: Any,
+                                 *, band: Optional[Tuple[float, float]] = None) -> float:
     """CF-4：经历分享动机的轻微加成——**只升不降**，上界 1.0。
 
     旧实现在 :func:`adjust_miss_probability` 之后仍用
@@ -142,6 +169,10 @@ def apply_experience_share_boost(probability: Any, strength: Any) -> float:
     - ``p <= CAP``：与旧行为逐字一致（0.2 → 0.23）；
     - ``p > CAP``：保持 ``p``（0.4 → 0.4），绝不回落，也不再强行抬高；
     - 结果恒钳 [0, 1]；非法/负数 ``strength`` 按 0 处理，非法 ``probability`` → 0。
+
+    ``band``（P0-ACT-1 阶梯想念）：仅当传入概率**已在带内**（阶梯公式产出）时才把
+    加成后的上界钳到 ``band[1]``——单拍概率不会因经历分享越过 0.12；带外值（旧契约/
+    外部调用）保持「只升不降」的既有语义，绝不被压低。
     """
     try:
         value = float(probability)
@@ -154,6 +185,8 @@ def apply_experience_share_boost(probability: Any, strength: Any) -> float:
     except (TypeError, ValueError):
         level = 0.0
     cap = max(EXPERIENCE_SHARE_PROB_CAP, value)
+    if band is not None and float(band[0]) <= value <= float(band[1]):
+        cap = min(cap, float(band[1]))
     boosted = value * (1.0 + EXPERIENCE_SHARE_PROB_RATIO * level)
     return max(0.0, min(1.0, min(cap, boosted)))
 
@@ -175,6 +208,107 @@ TIME_WINDOW_KEYS: Tuple[str, ...] = ()
 #: [schedule] 段或锚点缺失时的出厂兜底（与 planning.config.ScheduleSectionConfig 默认一致）
 _FALLBACK_SCHEDULE_WAKE = "07:00"
 _FALLBACK_SCHEDULE_SLEEP = "23:00"
+
+#: 3.17.33（D2 想念睡眠扣除）：只回看最近 N 天的睡眠会话——避免每拍全库扫描；更早的
+#: 沉默不再回扣，保证真实多日失联（>N 天）仍能越过人设锚点触发想念。
+MISS_SLEEP_LOOKBACK_DAYS = 7
+#: 单条睡眠会话的最长计入时长：一条连续「睡」超过 24h 视为多日失联而非睡眠，只按前
+#: 24h 扣除——既能让离线补全的一天量级整段扣除（离线会话按原始 gap 落行，有效睡眠
+#: 另有 10h 上限），又不会让 3 天/一周的连续段把怀念动机整段吞掉。
+MISS_SLEEP_SESSION_MAX_HOURS = 24.0
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    """防御性 float（bool/None/非数/NaN/Inf → None）。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _naive_local(value: datetime) -> datetime:
+    """带时区时间 → 与 ``datetime.now()`` 同口径的本地 naive（naive 原样返回）。"""
+    if value.tzinfo is None:
+        return value
+    try:
+        return value.astimezone().replace(tzinfo=None)
+    except (OverflowError, OSError, ValueError):
+        return value.replace(tzinfo=None)
+
+
+def sleep_intervals_from_rows(rows: Any, midnight: datetime) -> list[tuple[datetime, datetime]]:
+    """``sleep_sessions`` 行 → 绝对时间区间（只读投影；**只收 completed**）。
+
+    日帧口径与面板 ``estimated_segments`` 同源：``schedule_date`` 的 00:00 起算
+    ``actual_start_minute`` / ``actual_end_minute``，跨午夜时分钟 >1440 自然滚入次日。
+    缺端（未收口）、时间倒挂一律跳过；单条段按
+    :data:`MISS_SLEEP_SESSION_MAX_HOURS` 截断（超长的连续「睡眠」按多日失联处理）。
+    """
+    result: list[tuple[datetime, datetime]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        start = _finite_number(row.get("actual_start_minute"))
+        end = _finite_number(row.get("actual_end_minute"))
+        if start is None or end is None or end <= start:
+            continue
+        try:
+            seg_start = midnight + timedelta(minutes=start)
+            seg_end = midnight + timedelta(minutes=end)
+        except (OverflowError, ValueError):
+            continue
+        max_end = seg_start + timedelta(hours=MISS_SLEEP_SESSION_MAX_HOURS)
+        if seg_end > max_end:
+            seg_end = max_end
+        result.append((seg_start, seg_end))
+    return result
+
+
+def merge_sleep_intervals(intervals: Any) -> list[tuple[datetime, datetime]]:
+    """合并重叠/相接的睡眠区间（排序后线性合并；非法元素跳过）。"""
+    items: list[tuple[datetime, datetime]] = []
+    for item in intervals if isinstance(intervals, list) else []:
+        try:
+            start, end = item
+            if end > start:
+                items.append((start, end))
+        except (TypeError, ValueError):
+            continue
+    items.sort(key=lambda pair: pair[0])
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in items:
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def overlap_hours(intervals: Any, start: datetime, end: datetime) -> float:
+    """区间列表与 ``[start, end]`` 的重叠小时数（钳 [0, 窗口长度]；异常 → 0.0）。"""
+    try:
+        span = (end - start).total_seconds() / 3600.0
+    except (TypeError, ValueError):
+        return 0.0
+    if span <= 0:
+        return 0.0
+    seconds = 0.0
+    for item in merge_sleep_intervals(intervals):
+        seg_start, seg_end = item
+        try:
+            overlap = (min(seg_end, end) - max(seg_start, start)).total_seconds()
+        except TypeError:  # aware/naive 混比防御：该段不参与
+            continue
+        if overlap > 0:
+            seconds += overlap
+    hours = seconds / 3600.0
+    return max(0.0, min(hours, span))
 
 
 @dataclass(frozen=True)
@@ -539,12 +673,22 @@ class PatrolService:
         self._last_trigger_intent = ""
         #: 最近一次 optional_action dispatch 的状态（definite not-enqueued 才退回 claim）
         self._last_trigger_status = ""
+        #: 最近一次想念受理的 claim 键（阶梯 ``miss:s1``…；旧单次 ``miss``）。
+        #: after_response 确认时优先按它落 ``spoken``；进程重启后回退扫描周期 claims。
+        self._last_miss_claim_kind = ""
+        #: 阶段 4 委派诊断的已通知周期键（``miss:{anchor}``，只保留最近 4 个）。
+        #: 每个沉默周期 / 每个目标流只记一条正式的 ``stage4_delegated``，后续拍记
+        #: 静默重复态，避免长沉默期诊断日志被同一原因刷屏。
+        self._stage4_notified_cycles: list[str] = []
         self._last_tick_at: Optional[datetime] = None
         # M3 沉默事件频控（内存态，进程重启即清零；§4.2：每日 ≤2 次、间隔 ≥4h、仅 target）
         # 非法时间窗口配置的告警节流：配置项 -> 已告警过的原始值
         self._invalid_time_warned: dict[str, str] = {}
         # F5（2026-11-04）：整轮异常节流留痕的上次告警时刻（None = 从未告警）
         self._tick_error_warned_at: Optional[datetime] = None
+        # 3.17.33（D2）：睡眠段内 social_battery 的消费侧下限（进程内；醒来/非睡眠清空）。
+        # 只影响想念概率读到的电量，不写回 life_state（最小影响方案，见 _miss_state_inputs）。
+        self._sleep_social_floor: Optional[float] = None
 
     # ---- 事件总线（M0；self._config 可能是 plugin 或配置对象，均可空降级）----
     def _event_bus(self) -> Any:
@@ -657,11 +801,117 @@ class PatrolService:
         self._log_decision(action=ACTION_SKIP, reason="tick_error", trigger_type="patrol",
                            detail="巡检单轮异常，本轮未完成判定（详情见日志，节流留痕）")
 
+    def _open_miss_claim_kinds(self) -> list[str]:
+        """当前周期内仍待落定的想念 claim 键（阶梯阶段优先，旧单次最后）。"""
+        row = self._initiative_memory.doc.get('cycles', {}).get(self._target_qq)
+        claims = row.get('claims') if isinstance(row, dict) else None
+        return open_miss_claim_kinds(claims)
+
+    def _readonly_cycle_anchor(
+        self, now: datetime, last: datetime, *, staged: bool
+    ) -> Tuple[Optional[datetime], float]:
+        """只读投影「当前沉默周期的生效起点」与清醒时长（**绝不**调用 cycle()）。
+
+        与 ``_tick`` 的写路径同口径：
+        - 只看 ``last_user_msg_time``（目标私聊最后一条入站事件），不看 bot 发言；
+        - 阶梯开且最近一条文本为短回复 → 只把生效起点顺延 1.5h（半衰期上限），
+          已发阶段 claim 不清空；
+        - 真实长回复/文本不可得/阶梯关 → 新周期从最后来信时刻起算（等同 cycle() 重建）；
+        - 旧时间戳（last < 周期 anchor）→ 不复活旧周期。
+        """
+        row = self._initiative_memory.doc.get('cycles', {}).get(self._target_qq)
+        row_anchor = epoch(row.get('anchor')) if isinstance(row, dict) else None
+        if row_anchor is None:
+            return last, hours_between(now, last)
+        raw = epoch(row.get('raw_anchor'))
+        if raw is None:
+            raw = row_anchor
+        last_epoch = last.timestamp()
+        if last_epoch < row_anchor:
+            return None, 0.0
+        if last_epoch > raw:
+            text = self._last_target_message_text() if staged else None
+            if staged and text is not None and miss_trigger.is_short_reply(text):
+                defer = epoch(row.get('defer')) or 0.0
+                elapsed = max(0.0, last_epoch - row_anchor)
+                ceiling = elapsed * SHORT_REPLY_HALF_LIFE
+                defer = max(0.0, min(defer + SHORT_REPLY_DEFER_HOURS * 3600.0, ceiling))
+                effective = max(row_anchor, min(row_anchor + defer, last_epoch))
+            else:
+                # 真实长回复（或阶梯关/文本不可得）：cycle() 会以该时刻重建周期。
+                effective = last_epoch
+        else:
+            effective = effective_anchor_epoch(row)
+            if effective is None:
+                effective = row_anchor
+        try:
+            anchor_dt = datetime.fromtimestamp(effective)
+        except (OverflowError, OSError, ValueError):
+            return None, 0.0
+        return anchor_dt, hours_between(now, anchor_dt)
+
+    def current_target_miss_stage(
+        self, now: Optional[datetime] = None
+    ) -> Tuple[int, float]:
+        """只读状态出口：``(stage, effective_silence_hours)``。
+
+        供每日主动任务派发点查询第四阶段（>120h 渗透模式）。**纯读**：
+        不改 initiative 状态、不写盘、不调用 ``InitiativeMemory.cycle()``；
+        只看 ``last_user_msg_time``（不看 bot 自己的发言），睡眠扣除与 ``_tick``
+        同口径。阶梯开关关闭 → 恒返回 stage 0（旧行为没有阶段 4）；任何缺失/异常
+        → ``(0, 0.0)``，绝不阻塞调用方的日常任务。
+        """
+        try:
+            if not self._target_qq:
+                return (0, 0.0)
+            moment = datetime.now() if now is None else now
+            last = self._affection.last_user_msg_time()
+            if last is None or not hasattr(moment, 'timestamp') or not hasattr(last, 'timestamp'):
+                return (0, 0.0)
+            try:
+                profile = self._initiative_memory.profile()
+            except Exception:
+                profile = {}
+            try:
+                anchor_hours = float(profile.get('anchor_hours', DEFAULT_ANCHOR_HOURS))
+            except (TypeError, ValueError):
+                anchor_hours = DEFAULT_ANCHOR_HOURS
+            if not math.isfinite(anchor_hours) or not 2.0 <= anchor_hours <= 24.0:
+                anchor_hours = DEFAULT_ANCHOR_HOURS
+            staged = self._miss_stage_escalation_enabled()
+            anchor_dt, hours = self._readonly_cycle_anchor(moment, last, staged=staged)
+            if anchor_dt is None:
+                return (0, 0.0)
+            if hours >= anchor_hours and self._miss_sleep_excluded_enabled():
+                sleep_hours = self._sleep_hours_between(anchor_dt, moment)
+                if sleep_hours > 0:
+                    hours = max(0.0, hours - sleep_hours)
+            stage = miss_stage(hours, anchor_hours) if staged else 0
+            return (int(stage), float(hours))
+        except Exception:
+            logger.debug("只读想念阶段查询失败，按未知处理", exc_info=True)
+            return (0, 0.0)
+
+    def current_miss_stage(self, now: Optional[datetime] = None) -> Tuple[int, float]:
+        """兼容别名：:meth:`current_target_miss_stage`（旧命名，只读）。"""
+        return self.current_target_miss_stage(now)
+
     def mark_miss_spoken(self) -> bool:
-        """P1-8：确认主动回复后把本周期 miss claim 标 ``spoken``（仅一次）。"""
+        """P1-8：确认主动回复后把本周期 miss claim 标 ``spoken``（仅一次）。
+
+        阶梯想念下本次开口只属于某一个阶段——优先用刚受理的 claim 键；进程重启
+        后内存提示丢失，则回退到周期里唯一仍 pending 的阶段 claim（高阶段优先）。
+        """
         if not self._target_qq:
             return False
-        return self._initiative_memory.receipt(self._target_qq, 'miss', 'spoken')
+        kind = self._last_miss_claim_kind
+        if not kind:
+            open_kinds = self._open_miss_claim_kinds()
+            kind = open_kinds[0] if open_kinds else 'miss'
+        ok = self._initiative_memory.receipt(self._target_qq, kind, 'spoken')
+        if ok:
+            self._last_miss_claim_kind = ""
+        return ok
 
     def _current_cycle_key(self) -> str:
         """当前沉默周期的 miss dispatch key（``miss:{anchor}``）；无周期 → 空串。"""
@@ -701,7 +951,10 @@ class PatrolService:
             expired_key = str(row.get('key') or '')
             if expired_key and current_key and expired_key != current_key:
                 continue  # 旧沉默周期的回执：不得退回新周期 claim
-            self._initiative_memory.release(self._target_qq, 'miss')
+            # 阶梯想念：本周期可能同时存在多个阶段的 claim；release 只退 pending 类，
+            # spoken/unknown 终态不会被回滚（InitiativeMemory.release 的既有契约）。
+            for kind in (self._open_miss_claim_kinds() or ['miss']):
+                self._initiative_memory.release(self._target_qq, kind)
         return len(expired)
 
     # ------------------------------------------------------------------
@@ -730,37 +983,118 @@ class PatrolService:
         # Persona initialization is once per fingerprint; no Y/N request per candidate.
         profile = await self.initialize_disposition()
         last = self._affection.last_user_msg_time()
-        cycle = self._initiative_memory.cycle(self._target_qq, last, now)
+        staged = self._miss_stage_escalation_enabled()
+        # P0-ACT-1 第 3 条：短回复（<3 字/纯表情）只顺延周期起点，不彻底重置。
+        # 文本源 = AffectionReviewer 的滚动缓冲（chat Hook 已在刷新 last_user 的同一处
+        # 写入）；读不到 → None → cycle 按真实长回复处理（绝不因缺文本误顺延）。
+        reply_text = self._last_target_message_text() if staged else None
+        short_reply = miss_trigger.is_short_reply(reply_text) if reply_text is not None else None
+        cycle = self._initiative_memory.cycle(self._target_qq, last, now,
+                                              short_reply=short_reply)
         if cycle is None or last is None:
             done('no_user_message')
             return
-        hours = hours_between(now, last)
+        # 生效起点 = 周期首条来信 + 短回复顺延（≤ 真实最后来信）。派发 key 仍用
+        # ``cycle['anchor']``（周期键稳定，短回复前后指向同一沉默周期）。
+        effective_last = self._cycle_anchor_time(cycle) or last
+        natural_hours = hours_between(now, last)
+        hours = hours_between(now, effective_last)
+        defer_hours = cycle_defer_hours(cycle)
+        anchor_hours = float(profile.get('anchor_hours', 6))
+        # 3.17.33（D2 想念睡眠扣除）：想念用**清醒沉默时长**判定——从自然时长里扣除
+        # sleep_sessions 已收口睡眠段（含离线补全的 offline_reconnect 会话）与 life_state
+        # 当前睡眠段。仅在自然时长已越过人设锚点时才读睡眠源（短沉默零额外 IO）。
+        # ``miss_sleep_excluded`` 关 → sleep_hours=0，公式输入与旧版逐字一致。
+        #
+        # P0-ACT-1：睡眠窗口从**生效起点**（已含短回复顺延）算起，且只扣一次——
+        # 阶梯判定与睡眠扣除叠加时不会把同一段睡眠重复计入（顺延小时与睡眠小时
+        # 是同一时间轴上的两个独立扣减，各算一次）。
+        sleep_hours = 0.0
+        if hours >= anchor_hours and self._miss_sleep_excluded_enabled():
+            sleep_hours = self._sleep_hours_between(effective_last, now)
+            if sleep_hours > 0:
+                hours = max(0.0, hours - sleep_hours)
         energy, social, valence, _tier, _count = self._miss_state_inputs()
-        decision = evaluate_miss(hours, float(profile.get('anchor_hours', 6)),
-                                 float(profile.get('loneliness', .5)), energy, social, valence)
+        decision = evaluate_miss(hours, anchor_hours,
+                                 float(profile.get('loneliness', .5)), energy, social, valence,
+                                 staged=staged)
         # 复核 P1-7：好感档位（_tier）与情绪 proactive_rate 接入想念概率——
         # 原实现 tier/count 被丢弃、mood_effect 两乘数全仓无消费，关系生疏与挚爱
         # 曲线完全相同。判定契约不动，只在消费侧调节。
+        # P0-ACT-1：阶梯模式把微调限制在 [0.05, 0.12] 带内（单拍概率与 10 分钟巡检匹配）。
         try:
             mood_rate = float(self._mood_effect().get('proactive_rate') or 1.0)
         except Exception:
             mood_rate = 1.0
-        probability = adjust_miss_probability(decision.probability, _tier, mood_rate)
-        fields.update(silence_hours=round(hours, 3), anchor_hours=profile.get('anchor_hours'),
+        prob_band = ((MISS_STAGE_PROB_MIN, MISS_STAGE_PROB_MAX)
+                     if staged and decision.eligible else None)
+        probability = adjust_miss_probability(decision.probability, _tier, mood_rate,
+                                              band=prob_band)
+        claims = cycle.get('claims') or {}
+        # 阶梯关 = 旧单次键 ``miss``；阶梯开 = 当前阶段键（阶段窗口之外为空串，只作日志）。
+        claim_kind = stage_claim_kind(decision.stage) if staged else 'miss'
+        fields.update(silence_hours=round(natural_hours, 3), anchor_hours=profile.get('anchor_hours'),
                       loneliness=profile.get('loneliness'), motivation=round(decision.motivation,4),
                       capacity=round(decision.capacity,4), miss_probability=round(probability,4),
                       affinity_tier=_tier, mood_proactive_rate=round(mood_rate, 4),
-                      cycle_status=dict(cycle.get('claims') or {}), profile_source=profile.get('source'))
+                      cycle_status=dict(claims), profile_source=profile.get('source'),
+                      miss_stage_escalation=bool(staged), miss_stage=int(decision.stage),
+                      miss_claim_kind=claim_kind)
+        if defer_hours > 0:
+            # 观察字段：短回复只前移起点（不归零）；silence_hours 仍是自然时长。
+            fields.update(short_reply_deferred_hours=round(defer_hours, 3),
+                          effective_silence_hours=round(hours, 3),
+                          last_user_message_short=True)
+        if sleep_hours > 0:
+            # 观察字段：自然时长 / 扣除的睡眠 / 生效清醒时长（silence_hours 仍为自然时长，
+            # 旧消费口径不变）。
+            fields.update(sleep_excluded_hours=round(sleep_hours, 3),
+                          effective_silence_hours=round(hours, 3))
         # Same anchor for the silence fact and missing candidate; each has its own receipt.
         await self._maybe_publish_silence(now)
+        # 阶段 4 的归因优先于「近期 bot 刚发过言」冷却：阶段 4 本就不会开口，
+        # 若被 recent_bot_spoke 盖掉，诊断里就看不到「独立想念已停发」这一事实。
+        stage4 = bool(staged and decision.stage == 4)
         # 复核 P1-2：问候/主动发言后的冷却闸（原 _minutes_since_last_speak 全仓无调用方
         # = 死代码，致 12:01 午安连发后 12:21 又因 miss 私聊轰炸）。用户已接话则不拦。
-        if self._miss_suppressed_by_recent_speak(
+        if not stage4 and self._miss_suppressed_by_recent_speak(
                 now, last, float(profile.get('anchor_hours', 6))):
             done('recent_bot_spoke',
                  detail=f'{(self._minutes_since_last_speak(now) or 0):.0f}min since last speak')
             return
-        if 'miss' in cycle.get('claims', {}):
+        if staged:
+            # 阶梯受理：每阶段独立 claim；上一阶段开口不消耗下一阶段。
+            # 未落定的 pending 回执存在时不叠发（不轰炸）；当前阶段已受理过则跳过；
+            # 阶段窗口之外（>120h / 尚未到阶段 1）本周期不再开口。
+            open_kinds = open_miss_claim_kinds(claims)
+            if open_kinds:
+                fields['miss_pending_claim'] = open_kinds[0]
+                done('miss_pending_reply')
+                return
+            if stage4:
+                # 阶段 4（>120h）：独立想念停发，不写 claim、不调 _trigger_missing；
+                # 只留一条诊断记录供每日主动任务链路核对。每周期/每流只记一条正式
+                # ``stage4_delegated``（保留最近 4 个周期键），后续拍记静默重复态。
+                cycle_key = 'miss:' + str(cycle.get('anchor'))
+                notice_key = f'{self._target_qq}:{cycle_key}'
+                notified = getattr(self, '_stage4_notified_cycles', [])
+                if not isinstance(notified, list):
+                    notified = []
+                first = notice_key not in notified
+                if first:
+                    self._stage4_notified_cycles = (notified + [notice_key])[-4:]
+                fields['stage4_cycle_key'] = cycle_key
+                fields['stage4_notice'] = 'once' if first else 'repeat'
+                done('stage4_delegated' if first else 'stage4_delegated_silent',
+                     detail='阶段4：独立想念停发，改由每日主动任务承载')
+                return
+            if decision.stage <= 0:
+                done(decision.reason)
+                return
+            if claim_kind in claims:
+                done('stage_consumed')
+                return
+        elif 'miss' in claims:
             done('silence_cycle_consumed')
             return
         if not decision.eligible:
@@ -783,29 +1117,32 @@ class PatrolService:
             except (TypeError, ValueError):
                 strength = 0.0
             # CF-4：boost 只升不降（旧 min(CAP, …) 在 adjusted>CAP 时反降概率）。
-            probability = apply_experience_share_boost(probability, strength)
+            probability = apply_experience_share_boost(probability, strength, band=prob_band)
             fields.update(experience_share_ref=str((share.get('source') or {}).get('ref') or ''),
                           experience_share_strength=round(strength, 4),
                           miss_probability_boosted=round(probability, 4))
         if random.random() >= probability:
             done('dice')
             return
-        if not self._initiative_memory.claim(self._target_qq, last, now, 'miss',
+        if not self._initiative_memory.claim(self._target_qq, last, now, claim_kind,
                                              status='pending_reply'):
             done('recovery_or_cycle_claim')
             return
+        self._last_miss_claim_kind = claim_kind
         key = 'miss:' + str(cycle['anchor'])
-        success = await self._trigger_missing(hours, key=key, share_topic=share_topic)
+        success = await self._trigger_missing(hours, key=key, share_topic=share_topic,
+                                              stage=decision.stage if staged else 0)
         if success:
             # 入队只代表宿主受理；claim 保持 pending_reply，等 after_response 确认
             # （mark_miss_spoken）或 _reconcile_stale_optional_actions 超时退回。
-            self._initiative_memory.receipt(self._target_qq, 'miss', 'pending_reply')
+            self._initiative_memory.receipt(self._target_qq, claim_kind, 'pending_reply')
         elif self._last_trigger_status in _DEFINITE_NOT_ENQUEUED:
             # 明确未入队 → 本周期占用退回，下一次巡检可重新判定。
-            self._initiative_memory.release(self._target_qq, 'miss')
+            self._initiative_memory.release(self._target_qq, claim_kind)
+            self._last_miss_claim_kind = ""
         else:
             # unknown 交付态保留占用（既有语义：不重复开口）。
-            self._initiative_memory.receipt(self._target_qq, 'miss', 'unknown')
+            self._initiative_memory.receipt(self._target_qq, claim_kind, 'unknown')
         done('miss_trigger' if success else 'planner_not_enqueued', ACTION_TRIGGER if success else ACTION_SKIP)
 
 
@@ -813,13 +1150,13 @@ class PatrolService:
     # 各类触发（屏幕感知统一在 _trigger_planner 里先取）
     # ------------------------------------------------------------------
     async def _trigger_missing(self, hours_since_last: float, *, key: str = "",
-                               share_topic: str = "") -> bool:
-        reason = self._format_miss_reason(hours_since_last)
+                               share_topic: str = "", stage: int = 0) -> bool:
+        reason = self._format_miss_reason(hours_since_last, stage=stage)
         # PR-C1 H5：经历分享 topic 只作可选话题参考（不要求提起；空 = 逐字旧行为）
         if str(share_topic or '').strip():
             reason = (f"{reason}{EXPERIENCE_SHARE_TOPIC_PREFIX}{str(share_topic).strip()}"
                       f"{EXPERIENCE_SHARE_TOPIC_SUFFIX}")
-        result = await self._trigger_planner('missing', reason, key=key)
+        result = await self._trigger_planner('missing', reason, key=key, stage=stage)
         if result:
             self._affection.set_miss_sent()
         return result
@@ -858,7 +1195,8 @@ class PatrolService:
     # 注（2026-11-04 主动行为重写）：_trigger_activity / _trigger_daily（日程巡检的
     # 活动分享/日常搭话触发）已整条删除——patrol 侧不再有任何日程意图主动发言。
 
-    async def _trigger_planner(self, intent: str, reason: str, *, key: str = "") -> bool:
+    async def _trigger_planner(self, intent: str, reason: str, *, key: str = "",
+                               stage: int = 0) -> bool:
         action = getattr(self._config, 'optional_action', None)
         if not callable(action) or not self._stream_id:
             self._last_trigger_status = 'not_assembled'
@@ -867,8 +1205,11 @@ class PatrolService:
         # before 屏幕旁白与宿主 trigger 的 await，宿主可能先构建 replyer；
         # 非 enqueued（blocked/duplicate/rejected/unknown）→ discard 撤登记。
         # P1-8：入队不再预扣发言计数；预算/计数后移到 after_response 的实际发言确认。
+        # 2026-11-11 四阶段渗透：阶段号随 turn 落盘，replyer 钩子据此注入阶段 1~3
+        # 的追问强度（此前只用于 reason 文案，turn.miss_stage 恒 0 → 文案永不生效）。
         turn_id = register_turn(self._config, self._stream_id,
-                      'miss' if intent == 'missing' else 'patrol_chat', reason)
+                      'miss' if intent == 'missing' else 'patrol_chat', reason,
+                      miss_stage=stage)
         try:
             result = await action(key, intent, self._append_intent_hint(reason), before=self._publish_screen_narration)
         except asyncio.CancelledError:
@@ -931,7 +1272,10 @@ class PatrolService:
         last = self._affection.last_user_msg_time()
         if last is None:
             return
-        hours = hours_between(now, last)
+        # 与想念同一生效起点（短回复顺延后）：沉默事实与想念候选不各算一套时长。
+        cycle = self._initiative_memory.cycle(self._target_qq, last, now)
+        anchor_time = self._cycle_anchor_time(cycle) if cycle is not None else None
+        hours = hours_between(now, anchor_time or last)
         if hours < float(self._initiative_memory.profile().get('anchor_hours', 6)):
             return
         bus = self._event_bus()
@@ -1030,6 +1374,178 @@ class PatrolService:
             return dict(NEUTRAL_MOOD_EFFECT)
         return raw if isinstance(raw, dict) else dict(NEUTRAL_MOOD_EFFECT)
 
+    # ------------------------------------------------------------------
+    # 3.17.33（D2）想念睡眠扣除：只读睡眠段（sleep_sessions + life_state 当前段）
+    # ------------------------------------------------------------------
+    def _miss_sleep_excluded_enabled(self) -> bool:
+        """``[patrol].miss_sleep_excluded``（默认 True；读不到/异常 → True）。
+
+        关 = 想念按自然沉默时长判定（旧行为逐字恢复，包括不做 social_battery 睡眠钳制）。
+        """
+        try:
+            value = getattr(self._patrol_cfg(), "miss_sleep_excluded", True)
+        except Exception:
+            return True
+        if value is None:
+            return True
+        return bool(value)
+
+    def _miss_stage_escalation_enabled(self) -> bool:
+        """``[patrol].miss_stage_escalation_enabled``（默认 True；读不到/异常 → True）。
+
+        开 = 阶梯想念（阶段 1/2/3 各自受理、单拍概率 0.05~0.12、短回复只顺延周期）；
+        关 = 旧行为逐字恢复（同一沉默周期只受理一次 ``miss``，概率上限 0.35）。
+        """
+        try:
+            value = getattr(self._patrol_cfg(), "miss_stage_escalation_enabled", True)
+        except Exception:
+            return True
+        if value is None:
+            return True
+        return bool(value)
+
+    def _cycle_anchor_time(self, cycle: Any) -> Optional[datetime]:
+        """周期行 → 生效起点（短回复顺延后；任何异常/缺失 → None）。"""
+        timestamp = effective_anchor_epoch(cycle)
+        if timestamp is None:
+            return None
+        try:
+            return datetime.fromtimestamp(timestamp)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    def _last_target_message_text(self) -> Optional[str]:
+        """目标用户最近一条私聊文本（只读；短回复判定用；不可得 → None）。
+
+        真源 = ``CompanionServices.reviews``（``AffectionReviewer`` 的滚动缓冲）：
+        ``components.mai_hook_target_private_message`` 在刷新 ``last_user_msg_time``
+        的同一 Hook 里已把该条文本写入（review 关停也照常缓冲）。这里只读、不触发
+        采样、不改任何状态；未装配/异常 → None → cycle 按真实长回复处理。
+        """
+        for holder in (self._config, getattr(self._config, "config", None)):
+            companion = getattr(holder, "_companion", None)
+            reviewer = getattr(companion, "reviews", None)
+            items = getattr(reviewer, "_recent_messages", None)
+            if not isinstance(items, list) or not items:
+                continue
+            text = items[-1]
+            if isinstance(text, str) and text.strip():
+                return text
+        return None
+
+    def _sleep_session_db(self) -> Any:
+        """``sleep_sessions`` 只读句柄（``plugin._db`` / ``config._db``；无查询口 → None）。"""
+        for holder in (self._config, getattr(self._config, "config", None)):
+            db = getattr(holder, "_db", None)
+            if callable(getattr(db, "query_sleep_sessions", None)):
+                return db
+        return None
+
+    def _current_sleep_interval(self, now: datetime) -> Optional[Tuple[datetime, datetime]]:
+        """life_state 快照里的**当前**睡眠段 ``(入睡, now)``（不在睡/不可信/超窗 → None）。
+
+        只认带 ``continuous_sleep_minutes > 0`` 的快照（引擎每拍推入的证据），或睡眠引擎
+        明确判睡的兜底——老崩溃残留的 ``sleep_started_at`` 不会吞掉整段沉默。
+        """
+        life = getattr(self._config, "_life_state", None)
+        if life is None:
+            life = getattr(getattr(self._config, "config", None), "_life_state", None)
+        getter = getattr(life, "snapshot", None)
+        if not callable(getter):
+            return None
+        try:
+            snap = getter()
+        except Exception:
+            return None
+        if not isinstance(snap, dict):
+            return None
+        raw = snap.get("sleep_started_at") or snap.get("sleep_segment_started_at")
+        if not raw:
+            return None
+        try:
+            started = _naive_local(datetime.fromisoformat(str(raw)))
+        except (TypeError, ValueError):
+            return None
+        if started >= now:
+            return None
+        if (now - started) > timedelta(days=MISS_SLEEP_LOOKBACK_DAYS):
+            return None
+        continuous = _finite_number(snap.get("continuous_sleep_minutes")) or 0.0
+        if continuous <= 0 and not sleep_engine_asleep(self._config, now):
+            return None
+        return started, now
+
+    def _sleep_intervals(self, start: datetime, end: datetime) -> list[tuple[datetime, datetime]]:
+        """``[start, end]`` 内的睡眠段（只读；任何缺源/异常 → 空表 = 旧行为）。
+
+        源 1 = ``schedule.db.sleep_sessions`` 已收口会话（``actual_end_minute`` 非空；
+        含离线补全的 ``wake_reason="offline_reconnect"`` 会话——面板
+        ``estimated_segments`` 正是同一批行的投影，此处直接读会话，避免依赖面板层私有
+        函数）；源 2 = life_state 的当前睡眠段。两源合并去重。
+
+        时间口径 = 本地墙钟 naive（与 ``datetime.now()`` 同源；``sleep_started_at`` 的
+        tz 信息经 :func:`_naive_local` 折算）。部署时区与 ``[schedule_advanced].timezone``
+        不一致时按本地日帧近似——只影响扣多少，不影响可用性。
+        """
+        if end <= start:
+            return []
+        window_start = max(start, end - timedelta(days=MISS_SLEEP_LOOKBACK_DAYS))
+        intervals: list[tuple[datetime, datetime]] = []
+        db = self._sleep_session_db()
+        if db is not None:
+            day = (window_start - timedelta(days=1)).date()
+            last_day = end.date()
+            while day <= last_day:
+                midnight = datetime.combine(day, datetime.min.time())
+                try:
+                    rows = db.query_sleep_sessions(schedule_date=day.isoformat(), limit=32)
+                except Exception:
+                    rows = []
+                intervals.extend(sleep_intervals_from_rows(rows, midnight))
+                day += timedelta(days=1)
+        current = self._current_sleep_interval(end)
+        if current is not None:
+            intervals.append(current)
+        return merge_sleep_intervals(intervals)
+
+    def _sleep_hours_between(self, start: datetime, end: datetime) -> float:
+        """``[start, end]`` 内睡眠小时数（想念扣除用；读取失败 → 0.0 = 不扣）。"""
+        try:
+            intervals = self._sleep_intervals(start, end)
+        except Exception:
+            logger.debug("想念睡眠扣除：睡眠段读取失败，按自然时长判定", exc_info=True)
+            return 0.0
+        return overlap_hours(intervals, start, end)
+
+    def _sleeping_now(self) -> bool:
+        """当前是否处于睡眠段（只读：睡眠引擎权威 → life_state 当前段）。"""
+        now = datetime.now()
+        try:
+            if sleep_engine_asleep(self._config, now):
+                return True
+        except Exception:
+            pass
+        return self._current_sleep_interval(now) is not None
+
+    def _sleep_social_reading(self, social: Any, asleep: bool) -> Any:
+        """睡眠期间 ``social_battery`` 的**消费侧**只升不降（最小影响方案）。
+
+        真源（planning/life_state + settlement_v2）的睡眠积分本身是回充（
+        ``sleep_social_target=1.0``），本文件不改任何状态写入；但离线/降级路径可能把
+        睡眠算成清醒消耗——本层只在**读**上钳制：入睡时记下读数，睡眠期间生效值 =
+        max(当前, 入睡读数)，醒来清空。非法/缺失 → 原样返回（旧行为）。
+        """
+        value = _finite_number(social)
+        if value is None:
+            return social
+        if not asleep:
+            self._sleep_social_floor = None
+            return value
+        floor = self._sleep_social_floor
+        effective = value if floor is None else max(value, floor)
+        self._sleep_social_floor = effective
+        return effective
+
     def _miss_state_inputs(self) -> tuple[Any, Any, Any, Any, Any]:
         """想念概率公式的五路输入：``(energy, social_battery, valence, tier, tier_count)``。
 
@@ -1037,6 +1553,9 @@ class PatrolService:
         §八.2 口径）：生活状态读 ``plugin._life_state.snapshot()``（runtime 权威，不读
         配置不读表）；情绪读 ``EmotionService.effective_valence()``（先判 is_enabled）；
         好感读 affection 状态层 tier + 生效预设档位数（先判 is_enabled）。
+
+        3.17.33（D2）：``miss_sleep_excluded`` 开时，睡眠期间的 ``social_battery`` 走
+        :meth:`_sleep_social_reading`（只升不降）；关 = 逐字旧读数。
         """
         energy = social = valence = tier = tier_count = None
         life = getattr(self._config, "_life_state", None)
@@ -1051,6 +1570,8 @@ class PatrolService:
                     social = snap.get("social_battery")
             except Exception:
                 pass
+        if self._miss_sleep_excluded_enabled():
+            social = self._sleep_social_reading(social, self._sleeping_now())
         emotion = self._emotion_service()
         emotion_ok = True
         enabled = getattr(emotion, "is_enabled", None)
@@ -1106,18 +1627,21 @@ class PatrolService:
         """当前关系称谓（relation profile 未注入时回退「恋人」）。"""
         return getattr(self._relation, "word", None) or "恋人"
 
-    def _format_miss_reason(self, hours_since_last: float) -> str:
+    def _format_miss_reason(self, hours_since_last: float, *, stage: int = 0) -> str:
         """想念触发的 reason（2026-11-04 重写：文案在 companion.miss_trigger，模块内常量）。
 
         自然想念表达、不引导汇报日程；可携带一句关系记忆（用户习惯）作可选语境。
         首行保留「【触发原因·想念】」标注（注入上下文要标明为什么触发）。
+        P0-ACT-1：``stage`` 1/2/3 选对应阶段文案（轻度想念/挂念追问/直接追问去向）；
+        ``stage=0``（阶梯关/旧路径）逐字沿用原默认模板。
         """
         try:
             memory = miss_trigger.memory_line(self._affection.habits())
         except Exception:
             memory = ""
+        template = miss_trigger.miss_reason_for_stage(stage)
         return render(
-            miss_trigger.MISS_REASON_DEFAULT,
+            template,
             fallback=miss_trigger.MISS_REASON_DEFAULT,
             lover_name=self._lover_name,
             hours=f"{hours_since_last:.1f}",
