@@ -154,6 +154,7 @@ PLUGIN_ATTR_CONTRACT = frozenset({
     "_affection",         # 好感度管理器
     "_lover_name",        # 陪伴对象名
     "_personality",       # 陪伴对象人设
+    "_stream_id",         # 目标陪伴私聊 stream_id（F4 目标私聊判定，B3）
     "_plugin_root",       # 插件根目录
     "_attention",         # 注意力租约/忙闲观测
     "_group_attention",   # F1 群注意力衰减状态仓库/乘数入口（B1，进程内）

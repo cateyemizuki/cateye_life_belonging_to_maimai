@@ -124,6 +124,11 @@ class PluginContext:
         return self.get("personality")
 
     @property
+    def stream_id(self) -> Any:
+        # F4（B3）：目标陪伴私聊 stream_id，供社交边界判目标私聊。
+        return self.get("stream_id")
+
+    @property
     def plugin_root(self) -> Any:
         return self.get("plugin_root")
 

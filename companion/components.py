@@ -598,6 +598,38 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                     )
         except Exception:
             pass  # 群注意力采样失败绝不影响消息处理
+        # F4（v2 §5.5，2026-11-11）：群边界观测——只记「刚被点名/目标用户刚发言」，
+        # 供 planner 群状态行抑制；O(1) 内存写、零 IO、零 LLM，失败绝不影响消息处理。
+        try:
+            boundary = getattr(self, "_social_boundary", None)
+            if boundary is not None and isinstance(message, dict):
+                _bsid, _bgrp = extract_session_info_from_message(message)
+                if _bsid and _bgrp is True and not message.get("is_notify"):
+                    _btext = str(message.get("raw_message")
+                                 or message.get("plain_message") or "")
+                    _blover = str(getattr(self, "_lover_name", "") or "")
+                    _bmentioned = bool(message.get("is_mentioned"))
+                    _bat = bool(message.get("is_at"))
+                    _bdirect = (_bmentioned or _bat
+                                or (bool(_blover) and _blover in _btext))
+                    _buid = extract_user_id_from_message(message)
+                    _btarget = str(self._mai_target_qq() or "")
+                    _bgid = ""
+                    _binfo = message.get("message_info")
+                    if isinstance(_binfo, dict):
+                        _bgroup = _binfo.get("group_info")
+                        if isinstance(_bgroup, dict):
+                            _bgid = str(_bgroup.get("group_id") or "")
+                    if not _bgid:
+                        _bgid = str(message.get("group_id") or "")
+                    boundary.note_incoming(
+                        str(_bsid),
+                        direct=_bdirect,
+                        target_user=bool(_btarget and _buid and _buid == _btarget),
+                        group_id=_bgid,
+                    )
+        except Exception:
+            pass  # 群边界观测失败绝不影响消息处理
         return None
 
     @HookHandler(

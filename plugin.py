@@ -50,6 +50,7 @@ from companion.harass_report import HARASS_TOOL_NAME
 from companion.miss_trigger import append_stage4_miss_prompt
 from companion.services import CompanionServices
 from companion.attention import ConversationActivityTracker, SurfLeaseAuthority
+from companion.boundary import BoundaryService
 from companion.group_attention import GroupAttentionService
 from linkage import register_adapter
 from suite_config import (
@@ -479,6 +480,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 进程内、有界、不落盘；入站钩子只在群消息尾部 O(1) 采样，规划束经
         # _apply_frequency 逐群取乘数。默认关时全部入口短路（旧行为逐字不变）。
         self._group_attention = GroupAttentionService(self)
+        # F4（v2 §5.3，2026-11-11）：社交边界单一入口。普通类、进程内、有界、不落盘；
+        # 只生成 planner 状态行 / replyer 语气与节奏提示，绝不硬拦截。默认关时全短路。
+        self._social_boundary = BoundaryService(self)
         # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
         # M11（附录 II §3.3）：预算只统计发往目标陪伴私聊的主动打扰——注入 self._stream_id
         # 取值回调（G11 权威来源，随 _apply_target/热重载更新；不新增持久化状态）

@@ -111,5 +111,25 @@
     "confess_probability": 0.1,
     "confess_min_interval_minutes": 20,
     "procrastination_event_branch": false
+  },
+  "boundary": {
+    "refusal_energy_threshold": 0.25,
+    "refusal_stress_threshold": 0.8,
+    "refusal_mental_floor": 0.15,
+    "deep_work_types": [
+      "work",
+      "study"
+    ],
+    "deep_work_modes": [
+      "brief",
+      "later"
+    ],
+    "group_line_interval_minutes": 30,
+    "wait_hint_enabled": true,
+    "wait_hint_min_seconds": 45,
+    "wait_hint_max_seconds": 180,
+    "wait_hint_cooldown_minutes": 30,
+    "fragment_hint_probability": 0.2,
+    "rhythm_short_reply_probability": 0.25
   }
 }

@@ -303,6 +303,27 @@ class InjectService:
         except Exception:
             return ""
 
+    def _boundary_group_line(self, session_id: str, payload: Any) -> str:
+        """F4 群边界状态行（深工/睡眠；默认关/非群/已点名 → 空串）。"""
+        service = self._boundary_service()
+        if service is None:
+            return ""
+        try:
+            return str(service.group_state_line(session_id, payload=payload) or "")
+        except Exception:
+            return ""
+
+    def _boundary_wait_hint(self, session_id: str, *, has_real_message: bool) -> str:
+        """F4 wait 提示（只含 seconds；默认关/非群非目标私聊/冷却 → 空串）。"""
+        service = self._boundary_service()
+        if service is None:
+            return ""
+        try:
+            return str(service.wait_hint_line(
+                session_id, has_real_message=has_real_message) or "")
+        except Exception:
+            return ""
+
     def _transition_confession_line(self, session_id: str) -> str:
         """F3 转场拖延自我揭露（单入口；开关关/无合格 episode/未掷中/去重 → 空串）。
 
@@ -514,13 +535,14 @@ class InjectService:
                     description=current_description or "",
                     future_activities=future_activities if allow_next_line else [],
                     remaining_minutes=remaining_minutes,
+                    session_id=session_id,
                 )
                 logger.info(f"replyer 注入: {current_activity}")
             else:
                 # N1-2：无当前活动不静默早退——空活动变体（兜底文案见 [prompts].inject_no_activity）
                 # 门控同口径：非询问意图不携带接下来条目（兜底行本身不受门控影响）
                 activity_prompt = self._build_replyer_no_activity_prompt(
-                    future_activities if allow_next_line else [])
+                    future_activities if allow_next_line else [], session_id=session_id)
                 if not activity_prompt:
                     # 防御守卫：内部键 inject_no_activity 恒返非空默认，本分支正常
                     # 不可达（2026-11-04 评估问题8：原「文案被显式关空」口径已订正）
@@ -694,6 +716,17 @@ class InjectService:
             # 冷却（不吞、不抢日程块）；仅群生效集 ∧ m<阈值 ∧ 限频到期时出一行。
             attention_line = self._group_attention_hint_line(session_id)
 
+            # F4（v2 §5.5）：社交边界行/wait 提示——独立追加，不参与冷却；只在真实
+            # 来信回合（非主动分享轮且本轮有真实用户文本）出现。默认关时两者均空串。
+            boundary_lines: List[str] = []
+            has_real_message = bool(user_message.strip())
+            if not proactive_share and has_real_message:
+                for line in (self._boundary_group_line(session_id, payload),
+                             self._boundary_wait_hint(
+                                 session_id, has_real_message=has_real_message)):
+                    if line:
+                        boundary_lines.append(line)
+
             # 记录到上下文缓存
             if self._context_cache is not None:
                 self._context_cache.add_turn(
@@ -704,7 +737,7 @@ class InjectService:
                     activity=current_activity,
                 )
 
-            if not inject_content and not attention_line:
+            if not inject_content and not attention_line and not boundary_lines:
                 if payload is not payload_before_fold:
                     # 4.4b：本轮不注入日程，但旧日消极印象的折叠仍应送达
                     # （只改 system 文本，不新增条目）。
@@ -718,6 +751,9 @@ class InjectService:
             if attention_line:
                 inject_content = (f"{inject_content}\n{attention_line}"
                                   if inject_content else attention_line)
+            for line in boundary_lines:
+                inject_content = (f"{inject_content}\n{line}"
+                                  if inject_content else line)
 
             # 日期/节假日头部（2026-10-10：由陪伴模块迁入——只在日程块头部注一行，
             # 开关 [schedule].holiday_inject_enabled；失败/关闭时不出现）
@@ -1352,10 +1388,11 @@ class InjectService:
         return True if value is None else bool(value)
 
     def _life_state_snapshot(self) -> Dict[str, float]:
-        """只读五维状态快照（精力/饥饿/社交电量）；缺失/异常 → 空 dict。
+        """只读状态快照（精力/饥饿/社交电量/专注/压力/精神派生）；缺失/异常 → 空 dict。
 
+        F4（B3，2026-11-11）：扩读 ``focus`` / ``stress`` / ``mental_state``（只读，
+        不改状态）；原四语气分支仍只消费既有三键，默认关时文本逐字不变。
         取数序：``plugin._life_state`` → runtime 读模型的 ``_life`` 句柄。
-        只用于选择语气分支，不改任何状态数值。
         """
         life = getattr(self._plugin, "_life_state", None)
         if life is None:
@@ -1370,7 +1407,8 @@ class InjectService:
         if not isinstance(snapshot, dict):
             return {}
         out: Dict[str, float] = {}
-        for key in ("energy", "hunger", "social_battery"):
+        for key in ("energy", "hunger", "social_battery",
+                    "focus", "stress", "mental_state"):
             try:
                 out[key] = float(snapshot.get(key))
             except (TypeError, ValueError):
@@ -1389,13 +1427,47 @@ class InjectService:
         except Exception:
             return None
 
-    def _subconscious_tone_rule(self) -> str:
-        """按当前状态选语气分支（疲惫 > 饥饿 > 开心 > 平稳）。
+    def _boundary_service(self) -> Optional[Any]:
+        """F4 社交边界服务句柄（组合根装配；测试桩/旧配置缺失 → None）。"""
+        service = getattr(self, "_social_boundary_service", None)
+        if service is None:
+            service = getattr(self._plugin, "_social_boundary", None)
+        return service
 
-        疲惫：精力 < 0.40 或社交电量 < 0.20；饥饿：饥饿 >= 0.60；
-        开心：精力 >= 0.72 或社交电量 >= 0.85 或情绪效价 >= 0.30。
+    def _boundary_extreme_tone(self, session_id: str) -> str:
+        """目标私聊的极端状态语气（拒绝/脆弱）；其余会话/默认关/异常 → 空串。"""
+        service = self._boundary_service()
+        if service is None:
+            return ""
+        try:
+            return str(service.extreme_tone(
+                session_id, snapshot=self._life_state_snapshot()) or "")
+        except Exception:
+            return ""
+
+    def _boundary_reply_hints(self, session_id: str) -> List[str]:
+        """目标私聊的碎片化/短回复提示（提示词层；默认关/异常 → 空列表）。"""
+        service = self._boundary_service()
+        if service is None:
+            return []
+        try:
+            hints = service.reply_hints(session_id)
+            return [str(line) for line in (hints or []) if str(line).strip()]
+        except Exception:
+            return []
+
+    def _subconscious_tone_rule(self, session_id: str = "") -> str:
+        """按当前状态选语气分支（极端状态 > 疲惫 > 饥饿 > 开心 > 平稳）。
+
+        F4（B3）：极端状态（stress>0.80 / energy<0.25 / mental_state<0.15）且为
+        目标私聊时，优先返回「拒绝/脆弱」分支（含人设底线）；其他会话继续走原
+        四分支，默认关时逐字不变。疲惫：精力 < 0.40 或社交电量 < 0.20；饥饿：
+        饥饿 >= 0.60；开心：精力 >= 0.72 或社交电量 >= 0.85 或情绪效价 >= 0.30。
         数据缺失时落到平稳分支。
         """
+        extreme = self._boundary_extreme_tone(session_id)
+        if extreme:
+            return extreme
         snapshot = self._life_state_snapshot()
         energy = snapshot.get("energy")
         hunger = snapshot.get("hunger")
@@ -1418,6 +1490,7 @@ class InjectService:
         description: str,
         future_activities: List[Tuple[str, str]],
         remaining_minutes: Optional[int],
+        session_id: str = "",
     ) -> str:
         """构建 replyer 极简 extra_prompt（~30 token + 能量基线；模板可在 [prompts] 段定制）。"""
         cfg = self._schedule_cfg()
@@ -1436,9 +1509,14 @@ class InjectService:
         )
         if not (enable_detailed and description):
             state_line = state_line.replace("（）", "").replace("()", "").strip()
-        return self._render_replyer_status_block(state_line, future_activities)
+        return self._render_replyer_status_block(
+            state_line, future_activities, session_id=session_id)
 
-    def _build_replyer_no_activity_prompt(self, future_activities: List[Tuple[str, str]]) -> str:
+    def _build_replyer_no_activity_prompt(
+        self,
+        future_activities: List[Tuple[str, str]],
+        session_id: str = "",
+    ) -> str:
         """replyer extra_prompt 的空活动变体（2026-10-10 N1-2）。
 
         与有活动版本共用 ``[prompts]`` 模板：``state_line`` 换成「无当前活动」兜底行
@@ -1447,7 +1525,8 @@ class InjectService:
         返回空串」分支不可达，已随死代码清理移除。
         """
         state_line = self._no_activity_text()
-        return self._render_replyer_status_block(state_line, future_activities)
+        return self._render_replyer_status_block(
+            state_line, future_activities, session_id=session_id)
 
     def _replyer_energy_desc(self) -> str:
         """replyer「精神」能量行取值（R7 滚动化改造 §6.6：LifeState 优先）。
@@ -1482,6 +1561,7 @@ class InjectService:
         self,
         state_line: str,
         future_activities: List[Tuple[str, str]],
+        session_id: str = "",
     ) -> str:
         """按 ``inject_replyer_status`` 模板拼 replyer 状态块（能量 + 下一条活动）。
 
@@ -1492,6 +1572,9 @@ class InjectService:
         开（默认）→ 走潜意识模板：状态数据原样保留，但明确禁止直接复述状态词，
         改由 ``{tone_rule}`` 约束语气/句长（疲惫→短句/省略号、开心→轻快多句、
         饥饿→随口提食欲）；关 → 旧模板逐字不变。
+
+        F4（B3）：默认关时下方两处均短路，返回值与加入前逐字一致；开启且为目标
+        私聊时，``{tone_rule}`` 可切极端状态分支，并按概率追加节奏提示行。
         """
         energy_desc = self._replyer_energy_desc()
 
@@ -1505,17 +1588,20 @@ class InjectService:
             )
         if self._state_subconscious_style():
             # 内部固定模板（不新增用户 schema 键）：数据原样保留，口径改为语气约束
-            return render(
+            text = render(
                 INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
                 fallback=INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
                 state_line=state_line, energy=energy_desc,
-                tone_rule=self._subconscious_tone_rule(), next_line=next_line,
+                tone_rule=self._subconscious_tone_rule(session_id), next_line=next_line,
             )
-        return render(
-            prompt(self._plugin, "inject_replyer_status"),
-            fallback=INJECT_REPLYER_STATUS_DEFAULT,
-            state_line=state_line, energy=energy_desc, next_line=next_line,
-        )
+        else:
+            text = render(
+                prompt(self._plugin, "inject_replyer_status"),
+                fallback=INJECT_REPLYER_STATUS_DEFAULT,
+                state_line=state_line, energy=energy_desc, next_line=next_line,
+            )
+        hints = self._boundary_reply_hints(session_id)
+        return f"{text}\n" + "\n".join(hints) if hints else text
 
     def _resolve_replyer_intent(
         self,

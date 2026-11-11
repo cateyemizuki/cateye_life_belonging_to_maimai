@@ -86,10 +86,39 @@ def _clamp(value: Any, low: float, high: float, default: float = 0.0) -> float:
     return max(float(low), min(float(high), number))
 
 
-def _normalize_group_id(value: Any) -> str:
-    """群号归一化：剥离 ``group:`` / ``qq:group_`` 等前缀，取末段数字。"""
+def normalize_group_id(value: Any) -> str:
+    """群号归一化：剥离 ``group:`` / ``qq:group_`` 等前缀，取末段数字。
+
+    F4（B3，2026-11-11）起提升为公共纯函数：群边界行复用同一归一化口径，
+    不再在 ``companion/boundary.py`` 自建第二份副本。
+    """
     parts = re.findall(r"\d+", str(value or ""))
     return parts[-1] if parts else ""
+
+
+#: 兼容旧内部调用名（同对象，无第二份实现）
+_normalize_group_id = normalize_group_id
+
+
+def group_allowed(section: Any, group_id: Any) -> bool:
+    """群是否在 ``[planning_proactive]`` 群生效集内（纯函数、零 IO）。
+
+    黑名单：名单内不生效（留空 = 全部生效）；白名单：只有名单内生效
+    （留空 = 全部不生效）。群号未知时：黑名单放行、白名单拒绝（无法确认）。
+    F1 频率链与 F4 群边界行共用本函数，避免两套「生效集」口径漂移。
+    """
+    gid = normalize_group_id(group_id)
+    if section is None:
+        return False
+    raw_ids = getattr(section, "proactive_group_ids", None) or []
+    ids = {normalize_group_id(item) for item in raw_ids if normalize_group_id(item)}
+    mode = str(getattr(section, "proactive_group_list_mode", "blacklist")
+               or "blacklist").strip().lower()
+    if mode == "whitelist":
+        return bool(gid) and gid in ids
+    if not gid:
+        return True
+    return gid not in ids
 
 
 def activity_keywords(goal_type: Any, name: Any = "") -> Tuple[str, ...]:
@@ -304,23 +333,10 @@ class GroupAttentionService:
     def _group_allowed(self, group_id: Any) -> bool:
         """群是否在 ``[planning_proactive]`` 群生效集内（同步、纯内存）。
 
-        黑名单：名单内不生效（留空 = 全部生效）；白名单：只有名单内生效
-        （留空 = 全部不生效）。群号未知时：黑名单放行、白名单拒绝（无法确认）。
+        口径唯一真源 = 模块级 :func:`group_allowed`（F4 群边界行共用）。
         """
-        gid = _normalize_group_id(group_id)
         config = getattr(self._plugin, "config", None)
-        section = getattr(config, "planning_proactive", None)
-        if section is None:
-            return False
-        raw_ids = getattr(section, "proactive_group_ids", None) or []
-        ids = {_normalize_group_id(item) for item in raw_ids if _normalize_group_id(item)}
-        mode = str(getattr(section, "proactive_group_list_mode", "blacklist")
-                   or "blacklist").strip().lower()
-        if mode == "whitelist":
-            return bool(gid) and gid in ids
-        if not gid:
-            return True
-        return gid not in ids
+        return group_allowed(getattr(config, "planning_proactive", None), group_id)
 
     # ------------------------------------------------------------------
     # 状态仓库

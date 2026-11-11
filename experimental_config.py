@@ -9,10 +9,12 @@
 
 - ``[experimental].group_attention_*``：F1 群注意力衰减（B1 批）；
 - ``[experimental].transition_*``：F3 转场拖延（B2 批）；
-- 后续 F4/联动批的新键继续追加在本段，按批在迁移映射文档登记目标板块。
+- ``[experimental].social_boundary_*``：F4 社交边界（B3 批）；
+- 后续联动批的新键继续追加在本段，按批在迁移映射文档登记目标板块。
 
 参数默认值与 ``core.internal_tuning.INTERNAL_TUNING_DEFAULTS`` 对应 J 段同源
-（实验期用户可见；转正后参数迁回 J 类 ``[group_attention]`` / ``[transition]`` 段）。
+（实验期用户可见；转正后参数迁回 J 类 ``[group_attention]`` / ``[transition]`` /
+``[boundary]`` 段）。
 运行期只读本 section 的 pydantic 字段，不读 ``mappings/internal_tuning.json``——
 实验期配置只有一个用户可见入口。
 """
@@ -31,6 +33,9 @@ _GA: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["group_attention"])
 
 #: F3 参数默认值单一真源（转正后目标 = internal_tuning.json [transition]）
 _TR: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["transition"])
+
+#: F4 参数默认值单一真源（转正后目标 = internal_tuning.json [boundary]）
+_BD: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["boundary"])
 
 
 class ExperimentalSectionConfig(PluginConfigBase):
@@ -311,5 +316,141 @@ class ExperimentalSectionConfig(PluginConfigBase):
             "hint": "默认关；首期只做延迟分支，开本键不产生任何新行为",
             **_ui_i18n("Procrastination loafing branch (unused)",
                        "Reserved switch; not implemented in this batch."),
+        },
+    )
+
+    # ── F4 社交边界（B3；v2 §5）────────────────────────────────────
+    social_boundary_enabled: bool = Field(
+        default=False,
+        description="社交边界：深工/睡眠时只在群聊里给 planner 一行状态（不拦消息、不延迟），"
+                    "目标私聊在高压/极疲惫时使用「可拒绝、可脆弱」的语气分支，"
+                    "并在忙时提示 planner 可用 wait 工具晚点回；碎片化只做提示词建议。",
+        json_schema_extra={
+            "label": "社交边界",
+            "hint": "默认关。开 = 群状态行/私聊极端语气/wait 提示/碎片化提示；"
+                    "睡眠群仍是短慢软 + 原吵醒记账，不硬不回、不建账本",
+            **_ui_i18n("Social boundaries",
+                       "Experimental: when deep in work or asleep, state that in one "
+                       "planner line instead of blocking messages; in the target private "
+                       "chat, allow a boundary-respecting refusal/vulnerable tone. Never "
+                       "blocks or delays delivery."),
+        },
+    )
+    social_boundary_refusal_energy_threshold: float = Field(
+        default=_BD["refusal_energy_threshold"], ge=0.0, le=1.0,
+        description="目标私聊进入「脆弱」分支的精力阈值（energy 低于该值）",
+        json_schema_extra={
+            "label": "脆弱精力阈值",
+            "hint": "默认 0.25；与 mental_state 下限任一命中即可",
+            **_ui_i18n("Vulnerable energy threshold",
+                       "Energy below this enters the vulnerable tone branch."),
+        },
+    )
+    social_boundary_refusal_stress_threshold: float = Field(
+        default=_BD["refusal_stress_threshold"], ge=0.0, le=1.0,
+        description="目标私聊进入「拒绝」分支的压力阈值（stress 高于该值）",
+        json_schema_extra={
+            "label": "拒绝压力阈值",
+            "hint": "默认 0.80；高压优先于低精力选「拒绝」口径",
+            **_ui_i18n("Refusal stress threshold",
+                       "Stress above this enters the refusal tone branch."),
+        },
+    )
+    social_boundary_refusal_mental_floor: float = Field(
+        default=_BD["refusal_mental_floor"], ge=0.0, le=1.0,
+        description="目标私聊进入「脆弱」分支的 mental_state 下限（energy×focus×(1-stress)）",
+        json_schema_extra={
+            "label": "精神状态下限",
+            "hint": "默认 0.15；只读快照，不额外存状态",
+            **_ui_i18n("Mental state floor",
+                       "Derived mental_state below this enters the vulnerable branch."),
+        },
+    )
+    social_boundary_deep_work_types: List[str] = Field(
+        default=_BD["deep_work_types"],
+        description="深工活动类型（active goal_type 命中且 attention_mode 也命中才出群状态行）",
+        json_schema_extra={
+            "label": "深工活动类型",
+            "hint": "默认 work/study；只影响群状态行，不改日程/画像",
+            **_ui_i18n("Deep-work activity types",
+                       "Activity types considered deep work for the group state line."),
+        },
+    )
+    social_boundary_deep_work_modes: List[str] = Field(
+        default=_BD["deep_work_modes"],
+        description="深工注意力档（attention_mode 命中才视为不可分心；now 不算深工）",
+        json_schema_extra={
+            "label": "深工注意力档",
+            "hint": "默认 brief/later；now=随时可搭话，不出深工状态行",
+            **_ui_i18n("Deep-work attention modes",
+                       "Attention modes treated as non-interruptible deep work."),
+        },
+    )
+    social_boundary_group_line_interval_minutes: int = Field(
+        default=_BD["group_line_interval_minutes"], ge=1, le=1440,
+        description="同一群两次【此刻】边界状态行之间的最小间隔（分钟）",
+        json_schema_extra={
+            "label": "群状态行间隔(分钟)",
+            "hint": "默认 30；只限流，不抢日程块、不吞其他注入",
+            **_ui_i18n("Group boundary line interval",
+                       "Minimum interval between two group boundary lines."),
+        },
+    )
+    social_boundary_wait_hint_enabled: bool = Field(
+        default=_BD["wait_hint_enabled"],
+        description="是否向 planner 提示可用 wait 工具晚点回（宿主无 wait 工具时置 False）",
+        json_schema_extra={
+            "label": "wait 提示",
+            "hint": "默认开；只提示、不主动 wait，是否等由 planner 决定",
+            **_ui_i18n("Wait hint",
+                       "Mention that the planner may use the host wait tool."),
+        },
+    )
+    social_boundary_wait_hint_min_seconds: int = Field(
+        default=_BD["wait_hint_min_seconds"], ge=1, le=3600,
+        description="wait 提示的秒数下限",
+        json_schema_extra={
+            "label": "wait 秒数下限",
+            "hint": "默认 45；提示只生成 seconds，不生成 until（1.3.16 兼容）",
+            **_ui_i18n("Wait hint min seconds", "Lower bound of the suggested wait."),
+        },
+    )
+    social_boundary_wait_hint_max_seconds: int = Field(
+        default=_BD["wait_hint_max_seconds"], ge=1, le=3600,
+        description="wait 提示的秒数上限",
+        json_schema_extra={
+            "label": "wait 秒数上限",
+            "hint": "默认 180；与下限写反时按小值~大值夹取",
+            **_ui_i18n("Wait hint max seconds", "Upper bound of the suggested wait."),
+        },
+    )
+    social_boundary_wait_hint_cooldown_minutes: int = Field(
+        default=_BD["wait_hint_cooldown_minutes"], ge=0, le=1440,
+        description="同一聊天流两次 wait 提示的最小间隔（分钟）",
+        json_schema_extra={
+            "label": "wait 提示冷却(分钟)",
+            "hint": "默认 30；0 = 不冷却（仍受每轮一次限制）",
+            **_ui_i18n("Wait hint cooldown",
+                       "Minimum interval between two wait hints in one stream."),
+        },
+    )
+    social_boundary_fragment_hint_probability: float = Field(
+        default=_BD["fragment_hint_probability"], ge=0.0, le=1.0,
+        description="目标私聊追加「可以拆成两三条短句」提示的概率（只提示，不真分段）",
+        json_schema_extra={
+            "label": "碎片化提示概率",
+            "hint": "默认 0.20；按流×分钟稳定掷骰，首期不做真分段",
+            **_ui_i18n("Fragment hint probability",
+                       "Chance to suggest splitting a reply into short messages."),
+        },
+    )
+    social_boundary_rhythm_short_reply_probability: float = Field(
+        default=_BD["rhythm_short_reply_probability"], ge=0.0, le=1.0,
+        description="目标私聊追加「只回一个语气词/一句」提示的概率",
+        json_schema_extra={
+            "label": "短回复提示概率",
+            "hint": "默认 0.25；与碎片化提示独立掷骰",
+            **_ui_i18n("Short reply hint probability",
+                       "Chance to suggest a very short reply."),
         },
     )

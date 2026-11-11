@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""内部调参表（2026-11-04 配置精简轮，方案 J 类；3.17.6 起 46 键，B1 增 9、B2 增 16 → 71 键）。
+"""内部调参表（2026-11-04 配置精简轮，方案 J 类；3.17.6 起 46 键，B1 增 9、B2 增 16、
+B3 增 12 → 92 键）。
 
 把「内部调参但可能需现场微调」的阈值/权重/容量/缓存/超时/采样温度从聚合
 TOML schema 移入 ``mappings/internal_tuning.json``（表层用户数据区）+
@@ -43,7 +44,8 @@ SUPPORTED_VERSION = 1
 
 #: 出厂默认单一真源：段 → 键 → 默认值（3.17.6 起 46 键；历史注释「40 项」已陈旧，
 #: 后续批次有增键；3.17.6 退役 event_catalog.max_pool_events 一项，47→46；
-#: 数值逐字取自原 Field default）。种子 JSON 由本表生成，运行期内置兜底也用它。
+#: B1 增 9、B2 增 16、B3 增 12 → 92 键；数值逐字取自原 Field default）。种子 JSON
+#: 由本表生成，运行期内置兜底也用它。
 INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "patrol": {
         "screen_timeout_seconds": 20.0,
@@ -173,6 +175,24 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "confess_probability": 0.10,
         "confess_min_interval_minutes": 20,
         "procrastination_event_branch": False,
+    },
+    # F4 社交边界（B3，2026-11-11 v2 §5.4）：实验期参数在用户可见
+    # ``[experimental].social_boundary_*``（12 参数 + 1 总开关），本段是同源默认值
+    # 与「转正后迁回 J 类」的目标段（迁移映射见 union/20261111_实验配置迁移映射.md §3）。
+    # 运行期不读表层 internal_tuning.json 的该段；新增 12 键为 additive，不改既有键值。
+    "boundary": {
+        "refusal_energy_threshold": 0.25,
+        "refusal_stress_threshold": 0.80,
+        "refusal_mental_floor": 0.15,
+        "deep_work_types": ["work", "study"],
+        "deep_work_modes": ["brief", "later"],
+        "group_line_interval_minutes": 30,
+        "wait_hint_enabled": True,
+        "wait_hint_min_seconds": 45,
+        "wait_hint_max_seconds": 180,
+        "wait_hint_cooldown_minutes": 30,
+        "fragment_hint_probability": 0.20,
+        "rhythm_short_reply_probability": 0.25,
     },
 }
 
