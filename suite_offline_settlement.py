@@ -13,6 +13,7 @@ sys.path 含宿主 src 与兄弟插件目录，顶层通用名会被抢占（见
 
 from __future__ import annotations
 
+import inspect
 import math
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Optional
@@ -108,7 +109,8 @@ class OfflineSettlementService:
     def settle_offline_gap(self, life: Any, planner: Any, *,
                            engine_claimed: bool,
                            plan_settlement_fn: Optional[Callable[..., Any]] = None,
-                           baseline_hours: float = 8.0) -> None:
+                           baseline_hours: float = 8.0,
+                           repay_v2: bool = True) -> None:
         """冷启动离线 gap 收口（离线睡眠补全 A2 编排，2026-10-29；本方法不抛异常）。
 
         步序（指令 ①）：LifeState 冷启动已把原始离线 gap 暂存为 pending（A1）→
@@ -148,13 +150,26 @@ class OfflineSettlementService:
         # 策略函数由组合根调用期注入（缺省用本模块导入的同名函数）——保持
         # scratch 回归经 plugin 模块名补丁策略函数的接缝可用。
         plan_fn = plan_settlement_fn if callable(plan_settlement_fn) else plan_offline_settlement
+        # P0-NUM-1 离线路径：把 [life_state].sleep_debt_repay_v2 透传到离线结算
+        # 计划（默认 True 与在线一致）。**True/False 都显式透传**——历史回放传
+        # False 必须真走旧公式，不能被计划函数的默认值兜成 v2。旧签名策略函数
+        # （回归用例注入）没有 repay_v2 形参时自动退回旧调用。
         try:
-            # 复核 P0-4：基准非默认时透传（默认 8.0 保持旧二元调用，兼容回归
-            # 用例注入的旧签名策略函数）
+            accepts_repay = True
+            try:
+                params = inspect.signature(plan_fn).parameters
+                accepts_repay = ("repay_v2" in params
+                                 or any(p.kind is p.VAR_KEYWORD for p in params.values()))
+            except (TypeError, ValueError):
+                accepts_repay = True
+            kwargs: Dict[str, Any] = {}
             if float(baseline_hours) != 8.0:
-                plan = plan_fn(gap, debt_before, baseline_hours=float(baseline_hours))
-            else:
-                plan = plan_fn(gap, debt_before)
+                # 复核 P0-4：基准非默认时透传（默认 8.0 保持旧二元调用，兼容
+                # 回归用例注入的旧签名策略函数）
+                kwargs["baseline_hours"] = float(baseline_hours)
+            if accepts_repay:
+                kwargs["repay_v2"] = bool(repay_v2)
+            plan = plan_fn(gap, debt_before, **kwargs) if kwargs else plan_fn(gap, debt_before)
         except Exception as exc:
             self._warn("离线结算计划生成失败（回退旧冷启动漂移）：%s", exc)
         if not isinstance(plan, dict) or not plan.get("settle"):

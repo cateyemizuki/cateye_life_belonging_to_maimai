@@ -32,8 +32,10 @@
 
    **2026-11-04 主动行为重写（用户直派规格）新增两项**：
    - **中午问好**（``greeting_noon_enabled``，默认开）：**仅目标陪伴私聊**——本地
-     12:00–13:00 窗内首个巡检 tick 触发一次（无掷点漂移），marks v2 按流按 kind
-     （``noon``）每周期去重落盘 + affection ``noon_sent_today`` 按天护栏（热重载不重发）；
+     12:00–13:00 窗内触发一次；2026-11-11 P1-ACT-2 起不再「窗开首 tick 必发」，
+     而是 12:00 + 当日确定性抖动（``greeting_noon_jitter_minutes``，按自然日+流
+     播种，默认 20 分钟）后的首个 tick。marks v2 按流按 kind（``noon``）每周期
+     去重落盘 + affection ``noon_sent_today`` 按天护栏（热重载不重发）；
      睡眠引擎判定仍在睡 → 窗内暂缓（醒来仍在窗内才发，整窗在睡则当日不发）；
      与早/晚安同口径**免预算**（M11 历史授权设计）。群主动与其他私聊不加。
    - **早安有界**（``greeting_morning_latest``，默认 "10:00"）：早安生效上限 =
@@ -70,6 +72,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -95,7 +98,12 @@ from .config import (
     section_or_default,
 )
 from core.storage import load_json, save_json_atomic
-from tools.proactive_turn import discard_turn, register_turn
+from tools.proactive_turn import (
+    append_stage4_miss_prompt,
+    discard_turn,
+    register_turn,
+    stage4_intent_for_kind,
+)
 
 from .activity_properties import resolve_property
 from .cycle_state import (CycleState, anchored_state, day_cycle_epochs,
@@ -147,6 +155,37 @@ GREETING_NOON = "noon"
 #: 本任务文件边界内，新增 JSON 键会被校验器丢弃）
 NOON_WINDOW_START_MINUTE = 12 * 60   # 12:00
 NOON_WINDOW_END_MINUTE = 13 * 60     # 13:00（不含）
+#: 午安抖动窗上限（分钟）：绝不让抖动把触发时刻推出 12:00–13:00 窗口。
+NOON_JITTER_MAX_MINUTES = NOON_WINDOW_END_MINUTE - NOON_WINDOW_START_MINUTE - 1
+
+
+def noon_fire_offset_minutes(date_str: Any, stream_id: Any,
+                             jitter_minutes: Any) -> int:
+    """当日午安相对 12:00 的确定性抖动偏移（整数分钟，``1~jitter``；2026-11-11）。
+
+    报告 §3.2 问题 1 / P1-ACT-2「午安去闹钟化」：窗口开启后的第一个 tick 不再
+    必发，而是等一个按「自然日 + 目标流」播种的偏移时刻。同一 date/stream/jitter
+    组合跨进程、跨重启恒定（sha1 → ``random.Random``），因此可测试、可复现，不依赖
+    Python 进程级随机盐。
+
+    - ``jitter_minutes <= 0`` / 非法 → 0（旧行为：窗口开启即触发）；
+    - ``jitter_minutes > 0`` → ``1~min(jitter, 59)``，**绝不取 0**：开启抖动后
+      不会再有 12:00 整点触发（3.17.33 复核修正；旧实现 ``randint(0, jitter)``
+      在 28 天样本中会落到 0）；
+    - 上限 :data:`NOON_JITTER_MAX_MINUTES`（59 分钟），保证落在 12:00–13:00 内；
+    - 默认配置 20 → 当日触发时刻落在 12:01–12:20。
+    """
+    try:
+        jitter = int(float(jitter_minutes))
+    except (TypeError, ValueError):
+        return 0
+    if jitter <= 0:
+        return 0
+    jitter = min(jitter, NOON_JITTER_MAX_MINUTES)
+    seed_text = f"noon|{str(date_str or '')}|{str(stream_id or '')}"
+    digest = hashlib.sha1(seed_text.encode("utf-8")).hexdigest()
+    # 下限 1：抖动开启即代表用户不接受整点；jitter=1 时恒为 12:01。
+    return random.Random(int(digest[:16], 16)).randint(1, max(1, jitter))
 #: 早安有界（2026-11-04）：醒后相对窗（小时）——生效上限 = min(配置上限时刻,
 #: 周期起点 + 本值)。内部调参常量；绝对上限时刻为用户 TOML 字段 greeting_morning_latest。
 MORNING_AFTER_WAKE_HOURS = 2.0
@@ -158,6 +197,11 @@ PROACTIVE_INTENT_NOON_DEFAULT = (
     "语气符合人设，简短随意、轻松关心，不要提日程或今天的安排，不要追问不休"
 )
 PROACTIVE_REASON_NOON_DEFAULT = "陪伴：中午问好（目标私聊，每日一次，免预算）"
+#: 阶段 4 清醒沉默阈值（小时；设计 §1.1 “>120h”）。
+#: D5 结构守卫禁止 planning 模块 import companion（含懒导入），故此处只读镜像
+#: ``companion.initiative_profile.MISS_STAGE_END_HOURS``；若 patrol 暴露
+#: ``current_target_miss_stage`` 则优先采用 patrol 口径，避免两处漂移。
+STAGE4_SILENCE_HOURS = 120.0
 #: 覆盖类别（§3.4/B7；2026-10-22 §二十七 分支闸门分离）：目标私聊（激活强制）/
 #: 群聊（必要性配置 + 今日非 bot 消息硬门槛）/ 其他私聊（「对方发送」条数阈值恒开口）
 GREETING_CATEGORY_TARGET = "target"
@@ -297,6 +341,10 @@ class ProactiveService:
         self._greeting_gate_logged: Dict[Tuple[str, str, float], bool] = {}
         # M11 问候名单解析告警去重（§2.4）：{(date_str, 名单签名): True}（同签名每日一条）
         self._greeting_list_warned: Dict[Tuple[str, Tuple[str, ...]], bool] = {}
+        # 2026-11-11 P1-AFF-1：问候成功触发的进程内时刻 {(stream_id, kind): epoch 秒}。
+        # 只服务「Bot 发出早安/晚安后 30 分钟内用户回敬问候」的判定；30 分钟窗口外
+        # 无意义，故不落盘（重启即空，宁可不记也不虚构）。
+        self._greeting_fired_at: Dict[Tuple[str, str], float] = {}
         # 已应用的频率因子缓存：{stream_id: factor}（避免重复 set_adjust）
         self._current_factor: Dict[str, float] = {}
         # 白名单解析缓存：{raw_entry: (session_id 或 None, expire_at)}
@@ -1256,6 +1304,27 @@ class ProactiveService:
         attr = "greeting_morning_enabled" if kind == GREETING_MORNING else "greeting_night_enabled"
         return bool(getattr(self._proactive_cfg(), attr, True))
 
+    def recent_greeting(self, stream_id: Any, kind: str, *,
+                        within_minutes: float = 30.0,
+                        now: Optional[datetime] = None) -> bool:
+        """只读：该流该 kind 是否在 ``within_minutes`` 内成功触发过问候（P1-AFF-1）。
+
+        「成功触发」= :meth:`_fire_greeting` 收到宿主 trigger 成功回执（与 marks v2 /
+        affection 已发标记同一时点）。**纯内存**：插件重载/宿主重启后为空，窗口内的
+        互道会按「不记」降级（宁漏记不虚构）。供 companion 侧「用户回敬早安/晚安」
+        判定使用；kind 取 :data:`GREETING_MORNING` / :data:`GREETING_NIGHT`。
+        """
+        key = (str(stream_id or "").strip(), str(kind or "").strip())
+        fired = getattr(self, "_greeting_fired_at", {}).get(key)
+        if fired is None:
+            return False
+        try:
+            window = max(0.0, float(within_minutes)) * 60.0
+        except (TypeError, ValueError):
+            window = 30.0 * 60.0
+        now_ts = _epoch_ts(now) if isinstance(now, datetime) else time.time()
+        return 0.0 <= now_ts - float(fired) <= window
+
     def _greeting_requires_activation(self, cfg_p: Any) -> bool:
         """群聊早安**必要性**开关（§31.1；R7 = 用户 2026-10-23 第二轮直派）。
 
@@ -1271,6 +1340,29 @@ class ProactiveService:
         """
         try:
             value = getattr(cfg_p, "greeting_require_activation", True)
+        except Exception:
+            return True
+        if value is None:
+            return True
+        return bool(value)
+
+    def _greeting_night_requires_chain(self, cfg_p: Any) -> bool:
+        """群聊晚安**连锁开关**（``[planning_proactive].greeting_night_require_morning_chain``，
+        bool，默认 True；读不到/取值异常 → True，fail-closed 保持现状）。
+
+        键由配置侧（planning/config.py）负责声明；本层只做防御性读取，因此旧配置、
+        尚未加键的热重载窗口与裸测试桩都保持逐字旧行为：
+
+        - **True（默认）**：群聊晚安仍硬性要求「本群本轮早安已开口」（marks v2 连锁桶，
+          :meth:`_greeting_chain_state` / :meth:`_greeting_chain_pass`）——行为与旧版
+          逐字一致；
+        - **False**：群聊晚安**不再要求当日群早安**（解耦），直接通过掷点前闸门与到点
+          复核闸门；外层既有流程一律不变——候选枚举/名单、漂移掷点、观测窗与期限、
+          持久化去重（marks v2 ``night`` 标记 + 内存 status）、补发冷静期与预算口径
+          （问候本就不占 ``daily_max_speak`` 可选回合预算）全部沿用原实现。
+        """
+        try:
+            value = getattr(cfg_p, "greeting_night_require_morning_chain", True)
         except Exception:
             return True
         if value is None:
@@ -1544,6 +1636,7 @@ class ProactiveService:
           直接跳过、**不掷点、不创建条目**（决策日志留痕，每周期每流每 kind 一条）；
           necessity 开 → AND「今天日程第一个条目时段内非 bot 消息 ≥1」（关 = 不判）；
         - **群聊晚安**：硬性连锁（marks v2 连锁桶）——本群早安本轮未开口 → 不掷点；
+          ``greeting_night_require_morning_chain`` 关 = 解耦直通（不查连锁桶，其余流程不变）；
         - **其他私聊**：早安阈值（窗 ``[prev.start, cur.start)``）；晚安 = OR（连锁桶 ∨
           阈值，窗 ``[cur.start, 晚安期限)``）。
         """
@@ -1633,8 +1726,11 @@ class ProactiveService:
                     # 到期钳制弃——「窗内一直不满足则到期仍弃」（§31.1）
                     return "skip", False
             return "pass", False  # TARGET = 无条件（判定窗/阈值均不设）
-        # 晚安：群聊 = 硬性连锁；其他私聊 = OR（连锁 ∨ 阈值）；目标 = 无条件
+        # 晚安：群聊 = 硬性连锁（``greeting_night_require_morning_chain`` 默认 True；
+        # 关 = 解耦直通，其余闸门/频率/预算不变）；其他私聊 = OR（连锁 ∨ 阈值）；目标 = 无条件
         if category == GREETING_CATEGORY_GROUP:
+            if not self._greeting_night_requires_chain(cfg_p):
+                return "pass", False
             state = self._greeting_chain_state(stream_id, cycle, now_ts, cfg_p)
             if state == "sent":
                 return "pass", False
@@ -1826,6 +1922,10 @@ class ProactiveService:
                 return True, bool(over and now_ts > fire_at)
             return True, False
         if kind == GREETING_NIGHT and category == GREETING_CATEGORY_GROUP:
+            # ``greeting_night_require_morning_chain`` 关 = 解耦，到点复核不再查连锁桶
+            # （掷点/去重/冷静期/期限都在本闸之外或下游，保持不变）。
+            if not self._greeting_night_requires_chain(cfg_p):
+                return True, False
             return self._greeting_chain_pass(stream_id, cycle), False
         win_start, win_end = self._threshold_window_bounds(cycle, kind)
         if kind == GREETING_NIGHT and self._greeting_chain_pass(stream_id, cycle):
@@ -1970,6 +2070,15 @@ class ProactiveService:
             return
         entry["status"] = GREETING_STATUS_FIRED
         entry["fired_at"] = now_ts
+        # P1-AFF-1（2026-11-11）：记下该流该 kind 的成功触发时刻，供用户回敬问候时
+        # 判定「30 分钟内」；进程内、有界（只留最近 1 小时条目）。
+        # 兼容 __new__/旧实例（未走 __init__ 的测试桩）：缺 attribute 时就地补字典。
+        if not isinstance(getattr(self, "_greeting_fired_at", None), dict):
+            self._greeting_fired_at = {}
+        self._greeting_fired_at[(str(stream_id), str(kind))] = float(now_ts)
+        for old_key, stamp in list(self._greeting_fired_at.items()):
+            if now_ts - float(stamp) > 3600.0:
+                self._greeting_fired_at.pop(old_key, None)
         # marks v2（§31.1 连锁桶）：所有类别按流按 kind 落盘去重（重载后不重发），
         # 记录 = 最新已发 cycle_start（同周期只发一次）
         self._mark_stream_greeting(stream_id, kind, entry.get("cycle"))
@@ -2034,6 +2143,20 @@ class ProactiveService:
         """中午问好总开关（``[planning_proactive].greeting_noon_enabled``，默认开）。"""
         return bool(getattr(self._proactive_cfg(), "greeting_noon_enabled", True))
 
+    def _noon_jitter_minutes(self) -> int:
+        """午安抖动窗（``[planning_proactive].greeting_noon_jitter_minutes``，默认 20）。
+
+        非法/负数 → 0（窗开即触发，旧行为）；上限 :data:`NOON_JITTER_MAX_MINUTES`。
+        """
+        raw = getattr(self._proactive_cfg(), "greeting_noon_jitter_minutes", 20)
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            value = 20
+        if value <= 0:
+            return 0
+        return min(value, NOON_JITTER_MAX_MINUTES)
+
     def _noon_sent_on_affection(self) -> bool:
         """目标私聊中午问好按天护栏（affection ``noon_sent``；未装配/不可调 → False）。"""
         affection = getattr(self._plugin, "_affection", None)
@@ -2060,7 +2183,14 @@ class ProactiveService:
         self._note_greeting_spoke_on_affection(affection)
 
     async def _process_noon_greeting(self, now: datetime, cycle: CycleState) -> None:
-        """中午问好：本地 12:00–13:00 窗内首个 tick 触发一次（**仅目标陪伴私聊**）。
+        """中午问好：本地 12:00–13:00 窗内**抖动时刻之后**的首个 tick 触发一次。
+
+        2026-11-11（报告 §3.2 问题 1 / P1-ACT-2 午安去闹钟化）：不再「窗口开启首个
+        tick 必发」。当日触发时刻 = 12:00 + :func:`noon_fire_offset_minutes`
+        （按「自然日 + 目标流」确定性播种，抖动开启时 1~``greeting_noon_jitter_minutes``
+        分钟、绝不整点）；
+        抖动时刻前的 tick 静默等待（不写决策日志、不消耗任何标记），到点后的首个 tick
+        发送。``jitter=0`` → 恢复旧行为（窗开即发）。
 
         去重沿用现有问候口径：marks v2 按流按 kind（``noon``）每周期落盘 + affection
         ``noon_sent_today`` 按天护栏（热重载不重发）。**免预算**（与早/晚安同口径，
@@ -2076,6 +2206,13 @@ class ProactiveService:
             return
         cur_minute = now.hour * 60 + now.minute
         if not (NOON_WINDOW_START_MINUTE <= cur_minute < NOON_WINDOW_END_MINUTE):
+            return
+        jitter = self._noon_jitter_minutes()
+        offset = noon_fire_offset_minutes(now.strftime("%Y-%m-%d"), target, jitter)
+        fire_minute = NOON_WINDOW_START_MINUTE + offset
+        now_minute = cur_minute + now.second / 60.0
+        if now_minute < fire_minute:
+            # 抖动时刻未到：静默等待（不标记、不写日志、下一 tick 再看）。
             return
         cycle_key = float(cycle.current_cycle_start or 0.0)
         if self._stream_greeting_marked(target, GREETING_NOON, cycle_key) \
@@ -2108,6 +2245,8 @@ class ProactiveService:
             stream_id=target, category=GREETING_CATEGORY_TARGET,
             window=(f"{NOON_WINDOW_START_MINUTE // 60:02d}:{NOON_WINDOW_START_MINUTE % 60:02d}"
                     f"-{NOON_WINDOW_END_MINUTE // 60:02d}:{NOON_WINDOW_END_MINUTE % 60:02d}"),
+            jitter_minutes=jitter,
+            fire_at=(f"{fire_minute // 60:02d}:{fire_minute % 60:02d}"),
         )
 
     async def _trigger_greeting(self, stream_id: str, kind: str, date_str: str) -> bool:
@@ -2517,13 +2656,16 @@ class ProactiveService:
                     else:
                         conclusion = timing
                 else:
-                    state = self._greeting_chain_state(stream_id, cycle, now_ts, cfg_p)
-                    if state == "sent":
-                        conclusion = f"连锁已通过，{timing}"
-                    elif state == "inflight":
-                        conclusion = "早安未开始（连锁待定）"
+                    if not self._greeting_night_requires_chain(cfg_p):
+                        conclusion = f"连锁已解耦（不要求当日早安），{timing}"
                     else:
-                        conclusion = "因早安未开口→晚安连锁硬性忽略"
+                        state = self._greeting_chain_state(stream_id, cycle, now_ts, cfg_p)
+                        if state == "sent":
+                            conclusion = f"连锁已通过，{timing}"
+                        elif state == "inflight":
+                            conclusion = "早安未开始（连锁待定）"
+                        else:
+                            conclusion = "因早安未开口→晚安连锁硬性忽略"
             elif category == GREETING_CATEGORY_OTHER:
                 if kind == GREETING_NIGHT and self._greeting_chain_pass(stream_id, cycle):
                     conclusion = f"连锁已通过，{timing}"
@@ -2553,10 +2695,13 @@ class ProactiveService:
                 detail_parts.append(
                     "必要性=" + ("开" if self._greeting_requires_activation(cfg_p) else "关"))
                 if kind == GREETING_NIGHT:
-                    state = self._greeting_chain_state(stream_id, cycle, now_ts, cfg_p)
-                    detail_parts.append("连锁=已通过" if state == "sent"
-                                        else ("连锁=待定" if state == "inflight"
-                                              else "连锁=已失效"))
+                    if not self._greeting_night_requires_chain(cfg_p):
+                        detail_parts.append("连锁=已解耦（不使用）")
+                    else:
+                        state = self._greeting_chain_state(stream_id, cycle, now_ts, cfg_p)
+                        detail_parts.append("连锁=已通过" if state == "sent"
+                                            else ("连锁=待定" if state == "inflight"
+                                                  else "连锁=已失效"))
                 detail_parts.append(win_text)
             if entry is not None:
                 roll_text = str(entry.get("status") or "unknown")
@@ -2644,6 +2789,12 @@ class ProactiveService:
         window_text = (
             f"{NOON_WINDOW_START_MINUTE // 60:02d}:{NOON_WINDOW_START_MINUTE % 60:02d}"
             f"-{NOON_WINDOW_END_MINUTE // 60:02d}:{NOON_WINDOW_END_MINUTE % 60:02d}")
+        # P1-ACT-2（2026-11-11）：与主链同源的当日抖动时刻（确定性、纯读）。
+        jitter = self._noon_jitter_minutes()
+        offset = noon_fire_offset_minutes(now.strftime("%Y-%m-%d"), stream_id, jitter)
+        fire_minute = NOON_WINDOW_START_MINUTE + offset
+        fire_text = f"{fire_minute // 60:02d}:{fire_minute % 60:02d}"
+        now_minute = cur_minute + now.second / 60.0
         if category != GREETING_CATEGORY_TARGET:
             conclusion = "不适用（中午问好仅目标陪伴私聊）"
         elif not enabled:
@@ -2651,24 +2802,35 @@ class ProactiveService:
         elif marked:
             conclusion = "今日已发"
         elif in_window:
-            conclusion = ("暂缓（睡眠引擎判定仍在睡，窗内醒来才发）"
-                          if self._sleep_engine_asleep(now) is True
-                          else "已满足（窗内下一 tick 将发送）")
+            if self._sleep_engine_asleep(now) is True:
+                conclusion = "暂缓（睡眠引擎判定仍在睡，窗内醒来才发）"
+            elif now_minute < fire_minute:
+                conclusion = f"等待抖动时刻 {fire_text}（窗 {window_text}）"
+            else:
+                conclusion = "已满足（抖动时刻已到，窗内下一 tick 将发送）"
         elif cur_minute < NOON_WINDOW_START_MINUTE:
             conclusion = f"未满足（未到中午窗口 {window_text}）"
         else:
             conclusion = f"已放弃（中午窗口 {window_text} 已过）"
+        fire_ts: Optional[float] = None
+        try:
+            fire_ts = datetime(now.year, now.month, now.day,
+                               fire_minute // 60, fire_minute % 60,
+                               tzinfo=now.tzinfo).timestamp()
+        except (TypeError, ValueError, OSError, OverflowError):
+            fire_ts = None
         return {
             "kind": GREETING_NOON,
             "enabled": enabled,
             "conclusion": conclusion,
-            "detail": f"窗={window_text} / 标记={'是' if marked else '否'}",
+            "detail": (f"窗={window_text} / 抖动={jitter}分钟 / 当日触发={fire_text}"
+                       f" / 标记={'是' if marked else '否'}"),
             "activated": None,
             "marked": marked,
             "threshold": {"applicable": False, "need": 0, "count": 0,
                           "met": False, "cached": None, "query_ok": False},
-            "roll": {},
-            "fire_at": None,
+            "roll": {"jitter_minutes": jitter},
+            "fire_at": fire_ts,
             "observe_until": None,
         }
 
@@ -3160,6 +3322,11 @@ class ProactiveService:
         morning/noon/night_greeting），经 tools.proactive_turn 统一登记；
         登记只做事实记录与文案分类，不触碰预算/计数/豁免口径。
         PR-RELIABILITY（3.17.17 §1A）：登记前置到 trigger 调用前，失败 discard。
+        四阶段渗透（2026-11-11 §3.2）：仅目标陪伴私聊、且只读阶段查询 == 4 时，
+        早/午/晚安 intent 换成无互斥指令的轻量骨架并强制拼接
+        :data:`MISS_REASON_STAGE4_SUFFIX`；登记 ``miss_stage=4`` 供 replyer 强覆盖。
+        非目标流 / 阶段 0~3 的 intent、reason 与登记逐字不变（阶段 1~3 由 patrol
+        独立想念链承担，问候不做额外染色）。
         """
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "maisaka"):
@@ -3172,6 +3339,20 @@ class ProactiveService:
         if trigger is None:
             logger.warning("宿主未提供 maisaka.proactive.trigger 能力，主动发起跳过")
             return False
+
+        # 四阶段渗透（设计 §3.2）：目标私聊 + 阶段 4 → 替换 intent 骨架 + 两端拼尾缀。
+        # 只读查询（不调 InitiativeMemory.cycle，不推进/清空周期）；任何异常回 0。
+        stage = 0
+        stage_hours = 0.0
+        if self._is_companion_target_stream(stream_id):
+            stage, stage_hours = self._current_target_miss_stage_readonly()
+        if stage == 4:
+            relation = self._stage4_relation_word()
+            intent_prompt = append_stage4_miss_prompt(
+                stage4_intent_for_kind(kind, intent_prompt),
+                hours=stage_hours, relation=relation)
+            reason = append_stage4_miss_prompt(
+                reason, hours=stage_hours, relation=relation)
 
         # PR-LINKAGE-SCREEN（3.17.16）：问候主动轮触发前看一眼陪伴对象电脑屏幕。
         # 根因修复——旧路径直接 trigger 无 before/无屏幕旁白，问候轮 planner/replyer
@@ -3222,10 +3403,17 @@ class ProactiveService:
                 await bus.publish("proactive.used", source="planning",
                                   channel="planning", intent=label, stream_id=stream_id)
             except Exception:
-                logger.debug("proactive.used 发布失败", exc_info=True)
+                # 记账发布失败不阻断触发；日志带 stream_id 便于按流定位
+                # （U4 源码契约也要求记账发布点可关联到具体流）。
+                logger.debug("proactive.used 发布失败 stream_id=%s", stream_id,
+                             exc_info=True)
 
-        # 3.17.17 登记前置，失败 discard。
-        turn_id = register_turn(self._plugin, stream_id, kind, reason)
+        # 3.17.17 登记前置，失败 discard。阶段 4 额外把阶段号写进 turn（供 replyer
+        # 强覆盖）；其余路径保持既有 4 参调用逐字不变（源码子串契约）。
+        if stage == 4:
+            turn_id = register_turn(self._plugin, stream_id, kind, reason, miss_stage=4)
+        else:
+            turn_id = register_turn(self._plugin, stream_id, kind, reason)
         result = None
         if priority and priority != "normal":
             try:
@@ -3258,6 +3446,131 @@ class ProactiveService:
         target = str(getattr(self._plugin, "_stream_id", "") or "").strip()
         sid = str(stream_id or "").strip()
         return bool(target) and sid == target
+
+    def _stage4_relation_word(self) -> str:
+        """阶段 4 尾缀里的关系称谓（patrol 关系档案就绪时用其称谓，否则「恋人」）。"""
+        patrol = getattr(getattr(self._plugin, "_companion", None), "patrol", None)
+        getter = getattr(patrol, "_relation_word", None)
+        if callable(getter):
+            try:
+                return str(getter() or "恋人")
+            except Exception:
+                logger.debug("关系称谓读取失败（回退「恋人」）", exc_info=True)
+        return "恋人"
+
+    def _current_target_miss_stage_readonly(
+        self, now: Optional[datetime] = None,
+    ) -> Tuple[int, float]:
+        """只读查询目标私聊当前清醒沉默阶段 → ``(stage, effective_hours)``。
+
+        数据源优先级：
+        1. ``patrol.current_target_miss_stage``（其他模块提供的单一只读出口，若已落地）；
+        2. 本地只读镜像：``patrol._affection.last_user_msg_time()`` +
+           ``patrol._initiative_memory.doc['cycles'][target]``（生效起点含短回复顺延）
+           + ``patrol._sleep_hours_between``（睡眠扣除，开关关 → 不扣）。
+        **绝不调用** ``InitiativeMemory.cycle()``（它会写 defer/新周期并落盘）；
+        阶段 1~3 的精确分档不在此消费，>120h 判定为阶段 4。
+        任何异常/装配缺失 → ``(0, 0.0)``（fail-open：按非阶段 4 原样派发）。
+        """
+        try:
+            patrol = getattr(getattr(self._plugin, "_companion", None), "patrol", None)
+            if patrol is None:
+                return 0, 0.0
+            probe = getattr(patrol, "current_target_miss_stage", None)
+            if callable(probe):
+                try:
+                    raw = probe(now)
+                except TypeError:
+                    raw = probe()
+                if not isinstance(raw, (tuple, list)) or len(raw) < 2:
+                    return 0, 0.0
+                try:
+                    stage = int(raw[0])
+                    hours = float(raw[1])
+                except (TypeError, ValueError):
+                    return 0, 0.0
+                return (stage if 0 <= stage <= 4 else 0), max(0.0, hours)
+
+            affection = getattr(patrol, "_affection", None)
+            memory = getattr(patrol, "_initiative_memory", None)
+            target_qq = str(getattr(patrol, "_target_qq", "") or "").strip()
+            if affection is None or memory is None or not target_qq:
+                return 0, 0.0
+            last = affection.last_user_msg_time()
+            if last is None:
+                return 0, 0.0
+            now_dt = now or datetime.now()
+            # 服务循环与 patrol 的时钟可能一个 aware 一个 naive；统一到本地 naive。
+            if now_dt.tzinfo is not None:
+                now_dt = now_dt.astimezone().replace(tzinfo=None)
+            if getattr(last, "tzinfo", None) is not None:
+                last = last.astimezone().replace(tzinfo=None)
+            anchor = None
+            hours = 0.0
+            # 复核 finding：优先复用 patrol 的只读投影口（公开出口缺失时的兜底），
+            # 它会把最新短回复的 1.5h 顺延即时算进来，与 _tick/current_target_miss_stage
+            # 同口径；本地周期行镜像只含已落盘 defer，可能少一个顺延档。
+            projector = getattr(patrol, "_readonly_cycle_anchor", None)
+            if callable(projector):
+                try:
+                    staged = True
+                    gate = getattr(patrol, "_miss_stage_escalation_enabled", None)
+                    if callable(gate):
+                        staged = bool(gate())
+                    anchor, projected = projector(now_dt, last, staged=staged)
+                    if anchor is not None:
+                        hours = max(0.0, float(projected or 0.0))
+                except Exception:
+                    anchor = None
+            if anchor is None:
+                doc = getattr(memory, "doc", None)
+                cycles = doc.get("cycles") if isinstance(doc, dict) else None
+                row = cycles.get(target_qq) if isinstance(cycles, dict) else None
+                if not isinstance(row, dict):
+                    return 0, 0.0
+                anchor = self._stage4_anchor_datetime(patrol, row)
+                if anchor is None:
+                    return 0, 0.0
+                if (now_dt.tzinfo is None) != (anchor.tzinfo is None):
+                    # 旧装配路径：按调用方时钟对齐后计算自然时长。
+                    if now_dt.tzinfo is not None:
+                        anchor = anchor.replace(tzinfo=now_dt.tzinfo)
+                    else:
+                        now_dt = now_dt.replace(tzinfo=anchor.tzinfo)
+                hours = max(0.0, (now_dt - anchor).total_seconds() / 3600.0)
+            if hours > STAGE4_SILENCE_HOURS:
+                sleep_enabled = getattr(patrol, "_miss_sleep_excluded_enabled", None)
+                if callable(sleep_enabled) and sleep_enabled():
+                    sleeper = getattr(patrol, "_sleep_hours_between", None)
+                    if callable(sleeper):
+                        try:
+                            hours = max(0.0, hours - float(sleeper(anchor, now_dt) or 0.0))
+                        except Exception:
+                            logger.debug("阶段查询睡眠扣除失败（按自然时长）", exc_info=True)
+            return (4 if hours > STAGE4_SILENCE_HOURS else 0), hours
+        except Exception:
+            logger.debug("目标沉默阶段只读查询失败（按非阶段 4 处理）", exc_info=True)
+            return 0, 0.0
+
+    @staticmethod
+    def _stage4_anchor_datetime(patrol: Any, row: dict) -> Optional[datetime]:
+        """周期行 → 生效起点 datetime（优先 patrol 的既有只读换算，绝不写盘）。"""
+        converter = getattr(patrol, "_cycle_anchor_time", None)
+        if callable(converter):
+            try:
+                value = converter(row)
+                if isinstance(value, datetime):
+                    return value
+            except Exception:
+                logger.debug("周期生效起点换算失败（回退本地镜像）", exc_info=True)
+        try:
+            anchor = float(row.get("anchor"))
+            defer = max(0.0, float(row.get("defer") or 0.0))
+            raw = row.get("raw_anchor")
+            limit = float(raw) if raw is not None else anchor + defer
+            return datetime.fromtimestamp(max(anchor, min(anchor + defer, limit)))
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
 
     # 注（2026-10-20 用户指示）：原 _trigger_proactive（活动切换/约定主动开口的指令模板组装
     # 与触发，'commitment_due' / 'activity_switch' 两类 trigger_type）已删除；

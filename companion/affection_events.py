@@ -3,15 +3,16 @@
 统一入口 :func:`record_rule_event` —— 频控 → 日累计限幅 → 入账 → 档位重估 → 事件日志：
 
 - 频控（§5.4）：``chat_round`` 日累计 ≤ +2.0；``user_initiated`` 日 ≤ +1.0；
-  ``morning_exchange`` / ``night_exchange`` 各 1 次/日（**暂无触发点**：未接线，
-  问候成功只写 planning 侧已发标记，不经本层入账）；``commitment_kept`` /
+  ``morning_exchange`` / ``night_exchange`` 各 1 次/日（2026-11-11 P1-AFF-1 起
+  已接线：companion 侧在 Bot 发出早/晚安后 30 分钟内收到用户回敬问候时调用，
+  识别见 :func:`classify_greeting_exchange`）；``commitment_kept`` /
   ``commitment_broken`` 每约定 1 次（去重键见 ``key`` 参数）。
 - 日累计限幅（§5.5）：positive ≤ ``daily_positive_cap``(8.0)、negative ≥
   ``-daily_negative_cap``(6.0)，超出部分记日志丢弃。（2026-10-17 §19.1 起 0~200 标度，
   全部默认增量等比 ×2。）
 - 情绪调制（§六.2 B，M3 接线）：``delta_affection_final = delta × clamp(1 + 0.25 ×
   V_current × sign(delta), 0.6, 1.4)``；V_current 由 ``AffectionManager.emotion_valence()``
-  读取（emotion 模块未接线/停用时返回 None → 乘数恒 1.0），开关
+  读取（emotion 模块未装配/停用时返回 None → 乘数恒 1.0），开关
   ``affection.emotion_modulation``。调制系数与裁剪前后值落 decision_logs（§6.3-7）。
 
 调用方式二选一（等价）；示例增量取本表 ``chat_round`` 默认值
@@ -30,6 +31,7 @@ referee 侧二次限幅，本层只做日累计限幅与入账。其余 M3/M6 �
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -59,13 +61,15 @@ RULE_EVENT_TABLE: dict[str, dict[str, Any]] = {
         "delta": 0.4,
         "once_per_day": True,
         "desc": "互道早安",
-        "note": "各 1 次/日；暂无触发点（未接线；问候成功只写 planning 侧已发标记）",
+        "note": "各 1 次/日；已接线（2026-11-11 P1-AFF-1）：Bot 发出早安后 30 分钟内"
+                "用户回敬早安时由 companion 侧识别并入账（窗口为进程内，重载会漏记）",
     },
     "night_exchange": {
         "delta": 0.4,
         "once_per_day": True,
         "desc": "互道晚安",
-        "note": "各 1 次/日；暂无触发点（未接线；问候成功只写 planning 侧已发标记）",
+        "note": "各 1 次/日；已接线（2026-11-11 P1-AFF-1）：Bot 发出晚安后 30 分钟内"
+                "用户回敬晚安时由 companion 侧识别并入账（窗口为进程内，重载会漏记）",
     },
     "commitment_kept": {
         "delta": 2.0,
@@ -95,6 +99,41 @@ RULE_EVENT_TABLE: dict[str, dict[str, Any]] = {
 
 DEFAULT_DAILY_POSITIVE_CAP = 8.0
 DEFAULT_DAILY_NEGATIVE_CAP = 6.0
+
+# ── 早晚安互道识别（2026-11-11 Gemini 批，报告 §3.2 问题 2 / P1-AFF-1）────────
+# 只做「用户回复是否在回敬问候」的文本判别；入账由 record_rule_event 的
+# morning_exchange / night_exchange（各 +0.4、once_per_day）承担。
+MORNING_EXCHANGE_WORDS = ("早安", "早上好")
+NIGHT_EXCHANGE_WORDS = ("晚安", "睡了", "去睡")
+#: 单词「早」及其常见语气尾巴（整句匹配，避免「早点睡」被误判成早安）。
+_MORNING_SOLO_RE = re.compile(
+    r"^\s*早(?:早)*(?:安|上好|呀|啊|哦|哈|鸭|啦|咯|噢|喔)*"
+    r"[\s!！。.,，~～?？…]*$")
+
+
+def classify_greeting_exchange(text: Any) -> Optional[str]:
+    """用户回复命中早安/晚安词时返回规则事件 kind，否则 ``None``（P1-AFF-1）。
+
+    规则（词表：早/早安/早上好；晚安/睡了/去睡）：
+
+    - 晚安优先：文本包含 ``晚安`` / ``睡了`` / ``去睡`` → ``night_exchange``
+      （「我要睡了」「去睡啦」都算）；
+    - 早安：包含 ``早安`` / ``早上好``，或整句就是「早」及「早呀/早安/早上好呀」
+      这类短问候 → ``morning_exchange``；
+    - **不**把「早点睡」「早点休息」等含「早」的普通句子判成早安（整句正则约束）。
+
+    纯函数、零 IO；调用方（companion/components.py）还须叠加「Bot 30 分钟内发过
+    对应问候」与 `[affection].exchange_events_enabled` 两个前置条件。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if any(word in raw for word in NIGHT_EXCHANGE_WORDS):
+        return "night_exchange"
+    if any(word in raw for word in MORNING_EXCHANGE_WORDS) \
+            or _MORNING_SOLO_RE.match(raw):
+        return "morning_exchange"
+    return None
 
 #: 情绪调制兜底乘数（无情绪上下文/开关关闭时的恒等值；M3 起真实调制见 _emotion_multiplier）
 _EMOTION_MULTIPLIER = 1.0
@@ -127,7 +166,7 @@ def _emotion_multiplier(affection: Any, delta: float) -> tuple:
     正事件打折、负事件扣得更狠；乘数对称保正负同时缩放（不会"心情差所以骂人也不扣分"）。
 
     Returns:
-        ``(multiplier, valence)``；V 不可得（emotion 模块未接线/停用/异常）或
+        ``(multiplier, valence)``；V 不可得（emotion 模块未装配/停用/异常）或
         ``affection.emotion_modulation=false`` 时返回 ``(1.0, None)``——乘数恒 1，
         与 M1 占位行为一致（降级路径）。
     """
@@ -246,7 +285,7 @@ def record_rule_event(affection: Any, kind: str, delta: Optional[float] = None, 
         ``{"kind", "requested", "applied", "dropped", "reason", "score", "tier",
         "tier_changed", "multiplier", "requested_raw", "valence"}``
         （``requested_raw`` = 情绪调制前，``requested`` = 调制后/限幅前，``applied`` =
-        实际入账，``multiplier`` = 情绪调制系数（未接线时 1.0），``valence`` = 调制
+        实际入账，``multiplier`` = 情绪调制系数（emotion 不可用时 1.0），``valence`` = 调制
         所用当前 V（不可得时为 None）；``tier_changed`` = (old,new) 或 None）。
     """
     now = now or datetime.now()

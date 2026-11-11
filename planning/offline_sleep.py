@@ -84,7 +84,8 @@ def classify_offline_gap(seconds: Any) -> str:
 
 
 def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0,
-                            *, baseline_hours: Any = 8.0) -> Dict[str, Any]:
+                            *, baseline_hours: Any = 8.0,
+                            repay_v2: bool = True) -> Dict[str, Any]:
     """按分级生成一次离线睡眠结算计划（纯函数；不触状态/不落盘/不发事件）。
 
     Args:
@@ -93,6 +94,10 @@ def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0,
         baseline_hours: 复核 P0-4：零债基准（与在线 settle 同口径，默认 8.0）——
             短窗口用户离线睡满配置时长（≥基准）即按整晚规则结算，不再被 8h
             硬门槛完全拒结。
+        repay_v2: P0-NUM-1 离线路径：与在线引擎同一开关
+            ``[life_state].sleep_debt_repay_v2``（配置默认 True）。**默认 True
+            与在线一致**——补眠与在线会话同样走阶梯还债（无单次 1h 硬顶）；
+            历史回放/旧口径复现必须**显式传 False**（旧公式逐字不变）。
 
     Returns:
         计划 dict（编排方据此落库/应用，键集固定）：
@@ -152,12 +157,14 @@ def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0,
     sleep_debt_after = debt_before
     if category == "long" and effective_hours >= min(DEBT_SETTLE_MIN_HOURS, baseline):
         sleep_debt_after = settle_sleep_debt(debt_before, effective_hours,
-                                             baseline_hours=baseline)
+                                             baseline_hours=baseline,
+                                             repay_v2=bool(repay_v2))
         debt_settled = True
     elif category == "overlong":
         # 有效时长恒 = 10h：同 long 按整晚规则、按 10h 口径结算
         sleep_debt_after = settle_sleep_debt(debt_before, effective_hours,
-                                             baseline_hours=baseline)
+                                             baseline_hours=baseline,
+                                             repay_v2=bool(repay_v2))
         debt_settled = True
 
     gains = integrate_sleep_gains(
@@ -186,5 +193,8 @@ def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0,
             "gap_seconds": round(gap, 4),
             "unrecorded_seconds": round(unrecorded_seconds, 4),
             "unrecorded_note": UNRECORDED_NOTE if unrecorded_seconds > 0 else "",
+            # 3.17.33 复核修复：与在线会话 metadata.debt_repay_v2 同口径，便于
+            # 回放/排障区分「旧公式」与「阶梯还债」。
+            "debt_repay_v2": bool(repay_v2),
         },
     }

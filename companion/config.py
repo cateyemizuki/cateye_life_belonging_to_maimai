@@ -192,6 +192,37 @@ class PatrolSectionConfig(PluginConfigBase):
             **_ui_i18n("Enable miss trigger", "Off: never starts a chat out of missing someone."),
         },
     )
+    miss_sleep_excluded: bool = Field(
+        default=True,
+        description="想念判定用「清醒沉默时长」：从陪伴对象上次来信至今，扣除 sleep_sessions 里"
+                    "已收口的睡眠段（含离线补全的 offline_reconnect 会话）与 life_state 当前睡眠段；"
+                    "只有剩下的清醒时长达到人设锚点才进入想念候选。"
+                    "关闭 = 回到旧行为（直接按自然时长判定，睡眠也计入沉默）。",
+        json_schema_extra={
+            "label": "想念扣除睡眠",
+            "hint": "开 = 整夜/离线补的睡眠不算沉默，睡醒不会误报想念；关 = 按自然时长判定（旧行为）。"
+                    "睡眠段读不到时自动退回旧口径。",
+            **_ui_i18n("Exclude sleep from miss silence",
+                       "On: sleep segments (incl. offline-reconnect) do not count as silence. "
+                       "Off: legacy natural-time behavior."),
+        },
+    )
+    # 2026-11-11 Gemini 批：阶梯想念（报告 §3.1 问题 1，P0-ACT-1）。
+    # 只扩展沉默周期内的受理阶段，不改变状态门槛、预算与静默闸门。
+    miss_stage_escalation_enabled: bool = Field(
+        default=True,
+        description="阶梯想念：长沉默按阶段推进（轻度想念 → 挂念追问 → 直接追问去向），"
+                    "每个阶段独立受理一次；超过 120h 进入阶段 4（独立想念停发，"
+                    "早/午/晚安、刷QQ、视频等每日主动任务渗透式追问），用户真实回信回到阶段 0",
+        json_schema_extra={
+            "label": "阶梯想念",
+            "hint": "默认开：阶段越高语气越直接；>120h 不再独立想念，由每日主动任务带上追问；"
+                    "关 = 旧行为（同一沉默周期只想念一次）",
+            **_ui_i18n("Staged miss escalation",
+                       "Escalate miss outreach across silence stages instead of consuming the "
+                       "whole cycle on the first miss; off = legacy single-shot."),
+        },
+    )
     daily_max_speak: int = Field(
         default=5,
         ge=0,
@@ -201,6 +232,49 @@ class PatrolSectionConfig(PluginConfigBase):
             "label": "每日预算",
             "hint": "0 = 停止可选主动回合；仅目标私聊计数，受理回合不等于实际发出消息。",
             **_ui_i18n("Daily budget", "Counts optional proactive turns in the target private chat; greetings are exempt."),
+        },
+    )
+    # 2026-11-11 Gemini 批：主动预算弹性（默认开，仍受硬上限基础预算 +2 约束）。
+    budget_elasticity_enabled: bool = Field(
+        default=True,
+        description="主动预算弹性：高好感/高情绪时允许在每日预算基础上小幅追加可选主动回合；"
+                    "默认开启，追加幅度仍受硬上限（基础预算 +2）；关闭 = 固定按每日预算执行（旧行为）",
+        json_schema_extra={
+            "label": "主动预算弹性",
+            "hint": "默认开：高好感/高 Valence/法定节假日命中最多 +2，绝不超过基础预算 +2，"
+                    "问候继续免预算；关 = 每日预算为硬上限（旧行为）",
+            **_ui_i18n("Elastic proactive budget",
+                       "On by default: a small extra optional proactive allowance in "
+                       "high-affinity/high-mood states, hard-capped at base + 2. "
+                       "Off: fixed daily budget."),
+        },
+    )
+
+    # ── 回复时延（拟人化）────────────────────────────────────
+    # 2026-11-11 Gemini 批（报告 §2.3）：在消息发送前按字数与精力加入自然延迟。
+    # 只影响发送节奏，不改回复内容、预算与消息顺序；关闭 = 立即发送。
+    typing_delay_enabled: bool = Field(
+        default=True,
+        description="打字时延：回复发送前按字数与当前精力加入自然打字延迟，消除「机器人秒回」；"
+                    "关闭 = 生成完成后立即发送",
+        json_schema_extra={
+            "label": "打字时延",
+            "hint": "默认开：精力越低越慢，并带小幅抖动；关 = 不额外等待",
+            **_ui_i18n("Typing delay",
+                       "Add a natural typing delay based on reply length and energy; off = send immediately."),
+        },
+    )
+    typing_delay_max_seconds: float = Field(
+        default=8.0,
+        ge=0.0,
+        le=30.0,
+        description="单条回复打字时延上限（秒）：默认 8 秒，避免长回复等待过久；0 = 不额外延迟",
+        json_schema_extra={
+            "label": "打字时延上限(秒)",
+            "hint": "默认 8 秒；只在「打字时延」开启时生效",
+            "step": 0.5,
+            **_ui_i18n("Typing delay cap (s)",
+                       "Upper bound for the simulated typing delay; default 8 seconds."),
         },
     )
     # 注（2026-10-20 用户指示）：原 silence_start / silence_end 两键已移除——静默窗恒复用
@@ -363,6 +437,21 @@ class AffectionSectionConfig(PluginConfigBase):
             "label": "情绪调制好感",
             "hint": "关 = 所有增量按原值入账；情绪模块停用时本就恒为 1",
             **_ui_i18n("Emotion modulation"),
+        },
+    )
+    # ── 早晚安互动入账（2026-11-11 Gemini 批，报告 §3.2 问题 2 / P1-AFF-1）──
+    # 只接通已定义的 morning_exchange / night_exchange 规则事件（各 +0.4、每日一次），
+    # 不改规则事件表、日上限与衰减口径；关闭 = 早晚安只按普通聊天入账（旧行为）。
+    exchange_events_enabled: bool = Field(
+        default=True,
+        description="早晚安好感事件：用户与 bot 互道早安/晚安时触发 morning_exchange / "
+                    "night_exchange 规则事件（各 +0.4，每日一次），让日常仪式感真正入账",
+        json_schema_extra={
+            "label": "早晚安好感事件",
+            "hint": "默认开：只在成功互道且当日未重复时入账；关 = 早晚安按普通聊天计，不触发专属加分",
+            **_ui_i18n("Morning/night exchange events",
+                       "Wire the existing morning_exchange/night_exchange rule events into "
+                       "affection; off = ordinary chat only."),
         },
     )
     weekly_milestones_enabled: bool = Field(

@@ -46,3 +46,13 @@ class VideoShareSectionConfig(PluginConfigBase):
     decision_task_name: str = Field(default="utils",
         description="独立分享判断使用的宿主文本任务名；不调用聊天planner，不给模型提供工具。",
         json_schema_extra={"label": "分享判断任务"})
+    # 2026-11-11 Gemini 批：分享质量门槛（默认关，避免压低现有分享量）。
+    video_share_quality_gate: bool = Field(default=False,
+        description="自动视频分享质量门槛：开启后在既有相关性判断之外再按质量分过滤，低质量候选不投递；"
+                    "默认关，保持当前分享量与用户要求的提升口径",
+        json_schema_extra={"label": "分享质量门槛",
+            "hint": "默认关；开启后低于门槛值的候选不会自动分享，手动分享不受影响"})
+    video_share_quality_threshold: float = Field(default=0.55, ge=0.0, le=1.0,
+        description="自动视频分享质量门槛值（0~1）：质量分低于该值不自动分享；仅在「分享质量门槛」开启时生效",
+        json_schema_extra={"label": "质量门槛值", "step": 0.05,
+            "hint": "默认 0.55；门槛开启后才参与过滤"})

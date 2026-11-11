@@ -44,6 +44,14 @@ provider (life experience index, published tier, dedupe ``qzone:{tid}``);
 ``append_fact`` / the bot-self stream remain compatibility fallbacks only and
 are never required. No user-chat injection on either path.
 
+PR-3.3 (2026-11-11): optional share-quality gate (default OFF). When
+``[video_share].video_share_quality_gate`` is enabled the bridge scores each
+candidate from |ΔVAD| and target-interest overlap; a ``post`` below
+``video_share_quality_threshold`` becomes ``do_not_post``. The check is a pure
+extra veto placed after the existing daily-quota / sleep-silence-cooldown gates
+in the publish phase, so it can never bypass budget, night, cooldown or consent.
+Off → zero behavior change (users still get the higher share volume).
+
 The ledger is a synchronous, thread-safe SQLite layer modeled on
 ``integrations/video_share_ledger.py`` (independent connection + transaction per
 operation). Async callers offload ledger work with ``asyncio.to_thread`` so a
@@ -55,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import threading
@@ -103,6 +112,146 @@ ATTEMPT_ACTIVE_STATUSES = ('claimed', 'sending', 'sent', 'uncertain')
 ASSET_ID = re.compile(r"^vframe_[0-9a-f]{32}$")
 #: 资产合法状态（claimed/released 供 PR-A2/A3 使用，本批只写 reserved/available）
 ASSET_STATUSES = ('reserved', 'available', 'claimed', 'released', 'expired')
+
+# ── 3.3（2026-11-11 Gemini 批）：分享质量门槛（默认关）────────────────────────
+#: 门槛只在 [video_share].video_share_quality_gate=True 时参与；关闭时本段零副作用，
+#: 既有预算/夜间/冷却/授权闸与分享量逐字不变（用户要的「更多分享」保持）。
+QUALITY_IMPACT_WEIGHT = 0.6      # |ΔVAD| 情绪冲击度权重
+QUALITY_INTEREST_WEIGHT = 0.4    # 目标兴趣重合度权重
+#: |ΔVAD| 满量程：单次事件增量硬限幅 ±0.5（emotion 侧 EVENT_DELTA_CLAMP），
+#: 三维合成幅度以 0.5 计满分；超出按 1.0 夹取。
+QUALITY_VAD_FULL_SCALE = 0.5
+#: 质量分不足时的诊断原因前缀（写进 decision.reason / 发布留痕）。
+QUALITY_REJECT_REASON = '质量门槛未过'
+
+
+def _quality_ratio(value: Any, default: float = 0.0) -> float:
+    """把任意数值夹到 0~1；缺失/非法 → ``default``（同样夹取）。"""
+    return max(0.0, min(1.0, number(value, default)))
+
+
+def vad_delta_magnitude(value: Any) -> float | None:
+    """|ΔVAD| 合成幅度（0~1 满量程）；无法解析 → None（不伪造情绪冲击）。
+
+    接受 ``{valence,arousal,dominance}`` / ``{v,a,d}`` / ``[v,a,d]`` / 标量（视为 |ΔV|）。
+    三维按均方根合成后除以 ``QUALITY_VAD_FULL_SCALE``，再夹到 1.0。
+    """
+    parts: list[float] = []
+    if isinstance(value, dict):
+        for long_key, short_key in (('valence', 'v'), ('arousal', 'a'), ('dominance', 'd')):
+            if long_key in value:
+                parts.append(abs(number(value.get(long_key), 0.0)))
+            elif short_key in value:
+                parts.append(abs(number(value.get(short_key), 0.0)))
+        if not parts:
+            return None
+    elif isinstance(value, (list, tuple)):
+        for item in value[:3]:
+            parts.append(abs(number(item, 0.0)))
+        if not parts:
+            return None
+    elif isinstance(value, bool):
+        return None
+    else:
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(scalar):
+            return None
+        return _quality_ratio(abs(scalar) / QUALITY_VAD_FULL_SCALE)
+    rms = math.sqrt(sum(part * part for part in parts) / len(parts))
+    return _quality_ratio(rms / QUALITY_VAD_FULL_SCALE)
+
+
+def _interest_weights(value: Any) -> dict[str, float]:
+    """把目标兴趣归一成 ``{关键词: 权重}``；空/不可解析 → {}（不臆造兴趣）。"""
+    weights: dict[str, float] = {}
+
+    def _add(term: Any, weight: Any) -> None:
+        text = clean(str(term or ''), 40)
+        if not text:
+            return
+        score = number(weight, 1.0)
+        if score <= 0:
+            return
+        key = text.casefold()
+        if key not in weights or score > weights[key]:
+            weights[key] = min(10.0, score)
+
+    if isinstance(value, dict):
+        # 兼容 {"猫": 1.0} 与 {"interests": [...]} 两种外形
+        inner = value.get('interests') or value.get('keywords')
+        if isinstance(inner, (list, tuple, dict)):
+            return _interest_weights(inner)
+        for term, weight in value.items():
+            _add(term, weight)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, str):
+                _add(item, 1.0)
+            elif isinstance(item, dict):
+                term = (item.get('keyword') or item.get('term') or item.get('topic')
+                        or item.get('name') or item.get('text'))
+                weight = item.get('weight', item.get('score', 1.0))
+                _add(term, weight)
+    elif isinstance(value, str):
+        _add(value, 1.0)
+    return weights
+
+
+def interest_overlap_score(facts: dict, interests: Any) -> float | None:
+    """目标兴趣重合度（0~1）；没有可核验兴趣 → None。
+
+    口径 = 0.5×命中权重覆盖率 + 0.5×最强命中相对权重：既奖励「命中多个兴趣」，
+    也允许「精准命中一个核心兴趣」（报告 §3.3「Tag 命中对方爱好」）。只做子串匹配，
+    不调用 LLM、不编造主题。
+    """
+    weights = _interest_weights(interests)
+    if not weights:
+        return None
+    facts = facts if isinstance(facts, dict) else {}
+    text = ' '.join(str(facts.get(key) or '')
+                    for key in ('title', 'summary', 'impression', 'description')).casefold()
+    if not text.strip():
+        return 0.0
+    matched = {term: weight for term, weight in weights.items() if term in text}
+    if not matched:
+        return 0.0
+    total = sum(weights.values())
+    max_weight = max(weights.values())
+    coverage = sum(matched.values()) / total if total > 0 else 0.0
+    best = max(matched.values()) / max_weight if max_weight > 0 else 0.0
+    return _quality_ratio(0.5 * coverage + 0.5 * best)
+
+
+def share_quality_score(facts: dict, *, vad_delta: Any = None,
+                        interests: Any = None) -> dict:
+    """综合分享质量分（0~1）与分项诊断（3.3；纯函数、零 I/O、零 LLM）。
+
+    返回 ``{"score", "impact", "interest", "available", "signals"}``：
+    - ``impact`` = |ΔVAD| 归一化（None=没有可核验情绪增量）；
+    - ``interest`` = 目标兴趣重合度（None=没有可核验兴趣）；
+    - 分项可用时按 0.6/0.4 加权（只一项则按该项自身，权重重归一化）；
+    - 两项都不可用 → score=0、available=False（门槛开启时保守不分享，宁缺毋滥）。
+    """
+    impact = vad_delta_magnitude(vad_delta) if vad_delta is not None else None
+    interest = interest_overlap_score(facts if isinstance(facts, dict) else {}, interests)
+    weighted: list[tuple[float, float]] = []
+    signals: list[str] = []
+    if impact is not None:
+        weighted.append((QUALITY_IMPACT_WEIGHT, impact))
+        signals.append('impact')
+    if interest is not None:
+        weighted.append((QUALITY_INTEREST_WEIGHT, interest))
+        signals.append('interest')
+    if weighted:
+        weight_sum = sum(weight for weight, _ in weighted)
+        score = sum(weight * value for weight, value in weighted) / weight_sum
+    else:
+        score = 0.0
+    return {'score': _quality_ratio(score), 'impact': impact, 'interest': interest,
+            'available': bool(weighted), 'signals': signals}
 
 
 def clamp_delay_minutes(action: Any, value: Any,
@@ -895,7 +1044,8 @@ class QzoneVideoBridge:
                  post_moment=None, check_post_gates=None, posts_today=None,
                  daily_max_posts=None, list_my_moments=None, send_ambiguous=None,
                  now_dt=None, append_fact=None, preview_key=None,
-                 record_published=None):
+                 record_published=None, quality_config_provider=None,
+                 quality_signal_provider=None):
         self.ledger = ledger
         self._config = config_provider
         self._qzone_enabled = qzone_enabled_provider
@@ -924,11 +1074,140 @@ class QzoneVideoBridge:
         # (text, images, visibility) -> str（=post_moment preview key）；缺省 None → request_key 留空，
         # 幂等仍由 UNIQUE(bvid,watched_generation,channel) 保证（生产装配恒注入真实 preview_post）。
         self._preview_key = preview_key
+        # 3.3（2026-11-11 Gemini 批）：分享质量门槛。两端口均可选、缺省 None：
+        # - quality_config_provider 返回带 video_share_quality_gate / _threshold 的配置段
+        #   （装配根应传 config.video_share；缺省回退本桥配置，二者都缺字段时门槛关）；
+        # - quality_signal_provider(candidate) 返回 {"vad_delta"|"vad"+"vad_anchor",
+        #   "interests"|"target_interests"}，缺省时从 state_provider 的
+        #   vad/vad_anchor/target_interests 与候选 facts 取。
+        # 默认关：既有通道零行为变化；开启后只做「额外否决」，绝不跳过预算/夜间/冷却/授权闸。
+        self._quality_config = quality_config_provider
+        self._quality_signal = quality_signal_provider
         self._lock = asyncio.Lock()
 
     def _mode(self) -> str:
         mode = str(getattr(self._config(), 'mode', 'shadow') or 'shadow')
         return mode if mode in ('off', 'shadow', 'auto') else 'shadow'
+
+    # ---- 3.3 分享质量门槛（默认关；只做额外否决）----
+    def _quality_gate_config(self) -> Any:
+        """取质量门槛配置段；不接受根配置误传（缺字段 = 门槛关，绝不误开）。"""
+        provider = self._quality_config
+        if provider is not None:
+            try:
+                cfg = provider() if callable(provider) else provider
+            except Exception:
+                cfg = None
+        else:
+            try:
+                cfg = self._config()
+            except Exception:
+                cfg = None
+        if cfg is None:
+            return None
+        if hasattr(cfg, 'video_share_quality_gate'):
+            return cfg
+        section = getattr(cfg, 'video_share', None)
+        if section is not None and hasattr(section, 'video_share_quality_gate'):
+            return section
+        return cfg
+
+    def quality_gate_enabled(self) -> bool:
+        cfg = self._quality_gate_config()
+        return bool(cfg is not None and getattr(cfg, 'video_share_quality_gate', False))
+
+    def quality_threshold(self) -> float:
+        cfg = self._quality_gate_config()
+        raw = getattr(cfg, 'video_share_quality_threshold', 0.55) if cfg is not None else 0.55
+        return _quality_ratio(raw, 0.55)
+
+    def _quality_inputs(self, candidate: dict) -> tuple[Any, Any]:
+        """收集 |ΔVAD| 与目标兴趣：显式 provider 优先，其次 state/facts 的既有只读字段。
+
+        3.17.33 复核：provider 除 ``vad_delta`` / ``interests`` 外也可直接给
+        ``vad`` + ``vad_anchor``（装配根从当前生活状态读数）与 ``target_interests``
+        （关系记忆口径）——缺派生量时由本方法就地相减，避免「有信号但键名不合」
+        让门槛误判为不可用。state_provider 抛异常按无状态降级（门槛开启时保守）。
+        """
+        signals: dict = {}
+        provider = self._quality_signal
+        if provider is not None:
+            try:
+                value = provider(candidate) if callable(provider) else provider
+                if isinstance(value, dict):
+                    signals.update(value)
+            except Exception:
+                signals = {}
+        try:
+            state = self._state() if self._state is not None else {}
+        except Exception:
+            state = {}
+        state = state if isinstance(state, dict) else {}
+        facts = candidate.get('facts') if isinstance(candidate, dict) else None
+        facts = facts if isinstance(facts, dict) else {}
+        vad_delta = signals.get('vad_delta', signals.get('delta_vad'))
+        if vad_delta is None and isinstance(signals.get('vad'), dict) \
+                and isinstance(signals.get('vad_anchor'), dict):
+            vad_delta = self._vad_delta(signals['vad'], signals['vad_anchor'])
+        if vad_delta is None:
+            vad_delta = facts.get('vad_delta', facts.get('delta_vad'))
+        if vad_delta is None:
+            vad_delta = state.get('vad_delta', state.get('emotion_delta'))
+        if vad_delta is None:
+            vad_delta = self._derive_vad_delta(state)
+        interests = (signals.get('interests') or signals.get('target_interests')
+                     or state.get('target_interests')
+                     or state.get('interests') or state.get('video_interests'))
+        return vad_delta, interests
+
+    @staticmethod
+    def _vad_delta(current: dict, anchor: dict) -> dict:
+        """三维 VAD 差（缺任一维度的键只跳过该维度；两侧都空 → 空 dict）。"""
+        return {dim: number(current.get(dim), 0.0) - number(anchor.get(dim), 0.0)
+                for dim in ('valence', 'arousal', 'dominance')
+                if dim in current and dim in anchor}
+
+    @staticmethod
+    def _derive_vad_delta(state: dict) -> Any:
+        """从 state 的 vad/vad_anchor（或 emotion.vad/anchor）派生 ΔVAD；缺任一侧 → None。"""
+        for key in ('emotion', 'vad'):
+            value = state.get(key)
+            if not isinstance(value, dict):
+                continue
+            delta = value.get('delta') or value.get('vad_delta')
+            if delta is not None:
+                return delta
+            current = value.get('vad') if key == 'emotion' else value
+            anchor = value.get('anchor') or value.get('baseline')
+            if isinstance(current, dict) and isinstance(anchor, dict):
+                return {dim: number(current.get(dim), 0.0) - number(anchor.get(dim), 0.0)
+                        for dim in ('valence', 'arousal', 'dominance')}
+        current = state.get('vad')
+        anchor = state.get('vad_anchor') or state.get('vad_baseline')
+        if isinstance(current, dict) and isinstance(anchor, dict):
+            return {dim: number(current.get(dim), 0.0) - number(anchor.get(dim), 0.0)
+                    for dim in ('valence', 'arousal', 'dominance')}
+        return None
+
+    def quality_verdict(self, candidate: dict) -> dict | None:
+        """质量门槛判定；关闭 → None（调用方保持旧路径，零分支开销）。"""
+        if not self.quality_gate_enabled():
+            return None
+        threshold = self.quality_threshold()
+        vad_delta, interests = self._quality_inputs(candidate)
+        facts = candidate.get('facts')
+        detail = share_quality_score(facts if isinstance(facts, dict) else {},
+                                     vad_delta=vad_delta, interests=interests)
+        return {'enabled': True, 'passed': bool(detail['available']
+                                               and detail['score'] >= threshold),
+                'score': detail['score'], 'threshold': threshold,
+                'impact': detail['impact'], 'interest': detail['interest'],
+                'available': detail['available'], 'signals': detail['signals']}
+
+    @staticmethod
+    def _quality_reason(verdict: dict) -> str:
+        return (f"{QUALITY_REJECT_REASON}（score={verdict['score']:.2f} < "
+                f"{verdict['threshold']:.2f}）")
 
     # ---- 候选记录（同步；由分享记录器并列调用，异常由调用方隔离）----
     def record_from_result(self, result: dict, episode_id: str) -> bool:
@@ -980,6 +1259,17 @@ class QzoneVideoBridge:
         max_evaluations = max(1, int(getattr(cfg, 'max_evaluations', 3)))
         if decision['action'] == 'defer' and candidate.get('evaluations', 0) + 1 >= max_evaluations:
             decision = {**decision, 'action': 'do_not_post', 'delay_minutes': 0, 'reason': '重评超限'}
+        # 3.3：质量门槛只否决「本来要发」的候选；关闭时 verdict=None，字段与旧判定逐字一致。
+        verdict = self.quality_verdict(candidate)
+        if verdict is not None:
+            if decision['action'] == 'post' and not verdict['passed']:
+                decision = {**decision, 'action': 'do_not_post', 'delay_minutes': 0,
+                            'reason': self._quality_reason(verdict)}
+                if self._log is not None:
+                    self._log.info('空间视频质量门槛拦截: candidate=%s score=%.2f threshold=%.2f',
+                                   candidate.get('candidate_id'), verdict['score'],
+                                   verdict['threshold'])
+            decision = {**decision, 'quality': verdict}
         now = self._now()
         await asyncio.to_thread(self.ledger.decide, candidate['candidate_id'], decision, now, day=day)
         if self._log is not None:
@@ -1222,6 +1512,16 @@ class QzoneVideoBridge:
             await asyncio.to_thread(self.ledger.defer_publish, cid, now + GATE_RETRY_SECONDS)
             self._log_gate_skip(cid, reason)
             return {'status': 'gate_rejected', 'reason': reason}
+        # 闸 2.5（3.3）：分享质量门槛。位置刻意在共享额度（闸 1）与睡眠/静默/冷却/LLM（闸 2）
+        # **之后**——门槛只能追加一次否决，不能压过或绕过任何既有闸；关闭时 verdict=None 零副作用。
+        # 发布相位复检覆盖「判定后才开启门槛」的已 evaluated 候选，避免旧判定漏网。
+        quality = self.quality_verdict(candidate)
+        if quality is not None and not quality['passed']:
+            reason_text = self._quality_reason(quality)
+            await asyncio.to_thread(self.ledger.record_publish_rejected, cid, now, reason_text)
+            self._log_gate_skip(cid, reason_text)
+            return {'status': 'rejected', 'reason': 'quality_gate',
+                    'quality': quality}
         # 闸 3（PR-A3）：发布尝试事务认领——同键已 sent/uncertain/sending → 拒绝重发。
         # 本账本是「视频→空间」专用幂等关联层，post_moment 内部防重仍保持（两层都在）。
         task_id = str(candidate.get('task_id') or '')

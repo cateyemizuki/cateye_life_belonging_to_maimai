@@ -105,6 +105,27 @@ AXES: Tuple[str, ...] = ("energy", "hunger", "focus", "stress", "social_battery"
 #: 诊断 contrib 的来源桶（硬要求 6：基础/活动/睡眠/事件/情绪）
 CONTRIB_BUCKETS: Tuple[str, ...] = ("basal", "activity", "sleep", "event", "emotion")
 
+# ── 目标私聊社交电量折减（2026-11-11 Gemini 批，报告 §4.1 P1-NUM-2）──────────
+# 真实聊天事件的结算路径：
+#   companion/components.py::_mai_chat_social_drain（目标流真实回复）
+#   → LifeStateService.apply_episode(state_deltas={"social_battery": Δ})
+#   → life_state.STATE_FIELDS clamp [0,1] + settlement_diag event 桶 kind=chat。
+# ``target_private`` 由该处「回复流 == 巡检目标流」严格判定（群聊/其他私聊天然
+# 排除），再作为本组纯函数的入参，决定是否进入好感折减/回充分支。
+#: 好感满值（与 companion.affection.SCORE_MAX / affection_presets.SCORE_MAX 同口径；
+#: 本模块不 import companion，保持纯函数层零依赖）。
+TARGET_CHAT_AFFINITY_SCORE_MAX = 200.0
+#: 折减强度跨度：满好感时消耗降至 ``1 - 0.9 = 0.1`` 倍。
+TARGET_CHAT_AFFINITY_DISCOUNT_SPAN = 0.9
+#: 折减系数下限（绝不为 0：保留最低交互成本）。
+TARGET_CHAT_DISCOUNT_FLOOR = 0.1
+#: 「高好感」门槛：内置预设最高档起点 176/200（affection_presets.BUILTIN_TIER_BOUNDS）。
+TARGET_CHAT_RECHARGE_MIN_SCORE = 176.0
+#: 单次真实回复的微量回充上限（0~1 尺度；约为默认消耗 0.015 的 1/4）。
+TARGET_CHAT_RECHARGE_PER_REPLY = 0.004
+#: 「放松对话」判据：情绪效价 V ≥ 0（V 不可得 → 不判定放松、不回充）。
+TARGET_CHAT_RELAXED_VALENCE = 0.0
+
 
 def default_params() -> Dict[str, Any]:
     """内置参数深拷贝（调用方可自由改写而不污染 :data:`V2_PARAMS`）。"""
@@ -214,6 +235,94 @@ def approach_value(x_now: float, target: float, tau_min: float, dt_min: float) -
     if tau_min is None or tau_min <= 0.0 or tau_min != tau_min:
         return float(x_now)
     return target + (float(x_now) - target) * math.exp(-float(dt_min) / float(tau_min))
+
+
+def target_chat_affinity_factor(affinity: Any, *, enabled: bool = True) -> float:
+    """目标私聊好感折减系数 ``max(0.1, 1 - 0.9 × affinity / 200)``（纯函数）。
+
+    - ``enabled=False``（``[life_state].social_battery_affinity_discount`` 关）→ 恒 1.0；
+    - ``affinity`` 非法/缺失由调用方决定是否传入；本函数对 ``None`` 按 0 处理
+      （系数 1.0），但生产路径在好感读数不可得时**不进入折减**（见
+      :func:`target_chat_social_delta` 的 ``affinity=None`` 分支）。
+    """
+    if not enabled:
+        return 1.0
+    score = max(0.0, min(TARGET_CHAT_AFFINITY_SCORE_MAX, _finite(affinity, 0.0)))
+    return max(TARGET_CHAT_DISCOUNT_FLOOR,
+               1.0 - TARGET_CHAT_AFFINITY_DISCOUNT_SPAN
+               * score / TARGET_CHAT_AFFINITY_SCORE_MAX)
+
+
+def target_chat_social_delta(drain: Any, *, target_private: bool,
+                             affinity: Any = None,
+                             social_battery: Any = None,
+                             discount_enabled: bool = True,
+                             recharge_enabled: bool = True,
+                             valence: Any = None) -> Dict[str, Any]:
+    """目标陪伴私聊单次真实回复的社交电量增量（纯函数，P1-NUM-2）。
+
+    结算路径与 ``target_private`` 接线：``companion/components.py`` 的
+    ``_mai_chat_social_drain`` 只在「回复流 == 巡检目标流」时进入（F6 同口径；
+    群聊/其他私聊/流缺失直接 return），并把该判定显式作为 ``target_private=True``
+    连同 ``state_deltas`` 交给 ``LifeStateService.apply_episode``。本函数是该增量
+    的唯一计算点，``target_private=False`` 时逐字返回旧消耗（不折减、不回充）。
+
+    规则：
+
+    - 基础消耗 ``drain``（internal_tuning ``chat_social_drain_per_reply``，默认
+      0.015/次；≤0/非法 → 0）；
+    - 目标私聊 + 好感可得 + 开关开：消耗 × ``target_chat_affinity_factor``
+      （满好感 0.1 倍，最低 0.1）；好感读数不可得 → 不折减（保守，宁可按旧口径）；
+    - 高好感（≥ :data:`TARGET_CHAT_RECHARGE_MIN_SCORE`）**且**放松对话
+      （``valence`` 可得且 ≥ :data:`TARGET_CHAT_RELAXED_VALENCE`）且开关开 →
+      额外微量回充 ``TARGET_CHAT_RECHARGE_PER_REPLY``，并按「先扣消耗后的剩余
+      电量」封顶，**绝不把电量推过 1.0**（``social_battery=None`` 时退化为
+      仅按回充上限，实际落地仍由 apply_episode 的 clamp 兜底）；
+    - 返回 ``delta``（可直接放进 ``state_deltas["social_battery"]``）与诊断分解。
+    """
+    raw = max(0.0, _finite(drain, 0.0))
+    score: Optional[float] = None
+    if affinity is not None:
+        score = max(0.0, min(TARGET_CHAT_AFFINITY_SCORE_MAX, _finite(affinity, 0.0)))
+    factor = 1.0
+    reason = "not_target_private"
+    discount_applied = False
+    if target_private:
+        if not discount_enabled:
+            reason = "discount_disabled"
+        elif score is None:
+            reason = "affinity_unavailable"
+        else:
+            factor = target_chat_affinity_factor(score)
+            discount_applied = True
+            reason = "target_private"
+    effective = raw * factor
+    relaxed = (valence is not None
+               and _finite(valence, -1.0) >= TARGET_CHAT_RELAXED_VALENCE)
+    recharge = 0.0
+    if (target_private and recharge_enabled and score is not None
+            and score >= TARGET_CHAT_RECHARGE_MIN_SCORE and relaxed):
+        recharge = TARGET_CHAT_RECHARGE_PER_REPLY
+        if social_battery is not None:
+            current = _clamp01(_finite(social_battery, 0.0))
+            headroom = max(0.0, 1.0 - max(0.0, current - effective))
+            recharge = min(recharge, headroom)
+        reason = "target_private_recharge" if recharge > 0.0 else reason
+    delta = recharge - effective
+    if abs(delta) < 1e-12:  # 满电时「扣完即回满」的浮点残差归零，避免 -5e-17 记账
+        delta = 0.0
+    return {
+        "delta": delta,
+        "drain": raw,
+        "effective_drain": effective,
+        "factor": factor,
+        "recharge": recharge,
+        "affinity": score,
+        "target_private": bool(target_private),
+        "discount_applied": discount_applied,
+        "relaxed": bool(relaxed),
+        "reason": reason,
+    }
 
 
 def _activity_axis(params: Mapping[str, Any], profile_key: Optional[str],

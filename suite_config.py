@@ -4,7 +4,8 @@
   且同一进程可能加载多个插件，顶层 ``config`` 会被宿主 ``src/config`` 或
   兄弟插件抢占（L1 实证），故改名并由 plugin.py 顶部引导头接管自身模块解析。
 - 各业务子模块各自拥有自己的配置 section 类（模块化维护）：
-  - planning/config.py  日程系统：schedule / schedule_advanced / planning_proactive
+  - planning/config.py  日程系统：schedule / schedule_advanced / planning_proactive /
+                        planning_events（小事件权重乘数与分享概率）
   - companion/config.py 陪伴模块：patrol（含目标用户与屏幕感知）/ affection
   - suite_prompts.py    提示词集中模块：prompts
   - qzone/config.py     QQ 空间：qzone / qzone_video（空间视频候选·影子模式，PR-A0）
@@ -114,6 +115,7 @@ from companion.screen_config import ScreenSectionConfig, migrate_screen_config
 from emotion.config import EmotionSectionConfig
 from planning.config import (
     LifeStateSectionConfig,
+    PlanningEventsSectionConfig,
     PlanningProactiveSectionConfig,
     ScheduleAdvancedSectionConfig,
     ScheduleSectionConfig,
@@ -327,7 +329,17 @@ from suite_prompts import (
 # P2-4d 删除 settle_night_interrupts 冗余 guard；P2-5 前半视频桥影子文案改为
 # 真实发布口径、post 延迟不再被解析器清零。不新增用户可见配置字段（schema 不变
 # 18 段 202 叶子），按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.32"
+# 3.17.33（2026-11-11 WebUI 与刷视频批）：详情层移除折叠（section+常显标题）；
+# 空间最近动态不再二次截断 120 字（账本仍 5000 字上限）；最近观看透出
+# source/first_watched_at；自主刷视频 25–55 分钟（代码侧覆盖，不改内置库文案）；
+# 事件偏好标签按 evaluated/fallback/pending/unrecorded 真实分档 + 睡眠忙闲
+# pending 持久化清醒续排；心情历史相邻真实采样只连实线；离线/睡眠估算段覆盖
+# 顶层窗口不留空带；看视频任务发起后不打断（busy 只拦发起、工具排队、一次一个、
+# 即时入库、watched_at=发起时刻）；内置小事件库兼容装载（退役旧种子只读忽略、
+# 本批新增种子只读内存合并、reload 识别新增/删除、文案逐字保真）；D1 新增
+# [planning_events] 段 3 键（watch_bili/browse_qq 独立权重乘数、视频分享陪伴
+# 目标概率），默认全 1.0 保证零行为变化，按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.33"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -821,6 +833,17 @@ class DashboardDisplaySectionConfig(PluginConfigBase):
         return float(_tuning_value("dashboard_display", "history_debt_epsilon"))
 
 
+class EventCatalogServiceView(EventCatalogSectionConfig):
+    """``[event_catalog]`` 服务只读视图（不序列化、不出现在 WebUI 配置骨架）。
+
+    ``planning_events`` 只是把同一次配置快照里的 ``[planning_events]`` 段附挂给
+    ``EventCatalogService``（经 ``config_provider`` 动态读取乘数），避免事件库
+    服务为了两个权重乘数反向依赖装配根/插件实例。
+    """
+
+    planning_events: Any = None
+
+
 class CateyeSuiteConfig(PluginConfigBase):
     """插件完整配置。
 
@@ -835,6 +858,7 @@ class CateyeSuiteConfig(PluginConfigBase):
     schedule: ScheduleSectionConfig = Field(default_factory=ScheduleSectionConfig)
     schedule_advanced: ScheduleAdvancedSectionConfig = Field(default_factory=ScheduleAdvancedSectionConfig)
     planning_proactive: PlanningProactiveSectionConfig = Field(default_factory=PlanningProactiveSectionConfig)
+    planning_events: PlanningEventsSectionConfig = Field(default_factory=PlanningEventsSectionConfig)
     emotion: EmotionSectionConfig = Field(default_factory=EmotionSectionConfig)
     life_state: LifeStateSuiteSectionConfig = Field(default_factory=LifeStateSuiteSectionConfig)
     qzone: QzoneSectionConfig = Field(default_factory=QzoneSectionConfig)
@@ -851,8 +875,10 @@ class CateyeSuiteConfig(PluginConfigBase):
     def event_catalog(self) -> EventCatalogSectionConfig:
         """Typed service view; only schedule.event_catalog_* is serialized."""
         from core.config_migration import EVENT_CATALOG_FIELDS
-        return EventCatalogSectionConfig.model_validate({
-            key: getattr(self.schedule, "event_catalog_" + key) for key in EVENT_CATALOG_FIELDS})
+        payload = {key: getattr(self.schedule, "event_catalog_" + key)
+                   for key in EVENT_CATALOG_FIELDS}
+        payload["planning_events"] = self.planning_events
+        return EventCatalogServiceView.model_validate(payload)
 
     @pydantic.model_validator(mode="before")
     @classmethod

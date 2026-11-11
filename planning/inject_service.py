@@ -82,13 +82,23 @@ from .inject import (
 from .time_utils import (TimezoneManager, describe_energy, format_day_minute,
                          get_energy_level, parse_time_window, ring_minutes_ahead)
 from suite_prompts import (
+    IMPRESSION_FOLDED_MARK_DEFAULT,
+    IMPRESSION_TITLE_ACTIVE_DEFAULT,
+    IMPRESSION_TITLE_FOLDED_DEFAULT,
     INJECT_DATE_HEADER_DEFAULT,
     INJECT_HINT_CONTINUE_DEFAULT,
+    INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT,
     INJECT_REPLYER_NEXT_LINE_DEFAULT,
     INJECT_REPLYER_STATE_LINE_DEFAULT,
     INJECT_REPLYER_STATUS_DEFAULT,
+    INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
     INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
     INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
+    SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT,
+    SUBCONSCIOUS_TONE_HAPPY_DEFAULT,
+    SUBCONSCIOUS_TONE_HUNGRY_DEFAULT,
+    SUBCONSCIOUS_TONE_STEADY_DEFAULT,
+    SUBCONSCIOUS_TONE_TIRED_DEFAULT,
     prompt,
     render,
 )
@@ -125,6 +135,39 @@ _EXPERIENCE_SHARE_MARKER = "最近经历参考（可选话题）"
 #: replyer 复用本轮 planner 意图的最大年龄（秒，N6-1）。
 #: planner → replyer 同一轮内相隔仅数秒；超过该年龄说明不是同一轮，回落旧口径（闲聊）。
 _REPLYER_INTENT_REUSE_SECONDS = 180
+
+#: 结构化提取（2026-11-11 Gemini 批 §2.2 P0-1 残留）：消息项可能携带
+#: "这是 Bot 自己说的话"标志的宿主字段（快照之外的兼容面）。任一为真 →
+#: 该条不是真实用户输入，直接跳过（优先于旧正则滤镜）。
+_STRUCTURED_SELF_FLAG_KEYS = (
+    "is_self_message", "is_self", "is_bot", "sender_is_self",
+)
+#: 结构化来源字段里代表 Bot 自身/引导回复的取值。
+_STRUCTURED_SELF_SOURCES = frozenset({"guided_reply", "bot", "self", "assistant"})
+#: 宿主系统级 task 标签：整条是插件/宿主任务块，不是真实用户文本。
+_STRUCTURED_SYSTEM_TASK_PATTERN = re.compile(
+    r"^\s*<(?:plugin_proactive_task|system[_-]?task|task)\b", re.IGNORECASE)
+#: `<message ...>` 前缀属性解析（is_self_message 等宿主元数据）。
+_MESSAGE_TAG_PATTERN = re.compile(r"^\s*<message\b(?P<attrs>[^>]*)>", re.IGNORECASE)
+_MESSAGE_ATTR_PATTERN = re.compile(
+    r"(?P<key>[A-Za-z_][\w-]*)\s*=\s*(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+    re.DOTALL,
+)
+
+#: 日结印象行（companion 记忆行；只处理 system 文本，避免误改用户原话）。
+_IMPRESSION_LINE_PATTERN = re.compile(
+    r"^(?P<indent>[ \t]*)" + re.escape(IMPRESSION_TITLE_ACTIVE_DEFAULT)
+    + r"(?P<body>.*)$")
+_IMPRESSION_DATE_PATTERN = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2})\b")
+#: 条目分隔：只在「；」后面紧跟日期时切分，保留条目正文内部的自然分号。
+_IMPRESSION_ENTRY_SPLIT_PATTERN = re.compile(r"[；;]\s*(?=\d{4}-\d{2}-\d{2}\b)")
+#: 消极印象关键词（保守集：只认冲突/冷落/失望等明确负向，不把「累/忙」当消极）。
+_IMPRESSION_NEGATIVE_MARKERS = (
+    "没有互动", "没互动", "没有交流", "没交流", "没有联系", "没联系",
+    "冷淡", "冷落", "忽视", "忽略", "冷战", "疏远", "不理",
+    "争吵", "吵架", "争执", "闹别扭", "别扭", "敷衍",
+    "失望", "难过", "伤心", "生气", "不开心", "委屈", "沉默",
+)
 
 
 class InjectService:
@@ -480,6 +523,21 @@ class InjectService:
 
             # 提取最后一条 user 消息用于意图分析
             user_message = self._extract_last_user_text(payload)
+
+            # 4.4b（2026-11-11 Gemini 批）：次日发生真实互动后，旧日消极印象在
+            # prompt 中折叠为 [已翻篇] 并移到正文末尾；本轮无真实用户互动
+            # （主动开口/纯元数据载荷/仅历史消息）→ 原样。只改 system 文本，
+            # 不动状态数据。
+            payload_before_fold = payload
+            try:
+                today = self._tz_manager.get_now().strftime("%Y-%m-%d")
+                interacted = self._has_real_interaction_today(payload, today=today)
+                payload = self._fold_stale_impressions_in_payload(
+                    payload, interacted=interacted)
+            except Exception as exc:
+                payload = payload_before_fold
+                logger.debug("日结印象折叠旁路（保持原样）：%s", exc)
+
             user_id = session_id or "unknown"
             if not session_id:
                 logger.debug(
@@ -524,9 +582,12 @@ class InjectService:
                 if life_ov["future"]:
                     all_future_activities = life_ov["future"]
                 remaining_override = life_ov["remaining"]
-                life_lines = self._life_block_lines(life_view, life_ov)
+                life_lines = self._life_block_lines(
+                    life_view, life_ov, subconscious=self._state_subconscious_style())
                 if live_gate_enabled:
-                    life_lines_slim = self._life_block_lines(life_view, life_ov, slim=True)
+                    life_lines_slim = self._life_block_lines(
+                        life_view, life_ov, slim=True,
+                        subconscious=self._state_subconscious_style())
 
             # 无当前活动不再静默早退（N1-2）：照常走「分类 → 决策 → 模板路由」，
             # 模板侧自动切到空活动变体（兜底文案 = suite_prompts 内部键 inject_no_activity）。
@@ -559,6 +620,15 @@ class InjectService:
                 )
 
             if not inject_content:
+                if payload is not payload_before_fold:
+                    # 4.4b：本轮不注入日程，但旧日消极印象的折叠仍应送达
+                    # （只改 system 文本，不新增条目）。
+                    folded_kwargs: Dict[str, Any] = {
+                        **kwargs, "session_id": session_id, payload_key: payload,
+                    }
+                    if item_schema_version is not None:
+                        folded_kwargs["item_schema_version"] = item_schema_version
+                    return {"action": "continue", "modified_kwargs": folded_kwargs}
                 return {"action": "continue"}
 
             # 日期/节假日头部（2026-10-10：由陪伴模块迁入——只在日程块头部注一行，
@@ -604,16 +674,21 @@ class InjectService:
 
     @staticmethod
     def _message_role(msg: Dict[str, Any]) -> str:
-        """读取消息角色；兼容 ContextItem 快照投影（item_type）与旧 role/content。"""
+        """读取消息角色；兼容 ContextItem 快照投影（item_type）、meta.role 与旧 role/content。"""
         item_type = msg.get("item_type")
         if isinstance(item_type, str) and item_type:
-            if item_type == "UserMessageItem":
+            if item_type.endswith("UserMessageItem"):
                 return "user"
-            if item_type == "SystemMessageItem":
+            if item_type.endswith("SystemMessageItem"):
                 return "system"
-            if item_type == "AssistantMessageItem":
+            if item_type.endswith("AssistantMessageItem"):
                 return "assistant"
             return item_type
+        meta = msg.get("meta")
+        if isinstance(meta, dict):
+            meta_role = meta.get("role")
+            if isinstance(meta_role, str) and meta_role:
+                return meta_role
         role = msg.get("role")
         return role if isinstance(role, str) else ""
 
@@ -644,9 +719,163 @@ class InjectService:
             return candidates
         return []
 
+    # ---- 结构化元数据优先（2026-11-11 Gemini 批 §2.2 P0-1 残留修复）----------
+    # 旧实现只靠字符串正则倒序猜测宿主尾指令，宿主改文案即退化为全量闲聊。
+    # 现在先读消息项上的结构化标志（is_self_message / source / role / task 标签），
+    # 只有宿主字段缺失时才回退旧正则滤镜。
+
+    @staticmethod
+    def _parse_message_attrs(text: str) -> Dict[str, str]:
+        """解析 ``<message ...>`` 前缀属性（宿主元数据）；无前缀 → 空 dict。"""
+        match = _MESSAGE_TAG_PATTERN.match(text or "")
+        if not match:
+            return {}
+        attrs: Dict[str, str] = {}
+        for attr in _MESSAGE_ATTR_PATTERN.finditer(match.group("attrs") or ""):
+            attrs[attr.group("key").lower()] = attr.group("value")
+        return attrs
+
+    @staticmethod
+    def _truthy_flag(value: Any) -> bool:
+        """结构化布尔字段判定：bool / "true" / "1" / "yes" 为真。"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "y"}
+        return False
+
+    @classmethod
+    def _structured_self_state(cls, msg: Dict[str, Any], text: str) -> Optional[bool]:
+        """消息元数据判定「是否 Bot 自身发言」。
+
+        Returns:
+            True = 宿主明确标注自身发言；False = 宿主字段齐全且明确是真实用户；
+            None = 宿主字段缺失（调用方回退旧正则逻辑）。
+        """
+        saw_field = False
+        for key in _STRUCTURED_SELF_FLAG_KEYS:
+            if key in msg:
+                saw_field = True
+                if cls._truthy_flag(msg.get(key)):
+                    return True
+        meta = msg.get("meta")
+        if isinstance(meta, dict):
+            for key in _STRUCTURED_SELF_FLAG_KEYS:
+                if key in meta:
+                    saw_field = True
+                    if cls._truthy_flag(meta.get(key)):
+                        return True
+        for key in ("source", "source_kind", "sender_type"):
+            for holder in (msg, meta if isinstance(meta, dict) else None):
+                if isinstance(holder, dict) and key in holder:
+                    saw_field = True
+                    if str(holder.get(key) or "").strip().lower() in _STRUCTURED_SELF_SOURCES:
+                        return True
+        attrs = cls._parse_message_attrs(text)
+        if "is_self_message" in attrs:
+            saw_field = True
+            if cls._truthy_flag(attrs.get("is_self_message")):
+                return True
+        return False if saw_field else None
+
+    @classmethod
+    def _is_structured_system_task(cls, text: str) -> bool:
+        """宿主/插件系统任务块（task 标签）不是真实用户输入。
+
+        只认显式标签；旧正则尾指令过滤属「宿主字段缺失时的回退」，由调用方在
+        :meth:`_structured_self_state` 返回 ``None`` 后才启用。
+        """
+        return bool(_STRUCTURED_SYSTEM_TASK_PATTERN.match(text or ""))
+
+    @staticmethod
+    def _message_timestamp_date(msg: Dict[str, Any], text: str) -> Optional[str]:
+        """消息时间戳的日期部分（ISO ``YYYY-MM-DD``）；取不到 → None。
+
+        快照 ``meta.timestamp`` / 旧投影 ``timestamp``/``time`` 均可能是 ISO；
+        ``<message time="HH:MM:SS">`` 只有时刻没有日期，按无日期处理。
+        """
+        candidates: List[Any] = []
+        meta = msg.get("meta")
+        if isinstance(meta, dict):
+            candidates.append(meta.get("timestamp"))
+        for key in ("timestamp", "time", "created_at"):
+            candidates.append(msg.get(key))
+        for raw in candidates:
+            if not isinstance(raw, str):
+                continue
+            head = raw.strip()[:10]
+            if len(head) == 10 and head[4] == "-" and head[7] == "-" \
+                    and head.replace("-", "").isdigit():
+                return head
+        return None
+
+    @classmethod
+    def _has_real_interaction_today(
+        cls,
+        messages: List[Dict[str, Any]],
+        *,
+        today: str,
+    ) -> bool:
+        """本轮载荷里是否存在「今天」的真实用户发言（4.4b 触发条件）。
+
+        - 最新一条真实用户消息带日期且 == ``today`` → True（当天已互动，整日生效）；
+        - 带日期且早于今天（仅有历史）→ False（无互动不做折叠）；
+        - 全部无日期（旧投影）：载荷带 ``<plugin_proactive_task`` 主动块 → False；
+          否则按「最后一条真实用户文本即本轮输入」→ True（旧口径兼容）。
+        """
+        latest_date: Optional[str] = None
+        has_real = False
+        has_proactive_block = False
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            for candidate in cls._message_text_candidates(msg):
+                text = candidate.strip()
+                if not text:
+                    continue
+                if _STRUCTURED_SYSTEM_TASK_PATTERN.match(text) \
+                        and "plugin_proactive_task" in text.lower():
+                    has_proactive_block = True
+                elif cls._is_structured_system_task(text):
+                    continue
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or cls._message_role(msg) != "user":
+                continue
+            for candidate in cls._message_text_candidates(msg):
+                text = candidate.strip()
+                if not text or cls._is_structured_system_task(text):
+                    continue
+                self_state = cls._structured_self_state(msg, text)
+                if self_state is True:
+                    continue
+                if self_state is None:
+                    # 宿主字段缺失 → 回退旧正则/自身发言前缀过滤
+                    if cls._is_metadata_user_message(text):
+                        continue
+                    if cls._SELF_MESSAGE_PREFIX_PATTERN.match(text):
+                        continue
+                has_real = True
+                latest_date = cls._message_timestamp_date(msg, text)
+                break
+            if has_real:
+                break
+        if latest_date is not None:
+            return latest_date >= today
+        if not has_real:
+            return False
+        return not has_proactive_block
+
     @classmethod
     def _extract_last_user_text(cls, messages: List[Dict[str, Any]]) -> str:
-        """提取最新一条**含真实文本**的 user 消息（跳过元数据并剥除前缀）。"""
+        """提取最新一条**含真实文本**的 user 消息。
+
+        结构化优先（2026-11-11 Gemini 批 §2.2）：先看消息元数据
+        （``is_self_message`` / ``source`` / ``meta`` / ``<message ...>`` 属性 /
+        系统 task 标签）判定真实用户输入；只有宿主字段缺失时才回退旧正则滤镜
+        （跳过元数据消息、剥除 planner 前缀）。
+        """
         for msg in reversed(messages):
             if not isinstance(msg, dict):
                 continue
@@ -656,6 +885,18 @@ class InjectService:
                 text = candidate.strip()
                 if not text:
                     continue  # 空文本 → 找上一条 user
+                if cls._is_structured_system_task(text):
+                    continue  # 宿主系统 task / 尾指令块（结构化标签）
+                self_state = cls._structured_self_state(msg, text)
+                if self_state is True:
+                    continue  # 宿主明确标注 Bot 自身发言
+                if self_state is False:
+                    # 宿主字段齐全且明确是真实用户：不再用字符串正则猜测
+                    stripped = cls._strip_planner_prefix(text)
+                    if stripped.strip():
+                        return stripped
+                    continue
+                # 宿主字段缺失 → 回退旧逻辑（逐字保留 2026-10-10 N6-3 口径）
                 if cls._is_metadata_user_message(text):
                     continue  # 元数据消息/part → 跳过
                 if cls._SELF_MESSAGE_PREFIX_PATTERN.match(text):
@@ -966,7 +1207,12 @@ class InjectService:
                     time=time_str, name=name,
                 ).strip()
                 lines.append(f"接下来：{line}")
-            lines.extend(["", prompt(self._plugin, "inject_hint_current")])
+            if self._state_subconscious_style():
+                # 潜意识风格：问当前只如实说活动，状态用语气体现、不逐项汇报
+                current_hint = INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT
+            else:
+                current_hint = prompt(self._plugin, "inject_hint_current")
+            lines.extend(["", current_hint])
         else:
             if context_continue_inject:
                 lines.extend(["", render(
@@ -997,6 +1243,86 @@ class InjectService:
     def _no_activity_text(self) -> str:
         """无当前活动的固定上下文，不接受配置覆盖。"""
         return prompt(self._plugin, "inject_no_activity")
+
+    # ------------------------------------------------------------
+    # 状态潜意识化（2026-11-11 Gemini 批 P2-EXP-1 / 报告 §5.2）
+    # ------------------------------------------------------------
+
+    def _prompts_section(self) -> Any:
+        """``[prompts]`` 配置段（与 :func:`suite_prompts.prompt` 同取数序）。"""
+        section = getattr(self._plugin, "prompts", None)
+        if section is None:
+            section = getattr(getattr(self._plugin, "config", None), "prompts", None)
+        return section
+
+    def _state_subconscious_style(self) -> bool:
+        """``[prompts].state_subconscious_style``（出厂默认 True；段缺失按默认）。"""
+        section = self._prompts_section()
+        if section is None:
+            return True
+        value = getattr(section, "state_subconscious_style", True)
+        return True if value is None else bool(value)
+
+    def _life_state_snapshot(self) -> Dict[str, float]:
+        """只读五维状态快照（精力/饥饿/社交电量）；缺失/异常 → 空 dict。
+
+        取数序：``plugin._life_state`` → runtime 读模型的 ``_life`` 句柄。
+        只用于选择语气分支，不改任何状态数值。
+        """
+        life = getattr(self._plugin, "_life_state", None)
+        if life is None:
+            model = self._life_read_model()
+            life = getattr(model, "_life", None) if model is not None else None
+        if life is None:
+            return {}
+        try:
+            snapshot = life.snapshot()
+        except Exception:
+            return {}
+        if not isinstance(snapshot, dict):
+            return {}
+        out: Dict[str, float] = {}
+        for key in ("energy", "hunger", "social_battery"):
+            try:
+                out[key] = float(snapshot.get(key))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _emotion_valence(self) -> Optional[float]:
+        """情绪效价（开心分支辅助判据）；情绪模块缺失/异常 → None。"""
+        emotion = getattr(self._plugin, "_emotion", None)
+        service = getattr(emotion, "service", None)
+        getter = getattr(service, "effective_valence", None)
+        if not callable(getter):
+            return None
+        try:
+            return float(getter())
+        except Exception:
+            return None
+
+    def _subconscious_tone_rule(self) -> str:
+        """按当前状态选语气分支（疲惫 > 饥饿 > 开心 > 平稳）。
+
+        疲惫：精力 < 0.40 或社交电量 < 0.20；饥饿：饥饿 >= 0.60；
+        开心：精力 >= 0.72 或社交电量 >= 0.85 或情绪效价 >= 0.30。
+        数据缺失时落到平稳分支。
+        """
+        snapshot = self._life_state_snapshot()
+        energy = snapshot.get("energy")
+        hunger = snapshot.get("hunger")
+        social = snapshot.get("social_battery")
+        valence = self._emotion_valence()
+        if (energy is not None and energy < 0.40) or (
+                social is not None and social < 0.20):
+            return SUBCONSCIOUS_TONE_TIRED_DEFAULT
+        if hunger is not None and hunger >= 0.60:
+            return SUBCONSCIOUS_TONE_HUNGRY_DEFAULT
+        if (energy is not None and energy >= 0.72) or (
+                social is not None and social >= 0.85) or (
+                valence is not None and valence >= 0.30):
+            return SUBCONSCIOUS_TONE_HAPPY_DEFAULT
+        return SUBCONSCIOUS_TONE_STEADY_DEFAULT
 
     def _build_replyer_extra_prompt(
         self,
@@ -1073,6 +1399,11 @@ class InjectService:
 
         R7：能量行改经 :meth:`_replyer_energy_desc`（LifeState 优先，缺失/关闭
         回退静态 ``describe_energy``——关闭路径取值逐字不变）。
+
+        2026-11-11（Gemini 批 P2-EXP-1 / §5.2）：``state_subconscious_style``
+        开（默认）→ 走潜意识模板：状态数据原样保留，但明确禁止直接复述状态词，
+        改由 ``{tone_rule}`` 约束语气/句长（疲惫→短句/省略号、开心→轻快多句、
+        饥饿→随口提食欲）；关 → 旧模板逐字不变。
         """
         energy_desc = self._replyer_energy_desc()
 
@@ -1083,6 +1414,14 @@ class InjectService:
                 prompt(self._plugin, "inject_replyer_next_line"),
                 fallback=INJECT_REPLYER_NEXT_LINE_DEFAULT,
                 time=time_str, name=name,
+            )
+        if self._state_subconscious_style():
+            # 内部固定模板（不新增用户 schema 键）：数据原样保留，口径改为语气约束
+            return render(
+                INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
+                fallback=INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
+                state_line=state_line, energy=energy_desc,
+                tone_rule=self._subconscious_tone_rule(), next_line=next_line,
             )
         return render(
             prompt(self._plugin, "inject_replyer_status"),
@@ -1377,7 +1716,8 @@ class InjectService:
     @staticmethod
     def _life_block_lines(view: Optional[Dict[str, Any]],
                           override: Optional[Dict[str, Any]],
-                          slim: bool = False) -> List[str]:
+                          slim: bool = False,
+                          subconscious: bool = False) -> List[str]:
         """runtime 实况追加行（主设计 §3.3 注入清单；零 emoji）。
 
         current（名称/已进行/进度/注意力/剩余）+ next ≤2 + 状态行 + recent ≤2
@@ -1387,6 +1727,10 @@ class InjectService:
         接下来/状态/刚完成）——供非目标私聊会话的非询问意图使用，移除未来计划
         与刚完成语料（排查 E4/E5/E6 泄漏主源），保留当前活动维持角色连续性。
         缺省 False = 全量逐字（既有调用点与测试桩零变化）。
+
+        2026-11-11（Gemini 批 P2-EXP-1 / §5.2）：``subconscious=True`` 时在状态
+        行尾追加「只用于调整语气 / 不要直接复述」注记，状态数据本身不改；
+        缺省 False = 旧文案逐字（开关关闭路径）。
         """
         if not isinstance(view, dict):
             return []
@@ -1451,6 +1795,9 @@ class InjectService:
             lines.append("接下来：" + "；".join(nxt_parts))
         state_line = str(view.get("state_line") or "").strip()
         if state_line:
+            if subconscious:
+                # 内部键（不接受配置覆盖），直接取出厂文案，保持 staticmethod 无 plugin 依赖
+                state_line += SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT
             lines.append(state_line)
         for row in (view.get("completed") or [])[-2:]:
             if not isinstance(row, dict):
@@ -1472,6 +1819,173 @@ class InjectService:
                 span = ""
             lines.append(f"刚完成：{row_name}{span}")
         return lines
+
+    # ------------------------------------------------------------
+    # 日结印象次日折叠（2026-11-11 Gemini 批 4.4b / 报告 §4.4）
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _is_negative_impression(text: str) -> bool:
+        """保守判定一条印象是否消极（冲突/冷落/失望等明确负向）。"""
+        return any(marker in (text or "") for marker in _IMPRESSION_NEGATIVE_MARKERS)
+
+    @classmethod
+    def _fold_stale_impression_text(
+        cls,
+        text: str,
+        *,
+        today: str,
+        interacted: bool,
+        day_negative: Optional[Dict[str, bool]] = None,
+    ) -> str:
+        """把「日期早于今天 + 消极」的印象折叠到文本末尾并打 ``[已翻篇]``。
+
+        - ``interacted=False``（今天还没有真实用户互动）→ 原样返回；
+        - 条目日期缺失/坏值/等于今天/晚于今天 → 视为未过期，保持原样；
+        - 消极判定优先用 ``day_negative``（日结 week_log 的当日 delta < 0，结构化
+          数据）；该日无记录时才回退关键词保守判定；
+        - 积极/中性旧印象 → 不折叠（只折叠旧日消极印象）；
+        - 折叠块移到该文本末尾（不占【最近印象】首位），活跃条目保留；
+        - 幂等：折叠后的标题不再匹配【最近印象】，重复调用不叠加标记。
+        """
+        if not interacted or not isinstance(text, str) or not text:
+            return text
+        active_title = IMPRESSION_TITLE_ACTIVE_DEFAULT
+        folded_title = IMPRESSION_TITLE_FOLDED_DEFAULT
+        folded_mark = IMPRESSION_FOLDED_MARK_DEFAULT
+        flags = day_negative if isinstance(day_negative, dict) else {}
+        out_lines: List[str] = []
+        pending_folded: List[str] = []
+        for line in text.splitlines():
+            match = _IMPRESSION_LINE_PATTERN.match(line)
+            if not match:
+                out_lines.append(line)
+                continue
+            indent = match.group("indent") or ""
+            body = (match.group("body") or "").strip()
+            entries = [entry.strip() for entry in
+                       _IMPRESSION_ENTRY_SPLIT_PATTERN.split(body) if entry.strip()]
+            active_entries: List[str] = []
+            folded_entries: List[str] = []
+            for entry in entries:
+                date_match = _IMPRESSION_DATE_PATTERN.match(entry)
+                stale = bool(date_match and date_match.group("date") < today)
+                if stale:
+                    day = date_match.group("date")
+                    if day in flags:
+                        negative = bool(flags[day])
+                    else:
+                        negative = cls._is_negative_impression(entry)
+                else:
+                    negative = False
+                if stale and negative:
+                    folded_entries.append(entry)
+                else:
+                    active_entries.append(entry)
+            if not folded_entries:
+                out_lines.append(line)
+                continue
+            if active_entries:
+                out_lines.append(f"{indent}{active_title}" + "；".join(active_entries))
+            pending_folded.append(
+                folded_title + "；".join(f"{folded_mark} {entry}" for entry in folded_entries))
+        if not pending_folded:
+            return text
+        out_lines.extend(pending_folded)
+        return "\n".join(out_lines)
+
+    def _impression_day_flags(self) -> Dict[str, bool]:
+        """日结 ``week_log`` 的「当日是否消极」映射（``date → delta < 0``）。
+
+        只读 companion 好感状态（8 天滚动）；未装配/异常 → 空 dict，调用方回退
+        关键词判定。不写任何数据。
+        """
+        try:
+            companion = getattr(self._plugin, "_companion", None)
+            affection = getattr(companion, "affection", None)
+            getter = getattr(affection, "week_log", None)
+            if not callable(getter):
+                return {}
+            rows = getter() or {}
+        except Exception:
+            return {}
+        flags: Dict[str, bool] = {}
+        if isinstance(rows, dict):
+            for day, row in rows.items():
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    flags[str(day)] = float(row.get("delta") or 0.0) < 0.0
+                except (TypeError, ValueError):
+                    continue
+        return flags
+
+    def _fold_stale_impressions_in_payload(
+        self,
+        payload: List[Dict[str, Any]],
+        *,
+        interacted: bool,
+    ) -> List[Dict[str, Any]]:
+        """只改 system 文本里的【最近印象】行，用户原话与状态数据不动。
+
+        兼容 items 快照（``parts``）与旧 messages 投影（``content``）。companion
+        的好感记忆行在 planner Hook 链中先于本服务写入 system 条目（宿主持久化
+        Hook 按名称排序），本服务在注入前做最后一道口径归一；载荷里没有该行时
+        原样返回（组件未装配/已折叠均零副作用）。
+        """
+        if not interacted or not isinstance(payload, list) or not payload:
+            return payload
+        try:
+            today = self._tz_manager.get_now().strftime("%Y-%m-%d")
+        except Exception:
+            today = datetime.now().strftime("%Y-%m-%d")
+        day_negative = self._impression_day_flags()
+        changed = False
+        out: List[Dict[str, Any]] = []
+        for msg in payload:
+            if not isinstance(msg, dict) or self._message_role(msg) != "system":
+                out.append(msg)
+                continue
+            replacement = msg
+            parts = msg.get("parts")
+            if isinstance(parts, list):
+                new_parts: List[Any] = []
+                for part in parts:
+                    if (isinstance(part, dict) and part.get("type") == "text"
+                            and isinstance(part.get("text"), str)):
+                        new_text = self._fold_stale_impression_text(
+                            part["text"], today=today, interacted=True,
+                            day_negative=day_negative)
+                        if new_text != part["text"]:
+                            changed = True
+                            part = {**part, "text": new_text}
+                    new_parts.append(part)
+                if new_parts != parts:
+                    replacement = {**msg, "parts": new_parts}
+            else:
+                content = msg.get("content")
+                if isinstance(content, str):
+                    new_text = self._fold_stale_impression_text(
+                        content, today=today, interacted=True,
+                        day_negative=day_negative)
+                    if new_text != content:
+                        changed = True
+                        replacement = {**msg, "content": new_text}
+                elif isinstance(content, list):
+                    new_content: List[Any] = []
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            new_text = self._fold_stale_impression_text(
+                                part["text"], today=today, interacted=True,
+                                day_negative=day_negative)
+                            if new_text != part["text"]:
+                                changed = True
+                                part = {**part, "text": new_text}
+                        new_content.append(part)
+                    if new_content != content:
+                        replacement = {**msg, "content": new_content}
+            out.append(replacement)
+        return out if changed else payload
 
     # ------------------------------------------------------------
     # 对外公开：当前活动快照（供 @API 转发，跨插件可调）

@@ -37,11 +37,26 @@ class ProactiveDelivery(EventBus):
 
 def install_proactive_budget(bus: ProactiveDelivery, config_provider: Any = None,
                              decision_logger: Any = None, data_dir: Any = None,
-                             target_stream_provider: Any = None) -> ProactiveBudget:
+                             target_stream_provider: Any = None,
+                             elasticity_provider: Any = None) -> ProactiveBudget:
+    """装配主动预算，并在装配后注入可选弹性信号源（3.4）。
+
+    ``elasticity_provider`` 缺省 None 时 budget 的 ``cap()`` 与旧实现逐字一致；
+    真实组合根经本参数注入 affection/emotion/holiday 信号，避免「配置开了但没人
+    接线」。接线走 ``ProactiveBudget.set_elasticity_provider(...)``——构造参数
+    只保留既有字段，信号源是装配期可替换的端口（重复装配/热重载可重设）。
+    """
     # Repeated assembly on the same facade must not leave a stale second writer.
     bus.stop_budget()
     budget = ProactiveBudget(config_provider=config_provider, decision_logger=decision_logger,
                              data_dir=data_dir, target_stream_provider=target_stream_provider)
+    # 3.4（2026-11-11 复核修复）：install 后显式核验/注入信号端口；budget 侧若
+    # 新增/移除 setter，装配不因此拖挂启动（保留 None = 基础预算的旧行为）。
+    setter = getattr(budget, 'set_elasticity_provider', None)
+    if callable(setter):
+        setter(elasticity_provider)
+    elif elasticity_provider is not None:
+        budget._elasticity_provider = elasticity_provider
     bus._budget_unsubscribe = bus.subscribe('proactive.used', budget.on_proactive_used,
                                         owner='proactive_budget')
     bus._budget = budget

@@ -613,6 +613,22 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
             **_ui_i18n("Night greeting", "Off: no night greetings anywhere."),
         },
     )
+    # 2026-11-11 D2（复核修复 F1）：把群晚安解耦开关声明为真实配置字段。
+    # 默认 True = 旧行为逐字不变；False = 群聊晚安不再要求「本群本轮早安已开口」。
+    # 只作用于群聊晚安；群聊早安硬闸/必要性与其他私聊阈值均不受本键影响。
+    greeting_night_require_morning_chain: bool = Field(
+        default=True,
+        description="群聊晚安是否要求本群本轮已发过早安（连锁）：开 = 旧行为；"
+                    "关 = 群晚安不再要求当日群早安（解耦），预算/夜间/冷却等其余闸门不变",
+        json_schema_extra={
+            "label": "群聊晚安要求早安连锁",
+            "hint": "默认开：群晚安要等本群早安开口；关 = 群晚安与群早安解耦"
+                    "（群早安与其他私聊不受影响）",
+            **_ui_i18n("Group night requires morning chain",
+                       "On: a group night greeting still requires that group's morning "
+                       "greeting. Off: decouple group night from the morning chain."),
+        },
+    )
     greeting_noon_enabled: bool = Field(
         default=True,
         description="每天本地12:00–13:00向陪伴目标私聊问候一次；睡眠期间暂缓，窗口结束后跳过。",
@@ -622,6 +638,26 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
             **_ui_i18n("Noon greeting",
                        "On: one daily noon greeting in the companion target private chat "
                        "(12:00-13:00 window, budget-exempt, deduplicated)."),
+        },
+    )
+    # 2026-11-11 Gemini 批：午安去闹钟化（报告 §3.2 问题 1 / §5.1）。
+    # 只作为规划器生成当日午安触发时刻的抖动幅度；0 = 窗口开启即触发（旧行为）。
+    greeting_noon_jitter_minutes: int = Field(
+        default=20,
+        ge=0,
+        le=59,
+        description="午安触发时刻的随机抖动窗（分钟）：在 12:00–13:00 窗口内为当日午安生成"
+                    "带随机浮动的触发时刻（抖动开启时至少推迟 1 分钟，绝不整点），避免每天"
+                    " 12:00:00 准点打卡；0 = 窗口开启即触发（旧行为）；上限 59 防止推出窗口",
+        json_schema_extra={
+            "label": "午安抖动窗(分钟)",
+            "hint": "默认 20：当日触发时刻在 12:01–12:20 内随机浮动（设置 N 即 12:01–12:N，"
+                    "N 取 1–59；0 = 关闭抖动，窗开即发）",
+            "step": 1,
+            **_ui_i18n("Noon greeting jitter (min)",
+                       "Random jitter for the daily noon greeting inside the 12:00-13:00 "
+                       "window (at least 1 minute when enabled); 0 = fire at window open "
+                       "(legacy); max 59."),
         },
     )
     # ── PR-C1 H5（2026-11-07）：经历驱动的交流动机（消费在陪伴巡检候选阶段）──────
@@ -830,6 +866,79 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         if legacy_value != 5 and int(migrated.get("greeting_other_private_min_messages", 5) or 5) == 5:
             migrated["greeting_other_private_min_messages"] = legacy_value
         return migrated
+
+
+# ---------------------------------------------------------------------------
+# [planning_events] 小事件权重与视频分享概率（D1，2026-11-11）
+# ---------------------------------------------------------------------------
+
+
+class PlanningEventsSectionConfig(PluginConfigBase):
+    """单独调整看视频 / 刷 QQ 小事件的抽取权重，以及视频分享到陪伴目标的概率。
+
+    默认值全部为 1.0 = 与既有行为逐字一致（零行为变化）。两个权重乘数只在
+    ``event_catalog.EventCatalogStore.pick_event`` 的权重计算处生效，互不影响；
+    取值在运行期钳制到 ``[0.1, 10.0]``（非法/非有限数按 1.0）。视频分享概率
+    键已接到自然触发点（``integrations/video_share_scheduler.py`` 的
+    ``VideoSocialService._deliver``，仅陪伴目标私聊），1.0 = 不额外过滤；
+    既有预算/夜间/冷却/静默闸保持优先。
+    """
+
+    __ui_label__ = "事件与分享概率"
+    __ui_icon__ = "sparkles"
+    __ui_order__ = 7
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Event & share probability",
+               "description": "Independent weight multipliers for watch_bili / browse_qq and the "
+                              "video-share-to-companion probability. 1.0 keeps current behavior."}
+    }
+
+    watch_bili_weight_multiplier: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="「刷视频」(watch_bili) 小事件的抽取权重乘数：1.0 = 现状；"
+                    "调高更常抽到、调低更少抽到，不影响 browse_qq；运行期钳制 0.1–10.0",
+        json_schema_extra={
+            "label": "刷视频权重乘数",
+            "hint": "1.0 = 现状；只作用于 watch_bili 的抽取权重，不越过视频功能开关/时段/去重",
+            "step": 0.1,
+            **_ui_i18n("watch_bili weight multiplier",
+                       "Multiplier on the watch_bili pick weight; 1.0 = unchanged, clamped to 0.1-10.0."),
+        },
+    )
+    browse_qq_weight_multiplier: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="「刷QQ」(browse_qq) 小事件的抽取权重乘数：1.0 = 现状；"
+                    "调高更常抽到、调低更少抽到，不影响 watch_bili；运行期钳制 0.1–10.0",
+        json_schema_extra={
+            "label": "刷QQ权重乘数",
+            "hint": "1.0 = 现状；只作用于 browse_qq 的抽取权重，不越过时段/去重",
+            "step": 0.1,
+            **_ui_i18n("browse_qq weight multiplier",
+                       "Multiplier on the browse_qq pick weight; 1.0 = unchanged, clamped to 0.1-10.0."),
+        },
+    )
+    # 接线（3.17.33 复核修复 F2）：自然触发点 integrations/video_share_scheduler.py
+    # 的 VideoSocialService._deliver 已读取本键并只对陪伴目标私聊额外掷骰；既有
+    # 授权/夜间/冷却/预算闸优先。默认 1.0 = 零行为变化。纯读取口径见
+    # event_catalog.resolve_video_share_to_target_probability。
+    video_share_to_target_probability: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=3.0,
+        description="看视频后自动分享到陪伴目标私聊的机会系数：1.0 = 维持现有判断（不额外过滤）；"
+                    "0–1 = 按概率额外过滤；>1 = 放宽目标私聊的日限/流限/最小间隔（最多 3.0 倍），"
+                    "让 Bot 有更多机会分享，但不越过夜间/静默、冷却与授权闸",
+        json_schema_extra={
+            "label": "视频分享陪伴目标概率/倍率",
+            "hint": "1.0 = 现状；0–1 按概率过滤；1.5 = 目标私聊分享机会约 1.5 倍（日限/流限放宽、最小间隔缩短，上限 3.0）",
+            "step": 0.05,
+            **_ui_i18n("Video share to companion probability/boost",
+                       "1.0 = current behavior; 0-1 filters by probability; >1 boosts target share "
+                       "opportunities by relaxing daily/stream limits and min interval (max 3.0)."),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1153,46 @@ class LifeStateSectionConfig(PluginConfigBase):
             "hint": "关 = 睡太久只扣精力，专注不变；开 = 同时按曲线扣专注",
             **_ui_i18n("Oversleep penalizes focus",
                        "Off = oversleep only drains energy."),
+        },
+    )
+    # 2026-11-11 Gemini 批：睡眠债弹性还债（报告 §4.2 P0-NUM-1）。
+    # 只切换还款公式，不改欠债累积、上限与既有状态数值；关闭 = 旧公式逐字不变。
+    sleep_debt_repay_v2: bool = Field(
+        default=True,
+        description="睡眠债弹性还债：多睡时按阶梯清偿（超额前 2 小时全额、超出部分折半），"
+                    "不再单次封顶 1 小时；长期欠债可经周末补觉真正还清",
+        json_schema_extra={
+            "label": "睡眠债弹性还债",
+            "hint": "默认开：补觉越多还得越多（无 1 小时硬顶）；关 = 恢复旧公式（单次最多还 1 小时）",
+            **_ui_i18n("Elastic sleep-debt repayment",
+                       "Tiered repayment without the legacy 1-hour hard cap; off = old formula."),
+        },
+    )
+
+    # ── 社交电量的对象特异性（2026-11-11 Gemini 批，报告 §4.1 P1-NUM-2）────
+    # 只影响目标陪伴私聊的社交电量结算；公共群聊/其他私聊保持既有消耗。
+    social_battery_affinity_discount: bool = Field(
+        default=True,
+        description="目标私聊社交电量折减：与陪伴目标私聊时按好感度折减社交电量消耗"
+                    "（好感越高折减越多），避免「和喜欢的人聊天反而被耗空」",
+        json_schema_extra={
+            "label": "目标私聊电量折减",
+            "hint": "默认开：只作用于目标陪伴私聊；群聊与其他私聊的消耗口径不变；关 = 不折减",
+            **_ui_i18n("Affinity-based social drain discount",
+                       "Reduce social-battery drain in the target private chat by affection; "
+                       "off = no discount."),
+        },
+    )
+    target_chat_social_recharge: bool = Field(
+        default=True,
+        description="高好感目标私聊微量回血：好感达到高档后，与陪伴目标轻松私聊可微量恢复社交电量，"
+                    "模拟亲密关系的情感疗愈；关闭 = 目标私聊最多只折减消耗、不回血",
+        json_schema_extra={
+            "label": "目标私聊微量回血",
+            "hint": "默认开：仅高好感目标私聊生效且幅度很小；关 = 不正向恢复，只保留折减",
+            **_ui_i18n("Target-chat social recharge",
+                       "High-affinity target private chat may slightly recharge social battery; "
+                       "off = discount only."),
         },
     )
 

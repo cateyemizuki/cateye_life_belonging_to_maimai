@@ -12,6 +12,10 @@
 按日计数；各发布方触发前查询 :func:`ProactiveBudget.allow_proactive`；
 **上限 = ``patrol.daily_max_speak``（每日预算即上限；2026-10-10 配置整理轮移除独立的
 ``proactive_target_daily_cap`` / 旧键 ``global_proactive_cap``，不再叠加 +2 余量）**。
+3.4（2026-11-11）：``patrol.budget_elasticity_enabled`` 出厂默认 **开**（配置默认值轮）；
+命中高好感/高 Valence/节日时允许 +1~2 次，硬上限 base+2（且不越过 50），
+显式关闭时旧口径逐字不变；``daily_max_speak=0`` 不复活；弹性只放大额度，
+夜间/冷却/授权闸仍由各发布方先执行。
 计数口径 = **按发送流身份计数**：发往目标陪伴私聊的主动打扰都计入（发布方不限——
 陪伴侧巡检/想念、日程侧非问候主动行为、emotion 赖床提醒都发 ``proactive.used``；
 2026-11-04 F1 起告状工具回退到陪伴目标私聊的发送同样经 ``allow_proactive`` 闸门
@@ -44,6 +48,24 @@ from core.storage import load_json, save_json_atomic
 logger = logging.getLogger(__name__)
 
 
+def _clamp01(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if numeric != numeric:  # NaN
+        return 0.0
+    return max(0.0, min(1.0, numeric))
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+    return numeric if numeric == numeric else float(default)
+
+
 class ProactiveBudget:
     """主动打扰预算（仅目标陪伴私聊）计数器（§六.2 H）：按日计数，跨天自动清零。
 
@@ -62,12 +84,29 @@ class ProactiveBudget:
     #: 落盘状态的语义标记（§八.6）：旧文件缺该字段 = 收窄前旧语义计数 → 装载即重置
     STATE_SCOPE = "target_private"
 
+    #: 3.4（2026-11-11 Gemini 批）：预算弹性默认开（配置默认值轮）；开启后最多在每日预算上追加 2 次。
+    #: 「硬上限」= daily_max_speak + ELASTIC_MAX_BONUS（再叠加任何信号都不会更高）；
+    #: 每日预算为 0（用户明确停止可选主动回合）时弹性不复活预算，恒 0。
+    ELASTIC_MAX_BONUS = 2
+    #: 绝对硬上限（与 [patrol].daily_max_speak 的 le=50 同口径）：base+2 也不得超过 50。
+    ELASTIC_ABSOLUTE_MAX = 50
+    #: 高好感判定：provider 给的归一化比例（0~1）达到该值即算一条强信号。
+    ELASTIC_AFFECTION_MIN_RATIO = 0.7
+    #: 高 Valence 判定（报告 §3.4：Valence > 0.6）。
+    ELASTIC_VALENCE_MIN = 0.6
+    #: 节日/纪念日字符串里的否定值：这些不算节日信号。
+    ELASTIC_HOLIDAY_FALSE = ("", "0", "false", "none", "null", "无", "工作日", "普通日")
+
     def __init__(self, config_provider: Any = None, decision_logger: Any = None,
-                 data_dir: Any = None, target_stream_provider: Any = None) -> None:
+                 data_dir: Any = None, target_stream_provider: Any = None,
+                 elasticity_provider: Any = None) -> None:
         self._config_provider = config_provider
         self._decision_logger = decision_logger
         #: 目标陪伴私聊 stream 的取值来源（可调用 → 动态取值；None = 不可得）
         self._target_stream_provider = target_stream_provider
+        #: 3.4 弹性信号来源（可调用 → dict；见 :meth:`elasticity_breakdown`）。
+        #: 缺省 None = 弹性开启但没有高好感/高 Valence/节日信号 → 不追加（保持基础预算）。
+        self._elasticity_provider = elasticity_provider
         self._date = ""
         self._used = 0
         self._channels: Dict[str, int] = {}
@@ -226,23 +265,117 @@ class ProactiveBudget:
         except Exception:
             return None
 
-    def cap(self) -> int:
-        """目标陪伴私聊的每日主动打扰上限 = ``[patrol].daily_max_speak``（每日预算即上限）。
-
-        2026-10-10 配置整理轮：独立上限字段（旧 ``proactive_target_daily_cap`` /
-        ``global_proactive_cap``）已删除——预算按发送流身份计数：发往目标陪伴私聊的
-        主动打扰都计入（发布方不限，含赖床提醒；早/晚安免预算，见 planning/proactive_service
-        的免预算口径；活动切换开口在目标流已解析时不占），因此「每日预算」本身就是上限，
-        不再叠加 +2 余量；取不到配置时回退 5。
-        """
+    def base_cap(self) -> int:
+        """基础每日预算 = ``[patrol].daily_max_speak``（取不到回退 5；恒 ≥ 0）。"""
         cfg = self._config()
         patrol = getattr(cfg, "patrol", None)
         daily = getattr(patrol, "daily_max_speak", 5)
         try:
             daily_int = int(daily if daily is not None else 5)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             daily_int = 5
         return max(0, daily_int)
+
+    def _elasticity_enabled(self) -> bool:
+        cfg = self._config()
+        patrol = getattr(cfg, "patrol", None)
+        return bool(getattr(patrol, "budget_elasticity_enabled", False))
+
+    def set_elasticity_provider(self, provider: Any) -> None:
+        """装配期注入弹性信号源（可调用 → dict）；不传 provider 即保持基础预算。"""
+        self._elasticity_provider = provider
+
+    def _elasticity_signals(self) -> Dict[str, Any]:
+        """取弹性信号（provider 可调用 → dict；异常/非 dict → 空信号，保守不追加）。"""
+        provider = self._elasticity_provider
+        if provider is None:
+            return {}
+        try:
+            value = provider() if callable(provider) else provider
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _affection_ratio(value: Any) -> Optional[float]:
+        """好感信号归一化到 0~1：支持比例、v2 分数（0~200）、{ratio|score|tier}。"""
+        if isinstance(value, dict):
+            ratio = value.get("ratio")
+            if ratio is not None:
+                return _clamp01(ratio)
+            score = value.get("score")
+            if score is not None:
+                return _clamp01(_as_float(score) / max(1.0, _as_float(value.get("max_score"), 200.0)))
+            tier, size = value.get("tier"), value.get("tier_size")
+            if tier is not None:
+                count = max(1, int(_as_float(size, 5.0)))
+                return _clamp01(_as_float(tier) / max(1, count - 1))
+            return None
+        numeric = _as_float(value, -1.0)
+        if numeric < 0:
+            return None
+        # ≤1 视为已归一化比例；>1 按好感 v2 的 0~200 分制归一
+        return _clamp01(numeric if numeric <= 1.0 else numeric / 200.0)
+
+    def elasticity_breakdown(self) -> Dict[str, Any]:
+        """3.4 弹性预算分解（诊断/测试）：``{base, bonus, cap, reasons, enabled}``。
+
+        provider 期望返回（键均可缺省）：
+        ``{"affection": 0~1 或 0~200 分或 {"ratio"|"score"|"tier"},
+        "valence": -1~1 或 "vad": {"valence": …}, "holiday": bool|str}``；
+        缺省/异常 → 无信号（不追加），绝不因信号读取失败改动基础预算。
+
+        规则（默认开；显式关闭时不计）：
+        - 高好感（归一化 ≥0.7）/ 高 Valence（≥0.6）/ 节日 三条强信号；
+        - 命中 1 条 +1，命中 ≥2 条 +2；**硬上限 base+2**，任何信号组合都不再上浮；
+        - ``daily_max_speak=0``（用户明确关闭可选主动回合）时弹性不复活，恒 0。
+        冷却不在本类：`allow_proactive` 只回答额度，夜间/静默/冷却/授权闸仍在各发布方
+        原有链路上先于预算执行，弹性只放大额度、不能绕过任何闸。
+        """
+        base = self.base_cap()
+        reasons: list[str] = []
+        if self._elasticity_enabled() and base > 0:
+            signals = self._elasticity_signals()
+            affection_value = signals.get("affection")
+            if affection_value is None:
+                affection_value = signals.get("affection_ratio")
+            if affection_value is None:
+                affection_value = signals.get("affection_score")
+            affection = self._affection_ratio(affection_value)
+            valence_value = signals.get("valence")
+            if valence_value is None and isinstance(signals.get("vad"), dict):
+                valence_value = signals["vad"].get("valence")
+            if valence_value is None and isinstance(signals.get("emotion"), dict):
+                valence_value = signals["emotion"].get("valence")
+            valence = _as_float(valence_value, -1.0)
+            holiday = signals.get("holiday", signals.get("festival", signals.get("is_holiday")))
+            holiday_text = str(holiday).strip().casefold() if holiday is not None else ""
+            if affection is not None and affection >= self.ELASTIC_AFFECTION_MIN_RATIO:
+                reasons.append("affection")
+            if valence >= self.ELASTIC_VALENCE_MIN:
+                reasons.append("valence")
+            if (holiday is True or (isinstance(holiday, str)
+                                    and holiday_text not in self.ELASTIC_HOLIDAY_FALSE)):
+                reasons.append("holiday")
+        bonus = min(self.ELASTIC_MAX_BONUS, len(reasons))
+        # 硬上限：base+2，且不越过配置字段的 50 上限；base 本身异常超限时不被弹性压低。
+        hard_cap = max(base, min(base + bonus, self.ELASTIC_ABSOLUTE_MAX))
+        return {"base": base, "bonus": hard_cap - base, "cap": hard_cap,
+                "reasons": reasons, "enabled": self._elasticity_enabled()}
+
+    def cap(self) -> int:
+        """目标陪伴私聊的每日主动打扰上限（基础预算 + 有界弹性）。
+
+        2026-10-10 配置整理轮：独立上限字段（旧 ``proactive_target_daily_cap`` /
+        ``global_proactive_cap``）已删除——预算按发送流身份计数：发往目标陪伴私聊的
+        主动打扰都计入（发布方不限，含赖床提醒；早/晚安免预算，见 planning/proactive_service
+        的免预算口径；活动切换开口在目标流已解析时不占），因此「每日预算」本身就是上限。
+
+        3.4（2026-11-11）：``budget_elasticity_enabled`` 默认开（配置默认值轮）；命中高好感/
+        高 Valence/节日时在基础预算上追加 1~2 次，硬上限 base+2（见 :meth:`elasticity_breakdown`）。
+        显式关闭时返回值与旧实现逐字一致（取不到配置回退 5）。
+        """
+        return int(self.elasticity_breakdown()["cap"])
 
     def used_today(self) -> int:
         # F8（2026-11-04）：查询/记账与预留/提交统一持锁（RLock 可重入，嵌套调用安全）。
