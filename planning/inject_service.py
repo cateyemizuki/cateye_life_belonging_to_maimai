@@ -63,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from datetime import datetime
@@ -96,6 +97,7 @@ from suite_prompts import (
     INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
     SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT,
     SUBCONSCIOUS_TONE_HAPPY_DEFAULT,
+    TRANSITION_CONFESSION_LINE_DEFAULT,
     SUBCONSCIOUS_TONE_HUNGRY_DEFAULT,
     SUBCONSCIOUS_TONE_STEADY_DEFAULT,
     SUBCONSCIOUS_TONE_TIRED_DEFAULT,
@@ -220,6 +222,9 @@ class InjectService:
         """
         self._plugin = plugin
         self._holiday = holiday_service
+        # F3（B2，2026-11-11）：转场拖延自我揭露去重台账（进程内、有界、不落盘；
+        # 按 (聊天流, episode_id) 去重 + 同流最小间隔）。首次用到才创建。
+        self._transition_confessions: Optional[Any] = None
 
         # 时区 / 注入调优（2026-10-10 起全部在 [schedule_advanced] 段）。
         # PR8 3.0.0：原 15 分钟日程 LRU 缓存（``_schedule_cache``）随时间窗编造路径
@@ -281,6 +286,76 @@ class InjectService:
         target_stream = str(getattr(self._plugin, "_stream_id", "") or "")
         sid = str(session_id or "")
         return bool(target_stream) and sid == target_stream
+
+    def _group_attention_hint_line(self, session_id: str) -> str:
+        """F1 群注意力状态行（单入口；未装配/开关关/非群/限频未到 → 空串）。
+
+        服务内部负责「群生效集 ∧ m<阈值 ∧ 每群 ≥30min」判定与限频记账；
+        本方法只做鸭子类型取数与异常兜底（fail-open，绝不拖挂 planner 注入）。
+        """
+        service = getattr(self, "_group_attention_service", None)
+        if service is None:
+            service = getattr(self._plugin, "_group_attention", None)
+        if service is None:
+            return ""
+        try:
+            return str(service.build_planner_line(session_id) or "")
+        except Exception:
+            return ""
+
+    def _transition_confession_line(self, session_id: str) -> str:
+        """F3 转场拖延自我揭露（单入口；开关关/无合格 episode/未掷中/去重 → 空串）。
+
+        合格 active episode：``goal_type == "transition"``（或 metadata 带
+        ``transition_buffer``）或 metadata 带 ``procrastination``。独立种子
+        ``Random(stream|episode|transition_confess)``（同一 episode 同流只掷一次）；
+        去重按 ``(聊天流, episode_id)`` + 同流最小间隔（:class:`ConfessionLedger`）。
+        默认关 = 不读 DB、不建台账、返回空串（旧行为逐字不变）。
+        """
+        exp = getattr(getattr(self._plugin, "config", None), "experimental", None)
+        if exp is None or not bool(getattr(exp, "transition_enabled", False)):
+            return ""
+        db = getattr(self._plugin, "_db", None)
+        if db is None:
+            return ""
+        try:
+            active = db.active_episode()
+        except Exception:
+            return ""
+        if not isinstance(active, dict):
+            return ""
+        meta = active.get("metadata") if isinstance(active.get("metadata"), dict) else {}
+        is_buffer = (str(active.get("goal_type") or "") == "transition"
+                     or isinstance(meta.get("transition_buffer"), dict))
+        has_trace = isinstance(meta.get("procrastination"), dict)
+        if not (is_buffer or has_trace):
+            return ""
+        episode_id = str(active.get("episode_id") or "")
+        if not episode_id:
+            return ""
+        if self._transition_confessions is None:
+            from .transition import ConfessionLedger
+            self._transition_confessions = ConfessionLedger()
+        try:
+            probability = float(getattr(exp, "transition_confess_probability", 0.10))
+            interval = int(getattr(exp, "transition_confess_min_interval_minutes", 20))
+        except (TypeError, ValueError):
+            return ""
+        try:
+            now = self._tz_manager.get_now()
+            now_ts = now.timestamp() if now is not None else time.time()
+        except Exception:
+            now_ts = time.time()
+        rng = random.Random(f"{session_id or 'global'}|{episode_id}|transition_confess")
+        try:
+            hit = self._transition_confessions.should_confess(
+                session_id or "global", episode_id, now_ts=now_ts,
+                probability=probability, min_interval_minutes=interval, rng=rng)
+        except Exception:
+            return ""
+        if not hit:
+            return ""
+        return TRANSITION_CONFESSION_LINE_DEFAULT
 
     @staticmethod
     def _is_schedule_query_intent(intent: "UserIntent") -> bool:
@@ -452,6 +527,12 @@ class InjectService:
                     return {"action": "continue"}
                 logger.info("replyer 注入: 无当前活动（空活动变体）")
 
+            # F3（B2）：过渡窗/拖延中的低概率自我揭露——独立追加一句；开关关/
+            # 非合格 episode/未掷中/去重命中 → 空串（本段零改动）。
+            confession = self._transition_confession_line(session_id)
+            if confession:
+                activity_prompt = f"{activity_prompt}\n{confession}"
+
             if proactive_share:
                 # 复核 P1-9：分享/主动开口轮给「不要主动提及」一句运行时豁免，
                 # 避免状态块与 replyer 改写文案（想念/视频分享）互相抵消。
@@ -609,6 +690,10 @@ class InjectService:
                 proactive_share=proactive_share,
             )
 
+            # F1（v2 §3.5）：群聊注意力状态行——独立追加，不参与 InjectOptimizer
+            # 冷却（不吞、不抢日程块）；仅群生效集 ∧ m<阈值 ∧ 限频到期时出一行。
+            attention_line = self._group_attention_hint_line(session_id)
+
             # 记录到上下文缓存
             if self._context_cache is not None:
                 self._context_cache.add_turn(
@@ -619,7 +704,7 @@ class InjectService:
                     activity=current_activity,
                 )
 
-            if not inject_content:
+            if not inject_content and not attention_line:
                 if payload is not payload_before_fold:
                     # 4.4b：本轮不注入日程，但旧日消极印象的折叠仍应送达
                     # （只改 system 文本，不新增条目）。
@@ -630,6 +715,9 @@ class InjectService:
                         folded_kwargs["item_schema_version"] = item_schema_version
                     return {"action": "continue", "modified_kwargs": folded_kwargs}
                 return {"action": "continue"}
+            if attention_line:
+                inject_content = (f"{inject_content}\n{attention_line}"
+                                  if inject_content else attention_line)
 
             # 日期/节假日头部（2026-10-10：由陪伴模块迁入——只在日程块头部注一行，
             # 开关 [schedule].holiday_inject_enabled；失败/关闭时不出现）

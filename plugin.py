@@ -17,6 +17,7 @@ self._qzone，组件注册由三个 components.py 的 Mixin 提供（多继承�
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime
 from typing import Any, ClassVar, Dict, Iterable, Optional
 
@@ -49,6 +50,7 @@ from companion.harass_report import HARASS_TOOL_NAME
 from companion.miss_trigger import append_stage4_miss_prompt
 from companion.services import CompanionServices
 from companion.attention import ConversationActivityTracker, SurfLeaseAuthority
+from companion.group_attention import GroupAttentionService
 from linkage import register_adapter
 from suite_config import (
     CURRENT_LAYOUT_VERSION,
@@ -473,6 +475,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 重载即消失→自动冲浪保守恢复，额度窗口由 video_schedule 持久化）
         self._attention_tracker = ConversationActivityTracker()
         self._attention = SurfLeaseAuthority(self._attention_tracker)
+        # F1（v2 §3.3，2026-11-11）：群注意力状态仓库 + 60s tick 单一入口。普通类、
+        # 进程内、有界、不落盘；入站钩子只在群消息尾部 O(1) 采样，规划束经
+        # _apply_frequency 逐群取乘数。默认关时全部入口短路（旧行为逐字不变）。
+        self._group_attention = GroupAttentionService(self)
         # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
         # M11（附录 II §3.3）：预算只统计发往目标陪伴私聊的主动打扰——注入 self._stream_id
         # 取值回调（G11 权威来源，随 _apply_target/热重载更新；不新增持久化状态）
@@ -1149,11 +1155,39 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
     # ── 唯一结算模型参数接线（不改历史数值，下一拍使用新参数）──────────
 
+    def _transition_focus_override(self) -> Optional[tuple]:
+        """F3 过渡窗 focus 覆盖 ``(target, tau_min)``（``[experimental]``；坏值 → None）。
+
+        实验期配置只有一个用户可见入口（``[experimental].transition_focus_*``）；
+        这里的值经 ``settlement_params`` 注入 ``activity.transition.focus``，
+        与 ``[life_state].settlement_params_json`` 的覆盖同路生效（热重载经
+        :meth:`_sync_life_settlement` 重新推送）。
+        """
+        exp = getattr(getattr(self, "config", None), "experimental", None)
+        if exp is None:
+            return None
+        try:
+            target = float(getattr(exp, "transition_focus_target", 0.68))
+            tau = float(getattr(exp, "transition_focus_tau_min", 3.0))
+        except (TypeError, ValueError):
+            return None
+        try:
+            if not math.isfinite(target) or not math.isfinite(tau):
+                return None
+        except Exception:
+            return None
+        return (max(0.0, min(1.0, target)), max(0.5, tau))
+
     def _life_settlement_params(self) -> Optional[Dict[str, Any]]:
         """v2 参数覆盖（``[life_state].settlement_params_json``；空/坏值 → None=内置默认）。
 
         返回**已合并**参数 dict（:func:`planning.settlement_v2.merge_params`：未知键
         丢弃并告警、坏值保留默认），装配/热重载两处共用同一口径。
+
+        F3（2026-11-11 B2）：``[experimental].transition_focus_*`` 与
+        ``V2_PARAMS.activity.transition.focus`` 默认值 ``[0.68, 3.0]`` 不同时，
+        把实验值注入 ``params.activity.transition.focus`` 后返回（此时不再是
+        ``None``）；值等于默认时保持 ``None``（旧行为逐字不变）。
         """
         section = getattr(self.config, "life_state", None)
         raw = ""
@@ -1161,21 +1195,43 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             raw = str(getattr(section, "settlement_params_json", "") or "").strip()
         except Exception:
             raw = ""
-        if not raw:
-            return None
-        import json as _json
+        focus = self._transition_focus_override()
         try:
-            overrides = _json.loads(raw)
-        except Exception as exc:
-            self._warn_quiet("settlement_params_json 解析失败（按内置默认处理）：%s", exc)
+            default_focus = tuple(settlement_v2.V2_PARAMS["activity"]["transition"]["focus"])
+        except Exception:
+            default_focus = (0.68, 3.0)
+        needs_focus = focus is not None and tuple(focus) != default_focus
+        if not raw and not needs_focus:
             return None
-        if not isinstance(overrides, dict):
-            self._warn_quiet("settlement_params_json 顶层需为对象（按内置默认处理）：得 %s",
-                             type(overrides).__name__)
-            return None
+        overrides: Optional[Dict[str, Any]] = None
+        if raw:
+            import json as _json
+            try:
+                parsed = _json.loads(raw)
+            except Exception as exc:
+                self._warn_quiet("settlement_params_json 解析失败（按内置默认处理）：%s", exc)
+                parsed = None
+            if isinstance(parsed, dict):
+                overrides = parsed
+            elif parsed is not None:
+                self._warn_quiet("settlement_params_json 顶层需为对象（按内置默认处理）：得 %s",
+                                 type(parsed).__name__)
         try:
-            logger = getattr(getattr(self, "ctx", None), "logger", None)
-            return settlement_v2.merge_params(overrides, logger)
+            if overrides is None:
+                if not needs_focus:
+                    return None
+                params = settlement_v2.default_params()
+            else:
+                logger = getattr(getattr(self, "ctx", None), "logger", None)
+                params = settlement_v2.merge_params(overrides, logger)
+                if not needs_focus:
+                    return params
+            activity = params.get("activity")
+            if isinstance(activity, dict):
+                entry = dict(activity.get("transition") or {})
+                entry["focus"] = [float(focus[0]), float(focus[1])]
+                activity["transition"] = entry
+            return params
         except Exception as exc:
             self._warn_quiet("settlement_v2 参数合并失败（按内置默认处理）：%s", exc)
             return None

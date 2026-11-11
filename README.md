@@ -14,7 +14,7 @@
 
 ## 配置入口
 
-- 宿主 WebUI 插件配置为唯一入口；当前 schema **19 段 223 字段、2 隐藏**（3.17.33：新增 `[planning_events]` 3 键、`[patrol].miss_sleep_excluded`、`[planning_proactive].greeting_night_require_morning_chain`；Gemini 配置批再增 15 键：`[life_state]` 3、`[patrol]` 4、`[planning_proactive]` 1、`[affection]` 1、`[emotion]` 3、`[prompts]` 1、`[video_share]` 2；配置默认值轮再增 `[emotion].emotion_quota_partition_enabled` 1 键，配额分区总开关从 `internal_tuning` 移回用户 schema）。段键：`plugin / patrol / screen / affection / schedule / schedule_advanced / planning_proactive / planning_events / emotion / life_state / qzone / qzone_video / video_watch / video_share / llm / prompts / admin / dashboard_display / maimai_interaction`。
+- 宿主 WebUI 插件配置为唯一入口；当前 schema **20 段 249 字段、2 隐藏**（3.17.33：新增 `[planning_events]` 3 键、`[patrol].miss_sleep_excluded`、`[planning_proactive].greeting_night_require_morning_chain`；Gemini 配置批再增 15 键：`[life_state]` 3、`[patrol]` 4、`[planning_proactive]` 1、`[affection]` 1、`[emotion]` 3、`[prompts]` 1、`[video_share]` 2；配置默认值轮再增 `[emotion].emotion_quota_partition_enabled` 1 键，配额分区总开关从 `internal_tuning` 移回用户 schema；B1 F1 新增置顶 `[experimental]` 段 10 键、B2 F3 同段 16 键，实验期按用户裁定集中管理，默认关）。段键：`experimental / plugin / patrol / screen / affection / schedule / schedule_advanced / planning_proactive / planning_events / emotion / life_state / qzone / qzone_video / video_watch / video_share / llm / prompts / admin / dashboard_display / maimai_interaction`。
 - 起步最少配置：`[patrol] target_qq`（陪伴对象；占位值 = 不主动私聊任何人）、`[admin] admin_users`（管理员；留空 = 仅本机控制台）。QQ 空间另需 `[qzone] enabled` 与 SnowLuma 适配器；屏幕感知另需 `[screen] enabled` 与 cateye 统一连接插件。
 - 退役旧键（`spine_mode`、`[life_state]` 旧开关组、patrol 旧主动键、event_catalog 独立段键、`[qzone_video].attach_source` 等）升级时纯 pop、不做值搬运、不再出现在 WebUI；事件库配置已平铺进 `[schedule] event_catalog_mode` 与三时段双池配额键。
 - 用户映射表在 `mappings/` 表层（8 张，不随包更新覆盖），出厂种子在 `mappings/default_mappings/`；详见下文「自定义映射表」。
@@ -329,7 +329,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 - 本次运行接口可见8个命令和8个工具；该接口不包含全部Hook/API，不把交互入口数当作完整注册总数。
 - 声明 **17 项**宿主能力。
-配置以宿主运行schema为准：3.17.33 为 19 段 223 字段、2 隐藏；结算参数使用settlement_params_json，形象使用fish/human。历史字段变动见 CHANGELOG 与 union/20261106_配置项完整变动报告.md。
+配置以宿主运行schema为准：3.17.33 为 20 段 249 字段、2 隐藏（B1 F1 + B2 F3 新增置顶 `[experimental]` 段共 26 键）；结算参数使用settlement_params_json，形象使用fish/human。历史字段变动见 CHANGELOG 与 union/20261106_配置项完整变动报告.md，实验配置迁移见 union/20261111_实验配置迁移映射.md。
 - 用户可编辑表 **8 张**（七张映射表+内部调参表）：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可

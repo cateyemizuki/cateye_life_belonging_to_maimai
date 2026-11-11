@@ -124,6 +124,17 @@ async def build_streams_records(host: Any) -> list[dict[str, Any]]:
                 f" enabled={bool(getattr(patrol, 'enabled', False))}"
             )
 
+        # F1（B1）：实验开关开时才多一行「群注意力」；默认关输出与既有逐字一致。
+        try:
+            _attention = getattr(host, "_group_attention", None)
+            if _attention is not None and _attention.enabled():
+                _snap = dict(_attention.snapshot() or {})
+                _decaying = sum(1 for item in _snap.values()
+                                if float(item.get("multiplier", 1.0)) < 0.999)
+                b1.append(f"  群注意力: 跟踪={len(_snap)} 衰减中={_decaying}")
+        except Exception:
+            pass
+
         b2: List[str] = ["[候选解析]"]
         planning = getattr(host, "_planning", None)
         svc = getattr(planning, "proactive", None)

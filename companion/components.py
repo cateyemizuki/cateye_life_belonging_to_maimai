@@ -564,6 +564,40 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                     tracker.note_incoming(str(sid), direct=direct)
         except Exception:
             pass  # 忙闲记录失败绝不影响消息处理
+        # F1（v2 §3.3/§3.6，2026-11-11）：群注意力尾部采样。仅群聊、开关开时由
+        # 服务内部短路；O(1) 内存追加，零 IO、零 LLM，失败绝不影响消息处理。
+        # 目标用户在群内发言视为兴趣信号（刷新 last_direct_at、清空失配缓冲），
+        # 但不改变上面 tracker.note_incoming 的 direct 忙闲语义。
+        try:
+            attention = getattr(self, "_group_attention", None)
+            if attention is not None and isinstance(message, dict):
+                _sid, _grp = extract_session_info_from_message(message)
+                if _sid and _grp is True and not message.get("is_notify"):
+                    _text = str(message.get("raw_message")
+                                or message.get("plain_message") or "")
+                    _lover = str(getattr(self, "_lover_name", "") or "")
+                    _mentioned = message.get("is_mentioned")
+                    _at_bot = message.get("is_at")
+                    _direct = (bool(_mentioned) or bool(_at_bot)
+                               or (bool(_lover) and _lover in _text))
+                    _uid = extract_user_id_from_message(message)
+                    _target_qq = str(self._mai_target_qq() or "")
+                    _group_id = ""
+                    _info = message.get("message_info")
+                    if isinstance(_info, dict):
+                        _group_info = _info.get("group_info")
+                        if isinstance(_group_info, dict):
+                            _group_id = str(_group_info.get("group_id") or "")
+                    if not _group_id:
+                        _group_id = str(message.get("group_id") or "")
+                    attention.observe(
+                        str(_sid), _text,
+                        direct=_direct,
+                        target_user=bool(_target_qq and _uid and _uid == _target_qq),
+                        group_id=_group_id,
+                    )
+        except Exception:
+            pass  # 群注意力采样失败绝不影响消息处理
         return None
 
     @HookHandler(
@@ -1064,6 +1098,14 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         # 刷 last_speak_time，致 user_initiated 的 prev_user>last_speak 恒真被判
         # already_answered（沉默后再开口永久漏计）。
         _reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
+        # F1（v2 §3.5）：bot 在该群真实开口 → 刷新 last_bot_reply_at（只刷新已跟踪群；
+        # 零 IO、零 LLM，不改变任何回复/预算语义）。
+        _group_attention = getattr(self, "_group_attention", None)
+        if _group_attention is not None and _reply_stream:
+            try:
+                _group_attention.note_bot_reply(_reply_stream)
+            except Exception:
+                pass
         _target_stream = str(companion.patrol.patrol_status().get("stream_id") or "").strip()
         # P1-8：只有 replyer.before_request 的主动轮改写钩子留下的标记，才能证明
         # 这次 after_response 属于主动回合；否则窗内的被动回复会误提交预算/误计发言。

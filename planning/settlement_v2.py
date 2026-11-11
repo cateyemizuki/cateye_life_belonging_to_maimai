@@ -37,8 +37,10 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 #: v2 参数版本（结构/默认值变更时递增；随 ``settlement_diag.version`` 落盘可追溯）
 #: 20261110.1：P1-6 复核把 idle 的 focus 靶心 0.35→0.60（见 ``activity.idle``）；
+#: 20261111.1：B2 F3 给 ``activity.transition`` 增 focus 靶 ``[0.68, 3.0]``（过渡窗
+#: 专注爬坡；当前 transition 画像无调度产出，对既有轨迹零影响，只影响诊断版本追溯）。
 #: 默认参数变更必须同步递增版本，否则 ``settlement_diag.version`` 追溯失真（CF-7）。
-V2_PARAMS_VERSION = "20261110.1"
+V2_PARAMS_VERSION = "20261111.1"
 
 #: v2 结算内置参数（唯一真源；键集固定，未知覆盖键在 :func:`merge_params` 丢弃）
 V2_PARAMS: Dict[str, Any] = {
@@ -89,7 +91,10 @@ V2_PARAMS: Dict[str, Any] = {
                          "stress": [0.04, 60.0]},
         "meal":         {"energy": [0.70, 240.0], "hunger": [0.15, 15.0],
                          "focus": [0.50, 120.0], "stress": [0.04, 90.0]},
-        "transition":   {"stress": [0.05, 120.0]},
+        # F3（2026-11-11 B2）：过渡窗 focus 爬坡——3–8 分钟窗内指数趋近 0.68
+        # （tau 3.0min；起点 0.45~0.55 时窗末约 0.65，工作可用即可、不追求满值）。
+        # 实验期用户可经 [experimental].transition_focus_* 覆盖（plugin 侧注入）。
+        "transition":   {"focus": [0.68, 3.0], "stress": [0.05, 120.0]},
         "entertainment": {"energy": [0.72, 240.0], "stress": [0.05, 120.0]},
     },
     # ── 用餐强度建议（调度侧只读接口 :func:`meal_scheduling_hint`；不改调度）────

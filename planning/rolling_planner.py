@@ -48,6 +48,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.time_utils import minutes_of_now
 
 from . import activity_profiles
+from . import transition as transition_rules
 from .activity_preferences import interest_bonus
 from .circadian import nap_reason
 from .goal_manager import GoalStatus
@@ -470,6 +471,13 @@ class RollingPlanner:
         self._nap_skipped_date: str = ""
         self._nap_date = ""
         self._nap_reason = ""
+        #: F3 转场拖延（B2，2026-11-11 v2 §4）：跨拍 pending（进程内；跨日重置）。
+        #: 默认关时不创建/不读/不写；内容 = date/buffer_used/delay_used/delay_until/
+        #: procrastination/active/target_goal_type。
+        self._transition_pending: Dict[str, Any] = {}
+        #: F3：步 2 关闭的上一活动 goal_type（仅开关开时写；默认关恒空 = 零行为差）。
+        self._last_closed_goal_type: str = ""
+        self._transition_usage: Optional[transition_rules.TransitionUsageStore] = None
 
     # ── 配置读取（段缺失 → 附录 B.4.1 默认值）────────────────────────────
     def _cfg_section(self) -> Any:
@@ -496,6 +504,144 @@ class RollingPlanner:
     def _cfg_float(self, key: str, default: float) -> float:
         value = _as_number(self._cfg(key, None), None)
         return default if value is None else float(value)
+
+    # ── F3 转场拖延配置/状态（B2；默认关时全部入口短路，零 RNG/零写盘）────
+    def _transition_params(self) -> "transition_rules.TransitionParams":
+        """``[experimental].transition_*`` 归一参数（段缺失/异常 → 全默认 = 关）。"""
+        provider = self._config_provider
+        if provider is None:
+            return transition_rules.TransitionParams()
+        try:
+            cfg = provider() if callable(provider) else provider
+        except Exception:
+            return transition_rules.TransitionParams()
+        return transition_rules.TransitionParams.from_section(
+            getattr(cfg, "experimental", None))
+
+    def _transition_usage_store(self) -> "transition_rules.TransitionUsageStore":
+        if self._transition_usage is None:
+            self._transition_usage = transition_rules.TransitionUsageStore(self._data_dir)
+        return self._transition_usage
+
+    def _transition_pending_state(self, date: str) -> Dict[str, Any]:
+        """取当日 pending（跨日/首次 → 空状态；跨日由 :meth:`_roll_daily_counters` 重置）。"""
+        state = self._transition_pending
+        if not state or state.get("date") != str(date):
+            state = {
+                "date": str(date), "active": False, "buffer_used": False,
+                "delay_used": False, "delay_until": 0,
+                "procrastination": None, "target_goal_type": "",
+            }
+            self._transition_pending = state
+        return state
+
+    def _transition_clear_pending(self) -> None:
+        """目标高专注活动启动成功 → 本次切换的 pending 全部清除（跨日亦重置）。"""
+        if self._transition_pending:
+            self._transition_pending = {}
+
+    @staticmethod
+    def _transition_window_remaining(cand: Dict[str, Any], cur: int) -> Optional[int]:
+        window = cand.get("window")
+        if not window:
+            return None
+        try:
+            return int(window[1]) - int(cur)
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def _transition_gate(self, cand: Dict[str, Any], *, date: str, cur: int,
+                         boundary: Optional[int],
+                         params: "transition_rules.TransitionParams",
+                         usage: "transition_rules.TransitionUsageStore",
+                         pending: Dict[str, Any],
+                         report: Dict[str, Any]
+                         ) -> Tuple[str, Optional[Dict[str, Any]], Optional[int],
+                                    Optional[Dict[str, Any]]]:
+        """步 5 拦截判定：返回 ``(action, buffer_cand, duration, metadata)``。
+
+        - ``skip``：当前是拖延窗内的高专注软意图 → 本拍让路（可继续由后续候选填充）；
+        - ``buffer``：插入过渡窗（本拍结束；由调用方真正写库，成功后才记日限）；
+        - ``start``：按原路径启动（不消耗 planner 主 RNG）。
+        只作用于 ``kind=="intent"`` 的软意图；硬约定/resume/continuation/event/idle
+        永不延迟、永不替换（v2 §4.6）。
+        """
+        if not params.enabled or cand.get("kind") != "intent":
+            return "start", None, None, None
+        goal = str(cand.get("goal_type") or "")
+        if not transition_rules.is_high_focus(goal, params):
+            return "start", None, None, None
+        pending = self._transition_pending_state(date)
+        if int(pending.get("delay_until") or 0) > cur:
+            return "skip", None, None, None  # ① 拖延窗内：高专注软意图一律等待
+        if int(pending.get("delay_until") or 0) and int(pending["delay_until"]) <= cur:
+            pending["delay_until"] = 0  # 到点：保留 delay_used/active，进入缓冲/启动判定
+        prev = str(self._last_closed_goal_type or "")
+        contrast = bool(pending.get("active")) or transition_rules.is_low_focus(prev, params)
+        if not contrast or bool(pending.get("buffer_used")):
+            return "start", None, None, None  # 非常规反差 / 本次切换缓冲已用 → 原路径
+        window_remaining = self._transition_window_remaining(cand, cur)
+        if usage.allow_buffer(date, params.daily_buffer_limit):
+            rng_buffer = random.Random(f"{date}|{cur}|transition_buffer")
+            duration = transition_rules.sample_buffer_minutes(
+                params, rng_buffer, boundary=boundary,
+                window_end_remaining=window_remaining)
+            if duration is not None:
+                buffer_cand = {
+                    "kind": "transition",
+                    "name": transition_rules.transition_display_name(date, cur),
+                    "goal_type": "transition",
+                    "priority_score": PRIORITY_SCORES["low"],
+                    "min_minutes": int(duration), "max_minutes": int(duration),
+                    "interruptibility": 1.0, "profile_key": "transition",
+                    "window": None, "resume_of": None, "resume_bonus": 0.0,
+                    "intent_item_id": None,
+                    "note": f"从「{prev or '刚才的状态'}」缓一下再进入「{cand.get('name')}」",
+                }
+                metadata = {"transition_buffer": {
+                    "next_goal_type": goal,
+                    "next_name": str(cand.get("name") or ""),
+                    "duration_minutes": int(duration),
+                    "from_goal_type": prev,
+                }}
+                return "buffer", buffer_cand, int(duration), metadata
+        if not pending.get("delay_used") and usage.allow_procrastination(
+                date, params.daily_procrastination_limit):
+            rng_proc = random.Random(f"{date}|{cur}|procrastination")
+            if rng_proc.random() < params.procrastination_prob:
+                rng_delay = random.Random(f"{date}|{cur}|transition_delay")
+                delay = transition_rules.plan_delay(
+                    params, rng_delay, boundary=boundary,
+                    window_end_remaining=window_remaining)
+                if delay is not None:
+                    pending["active"] = True
+                    pending["delay_used"] = True
+                    pending["delay_until"] = int(cur) + int(delay)
+                    pending["target_goal_type"] = goal
+                    pending["procrastination"] = {
+                        "delay_until": int(cur) + int(delay),
+                        "delay_minutes": int(delay),
+                        "target_goal_type": goal,
+                        "target_name": str(cand.get("name") or ""),
+                        "scheduled_at_minute": int(cur),
+                        "date": str(date),
+                    }
+                    usage.note_procrastination(date)
+                    report["actions"].append("transition_procrastination")
+                    self._log("rolling.transition_procrastination", date=date,
+                              minute=cur, target_goal_type=goal,
+                              target_name=cand.get("name"), delay_minutes=int(delay),
+                              delay_until=int(cur) + int(delay))
+                    return "skip", None, None, None
+        return "start", None, None, None
+
+    @staticmethod
+    def _transition_episode_metadata(pending: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """拖延留痕：下一次启动的 episode 带 ``metadata.procrastination``（纯旁路）。"""
+        meta = pending.get("procrastination") if isinstance(pending, dict) else None
+        if isinstance(meta, dict) and meta:
+            return {"procrastination": dict(meta)}
+        return None
 
     @property
     def enabled(self) -> bool:
@@ -868,8 +1014,12 @@ class RollingPlanner:
             cur_frame = self._episode_frame_minute(current, now)
             if planned_end and cur_frame >= planned_end \
                     and not self._engine_owns_sleep(current):
+                # F3（B2）：开关开时记上一活动类型（反差源判定用）；默认关不写。
+                closed_goal_type = str(current.get("goal_type") or "")
                 self._finish_episode(current, now, snapshot,
                                      actual_end_minute=planned_end, reason="planned_end_reached")
+                if self._transition_params().enabled:
+                    self._last_closed_goal_type = closed_goal_type
                 report["actions"].append("closed_due_episode")
                 current = None
 
@@ -2304,6 +2454,12 @@ class RollingPlanner:
         order: List[Dict[str, Any]] = [chosen] if chosen is not None else []
         order += [c for _s, c in top if id(c) != id(chosen)]
         order += [c for _s, c in scored if id(c) not in top_ids and id(c) != id(chosen)]
+        # F3 转场拖延（B2）：仅开关开时取参数/日限/pending；关 = 本段零副作用
+        # （不读盘、不 RNG、不写状态），启动循环逐字不变。
+        tparams = self._transition_params()
+        tusage = self._transition_usage_store() if tparams.enabled else None
+        tpending: Dict[str, Any] = (self._transition_pending_state(date)
+                                    if tparams.enabled and tusage is not None else {})
         seen_ids: set = set()
         for cand in order:
             if id(cand) in seen_ids:
@@ -2319,12 +2475,52 @@ class RollingPlanner:
             if cand["kind"] == "intent" and str(cand.get("goal_type")) == "meal" \
                     and self._meal_intent_satisfied(date, cur, cand):
                 continue
+            action, buffer_cand, buffer_duration, buffer_meta = "start", None, None, None
+            if tparams.enabled and tusage is not None and tpending:
+                action, buffer_cand, buffer_duration, buffer_meta = self._transition_gate(
+                    cand, date=date, cur=cur, boundary=boundary,
+                    params=tparams, usage=tusage, pending=tpending, report=report)
+            if action == "skip":
+                continue  # 拖延窗内：高专注软意图让路，后续候选可填充（不强制 idle）
+            if action == "buffer" and buffer_cand is not None and buffer_duration is not None:
+                extra = dict(buffer_meta or {})
+                trace = self._transition_episode_metadata(tpending)
+                if trace:
+                    extra.update(trace)
+                if self._start_episode_for_candidate(
+                        buffer_cand, int(buffer_duration), date, cur, now, snapshot,
+                        scored, rng, report, extra_metadata=extra or None):
+                    tusage.note_buffer(date)
+                    if trace:
+                        tpending["procrastination"] = None
+                    tpending["active"] = True
+                    tpending["buffer_used"] = True
+                    tpending["target_goal_type"] = str(cand.get("goal_type") or "")
+                    self._log("rolling.transition_buffer", date=date, minute=cur,
+                              duration_minutes=int(buffer_duration),
+                              next_goal_type=cand.get("goal_type"),
+                              next_name=cand.get("name"))
+                    return
+                # 过渡窗启动失败（写库/认领失败）→ 回退按原路径启动该候选
             duration = self._sample_block(cand, snapshot, cur, boundary, rng)
             if duration is None:
                 continue
+            extra_metadata = None
+            if tparams.enabled and tpending:
+                extra_metadata = self._transition_episode_metadata(tpending)
+            # F3 留痕仅在存在时追加关键字参数：默认关/无留痕的调用签名与旧路径
+            # 逐字一致（既有测试桩以 lambda 覆盖本方法时也不会因新 kw 报错）。
+            extra_kwargs = ({"extra_metadata": extra_metadata}
+                            if extra_metadata else {})
             # P1：启动失败（一次性认领失败/写库失败）→ 换有序后备，不静默吞掉本拍。
             if self._start_episode_for_candidate(cand, duration, date, cur, now, snapshot,
-                                                 scored, rng, report):
+                                                 scored, rng, report, **extra_kwargs):
+                if tparams.enabled and tpending and transition_rules.is_high_focus(
+                        cand.get("goal_type"), tparams):
+                    # 目标高专注活动已启动 → 本次切换的缓冲/拖延 pending 清除
+                    if extra_metadata:
+                        tpending["procrastination"] = None
+                    self._transition_clear_pending()
                 return
         self._log("rolling.no_block_started", reason="min_block_insufficient",
                   candidates=len(scored),
@@ -2345,8 +2541,13 @@ class RollingPlanner:
     def _start_episode_for_candidate(self, cand: Dict[str, Any], duration: int,
                                      date: str, cur: int, now: datetime, snapshot: Any,
                                      scored: List[Tuple[float, Dict[str, Any]]], rng: random.Random,
-                                     report: Dict[str, Any]) -> bool:
-        """启动成功返回 True；认领失败/写库失败返回 False（调用方换有序后备）。"""
+                                     report: Dict[str, Any], *,
+                                     extra_metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """启动成功返回 True；认领失败/写库失败返回 False（调用方换有序后备）。
+
+        ``extra_metadata``：F3 纯旁路留痕（``transition_buffer`` / ``procrastination``），
+        只并入 episode metadata，不参与打分/调度；默认 ``None`` = 旧路径逐字不变。
+        """
         profile = activity_profiles.get_profile(cand["profile_key"])
         source = {"commitment": "commitment", "intent": "rolling", "anchor_meal": "rolling",
                   "resume": "resume", "idle": "rolling", "event": "rolling",
@@ -2374,6 +2575,8 @@ class RollingPlanner:
             metadata["intent_item_id"] = cand["intent_item_id"]
         if cand.get("note"):
             metadata["note"] = cand["note"]
+        if extra_metadata:
+            metadata.update(extra_metadata)
         eid: Optional[str] = None
         if cand["kind"] == "event":
             # P1 统一入口（§5.1 步5/6）：先持久认领一次性，再启动；定义快照随
@@ -2929,6 +3132,10 @@ class RollingPlanner:
         if date != self._last_date:
             self._last_date = date
             self._idle_roll_pending = True
+            # F3（B2）：跨日重置 pending 与上一活动类型（日限计数由
+            # transition_usage.json 按日期自然归零，无需在此写盘）。
+            self._transition_pending = {}
+            self._last_closed_goal_type = ""
 
     # ── 状态阈值事件（滞回：只在跨越时发，非每 tick）──────────────────────
     def _publish_state_changed(self, snapshot: Any, now: datetime) -> None:

@@ -113,6 +113,7 @@ from companion.config import (
 )
 from companion.screen_config import ScreenSectionConfig, migrate_screen_config
 from emotion.config import EmotionSectionConfig
+from experimental_config import ExperimentalSectionConfig
 from planning.config import (
     LifeStateSectionConfig,
     PlanningEventsSectionConfig,
@@ -851,6 +852,9 @@ class CateyeSuiteConfig(PluginConfigBase):
     各 section 类定义在各子模块的 config.py / suite_prompts.py 中（模块化维护）。
     """
 
+    # 2026-11-11 用户裁定：实验性特性配置集中段置顶（全部默认关；转正迁移见
+    # union/20261111_实验配置迁移映射.md）。
+    experimental: ExperimentalSectionConfig = Field(default_factory=ExperimentalSectionConfig)
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     patrol: PatrolSectionConfig = Field(default_factory=PatrolSectionConfig)
     screen: ScreenSectionConfig = Field(default_factory=ScreenSectionConfig)

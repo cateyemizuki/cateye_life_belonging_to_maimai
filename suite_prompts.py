@@ -204,6 +204,36 @@ INJECT_HINT_IDLE_DEFAULT = (
 #: 无当前活动时的兜底文案（占位符：无；2026-10-10 N1-2：
 #: 日程空档期不静默早退，改注入这一句；留空 = 不注入无活动兜底）
 INJECT_NO_ACTIVITY_DEFAULT = "你现在没有进行中的活动，处于空闲状态；不要声称正在做某事，也不要汇报不存在的活动或日程。"
+
+# ── F1 群注意力状态行（2026-11-11 B1；代码层常量，不新增 [prompts] 可配键）──
+#: 话题不搭 + 有点沉默：一行陈述事实，不命令、不评价；回不回由 planner 决定。
+#: 占位符：{topic} / {minutes}
+GROUP_ATTENTION_HINT_TOPIC_DEFAULT = (
+    "【群聊注意力】这个群最近在聊「{topic}」这类话题，和你手头的事不太搭；"
+    "你大约 {minutes} 分钟没被点名、也没接话。回不回、什么时候回由你判断。"
+)
+#: 话题失配但缓冲里没有可回显文本（图片/空文本）：仍只陈述状态。
+#: 占位符：{minutes}
+GROUP_ATTENTION_HINT_MISMATCH_DEFAULT = (
+    "【群聊注意力】这个群最近的话题和你手头的事不太搭；"
+    "你大约 {minutes} 分钟没被点名、也没接话。回不回、什么时候回由你判断。"
+)
+#: 主要是沉默（话题判断不足）：只陈述「多久没接话」。
+#: 占位符：{minutes}
+GROUP_ATTENTION_HINT_QUIET_DEFAULT = (
+    "【群聊注意力】你大约 {minutes} 分钟没在这个群被点名、也没接话。"
+    "回不回、什么时候回由你判断。"
+)
+
+# ── F3 转场拖延自我揭露（2026-11-11 B2；代码层常量，不新增 [prompts] 可配键）──
+#: 过渡窗/拖延中聊到时的低概率自我揭露（由 replyer extra_prompt 追加）。
+#: 口径：只当随口一提，不报时长/参数、不汇报日程；是否说由掷骰与去重决定。
+#: 占位符：无。
+TRANSITION_CONFESSION_LINE_DEFAULT = (
+    "（可以顺口带一句：刚才本来要开始了，结果又发了会儿呆、缓了几分钟才切过去。"
+    "只当随口一提，不要说具体等了多久，也不要把它说成日程安排。）"
+)
+
 #: replyer 状态注入模板（占位符：{state_line} / {energy} / {next_line}；{next_line} 为空时整行省略）
 INJECT_REPLYER_STATUS_DEFAULT = (
     "【角色当前状态】\n{state_line}\n身体与精神状态：{energy}。\n{next_line}"

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""内部调参表（2026-11-04 配置精简轮，方案 J 类；3.17.6 起 46 键）。
+"""内部调参表（2026-11-04 配置精简轮，方案 J 类；3.17.6 起 46 键，B1 增 9、B2 增 16 → 71 键）。
 
 把「内部调参但可能需现场微调」的阈值/权重/容量/缓存/超时/采样温度从聚合
 TOML schema 移入 ``mappings/internal_tuning.json``（表层用户数据区）+
@@ -136,6 +136,43 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "video_watch": {
         "queue_capacity": 3,
         "task_deadline_seconds": 10800,
+    },
+    # F1 群注意力衰减（B1，2026-11-11 v2 §3.4）：实验期参数在用户可见
+    # ``[experimental].group_attention_*``，本段是同源默认值与「转正后迁回 J 类」的
+    # 目标段（迁移映射见 union/20261111_实验配置迁移映射.md）。运行期不读表层
+    # internal_tuning.json 的该段；新增 9 键为 additive，不改既有键值。
+    "group_attention": {
+        "sample_size": 20,
+        "decay_window_minutes": 45,
+        "silence_weight": 0.45,
+        "mismatch_weight": 0.55,
+        "step_per_tick": 0.02,
+        "recover_step_per_tick": 0.05,
+        "planner_hint_min_multiplier": 0.85,
+        "planner_hint_interval_minutes": 30,
+        "quiet_group_grace_minutes": 30,
+    },
+    # F3 转场拖延（B2，2026-11-11 v2 §4.4）：实验期参数在用户可见
+    # ``[experimental].transition_*``（16 键），本段是同源默认值与「转正后迁回
+    # J 类」的目标段（迁移映射见 union/20261111_实验配置迁移映射.md §2）。运行期
+    # 不读表层 internal_tuning.json 的该段；新增 16 键为 additive，不改既有键值。
+    "transition": {
+        "enabled": False,
+        "window_min": 3,
+        "window_max": 8,
+        "procrastination_prob": 0.20,
+        "delay_minutes": 15,
+        "delay_jitter_minutes": 5,
+        "daily_buffer_limit": 4,
+        "daily_procrastination_limit": 2,
+        "low_focus_types": ["meal", "entertainment", "rest", "idle"],
+        "high_focus_types": ["work", "study"],
+        "boundary_margin_minutes": 2,
+        "focus_target": 0.68,
+        "focus_tau_min": 3.0,
+        "confess_probability": 0.10,
+        "confess_min_interval_minutes": 20,
+        "procrastination_event_branch": False,
     },
 }
 

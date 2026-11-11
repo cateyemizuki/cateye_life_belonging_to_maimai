@@ -132,6 +132,11 @@ class PluginContext:
         return self.get("attention")
 
     @property
+    def group_attention(self) -> Any:
+        # F1（B1）：群注意力衰减状态仓库/乘数入口（进程内）；缺失按 None 旧行为。
+        return self.get("group_attention")
+
+    @property
     def screen_perception(self) -> Any:
         # PR-LINKAGE-SCREEN（3.17.16）：屏幕感知联动服务（适配器 cateye_screen）；
         # 缺失按 None（未装配降级语义不变，patrol/问候链不阻塞触发）。

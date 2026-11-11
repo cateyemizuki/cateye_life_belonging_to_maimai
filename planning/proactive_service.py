@@ -406,6 +406,13 @@ class ProactiveService:
     def _proactive_cfg(self) -> PlanningProactiveSectionConfig:
         return section_or_default(self._plugin, "planning_proactive", PlanningProactiveSectionConfig)
 
+    def _group_attention(self) -> Any:
+        """F1 群注意力服务（组合根装配；未装配 → None，频率链逐字旧行为）。"""
+        service = getattr(self, "_group_attention_service", None)
+        if service is not None:
+            return service
+        return getattr(self._plugin, "_group_attention", None)
+
     def _decision_log(self, action: str, trigger_type: str = "", reason: str = "", **fields: Any) -> None:
         """决策日志（走 plugin._decision_logger，缺失时静默）。"""
         decision_logger = getattr(self._plugin, "_decision_logger", None)
@@ -556,13 +563,19 @@ class ProactiveService:
 
     async def _resolve_target_streams(self) -> List[str]:
         """主动行为生效的会话列表（活动切换用）：群聊生效集 ∪ 私聊生效集。"""
+        streams, _groups = await self._resolve_target_streams_split()
+        return streams
+
+    async def _resolve_target_streams_split(self) -> Tuple[List[str], List[str]]:
+        """返回 ``(群聊∪私聊去重流, 群聊生效集)``；F1 频率乘数只作用于第二个集合。"""
+        group_streams = await self._resolve_group_streams()
         streams: List[str] = []
         seen: set = set()
-        for sid in (await self._resolve_group_streams()) + (await self._resolve_private_streams()):
+        for sid in group_streams + (await self._resolve_private_streams()):
             if sid and sid not in seen:
                 streams.append(sid)
                 seen.add(sid)
-        return streams
+        return streams, [sid for sid in group_streams if sid]
 
     def _target_greeting_allowed(self) -> bool:
         """目标陪伴私聊是否允许问候（B2：严格遵循统一名单）。
@@ -693,7 +706,12 @@ class ProactiveService:
         ):
             return
 
-        streams = await self._resolve_target_streams()
+        # F1 默认关/未装配：保持旧解析与旧调用形态（群生效集不参与，逐字不变）。
+        attention_service = self._group_attention()
+        if attention_service is not None and attention_service.enabled():
+            streams, group_streams = await self._resolve_target_streams_split()
+        else:
+            streams, group_streams = await self._resolve_target_streams(), None
         now = self._tz_manager.get_now()
         current_min = now.hour * 60 + now.minute
         date_str = now.strftime("%Y-%m-%d")
@@ -712,7 +730,11 @@ class ProactiveService:
                 freq_info = self._find_current_activity(include_sleep=True)
             if freq_info is not None:
                 _name, goal_type = freq_info[0], freq_info[1]
-                await self._apply_frequency(streams, goal_type, name=_name)
+                if group_streams is not None:
+                    await self._apply_frequency(streams, goal_type, name=_name,
+                                                group_streams=group_streams)
+                else:
+                    await self._apply_frequency(streams, goal_type, name=_name)
 
         # 2. L2 早晚安漂移（§3.2/§3.3；2026-10-22 §27.1 分支闸门）：
         #    掷点复用 → 候选硬门槛 → 分支判定（目标激活强制/群聊必要性/其他阈值）→ 触发/推迟/放弃
@@ -2439,14 +2461,19 @@ class ProactiveService:
 
     async def _resolve_target_streams_readonly(self) -> List[str]:
         """诊断用频率调控候选枚举（纯读；不写解析缓存/名单告警）。"""
+        streams, _groups = await self._resolve_target_streams_readonly_split()
+        return streams
+
+    async def _resolve_target_streams_readonly_split(self) -> Tuple[List[str], List[str]]:
+        """纯读版 ``(群聊∪私聊去重流, 群聊生效集)``；F1 只对后者取乘数。"""
+        group_streams = await self._resolve_group_streams_readonly()
         streams: List[str] = []
         seen: set = set()
-        for sid in ((await self._resolve_group_streams_readonly())
-                    + (await self._resolve_private_streams_readonly())):
+        for sid in group_streams + (await self._resolve_private_streams_readonly()):
             if sid and sid not in seen:
                 streams.append(sid)
                 seen.add(sid)
-        return streams
+        return streams, [sid for sid in group_streams if sid]
 
     async def _resolve_greeting_streams_universe_readonly(
             self) -> List[Tuple[str, str]]:
@@ -3106,7 +3133,15 @@ class ProactiveService:
         # 复核 P0-3：注意力迁移后的频率刷新同样要识别睡眠（原睡眠期落 free_time 兜底）
         activity = self._find_current_activity(include_sleep=True)
         name, goal_type = (activity[0], activity[1]) if activity else ("空闲", "free_time")
-        await self._apply_frequency(await self._resolve_target_streams_readonly(), goal_type, name=name)
+        # 默认关 / 服务未装配：保持旧调用形态逐字不变（测试桩与生产旁路同口径）。
+        attention_service = self._group_attention()
+        if attention_service is not None and attention_service.enabled():
+            streams, group_streams = await self._resolve_target_streams_readonly_split()
+            await self._apply_frequency(streams, goal_type, name=name,
+                                        group_streams=group_streams)
+        else:
+            await self._apply_frequency(await self._resolve_target_streams_readonly(),
+                                        goal_type, name=name)
 
     # 注（2026-10-20 用户指示）：原触发窗口/随机延迟助手已随活动切换主动发起链移除。
 
@@ -3114,7 +3149,8 @@ class ProactiveService:
     # 频率调控
     # ------------------------------------------------------------
 
-    async def _apply_frequency(self, streams: List[str], goal_type: str, name: str = "") -> None:
+    async def _apply_frequency(self, streams: List[str], goal_type: str, name: str = "",
+                               group_streams: Optional[List[str]] = None) -> None:
         """按日程属性映射频率因子并对每个 stream 应用（因子不变则跳过）。
 
         §24.3 任务C（2026-10-21）：因子改经 :func:`activity_properties.resolve_property`
@@ -3136,6 +3172,12 @@ class ProactiveService:
         ``reply_factor`` = 1.5（``mappings/schedule_properties.json:73``，内置同值见
         ``planning/activity_properties.py`` 的 entertainment 条目）——计划书明确
         0.45/0.70 **不再乘** 这个 1.5。目标私聊仍由下方 §4.5 分支恒 1.0，不受本解析影响。
+
+        F1（v2 §3.5，2026-11-11）：``group_streams`` 为 ``[planning_proactive]`` 群生效集
+        时，逐群乘注意力乘数 ``m∈[0.5,1.0]``：``factor=min(base, max(0.05, base×m))``。
+        睡眠（goal_type=sleep 或名称命中睡觉关键词）不乘、不受 ×0.5 下限约束，且本拍
+        冻结乘数；目标私聊/其他私聊/未提供群生效集的调用逐字沿用旧因子。默认关时
+        不调 ``tick``，下发入参与 3.17.33 完全一致。
         """
         property_spec = resolve_property(goal_type, name)
         ctx_obj = getattr(self._plugin, "ctx", None)
@@ -3146,11 +3188,37 @@ class ProactiveService:
         surf_factor = self._surf_activity_factor()
         base_factor = surf_factor if surf_factor is not None else property_spec.reply_factor
 
+        # F1：注意力乘数只作用于群生效集；睡眠完全豁免（不乘/不推进/不套下限）。
+        group_set = {str(sid) for sid in (group_streams or []) if str(sid or "").strip()}
+        attention_service = self._group_attention()
+        attention: Dict[str, float] = {}
+        if group_set and attention_service is not None:
+            try:
+                if attention_service.enabled():
+                    is_sleep = str(goal_type or "") == "sleep" or any(
+                        keyword in str(name or "") for keyword in _SLEEP_NAME_KEYWORDS)
+                    now_dt = self._tz_manager.get_now()
+                    if is_sleep:
+                        attention_service.tick(now_dt, group_streams=sorted(group_set),
+                                               asleep=True)
+                    else:
+                        attention = attention_service.tick(
+                            now_dt, group_streams=sorted(group_set),
+                            activity_goal_type=goal_type, activity_name=name) or {}
+            except Exception:
+                attention = {}  # 旁路失败 → 不调频（被动侧 fail-open）
+
         # 定稿 §4.5：目标陪伴私聊本来就**不在** ``_resolve_target_streams()`` 的生效集里
         # （陪伴对象私聊恒按黑名单剔除），故开关开时在此**补一次**；非目标流因子逐字
         # 沿用属性表 reply_factor，不做任何"全流固定 1"的扩张。
         target_stream = self._target_frequency_stream()
-        targets: List[Tuple[str, float]] = [(sid, base_factor) for sid in streams]
+        targets: List[Tuple[str, float]] = []
+        for sid in streams:
+            factor = base_factor
+            if sid in group_set and attention_service is not None and attention:
+                factor = attention_service.effective_factor(
+                    base_factor, attention.get(sid, 1.0))
+            targets.append((sid, factor))
         if target_stream:
             if any(sid == target_stream for sid, _f in targets):
                 targets = [(sid, self.TARGET_FREQUENCY_FACTOR if sid == target_stream else factor)
