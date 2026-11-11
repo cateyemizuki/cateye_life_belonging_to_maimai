@@ -158,6 +158,7 @@ PLUGIN_ATTR_CONTRACT = frozenset({
     "_plugin_root",       # 插件根目录
     "_attention",         # 注意力租约/忙闲观测
     "_group_attention",   # F1 群注意力衰减状态仓库/乘数入口（B1，进程内）
+    "_social_boundary",   # F4 社交边界服务（B3；2026-11-12 结构审计批 R5 补登：inject_service 只读消费）
     "_qzone_video",       # 空间视频候选桥（PR-D1 H10：面板只读计数投影）
     "_video_watch",       # 视频观看服务（PR-ENTERTAINMENT 3.17.13：娱乐面板最近观看只读投影）
     "_screen_perception", # 屏幕感知联动服务（PR-LINKAGE-SCREEN 3.17.16：patrol/问候链委托 peek 旁白）

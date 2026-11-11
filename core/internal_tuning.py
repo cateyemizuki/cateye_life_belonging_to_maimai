@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """内部调参表（2026-11-04 配置精简轮，方案 J 类；3.17.6 起 46 键，B1 增 9、B2 增 16、
-B3 增 12 → 92 键）。
+B3 增 12 → 93 键；2026-11-12 AST 实测 13 段 93 键）。
 
 把「内部调参但可能需现场微调」的阈值/权重/容量/缓存/超时/采样温度从聚合
 TOML schema 移入 ``mappings/internal_tuning.json``（表层用户数据区）+
@@ -17,6 +17,14 @@ TOML schema 移入 ``mappings/internal_tuning.json``（表层用户数据区）+
   已有现场微调），生产非默认值不丢失。
 - 坏值口径：单键类型不符 → 该键回退出厂默认（告警一次），不整表拒绝；
   整表解析失败 → 全量内置默认（表层文件原地不动，红线同 mapping_dir）。
+
+2026-11-12 结构审计批（R8）：实验期镜像段/键（``group_attention`` 9 /
+``transition`` 16 / ``boundary`` 12 / ``life_state.group_chat_social_drain_per_reply``
+/ ``emotion.emotion_quota_partition_enabled``，共 39 键）**不再写入用户 J 表种子**，
+只保留在本文件的 :data:`INTERNAL_TUNING_DEFAULTS` 作为「转正后迁移目标 + 运行期
+兜底」代码常量（实验期运行期只读 ``[experimental]`` pydantic 字段）。
+:data:`SEED_OMITTED_SECTIONS` / :data:`SEED_OMITTED_KEYS` /
+:func:`seed_entries` 是种子视图的唯一裁量点。
 
 本模块只依赖标准库与 :mod:`core.mapping_dir`（不 import maibot_sdk / 业务模块），
 各 config section 可安全引用，无导入环。
@@ -44,8 +52,9 @@ SUPPORTED_VERSION = 1
 
 #: 出厂默认单一真源：段 → 键 → 默认值（3.17.6 起 46 键；历史注释「40 项」已陈旧，
 #: 后续批次有增键；3.17.6 退役 event_catalog.max_pool_events 一项，47→46；
-#: B1 增 9、B2 增 16、B3 增 12 → 92 键；数值逐字取自原 Field default）。种子 JSON
-#: 由本表生成，运行期内置兜底也用它。
+#: B1 增 9、B2 增 16、B3 增 12 → 93 键；数值逐字取自原 Field default）。种子 JSON
+#: 由本表的 :func:`seed_entries` 视图生成（剔除实验期镜像段/键），运行期内置兜底
+#: 仍用全量本表。
 INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "patrol": {
         "screen_timeout_seconds": 20.0,
@@ -95,6 +104,7 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         # B4 联动批（v2 §6.5/§6.6）：群聊真实回复社交电量消耗（实验期用户可见键为
         # ``[experimental].group_chat_social_drain_per_reply``；转正后目标即本键）。
         # 仅群回复且去重，不适用好感折减/回充；其他私聊维持 0。
+        # 2026-11-12（R8）：本键不写入用户 J 表种子（SEED_OMITTED_KEYS）。
         "group_chat_social_drain_per_reply": 0.02,
         "debt_stress_per_h": 0.01,
         # PR-STATE-CONTRACT（3.17.22 P1-C）：计划社交活动消耗幅度上限（/min，夹取 ≥0）。
@@ -131,6 +141,8 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "dedup_window_seconds": 180,
         # 4.3b（2026-11-11 修复轮）：评估配额分区总开关。内部调参，不占用户
         # schema 叶子；默认 True（私聊 6/群聊 4 分区），False = 回旧单一共享池。
+        # 2026-11-11 配置默认值轮已移回用户 schema（[emotion].emotion_quota_partition_enabled
+        # 真实 Field）；2026-11-12（R8）：本键不再写入用户 J 表种子。
         "emotion_quota_partition_enabled": True,
         # 3.17.33 每日情绪兜底结算（用户直派）：白天配额可能被用光，日终再结算一次。
         # 内部调参（J 类），不占用户 schema 叶子；缺键 = 默认开启 / 23:50 / 摘要 800 字。
@@ -146,7 +158,8 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # F1 群注意力衰减（B1，2026-11-11 v2 §3.4）：实验期参数在用户可见
     # ``[experimental].group_attention_*``，本段是同源默认值与「转正后迁回 J 类」的
     # 目标段（迁移映射见 union/20261111_实验配置迁移映射.md）。运行期不读表层
-    # internal_tuning.json 的该段；新增 9 键为 additive，不改既有键值。
+    # internal_tuning.json 的该段；2026-11-12（R8）起本段不写入用户 J 表种子
+    # （SEED_OMITTED_SECTIONS，仅代码常量 + 转正映射）。
     "group_attention": {
         "sample_size": 20,
         "decay_window_minutes": 45,
@@ -161,7 +174,9 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # F3 转场拖延（B2，2026-11-11 v2 §4.4）：实验期参数在用户可见
     # ``[experimental].transition_*``（16 键），本段是同源默认值与「转正后迁回
     # J 类」的目标段（迁移映射见 union/20261111_实验配置迁移映射.md §2）。运行期
-    # 不读表层 internal_tuning.json 的该段；新增 16 键为 additive，不改既有键值。
+    # 不读表层 internal_tuning.json 的该段；2026-11-12（R8）起本段不写入用户 J 表
+    # 种子（SEED_OMITTED_SECTIONS）。``procrastination_event_branch`` 为未实现的
+    # J 类预留键：不占用户 schema 叶子，转正时再决定是否实现。
     "transition": {
         "enabled": False,
         "window_min": 3,
@@ -183,7 +198,8 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # F4 社交边界（B3，2026-11-11 v2 §5.4）：实验期参数在用户可见
     # ``[experimental].social_boundary_*``（12 参数 + 1 总开关），本段是同源默认值
     # 与「转正后迁回 J 类」的目标段（迁移映射见 union/20261111_实验配置迁移映射.md §3）。
-    # 运行期不读表层 internal_tuning.json 的该段；新增 12 键为 additive，不改既有键值。
+    # 运行期不读表层 internal_tuning.json 的该段；2026-11-12（R8）起本段不写入
+    # 用户 J 表种子（SEED_OMITTED_SECTIONS）。
     "boundary": {
         "refusal_energy_threshold": 0.25,
         "refusal_stress_threshold": 0.80,
@@ -202,6 +218,35 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
 
 #: 插件根目录（本文件位于 core/ 下，parents[1] = 插件根；与 mapping_table.plugin_root 同口径）
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+
+
+#: 2026-11-12 结构审计批（R8）：实验期镜像段——运行期只读 ``[experimental]``，
+#: 不写入用户 J 表种子（避免零效果的双入口）；仍保留在
+#: :data:`INTERNAL_TUNING_DEFAULTS` 作为转正迁移目标与运行期兜底。
+SEED_OMITTED_SECTIONS = frozenset({"group_attention", "transition", "boundary"})
+
+#: 实验期镜像单键（段 → 键集合；同上：代码常量保留，种子不落）。
+SEED_OMITTED_KEYS: Dict[str, frozenset] = {
+    "life_state": frozenset({"group_chat_social_drain_per_reply"}),
+    "emotion": frozenset({"emotion_quota_partition_enabled"}),
+}
+
+
+def seed_entries() -> Dict[str, Dict[str, Any]]:
+    """用户 J 表种子视图：内置默认剔除实验期镜像段/键（返回新字典，不改常量）。
+
+    全量 :data:`INTERNAL_TUNING_DEFAULTS` 仍是运行期兜底与转正映射目标的唯一真源；
+    本视图只决定「哪些键出现在用户可编辑的 internal_tuning.json」。
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for section, keys in INTERNAL_TUNING_DEFAULTS.items():
+        if section in SEED_OMITTED_SECTIONS:
+            continue
+        omitted = SEED_OMITTED_KEYS.get(section, frozenset())
+        kept = {key: value for key, value in keys.items() if key not in omitted}
+        if kept:
+            out[section] = kept
+    return out
 
 #: 读取缓存：(path_str, mtime_ns, size) → 合并后的生效表；表层文件改动即失效
 _CACHE: Dict[str, Any] = {"key": None, "table": None}
@@ -380,7 +425,7 @@ def merge_captured(captured: Dict[str, Dict[str, Any]], *, root_dir: Any = None)
             present = False
     if not present and clean:
         doc: Dict[str, Any] = {"version": SUPPORTED_VERSION}
-        for section, keys in INTERNAL_TUNING_DEFAULTS.items():
+        for section, keys in seed_entries().items():
             merged = dict(keys)
             merged.update(clean.get(section) or {})
             doc[section] = merged

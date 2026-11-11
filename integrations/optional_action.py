@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core.storage import save_json_atomic
-from tools.proactive_turn import (
+# 阶段 4 文案/清洗单一 owner = suite_prompts（提示词集中模块）。
+# 2026-11-12 结构审计批（R7/R10）：直接从 suite_prompts 取公共常量/纯函数，
+# 删除 integrations → tools.proactive_turn 包级 import 边（硬边界 #1）。
+from suite_prompts import (
     MISS_REASON_STAGE4_SUFFIX,
     append_stage4_miss_prompt,
     clean_stage4_prompt,

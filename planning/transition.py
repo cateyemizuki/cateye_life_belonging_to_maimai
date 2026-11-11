@@ -32,29 +32,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from core.internal_tuning import INTERNAL_TUNING_DEFAULTS
+
 from . import settlement_v2
 
 logger = logging.getLogger(__name__)
 
 #: 实验期默认值 / 转正后 ``internal_tuning.json[transition]`` 目标段（16 键）。
 #: 键名与 ``[experimental].transition_<key>`` 一一对应（实验期字段加前缀）。
+#: 2026-11-12 结构审计批（R13）：不再维护字面副本，唯一真源 =
+#: :data:`core.internal_tuning.INTERNAL_TUNING_DEFAULTS` ``["transition"]``
+#: （列表值复制一份，防止调用方意外原地修改常量）。
 DEFAULTS: Dict[str, Any] = {
-    "enabled": False,
-    "window_min": 3,
-    "window_max": 8,
-    "procrastination_prob": 0.20,
-    "delay_minutes": 15,
-    "delay_jitter_minutes": 5,
-    "daily_buffer_limit": 4,
-    "daily_procrastination_limit": 2,
-    "low_focus_types": ["meal", "entertainment", "rest", "idle"],
-    "high_focus_types": ["work", "study"],
-    "boundary_margin_minutes": 2,
-    "focus_target": 0.68,
-    "focus_tau_min": 3.0,
-    "confess_probability": 0.10,
-    "confess_min_interval_minutes": 20,
-    "procrastination_event_branch": False,
+    key: (list(value) if isinstance(value, list) else value)
+    for key, value in INTERNAL_TUNING_DEFAULTS["transition"].items()
 }
 
 #: 过渡 episode 的确定性生活细节（goal_type=transition；不含延续关键词）。
@@ -113,24 +104,28 @@ def _types(value: Any, default: Iterable[str]) -> Tuple[str, ...]:
 
 @dataclass(frozen=True)
 class TransitionParams:
-    """F3 生效参数（不可变；由 ``[experimental]`` section 归一得到）。"""
+    """F3 生效参数（不可变；由 ``[experimental]`` section 归一得到）。
 
-    enabled: bool = False
-    window_min: int = 3
-    window_max: int = 8
-    procrastination_prob: float = 0.20
-    delay_minutes: int = 15
-    delay_jitter_minutes: int = 5
-    daily_buffer_limit: int = 4
-    daily_procrastination_limit: int = 2
-    low_focus_types: Tuple[str, ...] = ("meal", "entertainment", "rest", "idle")
-    high_focus_types: Tuple[str, ...] = ("work", "study")
-    boundary_margin_minutes: int = 2
-    focus_target: float = 0.68
-    focus_tau_min: float = 3.0
-    confess_probability: float = 0.10
-    confess_min_interval_minutes: int = 20
-    procrastination_event_branch: bool = False
+    字段默认值全部取自 :data:`DEFAULTS`（→ ``INTERNAL_TUNING_DEFAULTS["transition"]``
+    单源），本类不再维护第三份字面副本。
+    """
+
+    enabled: bool = DEFAULTS["enabled"]
+    window_min: int = DEFAULTS["window_min"]
+    window_max: int = DEFAULTS["window_max"]
+    procrastination_prob: float = DEFAULTS["procrastination_prob"]
+    delay_minutes: int = DEFAULTS["delay_minutes"]
+    delay_jitter_minutes: int = DEFAULTS["delay_jitter_minutes"]
+    daily_buffer_limit: int = DEFAULTS["daily_buffer_limit"]
+    daily_procrastination_limit: int = DEFAULTS["daily_procrastination_limit"]
+    low_focus_types: Tuple[str, ...] = tuple(DEFAULTS["low_focus_types"])
+    high_focus_types: Tuple[str, ...] = tuple(DEFAULTS["high_focus_types"])
+    boundary_margin_minutes: int = DEFAULTS["boundary_margin_minutes"]
+    focus_target: float = DEFAULTS["focus_target"]
+    focus_tau_min: float = DEFAULTS["focus_tau_min"]
+    confess_probability: float = DEFAULTS["confess_probability"]
+    confess_min_interval_minutes: int = DEFAULTS["confess_min_interval_minutes"]
+    procrastination_event_branch: bool = DEFAULTS["procrastination_event_branch"]
 
     @classmethod
     def from_section(cls, section: Any) -> "TransitionParams":

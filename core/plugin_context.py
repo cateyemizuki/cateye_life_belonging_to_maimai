@@ -142,6 +142,12 @@ class PluginContext:
         return self.get("group_attention")
 
     @property
+    def social_boundary(self) -> Any:
+        # F4（B3）：社交边界服务（进程内、只读口径）；缺失按 None 旧行为。
+        # 2026-11-12 结构审计批（R5）：与 _group_attention 同口径补具名视图。
+        return self.get("social_boundary")
+
+    @property
     def screen_perception(self) -> Any:
         # PR-LINKAGE-SCREEN（3.17.16）：屏幕感知联动服务（适配器 cateye_screen）；
         # 缺失按 None（未装配降级语义不变，patrol/问候链不阻塞触发）。

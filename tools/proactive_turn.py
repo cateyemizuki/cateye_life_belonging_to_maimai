@@ -43,11 +43,12 @@ from typing import Any, Callable, Optional
 
 from core.storage import save_json_atomic
 from integrations.proactive_reply_target import PROACTIVE_REPLY_NOTICE
-# 阶段 4 文案/清洗规则单一 owner = core.stage4_prompt（纯文本模块；companion
-# .miss_trigger 与 plugin 也转发同一份实现）。避免 tools 依赖 companion 包
-# 造成的循环导入，也避免两份表漂移（复核 finding）。
+# 阶段 4 文案/清洗规则单一 owner = suite_prompts（提示词集中模块；companion
+# .miss_trigger / planning.proactive_service / integrations.optional_action 也转发
+# 同一份实现）。避免 tools 依赖 companion 包造成的循环导入，也避免两份表漂移
+# （复核 finding）。2026-11-12 结构审计批（R7）：自 core.stage4_prompt 迁入。
 # 本模块只做转发：常量直接复用，append 保留 tools 侧「拿不到精确小时数 → 120+」口径。
-from core.stage4_prompt import (
+from suite_prompts import (
     MISS_REASON_STAGE4_SUFFIX,
     MISS_REASON_STAGE4_VIDEO_SUFFIX,
     STAGE4_SUPPRESSED_PHRASES,

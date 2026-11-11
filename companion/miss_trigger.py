@@ -3,18 +3,17 @@ from __future__ import annotations
 import unicodedata
 from typing import Any, Optional
 
-# 阶段 4 文案/清洗单一 owner = core.stage4_prompt（纯文本模块，无业务依赖）。
-# companion 与 tools.proactive_turn 都从这里转发，避免两份表漂移（复核 finding）。
+# 阶段 4 文案/清洗单一 owner = suite_prompts（提示词集中模块，纯文本、无业务依赖）。
+# companion / tools.proactive_turn / planning.proactive_service / integrations.optional_action
+# 都从 suite_prompts 转发，避免两份表漂移（复核 finding）。
 # 这些名字保持在本模块命名空间内（plugin/tests 既有 `miss_trigger.xxx` 引用不变）。
-from core.stage4_prompt import (  # noqa: E402
+# 2026-11-12 结构审计批（R7）：只 import 公共名，不再跨包 import core 私有函数。
+from suite_prompts import (  # noqa: E402
     MISS_REASON_STAGE4_SUFFIX,
     MISS_REASON_STAGE4_VIDEO_SUFFIX,
     STAGE4_SUPPRESSED_PHRASES,
     append_stage4_miss_prompt,
     clean_stage4_prompt,
-    _clean_stage4_base,
-    _format_hours,
-    _SUPPRESSED_PHRASES,
 )
 MEMORY_LINE_MAX_CHARS = 120
 EMOTION_VALENCE_THRESHOLD = .3
