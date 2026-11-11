@@ -92,6 +92,10 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         # 用户可见 schema 键；debt_stress_per_h 经 life_state._settlement_params_v2
         # 注入结算 params（纯函数层不读盘）。
         "chat_social_drain_per_reply": 0.015,
+        # B4 联动批（v2 §6.5/§6.6）：群聊真实回复社交电量消耗（实验期用户可见键为
+        # ``[experimental].group_chat_social_drain_per_reply``；转正后目标即本键）。
+        # 仅群回复且去重，不适用好感折减/回充；其他私聊维持 0。
+        "group_chat_social_drain_per_reply": 0.02,
         "debt_stress_per_h": 0.01,
         # PR-STATE-CONTRACT（3.17.22 P1-C）：计划社交活动消耗幅度上限（/min，夹取 ≥0）。
         # 软化旧默认画像 -0.02/min 的一次触底；经 _settlement_params_v2 注入结算，

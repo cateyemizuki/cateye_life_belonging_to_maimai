@@ -41,6 +41,7 @@
     "late_attention_progress": 0.7,
     "sleep_interrupt_min_minutes": 5,
     "chat_social_drain_per_reply": 0.015,
+    "group_chat_social_drain_per_reply": 0.02,
     "debt_stress_per_h": 0.01,
     "planned_social_drain_cap_per_min": 0.006
   },

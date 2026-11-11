@@ -10,6 +10,8 @@
 - ``[experimental].group_attention_*``：F1 群注意力衰减（B1 批）；
 - ``[experimental].transition_*``：F3 转场拖延（B2 批）；
 - ``[experimental].social_boundary_*``：F4 社交边界（B3 批）；
+- ``[experimental].bpp_bridge_enabled`` / ``group_chat_social_drain_per_reply``：
+  联动批（B4：bpp 认领让位 + 群社交电量）。
 - 后续联动批的新键继续追加在本段，按批在迁移映射文档登记目标板块。
 
 参数默认值与 ``core.internal_tuning.INTERNAL_TUNING_DEFAULTS`` 对应 J 段同源
@@ -36,6 +38,9 @@ _TR: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["transition"])
 
 #: F4 参数默认值单一真源（转正后目标 = internal_tuning.json [boundary]）
 _BD: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["boundary"])
+
+#: 联动批参数默认值单一真源（转正后目标 = internal_tuning.json [life_state]）
+_LS: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["life_state"])
 
 
 class ExperimentalSectionConfig(PluginConfigBase):
@@ -452,5 +457,34 @@ class ExperimentalSectionConfig(PluginConfigBase):
             "hint": "默认 0.25；与碎片化提示独立掷骰",
             **_ui_i18n("Short reply hint probability",
                        "Chance to suggest a very short reply."),
+        },
+    )
+
+    # ── 联动批：bpp 认领让位 + 群社交电量（B4；v2 §6）──────────────
+    bpp_bridge_enabled: bool = Field(
+        default=False,
+        description="与「更好的消息后处理」(bpp) 联动：life 在发送前向 bpp 登记本轮认领，"
+                    "bpp 后处理接管生效时由它模拟打字、life 让位（避免双重等待）；"
+                    "同时开启群聊真实回复的社交电量消耗。bpp 未安装/未激活/超时 → "
+                    "life 照常自己模拟打字，绝不劣化。",
+        json_schema_extra={
+            "label": "bpp 联动",
+            "hint": "默认关。开 = 认领让位 + 群电量；bpp 缺失/拒绝/超时仍走 life 原打字链，"
+                    "目标私聊折减/回充链逐字不变",
+            **_ui_i18n("bpp bridge",
+                       "Experimental: claim the reply round from the better-post-processing "
+                       "plugin so it owns typing simulation when active, and drain social "
+                       "battery for real group replies. Fails open to the old behavior."),
+        },
+    )
+    group_chat_social_drain_per_reply: float = Field(
+        default=_LS["group_chat_social_drain_per_reply"], ge=0.0, le=1.0,
+        description="群聊真实回复每次消耗的社交电量（不适用好感折减/回充；仅群回复且去重）",
+        json_schema_extra={
+            "label": "群回复电量消耗",
+            "hint": "默认 0.02；0 = 不消耗。目标私聊仍走原有折减/回充链，口径不变",
+            **_ui_i18n("Group reply social drain",
+                       "Social battery drained per real group reply; no affinity discount or "
+                       "recharge. 0 disables."),
         },
     )

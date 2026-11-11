@@ -1121,7 +1121,10 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             _sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or "")
             _tracker.note_reply_end(_sid)
         # P2-DEL-1：真实回复发送前的拟人打字时延（开关/上限见 [patrol]）。
-        await self._mai_apply_typing_delay(kwargs)
+        # B4（v2 §6.3/§6.4）：先向 bpp 认领本轮，再按对方返回的 typing_owner 决定
+        # 谁负责打字——只要 bpp 后处理接管生效（无论接受/拒绝认领），它都会分段并
+        # 模拟打字，life 一律让位；bpp 不可达/未激活/超时 → life 照常施加。
+        await self._mai_apply_typing_delay_with_bridge(kwargs)
         companion = self._mai_companion()
         if companion is None:
             return
@@ -1197,6 +1200,53 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             detail=(f"planner 已生成回复并发送（距触发 {elapsed_text} 秒）｜触发类型={trigger_type or '未知'}"
                     f"｜预算确认={confirmation.get('status') if isinstance(confirmation, dict) else 'unknown'}"),
         )
+
+    async def _mai_apply_typing_delay_with_bridge(self, kwargs: dict[str, Any]) -> None:
+        """B4：bpp 认领 + 按 ``typing_owner`` 让位打字（v2 §6.3/§6.4）。
+
+        单一所有者判据是 ``typing_owner`` 而不是 ``accepted``：
+
+        - bpp 生效（``active=True``，无论接受/拒绝认领）→ 返回的 owner 恒为 ``bpp``
+          → life 不施加任何打字等待（bpp 会按段模拟）；
+        - bpp 未安装/未激活/API 超时/无响应 → 不跳过，照常走
+          :meth:`_mai_apply_typing_delay`（与 3.17.33 逐字一致）；
+        - 主开关 ``[experimental].bpp_bridge_enabled`` 关 → 连 API 都不调用。
+
+        ``release`` 只用于空回复清理；被接受的认领必须留给 bpp 在同一轮的
+        ``before_post_process`` 消费（TTL 兜底），因此这里**不**立即释放。
+        """
+        bridge = getattr(self, "_post_process_bridge", None)
+        reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
+        reply_text = str(kwargs.get("response") or "").strip()
+        typing_owner = ""
+        if bridge is not None:
+            try:
+                if bridge.enabled():
+                    if reply_text:
+                        claim = await bridge.claim(
+                            reply_stream, reply_text, self._mai_bridge_directive(reply_stream))
+                        typing_owner = str((claim or {}).get("typing_owner") or "").lower()
+                    elif reply_stream:
+                        # 回复为空（纯工具调用/异常空串）：清掉上一轮可能残留的认领。
+                        await bridge.release(stream_id=reply_stream)
+            except Exception:
+                typing_owner = ""  # 认领失败 → life 接管（fail-open，不劣化）
+        if typing_owner == "bpp":
+            return
+        await self._mai_apply_typing_delay(kwargs)
+
+    def _mai_bridge_directive(self, session_id: str) -> dict[str, Any]:
+        """本轮交给 bpp 的策略元数据（首期只有碎片化提示是否命中）。
+
+        只读、无副作用；F4 关闭/非目标私聊/异常 → 空指令。bpp 本批只登记
+        ``fragment_hint``，不据此改分段（``mode="policy"``）。
+        """
+        try:
+            service = getattr(self, "_social_boundary", None)
+            hints = service.reply_hints(session_id) if service is not None else []
+            return {"fragment_hint": bool(hints)}
+        except Exception:
+            return {"fragment_hint": False}
 
     async def _mai_apply_typing_delay(self, kwargs: dict[str, Any]) -> None:
         """真实回复发送前插入拟人打字时延（P2-DEL-1，2026-11-11）。
@@ -1301,10 +1351,15 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         await asyncio.sleep(max(0.0, float(seconds)))
 
     def _mai_chat_social_drain(self, kwargs: dict[str, Any], companion: Any) -> None:
-        """陪伴目标私聊真实回复消耗社交电量（PR-REALISM-TUNING 3.17.20 §1A）。
+        """聊天真实回复消耗社交电量（PR-REALISM-TUNING 3.17.20 §1A + B4 §6.5）。
 
-        - 仅陪伴目标私聊：回复流 == 巡检目标流（F6 同口径；群聊/其他私聊流 id
-          不同，天然排除）；流 id 缺失 → 不施加；
+        - 目标私聊：回复流 == 巡检目标流（F6 同口径）→ 走下方完整的
+          :func:`planning.settlement_v2.target_chat_social_delta` 折减/回充链
+          （逐字不变）；
+        - 群聊（B4）：``[experimental].bpp_bridge_enabled`` 开启且
+          ``session_kinds.is_group(stream) is True`` → 交给
+          :meth:`_mai_group_social_drain`（固定小幅消耗、无折减/回充）；
+        - 其他私聊 / 群类型未知 → 0（不改对象特异性口径，fail-open）；
         - 主动轮不计：90 秒窗内有 proactive trigger（既有 0.5 补计同口径）→ 跳过；
         - 消耗量 = internal_tuning[life_state].chat_social_drain_per_reply（默认
           0.015，夹取 ≥0；≤0 → 不施加）。经既有 :meth:`LifeStateService.apply_episode`
@@ -1314,12 +1369,10 @@ class CompanionComponentsMixin(ScreenToolsMixin):
           ``target_private=True`` 与好感/效价/当前电量一起交给
           :func:`planning.settlement_v2.target_chat_social_delta` 计算实际增量——
           好感折减（1−0.9×好感/200，最低 0.1 倍）与高好感放松对话的微量回充
-          都在该纯函数里完成；群聊/其他私聊根本进不了本方法（上方流比对），
-          口径不变。**本批只实现目标私聊折减/回充**——群聊与其他私聊的聊天
-          社交电量基础消耗仍为 0，报告里「群聊高消耗 vs 目标私聊回血」的对照
-          留待后续批次。开关 ``social_battery_affinity_discount`` /
-          ``target_chat_social_recharge``（[life_state]，默认开）分别控制；
-        - 每回复恰一次：同 (流, 回复指纹) 短窗去重（钩子幂等）；
+          都在该纯函数里完成。群聊走独立分支（固定消耗、无折减/回充），其他私聊
+          维持 0。开关 ``social_battery_affinity_discount`` /
+          ``target_chat_social_recharge``（[life_state]，默认开）只作用于目标私聊；
+        - 每回复恰一次：同 (流, 回复指纹) 短窗去重（钩子幂等；群/目标共用）；
         - 空闲时 settlement 安静回充仍生效 → 电量随聊天节奏波动而非钉满；
         - 任何异常静默降级（OBSERVE 钩子不拖挂回复链）。
         """
@@ -1332,6 +1385,12 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 return
             target_stream = str(companion.patrol.patrol_status().get("stream_id") or "").strip()
             if not target_stream or reply_stream != target_stream:
+                # B4（v2 §6.5）：群聊真实回复消耗社交电量，仅当主开关开启且
+                # session_kinds 明确判定群聊（未知 → 不扣，fail-open）。目标私聊
+                # 分支逐字不变；其他私聊维持 0。
+                if (bool(self._mai_section_attr("experimental", "bpp_bridge_enabled", False))
+                        and companion.session_kinds.is_group(reply_stream) is True):
+                    self._mai_group_social_drain(reply_stream, kwargs)
                 return  # 仅陪伴目标私聊（群聊/其他私聊不计，F6 同口径）
             last_trigger = companion.patrol.get_last_trigger_time()
             if last_trigger is not None and (datetime.now() - last_trigger).total_seconds() < 90:
@@ -1424,6 +1483,75 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         except Exception:
             try:
                 self.ctx.logger.debug("聊天社交电量消耗施加失败（忽略）", exc_info=True)
+            except Exception:
+                pass
+
+    def _mai_group_social_drain(self, reply_stream: str, kwargs: dict[str, Any]) -> None:
+        """B4（v2 §6.5）：群聊真实回复的社交电量消耗。
+
+        口径（与目标私聊链严格分离）：
+
+        - **仅群回复**：调用方已用 ``session_kinds.is_group(...) is True`` 门控，
+          未知/其他私聊/目标私聊都进不到这里；
+        - 消耗量 = ``[experimental].group_chat_social_drain_per_reply``（默认 0.02，
+          夹取 ≥0；非法值回退默认）。**不适用**好感折减与高好感回充；
+        - 经既有 :meth:`LifeStateService.apply_episode` 显式增量门
+          （``settlement_kind="chat"``、``target_private=False``），不新增结算通路；
+        - 与目标私聊共用 (流, 回复指纹) 10s 去重窗，钩子重试幂等；
+        - 任何异常静默降级（不拖挂回复链，不误扣目标流）。
+        """
+        life = getattr(self, "_life_state", None)
+        if life is None:
+            return
+        try:
+            import hashlib
+            import time as _time
+            try:
+                group_drain = float(self._mai_section_attr(
+                    "experimental", "group_chat_social_drain_per_reply", 0.02))
+            except (TypeError, ValueError):
+                group_drain = 0.02
+            if (group_drain != group_drain
+                    or group_drain in (float("inf"), float("-inf"))):
+                group_drain = 0.02
+            group_drain = max(0.0, group_drain)
+            if group_drain <= 0.0:
+                return
+            fingerprint = hashlib.sha1(
+                str(kwargs.get("response") or "").encode("utf-8", "replace")).hexdigest()[:16]
+            key = (reply_stream, fingerprint)
+            now_mono = _time.monotonic()
+            recent = getattr(self, "_mai_chat_drain_recent", None)
+            if recent is None:
+                recent = self._mai_chat_drain_recent = {}
+            for old_key in [k for k, stamp in recent.items()
+                            if now_mono - stamp > self._CHAT_SOCIAL_DRAIN_DEDUP_SECONDS]:
+                del recent[old_key]
+            if key in recent:
+                return  # 同一群回复重复派发（钩子重试）：幂等跳过
+            life.apply_episode({
+                "episode_id": f"chat_social_drain:{reply_stream}:{fingerprint}:{now_mono:.6f}",
+                "state_deltas": {"social_battery": -group_drain},
+                "settlement_kind": "chat",
+                "target_private": False,
+                "chat_social": {
+                    "drain": group_drain,
+                    "effective_drain": group_drain,
+                    "factor": 1.0,
+                    "discount_applied": False,
+                    "recharge": 0.0,
+                    "affinity": None,
+                    "relaxed": False,
+                    "reason": "group_chat",
+                },
+            })
+            recent[key] = now_mono  # 施加成功才记去重戳（失败不挡重试）
+            if len(recent) > 64:
+                for old_key in sorted(recent, key=recent.get)[:len(recent) - 64]:
+                    del recent[old_key]
+        except Exception:
+            try:
+                self.ctx.logger.debug("群聊社交电量消耗施加失败（忽略）", exc_info=True)
             except Exception:
                 pass
 

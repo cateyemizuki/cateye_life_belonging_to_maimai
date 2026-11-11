@@ -51,6 +51,7 @@ from companion.miss_trigger import append_stage4_miss_prompt
 from companion.services import CompanionServices
 from companion.attention import ConversationActivityTracker, SurfLeaseAuthority
 from companion.boundary import BoundaryService
+from companion.post_process_bridge import PostProcessBridge
 from companion.group_attention import GroupAttentionService
 from linkage import register_adapter
 from suite_config import (
@@ -483,6 +484,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # F4（v2 §5.3，2026-11-11）：社交边界单一入口。普通类、进程内、有界、不落盘；
         # 只生成 planner 状态行 / replyer 语气与节奏提示，绝不硬拦截。默认关时全短路。
         self._social_boundary = BoundaryService(self)
+        # B4 联动批（v2 §6.3）：life → bpp 跨插件认领客户端。默认关；关时不发任何
+        # API 调用、打字时延与群聊电量口径都与 3.17.33 逐字一致。
+        self._post_process_bridge = PostProcessBridge(self)
         # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
         # M11（附录 II §3.3）：预算只统计发往目标陪伴私聊的主动打扰——注入 self._stream_id
         # 取值回调（G11 权威来源，随 _apply_target/热重载更新；不新增持久化状态）
