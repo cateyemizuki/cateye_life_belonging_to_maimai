@@ -81,16 +81,16 @@ INJECT_AFFECTION_BLOCK_DEFAULT = (
     "\n【{name}与{relation_word}（{target_label}）的好感度】档位 {tier}·{tier_label}（{tier_desc}）"
 )
 
-#: 主动发言回合给 planner 的主动激活引导（软约束；无占位符）。
+#: 主动发言回合给 planner 的主动激活引导（软约束；占位符：{bot_name}）。
 #: PR-PROACTIVE-REPLY（3.17.2）：不再要求「优先回应对方最后一条发言」（那条消息
 #: 可能已过时）；改为按状况概括+当前状态发言。读取仍经 prompt()（内部模板名，
 #: 回退表机制不变，兼容自定义模板口径）。
 INJECT_PROACTIVE_TURN_RULE_DEFAULT = (
-    "\n【本轮是主动发言】现在是你在主动找对方说话（不是对方来找你）："
-    "\n- 本轮为插件主动激活：根据你的状况概括，结合你此刻的状态自然发言，"
+    "\n【本轮是主动发言】现在是{bot_name}在主动找对方说话（不是对方来找{bot_name}）："
+    "\n- 本轮为插件主动激活：根据{bot_name}的状况概括，结合{bot_name}此刻的状态自然发言，"
     "不需要特地回复某个信息，也不要围绕某条过时的消息组织回复；"
-    "\n- 不要回复你自己发送的消息，也不要在发言里引用你自己的消息；"
-    "\n- 如果对方还没回你，直接说新内容或起一个新话题；"
+    "\n- 不要回复{bot_name}自己发送的消息，也不要在发言里引用{bot_name}自己的消息；"
+    "\n- 如果对方还没回{bot_name}，直接说新内容或起一个新话题；"
     "\n- reply 的 msg_id 只能选对方发送的消息。"
 )
 
@@ -165,115 +165,128 @@ AFFECTION_DAILY_REVIEW_DEFAULT = """你看不到任何好感度数值，也看�
 # 二、日程模块提示词
 # ===========================================================================
 
-#: planner 日程注入块首行（占位符：无）
-INJECT_SCHEDULE_HEADER_DEFAULT = "【可选上下文 - Bot 的当前日程】"
-#: 当前活动行模板（占位符：{activity} / {description} / {remaining_hint}）
-INJECT_SCHEDULE_CURRENT_LINE_DEFAULT = "现在：{activity}（{description}）{remaining_hint}"
-#: 未来安排标题（占位符：无）
-INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT = "接下来的安排:"
+#: planner 日程注入块首行（占位符：{bot_name}；2026-11-11 状态注入提示词批：
+#: 明确主语，不再用「Bot/角色/你」等泛用指代）
+INJECT_SCHEDULE_HEADER_DEFAULT = "【可选上下文 - {bot_name}的当前日程】"
+#: 当前活动行模板（占位符：{bot_name} / {activity} / {description} / {remaining_hint}）
+INJECT_SCHEDULE_CURRENT_LINE_DEFAULT = "{bot_name}现在：{activity}（{description}）{remaining_hint}"
+#: 未来安排标题（占位符：{bot_name}）
+INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT = "{bot_name}接下来的安排:"
 #: 未来安排条目模板（占位符：{time} / {name}）
 INJECT_SCHEDULE_FUTURE_LINE_DEFAULT = "  {time} - {name}"
-#: 询问未来时的引导行（占位符：无）
-INJECT_HINT_FUTURE_DEFAULT = "提示：用户询问未来计划，请自然地介绍后续安排。"
-#: 询问当前时的引导行（占位符：无）
-INJECT_HINT_CURRENT_DEFAULT = "提示：用户直接询问当前状态，请如实告知，并自然带出此刻的精神状态。"
-#: 询问当前时的引导行·潜意识风格（占位符：无；state_subconscious_style 开启时替代上行）
-INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT = (
-    "提示：用户直接询问当前状态，请如实告知当前活动；身体与精神状态只用语气、"
-    "句长和节奏自然体现，不要逐项汇报状态词。"
+#: 询问未来时的引导行（占位符：{bot_name}）
+INJECT_HINT_FUTURE_DEFAULT = "提示：对方询问{bot_name}未来的计划时，{bot_name}可以自然地介绍后续安排。"
+#: 询问当前时的引导行（占位符：{bot_name}）
+INJECT_HINT_CURRENT_DEFAULT = (
+    "提示：对方直接询问{bot_name}的当前状态时，{bot_name}如实告知，"
+    "并自然带出此刻的精神状态。"
 )
-#: 对话延续时的引导行（占位符：{reason}；2026-10-24 用户直派弱化：旧版「可自然带过当前活动」
+#: 询问当前时的引导行·潜意识风格（占位符：{bot_name}；state_subconscious_style 开启时替代上行）
+INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT = (
+    "提示：对方直接询问{bot_name}的当前状态时，{bot_name}如实告知当前活动；"
+    "{bot_name}的身体与精神状态只用语气、句长和节奏自然体现，不要逐项汇报状态词。"
+)
+#: 对话延续时的引导行（占位符：{bot_name} / {reason}；2026-10-24 用户直派弱化：旧版「可自然带过当前活动」
 #: 带弱鼓励色彩——现明确「只是背景信息、不问不说」，仅话题接不上时才允许用一句当前活动开新话题）
 INJECT_HINT_CONTINUE_DEFAULT = (
-    "提示：对话延续中（{reason}）。当前活动只是背景信息：用户不问就不要说；"
-    "只有当话题确实接不上、需要找新话题时，才可以用一句当前活动自然开启新话题。"
-    "不要主动汇报日程、接下来的安排或刚完成的事。"
+    "提示：对话延续中（{reason}）。{bot_name}的当前活动只是背景信息：对方不问就不要说；"
+    "只有当话题确实接不上、需要找新话题时，{bot_name}才可以用一句当前活动自然开启新话题。"
+    "{bot_name}不要主动汇报日程、接下来的安排或刚完成的事。"
 )
-#: 主动碎碎念时的引导行（占位符：无；2026-10-20 用户指示：不再引导 bot 无问自答提日程）
+#: 主动碎碎念时的引导行（占位符：{bot_name}；2026-10-20 用户指示：不再引导 bot 无问自答提日程）
 INJECT_HINT_PROACTIVE_DEFAULT = (
-    "提示：不要主动提及你正在日程里做什么。只有当对方问起你在做什么、"
-    "或你确实需要引出新话题时，才简要带一句当前活动。"
-    "群冷场时优先等待或结束本轮，不要为填补空白而主动起话题或汇报日程/接下来安排。"
+    "提示：{bot_name}不要主动提及自己正在日程里做什么。只有当对方问起{bot_name}在做什么、"
+    "或确实需要引出新话题时，{bot_name}才简要带一句当前活动。"
+    "群冷场时{bot_name}优先等待或结束本轮，不要为填补空白而主动起话题或汇报日程/接下来安排。"
 )
-#: 闲聊时的引导行（占位符：无；2026-11-04 强化：补充「闲聊不主动提自己日程、
+#: 闲聊时的引导行（占位符：{bot_name}；2026-11-04 强化：补充「闲聊不主动提自己日程、
 #: 除非对方问起」语义——软约束已被生产证伪不能单靠它，此处仅作双通道门控的辅助）
 INJECT_HINT_IDLE_DEFAULT = (
-    "提示：仅供参考；不相关请完全忽略，不要刻意提及。"
-    "闲聊时不主动提及自己的日程安排，除非对方问起；也不要主动汇报接下来安排或刚完成的事。"
+    "提示：以下内容仅供参考；与当前对话不相关时完全忽略，不要刻意提及。"
+    "闲聊时{bot_name}不主动提及自己的日程安排，除非对方问起；"
+    "也不要主动汇报接下来安排或刚完成的事。"
 )
-#: 无当前活动时的兜底文案（占位符：无；2026-10-10 N1-2：
+#: 无当前活动时的兜底文案（占位符：{bot_name}；2026-10-10 N1-2：
 #: 日程空档期不静默早退，改注入这一句；留空 = 不注入无活动兜底）
-INJECT_NO_ACTIVITY_DEFAULT = "你现在没有进行中的活动，处于空闲状态；不要声称正在做某事，也不要汇报不存在的活动或日程。"
+INJECT_NO_ACTIVITY_DEFAULT = (
+    "{bot_name}现在没有进行中的活动，处于空闲状态；"
+    "{bot_name}不要声称正在做某事，也不要汇报不存在的活动或日程。"
+)
 
 # ── F1 群注意力状态行（2026-11-11 B1；代码层常量，不新增 [prompts] 可配键）──
 #: 话题不搭 + 有点沉默：一行陈述事实，不命令、不评价；回不回由 planner 决定。
-#: 占位符：{topic} / {minutes}
+#: 占位符：{bot_name} / {topic} / {minutes}
 GROUP_ATTENTION_HINT_TOPIC_DEFAULT = (
-    "【群聊注意力】这个群最近在聊「{topic}」这类话题，和你手头的事不太搭；"
-    "你大约 {minutes} 分钟没被点名、也没接话。回不回、什么时候回由你判断。"
+    "【群聊注意力】这个群最近在聊「{topic}」这类话题，和{bot_name}手头的事不太搭；"
+    "{bot_name}大约 {minutes} 分钟没被点名、也没接话。回不回、什么时候回由{bot_name}判断。"
 )
 #: 话题失配但缓冲里没有可回显文本（图片/空文本）：仍只陈述状态。
-#: 占位符：{minutes}
+#: 占位符：{bot_name} / {minutes}
 GROUP_ATTENTION_HINT_MISMATCH_DEFAULT = (
-    "【群聊注意力】这个群最近的话题和你手头的事不太搭；"
-    "你大约 {minutes} 分钟没被点名、也没接话。回不回、什么时候回由你判断。"
+    "【群聊注意力】这个群最近的话题和{bot_name}手头的事不太搭；"
+    "{bot_name}大约 {minutes} 分钟没被点名、也没接话。回不回、什么时候回由{bot_name}判断。"
 )
 #: 主要是沉默（话题判断不足）：只陈述「多久没接话」。
-#: 占位符：{minutes}
+#: 占位符：{bot_name} / {minutes}
 GROUP_ATTENTION_HINT_QUIET_DEFAULT = (
-    "【群聊注意力】你大约 {minutes} 分钟没在这个群被点名、也没接话。"
-    "回不回、什么时候回由你判断。"
+    "【群聊注意力】{bot_name}大约 {minutes} 分钟没在这个群被点名、也没接话。"
+    "回不回、什么时候回由{bot_name}判断。"
 )
 
 # ── F3 转场拖延自我揭露（2026-11-11 B2；代码层常量，不新增 [prompts] 可配键）──
 #: 过渡窗/拖延中聊到时的低概率自我揭露（由 replyer extra_prompt 追加）。
 #: 口径：只当随口一提，不报时长/参数、不汇报日程；是否说由掷骰与去重决定。
-#: 占位符：无。
+#: 占位符：{bot_name}。
 TRANSITION_CONFESSION_LINE_DEFAULT = (
-    "（可以顺口带一句：刚才本来要开始了，结果又发了会儿呆、缓了几分钟才切过去。"
+    "（{bot_name}可以顺口带一句：刚才本来要开始了，结果又发了会儿呆、缓了几分钟才切过去。"
     "只当随口一提，不要说具体等了多久，也不要把它说成日程安排。）"
 )
 
 # ── F4 社交边界（2026-11-11 B3；代码层常量，不新增 [prompts] 可配键）──
 #: 群状态行·深工（只陈述状态，不命令；是否回复由 planner 判断）。
-#: 占位符：{activity}
+#: 占位符：{bot_name} / {activity}
 BOUNDARY_GROUP_DEEP_WORK_LINE_DEFAULT = (
-    "【此刻】你正在专注{activity}；这条群消息没有点你名。"
-    "回不回、什么时候回由你判断。"
+    "【此刻】{bot_name}正在专注{activity}；这条群消息没有点{bot_name}名。"
+    "回不回、什么时候回由{bot_name}判断。"
 )
 #: 群状态行·睡眠（保留现行短/慢/软口径，不要求「不要回」；吵醒记账仍由原链路负责）。
-#: 占位符：无。
+#: 占位符：{bot_name}。
 BOUNDARY_GROUP_ASLEEP_LINE_DEFAULT = (
-    "【此刻】你已经睡下了；这条把你吵醒了一点。按你的习惯，"
+    "【此刻】{bot_name}已经睡下了；这条把{bot_name}吵醒了一点。按{bot_name}的习惯，"
     "可以很短、很慢地回一句，也可以先不理；会不会算吵醒按原来的记账。"
 )
 #: wait 工具能力提示（只给 seconds；不写 until，兼容宿主 1.3.16）。
-#: 占位符：{seconds}
+#: 占位符：{bot_name} / {seconds}
 BOUNDARY_WAIT_HINT_DEFAULT = (
-    "【等待提示】想晚点回的话，可以用 wait 工具先把这轮停一下："
+    "【等待提示】想晚点回的话，{bot_name}可以用 wait 工具先把这轮停一下："
     "只填 seconds（{seconds} 左右），等手上的事告一段落再回来。"
 )
 #: 碎片化提示（首期只建议、不做真分段）。
+#: 占位符：{bot_name}
 BOUNDARY_FRAGMENT_HINT_DEFAULT = (
-    "【回复节奏】这轮可以拆成两三条很短的消息，中间自然停顿；不必一次说完。"
+    "【回复节奏】这轮{bot_name}可以拆成两三条很短的消息，中间自然停顿；不必一次说完。"
 )
 #: 「只回一个语气词/一句」提示。
+#: 占位符：{bot_name}
 BOUNDARY_SHORT_REPLY_HINT_DEFAULT = (
-    "【回复节奏】这轮可以只回一个语气词或一句短话，不展开。"
+    "【回复节奏】这轮{bot_name}可以只回一个语气词或一句短话，不展开。"
 )
 #: 极端状态语气·拒绝（高压；可拒绝本轮深入，不承诺账本）。
+#: 占位符：{bot_name}
 BOUNDARY_TONE_REFUSAL_DEFAULT = (
-    "此刻你不太想继续深入，也有一点被推着走的感觉：可以坦白说这轮不想聊深、"
+    "{bot_name}此刻不太想继续深入，也有一点被推着走的感觉：{bot_name}可以坦白说这轮不想聊深、"
     "想晚点再说，或者只回很短的一句；不用硬撑，也不用迎合。"
 )
 #: 极端状态语气·脆弱（低精力/低 mental_state；可以泄气、可以承认撑不住）。
+#: 占位符：{bot_name}
 BOUNDARY_TONE_VULNERABLE_DEFAULT = (
-    "此刻你有点撑不住，情绪是往下沉的：可以说一句泄气的话、承认自己现在状态不好，"
-    "也可以说想先缓一缓；不用装作没事，也不用把话说满。"
+    "{bot_name}此刻有点撑不住，情绪是往下沉的：{bot_name}可以说一句泄气的话、"
+    "承认自己现在状态不好，也可以说想先缓一缓；不用装作没事，也不用把话说满。"
 )
 #: 人设底线（所有极端语气分支共用；{harshness} 由人设脾气动态选择，{persona} 回扣人设）。
+#: 占位符：{bot_name} / {harshness} / {persona}
 BOUNDARY_PERSONA_BOTTOM_LINE_DEFAULT = (
-    "人设底线：{harshness}始终扣住你的人设基本设定（{persona}），"
+    "人设底线：{harshness}始终扣住{bot_name}的人设基本设定（{persona}），"
     "可以拒绝、可以脆弱，但不要变成另一个人，也不要把情绪发泄成对对方的攻击。"
 )
 #: 人设不暴躁时的硬底线：禁止人身攻击/贬低/羞辱/威胁。
@@ -282,53 +295,58 @@ BOUNDARY_PERSONA_HARSHNESS_STRICT = (
 )
 #: 人设本就暴躁/毒舌时的口径：允许更冲，但仍须扣住人设、不得成为纯粹辱骂。
 BOUNDARY_PERSONA_HARSHNESS_ALLOWED = (
-    "你的人设本就带脾气，可以按人设更冲、更直接、更刻薄一点；"
+    "人设本就带脾气，可以按人设更冲、更直接、更刻薄一点；"
     "但不要脱离人设变成纯粹的辱骂，也不要攻击与当前情绪无关的人。"
 )
 
-#: replyer 状态注入模板（占位符：{state_line} / {energy} / {next_line}；{next_line} 为空时整行省略）
+#: replyer 状态注入模板（占位符：{bot_name} / {state_line} / {energy} / {next_line}；
+#: {next_line} 为空时整行省略）
 INJECT_REPLYER_STATUS_DEFAULT = (
-    "【角色当前状态】\n{state_line}\n身体与精神状态：{energy}。\n{next_line}"
-    "注意：不要主动提及；仅在用户问到 / 强相关时自然带过。"
+    "【{bot_name}当前状态】\n{state_line}\n身体与精神状态：{energy}。\n{next_line}"
+    "注意：{bot_name}不要主动提及；仅在对方问到 / 强相关时自然带过。"
 )
 # ── 潜意识状态 / 日结印象（2026-11-11 Gemini 批；代码层文案，不新增 [prompts] 可配键）──
 
 #: replyer 状态注入·潜意识风格模板（2026-11-11 Gemini 批 P2-EXP-1 / 报告 §5.2）。
-#: 占位符：{state_line} / {energy} / {tone_rule} / {next_line}。
+#: 占位符：{bot_name} / {state_line} / {energy} / {tone_rule} / {next_line}。
 #: 口径：状态数据原样保留，只改变表达方式——禁止向用户直接复述状态词，
 #: 状态改为影响语气、句长与节奏；{tone_rule} 由代码按精力/饥饿/心情选择。
 INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT = (
-    "【角色当前状态】\n"
-    "（以下状态只用来决定你说话的语气、句长和节奏：禁止直接复述状态词，"
-    "也不要把状态当成话题汇报给用户；用户直接问起时，用一句生活化的话带过即可。）\n"
+    "【{bot_name}当前状态】\n"
+    "（以下状态只用来决定{bot_name}说话的语气、句长和节奏：禁止直接复述状态词，"
+    "也不要把状态当成话题汇报给对方；对方直接问起时，用一句生活化的话带过即可。）\n"
     "{state_line}\n"
     "身体与精神状态：{energy}。\n"
     "{tone_rule}\n"
     "{next_line}"
-    "注意：状态只影响语感，不要主动提及本提示；除非用户直接问起，"
+    "注意：状态只影响{bot_name}的语感，不要主动提及本提示；除非对方直接问起，"
     "否则不要把上面的状态词说出口。"
 )
-#: 潜意识语气分支·疲惫（占位符：无；精力低 / 社交电量低）
+#: 潜意识语气分支·疲惫（占位符：{bot_name}；精力低 / 社交电量低）
 SUBCONSCIOUS_TONE_TIRED_DEFAULT = (
-    "此刻很疲惫：回复收缩到 1~2 句短句，可以断句、可以用省略号收尾，"
+    "{bot_name}此刻很疲惫：回复收缩到 1~2 句短句，可以断句、可以用省略号收尾，"
     "不展开长篇大论，也不主动开长话题。"
 )
-#: 潜意识语气分支·饥饿（占位符：无；饥饿值高）
+#: 潜意识语气分支·饥饿（占位符：{bot_name}；饥饿值高）。
+#: 2026-11-11 状态注入提示词批：纯语感，不提供「想吃什么/翻冰箱」等内容邀请，
+#: 明确不主动提饿；只允许在对方问起时自然带过（内容邀请会压过上层「不复述状态」禁令）。
 SUBCONSCIOUS_TONE_HUNGRY_DEFAULT = (
-    "此刻有点饿：可以在话缝里随口带一句食欲（比如想吃点什么、想去翻冰箱），"
-    "像顺口一提，不要专门汇报。"
+    "{bot_name}此刻有点饿：这种饥饿只影响{bot_name}的语气——回复可以略慵懒、注意力略散，"
+    "但不主动提饿；对方问起才自然带过，不要专门汇报。"
 )
-#: 潜意识语气分支·开心（占位符：无；精力高 / 情绪效价高）
+#: 潜意识语气分支·开心（占位符：{bot_name}；精力高 / 情绪效价高）
 SUBCONSCIOUS_TONE_HAPPY_DEFAULT = (
-    "此刻心情轻快、有倾诉欲：语气活泼，可以自然地多说一两句，"
+    "{bot_name}此刻心情轻快、有倾诉欲：语气活泼，可以自然地多说一两句，"
     "愿意主动接话或反问一个小问题。"
 )
-#: 潜意识语气分支·平稳（占位符：无；没有显著状态）
+#: 潜意识语气分支·平稳（占位符：{bot_name}；没有显著状态）
 SUBCONSCIOUS_TONE_STEADY_DEFAULT = (
-    "此刻状态平稳：正常语气即可，不需要特意表现或说明状态。"
+    "{bot_name}此刻状态平稳：正常语气即可，不需要特意表现或说明状态。"
 )
-#: 日程实况状态行·潜意识注记（代码层追加在状态行尾；不新增可配键）
-SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT = "（只用于调整语气与篇幅；不要直接复述这些状态词）"
+#: 日程实况状态行·潜意识注记（占位符：{bot_name}；代码层追加在状态行尾；不新增可配键）
+SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT = (
+    "（只用于调整{bot_name}的语气与篇幅；不要直接复述这些状态词）"
+)
 
 #: 日结印象·活跃标题（companion 记忆行同文案；注入前折叠时按此重建）
 IMPRESSION_TITLE_ACTIVE_DEFAULT = "【最近印象】"
@@ -337,10 +355,10 @@ IMPRESSION_TITLE_FOLDED_DEFAULT = "【旧日印象·已翻篇（仅存档，不�
 #: 日结印象·单条翻篇标记
 IMPRESSION_FOLDED_MARK_DEFAULT = "[已翻篇]"
 
-#: replyer 状态行模板（占位符：{activity} / {description} / {remaining_hint}）
-INJECT_REPLYER_STATE_LINE_DEFAULT = "你现在正在 {activity}（{description}）{remaining_hint}。"
-#: replyer 下一条活动行（占位符：{time} / {name}；留空 = 不输出该行）
-INJECT_REPLYER_NEXT_LINE_DEFAULT = "接下来 {time} 要 {name}。\n"
+#: replyer 状态行模板（占位符：{bot_name} / {activity} / {description} / {remaining_hint}）
+INJECT_REPLYER_STATE_LINE_DEFAULT = "{bot_name}现在正在 {activity}（{description}）{remaining_hint}。"
+#: replyer 下一条活动行（占位符：{bot_name} / {time} / {name}；留空 = 不输出该行）
+INJECT_REPLYER_NEXT_LINE_DEFAULT = "{bot_name}接下来 {time} 要 {name}。\n"
 #: 日期/节假日头部模板（占位符：{date} / {weekday} / {holiday}）——注在日程块头部
 INJECT_DATE_HEADER_DEFAULT = "\n【当前日期】今天是 {date}（星期{weekday}），{holiday}。"
 

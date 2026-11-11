@@ -67,8 +67,8 @@ ADDRESS_LOOKBACK_SECONDS = 120.0
 #: 进程内跟踪流上限（有界；LRU 淘汰最旧）。
 MAX_TRACKED_STREAMS = 256
 
-#: 无 ``[experimental]`` 段时的人设兜底锚点。
-PERSONA_ANCHOR_FALLBACK = "按你原本的人设"
+#: 无 ``[experimental]`` 段时的人设兜底锚点（明确主语由外层 bot_name 承担，不用泛用「你」）。
+PERSONA_ANCHOR_FALLBACK = "按原本的人设"
 
 #: 回复侧沿用「被点名」结构化字段（宿主/兼容面）。
 _ADDRESS_FLAG_KEYS = frozenset({
@@ -212,12 +212,13 @@ def persona_is_hot_tempered(text: Any) -> bool:
     return any(marker in body for marker in HOT_TEMPER_MARKERS)
 
 
-def compose_persona_bottom_line(persona: Any) -> str:
+def compose_persona_bottom_line(persona: Any, bot_name: Any = "麦麦") -> str:
     """拼人设底线：{harshness} 按人设脾气动态选择，{persona} 回扣人设基本设定。"""
     body = str(persona or "")
     harshness = (BOUNDARY_PERSONA_HARSHNESS_ALLOWED if persona_is_hot_tempered(body)
                  else BOUNDARY_PERSONA_HARSHNESS_STRICT)
     return BOUNDARY_PERSONA_BOTTOM_LINE_DEFAULT.format(
+        bot_name=str(bot_name or "").strip() or "麦麦",
         harshness=harshness, persona=persona_anchor(body))
 
 
@@ -435,6 +436,11 @@ class BoundaryService:
         except Exception:
             return time.time()
 
+    def _bot_name(self) -> str:
+        """宿主 bot 名（注入文案主语占位；与 ``_bot_names`` 同源，空则回退出厂名）。"""
+        names = self._bot_names()
+        return names[0] if names else "麦麦"
+
     def _bot_names(self) -> Tuple[str, ...]:
         names = [str(getattr(self._plugin, "_lover_name", "") or ""),
                  str(getattr(self._plugin, "_bot_name", "") or ""), "麦麦"]
@@ -537,11 +543,13 @@ class BoundaryService:
                     return ""
                 state["last_group_line_at"] = stamp
             if facts.asleep or facts.napping:
-                line = BOUNDARY_GROUP_ASLEEP_LINE_DEFAULT
+                line = BOUNDARY_GROUP_ASLEEP_LINE_DEFAULT.format(
+                    bot_name=self._bot_name())
                 kind = "asleep"
             else:
                 name = facts.activity_name or "手头的事"
-                line = BOUNDARY_GROUP_DEEP_WORK_LINE_DEFAULT.format(activity=name)
+                line = BOUNDARY_GROUP_DEEP_WORK_LINE_DEFAULT.format(
+                    bot_name=self._bot_name(), activity=name)
                 kind = "deep_work"
             self._decision("group_line", kind=kind, stream=sid)
             return line
@@ -601,7 +609,8 @@ class BoundaryService:
                 seconds = int(rng.randint(low, high))
                 state["last_wait_hint_at"] = stamp
             self._decision("wait_hint", seconds=seconds, stream=sid)
-            return BOUNDARY_WAIT_HINT_DEFAULT.format(seconds=seconds)
+            return BOUNDARY_WAIT_HINT_DEFAULT.format(
+                bot_name=self._bot_name(), seconds=seconds)
         except Exception:
             return ""
 
@@ -626,7 +635,8 @@ class BoundaryService:
             if facts is None or not (facts.exhausted or facts.high_stress):
                 return ""
             tone = (BOUNDARY_TONE_REFUSAL_DEFAULT if facts.high_stress
-                    else BOUNDARY_TONE_VULNERABLE_DEFAULT)
+                    else BOUNDARY_TONE_VULNERABLE_DEFAULT).format(
+                        bot_name=self._bot_name())
             kind = "refusal" if facts.high_stress else "vulnerable"
             self._decision(
                 "tone", kind=kind, stream=sid,
@@ -634,7 +644,8 @@ class BoundaryService:
                 mental_state=facts.mental_state,
                 hot_tempered=facts.persona_hot_tempered,
             )
-            text = compose_persona_bottom_line(persona_text(self._plugin))
+            text = compose_persona_bottom_line(
+                persona_text(self._plugin), bot_name=self._bot_name())
             return f"{tone}\n{text}"
         except Exception:
             return ""
@@ -659,9 +670,11 @@ class BoundaryService:
             rng = random.Random(f"{sid}|{int(stamp // 60)}|boundary_rhythm")
             out: List[str] = []
             if rng.random() < fragment_p:
-                out.append(BOUNDARY_FRAGMENT_HINT_DEFAULT)
+                out.append(BOUNDARY_FRAGMENT_HINT_DEFAULT.format(
+                    bot_name=self._bot_name()))
             if rng.random() < short_p:
-                out.append(BOUNDARY_SHORT_REPLY_HINT_DEFAULT)
+                out.append(BOUNDARY_SHORT_REPLY_HINT_DEFAULT.format(
+                    bot_name=self._bot_name()))
             return out
         except Exception:
             return []

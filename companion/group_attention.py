@@ -231,6 +231,12 @@ class GroupAttentionService:
     # ------------------------------------------------------------------
     # 配置读取（全部读 pydantic 配置对象，零文件 IO；缺失回退内置默认）
     # ------------------------------------------------------------------
+    def _bot_name(self) -> str:
+        """宿主 bot 名（注入文案明确主语用；与 boundary/_lover_name 同源兜底）。"""
+        return (str(getattr(self._plugin, "_lover_name", "") or "").strip()
+                or str(getattr(self._plugin, "_bot_name", "") or "").strip()
+                or "麦麦")
+
     def _section(self) -> Any:
         config = getattr(self._plugin, "config", None)
         return getattr(config, "experimental", None)
@@ -585,11 +591,13 @@ class GroupAttentionService:
                     break
         if mismatch_ratio >= 0.5 and topic:
             line = GROUP_ATTENTION_HINT_TOPIC_DEFAULT.format(
-                topic=topic, minutes=minutes)
+                bot_name=self._bot_name(), topic=topic, minutes=minutes)
         elif mismatch_ratio >= 0.5:
-            line = GROUP_ATTENTION_HINT_MISMATCH_DEFAULT.format(minutes=minutes)
+            line = GROUP_ATTENTION_HINT_MISMATCH_DEFAULT.format(
+                bot_name=self._bot_name(), minutes=minutes)
         else:
-            line = GROUP_ATTENTION_HINT_QUIET_DEFAULT.format(minutes=minutes)
+            line = GROUP_ATTENTION_HINT_QUIET_DEFAULT.format(
+                bot_name=self._bot_name(), minutes=minutes)
         self._decision("hint", reason="group_attention.hint", stream=sid,
                        multiplier=round(float(state.get("multiplier") or 1.0), 4))
         return line

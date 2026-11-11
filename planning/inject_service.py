@@ -88,13 +88,20 @@ from suite_prompts import (
     IMPRESSION_TITLE_FOLDED_DEFAULT,
     INJECT_DATE_HEADER_DEFAULT,
     INJECT_HINT_CONTINUE_DEFAULT,
+    INJECT_HINT_CURRENT_DEFAULT,
     INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT,
+    INJECT_HINT_FUTURE_DEFAULT,
+    INJECT_HINT_IDLE_DEFAULT,
+    INJECT_HINT_PROACTIVE_DEFAULT,
+    INJECT_NO_ACTIVITY_DEFAULT,
     INJECT_REPLYER_NEXT_LINE_DEFAULT,
     INJECT_REPLYER_STATE_LINE_DEFAULT,
     INJECT_REPLYER_STATUS_DEFAULT,
     INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
     INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
     INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
+    INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT,
+    INJECT_SCHEDULE_HEADER_DEFAULT,
     SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT,
     SUBCONSCIOUS_TONE_HAPPY_DEFAULT,
     TRANSITION_CONFESSION_LINE_DEFAULT,
@@ -115,13 +122,13 @@ _ATTENTION_MODE_TEXT = {
 }
 
 #: 复核 P1-9：主动分享回合的运行时豁免——只追加在本次注入文本末尾，不新增
-#: ``[prompts]`` 可配键（schema 18 段 202 叶子不变）。
+#: ``[prompts]`` 可配键（schema 不变）。占位符：{bot_name}。
 _INJECT_PROACTIVE_SHARE_HINT = (
-    "（本轮是你主动分享近况/视频的回合：可以自然说出要分享的内容；"
+    "（本轮是{bot_name}主动分享近况/视频的回合：{bot_name}可以自然说出要分享的内容；"
     "上面『不主动提日程 / 刚完成的事』只约束背景信息，不限制本轮分享动机。）"
 )
 _INJECT_PROACTIVE_SHARE_REPLYER = (
-    "（本轮是你主动开口的回合：可以自然说出本轮想分享/想说的内容；"
+    "（本轮是{bot_name}主动开口的回合：{bot_name}可以自然说出本轮想分享/想说的内容；"
     "上面的『不要主动提及』只约束日程背景，不限制本轮主动动机。）"
 )
 _PROACTIVE_SHARE_KINDS = frozenset({"video_share", "surf_chitchat"})
@@ -376,7 +383,11 @@ class InjectService:
             return ""
         if not hit:
             return ""
-        return TRANSITION_CONFESSION_LINE_DEFAULT
+        return render(
+            TRANSITION_CONFESSION_LINE_DEFAULT,
+            fallback=TRANSITION_CONFESSION_LINE_DEFAULT,
+            bot_name=self._bot_name(),
+        )
 
     @staticmethod
     def _is_schedule_query_intent(intent: "UserIntent") -> bool:
@@ -558,7 +569,10 @@ class InjectService:
             if proactive_share:
                 # 复核 P1-9：分享/主动开口轮给「不要主动提及」一句运行时豁免，
                 # 避免状态块与 replyer 改写文案（想念/视频分享）互相抵消。
-                activity_prompt = f"{activity_prompt}\n{_INJECT_PROACTIVE_SHARE_REPLYER}"
+                activity_prompt = (
+                    f"{activity_prompt}\n"
+                    f"{render(_INJECT_PROACTIVE_SHARE_REPLYER, fallback=_INJECT_PROACTIVE_SHARE_REPLYER, bot_name=self._bot_name())}"
+                )
 
             if self._inject_optimizer is not None:
                 self._inject_optimizer.record_injection(
@@ -686,11 +700,13 @@ class InjectService:
                     all_future_activities = life_ov["future"]
                 remaining_override = life_ov["remaining"]
                 life_lines = self._life_block_lines(
-                    life_view, life_ov, subconscious=self._state_subconscious_style())
+                    life_view, life_ov, subconscious=self._state_subconscious_style(),
+                    bot_name=self._bot_name())
                 if live_gate_enabled:
                     life_lines_slim = self._life_block_lines(
                         life_view, life_ov, slim=True,
-                        subconscious=self._state_subconscious_style())
+                        subconscious=self._state_subconscious_style(),
+                        bot_name=self._bot_name())
 
             # 无当前活动不再静默早退（N1-2）：照常走「分类 → 决策 → 模板路由」，
             # 模板侧自动切到空活动变体（兜底文案 = suite_prompts 内部键 inject_no_activity）。
@@ -1259,6 +1275,7 @@ class InjectService:
         if remaining_minutes is not None and 0 < remaining_minutes <= 15:
             remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
 
+        bot_name = self._bot_name()
         if not current_activity:
             # P1：引擎确认已睡即使 episode 缺失也表达睡眠中，不降为「空闲」兜底文案。
             engine0 = getattr(self._plugin, "_sleep_engine", None)
@@ -1267,7 +1284,7 @@ class InjectService:
             except Exception:
                 asleep0 = None
             if asleep0 is True:
-                current_line = ("你现在已经入睡（睡眠中）；收到消息可自然短回复，"
+                current_line = (f"{bot_name}现在已经入睡（睡眠中）；收到消息可自然短回复，"
                                 "不要声称正在活动、待机或正准备睡。")
             else:
                 # 空活动变体：兜底文案（内部键恒返非空默认，无「显式关空」路径）
@@ -1276,6 +1293,7 @@ class InjectService:
             current_line = render(
                 prompt(self._plugin, "inject_schedule_current_line"),
                 fallback=INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
+                bot_name=bot_name,
                 activity=current_activity, description=current_description,
                 remaining_hint=remaining_hint,
             )
@@ -1284,6 +1302,7 @@ class InjectService:
             current_line = render(
                 prompt(self._plugin, "inject_schedule_current_line"),
                 fallback=INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
+                bot_name=bot_name,
                 activity=current_activity, description="", remaining_hint=remaining_hint,
             )
             current_line = current_line.replace("（）", "").replace("()", "").strip()
@@ -1307,21 +1326,33 @@ class InjectService:
                 current_line += f"（{cue}）"
 
         lines: List[str] = [
-            prompt(self._plugin, "inject_schedule_header"),
+            render(
+                prompt(self._plugin, "inject_schedule_header"),
+                fallback=INJECT_SCHEDULE_HEADER_DEFAULT,
+                bot_name=bot_name,
+            ),
             current_line,
         ]
         # 3.17.29（复核 VAD-4.2/P1-11）：日程块不再重复注入心情行——planner 的
         # 情绪底色由 emotion Hook 统一承载（injection_enabled 开关同源），日程块
         # 只负责日程事实。原实现另走 mood_text 摘要（含百分比）且绕过注入开关。
         if intent == UserIntent.QUERY_FUTURE and future_activities and max_show > 0:
-            lines.append(prompt(self._plugin, "inject_schedule_future_title"))
+            lines.append(render(
+                prompt(self._plugin, "inject_schedule_future_title"),
+                fallback=INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT,
+                bot_name=bot_name,
+            ))
             for time_str, name in future_activities[:max_show]:
                 lines.append(render(
                     prompt(self._plugin, "inject_schedule_future_line"),
                     fallback=INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
                     time=time_str, name=name,
                 ))
-            lines.extend(["", prompt(self._plugin, "inject_hint_future")])
+            lines.extend(["", render(
+                prompt(self._plugin, "inject_hint_future"),
+                fallback=INJECT_HINT_FUTURE_DEFAULT,
+                bot_name=bot_name,
+            )])
         elif intent == UserIntent.QUERY_CURRENT:
             if future_activities and max_show > 0:
                 time_str, name = future_activities[0]
@@ -1330,27 +1361,48 @@ class InjectService:
                     fallback=INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
                     time=time_str, name=name,
                 ).strip()
-                lines.append(f"接下来：{line}")
+                lines.append(f"{bot_name}接下来：{line}")
             if self._state_subconscious_style():
                 # 潜意识风格：问当前只如实说活动，状态用语气体现、不逐项汇报
-                current_hint = INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT
+                current_hint = render(
+                    INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT,
+                    fallback=INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT,
+                    bot_name=bot_name,
+                )
             else:
-                current_hint = prompt(self._plugin, "inject_hint_current")
+                current_hint = render(
+                    prompt(self._plugin, "inject_hint_current"),
+                    fallback=INJECT_HINT_CURRENT_DEFAULT,
+                    bot_name=bot_name,
+                )
             lines.extend(["", current_hint])
         else:
             if context_continue_inject:
                 lines.extend(["", render(
                     prompt(self._plugin, "inject_hint_continue"),
                     fallback=INJECT_HINT_CONTINUE_DEFAULT,
+                    bot_name=bot_name,
                     reason=context_reason or "",
                 )])
             elif proactive_hit:
-                lines.extend(["", prompt(self._plugin, "inject_hint_proactive")])
+                lines.extend(["", render(
+                    prompt(self._plugin, "inject_hint_proactive"),
+                    fallback=INJECT_HINT_PROACTIVE_DEFAULT,
+                    bot_name=bot_name,
+                )])
             else:
-                lines.extend(["", prompt(self._plugin, "inject_hint_idle")])
+                lines.extend(["", render(
+                    prompt(self._plugin, "inject_hint_idle"),
+                    fallback=INJECT_HINT_IDLE_DEFAULT,
+                    bot_name=bot_name,
+                )])
             if proactive_share:
                 # 复核 P1-9：主动分享轮追加运行时豁免（代码层，不改模板/schema）。
-                lines.append(_INJECT_PROACTIVE_SHARE_HINT)
+                lines.append(render(
+                    _INJECT_PROACTIVE_SHARE_HINT,
+                    fallback=_INJECT_PROACTIVE_SHARE_HINT,
+                    bot_name=bot_name,
+                ))
 
         lines.extend(["", "---", ""])
         # R7 runtime 实况追加行（runtime 视图就绪时由调用方传入；未就绪 → None
@@ -1364,9 +1416,23 @@ class InjectService:
             lines.extend(life_lines)
         return "\n".join(lines)
 
+    def _bot_name(self) -> str:
+        """宿主 bot 名（注入文案明确主语/标题占位用）。
+
+        读数路径与 bpp/视频兴趣的 ``name_provider`` 一致：宿主 ``ctx.config.get(
+        "bot.nickname")`` 由 ``plugin._refresh_persona`` 缓存到 ``_lover_name``
+        （plugin.py:3382-3388）；注入钩子为同步路径，读该缓存值而不是再走异步
+        ctx 接口。取不到时回退插件出厂名「麦麦」（与 ``_refresh_persona`` 兜底一致）。
+        """
+        return str(getattr(self._plugin, "_lover_name", "") or "").strip() or "麦麦"
+
     def _no_activity_text(self) -> str:
-        """无当前活动的固定上下文，不接受配置覆盖。"""
-        return prompt(self._plugin, "inject_no_activity")
+        """无当前活动的固定上下文，不接受配置覆盖；主语占位填宿主 bot 名。"""
+        return render(
+            prompt(self._plugin, "inject_no_activity"),
+            fallback=INJECT_NO_ACTIVITY_DEFAULT,
+            bot_name=self._bot_name(),
+        )
 
     # ------------------------------------------------------------
     # 状态潜意识化（2026-11-11 Gemini 批 P2-EXP-1 / 报告 §5.2）
@@ -1503,6 +1569,7 @@ class InjectService:
         state_line = render(
             prompt(self._plugin, "inject_replyer_state_line"),
             fallback=INJECT_REPLYER_STATE_LINE_DEFAULT,
+            bot_name=self._bot_name(),
             activity=current_activity,
             description=description if (enable_detailed and description) else "",
             remaining_hint=remaining_hint,
@@ -1571,12 +1638,13 @@ class InjectService:
         2026-11-11（Gemini 批 P2-EXP-1 / §5.2）：``state_subconscious_style``
         开（默认）→ 走潜意识模板：状态数据原样保留，但明确禁止直接复述状态词，
         改由 ``{tone_rule}`` 约束语气/句长（疲惫→短句/省略号、开心→轻快多句、
-        饥饿→随口提食欲）；关 → 旧模板逐字不变。
+        饥饿→纯语感：略慵懒/注意力略散、不主动提饿）；关 → 旧模板逐字不变。
 
         F4（B3）：默认关时下方两处均短路，返回值与加入前逐字一致；开启且为目标
         私聊时，``{tone_rule}`` 可切极端状态分支，并按概率追加节奏提示行。
         """
         energy_desc = self._replyer_energy_desc()
+        bot_name = self._bot_name()
 
         next_line = ""
         if future_activities:
@@ -1584,20 +1652,27 @@ class InjectService:
             next_line = render(
                 prompt(self._plugin, "inject_replyer_next_line"),
                 fallback=INJECT_REPLYER_NEXT_LINE_DEFAULT,
+                bot_name=bot_name,
                 time=time_str, name=name,
             )
         if self._state_subconscious_style():
             # 内部固定模板（不新增用户 schema 键）：数据原样保留，口径改为语气约束
+            tone_rule = self._subconscious_tone_rule(session_id)
+            if tone_rule:
+                # 语气分支带 {bot_name} 占位（极端分支已在 boundary 内渲染，重复渲染无副作用）
+                tone_rule = render(tone_rule, fallback=tone_rule, bot_name=bot_name)
             text = render(
                 INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
                 fallback=INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
+                bot_name=bot_name,
                 state_line=state_line, energy=energy_desc,
-                tone_rule=self._subconscious_tone_rule(session_id), next_line=next_line,
+                tone_rule=tone_rule, next_line=next_line,
             )
         else:
             text = render(
                 prompt(self._plugin, "inject_replyer_status"),
                 fallback=INJECT_REPLYER_STATUS_DEFAULT,
+                bot_name=bot_name,
                 state_line=state_line, energy=energy_desc, next_line=next_line,
             )
         hints = self._boundary_reply_hints(session_id)
@@ -1891,7 +1966,8 @@ class InjectService:
     def _life_block_lines(view: Optional[Dict[str, Any]],
                           override: Optional[Dict[str, Any]],
                           slim: bool = False,
-                          subconscious: bool = False) -> List[str]:
+                          subconscious: bool = False,
+                          bot_name: str = "麦麦") -> List[str]:
         """runtime 实况追加行（主设计 §3.3 注入清单；零 emoji）。
 
         current（名称/已进行/进度/注意力/剩余）+ next ≤2 + 状态行 + recent ≤2
@@ -1966,12 +2042,16 @@ class InjectService:
                 mark = "（打算）"
             nxt_parts.append(f"{format_day_minute(start)} {item_name}{mark}")
         if nxt_parts:
-            lines.append("接下来：" + "；".join(nxt_parts))
+            lines.append(f"{bot_name}接下来：" + "；".join(nxt_parts))
         state_line = str(view.get("state_line") or "").strip()
         if state_line:
             if subconscious:
-                # 内部键（不接受配置覆盖），直接取出厂文案，保持 staticmethod 无 plugin 依赖
-                state_line += SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT
+                # 内部键（不接受配置覆盖），直接取出厂文案并填宿主 bot 名
+                state_line += render(
+                    SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT,
+                    fallback=SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT,
+                    bot_name=bot_name,
+                )
             lines.append(state_line)
         for row in (view.get("completed") or [])[-2:]:
             if not isinstance(row, dict):

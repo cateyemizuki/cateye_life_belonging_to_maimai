@@ -94,6 +94,7 @@ from planning.schedule_query import SKIP_TYPES as _SCHEDULE_SKIP_TYPES
 from planning.time_utils import DAY_MINUTES, format_day_minute
 from suite_prompts import (
     INJECT_AFFECTION_BLOCK_DEFAULT,
+    INJECT_PROACTIVE_TURN_RULE_DEFAULT,
     prompt,
     render,
 )
@@ -1727,7 +1728,11 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             return ""
         if (datetime.now() - last_trigger).total_seconds() > _PROACTIVE_RULE_WINDOW_SECONDS:
             return ""
-        return prompt(self.config, "inject_proactive_turn_rule")
+        return render(
+            prompt(self.config, "inject_proactive_turn_rule"),
+            fallback=INJECT_PROACTIVE_TURN_RULE_DEFAULT,
+            bot_name=self._mai_lover_name(),
+        )
 
     # ==================================================================
     # Tools
