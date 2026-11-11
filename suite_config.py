@@ -340,7 +340,12 @@ from suite_prompts import (
 # 本批新增种子只读内存合并、reload 识别新增/删除、文案逐字保真）；D1 新增
 # [planning_events] 段 3 键（watch_bili/browse_qq 独立权重乘数、视频分享陪伴
 # 目标概率），默认全 1.0 保证零行为变化，按 R6 双号同步递增。
-SUPPORTED_CONFIG_VERSION = "3.17.33"
+# 3.17.34（2026-11-11 结构性延后项 + 联动 + 提示词质量批）：F1 群注意力衰减、
+# F3 转场拖延、F4 社交边界、B4 bpp 认领让位/群社交电量集中新增置顶 [experimental]
+# 段（41 键，实验期默认全关，关闭即回 3.17.33 行为）；状态注入标题改
+# 【{bot_name}当前状态】且主语显式化、饥饿分支去内容邀请只留纯语感。schema
+# 20 段 264 叶子（B1 F1 +10 / B2 F3 +16 / B3 F4 +13 / B4 +2），按 R6 双号同步递增。
+SUPPORTED_CONFIG_VERSION = "3.17.34"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
