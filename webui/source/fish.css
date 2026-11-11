@@ -54,12 +54,11 @@ body.fish-locked{overflow:hidden}
 .fish-meta-row .note{font-size:11px;color:var(--maibot-muted)}
 .fish-fold{margin:12px 0 0;border-top:1px solid var(--maibot-border);padding-top:2px;grid-column:1/-1}
 .fish-fold .fish-changes,.fish-fold.fish-changes{grid-column:auto}
-.fish-fold>summary{cursor:pointer;font-size:13.5px;min-height:38px;padding:9px 2px}
+.fish-fold>.fish-fold-title{font-size:13.5px;min-height:38px;padding:9px 2px;margin:0;color:var(--maibot-primary);font-weight:650}
 .fish-fold .chart{min-height:160px}
 .fish-fold .chart svg{max-height:none}
 .fish-fold .sleepstats{grid-template-columns:1fr 1fr 1fr}
 .fish-fold .sleep-archive{padding:0;border:0}
-.fish-fold .sleep-archive:after{display:none}
 .fish-fold .schedulegrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .fish-fold .schedulegrid>.card{box-shadow:none;border:0;border-radius:0;padding:10px 0}
 @media(max-width:900px){.fish-fold .schedulegrid{grid-template-columns:1fr}}
@@ -76,7 +75,7 @@ body.fish-locked{overflow:hidden}
 .fish-fold .cardtop h2{font-size:13px}
 /* 最近变化：时间 · 字段 前值 → 后值 · 来源 */
 .fish-changes{margin:12px 0 0;border-top:1px solid var(--maibot-border);padding-top:2px}
-.fish-changes>summary{cursor:pointer;font-size:12px;min-height:38px;padding:9px 2px}
+.fish-changes>.fish-fold-title{font-size:12px;min-height:38px;padding:9px 2px;margin:0;color:var(--maibot-muted);font-weight:650}
 .fish-changelist{list-style:none;margin:4px 0 0;padding:0;font-size:13px}
 .fish-changelist li{display:flex;gap:8px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--maibot-border);font-size:13px;flex-wrap:wrap}
 .fish-changelist li:last-child{border:0}
@@ -89,7 +88,6 @@ body.fish-locked{overflow:hidden}
 .fish-meta-row .info-wrap{vertical-align:baseline}
 .fish-popup-body .info-button{min-width:18px;min-height:18px;width:18px;height:18px}
 .fish-popup-body .info-tooltip{font-size:12px}
-.fish-popup-body details[open]>summary{color:var(--maibot-primary)}
 /* U 计划 §4.2：入口不再搬进标题栏——同一元素 portal 悬浮于遮罩之上，占位标记保持
    原屏幕坐标（视觉不搬家）；粘连气泡尾把面板与入口连成一体。 */
 /* 小鱼入口 portal 到遮罩之上时，原位占位标记保持坐标（视觉不搬家）。 */
@@ -103,5 +101,5 @@ body.fish-locked{overflow:hidden}
 [data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.26)}
 @supports not (backdrop-filter:blur(1px)){.fish-overlay:before{background:rgba(242,245,239,.82)}[data-theme=dark] .fish-overlay:before{background:rgba(23,29,26,.86)}}
 @media(max-width:1000px){.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:700px),(hover:none){.section-fish-button{left:-12px;bottom:-8px;width:44px;height:34px;min-height:34px}.fish-peek{width:44px;height:auto;margin:0}.fish-peek>svg{width:44px;transform:rotate(-12deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:var(--maibot-radius,18px)}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px;grid-template-columns:minmax(0,1fr)}.fish-popup-body>*{min-width:0}.fish-fold>summary{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:16px;min-width:16px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
+@media(max-width:700px),(hover:none){.section-fish-button{left:-12px;bottom:-8px;width:44px;height:34px;min-height:34px}.fish-peek{width:44px;height:auto;margin:0}.fish-peek>svg{width:44px;transform:rotate(-12deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:var(--maibot-radius,18px)}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px;grid-template-columns:minmax(0,1fr)}.fish-popup-body>*{min-width:0}.fish-fold>.fish-fold-title{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:16px;min-width:16px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
 @media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:rotate(-12deg)!important}.fish-overlay,.fish-panel{transition:none!important}}

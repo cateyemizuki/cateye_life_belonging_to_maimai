@@ -212,14 +212,14 @@ class VideoWatchService:
         return {"success": False,
                 "error": f"未知 action：{action}（支持 submit/status/result/cancel/next_candidate）"}
 
-    # ---- 父侧结果加工（manager._finish 在落缓存/写历史前 await 本钩子）----
+    # ---- 父侧结果加工（manager._finish 先即时入库，再 await 本钩子回填）----
     def _make_result_hook(self) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
         async def hook(result: Dict[str, Any]) -> Dict[str, Any]:
-            self._check_result_attention(result)
+            # 2026-11-10 不打断：busy/日程只在发起时把关；已完成观看的结果加工
+            # 不再因注意力变化撤销任务或中断（原 _check_result_attention 会
+            # revoke_automatic 并抛错，把已完成任务改判 cancelled）。
             result = await self._maybe_visual_summary(result)
-            self._check_result_attention(result)
             result = await self._maybe_content_description(result)
-            self._check_result_attention(result)
             result = await self._maybe_impression(result)
             return result
         return hook
@@ -482,7 +482,27 @@ class VideoWatchService:
             if manager._store.load_cache(bvid) is None:
                 continue
             video = row.get("video") if isinstance(row.get("video"), dict) else {}
-            out.append({"bvid": bvid, "title": video.get("title") or row.get("title"), "watched_at": watched})
+            first_watched = row.get("first_watched_at")
+            try:
+                first_watched = float(first_watched) if first_watched is not None else watched
+            except (TypeError, ValueError):
+                first_watched = watched
+            finished_at = row.get("finished_at")
+            try:
+                finished_at = float(finished_at) if finished_at is not None else None
+            except (TypeError, ValueError):
+                finished_at = None
+            out.append({
+                "bvid": bvid,
+                "title": video.get("title") or row.get("title"),
+                # 展示/筛选口径：观看时间取任务发起（入队/受理）时刻。
+                "watched_at": watched,
+                "first_watched_at": first_watched,
+                "finished_at": finished_at,
+                # 来源：tool / autonomous_schedule / autonomous_event（旧记录缺失 → 空串，不猜）。
+                "source": str(row.get("source") or ""),
+                "source_kind": str(row.get("source_kind") or ""),
+            })
             if len(out) >= max(1, min(50, limit)):
                 break
         return out
@@ -498,17 +518,17 @@ class VideoWatchService:
             return False
 
     def _check_result_attention(self, result: Dict[str, Any]) -> None:
-        manager = self._manager
-        task = manager._store.get_task(str(result.get("task_id") or "")) if manager else None
-        if task and not self._automatic_task_allowed(task):
-            self.revoke_automatic()
-            raise RuntimeError("自动观看注意力失效，停止后续模型调用")
+        """兼容占位（2026-11-10 不打断）：结果加工不再因忙闲/日程变化撤销任务。"""
+        return None
 
     def task_state(self, task_id: str) -> Dict[str, Any]:
         return self._require_manager().status(task_id)
 
     def revoke_automatic(self) -> int:
-        """Message hooks immediately detach automatic owners; manual owners survive."""
+        """Detach automatic owner references only; running tasks are never cancelled.
+
+        Busy/消息钩子只在“发起”阶段生效；已受理的观看任务继续处理到完成入库。
+        """
         manager = self._manager
         if manager is None:
             return 0
@@ -516,11 +536,11 @@ class VideoWatchService:
         for task in manager._store.load_tasks():
             if manager._store.is_terminal(str(task.get("status"))):
                 continue
-            owners = list(task.get("owners") or [])
-            for owner in owners:
+            for owner in list(task.get("owners") or []):
                 if str(owner).startswith("schedule:"):
-                    manager.cancel(str(task["task_id"]), owner=str(owner))
-                    count += 1
+                    receipt = manager.release_owner(str(task["task_id"]), str(owner))
+                    if receipt.get("released"):
+                        count += 1
         return count
 
     def _config(self) -> Any:

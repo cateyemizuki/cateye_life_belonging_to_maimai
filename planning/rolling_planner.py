@@ -123,7 +123,31 @@ MEAL_REPEAT_GUARD_MINUTES = 180
 SOFT_INTENT_EARLY_MINUTES = 10
 #: P1（2026-11-09 滚动日程计划 §5/§7）：代码内置·模块联动事件——只有装配层登记的
 #: 这两项能触发模块能力；仍走 _maybe_random_event 的转场掷骰+独立日预算路径。
-MODULE_LINKED_EVENT_IDS: Tuple[str, ...] = ("watch_bili", "browse_qq")
+WATCH_BILI_EVENT_ID = "watch_bili"
+MODULE_LINKED_EVENT_IDS: Tuple[str, ...] = (WATCH_BILI_EVENT_ID, "browse_qq")
+#: 自主刷视频（watch_bili）单次行为时长（分钟）：代码侧覆盖内置事件库的
+#: 10–25 分钟抽样，不改 `planning/small_events.py` 事件定义/文案。实际控制
+#: episode 的 planned_end_minute；剩余时段不足下限则本拍不启动（不静默缩到 10）。
+WATCH_BILI_MIN_MINUTES = 25
+WATCH_BILI_MAX_MINUTES = 55
+
+
+def sample_watch_bili_duration(rng: Any, remaining_minutes: Any) -> Optional[int]:
+    """在 25–55 分钟内采样一次刷视频时长；剩余时段不足 25 分钟 → None。
+
+    ``remaining_minutes`` 为当前时段距右边界（08:00/16:00/24:00）的整分钟数；
+    上界按剩余时段夹取（仍落在 25–55 内），不越过时段边界。
+    """
+    try:
+        remaining = int(remaining_minutes)
+    except (TypeError, ValueError):
+        remaining = 0
+    if remaining < WATCH_BILI_MIN_MINUTES:
+        return None
+    upper = min(WATCH_BILI_MAX_MINUTES, remaining)
+    return int(rng.randint(WATCH_BILI_MIN_MINUTES, upper))
+
+
 #: P1 §5.2 来源组平衡：同一来源/用途组内第 k 个候选的递减因子（防 30 个近义 JSON
 #: 项挤满 top3 饿死日意图）；组间基础权重见 EVENT_ORIGIN_PRIORS。
 EVENT_GROUP_PRESENCE_DECAY = 0.85
@@ -137,6 +161,29 @@ IDLE_PENALTY_START_MINUTES = 10.0
 #: 每多待机 5 分钟追加的降权（线性递增，上限 IDLE_PENALTY_MAX）。
 IDLE_PENALTY_PER_5_MIN = 0.15
 IDLE_PENALTY_MAX = 0.9
+#: 2.1（2026-11-11 Gemini 批）：idle 的**对外口径**。内部仍按 idle 调度（kind /
+#: goal_type / profile_key 不变，打分与采样结构零改动），只把写进 episode 的名称与
+#: 抽取原因换成具体生活细节——聊天/详情/预演不再出现「待机」这类系统词。
+IDLE_DISPLAY_DETAILS: Tuple[str, ...] = (
+    "伸了个懒腰", "对着窗外看了一会儿", "放着歌发了会儿呆",
+    "靠在椅背上放空了一会儿", "揉了揉眼睛", "起身走了两步",
+)
+
+
+def idle_display_name(date: Any, minute: Any) -> str:
+    """idle 对外生活细节（确定性映射，2.1）。
+
+    只以 ``date|minute`` 派生独立 ``random.Random`` 种子，**不消耗当日 RNG、
+    不参与打分/采样**，因此同一帧重复调用结果一致、调度轨迹与改动前逐字相同。
+    任何异常回退第一项，绝不阻塞开播。
+    """
+    try:
+        seed = f"{date}|{int(minute)}|idle_display"
+        return IDLE_DISPLAY_DETAILS[random.Random(seed).randrange(len(IDLE_DISPLAY_DETAILS))]
+    except (TypeError, ValueError, IndexError):
+        return IDLE_DISPLAY_DETAILS[0]
+
+
 #: P3 §14.6：偏好只施加给可行软候选（硬约定/生理锚点/睡眠/idle 不参与偏好竞争）。
 PREFERENCE_SOFT_KINDS = frozenset({"intent", "event", "resume", "continuation", "anchor_rest"})
 #: P3 §14.6：普通候选约 10% 受控探索（在合法替代项中；不绕过时间/状态/次数限制）。
@@ -1837,10 +1884,11 @@ class RollingPlanner:
         # （watch_bili/browse_qq）仍走 _maybe_random_event 的模块预算路径，不在此重复。
         candidates.extend(self._event_candidates(date, cur, snapshot))
 
-        # 源 5：idle 待机（永远存在的低优先候选——A.10.1 一等公民）
+        # 源 5：idle 待机（永远存在的低优先候选——A.10.1 一等公民）。
+        # 2.1：内部仍是 idle 候选；名称只作对外口径，写库/聊天/详情看到的是具体生活细节。
         idle_profile = activity_profiles.get_profile("idle")
         candidates.append({
-            "kind": "idle", "name": "待机", "goal_type": "idle",
+            "kind": "idle", "name": idle_display_name(date, cur), "goal_type": "idle",
             "priority_score": PRIORITY_SCORES["low"],
             "min_minutes": 0, "max_minutes": 0,
             "interruptibility": idle_profile.interruptibility,
@@ -1953,7 +2001,11 @@ class RollingPlanner:
             hunger = _as_number(state.get("hunger"), 0.0) or 0.0
             # kind / 状态直译（确定性优先，不走分量比较）
             if kind == "idle":
-                return "没什么特别想做的，先待机"
+                # 2.1：对外口径落到具体生活细节，不再输出「待机」。
+                detail = str(c.get("name") or "").strip()
+                if detail not in IDLE_DISPLAY_DETAILS:
+                    detail = idle_display_name(date, cur)
+                return f"没什么特别想做的，就{detail}"
             if kind in ("resume", "continuation"):
                 return "刚才的事还没做完，接着做"
             if kind == "commitment":
@@ -2799,6 +2851,19 @@ class RollingPlanner:
                         "description": template}
         from .event_slots import time_slot_of, slot_remaining_minutes, event_allowed_in_slot
         _tz = getattr(self._tz, "_tz", None)
+        # 自主刷视频时长（2026-11-10 刷视频批）：真正控制“刷视频行为持续时长”的是
+        # episode 的 duration_minutes（库里 watch_bili 仍是 10–25）。代码侧覆盖为
+        # 25–55 分钟，不修改内置库文件/文案；剩余时段不足下限则本拍如实不启动。
+        if event_key == WATCH_BILI_EVENT_ID:
+            watch_duration = sample_watch_bili_duration(
+                rng, slot_remaining_minutes(now, _tz))
+            if watch_duration is None:
+                return False
+            duration = watch_duration
+            # episode 快照与 planned_end 同口径：库内 watch_bili 的 duration_minutes
+            # 仍是旧值（10–25），不覆盖会让面板/历史显示一个比 episode 实际计划
+            # 时长更短的数，误以为视频几分钟就结束（实际由多支视频续投填满）。
+            metadata["duration_minutes"] = int(watch_duration)
         # 抽选与开始之间可能跨越 08:00/16:00/00:00 或热重载失配：启动前再核一次时段，
         # 一次性 claim 必须在此校验通过后才执行，避免未真正开始就消耗一次性事件。
         if not event_allowed_in_slot(event, time_slot_of(now, _tz)):

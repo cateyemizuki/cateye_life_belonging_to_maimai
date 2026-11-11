@@ -64,8 +64,9 @@ class PublishLedger:
         self.save();return row
     def recent_sent(self,limit: int=5) -> list[dict[str,Any]]:
         """PR-FIXED-CHROME（3.17.15）只读：最近已确认发送的说说（status=sent），
-        按 created_at 降序取≤limit（夹取 1..20）。返回 content 截断 120 字、
-        created_at（epoch 秒）、tid（回执 result.tid，缺失空串）、image_count。
+        按 created_at 降序取≤limit（夹取 1..20）。返回 content 原样（账本落盘时
+        已最多保留 5000 字，展示层不再二次截断）、created_at（epoch 秒）、
+        tid（回执 result.tid，缺失空串）、image_count。
         不改 rows、不落盘、不发起任何空间动作；供娱乐面板「最近动态」展示，
         不含路径/私聊正文。损坏行（created_at 非数值）按 0 排序兜底，不抛。"""
         try:limit=max(1,min(20,int(limit)))
@@ -79,7 +80,7 @@ class PublishLedger:
         for row in sent[:limit]:
             result=row.get('result') if isinstance(row.get('result'),dict) else {}
             images=row.get('image_count')
-            out.append({'content':str(row.get('content',''))[:120],
+            out.append({'content':str(row.get('content') or ''),
                         'created_at':row.get('created_at') if isinstance(row.get('created_at'),(int,float)) else None,
                         'tid':str(result.get('tid','') or ''),
                         'image_count':int(images) if isinstance(images,(int,float)) else 0})

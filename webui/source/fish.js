@@ -245,7 +245,7 @@ const SectionFish=(()=>{
   if(current)close(false);
   clearTimeout(closeTimer);clearTimeout(hoverTimer);overlay.classList.remove('is-closing');
   current=entry;lastTrigger=entry.button;pinnedOpen=pinned;
-  for(const group of entry.groups){if(group.tagName==='DETAILS')group.open=true;details.append(group)}  // 折叠默认展开（0425 目检：详情内不再折叠）
+  for(const group of entry.groups)details.append(group)  // 详情内不再折叠：分组是常显标题+内容
   if(entry.key==='schedule')$('schedule-recovery').before(metadata);
   floatEntry(entry);
   overlay.hidden=false;overlay.dataset.section=entry.key;
@@ -257,6 +257,8 @@ const SectionFish=(()=>{
   if(typeof Mascot!=='undefined')Mascot.setDetailMode(true);
   refresh();
   redraw();
+  // 详情层不再有 summary/toggle；由打开事件通知面板侧的懒加载（如逐笔用量记录）。
+  document.dispatchEvent(new CustomEvent('lbm:detail-open',{detail:{key:entry.key}}));
   requestAnimationFrame(()=>{syncFloat(entry);snapPanel(entry)});
   if(pinned)closeButton.focus({preventScroll:true});    // 悬停预览不抢键盘焦点
  }
@@ -287,7 +289,6 @@ const SectionFish=(()=>{
  });
  overlay.addEventListener('pointerdown',e=>{if(e.target===overlay)e.preventDefault()});
  overlay.addEventListener('click',e=>{if(e.target===overlay)close(true)});
- overlay.addEventListener('toggle',e=>{if(e.target.tagName==='DETAILS'&&e.target.open&&!e.target.closest('#usage-detail'))redraw()},true);
  // 从小麦麦移到气泡正文保持展开；离开连接区域与气泡才延迟收起（未固定时）。
  const previewCloseDelay=()=>{clearTimeout(hoverTimer);hoverTimer=setTimeout(()=>{if(current&&!pinnedOpen)close(false)},160)};
  panel.addEventListener('pointerenter',()=>clearTimeout(hoverTimer));
@@ -301,9 +302,18 @@ const SectionFish=(()=>{
   rows.forEach(([label,value,explanation],i)=>{let row=metadata.children[i];if(!row){row=metadataRow(label,value,explanation);metadata.append(row)}else{row.firstElementChild.firstChild.textContent=label;row.lastElementChild.textContent=value??'暂无记录';const tip=row.querySelector('.info-tooltip');if(tip)tip.textContent=explanation||'暂无说明'}});while(metadata.children.length>rows.length)metadata.lastElementChild.remove();
   renderChanges(e);
  }
- function fold(label,nodes){const list=nodes.filter(Boolean);if(!list.length)return null;let group;
-  if(list.length===1&&list[0].tagName==='DETAILS'){group=list[0];group.open=false}
-  else{group=el('details');group.append(el('summary','',label),...list)}group.classList.add('fish-fold');store.append(group);return group
+ function fold(label,nodes){const list=nodes.filter(Boolean);if(!list.length)return null;
+  // 3.17.33：详情层不再提供折叠——分组改为 section + 常显标题；单个 DETAILS 就地解包，
+  // 保留 .fish-fold 类与 fold(label,[node]) 调用签名（既有样式/构建断言仍可用）。
+  const group=el('section','fish-fold');group.append(el('h3','fish-fold-title',label));
+  for(const node of list){
+   if(node.tagName==='DETAILS'){
+    const content=el('div','fish-fold-body');
+    while(node.firstChild){const child=node.firstChild;node.removeChild(child);if(child.tagName==='SUMMARY')continue;content.append(child)}
+    group.append(content);
+   }else group.append(node);
+  }
+  store.append(group);return group
  }
  function mount(key,titleText,element,summaryFn,metaFn=()=>[],groups=[],gridClasses=[]){if(!element)return;const content=el('div','fish-content');while(element.firstChild)content.append(element.firstChild);for(const cls of gridClasses){element.classList.remove(cls);content.classList.add(cls)}element.append(content);element.classList.add('fish-section');element.dataset.fishSection=key;
   // 详情入口＝板块左下角探头小鱼（必须保留的设计）：点击固定详情气泡，hover 预览，
@@ -312,7 +322,7 @@ const SectionFish=(()=>{
   const allGroups=groups.filter(Boolean);
   const kind=CHANGES_KIND[key];
   let changesList=null;
-  if(kind){const changesGroup=el('details','fish-fold fish-changes');changesList=el('ul','fish-changelist');changesGroup.append(el('summary','','最近变化'),changesList);store.append(changesGroup);allGroups.push(changesGroup)}
+  if(kind){const changesGroup=el('section','fish-fold fish-changes');changesList=el('ul','fish-changelist');changesGroup.append(el('h3','fish-fold-title','最近变化'),changesList);store.append(changesGroup);allGroups.push(changesGroup)}
   entries.set(key,{key,title:titleText,element,content,button,summary:summaryFn,meta:metaFn,groups:allGroups,changesKind:kind,changesList,marker:null,floated:false,home:null});
   // 语义（U 计划 §4.1）：hover 临时预览（不抢焦点/不锁滚动）→ 移入气泡保持 → 点击固定
   // → 再点同入口取消固定并收起 → 点另一入口关闭旧并固定新。触屏/键盘激活=直接打开固定。

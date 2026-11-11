@@ -29,6 +29,21 @@ _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 _MAX_TERMINAL_TASKS = 200
 #: jobs 目录名形态（与 manager 生成的 task_id 同式；防误删任意目录）
 _TASK_ID_RE = re.compile(r"bw-[0-9a-f]{12}")
+#: 观看记忆有界条数（与 append_history 的 500 条口径一致）
+_MAX_HISTORY_ENTRIES = 500
+#: first_watched 跨裁剪映射的容量上限（按 BV 数；淘汰最早的首看记录）
+_MAX_FIRST_WATCHED = 5000
+
+
+def _epoch(value: Any) -> Optional[float]:
+    """宽松 epoch 解析（bool/非数值/非正数 → None）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
@@ -256,19 +271,131 @@ class WatchStore:
         return removed
 
     # ---- 观看记忆 ----
-    def load_history(self) -> List[Dict[str, Any]]:
-        payload = read_json(self._history_path, {"watched": []})
-        watched = payload.get("watched") if isinstance(payload, dict) else None
-        return [w for w in watched if isinstance(w, dict)] if isinstance(watched, list) else []
+    def _first_watched_map(self, watched: List[Dict[str, Any]],
+                           raw: Any = None) -> Dict[str, float]:
+        """按 bvid 汇总首次观看时间（epoch 秒）：历史根映射 ∪ 现存记录的最小值。
 
-    def append_history(self, entry: Dict[str, Any]) -> None:
-        watched = self.load_history()
-        watched.append(entry)
-        # 有界：最多保留 500 条真实观看记录，淘汰最旧（去重与 V2 分享用）
-        if len(watched) > 500:
-            watched = watched[-500:]
+        ``history.json`` 根上的 ``first_watched`` 负责跨 500 条裁剪保留首看；
+        旧文件没有该映射时从现存记录回填。读取不写盘（迁移在下次 append 落盘）。
+        """
+        first: Dict[str, float] = {}
+        if isinstance(raw, dict):
+            for bvid, value in raw.items():
+                key = str(bvid or "")
+                stamp = _epoch(value)
+                if key and stamp is not None:
+                    first[key] = stamp
+        for row in watched:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("bvid") or "")
+            stamp = _epoch(row.get("watched_at"))
+            if key and stamp is not None and (key not in first or stamp < first[key]):
+                first[key] = stamp
+        return first
+
+    def _load_history_doc(self) -> tuple[List[Dict[str, Any]], Dict[str, float]]:
         with self._lock:
-            atomic_write_json(self._history_path, {"watched": watched})
+            payload = read_json(self._history_path, {"watched": []})
+        watched = payload.get("watched") if isinstance(payload, dict) else None
+        rows = [w for w in watched if isinstance(w, dict)] if isinstance(watched, list) else []
+        raw_first = payload.get("first_watched") if isinstance(payload, dict) else None
+        return rows, self._first_watched_map(rows, raw_first)
+
+    def load_history(self) -> List[Dict[str, Any]]:
+        """观看记忆（旧记录在读取时回填 first_watched_at，dashboard 可直接读取）。"""
+        watched, first = self._load_history_doc()
+        for row in watched:
+            bvid = str(row.get("bvid") or "")
+            stamp = first.get(bvid)
+            if stamp is None:
+                stamp = _epoch(row.get("watched_at"))
+            if stamp is None:
+                continue
+            existing = _epoch(row.get("first_watched_at"))
+            if existing is None or stamp < existing:
+                row["first_watched_at"] = stamp
+        return watched
+
+    def append_history(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """追加一条真实观看记录；同一 bvid 的 first_watched_at 永不后移。
+
+        写入在**同一把锁**内完成（读→改→原子落盘），避免并发 append 丢失；
+        根映射 ``first_watched`` 与条目字段同时维护，条目被 500 条上限裁掉后
+        仍保留首看时间。返回实际落盘条目（含补全后的 watched_at/first_watched_at）。
+        """
+        with self._lock:
+            watched, first = self._load_history_doc()
+            row = dict(entry)
+            bvid = str(row.get("bvid") or "")
+            watched_at = _epoch(row.get("watched_at")) or time.time()
+            row["watched_at"] = watched_at
+            if bvid:
+                first_at = first.get(bvid)
+                if first_at is None or watched_at < first_at:
+                    first_at = watched_at
+                row["first_watched_at"] = first_at
+                first[bvid] = first_at
+            watched.append(row)
+            # 有界：最多保留 500 条真实观看记录，淘汰最旧（去重与 V2 分享用）
+            if len(watched) > _MAX_HISTORY_ENTRIES:
+                watched = watched[-_MAX_HISTORY_ENTRIES:]
+            if len(first) > _MAX_FIRST_WATCHED:
+                keep = sorted(first.items(), key=lambda item: item[1], reverse=True)[
+                    :_MAX_FIRST_WATCHED]
+                first = dict(keep)
+            atomic_write_json(self._history_path,
+                              {"watched": watched, "first_watched": first})
+            return row
+
+    def remove_history(self, task_id: str) -> bool:
+        """移除指定任务的历史条目（显式取消发生在即时入库之后时回滚）。"""
+        target = str(task_id or "")
+        if not target:
+            return False
+        with self._lock:
+            watched, first = self._load_history_doc()
+            removed = [row for row in watched
+                       if str(row.get("task_id") or "") == target]
+            if not removed:
+                return False
+            kept = [row for row in watched
+                    if str(row.get("task_id") or "") != target]
+            kept_bvids = {str(row.get("bvid") or "") for row in kept}
+            for row in removed:
+                bvid = str(row.get("bvid") or "")
+                if not bvid or bvid in kept_bvids:
+                    continue
+                first_seen = _epoch(row.get("first_watched_at"))
+                if first_seen is None or _epoch(first.get(bvid)) == first_seen:
+                    first.pop(bvid, None)
+            atomic_write_json(self._history_path,
+                              {"watched": kept, "first_watched": first})
+            return True
+
+    def update_history(self, task_id: str, updates: Dict[str, Any]) -> bool:
+        """按 task_id 回填观看记录（父侧观后感/描述在即时入库后异步完成）。
+
+        只更新匹配条目；``watched_at``/``first_watched_at`` 不允许被后处理覆盖。
+        """
+        target = str(task_id or "")
+        if not target or not isinstance(updates, dict):
+            return False
+        with self._lock:
+            watched, first = self._load_history_doc()
+            changed = False
+            for row in watched:
+                if str(row.get("task_id") or "") != target:
+                    continue
+                patch = dict(updates)
+                patch.pop("watched_at", None)
+                patch.pop("first_watched_at", None)
+                row.update(patch)
+                changed = True
+            if changed:
+                atomic_write_json(self._history_path,
+                                  {"watched": watched, "first_watched": first})
+            return changed
 
     def watched_bvids(self) -> List[str]:
         return [str(entry.get("bvid") or "") for entry in self.load_history()]

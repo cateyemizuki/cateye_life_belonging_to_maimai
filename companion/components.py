@@ -15,10 +15,14 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   - maisaka.replyer.before_model_request  过期主动任务块剥离 + 屏幕旁白注入 +
                                        陪伴私聊主动激活轮宿主目标指令改写
                                        （PR-PROACTIVE-REPLY 3.17.2；BLOCKING/NORMAL）
-  - maisaka.replyer.after_response     确认真实发言：提交 pending 预算预留 +
-                                       计 1.0 发言数 + spoken 回执 +
-                                       目标私聊真实回复社交电量小幅消耗
-                                       （P1-8 / PR-REALISM-TUNING 3.17.20；OBSERVE/LATE）
+  - maisaka.replyer.after_response     真实回复发送前按字数/精力模拟打字时延
+                                       （P2-DEL-1；BLOCKING/LATE）+ 确认真实发言：
+                                       提交 pending 预算预留 + 计 1.0 发言数 +
+                                       spoken 回执 + 目标私聊真实回复社交电量小幅消耗
+                                       （P1-8 / PR-REALISM-TUNING 3.17.20）
+                                       （工具/系统出站消息不经此钩子，不加时延）
+  - chat.receive.after_process（目标私聊）额外识别「回敬早安/晚安」→ 好感
+                                       morning_exchange / night_exchange（P1-AFF-1）
 - Tools ×2：lbm_mai_lover_affection（F3 2026-11-04：is_enabled + 目标私聊 scope 校验，
   决策痕带调用者身份）/
   lbm_report_harassment（2026-10-24 告状：受骚扰时转达维护者；纯逻辑见
@@ -48,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import random
 import threading
 import time
 from collections import deque as _deque
@@ -59,6 +64,7 @@ import cateye_dashboard
 from maibot_sdk import API, Command, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
+from companion.affection_events import classify_greeting_exchange, record_rule_event
 from companion.config import target_qq_of
 from companion.screen_config import screen_config_of
 from companion.screen_tools import ScreenToolsMixin
@@ -116,6 +122,60 @@ _PROACTIVE_RULE_WINDOW_SECONDS = 90.0
 _PROACTIVE_TURNS_ASSEMBLY_LOCK = threading.Lock()
 #: 省略图片时替换成的文本占位符（不能直接删 part，否则 item 可能没有 part）。
 _IMAGE_OMITTED_PLACEHOLDER = "[图片已省略：为控制上下文体积]"
+#: 打字时延（P2-DEL-1，2026-11-11）：基础 = clamp(1.5 + 0.08×字数×(2−精力), 1, 上限)，
+#: 另加 U(-0.5, +1.5) 秒抖动；上限 = [patrol].typing_delay_max_seconds（默认 8，
+#: 0 = 不延迟）。只作用于 replyer 的真实回复，工具/系统出站消息不经过该 Hook。
+TYPING_DELAY_BASE_SECONDS = 1.5
+TYPING_DELAY_PER_CHAR = 0.08
+TYPING_DELAY_MIN_SECONDS = 1.0
+TYPING_DELAY_JITTER_MIN = -0.5
+TYPING_DELAY_JITTER_MAX = 1.5
+DEFAULT_TYPING_DELAY_MAX_SECONDS = 8.0
+
+
+def typing_delay_seconds(chars: Any, energy: Any, *,
+                         max_seconds: Any = DEFAULT_TYPING_DELAY_MAX_SECONDS,
+                         jitter: Optional[float] = None) -> float:
+    """单条真实回复的拟人打字时延（纯函数，P2-DEL-1）。
+
+    ``base = clamp(1.5 + 0.08 × chars × (2 − energy), 1, max_seconds)``；
+    ``delay = base + jitter``，jitter 缺省取 ``U(-0.5, 1.5)``，最终钳
+    ``[0, max_seconds]``（配置上限是硬上限；0 = 不延迟）。
+
+    - ``chars``：回复正文字符数（负/非法按 0）；``energy``：当前精力 0~1
+      （缺失/非法按 0.5 中性，越低打字越慢）；
+    - ``jitter`` 显式传入时用于测试/确定性回放，钳在 [-0.5, 1.5]。
+    """
+    try:
+        limit = float(max_seconds)
+    except (TypeError, ValueError):
+        limit = DEFAULT_TYPING_DELAY_MAX_SECONDS
+    if limit != limit or limit <= 0.0:  # NaN / 0 / 负数 → 不延迟
+        return 0.0
+    limit = min(limit, 60.0)
+    try:
+        count = max(0, int(chars))
+    except (TypeError, ValueError):
+        count = 0
+    try:
+        energy_value = float(energy)
+    except (TypeError, ValueError):
+        energy_value = 0.5
+    if energy_value != energy_value or energy_value in (float("inf"), float("-inf")):
+        energy_value = 0.5
+    energy_value = max(0.0, min(1.0, energy_value))
+    base = TYPING_DELAY_BASE_SECONDS + TYPING_DELAY_PER_CHAR * count * (2.0 - energy_value)
+    base = max(TYPING_DELAY_MIN_SECONDS, min(limit, base))
+    extra = random.uniform(TYPING_DELAY_JITTER_MIN, TYPING_DELAY_JITTER_MAX) \
+        if jitter is None else jitter
+    try:
+        extra_value = float(extra)
+    except (TypeError, ValueError):
+        extra_value = 0.0
+    if extra_value != extra_value:
+        extra_value = 0.0
+    extra_value = max(TYPING_DELAY_JITTER_MIN, min(TYPING_DELAY_JITTER_MAX, extra_value))
+    return max(0.0, min(limit, base + extra_value))
 
 #: 主动行为决策日志里的跳过原因 → 中文说明（/lbm_diag decision 展示用）。
 _DIAG_REASON_LABELS: dict[str, str] = {
@@ -491,20 +551,17 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                     # 复核 P0-5：群聊仅当 Bot 自身被 @/点名才算直接消息。
                     # 优先宿主结构化 is_mentioned/is_at（宿主语义=Bot 被提及，
                     # 含 @组件目标核对与昵称/别名扫描）；缺失时回退「Bot 昵称
-                    # 出现在文本」。不再用任意 "@"——群友互@、邮箱地址都会误判，
-                    # 当场撤销后台看视频并锁 busy 3 分钟。lover 即 Bot 自身昵称
-                    # （plugin 装配注入），该文本分支保留。
+                    # 出现在文本」。不再用任意 "@"——群友互@、邮箱地址都会误判。
+                    # 2026-11-10：该忙闲事实只用于后续“能否发起”自动观看，不再
+                    # 撤销已进行的观看任务。lover 即 Bot 自身昵称（plugin 注入）。
                     _mentioned = message.get("is_mentioned")
                     _at_bot = message.get("is_at")
                     _structured = bool(_mentioned) or bool(_at_bot)
                     _named = bool(lover) and lover in text
                     direct = (grp is False) or (bool(grp) and (_structured or _named))
+                    # 2026-11-10 不打断：忙闲事实只用于“能否发起”自动观看，
+                    # 不再撤销已在进行的观看任务（工具/聊天轮不打断）。
                     tracker.note_incoming(str(sid), direct=direct)
-                    if direct:
-                        service = getattr(self, "_video_watch", None)
-                        if service is not None:
-                            if service.revoke_automatic():
-                                self._request_surf_frequency_refresh()
         except Exception:
             pass  # 忙闲记录失败绝不影响消息处理
         return None
@@ -560,6 +617,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 # 会话类型未知时按私聊兜底（与旧实现一致：group_info 缺失视为私聊）
                 now = datetime.now()
                 companion.affection.update_last_user_msg_time(now)
+                # 2026-11-11 P1-AFF-1：Bot 30 分钟内发过早/晚安 + 本条是回敬问候
+                # → morning_exchange / night_exchange（各 +0.4，每日一次）。
+                self._mai_note_greeting_exchange(companion, message, now)
                 # 复核 P1-5：chat_round 加 60s/流节流——原实现每条消息直接计数，
                 # 19 条连发 2 分钟即刷满全天 +2.0；现静默 60s 后的问答才计一次。
                 if self._chat_round_allowed(str(_session_id or ""), now):
@@ -567,6 +627,66 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 self._mai_note_review_round(companion, message)
         except Exception:
             pass
+
+    def _mai_recent_greeting(self, kind: str) -> bool:
+        """该流该 kind 是否 30 分钟内由 Bot 成功触发过问候（P1-AFF-1，只读）。
+
+        真源 = :meth:`planning.proactive_service.ProactiveService.recent_greeting`
+        （``_fire_greeting`` 收到宿主 trigger 成功回执时登记，进程内）。规划束未装配/
+        该方法缺失/异常 → False（宁可不记，不虚构互道）。
+
+        窗口比较用服务侧 ``time.time()``（不传 naive datetime）：问候时刻是 aware
+        时区 epoch，用 naive ``datetime.now()`` 换算在宿主时区≠插件时区时会偏移。
+        """
+        planning = getattr(self, "_planning", None)
+        service = getattr(planning, "proactive", None)
+        checker = getattr(service, "recent_greeting", None)
+        if not callable(checker):
+            return False
+        target = self._mai_target_stream_id()
+        if not target:
+            return False
+        try:
+            return bool(checker(target, kind, within_minutes=30.0))
+        except Exception:
+            return False
+
+    def _mai_note_greeting_exchange(self, companion: Any, message: Any,
+                                    now: datetime) -> None:
+        """用户回敬早安/晚安 → 好感 ``morning_exchange`` / ``night_exchange``（+0.4）。
+
+        前置（全部满足才入账，2026-11-11 P1-AFF-1）：
+
+        1. ``[affection].exchange_events_enabled`` 开（缺省 True；关 = 不记）；
+        2. 文本命中 :func:`classify_greeting_exchange`（早/早安/早上好；晚安/睡了/去睡）；
+        3. Bot 在 30 分钟内对该目标流成功触发过对应问候（proactive 进程内时间戳）。
+
+        每日一次/不重复入账由 :func:`companion.affection_events.record_rule_event`
+        的 ``once_per_day`` 频控保证（第二次调用返回 ``daily_once`` 丢弃，分数不变）。
+        任何异常静默降级，绝不影响消息接收链。
+        """
+        try:
+            if not self._mai_section_flag("affection", "exchange_events_enabled", True):
+                return
+            kind = classify_greeting_exchange(_message_plain_text(message))
+            if kind is None:
+                return
+            greeting_kind = "morning" if kind == "morning_exchange" else "night"
+            if not self._mai_recent_greeting(greeting_kind):
+                return
+            affection = getattr(companion, "affection", None)
+            if affection is None:
+                return
+            record_rule_event(
+                affection, kind, 0.4,
+                "互道早安" if kind == "morning_exchange" else "互道晚安",
+                now=now,
+            )
+        except Exception:
+            try:
+                self.ctx.logger.debug("早晚安互动入账失败（忽略）", exc_info=True)
+            except Exception:
+                pass
 
     def _mai_note_review_round(self, companion: Any, message: Any) -> None:
         """M2 会话采样触发点（§5.4-1，挂在 chat_round 记账点旁）。
@@ -718,11 +838,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             # 复核 P0-6：传真实流 id——空参时 key 恒 "-"，与 _last_direct 的真实
             # session_id 永不匹配，待答判定失效。
             _sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or "")
+            # 2026-11-10 不打断：回复轮/工具调用只记录忙闲事实（用于后续发起闸），
+            # 不再撤销正在进行的观看任务。
             _tracker.note_reply_start(_sid)
-            service = getattr(self, "_video_watch", None)
-            if service is not None:
-                if service.revoke_automatic():
-                    self._request_surf_frequency_refresh()
         stripped = without_stale_proactive_blocks(kwargs)
         if stripped is not None:
             kwargs = stripped
@@ -822,7 +940,14 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             # 只用于确认预算/发言数，避免把确认窗内的被动回复误算到主动回合。
             self._mai_proactive_reply_marker = {"stream": session_id,
                                                 "at": time.time()}
-            notice = rewrite_notice_for(turn.get("chat_type"), turn.get("kind"))
+            # 四阶段渗透（2026-11-11）：阶段号随 turn 透传——阶段 1~3 强化独立
+            # 想念文案，阶段 4 对任意目标私聊日常主动轮强制覆盖（先日常后追问）。
+            try:
+                miss_stage = int(turn.get("miss_stage", 0) or 0)
+            except (TypeError, ValueError):
+                miss_stage = 0
+            notice = rewrite_notice_for(turn.get("chat_type"), turn.get("kind"),
+                                        miss_stage=miss_stage)
             updated, replaced = rewrite_replyer_payload(payload_key, payload, notice)
             if replaced:
                 # claim 已原子消费，无需再 consume。
@@ -892,10 +1017,10 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     @HookHandler(
         "maisaka.replyer.after_response",
         name="mai_lover_replyer_speak_confirm",
-        description="目标流真实回复时确认可选回合预算（提交预留）并计 1.0 发言数，记录 spoken 回执",
-        mode=HookMode.OBSERVE,
+        description="真实回复发送前按字数/精力模拟打字时延，并确认可选回合预算与发言数",
+        mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
-        timeout_ms=1000,
+        timeout_ms=12000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def mai_hook_replyer_after_response(self, **kwargs: Any) -> None:
@@ -917,12 +1042,20 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         PR-REALISM-TUNING（3.17.20 §1A）：同钩子先对陪伴目标私聊的**真实回复**
         施加社交电量小幅消耗（主动轮按 90 秒窗口同口径排除；见
         :meth:`_mai_chat_social_drain`），再走既有补计逻辑（逐字不变）。
+
+        P2-DEL-1（2026-11-11）：本钩子改为 **BLOCKING**——先 ``await``
+        :meth:`_mai_apply_typing_delay` 模拟打字（宿主要在 after_response 返回后才
+        发送回复，故阻塞即“发送前等待”；``await asyncio.sleep`` 不阻塞事件循环）。
+        挂在本钩子上而不是新增第二个 HookHandler，是为保持注册面 15 个 hook 不变
+        （门禁按组件数钉死）；工具/系统出站消息不经过 replyer 钩子，天然不加延迟。
         """
         _tracker = getattr(self, "_attention_tracker", None)
         if _tracker is not None:
             # 复核 P0-6：与 note_reply_start 同口径传真实流 id，保证配对清计数。
             _sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or "")
             _tracker.note_reply_end(_sid)
+        # P2-DEL-1：真实回复发送前的拟人打字时延（开关/上限见 [patrol]）。
+        await self._mai_apply_typing_delay(kwargs)
         companion = self._mai_companion()
         if companion is None:
             return
@@ -991,6 +1124,42 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                     f"｜预算确认={confirmation.get('status') if isinstance(confirmation, dict) else 'unknown'}"),
         )
 
+    async def _mai_apply_typing_delay(self, kwargs: dict[str, Any]) -> None:
+        """真实回复发送前插入拟人打字时延（P2-DEL-1，2026-11-11）。
+
+        由 :meth:`mai_hook_replyer_after_response`（BLOCKING）在发送前调用；宿主要在
+        after_response 返回后才由 reply 工具发送，故 ``await`` 即「发送前等待」。
+        工具调用/系统出站消息不经过 replyer 钩子，天然不加延迟。
+
+        - 开关 ``[patrol].typing_delay_enabled``（缺省 True；关 → 0、不 sleep）；
+        - 时长 = :func:`typing_delay_seconds`（字数 + LifeState 精力 + 抖动），
+          上限 ``[patrol].typing_delay_max_seconds``（默认 8，0 = 不延迟）；
+        - ``response`` 为空（纯工具调用/无正文）→ 不延迟；
+        - ``await asyncio.sleep`` 不阻塞事件循环；异常静默降级不拖挂回复链。
+        """
+        try:
+            if not self._mai_typing_delay_enabled():
+                return
+            text = str(kwargs.get("response") or "").strip()
+            if not text:
+                return  # 工具调用 / 空正文：不模拟打字
+            try:
+                max_seconds = float(self._mai_section_attr(
+                    "patrol", "typing_delay_max_seconds",
+                    DEFAULT_TYPING_DELAY_MAX_SECONDS))
+            except (TypeError, ValueError):
+                max_seconds = DEFAULT_TYPING_DELAY_MAX_SECONDS
+            delay = typing_delay_seconds(len(text), self._mai_life_energy(),
+                                         max_seconds=max_seconds)
+            if delay <= 0.0:
+                return
+            await self._mai_typing_sleep(delay)
+        except Exception:
+            try:
+                self.ctx.logger.debug("打字时延施加失败（忽略）", exc_info=True)
+            except Exception:
+                pass
+
     #: PR-REALISM-TUNING（3.17.20 §1A）：真实回复社交消耗去重窗（秒）。宿主可能对
     #: 同一回复重试/重复派发 after_response；同 (流, 回复指纹) 窗内只施加一次。
     #: 窗外合法重复的同文案回复不受影响（episode 回执 id 带单调时间戳逐次唯一）。
@@ -1010,6 +1179,53 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         throttle[key] = now
         return prev is None or (now - prev).total_seconds() >= 60.0
 
+    def _mai_section_attr(self, section_name: str, key: str, default: Any) -> Any:
+        """读任意配置段字段（配置/段/键缺失 → ``default``；热重载即时生效）。"""
+        section = getattr(getattr(self, "config", None), section_name, None)
+        value = getattr(section, key, None)
+        return default if value is None else value
+
+    def _mai_section_flag(self, section_name: str, key: str, default: bool) -> bool:
+        """读任意配置段布尔开关（缺失 → 缺省值；非法值按 Python 真值语义）。"""
+        return bool(self._mai_section_attr(section_name, key, default))
+
+    def _mai_life_state_flag(self, key: str, default: bool) -> bool:
+        """读 ``[life_state]`` 布尔开关（配置缺失/非法 → 缺省值；热重载即时生效）。"""
+        return self._mai_section_flag("life_state", key, default)
+
+    def _mai_life_energy(self) -> float:
+        """当前精力（0~1）：取 LifeState 快照；不可用 → 0.5（中性，不惩罚也不加速）。"""
+        life = getattr(self, "_life_state", None)
+        getter = getattr(life, "snapshot", None)
+        if callable(getter):
+            try:
+                snapshot = getter()
+                if isinstance(snapshot, dict):
+                    value = snapshot.get("energy")
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        number = float(value)
+                        if number == number and number not in (float("inf"), float("-inf")):
+                            return max(0.0, min(1.0, number))
+            except Exception:
+                pass
+        return 0.5
+
+    def _mai_typing_delay_enabled(self) -> bool:
+        """``[patrol].typing_delay_enabled``（P2-DEL-1）。
+
+        段缺失（配置对象未装配/测试裸桩）→ **False**：宁可不延迟也不睡住发送链，
+        与「开关关闭 = 0」同一降级方向；真实配置对象恒有 patrol 段与 schema 默认 True。
+        """
+        section = getattr(getattr(self, "config", None), "patrol", None)
+        if section is None:
+            return False
+        value = getattr(section, "typing_delay_enabled", None)
+        return True if value is None else bool(value)
+
+    async def _mai_typing_sleep(self, seconds: float) -> None:
+        """等待 ``seconds`` 秒（独立方法便于测试替换；``await`` 不阻塞事件循环）。"""
+        await asyncio.sleep(max(0.0, float(seconds)))
+
     def _mai_chat_social_drain(self, kwargs: dict[str, Any], companion: Any) -> None:
         """陪伴目标私聊真实回复消耗社交电量（PR-REALISM-TUNING 3.17.20 §1A）。
 
@@ -1020,6 +1236,15 @@ class CompanionComponentsMixin(ScreenToolsMixin):
           0.015，夹取 ≥0；≤0 → 不施加）。经既有 :meth:`LifeStateService.apply_episode`
           显式增量门施加（统一 clamp [0,1]、diag contrib 归 event 桶 kind=chat、
           回执与状态同文件原子保存）——不新增结算通路；
+        - 2026-11-11 Gemini 批（报告 §4.1 P1-NUM-2）：目标私聊标记
+          ``target_private=True`` 与好感/效价/当前电量一起交给
+          :func:`planning.settlement_v2.target_chat_social_delta` 计算实际增量——
+          好感折减（1−0.9×好感/200，最低 0.1 倍）与高好感放松对话的微量回充
+          都在该纯函数里完成；群聊/其他私聊根本进不了本方法（上方流比对），
+          口径不变。**本批只实现目标私聊折减/回充**——群聊与其他私聊的聊天
+          社交电量基础消耗仍为 0，报告里「群聊高消耗 vs 目标私聊回血」的对照
+          留待后续批次。开关 ``social_battery_affinity_discount`` /
+          ``target_chat_social_recharge``（[life_state]，默认开）分别控制；
         - 每回复恰一次：同 (流, 回复指纹) 短窗去重（钩子幂等）；
         - 空闲时 settlement 安静回充仍生效 → 电量随聊天节奏波动而非钉满；
         - 任何异常静默降级（OBSERVE 钩子不拖挂回复链）。
@@ -1061,10 +1286,62 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 del recent[old_key]
             if key in recent:
                 return  # 同一回复重复派发（钩子重试）：幂等跳过
+            # ── P1-NUM-2：目标私聊好感折减 / 高好感放松回充（纯函数结算）──
+            # target_private 由上方流比对严格成立（群聊/其他私聊进不到这里），
+            # 显式标记随 episode 一起交给 apply_episode（其只消费 state_deltas，
+            # 未知键忽略——标记用于本处结算判定与审计留痕）。
+            from planning import settlement_v2
+            affection = getattr(companion, "affection", None)
+            affinity: Optional[float] = None
+            score_getter = getattr(affection, "score", None)
+            if callable(score_getter):
+                try:
+                    affinity = float(score_getter())
+                except Exception:
+                    affinity = None
+            valence: Optional[float] = None
+            valence_getter = getattr(affection, "emotion_valence", None)
+            if callable(valence_getter):
+                try:
+                    valence = valence_getter()
+                except Exception:
+                    valence = None
+            current_social: Optional[float] = None
+            try:
+                snapshot = life.snapshot()
+                if isinstance(snapshot, dict):
+                    value = snapshot.get("social_battery")
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        current_social = float(value)
+            except Exception:
+                current_social = None
+            settlement = settlement_v2.target_chat_social_delta(
+                drain,
+                target_private=True,  # 本方法仅处理目标私聊（上方流比对）
+                affinity=affinity,
+                social_battery=current_social,
+                discount_enabled=self._mai_life_state_flag(
+                    "social_battery_affinity_discount", True),
+                recharge_enabled=self._mai_life_state_flag(
+                    "target_chat_social_recharge", True),
+                valence=valence,
+            )
+            delta = float(settlement.get("delta") or 0.0)
             life.apply_episode({
                 "episode_id": f"chat_social_drain:{reply_stream}:{fingerprint}:{now_mono:.6f}",
-                "state_deltas": {"social_battery": -drain},
+                "state_deltas": {"social_battery": delta},
                 "settlement_kind": "chat",
+                "target_private": True,
+                "chat_social": {
+                    "drain": settlement.get("drain"),
+                    "effective_drain": settlement.get("effective_drain"),
+                    "factor": settlement.get("factor"),
+                    "discount_applied": settlement.get("discount_applied"),
+                    "recharge": settlement.get("recharge"),
+                    "affinity": settlement.get("affinity"),
+                    "relaxed": settlement.get("relaxed"),
+                    "reason": settlement.get("reason"),
+                },
             })
             recent[key] = now_mono  # 施加成功才记去重戳（失败不挡重试）
             if len(recent) > 64:
@@ -1644,6 +1921,35 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             self.ctx.logger.error(f"mai_cmd_help 发送失败: {e}")
             return False, f"发送失败: {e}", True
 
+    def _activity_preference_diag_line(self) -> str:
+        """P3 复核修复（3.17.33）：偏好缓存/持久 pending/今日请求的只读一行。
+
+        不重建偏好、不发请求、不清计数；未装配/关闭/异常均如实降级。
+        """
+        getter = getattr(self, 'activity_preferences_status', None)
+        if not callable(getter):
+            return '日程偏好：未装配'
+        try:
+            status = getter()
+        except Exception as exc:
+            return f'日程偏好：读取失败（{type(exc).__name__}）'
+        if not isinstance(status, dict) or not status.get('enabled'):
+            return '日程偏好：未启用/未装配'
+        pending = status.get('pending') if isinstance(status.get('pending'), dict) else {}
+        pending_count = max(0, int(status.get('pending_count')
+                                   or pending.get('count') or 0))
+        bits = [f"缓存 {int(status.get('cached_activities') or 0)} 项",
+                f"待评估 {pending_count} 项"]
+        since = str(pending.get('since') or '')
+        if pending_count and since:
+            bits.append('自 ' + since)
+        state = str(pending.get('last_status') or '')
+        if pending_count and state:
+            bits.append('上次 ' + state)
+        bits.append(f"今日请求 {int(status.get('requests_today') or 0)}"
+                    f"/{int(status.get('daily_limit') or 0)}")
+        return '日程偏好：' + ' · '.join(bits)
+
     @Command(
         name="/lbm_diag",
         pattern=r"(?<!\S)/lbm_diag(?:\s+(?P<diag_args>.*?))?\s*$"
@@ -1714,7 +2020,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if sub == "life":
             # 天数保持旧 /lbm_life diag 语义：1~7，缺省/非法一律 1
             days = self._diag_parse_days_arg(raw_days, lo=1, hi=7) or 1
-            await self._diag_reply(stream_id, self._qz_diag_text(days))
+            # P3 复核修复（3.17.33）：附一行只读偏好缓存/待评估/今日请求计数。
+            await self._diag_reply(stream_id, self._qz_diag_text(days) + "\n"
+                                   + self._activity_preference_diag_line())
             return True, "决策日志已发送", True
         if sub == "streams":
             # 2026-10-20 用户指示：主动候选流/名单状态诊断（无 emoji）。

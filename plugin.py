@@ -46,6 +46,7 @@ from companion.affection import AffectionManager
 from companion.components import CompanionComponentsMixin
 from companion.config import target_qq_of
 from companion.harass_report import HARASS_TOOL_NAME
+from companion.miss_trigger import append_stage4_miss_prompt
 from companion.services import CompanionServices
 from companion.attention import ConversationActivityTracker, SurfLeaseAuthority
 from linkage import register_adapter
@@ -475,10 +476,14 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
         # M11（附录 II §3.3）：预算只统计发往目标陪伴私聊的主动打扰——注入 self._stream_id
         # 取值回调（G11 权威来源，随 _apply_target/热重载更新；不新增持久化状态）
+        # 3.4（2026-11-11 复核修复）：弹性信号源也在此装配期注入——提供者惰性读
+        # ``_affection`` / ``_emotion``（后者在本段之后才装配），cap()/判定时才求值；
+        # 读取失败由 ProactiveBudget 内部按空信号降级，绝不改动基础预算。
         self._proactive_budget = install_proactive_budget(
             self._bus, config_provider=lambda: self.config, decision_logger=self._decision_logger,
             data_dir=data_dir,
-            target_stream_provider=lambda: getattr(self, "_stream_id", ""))
+            target_stream_provider=lambda: getattr(self, "_stream_id", ""),
+            elasticity_provider=self._proactive_elasticity_signals)
 
         # 服务束（内部动态读 self.config，热重载自动生效）
         self._planning = PlanningServices(self)
@@ -970,23 +975,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 from planning.activity_preferences import ActivityPreferencesService
 
                 def _pref_definitions() -> list:
-                    defs: list = []
-                    cat = getattr(getattr(self, "_planning", None), "event_catalog", None)
-                    if cat is not None:
-                        try:
-                            store = getattr(cat, "store", cat)
-                            defs.extend(dict(e) for e in (store.active_events or [])
-                                        if isinstance(e, dict))
-                        except Exception:
-                            pass
-                    rp = getattr(self, "_rolling_planner", None)
-                    if rp is not None:
-                        try:
-                            day = rp._date_of(rp._now())
-                            defs.extend(dict(c) for c in rp._spine_intents_cached(day))
-                        except Exception:
-                            pass
-                    return defs
+                    # 定义集合统一由只读方法给出（活跃 + 已 consumed 的生成项）。
+                    return self._preference_definitions()
 
                 def _pref_busy() -> bool:
                     engine = getattr(self, "_sleep_engine", None)
@@ -1132,10 +1122,19 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             baseline = debt_baseline_hours(sleep_min, wake_min)
         except Exception:
             baseline = 8.0
+        # P0-NUM-1 离线路径：v2 还债开关与在线引擎同源
+        # （[life_state].sleep_debt_repay_v2，配置默认 True）——离线补眠默认与
+        # 在线一致走阶梯还债；读不到配置时同样回退 True（在线默认口径），
+        # 历史回放需显式把配置/参数置 False（旧公式逐字不变）。
+        try:
+            life_cfg = getattr(self.config, "life_state", None)
+            repay_v2 = bool(getattr(life_cfg, "sleep_debt_repay_v2", True))
+        except Exception:
+            repay_v2 = True
         self._offline_settlement_service().settle_offline_gap(
             life, planner, engine_claimed=engine_claimed,
             plan_settlement_fn=plan_offline_settlement,
-            baseline_hours=baseline)
+            baseline_hours=baseline, repay_v2=repay_v2)
 
     def _apply_offline_settlement(self, life: Any, planner: Any, plan: Dict[str, Any]) -> None:
         """应用一次离线睡眠结算（薄委托；调用方保证恰好一次，编排体见 suite_offline_settlement）。"""
@@ -1549,6 +1548,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._kick_share_delivery()
         # PR-A0：空间视频候选影子判定（与 video_social tick 同节拍；单飞，只留痕不发布）
         self._kick_qzone_video_eval()
+        # P3 复核修复（3.17.33）：睡眠中推迟的偏好批次在清醒拍自动续排（含启动即醒）。
+        self._kick_preference_refresh()
         date = str(report.get("date") or "")
         if not date or date == getattr(self, "_life_cleanup_date", ""):
             return
@@ -1623,6 +1624,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 feedback_enabled_provider=self._interest_watch_feedback_enabled,
                 half_life_days_provider=self._interest_watch_half_life_days,
                 logger=self.ctx.logger)
+            # 3.3：分享质量门槛只读兴趣权重（不触发刷新/LLM）；保存引用供 provider
+            # 惰性读取，避免每次判分都重建服务。
+            self._video_interest = interest
             source = BiliCandidateSource(
                 interest, excluded_bvids=self._video_excluded_bvids, logger=self.ctx.logger)
             self._video_candidate_source_obj = source
@@ -1690,11 +1694,26 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 persona_provider=lambda:str(getattr(self,'_personality','') or ''),
                 state_provider=self._social_state,
                 task_provider=lambda:self.config.video_share.decision_task_name)
+            # F2（3.17.33 复核修复）：把 [planning_events].video_share_to_target_probability
+            # 接到真实自然分享触发点（VideoSocialService._deliver）；只对陪伴目标私聊掷骰，
+            # 既有授权/夜间/冷却/预算闸保持优先，默认 1.0 零行为变化。
+            def _share_probability() -> float:
+                try:
+                    from planning.event_catalog import resolve_video_share_to_target_probability
+                    return resolve_video_share_to_target_probability(
+                        self.config.planning_events)
+                except Exception:
+                    return 1.0  # 配置读取失败按旧行为（不额外过滤）
             return VideoSocialService(ledger,profiles,evaluator,config_provider=lambda:self.config.video_share,
                 clock=lambda:self._surf_now().timestamp(),day=self._surf_day,
                 prepare_card=self._video_card.generate_ark,send_card=self._send_social_ark,
                 preflight=self._social_preflight,reserve=self._social_reserve,
-                commit=self._social_commit,release=self._social_release,append_context=self._append_social_fact)
+                commit=self._social_commit,release=self._social_release,append_context=self._append_social_fact,
+                probability_provider=_share_probability,
+                # 2026-11-11 阶段 4 视频通道（设计方案 §3.3）：scheduler 只持有两个业务
+                # 端口，不 import plugin。阶段只读解析 + 卡片事实写入后的说话轮回调。
+                stage_provider=self._target_miss_stage,
+                after_deliver=self._on_video_share_delivered)
         except Exception as exc:
             self.ctx.logger.warning('独立视频分享初始化失败，保守停用发送：%s',type(exc).__name__)
             return None
@@ -1768,6 +1787,47 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception:
             return ""
 
+    def _preference_definitions(self) -> list:
+        """P3：偏好评估的语义定义集合（只读；不触发请求）。
+
+        3.17.33 修复：不仅取 ``active_events``，还并入 ``generated_events``——
+        当日已被 consumed 的一次性定义会从 active 池移除，但语义身份仍可能跨日
+        复用；只取 active 会让这些定义永远没有画像。同一 ``event_id`` 去重，
+        后续 ``_collect_needed`` 再按语义 ``activity_key`` 去重。事件库服务/
+        直接 store 两种形态都可装配（``store`` 优先）。
+        """
+        defs: list = []
+        cat = getattr(getattr(self, "_planning", None), "event_catalog", None)
+        if cat is not None:
+            try:
+                store = getattr(cat, "store", cat)
+            except Exception:
+                store = None
+            if store is not None:
+                seen_ids: set = set()
+                for attr in ("active_events", "generated_events"):
+                    try:
+                        events = getattr(store, attr, None) or []
+                    except Exception:
+                        continue
+                    for event in events:
+                        if not isinstance(event, dict):
+                            continue
+                        eid = str(event.get("event_id") or event.get("key") or "")
+                        if eid:
+                            if eid in seen_ids:
+                                continue
+                            seen_ids.add(eid)
+                        defs.append(dict(event))
+        rp = getattr(self, "_rolling_planner", None)
+        if rp is not None:
+            try:
+                day = rp._date_of(rp._now())
+                defs.extend(dict(c) for c in rp._spine_intents_cached(day))
+            except Exception:
+                pass
+        return defs
+
     def activity_preferences_status(self) -> Dict[str, Any]:
         """P3：只读诊断（人设/定义版本、命中/降级/待评估数量、实际 Token/次数）。
         查看诊断不清空计数、不重建偏好、不发请求。"""
@@ -1794,11 +1854,43 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self.ctx.logger.warning('日程偏好初始化失败（中性降级）：%s', type(exc).__name__)
             return {"status": "failed", "error": type(exc).__name__}
 
-    def schedule_preference_refresh(self) -> None:
-        """P3（§14.4）：日意图/事件库成功更新后合并安排增量批次（fire-and-forget）。
+    def _kick_preference_refresh(self) -> None:
+        """P3 复核修复：仅在「有持久 pending 且当前不在睡眠」时补一次续排。
 
-        非阻塞、单飞（服务内 asyncio.Lock）；受每日 ≤4/退避/忙闲门控约束，普通
-        滚动 tick 与页面读取绝不调用此入口。无运行中事件循环 → 静默跳过。
+        唯一调用点 = :meth:`_life_tick_once` 尾部（``plugin.py`` 内紧随
+        ``planner.tick`` 之后的 ``self._kick_preference_refresh()``），每
+        ``LIFE_TICK_SECONDS`` 一拍。``life.sleep_woke`` 在同一个 tick 的
+        ``_sleep_commit`` 里发出，之后才走到本调用；启动后 tick 循环也是先跑
+        ``_life_tick_once`` 再等待 → 醒沿与「启动即醒」都自然覆盖。普通清醒拍
+        没有 pending → 零请求；睡眠中 → 等醒后的 tick（忙闲门仍由服务自身复核）。
+        异常静默，不拖挂生活 tick。
+        """
+        prefs = getattr(self, '_activity_preferences', None)
+        if prefs is None:
+            return
+        try:
+            if not bool(prefs.has_pending()):
+                return
+            engine = getattr(self, '_sleep_engine', None)
+            if engine is not None and engine.is_asleep() is True:
+                return
+        except Exception:
+            return
+        self.schedule_preference_refresh()
+
+    def schedule_preference_refresh(self) -> None:
+        """P3（2026-11-09 §14.4）：显式触发偏好增量评估（fire-and-forget）。
+
+        实际调用点只有两处（与代码一致）：
+        1) 日意图生成成功后 ``planning/schedule_generator.py`` 的
+           ``getattr(self._plugin, "schedule_preference_refresh")()``；
+        2) 生活 tick 的持久 pending 清醒补排 :meth:`_kick_preference_refresh`
+           （``plugin.py`` 唯一调用点）。
+
+        事件库 reload/refresh 路径**不**调用本入口（保持既有低频口径；复核项
+        PREF-EVENT-REFRESH-TRIGGER 选择改注释而非在事件库周期刷新里加调用）。
+        非阻塞、单飞（服务内 asyncio.Lock）；受每日 ≤4/退避/忙闲门控约束；
+        普通滚动 tick 与页面读取不直接调用。无运行中事件循环 → 静默跳过。
         """
         prefs = getattr(self, '_activity_preferences', None)
         if prefs is None:
@@ -1848,10 +1940,20 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         if index is not None:
             try:
                 from integrations.video_share_policy import watched_facts
-                now = self._surf_now().timestamp()
-                facts = watched_facts(result, episode_id, now)
+                # 3.17.33 复核修复：经历索引与 watch history 同口径——用任务
+                # 发起/受理时刻（result.requested_at/created_at），不用完成时刻。
+                requested = ((result or {}).get('requested_at')
+                             or (result or {}).get('created_at'))
+                try:
+                    watched_at = float(requested)
+                except (TypeError, ValueError):
+                    watched_at = self._surf_now().timestamp()
+                if not watched_at > 0:
+                    watched_at = self._surf_now().timestamp()
+                facts = watched_facts(result, episode_id, watched_at)
                 task_id = str((result or {}).get('task_id') or '')
-                index.record_watched_video(facts, episode_id, task_id=task_id, now=now)
+                index.record_watched_video(facts, episode_id, task_id=task_id,
+                                           now=watched_at)
             except Exception as exc:
                 self.ctx.logger.warning('经历索引观看记录失败（忽略）：%s', exc)
         try:
@@ -1923,6 +2025,14 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 ledger,
                 config_provider=lambda: self.config.qzone_video,
                 qzone_enabled_provider=lambda: bool(self.config.qzone.enabled),
+                # 3.3（2026-11-11 复核修复）：质量门槛的开关/阈值在 [video_share]
+                # （用户可见配置所属段），不能回退到 [qzone_video]——后者没有
+                # video_share_quality_gate 字段，会让开关恒关。信号源惰性读
+                # emotion 生效 VAD/锚点（vad_delta/vad/vad_anchor）与关系记忆
+                # （目标私聊话题画像/好感习惯）的 target_interests；读取失败=无
+                # 信号（门槛开启时保守不分享，绝不虚构信号）。
+                quality_config_provider=lambda: self.config.video_share,
+                quality_signal_provider=self._video_share_quality_signals,
                 # LLM 唯一入口：LLMService → tools/llm_gateway；module='qzone'（发布面归属）
                 # PR-AUDIT（3.16.1 PR-1）：判定/文案两链路人设统一经 with_identity 进 system
                 # 前缀；body 不再序列化 persona（module='qzone' 发布面归属不变）。
@@ -1967,8 +2077,345 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception:state['state_available']=False
         return state
 
+    # ── 3.3 / 3.4（2026-11-11 复核修复）：真实装配的信号注入 ────────────────
+    def _video_share_quality_signals(self, candidate: dict | None = None) -> dict:
+        """分享质量门槛信号：``{vad, vad_anchor, vad_delta, target_interests}``。
+
+        装配根注入 :class:`QzoneVideoBridge` 的 ``quality_signal_provider``（3.3）。
+        键口径与桥的 ``_quality_inputs`` 对齐，读取失败只丢该项、绝不虚构：
+
+        - ``vad`` = emotion 生效 VAD（``effective_vad_snapshot``，三维）；
+        - ``vad_anchor`` = emotion 状态机的人设锚点（``params.anchor``）；
+        - ``vad_delta`` = 当前 VAD − 锚点（三维差；两侧齐备才给）；
+        - ``target_interests`` / ``interests`` = 关系记忆里的对方兴趣：优先目标
+          陪伴私聊的话题画像（``ShareLedger.profile(...).topics``），其次好感
+          习惯（``AffectionManager.habits()``），最后回退观看兴趣权重
+          （``VideoInterestService.effective_weights``，既有 3.3 口径）。
+          三者都缺 → 不提供（桥侧按「无可核验兴趣」处理）。
+        本方法只读、零网络；异常一律降级为空信号。
+        """
+        signals: dict = {}
+        current = None
+        try:
+            current = self._emotion_vad_snapshot()
+        except Exception:
+            current = None
+        anchor = None
+        try:
+            emotion = getattr(self, '_emotion', None)
+            machine = getattr(getattr(emotion, 'service', None), '_machine', None)
+            anchor_state = getattr(getattr(machine, 'params', None), 'anchor', None)
+            to_dict = getattr(anchor_state, 'to_dict', None)
+            anchor = to_dict() if callable(to_dict) else None
+        except Exception:
+            anchor = None
+        if isinstance(current, dict) and current:
+            signals['vad'] = {dim: current[dim] for dim in
+                              ('valence', 'arousal', 'dominance') if dim in current}
+        if isinstance(anchor, dict) and anchor:
+            signals['vad_anchor'] = {dim: anchor[dim] for dim in
+                                     ('valence', 'arousal', 'dominance') if dim in anchor}
+        if isinstance(signals.get('vad'), dict) and isinstance(signals.get('vad_anchor'), dict):
+            delta = {}
+            for dim in ('valence', 'arousal', 'dominance'):
+                try:
+                    delta[dim] = float(signals['vad'][dim]) - float(signals['vad_anchor'][dim])
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if delta:
+                signals['vad_delta'] = delta
+        # 生活状态里若已有 VAD 三键（未来 LifeState 扩展/测试注入），原样透传，
+        # 不自造字段；emotion 真源优先，缺失才补。
+        try:
+            state = self._social_state()
+        except Exception:
+            state = {}
+        if isinstance(state, dict):
+            for key in ('vad_delta', 'vad', 'vad_anchor'):
+                if key not in signals and state.get(key) is not None:
+                    signals[key] = state[key]
+        interests = self._relationship_target_interests()
+        if interests:
+            signals['interests'] = interests
+            signals['target_interests'] = interests
+        return signals
+
+    def _relationship_target_interests(self) -> dict:
+        """关系记忆里的目标兴趣权重（``{词: 权重}``；只读、无网络）。
+
+        取数序（先真实关系记忆，后既有观看兴趣）：
+        1) 目标陪伴私聊的观众画像话题（``ShareLedger.profile(stream).topics``，
+           由分享评估器从聊天里提炼；即「关系记忆」的对方兴趣）；
+        2) 好感习惯 ``habits`` 的键值（用户主动记下的习惯/喜好）；
+        3) ``VideoInterestService.effective_weights``（机器人观看兴趣，旧口径兜底）。
+        话题/习惯命中即返回，避免把「机器人想看的」盖过「对方聊过的」。
+        """
+        terms: dict[str, float] = {}
+        try:
+            social = getattr(self, '_video_social', None)
+            ledger = getattr(social, 'ledger', None)
+            stream = str(getattr(self, '_stream_id', '') or '')
+            profile = ledger.profile(stream) if ledger is not None and stream else {}
+            topics = profile.get('topics') if isinstance(profile, dict) else None
+            for topic in topics or []:
+                term = str(topic).strip()
+                if term and len(term) <= 40:
+                    terms.setdefault(term, 1.0)
+        except Exception:
+            terms = {}
+        if terms:
+            return terms
+        try:
+            affection = getattr(self, '_affection', None)
+            habits = affection.habits() if affection is not None else {}
+            if isinstance(habits, dict):
+                for key, value in habits.items():
+                    for term in (value, key):
+                        text = str(term).strip()
+                        if text and len(text) <= 40:
+                            terms.setdefault(text, 1.0)
+        except Exception:
+            terms = {}
+        if terms:
+            return terms
+        try:
+            interest = getattr(self, '_video_interest', None)
+            if interest is None:
+                source = self._video_candidate_source()
+                interest = getattr(source, '_interest', None)
+            weights = interest.effective_weights() if interest is not None else None
+            if isinstance(weights, dict):
+                for term, weight in weights.items():
+                    text = str(term).strip()
+                    if text and len(text) <= 40:
+                        try:
+                            terms[text] = float(weight)
+                        except (TypeError, ValueError):
+                            terms[text] = 1.0
+        except Exception:
+            terms = {}
+        return terms
+
+    def _today_is_holiday_cached(self) -> bool:
+        """当天是否法定节假日（只读 ``holiday_cache.json``；不联网、失败=False）。
+
+        3.4 预算弹性的 ``holiday`` 信号：HolidayService 的唯一落盘格式
+        ``{tables: {year: {days: {YYYY-MM-DD: {off, name, kind}}}}}``。这里不反向
+        依赖 planning 服务实例，也不触发网络；缓存按「日期 + 文件 mtime」失效，
+        磁盘预热完成后（mtime 变化）下一拍即可读到真值。周末不冒充法定节日。
+        """
+        data_dir = getattr(self, '_data_dir', None)
+        if data_dir is None:
+            return False
+        now = self._surf_now()
+        day = now.strftime('%Y-%m-%d')
+        from pathlib import Path
+        path = Path(data_dir) / 'holiday_cache.json'
+        try:
+            stamp = float(path.stat().st_mtime)
+        except Exception:
+            stamp = 0.0
+        cached = getattr(self, '_holiday_signal_cache', None)
+        if (isinstance(cached, tuple) and len(cached) == 3
+                and cached[0] == day and cached[1] == stamp):
+            return bool(cached[2])
+        holiday = False
+        try:
+            from core.storage import load_json
+            raw = load_json(path, None)
+            tables = raw.get('tables') if isinstance(raw, dict) else None
+            year_table = tables.get(str(now.year)) if isinstance(tables, dict) else None
+            days = year_table.get('days') if isinstance(year_table, dict) else None
+            entry = days.get(day) if isinstance(days, dict) else None
+            holiday = bool(isinstance(entry, dict) and entry.get('off') is True)
+        except Exception:
+            holiday = False
+        self._holiday_signal_cache = (day, stamp, holiday)
+        return holiday
+
+    def _proactive_elasticity_signals(self) -> dict:
+        """3.4 预算弹性信号：``{affection, valence, holiday}``（缺项=不追加）。
+
+        ``affection`` 传好感档位快照 ``{"score": 0~200, "ratio": 0~1,
+        "tier": 当前档位, "tier_size": 生效档位数}``——ProactiveBudget 优先读
+        ``ratio``（= score/200，与 200 分制一致），档位仅供诊断；``valence`` 取
+        emotion 生效 V，``holiday`` 只认 holiday_cache 中的法定节假日条目。
+        三者都是只读；任何一项读取失败只丢该项，绝不改基础预算。
+        """
+        signals: dict = {}
+        try:
+            affection = getattr(self, '_affection', None)
+            if affection is not None:
+                enabled = getattr(affection, 'is_enabled', None)
+                if not callable(enabled) or enabled():
+                    score = float(affection.score())
+                    signal: dict = {'score': score,
+                                    'ratio': max(0.0, min(1.0, score / 200.0))}
+                    tier = getattr(affection, 'tier', None)
+                    if callable(tier):
+                        try:
+                            signal['tier'] = int(tier())
+                        except Exception:
+                            pass
+                    preset = getattr(affection, 'preset', None)
+                    if callable(preset):
+                        try:
+                            signal['tier_size'] = int(preset().size)
+                        except Exception:
+                            pass
+                    signals['affection'] = signal
+        except Exception:
+            pass
+        try:
+            emotion = getattr(self, '_emotion', None)
+            getter = getattr(emotion, 'effective_valence', None)
+            if callable(getter):
+                value = getter()
+                if value is not None:
+                    signals['valence'] = float(value)
+        except Exception:
+            pass
+        try:
+            signals['holiday'] = self._today_is_holiday_cached()
+        except Exception:
+            pass
+        return signals
+
+    def _stage4_context(self) -> dict:
+        """阶段 4 只读上下文（异常/未装配 → 空 dict，调用方按 stage 0 处理）。"""
+        try:
+            context = self._target_miss_stage_context()
+        except Exception:
+            return {}
+        return context if isinstance(context, dict) else {}
+
+    def _target_miss_stage(self) -> int:
+        """scheduler 注入的只读阶段端口：陪伴目标当前想念阶段（0..4）。"""
+        try:
+            return int(self._stage4_context().get('stage') or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _target_miss_stage_context(self) -> dict:
+        """只读解析陪伴目标当前想念阶段与清醒沉默时长（**绝不写周期/预算**）。
+
+        优先复用 ``PatrolService.current_target_miss_stage()`` 的唯一只读出口
+        （设计方案 §1.2/§6）；该出口缺失/不可用时回退本地只读解析：生效起点取
+        周期行 ``effective_anchor_epoch``（含短回复顺延），周期缺失回退好感度最后
+        来信时间，睡眠扣除复用巡逻服务的只读睡眠段。任何异常 → stage 0。
+        """
+        empty = {'stage': 0, 'hours': 0.0, 'relation': '恋人', 'target': False}
+        try:
+            cfg = getattr(self, 'config', None)
+            section = getattr(cfg, 'patrol', None)
+            if section is None:
+                return empty
+            if not (getattr(section, 'enabled', False)
+                    and getattr(section, 'proactive_trigger_enabled', False)
+                    and getattr(section, 'miss_enabled', True)):
+                return empty
+            target = str(target_qq_of(cfg) or '')
+            stream = str(getattr(self, '_stream_id', '') or '')
+            if not target or not stream:
+                return empty
+            patrol = getattr(getattr(self, '_companion', None), 'patrol', None)
+            if patrol is None:
+                return empty
+            gate = getattr(patrol, '_miss_stage_escalation_enabled', None)
+            if callable(gate) and not gate():
+                return empty  # 阶梯关 = 旧单次想念；不派生阶段 4
+            relation = '恋人'
+            try:
+                word = getattr(patrol, '_relation_word', None)
+                if callable(word):
+                    relation = str(word() or '恋人')
+            except Exception:
+                relation = '恋人'
+            resolver = getattr(patrol, 'current_target_miss_stage', None)
+            if not callable(resolver):
+                resolver = getattr(patrol, 'current_miss_stage', None)
+            if callable(resolver):
+                try:
+                    stage, hours = resolver()
+                    return {'stage': int(stage or 0), 'hours': float(hours or 0.0),
+                            'relation': relation, 'target': True}
+                except Exception:
+                    pass
+            from companion.initiative_profile import (
+                MISS_STAGE_END_HOURS, effective_anchor_epoch)
+            last = None
+            try:
+                last = self._companion.affection.last_user_msg_time()
+            except Exception:
+                last = None
+            if last is None:
+                return empty
+            now_dt = self._surf_now()
+            if now_dt.tzinfo is not None:
+                now_dt = now_dt.astimezone().replace(tzinfo=None)
+            last_dt = last
+            if getattr(last_dt, 'tzinfo', None) is not None:
+                last_dt = last_dt.astimezone().replace(tzinfo=None)
+            anchor_dt = None
+            hours = 0.0
+            # 复核 finding：优先复用 patrol 的只读投影口（含最新短回复的 1.5h
+            # 顺延），避免本地镜像把「121h + 10 分钟前短回复」误判成阶段 4。
+            projector = getattr(patrol, '_readonly_cycle_anchor', None)
+            if callable(projector):
+                try:
+                    staged = True
+                    gate = getattr(patrol, '_miss_stage_escalation_enabled', None)
+                    if callable(gate):
+                        staged = bool(gate())
+                    anchor_dt, projected = projector(now_dt, last_dt, staged=staged)
+                    if anchor_dt is not None:
+                        hours = max(0.0, float(projected or 0.0))
+                except Exception:
+                    anchor_dt = None
+            if anchor_dt is None:
+                # 旧装配没有只读投影口：退回周期行镜像（只含已落盘 defer，不含最新
+                # 短回复的即时顺延；仅异常/旧装配路径，与公共出口可能差一个 1.5h 档）。
+                memory = getattr(patrol, '_initiative_memory', None)
+                doc = getattr(memory, 'doc', None)
+                cycles = doc.get('cycles') if isinstance(doc, dict) else None
+                row = cycles.get(target) if isinstance(cycles, dict) else None
+                anchor_epoch = effective_anchor_epoch(row)
+                if anchor_epoch is None:
+                    anchor_epoch = last_dt.timestamp()
+                try:
+                    anchor_dt = datetime.fromtimestamp(float(anchor_epoch))
+                except (OverflowError, OSError, ValueError):
+                    return empty
+                hours = max(0.0, (now_dt - anchor_dt).total_seconds() / 3600.0)
+            # 清醒沉默口径：仅在自然时长越过阶段 3 上界后才读睡眠段（短沉默零额外 IO）。
+            if hours > MISS_STAGE_END_HOURS:
+                try:
+                    sleep_enabled = getattr(patrol, '_miss_sleep_excluded_enabled', None)
+                    if callable(sleep_enabled) and sleep_enabled():
+                        sleeper = getattr(patrol, '_sleep_hours_between', None)
+                        if callable(sleeper):
+                            hours = max(0.0, hours - max(0.0, float(sleeper(anchor_dt, now_dt))))
+                except Exception:
+                    pass
+            return {'stage': 4 if hours > MISS_STAGE_END_HOURS else 0,
+                    'hours': hours, 'relation': relation, 'target': True}
+        except Exception:
+            return empty
+
+    def _is_companion_private_route(self, route: Any) -> bool:
+        """scheduler 路由是否仍是当前陪伴目标私聊（装配根同口径二次核验）。"""
+        try:
+            target = str(target_qq_of(self.config) or '')
+            stream = str(getattr(self, '_stream_id', '') or '')
+            return (isinstance(route, dict) and bool(target) and bool(stream)
+                    and str(route.get('kind') or '') == 'private'
+                    and str(route.get('stream_id') or '') == stream
+                    and str(route.get('user_id') or '') == target)
+        except Exception:
+            return False
+
     def _social_preflight(self, route: dict | None, *, budget_reserved: bool = False,
-                          own_holder: str = '') -> tuple[bool,str]:
+                          own_holder: str = '', ignore_spoke_at: Any = None) -> tuple[bool,str]:
         allowed,reason=self._autonomous_context()
         if not allowed:return allowed,reason
         lease=self._attention.current()
@@ -1979,7 +2426,16 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             if not budget_reserved and self._proactive_budget.remaining()<=0:return False,'目标私聊主动预算不足'
             last=self._companion.affection.last_speak_time()
             if last is not None and 0<=self._surf_now().timestamp()-last.timestamp()<300:
-                return False,'刚刚主动开口'
+                # 阶段 4 说话轮与刚受理的卡片属于同一次主动接触：只放行**卡片自身**
+                # 写入的开口时间（2s 容差），其它更晚的主动开口仍按 300s 冷却拦截。
+                own_ok = False
+                if ignore_spoke_at is not None:
+                    try:
+                        own_ok = abs(last.timestamp()-ignore_spoke_at.timestamp())<=2.0
+                    except Exception:
+                        own_ok = False
+                if not own_ok:
+                    return False,'刚刚主动开口'
         return True,''
 
     def _social_reserve(self, route: dict) -> str | None:
@@ -2008,7 +2464,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 return self._social_preflight(route,budget_reserved=True,own_holder=holder)
             receipt=await self._video_card.send_ark(route,ark,before_send=final_gate)
             if receipt.get('success') is True and route['stream_id']==str(getattr(self,'_stream_id','') or ''):
-                try:self._companion.affection.note_optional_spoke(self._surf_now())
+                spoke_at=self._surf_now()
+                try:
+                    self._companion.affection.note_optional_spoke(spoke_at)
+                    # 阶段 4 说话轮据此识别「这 300s 冷却由本卡片自己写入」。
+                    self._last_social_card_spoke_at=spoke_at
                 except Exception:self.ctx.logger.warning('视频卡片已受理，但共享开口时间更新失败')
             return receipt
         finally:
@@ -2019,6 +2479,106 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             segments=[{'type':'text','data':text}],visible_text=text,
             source_kind='plugin:cateye.life_belonging_to_maimai:video_share_fact',
             message_id='video_share_fact:'+attempt,replyable=False)
+
+    async def _on_video_share_delivered(self, *, attempt_id: str, route: dict,
+                                        facts: dict, stage: int = 0) -> None:
+        """VideoSocialService 卡片 accepted 后的阶段 4 回调（装配根承接）。
+
+        设计方案 §3.3：卡片 + 事实写入后，阶段 4 追加一次说话轮。这里只做快速
+        校验与 ``create_task`` 调度——``_deliver`` 持有分享调度锁，绝不能在回调里
+        await 完整 planner 触发。回调异常不影响已 accepted 的卡片回执（scheduler 隔离）。
+        """
+        if int(stage or 0) != 4:
+            return
+        if getattr(self, '_is_unloading', False):
+            return
+        if not self._is_companion_private_route(route):
+            return
+        seen = getattr(self, '_stage4_video_notified', None)
+        if seen is None:
+            seen = set()
+            self._stage4_video_notified = seen
+        if attempt_id in seen:
+            return
+        seen.add(attempt_id)
+        while len(seen) > 64:  # 进程内幂等集有界；重启后由 accepted 终态自然不重放
+            seen.pop()
+        try:
+            asyncio.get_running_loop().create_task(
+                self._run_video_share_stage4_turn(
+                    attempt_id=attempt_id, route=dict(route), facts=dict(facts or {})))
+        except RuntimeError:
+            return
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning('阶段4视频分享说话轮调度失败（忽略）：%s',
+                                        type(exc).__name__)
+            except Exception:
+                pass
+
+    async def _run_video_share_stage4_turn(self, *, attempt_id: str, route: dict,
+                                           facts: dict) -> None:
+        """阶段 4 视频卡片后的说话轮：登记 → 宿主 trigger，失败撤登记。
+
+        不 reserve/commit 任何预算（卡片已占本次主动接触的槽位）；夜间/睡眠/忙闲
+        与 300s 冷却经 ``_social_preflight(budget_reserved=True)`` 复检，复检不过
+        一次性跳过（不重试，避免醒来补发旧话）。intent 明确禁止再次发卡/调分享工具。
+        """
+        try:
+            if getattr(self, '_is_unloading', False):
+                return
+            if not self._is_companion_private_route(route):
+                return
+            allowed, _reason = self._social_preflight(
+                route, budget_reserved=True,
+                ignore_spoke_at=getattr(self, '_last_social_card_spoke_at', None))
+            if not allowed:
+                return
+            context = self._stage4_context()
+            if int(context.get('stage') or 0) != 4:
+                return  # 卡片与说话轮之间用户真实来信/周期重置 → 不再补阶段 4 尾缀
+            hours = float(context.get('hours') or 0.0)
+            relation = str(context.get('relation') or '恋人')
+            title = str((facts or {}).get('title') or (facts or {}).get('bvid') or '').strip()
+            summary = str((facts or {}).get('summary') or (facts or {}).get('description') or '').strip()
+            if len(summary) > 200:
+                summary = summary[:200] + '…'
+            head = f"你刚给陪伴目标分享了刚看完的B站视频《{title}》，可结合观看摘要简评几句。"
+            if summary:
+                head += f"观看摘要：{summary}。"
+            head += ("卡片已经发出：本轮不要再次发送卡片或链接，不要调用分享工具"
+                     "（lbm_watch_share_recent_video），也不要转发给其他聊天。")
+            intent = append_stage4_miss_prompt(
+                head, hours=hours, relation=relation, is_video=True)
+            # 设计 §3.3 第 2 条：reason 也带同一份阶段 4 视频拼接文案（保留
+            # video_share_card 机器标记作前缀，便于回执/诊断按原口径检索）。
+            stage4_reason = append_stage4_miss_prompt(
+                'video_share_card', hours=hours, relation=relation, is_video=True)
+            stream = str(route.get('stream_id') or '')
+            try:
+                turn_id = register_turn(self, stream, 'video_share', 'video_share_card',
+                                        miss_stage=4)
+            except TypeError:
+                # 兼容尚未扩展 miss_stage 参数的登记簿版本（S2 落地后走上面分支）。
+                turn_id = register_turn(self, stream, 'video_share', 'video_share_card')
+            try:
+                reply = await self.ctx.maisaka.proactive.trigger(
+                    stream_id=stream, intent=intent, reason=stage4_reason,
+                    metadata={'attempt_id': attempt_id,
+                              'delivery_kind': 'video_share_card', 'miss_stage': 4})
+            except Exception:
+                discard_turn(self, turn_id)
+                return
+            if not ((isinstance(reply, dict) and reply.get('success') is True) or reply is True):
+                discard_turn(self, turn_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                self.ctx.logger.warning('阶段4视频分享说话轮失败（忽略）：%s',
+                                        type(exc).__name__)
+            except Exception:
+                pass
 
     def _bind_video_candidate_provider(self) -> None:
         """把候选源同步 pick 面绑到观看 manager（幂等；未启用不绑）。"""
@@ -2211,10 +2771,35 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                   "请自然回复这次点播的实际结果，聚焦视频画面与内容本身，不要重新提交、不要调用status/result。"
                   "自然分享视频内容，聚焦内容本身，不主动强调观看方式或画面/声音/字幕缺失；不编造未获取到的细节，被直接问及时诚实简短回应；自然回复即可，无需追问对方未回应的细节；不要转发给其他聊天。\n"
                   + summary)
+        # 2026-11-11 阶段 4（设计方案 §3.3 第 3 条）：只对陪伴目标流、且当前阶段 4 时
+        # 在点播结果 intent 末尾拼接视频版深层想念尾缀，并把 miss_stage=4 写入登记。
+        stage, stage_hours, stage_relation = 0, 0.0, '恋人'
+        try:
+            if str(stream_id) == str(getattr(self, '_stream_id', '') or ''):
+                resolver = getattr(self, '_target_miss_stage_context', None)
+                context = resolver() if callable(resolver) else None
+                if isinstance(context, dict) and int(context.get('stage') or 0) == 4:
+                    stage = 4
+                    stage_hours = float(context.get('hours') or 0.0)
+                    stage_relation = str(context.get('relation') or '恋人')
+        except Exception:
+            stage = 0
+        if stage == 4:
+            intent = append_stage4_miss_prompt(
+                intent, hours=stage_hours, relation=stage_relation, is_video=True)
         # PR-RELIABILITY（3.17.17 §1A）：登记前置到 trigger 调用前（宿主可能先构建
         # replyer）；点播完成通知直接经宿主 trigger 激活 planner（全仓 grep 核定的
         # 第三处宿主调用点）→ 统一登记 video_share；失败/异常 → discard 撤登记。
-        turn_id = register_turn(self, stream_id, "video_share", "video_watch_completion")
+        if stage == 4:
+            try:
+                turn_id = register_turn(self, stream_id, "video_share",
+                                        "video_watch_completion", miss_stage=4)
+            except TypeError:
+                # 登记簿尚未扩展 miss_stage 参数时保持旧登记（行为降级不中断通知）。
+                turn_id = register_turn(self, stream_id, "video_share",
+                                        "video_watch_completion")
+        else:
+            turn_id = register_turn(self, stream_id, "video_share", "video_watch_completion")
         try:
             reply = await self.ctx.maisaka.proactive.trigger(
                 stream_id=stream_id, intent=intent, reason="video_watch_completion",
@@ -2284,6 +2869,24 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         recent = False
         if last is not None:
             recent = 0 <= now.timestamp() - last.timestamp() < 300
+        # 2026-11-11 四阶段渗透（复核 finding）：阶段号/清醒时长/关系称谓随 facts
+        # 透出，coordinator 不再只靠 reason 标题标记猜阶段 4（接口契约显式化）。
+        # 只读、异常 → stage 0（与 _stage4_context 的 fail-open 口径一致）。
+        stage_context: dict = {}
+        try:
+            raw_context = self._stage4_context()
+            if isinstance(raw_context, dict):
+                stage_context = raw_context
+        except Exception:
+            stage_context = {}
+        try:
+            miss_stage = int(stage_context.get('stage') or 0)
+        except (TypeError, ValueError):
+            miss_stage = 0
+        try:
+            miss_hours = float(stage_context.get('hours') or 0.0)
+        except (TypeError, ValueError):
+            miss_hours = 0.0
         return {
             'enabled': bool(cfg.plugin.enabled and cfg.patrol.enabled and cfg.patrol.proactive_trigger_enabled),
             'target_stream': str(getattr(self, '_stream_id', '') or ''),
@@ -2292,12 +2895,35 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             'coverage': attention.get('coverage'), 'busy': attention.get('busy', True),
             'recent_outbound': recent,
             'budget_remaining': budget.remaining() if budget is not None else None,
+            'miss_stage': miss_stage if 0 <= miss_stage <= 4 else 0,
+            'miss_silence_hours': max(0.0, miss_hours),
+            'relation': str(stage_context.get('relation') or '恋人'),
         }
 
     async def optional_action(self, key: str, intent: str, reason: str, *, before: Any = None) -> dict:
         coordinator = getattr(self, '_optional_actions', None)
         if coordinator is None:
             return {'status': 'blocked', 'reason': 'not_assembled'}
+        # 2026-11-11 阶段 4（设计方案 §3.3 第 4 条）：发往陪伴目标私聊的每日主动任务
+        # 在装配根统一拼接深层想念尾缀（视频类用视频版）；非阶段 4 不调用拼接，
+        # reason 逐字不变。登记侧把 miss_stage=4 一并透传给 replyer 改写链。
+        stage = 0
+        stage_hours = 0.0
+        stage_relation = '恋人'
+        try:
+            resolver = getattr(self, '_stage4_context', None)
+            context = resolver() if callable(resolver) else {}
+        except Exception:
+            context = {}
+        if isinstance(context, dict) and int(context.get('stage') or 0) == 4:
+            stage = 4
+            stage_hours = float(context.get('hours') or 0.0)
+            stage_relation = str(context.get('relation') or '恋人')
+            # 标题标记幂等：调用方已拼过尾缀时不重复追加（协调器侧同样按此标记判重）。
+            if '深层心理覆盖·失联阶段4' not in str(reason):
+                is_video = 'video' in str(intent).lower() or '视频' in str(intent)
+                reason = append_stage4_miss_prompt(
+                    reason, hours=stage_hours, relation=stage_relation, is_video=is_video)
         # PR-RELIABILITY（3.17.17 §1A）：登记前置到 dispatch 前——刷QQ随口联系
         # （SmallEventActions → optional_contact）不经过 patrol._trigger_planner，
         # 在装配根统一登记 surf_chitchat；patrol 的 missing/patrol_chat 已由 patrol
@@ -2305,7 +2931,16 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 防重复改写；optional_action 回执的 unknown 防重复策略不受影响）。
         turn_id = None
         if str(intent) == 'optional_contact':
-            turn_id = register_turn(self, getattr(self, '_stream_id', ''), 'surf_chitchat', reason)
+            if stage == 4:
+                try:
+                    turn_id = register_turn(self, getattr(self, '_stream_id', ''),
+                                            'surf_chitchat', reason, miss_stage=4)
+                except TypeError:
+                    turn_id = register_turn(self, getattr(self, '_stream_id', ''),
+                                            'surf_chitchat', reason)
+            else:
+                turn_id = register_turn(self, getattr(self, '_stream_id', ''),
+                                        'surf_chitchat', reason)
         result = await coordinator.dispatch(key, intent, reason, before=before)
         if result.get('status') == 'enqueued':
             # Share one collision timestamp with greetings and other optional channels.

@@ -9,13 +9,17 @@
 - 人设真源 = 宿主 ``personality.personality``（注入只读 provider，与 LLMService
   身份前缀同源）；不读用户私聊、不从陪伴目标推断 bot 性格。
 - 普通滚动 tick / 页面读取 / hover / 预览 / 翻页 / 热重载 **不发请求**；
-  ``preference_for`` 是纯读口。请求只在首次启用、显式初始化、人设变化、
-  日意图/事件库成功更新带来新定义时合并安排（``ensure_evaluated``）。
+  ``preference_for`` 是纯读口。请求只在首次启用、显式初始化/管理员重建、
+  人设变化、日意图生成后合并安排（``ensure_evaluated``）；事件库 reload/
+  refresh 不直接触发，新定义由下一次日意图/初始化合并（3.17.33 复核项
+  PREF-EVENT-REFRESH-TRIGGER 选择「注释对齐实际调用点」，不改事件库路径）。
 - 统一走 ``LLMService.generate_detailed(module='planning', task_name='utils',
   with_identity=True)``，独立 event 标签；每本地日 ≤4 次（含发出后失败），
   单批 ≤24（容量未知先 12），超时 30s，失败退避 ≥30min；不设 max_tokens 覆盖。
 - 批次异步单飞；缓存未就绪按规则/中性运行，不阻塞睡眠/活动结束/下一项选取；
-  正式睡眠/硬约定/回复生成中（busy provider）推迟自动增量。
+  正式睡眠/硬约定/回复生成中（busy provider）推迟自动增量；推迟/日限/退避/
+  失败把剩余项（含仅画像待评估）持久化到 ``pending`` 并写决策日志，清醒拍
+  （life tick 尾部）自动续排，不静默丢弃。
 - 语义身份 = 名称+类型+标签（不含随机 item_id/日期/窗口钟点/当前数值）；
   恢复/改计划/跨日延续映射回原语义；event_id 只是别名。
 - 人设改变 → 旧评分立即停止参与（persona_hash 不符 → 中性），新画像评估前
@@ -55,6 +59,8 @@ MAX_BATCH_SIZE = 24
 DEFAULT_BATCH_SIZE = 12
 #: 每本地日自动请求上限（含实际发送后失败的请求）
 DAILY_REQUEST_LIMIT = 4
+#: 单次排空最多尝试的批数（与每日上限同阶；失败/退避/上限会提前终止）
+MAX_DRAIN_BATCHES = DAILY_REQUEST_LIMIT
 #: 失败退避（分钟）与默认超时（毫秒）
 BACKOFF_MINUTES = 30
 REQUEST_TIMEOUT_MS = 30_000
@@ -184,6 +190,11 @@ class ActivityPreferencesService:
         self._total_requests = 0
         self._total_tokens = 0
         self._backoff_until: Optional[datetime] = None
+        #: 最近一次评估/排空状态（诊断只读；pending 清除后仍保留，便于 /lbm_diag
+        #: 看到「上次为何停下」）。
+        self._last_status = ""
+        #: 持久 pending：睡眠中被忙闲门/上限/退避挡下时留痕，醒后/下次清醒拍续排。
+        self._pending: Dict[str, Any] = {}
         self._load()
 
     # ---- 时间/开关 ----
@@ -264,6 +275,21 @@ class ActivityPreferencesService:
                     self._backoff_until = datetime.fromisoformat(raw_backoff)
                 except ValueError:
                     self._backoff_until = None
+            pending = doc.get("pending")
+            if isinstance(pending, dict):
+                pending_count = max(0, int(pending.get("count") or 0))
+                pending_traits = bool(pending.get("traits"))
+                # 只恢复真正有待办的状态；空 pending 不复活，避免每次加载后
+                # 首次调用误判「有待排空」而写盘/写日志。
+                if pending_count or pending_traits:
+                    self._pending = {
+                        "since": str(pending.get("since") or "")[:40],
+                        "count": pending_count,
+                        "last_status": str(pending.get("last_status") or "")[:40],
+                        "traits": pending_traits,
+                    }
+            self._last_status = str(doc.get("last_status")
+                                    or self._pending.get("last_status") or "")[:40]
         except Exception as exc:
             # 损坏原件留证（一次性备份），运行中性降级；不在读取中覆盖原件。
             self._corrupt = True
@@ -303,6 +329,8 @@ class ActivityPreferencesService:
                 "backoff_until": (self._backoff_until.isoformat()
                                   if self._backoff_until is not None else ""),
             },
+            "pending": dict(self._pending),
+            "last_status": self._last_status,
         }
 
     def _save(self) -> None:
@@ -398,6 +426,10 @@ class ActivityPreferencesService:
             "total_tokens": self._total_tokens,
             "backoff_until": (self._backoff_until.isoformat()
                               if self._backoff_until is not None else ""),
+            "pending": dict(self._pending),
+            "pending_count": max(0, int(self._pending.get("count") or 0)),
+            "pending_traits": bool(self._pending.get("traits")),
+            "last_status": self._last_status,
             "corrupt": self._corrupt,
             "scoring_version": SCORING_VERSION,
         }
@@ -418,97 +450,294 @@ class ActivityPreferencesService:
             self._request_date = date
             self._requests_today = 0
 
+    def _collect_needed(self, defs: Sequence[Mapping[str, Any]], *, force: bool,
+                        persona_changed: bool,
+                        skip_keys: Optional[set] = None
+                        ) -> Tuple[List[Tuple[str, str, Dict[str, Any]]], bool]:
+        """本轮仍需评估的语义项与是否需补画像（纯本地判定）。
+
+        ``skip_keys``：force 排空模式下本调用已处理过的语义 key（仍计入去重，
+        但不再重复请求），使 ``force=True`` 的重建也能跨批排空而不是每轮只取前 12。
+        """
+        needed: List[Tuple[str, str, Dict[str, Any]]] = []
+        seen: set = set()
+        skip = skip_keys or ()
+        for d in defs:
+            key, dhash = activity_identity(d)
+            if key in seen:
+                continue
+            seen.add(key)
+            if key in skip:
+                continue
+            entry = self._activities.get(key)
+            if force or persona_changed or entry is None \
+                    or entry.get("descriptor_hash") != dhash:
+                needed.append((key, dhash, d))
+        need_traits = (force or persona_changed or not self._traits
+                       or self._traits_source != "llm")
+        return needed, need_traits
+
+    def _mark_pending(self, count: int, status: str, now: Optional[datetime] = None,
+                      *, traits: bool = False) -> None:
+        """持久化「还有待评估项」：睡眠忙闲/日限/退避/失败后由清醒拍续排。
+
+        ``traits`` 单独标记「只有画像待评估」（活动定义为空的启动/换人设场景），
+        避免 deferred_busy 在无定义时无处可记而被静默丢弃。凡 pending 状态
+        发生变化都写一条 ``planning.preferences_pending`` 决策日志；同一状态
+        反复重试不重复刷日志。
+        """
+        count = max(0, int(count))
+        traits = bool(traits)
+        if count <= 0 and not traits:
+            return
+        moment = now or self._now()
+        status_text = str(status or "")[:40]
+        previous = (int(self._pending.get("count") or 0),
+                    str(self._pending.get("last_status") or ""),
+                    bool(self._pending.get("traits")))
+        changed = (not self._pending) or previous != (count, status_text, traits)
+        since = str(self._pending.get("since") or "") \
+            or moment.isoformat(timespec="seconds")
+        self._pending = {"since": since, "count": count,
+                         "last_status": status_text, "traits": traits}
+        self._last_status = status_text
+        if not changed:
+            return
+        self._save()
+        self._log("planning.preferences_pending", count=count,
+                  status=status_text, traits=traits, since=since,
+                  requests_today=self._requests_today)
+
+    def _clear_pending(self, status: str = "") -> None:
+        """清除持久 pending；由「已排空」状态显式闭环并写决策日志。
+
+        无 pending 时只更新 ``last_status``（不写日志），避免普通 cached 触发
+        制造噪声；pending 真正被处理掉时记 ``planning.preferences_pending_cleared``。
+        """
+        had_pending = (int(self._pending.get("count") or 0) > 0
+                       or bool(self._pending.get("traits")))
+        cleared_count = int(self._pending.get("count") or 0)
+        cleared_traits = bool(self._pending.get("traits"))
+        status_text = str(status or "")[:40]
+        # 普通 cached 命中不再覆盖「上次评估结果」（诊断里保留 ok/日限/退避等原因）；
+        # pending 真正被清除时，cached 也是一次有意义的闭环原因。
+        update_last = had_pending or (bool(status_text) and status_text != "cached")
+        changed = had_pending or (update_last and status_text != self._last_status)
+        if had_pending:
+            self._pending = {}
+        if update_last and status_text:
+            self._last_status = status_text
+        if changed:
+            self._save()
+        if had_pending:
+            self._log("planning.preferences_pending_cleared",
+                      status=status_text or "cleared", count=cleared_count,
+                      traits=cleared_traits, requests_today=self._requests_today)
+
+    def has_pending(self) -> bool:
+        """只读：是否有待评估项（供清醒拍有界续排；不触发请求）。"""
+        try:
+            return (int(self._pending.get("count") or 0) > 0
+                    or bool(self._pending.get("traits")))
+        except Exception:
+            return False
+
+    async def _evaluate_once(self, defs: Sequence[Mapping[str, Any]], *, force: bool,
+                             phash: str, persona_changed: bool,
+                             skip_keys: Optional[set] = None,
+                             include_traits_override: Optional[bool] = None
+                             ) -> Dict[str, Any]:
+        """单批评估（一次 LLM 请求）；排空循环据此逐批推进。
+
+        ``skip_keys`` 供 force 排空跳已处理项；``include_traits_override`` 让
+        force 重建只在首批请求画像（后续批次 ``force=True`` 仍扫描缓存项，但不
+        重复索要 traits）。返回结果在成功时带 ``processed``（本批语义 key）。
+        """
+        needed, need_traits = self._collect_needed(
+            defs, force=force, persona_changed=persona_changed,
+            skip_keys=skip_keys)
+        include_traits = (need_traits if include_traits_override is None
+                          else bool(include_traits_override and need_traits))
+        if not needed and not include_traits:
+            return {"status": "cached", "pending": 0}
+        now = self._now()
+        if self._requests_today >= DAILY_REQUEST_LIMIT:
+            return {"status": "daily_limit", "pending": len(needed)}
+        if self._backoff_until is not None and now < self._backoff_until:
+            return {"status": "backoff", "pending": len(needed),
+                    "until": self._backoff_until.isoformat()}
+        if not force and self._busy():
+            # 睡眠/回复中的推迟：留待清醒拍重试（不静默丢弃）。
+            return {"status": "deferred_busy", "pending": len(needed)}
+        batch = needed[:self._batch_size]
+        prompt = self._build_prompt(batch, include_traits=include_traits)
+        event_tag = _EVENT_TAG_PROFILE if include_traits else _EVENT_TAG_SCORE
+        # 请求计数在发送前落账（含发出后失败）；热重载恢复不重置。
+        self._requests_today += 1
+        self._total_requests += 1
+        self._save()
+        try:
+            result = await self._llm.generate_detailed(
+                prompt, module="planning", task_name="utils",
+                with_identity=True, event=event_tag,
+                timeout_ms=REQUEST_TIMEOUT_MS, temperature=0.4)
+        except Exception as exc:
+            self._backoff_until = self._now() + timedelta(minutes=BACKOFF_MINUTES)
+            self._save()
+            self._log("planning.preferences_request_failed", error=str(exc))
+            return {"status": "failed", "error": str(exc), "pending": len(needed)}
+        tokens = int(getattr(result, "total_tokens", None) or 0)
+        self._total_tokens += max(0, tokens)
+        if not getattr(result, "ok", False):
+            self._backoff_until = self._now() + timedelta(minutes=BACKOFF_MINUTES)
+            self._save()
+            self._log("planning.preferences_request_failed",
+                      error=str(getattr(result, "error", ""))[:200], tokens=tokens)
+            return {"status": "failed", "error": str(getattr(result, "error", "")),
+                    "tokens": tokens, "pending": len(needed)}
+        # 旧响应晚到复核：人设已换 → 整份丢弃（不写入已更换的人设）。
+        if _sha(self._persona()) != phash:
+            return {"status": "stale_persona_discarded", "tokens": tokens,
+                    "pending": len(needed)}
+        parsed = self._parse_response(str(getattr(result, "text", "") or ""),
+                                      batch, include_traits=include_traits)
+        committed = self._commit(parsed, phash, defs, now)
+        self._trim_cache(defs)
+        # 无效/截断/空结果（ok 但零合法发布）→ 如实降级 + 退避，不在同轮追加请求。
+        if committed["evaluated"] == 0 and not committed["traits"]:
+            self._backoff_until = self._now() + timedelta(minutes=BACKOFF_MINUTES)
+            self._save()
+            self._log("planning.preferences_invalid_result", tokens=tokens)
+            return {"status": "failed", "error": "invalid_or_empty_result",
+                    "tokens": tokens, **committed}
+        self._save()
+        self._log("planning.preferences_evaluated",
+                  evaluated=committed["evaluated"], traits=committed["traits"],
+                  tokens=tokens, requests_today=self._requests_today)
+        return {"status": "ok", "tokens": tokens,
+                "processed": [key for key, _h, _d in batch], **committed}
+
     async def ensure_evaluated(self, definitions: Optional[Sequence[Mapping[str, Any]]] = None,
-                               *, force: bool = False) -> Dict[str, Any]:
+                               *, force: bool = False, drain: bool = True) -> Dict[str, Any]:
         """合并安排增量批次：首次/显式初始化/人设变化/新定义。
 
-        force=True = 管理员明确重建（换本人人设画像；不顺带清空视频兴趣/
-        陪伴联系倾向/历史回执）。返回诊断 dict；任何失败中性降级不抛出。
+        ``drain=True``（默认）时在同一单飞锁内连续排空批次（单批 ≤12，最多
+        ``MAX_DRAIN_BATCHES`` 批且受每本地日 ≤4 次请求上限）；``force=True`` =
+        管理员明确重建（含画像）——同样排空全部批次，不再只取首批 12 项，画像
+        只随首批请求。忙闲/日限/退避/失败时把剩余项（含仅画像待评估）持久化到
+        ``pending`` 并写决策日志，由清醒拍/下次显式触发重试。返回诊断 dict；
+        任何失败中性降级不抛出。
         """
         if not self._enabled():
             return {"status": "disabled"}
         if self._llm is None:
             return {"status": "no_llm"}
+        # force=True 的契约是「完整重建」→ 必须排空，不受调用方 drain=False 削弱。
+        drain = bool(drain or force)
         async with self._batch_lock:
-            now = self._now()
-            self._roll_request_ledger(now)
-            persona = self._persona()
-            phash = _sha(persona)
-            persona_changed = bool(self._persona_hash) and phash != self._persona_hash
+            self._roll_request_ledger(self._now())
+            phash = _sha(self._persona())
             defs = [dict(d) for d in (definitions if definitions is not None
                                       else self._definitions())]
-            needed: List[Tuple[str, str, Dict[str, Any]]] = []
-            seen: set = set()
-            for d in defs:
-                key, dhash = activity_identity(d)
-                if key in seen:
-                    continue
-                seen.add(key)
-                entry = self._activities.get(key)
-                if force or persona_changed or entry is None \
-                        or entry.get("descriptor_hash") != dhash:
-                    needed.append((key, dhash, d))
-            need_traits = (force or persona_changed or not self._traits
-                           or self._traits_source != "llm")
-            if not needed and not need_traits:
-                return {"status": "cached", "pending": 0}
-            if self._requests_today >= DAILY_REQUEST_LIMIT:
-                return {"status": "daily_limit", "pending": len(needed)}
-            if self._backoff_until is not None and now < self._backoff_until:
-                return {"status": "backoff", "pending": len(needed),
-                        "until": self._backoff_until.isoformat()}
-            if not force and self._busy():
-                return {"status": "deferred_busy", "pending": len(needed)}
-            batch = needed[:self._batch_size]
-            include_traits = need_traits
-            prompt = self._build_prompt(batch, include_traits=include_traits)
-            event_tag = _EVENT_TAG_PROFILE if include_traits else _EVENT_TAG_SCORE
-            # 请求计数在发送前落账（含发出后失败）；热重载恢复不重置。
-            self._requests_today += 1
-            self._total_requests += 1
-            self._save()
-            try:
-                result = await self._llm.generate_detailed(
-                    prompt, module="planning", task_name="utils",
-                    with_identity=True, event=event_tag,
-                    timeout_ms=REQUEST_TIMEOUT_MS, temperature=0.4)
-            except Exception as exc:
-                self._backoff_until = self._now() + timedelta(minutes=BACKOFF_MINUTES)
-                self._save()
-                self._log("planning.preferences_request_failed", error=str(exc))
-                return {"status": "failed", "error": str(exc)}
-            tokens = int(getattr(result, "total_tokens", None) or 0)
-            self._total_tokens += max(0, tokens)
-            if not getattr(result, "ok", False):
-                self._backoff_until = self._now() + timedelta(minutes=BACKOFF_MINUTES)
-                self._save()
-                self._log("planning.preferences_request_failed",
-                          error=str(getattr(result, "error", ""))[:200], tokens=tokens)
-                return {"status": "failed", "error": str(getattr(result, "error", "")),
-                        "tokens": tokens}
-            # 旧响应晚到复核：人设已换 → 整份丢弃（不写入已更换的人设）。
-            if _sha(self._persona()) != phash:
-                return {"status": "stale_persona_discarded", "tokens": tokens}
-            parsed = self._parse_response(str(getattr(result, "text", "") or ""),
-                                          batch, include_traits=include_traits)
-            committed = self._commit(parsed, phash, defs, now)
-            self._trim_cache(defs)
-            # 无效/截断/空结果（ok 但零合法发布）→ 如实降级 + 退避，不在同轮追加请求。
-            if committed["evaluated"] == 0 and not committed["traits"]:
-                self._backoff_until = self._now() + timedelta(minutes=BACKOFF_MINUTES)
-                self._save()
-                self._log("planning.preferences_invalid_result", tokens=tokens)
-                return {"status": "failed", "error": "invalid_or_empty_result",
-                        "tokens": tokens, **committed}
-            self._save()
-            self._log("planning.preferences_evaluated",
-                      evaluated=committed["evaluated"], traits=committed["traits"],
-                      tokens=tokens, requests_today=self._requests_today)
-            return {"status": "ok", "tokens": tokens, **committed}
+            totals = {"evaluated": 0, "traits": False, "tokens": 0, "batches": 0}
+            # force 重建：记下本次应强制重评的语义 key，逐批跳过已处理项，
+            # 从而「每轮只取前 12」不再成立；首批后不再重复索要 traits。
+            force_keys: List[str] = []
+            force_done: set = set()
+            if force:
+                initial_needed, _initial_traits = self._collect_needed(
+                    defs, force=True, persona_changed=False)
+                force_keys = [key for key, _h, _d in initial_needed]
+
+            def _remaining() -> Tuple[List[str], bool, bool]:
+                """按最新人设/缓存重算剩余语义 key（force 未处理项也算剩余）。"""
+                changed = (bool(self._persona_hash)
+                           and _sha(self._persona()) != self._persona_hash)
+                still_needed, need_traits_now = self._collect_needed(
+                    defs, force=False, persona_changed=changed)
+                keys = [key for key, _h, _d in still_needed]
+                if force:
+                    seen_keys = set(keys)
+                    keys.extend(key for key in force_keys
+                                if key not in force_done and key not in seen_keys)
+                return keys, need_traits_now, changed
+
+            for index in range(MAX_DRAIN_BATCHES if drain else 1):
+                # 每批前重读人设：首批提交画像后不再把全部定义误判为「人设变化」。
+                current_changed = (bool(self._persona_hash)
+                                   and _sha(self._persona()) != self._persona_hash)
+                if force:
+                    result = await self._evaluate_once(
+                        defs, force=True, phash=phash,
+                        persona_changed=current_changed,
+                        skip_keys=force_done,
+                        include_traits_override=(index == 0))
+                else:
+                    result = await self._evaluate_once(
+                        defs, force=False,
+                        phash=phash, persona_changed=current_changed)
+                status = str(result.get("status") or "")
+                if status in ("disabled", "no_llm"):
+                    return result
+                if status == "cached":
+                    # 缓存已覆盖定义（含 pending 项已不可评估/已评估）：闭环清除。
+                    self._clear_pending("cached")
+                    if totals["batches"]:
+                        return {"status": "ok", **totals}
+                    return result
+                if status == "ok":
+                    totals["evaluated"] += int(result.get("evaluated") or 0)
+                    totals["traits"] = bool(totals["traits"] or result.get("traits"))
+                    totals["tokens"] += int(result.get("tokens") or 0)
+                    totals["batches"] += 1
+                    if force:
+                        force_done.update(result.get("processed") or ())
+                    # 提交后按最新人设/缓存重算剩余；force 未处理项继续参与排空。
+                    remaining, need_traits, current_changed = _remaining()
+                    # 人设变化但本批没拿到有效画像：后续批次不会补画像，继续排空
+                    # 只会重复请求 → 停在这里，留 pending 等下一次触发。
+                    if remaining and need_traits and current_changed \
+                            and not result.get("traits"):
+                        self._mark_pending(len(remaining), "traits_missing",
+                                           traits=True)
+                        return {"status": "ok", **totals, "pending": len(remaining)}
+                    if remaining and drain \
+                            and self._requests_today < DAILY_REQUEST_LIMIT:
+                        continue
+                    if remaining:
+                        pending_status = ("daily_limit"
+                                          if self._requests_today >= DAILY_REQUEST_LIMIT
+                                          else "partial")
+                        self._mark_pending(len(remaining), pending_status,
+                                           traits=need_traits)
+                    else:
+                        self._clear_pending("ok")
+                    return {"status": "ok", **totals,
+                            "pending": len(remaining)}
+                # 失败/推迟/退避/日限/人设切换：留 pending，等清醒拍或退避结束重试。
+                remaining, need_traits, _changed = _remaining()
+                if remaining or need_traits:
+                    # deferred_busy（睡眠/忙闲）与失败/日限/退避一律落盘 + 日志，
+                    # 不静默丢弃；同一状态重复重试由 _mark_pending 去重。
+                    self._mark_pending(len(remaining), status, traits=need_traits)
+                if totals["batches"]:
+                    return {"status": "partial", **totals,
+                            "pending": len(remaining),
+                            "error": str(result.get("error") or status)}
+                return result
+            # 达到排空批数上限仍未完：留 pending 给下一拍（不丢）。
+            remaining, need_traits, _changed = _remaining()
+            if remaining or need_traits:
+                self._mark_pending(len(remaining), "drain_capped",
+                                   traits=need_traits)
+            return {"status": "ok", **totals, "pending": len(remaining)}
 
     async def rebuild(self) -> Dict[str, Any]:
-        """管理员偏好重建入口（默认命中缓存由调用方控制；明确重建才换画像）。"""
-        return await self.ensure_evaluated(force=True)
+        """管理员偏好重建入口（默认命中缓存由调用方控制；明确重建才换画像）。
+
+        明确重建同样走排空循环（force 只影响首批是否强制重评 + 是否附带画像）。
+        """
+        return await self.ensure_evaluated(force=True, drain=True)
 
     def _build_prompt(self, batch: Sequence[Tuple[str, str, Dict[str, Any]]],
                       *, include_traits: bool) -> str:

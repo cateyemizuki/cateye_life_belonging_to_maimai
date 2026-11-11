@@ -32,6 +32,37 @@ _COMPLETED = "completed"
 _FAILED = "failed"
 _CANCELLED = "cancelled"
 
+#: 任务台账的兼容来源（2026-11-10 刷视频批）：`source` 仍只保留 schedule/tool
+#: （既有端口/分享/测试口径不变）；原始传入值与语义枚举另存 requested_source/
+#: source_kind，历史条目写 source（tool/schedule/event）与 source_kind。
+_SOURCE_KIND_BY_SOURCE = {
+    "schedule": "autonomous_schedule",
+    "autonomous_schedule": "autonomous_schedule",
+    "event": "autonomous_event",
+    "autonomous_event": "autonomous_event",
+    "tool": "tool",
+    "debug": "tool",
+}
+
+
+def _source_kind(source: str) -> str:
+    return _SOURCE_KIND_BY_SOURCE.get(str(source or "").strip().lower(), "tool")
+
+
+def _history_source(task: Dict[str, Any]) -> str:
+    """历史/投影 source：tool / autonomous_schedule / autonomous_event。
+
+    与 dashboard（S2）和前端视频来源标签的跨流域契约一致；debug 归 tool。
+    优先使用入队时已细分的 source_kind（gap-* 小事件不会被误标成日程）。
+    """
+    kind = str(task.get("source_kind") or "").strip().lower()
+    if kind in ("tool", "autonomous_schedule", "autonomous_event"):
+        return kind
+    requested = str(task.get("requested_source") or "").strip().lower()
+    if requested in ("tool", "schedule", "event"):
+        return _source_kind(requested)
+    return _source_kind(str(task.get("source") or "tool"))
+
 
 class WatchTaskManager:
     """任务台账 + worker 子进程编排。SDK 无关（worker 命令可注入以便测试）。"""
@@ -188,24 +219,39 @@ class WatchTaskManager:
                 return {"success": True, "cached": False, "deduped": True,
                         "task_id": task["task_id"], "status": task.get("status")}
         tasks = self._store.load_tasks()
-        active = [t for t in tasks if not self._store.is_terminal(str(t.get("status")))]
-        if len(active) >= self._queue_capacity:
+        # 2026-11-10 队列语义：运行中的那个视频不占排队名额（一次仍只跑一个）；
+        # 已有任务时工具调用按容量进入排队，满员才如实 queue_full。
+        queued = [t for t in tasks if str(t.get("status")) == _QUEUED]
+        if len(queued) >= self._queue_capacity:
             return {"success": False, "error_class": "queue_full",
                     "error": f"观看队列已满（{self._queue_capacity}），请稍后再提交"}
+        requested_source = str(source or "tool").strip().lower() or "tool"
+        source_kind = _source_kind(requested_source)
+        # 空隙冲浪（gap-*）没有日程行，来源语义是「小事件」而非「日程」；
+        # 兼容端口仍传 source="schedule"，在此按 episode 前缀细分（不改端口契约）。
+        if source_kind == "autonomous_schedule" and str(episode_id or "").startswith("gap-"):
+            source_kind = "autonomous_event"
+        now = time.time()
         task = {
             "task_id": f"bw-{uuid.uuid4().hex[:12]}",
             "bvid": bvid,
             "purpose": str(purpose or "")[:200],
-            "source": "schedule" if source == "schedule" else "tool",
+            # 兼容字段：既有端口契约只有 schedule/tool；语义枚举见 source_kind。
+            "source": ("schedule" if requested_source in ("schedule", "autonomous_schedule")
+                       else "tool"),
+            "requested_source": requested_source,
+            "source_kind": source_kind,
             "episode_id": str(episode_id or ""),
             "owners": [owner] if owner else [],
             "cache_mode": requested_mode,
             "visual_spec": self._visual_spec(),
             "qzone_assets_spec": self._qzone_assets_spec(),
             "status": _QUEUED,
-            "created_at": time.time(),
+            # 发起/受理时刻：观看入库的 watched_at 取此值（不是处理完成时间）。
+            "created_at": now,
+            "requested_at": now,
             "deadline_seconds": self._deadline_seconds,
-            "deadline_epoch": time.time() + self._deadline_seconds,
+            "deadline_epoch": now + self._deadline_seconds,
             "error_class": None,
             "error": None,
         }
@@ -220,7 +266,12 @@ class WatchTaskManager:
         if not task:
             return {"success": False, "error_class": "not_found", "error": "任务不存在"}
         receipt = {"success": True, "task_id": task_id, "status": task.get("status"),
-                   "bvid": task.get("bvid")}
+                   "bvid": task.get("bvid"),
+                   # 结算口径：任务真正开始处理/发起/结束的时刻（取消/中断时
+                   # 上层按 started_at 结算实际观看，排队时间不算观看）。
+                   "created_at": task.get("created_at"),
+                   "started_at": task.get("started_at"),
+                   "finished_at": task.get("finished_at")}
         if str(task.get("status")) == _RUNNING:
             progress = read_json(self._job_dir(task_id) / "progress.json", None)
             if isinstance(progress, dict):
@@ -238,6 +289,8 @@ class WatchTaskManager:
         status = str(task.get("status"))
         if not self._store.is_terminal(status):
             return {"success": False, "error_class": "not_ready", "status": status,
+                    "created_at": task.get("created_at"),
+                    "started_at": task.get("started_at"),
                     "error": "任务尚未结束"}
         data = read_json(self._job_dir(task_id) / "result.json", None)
         if (isinstance(data, dict) and data.get("task_id") in (None, task_id)
@@ -245,21 +298,30 @@ class WatchTaskManager:
             visual = data.get("visual")
             if isinstance(visual, dict):
                 visual.pop("frames", None)
+            # 3.17.33 复核修复：结果回执携带发起/受理时刻，下游经历索引与
+            # watch history 共用「任务发起时间」口径（不再用完成时刻）。
+            data.setdefault("created_at", task.get("created_at"))
+            data.setdefault("requested_at", task.get("requested_at") or task.get("created_at"))
+            data.setdefault("started_at", task.get("started_at"))
             return {"success": True, "status": status, "result": data}
         if status == _COMPLETED:
             return {"success": False, "status": status, "error_class": "result_missing",
                     "error": "本任务结果不可得，未使用同BV其他任务的结果代替"}
         return {"success": True, "status": status, "result": {
             "task_id": task_id, "status": status, "error_class": task.get("error_class"),
-            "error": task.get("error")}}
+            "error": task.get("error"), "created_at": task.get("created_at"),
+            "started_at": task.get("started_at"),
+            "requested_at": task.get("requested_at") or task.get("created_at")}}
 
     def cancel(self, task_id: str, owner: str = "", force: bool = False) -> Dict[str, Any]:
-        """取消/释放观看任务（S0 所有权语义，B 计划/冲浪计划 §4.2）。
+        """取消/释放观看任务（S0 所有权 + 2026-11-10 不打断语义）。
 
-        - ``force=True``（用户经工具显式取消）：无条件取消，清空全部引用；
-        - ``force=False``（自动事件释放）：撤销自己的引用；仍有其他调用者持有
-          时**只释放不取消**（回执 ``released=True``），避免日程收尾误杀用户的
-          显式点播或另一个事件的任务；无引用信息时保持旧行为（直接取消）。
+        - ``force=True``（用户经工具显式取消）：无条件终止；
+        - ``force=False + owner=schedule:/event:``（日程/租约/消息钩子的自动
+          释放）：**只撤销该 owner 引用，绝不取消任务**——日程结束、owner 释放、
+          busy 变化都不再打断已受理的观看；任务照常跑完并入库；
+        - ``force=False + tool/debug 显式所有者``：按显式取消处理（工具语义）；
+        - ``force=False + 无 owner``：历史 API 兜底，直接取消。
         """
         task = self._store.get_task(task_id or "")
         if not task:
@@ -272,22 +334,26 @@ class WatchTaskManager:
         owner = str(owner or "").strip()
         if not force and owner:
             owners = [str(o) for o in (task.get("owners") or [])]
-            if owners and owner not in owners:
+            matched = owner in owners
+            if owners and not matched:
                 return {"success": False, "task_id": task_id, "status": status,
                         "error_class": "owner_mismatch", "error": "调用者未持有本任务引用"}
-            if owner in owners and len(owners) > 1:
+            if matched:
                 owners.remove(owner)
                 task["owners"] = owners
                 self._store.upsert_task(task)
+            # 日程/事件自动引用：只释放、绝不取消（日程结束/租约失效/忙闲）。
+            if owner.startswith(("schedule:", "event:", "autonomous_schedule:",
+                                 "autonomous_event:")):
                 return {"success": True, "task_id": task_id, "status": status,
-                        "released": True,
-                        "content": f"任务 {task_id} 仍有其他调用者（{len(owners)}），本次只释放引用不取消"}
+                        "released": True, "owner_matched": matched,
+                        "content": (f"任务 {task_id} 已释放引用 {owner}；观看任务不因"
+                                    "日程/忙闲/工具调用中断，继续处理至完成")}
+            # tool/debug 等显式调用者：无 force 也按显式取消处理（历史 API 语义）。
+            force = True
         if not force:
-            # 释放最后一个引用后清空（下次 dedupe 重新登记）
-            if owner:
-                owners = [str(o) for o in (task.get("owners") or []) if o != owner]
-                task["owners"] = owners
-                self._store.upsert_task(task)
+            # 显式 cancel（无 owner）：保留历史 API 的直接取消语义。
+            pass
         else:
             task["owners"] = []
             self._store.upsert_task(task)
@@ -301,6 +367,32 @@ class WatchTaskManager:
         # running：由监视循环在下一个轮询点终止子进程并落终态
         return {"success": True, "task_id": task_id, "status": status,
                 "cancelling": True}
+
+    def release_owner(self, task_id: str, owner: str) -> Dict[str, Any]:
+        """只移除引用、绝不取消任务（消息钩子/协调器释放专用）。
+
+        与 ``cancel(force=False, owner=...)`` 同语义的显式命名入口；owner 不
+        存在时幂等成功，便于日程/租约重复释放。
+        """
+        task = self._store.get_task(task_id or "")
+        if not task:
+            return {"success": False, "error_class": "not_found", "error": "任务不存在"}
+        status = str(task.get("status"))
+        if self._store.is_terminal(status):
+            return {"success": True, "task_id": task_id, "status": status,
+                    "already_terminal": True, "released": False}
+        owner = str(owner or "").strip()
+        if not owner:
+            return {"success": False, "error_class": "invalid_input",
+                    "error": "释放引用必须指定 owner"}
+        owners = [str(o) for o in (task.get("owners") or [])]
+        matched = owner in owners
+        if matched:
+            owners.remove(owner)
+            task["owners"] = owners
+            self._store.upsert_task(task)
+        return {"success": True, "task_id": task_id, "status": status,
+                "released": matched, "owner_matched": matched}
 
     async def shutdown(self) -> None:
         """停机（S0 生命周期修复）：取消任务泵、终止在跑 worker。
@@ -430,14 +522,20 @@ class WatchTaskManager:
 
     async def _run_task(self, task: Dict[str, Any]) -> None:
         task_id = str(task["task_id"])
-        if self._closed or (self._task_guard is not None and not self._task_guard(task)):
-            self._set_terminal(task, _CANCELLED, "attention_revoked", "自动观看条件已失效")
+        # 2026-11-10 不打断：busy/日程状态只在 submit 发起时把关；任务一经受理，
+        # 运行期不再用 task_guard 取消（否则排队期间忙闲变化会杀掉已受理任务）。
+        if self._closed:
+            self._set_terminal(task, _CANCELLED, "cancelled", "观看服务停止")
             return
         job_dir = self._job_dir(task_id)
         job_dir.mkdir(parents=True, exist_ok=True)
+        started_at = time.time()
         spec = {"task_id": task_id, "bvid": task.get("bvid"),
                 "purpose": task.get("purpose", ""),
                 "max_video_duration_seconds": self._max_duration,
+                "created_at": float(task.get("created_at") or started_at),
+                "requested_at": float(task.get("requested_at") or task.get("created_at") or started_at),
+                "started_at": started_at,
                 "deadline_epoch": float(task.get("deadline_epoch") or
                                         time.time() + float(task.get("deadline_seconds") or self._deadline_seconds))}
         if time.time() >= spec["deadline_epoch"]:
@@ -453,7 +551,7 @@ class WatchTaskManager:
             spec["qzone_assets"] = qzone_assets_spec
         atomic_write_json(job_dir / "spec.json", spec)
         task["status"] = _RUNNING
-        task["started_at"] = time.time()
+        task["started_at"] = started_at
         self._store.upsert_task(task)
         self._notify_state()
         cmd = [*self._watch_cmd(), str(job_dir / "spec.json"), str(job_dir / "result.json")]
@@ -530,90 +628,149 @@ class WatchTaskManager:
             pass
 
     async def _finish(self, task: Dict[str, Any], result: Dict[str, Any]) -> None:
-        result["task_id"] = str(task["task_id"])
-        self._current_task_id = str(task["task_id"])
+        task_id = str(task["task_id"])
+        result["task_id"] = task_id
+        self._current_task_id = task_id
         status = str(result.get("status"))
-        if status == _COMPLETED:
-            # 观后感/画面摘要（可选）：经宿主 LLM 生成；S0 起纳入任务总截止——
-            # 预算=剩余截止（上限 180s），耗尽/超时都如实标注并保留 worker 原始结果
-            if self._impression_hook is not None:
-                remaining = float(task.get("deadline_epoch") or 0) - time.time()
-                budget = min(180.0, remaining) if remaining > 0 else 0.0
-                if budget <= 0:
-                    result["impression"] = None
-                    result["impression_error"] = ("父侧加工窗口已被任务总截止耗尽，"
-                                                  "保留 worker 原始结果（如实标注）")
-                else:
-                    try:
-                        self._postprocess_task = asyncio.create_task(
-                            self._impression_hook(dict(result)))
-                        patched = await asyncio.wait_for(
-                            self._postprocess_task, timeout=budget)
-                        if isinstance(patched, dict):
-                            result = patched
-                    except asyncio.TimeoutError:
-                        result["impression"] = None
-                        result["impression_error"] = ("父侧加工（观后感/画面摘要）超过任务总截止，"
-                                                      "如实截断（不做晚到补跑）")
-                    except asyncio.CancelledError:
-                        if str(task["task_id"]) not in self._cancel_requested:
-                            raise
-                        self._set_terminal(task, _CANCELLED, "cancelled", "父侧加工时取消")
-                        return
-                    except Exception as exc:
-                        result["impression"] = None
-                        result["impression_error"] = f"观后感生成失败（如实降级）：{exc}"
-                    finally:
-                        self._postprocess_task = None
-            if str(task["task_id"]) in self._cancel_requested:
-                self._set_terminal(task, _CANCELLED, "cancelled", "结果入库前取消")
-                return
-            # Enforce the result boundary even when a hook failed or exhausted its budget.
-            visual = result.get("visual")
-            if isinstance(visual, dict):
-                visual.pop("frames", None)
-                if not str(visual.get("summary") or "").strip():
-                    visual["understanding_status"] = "not_completed"
-                    result["completeness"] = "partial"
-                else:
-                    result["completeness"] = "visual"
-            # 2026-11-04 刷视频功能批（前批遗留修复）：impression_error 只作内部
-            # 诊断——result_text 会把 impression_error 兜底成对外「观后感」，导致
-            # processing 错误文案外泄；改名 impression_diag（仍留 result.json/
-            # history 供追溯），对外文本诚实回落「暂无观后感」，不带错误细节。
-            impression_diag = result.pop("impression_error", None)
-            if impression_diag:
-                result["impression_diag"] = str(impression_diag)[:400]
-            task["status"] = _COMPLETED
-            task["result_cache_mode"] = self._result_mode_token(result)
-            try:
-                self._store.save_cache(str(task.get("bvid")), result)
-            except OSError as exc:
-                # 缓存失败不能抹掉真实任务终态或触发重复观看。
-                if self._log:
-                    self._log.warning("视频文字缓存写入失败：%s", exc)
-            entry = dict(result)
-            entry["bvid"] = task.get("bvid")
-            entry["watched_at"] = time.time()
-            entry["task_id"] = task.get("task_id")
-            entry["episode_id"] = task.get("episode_id", "")
-            entry["purpose"] = task.get("purpose", "")
-            # V2 主动分享扩展位（本期不启用、不默认填写）
-            entry.setdefault("recommended_reason", "")
-            entry.setdefault("shared_to", "")
-            entry.setdefault("shared_at", "")
-            entry.setdefault("share_receipt", "")
-            self._store.append_history(entry)
-            self._set_terminal(task, _COMPLETED, None, None, result=result)
-        else:
+        if status != _COMPLETED:
             self._set_terminal(task, _FAILED,
                                str(result.get("error_class") or "worker_error"),
                                str(result.get("error") or "worker 上报失败"))
+            return
+        # 2026-11-10 刷视频批：worker 处理完立即视为看完并入库——先写缓存与历史，
+        # 再跑观后感/画面摘要等父侧模型加工；后处理只回填字段，不改 watched_at。
+        finished_at = float(result.get("finished_at") or time.time())
+        self._enforce_result_boundary(result)
+        task["result_cache_mode"] = self._result_mode_token(result)
+        self._persist_completed(task, result,
+                                self._completion_entry(task, result, finished_at),
+                                append=True, final=False)
+        # 观后感/画面摘要（可选）：经宿主 LLM 生成；S0 起纳入任务总截止——
+        # 预算=剩余截止（上限 180s），耗尽/超时都如实标注并保留 worker 原始结果
+        result = await self._run_completion_hooks(task, result)
+        if task_id in self._cancel_requested:
+            # 显式取消发生在即时入库之后：回滚刚写入的观看记忆并落 cancelled。
+            self._store.remove_history(task_id)
+            self._set_terminal(task, _CANCELLED, "cancelled",
+                               "后处理阶段被显式取消")
+            return
+        # Enforce the result boundary even when a hook failed or exhausted its budget.
+        self._enforce_result_boundary(result)
+        # 2026-11-04 刷视频功能批（前批遗留修复）：impression_error 只作内部
+        # 诊断——result_text 会把 impression_error 兜底成对外「观后感」，导致
+        # processing 错误文案外泄；改名 impression_diag（仍留 result.json/
+        # history 供追溯），对外文本诚实回落「暂无观后感」，不带错误细节。
+        impression_diag = result.pop("impression_error", None)
+        if impression_diag:
+            result["impression_diag"] = str(impression_diag)[:400]
+        # 回填后处理字段（按 task_id 更新同一条历史；watched_at/first_watched_at 不动）。
+        self._persist_completed(task, result,
+                                self._completion_entry(task, result, finished_at),
+                                append=False)
+        self._set_terminal(task, _COMPLETED, None, None, result=result,
+                           finished_at=finished_at)
+
+    async def _run_completion_hooks(self, task: Dict[str, Any],
+                                    result: Dict[str, Any]) -> Dict[str, Any]:
+        if self._impression_hook is None:
+            return result
+        task_id = str(task.get("task_id") or "")
+        remaining = float(task.get("deadline_epoch") or 0) - time.time()
+        budget = min(180.0, remaining) if remaining > 0 else 0.0
+        if budget <= 0:
+            result["impression"] = None
+            result["impression_error"] = ("父侧加工窗口已被任务总截止耗尽，"
+                                          "保留 worker 原始结果（如实标注）")
+            return result
+        try:
+            self._postprocess_task = asyncio.create_task(
+                self._impression_hook(dict(result)))
+            patched = await asyncio.wait_for(self._postprocess_task, timeout=budget)
+            if isinstance(patched, dict):
+                return patched
+            return result
+        except asyncio.TimeoutError:
+            result["impression"] = None
+            result["impression_error"] = ("父侧加工（观后感/画面摘要）超过任务总截止，"
+                                          "如实截断（不做晚到补跑）")
+            return result
+        except asyncio.CancelledError:
+            if task_id not in self._cancel_requested:
+                raise
+            # 显式取消：跳过剩余后处理，由 _finish 回滚即时写入的历史条目。
+            return result
+        except Exception as exc:
+            result["impression"] = None
+            result["impression_error"] = f"观后感生成失败（如实降级）：{exc}"
+            return result
+        finally:
+            self._postprocess_task = None
+
+    @staticmethod
+    def _enforce_result_boundary(result: Dict[str, Any]) -> None:
+        visual = result.get("visual")
+        if isinstance(visual, dict):
+            visual.pop("frames", None)
+            if not str(visual.get("summary") or "").strip():
+                visual["understanding_status"] = "not_completed"
+                result["completeness"] = "partial"
+            else:
+                result["completeness"] = "visual"
+
+    def _completion_entry(self, task: Dict[str, Any], result: Dict[str, Any],
+                          finished_at: float) -> Dict[str, Any]:
+        entry = dict(result)
+        # 观看时间口径：任务入队/受理时刻（created_at），不是父侧处理完成时间。
+        watched_at = float(task.get("created_at") or task.get("requested_at")
+                           or task.get("started_at") or finished_at)
+        entry["bvid"] = task.get("bvid")
+        entry["watched_at"] = watched_at
+        entry["requested_at"] = watched_at
+        entry["finished_at"] = finished_at
+        entry["task_id"] = task.get("task_id")
+        entry["episode_id"] = task.get("episode_id", "")
+        entry["purpose"] = task.get("purpose", "")
+        entry["source"] = _history_source(task)
+        entry["source_kind"] = str(task.get("source_kind")
+                                   or _source_kind(entry["source"]))
+        entry["requested_source"] = str(task.get("requested_source")
+                                        or entry["source"])
+        # V2 主动分享扩展位（本期不启用、不默认填写）
+        entry.setdefault("recommended_reason", "")
+        entry.setdefault("shared_to", "")
+        entry.setdefault("shared_at", "")
+        entry.setdefault("share_receipt", "")
+        return entry
+
+    def _persist_completed(self, task: Dict[str, Any], result: Dict[str, Any],
+                           entry: Dict[str, Any], *, append: bool,
+                           final: bool = True) -> None:
+        """落文字缓存 + 历史条目（首次 append；后处理按 task_id 回填）。
+
+        ``final=False`` 用于 worker 完成后的即时入库：历史/缓存先写，任务状态
+        仍保持 running 直到父侧后处理结束（显式取消可在此窗口回滚历史）。
+        """
+        if final:
+            task["status"] = _COMPLETED
+            task["finished_at"] = float(entry.get("finished_at") or time.time())
+        task["result_cache_mode"] = self._result_mode_token(result)
+        self._store.upsert_task(task)
+        try:
+            self._store.save_cache(str(task.get("bvid")), result)
+        except OSError as exc:
+            # 缓存失败不能抹掉真实任务终态或触发重复观看。
+            if self._log:
+                self._log.warning("视频文字缓存写入失败：%s", exc)
+        if append:
+            self._store.append_history(entry)
+        else:
+            self._store.update_history(str(task.get("task_id") or ""), entry)
 
     def _set_terminal(self, task: Dict[str, Any], status: str, error_class: Optional[str],
-                      error: Optional[str], result: Optional[Dict[str, Any]] = None) -> None:
+                      error: Optional[str], result: Optional[Dict[str, Any]] = None,
+                      finished_at: Optional[float] = None) -> None:
         task["status"] = status
-        task["finished_at"] = time.time()
+        task["finished_at"] = float(finished_at) if finished_at is not None else time.time()
         task["error_class"] = error_class
         task["error"] = error
         self._store.upsert_task(task)

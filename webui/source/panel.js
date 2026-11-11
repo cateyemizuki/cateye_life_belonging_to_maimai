@@ -81,30 +81,83 @@ text('history-info',points.length?`${real} 个真实观察点 · ${estimated} �
 function svg(tag,attrs={},content){const e=document.createElementNS(NS,tag);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,String(v));if(content!==undefined)e.textContent=String(content);return e}
 function visiblePoints(){return zoom?points.filter(p=>+date(p.at)>=zoom[0]&&+date(p.at)<=zoom[1]):points}
 function smoothPath(segment,step){if(!segment.length)return '';let d=`M${segment[0][0]} ${segment[0][1]}`;if(step){for(let i=1;i<segment.length;i++)d+=`H${segment[i][0]}V${segment[i][1]}`;return d}const slopes=segment.slice(1).map((p,i)=>(p[1]-segment[i][1])/Math.max(.000001,p[0]-segment[i][0])),m=segment.map((p,i)=>i===0?slopes[0]:i===segment.length-1?slopes.at(-1):slopes[i-1]*slopes[i]<=0?0:2/(1/slopes[i-1]+1/slopes[i]));for(let i=1;i<segment.length;i++){const a=segment[i-1],b=segment[i],dx=(b[0]-a[0])/3;d+=`C${a[0]+dx} ${a[1]+m[i-1]*dx} ${b[0]-dx} ${b[1]-m[i]*dx} ${b[0]} ${b[1]}`}return d}
+// 3.17.33：睡眠/离线区间背景带。后端顶层与按日视图都下发窗口内全部 completed
+// 会话的 estimated_segments（含 offline）；前端只消费该投影，不再用最多 8 条的
+// sleep.sessions 兜底重建（旧快照缺键时保持空白，不拿不完整列表冒充完整窗口）。
+function sleepChartSegments(day){
+ const out=[],seen=new Set();
+ const add=(start,end,estimated,offline,source)=>{
+  const a=Number(date(start)),b=Number(date(end));
+  if(!Number.isFinite(a)||!Number.isFinite(b)||b<=a)return;
+  const key=a+'|'+b;if(seen.has(key))return;seen.add(key);
+  out.push({start:a,end:b,estimated:!!estimated,offline:!!offline,source});
+ };
+ for(const list of [day?.sleep?.estimated_segments,data?.sleep?.estimated_segments]){
+  for(const segment of Array.isArray(list)?list:[]){
+   if(!segment||typeof segment!=='object')continue;
+   add(segment.start,segment.end,true,segment.offline===true||segment.wake_reason==='offline_reconnect','estimated_segments');
+  }
+ }
+ return out;
+}
 function chart(target,rows,keys,max=1,height=260,min=0){
- target.replaceChildren();const day=dayView(),sleepSegments=day?.sleep?.estimated_segments||[];
+ target.replaceChildren();const day=dayView(),sleepSegments=sleepChartSegments(day);
  const dayBounds=selectedDay&&day? [Number(date(day.window_start)),Number(date(day.window_end))]:null;
  if(!rows.length&&!sleepSegments.length){empty(target,'还没有这段时间的记录','真实采样到来后，曲线会在这里慢慢展开。');return}
  if(!keys.length){empty(target,'曲线已隐藏','点击图例选择想看的状态。');return}
  const w=Math.max(280,Math.min(1100,target.clientWidth||1000)),l=38,r=18,top=22,bottom=52;
- const t0=zoom?.[0]??dayBounds?.[0]??Number(date(rows[0]?.at)),t1=zoom?.[1]??dayBounds?.[1]??Number(date(rows.at(-1)?.at));
+ const nowMs=Number(date(data?.generated_at));
+ let t0=zoom?.[0]??dayBounds?.[0]??Number(date(rows[0]?.at)),t1=zoom?.[1]??dayBounds?.[1]??Number(date(rows.at(-1)?.at));
+ // 行内没有点（离线/睡眠尾段）时不再取到 NaN：回退到睡眠段边界或当前统计窗口。
+ if(!rows.length){
+  const winStart=Number.isFinite(nowMs)?nowMs-hours*3600000:-Infinity;
+  const bands=sleepSegments.filter(segment=>selectedDay||!Number.isFinite(nowMs)||(segment.end>=winStart&&segment.start<=nowMs));
+  if(bands.length){
+   t0=Math.max(Math.min(...bands.map(segment=>segment.start)),winStart);
+   t1=Math.min(Math.max(...bands.map(segment=>segment.end)),Number.isFinite(nowMs)?nowMs:Infinity);
+  }
+  if(!Number.isFinite(t0)||!Number.isFinite(t1)||t1<=t0){
+   if(Number.isFinite(nowMs)){t1=nowMs;t0=nowMs-hours*3600000}else{t0=0;t1=1}
+  }
+ }else if(!Number.isFinite(t0)||!Number.isFinite(t1)||t1<=t0)t1=t0+300000;
+ // 睡眠段可延伸到最后一个真实点之后（离线尾段）：只在未缩放/未选日时扩到段尾，
+ // 且限制在当前 hours 窗口内，避免把 7 天前的离线会话拉进 24h 图。
+ if(sleepSegments.length&&!zoom&&!dayBounds&&Number.isFinite(nowMs)){
+  const winStart=nowMs-hours*3600000;
+  for(const segment of sleepSegments){
+   if(segment.end<winStart||segment.start>nowMs)continue;
+   const bandStart=Math.max(segment.start,winStart),bandEnd=Math.min(segment.end,nowMs);
+   if(bandStart<t0)t0=bandStart;
+   if(bandEnd>t1)t1=bandEnd;
+  }
+ }
+ const lastRow=rows.at(-1),tailSleeping=Boolean(lastRow&&(lastRow.sleeping===true||lastRow.frozen===true));
+ if(tailSleeping&&!zoom&&!dayBounds&&Number.isFinite(nowMs)&&nowMs>t1)t1=nowMs;
  const span=Math.max(300000,t1-t0),x=t=>l+(t-t0)/span*(w-l-r),y=v=>height-bottom-Math.max(0,Math.min(1,(v-min)/(max-min)))*(height-top-bottom),step=document.documentElement.dataset.dashboardStyle==='millennium';
  const root=svg('svg',{viewBox:`0 0 ${w} ${height}`,role:'img',tabindex:'0','aria-label':min<0?'情绪 VAD 趋势，纵轴 −1 到 1':max===1?'生活状态趋势，纵轴百分比，拖动或双指缩放；按 Escape 重置':'睡眠债趋势，纵轴小时'});
  // PR-UI-DETAIL（3.17.21）§1C：VAD（min<0）为事件驱动不规则采样，>15min 间隔是常态而非缺测。
  const sparseVad=min<0;
- root.style.userSelect='none';root.append(svg('title',{},sparseVad?'实线为真实观察；圆点为真实采样点；点线为采样缺口连线（两端真实，未插入估算点）；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':'实线为真实观察；虚线为中间缺口估算；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。'));
+ // S2-6/3.17.33：只有可见的「心情变化」图强制实线；生活状态/睡眠债/隐藏 VAD 图保持原口径。
+ const solidMood=target.id==='emotion-history-chart';
+ const chartTitle=solidMood?'实线为真实观察，缺口直接连线；圆点为真实采样点；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':sparseVad?'实线为真实观察；圆点为真实采样点；点线为采样缺口连线（两端真实，未插入估算点）；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':'实线为真实观察；虚线为中间缺口估算；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。';
+ root.style.userSelect='none';root.append(svg('title',{},chartTitle));
  const clipId=target.id+'-clip',hatchId=target.id+'-hatch',defs=svg('defs'),clip=svg('clipPath',{id:clipId});clip.append(svg('rect',{x:l,y:top,width:w-l-r,height:height-top-bottom}));defs.append(clip);
  const hatch=svg('pattern',{id:hatchId,patternUnits:'userSpaceOnUse',width:8,height:8,patternTransform:'rotate(45)'});hatch.append(svg('line',{x1:0,y1:0,x2:0,y2:8,stroke:'var(--focus)','stroke-width':2,opacity:.18}));defs.append(hatch);root.append(defs);
  const under=svg('g',{'clip-path':`url(#${clipId})`});
  // Background bands are descriptive, never added to the numerical samples.
- for(const segment of sleepSegments){const a=Math.max(t0,Number(date(segment.start))),b=Math.min(t1,Number(date(segment.end)));if(!(b>a))continue;const band=svg('rect',{x:x(a),y:top,width:x(b)-x(a),height:height-top-bottom,fill:`url(#${hatchId})`,'data-estimated-sleep':'true'});band.append(svg('title',{},'离线睡眠估算段 · 无连续采样，不计为真实观察点'));under.append(band)}
- let sleepStart=null;for(let i=0;i<=rows.length;i++){const p=rows[i],asleep=p&&(p.sleeping===true||p.frozen===true);if(asleep&&sleepStart===null)sleepStart=Number(date(p.at));if(!asleep&&sleepStart!==null){const end=Number(date(p?.at||rows[i-1].at));under.append(svg('rect',{x:x(sleepStart),y:top,width:Math.max(1,x(end)-x(sleepStart)),height:height-top-bottom,fill:'var(--focus)',opacity:.055}));sleepStart=null}}
+ for(const segment of sleepSegments){const a=Math.max(t0,segment.start),b=Math.min(t1,segment.end);if(!(b>a))continue;const offline=segment.offline===true;const band=svg('rect',{x:x(a),y:top,width:x(b)-x(a),height:height-top-bottom,fill:`url(#${hatchId})`,'data-estimated-sleep':'true','data-offline-sleep':offline?'true':'false'});band.append(svg('title',{},offline?'离线睡眠估算段 · 无连续采样，不计为真实观察点':'睡眠估算段 · 无连续采样，不计为真实观察点'));under.append(band)}
+ let sleepStart=null;for(let i=0;i<=rows.length;i++){const p=rows[i],asleep=p&&(p.sleeping===true||p.frozen===true);if(asleep&&sleepStart===null)sleepStart=Number(date(p.at));if(!asleep&&sleepStart!==null){
+  // 最后一点仍处于睡眠时没有下一行可闭合：尾段延伸到快照时刻（离线/睡眠尾段不再只剩 1px）。
+  const lastAt=Number(date(rows.at(-1)?.at));const end=p?Number(date(p.at)):Number.isFinite(nowMs)?Math.max(nowMs,lastAt):lastAt;
+  if(Number.isFinite(end))under.append(svg('rect',{x:x(sleepStart),y:top,width:Math.max(1,x(end)-x(sleepStart)),height:height-top-bottom,fill:'var(--focus)',opacity:.055,'data-sleep-run':'true'}));sleepStart=null}}
  root.append(under);
  for(let i=0;i<=4;i++){const yy=y(min+(max-min)*i/4);root.append(svg('line',{x1:l,x2:w-r,y1:yy,y2:yy,stroke:'var(--maibot-border)','stroke-width':step?1.5:.8,'stroke-dasharray':step?'none':'3 3'}),svg('text',{x:l-9,y:yy+4,'text-anchor':'end',fill:'var(--maibot-muted)','font-size':11},min===0&&max===1?i*25:Number((min+(max-min)*i/4).toFixed(2))))}
  root.append(svg('line',{x1:l,x2:l,y1:top,y2:height-bottom,stroke:'var(--maibot-border)'}),svg('line',{x1:l,x2:w-r,y1:height-bottom,y2:height-bottom,stroke:'var(--maibot-border)'}));
  const ticks=w<600?4:7;for(let i=0;i<ticks;i++){const at=t0+span*i/(ticks-1),xx=x(at),yy=height-bottom+15;root.append(svg('text',{x:xx,y:yy,transform:`rotate(-35 ${xx} ${yy})`,'text-anchor':'end',fill:'var(--maibot-muted)','font-size':11},clock(new Date(at).toISOString(),!selectedDay&&hours>24)))}
  const curves=svg('g',{'clip-path':`url(#${clipId})`});
- const downsampled=(target.id==='vad-chart'||target.id==='emotion-history-chart')?vadSeries().downsampled:lifeSeries().downsampled;
+ const downsampled=solidMood?true:((target.id==='vad-chart'||target.id==='emotion-history-chart')?vadSeries().downsampled:lifeSeries().downsampled);
+ // 心情图：相邻真实采样点之间直接连实线——不因 gap_before / >15min 间隔断开（不改原数组）。
+ if(solidMood&&rows.some(p=>p.gap_before))rows=rows.map(p=>p.gap_before?{...p,gap_before:false}:p);
  for(const key of keys){
   // 实线只连真实观察点、虚线只连估算填充点：抽稀后两者交错时，旧逻辑把任一端点
   // 为估算的边画成虚线，连真实观察也被画成虚线（历史按日首屏全虚线）。分开构建后
@@ -116,7 +169,7 @@ function chart(target,rows,keys,max=1,height=260,min=0){
    }flush();return paths};
   const real=build(false),estimated=build(true);
   if(real.length)curves.append(svg('path',{d:real.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':key==='stress'?3:(step?3:2),'stroke-linejoin':'round','stroke-linecap':'round','data-series':key}));
-  if(estimated.length)curves.append(svg('path',{d:estimated.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':2,'stroke-dasharray':'5 5',class:'estimated-line','data-series':key}));
+  if(estimated.length&&!solidMood)curves.append(svg('path',{d:estimated.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':2,'stroke-dasharray':'5 5',class:'estimated-line','data-series':key}));
   if(sparseVad){
    // PR-UI-DETAIL（3.17.21）§1C 根因修复：VAD 事件驱动稀疏采样（生产约 22min/点），
    // >15min 间隔标 gap_before——旧逻辑据此断线，单点段 smoothPath 只产出 "M x y"
@@ -128,7 +181,7 @@ function chart(target,rows,keys,max=1,height=260,min=0){
    for(const p of rows){if(p.estimated||num(p[key])===null){prevP=null;continue}
     if(prevP&&(p.gap_before||(!downsampled&&Number(date(p.at))-Number(date(prevP.at))>900000)))edges.push(`M${x(Number(date(prevP.at)))} ${y(prevP[key])}L${x(Number(date(p.at)))} ${y(p[key])}`);
     prevP=p}
-   if(edges.length){const bridge=svg('path',{d:edges.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':1.5,'stroke-dasharray':'2 4',opacity:.6,'data-gap-bridge':key});bridge.append(svg('title',{},'采样缺口连线：两端均为真实观察，未插入估算点'));curves.append(bridge)}
+   if(edges.length&&!solidMood){const bridge=svg('path',{d:edges.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':1.5,'stroke-dasharray':'2 4',opacity:.6,'data-gap-bridge':key});bridge.append(svg('title',{},'采样缺口连线：两端均为真实观察，未插入估算点'));curves.append(bridge)}
    for(const p of rows){if(p.estimated||num(p[key])===null)continue;const dot=svg('circle',{cx:x(Number(date(p.at))),cy:y(p[key]),r:2.5,fill:`var(${colors[key]})`,'data-real-point':key});dot.append(svg('title',{},clock(p.at,true)+' · 真实观察'));curves.append(dot)}
   }
   if(!sparseVad&&rows.length===1&&num(rows[0][key])!==null)curves.append(svg('circle',{cx:x(Number(date(rows[0].at))),cy:y(rows[0][key]),r:3,fill:`var(${colors[key]})`}))
@@ -237,22 +290,20 @@ function scheduleFootprint(rows, day){
  }
  return result;
 }
-function idleRunDetails(row,open){
+function idleRunDetails(row){
  const segments=row.idleSegments;
  const key=[row.schedule_date,row.name,row.source,row.actual_start_minute].join('|');
- const details=el('details','idle-run'),list=el('ol','idle-segments');
- details.dataset.idleRun=key;details.open=open.has(key);
- details.append(el('summary','',segments.length+' 段待机'+(row.idleGap?' · 间隔共 '+row.idleGap+' 分钟':'')));
+ // 3.17.33：待机分段常显（不再用 details/summary 折叠）。
+ const box=el('div','idle-run'),list=el('ol','idle-segments');
+ box.dataset.idleRun=key;
+ box.append(el('div','idle-run-title',segments.length+' 段待机'+(row.idleGap?' · 间隔共 '+row.idleGap+' 分钟':'')));
  for(const [i,segment] of segments.entries()){
   const gap=i?segment.actual_start_minute-segments[i-1].actual_end_minute:0;
   if(gap>0)list.append(el('li','note','间隔 '+gap+' 分钟，暂无活动记录'));
   list.append(el('li','',minute(segment.actual_start_minute)+' → '+(segment.status==='active'?'此刻':minute(segment.actual_end_minute))));
  }
- details.append(list);
- return details;
-}
-function openedIdleRuns(root){
- return new Set([...root.querySelectorAll('details[data-idle-run][open]')].map(e=>e.dataset.idleRun));
+ box.append(list);
+ return box;
 }
 const episodeLabel=status=>({active:'进行中',completed:'已完成',paused:'暂停',interrupted:'已中断',abandoned:'已放下',skipped:'已跳过',planned:'未开始'}[status]||status||'已记录');
 const schedulePages=[
@@ -329,7 +380,7 @@ function renderSchedulePool(key){
    if(item.definition_version)details.push('定义版本：'+item.definition_version);
    if(num(item.cooldown_minutes)>0)details.push('冷却：'+item.cooldown_minutes+' 分钟');
    const eff=poolStateEffect(item);if(eff)details.push('状态作用：'+eff);
-   if(item.preference)details.push('偏好：'+item.preference.label+'（'+item.preference.source+(item.preference.evaluated?'·已评估':'·待评估')+'）');
+   if(item.preference){const prefState=({evaluated:'已评估',fallback:'规则推断',pending:'待评估',unrecorded:'未记录'})[item.preference.state]||(item.preference.evaluated?'已评估':'待评估');details.push('偏好：'+item.preference.label+'（'+item.preference.source+'·'+prefState+'）')}
    if(key==='generated'||key==='one_shot'||key==='consumed'){
     source.append(document.createTextNode(
      (date(pools.generated_at)?' · 生成于 '+clock(pools.generated_at,true):' · 生成时间未记录')+
@@ -522,7 +573,7 @@ function renderSchedule(){
    const label=actual?(selectedDay?'这一天没有活动足迹':'今天还没有活动足迹'):(dayView()?.intent?.plans_available===false?'计划已超出保留期':selectedDay?'这一天没有计划记录':'今天的意图尚未生成');
    empty(target,sch.enabled?label:'日程未启用',actual?'实际发生后再留下记录。':'计划与实际活动分别展示。');return;
   }
-  const open=openedIdleRuns(target);target.replaceChildren();
+  target.replaceChildren();
   for(const row of list){
    const active=actual&&row.status==='active';
    const start=actual?(row.actual_start_minute??row.planned_start_minute):row.start_minute;
@@ -530,7 +581,7 @@ function renderSchedule(){
    const box=el('div','activityrow'+(active?' active':'')),center=el('div');
    const separator=row.idleGap?' 至 ':' → ';
    center.append(el('h3','',row.name||'未命名活动'),el('div','note',minute(start)+separator+(active?'此刻':minute(spanEnd(start,end)))+(actual?' · '+source(row.source):'')));
-   if(row.idleSegments)center.append(idleRunDetails(row,open));
+   if(row.idleSegments)center.append(idleRunDetails(row));
    if(actual&&row.state_before&&row.state_after){
     const changes=spec.filter(([k])=>num(row.state_before[k])!==null&&num(row.state_after[k])!==null&&Math.abs(row.state_after[k]-row.state_before[k])>=.01).slice(0,3).map(([k,l])=>l+' '+pct(row.state_before[k])+'→'+pct(row.state_after[k]));
     if(changes.length)center.append(el('div','statechange',changes.join(' · ')));
@@ -563,7 +614,7 @@ function renderHealth(){const h=data.history||{},s=data.schedule||{},health=data
  if(num(health.external_errors)>0)errBits.push(`其他模块错误 ${count(health.external_errors)}`);
  text('health-brief',(warnings.length?`数据可用 · ${warnings.length} 项提示`:'数据正常')+' · 最近更新 '+(data.generated_at?clock(data.generated_at,true):'—')+(errBits.length?' · '+errBits.join(' · '):'')+' · 来源、新鲜度与警告点左下角麦麦查看')}
 function validDay(value){return typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString().slice(0,10)===value}
-function validateSnapshot(v){const obj=x=>x&&typeof x==='object'&&!Array.isArray(x),rows=(x,max)=>Array.isArray(x)&&x.length<=max&&x.every(obj);if(!obj(v)||v.schema_version!==1||!obj(v.state)||!obj(v.schedule)||!obj(v.history)||!rows(v.history.points,2304)||!rows(v.schedule.episodes,120)||!rows(v.schedule.intents,80)||!(v.schedule.current===null||obj(v.schedule.current))||!obj(v.sleep)||!rows(v.sleep.sessions,8)||!Array.isArray(v.observations)||!v.observations.every(x=>typeof x==='string')||!Array.isArray(v.warnings)||!v.warnings.every(x=>typeof x==='string'))throw Error('文件不是受支持的生活面板快照');if(v.day?.available&&(!obj(v.day)||!validDay(v.day.date)||!date(v.day.window_start)||!date(v.day.window_end)||+date(v.day.window_end)<=+date(v.day.window_start)||!rows(v.day.footprint?.episodes??v.day.footprint?.items,120)||!rows(v.day.intent?.items,80)||!rows(v.day.state_history?.points,288)||!rows(v.day.vad_history?.points,288)||!rows(v.day.sleep?.sessions,8)||!rows(v.day.sleep?.estimated_segments,16)))throw Error('按日快照结构或记录数量不受支持');if(v.qzone?.delivery?.recent!==undefined&&!rows(v.qzone.delivery.recent,40))throw Error('发送回执快照结构不受支持');if(v.video!==undefined&&(!obj(v.video)||!rows(v.video.recent??[],10)||!rows(v.video.interests??[],8)))throw Error('视频信息快照结构不受支持');return v}
+function validateSnapshot(v){const obj=x=>x&&typeof x==='object'&&!Array.isArray(x),rows=(x,max)=>Array.isArray(x)&&x.length<=max&&x.every(obj);if(!obj(v)||v.schema_version!==1||!obj(v.state)||!obj(v.schedule)||!obj(v.history)||!rows(v.history.points,2304)||!rows(v.schedule.episodes,120)||!rows(v.schedule.intents,80)||!(v.schedule.current===null||obj(v.schedule.current))||!obj(v.sleep)||!rows(v.sleep.sessions,320)||(v.sleep.estimated_segments!==undefined&&!rows(v.sleep.estimated_segments,320))||!Array.isArray(v.observations)||!v.observations.every(x=>typeof x==='string')||!Array.isArray(v.warnings)||!v.warnings.every(x=>typeof x==='string'))throw Error('文件不是受支持的生活面板快照');if(v.day?.available&&(!obj(v.day)||!validDay(v.day.date)||!date(v.day.window_start)||!date(v.day.window_end)||+date(v.day.window_end)<=+date(v.day.window_start)||!rows(v.day.footprint?.episodes??v.day.footprint?.items,120)||!rows(v.day.intent?.items,80)||!rows(v.day.state_history?.points,288)||!rows(v.day.vad_history?.points,288)||!rows(v.day.sleep?.sessions,8)||!rows(v.day.sleep?.estimated_segments,16)))throw Error('按日快照结构或记录数量不受支持');if(v.qzone?.delivery?.recent!==undefined&&!rows(v.qzone.delivery.recent,40))throw Error('发送回执快照结构不受支持');if(v.video!==undefined&&(!obj(v.video)||!rows(v.video.recent??[],10)||!rows(v.video.interests??[],8)))throw Error('视频信息快照结构不受支持');return v}
 // W-15（2026-11-03）：原 renderModules 一次重建「心情与分享」+「系统」两个 tab 的
 // 内容、VAD 图与用量矩阵表；拆成 renderMood/renderUsage，各自只在所属 tab 激活时
 // 执行（由 renderActiveTab 调度），隐藏 tab 不再每 30 秒重建表格与 SVG。
@@ -577,10 +628,20 @@ function renderEmotion(){const emotion=data.emotion||{};text('emotion-label',emo
 // ≤10 条；watched_at 为 epoch 秒，clock 按毫秒解析故 ×1000）；兴趣话题=兴趣文档最终权重
 // top8（persona_base+watch_score 口径，只读不触发刷新）。服务缺失/旧快照无 video 键 →
 // 空态降级，不造假 0；标题/BV 均为公开视频信息，不含私聊正文与路径。
+// S2/S3 契约：source 取值 tool / autonomous_schedule / autonomous_event（兼容旧 schedule），
+// first_watched_at 与 watched_at 同为 epoch 秒。缺失一律显示「未记录」，不猜测。
+function videoSourceLabel(value){
+ const key=typeof value==='string'?value.trim():'';
+ return ({tool:'工具观看',schedule:'自主观看·日程',autonomous_schedule:'自主观看·日程',autonomous_event:'自主观看·小事件'})[key]||(key||'未记录');
+}
+function videoRecentMeta(row){
+ const first=num(row?.first_watched_at);
+ return [row?.bvid||'BV 未记录','来源 '+videoSourceLabel(row?.source),'首次观看 '+(first===null||first<=0?'未记录':clock(first*1000,true))].join(' · ');
+}
 function renderMood(){const v=data.video||{};
  const videoRecentBox=$('video-recent'),recent=Array.isArray(v.recent)?v.recent.slice(0,10):[];
  text('video-recent-count',v.available?recent.length+' 条':'—');
- if(videoRecentBox){if(recent.length){videoRecentBox.replaceChildren(...recent.map(row=>{const box=el('div','sleeprow videorrow'),info=el('div');info.append(el('strong','',row.title||'标题未记录'),el('div','note',row.bvid||''));box.append(info,el('span','note',num(row.watched_at)!==null?clock(row.watched_at*1000,true):'—'));return box}))}else empty(videoRecentBox,v.available?'最近没有看完的视频':'视频信息暂不可用',v.available?'看完的视频会在这里留下记录。':'视频观看模块就绪后展示。')}
+ if(videoRecentBox){if(recent.length){videoRecentBox.replaceChildren(...recent.map(row=>{const box=el('div','sleeprow videorrow'),info=el('div');info.append(el('strong','',row.title||'标题未记录'),el('div','note videometa',videoRecentMeta(row)));const latest=el('span','note',num(row.watched_at)!==null?clock(row.watched_at*1000,true):'—');latest.title='最近观看时间';box.append(info,latest);return box}))}else empty(videoRecentBox,v.available?'最近没有看完的视频':'视频信息暂不可用',v.available?'看完的视频会在这里留下记录。':'视频观看模块就绪后展示。')}
  const interestBox=$('video-interests'),interests=Array.isArray(v.interests)?v.interests.slice(0,8):[];
  if(interestBox){if(interests.length){const max=Math.max(...interests.map(row=>num(row.weight)??0),.001);interestBox.replaceChildren(...interests.map(row=>{const box=el('div','interestrow'),head=el('div','interesthead'),w=num(row.weight),bar=el('div','meter'),fill=el('i');fill.style.background='var(--focus)';fill.style.width=(w===null?0:Math.max(0,Math.min(1,w/max))*100)+'%';bar.append(fill);head.append(el('strong','',row.topic||'未知话题'),el('span','note',fix(w,2)));box.append(head,bar);return box}))}else empty(interestBox,'暂无兴趣话题',v.available?'兴趣文档生成后展示。':'视频观看模块就绪后展示。')}
  const q=data.qzone||{};text('qzone-enabled',q.available?(q.enabled?'已启用':'未启用'):'未就绪');const cookie=q.cookie_health||{},cookieLabels={not_checked:'尚未检查登录状态',not_logged_in:'尚未登录空间',expired:'登录凭据过期或不完整',adapter_unavailable:'适配器暂不可用',network_error:'网络暂不可用',ready:'登录凭据已获取',cached:'使用本地缓存，尚未确认'};
@@ -636,7 +697,6 @@ function renderUsageOverview(usage){
 }
 function renderUsageModules(usage){
  const container=$('usage-models'),matrix=usage.matrix||{};
- const open=new Set([...container.querySelectorAll('details[open]')].map(node=>node.dataset.module));
  const sorted=Object.keys(matrix).sort((a,b)=>(usage.modules?.[b]||0)-(usage.modules?.[a]||0)||a.localeCompare(b));
  const models=entries=>{
   const list=el('ul','usage-model-list');
@@ -649,8 +709,9 @@ function renderUsageModules(usage){
  };
  container.replaceChildren();
  for(const module of sorted){
-  const group=el('details','usage-module'),heading=el('summary','usage-module-head'),totals=el('span','usage-amounts');
-  group.dataset.module=module;group.open=open.has(module);
+  // 3.17.33：用量模块常显（不再用 details/summary 折叠）。
+  const group=el('section','usage-module'),heading=el('div','usage-module-head'),totals=el('span','usage-amounts');
+  group.dataset.module=module;
   totals.append(el('span','note',usageCount(usage.module_calls?.[module])+' 次'),el('strong','',usageCount(usage.modules?.[module])+' Token'));
   heading.append(el('span','usage-name',usageModuleLabel(module)),totals);
   const records=el('button','usage-module-records','查看该模块的记录');
@@ -663,7 +724,7 @@ function renderUsageModules(usage){
   container.append(models(fallback.map(([model,tokens])=>[model,{tokens,calls:usage.model_calls?.[model]}])));
  }
  if(!container.hasChildNodes())container.append(el('p','usage-empty note','这个统计范围内暂无模型用量。'));
- text('usage-models-hint',sorted.length?'展开模块查看各模型的调用与 Token。':fallback.length?'这份记录按模型汇总。':'');
+ text('usage-models-hint',sorted.length?'按模块展示各模型的调用与 Token。':fallback.length?'这份记录按模型汇总。':'');
  renderUsageFilter();
 }
 function renderUsage(){
@@ -782,9 +843,9 @@ function renderUsageFilter(){
 function showUsageRecords(module){
  usageFilter=module;
  renderUsageFilter();
- $('usage-details').open=true;
+ // 逐笔记录区常显，不再有 summary/open 可切换；只负责按模块过滤并加载。
  loadUsageRows();
- $('usage-details').querySelector('summary').focus();
+ $('usage-module-filter').focus({preventScroll:true});
 }
 function usageRecord(row){
  const item=el('li','usage-record'),context=el('div','usage-record-context'),model=el('div','usage-record-model');
@@ -844,7 +905,7 @@ async function loadUsageRows(append=false){
   usageRowsTotal=num(page.total)??usageRowsOffset;
   usageRowsTruncated=Boolean(page.truncated&&page.rows.length);
   usageRowsLoaded=true;renderUsageRows();
-  if(append)(target.querySelector('.usage-more')||$('usage-details').querySelector('summary')).focus({preventScroll:true});
+  if(append)(target.querySelector('.usage-more')||$('usage-module-filter')).focus({preventScroll:true});
  }catch(e){
   if(seq!==usageRowsSeq)return;
   const retry=el('button','usage-more','重试读取');
@@ -861,16 +922,18 @@ async function changeUsageRange(event){
  usageHours=next;
  try{localStorage.setItem('lbmUsageHours',String(usageHours))}catch(err){}
  resetUsageRows();syncUsageRange();
- if($('usage-details').open)$('usage-rows').append(el('p','usage-empty note','正在切换统计范围…'));
+ // 逐笔记录区常显：切换范围时始终显示过渡文案（不再判断 details.open）。
+ $('usage-rows').append(el('p','usage-empty note','正在切换统计范围…'));
  await refresh(true);
- if(usageHours!==next||!$('usage-details').open)return;
+ if(usageHours!==next)return;
  if(lastError){$('usage-rows').replaceChildren(el('p','usage-empty note','统计范围暂未更新，请刷新后重试。'));return}
  loadUsageRows();
 }
 $('usage-range').onclick=changeUsageRange;
 $('usage-detail-range').onclick=changeUsageRange;
 $('usage-module-filter').onchange=e=>{usageFilter=e.target.value;loadUsageRows()};
-$('usage-details').ontoggle=()=>{if($('usage-details').open)loadUsageRows()};
+// 3.17.33：逐笔记录区不再折叠，原 details toggle 懒加载改为详情打开事件触发。
+document.addEventListener('lbm:detail-open',event=>{if(event.detail?.key==='usage')loadUsageRows()});
 $('samples-toggle').onclick=()=>{const open=$('samples').hidden;$('samples').hidden=!open;$('samples-toggle').setAttribute('aria-expanded',String(open));text('samples-toggle',open?'收起采样值':'查看采样值')};
 $('emotion-samples-toggle').onclick=()=>{const open=$('emotion-history-samples').hidden;$('emotion-history-samples').hidden=!open;$('emotion-samples-toggle').setAttribute('aria-expanded',String(open));text('emotion-samples-toggle',open?'收起采样值':'查看采样值')};
 $('export').onclick=()=>{if(!data)return;$('snapshot-text').value=JSON.stringify(data);$('snapshot-panel').hidden=false;$('snapshot-panel').scrollIntoView({block:'start'})};$('snapshot-close').onclick=()=>$('snapshot-panel').hidden=true;$('snapshot-select').onclick=()=>{$('snapshot-text').focus();$('snapshot-text').select()};
@@ -936,7 +999,6 @@ function renderExtras(){
 }
 function renderTimeline(){
  const sch=dayRows(),day=selectedDay||sch.date||dayText(data.generated_at),root=$('dual-timeline');
- const open=openedIdleRuns(root);
  root.replaceChildren();text('timeline-date',day);
  const items=scheduleFootprint((sch.episodes||[]).slice(0,120),day).map(row=>({
   row,fixed:false,start:num(row.actual_start_minute)??num(row.planned_start_minute),
@@ -962,7 +1024,7 @@ function renderTimeline(){
   else if(!fixed&&row.crosses_midnight)head.append(el('span','vtime-badge crossdaybadge','跨日'));
   const origin=fixed?(row.origin==='archived'?'历史计划归档':'日计划'):source(row.source);
   body.append(head,el('p','note',minute(start)+separator+(active?'此刻':end===null?'待定':minute(end))+' · '+origin));
-  if(row.idleSegments)body.append(idleRunDetails(row,open));
+  if(row.idleSegments)body.append(idleRunDetails(row));
   if(!fixed&&row.state_before&&row.state_after){
    const changes=spec.filter(([k])=>num(row.state_before[k])!==null&&num(row.state_after[k])!==null&&Math.abs(row.state_after[k]-row.state_before[k])>=.01).slice(0,3).map(([k,l])=>l+' '+pct(row.state_before[k])+'%→'+pct(row.state_after[k])+'%');
    if(changes.length)body.append(el('p','vtime-change',changes.join(' · ')));

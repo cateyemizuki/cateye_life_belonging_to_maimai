@@ -148,15 +148,31 @@ def _schedule_pools(planning: Any, model: Any, now: datetime, read: Any,
             return None
         aff = _number(p.get('affinity')) or 0.0
         src = str(p.get('source') or '')
-        if not p.get('evaluated') and src in ('neutral', 'persona_changed', 'cache_corrupt'):
-            label = '待评估' if src == 'neutral' else '未记录'
-        elif aff >= 0.35:
-            label = '喜欢'
-        elif aff <= -0.35:
-            label = '不太想做'
+        evaluated = bool(p.get('evaluated'))
+        # 3.17.33：标签按真实评估状态分档，不再把所有未命中都落到同一个兜底文案。
+        # evaluated=True → LLM 逐活动结论；rule_fallback → 人设 traits 的保守匹配
+        # （有分但未逐项评估）；neutral → 该项从未评估；persona_changed/cache_corrupt
+        # 及未知来源 → 未记录。state 供前端区分『待评估』与『未记录』，不改变
+        # 既有 label/source/evaluated 契约。
+        if evaluated:
+            state = 'evaluated'
+        elif src == 'rule_fallback':
+            state = 'fallback'
+        elif src == 'neutral':
+            state = 'pending'
         else:
-            label = '一般'
-        return {'label': label, 'source': src[:24], 'evaluated': bool(p.get('evaluated'))}
+            state = 'unrecorded'
+        if state in ('evaluated', 'fallback'):
+            if aff >= 0.35:
+                label = '喜欢'
+            elif aff <= -0.35:
+                label = '不太想做'
+            else:
+                label = '一般'
+        else:
+            label = '待评估' if state == 'pending' else '未记录'
+        return {'label': label, 'source': src[:24], 'evaluated': evaluated,
+                'state': state}
 
     def events(rows: Any) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -388,64 +404,150 @@ def _large_gap_count(rows: list[dict[str, Any]], *, time_key: str) -> int:
     return count
 
 
-def _estimated_sleep_segments(db: Any, *, day_start: datetime,
-                              day_end: datetime) -> list[dict[str, Any]]:
-    """窗口内大间隙的睡眠会话估算段（报告 §2.5：图表用会话数据画虚线/斜纹）。
+def _sleep_bounds(row: Any, midnight: datetime) -> tuple[datetime, datetime | None] | None:
+    """sleep_sessions 行 → (绝对起点, 绝对终点)；跨午夜 ``end<start`` 统一 +1440。
 
-    从 ``sleep_sessions`` 取与窗口重叠的 **completed** 会话（``actual_end_minute``
-    非 NULL = 已收口；schedule_db 无 status 列，completed 口径与会话写库方
-    plugin.py 一致；含 ``offline_reconnect`` 离线补全会话，不按 wake_reason 过滤）。
-    会话真实起止按 schedule_date 日帧分钟（跨午夜 >1440）映射为绝对时刻后裁剪到
-    窗口。会话不覆盖的剩余大间隙**保持空洞**（如实缺口，不伪造）。只读投影：
-    不写任何库/历史；段上的 ``estimated:true`` 表示「图表估算段」（该段无 5 分钟
-    真实观测样本、由会话记录覆盖渲染），不代表会话记录本身是估算。
+    DB 通常直接存 >1440 的 end，但 ``end < start`` 的跨午夜写法也按同一日帧
+    规则归一，供 sessions 窗口判定与 estimated_segments 投影共用，避免一边
+    保留、一边因 ``segment_end <= segment_start`` 丢弃而出现面板空白带。
+    未收口行返回终点 None；缺起点/非法分钟返回 None。
     """
+    if not isinstance(row, dict):
+        return None
+    start_minute = row.get('actual_start_minute')
+    if start_minute is None:
+        return None
+    try:
+        start_raw = int(start_minute)
+        end_raw = row.get('actual_end_minute')
+        end_minutes = None if end_raw is None else int(end_raw)
+        if end_minutes is not None and end_minutes < start_raw:
+            end_minutes += 1440
+        start = midnight + timedelta(minutes=start_raw)
+        end = None if end_minutes is None else midnight + timedelta(minutes=end_minutes)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return start, end
+
+
+def _sleep_segment(row: Any, midnight: datetime, *, date_text: str,
+                   clip_start: datetime, clip_end: datetime) -> dict[str, Any] | None:
+    """单条 sleep_sessions 行 → 裁剪到窗口的估算段（未收口/非法行返回 None）。"""
+    bounds = _sleep_bounds(row, midnight)
+    if bounds is None:
+        return None
+    session_start, session_end = bounds
+    if session_end is None:
+        return None  # 未收口（非 completed）→ 不进估算段
+    segment_start = max(session_start, clip_start)
+    segment_end = min(session_end, clip_end)
+    if segment_end <= segment_start:
+        return None
+    metadata = row.get('metadata') if isinstance(row.get('metadata'), dict) else {}
+    wake_reason = str(row.get('wake_reason'))[:40] if row.get('wake_reason') else None
+    note = metadata.get('unrecorded_note')
+    return {
+        'kind': 'sleep', 'estimated': True,
+        'start': segment_start.isoformat(), 'end': segment_end.isoformat(),
+        'session_start': session_start.isoformat(),
+        'session_end': session_end.isoformat(),
+        'session_id': str(row.get('session_id') or '')[:80],
+        'schedule_date': str(row.get('schedule_date') or date_text)[:10],
+        'wake_reason': wake_reason,
+        'source': 'sleep_sessions',
+        'offline': bool(metadata.get('offline_settlement')
+                        or metadata.get('offline_reconnect')
+                        or wake_reason == 'offline_reconnect'),
+        'continuous_minutes': _number(row.get('continuous_minutes')),
+        'interruption_count': _number(row.get('interruption_count')),
+        'quality': _number(row.get('quality')),
+        'sleep_debt_after': _number(row.get('sleep_debt_after')),
+        'unrecorded_note': str(note)[:80] if note else None,
+    }
+
+
+def _sleep_session_in_window(row: Any, midnight: datetime, *,
+                             window_start: datetime,
+                             window_end: datetime) -> bool:
+    """sleep_sessions 行的绝对会话区间是否与窗口重叠（未收口按起点判定）。
+
+    会话起止按 schedule_date 日帧分钟映射；跨午夜 end<start 时补 1440（DB 通常
+    直接存 >1440，此处只做防御）。非法/缺开始分钟的行不进入窗口投影。
+    """
+    if not isinstance(row, dict):
+        return False
+    bounds = _sleep_bounds(row, midnight)
+    if bounds is None:
+        return False
+    start, end = bounds
+    if end is None:
+        return start < window_end
+    return start < window_end and end > window_start
+
+
+def _window_sleep_projection(db: Any, *, window_start: datetime,
+                             window_end: datetime) -> tuple[
+                                 list[dict[str, Any]], list[dict[str, Any]]]:
+    """任意窗口内的会话视图 + completed 会话估算段（一次逐日读取）。
+
+    ``sessions`` 覆盖与窗口重叠的**全部**行（含未收口的当前会话），顶层
+    ``sleep.sessions`` 不再固定截 8 条；``estimated_segments`` 只含
+    ``actual_end_minute`` 非 NULL 的 completed 行（含 ``offline_reconnect``
+    离线补全会话，不按 wake_reason 过滤）。会话真实起止按 schedule_date 日帧分钟
+    （跨午夜 >1440）映射为绝对时刻后裁剪到窗口；会话不覆盖的剩余大间隙**保持
+    空洞**（如实缺口，不伪造）。只读投影：不写任何库/历史；段上的
+    ``estimated:true`` 表示「图表估算段」，不代表会话记录本身是估算。多取前一天
+    以覆盖跨午夜会话。
+    """
+    sessions: list[dict[str, Any]] = []
     segments: list[dict[str, Any]] = []
-    for midnight in (day_start - timedelta(days=1), day_start):
+    seen: set = set()
+    midnight = datetime.combine(window_start.date() - timedelta(days=1),
+                                datetime.min.time()).replace(tzinfo=window_start.tzinfo)
+    last_midnight = datetime.combine(window_end.date(),
+                                     datetime.min.time()).replace(tzinfo=window_start.tzinfo)
+    while midnight <= last_midnight:
         date_text = midnight.date().isoformat()
         try:
             rows = db.query_sleep_sessions(schedule_date=date_text, limit=32)
         except Exception:
             rows = []
         for row in rows if isinstance(rows, list) else []:
-            if not isinstance(row, dict):
+            if _sleep_session_in_window(row, midnight, window_start=window_start,
+                                        window_end=window_end):
+                sessions.append(_sleep_session_view(row))
+            segment = _sleep_segment(row, midnight, date_text=date_text,
+                                     clip_start=window_start, clip_end=window_end)
+            if segment is None:
                 continue
-            start_minute = row.get('actual_start_minute')
-            end_minute = row.get('actual_end_minute')
-            if start_minute is None or end_minute is None:
-                continue  # 未收口（非 completed）→ 不进估算段
-            try:
-                session_start = midnight + timedelta(minutes=int(start_minute))
-                session_end = midnight + timedelta(minutes=int(end_minute))
-            except (TypeError, ValueError, OverflowError):
+            key = (segment['session_id'], segment['start'], segment['end'])
+            if key in seen:
                 continue
-            segment_start = max(session_start, day_start)
-            segment_end = min(session_end, day_end)
-            if segment_end <= segment_start:
-                continue
-            metadata = row.get('metadata') if isinstance(row.get('metadata'), dict) else {}
-            wake_reason = str(row.get('wake_reason'))[:40] if row.get('wake_reason') else None
-            note = metadata.get('unrecorded_note')
-            segments.append({
-                'kind': 'sleep', 'estimated': True,
-                'start': segment_start.isoformat(), 'end': segment_end.isoformat(),
-                'session_start': session_start.isoformat(),
-                'session_end': session_end.isoformat(),
-                'session_id': str(row.get('session_id') or '')[:80],
-                'schedule_date': str(row.get('schedule_date') or date_text)[:10],
-                'wake_reason': wake_reason,
-                'source': 'sleep_sessions',
-                'offline': bool(metadata.get('offline_settlement')
-                                or metadata.get('offline_reconnect')
-                                or wake_reason == 'offline_reconnect'),
-                'continuous_minutes': _number(row.get('continuous_minutes')),
-                'interruption_count': _number(row.get('interruption_count')),
-                'quality': _number(row.get('quality')),
-                'sleep_debt_after': _number(row.get('sleep_debt_after')),
-                'unrecorded_note': str(note)[:80] if note else None,
-            })
+            seen.add(key)
+            segments.append(segment)
+        midnight += timedelta(days=1)
+    sessions.sort(key=lambda row: (row.get('schedule_date') or '',
+                                   row.get('actual_start_minute') or 0), reverse=True)
     segments.sort(key=lambda item: item['start'])
-    return segments
+    return sessions, segments
+
+
+def _window_estimated_sleep_segments(db: Any, *, window_start: datetime,
+                                     window_end: datetime) -> list[dict[str, Any]]:
+    """任意窗口内 completed 会话的估算段（顶层 6/24/72/168h 与按日共用）。
+
+    实现见 :func:`_window_sleep_projection`；此处只返回估算段，保持按日视图
+    既有调用面不变。
+    """
+    return _window_sleep_projection(db, window_start=window_start,
+                                    window_end=window_end)[1]
+
+
+def _estimated_sleep_segments(db: Any, *, day_start: datetime,
+                              day_end: datetime) -> list[dict[str, Any]]:
+    """单日窗口的睡眠会话估算段（按日视图口径；实现见普通窗口函数）。"""
+    return _window_estimated_sleep_segments(db, window_start=day_start,
+                                            window_end=day_end)
 
 
 def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: str,
@@ -755,16 +857,20 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
         current = None
     history = read('生活历史暂不可读', lambda: life.history_snapshot(now=now, hours=hours), {'points': []}) if enabled and life else {'points': []}
     sessions: list[dict[str, Any]] = []
+    sleep_segments: list[dict[str, Any]] = []
     if ready and db:
-        for offset in range(7):
-            # 局部名 scan_day：不得遮蔽 build_life_dashboard 的 day 形参（day 路径入参）。
-            scan_day = (now-timedelta(days=offset)).strftime('%Y-%m-%d')
-            rows = read('睡眠记录暂不可读', lambda d=scan_day: db.query_sleep_sessions(schedule_date=d, limit=16), [])
-            for row in rows:
-                sessions.append(_sleep_session_view(row))
-            if len(sessions) >= 8:
-                break
-        sessions.sort(key=lambda row: (row.get('schedule_date') or '', row.get('actual_start_minute') or 0), reverse=True)
+        # 复核修复（3.17.33）：顶层窗口投影不再只取最近 8 条 sessions——
+        # 一次逐日读取同时得到窗口内全部会话视图与 completed 会话估算段；
+        # 6/24/72/168h 与按日视图共用同一裁剪口径（跨午夜会话多取前一天）。
+        window_start = now - timedelta(hours=hours)
+        projection = read(
+            '睡眠记录暂不可读',
+            lambda: _window_sleep_projection(
+                db, window_start=window_start, window_end=now), ([], []))
+        if (isinstance(projection, tuple) and len(projection) == 2
+                and isinstance(projection[0], list)
+                and isinstance(projection[1], list)):
+            sessions, sleep_segments = projection
     engine = ctx.sleep_engine
     sleep_live = read('睡眠引擎暂不可读', lambda: engine.sleep_status(now), None) if enabled and engine else None
     safe_sleep = None
@@ -809,7 +915,8 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
                      'episodes': today_episodes,
                      'summary': {key: _number(today.get('summary', {}).get(key)) for key in
                                  ('intent_count', 'episode_count', 'completed_count', 'interrupted_count', 'abandoned_count')}},
-        'sleep': {'current': safe_sleep, 'sessions': sessions[:8],
+        'sleep': {'current': safe_sleep, 'sessions': sessions,
+                  'estimated_segments': sleep_segments,
                   'configured_sleep': str(getattr(getattr(cfg, 'schedule', None), 'sleep_time', '') or '')[:8],
                   'configured_wake': str(getattr(getattr(cfg, 'schedule', None), 'wake_time', '') or '')[:8]},
         'companion': companion, 'observations': observations, 'warnings': list(dict.fromkeys(warnings))[:8],
@@ -903,7 +1010,7 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]
     """PR-FIXED-CHROME（3.17.15）：空间「最近动态」只读投影（≤5 条已确认发送）。
 
     数据源 ``PublishLedger.recent_sent(5)``（status=sent 按 created_at 降序，content
-    截 120 字/created_at/tid/image_count）。来源判定：tid 命中空间视频发布回执
+    原样（账本最多 5000 字）/created_at/tid/image_count）。来源判定：tid 命中空间视频发布回执
     （``QzoneVideoLedger.recent_attempts(100)`` 的 receipt_tid 集合，既有公开只读面）
     →「视频分享」，否则「日程说说」；视频桥接缺失/读取失败 → 全部「日程说说」降级。
     服务缺失/ledger 异常 → ``[]`` 降级，不抛到读端。只读，不含路径/私聊正文。
@@ -932,7 +1039,7 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]
         if not isinstance(row, dict):
             continue
         tid = str(row.get('tid') or '')
-        out.append({'content': str(row.get('content', ''))[:120],
+        out.append({'content': str(row.get('content') or ''),
                     'created_at': row.get('created_at'),
                     'tid': tid,
                     'image_count': row.get('image_count', 0),
@@ -1008,6 +1115,10 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
     # VideoInterestService.load() 公开只读面（损坏/非法→None，不改写用户文件）；
     # 展示口径不做半衰期衰减（衰减属候选排序口径 effective_weights，此处如实展示
     # 落盘分值）。服务缺失/读失败/文档损坏 → 该源降级空；任一源可读 available=True。
+    # 3.17.33（S2）：recent 行在既有 bvid/title/watched_at 之上原样透出 S3 约定字段
+    # source（tool/autonomous_schedule/autonomous_event，空串=来源未记录）与
+    # first_watched_at（epoch 秒，口径同 watched_at）；旧历史行缺字段 → ''/None，
+    # 不猜来源、不抛错。前端只读，不再二次加工。
     # 只暴露公开视频标题/BV/观看时间与话题权重，不含路径/私聊正文。
     video: dict[str, Any] = {'available': False, 'recent': [], 'interests': []}
     recent_ok = False
@@ -1018,7 +1129,9 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
             video['recent'] = [
                 {'bvid': str(row.get('bvid') or '')[:20],
                  'title': str(row.get('title') or '')[:120],
-                 'watched_at': _number(row.get('watched_at'))}
+                 'watched_at': _number(row.get('watched_at')),
+                 'source': str(row.get('source') or '')[:32],
+                 'first_watched_at': _number(row.get('first_watched_at'))}
                 for row in (rows or [])[:10] if isinstance(row, dict)]
             recent_ok = True
     except Exception:

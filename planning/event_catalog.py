@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -75,6 +76,24 @@ MIN_NAME_CHARS = 2
 MAX_DELTA_ABS = 0.08
 MIN_WEIGHT = 0.1
 MAX_WEIGHT = 1.0
+#: D1（2026-11-11）：[planning_events] 两个联动小事件的独立权重乘数。
+#: 默认 1.0 = 既有抽取行为逐字不变；运行期钳制到合理范围（0.1–10.0），
+#: 非法/非有限值按 1.0。乘数只影响 pick_event 的权重，不改变事件定义/文案。
+DEFAULT_EVENT_WEIGHT_MULTIPLIER = 1.0
+MIN_EVENT_WEIGHT_MULTIPLIER = 0.1
+MAX_EVENT_WEIGHT_MULTIPLIER = 10.0
+EVENT_WEIGHT_MULTIPLIER_KEYS: Tuple[Tuple[str, str], ...] = (
+    ("watch_bili", "watch_bili_weight_multiplier"),
+    ("browse_qq", "browse_qq_weight_multiplier"),
+)
+#: 视频分享到陪伴目标的独立概率键（默认 1.0 = 不加额外闸）。自然触发点
+#: integrations/video_share_scheduler.py 的 ``VideoSocialService._deliver`` 自
+#: 3.17.33 复核修复 F2 起读取本口径（仅陪伴目标私聊、既有闸门之后掷骰）；
+#: 本模块只负责在配置层定义取值/钳制口径，供分享链与只读诊断共用。
+DEFAULT_VIDEO_SHARE_TO_TARGET_PROBABILITY = 1.0
+#: 3.17.33 配置默认值轮：>1 解释为「目标私聊分享机会倍率」（放宽日限/流限/最小间隔），
+#: 上限 3.0；0–1 仍是额外过滤概率。与 integrations/video_share_scheduler.py 同口径。
+MAX_VIDEO_SHARE_TO_TARGET_MULTIPLIER = 3.0
 #: 五维状态（禁止 sleep_debt）
 STATE_FIELDS: Tuple[str, ...] = ("energy", "hunger", "focus", "stress", "social_battery")
 #: 允许的 goal_type：禁止 sleep/meal/pending_commitment（附录 B.1.4）
@@ -588,6 +607,75 @@ def resolve_state_deltas(metadata: Any,
     return None
 
 
+def _weight_multiplier_value(section: Any, name: str) -> float:
+    """读取单个权重乘数并钳制；缺失/非法/非有限 → 1.0（零行为变化）。"""
+    if section is None:
+        return DEFAULT_EVENT_WEIGHT_MULTIPLIER
+    value = section.get(name) if isinstance(section, Mapping) else getattr(section, name, None)
+    if not _is_number(value):
+        return DEFAULT_EVENT_WEIGHT_MULTIPLIER
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_EVENT_WEIGHT_MULTIPLIER
+    if not math.isfinite(number):
+        return DEFAULT_EVENT_WEIGHT_MULTIPLIER
+    return max(MIN_EVENT_WEIGHT_MULTIPLIER,
+               min(MAX_EVENT_WEIGHT_MULTIPLIER, number))
+
+
+def resolve_event_weight_multipliers(source: Any = None) -> Dict[str, float]:
+    """``[planning_events]`` → ``{event_id: multiplier}``（纯函数，无副作用）。
+
+    接受聚合配置 / ``[planning_events]`` section / dict / SimpleNamespace /
+    ``EventCatalogServiceView``；找不到该段或字段缺失时返回全 1.0，保证默认
+    配置与引入本键之前的行为完全一致。乘数只作用于 ``pick_event`` 的权重。
+    """
+    if source is None:
+        section: Any = None
+    elif isinstance(source, Mapping):
+        nested = source.get("planning_events")
+        section = nested if nested is not None else source
+    else:
+        nested = getattr(source, "planning_events", None)
+        section = nested if nested is not None else source
+    return {event_id: _weight_multiplier_value(section, field)
+            for event_id, field in EVENT_WEIGHT_MULTIPLIER_KEYS}
+
+
+def resolve_video_share_to_target_probability(source: Any = None) -> float:
+    """``[planning_events].video_share_to_target_probability``（默认 1.0）。
+
+    纯读取/钳制；1.0 = 维持现有分享判断、不额外过滤；0–1 为额外过滤概率；
+    >1 为目标私聊分享机会倍率（日限/流限放宽、最小间隔缩短，上限 3.0）。真正的自然触发点过滤
+    在 integrations/video_share_scheduler.py（``VideoSocialService._deliver``，
+    3.17.33 复核修复 F2 已接线；仅陪伴目标私聊、且在既有授权/夜间/冷却/预算闸
+    之后掷骰）；本函数只统一取值口径，供触发点与只读诊断共用。
+    """
+    if source is None:
+        section: Any = None
+    elif isinstance(source, Mapping):
+        nested = source.get("planning_events")
+        section = nested if nested is not None else source
+    else:
+        nested = getattr(source, "planning_events", None)
+        section = nested if nested is not None else source
+    if section is None:
+        return DEFAULT_VIDEO_SHARE_TO_TARGET_PROBABILITY
+    value = (section.get("video_share_to_target_probability")
+             if isinstance(section, Mapping)
+             else getattr(section, "video_share_to_target_probability", None))
+    if not _is_number(value):
+        return DEFAULT_VIDEO_SHARE_TO_TARGET_PROBABILITY
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_VIDEO_SHARE_TO_TARGET_PROBABILITY
+    if not math.isfinite(number):
+        return DEFAULT_VIDEO_SHARE_TO_TARGET_PROBABILITY
+    return max(0.0, min(MAX_VIDEO_SHARE_TO_TARGET_MULTIPLIER, number))
+
+
 def state_affinity(event: Mapping[str, Any], state: Any) -> float:
     """状态 → 事件权重乘子（纯函数；无状态/无法解析 = 1.0）。
 
@@ -654,6 +742,10 @@ class EventCatalogStore:
         # 运行时事件门控（2026-11-04 刷视频功能批）：event_key -> bool；
         # None = 不设闸（旧行为）。闸是动态配置读数，不进快照/不改用户文件。
         self._event_gate: Optional[Callable[[str], bool]] = None
+        # D1（2026-11-11）：联动小事件独立权重乘数（event_id -> multiplier）。
+        # 空 dict = 全 1.0（旧行为）；由 EventCatalogService 从 [planning_events]
+        # 动态注入，直接使用本 Store 的旧测试/装配不受影响。
+        self._weight_multipliers: Dict[str, float] = {}
         # mode=off 时**不读**生成库（2026-10-27 共享接线契约：off 不读写生成库）：
         # 只保留内置池快照，用户文件既不删除也不改写；切到 manual/auto 时由 reload() 补读。
         if load_on_init:
@@ -675,6 +767,32 @@ class EventCatalogStore:
         自动把「刷B站」加入可 roll 的小事件池，关闭即移出）。
         """
         self._event_gate = gate
+
+    def set_weight_multipliers(self, multipliers: Optional[Mapping[str, Any]]) -> None:
+        """注入联动小事件权重乘数（D1；空/非法 = 全 1.0）。
+
+        只把合法键写进内存；未知 event_id 忽略，避免配置笔误扩大影响面。
+        乘数在 :meth:`pick_event` 的权重计算处生效，不修改事件定义/快照。
+        """
+        resolved: Dict[str, float] = {}
+        if isinstance(multipliers, Mapping):
+            valid_ids = {event_id for event_id, _field in EVENT_WEIGHT_MULTIPLIER_KEYS}
+            for event_id in valid_ids:
+                value = multipliers.get(event_id)
+                if _is_number(value):
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(number):
+                        resolved[event_id] = max(MIN_EVENT_WEIGHT_MULTIPLIER,
+                                                 min(MAX_EVENT_WEIGHT_MULTIPLIER, number))
+        self._weight_multipliers = resolved
+
+    @property
+    def weight_multipliers(self) -> Dict[str, float]:
+        """只读乘数快照（诊断用；缺省键按 1.0 由 pick_event 兜底）。"""
+        return dict(self._weight_multipliers)
 
     def _gate_allows(self, event_id: str) -> bool:
         gate = self._event_gate
@@ -727,11 +845,20 @@ class EventCatalogStore:
                 "origin_kind": origin,
                 "allowed_slots": list(raw.get("allowed_slots") or TIME_SLOTS),
             }
-            for key in ("cooldown_minutes", "tags", "source_file", "definition_version"):
+            for key in ("cooldown_minutes", "tags", "source_file", "definition_version",
+                        "seed_merged"):
                 if raw.get(key) is not None:
                     entry[key] = raw[key]
             output.append(entry)
         return output
+
+    def set_builtin(self, items: Sequence[Mapping[str, Any]]) -> None:
+        """替换初始池（运行目录 initial_events 变更后的 reload 入口）。
+
+        只改内存 ``_builtin``，不读写用户文件；调用方随后 ``reload()`` 才会用新
+        初始池重建快照。生成库与消耗记录不受影响。
+        """
+        self._builtin = tuple(self._normalize_builtin(items))
 
     # ---- 装载 ----
     def _fallback(self, reason: str, *, document: Optional[Dict[str, Any]] = None,
@@ -1034,7 +1161,11 @@ class EventCatalogStore:
                 weight = float(event.get("weight") or 0.0)
             except (TypeError, ValueError):
                 weight = 0.0
-            weights.append(max(0.0, weight * state_affinity(event, state)))
+            eid = str(event.get("event_id") or event.get("key") or "")
+            # D1：联动两项的独立乘数（默认 1.0 时与旧口径逐字一致；
+            # 乘数不改变事件定义、冷却、时段或门控，只缩放抽取权重）。
+            multiplier = self._weight_multipliers.get(eid, DEFAULT_EVENT_WEIGHT_MULTIPLIER)
+            weights.append(max(0.0, weight * state_affinity(event, state) * multiplier))
         if sum(weights) <= 0:
             weights = [1.0 for _ in cooled]
         try:
@@ -1147,6 +1278,12 @@ class EventCatalogService:
         self._config = config
         self._config_provider = config_provider
         self._llm = llm
+        #: 初始事件库自动装载上下文：``plugin_root`` 非空且调用方未显式注入
+        #: ``initial_events`` 时，reload()/refresh() 会重读运行目录（用户复制/
+        #: 删除 JSON 后无需重启插件即可生效）；显式注入的测试/装配保持原样。
+        self._plugin_root = plugin_root
+        self._initial_events_injected = initial_events is not None
+        self._initial_lock = threading.Lock()
         self._now_provider = now_provider
         self._rng = rng or random.Random()
         self._persona_provider = persona_provider
@@ -1191,6 +1328,8 @@ class EventCatalogService:
             max_generated_events=cfg.max_generated_events, tz=self._tz,
             # mode=off：构造期就不读生成库（off 只用初始池；不删不改用户文件）
             load_on_init=cfg.mode != "off")
+        # D1：联动小事件独立权重乘数（[planning_events]，默认全 1.0）。
+        self._apply_weight_multipliers()
         self._lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
@@ -1205,6 +1344,43 @@ class EventCatalogService:
             except Exception:
                 source = self._config
         return resolve_config(source)
+
+    def _planning_events_section(self) -> Any:
+        """``[planning_events]`` 段（动态读；缺失 = None → 全 1.0）。
+
+        优先从 ``config_provider`` 返回的 ``[event_catalog]`` 服务视图附挂的
+        ``planning_events`` 读取（``CateyeSuiteConfig.event_catalog`` 负责附挂），
+        这样配置热重载后无需重启即可生效；测试/独立装配直接给聚合配置或
+        ``[planning_events]`` dict 时回退到 ``self._config``。
+        """
+        provider = self._config_provider
+        if provider is not None:
+            try:
+                section = provider()
+                attached = getattr(section, "planning_events", None)
+                if attached is not None:
+                    return attached
+            except Exception:
+                logger.debug("event_catalog: planning_events provider 读取失败（回退）",
+                             exc_info=True)
+        source = self._config
+        if isinstance(source, Mapping):
+            return source.get("planning_events")
+        return getattr(source, "planning_events", None)
+
+    def _apply_weight_multipliers(self) -> Dict[str, float]:
+        """从当前配置解析并注入权重乘数（永不抛出；默认全 1.0）。"""
+        try:
+            multipliers = resolve_event_weight_multipliers(
+                self._planning_events_section())
+            setter = getattr(self.store, "set_weight_multipliers", None)
+            if callable(setter):
+                setter(multipliers)
+            return multipliers
+        except Exception:
+            logger.debug("event_catalog: 权重乘数解析失败（按 1.0 处理）", exc_info=True)
+            return {event_id: DEFAULT_EVENT_WEIGHT_MULTIPLIER
+                    for event_id, _field in EVENT_WEIGHT_MULTIPLIER_KEYS}
 
     def _now(self, now: Optional[datetime] = None) -> datetime:
         if now is not None:
@@ -1316,6 +1492,8 @@ class EventCatalogService:
     def pick_event(self, rng: random.Random, state: Any = None, recent: Any = None,
                    *, now: Optional[datetime] = None, context: Optional[str] = None,
                    events: Optional[Sequence[Mapping[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+        # D1：每次 pick 前同步 [planning_events] 乘数（热重载即时生效；默认 1.0）。
+        self._apply_weight_multipliers()
         try:
             return self.store.pick_event(rng, state, recent, now=self._now(now),
                                          context=context, events=events)
@@ -1389,10 +1567,15 @@ class EventCatalogService:
             "reusable_events": len(snap.reusable_events),
             "one_shot_remaining": len(snap.one_shot_events),
             "one_shot_consumed": len(snap.consumed_events),
+            # D1：权重乘数与视频分享概率的只读诊断（默认全 1.0）。
+            "weight_multipliers": dict(getattr(self.store, "weight_multipliers", {}) or {}),
+            "video_share_to_target_probability":
+                resolve_video_share_to_target_probability(self._planning_events_section()),
             "generation_id": snap.generation_id,
             "builtin_events": len(snap.builtin_events),
             "active_events": len(snap.active_events),
             # P2：初始池来源诊断（代码联动/JSON 状态；加载失败/部分跳过原因）
+            # 3.17.33：追加只读退役/种子差异（不触发复制/覆盖/删除）。
             "initial_events": (None if self.initial_events_result is None else {
                 "accepted": len(self.initial_events_result.events),
                 "files_seen": self.initial_events_result.files_seen,
@@ -1401,6 +1584,18 @@ class EventCatalogService:
                 "dir_exists": self.initial_events_result.dir_exists,
                 "skipped": [{"file": n, "reason": r}
                             for n, r in self.initial_events_result.skipped],
+                "retired": [{"file": n, "event_id": eid}
+                            for n, eid in self.initial_events_result.retired],
+                "retired_count": self.initial_events_result.retired_count,
+                # D1：本批新增种子的只读内存合并诊断（不写用户目录）。
+                "merged": [{"file": n, "event_id": eid}
+                           for n, eid in getattr(self.initial_events_result, "merged", ())],
+                "merged_count": int(getattr(self.initial_events_result,
+                                            "merged_count", 0) or 0),
+                "seed_files": self.initial_events_result.seed_files,
+                "seed_only": list(self.initial_events_result.seed_only),
+                "runtime_only": list(self.initial_events_result.runtime_only),
+                "seed_changed": list(self.initial_events_result.seed_changed),
             }),
             "invalid_count": snap.invalid_count,
             "pool_truncated": snap.pool_truncated,
@@ -1433,9 +1628,72 @@ class EventCatalogService:
             parts.append(f"状态：降级（{snap.reason or 'invalid'}）")
         return "；".join(parts)
 
-    def reload(self) -> CatalogSnapshot:
-        """重新装载事件库；``mode=off`` 时**不读**生成库（只保留内置池）。"""
+    def _reload_initial_events(self) -> bool:
+        """重读运行目录初始事件库（用户复制/删除 JSON 后无需重启插件）。
+
+        仅在自动装载路径（构造时未显式注入 ``initial_events``）生效；内容版本
+        与退役集合都没变时不重建池。任何异常保留旧池并返回 False，绝不抛出。
+        只读用户文件：这里永远不复制、覆盖、删除或改写 ``mappings/initial_events/``。
+        """
+        if self._initial_events_injected or self._plugin_root is None:
+            return False
+        with self._initial_lock:
+            return self._reload_initial_events_locked()
+
+    def _reload_initial_events_locked(self) -> bool:
         try:
+            from .initial_events import load_initial_events
+            result = load_initial_events(self._plugin_root)
+        except Exception as exc:
+            logger.warning("event_catalog: 初始事件库重载失败（保留旧池）：%s", exc)
+            return False
+        old = self.initial_events_result
+        if old is not None and old.content_version == result.content_version \
+                and old.retired == result.retired \
+                and old.dir_exists == result.dir_exists:
+            # 内容相同：只刷新 skipped/disabled/种子差异等诊断字段。
+            self.initial_events_result = result
+            return False
+        self.initial_events_result = result
+        combined = [*builtin_events(), *result.events]
+        if not self._custom_validator:
+            self._validator.builtin_count = len(combined)
+            self._validator.max_pool_events = derive_pool_cap(
+                len(combined), self._validator.reusable_limits,
+                self._validator.one_shot_limits)
+        setter = getattr(self.store, "set_builtin", None)
+        if callable(setter):
+            setter(combined)
+            # 立即重建快照，保证 refresh 在 mode=off/未到期提前返回时也不会
+            # 留下「_builtin 已换、snapshot 仍旧」的不一致；off 仍不读生成库。
+            try:
+                mode = self._current_config().mode
+            except Exception:
+                mode = "off"
+            if mode == "off":
+                self.store.use_builtin_only("mode_off")
+            else:
+                self.store.reload()
+        logger.info("event_catalog: 初始事件库已重载（accepted=%d，退役=%d）",
+                    len(result.events), result.retired_count)
+        return True
+
+    def reload(self) -> CatalogSnapshot:
+        """重新装载事件库；``mode=off`` 时**不读**生成库（只保留内置池）。
+
+        3.17.33：同时重读运行目录 ``initial_events``（未显式注入时），使用户
+        复制/删除 JSON 后调用 reload 即可生效，无需插件重启。
+
+        D1 复核（2026-11-11）：本方法与 :meth:`refresh` 的成功路径**不**调用
+        ``plugin.schedule_preference_refresh``——事件库服务不持有装配根，偏好
+        增量批次属于偏好服务/D2 的触发范围；现有调用点只有日意图生成成功后
+        ``schedule_generator.py`` 的 getattr 调用（init 阶段走偏好服务
+        ``ensure_evaluated``，不经过本服务）。若后续接线，应以显式可选回调
+        注入，避免 event_catalog 反向依赖 plugin。
+        """
+        try:
+            self._apply_weight_multipliers()
+            self._reload_initial_events()
             if self._current_config().mode == "off":
                 return self.store.use_builtin_only("mode_off")
             return self.store.reload()
@@ -1492,7 +1750,14 @@ class EventCatalogService:
 
     async def refresh(self, *, manual: bool = False,
                       now: Optional[datetime] = None) -> RefreshResult:
-        """生成一次并全量替换（manual=True 时错误逐条返回给调用方）。"""
+        """生成一次并全量替换（manual=True 时错误逐条返回给调用方）。
+
+        3.17.33：无论本次生成是否被执行（mode off/未到期），都先重读运行目录
+        初始事件库——``/lbm_init events`` 能让用户刚复制/删除的 JSON 立即生效。
+        D1：同时同步 ``[planning_events]`` 权重乘数（默认 1.0）。
+        """
+        self._apply_weight_multipliers()
+        self._reload_initial_events()
         cfg = self._current_config()
         if cfg.mode == "off":
             result = self._skipped("mode_off", manual=manual)
@@ -1564,6 +1829,9 @@ class EventCatalogService:
 
     async def _refresh_locked(self, cfg: EventCatalogConfig, manual: bool,
                               now: datetime) -> RefreshResult:
+        # 已由 refresh() 在锁外预读；这里再确认一次（内容未变时为空操作），
+        # 使生成期间不会用旧初始池校验新库。
+        self._reload_initial_events()
         self.store.reload()
         start_fp = self.store.file_fingerprint()
         persona = str(self._provider_value(self._persona_provider, '') or '')
@@ -1824,6 +2092,8 @@ __all__ = [
     "BUILTIN_EVENTS", "CatalogSnapshot", "EventCatalogService", "EventCatalogStore",
     "EventCatalogValidator", "RefreshResult", "ValidationError", "ValidationResult",
     "build_json_schema", "builtin_events", "compute_catalog_version",
+    "resolve_event_weight_multipliers",
+    "resolve_video_share_to_target_probability",
     "resolve_state_deltas", "state_affinity",
 ]
 
