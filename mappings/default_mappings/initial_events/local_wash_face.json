@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "event": {
+    "event_id": "local_wash_face",
+    "name": "洗把脸",
+    "enabled": true,
+    "goal_type": "daily_routine",
+    "min_minutes": 4,
+    "max_minutes": 8,
+    "interruptibility": 0.9,
+    "weight": 0.55,
+    "cooldown_minutes": 90,
+    "allowed_slots": [
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "focus": 0.02,
+      "energy": 0.01
+    },
+    "templates": [
+      "去洗手间用凉水洗了把脸，水珠一抹，整个人一下子清醒了不少。",
+      "洗了个手擦干，稍微整理了一下头发，感觉精神提起来了一点。"
+    ],
+    "tags": [
+      "洗脸",
+      "提神"
+    ]
+  }
+}

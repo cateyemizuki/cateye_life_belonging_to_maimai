@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "event": {
+    "event_id": "local_rest_eyes",
+    "name": "闭目养神",
+    "enabled": true,
+    "goal_type": "rest",
+    "min_minutes": 5,
+    "max_minutes": 15,
+    "interruptibility": 0.95,
+    "weight": 0.65,
+    "cooldown_minutes": 60,
+    "allowed_slots": [
+      "00-08",
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "energy": 0.01,
+      "stress": -0.02
+    },
+    "templates": [
+      "闭起眼睛揉了揉眼角，让发酸的眼睛好好休息了一阵。",
+      "靠在椅子上闭着眼睛歇了一小会儿，什么屏幕和书都不看了。"
+    ],
+    "tags": [
+      "闭目",
+      "养神"
+    ]
+  }
+}

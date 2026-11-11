@@ -2,17 +2,28 @@
   "version": 1,
   "event": {
     "event_id": "snack",
-    "name": "吃点小零食",
+    "name": "吃点零食",
     "enabled": true,
     "goal_type": "entertainment",
     "min_minutes": 5,
     "max_minutes": 12,
     "interruptibility": 0.9,
-    "weight": 0.7,
+    "weight": 0.65,
     "cooldown_minutes": 90,
-    "allowed_slots": ["08-16", "16-24"],
-    "state_deltas": {"hunger": -0.05},
-    "templates": ["麦麦拆开一小包零食慢慢吃着，嘴巴没闲着，肚子也不那么空了，不过正餐还是要好好吃的。"],
-    "tags": ["零食", "解馋"]
+    "allowed_slots": [
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "hunger": -0.04
+    },
+    "templates": [
+      "随手拆了包小零食慢慢吃着，垫垫肚子解解馋。",
+      "找了块小点心吃了几口，稍微补充了一点能量。"
+    ],
+    "tags": [
+      "零食",
+      "垫肚子"
+    ]
   }
 }

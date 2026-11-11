@@ -2,17 +2,29 @@
   "version": 1,
   "event": {
     "event_id": "daydream",
-    "name": "发呆",
+    "name": "发会呆",
     "enabled": true,
     "goal_type": "rest",
-    "min_minutes": 4,
-    "max_minutes": 10,
-    "interruptibility": 0.9,
+    "min_minutes": 5,
+    "max_minutes": 12,
+    "interruptibility": 0.95,
     "weight": 0.7,
-    "cooldown_minutes": 30,
-    "allowed_slots": ["00-08", "08-16", "16-24"],
-    "state_deltas": {"stress": -0.02},
-    "templates": ["麦麦停下手头的事，望着远处发了一会呆，脑子里什么也没想，紧绷的感觉慢慢散开了。"],
-    "tags": ["放空", "放松"]
+    "cooldown_minutes": 45,
+    "allowed_slots": [
+      "00-08",
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "stress": -0.02
+    },
+    "templates": [
+      "望着窗外发了一小会儿呆，脑子里放空了一阵。",
+      "靠在椅背上走了一小会儿神，什么也没想。"
+    ],
+    "tags": [
+      "放空",
+      "发呆"
+    ]
   }
 }

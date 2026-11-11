@@ -2,17 +2,31 @@
   "version": 1,
   "event": {
     "event_id": "lie_down",
-    "name": "躺一会",
+    "name": "躺会",
     "enabled": true,
     "goal_type": "rest",
-    "min_minutes": 15,
-    "max_minutes": 35,
-    "interruptibility": 0.8,
+    "min_minutes": 10,
+    "max_minutes": 25,
+    "interruptibility": 0.85,
     "weight": 0.7,
-    "cooldown_minutes": 120,
-    "allowed_slots": ["00-08", "08-16", "16-24"],
-    "state_deltas": {"energy": 0.03, "focus": 0.02},
-    "templates": ["麦麦找了个舒服的姿势躺了一会，闭着眼睛养了养神，感觉精神和注意力都恢复了一些。"],
-    "tags": ["休息", "小憩"]
+    "cooldown_minutes": 90,
+    "allowed_slots": [
+      "00-08",
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "energy": 0.02,
+      "focus": 0.02,
+      "stress": -0.02
+    },
+    "templates": [
+      "找了个舒服的姿势躺了一会儿，闭着眼睛养了养神。",
+      "趴着歇了一小会儿，让脑子放空放松一下。"
+    ],
+    "tags": [
+      "休息",
+      "歇会儿"
+    ]
   }
 }

@@ -2,17 +2,29 @@
   "version": 1,
   "event": {
     "event_id": "local_tidy_desk",
-    "name": "收拾桌面",
+    "name": "顺手理下桌面",
     "enabled": true,
     "goal_type": "daily_routine",
-    "min_minutes": 10,
-    "max_minutes": 25,
+    "min_minutes": 8,
+    "max_minutes": 18,
     "interruptibility": 0.85,
     "weight": 0.5,
-    "cooldown_minutes": 180,
-    "allowed_slots": ["08-16", "16-24"],
-    "state_deltas": {"stress": -0.01, "energy": -0.01},
-    "templates": ["麦麦把桌面上的东西归拢了一下，擦了擦灰，看着整洁的桌面心情也清爽了些。"],
-    "tags": ["整理", "日常"]
+    "cooldown_minutes": 120,
+    "allowed_slots": [
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "stress": -0.01,
+      "focus": 0.01
+    },
+    "templates": [
+      "顺手把桌上散落的东西归拢摆齐，废纸杂物扔掉，看着顺眼多了。",
+      "把手边乱糟糟的台面稍微收拾了一下，摆放整洁了些。"
+    ],
+    "tags": [
+      "整理",
+      "日常"
+    ]
   }
 }

@@ -2,17 +2,29 @@
   "version": 1,
   "event": {
     "event_id": "local_walk",
-    "name": "散一会步",
+    "name": "出去走走",
     "enabled": true,
     "goal_type": "exercise",
-    "min_minutes": 20,
-    "max_minutes": 40,
+    "min_minutes": 10,
+    "max_minutes": 20,
     "interruptibility": 0.85,
     "weight": 0.5,
-    "cooldown_minutes": 180,
-    "allowed_slots": ["08-16", "16-24"],
-    "state_deltas": {"stress": -0.03, "focus": 0.01, "energy": -0.02, "hunger": 0.01},
-    "templates": ["麦麦慢悠悠地散了一会步，看看沿途的风景，心情放松下来，思路也清晰了一点。"],
-    "tags": ["散步", "减压"]
+    "cooldown_minutes": 120,
+    "allowed_slots": [
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "stress": -0.03,
+      "focus": 0.01
+    },
+    "templates": [
+      "离开座位在走廊和附近慢悠悠溜达了一圈，透了透气。",
+      "在外面吹了会儿风随意转了转，活动活动手脚。"
+    ],
+    "tags": [
+      "溜达",
+      "透气"
+    ]
   }
 }

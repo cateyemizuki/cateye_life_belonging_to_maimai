@@ -2,17 +2,29 @@
   "version": 1,
   "event": {
     "event_id": "local_music",
-    "name": "听一会音乐",
+    "name": "听会歌",
     "enabled": true,
     "goal_type": "entertainment",
-    "min_minutes": 20,
-    "max_minutes": 45,
+    "min_minutes": 10,
+    "max_minutes": 25,
     "interruptibility": 0.9,
-    "weight": 0.75,
+    "weight": 0.7,
     "cooldown_minutes": 60,
-    "allowed_slots": ["00-08", "08-16", "16-24"],
-    "state_deltas": {"stress": -0.02},
-    "templates": ["麦麦戴上耳机听了一会喜欢的音乐，跟着旋律轻轻晃着，心情慢慢平静下来。"],
-    "tags": ["音乐", "放松"]
+    "allowed_slots": [
+      "00-08",
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "stress": -0.02
+    },
+    "templates": [
+      "戴上耳机听了会喜欢的歌，跟着旋律轻轻放空。",
+      "挑了几首轻快的歌放着，心情慢慢放松了下来。"
+    ],
+    "tags": [
+      "听歌",
+      "放松"
+    ]
   }
 }

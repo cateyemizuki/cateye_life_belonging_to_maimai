@@ -2,17 +2,30 @@
   "version": 1,
   "event": {
     "event_id": "local_quiet_time",
-    "name": "安静独处一会",
+    "name": "一个人待会",
     "enabled": true,
     "goal_type": "rest",
     "min_minutes": 10,
     "max_minutes": 25,
-    "interruptibility": 0.85,
-    "weight": 0.7,
-    "cooldown_minutes": 120,
-    "allowed_slots": ["00-08", "08-16", "16-24"],
-    "state_deltas": {"social_battery": 0.02},
-    "templates": ["麦麦一个人安安静静地待了一会，不说话也不看消息，感觉社交的电量慢慢充回来了一点。"],
-    "tags": ["独处", "充电"]
+    "interruptibility": 0.9,
+    "weight": 0.65,
+    "cooldown_minutes": 90,
+    "allowed_slots": [
+      "00-08",
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "social_battery": 0.03,
+      "stress": -0.01
+    },
+    "templates": [
+      "找了个安静地方一个人坐了一会儿，什么也不干，默默放空。",
+      "不说话也不看消息，安安静静待了一阵，给社交电量充了充。"
+    ],
+    "tags": [
+      "独处",
+      "充充电"
+    ]
   }
 }

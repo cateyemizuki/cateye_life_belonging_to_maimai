@@ -2,17 +2,29 @@
   "version": 1,
   "event": {
     "event_id": "local_stretch",
-    "name": "舒展肩背",
+    "name": "伸个懒腰",
     "enabled": true,
     "goal_type": "exercise",
-    "min_minutes": 8,
-    "max_minutes": 15,
-    "interruptibility": 0.85,
-    "weight": 0.5,
+    "min_minutes": 5,
+    "max_minutes": 10,
+    "interruptibility": 0.9,
+    "weight": 0.55,
     "cooldown_minutes": 60,
-    "allowed_slots": ["08-16", "16-24"],
-    "state_deltas": {"stress": -0.02, "energy": -0.01},
-    "templates": ["麦麦站起来伸了个大大的懒腰，转了转肩膀、拉了拉背，久坐的僵硬感缓解了不少。"],
-    "tags": ["拉伸", "久坐"]
+    "allowed_slots": [
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "stress": -0.02,
+      "energy": 0.01
+    },
+    "templates": [
+      "站起来伸了个大大的懒腰，转了转肩膀，活动坐僵的身子。",
+      "拉了拉手臂和后背，活动了一下脖子手腕，舒服多了。"
+    ],
+    "tags": [
+      "拉伸",
+      "伸懒腰"
+    ]
   }
 }

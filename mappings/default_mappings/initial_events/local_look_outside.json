@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "event": {
+    "event_id": "local_look_outside",
+    "name": "看看窗外",
+    "enabled": true,
+    "goal_type": "rest",
+    "min_minutes": 5,
+    "max_minutes": 12,
+    "interruptibility": 0.95,
+    "weight": 0.7,
+    "cooldown_minutes": 45,
+    "allowed_slots": [
+      "00-08",
+      "08-16",
+      "16-24"
+    ],
+    "state_deltas": {
+      "stress": -0.02
+    },
+    "templates": [
+      "走到窗边趴着看了一会儿外面的天色和云彩，让眼睛歇了歇。",
+      "望向窗外发了会呆，看外面的风吹草动和路上经过的人影。"
+    ],
+    "tags": [
+      "看窗外",
+      "歇眼睛"
+    ]
+  }
+}
