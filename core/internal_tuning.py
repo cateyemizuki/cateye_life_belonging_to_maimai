@@ -123,6 +123,15 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "episode_idle_minutes": 10,
         "target_bonus_step": 0.1,
         "dedup_window_seconds": 180,
+        # 4.3b（2026-11-11 修复轮）：评估配额分区总开关。内部调参，不占用户
+        # schema 叶子；默认 True（私聊 6/群聊 4 分区），False = 回旧单一共享池。
+        "emotion_quota_partition_enabled": True,
+        # 3.17.33 每日情绪兜底结算（用户直派）：白天配额可能被用光，日终再结算一次。
+        # 内部调参（J 类），不占用户 schema 叶子；缺键 = 默认开启 / 23:50 / 摘要 800 字。
+        # ``daily_settlement_minute`` = 当日第几分钟（1430 = 23:50）。
+        "daily_settlement_enabled": True,
+        "daily_settlement_minute": 1430,
+        "daily_settlement_max_chars": 800,
     },
     "video_watch": {
         "queue_capacity": 3,
@@ -168,11 +177,17 @@ def default_root() -> Path:
 
 
 def _type_ok(value: Any, default: Any) -> bool:
-    """单键类型校验：bool 严格排除；float 默认收 int/float（JSON 里 20 与 20.0 同义）。"""
-    if isinstance(value, bool):
-        return False
+    """单键类型校验：默认值决定期望类型；bool 只接受 bool（防 true/false 混进数值键）。
+
+    3.17.33：先判 ``default`` 是否为 bool 再排除「value 是 bool」——原实现把
+    ``isinstance(value, bool)`` 放在最前，导致所有 bool 键的现场值被静默丢弃、
+    永远回退出厂默认（``daily_settlement_enabled`` / ``emotion_quota_partition_enabled``
+    这类开关无法从表层 JSON 关闭）。数值默认仍严格排除 bool（``True`` 不算 1）。
+    """
     if isinstance(default, bool):
         return isinstance(value, bool)
+    if isinstance(value, bool):
+        return False
     if isinstance(default, int):
         return isinstance(value, int)
     if isinstance(default, float):

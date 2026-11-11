@@ -177,6 +177,11 @@ INJECT_SCHEDULE_FUTURE_LINE_DEFAULT = "  {time} - {name}"
 INJECT_HINT_FUTURE_DEFAULT = "提示：用户询问未来计划，请自然地介绍后续安排。"
 #: 询问当前时的引导行（占位符：无）
 INJECT_HINT_CURRENT_DEFAULT = "提示：用户直接询问当前状态，请如实告知，并自然带出此刻的精神状态。"
+#: 询问当前时的引导行·潜意识风格（占位符：无；state_subconscious_style 开启时替代上行）
+INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT = (
+    "提示：用户直接询问当前状态，请如实告知当前活动；身体与精神状态只用语气、"
+    "句长和节奏自然体现，不要逐项汇报状态词。"
+)
 #: 对话延续时的引导行（占位符：{reason}；2026-10-24 用户直派弱化：旧版「可自然带过当前活动」
 #: 带弱鼓励色彩——现明确「只是背景信息、不问不说」，仅话题接不上时才允许用一句当前活动开新话题）
 INJECT_HINT_CONTINUE_DEFAULT = (
@@ -204,6 +209,52 @@ INJECT_REPLYER_STATUS_DEFAULT = (
     "【角色当前状态】\n{state_line}\n身体与精神状态：{energy}。\n{next_line}"
     "注意：不要主动提及；仅在用户问到 / 强相关时自然带过。"
 )
+# ── 潜意识状态 / 日结印象（2026-11-11 Gemini 批；代码层文案，不新增 [prompts] 可配键）──
+
+#: replyer 状态注入·潜意识风格模板（2026-11-11 Gemini 批 P2-EXP-1 / 报告 §5.2）。
+#: 占位符：{state_line} / {energy} / {tone_rule} / {next_line}。
+#: 口径：状态数据原样保留，只改变表达方式——禁止向用户直接复述状态词，
+#: 状态改为影响语气、句长与节奏；{tone_rule} 由代码按精力/饥饿/心情选择。
+INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT = (
+    "【角色当前状态】\n"
+    "（以下状态只用来决定你说话的语气、句长和节奏：禁止直接复述状态词，"
+    "也不要把状态当成话题汇报给用户；用户直接问起时，用一句生活化的话带过即可。）\n"
+    "{state_line}\n"
+    "身体与精神状态：{energy}。\n"
+    "{tone_rule}\n"
+    "{next_line}"
+    "注意：状态只影响语感，不要主动提及本提示；除非用户直接问起，"
+    "否则不要把上面的状态词说出口。"
+)
+#: 潜意识语气分支·疲惫（占位符：无；精力低 / 社交电量低）
+SUBCONSCIOUS_TONE_TIRED_DEFAULT = (
+    "此刻很疲惫：回复收缩到 1~2 句短句，可以断句、可以用省略号收尾，"
+    "不展开长篇大论，也不主动开长话题。"
+)
+#: 潜意识语气分支·饥饿（占位符：无；饥饿值高）
+SUBCONSCIOUS_TONE_HUNGRY_DEFAULT = (
+    "此刻有点饿：可以在话缝里随口带一句食欲（比如想吃点什么、想去翻冰箱），"
+    "像顺口一提，不要专门汇报。"
+)
+#: 潜意识语气分支·开心（占位符：无；精力高 / 情绪效价高）
+SUBCONSCIOUS_TONE_HAPPY_DEFAULT = (
+    "此刻心情轻快、有倾诉欲：语气活泼，可以自然地多说一两句，"
+    "愿意主动接话或反问一个小问题。"
+)
+#: 潜意识语气分支·平稳（占位符：无；没有显著状态）
+SUBCONSCIOUS_TONE_STEADY_DEFAULT = (
+    "此刻状态平稳：正常语气即可，不需要特意表现或说明状态。"
+)
+#: 日程实况状态行·潜意识注记（代码层追加在状态行尾；不新增可配键）
+SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT = "（只用于调整语气与篇幅；不要直接复述这些状态词）"
+
+#: 日结印象·活跃标题（companion 记忆行同文案；注入前折叠时按此重建）
+IMPRESSION_TITLE_ACTIVE_DEFAULT = "【最近印象】"
+#: 日结印象·翻篇标题（旧日消极印象折叠到文本末尾，不再整日置顶）
+IMPRESSION_TITLE_FOLDED_DEFAULT = "【旧日印象·已翻篇（仅存档，不要据此翻旧账）】"
+#: 日结印象·单条翻篇标记
+IMPRESSION_FOLDED_MARK_DEFAULT = "[已翻篇]"
+
 #: replyer 状态行模板（占位符：{activity} / {description} / {remaining_hint}）
 INJECT_REPLYER_STATE_LINE_DEFAULT = "你现在正在 {activity}（{description}）{remaining_hint}。"
 #: replyer 下一条活动行（占位符：{time} / {name}；留空 = 不输出该行）
@@ -420,6 +471,27 @@ EMOTION_EVALUATE_DEFAULT = """你看不到角色当前的绝对情绪数值，�
 【AI 的回复内容 / 待评估的交流内容】
 {reply_text}"""
 
+#: 每日情绪兜底结算提示词（3.17.33，用户直派；占位符：{v}/{a}/{d}/{limit}/{summary}）。
+#: 输入只有当天 VAD 采样点的统计摘要（点数/均值/极值/冻结占比/最近点/配额），
+#: **不携带聊天原文**；人设经 LLMService with_identity 注入 system_prompt。
+EMOTION_DAILY_SETTLEMENT_DEFAULT = """你是 AI 角色的「每日情绪兜底结算器」。你看不到聊天原文，只能依据下面的采样统计摘要，判断这一天结束时角色情绪应如何收敛。你不参与对话，只输出 JSON。
+
+【要求】
+1. 只输出有界增量 delta_vad，每一维范围 [-{limit:.2f}, {limit:.2f}]；
+2. 全天均值是这一天的主基调：当前值与均值偏离明显时，向均值方向收敛；全天平稳时增量应接近 0；
+3. 最低/最高值只用于判断波动幅度，不要让单个极端点主导结算；
+4. 冻结占比高说明当天大部分时间在睡眠，结算幅度应更小；
+5. 结合角色人设做情绪过滤，但禁止脑补摘要里没有的事件、对话或人际互动；
+6. reason 不超过 40 字，概括依据即可。
+
+只输出 JSON：{{"delta_vad": {{"valence": 0.0, "arousal": 0.0, "dominance": 0.0}}, "reason": "..."}}
+
+【当前 VAD 绝对值】
+V: {v:+.2f}, A: {a:+.2f}, D: {d:+.2f}
+
+【当天采样摘要】
+{summary}"""
+
 #: 情绪底色注入文本（占位符：{mood}）——planner/replyer 双通道共用
 #: 3.17.29（复核 VAD-4.1）：原「要求：语气、措辞、节奏与该情绪保持一致」是强制表演
 #: 指令，会把情绪变成每轮的表达任务；改为轻量背景参考（用户定案：VAD 只轻微影响
@@ -531,6 +603,21 @@ class PromptsSectionConfig(PluginConfigBase):
         "en": {"title": "Prompts (Advanced)",
                "description": "Customize wording and additional schedule preferences; internal protocols are maintained by the plugin."}
     }
+
+    # ── 状态注入风格（2026-11-11 Gemini 批，报告 §2.2/§5.2）──────────
+    # 只改变状态行的表达范式，不改状态数值与注入开关；关闭 = 旧版直白汇报口径。
+    state_subconscious_style: bool = Field(
+        default=True,
+        description="状态潜意识化：把精力/社交电量等状态改写为语气与篇幅约束（禁止直接复述状态词），"
+                    "让状态自然渗透而不是每句都汇报「我累了」",
+        json_schema_extra={
+            "label": "状态潜意识化提示词",
+            "hint": "默认开：状态只影响语气、字数与节奏，不要求模型念出状态；关 = 旧版直白状态注入",
+            **_ui_i18n("Subconscious state styling",
+                       "Express state through tone and length instead of reporting status words; "
+                       "off = legacy explicit state injection."),
+        },
+    )
 
     # ── 陪伴模块 ─────────────────────────────────────────────
     companion_miss_reason: str = Field(
@@ -669,6 +756,7 @@ PROMPT_FALLBACKS: Dict[str, str] = {
     'emotion_sleep_referee': EMOTION_SLEEP_REFEREE_DEFAULT,
     'emotion_init_system': EMOTION_INIT_SYSTEM_DEFAULT,
     'emotion_evaluate': EMOTION_EVALUATE_DEFAULT,
+    'emotion_daily_settlement': EMOTION_DAILY_SETTLEMENT_DEFAULT,
     'emotion_injection': EMOTION_INJECTION_DEFAULT,
     'emotion_night_hint': EMOTION_NIGHT_HINT_DEFAULT,
     'qzone_post': QZONE_POST_DEFAULT,

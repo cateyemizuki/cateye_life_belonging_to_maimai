@@ -65,7 +65,11 @@
   "emotion": {
     "episode_idle_minutes": 10,
     "target_bonus_step": 0.1,
-    "dedup_window_seconds": 180
+    "dedup_window_seconds": 180,
+    "emotion_quota_partition_enabled": true,
+    "daily_settlement_enabled": true,
+    "daily_settlement_minute": 1430,
+    "daily_settlement_max_chars": 800
   },
   "video_watch": {
     "queue_capacity": 3,

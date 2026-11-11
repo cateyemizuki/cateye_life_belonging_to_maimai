@@ -35,9 +35,34 @@ class EmotionSectionConfig(PluginConfigBase):
         default=0.08,
         ge=0.01,
         le=0.3,
-        description="日常指数衰减率（每小时）：情绪向 0（中性）回落的速度；向人设锚点收敛只在睡眠大修发生；"
+        description="日常指数衰减率（每小时，0.01–0.30）：默认清醒与睡眠都按同一速率向人设锚点"
+                    "收敛（「清醒回归人设锚点」默认开启）；关闭该开关 = 清醒向 0（中性）回落；"
                     "对话频繁可调高防无限累积",
-        json_schema_extra={"label": "衰减率", "step": 0.01, **_ui_i18n("Decay rate")},
+        json_schema_extra={
+            "label": "衰减率",
+            "step": 0.01,
+            "hint": "0.01–0.30；默认清醒/睡眠同速率向人设锚点收敛（「清醒回归人设锚点」默认开）；"
+                    "关该开关 = 清醒向中性 0 回落",
+            **_ui_i18n("Decay rate",
+                       "Hourly exponential decay rate (0.01-0.30). By default both awake and sleep "
+                       "decay converge to the persona anchor; with awake-to-persona-anchor off, "
+                       "awake decay goes toward neutral zero."),
+        },
+    )
+    # 2026-11-11 Gemini 批：清醒/睡眠回归基准统一（报告 §4.3 问题 1）。
+    # 2026-11-11 配置默认值轮：默认改为开启（避免心情每天被拉向绝对中性、
+    # 入睡又突然拉回人设的锯齿）；关闭 = 恢复旧行为（清醒向 0 中性衰减）。
+    decay_to_persona_anchor: bool = Field(
+        default=True,
+        description="清醒时情绪向人设锚点回归（与睡眠大修同一基准线），避免心情每天被拉向绝对中性、"
+                    "入睡又突然拉回人设的锯齿；默认开启，关闭 = 恢复旧行为（清醒向 0 中性衰减）",
+        json_schema_extra={
+            "label": "清醒回归人设锚点",
+            "hint": "默认开：清醒衰减与睡眠大修基准一致；关 = 向中性 0 回落（旧行为）",
+            **_ui_i18n("Awake decay to persona anchor",
+                       "On by default: awake decay converges to the persona VAD anchor like sleep "
+                       "overhaul. Off: legacy decay toward neutral zero."),
+        },
     )
     evaluate_on_reply: bool = Field(
         default=True,
@@ -61,6 +86,53 @@ class EmotionSectionConfig(PluginConfigBase):
         le=200,
         description="情绪评估每日上限（次，两种模式共用，硬封顶；0=当日不评估）",
         json_schema_extra={"label": "评估每日上限(次)", **_ui_i18n("Max evaluations per day")},
+    )
+    # ── 分场景配额隔离（2026-11-11 Gemini 批，报告 §4.3 问题 2）──────────
+    # 私聊/群聊各自独享配额，群聊不能侵占私聊；两者仍共同受 evaluate_max_per_day 硬封顶。
+    # 2026-11-11 配置默认值轮：分区总开关从 internal_tuning 移回用户 WebUI schema
+    # （emotion_quota_partition_enabled 真实 Field，默认 True = 分区）；
+    # 关 = 回到 3.17.32 的单一共享池（只用 evaluate_max_per_day）。
+    emotion_quota_partition_enabled: bool = Field(
+        default=True,
+        description="情绪评估配额分区总开关：开 = 私聊/群聊各自独享配额（默认私聊 6/日、群聊 4/日，"
+                    "群聊不能侵占私聊）；关 = 回到旧共享池（只用评估每日上限，群聊可占满）；"
+                    "两种模式都仍受评估每日上限总封顶",
+        json_schema_extra={
+            "label": "评估配额分区",
+            "hint": "默认开：私聊 6/日、群聊 4/日分区，群聊活跃不占私聊额度；"
+                    "关 = 旧共享 10 次池（总上限仍生效）",
+            **_ui_i18n("Eval quota partition",
+                       "On by default: private chats get 6/day and group chats 4/day, "
+                       "so group activity cannot consume the private quota. "
+                       "Off: legacy shared pool capped by the daily evaluation limit."),
+        },
+    )
+    private_eval_quota: int = Field(
+        default=6,
+        ge=0,
+        le=200,
+        description="私聊情绪评估专属配额（次/日）：独享且不可被群聊侵占，保护目标私聊的情绪波动；"
+                    "0 = 私聊不做自动评估；仍受评估每日上限总封顶；仅在配额分区开启时生效",
+        json_schema_extra={
+            "label": "私聊评估配额(次/日)",
+            "hint": "默认 6；与群聊配额分开计，群聊活跃不会提前烧光私聊额度"
+                    "（分区开关关闭时本键不生效）",
+            **_ui_i18n("Private-chat eval quota",
+                       "Daily evaluation quota reserved for private chats; 0 disables private auto-eval."),
+        },
+    )
+    group_eval_quota: int = Field(
+        default=4,
+        ge=0,
+        le=200,
+        description="群聊情绪评估专属配额（次/日）：只用于群聊事件，不能侵占私聊配额；"
+                    "0 = 群聊不做自动评估；仍受评估每日上限总封顶；仅在配额分区开启时生效",
+        json_schema_extra={
+            "label": "群聊评估配额(次/日)",
+            "hint": "默认 4；群聊配额用完即停，不影响私聊剩余额度（分区开关关闭时本键不生效）",
+            **_ui_i18n("Group-chat eval quota",
+                       "Daily evaluation quota reserved for group chats; 0 disables group auto-eval."),
+        },
     )
     evaluate_min_interval_seconds: int = Field(
         default=60,
@@ -170,6 +242,11 @@ class EmotionSectionConfig(PluginConfigBase):
     def dedup_window_seconds(self) -> int:
         """跨来源去重时间窗（秒）；0 = 关闭窗口判定。"""
         return int(_tuning_value("emotion", "dedup_window_seconds"))
+
+    # 注：emotion_quota_partition_enabled 已从 internal_tuning 移回本类真实 Field
+    # （2026-11-11 配置默认值轮）：用户可在 WebUI 直接开关；emotion/service.py 的
+    # _emotion_cfg("emotion_quota_partition_enabled", ...) 经 getattr 直读该 Field，
+    # 无需只读 property。internal_tuning.json 中残留的同名键不再被读取。
 
     # 注：M6 的 emoji 情绪联动键已于 2026-10-11 按用户裁决随实现一并移除
     # （自 T6 起无消费组件；DEV_GUIDE 附录 A-7）。**维持移除不变**——2026-10-14 §18.2

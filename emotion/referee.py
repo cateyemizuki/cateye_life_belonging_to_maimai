@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from core.json_payload import extract_json_payload
 from suite_prompts import EMOTION_SLEEP_REFEREE_DEFAULT, EMOTION_INIT_SYSTEM_DEFAULT, EMOTION_EVALUATE_DEFAULT
+from suite_prompts import EMOTION_DAILY_SETTLEMENT_DEFAULT
 from suite_prompts import prompt as prompt_of, render
 
 from .state_machine import EmotionParams
@@ -30,6 +31,11 @@ DEFAULT_SLEEP_DELTA_LIMIT = 0.8
 INIT_SYSTEM_PROMPT = EMOTION_INIT_SYSTEM_DEFAULT
 
 EVALUATE_PROMPT = EMOTION_EVALUATE_DEFAULT
+
+DAILY_SETTLEMENT_PROMPT = EMOTION_DAILY_SETTLEMENT_DEFAULT
+#: 每日兜底结算的 ΔVAD 限幅（3.17.33）：日终收敛只做小幅修正，恒小于单事件 ±0.5；
+#: 服务侧仍经 ``_apply_external_delta`` 的 ±0.5 硬限幅二次兜底。
+DAILY_SETTLEMENT_DELTA_LIMIT = 0.3
 
 
 #: 评估 prompt 里「待评估正文」的默认字符预算（per_reply 旧口径；片段制由调用方放宽）
@@ -225,3 +231,45 @@ async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_na
     if delta is None:          # F1：数值位非法 → 按评估失败处理（返回 None）
         return None
     return event, delta
+
+
+async def evaluate_daily_settlement(llm: Any, summary: str, current_vad: Optional[VADState],
+                                    persona: str, task_name: str, *,
+                                    plugin: Any = None,
+                                    delta_limit: float = DAILY_SETTLEMENT_DELTA_LIMIT
+                                    ) -> Optional[VADState]:
+    """每日情绪兜底结算（3.17.33）：压缩摘要 → 日终 ΔVAD；失败/无结构化结果返回 None。
+
+    输入**只有**采样统计摘要（点数/均值/极值/冻结占比/最近点/配额）与当前 VAD，
+    不含聊天原文；人设统一经 ``with_identity=True`` 注入 system_prompt（``persona``
+    形参保留兼容，渲染传空防旧定制模板残留 ``{persona}`` 触发 KeyError——与
+    :func:`evaluate_reply_delta` 同口径）。
+
+    ``delta_limit`` 默认 ±:data:`DAILY_SETTLEMENT_DELTA_LIMIT`（0.3），服务侧还会经
+    ``_apply_external_delta`` 的 ±0.5 硬限幅二次兜底。模型回执缺 ``delta_vad``
+    或数值位非法 → None（调用方走确定性 rule 兜底，不消耗配额计数）。
+    """
+    try:
+        limit = abs(float(delta_limit))
+    except (TypeError, ValueError):
+        limit = DAILY_SETTLEMENT_DELTA_LIMIT
+    limit = max(0.05, min(0.5, limit))
+    vad = current_vad or VADState()
+    response = await llm.generate(
+        prompt=render(
+            prompt_of(plugin, "emotion_daily_settlement"),
+            fallback=DAILY_SETTLEMENT_PROMPT,
+            persona="", v=vad.valence, a=vad.arousal, d=vad.dominance,
+            limit=limit, summary=str(summary or ""),
+        ),
+        module="emotion", task_name=task_name, temperature=0.2,
+        event="emotion_daily_settlement",
+        with_identity=True,
+    )
+    data = _parse_json_loose(response)
+    if not isinstance(data, dict) or "delta_vad" not in data:
+        return None
+    delta = _delta_from(data, limit)
+    if delta is None:          # 数值位非法 → 按结算失败处理（rule 兜底）
+        return None
+    return delta

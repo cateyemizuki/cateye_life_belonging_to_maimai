@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -23,10 +24,12 @@ from suite_prompts import (
 )
 
 from . import descriptions, mapping_override
+from . import daily_settlement
 from . import presentation
 from . import state_store
 from .bridge import apply_template_events
-from .referee import ask_sleep_referee, derive_params_from_persona, evaluate_reply_delta
+from .referee import (ask_sleep_referee, derive_params_from_persona,
+                      evaluate_daily_settlement, evaluate_reply_delta)
 from .state_machine import (DAILY_V_KEEP_DAYS, LOW_MOOD_MIN_DAYS, SCHEDULE_TONE_CLAMP,
                             EmotionParams, EmotionStateMachine)
 from . import sleep_cache
@@ -53,6 +56,63 @@ DEDUP_WINDOW_DEFAULT_SECONDS = 180
 _DEDUP_REGISTRY_MAX = 64
 #: 情绪评估模式合法值（REGISTRY §二.5：episode=会话闲置后整段评估 / per_reply=旧每回复 / off=不评估）
 EVALUATE_MODES = ("episode", "per_reply", "off")
+#: 4.3b（2026-11-11 Gemini 批）：评估配额分区。私聊/群聊各自独享，群聊不能侵占私聊；
+#: 两者仍共同受 ``evaluate_max_per_day`` 总封顶（默认 10 = 6+4）。
+#: 2026-11-11 修复轮：``emotion_quota_partition_enabled`` 默认 True（内部调参
+#: ``mappings/internal_tuning.json[emotion]``，不占用户 schema 叶子）；关 = 回到
+#: 3.17.32 的单一共享池（只有 ``evaluate_max_per_day``，默认 10）。
+EVAL_QUOTA_PRIVATE = "private"
+EVAL_QUOTA_GROUP = "group"
+DEFAULT_PRIVATE_EVAL_QUOTA = 6
+DEFAULT_GROUP_EVAL_QUOTA = 4
+DEFAULT_EVAL_QUOTA_PARTITION_ENABLED = True
+
+
+class _EvalQuotaTicket(str):
+    """4.3b 配额 ticket：字符串值仍是旧契约的 ``YYYY-MM-DD``（旧调用/测试按日比较），
+    另以 ``category`` 属性携带私聊/群聊类别，供成功计数与释放归到正确分区。"""
+
+    def __new__(cls, day: str, category: str) -> "_EvalQuotaTicket":
+        ticket = str.__new__(cls, str(day))
+        ticket.category = category if category in (EVAL_QUOTA_PRIVATE, EVAL_QUOTA_GROUP) else ""
+        return ticket
+
+
+class _AnchorDecayStateMachine(EmotionStateMachine):
+    """4.3a：清醒衰减向人设锚点收敛（仅 ``decay_to_persona_anchor`` 开启时装配）。
+
+    与睡眠大修同一基准线 ``params.anchor``：``VAD = A + (VAD-A)·e^{-k·Δt}``。
+    默认关闭时本类不实例化，旧轨迹（向 0 衰减）逐字不变。
+    """
+
+    def apply_daily_decay(self, now: Optional[datetime] = None) -> float:
+        if self.frozen:
+            return 1.0
+        now = now or datetime.now()
+        hours = (now - self.last_update).total_seconds() / 3600.0
+        if hours <= 0:
+            return 1.0
+        factor = math.exp(-self.decay_rate * hours)
+        anchor = self.params.anchor
+        self.vad_raw = VADState(
+            _clip(anchor.valence + (self.vad_raw.valence - anchor.valence) * factor),
+            _clip(anchor.arousal + (self.vad_raw.arousal - anchor.arousal) * factor),
+            _clip(anchor.dominance + (self.vad_raw.dominance - anchor.dominance) * factor),
+        )
+        self.last_update = now
+        return factor
+
+
+def build_emotion_state_machine(cfg: Any, params: Optional[EmotionParams],
+                                decay_rate: float) -> EmotionStateMachine:
+    """按 ``[emotion].decay_to_persona_anchor`` 装配状态机（4.3a）。
+
+    默认关 → 与改动前完全相同的 ``EmotionStateMachine``（同一参数、同一衰减公式）；
+    仅显式开启才换成向人设锚点收敛的子类，不改变其它任何结算语义。
+    """
+    if bool(getattr(cfg, "decay_to_persona_anchor", False)):
+        return _AnchorDecayStateMachine(params=params, decay_rate=decay_rate)
+    return EmotionStateMachine(params=params, decay_rate=decay_rate)
 #: episode 片段的消息条数 / 字符数上限（超出时保留**最近**的往来并在头部标注省略）
 EPISODE_SEGMENT_MAX_MESSAGES = 40
 EPISODE_SEGMENT_MAX_CHARS = 3000
@@ -250,9 +310,11 @@ class EmotionService:
                                 self._mapping_result.counts())
 
         cfg = getattr(plugin.config, "emotion", None)
-        self._machine = EmotionStateMachine(
-            params=EmotionParams.from_dict((load_json(self._config_path, {}) or {}).get("params")),
-            decay_rate=float(getattr(cfg, "decay_rate", 0.08) or 0.08),
+        # 4.3a：decay_to_persona_anchor 默认关 → 与原实现完全相同的状态机。
+        self._machine = build_emotion_state_machine(
+            cfg,
+            EmotionParams.from_dict((load_json(self._config_path, {}) or {}).get("params")),
+            float(getattr(cfg, "decay_rate", 0.08) or 0.08),
         )
         # 兼容旧状态文件：state 里的 params 以 config 文件为准（初始化结果不丢）
         state = load_json(self._state_path, {}) or {}
@@ -273,10 +335,18 @@ class EmotionService:
         #: episode 水位（stream → 上次评估的 epoch 秒）与日计数（与状态同文件落盘，
         #: 缺键/坏类型 → 空默认，绝不因旧状态文件启动失败）
         self._episode_state: Dict[str, Any] = self._parse_episode_state(state.get("episode"))
+        #: 4.3b：分场景评估计数（与 episode 状态同文件持久化，跨热重载/重启连续）。
+        self._eval_partition_state: Dict[str, Any] = self._parse_eval_partition(
+            state.get("eval_partition"))
         #: per_reply 并发评估的日配额**在途预占**（2026-10-27 用户批准 Q3）：day ticket →
         #: 在途名额数。请求开始预占（乐观），LLM 成功沿用原计数点 ``_note_evaluation_used``
         #: 计入、失败/取消释放；纯内存（在途请求不跨重启），旧日 ticket 不污染新日额度。
         self._eval_reserved: Dict[str, int] = {}
+        #: 4.3b：分区在途预占（key = "day|private|group"），与总数预占同一同步区。
+        self._eval_reserved_partition: Dict[str, int] = {}
+        #: 4.3b：预占调用前的会话提示（同步赋值→同步 reserve 读取→立即清空；
+        #: 不改变 ``_reserve_evaluation_quota`` 的既有调用形状，旧测试桩仍兼容）。
+        self._eval_session_hint: str = ""
         #: 跨来源去重登记：stream → (最近一次真正入账的 source, monotonic 时间, 事件指纹)（§2.4.6 A3）
         self._cross_source_last: Dict[str, Tuple[str, float, str]] = {}
         self._stop_event: Optional[asyncio.Event] = None
@@ -359,6 +429,20 @@ class EmotionService:
         """解析状态文件里的 ``episode`` 键（水位 + 日计数）；实现见 state_store。"""
         return state_store.parse_episode_state(raw)
 
+    @staticmethod
+    def _parse_eval_partition(raw: Any) -> Dict[str, Any]:
+        """解析 4.3b 分区计数（缺键/坏类型 → 空默认，绝不因旧状态文件启动失败）。"""
+        out: Dict[str, Any] = {"date": "", EVAL_QUOTA_PRIVATE: 0, EVAL_QUOTA_GROUP: 0}
+        if not isinstance(raw, dict):
+            return out
+        out["date"] = str(raw.get("date") or "")
+        for category in (EVAL_QUOTA_PRIVATE, EVAL_QUOTA_GROUP):
+            try:
+                out[category] = max(0, int(raw.get(category) or 0))
+            except (TypeError, ValueError):
+                out[category] = 0
+        return out
+
     def _restore_sleep_receipt(self, state: Dict[str, Any], now: datetime) -> None:
         restored = sleep_cache.decode(state.get("pending_sleep_overhaul"), now)
         if restored is None:
@@ -394,6 +478,15 @@ class EmotionService:
             sleep_period=getattr(self, "_sleep_period", None),
             applying_cycle=getattr(self, "_saving_sleep_cycle", ""),
         )
+        # 4.3b：分区计数与 episode 同文件持久化（state_store 只管 episode 三键，
+        # 这里合入顶层 eval_partition；状态机 load_dict 忽略未知键，向后兼容）。
+        partition = getattr(self, "_eval_partition_state", None)
+        if isinstance(partition, dict):
+            state["eval_partition"] = {
+                "date": str(partition.get("date") or ""),
+                EVAL_QUOTA_PRIVATE: int(partition.get(EVAL_QUOTA_PRIVATE) or 0),
+                EVAL_QUOTA_GROUP: int(partition.get(EVAL_QUOTA_GROUP) or 0),
+            }
         if not state_store.write_document(self._state_path, state, writer=save_json_atomic):
             return False
         try:
@@ -664,19 +757,98 @@ class EmotionService:
         return max(0, min(200, cap))
 
     def _eval_day_count(self, now: datetime) -> Tuple[str, int]:
-        """返回 ``(day, 当日已成功评估数)``；跨日清零（episode/per_reply 共用同一计数）。"""
+        """返回 ``(day, 当日已成功评估数)``；跨日清零（episode/per_reply 共用同一计数）。
+
+        4.3b：跨日同时清零私聊/群聊分区计数（分区持久化在 ``eval_partition``）。
+        """
         day = now.strftime("%Y-%m-%d")
         if str(self._episode_state.get("eval_date") or "") != day:
             self._episode_state["eval_date"] = day
             self._episode_state["eval_count"] = 0
+            partition = getattr(self, "_eval_partition_state", None)
+            if not isinstance(partition, dict) or str(partition.get("date") or "") != day:
+                self._eval_partition_state = {"date": day, EVAL_QUOTA_PRIVATE: 0,
+                                              EVAL_QUOTA_GROUP: 0}
         return day, int(self._episode_state.get("eval_count") or 0)
+
+    def _eval_quota_partition_enabled(self) -> bool:
+        """4.3b 分区开关（``internal_tuning.json[emotion].emotion_quota_partition_enabled``，
+        默认 True；经 EmotionSectionConfig 同名只读 property 桥接，不占用户 schema）。
+
+        缺键/异常 → True（默认分区）；关 = 私聊/群聊共用 ``evaluate_max_per_day``
+        单一池（旧行为），分区计数仍照常记录，便于重新开启后按当日真实用量续算。
+        """
+        try:
+            return bool(self._emotion_cfg("emotion_quota_partition_enabled",
+                                          DEFAULT_EVAL_QUOTA_PARTITION_ENABLED))
+        except Exception:
+            return DEFAULT_EVAL_QUOTA_PARTITION_ENABLED
+
+    def _eval_quota_caps(self) -> Tuple[int, int]:
+        """4.3b 分区上限 ``(private, group)``（夹 [0,200]；缺配置回退 6/4）。
+
+        分区上限只决定「哪类会话能用多少」，总上限仍是 :meth:`_evaluate_max_per_day`
+        ——两者同时满足才放行（默认 6+4=10，与旧单一 10 次池的日总量一致）。
+        分区开关关闭时本上限不参与判定（见 :meth:`_eval_quota_partition_enabled`）。
+        """
+        try:
+            private = int(self._emotion_cfg("private_eval_quota", DEFAULT_PRIVATE_EVAL_QUOTA))
+        except (TypeError, ValueError):
+            private = DEFAULT_PRIVATE_EVAL_QUOTA
+        try:
+            group = int(self._emotion_cfg("group_eval_quota", DEFAULT_GROUP_EVAL_QUOTA))
+        except (TypeError, ValueError):
+            group = DEFAULT_GROUP_EVAL_QUOTA
+        return max(0, min(200, private)), max(0, min(200, group))
+
+    def _eval_stream_category(self, session_id: str) -> str:
+        """会话类别：目标私聊/私聊 → private；群聊 → group；未知保守归 group。
+
+        未知归群聊是刻意的：宁可让启动初期尚未登记的私聊少用一点群聊额度，也绝不让
+        群聊在类别未知时侵占私聊专属配额（4.3b 红线）。
+        """
+        sid = str(session_id or "").strip()
+        if self.is_target_session(sid):
+            return EVAL_QUOTA_PRIVATE
+        companion = getattr(self._plugin, "_companion", None)
+        kinds = getattr(companion, "session_kinds", None)
+        getter = getattr(kinds, "is_group", None)
+        if callable(getter):
+            try:
+                is_group = getter(sid)
+            except Exception:
+                is_group = None
+            if is_group is True:
+                return EVAL_QUOTA_GROUP
+            if is_group is False:
+                return EVAL_QUOTA_PRIVATE
+        return EVAL_QUOTA_GROUP
+
+    def _eval_partition_for(self, day: str) -> Dict[str, Any]:
+        """取某日分区计数（缺失/跨日 → 新建；只改内存，落盘由 ``_save_state`` 统一做）。"""
+        partition = getattr(self, "_eval_partition_state", None)
+        if not isinstance(partition, dict) or str(partition.get("date") or "") != str(day):
+            partition = {"date": str(day), EVAL_QUOTA_PRIVATE: 0, EVAL_QUOTA_GROUP: 0}
+            self._eval_partition_state = partition
+        return partition
+
+    @staticmethod
+    def _split_eval_ticket(ticket: Any) -> Tuple[str, str]:
+        """ticket → ``(day, category)``；兼容旧式纯日期字符串与 ``"day|category"``。"""
+        if isinstance(ticket, _EvalQuotaTicket):
+            return str(ticket), str(getattr(ticket, "category", "") or "")
+        text = str(ticket or "")
+        day, _sep, category = text.partition("|")
+        if category in (EVAL_QUOTA_PRIVATE, EVAL_QUOTA_GROUP):
+            return day, category
+        return text, ""
 
     def _daily_quota_ok(self, now: datetime, *, label: str) -> bool:
         """日上限判定（只判定不预占；保留兼容旧调用方/测试）。
 
         F2（2026-11-04 模块评估 P1-09）起 episode 与 per_reply 两条评估路径都改走
         :meth:`_reserve_evaluation_quota`（判定+在途预占同一同步区），本方法不再被
-        生产路径调用；口径仍为 当日已成功数 + 当日在途预占数。
+        生产路径调用；口径仍为 当日已成功数 + 当日在途预占数（**不含** 4.3b 分区判定）。
         """
         day, used = self._eval_day_count(now)
         reserved = int(self._eval_reserved.get(day) or 0)
@@ -699,20 +871,33 @@ class EmotionService:
             return False
         return True
 
-    def _reserve_evaluation_quota(self, now: datetime, *, label: str) -> Optional[str]:
-        """per_reply 评估日配额**乐观预占**（2026-10-27 用户批准 Q3），返回 day ticket。
+    def _reserve_evaluation_quota(self, now: datetime, *, label: str,
+                                  session_id: str = "") -> Optional[str]:
+        """评估日配额**乐观预占**（2026-10-27 Q3 + 2026-11-11 4.3b），返回 day ticket。
 
-        - 判定口径 = 当日已成功数 + 当日**在途预占数**；达上限返回 None（本次不调 LLM）；
-        - day ticket 在**请求开始**捕获，成功/释放都按 ticket 归账 → 旧请求结束时不会把
-          额度记到新日（``_note_evaluation_used(ticket)`` 有同日守卫）；
+        - 判定口径 = 当日已成功数 + 当日在途预占数 ≤ 总上限，**且** 该会话类别
+          （私聊/群聊）已用+在途 < 该类专属配额；任一不满足返回 None（本次不调 LLM）；
+        - 群聊配额耗尽只挡群聊，不影响私聊剩余额度（分区隔离）；
+        - 分区开关 ``internal_tuning.json[emotion].emotion_quota_partition_enabled``
+          关 → 跳过类别专属配额，只保留总上限判定（旧单一共享池；ticket 仍带类别，
+          成功计数照常记录用于审计）；
+        - ticket 仍是旧契约的日期字符串（比较/落盘兼容），另带 ``category`` 属性，
+          成功/释放都按 ticket 归账 → 旧请求结束时不会把额度记到新日（同日守卫）；
         - 旧日 ticket 在本方法清理（在途旧请求的释放按 ticket 归旧日，对新日无影响）；
         - 必须在 ``_llm_interval_ok`` **之后**调用（节流被挡不产生预占，避免泄漏）。
         """
         day, used = self._eval_day_count(now)
         for stale in [key for key in self._eval_reserved if key != day]:
             self._eval_reserved.pop(stale, None)
+        prefix = day + "|"
+        for stale in [key for key in self._eval_reserved_partition if not key.startswith(prefix)]:
+            self._eval_reserved_partition.pop(stale, None)
         reserved = int(self._eval_reserved.get(day) or 0)
         cap = self._evaluate_max_per_day()
+        category = self._eval_stream_category(
+            session_id or str(getattr(self, "_eval_session_hint", "") or ""))
+        partition_enabled = self._eval_quota_partition_enabled()
+        category_key = f"{day}|{category}"
         if used + reserved >= cap:
             self._log_decision(
                 "emotion.evaluate_daily_cap", trigger_type="emotion",
@@ -722,29 +907,80 @@ class EmotionService:
                 reserved=reserved, cap=cap,
             )
             return None
+        if partition_enabled:
+            private_cap, group_cap = self._eval_quota_caps()
+            category_cap = private_cap if category == EVAL_QUOTA_PRIVATE else group_cap
+            partition = self._eval_partition_for(day)
+            category_used = int(partition.get(category) or 0)
+            category_reserved = int(self._eval_reserved_partition.get(category_key) or 0)
+            if category_used + category_reserved >= category_cap:
+                self._log_decision(
+                    "emotion.evaluate_partition_cap", trigger_type="emotion",
+                    reason=(f"partition_cap：{category} 评估配额已用尽（{category_used} 次 + 在途 "
+                            f"{category_reserved}/{category_cap}），本次不再调 LLM"),
+                    mode=str(label or ""), eval_date=day, category=category,
+                    category_used=category_used, category_reserved=category_reserved,
+                    category_cap=category_cap, total_used=used, total_cap=cap,
+                )
+                return None
         self._eval_reserved[day] = reserved + 1
-        return day
+        if partition_enabled:
+            category_reserved = int(self._eval_reserved_partition.get(category_key) or 0)
+            self._eval_reserved_partition[category_key] = category_reserved + 1
+        return _EvalQuotaTicket(day, category)
 
-    def _release_evaluation_quota(self, day: str) -> None:
+    def _release_evaluation_quota(self, day: str, *, session_id: str = "") -> None:
         """释放一个在途预占（失败/取消/成功后归零；多释放不减成负数）。"""
-        key = str(day or "")
+        day_text, category = self._split_eval_ticket(day)
+        key = day_text or str(day or "")
         current = int(self._eval_reserved.get(key) or 0)
+        if current > 0:
+            if current == 1:
+                self._eval_reserved.pop(key, None)
+            else:
+                self._eval_reserved[key] = current - 1
+        if not category:
+            category = self._eval_stream_category(session_id)
+        category_key = f"{key}|{category}"
+        current = int(self._eval_reserved_partition.get(category_key) or 0)
         if current <= 0:
             return
         if current == 1:
-            self._eval_reserved.pop(key, None)
+            self._eval_reserved_partition.pop(category_key, None)
         else:
-            self._eval_reserved[key] = current - 1
+            self._eval_reserved_partition[category_key] = current - 1
 
-    def _note_evaluation_used(self, day: Optional[str] = None) -> None:
-        """记一次已发生的评估：日计数 +1 并落盘（跨日由 :meth:`_eval_day_count` 清零）。
+    def _note_eval_partition(self, ticket: Any, session_id: str = "") -> None:
+        """成功评估后给分区计数 +1（只改内存；由调用方统一落盘）。
+
+        分区开关关闭时仍照常计数（仅审计/重新开启后按当日真实用量续算），
+        但不参与配额判定。
+        """
+        day, category = self._split_eval_ticket(ticket)
+        if not day:
+            day = str(self._episode_state.get("eval_date") or "")
+        if not category:
+            category = self._eval_stream_category(session_id)
+        if not day or not category:
+            return
+        partition = self._eval_partition_for(day)
+        partition[category] = int(partition.get(category) or 0) + 1
+
+    def _note_evaluation_used(self, day: Optional[str] = None, *,
+                              session_id: str = "") -> None:
+        """记一次已发生的评估：日计数 +1（含 4.3b 分区计数）并落盘。
 
         Q3：``day`` 是请求开始捕获的 ticket；与当前计数日不一致（跨日完成的旧请求）时
         不回灌新日额度——旧日额度已随日切清零、不可追溯。episode 路径不传即旧语义。
+        4.3b：ticket 携带类别（``_EvalQuotaTicket.category``），旧式纯日期 ticket 按
+        session 重新判类，保证并行路径也不会把群聊计入私聊。
         """
-        if day is not None and str(self._episode_state.get("eval_date") or "") != str(day):
+        day_text, _category = self._split_eval_ticket(day) if day is not None else ("", "")
+        if day is not None and str(self._episode_state.get("eval_date") or "") != day_text:
             return
         self._episode_state["eval_count"] = int(self._episode_state.get("eval_count") or 0) + 1
+        self._note_eval_partition(day if day is not None else self._episode_state.get("eval_date"),
+                                  session_id)
         self._save_state()
 
     def _prune_stale_watermarks(self, now_ts: float) -> int:
@@ -801,8 +1037,13 @@ class EmotionService:
         # Q3（2026-10-27 用户批准）：日配额改为**请求开始预占 + 成功计入 + 失败/取消释放**，
         # 日界 = 本处捕获的 day ticket（旧请求完成不回灌新日）。成功定义不变——仍是
         # ``evaluate_reply_delta`` 返回有效结果后由 ``_note_evaluation_used`` 计数。
-        ticket_day = self._reserve_evaluation_quota(
-            datetime.now(), label=f"per_reply:{str(session_id or '-')}")
+        # 4.3b：预占前同步传入会话类别（不改变既有 reserve 调用形状/测试桩签名）。
+        self._eval_session_hint = str(session_id or "")
+        try:
+            ticket_day = self._reserve_evaluation_quota(
+                datetime.now(), label=f"per_reply:{str(session_id or '-')}")
+        finally:
+            self._eval_session_hint = ""
         if ticket_day is None:
             return
         try:
@@ -817,7 +1058,7 @@ class EmotionService:
                 return
             if not result:
                 return
-            self._note_evaluation_used(ticket_day)   # 原有成功计数点（唯一定义）
+            self._note_evaluation_used(ticket_day, session_id=session_id)   # 原有成功计数点（唯一定义）
             event, delta = result
             is_target = self.is_target_session(session_id)
             self._apply_external_delta(event or "日常对话", delta, source="replyer",
@@ -826,7 +1067,7 @@ class EmotionService:
             # M0 事件：VAD 结算后发低分辨率 VAD（附录 A ★，consumer=调试日志）
             await self._publish("emotion.updated", **self._updated_payload("reply_evaluated"))
         finally:
-            self._release_evaluation_quota(ticket_day)
+            self._release_evaluation_quota(ticket_day, session_id=session_id)
 
     # ── 会话片段制（T7；REGISTRY §二：Hook 只记录 → 闲置冲刷 → 整段一次评估）──
     def note_reply_for_episode(self, session_id: str) -> None:
@@ -1009,8 +1250,12 @@ class EmotionService:
         # 判定与预占同一同步区：总线回调（_on_schedule_generated → flush_all_episodes）
         # 与情绪循环任务并发冲刷**不同流**时，不再双双通过 used=cap-1 的判定各 +1
         # 击穿 evaluate_max_per_day。成功计数点/水位推进语义逐字不变，预占在 finally 释放。
-        ticket_day = self._reserve_evaluation_quota(
-            current, label=f"episode:{flush_reason or 'flush'}")
+        self._eval_session_hint = stream
+        try:
+            ticket_day = self._reserve_evaluation_quota(
+                current, label=f"episode:{flush_reason or 'flush'}")
+        finally:
+            self._eval_session_hint = ""
         if ticket_day is None:
             # 日上限（裁定 REGISTRY §二.3）：该片段**丢弃不并入次日**（避免陈旧上下文），
             # 水位推进防重复取同一段；已有决策日志可回放
@@ -1061,6 +1306,8 @@ class EmotionService:
                                    pending_seconds=pending_seconds)
                 return False
             self._episode_state["eval_count"] = int(self._episode_state.get("eval_count") or 0) + 1
+            # 4.3b：同一成功计数点给私聊/群聊分区 +1（不单独落盘，随下方 _save_state 持久化）
+            self._note_eval_partition(ticket_day, stream)
             self._episode_state["last_eval_ts"][stream] = ts
             self._prune_stale_watermarks(ts)   # F3：成功入账的水位写入同样触发清理
             self._save_state()
@@ -1075,7 +1322,7 @@ class EmotionService:
             )
             return True
         finally:
-            self._release_evaluation_quota(ticket_day)
+            self._release_evaluation_quota(ticket_day, session_id=stream)
 
     async def flush_all_episodes(self, *, reason: str) -> int:
         """串行冲刷全部已登记流（避免 LLM 并发）；无论成败清空登记，返回成功条数。
@@ -2372,6 +2619,281 @@ class EmotionService:
         self._low_mood_day = {}  # 未达标 → 清空（planning 侧不再强制）
         return None
 
+    # ── 每日情绪兜底结算（3.17.33，用户直派）────────────────────
+    def _daily_settlement_path(self) -> Path:
+        """跨日去重状态文件（与 ``emotion_state.json`` 同目录的独立小文件）。"""
+        return daily_settlement.settlement_state_path(self._state_path)
+
+    def _daily_settlement_memory_state(self) -> Dict[str, Any]:
+        """内存优先的去重状态（热重载/重启后从磁盘恢复；损坏 → 空默认）。"""
+        state = getattr(self, "_daily_settlement_state", None)
+        if not isinstance(state, dict):
+            state = daily_settlement.load_state(self._daily_settlement_path())
+            self._daily_settlement_state = state
+        return state
+
+    def _daily_settlement_points(self) -> list:
+        """只读 ``EmotionObservations`` 的 VAD 采样点（**绝不读聊天原文**）。"""
+        history = getattr(self, "_observations", None)
+        if history is None:
+            try:
+                from .observations import EmotionObservations
+                history = self._observations = EmotionObservations(
+                    self._state_path.with_name("emotion_observations.json"))
+            except Exception:
+                return []
+        try:
+            return list(getattr(history, "points", []) or [])
+        except Exception:
+            return []
+
+    def _daily_settlement_quota_snapshot(self, date_key: str,
+                                         now: datetime) -> Dict[str, Any]:
+        """配额使用与两种 cap 跳过次数（状态优先、决策日志兜底；取不到留 None）。
+
+        - total/private/group：目标日 = 今天且计数日匹配时读状态；否则从决策日志回放
+          ``emotion.external_event``（``source=replyer`` 且 ``llm=True``，工具上报不计配额）；
+        - ``skipped_*``：统计当日 ``emotion.evaluate_daily_cap`` /
+          ``emotion.evaluate_partition_cap`` 条数（日志不可读 → 留 None，摘要省略该行）。
+        """
+        snapshot: Dict[str, Any] = {
+            "total": None, "private": None, "group": None,
+            "total_cap": None, "private_cap": None, "group_cap": None,
+            "skipped_total": None, "skipped_private": None, "skipped_group": None,
+        }
+        try:
+            snapshot["total_cap"] = int(self._evaluate_max_per_day())
+            private_cap, group_cap = self._eval_quota_caps()
+            snapshot["private_cap"], snapshot["group_cap"] = int(private_cap), int(group_cap)
+        except Exception:
+            pass
+        episode = getattr(self, "_episode_state", None)
+        if isinstance(episode, dict) and str(episode.get("eval_date") or "") == date_key:
+            try:
+                snapshot["total"] = max(0, int(episode.get("eval_count") or 0))
+            except (TypeError, ValueError):
+                pass
+        partition = getattr(self, "_eval_partition_state", None)
+        if isinstance(partition, dict) and str(partition.get("date") or "") == date_key:
+            for category in (EVAL_QUOTA_PRIVATE, EVAL_QUOTA_GROUP):
+                try:
+                    snapshot[category] = max(0, int(partition.get(category) or 0))
+                except (TypeError, ValueError):
+                    pass
+        logger_ = getattr(self._plugin, "_decision_logger", None)
+        reader = getattr(logger_, "read_entries", None)
+        entries: list = []
+        logs_ok = False
+        # 决策日志关闭时 record() 不落盘，read_entries 的「空」不代表 0 次 → 不据它回填
+        logs_readable = getattr(logger_, "enabled", True) is not False
+        if callable(reader) and logs_readable:
+            try:
+                entries = list(reader(days=2) or [])
+                logs_ok = True
+            except Exception:
+                entries, logs_ok = [], False
+        skipped_total = skipped_private = skipped_group = 0
+        logged_used = logged_private = logged_group = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            action = str(entry.get("action") or "")
+            if action in ("emotion.evaluate_daily_cap", "emotion.evaluate_partition_cap"):
+                if str(entry.get("eval_date") or "") != date_key:
+                    continue
+                if action == "emotion.evaluate_daily_cap":
+                    skipped_total += 1
+                else:
+                    category = str(entry.get("category") or "")
+                    if category == EVAL_QUOTA_PRIVATE:
+                        skipped_private += 1
+                    elif category == EVAL_QUOTA_GROUP:
+                        skipped_group += 1
+                continue
+            # 成功次数回退：只有 replyer 的 LLM 评估走配额计数（工具上报不计配额）
+            if (action == "emotion.external_event" and entry.get("llm") is True
+                    and str(entry.get("source") or "") == "replyer"
+                    and str(entry.get("time") or "")[:10] == date_key):
+                logged_used += 1
+                try:
+                    category = self._eval_stream_category(str(entry.get("session_id") or ""))
+                except Exception:
+                    category = ""
+                if category == EVAL_QUOTA_PRIVATE:
+                    logged_private += 1
+                elif category == EVAL_QUOTA_GROUP:
+                    logged_group += 1
+        if logs_ok:
+            snapshot["skipped_total"] = skipped_total
+            snapshot["skipped_private"] = skipped_private
+            snapshot["skipped_group"] = skipped_group
+            if snapshot["total"] is None:
+                snapshot["total"] = logged_used
+            if snapshot["private"] is None:
+                snapshot["private"], snapshot["group"] = logged_private, logged_group
+        return snapshot
+
+    def _daily_settlement_reserve(self, now: datetime) -> Optional[str]:
+        """为日终结算预占一次评估配额（不绕过每日总上限；失败返回 None）。
+
+        日终结算不属于某个聊天流：先按目标私聊分类尝试，再按未知流（保守归群聊）
+        尝试——哪个分区还有余量就用哪个；总上限已满直接返回 None（走 rule 兜底，
+        不重复写 ``evaluate_daily_cap`` 日志）。预占失败不改变任何计数。
+        """
+        try:
+            day, used = self._eval_day_count(now)
+            cap = self._evaluate_max_per_day()
+            reserved = int(getattr(self, "_eval_reserved", {}).get(day) or 0)
+        except Exception:
+            day, used, cap, reserved = "", 0, 0, 0
+        if day and used + reserved >= cap:
+            return None
+        target = str(getattr(self._plugin, "_stream_id", "") or "").strip()
+        hints = [target, ""] if target else [""]
+        for hint in hints:
+            self._eval_session_hint = hint
+            try:
+                ticket = self._reserve_evaluation_quota(now, label="daily_settlement")
+            except Exception as exc:
+                logger.warning("每日兜底结算配额预占异常（按 rule 兜底）：%s", exc)
+                ticket = None
+            finally:
+                self._eval_session_hint = ""
+            if ticket is not None:
+                return ticket
+        return None
+
+    def _save_daily_settlement_state(self, date_key: str, mode: str,
+                                     points: int, catch_up: bool) -> None:
+        """记下已结算日期（内存立即生效；落盘失败只留痕，不影响本次入账）。"""
+        state = {"last_date": str(date_key), "mode": str(mode),
+                 "points": int(points), "catch_up": bool(catch_up),
+                 "at": datetime.now().isoformat(timespec="seconds")}
+        self._daily_settlement_state = state
+        if not daily_settlement.save_state(self._daily_settlement_path(), **state):
+            logger.warning("每日兜底结算日期状态落盘失败（内存去重仍生效；重启后可能重复结算）")
+
+    async def _apply_daily_settlement(self, now: datetime, date_key: str,
+                                      catch_up: bool, max_chars: int) -> Dict[str, Any]:
+        """执行一次兜底结算：压缩摘要 → （配额可用时）一次 LLM → 否则 rule → 入账留痕。"""
+        rows = daily_settlement.points_for_date(self._daily_settlement_points(), date_key)
+        quota = self._daily_settlement_quota_snapshot(date_key, now)
+        summary = daily_settlement.summarize_points(
+            rows, date_key=date_key, max_chars=max_chars, quota=quota)
+        if not rows:
+            # 无采样点 = 没有可结算的内容：记录 no_data，不调 LLM、不耗配额、
+            # 不改 VAD（避免用「无数据衰减」伪造情绪变化）。
+            entry: Dict[str, Any] = {
+                "date": date_key,
+                "mode": "no_data",
+                "points": 0,
+                "input_chars": len(summary["text"]),
+                "quota_used": {key: quota.get(key) for key in ("total", "private", "group")},
+                "catch_up": bool(catch_up),
+                "delta": None,
+                "delta_applied": None,
+                "summary": summary["text"][:max(1, int(max_chars))],
+                "llm": False,
+            }
+            self._log_decision(
+                "emotion.daily_settlement", trigger_type="emotion",
+                reason=(f"每日情绪兜底结算（no_data）：{date_key} 无采样点，"
+                        f"跳过结算{'（补结算）' if catch_up else ''}"),
+                **entry)
+            self._save_daily_settlement_state(date_key, "no_data", 0, catch_up)
+            return entry
+        current = self._machine.effective_vad()
+        delta: Optional[VADState] = None
+        mode = "rule"
+        llm_error = ""
+        if rows:
+            ticket = self._daily_settlement_reserve(now)
+            if ticket is not None:
+                task_name = purpose_task(self._plugin, "emotion_evaluator", default="utils")
+                try:
+                    delta = await evaluate_daily_settlement(
+                        self._llm(), summary["text"], current, self._persona_text(),
+                        task_name, plugin=self._plugin)
+                    if delta is not None:
+                        # 成功计数点：与 episode/per_reply 同一日计数与分区计数
+                        self._note_evaluation_used(ticket)
+                        mode = "llm"
+                except Exception as exc:
+                    delta = None
+                    llm_error = type(exc).__name__
+                    logger.warning("每日兜底结算 LLM 失败（按 rule 兜底）：%s", exc)
+                finally:
+                    self._release_evaluation_quota(ticket)
+        if delta is None:
+            anchor = getattr(getattr(self._machine, "params", None), "anchor", None)
+            delta = daily_settlement.rule_delta(current, summary["mean"], anchor)
+        outcome = self._apply_external_delta(
+            f"每日情绪兜底结算（{date_key}{'，补结算' if catch_up else ''}）",
+            delta, source="daily_settlement", multiplier=1.0, llm=(mode == "llm"))
+        applied = outcome.get("delta") if isinstance(outcome, dict) else None
+        entry: Dict[str, Any] = {
+            "date": date_key,
+            "mode": mode,
+            "points": int(summary["count"]),
+            "input_chars": len(summary["text"]),
+            "quota_used": {key: quota.get(key) for key in ("total", "private", "group")},
+            "catch_up": bool(catch_up),
+            "delta": delta.to_dict(),
+            "delta_applied": applied.to_dict() if isinstance(applied, VADState) else None,
+            # 摘要已按预算压缩；落决策日志再按同一预算硬截断（防现场把预算调大后刷日志）
+            "summary": summary["text"][:max(1, int(max_chars))],
+            "llm": (mode == "llm"),
+        }
+        if llm_error:
+            entry["llm_error"] = llm_error
+        self._log_decision(
+            "emotion.daily_settlement", trigger_type="emotion",
+            reason=(f"每日情绪兜底结算（{mode}）：{date_key} 采样 {summary['count']} 点，"
+                    f"{'补结算' if catch_up else '当日结算'}"),
+            **entry)
+        self._save_daily_settlement_state(date_key, mode, int(summary["count"]), catch_up)
+        await self._publish("emotion.updated", **self._updated_payload("daily_settlement"))
+        return entry
+
+    async def _tick_daily_settlement(self, now: Optional[datetime] = None
+                                     ) -> Optional[Dict[str, Any]]:
+        """每日一次的情绪兜底结算（默认 23:50；错过则下一拍补「上一日」一次）。
+
+        - **每日至多一次 LLM**：同一 ``date_key`` 只结算一次（独立状态文件持久去重，
+          跨日不重复；到点但上一日也漏了时先补上一日，今天等下一拍）；
+        - **冻结期顺延**：既有冻结语义下事件只入队、不入 VAD（醒后并入日志并被大修
+          清掉），此时结算等于白耗配额；故冻结拍不标记已结算，醒后第一拍按「上一日」
+          补结算（``catch_up=True``），保证兜底 Δ 真实生效；
+        - 有采样且配额可用 → 一次 LLM 结算；配额耗尽 / LLM 失败 / 无采样 →
+          确定性 rule 兜底（不调 LLM、不占配额）。
+        """
+        if getattr(self, "_daily_settlement_running", False):
+            return None
+        cfg = daily_settlement.settings()
+        if not cfg["enabled"]:
+            return None
+        if self.is_frozen():
+            return None
+        now = now or datetime.now()
+        state = self._daily_settlement_memory_state()
+        if not str(state.get("last_date") or ""):
+            # 首次启用/状态文件丢失：从今天起算，不补历史、首日不结算。
+            # 目的：避免首拍用「昨日无采样」的规则兜底改动 VAD，也避免补出陈旧结算。
+            # 代价：安装/清状态当天不做日终结算，次日 23:50 起正常。
+            self._save_daily_settlement_state(
+                now.strftime("%Y-%m-%d"), "bootstrap", 0, False)
+            return None
+        target = daily_settlement.resolve_target(now, cfg["minute"], state.get("last_date"))
+        if target is None:
+            return None
+        date_key, catch_up = target
+        self._daily_settlement_running = True
+        try:
+            return await self._apply_daily_settlement(
+                now, date_key, catch_up, cfg["max_chars"])
+        finally:
+            self._daily_settlement_running = False
+
     def _wake_side_inputs(self, ref: datetime,
                           cached: Dict[str, Any]) -> Tuple[VADState, VADState, float]:
         """醒来时重算状态侧三输入（R/E/约定）；日期基准 = 入睡时刻（``computed_at``）。
@@ -2679,6 +3201,8 @@ class EmotionService:
         low_mood_payload = self._tick_daily_mood(now)
         if low_mood_payload is not None:
             await self._publish("emotion.low_mood_day", **low_mood_payload)
+        # 3.17.33 每日情绪兜底结算（不依赖日程；冻结期在 _tick 内顺延到醒后补结算）
+        await self._tick_daily_settlement(now)
         if query is None:
             return
         # PR8 3.0.0（W4 步骤 7，依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单，
