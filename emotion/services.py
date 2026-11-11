@@ -258,6 +258,18 @@ class EmotionServices:
         except Exception:
             return None
 
+    def anchor_snapshot(self) -> Optional[Dict[str, Any]]:
+        """人设 VAD 锚点公开只读端口（R2 结构审计批；转发 service.anchor_snapshot）。
+
+        与 effective_vad_snapshot 不同，本端口**不检查 is_enabled**——锚点是人设
+        静态配置，分享质量门槛在模块停用态仍需读取（旧组合根直读
+        ``service._machine.params.anchor`` 的口径逐字保留）；异常 → None。
+        """
+        try:
+            return self.service.anchor_snapshot()
+        except Exception:
+            return None
+
     def is_enabled(self) -> bool:
         return self.service._enabled()
 

@@ -86,7 +86,9 @@ from planning.time_utils import is_in_day_frame, is_in_time_window
 from suite_prompts import render
 from tools.proactive_turn import discard_turn, register_turn
 
-from .initiative_profile import (DEFAULT_ANCHOR_HOURS, MISS_STAGE_PROB_MAX,
+from .config import target_qq_of
+from .initiative_profile import (DEFAULT_ANCHOR_HOURS, MISS_STAGE_END_HOURS,
+                                 MISS_STAGE_PROB_MAX,
                                  MISS_STAGE_PROB_MIN, SHORT_REPLY_DEFER_HOURS,
                                  SHORT_REPLY_HALF_LIFE, InitiativeMemory, cycle_defer_hours,
                                  effective_anchor_epoch, epoch, evaluate_miss, miss_stage,
@@ -636,6 +638,117 @@ ACTION_SKIP = "skip"
 _DEFINITE_NOT_ENQUEUED = frozenset({'blocked', 'rejected', 'not_assembled'})
 
 
+def resolve_target_miss_stage_context(*, config: Any, stream_id: str,
+                                      now_provider: Any, patrol: Any,
+                                      affection: Any) -> dict:
+    """只读解析陪伴目标当前想念阶段与清醒沉默时长（**绝不写周期/预算**）。
+
+    R2 结构审计批（2026-11-12）：自组合根 ``plugin._target_miss_stage_context``
+    逐字下沉——本函数是阶段 4 上下文的**单一只读出口**（组合根只薄委托）。
+    优先复用 ``PatrolService.current_target_miss_stage()`` 的唯一只读出口
+    （设计方案 §1.2/§6）；该出口缺失/不可用时回退本地只读解析：生效起点取
+    周期行 ``effective_anchor_epoch``（含短回复顺延），周期缺失回退好感度最后
+    来信时间，睡眠扣除复用巡逻服务的只读睡眠段。任何异常 → stage 0。
+
+    依赖全部经参数注入（config/流 id/时钟/巡逻服务/好感度），不 import 服务束；
+    ``patrol`` 鸭子兼容旧装配桩（只读 getattr，绝不写其私有状态）。
+    """
+    empty = {'stage': 0, 'hours': 0.0, 'relation': '恋人', 'target': False}
+    try:
+        cfg = config
+        section = getattr(cfg, 'patrol', None)
+        if section is None:
+            return empty
+        if not (getattr(section, 'enabled', False)
+                and getattr(section, 'proactive_trigger_enabled', False)
+                and getattr(section, 'miss_enabled', True)):
+            return empty
+        target = str(target_qq_of(cfg) or '')
+        stream = str(stream_id or '')
+        if not target or not stream:
+            return empty
+        if patrol is None:
+            return empty
+        gate = getattr(patrol, '_miss_stage_escalation_enabled', None)
+        if callable(gate) and not gate():
+            return empty  # 阶梯关 = 旧单次想念；不派生阶段 4
+        relation = '恋人'
+        try:
+            word = getattr(patrol, '_relation_word', None)
+            if callable(word):
+                relation = str(word() or '恋人')
+        except Exception:
+            relation = '恋人'
+        resolver = getattr(patrol, 'current_target_miss_stage', None)
+        if not callable(resolver):
+            resolver = getattr(patrol, 'current_miss_stage', None)
+        if callable(resolver):
+            try:
+                stage, hours = resolver()
+                return {'stage': int(stage or 0), 'hours': float(hours or 0.0),
+                        'relation': relation, 'target': True}
+            except Exception:
+                pass
+        last = None
+        try:
+            last = affection.last_user_msg_time()
+        except Exception:
+            last = None
+        if last is None:
+            return empty
+        now_dt = now_provider()
+        if now_dt.tzinfo is not None:
+            now_dt = now_dt.astimezone().replace(tzinfo=None)
+        last_dt = last
+        if getattr(last_dt, 'tzinfo', None) is not None:
+            last_dt = last_dt.astimezone().replace(tzinfo=None)
+        anchor_dt = None
+        hours = 0.0
+        # 复核 finding：优先复用 patrol 的只读投影口（含最新短回复的 1.5h
+        # 顺延），避免本地镜像把「121h + 10 分钟前短回复」误判成阶段 4。
+        projector = getattr(patrol, '_readonly_cycle_anchor', None)
+        if callable(projector):
+            try:
+                staged = True
+                gate = getattr(patrol, '_miss_stage_escalation_enabled', None)
+                if callable(gate):
+                    staged = bool(gate())
+                anchor_dt, projected = projector(now_dt, last_dt, staged=staged)
+                if anchor_dt is not None:
+                    hours = max(0.0, float(projected or 0.0))
+            except Exception:
+                anchor_dt = None
+        if anchor_dt is None:
+            # 旧装配没有只读投影口：退回周期行镜像（只含已落盘 defer，不含最新
+            # 短回复的即时顺延；仅异常/旧装配路径，与公共出口可能差一个 1.5h 档）。
+            memory = getattr(patrol, '_initiative_memory', None)
+            doc = getattr(memory, 'doc', None)
+            cycles = doc.get('cycles') if isinstance(doc, dict) else None
+            row = cycles.get(target) if isinstance(cycles, dict) else None
+            anchor_epoch = effective_anchor_epoch(row)
+            if anchor_epoch is None:
+                anchor_epoch = last_dt.timestamp()
+            try:
+                anchor_dt = datetime.fromtimestamp(float(anchor_epoch))
+            except (OverflowError, OSError, ValueError):
+                return empty
+            hours = max(0.0, (now_dt - anchor_dt).total_seconds() / 3600.0)
+        # 清醒沉默口径：仅在自然时长越过阶段 3 上界后才读睡眠段（短沉默零额外 IO）。
+        if hours > MISS_STAGE_END_HOURS:
+            try:
+                sleep_enabled = getattr(patrol, '_miss_sleep_excluded_enabled', None)
+                if callable(sleep_enabled) and sleep_enabled():
+                    sleeper = getattr(patrol, '_sleep_hours_between', None)
+                    if callable(sleeper):
+                        hours = max(0.0, hours - max(0.0, float(sleeper(anchor_dt, now_dt))))
+            except Exception:
+                pass
+        return {'stage': 4 if hours > MISS_STAGE_END_HOURS else 0,
+                'hours': hours, 'relation': relation, 'target': True}
+    except Exception:
+        return empty
+
+
 class PatrolService:
     """巡检调度引擎（判定链与源插件 scheduler.py 逐条对齐）。"""
 
@@ -895,6 +1008,27 @@ class PatrolService:
     def current_miss_stage(self, now: Optional[datetime] = None) -> Tuple[int, float]:
         """兼容别名：:meth:`current_target_miss_stage`（旧命名，只读）。"""
         return self.current_target_miss_stage(now)
+
+    def miss_stage_projection(self, now: Optional[datetime] = None, *,
+                              config: Any = None,
+                              stream_id: Optional[str] = None) -> dict:
+        """阶段 4 上下文公开只读端口（R2 结构审计批，2026-11-12）。
+
+        把阶梯开关/关系称谓/周期生效起点/睡眠扣除四个私有读数位封装为单一
+        公开出口（``{stage, hours, relation, target}``）；组合根与其他消费方
+        不再下钻 ``_miss_stage_escalation_enabled`` / ``_relation_word`` /
+        ``_readonly_cycle_anchor`` / ``_initiative_memory`` / ``_sleep_hours_between``。
+        **纯读**：不写周期/预算；任何缺失/异常 → stage 0 空上下文。
+        缺省 config 取装配根当前配置、stream_id 取本服务已登记目标流。
+        """
+        if config is None:
+            config = getattr(self._config, 'config', None)
+        if stream_id is None:
+            stream_id = self._stream_id
+        return resolve_target_miss_stage_context(
+            config=config, stream_id=str(stream_id or ''),
+            now_provider=(lambda: now) if now is not None else datetime.now,
+            patrol=self, affection=self._affection)
 
     def mark_miss_spoken(self) -> bool:
         """P1-8：确认主动回复后把本周期 miss claim 标 ``spoken``（仅一次）。

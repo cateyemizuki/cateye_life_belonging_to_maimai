@@ -1036,6 +1036,143 @@ class QzoneVideoLedger:
                                  {'fact_sync': state, 'fact_sync_attempts': max(0, int(attempts))})
 
 
+class RelationshipTargetInterests:
+    """关系记忆里的目标兴趣权重只读 provider（``{词: 权重}``；只读、无网络）。
+
+    R2 结构审计批（2026-11-12）：自组合根 ``plugin._relationship_target_interests``
+    逐字下沉。取数序（先真实关系记忆，后既有观看兴趣）：
+    1) 目标陪伴私聊的观众画像话题（``ShareLedger.profile(stream).topics``，
+       由分享评估器从聊天里提炼；即「关系记忆」的对方兴趣）；
+    2) 好感习惯 ``habits`` 的键值（用户主动记下的习惯/喜好）；
+    3) ``VideoInterestService.effective_weights``（机器人观看兴趣，旧口径兜底；
+       候选源经公开 ``effective_weights()`` 端口读取，不再下钻私有 ``_interest``）。
+    话题/习惯命中即返回，避免把「机器人想看的」盖过「对方聊过的」。
+    依赖全部由组合根注入只读端口；本类不持业务状态、不 import 业务包。
+    """
+
+    def __init__(self, *, ledger_provider, stream_provider,
+                 affection_provider, interest_provider):
+        self._ledger = ledger_provider        # () -> ShareLedger | None
+        self._stream = stream_provider        # () -> str（目标陪伴私聊流 id）
+        self._affection = affection_provider  # () -> AffectionManager | None
+        self._interest = interest_provider    # () -> 兴趣服务/候选源（公开 effective_weights）| None
+
+    def __call__(self) -> dict:
+        terms: dict[str, float] = {}
+        try:
+            ledger = self._ledger()
+            stream = str(self._stream() or '')
+            profile = ledger.profile(stream) if ledger is not None and stream else {}
+            topics = profile.get('topics') if isinstance(profile, dict) else None
+            for topic in topics or []:
+                term = str(topic).strip()
+                if term and len(term) <= 40:
+                    terms.setdefault(term, 1.0)
+        except Exception:
+            terms = {}
+        if terms:
+            return terms
+        try:
+            affection = self._affection()
+            habits = affection.habits() if affection is not None else {}
+            if isinstance(habits, dict):
+                for key, value in habits.items():
+                    for term in (value, key):
+                        text = str(term).strip()
+                        if text and len(text) <= 40:
+                            terms.setdefault(text, 1.0)
+        except Exception:
+            terms = {}
+        if terms:
+            return terms
+        try:
+            interest = self._interest()
+            weights = interest.effective_weights() if interest is not None else None
+            if isinstance(weights, dict):
+                for term, weight in weights.items():
+                    text = str(term).strip()
+                    if text and len(text) <= 40:
+                        try:
+                            terms[text] = float(weight)
+                        except (TypeError, ValueError):
+                            terms[text] = 1.0
+        except Exception:
+            terms = {}
+        return terms
+
+
+class VideoShareQualitySignals:
+    """分享质量门槛信号只读 provider：``{vad, vad_anchor, vad_delta, target_interests}``。
+
+    R2 结构审计批（2026-11-12）：自组合根 ``plugin._video_share_quality_signals``
+    逐字下沉；装配根把本实例注入 :class:`QzoneVideoBridge` 的
+    ``quality_signal_provider``（3.3）。键口径与桥的 ``_quality_inputs`` 对齐，
+    读取失败只丢该项、绝不虚构：
+
+    - ``vad`` = emotion 生效 VAD（``effective_vad_snapshot``，三维）；
+    - ``vad_anchor`` = emotion 人设锚点（公开 ``anchor_snapshot()`` 端口）；
+    - ``vad_delta`` = 当前 VAD − 锚点（三维差；两侧齐备才给）；
+    - ``target_interests`` / ``interests`` = 关系记忆里的对方兴趣
+      （:class:`RelationshipTargetInterests` 三级回退）。
+      三者都缺 → 不提供（桥侧按「无可核验兴趣」处理）。
+    本 provider 只读、零网络；异常一律降级为空信号。依赖全部由组合根注入。
+    """
+
+    def __init__(self, *, vad_snapshot_provider, anchor_provider,
+                 social_state_provider, interests_provider):
+        self._vad_snapshot = vad_snapshot_provider    # () -> dict | None
+        self._anchor = anchor_provider                # () -> dict | None（emotion 公开端口）
+        self._social_state = social_state_provider    # () -> dict（生活状态只读投影）
+        self._interests = interests_provider          # () -> dict（关系记忆兴趣权重）
+
+    def interests(self) -> dict:
+        """关系记忆目标兴趣权重（公开只读面；质量信号内部共用同一 provider）。"""
+        return self._interests()
+
+    def __call__(self, candidate: dict | None = None) -> dict:
+        signals: dict = {}
+        current = None
+        try:
+            current = self._vad_snapshot()
+        except Exception:
+            current = None
+        anchor = None
+        try:
+            anchor = self._anchor()
+        except Exception:
+            anchor = None
+        if isinstance(current, dict) and current:
+            signals['vad'] = {dim: current[dim] for dim in
+                              ('valence', 'arousal', 'dominance') if dim in current}
+        if isinstance(anchor, dict) and anchor:
+            signals['vad_anchor'] = {dim: anchor[dim] for dim in
+                                     ('valence', 'arousal', 'dominance') if dim in anchor}
+        if isinstance(signals.get('vad'), dict) and isinstance(signals.get('vad_anchor'), dict):
+            delta = {}
+            for dim in ('valence', 'arousal', 'dominance'):
+                try:
+                    delta[dim] = float(signals['vad'][dim]) - float(signals['vad_anchor'][dim])
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if delta:
+                signals['vad_delta'] = delta
+        # 生活状态里若已有 VAD 三键（未来 LifeState 扩展/测试注入），原样透传，
+        # 不自造字段；emotion 真源优先，缺失才补。
+        try:
+            state = self._social_state()
+        except Exception:
+            state = {}
+        if isinstance(state, dict):
+            for key in ('vad_delta', 'vad', 'vad_anchor'):
+                if key not in signals and state.get(key) is not None:
+                    signals[key] = state[key]
+        interests = self._interests()
+        if interests:
+            signals['interests'] = interests
+            signals['target_interests'] = interests
+        return signals
+
+
 class QzoneVideoBridge:
     """Candidate intake + shadow-only LLM decisions, with injected business ports."""
 

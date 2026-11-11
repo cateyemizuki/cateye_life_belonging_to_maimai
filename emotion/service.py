@@ -529,6 +529,22 @@ class EmotionService:
         """
         return float(self._machine.effective_vad().valence)
 
+    def anchor_snapshot(self) -> Optional[Dict[str, Any]]:
+        """人设 VAD 锚点公开只读端口（R2 结构审计批，2026-11-12）。
+
+        返回 ``params.anchor.to_dict()``（valence/arousal/dominance 三维）；
+        状态机/锚点缺失或读取失败 → ``None``。消费方（分享质量门槛等）据此
+        计算 VAD−锚点差，不再下钻私有 ``_machine.params.anchor``。
+        锚点是人设静态配置：与生效 VAD 不同，本端口**不检查模块启用开关**
+        （旧组合根直读口径逐字保留——停用态质量门槛仍可读到锚点）。
+        """
+        try:
+            anchor = getattr(getattr(self._machine, "params", None), "anchor", None)
+            to_dict = getattr(anchor, "to_dict", None)
+            return to_dict() if callable(to_dict) else None
+        except Exception:
+            return None
+
     def _primary_emotion_description(self) -> str:
         """当前主导情绪的详细文字描述（F5；映射表外/无命中 → 通用固定描述）。"""
         descriptions_map = getattr(self, "_emotion_descriptions", None) or {}

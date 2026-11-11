@@ -108,6 +108,46 @@ class HolidayService:
         """返回某年已缓存的特殊日期条数（0 表示没有该年数据）。"""
         return len(self._tables.get(year, {}))
 
+    def cached_is_statutory_holiday(self, date: str) -> bool:
+        """同步只读端口：指定日期是否法定节假日（**只读磁盘缓存，不联网**）。
+
+        R2 结构审计批（2026-11-12）：预算弹性 ``holiday`` 信号的唯一读取出口
+        （DEV_GUIDE 结构守则 §5-A「读走公开只读面」）——组合根/ProactiveBudget
+        不再按私有格式直读 ``holiday_cache.json`` 自建第二读取路径。
+
+        口径与旧组合根实现逐字一致：只认整年表里 ``off is True`` 的条目
+        （周末不冒充法定节日）；缓存按「日期 + 文件 mtime」失效，磁盘预热完成
+        （mtime 变化）后下一拍即可读到真值；日期非法/缓存缺失/读取失败 → False。
+        本端口不触碰 :meth:`get_holiday_info` 的内存描述缓存与 TTL 刷新语义。
+        """
+        day = str(date or "").strip()
+        dt = self._parse_date(day)
+        if dt is None:
+            return False
+        path = self._cache_file
+        if path is None:
+            return False
+        try:
+            stamp = float(path.stat().st_mtime)
+        except Exception:
+            stamp = 0.0
+        cached = getattr(self, "_holiday_signal_cache", None)
+        if (isinstance(cached, tuple) and len(cached) == 3
+                and cached[0] == day and cached[1] == stamp):
+            return bool(cached[2])
+        holiday = False
+        try:
+            raw = load_json(path, None)
+            tables = raw.get("tables") if isinstance(raw, dict) else None
+            year_table = tables.get(str(dt.year)) if isinstance(tables, dict) else None
+            days = year_table.get("days") if isinstance(year_table, dict) else None
+            entry = days.get(day) if isinstance(days, dict) else None
+            holiday = bool(isinstance(entry, dict) and entry.get("off") is True)
+        except Exception:
+            holiday = False
+        self._holiday_signal_cache = (day, stamp, holiday)
+        return holiday
+
     # ── 磁盘缓存（原子写）────────────────────────────────────────────────
 
     @property

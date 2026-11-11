@@ -877,3 +877,48 @@ class ActivityPreferencesService:
         self._activities = dict(items[:MAX_CACHE_ENTRIES])
         self._aliases = {k: v for k, v in self._aliases.items()
                          if v in self._activities}
+
+
+def collect_preference_definitions(event_catalog: Any, rolling_planner: Any) -> list:
+    """P3：偏好评估的语义定义集合（只读；不触发请求）。
+
+    R2 结构审计批（2026-11-12）：自组合根 ``plugin._preference_definitions``
+    逐字下沉——定义集合的取数算法归 planning 偏好服务所在包；组合根只薄委托。
+
+    3.17.33 修复：不仅取 ``active_events``，还并入 ``generated_events``——
+    当日已被 consumed 的一次性定义会从 active 池移除，但语义身份仍可能跨日
+    复用；只取 active 会让这些定义永远没有画像。同一 ``event_id`` 去重，
+    后续 ``_collect_needed`` 再按语义 ``activity_key`` 去重。事件库服务/
+    直接 store 两种形态都可装配（``store`` 优先）。
+    """
+    defs: list = []
+    cat = event_catalog
+    if cat is not None:
+        try:
+            store = getattr(cat, "store", cat)
+        except Exception:
+            store = None
+        if store is not None:
+            seen_ids: set = set()
+            for attr in ("active_events", "generated_events"):
+                try:
+                    events = getattr(store, attr, None) or []
+                except Exception:
+                    continue
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    eid = str(event.get("event_id") or event.get("key") or "")
+                    if eid:
+                        if eid in seen_ids:
+                            continue
+                        seen_ids.add(eid)
+                    defs.append(dict(event))
+    rp = rolling_planner
+    if rp is not None:
+        try:
+            day = rp._date_of(rp._now())
+            defs.extend(dict(c) for c in rp._spine_intents_cached(day))
+        except Exception:
+            pass
+    return defs

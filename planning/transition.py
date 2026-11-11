@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import tempfile
@@ -30,6 +31,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
+
+from . import settlement_v2
 
 logger = logging.getLogger(__name__)
 
@@ -401,3 +404,93 @@ class ConfessionLedger:
 
     def has_seen(self, stream_id: Any, episode_id: Any) -> bool:
         return (str(stream_id or "global"), str(episode_id or "")) in self._seen
+
+
+# ── 唯一结算模型参数接线（R2 结构审计批自组合根逐字下沉；不改历史数值）──────
+
+
+def transition_focus_override(config: Any) -> Optional[Tuple[float, float]]:
+    """F3 过渡窗 focus 覆盖 ``(target, tau_min)``（``[experimental]``；坏值 → None）。
+
+    R2 结构审计批（2026-11-12）：自 ``plugin._transition_focus_override`` 逐字
+    下沉——实验期配置只有一个用户可见入口（``[experimental].transition_focus_*``）；
+    这里的值经 ``settlement_params`` 注入 ``activity.transition.focus``，
+    与 ``[life_state].settlement_params_json`` 的覆盖同路生效（热重载经
+    组合根 ``_sync_life_settlement`` 重新推送）。
+    """
+    exp = getattr(config, "experimental", None)
+    if exp is None:
+        return None
+    try:
+        target = float(getattr(exp, "transition_focus_target", 0.68))
+        tau = float(getattr(exp, "transition_focus_tau_min", 3.0))
+    except (TypeError, ValueError):
+        return None
+    try:
+        if not math.isfinite(target) or not math.isfinite(tau):
+            return None
+    except Exception:
+        return None
+    return (max(0.0, min(1.0, target)), max(0.5, tau))
+
+
+def life_settlement_params(config: Any, warn: Any,
+                           logger: Any = None) -> Optional[Dict[str, Any]]:
+    """v2 参数覆盖（``[life_state].settlement_params_json``；空/坏值 → None=内置默认）。
+
+    R2 结构审计批（2026-11-12）：自 ``plugin._life_settlement_params`` 逐字下沉。
+    返回**已合并**参数 dict（:func:`planning.settlement_v2.merge_params`：未知键
+    丢弃并告警、坏值保留默认），装配/热重载两处共用同一口径。
+
+    F3（2026-11-11 B2）：``[experimental].transition_focus_*`` 与
+    ``V2_PARAMS.activity.transition.focus`` 默认值 ``[0.68, 3.0]`` 不同时，
+    把实验值注入 ``params.activity.transition.focus`` 后返回（此时不再是
+    ``None``）；值等于默认时保持 ``None``（旧行为逐字不变）。
+
+    ``warn(message, exc)`` 为组合根注入的装配期容错告警端口；``logger`` 为
+    merge_params 的宿主 logger（可空）。
+    """
+    section = getattr(config, "life_state", None)
+    raw = ""
+    try:
+        raw = str(getattr(section, "settlement_params_json", "") or "").strip()
+    except Exception:
+        raw = ""
+    focus = transition_focus_override(config)
+    try:
+        default_focus = tuple(settlement_v2.V2_PARAMS["activity"]["transition"]["focus"])
+    except Exception:
+        default_focus = (0.68, 3.0)
+    needs_focus = focus is not None and tuple(focus) != default_focus
+    if not raw and not needs_focus:
+        return None
+    overrides: Optional[Dict[str, Any]] = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            warn("settlement_params_json 解析失败（按内置默认处理）：%s", exc)
+            parsed = None
+        if isinstance(parsed, dict):
+            overrides = parsed
+        elif parsed is not None:
+            warn("settlement_params_json 顶层需为对象（按内置默认处理）：得 %s",
+                 type(parsed).__name__)
+    try:
+        if overrides is None:
+            if not needs_focus:
+                return None
+            params = settlement_v2.default_params()
+        else:
+            params = settlement_v2.merge_params(overrides, logger)
+            if not needs_focus:
+                return params
+        activity = params.get("activity")
+        if isinstance(activity, dict):
+            entry = dict(activity.get("transition") or {})
+            entry["focus"] = [float(focus[0]), float(focus[1])]
+            activity["transition"] = entry
+        return params
+    except Exception as exc:
+        warn("settlement_v2 参数合并失败（按内置默认处理）：%s", exc)
+        return None

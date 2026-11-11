@@ -501,3 +501,56 @@ class ProactiveBudget:
             pass
 
 
+def proactive_elasticity_signals(*, affection: Any, emotion: Any,
+                                 holiday_provider: Any) -> Dict[str, Any]:
+    """3.4 预算弹性信号只读 provider：``{affection, valence, holiday}``（缺项=不追加）。
+
+    R2 结构审计批（2026-11-12）：自组合根 ``plugin._proactive_elasticity_signals``
+    逐字下沉——预算弹性信号的取数算法归预算所有者所在包；组合根只保留薄委托，
+    依赖（好感/情绪/节假日端口）由装配根注入，本函数不 import 任何服务束。
+
+    ``affection`` 传好感档位快照 ``{"score": 0~200, "ratio": 0~1,
+    "tier": 当前档位, "tier_size": 生效档位数}``——ProactiveBudget 优先读
+    ``ratio``（= score/200，与 200 分制一致），档位仅供诊断；``valence`` 取
+    emotion 生效 V，``holiday`` 只认 HolidayService 缓存中的法定节假日条目
+    （经 ``holiday_provider`` 公开只读端口）。三者都是只读；任何一项读取失败
+    只丢该项，绝不改基础预算。
+    """
+    signals: dict = {}
+    try:
+        if affection is not None:
+            enabled = getattr(affection, 'is_enabled', None)
+            if not callable(enabled) or enabled():
+                score = float(affection.score())
+                signal: dict = {'score': score,
+                                'ratio': max(0.0, min(1.0, score / 200.0))}
+                tier = getattr(affection, 'tier', None)
+                if callable(tier):
+                    try:
+                        signal['tier'] = int(tier())
+                    except Exception:
+                        pass
+                preset = getattr(affection, 'preset', None)
+                if callable(preset):
+                    try:
+                        signal['tier_size'] = int(preset().size)
+                    except Exception:
+                        pass
+                signals['affection'] = signal
+    except Exception:
+        pass
+    try:
+        getter = getattr(emotion, 'effective_valence', None)
+        if callable(getter):
+            value = getter()
+            if value is not None:
+                signals['valence'] = float(value)
+    except Exception:
+        pass
+    try:
+        signals['holiday'] = holiday_provider()
+    except Exception:
+        pass
+    return signals
+
+

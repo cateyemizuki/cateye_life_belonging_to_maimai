@@ -677,6 +677,16 @@ class BiliCandidateSource:
             pass
         return time.time()
 
+    def effective_weights(self) -> Optional[Dict[str, float]]:
+        """观看兴趣最终权重公开只读端口（R2 结构审计批，2026-11-12）。
+
+        委托 :meth:`VideoInterestService.effective_weights`（不触发刷新/LLM）；
+        组合根/分享质量门槛据此取兜底兴趣权重，不再读私有 ``_interest`` 成员。
+        兴趣服务缺失 → ``None``（与旧组合根 getattr 兜底口径一致）。
+        """
+        interest = self._interest
+        return interest.effective_weights() if interest is not None else None
+
     # ---- 抓取 ----
     async def _default_fetch(self, url: str) -> Any:
         import httpx  # 延迟导入：离线注入 fetch_json 的环境无需 httpx
