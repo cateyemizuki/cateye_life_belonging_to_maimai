@@ -148,6 +148,13 @@ class PluginContext:
         return self.get("screen_perception")
 
     @property
+    def bpp_bridge(self) -> Any:
+        # R1（结构审计批）：life→bpp 跨插件联动适配器（cateye_bpp）具名视图；
+        # 运行期消费方经 linkage.get_adapter("cateye_bpp") 查询注册表，本视图
+        # 供诊断/面板只读；缺失按 None（未装配降级语义不变，fail-open）。
+        return self.get("bpp_bridge")
+
+    @property
     def activity_preferences(self) -> Any:
         # P3（3.17.27）：日程偏好服务；缺失按 None（未装配 → 面板偏好标签不显示，
         # 纯读降级，不阻塞池投影）。

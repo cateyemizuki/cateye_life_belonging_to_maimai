@@ -176,6 +176,9 @@ class CompanionServices:
         # 若本束模块级 import linkage 则 companion/__init__ 经 services 回环 linkage _partial）。
         # 与既有 plugin.on_load / services._resolve_relation 的装配期惰性 import 同模式。
         from linkage.screen import CateyeClient, ScreenPerceptionService
+        # R1（结构审计批）：life → bpp 桥迁 linkage/bpp/（适配器 cateye_bpp）。
+        # 同装配期惰性 import 模式；客户端纯 stdlib + plugin 动态读，零 companion 反向边。
+        from linkage.bpp import build_bpp_adapter
         #: 陪伴对象电脑联动客户端（connect-hub 跨插件 API）
         self.cateye = CateyeClient(plugin, llm=self.llm, call_logger=self.llm_logger)
         #: 本地记忆库（用户习惯）
@@ -200,6 +203,10 @@ class CompanionServices:
             plugin, cateye=self.cateye, screen_store=self.screen_store,
             user_name_provider=lambda: getattr(self.patrol, "_target_display_name", ""),
         )
+        #: life → bpp 跨插件联动适配器（R1 结构审计批；linkage 适配器 cateye_bpp）。
+        # 组合根 on_load 只 register_adapter；消费方 components 经 get_adapter 查询。
+        # 客户端动态读 plugin.config/ctx（热重载即时生效），默认关时零 API 调用。
+        self.bpp_bridge = build_bpp_adapter(plugin)
         #: M2 好感 LLM 裁判编排器（会话采样 + 关系日结；总线可空降级）
         self.reviews = AffectionReviewer(
             plugin, self.affection, self.llm, bus=self.bus,

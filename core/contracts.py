@@ -161,5 +161,6 @@ PLUGIN_ATTR_CONTRACT = frozenset({
     "_qzone_video",       # 空间视频候选桥（PR-D1 H10：面板只读计数投影）
     "_video_watch",       # 视频观看服务（PR-ENTERTAINMENT 3.17.13：娱乐面板最近观看只读投影）
     "_screen_perception", # 屏幕感知联动服务（PR-LINKAGE-SCREEN 3.17.16：patrol/问候链委托 peek 旁白）
+    "_bpp_bridge",        # life→bpp 联动适配器（R1 结构审计批：服务束装配+组合根登记；消费方经 linkage.get_adapter("cateye_bpp")）
     "_activity_preferences",  # 日程偏好服务（P3 3.17.27：面板池详情只读偏好标签投影）
 })

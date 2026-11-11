@@ -86,6 +86,9 @@ from .streams_diag import build_streams_records
 from core.diag import DecisionLogger
 from core.storage import load_json, save_json_atomic
 from core.inject import pick_payload_key, project_injection, without_stale_proactive_blocks
+# R1（结构审计批）：跨插件联动只经 linkage 注册表查询（get_adapter），不直接 import
+# 具体适配器实现（DEV_GUIDE 结构守则 §2 硬边界；linkage 注册表纯 stdlib，无环）。
+from linkage import get_adapter
 # §31.3 B3 修复（R7 = 用户 2026-10-23 第二轮直派，A-22 bug③）：读取渲染面时间一律
 # 经 time_utils.format_day_minute（禁手写 //60/%60；day_offset=1 行带「次日」标注），
 # 日帧行为过滤复用 schedule_query 的 SKIP_TYPES 同语义（{"sleep"}；D1 起为公开常量）。
@@ -1215,8 +1218,12 @@ class CompanionComponentsMixin(ScreenToolsMixin):
 
         ``release`` 只用于空回复清理；被接受的认领必须留给 bpp 在同一轮的
         ``before_post_process`` 消费（TTL 兜底），因此这里**不**立即释放。
+
+        R1（结构审计批）：桥接已迁 ``linkage/bpp/``（适配器 ``cateye_bpp``），
+        这里只经注册表 ``get_adapter`` 查询；未登记/未装配按 None 降级，
+        照常施加打字时延（fail-open，与迁移前逐字一致）。
         """
-        bridge = getattr(self, "_post_process_bridge", None)
+        bridge = get_adapter("cateye_bpp")
         reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
         reply_text = str(kwargs.get("response") or "").strip()
         typing_owner = ""
