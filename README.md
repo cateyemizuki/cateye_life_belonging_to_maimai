@@ -1,6 +1,6 @@
 # 属于麦麦的生活
 
-> 当前版本 **3.17.32**。一个 MaiBot 插件，让麦麦拥有自己的日程、关系、QQ 空间与情绪。本文只描述当前能力；版本沿革与逐批变更记录见 [CHANGELOG.md](CHANGELOG.md)，不以本文历史段落判断部署版本。日程侧：普通小事件（可编辑 `mappings/initial_events/` JSON 库 + 生成池）作为正常滚动候选参与选取，待机仅为短空档兜底；人设驱动的日程偏好低频批量评估、普通滚动 0 LLM；模块联动（刷视频/刷QQ）保留独立预算。
+> 当前版本 **3.17.33**。一个 MaiBot 插件，让麦麦拥有自己的日程、关系、QQ 空间与情绪。本文只描述当前能力；版本沿革与逐批变更记录见 [CHANGELOG.md](CHANGELOG.md)，不以本文历史段落判断部署版本。日程侧：普通小事件（可编辑 `mappings/initial_events/` JSON 库 + 生成池）作为正常滚动候选参与选取，待机仅为短空档兜底；人设驱动的日程偏好低频批量评估、普通滚动 0 LLM；模块联动（刷视频/刷QQ）保留独立预算。
 
 ## 当前能力概述（v3.17.x）
 
@@ -14,7 +14,7 @@
 
 ## 配置入口
 
-- 宿主 WebUI 插件配置为唯一入口；当前 schema **18 段 202 字段、2 隐藏**（3.17.17，`[qzone_video].attach_source` 退役）。段键：`plugin / patrol / screen / affection / schedule / schedule_advanced / planning_proactive / emotion / life_state / qzone / qzone_video / video_watch / video_share / llm / prompts / admin / dashboard_display / maimai_interaction`。
+- 宿主 WebUI 插件配置为唯一入口；当前 schema **19 段 223 字段、2 隐藏**（3.17.33：新增 `[planning_events]` 3 键、`[patrol].miss_sleep_excluded`、`[planning_proactive].greeting_night_require_morning_chain`；Gemini 配置批再增 15 键：`[life_state]` 3、`[patrol]` 4、`[planning_proactive]` 1、`[affection]` 1、`[emotion]` 3、`[prompts]` 1、`[video_share]` 2；配置默认值轮再增 `[emotion].emotion_quota_partition_enabled` 1 键，配额分区总开关从 `internal_tuning` 移回用户 schema）。段键：`plugin / patrol / screen / affection / schedule / schedule_advanced / planning_proactive / planning_events / emotion / life_state / qzone / qzone_video / video_watch / video_share / llm / prompts / admin / dashboard_display / maimai_interaction`。
 - 起步最少配置：`[patrol] target_qq`（陪伴对象；占位值 = 不主动私聊任何人）、`[admin] admin_users`（管理员；留空 = 仅本机控制台）。QQ 空间另需 `[qzone] enabled` 与 SnowLuma 适配器；屏幕感知另需 `[screen] enabled` 与 cateye 统一连接插件。
 - 退役旧键（`spine_mode`、`[life_state]` 旧开关组、patrol 旧主动键、event_catalog 独立段键、`[qzone_video].attach_source` 等）升级时纯 pop、不做值搬运、不再出现在 WebUI；事件库配置已平铺进 `[schedule] event_catalog_mode` 与三时段双池配额键。
 - 用户映射表在 `mappings/` 表层（8 张，不随包更新覆盖），出厂种子在 `mappings/default_mappings/`；详见下文「自定义映射表」。
@@ -77,7 +77,7 @@
 
 **前置条件**：QQ 空间需要 SnowLuma 适配器（NapCat 画像不支持 QZone API）；屏幕感知需要「cateye 统一连接插件」且对方电脑上的客户端在线。目标私聊流解析不到时，插件每 60 秒重试一次，期间不会有任何主动消息；先与目标 QQ 互发一条消息通常即可解析到。
 
-WebUI 段键对照见上文「配置入口」（18 段：插件/陪伴模块/屏幕感知/好感度/日程系统/日程系统·高级设置/日程主动行为/情绪系统/生活状态/QQ 空间/空间视频/视频观看/视频分享/LLM 调用/提示词（高级）/管理与日志/数据展示/麦麦互动）；事件库不再是独立段，配置平铺进 `[schedule]`。
+WebUI 段键对照见上文「配置入口」（19 段：插件/陪伴模块/屏幕感知/好感度/日程系统/日程系统·高级设置/日程主动行为/事件与分享概率/情绪系统/生活状态/QQ 空间/空间视频/视频观看/视频分享/LLM 调用/提示词（高级）/管理与日志/数据展示/麦麦互动）；事件库不再是独立段，配置平铺进 `[schedule]`。
 
 ## 工具主动私聊（已移除）
 
@@ -196,7 +196,7 @@ WebUI 段键对照见上文「配置入口」（18 段：插件/陪伴模块/屏
   目标私聊**无条件**（只看陪伴模块开关，不再要求当日有消息）；群聊早安过**硬闸**（判定窗内 ≥1 条非 bot 消息，必要性开关开启的话再叠加「今天日程第一个条目时段内有人主动开口」）；其他私聊早安 = 判定窗内对方发送条数达门槛（默认 5），晚安 = 早安已发**连锁**或对方发送达晚安阈值（默认 5）二选一。
 - 群聊早安本轮没开口，当晚群晚安**连锁硬性失效**；过了掷点才达标的补发还有**冷静期**——bot 本会话最近一条消息距今 ≥ `greeting_min_silence_minutes` 分钟才开口，一直不满足则到期仍弃。
 - **早安沉默闸**（`greeting_morning_silence_hours`，默认 2 小时，0 = 关闭）：今日第一日程（周期起点）前 N 小时内 bot 自己在该会话发过消息 → 该会话本周期跳过早安（三流统一生效，含目标私聊；不掷点、不建条目）。
-- 陪伴巡检与想念只发生在目标私聊，受每日预算、最小间隔、用户冷却与静默时段约束。想念为状态·情绪·好感驱动的概率触发（3.2.0 重写，不再要求沉默超阈值、不再每日一次）；日程主动巡检已删除（旧配置键升级时一次性 pop 退役）。
+- 陪伴巡检与想念只发生在目标私聊，受每日预算、最小间隔、用户冷却与静默时段约束。想念为状态·情绪·好感驱动的概率触发（3.2.0 重写，不再要求沉默超阈值、不再每日一次）；3.17.33 起默认开启阶梯想念（清醒沉默 6–20h / 20–48h / 48–120h，每阶段独立受理一次）。**120h 含在阶段 3 内，>120h 进入阶段 4（渗透模式）**：阶段 4 不再产生独立想念主动消息，改由早/午/晚安、刷QQ随口联系、视频分享等每日主动任务承载（先完成日常分享/问候，再沉下来反复确认对方是否还在）；用户下一次真实长回复回到阶段 0（<3 字/纯表情短回复只顺延起点、不重置周期）；`relation.silence_detected` 沉默事件与每日预算内的其他巡检行为不受该阶段窗口限制。日程主动巡检已删除（旧配置键升级时一次性 pop 退役）。
 - 静默时段恒等于日程作息（入睡到起床），不需要单独配置。
 - 可选：屏幕感知旁白、周结大事记、午休静默。
 
@@ -243,6 +243,10 @@ WebUI 段键对照见上文「配置入口」（18 段：插件/陪伴模块/屏
 | `[patrol] relation_type` | `恋人` | bot 与对方的关系，影响口吻与档位名称 |
 | QQ空间午休静默 | 始终适用 | 只静默真实午休，不依据意图预先静默 |
 | `[planning_proactive] greeting_morning_enabled` / `greeting_night_enabled` | `true` / `true` | 早安、晚安总开关 |
+| `[planning_proactive] greeting_night_require_morning_chain` | `true` | 群聊晚安是否要求本群本轮已发过早安；关 = 群晚安与早安连锁解耦 |
+| `[planning_events] watch_bili_weight_multiplier` / `browse_qq_weight_multiplier` | `1.0` / `1.0` | 刷视频/刷QQ 小事件抽取权重乘数（运行期 0.1–10.0） |
+| `[planning_events] video_share_to_target_probability` | `1.0` | 0–1 按概率额外过滤；>1 为陪伴目标分享机会倍率（日限/流限放宽、最小间隔缩短，上限 3.0）；既有预算/夜间/冷却/授权闸优先 |
+| `[patrol] miss_sleep_excluded` | `true` | 想念沉默时长扣除已收口睡眠段（关 = 旧的自然时长） |
 | `[planning_proactive] morning_drift` / `night_drift` | `10-30` | 问候漂移区间（分钟） |
 | `[planning_proactive] greeting_morning_silence_hours` | `2.0` | 早安沉默闸（小时）；0 = 关闭 |
 | `[planning_proactive] greeting_morning_latest` | `10:00` | 早安有界上限时刻（3.2.0）：与醒后2小时取早，超界静默放弃留诊断；非法值回退默认 |
@@ -263,6 +267,14 @@ WebUI 段键对照见上文「配置入口」（18 段：插件/陪伴模块/屏
 | `[video_watch] enabled` | `true` | 内置视频观看模块总开关（关 = 工具如实返回未启用、watch_bili 事件不可 roll、日程刷视频跳过；3.2.0 起运行时门控即时生效） |
 | `[video_watch] visual_enabled` | `true` | 画面采样（本机无 ffmpeg 或 vlm 任务不可用时如实降级为文本来源） |
 
+3.17.33 Gemini 配置批新增键（**均已接线并生效**；下列默认值即运行时行为）：
+
+- **默认开**：`[life_state]` `sleep_debt_repay_v2`（在线会话结束与离线重连补眠都走阶梯还债：基准外前 2h 全额、超出部分折半，不再单次封顶 1h；总债 12h 上限不变）、`social_battery_affinity_discount`（仅目标陪伴私聊按好感折减社交电量消耗）、`target_chat_social_recharge`（仅目标陪伴私聊高好感放松对话微量回充）；`[planning_proactive]` `greeting_noon_jitter_minutes=20`（当日触发时刻落在 12:01–12:20；设为 N 即 12:01–12:N，N 取 1–59，抖动开启时绝不 12:00 整点；0 = 窗开即发）；`[patrol]` `miss_stage_escalation_enabled`（阶梯想念 6–20h/20–48h/48–120h，三阶段各可受理一次；**>120h 进入阶段 4：独立想念停发、每日任务渗透**，用户真实长回复回到阶段 0（短回复只顺延不重置））、`typing_delay_enabled=true` / `typing_delay_max_seconds=8.0`、`budget_elasticity_enabled`（高好感/高 Valence/法定节假日命中 1 条 +1、≥2 条 +2，硬上限基础预算 +2；`daily_max_speak=0` 不复活；显式关 = 固定每日预算）；`[affection]` `exchange_events_enabled`（Bot 发早安/晚安后 30 分钟内用户回敬 → 好感 `morning_exchange`/`night_exchange`；该 30 分钟窗口是进程内状态，插件重载/宿主重启后窗口内可能漏记一次）；`[emotion]` `decay_to_persona_anchor`（清醒衰减也向人设锚点收敛，与睡眠大修同一基准线；显式关 = 旧行为向 0 中性衰减）、`emotion_quota_partition_enabled`（开 = 私聊 6/日、群聊 4/日分区；关 = 旧共享池，见下条）、`private_eval_quota=6` / `group_eval_quota=4`（分区开启时各类专属配额，设为 0 可停用该类自动评估）、`[prompts]` `state_subconscious_style`。
+- **默认关**：`[video_share]` `video_share_quality_gate=false` / `video_share_quality_threshold=0.55`（开 = 空间视频自动发布链在既有额度/睡眠/静默/冷却闸之后追加质量否决：0.6×|ΔVAD| + 0.4×目标兴趣重合度；只否决、不绕过任何既有闸。聊天视频分享链本批未消费该键）。
+- 报告 §4.1 P1-NUM-2 本批只限定为**目标私聊折减/回充**：仅目标陪伴私聊的真实回复走好感折减与高好感放松回充，群聊/其他私聊的聊天社交电量基础消耗仍为 0；**群聊对照未建立**，不声称已实现「公共群聊高消耗 / 目标私聊回血」的对照（后续批次）。
+- 报告 §4.3b 的「仅高情绪强度才扣评估配额」**未在本批实现**（当前只要通过配额/节流/冻结等既有闸就会消耗配额，分区只是把私聊/群聊额度分开），留待后续批次；本批先保证私聊配额不被群聊侵占。
+- **配额分区总开关（用户 WebUI schema，默认开）**：`[emotion]` `emotion_quota_partition_enabled=true`（默认开 = 私聊 6/日、群聊 4/日分区，总 10/日封顶；关 = 回 3.17.32 的单一共享池，群聊可占满；`mappings/internal_tuning.json` 里的旧同名键保留但不再读取）。
+
 `spine_mode`、`[life_state] enabled`、`[life_state] sleep_engine_enabled` 等旧键已退役；旧配置中的显式值在升级时被一次性 pop，不再出现在 WebUI。
 
 ## 自定义映射表
@@ -273,6 +285,8 @@ WebUI 段键对照见上文「配置入口」（18 段：插件/陪伴模块/屏
 |---|---|
 | `mappings/`（表层） | **用户数据区**：八张用户表（七张映射表+内部调参表）放这里、按需编辑；表层文件**不随插件包分发，更新插件也不会覆盖**。首次使用若表层缺表，插件自动从深层复制出厂默认补齐 |
 | `mappings/default_mappings/`（深层） | **随包种子源**：出厂说明文档与八张默认表随包分发、随插件版本更新；是否把新版出厂内容合并进你的表层，由你自行决定 |
+
+> 初始小事件库升级提示：`mappings/default_mappings/initial_events/` 中**新增**的出厂事件不会自动复制进已存在的 `mappings/initial_events/`（这是为了防止覆盖你的编辑与删除）。首次初始化之后如需采用新版种子，请手动把缺失的 JSON 文件复制到 `mappings/initial_events/`；不要整目录覆盖，已修改/已删除的条目保持现状。面板/诊断里的 `seed_only` 列表即「种子有、运行目录尚未采用」的条目。
 
 八张用户表（文件名不变；出厂种子在 `mappings/default_mappings/`，你的编辑/运行读取在 `mappings/` 表层）：
 
@@ -315,7 +329,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 - 本次运行接口可见8个命令和8个工具；该接口不包含全部Hook/API，不把交互入口数当作完整注册总数。
 - 声明 **17 项**宿主能力。
-配置以宿主运行schema为准：3.17.17 为 18 段 202 字段、2 隐藏；结算参数使用settlement_params_json，形象使用fish/human。历史字段变动见 CHANGELOG 与 union/20261106_配置项完整变动报告.md。
+配置以宿主运行schema为准：3.17.33 为 19 段 223 字段、2 隐藏；结算参数使用settlement_params_json，形象使用fish/human。历史字段变动见 CHANGELOG 与 union/20261106_配置项完整变动报告.md。
 - 用户可编辑表 **8 张**（七张映射表+内部调参表）：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可
@@ -346,7 +360,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 WebUI 的「属于麦麦的生活」展示生活趋势、实际活动/日意图、睡眠、陪伴、情绪 VAD、睡眠裁判、空间凭据健康/发布回执及模型用量。趋势支持图例、拖动缩放、采样表与安全快照导入；继承宿主颜色、明暗和图表风格。持久化历史只记录真实采样，不补造部署前数据；图表可显示带 `estimated` 标记的小缺口/离线睡眠估算段，估算不写回历史。
 
-专注 0 表示注意力涣散，压力 0 表示很放松。低专注/低精力/高压力会增加休息候选；修复零值在评分中误当成满值、社交电量速率字段未接线的问题。恢复遵循真实时间和活动，不直接修改状态。
+专注 0 表示注意力涣散，压力 0 表示很放松。低专注/低精力/高压力会增加休息候选；修复零值在评分中误当成满值、社交电量速率字段的接线问题。恢复遵循真实时间和活动，不直接修改状态。
 
 空间草稿在浏览器本地预览。发布以回执为准，同内容 24 小时去重；仅明确未发出的纯文字请求在原有静默、冷却和预算闸内最多尝试两次。发送结果不明会保留待核对，重启后也不自动重发；图片失败需重新提供图片，不降成队列纯文字重发。回执与凭据文件留在服务器，WebUI 不显示原文与秘密。
 
