@@ -1,40 +1,37 @@
 # -*- coding: utf-8 -*-
-"""PR5 统一初始化服务（``/lbm ops init`` 的独立业务层）。
+"""统一初始化服务（自 ``planning/init_service.py`` 整体迁入 ``tools/init/``）。
 
-设计约束（定稿 §4.4 / 附录 B.5）：
+设计约束（定稿 §4.4 / 附录 B.5；2026-11-13 自动初始化裁决批）：
 
 - 只编排，不直接发 QQ：:class:`InitService` 永远不持有 ``ctx`` / 不调用
   ``send.text``；命令入口把 ``result.summary_lines`` / ``result.error_lines``
   逐条发送。自动调用（``manual=False``）因此天然不产生主动消息。
-- 阶段独立：preflight 失败才整体停止；业务四阶段（emotion / events /
-  state_sleep / frequency）互不阻断，失败只影响本阶段与汇总状态。
+- 阶段独立：preflight 失败才整体停止；业务字段（``STAGE_ORDER`` 七项）互不
+  阻断，失败只影响本字段（自动驱动逐字段捕获异常继续）。
 - 幂等：全量初始化重复执行时，已初始化的情绪参数与未到期的事件库直接
   ``skipped``，不重复消费模型；已有 ``life_state.json`` 只补缺失键，绝不
   覆盖已有值，也不改配置（不会自动启用生活状态/睡眠引擎）。
 - 事件：全量走 ``EventCatalogService.refresh(manual=True)`` 的到期检查；
   ``/lbm ops init events`` 强制刷新。成功才采用返回的 ``next_update_at``；
   失败保留旧库（由 EventCatalogService 保证），本服务只如实记录旧值。
-- 汇总：``<data_dir>/life_init.json``，``core.storage.save_json_atomic``
-  原子写，记录成功/失败/跳过、persona 指纹、版本、事件版本、下次更新与
-  各阶段详情。取消会写 ``cancelled`` 且不会记作完成。
-- status 纯读：只读 ``life_init.json``、事件服务 ``status()``、情绪
-  ``status_snapshot()``、生命周期文件存在性与 DB schema，不写任何文件。
+- 完成标记：**不再写 ``life_init.json`` 汇总**（2026-11-13 用户裁决弃用）。
+  逐字段完成状态由 :mod:`tools.init.registry` 的 ``init_registry.json`` 承担；
+  ``status()`` 直读登记文件，不再读旧汇总。
+- status 纯读：只读登记文件、事件服务 ``status()``、情绪 ``status_snapshot()``、
+  生命周期文件存在性与 DB schema，不写任何文件。
 
-后续共享接线（不在本文件内做）：
+后续共享接线：
 
 1. ``PlanningServices`` 构造 ``InitService(self._plugin, data_dir=...)`` 并
    暴露为 ``self.init``；``plugin.py`` 可用 ``_planning.init`` 取用。
-2. 双语根命令 ``/lbm ops init`` / ``/麦麦生活 运维 初始化`` 经注册表 handler 进入；入口先查
-   ``plugin.enabled`` 与 ``_qz_is_admin``，再调 ``run_full/run_emotion/
-   run_events``，最后逐条 ``ctx.send.text``。旧 ``lbm_emotion_init`` 保持
-   现有强制语义，只加迁移提示（PR8 再删）。
+2. 双语根命令 ``/lbm ops init [字段|all|status]`` / ``/麦麦生活 运维 初始化``
+   经注册表 handler 进入 ``tools.init.auto_init`` 的统一驱动；手动不受退避限制。
 3. 事件服务实例必须提供 ``status() -> dict`` 与
    ``async refresh(*, manual: bool) -> RefreshResult``（PR4 已完成）。
 4. 频率阶段需要「目标频率公共校准口」：默认解析
    ``plugin._planning.proactive.calibrate_target_frequency()``，返回
    ``None/True`` 或 ``{"ok": bool, "target_resolved": bool, ...}``；
-   也可由构造参数 ``frequency_calibrator`` 注入。PR6 实现该方法前，本阶段
-   会明确报「未接线」而不是假装成功。
+   也可由构造参数 ``frequency_calibrator`` 注入。
 """
 
 from __future__ import annotations
@@ -50,21 +47,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from core.storage import load_json, save_json_atomic
-from .life_state import (STATE_FILE_NAME, STATE_VERSION, default_state_document,
-                         resolve_state_file_path)
+from core.storage import save_json_atomic
+from planning.life_state import (STATE_FILE_NAME, STATE_VERSION, default_state_document,
+                                resolve_state_file_path)
+
+from .manifest import INIT_FIELDS
+from .registry import InitRegistry
 
 logger = logging.getLogger(__name__)
 
-#: 汇总文件名（定稿 §5.1：初始化结果 ``<data_dir>/life_init.json``）
-SUMMARY_FILE_NAME = "life_init.json"
-SUMMARY_VERSION = 1
-SUMMARY_HISTORY_LIMIT = 5
-
-#: 业务阶段顺序（preflight / summary 为框架阶段，不计入四阶段 DoD）
-#: P3（2026-11-09 §14.8）：activity_preferences 可独立标记成功/降级/失败，
-#: 先失败不阻塞情绪/日程整个初始化（_execute 逐阶段捕获异常继续）。
-STAGE_ORDER: Tuple[str, ...] = ("emotion", "events", "state_sleep", "frequency", "video_interest", "companion_disposition", "activity_preferences")
+#: 业务字段顺序（preflight 为框架阶段，不计入字段 DoD；顺序 = 依赖顺序）
+STAGE_ORDER: Tuple[str, ...] = tuple(INIT_FIELDS)
 
 #: 当前 ``life_state.json`` 的完整字段及缺失时的最小默认值。
 #: **唯一真源 = planning.life_state.default_state_document()**（与服务 save() 共用
@@ -114,7 +107,7 @@ class StageResult:
 
 @dataclass(frozen=True)
 class InitResult:
-    """一次初始化命令的结构化结果。"""
+    """单个字段/一次命令初始化的结构化结果。"""
 
     command: str
     manual: bool
@@ -122,9 +115,6 @@ class InitResult:
     stages: Tuple[StageResult, ...]
     started_at: str = ""
     finished_at: str = ""
-    summary_path: str = ""
-    summary_written: bool = False
-    summary_error: str = ""
     persona_name: str = ""
     persona_fingerprint: str = ""
     plugin_version: str = ""
@@ -159,8 +149,6 @@ class InitResult:
                 text = str(line or "").strip()
                 if text:
                     lines.append(f"{_stage_label(stage.stage)}：{text}")
-        if self.summary_error:
-            lines.append(f"初始化汇总：{self.summary_error}")
         return tuple(lines)
 
     @property
@@ -185,10 +173,6 @@ class InitResult:
             lines.append(f"下次事件更新：{_short_ts(self.next_update_at)}")
         if self.catalog_version:
             lines.append(f"事件库版本：{self.catalog_version}")
-        if self.summary_error:
-            lines.append(f"初始化汇总写入失败：{self.summary_error}")
-        if not self.summary_written and not self.summary_error and self.status != "disabled":
-            lines.append("初始化汇总未写入（data_dir 不可用）。")
         return lines
 
     @property
@@ -203,9 +187,6 @@ class InitResult:
             "ok": self.ok,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
-            "summary_path": self.summary_path,
-            "summary_written": bool(self.summary_written),
-            "summary_error": self.summary_error,
             "persona": {"name": self.persona_name,
                         "fingerprint": self.persona_fingerprint},
             "plugin_version": self.plugin_version,
@@ -220,13 +201,13 @@ class InitResult:
 
 @dataclass(frozen=True)
 class InitStatus:
-    """``/lbm ops init status`` 的只读快照。"""
+    """``/lbm ops init status`` 的只读快照（直读 init_registry.json）。"""
 
     plugin_enabled: bool
-    has_record: bool
-    last_status: str
-    last_run: Mapping[str, Any]
-    last_success: Optional[Mapping[str, Any]]
+    registry_path: str
+    registry_plugin_version: str
+    fields: Mapping[str, Mapping[str, Any]]
+    preflight: Mapping[str, Any]
     next_update_at: Optional[str]
     catalog_version: str
     event_mode: str
@@ -238,7 +219,6 @@ class InitStatus:
     life_state_file: str
     db_version: str
     sleep_sessions: bool
-    summary_path: str
 
     def to_dict(self) -> Dict[str, Any]:
         return _jsonable(asdict(self))
@@ -248,27 +228,27 @@ class InitStatus:
         lines: List[str] = []
         if not self.plugin_enabled:
             lines.append("插件未启用（plugin.enabled=false）。")
-        if not self.has_record:
-            lines.append("尚无初始化记录：可执行 /lbm ops init 做全量初始化（中文 /麦麦生活 运维 初始化）。")
+        lines.append(f"初始化登记：{self.registry_path}"
+                     f"（schema v1，登记版本={self.registry_plugin_version or '未写入'}）")
+        preflight = self.preflight or {}
+        preflight_ok = preflight.get("ok")
+        if preflight_ok is True:
+            lines.append(f"预检：通过（{_short_ts(preflight.get('checked_at')) or '时间未知'}）")
+        elif preflight_ok is False:
+            reason = str(preflight.get("reason") or "未知原因")
+            lines.append(f"预检：失败（{reason}；整体未初始化）")
         else:
-            run = self.last_run or {}
-            finished = str(run.get("finished_at") or run.get("started_at") or "")
-            command = str(run.get("command") or "full")
-            lines.append(f"上次初始化：{_short_ts(finished) or '时间未知'}（{command}，"
-                         f"{_overall_word(self.last_status)}）")
-            stages = run.get("stages") or []
-            if isinstance(stages, Sequence):
-                for item in stages:
-                    if not isinstance(item, Mapping):
-                        continue
-                    name = str(item.get("stage") or "")
-                    if name in ("preflight", "summary"):
-                        continue
-                    detail = str(item.get("message") or "")
-                    lines.append(f"- {_stage_label(name)}：{_status_word(str(item.get('status') or ''))}"
-                                 + (f"（{detail}）" if detail else ""))
-            if self.last_success:
-                lines.append(f"上次完全成功：{_short_ts(str(self.last_success.get('finished_at') or ''))}")
+            lines.append("预检：尚无记录（插件停用或尚未执行加载自动初始化）")
+        for name in STAGE_ORDER:
+            entry = self.fields.get(name) or {}
+            initialized = bool(entry.get("initialized"))
+            lines.append(
+                f"- {_stage_label(name)}：{'已初始化' if initialized else '未初始化'}"
+                f"，version={entry.get('version') or '-'}"
+                f"，attempts={int(entry.get('attempts') or 0)}"
+                f"，validated_at={_short_ts(entry.get('validated_at')) or '-'}"
+                f"，last_failed_at={_short_ts(entry.get('last_failed_at')) or '-'}"
+            )
         lines.append(f"事件库：模式 {self.event_mode}，版本 {self.catalog_version or '无'}"
                      + ("（降级：" + self.event_reason + "）" if self.event_degraded else ""))
         if self.next_update_at:
@@ -527,7 +507,7 @@ class InitService:
         state_preparer / sleep_sessions_ensurer: 测试/后续接线的替换口。
         persona_provider / version_provider: 汇总元数据 getter。
         now_provider / tz: 时间注入（离线测试固定时间）。
-        summary_path: 汇总文件路径（缺省 ``<data_dir>/life_init.json``）。
+        summary_path: 旧 ``life_init.json`` 路径（只读兼容属性；2026-11-13 起不再写入/读取）。
     """
 
     def __init__(
@@ -587,7 +567,9 @@ class InitService:
         self._now_provider = now_provider
         self._tz = tz
         self.summary_path = (Path(summary_path) if summary_path is not None
-                             else self.data_dir / SUMMARY_FILE_NAME)
+                             else self.data_dir / "life_init.json")
+        #: 逐字段登记文件（完成状态唯一真源；旧 life_init.json 已弃用）
+        self.registry = InitRegistry(self.data_dir)
         #: 同一实例的初始化串行化：并发两次 full 不会重复生成；第二个执行时
         #: 情绪已 initialized / 事件 next_update_at 未到期 → skipped。
         self._lock = asyncio.Lock()
@@ -695,7 +677,7 @@ class InitService:
             except Exception:
                 pass
         plugin_root = getattr(self._plugin, "_plugin_root", None)
-        root = Path(plugin_root) if plugin_root is not None else Path(__file__).resolve().parent.parent
+        root = Path(plugin_root) if plugin_root is not None else Path(__file__).resolve().parents[2]
         plugin_version = ""
         try:
             manifest = json.loads((root / "_manifest.json").read_text(encoding="utf-8"))
@@ -990,6 +972,7 @@ class InitService:
                                                 "event_catalog", "mode", "off") or "off")
         details.update({
             "mode": mode,
+            "catalog_path": status.get("path"),
             "generated_events": status.get("generated_events"),
             "old_catalog_version": status.get("catalog_version") or "",
             "old_next_update_at": status.get("next_update_at"),
@@ -1029,6 +1012,19 @@ class InitService:
             return StageResult("events", "failed",
                                error_lines=tuple(outcome.get("errors") or ("事件库刷新失败。",)),
                                details=details)
+        # 校验器需要刷新后的真实目录快照（条目数/版本/路径），不只旧值。
+        try:
+            refreshed = await self._event_status(service)
+        except Exception:
+            refreshed = {}
+        if refreshed:
+            details.update({
+                "catalog_path": refreshed.get("path") or details.get("catalog_path"),
+                "generated_events": refreshed.get("generated_events"),
+                "catalog_version": refreshed.get("catalog_version") or "",
+                "next_update_at": refreshed.get("next_update_at"),
+                "degraded": bool(refreshed.get("degraded", False)),
+            })
         return StageResult("events", "success",
                            message=_first_line(outcome.get("message", "")) or "事件库已刷新。",
                            details=details)
@@ -1070,7 +1066,7 @@ class InitService:
         # v6 已由 preflight 保证；这里用 ScheduleDB 的公开构造重跑幂等迁移
         # （CREATE TABLE IF NOT EXISTS），避免手抄 sleep_sessions DDL。
         try:
-            from .schedule_db import ScheduleDB
+            from planning.schedule_db import ScheduleDB
             handle = ScheduleDB(self._database_path())
             try:
                 handle.close()
@@ -1094,7 +1090,7 @@ class InitService:
                                   "fields_added": [], "existing_values_preserved": True}
         if not path.exists():
             try:
-                from .life_state import LifeStateService
+                from planning.life_state import LifeStateService
                 service = LifeStateService(path, timezone_str=self._timezone_str(cfg))
                 if not service.save():
                     result.update({"ok": False, "error": "状态文件写入失败（原子写返回 False）"})
@@ -1173,6 +1169,7 @@ class InitService:
         # 直接清理 + 逐符号审定清单 WP1）。
         path = self._state_file_path(cfg)
         details["state_file"] = str(path)
+        details["db_path"] = str(self._database_path())
         try:
             if self._state_preparer is not None:
                 raw = self._state_preparer(path, cfg)
@@ -1300,10 +1297,10 @@ class InitService:
             return "skipped"
         return "success"
 
-    def _run_record(self, *, command: str, manual: bool, status: str,
-                    started: str, finished: str,
-                    stages: Sequence[StageResult], catalog: Mapping[str, Any],
-                    persona: Mapping[str, Any], versions: Mapping[str, str]) -> Dict[str, Any]:
+    def _result(self, *, command: str, manual: bool, status: str,
+                stages: Sequence[StageResult], started: str, finished: str,
+                catalog: Mapping[str, Any], persona: Mapping[str, Any],
+                versions: Mapping[str, str], disabled: bool = False) -> InitResult:
         events = next((s for s in stages if s.stage == "events"), None)
         details = events.details if events is not None else {}
         next_update = (catalog.get("next_update_at")
@@ -1312,99 +1309,9 @@ class InitService:
         catalog_version = (catalog.get("catalog_version")
                            or details.get("catalog_version")
                            or details.get("old_catalog_version") or "")
-        return {
-            "command": command,
-            "manual": bool(manual),
-            "status": status,
-            "started_at": started,
-            "finished_at": finished,
-            "persona": dict(persona),
-            "persona_name": str(persona.get("name") or ""),
-            "persona_fingerprint": str(persona.get("fingerprint") or ""),
-            "plugin_version": str(versions.get("plugin_version") or ""),
-            "config_version": str(versions.get("config_version") or ""),
-            "catalog_version": str(catalog_version or ""),
-            "next_update_at": next_update,
-            "stages": [stage.to_dict() for stage in stages],
-            "success": [s.stage for s in stages
-                        if s.stage in STAGE_ORDER and s.status == "success"],
-            "skipped": [s.stage for s in stages
-                        if s.stage in STAGE_ORDER and s.status == "skipped"],
-            "failed": [s.stage for s in stages
-                       if s.stage in STAGE_ORDER and s.failed],
-            "errors": [line for s in stages for line in s.error_lines],
-        }
-
-    def _write_summary(self, *, command: str, manual: bool, status: str,
-                       started: str, finished: str,
-                       stages: Sequence[StageResult], catalog: Mapping[str, Any],
-                       persona: Mapping[str, Any], versions: Mapping[str, str]) -> StageResult:
-        record = self._run_record(command=command, manual=manual, status=status,
-                                  started=started, finished=finished, stages=stages,
-                                  catalog=catalog, persona=persona, versions=versions)
-        old = load_json(self.summary_path, {})
-        old = old if isinstance(old, Mapping) else {}
-        last_success = old.get("last_success") if isinstance(old.get("last_success"), Mapping) else None
-        if status in ("success", "skipped"):
-            last_success = record
-        history = old.get("history") if isinstance(old.get("history"), list) else []
-        history = [item for item in history if isinstance(item, Mapping)]
-        previous = old.get("last_run") if isinstance(old.get("last_run"), Mapping) else None
-        if previous is not None:
-            history = (history + [previous])[-SUMMARY_HISTORY_LIMIT:]
-        document = {
-            "version": SUMMARY_VERSION,
-            "updated_at": finished,
-            "last_run": record,
-            "last_success": last_success,
-            "history": history,
-            "next_update_at": record["next_update_at"],
-            "event_catalog_version": record["catalog_version"],
-            "persona": dict(persona),
-            "persona_name": record["persona_name"],
-            "persona_fingerprint": record["persona_fingerprint"],
-            "plugin_version": record["plugin_version"],
-            "config_version": record["config_version"],
-        }
-        try:
-            ok = save_json_atomic(self.summary_path, document)
-        except Exception as exc:
-            ok = False
-            error = str(exc)
-        else:
-            error = "" if ok else "原子写返回 False"
-        if not ok:
-            return StageResult("summary", "failed",
-                               error_lines=(f"life_init.json 写入失败：{error or '未知原因'}",
-                                            f"路径：{self.summary_path}"),
-                               details={"path": str(self.summary_path)})
-        return StageResult("summary", "success",
-                           message=f"汇总已写入 {self.summary_path.name}。",
-                           details={"path": str(self.summary_path)})
-
-    def _result(self, *, command: str, manual: bool, status: str,
-                stages: Sequence[StageResult], started: str, finished: str,
-                catalog: Mapping[str, Any], persona: Mapping[str, Any],
-                versions: Mapping[str, str], summary: Optional[StageResult],
-                disabled: bool = False) -> InitResult:
-        all_stages = tuple(stages) + ((summary,) if summary is not None else ())
-        events = next((s for s in all_stages if s.stage == "events"), None)
-        details = events.details if events is not None else {}
-        next_update = (catalog.get("next_update_at")
-                       or details.get("next_update_at")
-                       or details.get("old_next_update_at"))
-        catalog_version = (catalog.get("catalog_version")
-                           or details.get("catalog_version")
-                           or details.get("old_catalog_version") or "")
-        summary_written = bool(summary is not None and summary.status == "success")
-        summary_error = ""
-        if summary is not None and summary.status == "failed":
-            summary_error = "；".join(summary.error_lines) or "汇总写入失败"
         return InitResult(
-            command=command, manual=bool(manual), status=status, stages=all_stages,
+            command=command, manual=bool(manual), status=status, stages=tuple(stages),
             started_at=started, finished_at=finished,
-            summary_path=str(self.summary_path), summary_written=summary_written,
-            summary_error=summary_error,
             persona_name=str(persona.get("name") or ""),
             persona_fingerprint=str(persona.get("fingerprint") or ""),
             plugin_version=str(versions.get("plugin_version") or ""),
@@ -1412,8 +1319,125 @@ class InitService:
             catalog_version=str(catalog_version or ""),
             next_update_at=next_update, disabled=bool(disabled))
 
+    def _build_plan(self, command: str, *, field: Optional[str], manual: bool,
+                    cfg: Any, emotion_force: bool, events_force: bool,
+                    force: bool) -> List[Tuple[str, Callable[[], Any]]]:
+        """按命令或单字段构造执行计划（顺序 = ``STAGE_ORDER``）。"""
+        plan: List[Tuple[str, Callable[[], Any]]] = []
+
+        def add_emotion() -> None:
+            plan.append(("emotion", lambda: self._stage_emotion(force=emotion_force)))
+
+        def add_events() -> None:
+            plan.append(("events", lambda: self._stage_events(
+                force=events_force, now=self._now())))
+
+        def add_state_sleep() -> None:
+            plan.append(("state_sleep", lambda: self._stage_state_sleep(cfg)))
+
+        def add_frequency() -> None:
+            plan.append(("frequency", lambda: self._stage_frequency(cfg)))
+
+        def add_video_interest() -> None:
+            video_initializer = getattr(self._plugin, "_initialize_video_interest", None)
+            if not callable(video_initializer):
+                return
+
+            async def video_stage() -> StageResult:
+                result = await video_initializer()
+                state = result.get("status") if isinstance(result, dict) else "unavailable"
+                keywords = result.get("keywords") if isinstance(result, dict) else ()
+                return StageResult(
+                    "video_interest",
+                    "success" if state == "fresh"
+                    else "skipped" if state in ("disabled", "cached")
+                    else "failed",
+                    message=(f"已按人设重置视频偏好（{len(keywords or [])} 个关键词）"
+                             if state == "fresh" else "视频模块关闭，跳过偏好初始化"
+                             if state == "disabled" else "沿用未到期视频偏好"
+                             if state == "cached" else "偏好生成失败，旧偏好已失效"),
+                    reason=str(state), details={"source": "persona_init"})
+
+            plan.append(("video_interest", video_stage))
+
+        def add_disposition() -> None:
+            initializer = getattr(self._plugin, "_initialize_companion_disposition", None)
+            if not callable(initializer):
+                return
+
+            async def disposition_stage() -> StageResult:
+                profile = await initializer(force=bool(force if field else manual))
+                generated = profile.get("source") == "persona_llm"
+                return StageResult(
+                    "companion_disposition", "success" if generated else "skipped",
+                    message="已生成人设联系倾向" if generated else "采用中性联系倾向",
+                    details={"source": profile.get("source"),
+                             "anchor_hours": profile.get("anchor_hours"),
+                             "loneliness": profile.get("loneliness")})
+
+            plan.append(("companion_disposition", disposition_stage))
+
+        def add_preferences() -> None:
+            # P3（2026-11-09 §14.8）：日程偏好阶段——可独立标记成功/降级/失败；
+            # 默认命中缓存，明确重建（manual/字段显式）才换本人人设画像。
+            pref_initializer = getattr(self._plugin, "_initialize_activity_preferences", None)
+            if not callable(pref_initializer):
+                return
+
+            async def preferences_stage() -> StageResult:
+                result = await pref_initializer(force=bool(force if field else manual))
+                state = str(result.get("status") or "unavailable")
+                ok_states = ("ok", "partial", "cached")
+                stage_state = ("success" if state in ok_states
+                               else "skipped" if state in ("disabled", "no_llm", "deferred_busy")
+                               else "failed")
+                return StageResult(
+                    "activity_preferences", stage_state,
+                    message=(f"日程偏好就绪（评估 {result.get('evaluated', 0)} 项）"
+                             if stage_state == "success"
+                             else "日程偏好未启用或暂缓（中性降级，不阻塞日程）"
+                             if stage_state == "skipped"
+                             else "日程偏好评估失败（中性降级，旧有效画像保留）"),
+                    reason=state,
+                    details={"evaluated": result.get("evaluated", 0),
+                             "traits": result.get("traits", False),
+                             "tokens": result.get("tokens", 0)})
+
+            plan.append(("activity_preferences", preferences_stage))
+
+        builders = {
+            "emotion": add_emotion,
+            "events": add_events,
+            "state_sleep": add_state_sleep,
+            "frequency": add_frequency,
+            "video_interest": add_video_interest,
+            "companion_disposition": add_disposition,
+            "activity_preferences": add_preferences,
+        }
+        if field is not None:
+            builders[field]()
+            return plan
+        if command in ("full", "emotion"):
+            add_emotion()
+        if command in ("full", "events"):
+            add_events()
+        if command == "full":
+            add_state_sleep()
+            add_frequency()
+            # 全量命令保留既有语义：仅人工全量重置视频偏好；自动驱动走 run_stage
+            # 逐字段执行（``field`` 分支），不受此限制。
+            if manual:
+                add_video_interest()
+            add_disposition()
+            add_preferences()
+        return plan
+
     async def _execute(self, command: str, *, manual: bool,
-                       emotion_force: bool, events_force: bool) -> InitResult:
+                       emotion_force: bool, events_force: bool,
+                       field: Optional[str] = None,
+                       force: bool = False) -> InitResult:
+        if field is not None and field not in STAGE_ORDER:
+            raise ValueError(f"未知初始化字段：{field}")
         async with self._lock:
             started_dt = self._now()
             started = started_dt.isoformat(timespec="seconds")
@@ -1428,83 +1452,17 @@ class InitService:
                 return self._result(command=command, manual=manual, status="disabled",
                                     stages=stages, started=started, finished=finished,
                                     catalog={}, persona=persona, versions=versions,
-                                    summary=None, disabled=True)
+                                    disabled=True)
             if not preflight.ok:
-                status = "failed"
                 finished = self._now().isoformat(timespec="seconds")
-                summary = self._write_summary(command=command, manual=manual, status=status,
-                                              started=started, finished=finished,
-                                              stages=stages, catalog={},
-                                              persona=persona, versions=versions)
-                return self._result(command=command, manual=manual, status=status,
+                return self._result(command=command, manual=manual, status="failed",
                                     stages=stages, started=started, finished=finished,
-                                    catalog={}, persona=persona, versions=versions,
-                                    summary=summary)
+                                    catalog={}, persona=persona, versions=versions)
 
-            plan: List[Tuple[str, Callable[[], Any]]] = []
-            if command in ("full", "emotion"):
-                plan.append(("emotion", lambda: self._stage_emotion(force=emotion_force)))
-            if command in ("full", "events"):
-                plan.append(("events", lambda: self._stage_events(
-                    force=events_force, now=self._now())))
-            if command == "full":
-                plan.append(("state_sleep", lambda: self._stage_state_sleep(cfg)))
-                plan.append(("frequency", lambda: self._stage_frequency(cfg)))
-                video_initializer = getattr(self._plugin, "_initialize_video_interest", None)
-                if manual and callable(video_initializer):
-                    async def video_stage() -> StageResult:
-                        result = await video_initializer()
-                        state = result.get("status") if isinstance(result, dict) else "unavailable"
-                        return StageResult("video_interest",
-                            "success" if state == "fresh" else "skipped" if state == "disabled" else "failed",
-                            message=(f"已按人设重置视频偏好（{len(result.get('keywords') or [])} 个关键词）"
-                                     if state == "fresh" else "视频模块关闭，跳过偏好初始化"
-                                     if state == "disabled" else "偏好生成失败，旧偏好已失效"),
-                            reason=str(state), details={"source": "persona_init"})
-                    plan.append(("video_interest", video_stage))
-
-            if command == "full":
-                initializer = getattr(self._plugin, '_initialize_companion_disposition', None)
-                if callable(initializer):
-                    async def disposition_stage() -> StageResult:
-                        profile = await initializer(force=bool(manual))
-                        generated = profile.get('source') == 'persona_llm'
-                        return StageResult('companion_disposition', 'success' if generated else 'skipped',
-                                           message='已生成人设联系倾向' if generated else '采用中性联系倾向',
-                                           details={'source': profile.get('source'),
-                                                    'anchor_hours': profile.get('anchor_hours'),
-                                                    'loneliness': profile.get('loneliness')})
-                    plan.append(('companion_disposition', disposition_stage))
-
-            # P3（2026-11-09 §14.8）：日程偏好阶段——可独立标记成功/降级/失败；
-            # 初始画像可先供日意图生成，活动定义就绪后补逐项评估。先失败不阻塞
-            # 情绪/日程整个初始化（下方逐阶段捕获异常继续）。默认命中缓存，
-            # 明确重建（manual）才换本人人设画像。
-            if command == "full":
-                pref_initializer = getattr(self._plugin, '_initialize_activity_preferences', None)
-                if callable(pref_initializer):
-                    async def preferences_stage() -> StageResult:
-                        result = await pref_initializer(force=bool(manual))
-                        state = str(result.get('status') or 'unavailable')
-                        ok_states = ('ok', 'partial', 'cached')
-                        stage_state = ('success' if state in ok_states
-                                       else 'skipped' if state in ('disabled', 'no_llm', 'deferred_busy')
-                                       else 'failed')
-                        return StageResult('activity_preferences', stage_state,
-                                           message=(f"日程偏好就绪（评估 {result.get('evaluated', 0)} 项）"
-                                                    if stage_state == 'success'
-                                                    else '日程偏好未启用或暂缓（中性降级，不阻塞日程）'
-                                                    if stage_state == 'skipped'
-                                                    else '日程偏好评估失败（中性降级，旧有效画像保留）'),
-                                           reason=state,
-                                           details={'evaluated': result.get('evaluated', 0),
-                                                    'traits': result.get('traits', False),
-                                                    'tokens': result.get('tokens', 0)})
-                    plan.append(('activity_preferences', preferences_stage))
-
-            cancelled_stage = ""
+            plan = self._build_plan(command, field=field, manual=manual, cfg=cfg,
+                                    emotion_force=emotion_force,
+                                    events_force=events_force, force=force)
             for name, factory in plan:
-                cancelled_stage = name
                 try:
                     stage = await factory()
                 except asyncio.CancelledError:
@@ -1512,11 +1470,6 @@ class InitService:
                         name, "cancelled", reason="cancelled",
                         message="执行被取消，本阶段未记作完成；可重新执行。",
                         details={"cancelled": True}))
-                    finished = self._now().isoformat(timespec="seconds")
-                    self._write_summary(command=command, manual=manual, status="cancelled",
-                                        started=started, finished=finished, stages=stages,
-                                        catalog=self._catalog_view(), persona=persona,
-                                        versions=versions)
                     raise
                 except Exception as exc:
                     logger.warning("init_service: 阶段 %s 未捕获异常（继续后续阶段）：%s",
@@ -1525,27 +1478,19 @@ class InitService:
                                         error_lines=(f"阶段执行异常：{exc}",),
                                         details={"exception": type(exc).__name__})
                 stages.append(stage)
-                cancelled_stage = ""
 
             catalog = self._catalog_view()
             status = self._overall(stages)
             finished = self._now().isoformat(timespec="seconds")
-            summary = self._write_summary(command=command, manual=manual, status=status,
-                                          started=started, finished=finished,
-                                          stages=stages, catalog=catalog,
-                                          persona=persona, versions=versions)
-            if summary.status == "failed":
-                status = "partial" if status in ("success", "skipped") else status
             return self._result(command=command, manual=manual, status=status,
                                 stages=stages, started=started, finished=finished,
-                                catalog=catalog, persona=persona, versions=versions,
-                                summary=summary)
+                                catalog=catalog, persona=persona, versions=versions)
 
     # ------------------------------------------------------------------
     # 公开入口
     # ------------------------------------------------------------------
     async def run_full(self, *, manual: bool = True) -> InitResult:
-        """全量：基础四阶段 + 显式初始化的视频偏好重置 + 汇总。"""
+        """全量：七字段（既有幂等语义）+ 人工全量的视频偏好重置。"""
         return await self._execute("full", manual=manual, emotion_force=False,
                                    events_force=False)
 
@@ -1559,18 +1504,41 @@ class InitService:
         return await self._execute("events", manual=manual, emotion_force=False,
                                    events_force=force)
 
+    async def run_stage(self, stage: str, *, manual: bool = False,
+                        force: bool = False) -> InitResult:
+        """只跑一个字段（自动驱动/字段命令共用；与 full 共用同一实例锁）。"""
+        if stage not in STAGE_ORDER:
+            raise ValueError(f"未知初始化字段：{stage}")
+        return await self._execute(f"stage:{stage}", manual=manual,
+                                   emotion_force=force, events_force=force,
+                                   field=stage, force=force)
+
+    # ------------------------------------------------------------------
+    # 公开只读口（自动驱动 / 命令共用）
+    # ------------------------------------------------------------------
+    def preflight(self) -> StageResult:
+        """preflight（plugin.enabled / data_dir / DB v6 / 配置）只读检查。"""
+        return self._preflight(self._current_config())
+
+    def versions(self) -> Dict[str, str]:
+        """当前插件/配置版本（登记文件写回用）。"""
+        return self._versions()
+
+    def persona(self) -> Dict[str, Any]:
+        """当前人设摘要（name/fingerprint/personality_length）。"""
+        return self._persona()
+
+    def config(self) -> Any:
+        """当前配置对象（热重载友好；只读消费）。"""
+        return self._current_config()
+
     # ------------------------------------------------------------------
     # 只读 status（无副作用：不建目录、不写文件、不 reload、不调用模型）
     # ------------------------------------------------------------------
     def status(self) -> InitStatus:
         cfg = self._current_config()
         enabled = self._plugin_enabled()
-        raw = load_json(self.summary_path, {})
-        raw = raw if isinstance(raw, Mapping) else {}
-        last_run = raw.get("last_run") if isinstance(raw.get("last_run"), Mapping) else {}
-        last_success = raw.get("last_success") if isinstance(raw.get("last_success"), Mapping) else None
-        record_next = last_run.get("next_update_at") if last_run else None
-        record_version = str(last_run.get("catalog_version") or "") if last_run else ""
+        registry = self.registry.snapshot()
         catalog = self._catalog_view()
         switches = self._switches(cfg)
         state_path = self._state_file_path(cfg)
@@ -1578,12 +1546,12 @@ class InitService:
         db = self._schema_status()
         return InitStatus(
             plugin_enabled=enabled,
-            has_record=bool(last_run),
-            last_status=str(last_run.get("status") or "") if last_run else "",
-            last_run=dict(last_run),
-            last_success=dict(last_success) if last_success else None,
-            next_update_at=(catalog.get("next_update_at") or record_next),
-            catalog_version=str(catalog.get("catalog_version") or record_version or ""),
+            registry_path=str(registry.get("path") or self.registry.path),
+            registry_plugin_version=str(registry.get("plugin_version") or ""),
+            fields=dict(registry.get("fields") or {}),
+            preflight=dict(registry.get("preflight") or {}),
+            next_update_at=catalog.get("next_update_at"),
+            catalog_version=str(catalog.get("catalog_version") or ""),
             event_mode=str(catalog.get("mode") or switches["event_catalog_mode"]),
             event_degraded=bool(catalog.get("degraded", False)),
             event_reason=str(catalog.get("reason") or ""),
@@ -1593,7 +1561,6 @@ class InitService:
             life_state_file=str(state_path),
             db_version=str(db.get("version") or ""),
             sleep_sessions=bool(db.get("sleep_sessions")),
-            summary_path=str(self.summary_path),
         )
 
     def status_text(self) -> str:
@@ -1660,8 +1627,7 @@ def _frequency_outcome(raw: Any) -> Dict[str, Any]:
 
 
 __all__ = [
-    "SUMMARY_FILE_NAME", "SUMMARY_VERSION", "STAGE_ORDER",
-    "StageResult", "InitResult", "InitStatus", "InitService",
+    "STAGE_ORDER", "StageResult", "InitResult", "InitStatus", "InitService",
 ]
 
 

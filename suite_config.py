@@ -354,7 +354,7 @@ from suite_prompts import (
 # 20 段 264 叶子（B1 F1 +10 / B2 F3 +16 / B3 F4 +13 / B4 +2），按 R6 双号同步递增。
 # 2026-11-12 结构审计批（R12）：移除未实现的 transition_procrastination_event_branch
 # 用户叶子（-1）→ [experimental] 40 键、schema 20 段 263 叶子 / 2 隐藏（J 类预留保留）。
-SUPPORTED_CONFIG_VERSION = "3.17.34"
+SUPPORTED_CONFIG_VERSION = "3.17.35"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"

@@ -617,8 +617,12 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # PR6（2026-10-27）：目标频率校准的单飞 task 与「无 loop 时挂起」标记
         self._frequency_calibration_task: Any = None
         self._frequency_calibration_pending = False
+        # 2026-11-13 自动初始化：加载驱动的单飞 task（非阻塞；on_unload 取消）
+        self._auto_init_task: asyncio.Task | None = None
         if not cfg.plugin.enabled:
             self.ctx.logger.info("插件未启用（plugin.enabled=false），仅加载组件")
+            # preflight 登记 disabled 状态（整体不 init；区别于业务字段失败）。
+            self._start_auto_init()
             return
 
         # 目标私聊 stream 解析（失败则后台重试）
@@ -629,9 +633,19 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 绝不拖挂插件加载（_setup_life_services 内保底）
         self._setup_life_services()
         await self._start_bg()
+        self._start_auto_init()
         self.ctx.logger.info("属于麦麦的生活已加载 v%s（目标=%s，stream=%s）",
                              SUPPORTED_CONFIG_VERSION, target_qq_of(cfg) or "未配置",
                              self._stream_id or "待解析")
+
+    def _start_auto_init(self) -> None:
+        """非阻塞启动加载自动初始化（单飞/退避/逐字段校验；异常静默降级）。"""
+        try:
+            from tools.init.auto_init import schedule
+            self._auto_init_task = schedule(self)
+        except Exception as exc:
+            self._auto_init_task = None
+            self._warn_quiet("加载自动初始化调度失败（忽略）：%s", exc)
 
     async def on_unload(self) -> None:
         self._is_unloading = True
@@ -659,6 +673,12 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 tick_task.cancel()
             except Exception:
                 pass
+        auto_init_task = getattr(self, "_auto_init_task", None)
+        if auto_init_task is not None:
+            try:
+                auto_init_task.cancel()
+            except Exception:
+                pass
         self._stop_life_services()
         affection = getattr(self, "_affection", None)
         if affection is not None:
@@ -680,7 +700,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def _shutdown_chain(self) -> None:
         """串行停机链（F2：每步独立防御；总超时预算由 on_unload 的 wait_for 控制）。"""
         # Stop single-flight integration work before any service/database teardown.
-        for task_name in ("_video_watch_sync_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task"):
+        for task_name in ("_video_watch_sync_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task", "_auto_init_task"):
             task = getattr(self, task_name, None)
             if task is not None and not task.done():
                 task.cancel()

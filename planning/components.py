@@ -136,11 +136,10 @@ class PlanningComponentsMixin:
         )
 
     async def cmd_ops_init(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
-        """ops/init → 既有统一初始化；args 双语已在分发器归一。"""
+        """ops/init → 统一初始化驱动；args 双语已在分发器归一。"""
         del cmd
-        arg = str(args[0]).lower() if args else ""
-        if arg not in ("emotion", "events", "status"):
-            arg = ""
+        # 兼容旧三参数（emotion/events/status）与新增七字段/全部。
+        arg = " ".join(str(item).strip().lower() for item in args).strip()
         return await self.plan_command_init(
             matched_groups={"init_args": arg}, **kwargs)
 
@@ -155,15 +154,19 @@ class PlanningComponentsMixin:
         is_local_operator: bool = False,
         **kwargs: Any,
     ) -> tuple:
-        """``/lbm ops init [emotion|events|status]``（PR5 公共入口，2026-10-27 接线）。
+        """``/lbm ops init [字段|all|status]``（2026-11-13 自动初始化统一入口）。
 
-        顺序（工单要求）：先 ``[plugin].enabled``，再管理员（``admin_users`` /
-        本机控制台）。四态：缺省=全量（幂等）；``emotion``=强制情绪阶段
-        （PR8 3.0.0：旧独立命令 /lbm_emotion_init 已删除，统一并入本入口）；
-        ``events``=强制刷新事件库；``status``=只读。
-        人工调用才发 QQ，自动阶段（``manual=False``）只在服务内写汇总，本入口不参与。
+        顺序：先 ``[plugin].enabled``，再管理员（``admin_users`` / 本机控制台）。
+        - 缺省 / ``all``：七字段全量（幂等；显式字段才强制重 init）；
+        - ``emotion|events|state_sleep|frequency|video_interest|
+          companion_disposition|activity_preferences``：只跑该字段并强制重 init；
+        - ``status``：只读 ``init_registry.json`` 逐字段展示，不触发任何 init。
+        **手动不受 attempts 退避限制**；自动驱动（``plugin.on_load``）才受退避。
         """
         del kwargs, platform, group_id
+        from tools.init.auto_init import run_manual, status_text
+        from tools.init.manifest import INIT_FIELDS
+
         groups = matched_groups if isinstance(matched_groups, dict) else {}
         raw = str(groups.get("init_cmd") or text or "").strip()
         arg = str(groups.get("init_args") or "").strip().lower()
@@ -171,8 +174,9 @@ class PlanningComponentsMixin:
             parts = raw.split()
             if len(parts) > 1:
                 arg = parts[1].strip().lower()
-        if arg not in ("emotion", "events", "status"):
-            arg = ""
+        valid_fields = tuple(INIT_FIELDS)
+        if arg not in valid_fields and arg not in ("", "all", "status"):
+            arg = "__invalid__"
 
         async def _reply(message: str) -> None:
             if stream_id:
@@ -193,26 +197,26 @@ class PlanningComponentsMixin:
             await _reply("你不是管理员哦~只有管理员才能执行初始化（本机控制台不受限）")
             return True, "没有权限", True
 
+        if arg == "__invalid__":
+            await _reply(
+                "参数无效。用法：/lbm ops init [字段|all|status]\n"
+                "字段：" + " / ".join(valid_fields) + "\n"
+                "中文：/麦麦生活 运维 初始化 [字段|全部|状态]"
+            )
+            return True, "参数无效", True
+        if arg == "status":
+            await _reply(status_text(self) or "暂无初始化状态")
+            return True, "初始化状态", True
+
         svc = getattr(self, "_planning", None)
         init_svc = getattr(svc, "init", None) if svc is not None else None
         if init_svc is None:
             await _reply("初始化服务未装配（插件未完成加载）")
             return True, "初始化服务未装配", True
+        fields = None if arg in ("", "all") else [arg]
         try:
-            if arg == "status":
-                status = init_svc.status()
-                await _reply(getattr(status, "status_text", "") or "暂无初始化状态")
-                return True, "初始化状态", True
-            if arg == "emotion":
-                result = await init_svc.run_emotion(manual=True, force=True)
-            elif arg == "events":
-                result = await init_svc.run_events(manual=True, force=True)
-            else:
-                result = await init_svc.run_full(manual=True)
-            lines = list(getattr(result, "summary_lines", ()) or ())
-            if not lines:
-                lines = [f"初始化结果：{getattr(result, 'status', 'unknown')}"]
-            await _reply("\n".join(str(x) for x in lines))
+            report = await run_manual(self, fields)
+            await _reply(report.text or "初始化完成")
             return True, "初始化完成", True
         except Exception as exc:
             await _reply(f"初始化失败：{exc}")

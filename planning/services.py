@@ -34,11 +34,12 @@ from .event_catalog import EventCatalogService
 from .goal_manager import close_goal_manager, get_goal_manager
 from .holiday_service import HolidayService
 from .inject_service import InjectService
-from .init_service import InitService
 from .proactive_service import ProactiveService
 from .schedule_generator import ScheduleGenerator
 from .schedule_items import is_night_sleep_item
 from .tools_service import ToolsService
+# 2026-11-13 自动初始化裁决：InitService 整体迁入 tools/init/（工具入口层编排）。
+from tools.init.service import InitService
 
 logger = logging.getLogger(__name__)
 
