@@ -1797,7 +1797,8 @@ class PatrolService:
         last_speak = self._affection.last_speak_time()
         if last_speak is None:
             return None
-        return max(0.0, (now - last_speak).total_seconds() / 60)
+        # 统一本地 naive 口径，避免 offset-naive/aware 相减 TypeError（2026-11-12 修复）
+        return max(0.0, (_naive_local(now) - _naive_local(last_speak)).total_seconds() / 60)
 
     def _miss_suppressed_by_recent_speak(self, now: datetime, last_user: Optional[datetime],
                                          anchor_hours: float) -> bool:
@@ -1811,7 +1812,7 @@ class PatrolService:
         since = self._minutes_since_last_speak(now)
         if last_speak is None or since is None:
             return False
-        if last_user is not None and last_user > last_speak:
+        if last_user is not None and _naive_local(last_user) > _naive_local(last_speak):
             return False
         try:
             threshold = max(60.0, float(anchor_hours) * 30.0)
