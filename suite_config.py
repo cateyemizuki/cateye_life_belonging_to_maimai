@@ -873,10 +873,10 @@ _LS: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["life_state"])
 
 
 class ExperimentalSectionConfig(PluginConfigBase):
-    """实验性功能（默认全关；观察 1–2 周后逐特性裁决转正/调参/回退）。
+    """实验性功能（2026-11-12 用户裁决 3：F1/F3/F4/B4 四项默认转正开启）。
 
-    迁移提示：转正后按 ``union/20261111_实验配置迁移映射.md`` 迁回目标板块；
-    关闭本段任一开关即回到 3.17.33 对应行为（专项含默认关逐字不变断言）。
+    迁移提示：已转正项按 ``union/20261111_实验配置迁移映射.md`` 仍留在本段，
+    逐项关闭即回到 3.17.33 对应行为（专项含开/关双路径断言）。
     """
 
     __ui_label__ = "实验性功能"
@@ -884,20 +884,21 @@ class ExperimentalSectionConfig(PluginConfigBase):
     __ui_order__ = 0
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Experimental",
-               "description": "Experimental features. All off by default; promotion plan is "
-                              "documented per key in the migration map."}
+               "description": "Experimental features. Promoted switches default to on "
+                              "(2026-11-12 ruling) and can be turned off to revert; "
+                              "the promotion plan is documented per key in the migration map."}
     }
 
     # ── F1 群注意力衰减（B1；v2 §3）────────────────────────────────
     group_attention_decay_enabled: bool = Field(
-        default=False,
+        default=True,
         description="群注意力衰减：群话题与当前活动不搭、且 bot 很久没被点名/接话时，"
                     "逐步降低该群的下发频率；被点名、目标用户发言或话题回到活动时逐步恢复。"
                     "只调频率、不拦消息，回不回由 bot/planner 决定。",
         json_schema_extra={
             "label": "群注意力衰减",
-            "hint": "默认关。开 = 只对 [planning_proactive] 群生效集生效；下限=宿主因子×0.5，"
-                    "睡眠完全豁免，目标私聊恒 1.0；安静群不衰减",
+            "hint": "默认开（2026-11-12 转正）。开 = 只对 [planning_proactive] 群生效集生效；"
+                    "下限=宿主因子×0.5，睡眠完全豁免，目标私聊恒 1.0；安静群不衰减",
             **_ui_i18n("Group attention decay",
                        "Experimental: gradually lower reply frequency in groups whose topic "
                        "doesn't match the current activity and where the bot hasn't been "
@@ -998,8 +999,8 @@ class ExperimentalSectionConfig(PluginConfigBase):
                     "硬约定/睡眠/吃饭锚点完全不碰。",
         json_schema_extra={
             "label": "转场拖延",
-            "hint": "默认关。开 = 每次高反差软切换最多一次缓冲（日限 4）+ 一次拖延（日限 2）；"
-                    "idle 调度与对外口径不变",
+            "hint": "默认开（2026-11-12 转正）。开 = 每次高反差软切换最多一次缓冲（日限 4）"
+                    "+ 一次拖延（日限 2）；idle 调度与对外口径不变",
             **_ui_i18n("Transition drag",
                        "Experimental: after a low-focus activity, insert a 3-8 minute "
                        "transition window before work/study and occasionally delay the "
@@ -1148,13 +1149,13 @@ class ExperimentalSectionConfig(PluginConfigBase):
 
     # ── F4 社交边界（B3；v2 §5）────────────────────────────────────
     social_boundary_enabled: bool = Field(
-        default=False,
+        default=True,
         description="社交边界：深工/睡眠时只在群聊里给 planner 一行状态（不拦消息、不延迟），"
                     "目标私聊在高压/极疲惫时使用「可拒绝、可脆弱」的语气分支，"
                     "并在忙时提示 planner 可用 wait 工具晚点回；碎片化只做提示词建议。",
         json_schema_extra={
             "label": "社交边界",
-            "hint": "默认关。开 = 群状态行/私聊极端语气/wait 提示/碎片化提示；"
+            "hint": "默认开（2026-11-12 转正）。开 = 群状态行/私聊极端语气/wait 提示/碎片化提示；"
                     "睡眠群仍是短慢软 + 原吵醒记账，不硬不回、不建账本",
             **_ui_i18n("Social boundaries",
                        "Experimental: when deep in work or asleep, state that in one "
@@ -1284,15 +1285,15 @@ class ExperimentalSectionConfig(PluginConfigBase):
 
     # ── 联动批：bpp 认领让位 + 群社交电量（B4；v2 §6）──────────────
     bpp_bridge_enabled: bool = Field(
-        default=False,
+        default=True,
         description="与「更好的消息后处理」(bpp) 联动：life 在发送前向 bpp 登记本轮认领，"
                     "bpp 后处理接管生效时由它模拟打字、life 让位（避免双重等待）；"
                     "同时开启群聊真实回复的社交电量消耗。bpp 未安装/未激活/超时 → "
                     "life 照常自己模拟打字，绝不劣化。",
         json_schema_extra={
             "label": "bpp 联动",
-            "hint": "默认关。开 = 认领让位 + 群电量；bpp 缺失/拒绝/超时仍走 life 原打字链，"
-                    "目标私聊折减/回充链逐字不变",
+            "hint": "默认开（2026-11-12 转正）。开 = 认领让位 + 群电量；"
+                    "bpp 缺失/拒绝/超时仍走 life 原打字链，目标私聊折减/回充链逐字不变",
             **_ui_i18n("bpp bridge",
                        "Experimental: claim the reply round from the better-post-processing "
                        "plugin so it owns typing simulation when active, and drain social "
@@ -1311,6 +1312,23 @@ class ExperimentalSectionConfig(PluginConfigBase):
         },
     )
 
+    # ── F5 广义抑饿（2026-11-12 用户裁决 2-A）──────────────────────
+    suppress_hunger_mention_enabled: bool = Field(
+        default=True,
+        description="抑制主动提饿：潜意识状态注入里追加一条广义禁令，不论当前是否命中"
+                    "饥饿语气分支，都不主动提及饥饿/食欲；对方问起才自然带过。"
+                    "关闭 = 只保留饥饿分支自身的「不主动提饿」措辞。",
+        json_schema_extra={
+            "label": "抑制主动提饿",
+            "hint": "默认开。开 = 回复/planner 两支潜意识状态注入都追加广义禁令；"
+                    "关 = 不追加，行为回到 3.17.34",
+            **_ui_i18n("Suppress hunger mentions",
+                       "Append a broad instruction to the subconscious state injection so "
+                       "the bot never brings up hunger on its own, whether or not the hungry "
+                       "tone branch is selected."),
+        },
+    )
+
 
 class CateyeSuiteConfig(PluginConfigBase):
     """插件完整配置。
@@ -1321,10 +1339,10 @@ class CateyeSuiteConfig(PluginConfigBase):
     直接定义在本模块（原顶层 experimental_config.py 已并入，R11）。
     """
 
-    # 2026-11-11 用户裁定：实验性特性配置集中段置顶（全部默认关；转正迁移见
-    # union/20261111_实验配置迁移映射.md）。
-    experimental: ExperimentalSectionConfig = Field(default_factory=ExperimentalSectionConfig)
+    # 2026-11-12 用户裁决 2：段序后移——plugin 第一、experimental 第二。
+    # （原 2026-11-11「实验性配置集中置顶」随转正结束。）
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
+    experimental: ExperimentalSectionConfig = Field(default_factory=ExperimentalSectionConfig)
     patrol: PatrolSectionConfig = Field(default_factory=PatrolSectionConfig)
     screen: ScreenSectionConfig = Field(default_factory=ScreenSectionConfig)
     affection: AffectionSectionConfig = Field(default_factory=AffectionSectionConfig)

@@ -501,6 +501,13 @@ SUBCONSCIOUS_TONE_STEADY_DEFAULT = (
 SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT = (
     "（只用于调整{bot_name}的语气与篇幅；不要直接复述这些状态词）"
 )
+#: 潜意识状态注入·广义抑饿禁令（占位符：{bot_name}；F5 开关默认开时追加）。
+#: 2026-11-12 用户裁决 2-A：状态数据本身可能含「有点饿」，即便未命中饥饿语气分支
+#: 也可能诱发自发提饿；本禁令与分支选择无关，统一要求不主动提及饥饿/食欲。
+SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT = (
+    "（{bot_name}不要主动提及饥饿/食欲，对方问起才自然带过；"
+    "不要把它当成话题主动展开。）"
+)
 
 #: 日结印象·活跃标题（companion 记忆行同文案；注入前折叠时按此重建）
 IMPRESSION_TITLE_ACTIVE_DEFAULT = "【最近印象】"

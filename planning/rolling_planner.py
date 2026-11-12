@@ -505,9 +505,9 @@ class RollingPlanner:
         value = _as_number(self._cfg(key, None), None)
         return default if value is None else float(value)
 
-    # ── F3 转场拖延配置/状态（B2；默认关时全部入口短路，零 RNG/零写盘）────
+    # ── F3 转场拖延配置/状态（B2；关时全部入口短路，零 RNG/零写盘）────
     def _transition_params(self) -> "transition_rules.TransitionParams":
-        """``[experimental].transition_*`` 归一参数（段缺失/异常 → 全默认 = 关）。"""
+        """``[experimental].transition_*`` 归一参数（段缺失/异常 → TransitionParams 默认）。"""
         provider = self._config_provider
         if provider is None:
             return transition_rules.TransitionParams()

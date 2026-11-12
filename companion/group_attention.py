@@ -15,8 +15,9 @@
 - 睡眠完全豁免：不采样、不推进乘数、不参与 ``×0.5`` 下限；
 - 安静群（宽限窗内无任何消息）目标回 1.0，不继续衰减。
 
-默认关（``[experimental].group_attention_decay_enabled=False``）时本模块所有
-入口短路：不采样、不 tick、不注入状态行，频率链与 3.17.33 逐字一致。
+关闭（``[experimental].group_attention_decay_enabled=False``；2026-11-12 裁决 3 起
+默认 True）时本模块所有入口短路：不采样、不 tick、不注入状态行，频率链与 3.17.33
+逐字一致。
 """
 
 from __future__ import annotations

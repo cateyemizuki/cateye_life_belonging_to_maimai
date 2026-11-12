@@ -482,10 +482,12 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._attention = SurfLeaseAuthority(self._attention_tracker)
         # F1（v2 §3.3，2026-11-11）：群注意力状态仓库 + 60s tick 单一入口。普通类、
         # 进程内、有界、不落盘；入站钩子只在群消息尾部 O(1) 采样，规划束经
-        # _apply_frequency 逐群取乘数。默认关时全部入口短路（旧行为逐字不变）。
+        # _apply_frequency 逐群取乘数。开关关时全部入口短路（旧行为逐字不变；
+        # 2026-11-12 裁决 3 起默认 True）。
         self._group_attention = GroupAttentionService(self)
         # F4（v2 §5.3，2026-11-11）：社交边界单一入口。普通类、进程内、有界、不落盘；
-        # 只生成 planner 状态行 / replyer 语气与节奏提示，绝不硬拦截。默认关时全短路。
+        # 只生成 planner 状态行 / replyer 语气与节奏提示，绝不硬拦截。开关关时全短路
+        # （2026-11-12 裁决 3 起默认 True）。
         self._social_boundary = BoundaryService(self)
         # A2：预算计数落盘 data_dir（proactive_budget.json），跨 file_watcher 热重载连续
         # M11（附录 II §3.3）：预算只统计发往目标陪伴私聊的主动打扰——注入 self._stream_id
@@ -513,8 +515,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # R1（结构审计批，2026-11-12）：life → bpp 跨插件桥迁 linkage/bpp/（适配器
         # cateye_bpp；服务束构造，组合根只 register_adapter，不模块级 import 具体实现）。
         # 消费方 companion.components 经 linkage.get_adapter("cateye_bpp") 查询，
-        # 未登记按 None 降级（fail-open）。默认关；关时不发任何 API 调用、打字时延
-        # 与群聊电量口径都与 3.17.33 逐字一致（B4 联动批 v2 §6.3 语义不变）。
+        # 未登记按 None 降级（fail-open）。开关关时不发任何 API 调用、打字时延
+        # 与群聊电量口径都与 3.17.33 逐字一致（2026-11-12 裁决 3 起默认 True）。
         self._bpp_bridge = self._companion.bpp_bridge
         register_adapter(self._bpp_bridge)
         self._qzone_cookies = QzoneCookieManager(

@@ -19,8 +19,9 @@
 - ``BoundaryFacts`` 任一取数异常 → 被动侧 fail-open（不注入行、不切语气），
   主动侧不消费本模块。
 
-默认关（``[experimental].social_boundary_enabled=False``）时所有入口短路：
-无新行、无语气切换、无提示、零随机、零状态写，3.17.33 文本逐字不变。
+关闭（``[experimental].social_boundary_enabled=False``；2026-11-12 裁决 3 起默认
+True）时所有入口短路：无新行、无语气切换、无提示、零随机、零状态写，3.17.33
+文本逐字不变。
 """
 
 from __future__ import annotations

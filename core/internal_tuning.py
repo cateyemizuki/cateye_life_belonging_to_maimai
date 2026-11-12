@@ -175,10 +175,11 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
     # ``[experimental].transition_*``（16 键），本段是同源默认值与「转正后迁回
     # J 类」的目标段（迁移映射见 union/20261111_实验配置迁移映射.md §2）。运行期
     # 不读表层 internal_tuning.json 的该段；2026-11-12（R8）起本段不写入用户 J 表
-    # 种子（SEED_OMITTED_SECTIONS）。``procrastination_event_branch`` 为未实现的
-    # J 类预留键：不占用户 schema 叶子，转正时再决定是否实现。
+    # 种子（SEED_OMITTED_SECTIONS）。2026-11-12 用户裁决 3：``enabled`` 默认转正
+    # 为 True（``suite_config.transition_enabled`` 同源派生）。``procrastination_event_branch``
+    # 为未实现的 J 类预留键：不占用户 schema 叶子，转正时再决定是否实现。
     "transition": {
-        "enabled": False,
+        "enabled": True,
         "window_min": 3,
         "window_max": 8,
         "procrastination_prob": 0.20,

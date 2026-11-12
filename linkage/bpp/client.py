@@ -61,7 +61,7 @@ class PostProcessBridge:
     # ------------------------------------------------------------------
 
     def enabled(self) -> bool:
-        """``[experimental].bpp_bridge_enabled``（实验期主开关，默认关）。"""
+        """``[experimental].bpp_bridge_enabled``（主开关；2026-11-12 裁决 3 起默认 True）。"""
         section = getattr(getattr(self._plugin, "config", None), "experimental", None)
         value = getattr(section, "bpp_bridge_enabled", False)
         return bool(value) if value is not None else False

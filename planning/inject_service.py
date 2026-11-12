@@ -102,6 +102,7 @@ from suite_prompts import (
     INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
     INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT,
     INJECT_SCHEDULE_HEADER_DEFAULT,
+    SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
     SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT,
     SUBCONSCIOUS_TONE_HAPPY_DEFAULT,
     TRANSITION_CONFESSION_LINE_DEFAULT,
@@ -311,7 +312,7 @@ class InjectService:
             return ""
 
     def _boundary_group_line(self, session_id: str, payload: Any) -> str:
-        """F4 群边界状态行（深工/睡眠；默认关/非群/已点名 → 空串）。"""
+        """F4 群边界状态行（开关关/非群/已点名 → 空串；默认值 2026-11-12 起 True）。"""
         service = self._boundary_service()
         if service is None:
             return ""
@@ -321,7 +322,7 @@ class InjectService:
             return ""
 
     def _boundary_wait_hint(self, session_id: str, *, has_real_message: bool) -> str:
-        """F4 wait 提示（只含 seconds；默认关/非群非目标私聊/冷却 → 空串）。"""
+        """F4 wait 提示（只含 seconds；开关关/非群非目标私聊/冷却 → 空串）。"""
         service = self._boundary_service()
         if service is None:
             return ""
@@ -338,7 +339,7 @@ class InjectService:
         ``transition_buffer``）或 metadata 带 ``procrastination``。独立种子
         ``Random(stream|episode|transition_confess)``（同一 episode 同流只掷一次）；
         去重按 ``(聊天流, episode_id)`` + 同流最小间隔（:class:`ConfessionLedger`）。
-        默认关 = 不读 DB、不建台账、返回空串（旧行为逐字不变）。
+        关 = 不读 DB、不建台账、返回空串（旧行为逐字不变；默认值 2026-11-12 起 True）。
         """
         exp = getattr(getattr(self._plugin, "config", None), "experimental", None)
         if exp is None or not bool(getattr(exp, "transition_enabled", False)):
@@ -701,12 +702,14 @@ class InjectService:
                 remaining_override = life_ov["remaining"]
                 life_lines = self._life_block_lines(
                     life_view, life_ov, subconscious=self._state_subconscious_style(),
-                    bot_name=self._bot_name())
+                    bot_name=self._bot_name(),
+                    suppress_hunger_mention=self._suppress_hunger_mention())
                 if live_gate_enabled:
                     life_lines_slim = self._life_block_lines(
                         life_view, life_ov, slim=True,
                         subconscious=self._state_subconscious_style(),
-                        bot_name=self._bot_name())
+                        bot_name=self._bot_name(),
+                        suppress_hunger_mention=self._suppress_hunger_mention())
 
             # 无当前活动不再静默早退（N1-2）：照常走「分类 → 决策 → 模板路由」，
             # 模板侧自动切到空活动变体（兜底文案 = suite_prompts 内部键 inject_no_activity）。
@@ -1453,6 +1456,19 @@ class InjectService:
         value = getattr(section, "state_subconscious_style", True)
         return True if value is None else bool(value)
 
+    def _suppress_hunger_mention(self) -> bool:
+        """F5（用户裁决 2-A）：``[experimental].suppress_hunger_mention_enabled``。
+
+        出厂默认 True；段缺失/异常同样按 True（与 pydantic 默认同口径）——
+        该禁令只是语气约束，取不到配置时宁可多压一句，也不让状态上下文诱发提饿；
+        显式关闭则完全不追加（旧文本逐字不变）。
+        """
+        section = getattr(getattr(self._plugin, "config", None), "experimental", None)
+        if section is None:
+            return True
+        value = getattr(section, "suppress_hunger_mention_enabled", True)
+        return True if value is None else bool(value)
+
     def _life_state_snapshot(self) -> Dict[str, float]:
         """只读状态快照（精力/饥饿/社交电量/专注/压力/精神派生）；缺失/异常 → 空 dict。
 
@@ -1661,6 +1677,15 @@ class InjectService:
             if tone_rule:
                 # 语气分支带 {bot_name} 占位（极端分支已在 boundary 内渲染，重复渲染无副作用）
                 tone_rule = render(tone_rule, fallback=tone_rule, bot_name=bot_name)
+            # F5（用户裁决 2-A）：无论命中哪个语气分支（含极端/平稳），开关开时
+            # 都追加一条广义抑饿禁令——状态数据里的「有点饿」本身可能诱发主动提饿。
+            if self._suppress_hunger_mention():
+                hunger_ban = render(
+                    SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
+                    fallback=SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
+                    bot_name=bot_name,
+                )
+                tone_rule = f"{tone_rule}\n{hunger_ban}" if tone_rule else hunger_ban
             text = render(
                 INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
                 fallback=INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
@@ -1967,7 +1992,8 @@ class InjectService:
                           override: Optional[Dict[str, Any]],
                           slim: bool = False,
                           subconscious: bool = False,
-                          bot_name: str = "麦麦") -> List[str]:
+                          bot_name: str = "麦麦",
+                          suppress_hunger_mention: bool = False) -> List[str]:
         """runtime 实况追加行（主设计 §3.3 注入清单；零 emoji）。
 
         current（名称/已进行/进度/注意力/剩余）+ next ≤2 + 状态行 + recent ≤2
@@ -1981,6 +2007,10 @@ class InjectService:
         2026-11-11（Gemini 批 P2-EXP-1 / §5.2）：``subconscious=True`` 时在状态
         行尾追加「只用于调整语气 / 不要直接复述」注记，状态数据本身不改；
         缺省 False = 旧文案逐字（开关关闭路径）。
+
+        2026-11-12（用户裁决 2-A / F5）：``subconscious=True`` 且
+        ``suppress_hunger_mention=True`` 时，同一状态行尾再追加广义抑饿禁令
+        （与语气分支是否命中饥饿无关）；缺省 False = 不追加，旧文本逐字不变。
         """
         if not isinstance(view, dict):
             return []
@@ -2052,6 +2082,13 @@ class InjectService:
                     fallback=SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT,
                     bot_name=bot_name,
                 )
+                if suppress_hunger_mention:
+                    # F5（用户裁决 2-A）：同一状态行尾追加广义抑饿禁令
+                    state_line += render(
+                        SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
+                        fallback=SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
+                        bot_name=bot_name,
+                    )
             lines.append(state_line)
         for row in (view.get("completed") or [])[-2:]:
             if not isinstance(row, dict):

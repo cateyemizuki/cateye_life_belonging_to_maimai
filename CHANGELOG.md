@@ -1,5 +1,9 @@
 # 更新日志（CHANGELOG）
 
+## 裁决批（2026-11-12，无版本递增）
+
+用户裁决 2/2-A/3 落地，**版本双号保持 3.17.34**（沿用 dev 批口径，不新增 release 号）：**① F5 广义抑饿**——新增用户可见实验开关 `[experimental].suppress_hunger_mention_enabled`（bool，默认 True）：开时在潜意识状态注入追加广义禁令「不要主动提及饥饿/食欲，对方问起才自然带过」（常量 `suite_prompts.SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT`，`planning/inject_service._subconscious_tone_rule` 调用处组装 replyer 语气块；planner 的 `_life_block_lines` 同一状态行尾同步追加）；**无论是否命中饥饿语气分支都生效**（状态数据本身可能含「有点饿」）；关 = 不追加，旧文本逐字不变。**② 段序后移**——`CateyeSuiteConfig` 中 `plugin` 第一、`experimental` 第二（原「实验段置顶」随转正结束）。**③ 四开关转正默认开**——`group_attention_decay_enabled` / `social_boundary_enabled` / `bpp_bridge_enabled` 由 False 改 True；`transition_enabled` 经 `INTERNAL_TUNING_DEFAULTS["transition"]["enabled"]` 单源改 True（J 段仍 16 键）。schema 20 段 **264 叶子 / 2 隐藏 / 262 可见**，`[experimental]` **41 键**。门禁同步：round/smoke/4 个结构专项/realism/sleep_recovery/reliability/prompt_quality 计数与默认值断言；新增专项 `scratch/test_ruling_31734.py`（10 例：schema+段序、五开关默认、抑饿开/关双路径与 planner 状态行）。验证：官方套件 359/359、七门禁 7/7、`build_webui.py` 幂等。
+
 ## 文档维护（2026-11-12，R4 批，无版本递增）
 
 文档同步与授权例外登记，**无运行语义变更、不递增版本**：①种子计数口径统一为 **13 JSON + 2 代码联动 = 统一初始池 15**（`suite_config.py` 注释与开发文档同步）；②出厂种子目录移出 `EMOTION_OPTIMIZATION_REPORT.md`（→ 开发文档仓 `work_report/20261112_EMOTION_OPTIMIZATION_REPORT.md`），目录只留 13 JSON + README，README 补「新增种子内存合并、升级不覆盖、不补回删除项、退役旧种子不复活」；③`budget_elasticity_enabled=True`（3.17.33 默认值轮）经用户 2026-11-12 授权保留，红线口径改为「基础 5 + 弹性硬上限 2（=7）」，验收同时报告 `cap()`/`used_today()`；④阶段 4「视频卡片 + 说话轮同一槽位」登记为预算例外（不 reserve/commit、一槽一次主动消息），新增 `scratch/test_stage4_budget_slot_r4.py`（7 例）锁定。授权与 18 路径种子文案例外见 `union/20261112_R4_授权例外登记与文档同步.md` 与 DEV_GUIDE §8。验证：官方套件 359/359、七门禁 7/7、构建幂等。
