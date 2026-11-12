@@ -403,6 +403,12 @@ BOUNDARY_GROUP_ASLEEP_LINE_DEFAULT = (
     "【此刻】{bot_name}已经睡下了；这条把{bot_name}吵醒了一点。按{bot_name}的习惯，"
     "可以很短、很慢地回一句，也可以先不理；会不会算吵醒按原来的记账。"
 )
+#: 群状态行·一般休息（rest 但非真正小憩，如「看看窗外」；2026-11-12 修复 rest≠睡眠措辞错配）。
+#: 占位符：{bot_name} / {activity}。
+BOUNDARY_GROUP_REST_LINE_DEFAULT = (
+    "【此刻】{bot_name}正在休息（{activity}）；这条群消息没有点{bot_name}名。"
+    "回不回、什么时候回由{bot_name}判断。"
+)
 #: wait 工具能力提示（只给 seconds；不写 until，兼容宿主 1.3.16）。
 #: 占位符：{bot_name} / {seconds}
 BOUNDARY_WAIT_HINT_DEFAULT = (

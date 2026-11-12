@@ -39,6 +39,7 @@ from suite_prompts import (
     BOUNDARY_FRAGMENT_HINT_DEFAULT,
     BOUNDARY_GROUP_ASLEEP_LINE_DEFAULT,
     BOUNDARY_GROUP_DEEP_WORK_LINE_DEFAULT,
+    BOUNDARY_GROUP_REST_LINE_DEFAULT,
     BOUNDARY_PERSONA_BOTTOM_LINE_DEFAULT,
     BOUNDARY_PERSONA_HARSHNESS_ALLOWED,
     BOUNDARY_PERSONA_HARSHNESS_STRICT,
@@ -299,6 +300,7 @@ class BoundaryFacts:
 
     asleep: bool = False
     napping: bool = False
+    actual_nap: bool = False
     silent: bool = False
     deep_work: bool = False
     exhausted: bool = False
@@ -365,12 +367,15 @@ class BoundaryFacts:
                 asleep = getter(stamp_dt) is True
 
             napping = False
+            actual_nap = False
             gate = getattr(plugin, "companion_silence_gate", None)
             if callable(gate) and active:
                 try:
                     napping = bool(gate().nap_item_matches(active))
+                    actual_nap = bool(gate().actual_nap_item_matches(active))
                 except Exception:
                     napping = False
+                    actual_nap = False
 
             # silent = 睡眠/午休（不引入 planning 依赖；群状态行只用 asleep/napping）
             silent = bool(asleep or napping)
@@ -380,6 +385,7 @@ class BoundaryFacts:
             return cls(
                 asleep=asleep,
                 napping=napping,
+                actual_nap=actual_nap,
                 silent=silent,
                 deep_work=deep_work,
                 exhausted=((energy is not None and energy < energy_threshold)
@@ -542,10 +548,15 @@ class BoundaryService:
                 if last is not None and stamp - float(last) < interval:
                     return ""
                 state["last_group_line_at"] = stamp
-            if facts.asleep or facts.napping:
+            if facts.asleep or facts.actual_nap:
                 line = BOUNDARY_GROUP_ASLEEP_LINE_DEFAULT.format(
                     bot_name=self._bot_name())
                 kind = "asleep"
+            elif facts.napping:
+                name = facts.activity_name or "休息"
+                line = BOUNDARY_GROUP_REST_LINE_DEFAULT.format(
+                    bot_name=self._bot_name(), activity=name)
+                kind = "rest"
             else:
                 name = facts.activity_name or "手头的事"
                 line = BOUNDARY_GROUP_DEEP_WORK_LINE_DEFAULT.format(
