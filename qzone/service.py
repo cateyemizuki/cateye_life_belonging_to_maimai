@@ -857,7 +857,7 @@ class QzoneService:
             self._log("skip", trigger_type="qzone_post", reason=f"[{gate}] {reason}")
 
     def decision_history_text(self, limit: int = 10) -> str:
-        """发帖判定历史文本（/lbm_life qzone decisions 用；进程内 deque，重启清零）。"""
+        """发帖判定历史文本（/lbm qzone decisions 用；进程内 deque，重启清零）。"""
         return self._decision_history.format_text(limit=limit)
 
     async def collect_moment_images(self, text: str) -> List[bytes]:
@@ -1443,7 +1443,7 @@ class QzoneService:
         )
 
     def status_snapshot(self) -> Dict[str, Any]:
-        """聚合总览用的只读状态快照（M7 /lbm_dashboard 消费）。
+        """聚合总览用的只读状态快照（M7 /lbm status dashboard 消费）。
 
         只读：不发起任何空间动作、不落盘；数值与 ``status_text()`` 同源
         （``posts_today`` / 通道缓存 / cookie 文案 / 评论监听开关），

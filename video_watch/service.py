@@ -157,7 +157,7 @@ class VideoWatchService:
             elif source == "schedule" and episode_id:
                 owner = f"schedule:{episode_id}"
             elif source == "debug" and episode_id:
-                # PR-WATCH：/lbm_plan watch 调试强制观看——引用身份与 schedule 隔离
+                # PR-WATCH：/lbm plan watch 调试强制观看——引用身份与 schedule 隔离
                 # （收尾只释放自己的引用，不误杀日程/用户引用）；submit 注意力闸与
                 # 运行期守卫只约束 source=="schedule"，debug 自然放行（额度/候选/
                 # 防重门不变）。manager 台账 source 归一为 tool，消息钩子

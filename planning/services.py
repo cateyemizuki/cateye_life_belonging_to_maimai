@@ -120,7 +120,7 @@ class PlanningServices:
             plugin._event_catalog = self.event_catalog
         except Exception:
             pass
-        # ── PR5 统一初始化服务（/lbm_init 的业务层）：单实例、无后台 task ──────────
+        # ── PR5 统一初始化服务（/lbm ops init 的业务层）：单实例、无后台 task ──────────
         # 事件统一走上面的 EventCatalogService.refresh(manual=True)（不重复生成/预算）；
         # 频率校准走 PR6 公共口 self.calibrate_target_frequency。
         self.init = InitService(

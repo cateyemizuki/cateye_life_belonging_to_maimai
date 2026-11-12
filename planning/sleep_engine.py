@@ -857,7 +857,7 @@ class SleepEngine:
         return bool(getattr(getattr(self._cfg_obj(), "schedule", None), "enabled", False))
 
     def diagnostics(self) -> Dict[str, Any]:
-        """只读诊断（不触发任何写入；供 /lbm_life rolling 与报告核对）。"""
+        """只读诊断（不触发任何写入；供 /lbm diag rolling 与报告核对）。"""
         session = self._session
         result = {
             "enabled": self.enabled,

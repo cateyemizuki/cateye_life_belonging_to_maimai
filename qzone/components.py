@@ -3,13 +3,14 @@
 组件清单：
 - Tools ×1：lbm_life_qzone（action=post 发说说，留空自动生成文案，按 [qzone].image_mode 自动配图；
   action=moments 查最近说说）
-- Command ×1：/lbm_life（status | qzone [moments/comments/post/reply/like/decisions] | diag | help；
-  diag 为 /lbm_diag life 的旧名别名，行为不变）
+- Command：无独立入口；空间组与生活状态由双语根命令 ``/lbm`` / ``/麦麦生活``
+  经 ``core/command_registry.py`` 引用本 Mixin 的 handler
+  （2026-11-13 命令体系重构：旧 ``/lbm_life`` 注册已删除）。
 
 约定（与 planning/companion 的 mixin 一致）：
-- 方法名 `qzone_` 前缀（私有助手 `_qz_` 前缀），组件名 `lbm_life_*` / `lbm_life_suite`；
+- 方法名 `qzone_` 前缀（私有助手 `_qz_` 前缀），Tool 组件名沿用 `lbm_life_*`；
 - 方法开头判空 ``getattr(self, "_qzone", None)``（服务束未挂上时降级）；
-- 状态聚合（/lbm_life status）同时展示 companion / planning / qzone 三个子模块。
+- 状态聚合（status/life）同时展示 companion / planning / qzone 三个子模块。
 """
 
 from __future__ import annotations
@@ -17,16 +18,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, ClassVar, Dict
 
-from maibot_sdk import Command, Tool
+from maibot_sdk import Tool
 
 
 class QzoneComponentsMixin:
-    """QQ 空间组件（1 Tool + 1 Command）。"""
+    """QQ 空间组件（1 Tool + 0 独立 Command；命令面经双语根注册表）。"""
 
     qzone_components_info: ClassVar[Dict[str, str]] = {
         "lbm_life_qzone": "Tool：空间运营合一（action=post 发说说/留空自动生成文案；action=moments 查最近说说）",
-        "lbm_life_suite": "Command：/lbm_life status|qzone|diag|help"
-                                 "（diag = /lbm_diag life 的旧名别名）",
+        "lbm_command_root": "Command：双语双根命令 /lbm 与 /麦麦生活（6 组 + help；"
+                            "空间组 = /lbm qzone status|moments|comments|post|reply|like|decisions|video）",
     }
 
     # ============================================================
@@ -97,15 +98,18 @@ class QzoneComponentsMixin:
         return max(0, self.config.qzone.daily_max_posts - qz.posts_today())
 
     # ============================================================
-    # Command：/lbm_life
+    # 空间/生活组 handler（2026-11-13 双语根命令注册表引用）
     # ============================================================
-    @Command("lbm_life_suite",
-             description="属于麦麦的生活管理命令（/lbm_life status|qzone|diag|help）",
-             pattern=r"(?P<life_cmd>(?<!\S)/lbm_life(?:\s+(?P<life_args>.*))?)\s*$")
     async def qzone_cmd_life(self, text: str = "", stream_id: str = "", user_id: str = "",
                              is_local_operator: bool = False, **kwargs: Any) -> tuple[bool, str, bool]:
+        """空间组内部分发：``status`` / ``qzone <action> ...`` / ``qzone_video ...``。
+
+        用户面入口只有 ``/lbm qzone ...`` 与 ``/麦麦生活 空间 ...``（注册表 handler
+        ``cmd_qzone_entry`` 调用本方法）；旧 ``/lbm_life`` 命令与 diag/rolling 分支已删除。
+        """
+        del text
         args = str((kwargs.get("matched_groups") or {}).get("life_args") or "").strip()
-        sub, *rest = args.split(maxsplit=1) if args else ("help", "")
+        sub, *rest = args.split(maxsplit=1) if args else ("", "")
         admin = self._qz_is_admin(str(user_id), bool(is_local_operator))
         if sub in ("help", ""):
             reply = self._qz_help_text()
@@ -113,35 +117,36 @@ class QzoneComponentsMixin:
             reply = self._qz_status_text()
         elif sub == "qzone":
             reply = await self._qz_handle_qzone(rest[0].strip() if rest else "", admin)
-        elif sub == "diag":
-            if not admin:
-                reply = "权限不足：仅管理员可用 /lbm_life diag。"
-            else:
-                try:
-                    days = max(1, min(7, int((rest[0].strip() or "1") if rest else 1)))
-                except ValueError:
-                    days = 1
-                reply = self._qz_diag_text(days)
-        elif sub == "rolling":
-            # R7 滚动化调试命令（R7 依据 = 用户 2026-10-25 直派【日程系统滚动化改造】）：
-            # 实现集中在 companion/components.py 的 _lbm_life_rolling 单一函数，
-            # 本分发表只加这一行——移除时删函数 + 本行即净（「便利移除」用户要求）。
-            reply = (self._lbm_life_rolling(rest[0].strip() if rest else "") if admin
-                     else "权限不足：仅管理员可用 /lbm_life rolling。")
-        elif sub == "share":
-            # 视频分享运维：status 只读诊断，clear 经管理员显式确认清除 uncertain 回执。
-            # 实现集中在 integrations/video_share_diag.py，本分发表只加这一行。
-            reply = (self._lbm_life_share(rest[0].strip() if rest else "") if admin
-                     else "权限不足：仅管理员可用 /lbm_life share。")
         elif sub == "qzone_video":
-            # PR-A3 空间视频运维：status 只读诊断，clear 经管理员显式确认清除 uncertain 回执。
-            # 实现集中在 integrations/qzone_video_diag.py，本分发表只加这一行（命令总数不变）。
             reply = (self._lbm_life_qzone_video(rest[0].strip() if rest else "") if admin
-                     else "权限不足：仅管理员可用 /lbm_life qzone_video。")
+                     else "权限不足：仅管理员可用 空间/视频。")
+        elif sub == "share":
+            reply = (self._lbm_life_share(rest[0].strip() if rest else "") if admin
+                     else "权限不足：仅管理员可用 运维/分享。")
         else:
             reply = f"未知子命令：{sub}\n{self._qz_help_text()}"
         await self.ctx.send.text(reply, stream_id)  # 命令回复必须显式发送
-        return True, "life done", True
+        return True, "qzone done", True
+
+    async def cmd_status_life(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
+        """status/life → 既有生活状态聚合（public）。"""
+        del cmd, args
+        stream_id = str(kwargs.get("stream_id", "") or "")
+        await self.ctx.send.text(self._qz_status_text(), stream_id)
+        return True, "生活状态已发送", True
+
+    async def cmd_qzone_entry(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
+        """qzone/* → 既有空间命令分发（status/moments/comments/post/reply/like/
+        decisions/video）；admin 闸在分发器，handler 内保留 qzone 防御式判定。"""
+        key = str(getattr(cmd, "key", "") or "")
+        prefix = "qzone_video" if key == "video" else "qzone"
+        life_args = " ".join([prefix, *[str(item) for item in args]]).strip()
+        return await self.qzone_cmd_life(
+            stream_id=str(kwargs.get("stream_id", "") or ""),
+            user_id=str(kwargs.get("user_id", "") or ""),
+            is_local_operator=bool(kwargs.get("is_local_operator", False)),
+            matched_groups={"life_args": life_args},
+        )
 
     # ------------------------------------------------------------
     # 私有助手
@@ -155,16 +160,14 @@ class QzoneComponentsMixin:
 
     def _qz_help_text(self) -> str:
         return (
-            "属于麦麦的生活命令：\n"
-            "/lbm_life status - 生活状态总览（好感度/巡检/日程/空间）\n"
-            "/lbm_life qzone - QQ空间状态｜moments 最近说说｜comments 说说评论列表\n"
-            "           （管理员：post 文本、reply 说说序号 [评论序号] 内容、like tid [目标QQ]、"
-            "decisions [条数] 发帖判定历史）\n"
-            "/lbm_life diag [天数] - 决策日志（管理员）；旧名别名，新入口为 /lbm_diag life，行为相同\n"
-            "/lbm_life rolling [status|state|episodes|spine|sleep|preview] - 滚动日程调试（管理员；纯只读）\n"
-            "/lbm_life share [status|clear <id> confirm] - 视频分享运维（管理员；status 只读，clear 需核验确未送达）\n"
-            "/lbm_life qzone_video [status|clear <id> confirm] - 空间视频运维（管理员；status 只读，clear 需核验确未送达）\n"
-            "/lbm_life help - 本帮助；日程与陪伴功能另有 /lbm_plan 与 /lbm_mai_* 命令"
+            "属于麦麦的生活命令（双根：/lbm 英文 · /麦麦生活 中文）：\n"
+            "/lbm status dashboard|life|affection|schedule — 状态/面板｜生活｜好感｜行程\n"
+            "/lbm plan list|regenerate|events|delete|clear|sleep|watch — 日程组\n"
+            "/lbm qzone status|moments|comments|post|reply|like|decisions|video — 空间组\n"
+            "/lbm emotion config — 情绪参数（管理员）\n"
+            "/lbm diag llm|decision|life|streams|video_share|qzone_video|rolling — 诊断组（管理员）\n"
+            "/lbm ops init|share — 运维组（管理员）\n"
+            "中文：/麦麦生活 状态|日程|空间|情绪|诊断|运维 ...；帮助：/lbm help 或 /麦麦生活 帮助"
         )
 
     def _qz_status_text(self) -> str:
@@ -209,7 +212,7 @@ class QzoneComponentsMixin:
         if action == "moments":
             moments = await qz.list_my_moments(num=10)
             if not moments:
-                return "最近没有说说，或空间接口不可用（查看 /lbm_life qzone status 的通道状态）。"
+                return "最近没有说说，或空间接口不可用（查看 /lbm qzone status 的通道状态）。"
             lines = []
             for idx, m in enumerate(moments, 1):
                 excerpt = str(m.get("content") or "")[:40] or "（无文字）"
@@ -219,7 +222,7 @@ class QzoneComponentsMixin:
             # Web CGI 读自己说说及其评论（含楼中楼），供 reply 定位
             feeds = await qz.list_own_feeds_with_comments(num=10)
             if not feeds:
-                return "读不到说说评论（cookie 未就绪或接口失败，见 /lbm_life qzone status）。"
+                return "读不到说说评论（cookie 未就绪或接口失败，见 /lbm qzone status）。"
             self_uin = self._qz_cookie_uin()
             lines = []
             for idx, feed in enumerate(feeds, 1):
@@ -228,13 +231,13 @@ class QzoneComponentsMixin:
                 for c_idx, c in enumerate(feed.get("comments") or [], 1):
                     owner = "（自己）" if str(c.get("qq_account")) == self_uin else ""
                     lines.append(f"   {idx}.{c_idx} {c.get('nickname', '?')}{owner}：{str(c.get('content'))[:36]}")
-            return "说说评论（序号用于 /lbm_life qzone reply 楼中楼回复）：\n" + "\n".join(lines[:40])
+            return "说说评论（序号用于 /lbm qzone reply 楼中楼回复）：\n" + "\n".join(lines[:40])
         if not admin:
             return "权限不足：需要管理员权限。"
         if action == "post":
             text = (rest[0].strip() if rest else "")
             if not text:
-                return "用法：/lbm_life qzone post <说说内容>"
+                return "用法：/lbm qzone post <说说内容>（中文 /麦麦生活 空间 发布 <正文>）"
             # P1-14：命令直发同样过闸——「整夜不发说说」是用户指示，管理员路径
             # 不豁免时段/冷却/严判闸（与 Tool、自动路径同口径）。
             allowed, gate_reason = await qz.check_post_gates()
@@ -253,7 +256,7 @@ class QzoneComponentsMixin:
             #   只给说说序号 = 普通评论；给「说说.评论」序号（或两个数字）= 楼中楼回复该评论
             parts = (rest[0].strip() if rest else "").split(maxsplit=2)
             if len(parts) < 2 or not parts[-1].strip():
-                return "用法：/lbm_life qzone reply <说说序号> [评论序号] <内容>（序号见 /lbm_life qzone comments）"
+                return "用法：/lbm qzone reply <说说序号> [评论序号] <内容>（序号见 /lbm qzone comments；中文 /麦麦生活 空间 回复）"
             nums = parts[0].replace(".", " ").split()
             try:
                 feed_idx = int(nums[0]) - 1
@@ -263,7 +266,7 @@ class QzoneComponentsMixin:
             content = parts[-1].strip()
             feeds = await qz.list_own_feeds_with_comments(num=10)
             if not (0 <= feed_idx < len(feeds)):
-                return "说说序号超出范围，先 /lbm_life qzone comments 查看。"
+                return "说说序号超出范围，先 /lbm qzone comments 查看。"
             feed = feeds[feed_idx]
             fid = str(feed.get("tid") or "")
             if comment_idx is None:
@@ -271,7 +274,7 @@ class QzoneComponentsMixin:
                 return "已评论。" if comment_id is not None else "评论失败。"
             comments = feed.get("comments") or []
             if not (0 <= comment_idx < len(comments)):
-                return "评论序号超出范围，先 /lbm_life qzone comments 查看。"
+                return "评论序号超出范围，先 /lbm qzone comments 查看。"
             c = comments[comment_idx]
             if str(c.get("qq_account")) == self._qz_cookie_uin():
                 return "这是自己发的评论，不需要回复。"
@@ -282,7 +285,7 @@ class QzoneComponentsMixin:
             # 用法：/life qzone like <tid> [目标QQ]（自己的说说省略目标QQ；好友说说传对方QQ号）
             parts = (rest[0].strip() if rest else "").split()
             if not parts:
-                return "用法：/lbm_life qzone like <说说tid> [目标QQ]"
+                return "用法：/lbm qzone like <说说tid> [目标QQ]（中文 /麦麦生活 空间 点赞）"
             target_qq = parts[1] if len(parts) > 1 else ""
             ok = await qz.like_moment(parts[0], target_uin=target_qq)
             return "已点赞。" if ok else "点赞失败。"
@@ -294,7 +297,7 @@ class QzoneComponentsMixin:
                 limit = 10
             text = qz.decision_history_text(limit=limit)
             return f"发帖判定历史（最近 {limit} 条，最新在前；重启后清零）：\n{text}"
-        return "未知空间子命令，用 /lbm_life help 查看。"
+        return "未知空间子命令，用 /lbm qzone 查看组帮助（/lbm help qzone）。"
 
     def _qz_cookie_uin(self) -> str:
         """当前空间 cookie 对应的 bot QQ 号（用于标注自己的评论；取不到返回空串）。

@@ -113,7 +113,7 @@ class DecisionHistory:
 
         只统计 ``action='skip'`` 的判定，按 ``gate`` 计数；每闸附最近一次拒绝的
         原因与时间（历史最新在前，首个命中即最近）。空 gate 归 ``unknown``。
-        供 /lbm_diag qzone_video 展示「为什么没发」；不修改历史。
+        供 /lbm diag qzone_video 展示「为什么没发」；不修改历史。
         """
         summary: Dict[str, Dict[str, Any]] = {}
         for entry in self._entries:

@@ -67,6 +67,7 @@ from core.diag import DecisionLogger, LLMCallLogger
 from core.life_experience_index import LifeExperienceIndex
 from integrations.proactive_delivery import ProactiveDelivery, install_proactive_budget
 from tools.proactive_turn import discard_turn, register_turn
+from tools.command_components import CommandRootComponentsMixin
 from core.llm_utils import LLMService, llm_task_name_of
 from emotion.components import EmotionComponentsMixin
 from emotion.services import EmotionServices
@@ -236,7 +237,8 @@ def _rescue_config_from_disk(config_data: object) -> tuple[object, bool]:
 
 
 class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, CompanionComponentsMixin, QzoneComponentsMixin,
-                        EmotionComponentsMixin, VideoWatchComponentsMixin, MaiBotPlugin):
+                        EmotionComponentsMixin, VideoWatchComponentsMixin,
+                        CommandRootComponentsMixin, MaiBotPlugin):
     config_model: ClassVar[type] = CateyeSuiteConfig
     # 订阅宿主 bot 配置热重载（人设/昵称变化自动同步）
     config_reload_subscriptions: ClassVar[Iterable[str]] = ("bot",)

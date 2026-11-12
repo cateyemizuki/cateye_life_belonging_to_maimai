@@ -1245,7 +1245,7 @@ class RefreshResult:
 
 
 class EventCatalogService:
-    """事件库服务（供 plugin 装配、planner 取池、/lbm_init events 调用）。
+    """事件库服务（供 plugin 装配、planner 取池、/lbm ops init events 调用）。
 
     构造参数（全部可选，便于离线测试与后续接线）：
 
@@ -1753,7 +1753,7 @@ class EventCatalogService:
         """生成一次并全量替换（manual=True 时错误逐条返回给调用方）。
 
         3.17.33：无论本次生成是否被执行（mode off/未到期），都先重读运行目录
-        初始事件库——``/lbm_init events`` 能让用户刚复制/删除的 JSON 立即生效。
+        初始事件库——``/lbm ops init events`` 能让用户刚复制/删除的 JSON 立即生效。
         D1：同时同步 ``[planning_events]`` 权重乘数（默认 1.0）。
         """
         self._apply_weight_multipliers()

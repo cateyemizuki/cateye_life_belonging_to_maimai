@@ -30,11 +30,10 @@ mixin 方法开头一律判空 ``getattr(self, "_companion", None)``（服务束
   过滤在 plugin.get_components override；F1 2026-11-04：目标私聊主动打扰口径纳入
   proactive_budget 记账、冷却落盘持久化、回执结构化判定）
   （原 current_activity / status / schedule 三工具已随 T6 注册面收口移除：
-  当前活动与日程查询见 lbm_get_schedule_info，状态总览见 /lbm_dashboard）
-- Commands ×4：/lbm_mai_affection（鉴权：target_qq 白名单 + 本机控制台，
-  占位默认值一律拒绝）｜/lbm_mai_help｜/lbm_diag（A5 排障四合一：
-  llm|decision|life|streams 子命令，旧名 /lbm_mai_llm_log、/lbm_mai_diag 与
-  /lbm_life diag 保留为别名；鉴权 = admin 判定）｜/lbm_dashboard
+  当前活动与日程查询见 lbm_get_schedule_info，状态总览见 /lbm status dashboard）
+- Commands：无独立注册；/lbm status affection 等由双语根命令注册表引用本 Mixin（鉴权：target_qq 白名单 + 本机控制台，
+  占位默认值一律拒绝）。排障诊断、状态面板等 handler 仍在 companion：
+  llm|decision|life|streams|video_share|qzone_video 子命令；鉴权 = admin 判定。
   （M7 聚合总览：四模块状态图 + 纯文本降级，文本档展开完整日程并附配置摘要；
   鉴权同 admin 判定；渲染失败/超时静默降级为纯文本）
   （原 /mai_status、/mai_schedule、/mai_config、/mai_test 四条命令已移除：状态/日程
@@ -61,7 +60,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cateye_dashboard
-from maibot_sdk import API, Command, HookHandler, Tool
+from maibot_sdk import API, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from companion.affection_events import classify_greeting_exchange, record_rule_event
@@ -181,7 +180,7 @@ def typing_delay_seconds(chars: Any, energy: Any, *,
     extra_value = max(TYPING_DELAY_JITTER_MIN, min(TYPING_DELAY_JITTER_MAX, extra_value))
     return max(0.0, min(limit, base + extra_value))
 
-#: 主动行为决策日志里的跳过原因 → 中文说明（/lbm_diag decision 展示用）。
+#: 主动行为决策日志里的跳过原因 → 中文说明（/lbm diag decision 展示用）。
 _DIAG_REASON_LABELS: dict[str, str] = {
     "no_candidate": "本轮没有满足条件的触发",
     "silence": "处于静默时段",
@@ -204,17 +203,18 @@ _DIAG_REASON_LABELS: dict[str, str] = {
     "tool_send_message": "planner 通过 Tool 主动发消息",
 }
 
-#: /lbm_diag 用法帮助（无参数或未知子命令时原样回复；含旧名别名对应关系）。
-#: PR-D1（H10）：追加 qzone_video 只读子输出（命令总数不变，仍是同一个 /lbm_diag）。
+#: 诊断组用法帮助（直调兜底；用户面入口统一走 /lbm diag 或 /麦麦生活 诊断）。
+#: 2026-11-13 命令体系重构：旧 /lbm_diag 注册与 legacy 别名已删除。
 _DIAG_USAGE_TEXT = (
-    "用法: /lbm_diag <llm|decision|life|streams|video_share|qzone_video> [天数]（管理员）\n"
-    "  llm [天数]      — LLM 调用日志，合并转发（1~30 天；旧名 /lbm_mai_llm_log）\n"
-    "  decision [天数] — 主动行为决策日志，合并转发（1~30 天；旧名 /lbm_mai_diag）\n"
-    "  life [天数]     — 决策日志紧凑文本（1~7 天；旧名 /lbm_life diag）\n"
-    "  streams [序号]  — 主动候选流与名单状态；带序号只看该流早/晚安触发状态"
-    "（今日最后一条非命令消息时间）\n"
+    "用法: /lbm diag <llm|decision|life|streams|video_share|qzone_video|rolling> [天数]（管理员）\n"
+    "      /麦麦生活 诊断 <模型|决策|生活|会话|视频分享|空间视频|滚动> [天数]\n"
+    "  llm [天数]      — LLM 调用日志，合并转发（1~30 天）\n"
+    "  decision [天数] — 主动行为决策日志，合并转发（1~30 天）\n"
+    "  life [天数]     — 决策日志紧凑文本（1~7 天）\n"
+    "  streams [序号]  — 主动候选流与名单状态；带序号只看该流早/晚安触发状态\n"
     "  video_share     — 视频分享决策、发送回执与事实同步状态（仅目标私聊或本地）\n"
-    "  qzone_video     — 空间视频全链只读诊断：候选状态/最近决策及原因/资产清单/发布回执（含 uncertain）/事实同步/门控拒绝聚合"
+    "  qzone_video     — 空间视频全链只读诊断（候选/决策/资产/回执/事实同步/门控拒绝）\n"
+    "  rolling [子项]  — 滚动日程只读调试（status|state|episodes|spine|sleep|preview）"
 )
 
 #: 注入作用域（2026-10-10 注入矩阵：目标私聊 / 含陪伴用户的群聊 / 跳过）
@@ -2059,8 +2059,43 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 pass
         return False
 
-    @Command(name="/lbm_mai_affection", pattern=r"(?<!\S)/lbm_mai_affection(?:\s+(?P<mai_level>\S+))?\s*$",
-             description="查看/调整好感度（score/baseline/档位/今日Δ）。用法: /lbm_mai_affection [档位1~N]")
+    # ============================================================
+    # 双语根命令 handler 适配（2026-11-13 命令体系重构）
+    # 业务仍在既有方法内；这里只把注册表 entry 翻成既有参数形态。
+    # ============================================================
+
+    async def cmd_status_dashboard(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
+        """status/dashboard → 既有聚合状态总览（admin 闸在分发器）。"""
+        del cmd, args
+        return await self.mai_cmd_dashboard(**kwargs)
+
+    async def cmd_status_affection(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
+        """status/affection → 既有好感档位查看/调整（target 白名单仍在方法内）。"""
+        del cmd
+        level = str(args[0]) if args else ""
+        return await self.mai_cmd_affection(
+            matched_groups={"mai_level": level}, **kwargs)
+
+    async def cmd_diag_entry(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
+        """diag/* → 既有诊断各分支；rolling 走只读滚动调试渲染。"""
+        stream_id = str(kwargs.get("stream_id", "") or "")
+        key = str(getattr(cmd, "key", "") or "")
+        if key == "rolling":
+            reply = self._lbm_life_rolling(" ".join(str(item) for item in args))
+            await self.ctx.send.text(reply, stream_id)
+            return True, "滚动诊断已发送", True
+        diag_args = " ".join([key, *[str(item) for item in args]]).strip()
+        return await self.mai_cmd_diag(
+            matched_groups={"diag_args": diag_args}, **kwargs)
+
+    async def cmd_ops_share(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
+        """ops/share → 既有视频分享运维（status 只读 / clear 需确认）。"""
+        del cmd
+        stream_id = str(kwargs.get("stream_id", "") or "")
+        reply = self._lbm_life_share(" ".join(str(item) for item in args))
+        await self.ctx.send.text(reply, stream_id)
+        return True, "视频分享运维已发送", True
+
     async def mai_cmd_affection(self, **kwargs: Any) -> tuple[bool, str, bool]:
         companion = self._mai_companion()
         if not await self._authorize_command(kwargs):
@@ -2091,7 +2126,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             # 不带参数 = 查看好感状态（M2：含最近印象与关系温度）
             current = self._mai_affection_state_line() if companion else "好感度管理器未初始化。"
             await _reply(
-                f"用法: /lbm_mai_affection <1~{tier_count}>（不带参数只看状态）\n"
+                f"用法: /lbm status affection <1~{tier_count}>"
+                f"（中文 /麦麦生活 状态 好感 <1~{tier_count}>；不带参数只看状态）\n"
                 f"档位（预设「{companion.affection.preset_name() if companion else '恋人'}」）：{usage}"
                 f"（score 移至该档区间中值）\n"
                 f"当前状态: {current}"
@@ -2112,28 +2148,6 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         self.ctx.logger.info(f"好感度已通过命令调整到第 {tier_1based} 档（score 移至对应区间中值）")
         await _reply(f"好感度已更新：{self._mai_affection_state_line()}")
         return True, "好感度已调整", True
-
-    @Command(name="/lbm_mai_help", pattern=r"(?<!\S)/lbm_mai_help\s*$",
-             description="查看麦麦陪伴所有可用命令")
-    async def mai_cmd_help(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        if not await self._authorize_command(kwargs):
-            return True, "没有权限", True
-        stream_id = str(kwargs.get("stream_id", "") or "")
-        name = self._mai_lover_name()
-        help_text = (
-            f"{name} 可用命令:\n"
-            "/lbm_mai_affection — 查看/调整好感度: /lbm_mai_affection <1~档位数>\n"
-            "/lbm_diag          — 排障诊断 [llm|decision|life] [天数]（管理员；旧名 mai_llm_log/mai_diag 仍可用）\n"
-            "/lbm_dashboard     — 状态总览图（日程/关系/情绪/空间，管理员）\n"
-            "日程与生活管理见 /lbm_plan 与 /lbm_life\n"
-            "/lbm_mai_help      — 本帮助"
-        )
-        try:
-            await self.ctx.send.text(text=help_text, stream_id=stream_id)
-            return True, "帮助已发送", True
-        except Exception as e:
-            self.ctx.logger.error(f"mai_cmd_help 发送失败: {e}")
-            return False, f"发送失败: {e}", True
 
     def _activity_preference_diag_line(self) -> str:
         """P3 复核修复（3.17.33）：偏好缓存/持久 pending/今日请求的只读一行。
@@ -2164,42 +2178,24 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                     f"/{int(status.get('daily_limit') or 0)}")
         return '日程偏好：' + ' · '.join(bits)
 
-    @Command(
-        name="/lbm_diag",
-        pattern=r"(?<!\S)/lbm_diag(?:\s+(?P<diag_args>.*?))?\s*$"
-                r"|(?<!\S)(?P<legacy_llm>/lbm_mai_llm_log)(?:\s+(?P<llm_days>\S+))?\s*$"
-                r"|(?<!\S)(?P<legacy_decision>/lbm_mai_diag)(?:\s+(?P<mai_days>\S+))?\s*$",
-        description="排障诊断合一：/lbm_diag [llm|decision|life|streams|video_share|qzone_video] [天数]"
-                    "（旧名 mai_llm_log/mai_diag/life diag 保留为别名）",
-    )
     async def mai_cmd_diag(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        """A5 排障合一：llm / decision / life / streams / video_share / qzone_video
-        子命令 + 旧命令名别名直达（qzone_video 为 PR-D1 H10 只读子输出，命令总数不变）。
+        """diag 组业务主体：llm / decision / life / streams / video_share /
+        qzone_video（2026-11-13 起由双语根命令 ``cmd_diag_entry`` 调用；旧
+        ``/lbm_diag`` 注册与 legacy 别名分支已删除，用户面入口只有
+        ``/lbm diag ...`` 与 ``/麦麦生活 诊断 ...``）。
 
-        输出与旧三件套完全同构（llm = 旧 /lbm_mai_llm_log、decision = 旧
-        /lbm_mai_diag、life = 旧 /lbm_life diag 紧凑文本）；旧名由
-        pattern 的 ``legacy_llm`` / ``legacy_decision`` 命名捕获进入同一逻辑（同一组件，
-        零组件成本）。``streams``（2026-10-20 用户指示）输出主动候选流/名单状态，
-        §25.2 起改合并转发送出（§26.1 起为多节点布局：固定 2 节点 + 群聊/私聊切片；
-        R7：用户 2026-10-21 追加三直派②、2026-10-22 三直派）。
-        鉴权统一收归 admin 判定（旧 mai_diag/llm_log 走 target 白名单、
-        旧 life diag 走 admin，收归后口径见 USAGE）。
+        ``streams`` 输出主动候选流/名单状态，§25.2 起改合并转发送出（`§26.1` 起为
+        多节点布局：固定 2 节点 + 群聊/私聊切片）。鉴权统一由分发器 admin 闸执行，
+        本方法保留同名兜底（防御式，同一 ``admin_users``/本机控制台口径）。
         """
         stream_id = str(kwargs.get("stream_id", "") or "")
         if not self._qz_is_admin(str(kwargs.get("user_id") or ""),
                                  bool(kwargs.get("is_local_operator", False))):
-            await self._diag_reply(stream_id, "权限不足：仅管理员可用 /lbm_diag。")
+            await self._diag_reply(stream_id, "权限不足：仅管理员可用诊断命令。")
             return True, "没有权限", True
 
         groups = kwargs.get("matched_groups")
         groups = groups if isinstance(groups, dict) else {}
-        if str(groups.get("legacy_llm") or "").strip():
-            return await self._diag_llm_log(
-                stream_id, self._diag_parse_days_arg(groups.get("llm_days")))
-        if str(groups.get("legacy_decision") or "").strip():
-            return await self._diag_decision_log(
-                stream_id, self._diag_parse_days_arg(groups.get("mai_days")))
-
         parts = str(groups.get("diag_args") or "").split()
         sub = parts[0].lower() if parts else ""
         raw_days = parts[1] if len(parts) > 1 else ""
@@ -2209,7 +2205,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 return True,'诊断范围受限',True
             service=getattr(self,'_video_social',None)
             payload=service.snapshot() if service is not None else {'status':'unavailable'}
-            # PR-B1：经历索引 count/recent 只读诊断（挂既有 /lbm_diag video_share，
+            # PR-B1：经历索引 count/recent 只读诊断（挂既有 /lbm diag video_share，
             # 命令总数不变；开关关闭时已有数据仍保留只读）。失败空降级。
             index=getattr(self,'_experience_index',None)
             try:
@@ -2220,10 +2216,10 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             await self._diag_reply(stream_id,'视频独立分享诊断\n'+_json.dumps(payload,ensure_ascii=False,indent=1)[:10000])
             return True,'视频分享诊断已发送',True
         if sub == 'qzone_video':
-            # PR-D1（H10）：既有 /lbm_diag 挂只读子输出（命令总数不变）——候选状态
+            # PR-D1（H10）：既有 /lbm diag 挂只读子输出（命令总数不变）——候选状态
             # 分布/最近决策及原因/资产清单（id/尺寸/TTL，无路径）/发布回执（含
             # uncertain）/事实同步/门控拒绝聚合。零 LLM、零发送、零落盘；鉴权沿用
-            # 顶部 admin 判定（与 /lbm_life qzone_video status 同口径，无聊天正文）。
+            # 顶部 admin 判定（与 /lbm qzone video status 同口径，无聊天正文）。
             payload = qzone_video_diag_payload(self)
             await self._diag_reply(stream_id,'空间视频全链诊断（只读）\n'+_json.dumps(payload,ensure_ascii=False,indent=1)[:10000])
             return True,'空间视频诊断已发送',True
@@ -2232,7 +2228,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if sub == "decision":
             return await self._diag_decision_log(stream_id, self._diag_parse_days_arg(raw_days))
         if sub == "life":
-            # 天数保持旧 /lbm_life diag 语义：1~7，缺省/非法一律 1
+            # 天数保持旧 /lbm diag life 语义：1~7，缺省/非法一律 1
             days = self._diag_parse_days_arg(raw_days, lo=1, hi=7) or 1
             # P3 复核修复（3.17.33）：附一行只读偏好缓存/待评估/今日请求计数。
             await self._diag_reply(stream_id, self._qz_diag_text(days) + "\n"
@@ -2253,15 +2249,11 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         await self._diag_reply(stream_id, _DIAG_USAGE_TEXT)
         return True, ("用法已发送" if not sub else f"未知子命令: {sub}"), True
 
-    @Command(
-        name="/lbm_dashboard",
-        pattern=r"(?<!\S)/lbm_dashboard\s*$",
-        description="聚合总览四模块状态（日程/关系/情绪/空间）并渲染状态图，失败自动降级纯文本",
-    )
     async def mai_cmd_dashboard(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        """M7 聚合状态指令：四模块状态块 → 状态图 + 纯文本。
+        """聚合状态总览业务主体（2026-11-13 起由 ``/lbm status dashboard`` /
+        ``/麦麦生活 状态 面板`` 经注册表 handler 调用）。
 
-        发送形态同 planning/command_service.py 的 ``/lbm_plan list``：有图 → 合并转发
+        发送形态同 planning/command_service.py 的日程图：有图 → 合并转发
         （第一条图片、第二条文字）；转发失败回退 ``send.image`` → ``send.text``；
         无图（PIL 缺失/绘制异常/超时）直接发纯文本，全程静默降级不发失败提示。
         文本档末行追加配置摘要（A5：mai_config Tool 并入此处；读配置异常则跳过该行）。
@@ -2269,7 +2261,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if not self._qz_is_admin(str(kwargs.get("user_id") or ""),
                                  bool(kwargs.get("is_local_operator", False))):
             try:
-                await self.ctx.send.text("权限不足：仅管理员可用 /lbm_dashboard。",
+                await self.ctx.send.text("权限不足：仅管理员可用 状态/面板。",
                                          str(kwargs.get("stream_id", "") or ""))
             except Exception:
                 pass
@@ -2336,7 +2328,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     # ---- 命令辅助 ----
 
     def _mai_dashboard_blocks(self, now: Optional[datetime] = None) -> dict[str, Any]:
-        """聚合四模块状态块（M7 /lbm_dashboard 的数据面）。
+        """聚合四模块状态块（M7 /lbm status dashboard 的数据面）。
 
         live 判定必须真实走服务束属性链（不是只看束对象是否存在）：属性名与各束实现
         一致，静态可达性由 behavior 的组件门面审计断言（组件调了不存在的属性会当场红）。
@@ -2626,7 +2618,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             return image_base64
         except Exception as exc:
             # 静默降级：不提示失败，仅记录日志供排查
-            self.ctx.logger.info(f"/lbm_dashboard 状态图绘制放弃（静默降级为文本）: {exc}")
+            self.ctx.logger.info(f"/lbm status dashboard 状态图绘制放弃（静默降级为文本）: {exc}")
             return None
 
     def _mai_affection_state_line(self) -> str:
@@ -2672,7 +2664,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             self.ctx.logger.warning(f"mai_cmd_diag 回复发送失败: {e}")
 
     async def _mai_diag_streams_records(self) -> list[dict[str, Any]]:
-        """``/lbm_diag streams`` 合并转发节点主体；实现见 companion/streams_diag.py（P2-06）。"""
+        """``/lbm diag streams`` 合并转发节点主体；实现见 companion/streams_diag.py（P2-06）。"""
         return await build_streams_records(self)
 
     async def _mai_diag_stream_index(self) -> tuple[Any, Dict[str, str], List[tuple]]:
@@ -2746,7 +2738,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
 
     async def _mai_diag_stream_status(self, stream_id: str,
                                       raw_num: Any) -> tuple[bool, str, bool]:
-        """``/lbm_diag streams <序号>``：指定问候候选流的早/晚安触发状态快照（§26.2）。
+        """``/lbm diag streams <序号>``：指定问候候选流的早/晚安触发状态快照（§26.2）。
 
         单节点 ``[流 #NN {label}]``，早/晚各一行结论 + 一行「当前判定关键量」；
         序号越界/非数字/0/负数 → 单节点提示可用序号范围与用法（经 forward，失败按
@@ -2774,10 +2766,10 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             if num < 1 or num > total:
                 if total:
                     usage = (f"可用序号范围: #01~#{total:02d}；"
-                             f"用法: /lbm_diag streams <序号>")
+                             f"用法: /lbm diag streams <序号>")
                 else:
                     usage = ("当前无问候候选流（可用序号范围为空）；"
-                             "用法: /lbm_diag streams <序号>")
+                             "用法: /lbm diag streams <序号>")
                 shown = num_text if num_text else "（空）"
                 return await self._mai_send_forward(
                     [_record(f"[流状态] 「{shown}」不是有效序号（需正整数）。\n  {usage}")],
@@ -2801,7 +2793,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 stream_id, "streams 流状态")
 
     async def _diag_llm_log(self, stream_id: str, days: Optional[int]) -> tuple[bool, str, bool]:
-        """diag llm 子命令 = 旧 /lbm_mai_llm_log（llm_logger 调用日志合并转发）。"""
+        """diag llm 子命令 = 旧 /lbm diag llm（llm_logger 调用日志合并转发）。"""
         companion = self._mai_companion()
         llm_logger = getattr(companion, "llm_logger", None) if companion else None
         if llm_logger is None or not llm_logger.enabled:
@@ -2819,7 +2811,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         return await self._mai_send_forward(records, stream_id, "LLM 日志")
 
     async def _diag_decision_log(self, stream_id: str, days: Optional[int]) -> tuple[bool, str, bool]:
-        """diag decision 子命令 = 旧 /lbm_mai_diag（决策日志合并转发）。"""
+        """diag decision 子命令 = 旧 /lbm diag decision（决策日志合并转发）。"""
         companion = self._mai_companion()
         decision_logger = getattr(companion, "decision_logger", None) if companion else None
         if decision_logger is None or not decision_logger.enabled:
@@ -2863,7 +2855,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     # ==================================================================
 
     def _mai_patrol_status_line(self) -> str:
-        """一行巡检运行状态（/lbm_diag decision 汇总与自诊断用）。"""
+        """一行巡检运行状态（/lbm diag decision 汇总与自诊断用）。"""
         companion = self._mai_companion()
         if companion is None:
             return ""
@@ -3139,17 +3131,17 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         return companion.affection.tier()
 
     # ==================================================================
-    # /lbm_life rolling（滚动化调试命令；R7 依据 = 用户 2026-10-25 直派）
+    # /lbm diag rolling（滚动化调试命令；R7 依据 = 用户 2026-10-25 直派）
     # ==================================================================
 
     def _lbm_life_rolling(self, args: str) -> str:
-        """`/lbm_life rolling` 只读诊断主体；实现见 companion/rolling_diag.py（P2-06）。"""
+        """`/lbm diag rolling` 只读诊断主体；实现见 companion/rolling_diag.py（P2-06）。"""
         return render_rolling(self, args)
 
     def _lbm_life_share(self, args: str) -> str:
-        """`/lbm_life share` 视频分享运维主体；实现见 integrations/video_share_diag.py。"""
+        """`/lbm ops share` 视频分享运维主体；实现见 integrations/video_share_diag.py。"""
         return render_share(self, args)
 
     def _lbm_life_qzone_video(self, args: str) -> str:
-        """`/lbm_life qzone_video` 空间视频运维主体（PR-A3）；实现见 integrations/qzone_video_diag.py。"""
+        """`/lbm qzone video` 空间视频运维主体（PR-A3）；实现见 integrations/qzone_video_diag.py。"""
         return render_qzone_video(self, args)

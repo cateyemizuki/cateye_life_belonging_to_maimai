@@ -1,4 +1,4 @@
-"""`/lbm_life share` 独立视频分享运维：只读诊断 + 经授权的人工清除。
+"""`/lbm ops share` 独立视频分享运维：只读诊断 + 经授权的人工清除。
 
 status 纯只读：零 LLM、零发送、零副作用。clear 仅在管理员显式确认某条 uncertain
 回执确未送达后，把它标记为确知未发（保留审计行、不删除证据），并将对应视频置终态
@@ -21,7 +21,7 @@ def _fmt_epoch(value: Any) -> str:
 
 def render_share(host: Any, args: str) -> str:
     usage = (
-        "用法: /lbm_life share <status|clear>（管理员）\n"
+        "用法: /lbm ops share <status|clear>（管理员）\n"
         "  status                     — 只读：运行模式/候选状态/uncertain 明细\n"
         "  clear <attempt_id> confirm — 核验确未送达后清除该 uncertain 回执（保留审计）"
     )
@@ -53,7 +53,7 @@ def render_share(host: Any, args: str) -> str:
         return '\n'.join(lines)
     if sub == 'clear':
         if len(parts) < 3 or parts[2].lower() != 'confirm':
-            return ("清除需显式确认：/lbm_life share clear <attempt_id> confirm\n"
+            return ("清除需显式确认：/lbm ops share clear <attempt_id> confirm\n"
                     "务必先核实该卡片确未送达，否则可能重复发送。")
         attempt_id = parts[1]
         result = ledger.resolve_uncertain(attempt_id)

@@ -1,9 +1,9 @@
 """EmotionComponentsMixin —— 情绪系统的 SDK 组件注册（装饰器方法）。
 
 组件清单（组件名带 lbm_ 前缀，与其他模块同规则）：
-- Command ×1：/lbm_emotion_config [reset|clear]（查看/重置）
+- Command：无独立注册；情绪组 /lbm emotion config（中文 /麦麦生活 情绪 配置）由双语根注册表引用
   （PR8 3.0.0：旧 /lbm_emotion_init 独立命令已删除，人设初始化统一经
-  /lbm_init emotion（InitService.run_emotion）执行；依据：用户 2026-10-27 授权直接清理）
+  /lbm ops init emotion（InitService.run_emotion）执行；依据：用户 2026-10-27 授权直接清理）
 - Tool ×1：lbm_emotion_report(event, is_target)（上报影响心情的事件；群聊 target 声明，M3）
   （原 lbm_emotion_mood 已随 T6 注册面收口移除：「你现在什么心情」类问答由情绪
   底色注入覆盖；injection_enabled=false 的组合不支持心情问答，见 USAGE.md）
@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, ClassVar, Dict, Optional
 
-from maibot_sdk import Command, HookHandler, Tool
+from maibot_sdk import HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from core.inject import (
@@ -35,10 +35,10 @@ from core.inject import (
 
 
 class EmotionComponentsMixin:
-    """情绪组件（1 Command + 1 Tool + 3 HookHandler）。"""
+    """情绪组件（0 独立 Command + 1 Tool + 3 HookHandler；命令面经双语根注册表）。"""
 
     emotion_components_info: ClassVar[Dict[str, str]] = {
-        "lbm_emotion_config": "Command：查看情绪参数；reset 子命令恢复默认",
+        "lbm_command_root": "Command：双语双根 /lbm 与 /麦麦生活（情绪组 emotion/config）",
         "lbm_emotion_report": "Tool：上报一件影响心情的事件；is_target 声明是否由重要的人引发（M3）",
         "emotion_planner_inject": "HookHandler：maisaka.planner.before_request 情绪底色注入（系统提示词后）",
         "emotion_replyer_model_inject": "HookHandler：maisaka.replyer.before_model_request 情绪底色注入（系统提示词后）",
@@ -55,11 +55,15 @@ class EmotionComponentsMixin:
         return bool(getattr(plugin_section, "enabled", True)) and bool(getattr(cfg, "enabled", True))
 
     # ============================================================
-    # Commands
+    # 情绪组 handler（2026-11-13 双语根命令注册表引用）
     # ============================================================
-    @Command("lbm_emotion_config",
-             description="查看情绪系统参数（锚点/偏移/乘数/当前VAD）；reset 子命令恢复默认",
-             pattern=r"(?<!\S)/lbm_emotion_config(?:\s+(?P<emo_args>\S+))?\s*$")
+    async def cmd_emotion_config(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
+        """emotion/config → 既有参数查看/重置/清空（admin 闸在分发器，方法内兜底）。"""
+        del cmd
+        arg = str(args[0]).lower() if args else ""
+        return await self.emo_cmd_config(
+            matched_groups={"emo_args": arg}, **kwargs)
+
     async def emo_cmd_config(self, **kwargs: Any) -> tuple[bool, str, bool]:
         svc = self._emo_service()
         stream_id = str(kwargs.get("stream_id", "") or "")

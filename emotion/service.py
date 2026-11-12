@@ -672,11 +672,11 @@ class EmotionService:
         }
 
     def params_summary(self) -> str:
-        """/lbm_emotion_config 查看文本。"""
+        """/lbm emotion config 查看文本。"""
         return presentation.params_summary(self._machine)
 
     def status_snapshot(self) -> Dict[str, Any]:
-        """聚合总览用的只读状态快照（M7 /lbm_dashboard 消费）。
+        """聚合总览用的只读状态快照（M7 /lbm status dashboard 消费）。
 
         只读：不落盘、不改状态机任何字段（含冻结标记）；数值口径与 ``params_summary`` /
         ``mood_text`` 同源（``labels`` 即 map_emotions 的前 3 个标签名，mood_text 取其中前 2 个）。

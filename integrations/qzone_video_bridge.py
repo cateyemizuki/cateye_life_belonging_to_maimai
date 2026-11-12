@@ -32,7 +32,7 @@ when the same key is already sent/uncertain/sending; ``request_key`` (= the
 after assembly) recovers crash residue: sending/claimed attempts → uncertain
 (never blind replay), claimed assets triaged by candidate state (posted→released,
 uncertain→kept as evidence, rejected/expired→file deleted), pending/deferred
-expiry re-checked; every action logged + persisted. ``/lbm_life qzone_video
+expiry re-checked; every action logged + persisted. ``/lbm qzone video
 status|clear`` offers read-only diagnosis and admin-verified manual clearance
 (reason=manual_verified_unsent, audit kept, no auto-resend). Posted-candidate
 fact write-back retries are bounded (≤3 tick retries then ``fact_sync=failed``);

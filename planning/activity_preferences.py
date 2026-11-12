@@ -190,7 +190,7 @@ class ActivityPreferencesService:
         self._total_requests = 0
         self._total_tokens = 0
         self._backoff_until: Optional[datetime] = None
-        #: 最近一次评估/排空状态（诊断只读；pending 清除后仍保留，便于 /lbm_diag
+        #: 最近一次评估/排空状态（诊断只读；pending 清除后仍保留，便于 /lbm diag
         #: 看到「上次为何停下」）。
         self._last_status = ""
         #: 持久 pending：睡眠中被忙闲门/上限/退避挡下时留痕，醒后/下次清醒拍续排。

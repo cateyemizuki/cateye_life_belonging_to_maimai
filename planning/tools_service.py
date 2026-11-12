@@ -119,7 +119,7 @@ class ToolsService:
             "no_sleep_mode": cfg.no_sleep_mode,
             # PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：spine 为唯一
             # 生成路线，mode 恒 "spine"（原 [schedule].spine_mode 三元随退役键删除）；
-            # regenerate 链（/lbm_plan regenerate 与 update_schedule 的「今天」分支）与
+            # regenerate 链（/lbm plan regenerate 与 update_schedule 的「今天」分支）与
             # auto_scheduler 自动生成侧同口径；generator 侧 **kwargs 透传，零改动。
             "mode": "spine",
             "timezone": adv.timezone,
@@ -319,7 +319,7 @@ class ToolsService:
                                                    "episodes": [], "summary": {}}
 
     def list_runtime_lines(self, limit: int = 2) -> List[str]:
-        """``/lbm_plan list`` 的 runtime 只读补充行（供命令层直接追加到既有文字档）。
+        """``/lbm plan list`` 的 runtime 只读补充行（供命令层直接追加到既有文字档）。
 
         纯读、零写、零 LLM、零发送：runtime 未就绪 → 空列表（命令层保持旧输出）。
         命令层接入方式（后续统一接线）：``text += "\\n\\n" + "\\n".join(

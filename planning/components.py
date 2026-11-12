@@ -18,17 +18,18 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Dict, List
 
-from maibot_sdk import API, Command, HookHandler, Tool
+from maibot_sdk import API, HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 
 class PlanningComponentsMixin:
-    """日程规划组件（2 Tool + 1 Command + 1 API + 2 HookHandler）。
+    """日程规划组件（2 Tool + 0 独立 Command + 1 API + 2 HookHandler）。
 
     PR8 3.0.0 清退（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：
     旧别名 Tool ``lbm_update_schedule_v4`` 与 M9 赖床 Tool ``lbm_nap_lie_in``
-    已删除；保留 ``schedule_inject`` / ``schedule_inject_replyer`` /
-    ``lbm_planning`` 注册名；用户命令入口保持 /lbm_plan。
+    已删除；保留 ``schedule_inject`` / ``schedule_inject_replyer``。
+    2026-11-13 命令体系重构：``lbm_planning`` / ``lbm_init`` 两个 @Command 注册已删除，
+    日程组/运维组由双语根命令 ``/lbm`` / ``/麦麦生活`` 经注册表引用本 Mixin 的 handler。
     """
 
     # 供 SDK / 调试用的组件清单说明（不影响注册）
@@ -38,8 +39,7 @@ class PlanningComponentsMixin:
         "lbm_update_schedule": "Tool（规范名）：自然语言日程变更（唯一日程写入口；"
                                "角色裁判 today/future/reject；写 spine 意图/"
                                "pending_commitment，硬约定代码强制 hardness=hard）",
-        "lbm_planning": "Command：/lbm_plan 或 /lbm_规划（list/regenerate/delete/clear/help）",
-        "lbm_init": "Command：/lbm_init [emotion|events|status]（全量幂等/定向强制/只读；先插件开关再管理员）",
+        "lbm_command_root": "Command：双语双根 /lbm 与 /麦麦生活（日程组 plan/*、运维组 ops/init）",
         "get_current_activity": "API：当前活动快照（跨插件可调；日程未启用时 has_activity=False）",
         "schedule_inject": "HookHandler：maisaka.planner.before_request 日程注入",
         "schedule_inject_replyer": "HookHandler：maisaka.replyer.before_request 活动提醒注入",
@@ -84,16 +84,29 @@ class PlanningComponentsMixin:
         return await svc.tools.update_schedule(**kwargs)
 
     # ============================================================
-    # Command（/lbm_plan 或 /lbm_规划）
+    # 日程组 / 运维组 handler（2026-11-13 双语根命令注册表引用）
     # ============================================================
 
-    @Command(
-        "lbm_planning",
-        description="日程规划系统管理命令（支持 /lbm_plan 与 /lbm_规划）",
-        # 用负向前瞻代替 ^ 锚点——回复引用场景下命令不在文本开头；
-        # (?<!\S) 同时避免命中行中片段（照抄源插件 pattern）
-        pattern=r"(?P<planning_cmd>(?<!\S)/lbm_(?:plan|规划)(?:\s.*)?)$",
-    )
+    async def cmd_plan_entry(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
+        """plan/* 与 status/schedule → 既有 CommandService（含模块开关/权限/白名单）。
+
+        注册表 entry 的 ``key`` 已把 status/schedule 归一为 ``list``；业务分支、
+        输出格式与权限口径完全沿用 CommandService。
+        """
+        stream_id = str(kwargs.get("stream_id", "") or "")
+        svc = getattr(self, "_planning", None)
+        if svc is None:
+            if stream_id:
+                await self.ctx.send.text("插件未启用", stream_id)
+            return False, "插件未启用", True
+        return await svc.commands.execute_action(
+            action=str(getattr(cmd, "key", "") or ""),
+            args=[str(item) for item in args],
+            stream_id=stream_id,
+            user_id=str(kwargs.get("user_id", "") or ""),
+            is_local_operator=bool(kwargs.get("is_local_operator", False)),
+        )
+
     async def plan_command_planning(
         self,
         text: str = "",
@@ -105,7 +118,7 @@ class PlanningComponentsMixin:
         is_local_operator: bool = False,
         **kwargs: Any,
     ) -> tuple:
-        """``/lbm_plan`` 命令入口，转发给 CommandService。"""
+        """内部兼容入口（不再注册）；新用户面走 ``cmd_plan_entry``。"""
         del kwargs
         svc = getattr(self, "_planning", None)
         if svc is None:
@@ -122,12 +135,15 @@ class PlanningComponentsMixin:
             is_local_operator=bool(is_local_operator),
         )
 
-    @Command(
-        "lbm_init",
-        description="统一初始化：全量 / 情绪 / 事件库 / 只读状态",
-        # 只注册一次（全量/emotion/events/status 四态）；负向前瞻不用 ^ 锚点（回复引用场景）
-        pattern=r"(?P<init_cmd>(?<!\S)/lbm_init(?:\s+(?P<init_args>emotion|events|status))?\s*)$",
-    )
+    async def cmd_ops_init(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
+        """ops/init → 既有统一初始化；args 双语已在分发器归一。"""
+        del cmd
+        arg = str(args[0]).lower() if args else ""
+        if arg not in ("emotion", "events", "status"):
+            arg = ""
+        return await self.plan_command_init(
+            matched_groups={"init_args": arg}, **kwargs)
+
     async def plan_command_init(
         self,
         text: str = "",
@@ -139,7 +155,7 @@ class PlanningComponentsMixin:
         is_local_operator: bool = False,
         **kwargs: Any,
     ) -> tuple:
-        """``/lbm_init [emotion|events|status]``（PR5 公共入口，2026-10-27 接线）。
+        """``/lbm ops init [emotion|events|status]``（PR5 公共入口，2026-10-27 接线）。
 
         顺序（工单要求）：先 ``[plugin].enabled``，再管理员（``admin_users`` /
         本机控制台）。四态：缺省=全量（幂等）；``emotion``=强制情绪阶段
@@ -212,7 +228,7 @@ class PlanningComponentsMixin:
     @staticmethod
     def _init_is_admin(user_id: str, is_local_operator: bool = False,
                        admin_users: Any = None) -> bool:
-        """``/lbm_init`` 权限：本机控制台直通；否则精确匹配 ``admin_users``（末段 ID）。"""
+        """``/lbm ops init`` 权限：本机控制台直通；否则精确匹配 ``admin_users``（末段 ID）。"""
         if is_local_operator:
             return True
 

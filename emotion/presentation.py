@@ -1,8 +1,8 @@
 """情绪展示与只读状态摘要（P2-07 第二阶段自 emotion/service.py 下沉）。
 
 只依赖状态机对象、映射表文字与 VAD 纯函数，不持有服务状态、不落盘、不调 LLM；
-EmotionService 保留同名方法作为薄包装。外部调用面（`/lbm_emotion_config`、
-`/lbm_dashboard`、planner/replyer 注入）语义不变。
+EmotionService 保留同名方法作为薄包装。外部调用面（`/lbm emotion config`、
+`/lbm status dashboard`、planner/replyer 注入）语义不变。
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def emotion_description_text(vad: Any, descriptions_map: Optional[Dict[str, Any]
 
 
 def params_summary(machine: Any) -> str:
-    """/lbm_emotion_config 查看文本。"""
+    """/lbm emotion config 查看文本。"""
     p = machine.params
     eff = machine.effective_vad()
     labels, _ = map_emotions(eff)

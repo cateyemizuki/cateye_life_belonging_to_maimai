@@ -180,12 +180,12 @@ from suite_prompts import (
 # （schema 不变，202 叶子）；3.8.0 已落地 P1–P3 不重复开发，本批以 14 例回归
 # 矩阵加固为主（scratch/test_sleep_consistency_c3.py），按 R6 双号同步递增。
 # 3.16.0（2026-11-07 PR-D1 空间多日主题延续与全链诊断）：无新增配置字段
-# （schema 不变，202 叶子）；主题记忆复用 B1 索引不新建表，诊断挂既有 /lbm_diag
+# （schema 不变，202 叶子）；主题记忆复用 B1 索引不新建表，诊断挂既有 /lbm diag
 # 只读子输出（命令总数不变），WebUI 系统板块加计数芯片，按 R6 双号同步递增。
 # 3.16.1（2026-11-07 PR-AUDIT 提示词统一人设前缀与重复人设清理）：无新增配置字段
 # （schema 不变，18 段 202 叶子）；QZONE_POST_GATE_DEFAULT 默认模板内容变更但
 # [prompts] 字段面不变（自定义模板保持），按 R6 双号同步递增。
-# 3.17.0（2026-11-07 PR-WATCH /lbm_plan watch 改为强制 debug 命令并行触发）：无新增
+# 3.17.0（2026-11-07 PR-WATCH /lbm plan watch 改为强制 debug 命令并行触发）：无新增
 # 配置字段（schema 不变，18 段 202 叶子）；debug 强制是命令固有语义（force_debug
 # 仅命令路径置位），不新增配置键，按 R6 双号同步递增。
 # 3.17.1（2026-11-07 PR-FIX-ASSET 修复空间视频判定 asset_ids 恒空）：无新增配置字段

@@ -1480,7 +1480,7 @@ class ProactiveService:
     async def stream_display_labels(self) -> Dict[str, str]:
         """诊断用「session_id → 显示名」映射（R7 依据 = 用户 2026-10-21 追加三直派①计划书 §二十五）。
 
-        供 ``/lbm_diag streams``（companion/components.py ``_mai_diag_streams_records``，
+        供 ``/lbm diag streams``（companion/components.py ``_mai_diag_streams_records``，
         §25.2 起 records 化、§26.1 起按群聊/私聊切片）把纯 sid 展示位换成可读名称：单次 ``ctx.chat.get_all_streams(platform="qq")`` 全量枚举，
         每流按 ``is_group_session`` 真值或 ``group_id`` 非空判型——群流取 ``group_name``；
         私聊流 ``user_cardname`` 优先、``user_nickname`` 次之（均 strip 后**非空才用**）。
@@ -2348,7 +2348,7 @@ class ProactiveService:
     def greeting_cycle_span(self) -> Dict[str, Optional[float]]:
         """诊断读口（§31.3，R7 = 用户 2026-10-23 第二轮直派）：周期四变量窗端。
 
-        返回 ``{"prev_start", "cur_start", "cur_end", "anchored"}``——``/lbm_diag streams``
+        返回 ``{"prev_start", "cur_start", "cur_end", "anchored"}``——``/lbm diag streams``
         的检查窗标题/查询窗与流状态窗端全部经本读口取数（无日历 0 点）。
         """
         now = self._tz_manager.get_now()

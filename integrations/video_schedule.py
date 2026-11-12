@@ -386,7 +386,7 @@ class VideoWatchCoordinator:
     # ------------------------------------------------------------------
     # 管理员命令：立即触发一次完整刷视频周期（候选→观看→完成→独立分享判断）
     # 复用既有 gap 链路，把随机掷点换成确定性触发；防叠加：已有活跃观看任务或
-    # 周期在跑则不叠加。PR-WATCH：/lbm_plan watch 以 force_debug=True 强制并行——
+    # 周期在跑则不叠加。PR-WATCH：/lbm plan watch 以 force_debug=True 强制并行——
     # 绕过注意力门控（不占聊天租约），额度/候选/防重/账号核验门仍全部保留。
     # ------------------------------------------------------------------
     def _active_watch_entry(self) -> Optional[tuple]:
@@ -437,7 +437,7 @@ class VideoWatchCoordinator:
         返回 ``{"started": bool, "reason": str}``；started=False 时调用方应改用
         :meth:`watch_status` 展示当前任务/进度/预计结束时间，不叠加新任务。
 
-        PR-WATCH：``force_debug=True``（仅 /lbm_plan watch 调试命令路径置位）→
+        PR-WATCH：``force_debug=True``（仅 /lbm plan watch 调试命令路径置位）→
         与当前日程并行强制启动，绕过注意力门控（不占聊天租约）；额度/候选/
         证据/隐私/防重门不变。缺省 False = 旧语义（随机 gap/日程路径恒 False）。
         """
@@ -653,7 +653,7 @@ class VideoWatchCoordinator:
             if not (isinstance(entry, dict) and entry.get("scenario") == "gap"
                     and entry.get("task_id") and not entry.get("closed")):
                 continue
-            # PR-WATCH：forced_debug（/lbm_plan watch）与日程并行——日程恢复不收回
+            # PR-WATCH：forced_debug（/lbm plan watch）与日程并行——日程恢复不收回
             # debug 任务（其引用身份为 debug:{episode_id}，schedule owner 也不匹配）；
             # 照常轮询至终态存档。普通 gap 条目语义不变（日程恢复即收尾）。
             if active_id and not entry.get("forced_debug"):
@@ -961,7 +961,7 @@ class VideoWatchCoordinator:
         phase = "candidate"
         retryable = False
         try:
-            # PR-WATCH：force_debug（/lbm_plan watch 调试命令）不申请 SURF 租约——
+            # PR-WATCH：force_debug（/lbm plan watch 调试命令）不申请 SURF 租约——
             # 与当前日程/聊天并行，不占注意力；无租约则收尾 _release_surf 空操作。
             # 随机 gap/日程 dedicated 路径 force_debug 恒 False，注意力语义不变。
             if self._attention is not None and not force_debug:

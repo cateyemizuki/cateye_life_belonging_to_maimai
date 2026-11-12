@@ -1,4 +1,4 @@
-"""`/lbm_life rolling` 只读诊断渲染（P2-06 自 companion/components.py 下沉）。"""
+"""`/lbm diag rolling` 只读诊断渲染（P2-06 自 companion/components.py 下沉）。"""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ from planning.time_utils import format_day_minute, ring_minutes_ahead
 
 
 def render_rolling(host: Any, args: str) -> str:
-    """滚动化调试命令主体（/lbm_life rolling <status|state|episodes|spine|sleep|preview>）。
+    """滚动化调试命令主体（/lbm diag rolling <status|state|episodes|spine|sleep|preview>）。
 
     R7 依据 = 用户 2026-10-25 直派（日程系统滚动化改造，设计目录
     D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改造设计）。
-    纯只读：零 LLM、零消息发送（返回文本由 /lbm_life 命令层统一发送）、
+    纯只读：零 LLM、零消息发送（返回文本由根命令分发层统一发送）、
     零副作用（不写库/不写状态文件/不推进 tick/不掷骰）；任何异常降级为错误
     提示绝不抛；输出零 emoji。实现集中于本单一函数（含全部子渲染与句柄解析），
     命令分发表只加一行（qzone/components.py 的 ``rolling`` 分支）——移除时
@@ -30,7 +30,7 @@ def render_rolling(host: Any, args: str) -> str:
     总开关关闭 → 「rolling 未启用」提示，开启但服务未接线 → 就绪=否。
     """
     usage = (
-        "用法: /lbm_life rolling <status|state|episodes|spine|sleep|preview>"
+        "用法: /lbm diag rolling <status|state|episodes|spine|sleep|preview>"
         "（管理员；纯只读，零 LLM 零发送零副作用）\n"
         "  status   — 总览（总开关/就绪/当前 episode/next 2 条/状态行/今日 episode 计数）\n"
         "  state    — LifeState 全字段数值 + 最近阈值跨越\n"

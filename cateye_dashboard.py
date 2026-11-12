@@ -117,11 +117,11 @@ _MODULE_KEYS: Tuple[str, ...] = ("planning", "companion", "emotion", "qzone")
 
 #: 唯一命令区（指导 §7.3：命令只出现一次，按 01~05 与右栏节号一一对应）
 _COMMAND_ROWS: Tuple[Tuple[str, str, str], ...] = (
-    ("01", "日程", "/lbm_plan list"),
-    ("02", "陪伴", "/lbm_mai_affection"),
-    ("03", "情绪", "/lbm_emotion_config"),
-    ("04", "空间", "/lbm_life qzone comments"),
-    ("05", "消耗", "/lbm_mai_diag llm 1"),
+    ("01", "日程", "/lbm plan list"),
+    ("02", "陪伴", "/lbm status affection"),
+    ("03", "情绪", "/lbm emotion config"),
+    ("04", "空间", "/lbm qzone comments"),
+    ("05", "消耗", "/lbm diag llm 1"),
 )
 
 #: 关系/情绪引用块最多行数（指导 §7.3/§7.4）
@@ -941,7 +941,7 @@ def build_dashboard_view(blocks: Any, *, now: Optional[datetime] = None) -> Dict
         "sub_text": f"Token 消耗 · {calls} 次调用（含失败）",
         "groups": [
             {"label": "按模型", "rows": model_rows,
-             "note": "其余见 /lbm_mai_diag llm 1" if model_overflow > 0 else ""},
+             "note": "其余见 /lbm diag llm 1" if model_overflow > 0 else ""},
             {"label": "按模块", "rows": module_usage_rows, "note": ""},
         ],
     }

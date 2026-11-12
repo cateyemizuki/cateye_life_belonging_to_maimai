@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 
 class ScheduleImageGenerator:
-    """生成 ``/lbm_plan list`` 日程图片（指导 §6 固定列网格版式）。"""
+    """生成 ``/lbm plan list`` 日程图片（指导 §6 固定列网格版式）。"""
 
     # 并发限制（最多 3 个并发生成）
     _generation_semaphore = threading.Semaphore(3)
@@ -165,9 +165,9 @@ class ScheduleImageGenerator:
     NOTE_TEXT = "跨午夜条目按 24h 环标注「次日」；凌晨 00:30 起与昨日帧合并判定。"
     #: 命令唯一一次（§6.8）
     COMMAND_SEGMENTS = (
-        "完整日程 /lbm_plan list",
-        "重新生成 /lbm_plan regenerate",
-        "今日更新 /lbm_mai_diag decision 1",
+        "完整日程 /lbm plan list",
+        "重新生成 /lbm plan regenerate",
+        "今日更新 /lbm diag decision 1",
     )
 
     # 性能优化：字体缓存（PIL 对象在首次调用时才创建）

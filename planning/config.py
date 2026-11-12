@@ -285,7 +285,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
     # ── 命令展示 ────────────────────────────────────────────
     list_draw_image: bool = Field(
         default=True,
-        description="/lbm_plan list 是否绘制日程图片（内置字体渲染后合并转发）；关闭后只返回文字长文本",
+        description="/lbm plan list 是否绘制日程图片（内置字体渲染后合并转发）；关闭后只返回文字长文本",
         json_schema_extra={
             "label": "list 绘制图片",
             "hint": "关 = 纯文字，省渲染开销；渲染失败时会自动降级为纯文字",

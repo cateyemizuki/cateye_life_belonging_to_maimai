@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 
 async def build_streams_records(host: Any) -> list[dict[str, Any]]:
-    """``/lbm_diag streams`` 的合并转发节点主体：主动候选流与名单状态（2026-10-20 用户指示）。
+    """``/lbm diag streams`` 的合并转发节点主体：主动候选流与名单状态（2026-10-20 用户指示）。
 
     节点布局（无 emoji，便于日志粘贴；§25.2 records 化，§26.1 展示重构，§29.1 序号根治）：
 

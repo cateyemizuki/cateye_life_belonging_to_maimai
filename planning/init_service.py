@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""PR5 统一初始化服务（``/lbm_init`` 的独立业务层）。
+"""PR5 统一初始化服务（``/lbm ops init`` 的独立业务层）。
 
 设计约束（定稿 §4.4 / 附录 B.5）：
 
@@ -12,7 +12,7 @@
   ``skipped``，不重复消费模型；已有 ``life_state.json`` 只补缺失键，绝不
   覆盖已有值，也不改配置（不会自动启用生活状态/睡眠引擎）。
 - 事件：全量走 ``EventCatalogService.refresh(manual=True)`` 的到期检查；
-  ``/lbm_init events`` 强制刷新。成功才采用返回的 ``next_update_at``；
+  ``/lbm ops init events`` 强制刷新。成功才采用返回的 ``next_update_at``；
   失败保留旧库（由 EventCatalogService 保证），本服务只如实记录旧值。
 - 汇总：``<data_dir>/life_init.json``，``core.storage.save_json_atomic``
   原子写，记录成功/失败/跳过、persona 指纹、版本、事件版本、下次更新与
@@ -24,7 +24,7 @@
 
 1. ``PlanningServices`` 构造 ``InitService(self._plugin, data_dir=...)`` 并
    暴露为 ``self.init``；``plugin.py`` 可用 ``_planning.init`` 取用。
-2. ``planning/components.py`` 注册 ``@Command("lbm_init")``；入口先查
+2. 双语根命令 ``/lbm ops init`` / ``/麦麦生活 运维 初始化`` 经注册表 handler 进入；入口先查
    ``plugin.enabled`` 与 ``_qz_is_admin``，再调 ``run_full/run_emotion/
    run_events``，最后逐条 ``ctx.send.text``。旧 ``lbm_emotion_init`` 保持
    现有强制语义，只加迁移提示（PR8 再删）。
@@ -220,7 +220,7 @@ class InitResult:
 
 @dataclass(frozen=True)
 class InitStatus:
-    """``/lbm_init status`` 的只读快照。"""
+    """``/lbm ops init status`` 的只读快照。"""
 
     plugin_enabled: bool
     has_record: bool
@@ -249,7 +249,7 @@ class InitStatus:
         if not self.plugin_enabled:
             lines.append("插件未启用（plugin.enabled=false）。")
         if not self.has_record:
-            lines.append("尚无初始化记录：可执行 /lbm_init 做全量初始化。")
+            lines.append("尚无初始化记录：可执行 /lbm ops init 做全量初始化（中文 /麦麦生活 运维 初始化）。")
         else:
             run = self.last_run or {}
             finished = str(run.get("finished_at") or run.get("started_at") or "")
@@ -1555,7 +1555,7 @@ class InitService:
                                    events_force=False)
 
     async def run_events(self, *, manual: bool = True, force: bool = True) -> InitResult:
-        """只跑事件库；默认强制刷新（定稿 ``/lbm_init events``）。"""
+        """只跑事件库；默认强制刷新（定稿 ``/lbm ops init events``）。"""
         return await self._execute("events", manual=manual, emotion_force=False,
                                    events_force=force)
 

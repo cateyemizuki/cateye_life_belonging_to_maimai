@@ -1,8 +1,8 @@
-"""``/lbm_plan`` 命令的业务实现（来源：自主规划插件 services/command_service.py，移植版）。
+"""日程命令的业务实现（来源：自主规划插件 services/command_service.py，移植版）。
 
 通过 ``self._plugin.ctx.send.text(...) / ctx.send.forward(...)`` 发送消息。
 
-子命令：list / regenerate / events / delete / clear / help。
+子命令：list / regenerate / events / delete / clear / sleep / watch / help。
 - list：今日日程（图片 + 详细文字合并转发；无日程时自动先生成）；
 - 图片绘制失败/超时**静默**降级为纯文字（不提示失败）；
 - send.forward / send.image 能力宿主未声明时自动回退纯文本。
@@ -102,16 +102,41 @@ class CommandService:
         matched_groups: Dict[str, str] | None = None,
         is_local_operator: bool = False,
     ) -> Tuple[bool, str, bool]:
-        """命令执行入口，按子命令分发。
+        """内部兼容入口：从旧 ``/lbm_plan <sub>`` 文本解析（不再注册用户命令）。
 
-        Returns:
-            (success, response_text, intercept_message) 三元组。
+        新用户面统一走 :meth:`execute_action`（双语根命令注册表 handler 调用），
+        业务分支、权限与输出完全共用 :meth:`_run_parts`。
         """
         del platform, group_id  # 当前命令未使用，保留参数防止未来扩展
         groups = matched_groups or {}
         command_text = str(groups.get("planning_cmd", text) or "").strip()
         parts = command_text.split()
+        return await self._run_parts(parts, stream_id, user_id, is_local_operator)
 
+    async def execute_action(
+        self,
+        action: str,
+        args: List[str] | None = None,
+        stream_id: str = "",
+        user_id: str = "",
+        is_local_operator: bool = False,
+    ) -> Tuple[bool, str, bool]:
+        """新命令面入口：``/lbm plan <action> [args]`` / ``/麦麦生活 日程 <动作>``。
+
+        组内动作已由注册表双语归一；这里只把 action/args 还原成既有
+        ``parts = [canonical, action, *args]`` 形态，复用全部既有子命令实现。
+        """
+        parts = ["/lbm plan", str(action or ""), *[str(item) for item in (args or [])]]
+        return await self._run_parts(parts, stream_id, user_id, is_local_operator)
+
+    async def _run_parts(
+        self,
+        parts: List[str],
+        stream_id: str,
+        user_id: str,
+        is_local_operator: bool,
+    ) -> Tuple[bool, str, bool]:
+        """模块开关 → 管理员 → 会话白名单 → 子命令分发（旧/新入口共用）。"""
         # 模块独立总开关：停用期间命令不可用（提示配置位置）
         schedule_cfg = getattr(self._plugin.config, "schedule", None)
         if not bool(getattr(schedule_cfg, "enabled", True)):
@@ -124,7 +149,7 @@ class CommandService:
                 await self._send(
                     stream_id,
                     "尚未配置管理员：请在插件配置 [管理与日志] 的 admin_users 中"
-                    "添加你的用户 ID 后再使用 /lbm_plan（本机控制台不受限）",
+                    "添加你的用户 ID 后再使用日程命令（本机控制台不受限）",
                 )
             else:
                 await self._send(stream_id, "你不是管理员哦~只有管理员才能查看和管理日程呢")
@@ -163,7 +188,7 @@ class CommandService:
         elif subcommand == "help":
             await self._show_help(stream_id)
         else:
-            await self._send(stream_id, f"未知命令: {subcommand}\n使用 /lbm_plan help 查看帮助")
+            await self._send(stream_id, f"未知命令: {subcommand}\n使用 /lbm 日程 或 /lbm help plan 查看帮助")
 
         return True, "命令执行完成", True
 
@@ -293,7 +318,7 @@ class CommandService:
             return img_base64
         except Exception as exc:
             # 静默降级：不提示失败、不发图片，仅记录日志供排查
-            logger.info(f"/lbm_plan list 图片绘制放弃（静默降级为文本）: {exc}")
+            logger.info(f"/lbm plan list 图片绘制放弃（静默降级为文本）: {exc}")
             return None
 
     def _image_output_dir(self):
@@ -309,7 +334,7 @@ class CommandService:
     # ------------------------------------------------------------
 
     def _runtime_lines_block(self) -> str:
-        """``/lbm_plan list`` 的真实 runtime 补充行（只读、零写、零 LLM）。
+        """``/lbm plan list`` 的真实 runtime 补充行（只读、零写、零 LLM）。
 
         数据口 = ``ToolsService.list_runtime_lines()``（runtime provider 未装配 →
         空串，命令输出与旧版逐字一致）。**不**在旧计划正文后叠一段时间窗编造的
@@ -322,12 +347,12 @@ class CommandService:
         try:
             lines = getter() or []
         except Exception as exc:
-            logger.info(f"/lbm_plan list runtime 行读取失败（忽略）：{exc}")
+            logger.info(f"/lbm plan list runtime 行读取失败（忽略）：{exc}")
             return ""
         return "\n".join(str(line) for line in lines if str(line or "").strip())
 
     async def _handle_list(self, stream_id: str) -> None:
-        """``/lbm_plan list``：今日日程（图片 + 详细文字，合并转发）。
+        """``/lbm plan list``：今日日程（图片 + 详细文字，合并转发）。
 
         流程：先检查今日是否有日程 → 无则代码层触发生成后再发送；
         发送形态：合并转发两条记录（第一条图片（若绘制成功），第二条详细文字）；
@@ -348,12 +373,12 @@ class CommandService:
             try:
                 await tools_svc.regenerate_today_schedule_now()
             except Exception as exc:
-                logger.error(f"/lbm_plan list 触发生成日程失败: {exc}", exc_info=True)
+                logger.error(f"/lbm plan list 触发生成日程失败: {exc}", exc_info=True)
                 await self._send(stream_id, f"日程生成失败: {exc}")
                 return
             schedule_goals = self._get_today_schedule_goals(goal_manager)
             if not schedule_goals:
-                await self._send(stream_id, "注意：日程生成完成但没有产生有效活动，请稍后用 /lbm_plan list 重试")
+                await self._send(stream_id, "注意：日程生成完成但没有产生有效活动，请稍后用 /lbm plan list 重试")
                 return
 
         text = self._build_status_text(schedule_goals)
@@ -388,7 +413,7 @@ class CommandService:
 
         try:
             await self._plugin.ctx.send.forward(records, stream_id)
-            logger.info("/lbm_plan list 已合并转发（图片=%s）", "有" if image_base64 else "无（文字档）")
+            logger.info("/lbm plan list 已合并转发（图片=%s）", "有" if image_base64 else "无（文字档）")
         except Exception as exc:
             # 合并转发失败（能力未声明 / 平台不支持）→ 回退普通发送
             logger.warning(f"合并转发失败，回退为普通发送: {exc}")
@@ -400,7 +425,7 @@ class CommandService:
             await self._send(stream_id, text)
 
     async def _handle_regenerate(self, stream_id: str, parts: List[str]) -> None:
-        """``/lbm_plan regenerate [额外要求...]``：立即重新生成今日日程。"""
+        """``/lbm plan regenerate [额外要求...]``：立即重新生成今日日程。"""
         tools_svc = self._tools_svc()
         if tools_svc is None:
             await self._send(stream_id, "插件未完成初始化，无法重新生成日程")
@@ -421,11 +446,11 @@ class CommandService:
             await self._send(stream_id, f"重新生成失败: {exc}")
             return
 
-        msg = f"已重新生成今日日程，共 {len(items)} 项活动\n\n提示：使用 /lbm_plan list 查看（图片+文字详情）"
+        msg = f"已重新生成今日日程，共 {len(items)} 项活动\n\n提示：使用 /lbm plan list 查看（图片+文字详情）"
         await self._send(stream_id, msg)
 
     async def _handle_events(self, stream_id: str, parts: List[str]) -> None:
-        """``/lbm_plan events [force]``：按三时段重新生成小事件库（v3.9.0）。
+        """``/lbm plan events [force]``：按三时段重新生成小事件库（v3.9.0）。
 
         manual=True 即忽略生成周期立即生成；force 为显式别名。旧无时段标签的事件库
         会被整份替换（原子发布，任一时段失败则保留旧库）。模式 off 时不生成。
@@ -453,7 +478,7 @@ class CommandService:
             await self._send(stream_id, f"小事件库生成失败（旧库保留）：{detail}")
 
     async def _handle_watch(self, stream_id: str) -> None:
-        """``/lbm_plan watch``：debug 命令——后台强制触发一次完整刷视频周期。
+        """``/lbm plan watch``：debug 命令——后台强制触发一次完整刷视频周期。
 
         PR-WATCH：除非插件已因日程启用观看后台任务，否则强制启用，与当前日程
         并行触发（force_debug=True，绕过 attention_revoked 注意力门控，不占聊天
@@ -473,13 +498,13 @@ class CommandService:
         try:
             coord = plugin._video_coordinator()
         except Exception as exc:
-            logger.warning(f"/lbm_plan watch 协调器不可用: {exc}")
+            logger.warning(f"/lbm plan watch 协调器不可用: {exc}")
             await self._send(stream_id, "刷视频联动未装配，无法触发周期。")
             return
         try:
             status = await coord.watch_status()
         except Exception as exc:
-            logger.warning(f"/lbm_plan watch 状态读取失败: {exc}")
+            logger.warning(f"/lbm plan watch 状态读取失败: {exc}")
             status = {"active": False}
         if status.get("active"):
             await self._send(stream_id, self._format_watch_busy(status))
@@ -500,7 +525,7 @@ class CommandService:
             stream_id,
             "已在后台强制触发一次完整刷视频周期（debug 命令，与当前日程并行；候选→观看→完成→独立分享判断），完成后会写日志。\n"
             "调试命令绕过聊天/睡眠/静默注意力门控；若额度不足或无真实候选，会如实跳过并记录原因。\n"
-            "进行中再次发送 /lbm_plan watch 只显示进度、不叠加；结束后可再次触发用于抽卡测试。",
+            "进行中再次发送 /lbm plan watch 只显示进度、不叠加；结束后可再次触发用于抽卡测试。",
         )
 
     def _format_watch_busy(self, status: Dict[str, Any]) -> str:
@@ -519,17 +544,17 @@ class CommandService:
                 lines.append("预计结束：" + datetime.fromtimestamp(float(eta)).strftime("%H:%M:%S"))
             except (TypeError, ValueError, OSError):
                 pass
-        lines.append("结束后再发送 /lbm_plan watch 可重新触发。")
+        lines.append("结束后再发送 /lbm plan watch 可重新触发。")
         return "\n".join(lines)
 
     async def _handle_delete(self, stream_id: str, parts: List[str]) -> Tuple[bool, str, bool]:
-        """``/lbm_plan delete <id|序号>``：删除目标（含合成视图的日程条目）。"""
+        """``/lbm plan delete <id|序号>``：删除目标（含合成视图的日程条目）。"""
         goal_manager = get_goal_manager()
 
         if len(parts) < 3:
             await self._send(
                 stream_id,
-                "请提供要删除的目标 ID 或序号\n\n用法: /lbm_plan delete <goal_id或序号>\n\n使用 /lbm_plan list 查看所有目标",
+                "请提供要删除的目标 ID 或序号\n\n用法: /lbm plan delete <goal_id或序号>\n\n使用 /lbm plan list 查看所有目标",
             )
             return True, "缺少参数", True
 
@@ -544,7 +569,7 @@ class CommandService:
                 goal_id = goal.goal_id
                 goal_name = goal.name
             else:
-                await self._send(stream_id, f"序号 {identifier} 超出范围\n使用 /lbm_plan list 查看所有目标")
+                await self._send(stream_id, f"序号 {identifier} 超出范围\n使用 /lbm plan list 查看所有目标")
                 return True, "序号无效", True
         else:
             # 作为 goal_id 处理
@@ -563,7 +588,7 @@ class CommandService:
         return True, "命令执行完成", True
 
     async def _handle_clear(self, stream_id: str, parts: List[str]) -> None:
-        """``/lbm_plan clear [days]``：清理旧日程（days=0 表示仅保留今天）。"""
+        """``/lbm plan clear [days]``：清理旧日程（days=0 表示仅保留今天）。"""
         goal_manager = get_goal_manager()
 
         days_to_keep = 0
@@ -614,31 +639,31 @@ class CommandService:
             await self._send(stream_id, "清理失败")
 
     async def _show_help(self, stream_id: str) -> None:
-        """显示帮助（完整帮助文本作为单条消息合并转发）。"""
-        help_text = """日程规划系统
+        """日程组帮助（直调兜底；用户面统一走 /lbm help plan 或 /麦麦生活 帮助 日程）。"""
+        help_text = """日程规划系统（双语根命令第二分支）
 
-命令列表:
-/lbm_plan list - 查看今日日程（图片+详细文字合并转发；无日程时自动先生成）
-/lbm_plan regenerate [额外要求] - 重新生成今日日程（先删今天再重生，可附加临时要求）
-/lbm_plan events [force] - 按三时段重新生成小事件库（替换旧无时段标签事件）
-/lbm_plan delete <goal_id或序号> - 删除指定目标
-/lbm_plan clear - 清理昨天及更早的旧日程
-/lbm_plan sleep - 在动态睡眠的允许窗口内立即入睡
-/lbm_plan watch - 后台立即触发一次完整刷视频周期（进行中只显示进度不叠加，可多次抽卡测试）
-/lbm_plan help - 显示此帮助
+命令列表（英文 /lbm · 中文 /麦麦生活）:
+/lbm plan list              /麦麦生活 日程 列表      今日日程（图片+详细文字合并转发；无日程时自动先生成）
+/lbm plan regenerate [要求] /麦麦生活 日程 重新生成  重新生成今日日程（可附加临时要求）
+/lbm plan events [force]    /麦麦生活 日程 事件      按三时段重新生成小事件库
+/lbm plan delete <id|序号>  /麦麦生活 日程 删除      删除指定目标
+/lbm plan clear [天数]      /麦麦生活 日程 清空      清理旧日程（默认保留今天）
+/lbm plan sleep             /麦麦生活 日程 睡眠      在动态睡眠的允许窗口内立即入睡
+/lbm plan watch             /麦麦生活 日程 刷视频    后台立即触发一次完整刷视频周期
+/lbm help plan              /麦麦生活 帮助 日程      显示本组帮助
 
 使用方式:
-1. 对我说 "帮我生成今天的日程" / 直接 /lbm_plan list，没有日程时会自动创建
-2. 使用 regenerate 在不满意当前日程时立即重新生成
-3. 使用 clear 清理旧日程，保持目标列表整洁
+1. 直接 /lbm plan list，没有日程时会自动创建
+2. regenerate 在不满意当前日程时立即重新生成
+3. clear 清理旧日程，保持目标列表整洁
 
 重新生成示例:
-/lbm_plan regenerate                # 直接重新生成今日日程
-/lbm_plan regenerate 加入下午跑步     # 重新生成并临时叠加要求
+/lbm plan regenerate                     # 直接重新生成今日日程
+/lbm plan regenerate 加入下午跑步          # 重新生成并临时叠加要求
 
 注意:
 - 日程每天自动生成，无需手动创建
-- /lbm_plan list 在今日无日程时会先自动生成再展示
+- list 在今日无日程时会先自动生成再展示
 - regenerate 会丢弃今天已有日程并重新生成，操作不可逆
 - clear 命令会自动保留今天的日程
 """

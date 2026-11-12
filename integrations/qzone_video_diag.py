@@ -1,6 +1,6 @@
-"""`/lbm_life qzone_video` 空间视频联动运维（PR-A3）：只读诊断 + 经授权的人工清除。
+"""`/lbm qzone video` 空间视频联动运维（PR-A3）：只读诊断 + 经授权的人工清除。
 
-参照 3.7.1 `/lbm_life share`（integrations/video_share_diag.py）的实现模式：
+参照 3.7.1 `/lbm ops share`（integrations/video_share_diag.py）的实现模式：
 status 纯只读（零 LLM、零发送、零副作用）；clear 仅在管理员显式确认某条 uncertain
 回执确未送达后，把它标记 rejected（reason=manual_verified_unsent，保留审计行不删证据），
 资产 released，候选可重新评估一次——**不自动恢复发送**（再发仍走完整门控）。
@@ -33,7 +33,7 @@ def _host_now(host: Any) -> float:
 
 
 def qzone_video_diag_payload(host: Any) -> dict:
-    """PR-D1（H10）：``/lbm_diag qzone_video`` 全链只读诊断投影。
+    """PR-D1（H10）：``/lbm diag qzone_video`` 全链只读诊断投影。
 
     零 LLM、零发送、零落盘：只读 ledger 快照/资产清单（id/尺寸/TTL，无路径）/
     发布回执（含 uncertain）/事实同步状态，并复用 qzone DecisionHistory 聚合
@@ -95,7 +95,7 @@ def qzone_video_diag_payload(host: Any) -> dict:
 
 def render_qzone_video(host: Any, args: str) -> str:
     usage = (
-        "用法: /lbm_life qzone_video <status|clear>（管理员）\n"
+        "用法: /lbm qzone video <status|clear>（管理员）\n"
         "  status                     — 只读：运行模式/候选与尝试状态/uncertain 明细/事实同步\n"
         "  clear <attempt_id> confirm — 核验确未送达后清除该 uncertain 回执（保留审计，不自动重发）"
     )
@@ -130,7 +130,7 @@ def render_qzone_video(host: Any, args: str) -> str:
         return '\n'.join(lines)
     if sub == 'clear':
         if len(parts) < 3 or parts[2].lower() != 'confirm':
-            return ("清除需显式确认：/lbm_life qzone_video clear <attempt_id> confirm\n"
+            return ("清除需显式确认：/lbm qzone video clear <attempt_id> confirm\n"
                     "务必先核实该说说确未送达，否则可能重复发布。")
         attempt_id = parts[1]
         result = ledger.resolve_uncertain_attempt(attempt_id, _host_now(host))
