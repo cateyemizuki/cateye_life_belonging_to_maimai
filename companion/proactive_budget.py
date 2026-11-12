@@ -12,10 +12,18 @@
 按日计数；各发布方触发前查询 :func:`ProactiveBudget.allow_proactive`；
 **上限 = ``patrol.daily_max_speak``（每日预算即上限；2026-10-10 配置整理轮移除独立的
 ``proactive_target_daily_cap`` / 旧键 ``global_proactive_cap``，不再叠加 +2 余量）**。
-3.4（2026-11-11）：``patrol.budget_elasticity_enabled`` 出厂默认 **开**（配置默认值轮）；
-命中高好感/高 Valence/节日时允许 +1~2 次，硬上限 base+2（且不越过 50），
-显式关闭时旧口径逐字不变；``daily_max_speak=0`` 不复活；弹性只放大额度，
-夜间/冷却/授权闸仍由各发布方先执行。
+3.4（2026-11-11）：``patrol.budget_elasticity_enabled`` 出厂默认 **开**（配置默认值轮；
+2026-11-12 R4 用户授权保留并修订红线，见 DEV_GUIDE §5/§8 E2）；命中高好感/高 Valence/
+节日时允许 +1~2 次，硬上限 base+2（且不越过 50），显式关闭时旧口径逐字不变；
+``daily_max_speak=0`` 不复活；弹性只放大额度，夜间/冷却/授权闸仍由各发布方先执行。
+
+**已登记例外（2026-11-12 R4，DEV_GUIDE §8 E3）——阶段 4「视频卡片 + 说话轮同一槽位」**：
+卡片经本类 ``reserve`` → accepted → ``commit_reservation`` **恰好一次**；随后同一场景的
+阶段 4 说话轮（``integrations/video_share_stage4_turn.py``）属于同一次主动接触，以
+``budget_reserved=True`` 跳过 ``remaining()`` 且**不 reserve/commit/release**，不占第二个
+槽位。产品口径 = 一槽一次主动消息（卡片 1 条 + 同一场景说话轮 1 条）；测试
+``scratch/test_stage4_budget_slot_r4.py`` 锁定；若改为「一槽一句」，须把说话轮计入
+``reserve/commit`` 并删除该例外。
 计数口径 = **按发送流身份计数**：发往目标陪伴私聊的主动打扰都计入（发布方不限——
 陪伴侧巡检/想念、日程侧非问候主动行为、emotion 赖床提醒都发 ``proactive.used``；
 2026-11-04 F1 起告状工具回退到陪伴目标私聊的发送同样经 ``allow_proactive`` 闸门

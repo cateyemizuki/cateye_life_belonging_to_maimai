@@ -2,12 +2,14 @@
 
 ## 这个目录是什么
 
-本目录（`mappings/default_mappings/initial_events/`）是插件**随包出厂的种子事件库**。
+本目录（`mappings/default_mappings/initial_events/`）是插件**随包出厂的种子事件库**，当前共 **13 份 JSON**（另有 2 项代码联动 `watch_bili`/`browse_qq`，统一初始池合计 15 项）。
 
 - **首次初始化**时，插件会把这里的 JSON 文件复制到用户目录 `mappings/initial_events/`。
 - `mappings/initial_events/` 是**用户编辑的唯一运行目录**：之后所有增删改都在那里进行。
 - **升级不覆盖**用户目录中已有的文件；用户删掉的事件**不会自动补回**。
-- 想让出厂新增事件生效，需手动把对应文件复制进用户目录。
+- **新增种子内存合并（现行契约）**：后续版本新增的种子（当前为 `local_look_outside` / `local_rest_eyes` / `local_wash_face`）在用户目录**没有同名文件**（文件名或 `event_id` 任一命中即视为用户已接手）时，由插件从出厂种子**只读合并进内存事件池**——**不写盘、不补文件、不改文案**；被合并项在装载诊断中标记 `seed_merged=True` 并计入 `merged`。因此升级后新增种子会直接生效，**不需要手动复制**。
+- **退役旧种子不复活**：3.17.33 起删除的 5 份旧种子（`local_doodle` / `local_journal` / `local_light_exercise` / `local_old_notes` / `local_organize`）只在运行目录副本仍与旧种子逐字段一致时**内存忽略**（记 `retired`，不删用户文件）；用户改过则视为用户自定义继续参与。
+- **不补回用户删除项**：内存合并清单只列本批新增项、不列历史项，用户显式删除的旧种子不会被复活。
 
 ## 最小示例
 
@@ -18,21 +20,26 @@
   "version": 1,
   "event": {
     "event_id": "daydream",
-    "name": "发呆",
+    "name": "发会呆",
     "enabled": true,
     "goal_type": "rest",
-    "min_minutes": 4,
-    "max_minutes": 10,
-    "interruptibility": 0.9,
+    "min_minutes": 5,
+    "max_minutes": 12,
+    "interruptibility": 0.95,
     "weight": 0.7,
-    "cooldown_minutes": 30,
+    "cooldown_minutes": 45,
     "allowed_slots": ["00-08", "08-16", "16-24"],
     "state_deltas": {"stress": -0.02},
-    "templates": ["麦麦停下手头的事，望着远处发了一会呆，紧绷的感觉慢慢散开了。"],
-    "tags": ["放空", "放松"]
+    "templates": [
+      "望着窗外发了一小会儿呆，脑子里放空了一阵。",
+      "靠在椅背上走了一小会儿神，什么也没想。"
+    ],
+    "tags": ["放空", "发呆"]
   }
 }
 ```
+
+> 示例即现行出厂种子 `daydream.json` 的完整内容（13 份种子之一）；时长单位分钟、范围 3–120。
 
 ## 字段说明
 
@@ -105,7 +112,7 @@
 
 ## 生效方式
 
-- 插件**热重载**时统一读取用户目录中的全部事件文件。
+- 插件**热重载**时统一读取用户目录中的全部事件文件；出厂新增种子按上面的「内存合并」规则并入事件池（不写盘）。
 - 运行中修改/删除文件**只影响后续选取**；已经开始的活动按它启动时的快照正常结束，不会被中途改写。
 
 ## 重要声明
