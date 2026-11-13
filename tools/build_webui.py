@@ -41,21 +41,45 @@ def build() -> None:
     panel_js = (SRC / "panel.js").read_text(encoding="utf-8")
     found = panel_js.count(token)
     assert found == 1, f"injection token {token} must appear exactly once in panel.js, found {found}"
+    # 2026-11-14 主题对比批：layout_fix.js（布局层行为，依赖 fish.js 的
+    # lbm:detail-open 与 .fish-panel DOM）与 theme.js（临时主题切换器，依赖
+    # 前三者）依次追加在 maimai.js/fish.js 之后，共享 panel.js 闭包、additive。
     extensions = (
         (SRC / "maimai.js").read_text(encoding="utf-8")
         + "\n"
         + (SRC / "fish.js").read_text(encoding="utf-8")
         + "\n"
+        + (SRC / "layout_fix.js").read_text(encoding="utf-8")
+        + "\n"
+        + (SRC / "theme.js").read_text(encoding="utf-8")
+        + "\n"
     )
     js = panel_js.replace(token, extensions, 1)
-    output = template.replace("{{CSS}}", css).replace("{{JS}}", js)
+    # 2026-11-14 主题对比批：皮肤 CSS 走独立 slot，注入模板 #host-theme 之后的
+    # <style id="lbm-themes">——built {{CSS}} 在宿主样式之前，同特异性 :root 令牌
+    # 会被宿主 c.styles 压过；themes.css 以 html:root[data-lbm-theme=X] 更高特异性
+    # 作用域 + 位于 #host-theme 之后，忠实还原三版预览的级联位置。
+    themes_css = (SRC / "themes.css").read_text(encoding="utf-8")
+    output = (
+        template.replace("{{CSS}}", css)
+        .replace("{{THEMES_CSS}}", themes_css)
+        .replace("{{JS}}", js)
+    )
     assert not re.search(r"\{\{[A-Z_]+\}\}", output), "unresolved asset slot"
     assert len(output.encode("utf-8")) < 2 * 1024 * 1024, "host page limit exceeded"
-    # W-14：注入生效断言——产物必须真的包含三段扩展的关键标识（旧锚点漏注入时
+    # W-14：注入生效断言——产物必须真的包含各段扩展的关键标识（旧锚点漏注入时
     # 这里会失败，而不是静默产出缺桌宠/详情层的页面）。
     # 用完整定义串而非前缀：`const Bear` 会被 `const BearX` 这类改名的子串骗过。
-    for marker in ("const Mascot=(()=>{", "const Bear=(()=>{", "const SectionFish=(()=>{"):
+    # 2026-11-14 主题对比批：布局层行为与主题切换器同样以文件头标记断言注入生效。
+    for marker in (
+        "const Mascot=(()=>{",
+        "const Bear=(()=>{",
+        "const SectionFish=(()=>{",
+        "/* LBM_LAYOUT_FIX */",
+        "/* LBM_THEME_SWITCHER */",
+    ):
         assert marker in output, f"injected extensions missing: {marker}"
+    assert '<style id="lbm-themes">' in output, "themes style slot missing"
 
     # finding #2（2026-11-04）：显式固定产物换行符，消除平台 SHA 漂移。
     # 旧写法 write_text 默认 newline=None——Windows 产 CRLF、Linux 产 LF，内容相同

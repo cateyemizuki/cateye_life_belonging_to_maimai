@@ -106,3 +106,74 @@ body.fish-locked{overflow:hidden}
 @media(max-width:1000px){.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:700px),(hover:none){.section-fish-button{left:-12px;bottom:-8px;width:44px;height:34px;min-height:34px}.fish-peek{width:44px;height:auto;margin:0}.fish-peek>svg{width:44px;transform:rotate(-12deg)!important;transition:none}.fish-overlay{padding:10px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}.fish-panel{max-height:92vh;max-height:92dvh;border-radius:var(--maibot-radius,18px)}.fish-close{min-width:44px;min-height:38px}.fish-popup-heading{padding:10px 13px}.fish-popup-body{padding:12px 13px;grid-template-columns:minmax(0,1fr)}.fish-popup-body>*{min-width:0}.fish-fold>.fish-fold-title{min-height:44px;padding:11px 2px}.fish-section[data-fish-section=state]{margin-top:13px}.fish-section[data-fish-section=state]>.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.fish-section[data-fish-section=state] .metric:last-child{grid-column:1/-1}.sleep-combined>.fish-content{display:block}.fish-section .fish-content .info-button{min-height:16px;min-width:16px}.fish-metadata .info-tooltip,.fish-fold .info-tooltip{bottom:calc(80px + env(safe-area-inset-bottom))}.fish-changelist .change-why{margin-left:0;text-align:left;width:100%}}
 @media(prefers-reduced-motion:reduce){.fish-peek>svg{transition:none!important;transform:rotate(-12deg)!important}.fish-overlay,.fish-panel{transition:none!important}}
+
+/* =====================================================================
+   LBM 布局修正层（2026-11-14 主题对比批并入基线，对所有主题含原版生效）
+   来源：设计评估 shared/layout_fix.css（三版统一规范层），合并到本文件尾部
+   保持 cascade 末位。根因：.fish-popup-body 是双列 grid，但 .fish-metadata /
+   .fish-records 是两个普通 div 子元素 → meta 独占左半列、内容挤右半列；
+   .fish-fold{grid-column:1/-1} 在非 grid 父元素里无效。
+   本层只改布局几何，不改各主题配色/字体/圆角等皮肤；themes.css 各版皮肤
+   已剥离与本层重复的几何声明（单列/display:block/包装跨列/meta 列宽）。
+   配套行为脚本：layout_fix.js（classifyWide/adaptWidth，LBM_EXTENSIONS 注入）。
+   ===================================================================== */
+/* 1) 恢复双列 grid，并把两个包装 div 摊平（display:contents），
+      让 meta 行与折叠组成为 .fish-popup-body 的直接 grid 项。 */
+.fish-popup-body{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:2px 24px;
+  align-items:start;
+}
+.fish-popup-body>.fish-popup-summary{grid-column:1/-1}
+.fish-metadata,.fish-records{display:contents}
+/* 折叠组（含「最近变化」）一律跨双列恢复全宽。
+   上方 .fish-fold.fish-changes{grid-column:auto} 会把它挤回半列，这里压过。 */
+.fish-popup-body .fish-fold,
+.fish-popup-body .fish-fold.fish-changes{grid-column:1/-1}
+
+/* 2) meta 行标签列改 auto 宽，值紧随标签（左对齐），消除标签—值中间空白。
+      每行占一个 grid 单元 → 双列下自然两对一行。 */
+.fish-meta-row{grid-template-columns:auto minmax(0,1fr)}
+.fish-meta-row>span:last-child{text-align:left}
+
+/* 3) 卡片型内容真双列：字段块 / 模块行 / 日志块容器均为双列网格。
+      长 pre / 图表显式跨双列（.lbm-wide 由 layout_fix.js 按 pre 文本量判定；
+      日志块整条是长 pre 记录，默认跨双列保证报错原文可读）。 */
+#core-fields-detail,
+#core-modules-detail,
+#core-logs-detail{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:12px;
+  align-items:start;
+}
+#core-modules-detail{gap:8px}
+#core-fields-detail>.core-raw-field.lbm-wide,
+#core-logs-detail>.core-raw-field,
+#core-fields-detail>pre,
+#core-fields-detail>.chart,
+#core-modules-detail>pre,
+#core-modules-detail>.chart,
+#core-logs-detail>pre,
+#core-logs-detail>.chart{grid-column:1/-1}
+/* 双列卡片内的 pre 仍受自身 max-height+overflow 约束，不撑破卡片 */
+#core-fields-detail .core-raw-pre,
+#core-logs-detail .core-raw-pre{min-width:0}
+
+/* 4) 面板宽度自适应由 layout_fix.js 写 inline width（clamp 480–720，空态收缩）。
+      这里给一个 CSS 兜底下限，避免脚本未及执行时稀疏 section 过宽。 */
+.fish-overlay[data-section="core-modules"] .fish-panel,
+.fish-overlay[data-section="core-status"] .fish-panel,
+.fish-overlay[data-section="core-logs"] .fish-panel{
+  max-width:720px;
+}
+
+/* 移动端（≤700px，与上方断点一致）：正文与卡片网格收回单列。
+   必须自带此媒体查询——本层在 cascade 末位，base 的双列会压过上方移动端单列。 */
+@media (max-width:700px){
+  .fish-popup-body{grid-template-columns:minmax(0,1fr)}
+  #core-fields-detail,
+  #core-modules-detail,
+  #core-logs-detail{grid-template-columns:minmax(0,1fr)}
+}
