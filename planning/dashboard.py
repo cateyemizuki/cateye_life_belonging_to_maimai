@@ -999,7 +999,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
                           qzone={'available': False, 'reason': 'payload_limit'},
                           qzone_video={'available': False, 'reason': 'payload_limit'},
                           video={'available': False, 'reason': 'payload_limit'},
-                          usage={}, health={})
+                          usage={}, health={}, init={'available': False, 'reason': 'payload_limit'})
             if result.get('day') is not None:
                 result['day'] = {'available': False, 'reason': 'payload_limit'}
             break
@@ -1047,12 +1047,73 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]
     return out
 
 
+def _init_summary(plugin: Any) -> dict[str, Any]:
+    """「核心」页初始化投影：registry 解析状态（唯一真源）+ 最近一次报告原文。
+
+    只读，零模型调用；registry/报告缺失或损坏 → available=False 如实降级。
+    parsed 状态来自 init_registry.json（initialized/attempts/validated_at/last_error），
+    raw 原文来自 init_last_report.json（逐字段最近一次 init 的 message/errors/details）。
+    """
+    try:
+        from tools.init.auto_init import FIELD_LABELS, last_report, registry_snapshot
+        from tools.init.manifest import INIT_FIELDS
+        snap = registry_snapshot(plugin)
+        report = last_report(plugin)
+    except Exception:
+        return {'available': False, 'reason': 'projection_unavailable'}
+    fields_raw = snap.get('fields') or {}
+    outcomes = report.get('outcomes') or {}
+    fields: list[dict[str, Any]] = []
+    initialized_count = 0
+    for name in INIT_FIELDS:
+        state = fields_raw.get(name) or {}
+        initialized = bool(state.get('initialized'))
+        if initialized:
+            initialized_count += 1
+        raw = outcomes.get(name) if isinstance(outcomes.get(name), dict) else None
+        fields.append({
+            'field': name,
+            'label': FIELD_LABELS.get(name, name),
+            'initialized': initialized,
+            'attempts': int(state.get('attempts') or 0),
+            'version': state.get('version'),
+            'validated_at': state.get('validated_at'),
+            'last_failed_at': state.get('last_failed_at'),
+            'last_error': state.get('last_error'),
+            'raw': ({
+                'status': raw.get('status'),
+                'stage_status': raw.get('stage_status'),
+                'message': raw.get('message'),
+                'errors': [str(e) for e in (raw.get('errors') or [])],
+                'details': raw.get('details') or {},
+                'validated': raw.get('validated'),
+                'run_at': raw.get('run_at'),
+            } if raw else None),
+        })
+    preflight = snap.get('preflight') or {}
+    total = len(fields)
+    return {
+        'available': True,
+        'plugin_version': snap.get('plugin_version'),
+        'registry_path': snap.get('path'),
+        'preflight': {'ok': preflight.get('ok'), 'checked_at': preflight.get('checked_at'),
+                      'reason': preflight.get('reason')},
+        'fields': fields,
+        'summary': {'total': total, 'initialized': initialized_count,
+                    'pending': total - initialized_count},
+        'last_run_at': report.get('generated_at'),
+        'last_manual': report.get('manual'),
+        'report_available': bool(report.get('available')),
+    }
+
+
 def _extension_summary(plugin: Any, now: datetime, hours: int,
                        usage_hours: int = 720, usage_rows_limit: int = 0,
                        usage_rows_offset: int = 0) -> dict[str, Any]:
     """Independent module projections; never propagate raw event descriptions/logs."""
     result: dict[str, Any] = {'emotion': {'available': False}, 'qzone': {'available': False},
-                              'qzone_video': {'available': False}, 'usage': {}, 'health': {}}
+                              'qzone_video': {'available': False}, 'usage': {}, 'health': {},
+                              'init': {'available': False}}
     ctx = PluginContext(plugin)
     try:
         service = getattr(ctx.emotion, 'service', None)
@@ -1184,4 +1245,5 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
         result['health'] = runtime_health(plugin, now)
     except Exception:
         pass
+    result['init'] = _init_summary(plugin)
     return result

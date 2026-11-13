@@ -49,6 +49,7 @@ function renderActiveTab(){
  if(activeTab==='schedule'){renderSchedulePage();return}
  if(activeTab==='mood'){renderMood();return}
  if(activeTab==='system'){renderUsage();renderHealth();renderQzoneVideoChips();return}
+ if(activeTab==='core'){renderCore();return}
  // PR-ENTERTAINMENT（3.17.13）：情绪卡片并入「此刻」（生活状态之后、睡眠之前），
  // now 路径渲染 renderEmotion；情绪数据投影与渲染逻辑本身零改动（仅展示位置迁移）。
  renderEmotion();renderSleep();
@@ -66,6 +67,56 @@ function renderQzoneVideoChips(){const box=$('qzone-video-chips');if(!box)return
   `发布回执 ${count(sum(qv.publish_attempts))}${detail(qv.publish_attempts)?'（'+detail(qv.publish_attempts)+'）':''}`,
   `事实同步 ${detail(qv.fact_sync)||'暂无'}`];
  box.hidden=false;box.replaceChildren(...chips.map(s=>el('span','',s)))}
+// 核心页（初始化）：解析状态视图 + 输出原文视图。data.init 来自 planning/dashboard._init_summary
+// （registry 解析状态为唯一真源；raw 原文来自 init_last_report.json 逐字段合并）。零模型调用。
+let coreView='status';
+function coreBadge(f){if(f.initialized)return['已初始化','ok'];if(num(f.attempts)>0)return['失败 '+count(f.attempts)+' 次','bad'];return['待初始化','pending']}
+function applyCoreView(){const raw=coreView==='raw';$('core-status-view').hidden=raw;$('core-raw-view').hidden=!raw;$('core-view-status').setAttribute('aria-pressed',String(!raw));$('core-view-raw').setAttribute('aria-pressed',String(raw))}
+function renderCore(){
+ const box=$('core-fields'),rawBox=$('core-raw-fields');if(!box)return;
+ const init=data?.init;
+ if(!init||!init.available){
+  text('core-count','—');text('core-count-note','初始化数据暂不可用');$('core-meter-fill').style.width='0';$('core-meter').setAttribute('aria-valuenow','0');
+  text('core-preflight','—');$('core-preflight').className='pill';text('core-reg-version','—');text('core-last-run','—');text('core-preflight-text','—');text('core-registry-path','—');text('core-version','—');
+  text('core-run-meta','连接宿主后读取初始化登记；离线快照需包含 init 块。');
+  empty(box,'初始化数据暂不可用','连接宿主插件后自动读取 init_registry.json。');
+  if(rawBox)empty(rawBox,'暂无输出原文','初始化运行后此处展示各部分输出原文。');
+  applyCoreView();return;
+ }
+ const sum=init.summary||{},fields=Array.isArray(init.fields)?init.fields:[];
+ const total=num(sum.total)??fields.length,done=num(sum.initialized)??0,ratio=total>0?Math.round(done/total*100):0;
+ text('core-count',done+' / '+total);text('core-count-note',ratio===100?'全部字段已初始化并通过校验':'已初始化 / 共 '+total+' 项');
+ $('core-meter-fill').style.width=ratio+'%';$('core-meter').setAttribute('aria-valuenow',String(ratio));$('core-meter').classList.toggle('complete',ratio===100);
+ text('core-version',init.plugin_version?('插件版本 '+init.plugin_version):'—');text('core-reg-version',init.plugin_version||'未写入');
+ text('core-last-run',init.last_run_at?clock(init.last_run_at,true):'尚无运行');
+ const pf=init.preflight||{},pfText=pf.ok===true?'通过':pf.ok===false?'失败':'尚无记录';
+ text('core-preflight',pfText);$('core-preflight').className='pill '+(pf.ok===true?'ok':pf.ok===false?'bad':'pending');
+ text('core-preflight-text',pfText+(pf.ok===false&&pf.reason?'（'+pf.reason+'）':''));text('core-registry-path',init.registry_path||'登记文件未装配');
+ text('core-run-meta',(init.last_manual?'最近一次：手动初始化':'最近一次：自动初始化')+(init.last_run_at?' · '+clock(init.last_run_at,true):'')+(init.report_available?'':' · 尚无报告原文'));
+ if(!fields.length){empty(box,'暂无初始化字段','登记文件未返回字段状态。');if(rawBox)empty(rawBox,'暂无输出原文','初始化运行后此处展示各部分输出原文。');applyCoreView();return}
+ box.replaceChildren(...fields.map(f=>{
+  const [badgeText,cls]=coreBadge(f),card=el('article','core-field '+cls),head=el('div','core-field-head');
+  head.append(el('h3','',f.label||f.field),el('span','pill '+cls,badgeText));card.append(head);
+  const meta=el('div','core-field-meta');meta.append(el('span','note','尝试 '+count(f.attempts)+' 次'));
+  if(f.validated_at)meta.append(el('span','note','校验 '+clock(f.validated_at,true)));
+  if(f.version)meta.append(el('span','note','版本 '+f.version));
+  card.append(meta);
+  if(!f.initialized&&f.last_error)card.append(el('div','core-field-error',f.last_error));
+  return card}));
+ if(rawBox)rawBox.replaceChildren(...fields.map(f=>{
+  const block=el('article','core-raw-field'),head=el('div','core-field-head'),raw=f.raw;
+  head.append(el('h3','',f.label||f.field),el('span','pill '+(raw?(raw.status==='success'?'ok':raw.status==='failed'?'bad':'pending'):'pending'),raw?(raw.status||'—'):'无记录'));block.append(head);
+  if(!raw){block.append(el('p','note','尚无初始化输出记录（已初始化幂等跳过或从未运行）。'));return block}
+  if(raw.run_at)block.append(el('div','note core-raw-at','运行于 '+clock(raw.run_at,true)+(raw.stage_status?' · 阶段 '+raw.stage_status:'')));
+  if(raw.message)block.append(el('pre','core-raw-pre',raw.message));
+  if(Array.isArray(raw.errors)&&raw.errors.length){block.append(el('div','core-raw-label','错误原文'));block.append(el('pre','core-raw-pre core-raw-err',raw.errors.join('\n')))}
+  const details=raw.details||{};
+  if(Object.keys(details).length){block.append(el('div','core-raw-label','details 原文'));let pretty;try{pretty=JSON.stringify(details,null,2)}catch(e){pretty=String(details)}block.append(el('pre','core-raw-pre',pretty))}
+  return block}));
+ applyCoreView();
+}
+$('core-view-status').onclick=()=>{coreView='status';applyCoreView()};
+$('core-view-raw').onclick=()=>{coreView='raw';applyCoreView()};
 function dayView(){return data?.day?.available&&data.day.date===selectedDay?data.day:null}
 function lifeSeries(){return selectedDay?(dayView()?.state_history||{}):(data?.history||{})}
 function vadSeries(){return selectedDay?(dayView()?.vad_history||{}):(data?.emotion?.history||{})}
@@ -969,7 +1020,7 @@ function dayText(value){const d=date(value)||new Date();const parts=new Intl.Dat
 function zonedMidnight(day){const target=Date.parse(day+'T00:00:00Z');let guess=target;const fmt=new Intl.DateTimeFormat('en-GB',{timeZone:data?.timezone||'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});for(let i=0;i<3;i++){const parts=Object.fromEntries(fmt.formatToParts(new Date(guess)).map(p=>[p.type,p.value]));const local=Date.UTC(+parts.year,+parts.month-1,+parts.day,+parts.hour,+parts.minute,+parts.second);guess+=target-local}return guess}
 function shiftDay(day,delta){return new Date(Date.parse(day+'T12:00:00Z')+delta*86400000).toISOString().slice(0,10)}
 function setDay(day){if(imported&&day&&data.day?.date!==day){notice('这份离线快照没有所选日期，保留原有记录。');$('history-day').value=selectedDay;return}selectedDay=day;zoom=null;$('zoom-reset').hidden=true;$('history-day').value=day;if(live&&!imported)refresh(true);else if(data){render();if(day&&data.day?.date!==day)notice('这份离线快照没有所选日期，仍展示快照中的记录。')}}
-function activateTab(key,focus=false){SectionFish.close();activeTab=key;$("datebar").hidden=key==="now"||key==="system";for(const b of document.querySelectorAll('[role=tab]')){const chosen=b.dataset.tab===key;b.setAttribute('aria-selected',String(chosen));b.tabIndex=chosen?0:-1;$('panel-'+b.dataset.tab).hidden=!chosen;if(chosen&&focus)b.focus()}if(data){updateDateLabel();computePoints();renderActiveTab()}}
+function activateTab(key,focus=false){SectionFish.close();activeTab=key;$("datebar").hidden=key==="now"||key==="system"||key==="core";for(const b of document.querySelectorAll('[role=tab]')){const chosen=b.dataset.tab===key;b.setAttribute('aria-selected',String(chosen));b.tabIndex=chosen?0:-1;$('panel-'+b.dataset.tab).hidden=!chosen;if(chosen&&focus)b.focus()}if(data){updateDateLabel();computePoints();renderActiveTab()}}
 // 3.17.11 PR-TABS-LEFT：栏目改左侧纵向后方向键语义加上下（Down=下一栏/Up=上一栏），左右保留兼容；Home/End 与切换逻辑不变。
 for(const b of document.querySelectorAll('[role=tab]')){b.onclick=()=>activateTab(b.dataset.tab);b.onkeydown=e=>{const list=[...document.querySelectorAll('[role=tab]')],i=list.indexOf(b);let next=null;if(e.key==='ArrowDown'||e.key==='ArrowRight')next=list[(i+1)%list.length];if(e.key==='ArrowUp'||e.key==='ArrowLeft')next=list[(i+list.length-1)%list.length];if(e.key==='Home')next=list[0];if(e.key==='End')next=list.at(-1);if(next){e.preventDefault();activateTab(next.dataset.tab,true)}}}
 $('zoom-in').onclick=()=>{if(!points.length)return;const a=zoom?.[0]??Number(date(points[0].at)),b=zoom?.[1]??Number(date(points.at(-1).at)),mid=(a+b)/2;zoom=[mid-(b-a)/4,mid+(b-a)/4];$('zoom-reset').hidden=false;drawHistory()};$('zoom-out').onclick=resetZoom;

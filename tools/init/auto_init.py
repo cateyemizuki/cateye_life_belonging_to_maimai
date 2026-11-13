@@ -25,17 +25,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from core.storage import save_json_atomic
+
 from .manifest import (INIT_FIELDS, VALIDATORS, ValidationContext, ValidationResult,
                        backoff_seconds, reinit_fields_for_upgrade)
 from .registry import InitRegistry, parse_timestamp
 
 logger = logging.getLogger(__name__)
+
+#: 最后一次初始化报告原文（逐字段合并落盘，供 WebUI「核心」详情页直读）。
+#: 与 init_registry.json 分离：registry 是「完成信号」唯一真源（只存状态），
+#: 本文件存各字段最近一次 init 的原始输出（message/errors/details），不参与判定。
+LAST_REPORT_FILE_NAME = "init_last_report.json"
 
 #: 单飞锁（key = (data_dir, id(loop))；测试/热重载各自 loop 不串）
 _RUN_LOCKS: Dict[Tuple[str, int], asyncio.Lock] = {}
@@ -284,7 +292,52 @@ class AutoInitDriver:
             if unknown:
                 raise ValueError(f"未知初始化字段：{', '.join(unknown)}")
         async with _lock_for(self.data_dir):
-            return await self._run_locked(manual=manual, fields=fields, force=force)
+            report = await self._run_locked(manual=manual, fields=fields, force=force)
+            self._save_last_report(report)
+            return report
+
+    def _save_last_report(self, report: "AutoInitReport") -> None:
+        """逐字段合并落盘最近一次 init 原始输出（崩溃安全；失败静默降级）。
+
+        合并而非覆盖：幂等跳过的字段保留上一次输出，使「核心」详情页每个字段
+        都能展示最近一次原文。只读展示用，绝不参与初始化判定（registry 才是真源）。
+        """
+        try:
+            path = self.data_dir / LAST_REPORT_FILE_NAME
+            prior: Dict[str, Any] = {}
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, Mapping) and isinstance(loaded.get("outcomes"), Mapping):
+                    prior = dict(loaded["outcomes"])
+            except (OSError, ValueError):
+                prior = {}
+            run_at = self._now().isoformat(timespec="seconds")
+            merged = dict(prior)
+            for item in report.to_dict().get("outcomes", []):
+                field_name = str(item.get("field") or "")
+                if field_name:
+                    merged[field_name] = {**item, "run_at": run_at}
+            document = {
+                "schema_version": 1,
+                "generated_at": run_at,
+                "manual": bool(report.manual),
+                "plugin_version": report.plugin_version,
+                "registry_path": report.registry_path,
+                "preflight": dict(report.preflight or {}),
+                "disabled": bool(report.disabled),
+                "need": list(report.need),
+                "outcomes": merged,
+            }
+            # details 可能含 datetime 等非 JSON 原生值；default=str 归一后再原子写，
+            # 避免 save_json_atomic 的 json.dump 抛 TypeError 导致整份报告丢失。
+            document = json.loads(json.dumps(document, ensure_ascii=False, default=str))
+            save_json_atomic(path, document)
+        except Exception as exc:
+            try:
+                self._log.warning("初始化报告原文落盘失败（忽略，不影响初始化）：%s", exc)
+            except Exception:
+                pass
 
     async def _run_locked(self, *, manual: bool, fields: Optional[Sequence[str]],
                           force: Optional[bool]) -> AutoInitReport:
@@ -484,6 +537,34 @@ def registry_snapshot(plugin: Any) -> Dict[str, Any]:
     return InitRegistry(data_dir).snapshot()
 
 
+def last_report(plugin: Any) -> Dict[str, Any]:
+    """只读最近一次初始化报告原文（逐字段 outcomes；不存在/损坏 → 空 outcomes）。
+
+    供 WebUI「核心」详情页展示各字段 init 输出原文；不触发任何写口/业务副作用。
+    """
+    data_dir = _plugin_data_dir(plugin)
+    empty = {"available": False, "generated_at": None, "outcomes": {}}
+    if data_dir is None:
+        return empty
+    try:
+        with open(data_dir / LAST_REPORT_FILE_NAME, "r", encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(doc, Mapping):
+        return empty
+    outcomes = doc.get("outcomes")
+    return {
+        "available": True,
+        "generated_at": doc.get("generated_at"),
+        "manual": bool(doc.get("manual")),
+        "plugin_version": doc.get("plugin_version"),
+        "preflight": dict(doc.get("preflight") or {}),
+        "disabled": bool(doc.get("disabled")),
+        "outcomes": dict(outcomes) if isinstance(outcomes, Mapping) else {},
+    }
+
+
 def status_text(plugin: Any) -> str:
     """``/lbm ops init status`` 文本：直读 init_registry.json 逐字段展示。"""
     snapshot = registry_snapshot(plugin)
@@ -514,7 +595,8 @@ def status_text(plugin: Any) -> str:
 
 __all__ = [
     "AutoInitDriver", "AutoInitReport", "FieldOutcome", "FIELD_LABELS",
+    "LAST_REPORT_FILE_NAME",
     "build_driver", "run", "run_manual", "schedule", "status_text",
-    "registry_snapshot", "compute_need", "retry_allowed", "next_retry_at",
-    "field_label",
+    "registry_snapshot", "last_report", "compute_need", "retry_allowed",
+    "next_retry_at", "field_label",
 ]
