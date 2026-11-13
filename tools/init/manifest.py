@@ -114,6 +114,7 @@ class ValidationContext:
     config: Any = None
     plugin_root: Optional[Path] = None
     personality: str = ""
+    lover_name: str = ""                    # bot 名（persona_digest 写入侧「名称：」前缀同源）
     plugin_version: str = ""
     now: Optional[datetime] = None
     extra: Mapping[str, Any] = field(default_factory=dict)
@@ -220,17 +221,34 @@ def _schedule_enabled(ctx: ValidationContext) -> bool:
                 and _config_value(ctx.config, "schedule", "enabled", True))
 
 
-def _persona_matches(stored: Any, personality: str) -> bool:
-    """persona 指纹匹配：存储摘要 == 当前人设前 500 字（与 referee 落盘同口径）。
+def _expected_persona_digest(personality: str, lover_name: str) -> str:
+    """按写入侧口径重建 persona 摘要（唯一真源 emotion/service.py::_persona_text）。
+
+    写入侧（emotion/service.py:1873 ``_persona_text`` → referee.py:189
+    ``persona_digest=persona_text[:500]``）落盘的是**带前缀的格式化文本**：
+    ``名称：{bot名}`` +（人设非空时）``\\n性格与人设：{persona[:800]}``，再截前 500 字。
+    校验侧必须用同一口径重建期望摘要，否则永远不匹配（2026-11-13 修复）。
+    """
+    parts = [f"名称：{lover_name}"]
+    persona = str(personality or "")
+    if persona:
+        parts.append(f"性格与人设：{persona[:800]}")
+    return "\n".join(parts)[:500]
+
+
+def _persona_matches(stored: Any, personality: str, lover_name: str) -> bool:
+    """persona 指纹匹配：存储摘要 == 写入侧口径重建的期望摘要。
 
     - 当前人设不可得时只要求摘要非空（不伪造匹配）。
-    - 人设可得时摘要必须逐字等于前缀；空摘要视为不匹配（防旧默认值冒充）。
+    - 人设可得时摘要必须逐字等于 ``_expected_persona_digest``（含「名称：/性格与人设：」
+      前缀，与 referee 落盘同口径）；空摘要视为不匹配（防旧默认值冒充）。
     """
     digest = _text(stored)
-    current = str(personality or "")
-    if current:
-        return bool(digest) and digest == current[:500]
-    return bool(digest)
+    if not digest:
+        return False
+    if str(personality or ""):
+        return digest == _expected_persona_digest(personality, lover_name)
+    return True
 
 
 # ----------------------------------------------------------------------
@@ -271,7 +289,8 @@ def validate_emotion(ctx: ValidationContext) -> ValidationResult:
         for key in ("positive_gain", "negative_decay"):
             if not _number(params.get(key)):
                 errors.append(f"params.{key} 缺失/非数")
-        if not _persona_matches(params.get("persona_digest"), ctx.personality):
+        if not _persona_matches(params.get("persona_digest"), ctx.personality,
+                                ctx.lover_name):
             if not _text(params.get("persona_digest")):
                 errors.append("persona_digest 缺失（需重 init）")
             elif str(ctx.personality or ""):

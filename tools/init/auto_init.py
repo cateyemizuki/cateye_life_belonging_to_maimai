@@ -269,6 +269,7 @@ class AutoInitDriver:
             config=config,
             plugin_root=Path(root) if root else None,
             personality=str(getattr(self.plugin, "_personality", "") or ""),
+            lover_name=str(getattr(self.plugin, "_lover_name", "") or "麦麦"),
             plugin_version=version,
             now=self._now(),
         )
