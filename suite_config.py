@@ -8,7 +8,8 @@
                         planning_events（小事件权重乘数与分享概率）
   - companion/config.py 陪伴模块：patrol（含目标用户与屏幕感知）/ affection
   - suite_prompts.py    提示词集中模块：prompts
-  - qzone/config.py     QQ 空间：qzone / qzone_video（空间视频候选·影子模式，PR-A0）
+  - qzone/config.py     QQ 空间：qzone / qzone_video（空间视频候选·影子模式，PR-A0）/
+                        legacy_compat（旧版兼容：Snowluma HTTP cookie 降级，3.17.36）
   - emotion/config.py   情绪系统：emotion
 - 顶层只保留跨模块共享的基础段（plugin / admin）与新增的 LLM 调用段（llm），
   并把各子模块 section 扁平挂载为聚合模型的顶层字段（嵌套段 WebUI 不渲染）。
@@ -129,10 +130,16 @@ from planning.event_catalog_config import (
     EventCatalogSectionConfig,
     migrate_legacy_event_catalog,
 )
-from qzone.config import QzoneSectionConfig, QzoneVideoSectionConfig
+from qzone.config import LegacyCompatSectionConfig, QzoneSectionConfig, QzoneVideoSectionConfig
+from video_watch.autonomous_config import VideoAutonomousSectionConfig
 from video_watch.config import VideoWatchSectionConfig
 from video_watch.share_config import VideoShareSectionConfig
-from core.config_migration import migrate_display_config, migrate_internal_tuning, migrate_release_config
+from core.config_migration import (
+    migrate_display_config,
+    migrate_internal_tuning,
+    migrate_legacy_compat_config,
+    migrate_release_config,
+)
 from core.i18n import ui_i18n as _ui_i18n
 from core.internal_tuning import (
     INTERNAL_TUNING_DEFAULTS,
@@ -354,7 +361,27 @@ from suite_prompts import (
 # 20 段 264 叶子（B1 F1 +10 / B2 F3 +16 / B3 F4 +13 / B4 +2），按 R6 双号同步递增。
 # 2026-11-12 结构审计批（R12）：移除未实现的 transition_procrastination_event_branch
 # 用户叶子（-1）→ [experimental] 40 键、schema 20 段 263 叶子 / 2 隐藏（J 类预留保留）。
-SUPPORTED_CONFIG_VERSION = "3.17.35"
+# 3.17.36（2026-11-14 配置体系批）：新增 [legacy_compat] 旧版兼容段 3 键
+# （snowluma_http_host/port/token），[qzone] 移出 napcat_http_* 3 键（跨段改名值搬运，
+# core.config_migration.migrate_legacy_compat_config + rescue_release_config 磁盘抢救）；
+# 段序 __ui_order__=17 紧跟 qzone_video（16）之后（2026-11-14 段序修正批已改
+# 11/10，见下方批注）；[llm].over_limit_auto_trim 默认
+# True→False（schema/getattr 兜底/消费侧 params 兜底同步）。schema 21 段 264 叶子 / 2 隐藏
+# （段 +1、叶子净 ±0），按 R6 双号同步递增。
+# 3.17.37（2026-11-14 视频自主观看批）：新增 [video_autonomous] 段 4 键
+# （min_views/min_replies/min_coins/min_favorites），承载日程主动观看的候选数据门槛；
+# 只约束主动选片（BiliCandidateSource.prepare/pick），工具点播不受影响。[video_share]
+# 的 quality_gate/threshold 经核对消费方（仅 Qzone 发布桥）保留原段不迁移，观看侧另设
+# 独立统计阈值。schema 21→22 段、264→268 叶子 / 2 隐藏（段 +1、叶子 +4），按 R6 双号同步递增。
+# 2026-11-14 段序修正批（无版本递增）：独立复核发现 qzone_video（order=16）与
+# legacy_compat（order=17）渲染垫底、不与 qzone（order=9）相邻。按用户要求三段
+# 「QQ空间 → 空间视频候选 → 旧版兼容」渲染相邻：qzone_video 16→10、legacy_compat
+# 17→11（qzone/config.py），qzone=9 不变；video_watch 起其余段整体顺延 +2、彼此
+# 相对顺序不变——video_watch/video_autonomous/video_share 10→12、llm 11→13、
+# prompts 12→14、event_catalog（服务视图）12→14、admin 13→15、
+# dashboard_display 14→16、maimai_interaction 15→17。只改 __ui_order__ 与注释/文档，
+# 段数/字段数/隐藏数/默认值/迁移/版本号均不变。
+SUPPORTED_CONFIG_VERSION = "3.17.37"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -583,17 +610,17 @@ class LlmSectionConfig(PluginConfigBase):
 
     __ui_label__ = "LLM 调用"
     __ui_icon__ = "cpu"
-    __ui_order__ = 11
+    __ui_order__ = 13  # 2026-11-14 段序修正批整体顺延（原 11）
     prompt_optimization_enabled: bool = Field(
         default=True,
         description="短任务出现多余思考输出后，后续请求追加一次直接输出提示；不增加重试或延长超时。",
         json_schema_extra={"label": "自动约束短任务输出"},
     )
     over_limit_auto_trim: bool = Field(
-        default=True,
-        description="生成结果超出条数上限时自动裁剪兜底（默认开）：小事件取前N条避免整批作废；日程按时间排序后保留末尾，晚间计划不被裁掉。关闭则小事件超量整批拒绝、日程沿用旧的输出序截断。",
+        default=False,
+        description="生成结果超出条数上限时自动裁剪兜底（3.17.36 起默认关）：开启后小事件取前N条避免整批作废；日程按时间排序后保留末尾，晚间计划不被裁掉。关闭（默认）则小事件超量整批拒绝、日程沿用旧的输出序截断。",
         json_schema_extra={"label": "超限自动裁剪",
-                           **_ui_i18n("Auto-trim over-limit", "Gracefully trim over-limit generation results instead of failing; schedule keeps the tail (evening).")},
+                           **_ui_i18n("Auto-trim over-limit", "Gracefully trim over-limit generation results instead of failing; schedule keeps the tail (evening). Off by default.")},
     )
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "LLM Calls",
@@ -710,7 +737,7 @@ class AdminSectionConfig(PluginConfigBase):
 
     __ui_label__ = "管理与日志"
     __ui_icon__ = "shield"
-    __ui_order__ = 13
+    __ui_order__ = 15  # 2026-11-14 段序修正批整体顺延（原 13）
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Admin & Logs", "description": "Command permissions and diagnostic logs."}
     }
@@ -790,7 +817,7 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
 
     __ui_label__ = "麦麦互动"
     __ui_icon__ = "heart"
-    __ui_order__ = 15
+    __ui_order__ = 17  # 2026-11-14 段序修正批整体顺延（原 15）
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Maimai Interaction",
                "description": "Corner mascot and fullscreen detail look & feel (display-only)."}
@@ -825,7 +852,7 @@ class DashboardDisplaySectionConfig(PluginConfigBase):
     """设置历史明细的条数和变化显示阈值。"""
     __ui_label__ = "数据展示"
     __ui_icon__ = "chart-line"
-    __ui_order__ = 14
+    __ui_order__ = 16  # 2026-11-14 段序修正批整体顺延（原 14）
 
     history_changes_limit: int = Field(
         default=30, ge=5, le=30,
@@ -1355,12 +1382,23 @@ class CateyeSuiteConfig(PluginConfigBase):
     qzone: QzoneSectionConfig = Field(default_factory=QzoneSectionConfig)
     qzone_video: QzoneVideoSectionConfig = Field(default_factory=QzoneVideoSectionConfig)
     video_watch: VideoWatchSectionConfig = Field(default_factory=VideoWatchSectionConfig)
+    # 3.17.37 视频自主观看段：日程主动观看的候选数据门槛（播放量/评论/投币/收藏）。
+    # 与 video_watch / video_share 同为 __ui_order__=12（2026-11-14 段序修正批
+    # 整体顺延，原 10）；声明序插在两者之间 →
+    # 渲染序 video_watch → video_autonomous → video_share（order 升序稳定排序）。
+    # 只约束主动选片（BiliCandidateSource.prepare/pick），工具点播不受影响。
+    video_autonomous: VideoAutonomousSectionConfig = Field(default_factory=VideoAutonomousSectionConfig)
     video_share: VideoShareSectionConfig = Field(default_factory=VideoShareSectionConfig)
     llm: LlmSectionConfig = Field(default_factory=LlmSectionConfig)
     prompts: PromptsSectionConfig = Field(default_factory=PromptsSectionConfig)
     admin: AdminSectionConfig = Field(default_factory=AdminSectionConfig)
     dashboard_display: DashboardDisplaySectionConfig = Field(default_factory=DashboardDisplaySectionConfig)
     maimai_interaction: MaimaiInteractionSectionConfig = Field(default_factory=MaimaiInteractionSectionConfig)
+    # 3.17.36 旧版兼容段：渲染序由 __ui_order__=11 决定（2026-11-14 段序修正批，
+    # 原 17 垫底），紧跟 qzone_video（order=10）、qzone（order=9）之后，三段渲染
+    # 相邻。声明序不决定渲染序：SDK 按 __ui_order__ 建 schema
+    # （maibot_sdk/config.py _build_section_schema），宿主前端按 order 升序稳定排序。
+    legacy_compat: LegacyCompatSectionConfig = Field(default_factory=LegacyCompatSectionConfig)
 
     @property
     def event_catalog(self) -> EventCatalogSectionConfig:
@@ -1423,6 +1461,10 @@ class CateyeSuiteConfig(PluginConfigBase):
         # Preserve canonical explicit defaults before the ancient layout cleaner
         # strips default-valued keys; legacy aliases must already be gone then.
         migrated = migrate_release_config(migrated)
+        # 0-r) 3.17.36 旧版兼容段：[qzone].napcat_http_* → [legacy_compat].snowluma_http_*
+        #      跨段改名值搬运（两分支共经；幂等——旧键搬完即 pop）。目标键等于出厂
+        #      默认 "" 视同缺位，merge 过默认的输入也能搬入旧值。
+        migrated = migrate_legacy_compat_config(migrated)
         # 0a) [event_catalog] 旧键 max_events → 规范字段 max_generated_events（2026-10-27 用户裁定）。
         #     必须发生在「默认值填充之前」：宿主/SDK 先 merge 出厂默认，之后 pydantic 的
         #     model_fields_set 会把每个字段都当显式值，段级 resolve_config 的「规范字段优先」

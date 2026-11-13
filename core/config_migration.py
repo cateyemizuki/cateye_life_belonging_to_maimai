@@ -33,6 +33,48 @@ EVENT_CATALOG_FIELDS = ("mode", "min_interval_days", "max_interval_days", "max_g
                         "reusable_00_08", "reusable_08_16", "reusable_16_24",
                         "one_shot_00_08", "one_shot_08_16", "one_shot_16_24", "no_puzzle")
 
+#: 3.17.36（旧版兼容段）：[qzone].napcat_http_* → [legacy_compat].snowluma_http_*。
+#: 概念改名 NapCat HTTP → Snowluma HTTP 且整段移出 [qzone]（跨段 + 改名，值搬运）。
+#: 三键出厂默认均为 ""：目标键缺位**或仍等于出厂默认 ""** 视同可搬入
+#: （_strip_factory_defaults 同口径——宿主/SDK 先 merge 默认，setdefault 裸用会吞旧值）；
+#: 用户在新段的显式非空值优先。旧键搬完即 pop（退役，不再出现在 schema）。
+LEGACY_COMPAT_RENAMES = {
+    "napcat_http_host": "snowluma_http_host",
+    "napcat_http_port": "snowluma_http_port",
+    "napcat_http_token": "snowluma_http_token",
+}
+
+
+def migrate_legacy_compat_config(value: Any) -> Any:
+    """[qzone].napcat_http_* → [legacy_compat].snowluma_http_*（纯内存、幂等、不改入参）。
+
+    与 :func:`migrate_display_config` 同精神（跨段 setdefault+pop），但带键名改名，
+    且目标键等于出厂默认 "" 时视同缺位（见 :data:`LEGACY_COMPAT_RENAMES` 注释）。
+    调用点：plugin.normalize_plugin_config 的原始输入与磁盘抢救结果（SDK merge 之前）、
+    聚合校验器入口（两分支共经）、:func:`rescue_release_config` 的磁盘抢救对。
+    """
+    if not isinstance(value, dict):
+        return value
+    out = dict(value)
+    old = out.get("qzone")
+    if not isinstance(old, dict):
+        return out
+    old = dict(old)
+    compat = dict(out.get("legacy_compat") or {})
+    changed = False
+    for old_key, new_key in LEGACY_COMPAT_RENAMES.items():
+        if old_key not in old:
+            continue
+        legacy_value = old.pop(old_key)
+        changed = True
+        if not compat.get(new_key):  # 缺位或仍为出厂默认 "" → 搬旧值；显式非空值优先
+            compat[new_key] = legacy_value
+    if changed:
+        out["qzone"] = old
+    if compat:
+        out["legacy_compat"] = compat
+    return out
+
 
 def migrate_release_config(value: Any) -> Any:
     """Pure, idempotent migration; explicit canonical values win, including false/0."""
@@ -80,14 +122,17 @@ def rescue_release_config(value: Any, disk: Any) -> Any:
     """
     if not isinstance(value, dict):
         return value
-    out = migrate_release_config(value)
+    out = migrate_legacy_compat_config(migrate_release_config(value))
     if not isinstance(disk, dict):
         return out
-    migrated_disk = migrate_release_config(disk)
+    migrated_disk = migrate_legacy_compat_config(migrate_release_config(disk))
     pairs = [(sec, old, sec, new) for sec, mapping in RELEASE_RENAMES.items() for old, new in mapping.items()]
     pairs += [("event_catalog", key, "schedule", "event_catalog_" + key) for key in EVENT_CATALOG_FIELDS]
     # The oldest event cap alias needs the same pre-merge rescue.
     pairs += [("event_catalog", "max_events", "schedule", "event_catalog_max_generated_events")]
+    # 3.17.36：[qzone].napcat_http_* → [legacy_compat].snowluma_http_* 跨段改名对
+    # （磁盘旧键在宿主重建后只存在于磁盘时的抢救通道，与 event_catalog 同口径）。
+    pairs += [("qzone", old, "legacy_compat", new) for old, new in LEGACY_COMPAT_RENAMES.items()]
     for old_sec, old_key, new_sec, new_key in pairs:
         src_disk = disk.get(old_sec)
         canonical_disk = disk.get(new_sec)

@@ -131,6 +131,19 @@ def _read(path: Path, default: Any) -> Any:
         return default
 
 
+def _stat_int(stat: Dict[str, Any], key: str) -> int:
+    """popular 响应 stat 计数安全取整（缺失/非法 → 0，与既有 views 口径一致）。
+
+    3.17.37 视频自主观看批：评论/投币/收藏在 popular 响应自带（侦查实测 stat 含
+    reply/coin/favorite），此处一并解析供主动侧数据门槛使用；搜索路不解析这三项
+    （接口未验证可得），候选 dict 缺键 → 门槛跳过该项，不假装检查。
+    """
+    try:
+        return int(stat.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _clean_terms(raw: Any, limit: int) -> List[str]:
     """把模型输出的词表清洗成有界、去重、无链接的字符串列表（不编造补充）。"""
     if not isinstance(raw, (list, tuple)):
@@ -651,12 +664,17 @@ class BiliCandidateSource:
                  excluded_bvids: Optional[Callable[[], Iterable[str]]] = None,
                  logger: Any = None,
                  fetch_json: Optional[Callable[[str], Any]] = None,
-                 now_provider: Optional[Callable[[], float]] = None) -> None:
+                 now_provider: Optional[Callable[[], float]] = None,
+                 stat_gate_provider: Optional[Callable[[], Any]] = None) -> None:
         self._interest = interest
         self._excluded_bvids = excluded_bvids
         self._log = logger if logger is not None else logging.getLogger(__name__)
         self._fetch_json = fetch_json
         self._now_provider = now_provider
+        #: 3.17.37 视频自主观看批：[video_autonomous] 段惰性只读 provider（装配根
+        #: 注入，热重载即时生效）。None/读失败 = 不加数据门槛（保持旧行为，兼容未装配
+        #: 场景与既有测试）。门槛只作用于本候选源（主动选片），工具点播不经此路径。
+        self._stat_gate_provider = stat_gate_provider
         self._pool: List[Dict[str, Any]] = []
         self._reason = "not_prepared"
         self._prepared_at = 0.0
@@ -686,6 +704,55 @@ class BiliCandidateSource:
         """
         interest = self._interest
         return interest.effective_weights() if interest is not None else None
+
+    # ---- 3.17.37 视频自主观看批：主动侧候选数据门槛 ----
+    def _passes_stat_gate(self, item: Dict[str, Any]) -> bool:
+        """按 [video_autonomous] 阈值过滤候选；只被 prepare/pick（自主选片）调用。
+
+        - 工具点播（service.submit 直传 BV）从不经过本候选源，故不受任何阈值约束；
+        - 每项阈值 0 = 不检查该项；播放量低于 min_views → 拒（views 两路恒可得）；
+        - 评论/投币/收藏仅在候选 dict 真实含该键时参与检查（popular 路自带）；
+          搜索候选缺键 → 跳过该项，绝不假装检查不可得统计（降级不编造）；
+        - provider 未注入/读取失败/段缺位 → 不加门槛（保持旧行为，保守不拦观看）。
+        """
+        provider = self._stat_gate_provider
+        if provider is None:
+            return True
+        try:
+            cfg = provider()
+        except Exception:
+            return True
+        if cfg is None:
+            return True
+        try:
+            min_views = int(getattr(cfg, "min_views", 0) or 0)
+        except (TypeError, ValueError):
+            min_views = 0
+        if min_views > 0:
+            try:
+                views = int(item.get("views") or 0)
+            except (TypeError, ValueError):
+                views = 0
+            if views < min_views:
+                return False
+        for field, attr in (("replies", "min_replies"),
+                            ("coins", "min_coins"),
+                            ("favorites", "min_favorites")):
+            try:
+                threshold = int(getattr(cfg, attr, 0) or 0)
+            except (TypeError, ValueError):
+                threshold = 0
+            if threshold <= 0:
+                continue
+            if field not in item:
+                continue  # 统计不可得（搜索路）→ 跳过该项，不假装检查
+            try:
+                value = int(item.get(field) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value < threshold:
+                return False
+        return True
 
     # ---- 抓取 ----
     async def _default_fetch(self, url: str) -> Any:
@@ -754,7 +821,12 @@ class BiliCandidateSource:
                         "duration_seconds": duration,
                         "tname": str(item.get("tname") or "").strip(),
                         "desc": str(item.get("desc") or "").strip()[:300],
-                        "views": views})
+                        "views": views,
+                        # 3.17.37 视频自主观看批：评论/投币/收藏（popular 响应自带，
+                        # 供主动侧数据门槛；搜索路无此三键 → 门槛缺失即跳过）。
+                        "replies": _stat_int(stat, "reply"),
+                        "coins": _stat_int(stat, "coin"),
+                        "favorites": _stat_int(stat, "favorite")})
         return out
 
     # ---- 准备与挑选 ----
@@ -909,6 +981,13 @@ class BiliCandidateSource:
                             if eligible_count > 0 and excluded_count == eligible_count
                             else "interest_no_match")
             return self.snapshot()
+        # 3.17.37 视频自主观看批：主动侧数据门槛（[video_autonomous]）。在关键词
+        # 匹配之后、排序入池之前过滤——低热度候选不进池；全部被拒 → 如实 no_candidate。
+        # 只作用于本候选源（日程/空隙/调试自主选片），工具点播不经此路径。
+        matched = [c for c in matched if self._passes_stat_gate(c)]
+        if not matched:
+            self._reason = "candidate_below_stat_threshold"
+            return self.snapshot()
         matched.sort(key=lambda c: (-c["_score"], -int(c.get("views") or 0)))
         selected = matched[:CANDIDATE_POOL_LIMIT]
         if feedback_on and len(matched) > CANDIDATE_POOL_LIMIT:
@@ -940,6 +1019,8 @@ class BiliCandidateSource:
 
         挑选时再核一次去重集合（prepare 与 pick 之间历史/活跃任务可能变化；
         prepare 超时残留旧池时也绝不推荐已看 BV）。去重集合不可读 → 保守不推荐。
+        3.17.37：同口径再核一次数据门槛（防 prepare 超时残留旧池/阈值热重载后
+        旧池未过滤）；工具点播不经本路径，不受影响。
         """
         current = self._interest.load() or {}
         if str(current.get("generation") or "") != self._interest_generation:
@@ -954,6 +1035,8 @@ class BiliCandidateSource:
         while self._pool:
             candidate = self._pool.pop(0)
             if str(candidate.get("bvid") or "") in excluded:
+                continue
+            if not self._passes_stat_gate(candidate):
                 continue
             return {"success": True, "candidate": candidate, "reason": ""}
         return {"success": True, "candidate": None,

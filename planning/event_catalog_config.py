@@ -72,7 +72,9 @@ class EventCatalogSectionConfig(PluginConfigBase):
 
     __ui_label__ = "事件库（生成小事件）"
     __ui_icon__ = "sparkles"
-    __ui_order__ = 12
+    # 服务视图段（不挂顶层、不参与渲染）；随 prompts 同步顺延保持编号口径一致
+    # （2026-11-14 段序修正批，原 12）。
+    __ui_order__ = 14
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Event Catalog (generated events)",
                "description": "LLM-generated small events used as idle/transition fillers. Off by default."}

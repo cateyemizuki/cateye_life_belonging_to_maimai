@@ -525,7 +525,9 @@ class ScheduleGenerator:
             if row is not None:
                 rows.append(row)
         max_int = int(params.get("max_intentions", 6))
-        if params.get("over_limit_auto_trim", True):
+        # 3.17.36：兜底默认与 [llm].over_limit_auto_trim 出厂默认同步改 False
+        # （正常路径 params 恒含该键，见 _spine_params 的 over_limit_auto_trim 写入）。
+        if params.get("over_limit_auto_trim", False):
             # 保尾裁剪：先按时间排序，超量时保留最晚的 N 条，晚间计划不被裁掉
             # （避免「晚上永不出现计划」）；睡眠锚点若被裁掉由后续护栏补回。
             rows.sort(key=lambda it: int(it["start_minute"]))

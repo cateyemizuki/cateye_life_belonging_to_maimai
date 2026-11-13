@@ -300,9 +300,15 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 2026-10-27 用户裁定：规范 max_generated_events 显式值（含 8）优先于旧
         # max_events；必须在本方法即将调用的 SDK「merge 出厂默认 → 校验」之前，对
         # **原始输入**先搬迁旧键，否则默认 8 一旦 merge 进来就无法再靠值判断显式性。
-        from core.config_migration import migrate_display_config, migrate_internal_tuning
+        from core.config_migration import (
+            migrate_display_config,
+            migrate_internal_tuning,
+            migrate_legacy_compat_config,
+        )
         from companion.screen_config import migrate_screen_config, rescue_screen_config
-        incoming = rescue_screen_config(migrate_display_config(config_data),
+        # 3.17.36：[qzone].napcat_http_* → [legacy_compat].snowluma_http_* 跨段改名
+        # 值搬运（原始输入通道；磁盘抢救结果在下方同口径再搬一次）。
+        incoming = rescue_screen_config(migrate_legacy_compat_config(migrate_display_config(config_data)),
                                        _read_config_file(_os.path.join(_PLUGIN_DIR, _CONFIG_FILE_NAME)))
         # 3.1.0 配置精简轮（J 类 40 项）：旧 TOML 内部调参键的捕获值必须在 SDK
         # 「merge 出厂默认 → 校验」**之前**落盘 mappings/internal_tuning.json——
@@ -373,7 +379,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
         incoming = _pop_retired_keys(incoming)
         rescued, rescued_changed = _rescue_config_from_disk(incoming)
-        rescued = migrate_screen_config(migrate_display_config(rescued))
+        # 3.17.36：磁盘抢救会把 [qzone].napcat_http_* 旧键带回（_merge_disk_values
+        # 对已删键无类型参照）——在 SDK merge 之前搬进 [legacy_compat].snowluma_http_*。
+        rescued = migrate_legacy_compat_config(migrate_screen_config(migrate_display_config(rescued)))
         # 抢救可能把磁盘里的 J 类旧键并回输入（_merge_disk_values 对已删键无类型参照）：
         # 同口径在 SDK merge 前 pop；捕获值已由上方磁盘通道落盘，此处只清键。
         rescued, _rescued_tuning_captured = migrate_internal_tuning(rescued)
@@ -521,11 +529,21 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 与群聊电量口径都与 3.17.33 逐字一致（2026-11-12 裁决 3 起默认 True）。
         self._bpp_bridge = self._companion.bpp_bridge
         register_adapter(self._bpp_bridge)
+        # 旧版兼容（3.17.36）：[legacy_compat] snowluma_http_* 改惰性访问器装配——
+        # 只有 cookie 降级通道 2（Snowluma HTTP，仅 <2.0.0 的 SnowLuma 需要）真正
+        # 执行时才读取本段；适配器直连成功路径永不触碰（包括不读其值）。
+        # 每次调用重取 self.config：SDK 热重载整体替换配置实例后即时生效。
+        def _legacy_compat_http() -> tuple:
+            sec = getattr(self.config, "legacy_compat", None)
+            return (
+                str(getattr(sec, "snowluma_http_host", "") or ""),
+                str(getattr(sec, "snowluma_http_port", "") or ""),
+                str(getattr(sec, "snowluma_http_token", "") or ""),
+            )
+
         self._qzone_cookies = QzoneCookieManager(
             self.ctx, data_dir,
-            napcat_http_host=cfg.qzone.napcat_http_host,
-            napcat_http_port=cfg.qzone.napcat_http_port,
-            napcat_http_token=cfg.qzone.napcat_http_token,
+            legacy_http_provider=_legacy_compat_http,
         )
         # 第二实参为配置实例（服务读 .qzone 段）；另显式传 plugin：bus/emotion 动态属性与
         # 热重载配置（plugin.config 每次重取，SDK 热重载会整体替换配置实例）都挂在插件对象上
@@ -1664,7 +1682,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             # 惰性读取，避免每次判分都重建服务。
             self._video_interest = interest
             source = BiliCandidateSource(
-                interest, excluded_bvids=self._video_excluded_bvids, logger=self.ctx.logger)
+                interest, excluded_bvids=self._video_excluded_bvids, logger=self.ctx.logger,
+                # 3.17.37 视频自主观看批：主动侧候选数据门槛（[video_autonomous]）。
+                # 惰性读段（热重载即时生效）；只约束本候选源的自主选片，工具点播
+                # （service.submit 直传 BV）不经 prepare/pick，不受任何阈值影响。
+                stat_gate_provider=lambda: getattr(self.config, "video_autonomous", None))
             self._video_candidate_source_obj = source
         return source
 

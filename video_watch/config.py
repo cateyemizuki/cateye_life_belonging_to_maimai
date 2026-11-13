@@ -24,7 +24,9 @@ class VideoWatchSectionConfig(PluginConfigBase):
 
     __ui_label__ = "视频观看"
     __ui_icon__ = "video"
-    __ui_order__ = 10
+    # 2026-11-14 段序修正批：qzone_video/legacy_compat 插到 qzone 之后（10/11），
+    # 本段与 video_autonomous/video_share 整体顺延 10→12，彼此相对顺序不变。
+    __ui_order__ = 12
 
     @model_validator(mode="before")
     @classmethod

@@ -859,7 +859,7 @@ class PromptsSectionConfig(PluginConfigBase):
 
     __ui_label__ = "提示词（高级）"
     __ui_icon__ = "message-square"
-    __ui_order__ = 12
+    __ui_order__ = 14  # 2026-11-14 段序修正批整体顺延（原 12）
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Prompts (Advanced)",
                "description": "Customize wording and additional schedule preferences; internal protocols are maintained by the plugin."}

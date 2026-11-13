@@ -154,22 +154,10 @@ class QzoneSectionConfig(PluginConfigBase):
     # 日程作息（[schedule] sleep_time~wake_time，入睡~起床整夜不发说说、不监听评论），
     # 与陪伴静默共用同一解析真源 companion.patrol.resolve_silence_window；
     # 旧配置里的显式值由迁移器丢弃并登记。
-    napcat_http_host: str = Field(
-        default="",
-        description="备选：NapCat HTTP 服务器地址（cookie 获取降级通道 2，如 127.0.0.1）。"
-                    "该通道为 http 明文且携带 Bearer token，仅限回环地址（127.0.0.1/localhost），勿填局域网或公网地址",
-        json_schema_extra={"label": "NapCat HTTP 地址", "placeholder": "127.0.0.1", **_ui_i18n("NapCat HTTP host")},
-    )
-    napcat_http_port: str = Field(
-        default="",
-        description="备选：NapCat HTTP 服务器端口（如 9999）；留空则不用该通道",
-        json_schema_extra={"label": "NapCat HTTP 端口", "placeholder": "9999", **_ui_i18n("NapCat HTTP port")},
-    )
-    napcat_http_token: str = Field(
-        default="",
-        description="备选：NapCat HTTP 服务器的 access token",
-        json_schema_extra={"label": "NapCat HTTP Token", **_ui_i18n("NapCat HTTP token")},
-    )
+    # 注（3.17.36 旧版兼容段）：原 napcat_http_host/port/token 三键已移出本段——
+    # 概念改名 NapCat HTTP → Snowluma HTTP，整段迁往 [legacy_compat]
+    # snowluma_http_host/port/token（值搬运，见 core.config_migration.migrate_legacy_compat_config）。
+    # 读取时机同步改惰性：仅适配器直连 get_cookies 失效时才读 [legacy_compat]。
 
 
 class QzoneVideoSectionConfig(PluginConfigBase):
@@ -178,7 +166,9 @@ class QzoneVideoSectionConfig(PluginConfigBase):
 
     __ui_label__ = "空间视频候选"
     __ui_icon__ = "video"
-    __ui_order__ = 16
+    # 段序紧跟 [qzone]（order=9）：qzone → qzone_video → legacy_compat 三段渲染相邻
+    # （2026-11-14 段序修正批，原 order=16 渲染最末）。
+    __ui_order__ = 10
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "QZone video candidates",
                "description": "Shadow-mode candidates from autonomous watching; no posting yet."}
@@ -270,3 +260,39 @@ class QzoneVideoSectionConfig(PluginConfigBase):
     def _normalize_mode(cls, value: object) -> str:
         """三值收敛：off/shadow/auto 之外（含非字符串）一律回退 shadow（保守不放宽）。"""
         return value if isinstance(value, str) and value in ("off", "shadow", "auto") else "shadow"
+
+
+class LegacyCompatSectionConfig(PluginConfigBase):
+    """SnowLuma 2.0.0 及以上版本无需配置本段；低于 2.0.0 的 SnowLuma 需要配置。
+    旧版 Snowluma HTTP cookie 降级通道（原 [qzone] napcat_http_*，3.17.36 改名搬段）：
+    仅当适配器直连 get_cookies 失效时才读取本段，直连成功路径永不触碰。"""
+
+    __ui_label__ = "旧版兼容"
+    __ui_icon__ = "history"
+    # 段序紧跟 [qzone_video]（__ui_order__=10）之后：qzone(9) → qzone_video(10) →
+    # legacy_compat(11) 三段渲染相邻（2026-11-14 段序修正批，原 16/17 垫底已废）。
+    __ui_order__ = 11
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Legacy compatibility",
+               "description": "SnowLuma 2.0.0+ needs nothing here; only SnowLuma older than 2.0.0 "
+                              "requires the Snowluma HTTP cookie fallback. Read only when the "
+                              "adapter direct get_cookies channel fails."}
+    }
+
+    snowluma_http_host: str = Field(
+        default="",
+        description="Snowluma HTTP 服务器地址（cookie 获取降级通道 2，如 127.0.0.1）。"
+                    "仅低于 2.0.0 的 SnowLuma 需要；仅当适配器直连 get_cookies 失效时才读取。"
+                    "该通道为 http 明文且携带 Bearer token，仅限回环地址（127.0.0.1/localhost），勿填局域网或公网地址",
+        json_schema_extra={"label": "Snowluma HTTP 地址", "placeholder": "127.0.0.1", **_ui_i18n("Snowluma HTTP host")},
+    )
+    snowluma_http_port: str = Field(
+        default="",
+        description="Snowluma HTTP 服务器端口（如 9999）；留空则不用该通道",
+        json_schema_extra={"label": "Snowluma HTTP 端口", "placeholder": "9999", **_ui_i18n("Snowluma HTTP port")},
+    )
+    snowluma_http_token: str = Field(
+        default="",
+        description="Snowluma HTTP 服务器的 access token",
+        json_schema_extra={"label": "Snowluma HTTP Token", **_ui_i18n("Snowluma HTTP token")},
+    )

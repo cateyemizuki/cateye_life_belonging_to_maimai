@@ -212,9 +212,9 @@ def _llm_section(config_or_plugin: Any) -> Any:
 
 
 def over_limit_trim_enabled(config_or_plugin: Any) -> bool:
-    """``[llm].over_limit_auto_trim``（默认 True）：超限生成结果自动裁剪兜底开关。"""
+    """``[llm].over_limit_auto_trim``（3.17.36 起默认 False）：超限生成结果自动裁剪兜底开关。"""
     section = _llm_section(config_or_plugin)
-    return bool(getattr(section, "over_limit_auto_trim", True))
+    return bool(getattr(section, "over_limit_auto_trim", False))
 
 
 def build_host_identity_prefix(bot_name: Any, alias_names: Any, personality: Any) -> str:

@@ -1,6 +1,6 @@
 # 属于麦麦的生活
 
-> 当前版本 **3.17.35**。一个 MaiBot 插件，让麦麦拥有自己的日程、关系、QQ 空间与情绪。本文只描述当前能力；版本沿革与逐批变更记录见 [CHANGELOG.md](CHANGELOG.md)，不以本文历史段落判断部署版本。日程侧：普通小事件（可编辑 `mappings/initial_events/` JSON 库 + 生成池）作为正常滚动候选参与选取，待机仅为短空档兜底；人设驱动的日程偏好低频批量评估、普通滚动 0 LLM；模块联动（刷视频/刷QQ）保留独立预算。
+> 当前版本 **3.17.37**。一个 MaiBot 插件，让麦麦拥有自己的日程、关系、QQ 空间与情绪。本文只描述当前能力；版本沿革与逐批变更记录见 [CHANGELOG.md](CHANGELOG.md)，不以本文历史段落判断部署版本。日程侧：普通小事件（可编辑 `mappings/initial_events/` JSON 库 + 生成池）作为正常滚动候选参与选取，待机仅为短空档兜底；人设驱动的日程偏好低频批量评估、普通滚动 0 LLM；模块联动（刷视频/刷QQ）保留独立预算。
 
 ## 当前能力概述（v3.17.x）
 
@@ -14,9 +14,9 @@
 
 ## 配置入口
 
-- 宿主 WebUI 插件配置为唯一入口；当前 schema **20 段 264 字段、2 隐藏**（3.17.33：新增 `[planning_events]` 3 键、`[patrol].miss_sleep_excluded`、`[planning_proactive].greeting_night_require_morning_chain`；Gemini 配置批再增 15 键：`[life_state]` 3、`[patrol]` 4、`[planning_proactive]` 1、`[affection]` 1、`[emotion]` 3、`[prompts]` 1、`[video_share]` 2；配置默认值轮再增 `[emotion].emotion_quota_partition_enabled` 1 键，配额分区总开关从 `internal_tuning` 移回用户 schema；3.17.34 `[experimental]` 段 41 键 = B1 F1 群注意力 10 + B2 F3 转场拖延 16 + B3 F4 社交边界 13 + B4 bpp 联动/群电量 2 − 2026-11-12 结构审计批移除未实现开关 `transition_procrastination_event_branch` 1 + 裁决批 F5 抑饿 1；裁决 3 将 F1/F3/F4/B4 四开关默认转正为开，裁决 2 将段序改为 plugin 第一、experimental 第二）。段键：`plugin / experimental / patrol / screen / affection / schedule / schedule_advanced / planning_proactive / planning_events / emotion / life_state / qzone / qzone_video / video_watch / video_share / llm / prompts / admin / dashboard_display / maimai_interaction`。
+- 宿主 WebUI 插件配置为唯一入口；当前 schema **22 段 268 字段、2 隐藏**（3.17.37：新增 `[video_autonomous]` 视频自主观看段 4 键 `min_views/min_replies/min_coins/min_favorites`——日程主动观看的候选数据门槛（播放量默认 50000，评论/投币/收藏默认 0=不检查），**只约束日程触发的自主选片，工具点播不受任何阈值影响**；评论/投币/收藏仅候选阶段真实可得时参与检查（搜索路缺失即跳过）。`[video_share]` 的 `video_share_quality_gate/threshold` 经核对消费方（仅 Qzone 发布桥）保留原段不迁移，观看侧另设独立统计阈值。3.17.36：新增 `[legacy_compat]` 旧版兼容段 3 键 `snowluma_http_host/port/token`，`[qzone]` 移出 `napcat_http_*` 3 键——跨段改名**值搬运**，段 +1、字段净 ±0；`[llm].over_limit_auto_trim` 默认改关。3.17.33：新增 `[planning_events]` 3 键、`[patrol].miss_sleep_excluded`、`[planning_proactive].greeting_night_require_morning_chain`；Gemini 配置批再增 15 键：`[life_state]` 3、`[patrol]` 4、`[planning_proactive]` 1、`[affection]` 1、`[emotion]` 3、`[prompts]` 1、`[video_share]` 2；配置默认值轮再增 `[emotion].emotion_quota_partition_enabled` 1 键，配额分区总开关从 `internal_tuning` 移回用户 schema；3.17.34 `[experimental]` 段 41 键 = B1 F1 群注意力 10 + B2 F3 转场拖延 16 + B3 F4 社交边界 13 + B4 bpp 联动/群电量 2 − 2026-11-12 结构审计批移除未实现开关 `transition_procrastination_event_branch` 1 + 裁决批 F5 抑饿 1；裁决 3 将 F1/F3/F4/B4 四开关默认转正为开，裁决 2 将段序改为 plugin 第一、experimental 第二）。段键（**按 WebUI 实际渲染序**，即各段 `__ui_order__` 升序、同序按声明序稳定排序）：`plugin / experimental / patrol / screen / affection / schedule / schedule_advanced / planning_proactive / planning_events / emotion / life_state / qzone / qzone_video / legacy_compat / video_watch / video_autonomous / video_share / llm / prompts / admin / dashboard_display / maimai_interaction`。`[qzone]` → `[qzone_video]`（空间视频候选）→ `[legacy_compat]`（旧版兼容）三段渲染相邻（2026-11-14 段序修正批，无版本递增：qzone_video 16→10、legacy_compat 17→11，video_watch 起其余段整体顺延 +2、彼此相对顺序不变）。`[video_autonomous]`（视频自主观看）与 `[video_watch]`/`[video_share]` 同为 `__ui_order__=12`，声明序插在两者之间 → 渲染序 video_watch → video_autonomous → video_share。`[legacy_compat]`（旧版兼容）：SnowLuma 2.0.0 及以上版本无需配置本段；低于 2.0.0 的 SnowLuma 需要配置，且仅当适配器直连 get_cookies 失效时才会读取。
 - 起步最少配置：`[patrol] target_qq`（陪伴对象；占位值 = 不主动私聊任何人）、`[admin] admin_users`（管理员；留空 = 仅本机控制台）。QQ 空间另需 `[qzone] enabled` 与 SnowLuma 适配器；屏幕感知另需 `[screen] enabled` 与 cateye 统一连接插件。
-- 退役旧键（`spine_mode`、`[life_state]` 旧开关组、patrol 旧主动键、event_catalog 独立段键、`[qzone_video].attach_source` 等）升级时纯 pop、不做值搬运、不再出现在 WebUI；事件库配置已平铺进 `[schedule] event_catalog_mode` 与三时段双池配额键。
+- 退役旧键（`spine_mode`、`[life_state]` 旧开关组、patrol 旧主动键、event_catalog 独立段键、`[qzone_video].attach_source` 等）升级时纯 pop、不做值搬运、不再出现在 WebUI；事件库配置已平铺进 `[schedule] event_catalog_mode` 与三时段双池配额键。例外：`[qzone].napcat_http_host/port/token` 于 3.17.36 改名为 `[legacy_compat].snowluma_http_host/port/token`，升级时**值搬运**（新段显式非空值优先），旧键不再出现在 WebUI。
 - 用户映射表在 `mappings/` 表层（8 张，不随包更新覆盖），出厂种子在 `mappings/default_mappings/`；详见下文「自定义映射表」。
 
 ## 已知限制
@@ -77,7 +77,7 @@
 
 **前置条件**：QQ 空间需要 SnowLuma 适配器（NapCat 画像不支持 QZone API）；屏幕感知需要「cateye 统一连接插件」且对方电脑上的客户端在线。目标私聊流解析不到时，插件每 60 秒重试一次，期间不会有任何主动消息；先与目标 QQ 互发一条消息通常即可解析到。
 
-WebUI 段键对照见上文「配置入口」（19 段：插件/陪伴模块/屏幕感知/好感度/日程系统/日程系统·高级设置/日程主动行为/事件与分享概率/情绪系统/生活状态/QQ 空间/空间视频/视频观看/视频分享/LLM 调用/提示词（高级）/管理与日志/数据展示/麦麦互动）；事件库不再是独立段，配置平铺进 `[schedule]`。
+WebUI 段键对照见上文「配置入口」（22 段，按实际渲染序：插件/实验性功能/陪伴模块/屏幕感知/好感度/日程系统/日程系统·高级设置/日程主动行为/事件与分享概率/情绪系统/生活状态/QQ 空间/空间视频候选/旧版兼容/视频观看/视频自主观看/视频自主分享/LLM 调用/提示词（高级）/管理与日志/数据展示/麦麦互动）；事件库不再是独立段，配置平铺进 `[schedule]`。
 
 ## 工具主动私聊（已移除）
 
@@ -265,16 +265,23 @@ WebUI 段键对照见上文「配置入口」（19 段：插件/陪伴模块/屏
 | `[schedule_advanced] lie_in_max_until` | `12:00` | 赖床硬上限时刻 |
 | `[qzone] enabled` | `false` | QQ 空间模块总开关 |
 | `[qzone] image_mode` | `emoji` | 配图来源：`off` / `emoji` / `library` / `random` |
+| `[llm] over_limit_auto_trim` | `false` | 超限自动裁剪（3.17.36 起默认关）：开 = 小事件超量取前N条避免整批作废、日程按时间排序保尾（晚间不被裁）；关 = 小事件超量整批拒绝、日程沿用旧输出序截断 |
+| `[legacy_compat] snowluma_http_host` / `snowluma_http_port` / `snowluma_http_token` | `""` | 旧版兼容（3.17.36，原 `[qzone] napcat_http_*` 值搬运改名）：SnowLuma 2.0.0 及以上无需配置；低于 2.0.0 才需填。仅适配器直连 get_cookies 失效时才读取；仅限回环地址 |
 | `[patrol] daily_max_speak` | `5` | 每日主动预算上限，只统计巡检与想念 |
 | `[life_state] emotion_modulation_enabled` | `false` | 情绪-生活双向调制（独立于日程总开关） |
 | `[schedule] event_catalog_mode` | `off` | 事件库：`off` / `manual` / `auto` |
 | `[video_watch] enabled` | `true` | 内置视频观看模块总开关（关 = 工具如实返回未启用、watch_bili 事件不可 roll、日程刷视频跳过；3.2.0 起运行时门控即时生效） |
 | `[video_watch] visual_enabled` | `true` | 画面采样（本机无 ffmpeg 或 vlm 任务不可用时如实降级为文本来源） |
+| `[video_autonomous] min_views` | `50000` | 日程主动观看播放量门槛：低于此值的候选不主动看；0=不检查。**只影响日程触发的自主选片，工具点播不受约束**（3.17.37） |
+| `[video_autonomous] min_replies` | `0` | 主动观看评论数门槛；0=不检查（默认）。仅候选阶段真实可得时参与检查（热门排行榜自带）；搜索候选缺失则跳过该项，不假装检查。工具点播不受约束（3.17.37） |
+| `[video_autonomous] min_coins` | `0` | 主动观看投币数门槛；0=不检查（默认）。口径同评论数（仅可得时检查、搜索缺失跳过、工具不受约束）（3.17.37） |
+| `[video_autonomous] min_favorites` | `0` | 主动观看收藏数门槛；0=不检查（默认）。口径同评论数（仅可得时检查、搜索缺失跳过、工具不受约束）（3.17.37） |
 
 3.17.33 Gemini 配置批新增键（**均已接线并生效**；下列默认值即运行时行为）：
 
 - **默认开**：`[life_state]` `sleep_debt_repay_v2`（在线会话结束与离线重连补眠都走阶梯还债：基准外前 2h 全额、超出部分折半，不再单次封顶 1h；总债 12h 上限不变）、`social_battery_affinity_discount`（仅目标陪伴私聊按好感折减社交电量消耗）、`target_chat_social_recharge`（仅目标陪伴私聊高好感放松对话微量回充）；`[planning_proactive]` `greeting_noon_jitter_minutes=20`（当日触发时刻落在 12:01–12:20；设为 N 即 12:01–12:N，N 取 1–59，抖动开启时绝不 12:00 整点；0 = 窗开即发）；`[patrol]` `miss_stage_escalation_enabled`（阶梯想念 6–20h/20–48h/48–120h，三阶段各可受理一次；**>120h 进入阶段 4：独立想念停发、每日任务渗透**，用户真实长回复回到阶段 0（短回复只顺延不重置））、`typing_delay_enabled=true` / `typing_delay_max_seconds=8.0`、`budget_elasticity_enabled`（高好感/高 Valence/法定节假日命中 1 条 +1、≥2 条 +2，硬上限基础预算 +2；`daily_max_speak=0` 不复活；显式关 = 固定每日预算）；`[affection]` `exchange_events_enabled`（Bot 发早安/晚安后 30 分钟内用户回敬 → 好感 `morning_exchange`/`night_exchange`；该 30 分钟窗口是进程内状态，插件重载/宿主重启后窗口内可能漏记一次）；`[emotion]` `decay_to_persona_anchor`（清醒衰减也向人设锚点收敛，与睡眠大修同一基准线；显式关 = 旧行为向 0 中性衰减）、`emotion_quota_partition_enabled`（开 = 私聊 6/日、群聊 4/日分区；关 = 旧共享池，见下条）、`private_eval_quota=6` / `group_eval_quota=4`（分区开启时各类专属配额，设为 0 可停用该类自动评估）、`[prompts]` `state_subconscious_style`。
-- **默认关**：`[video_share]` `video_share_quality_gate=false` / `video_share_quality_threshold=0.55`（开 = 空间视频自动发布链在既有额度/睡眠/静默/冷却闸之后追加质量否决：0.6×|ΔVAD| + 0.4×目标兴趣重合度；只否决、不绕过任何既有闸。聊天视频分享链本批未消费该键）。
+- **默认关**：`[video_share]` `video_share_quality_gate=false` / `video_share_quality_threshold=0.55`（开 = 空间视频自动发布链在既有额度/睡眠/静默/冷却闸之后追加质量否决：0.6×|ΔVAD| + 0.4×目标兴趣重合度；只否决、不绕过任何既有闸。聊天视频分享链本批未消费该键）。**注**：此二键属发布侧质量分，3.17.37 经核对消费方保留原段不迁移；观看侧「看什么」的数据门槛另见 `[video_autonomous]`（播放量/评论/投币/收藏统计阈值，信号面与发布侧完全不同，二者不复用同一开关）。
+- **3.17.37 视频自主观看默认口径**：`[video_autonomous] min_views=50000`（默认开播放量门槛）、`min_replies/min_coins/min_favorites=0`（默认不检查，保守不预设压低观看量；用户可自行调高）。评论/投币/收藏仅热门排行榜候选可得，关键词搜索候选缺此三项 → 跳过该项不假装检查。全部阈值只约束日程/空隙/调试命令的自主选片，工具点播（用户直接给链接/BV）完全不受影响。
 - 报告 §4.1 P1-NUM-2 本批只限定为**目标私聊折减/回充**：仅目标陪伴私聊的真实回复走好感折减与高好感放松回充，群聊/其他私聊的聊天社交电量基础消耗仍为 0；**群聊对照未建立**，不声称已实现「公共群聊高消耗 / 目标私聊回血」的对照（后续批次）。
 - 报告 §4.3b 的「仅高情绪强度才扣评估配额」**未在本批实现**（当前只要通过配额/节流/冻结等既有闸就会消耗配额，分区只是把私聊/群聊额度分开），留待后续批次；本批先保证私聊配额不被群聊侵占。
 - **配额分区总开关（用户 WebUI schema，默认开）**：`[emotion]` `emotion_quota_partition_enabled=true`（默认开 = 私聊 6/日、群聊 4/日分区，总 10/日封顶；关 = 回 3.17.32 的单一共享池，群聊可占满；`mappings/internal_tuning.json` 里的旧同名键保留但不再读取）。
@@ -333,7 +340,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 - 本次运行接口可见8个命令和8个工具；该接口不包含全部Hook/API，不把交互入口数当作完整注册总数。
 - 声明 **17 项**宿主能力。
-配置以宿主运行schema为准：3.17.34 为 20 段 264 字段、2 隐藏（`[experimental]` 段共 41 键 = B1 F1 10 + B2 F3 16 + B3 F4 13 + B4 联动 2 − 2026-11-12 结构审计批移除的未实现开关 1 + 裁决批 F5 抑饿 1；段序 plugin 第一、experimental 第二；F1/F3/F4/B4 四开关默认转正为开）；结算参数使用settlement_params_json，形象使用fish/human。历史字段变动见 CHANGELOG 与 union/20261106_配置项完整变动报告.md，实验配置迁移见 union/20261111_实验配置迁移映射.md。
+配置以宿主运行schema为准：3.17.37 为 22 段 268 字段、2 隐藏（3.17.37 新增 `[video_autonomous]` 4 键 `min_views/min_replies/min_coins/min_favorites`，段 +1、字段 +4，渲染序插在 video_watch 与 video_share 之间；3.17.36 新增 `[legacy_compat]` 3 键、`[qzone]` 移出 `napcat_http_*` 3 键，段 +1、字段净 ±0；`[experimental]` 段共 41 键 = B1 F1 10 + B2 F3 16 + B3 F4 13 + B4 联动 2 − 2026-11-12 结构审计批移除的未实现开关 1 + 裁决批 F5 抑饿 1；段序 plugin 第一、experimental 第二，`[qzone]` → `[qzone_video]` → `[legacy_compat]` 三段渲染相邻（2026-11-14 段序修正，不再垫底）；F1/F3/F4/B4 四开关默认转正为开）；结算参数使用settlement_params_json，形象使用fish/human。历史字段变动见 CHANGELOG 与 union/20261106_配置项完整变动报告.md，实验配置迁移见 union/20261111_实验配置迁移映射.md。
 - 用户可编辑表 **8 张**（七张映射表+内部调参表）：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可
