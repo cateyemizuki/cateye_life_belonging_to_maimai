@@ -401,5 +401,5 @@ const SectionFish=(()=>{
  mount('usage','模型调用',usageCard,()=>'',()=>[],[usageDetail]);
  const healthGroup=fold('数据来源与运行明细',[$('health-data'),$('warnings')]);
  mount('health','数据与运行说明',$('health-section'),d=>d.warnings?.length?`${d.warnings.length} 项数据提示`:'随真实记录更新',d=>[['新鲜度',d.stale?'状态快照可能已过期':'查看顶部更新状态','独立计时超过45秒提示可能过期，120秒提示陈旧。'],['刷新方式',imported?'离线快照':'约30秒读取一次','页面隐藏时暂停轮询；失败保留上次快照，8秒超时后可重试。']],[healthGroup]);
- return {close,refresh};
+ return {close,refresh,mount,fold};
 })();

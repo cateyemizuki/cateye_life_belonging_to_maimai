@@ -69,54 +69,89 @@ function renderQzoneVideoChips(){const box=$('qzone-video-chips');if(!box)return
  box.hidden=false;box.replaceChildren(...chips.map(s=>el('span','',s)))}
 // 核心页（初始化）：解析状态视图 + 输出原文视图。data.init 来自 planning/dashboard._init_summary
 // （registry 解析状态为唯一真源；raw 原文来自 init_last_report.json 逐字段合并）。零模型调用。
-let coreView='status';
 function coreBadge(f){if(f.initialized)return['已初始化','ok'];if(num(f.attempts)>0)return['失败 '+count(f.attempts)+' 次','bad'];return['待初始化','pending']}
-function applyCoreView(){const raw=coreView==='raw';$('core-status-view').hidden=raw;$('core-raw-view').hidden=!raw;$('core-view-status').setAttribute('aria-pressed',String(!raw));$('core-view-raw').setAttribute('aria-pressed',String(raw))}
+function coreSummaryText(d){const i=d?.init;if(!i||!i.available)return '初始化数据暂不可用';return `已初始化 ${i.summary?.initialized??0}/${i.summary?.total??0} 字段`}
 function renderCore(){
- const box=$('core-fields'),rawBox=$('core-raw-fields');if(!box)return;
- const init=data?.init;
+ const init=data?.init,setT=(id,v)=>{const e=$(id);if(e)e.textContent=String(v??'—')};
  if(!init||!init.available){
-  text('core-count','—');text('core-count-note','初始化数据暂不可用');$('core-meter-fill').style.width='0';$('core-meter').setAttribute('aria-valuenow','0');
-  text('core-preflight','—');$('core-preflight').className='pill';text('core-reg-version','—');text('core-last-run','—');text('core-preflight-text','—');text('core-registry-path','—');text('core-version','—');
-  text('core-run-meta','连接宿主后读取初始化登记；离线快照需包含 init 块。');
-  empty(box,'初始化数据暂不可用','连接宿主插件后自动读取 init_registry.json。');
-  if(rawBox)empty(rawBox,'暂无输出原文','初始化运行后此处展示各部分输出原文。');
-  applyCoreView();return;
+  setT('core-count','—');setT('core-count-note','初始化数据暂不可用');$('core-meter-fill').style.width='0';
+  setT('core-preflight','—');$('core-preflight').className='pill';setT('core-reg-version','—');setT('core-last-run','—');setT('core-preflight-text','—');setT('core-registry-path','—');setT('core-version','—');
+  empty($('core-fields'),'初始化数据暂不可用','连接宿主后读取 init_registry.json。');
+  empty($('core-modules'),'模块状态暂不可用','连接宿主后读取配置投影。');
+  empty($('core-logs'),'日志暂不可用','连接宿主后读取最近日志尾。');return;
  }
- const sum=init.summary||{},fields=Array.isArray(init.fields)?init.fields:[];
+ const sum=init.summary||{},fields=Array.isArray(init.fields)?init.fields:[],modules=Array.isArray(init.modules)?init.modules:[];
  const total=num(sum.total)??fields.length,done=num(sum.initialized)??0,ratio=total>0?Math.round(done/total*100):0;
- text('core-count',done+' / '+total);text('core-count-note',ratio===100?'全部字段已初始化并通过校验':'已初始化 / 共 '+total+' 项');
+ setT('core-count',done+' / '+total);setT('core-count-note',ratio===100?'全部字段已初始化并通过校验':'已初始化 / 共 '+total+' 项');
  $('core-meter-fill').style.width=ratio+'%';$('core-meter').setAttribute('aria-valuenow',String(ratio));$('core-meter').classList.toggle('complete',ratio===100);
- text('core-version',init.plugin_version?('插件版本 '+init.plugin_version):'—');text('core-reg-version',init.plugin_version||'未写入');
- text('core-last-run',init.last_run_at?clock(init.last_run_at,true):'尚无运行');
+ setT('core-version',init.plugin_version?('插件版本 '+init.plugin_version):'—');setT('core-reg-version',init.plugin_version||'未写入');
+ setT('core-last-run',init.last_run_at?clock(init.last_run_at,true):'尚无运行');
  const pf=init.preflight||{},pfText=pf.ok===true?'通过':pf.ok===false?'失败':'尚无记录';
- text('core-preflight',pfText);$('core-preflight').className='pill '+(pf.ok===true?'ok':pf.ok===false?'bad':'pending');
- text('core-preflight-text',pfText+(pf.ok===false&&pf.reason?'（'+pf.reason+'）':''));text('core-registry-path',init.registry_path||'登记文件未装配');
- text('core-run-meta',(init.last_manual?'最近一次：手动初始化':'最近一次：自动初始化')+(init.last_run_at?' · '+clock(init.last_run_at,true):'')+(init.report_available?'':' · 尚无报告原文'));
- if(!fields.length){empty(box,'暂无初始化字段','登记文件未返回字段状态。');if(rawBox)empty(rawBox,'暂无输出原文','初始化运行后此处展示各部分输出原文。');applyCoreView();return}
- box.replaceChildren(...fields.map(f=>{
+ setT('core-preflight',pfText);$('core-preflight').className='pill '+(pf.ok===true?'ok':pf.ok===false?'bad':'pending');
+ setT('core-preflight-text',pfText+(pf.ok===false&&pf.reason?'（'+pf.reason+'）':''));setT('core-registry-path',init.registry_path||'登记文件未装配');
+ $('core-fields').replaceChildren(...fields.map(f=>{
   const [badgeText,cls]=coreBadge(f),card=el('article','core-field '+cls),head=el('div','core-field-head');
   head.append(el('h3','',f.label||f.field),el('span','pill '+cls,badgeText));card.append(head);
   const meta=el('div','core-field-meta');meta.append(el('span','note','尝试 '+count(f.attempts)+' 次'));
   if(f.validated_at)meta.append(el('span','note','校验 '+clock(f.validated_at,true)));
-  if(f.version)meta.append(el('span','note','版本 '+f.version));
   card.append(meta);
   if(!f.initialized&&f.last_error)card.append(el('div','core-field-error',f.last_error));
   return card}));
- if(rawBox)rawBox.replaceChildren(...fields.map(f=>{
-  const block=el('article','core-raw-field'),head=el('div','core-field-head'),raw=f.raw;
-  head.append(el('h3','',f.label||f.field),el('span','pill '+(raw?(raw.status==='success'?'ok':raw.status==='failed'?'bad':'pending'):'pending'),raw?(raw.status||'—'):'无记录'));block.append(head);
-  if(!raw){block.append(el('p','note','尚无初始化输出记录（已初始化幂等跳过或从未运行）。'));return block}
-  if(raw.run_at)block.append(el('div','note core-raw-at','运行于 '+clock(raw.run_at,true)+(raw.stage_status?' · 阶段 '+raw.stage_status:'')));
-  if(raw.message)block.append(el('pre','core-raw-pre',raw.message));
-  if(Array.isArray(raw.errors)&&raw.errors.length){block.append(el('div','core-raw-label','错误原文'));block.append(el('pre','core-raw-pre core-raw-err',raw.errors.join('\n')))}
-  const details=raw.details||{};
-  if(Object.keys(details).length){block.append(el('div','core-raw-label','details 原文'));let pretty;try{pretty=JSON.stringify(details,null,2)}catch(e){pretty=String(details)}block.append(el('pre','core-raw-pre',pretty))}
-  return block}));
- applyCoreView();
+ $('core-modules').replaceChildren(...modules.map(m=>{
+  const row=el('div','core-module-row'),left=el('div','core-module-name');
+  left.append(el('strong','',m.label||m.module),el('span','note',m.module));
+  const right=el('div','core-module-status');
+  right.append(el('span','pill '+(m.status==='停用'?'pending':'ok'),m.status||'—'));
+  if(num(m.error_count)>0)right.append(el('span','pill bad','报错 '+count(m.error_count)));
+  row.append(left,right);return row}));
+ const errModules=modules.filter(m=>num(m.error_count)>0);
+ setT('core-logs-scope',init.modules_truncated?'日志尾已截断 · 按模块':'最近日志尾 · 按模块');
+ if(!errModules.length){empty($('core-logs'),'最近日志无模块报错','各模块最近日志尾未见 error/critical。')}
+ else{$('core-logs').replaceChildren(...errModules.map(m=>{
+   const row=el('div','core-log-row'),head=el('div','core-field-head');
+   head.append(el('h3','',m.label||m.module),el('span','pill bad',count(m.error_count)+' 条'));
+   row.append(head);
+   if(m.last_error_at)row.append(el('div','note','最近报错 '+clock(m.last_error_at,true)));
+   const ev=(m.errors||[])[0];if(ev&&ev.event)row.append(el('div','core-log-event',ev.event));
+   return row}))}
+ renderCoreDetails(init,fields,modules);
 }
-$('core-view-status').onclick=()=>{coreView='status';applyCoreView()};
-$('core-view-raw').onclick=()=>{coreView='raw';applyCoreView()};
+function renderCoreDetails(init,fields,modules){
+ const sd=$('core-status-detail');if(sd)sd.replaceChildren(el('pre','core-raw-pre',JSON.stringify({plugin_version:init.plugin_version,registry_path:init.registry_path,preflight:init.preflight,summary:init.summary,last_run_at:init.last_run_at},null,2)));
+ const fd=$('core-fields-detail');if(fd)fd.replaceChildren(...fields.map(f=>{
+   const block=el('div','core-raw-field'),head=el('div','core-field-head'),d=f.data||{};
+   head.append(el('h3','',f.label||f.field),el('span','pill '+(d.exists?'ok':'pending'),d.exists?(d.artifact||'配置项'):'缺失'));
+   block.append(head);
+   const meta=el('div','core-field-meta');
+   if(d.bytes)meta.append(el('span','note',count(d.bytes)+' B'));
+   if(d.truncated)meta.append(el('span','note','预览已截断'));
+   if(d.note)meta.append(el('span','note',d.note));
+   block.append(meta);
+   if(d.summary&&Object.keys(d.summary).length)block.append(el('pre','core-raw-pre',JSON.stringify(d.summary,null,2)));
+   if(d.preview)block.append(el('pre','core-raw-pre',d.preview));
+   if(f.raw&&f.raw.message){block.append(el('div','core-raw-label','最近运行'));block.append(el('pre','core-raw-pre',f.raw.message))}
+   return block}));
+ const md=$('core-modules-detail');if(md)md.replaceChildren(...modules.map(m=>{
+   const row=el('div','core-module-row'),left=el('div','core-module-name');
+   left.append(el('strong','',m.label||m.module),el('span','note','近期日志 '+count(m.recent_rows)+' 行'));
+   const right=el('div','core-module-status');right.append(el('span','pill '+(m.status==='停用'?'pending':'ok'),m.status||'—'));
+   row.append(left,right);return row}));
+ const ld=$('core-logs-detail');if(ld){const errs=modules.filter(m=>(m.errors||[]).length);
+  if(!errs.length)ld.replaceChildren(el('p','note','最近日志尾无模块报错记录。'));
+  else ld.replaceChildren(...errs.map(m=>{
+   const block=el('div','core-raw-field');block.append(el('div','core-raw-label',(m.label||m.module)+' · '+count(m.error_count)+' 条'));
+   block.append(el('pre','core-raw-pre core-raw-err',(m.errors||[]).map(e=>(e.at?clock(e.at,true)+' ':'')+'['+(e.level||'error')+'] '+(e.event||'')).join('\n')));
+   return block}))}
+}
+function mountCoreFish(){
+ if(typeof SectionFish==='undefined'||!SectionFish.mount)return;
+ const F=SectionFish;
+ F.mount('core-status','初始化状态',$('core-status-box'),d=>coreSummaryText(d),d=>[['登记版本',d?.init?.plugin_version||'—',''],['最近运行',d?.init?.last_run_at?clock(d.init.last_run_at,true):'—','']],[F.fold('登记与预检原文',[$('core-status-detail')])]);
+ F.mount('core-fields','初始化字段',$('core-fields-box'),d=>coreSummaryText(d),()=>[['数据来源','init_registry.json + 数据目录产物','只读，不依赖 init 运行。']],[F.fold('各字段初始化产物原文',[$('core-fields-detail')])]);
+ F.mount('core-modules','各模块状态',$('core-modules-box'),d=>`${(d?.init?.modules||[]).length} 个模块`,()=>[['状态来源','配置投影','']],[F.fold('模块状态明细',[$('core-modules-detail')])]);
+ F.mount('core-logs','模块日志',$('core-logs-box'),d=>{const m=d?.init?.modules||[];const e=m.reduce((a,x)=>a+(num(x.error_count)||0),0);return e?`${e} 条模块报错`:'最近日志无模块报错'},()=>[['口径','bounded 日志尾 · 按 module 聚合','只展示有界尾片段。']],[F.fold('具体报错记录',[$('core-logs-detail')])]);
+}
+
 function dayView(){return data?.day?.available&&data.day.date===selectedDay?data.day:null}
 function lifeSeries(){return selectedDay?(dayView()?.state_history||{}):(data?.history||{})}
 function vadSeries(){return selectedDay?(dayView()?.vad_history||{}):(data?.emotion?.history||{})}
@@ -1101,6 +1136,7 @@ function infoTip(explanation,tipLeft){
 
 
 /* LBM_EXTENSIONS */
+mountCoreFish();
 freshnessTimer=setInterval(()=>updateFreshness(),1000);
 (async()=>{if(window.maibot){try{live=true;await deadline(window.maibot.ready);context();await refresh()}catch(e){lastError=String(e.message||e);updateFreshness();notice(lastError,true);schedule()}}else{document.documentElement.dataset.theme=matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';$('offline').hidden=false;$('theme').hidden=false;$('refresh').disabled=true;connection('离线查看','warn');text('updated','导入快照后查看真实记录')}})();
 })();

@@ -1047,13 +1047,153 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]
     return out
 
 
-def _init_summary(plugin: Any) -> dict[str, Any]:
-    """「核心」页初始化投影：registry 解析状态（唯一真源）+ 最近一次报告原文。
+#: 字段 → 数据目录内持久化初始化产物（与 manifest 校验器同口径；只读，分块 bounded）。
+_INIT_ARTIFACT_REL = {
+    'emotion': 'emotion_config.json',
+    'events': 'generated_events.json',
+    'state_sleep': 'life_state.json',
+    'frequency': None,                       # 频率校准为配置项，无独立数据文件
+    'video_interest': 'video_watch/video_interest.json',
+    'companion_disposition': 'initiative_state.json',
+    'activity_preferences': 'activity_preferences.json',
+}
 
-    只读，零模型调用；registry/报告缺失或损坏 → available=False 如实降级。
-    parsed 状态来自 init_registry.json（initialized/attempts/validated_at/last_error），
-    raw 原文来自 init_last_report.json（逐字段最近一次 init 的 message/errors/details）。
+#: 顶层模块（与日志 module 字段后缀首段一致）→ 中文名。模块日志已按 __name__ 区分，
+#: 统一日志工具解耦见 union/20261113_模块日志解耦计划书.md（未来实现）。
+_MODULE_DEFS = [
+    ('planning', '日程规划'), ('emotion', '情绪'), ('companion', '陪伴'),
+    ('qzone', '空间'), ('integrations', '联动'), ('core', '核心基础'),
+    ('tools', '工具'), ('linkage', '跨插件'),
+]
+_PLUGIN_MODULE_PREFIX = 'plugins.cateye_life_belonging_to_maimai.'
+
+
+def _read_init_artifact(path: Any, cap: int = 3500) -> dict[str, Any]:
+    """只读 bounded 读取初始化产物原文：完整解析取摘要，预览截断防 payload 膨胀。"""
+    from pathlib import Path
+    out: dict[str, Any] = {'exists': False, 'bytes': 0, 'preview': '', 'truncated': False, 'doc': None}
+    try:
+        p = Path(path)
+        if not p.exists():
+            return out
+        raw = p.read_bytes()
+        out['exists'] = True
+        out['bytes'] = len(raw)
+        text = raw.decode('utf-8', errors='replace')
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            doc = None
+        out['doc'] = doc
+        pretty = json.dumps(doc, ensure_ascii=False, indent=2) if doc is not None else text
+        out['truncated'] = len(pretty) > cap
+        out['preview'] = pretty[:cap]
+    except OSError:
+        pass
+    return out
+
+
+def _init_field_data(data_dir: Any, plugin_root: Any, field: str, config: Any) -> dict[str, Any]:
+    """逐字段读数据目录已记录的初始化产物（不依赖 init 运行，始终可得）。"""
+    from pathlib import Path
+    empty = {'artifact': None, 'exists': False, 'bytes': 0, 'preview': '', 'truncated': False, 'summary': {}}
+    if data_dir is None:
+        return empty
+    if field == 'frequency':
+        sec = getattr(config, 'planning_proactive', None)
+        always_one = bool(getattr(sec, 'target_frequency_always_one', True))
+        return {'artifact': None, 'exists': True, 'bytes': 0,
+                'preview': json.dumps({'target_frequency_always_one': always_one}, ensure_ascii=False, indent=2),
+                'truncated': False, 'summary': {'target_frequency_always_one': always_one},
+                'note': '频率校准为配置项，无独立数据文件'}
+    rel = _INIT_ARTIFACT_REL.get(field)
+    if rel is None:
+        return empty
+    path = Path(data_dir) / rel
+    if field == 'events' and not path.exists() and plugin_root:
+        alt = Path(plugin_root) / 'mappings' / 'generated_events.json'
+        if alt.exists():
+            path = alt
+    art = _read_init_artifact(path)
+    doc = art['doc'] if isinstance(art['doc'], dict) else {}
+    summary: dict[str, Any] = {}
+    if field == 'emotion':
+        params = doc.get('params') or {}
+        summary = {'initialized': params.get('initialized'),
+                   'persona_digest': str(params.get('persona_digest') or '')[:40],
+                   'positive_gain': params.get('positive_gain'), 'negative_decay': params.get('negative_decay')}
+    elif field == 'events':
+        ev = doc.get('events')
+        summary = {'event_count': len(ev) if isinstance(ev, list) else 0}
+    elif field == 'state_sleep':
+        summary = {'version': doc.get('version'), 'key_count': len(doc), 'sleep_debt': doc.get('sleep_debt')}
+    elif field == 'video_interest':
+        kw = doc.get('keywords')
+        summary = {'keyword_count': len(kw) if isinstance(kw, list) else 0, 'obtained_at': doc.get('obtained_at')}
+    elif field == 'companion_disposition':
+        prof = doc.get('profile') or {}
+        summary = {'version': doc.get('version'), 'anchor_hours': prof.get('anchor_hours'), 'loneliness': prof.get('loneliness')}
+    elif field == 'activity_preferences':
+        summary = {'schema_version': doc.get('schema_version'),
+                   'activity_count': len(doc.get('activities') or {}), 'trait_count': len(doc.get('traits') or {})}
+    return {'artifact': rel, 'exists': art['exists'], 'bytes': art['bytes'],
+            'preview': art['preview'], 'truncated': art['truncated'], 'summary': summary}
+
+
+def _module_status(plugin: Any, module: str) -> str:
+    cfg = getattr(plugin, 'config', None)
+    section = {'planning': 'schedule', 'emotion': 'emotion', 'companion': 'companion',
+               'qzone': 'qzone', 'integrations': 'video_watch'}.get(module)
+    if section is None:
+        return '运行中'
+    sec = getattr(cfg, section, None)
+    if sec is None:
+        return '运行中'
+    return '启用' if bool(getattr(sec, 'enabled', True)) else '停用'
+
+
+def _module_health(plugin: Any, now: datetime) -> dict[str, Any]:
+    """各模块状态 + 最近日志报错（bounded 日志尾，按 module 字段聚合；只读）。"""
+    from pathlib import Path
+    from core.monitoring import tail_records, _log_time
+    modules = {name: {'module': name, 'label': label, 'status': _module_status(plugin, name),
+                      'error_count': 0, 'last_error_at': None, 'errors': [], 'recent_rows': 0}
+               for name, label in _MODULE_DEFS}
+    truncated = False
+    root = getattr(plugin, '_plugin_root', None)
+    if root:
+        try:
+            folder = Path(root).parent.parent / 'logs'
+            files = list(folder.glob('app_*.log.jsonl'))
+            if files:
+                rows, truncated = tail_records(max(files, key=lambda f: f.stat().st_mtime))
+                for row in rows:
+                    mod = str(row.get('module') or '')
+                    if not mod.startswith(_PLUGIN_MODULE_PREFIX):
+                        continue
+                    entry = modules.get(mod[len(_PLUGIN_MODULE_PREFIX):].split('.')[0])
+                    if entry is None:
+                        continue
+                    entry['recent_rows'] += 1
+                    level = str(row.get('level') or '').lower()
+                    if level in ('error', 'critical'):
+                        entry['error_count'] += 1
+                        at = _log_time(row.get('timestamp'), now)
+                        if at:
+                            entry['last_error_at'] = at
+                        entry['errors'].append({'at': at, 'level': level,
+                                                'event': str(row.get('event') or '')[:200]})
+                        entry['errors'] = entry['errors'][-6:]   # 保留最近 6 条原文
+        except OSError:
+            pass
+    return {'modules': list(modules.values()), 'truncated': truncated, 'scope': 'bounded_recent_log_tail'}
+
+
+def _init_summary(plugin: Any, now: datetime) -> dict[str, Any]:
+    """「核心」页投影：registry 解析状态（唯一真源）+ 数据目录已记录的初始化产物原文
+    + 各模块状态/最近日志报错。只读、零模型调用；不依赖 init 运行（产物始终可得）。
     """
+    from pathlib import Path
     try:
         from tools.init.auto_init import FIELD_LABELS, last_report, registry_snapshot
         from tools.init.manifest import INIT_FIELDS
@@ -1061,6 +1201,10 @@ def _init_summary(plugin: Any) -> dict[str, Any]:
         report = last_report(plugin)
     except Exception:
         return {'available': False, 'reason': 'projection_unavailable'}
+    reg_path = snap.get('path') or ''
+    data_dir = Path(reg_path).parent if reg_path else None
+    plugin_root = getattr(plugin, '_plugin_root', None)
+    config = getattr(plugin, 'config', None)
     fields_raw = snap.get('fields') or {}
     outcomes = report.get('outcomes') or {}
     fields: list[dict[str, Any]] = []
@@ -1080,6 +1224,7 @@ def _init_summary(plugin: Any) -> dict[str, Any]:
             'validated_at': state.get('validated_at'),
             'last_failed_at': state.get('last_failed_at'),
             'last_error': state.get('last_error'),
+            'data': _init_field_data(data_dir, plugin_root, name, config),
             'raw': ({
                 'status': raw.get('status'),
                 'stage_status': raw.get('stage_status'),
@@ -1092,6 +1237,7 @@ def _init_summary(plugin: Any) -> dict[str, Any]:
         })
     preflight = snap.get('preflight') or {}
     total = len(fields)
+    module_health = _module_health(plugin, now)
     return {
         'available': True,
         'plugin_version': snap.get('plugin_version'),
@@ -1099,6 +1245,8 @@ def _init_summary(plugin: Any) -> dict[str, Any]:
         'preflight': {'ok': preflight.get('ok'), 'checked_at': preflight.get('checked_at'),
                       'reason': preflight.get('reason')},
         'fields': fields,
+        'modules': module_health['modules'],
+        'modules_truncated': module_health['truncated'],
         'summary': {'total': total, 'initialized': initialized_count,
                     'pending': total - initialized_count},
         'last_run_at': report.get('generated_at'),
@@ -1245,5 +1393,5 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
         result['health'] = runtime_health(plugin, now)
     except Exception:
         pass
-    result['init'] = _init_summary(plugin)
+    result['init'] = _init_summary(plugin, now)
     return result
