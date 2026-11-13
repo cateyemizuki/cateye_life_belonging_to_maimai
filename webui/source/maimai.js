@@ -258,13 +258,14 @@ const Bubble=(()=>{
    - 拖动：按住即拖（位移 <10px 算点按），拖动中 .is-dragging 关过渡；松手按
      吸附区归位（左右 10%、底 15%、顶边禁用——同挂件 v3 默认），锚点以
      「贴边+净距离」存 localStorage('maimai-bear-pos')，窗口缩放按锚点重算；
-     取消/丢坐标回原位不落盘（同挂件）。
+     取消/丢坐标回原位不落盘（同挂件）；强制释放则就地落位（见下「边缘吸附与强制释放」）。
    - 镜像翻转（2026-11-03 追加，同挂件语义）：贴左必翻、贴右不翻（朝向屏幕内），
      自由摆放按中心 x 是否在左半屏判定；翻转态随锚点落盘（fl 字段）并随恢复重现。
    - 不消费 maimai_interaction 数值参数；位置存取失败（隐私模式等）退化为会话内记忆。
-   - 边缘吸附与强制释放（2026-11-14 旧版遗留修复）：松手瞬间距视口边缘 ≤28px 即贴齐最近边
-     （EDGE_SNAP_PX，仅 settle 判定、拖拽中不吸附，走既有 left/top .16s 过渡）；document
-     pointerleave/mouseleave 与既有 blur/visibilitychange/pointercancel 一并强制收尾，杜绝卡死。 */
+   - 边缘吸附与强制释放（2026-11-14 旧版遗留修复）：松手瞬间距视口边缘 ≤42px 即贴齐最近边
+     （EDGE_SNAP_PX，仅 settle（pointerup/强制释放）判定、拖拽中不吸附，走既有 left/top .16s 过渡）；
+     document pointerleave/mouseleave 与既有 blur/visibilitychange/pointercancel 一并强制收尾：
+     提交拖拽中的 live left/top 就地落位 + 同规则边缘吸附，绝不回弹本次拖拽起点，杜绝卡死。 */
 const Bear=(()=>{
   const root=document.getElementById('maimai-bear');
   // finding #4（2026-11-04）：stub 补 no-op reanchor，与真实接口口径一致（调用方虽已判空）。
@@ -273,13 +274,13 @@ const Bear=(()=>{
   const POS_KEY='maimai-bear-pos';
   const CLICK_SQ=100;                                    // 位移平方 <100（<10px）= 点按
   const SNAP={L:.20,R:.20,B:.30,T:0};                    // 吸附区比例（挂件 v3 默认 10/10/15 偏小，2026-11-03 按反馈加大）；T=0 顶边禁用
-  // 边缘就近吸附阈值（2026-11-14，旧版遗留修复①）：松手瞬间桌宠任一边距视口边缘 ≤28px，
-  // 立即贴齐「最近的那条边」（该轴锚点距离归 0）。只在 settle（pointerup 收尾）判定——
-  // onMove 拖拽过程只钳制不吸附；贴齐位移由 .maimai-bear 既有 left/top .16s ease 过渡平滑
-  // 完成（applyPos 写 left/top 前先读 offsetWidth 强制回流，过渡必生效）。比例吸附区 SNAP
-  // 仍作远离边缘时的兜底；就近吸附覆盖四条边（含顶边——气泡 place 已支持顶位翻到下方），
-  // 与 SNAP.T=0 关闭的「顶部比例区」语义不冲突。
-  const EDGE_SNAP_PX=28;
+  // 边缘就近吸附阈值（2026-11-14，旧版遗留修复①；同日微调①：28→42，触发范围调大一半）：
+  // 松手瞬间桌宠任一边距视口边缘 ≤42px，立即贴齐「最近的那条边」（该轴锚点距离归 0）。
+  // 只在 settle（pointerup/强制释放收尾）判定——onMove 拖拽过程只钳制不吸附；贴齐位移由
+  // .maimai-bear 既有 left/top .16s ease 过渡平滑完成（applyPos 写 left/top 前先读 offsetWidth
+  // 强制回流，过渡必生效）。比例吸附区 SNAP 仍作远离边缘时的兜底；就近吸附覆盖四条边
+  // （含顶边——气泡 place 已支持顶位翻到下方），与 SNAP.T=0 关闭的「顶部比例区」语义不冲突。
+  const EDGE_SNAP_PX=42;
   let enabled=false,detailMode=false,drag=null,flip=false;
   let memPos=null;                                       // localStorage 不可用时的会话内兜底
   const clamp=(v,lo,hi)=>Math.min(hi,Math.max(lo,v));
@@ -317,7 +318,7 @@ const Bear=(()=>{
     if(loadPos())applyAnchors();
     else{root.style.left='';root.style.top='';root.style.bottom=''}
   }
-  function settle(left,top){                             // 松手：夹回视口 → 吸附区判定 → 锚点落盘
+  function settle(left,top){                             // 松手/强制释放：夹回视口 → 吸附区判定 → 锚点落盘
     const w=root.offsetWidth||144,h=root.offsetHeight||144,v=vp();
     left=clamp(left,0,Math.max(0,v.w-w));top=clamp(top,0,Math.max(0,v.h-h));
     const cx=left+w/2,footY=top+h;
@@ -351,12 +352,18 @@ const Bear=(()=>{
     if(!drag||!drag.active)return;
     const dx=e.clientX-drag.startX,dy=e.clientY-drag.startY;
     if(dx*dx+dy*dy>=CLICK_SQ)drag.moved=true;
-    // 全程钳制在视口内（禁止出界；松手 settle 会再做一次吸附判定）
-    root.style.left=clamp(drag.origLeft+dx,0,Math.max(0,innerWidth-drag.w))+'px';
-    root.style.top=clamp(drag.origTop+dy,0,Math.max(0,innerHeight-drag.h))+'px';
+    // 全程钳制在视口内（禁止出界；松手 settle 会再做一次吸附判定）。同时把钳制后的 live
+    // left/top 记进 drag，供强制释放（移出页面/失焦/隐藏/pointercancel）就地落位提交。
+    drag.liveLeft=clamp(drag.origLeft+dx,0,Math.max(0,innerWidth-drag.w));
+    drag.liveTop=clamp(drag.origTop+dy,0,Math.max(0,innerHeight-drag.h));
+    root.style.left=drag.liveLeft+'px';
+    root.style.top=drag.liveTop+'px';
     Bubble.sync(root,flip);                              // 气泡开着时跟随拖动
   }
-  function endDrag(e,cancelled){
+  // mode：'up' 正常抬起（按事件坐标 settle）| 'cancel' 真取消（回原位、不落盘）|
+  // 'force' 强制释放（移出页面/失焦/隐藏/pointercancel：提交拖拽中的 live left/top 就地
+  // 落位 + 同规则边缘吸附，绝不回弹本次拖拽起点）。三条强制释放路径共用此 'force' 分支。
+  function endDrag(e,mode){
     if(!drag||!drag.active)return;
     drag.active=false;
     document.removeEventListener('pointermove',onMove,true);
@@ -364,8 +371,12 @@ const Bear=(()=>{
     document.removeEventListener('pointercancel',onCancel,true);
     press(false);
     root.classList.remove('is-dragging');
+    if(mode==='force'){                                  // 强制释放：就地落位（live 坐标恒有值，
+      settle(drag.liveLeft,drag.liveTop);                // pointerdown 已初始化为起点），不回弹、不点按
+      return;
+    }
     const noCoord=!e||typeof e.clientX!=='number'||!Number.isFinite(e.clientX);
-    if(cancelled||noCoord){                              // 取消/丢坐标：回原位、不落盘（同挂件）
+    if(mode==='cancel'||noCoord){                        // 取消/丢坐标：回原位、不落盘（同挂件）
       restorePos();
       return;
     }
@@ -376,31 +387,35 @@ const Bear=(()=>{
     }
     settle(drag.origLeft+e.clientX-drag.startX,drag.origTop+e.clientY-drag.startY);
   }
-  function onUp(e){endDrag(e,false)}
-  function onCancel(e){endDrag(e,true)}
+  function onUp(e){endDrag(e,'up')}
+  function onCancel(e){endDrag(e,'force')}               // pointercancel：强制释放，就地落位（同移出页面）
   // 丢 pointerup 自愈（同挂件 onDocPointerMoveCursor）：拖动中 pointermove 带 buttons===0
   // = 按钮已松开但抬起事件丢了（指针移出窗口等）→ 按最后一次坐标收尾，别让形象黏在半空。
-  document.addEventListener('pointermove',e=>{if(drag&&drag.active&&!e.buttons)endDrag(e,false)},{passive:true});
+  document.addEventListener('pointermove',e=>{if(drag&&drag.active&&!e.buttons)endDrag(e,'up')},{passive:true});
   // 双保险：任何新的按下（含落点不在形象上的）都先取消遗留拖拽——拖拽只有一个指针会话，
   // 新按下 = 旧会话必死（真实输入必有 up/cancel，会先走正常路径；这里只兜异常丢失）。
-  document.addEventListener('pointerdown',()=>{if(drag&&drag.active)endDrag(null,true)},true);
-  // 窗口失焦/页面隐藏时拖拽不可能再收到抬起：按取消收尾（回原位、不落盘）。
-  window.addEventListener('blur',()=>{if(drag&&drag.active)endDrag(null,true)});
-  document.addEventListener('visibilitychange',()=>{if(document.hidden&&drag&&drag.active)endDrag(null,true)});
-  // 鼠标移出页面（document pointerleave/mouseleave，2026-11-14 旧版遗留修复②）：强制结束拖拽。
-  // 与 blur/visibilitychange 同口径按「取消」收尾——回锚点位、不落盘，清 is-dragging/is-pressed
+  document.addEventListener('pointerdown',()=>{if(drag&&drag.active)endDrag(null,'cancel')},true);
+  // 窗口失焦/页面隐藏时拖拽不可能再收到抬起：强制释放，提交 live left/top 就地落位 + 同规则
+  // 吸附（2026-11-14 微调②：不再回弹起点），与 pointerleave/pointercancel 同一 'force' 分支。
+  window.addEventListener('blur',()=>{if(drag&&drag.active)endDrag(null,'force')});
+  document.addEventListener('visibilitychange',()=>{if(document.hidden&&drag&&drag.active)endDrag(null,'force')});
+  // 鼠标移出页面（document pointerleave/mouseleave，2026-11-14 旧版遗留修复②；同日微调②）：
+  // 强制结束拖拽，与 blur/visibilitychange/pointercancel 同口径走 'force' 分支——提交拖拽中的
+  // live left/top 就地落位 + 同规则边缘吸附，绝不回弹本次拖拽起点；清 is-dragging/is-pressed
   // 与 document 级 move/up/cancel 监听，杜绝桌宠卡在「持续被按住」。Bear 拖拽未用 setPointerCapture
   // （靠 document 捕获阶段监听），无指针捕获需释放，清标志位+撤监听即等效。mouseleave 兜底旧浏览器。
-  const onLeave=()=>{if(drag&&drag.active)endDrag(null,true)};
+  const onLeave=()=>{if(drag&&drag.active)endDrag(null,'force')};
   document.addEventListener('pointerleave',onLeave);
   document.addEventListener('mouseleave',onLeave);
   img.addEventListener('pointerdown',e=>{
     if(!enabled||detailMode||(e.pointerType==='mouse'&&e.button!==0))return;
-    if(drag&&drag.active)endDrag(null,true);             // 上一次拖拽未收尾（丢抬起）：先取消再开新的
+    if(drag&&drag.active)endDrag(null,'cancel');         // 上一次拖拽未收尾（丢抬起）：先取消再开新的
     e.preventDefault();                                  // 防选中/原生拖图；touch 滚动由 touch-action:none 承担
-    // 拖拽起点用布局坐标（offset*）：翻转过渡期间 gBCR 是变形中的盒子，会把起点算歪、错过吸附带
+    // 拖拽起点用布局坐标（offset*）：翻转过渡期间 gBCR 是变形中的盒子，会把起点算歪、错过吸附带。
+    // liveLeft/liveTop 初始化为起点：强制释放即便发生在首次 move 前也有合法 live 坐标可提交。
     drag={active:true,startX:e.clientX,startY:e.clientY,
           origLeft:root.offsetLeft,origTop:root.offsetTop,moved:false,
+          liveLeft:root.offsetLeft,liveTop:root.offsetTop,
           w:root.offsetWidth,h:root.offsetHeight};
     root.classList.add('is-dragging');
     press(true);                                         // 拖动期间保持捏压（同挂件 pressDown）
@@ -423,13 +438,13 @@ const Bear=(()=>{
     root.hidden=!enabled;
     press(false);
     if(!enabled)Bubble.hide();                           // 预设切走/总开关关：气泡一并收起
-    if(drag&&drag.active)endDrag(null,true);             // 预设切走时还没松手：按取消收尾
+    if(drag&&drag.active)endDrag(null,'cancel');         // 预设切走时还没松手：按取消收尾
     if(enabled)applyAnchors();
   }
   function setDetailMode(on){
     detailMode=!!on;
     root.classList.toggle('is-above',on);
-    if(on){press(false);Bubble.hide();if(drag&&drag.active)endDrag(null,true)}
+    if(on){press(false);Bubble.hide();if(drag&&drag.active)endDrag(null,'cancel')}
   }
   /* W-13 新熊睡眠态（2026-11-03）：日程睡眠（panel.js setSleep 投影）时降饱和+亮度
      呼吸 + 头顶 Zzz 徽标——没有闭眼素材，不做假闭眼；捏捏/拖动/点开气泡照旧
