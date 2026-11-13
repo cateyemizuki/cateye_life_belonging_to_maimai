@@ -7,8 +7,8 @@
 2. 算需 init 字段：``initialized==false`` ∪ 版本重 init 区间并集
    （``(旧版本, 当前版本]`` 内各版本 ``VERSION_REINIT`` 字段）。
 3. 按 :data:`tools.init.manifest.INIT_FIELDS` 顺序逐字段
-   ``InitService.run_stage`` → 独立校验器 → 成功且校验通过才 ``mark_true``，
-   否则 ``mark_false``（attempts+1 + last_failed_at）。
+   ``InitService.run_stage`` → 独立校验器（``ValidationResult``）→ 成功且校验通过
+   才 ``mark_true``，否则 ``mark_false``（attempts+1 + last_failed_at + last_error）。
 4. 写回 ``plugin_version``；失败字段下次加载自动重 init（崩溃恢复）。
 
 退避
@@ -31,8 +31,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .manifest import (INIT_FIELDS, VALIDATORS, ValidationContext, backoff_seconds,
-                       reinit_fields_for_upgrade)
+from .manifest import (INIT_FIELDS, VALIDATORS, ValidationContext, ValidationResult,
+                       backoff_seconds, reinit_fields_for_upgrade)
 from .registry import InitRegistry, parse_timestamp
 
 logger = logging.getLogger(__name__)
@@ -383,18 +383,34 @@ class AutoInitDriver:
                                 details=dict(getattr(stage, "details", {}) or {}))
         validator = VALIDATORS.get(name)
         validated = False
+        errors: Tuple[str, ...] = ()
+        validator_note = ""
         if validator is not None:
             try:
-                validated = bool(validator(self._validation_context(stage, version)))
+                result = validator(self._validation_context(stage, version))
+                if isinstance(result, ValidationResult):
+                    validated = bool(result.ok)
+                    errors = tuple(str(line) for line in result.errors if str(line).strip())
+                else:
+                    # 兼容旧式 bool 校验器（测试替身/外部注入）：无详细原因可用。
+                    validated = bool(result)
             except Exception as exc:
                 validated = False
+                validator_note = f"校验器异常：{type(exc).__name__}: {exc}"
+                errors = (validator_note,)
                 self._log.warning("初始化字段 %s 校验器异常（留 false）：%s", name, exc)
         if not validated:
+            detail = "；".join(errors)
             message = "初始化返回成功但独立校验未通过（不记完成）"
-            self.registry.mark_false(name, error=message)
+            if detail:
+                message = f"{message}：{detail}"
+            elif not validator_note:
+                # 无校验器 / 旧式 bool 校验器只给 False 时，至少说明未通过。
+                detail = message
+            self.registry.mark_false(name, error=detail or message)
             state = self.registry.field_state(name)
             return FieldOutcome(name, "failed", stage_status=stage_status,
-                                message=message, validated=False,
+                                message=message, errors=errors, validated=False,
                                 attempts=int(state.get("attempts") or 0),
                                 details=dict(getattr(stage, "details", {}) or {}))
         self.registry.mark_true(name, version)
@@ -488,6 +504,9 @@ def status_text(plugin: Any) -> str:
                 f"，attempts={int(entry.get('attempts') or 0)}"
                 f"，validated_at={_short_ts(entry.get('validated_at')) or '-'}"
                 f"，last_failed_at={_short_ts(entry.get('last_failed_at')) or '-'}")
+        last_error = str(entry.get("last_error") or "").strip()
+        if last_error and not initialized:
+            line = f"{line}\n  上次失败原因：{last_error}"
         lines.append(line)
     return "\n".join(lines)
 

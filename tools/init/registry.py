@@ -13,8 +13,9 @@
 
 字段条目：
 ``{"initialized": bool, "version": str|None, "validated_at": str|None,
-   "attempts": int, "last_failed_at": str|None}``
-顶层另有 ``plugin_version`` 与 ``preflight``（预检状态，区别于业务字段失败）。
+   "attempts": int, "last_failed_at": str|None, "last_error": str|None}``
+``last_error`` 存最近一次失败/校验不过的详细原因（中文，供 status/诊断直读）；
+成功标记时清空。顶层另有 ``plugin_version`` 与 ``preflight``（预检状态，区别于业务字段失败）。
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ def default_field_state() -> Dict[str, Any]:
         "validated_at": None,
         "attempts": 0,
         "last_failed_at": None,
+        "last_error": None,
     }
 
 
@@ -85,7 +87,10 @@ def _valid_field_entry(entry: Any) -> bool:
     attempts = entry.get("attempts")
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
         return False
-    return _is_optional_text(entry.get("last_failed_at"))
+    if not _is_optional_text(entry.get("last_failed_at")):
+        return False
+    # 旧文件无 last_error 键 → get() 为 None，按可接受处理（无需重写历史登记）。
+    return _is_optional_text(entry.get("last_error"))
 
 
 def _valid_preflight(value: Any) -> bool:
@@ -200,7 +205,7 @@ class InitRegistry:
             return False
 
     def mark_true(self, field: str, version: str, *, validated_at: Any = None) -> bool:
-        """init 成功且校验通过：写 true（attempts 归零、清空失败时间）。"""
+        """init 成功且校验通过：写 true（attempts 归零、清空失败时间与原因）。"""
         if field not in INIT_FIELDS:
             raise ValueError(f"未知初始化字段：{field}")
         with self._io_lock:
@@ -212,13 +217,15 @@ class InitRegistry:
                 validated_at=str(validated_at or _now_iso()),
                 attempts=0,
                 last_failed_at=None,
+                last_error=None,
             )
             return self._save(document)
 
     def mark_false(self, field: str, *, error: str = "") -> bool:
-        """init 失败/校验不过：保持 false，attempts+1 并记最后失败时间。"""
+        """init 失败/校验不过：保持 false，attempts+1，落盘 last_error 详细原因。"""
         if field not in INIT_FIELDS:
             raise ValueError(f"未知初始化字段：{field}")
+        detail = str(error or "").strip()
         with self._io_lock:
             document = self.load()
             entry = document["fields"][field]
@@ -228,10 +235,11 @@ class InitRegistry:
                 validated_at=None,
                 attempts=int(entry.get("attempts") or 0) + 1,
                 last_failed_at=_now_iso(),
+                last_error=detail or None,
             )
-            if error:
+            if detail:
                 logger.info("初始化字段 %s 留 false（attempts=%s）：%s",
-                            field, entry["attempts"], error)
+                            field, entry["attempts"], detail)
             return self._save(document)
 
     def invalidate(self, field: str) -> bool:

@@ -242,13 +242,17 @@ class InitStatus:
         for name in STAGE_ORDER:
             entry = self.fields.get(name) or {}
             initialized = bool(entry.get("initialized"))
-            lines.append(
+            line = (
                 f"- {_stage_label(name)}：{'已初始化' if initialized else '未初始化'}"
                 f"，version={entry.get('version') or '-'}"
                 f"，attempts={int(entry.get('attempts') or 0)}"
                 f"，validated_at={_short_ts(entry.get('validated_at')) or '-'}"
                 f"，last_failed_at={_short_ts(entry.get('last_failed_at')) or '-'}"
             )
+            last_error = str(entry.get("last_error") or "").strip()
+            if last_error and not initialized:
+                line = f"{line}\n  上次失败原因：{last_error}"
+            lines.append(line)
         lines.append(f"事件库：模式 {self.event_mode}，版本 {self.catalog_version or '无'}"
                      + ("（降级：" + self.event_reason + "）" if self.event_degraded else ""))
         if self.next_update_at:
