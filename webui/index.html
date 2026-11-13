@@ -621,6 +621,12 @@ html[data-embedded=true] .mast-side{padding-right:10px}
 .core-box{min-width:0}
 .core-box .core-fields{display:flex;flex-direction:column;gap:10px}
 .core-field-affects{font-size:12px;line-height:1.5;color:var(--maibot-muted);margin:-2px 0 8px}
+/* 字段卡片人话摘要：沿用卡片 12px 正文口径与 note 弱化色；min-width:0+anywhere 保证
+   移动端单列（.core-box .core-fields 纵排 / ≤700px 1fr）长摘要不溢出。人设摘要两行
+   截断（后端已限 40 字，title 给全文），不撑高卡片。 */
+.core-field-summary{display:flex;flex-direction:column;gap:3px;margin:0 0 8px;font-size:12px;line-height:1.5;min-width:0;overflow-wrap:anywhere}
+.core-field-summary .note{font-size:11.5px}
+.core-field-digest{color:var(--maibot-muted);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
 .core-modules{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
 .core-module-row{display:flex;flex-direction:column;gap:7px;padding:10px;border:1px solid var(--maibot-border);border-radius:10px;background:var(--maibot-surface);transition:border-color .18s,transform .18s}
 .core-module-row:hover{border-color:var(--maibot-primary);transform:translateY(-1px)}
@@ -685,7 +691,10 @@ body.fish-locked{overflow:hidden}
 .fish-popup-body>.fish-section{grid-column:1/-1}
 .fish-popup-summary{font-size:14px;line-height:1.8;margin:0 0 12px;overflow-wrap:anywhere;grid-column:1/-1}
 .fish-meta-row{display:grid;grid-template-columns:minmax(100px,.9fr) minmax(0,1.2fr);align-items:start;gap:8px;padding:8px 0;border-bottom:1px solid var(--maibot-border);font-size:12.5px;overflow-wrap:anywhere}
-.fish-meta-row>span:last-child{text-align:right}
+/* 390px 孤字修复：值列右对齐不变，追加 text-wrap:pretty——支持的浏览器避免末行只剩
+   一两个字的孤行（overflow-wrap:anywhere 的紧急断行仍兜底）；不支持时按原样换行，
+   列宽/对齐/其余行观感零变化。口径文案本身已同步精简（panel.js mountCoreFish）。 */
+.fish-meta-row>span:last-child{text-align:right;text-wrap:pretty}
 .fish-meta-row .note{font-size:11px;color:var(--maibot-muted)}
 .fish-fold{margin:12px 0 0;border-top:1px solid var(--maibot-border);padding-top:2px;grid-column:1/-1}
 .fish-fold .fish-changes,.fish-fold.fish-changes{grid-column:auto}
@@ -889,8 +898,35 @@ function renderQzoneVideoChips(){const box=$('qzone-video-chips');if(!box)return
 // 核心页（初始化）：解析状态视图 + 输出原文视图。data.init 来自 planning/dashboard._init_summary
 // （registry 解析状态为唯一真源；raw 原文来自 init_last_report.json 逐字段合并）。零模型调用。
 function coreBadge(f){if(f.initialized)return['已初始化','ok'];if(num(f.attempts)>0)return['失败 '+count(f.attempts)+' 次','bad'];return['待初始化','pending']}
+// init 运行结果状态 → 中文（auto_init.FieldOutcome.status 与 StageResult.status 的并集；
+// 未知值原样展示，不猜译）。
+const CORE_RAW_STATUS={success:'成功',failed:'失败',backoff:'退避',blocked:'跳过',skipped:'跳过'};
+// 小时数展示：保留一位小数、整数不带 .0（睡眠债/联系锚点同口径）。
+const coreHours=v=>num(v)===null?'—':String(Math.round(v*10)/10);
 const CORE_FIELD_AFFECTS={emotion:'心情与情绪表达：语气、分享欲与情绪驱动的反应',events:'活动事件库：日程能安排哪些活动',state_sleep:'生活状态与作息：精力/饥饿/专注等状态与睡眠恢复',frequency:'主动频率：bot 主动找你/回复的频繁程度',video_interest:'视频兴趣：看什么视频与兴趣话题',companion_disposition:'联系倾向：主动联系的时机与想念表达',activity_preferences:'日程偏好：活动排序与休闲/社交等倾向'};
 function coreSummaryText(d){const i=d?.init;if(!i||!i.available)return '初始化数据暂不可用';return `已初始化 ${i.summary?.initialized??0}/${i.summary?.total??0} 字段`}
+// 外部字段卡片的人话摘要：只消费后端 _init_field_data 已聚合的 summary，不重算业务值。
+// 单位与后端一致：sleep_debt/anchor_hours 为小时，loneliness 0–1，增益/衰减为倍率。
+// 产物缺失给含蓄提示而非空白；数字缺失按既有 count/fix 口径展示 —。
+function coreFieldBrief(f){
+ const d=f.data||{},s=d.summary||{},box=el('div','core-field-summary');
+ if(!d.exists){box.append(el('span','note','初始化产物尚未生成，完成后这里会补充摘要。'));return box}
+ const lines=[];
+ switch(f.field){
+  case 'events':lines.push('事件 '+count(s.event_count)+' 条');break;
+  case 'video_interest':lines.push('关键词 '+count(s.keyword_count)+' 个');break;
+  case 'state_sleep':lines.push('睡眠债 '+coreHours(s.sleep_debt)+' h');break;
+  case 'companion_disposition':lines.push('锚点 '+coreHours(s.anchor_hours)+'h · 孤独感 '+(num(s.loneliness)===null?'—':s.loneliness.toFixed(2)));break;
+  case 'activity_preferences':lines.push('活动 '+count(s.activity_count)+' · 特质 '+count(s.trait_count));break;
+  case 'emotion':{
+   if(s.persona_digest){const dg=el('span','core-field-digest','人设 · '+s.persona_digest);dg.title=s.persona_digest;box.append(dg)}
+   lines.push('增益 '+fix(s.positive_gain,2)+' · 衰减 '+fix(s.negative_decay,2));break}
+  case 'frequency':lines.push(s.target_frequency_always_one===false?'配置项 · 目标频率随校准变化':'配置项 · 目标频率恒为 1');break;
+ }
+ if(!lines.length&&!box.childElementCount){box.append(el('span','note','产物已就位，摘要待补充。'));return box}
+ for(const t of lines)box.append(el('span','',t));
+ return box;
+}
 function renderCore(){
  const init=data?.init,setT=(id,v)=>{const e=$(id);if(e)e.textContent=String(v??'—')};
  if(!init||!init.available){
@@ -913,6 +949,7 @@ function renderCore(){
   const [badgeText,cls]=coreBadge(f),card=el('article','core-field '+cls),head=el('div','core-field-head');
   head.append(el('h3','',f.label||f.field),el('span','pill '+cls,badgeText));card.append(head);
   if(CORE_FIELD_AFFECTS[f.field])card.append(el('div','core-field-affects',CORE_FIELD_AFFECTS[f.field]));
+  card.append(coreFieldBrief(f));
   const meta=el('div','core-field-meta');meta.append(el('span','note','尝试 '+count(f.attempts)+' 次'));
   if(f.validated_at)meta.append(el('span','note','校验 '+clock(f.validated_at,true)));
   card.append(meta);
@@ -950,7 +987,25 @@ function renderCoreDetails(init,fields,modules){
    block.append(meta);
    if(d.summary&&Object.keys(d.summary).length)block.append(el('pre','core-raw-pre',JSON.stringify(d.summary,null,2)));
    if(d.preview)block.append(el('pre','core-raw-pre',d.preview));
-   if(f.raw&&f.raw.message){block.append(el('div','core-raw-label','最近运行'));block.append(el('pre','core-raw-pre',f.raw.message))}
+   // 原始输出完整展示：message 之外，errors/details 非空也要可见；
+   // status/stage_status/run_at 作为元信息行（后端 _init_summary 逐字段合并自 init_last_report）。
+   const r=f.raw;
+   if(r){
+    const errs=Array.isArray(r.errors)?r.errors.filter(Boolean):[];
+    const det=r.details&&typeof r.details==='object'&&!Array.isArray(r.details)?r.details:null;
+    const detKeys=det?Object.keys(det):[];
+    if(r.message||errs.length||detKeys.length||r.status||r.stage_status||r.run_at){
+     block.append(el('div','core-raw-label','最近运行'));
+     const rmeta=el('div','core-field-meta');
+     if(r.status)rmeta.append(el('span','note','状态 '+(CORE_RAW_STATUS[r.status]||r.status)));
+     if(r.stage_status)rmeta.append(el('span','note','阶段 '+(CORE_RAW_STATUS[r.stage_status]||r.stage_status)));
+     if(r.run_at)rmeta.append(el('span','note','运行 '+clock(r.run_at,true)));
+     if(rmeta.childElementCount)block.append(rmeta);
+     if(r.message)block.append(el('pre','core-raw-pre',r.message));
+     if(errs.length){block.append(el('div','core-raw-label','报错原文'));block.append(el('pre','core-raw-pre core-raw-err',errs.join('\n')))}
+     if(detKeys.length){block.append(el('div','core-raw-label','运行明细'));block.append(el('pre','core-raw-pre',JSON.stringify(det,null,2)))}
+    }
+   }
    return block}));
  const md=$('core-modules-detail');if(md)md.replaceChildren(...modules.map(m=>{
    const row=el('div','core-module-row'),left=el('div','core-module-name');
@@ -967,10 +1022,14 @@ function renderCoreDetails(init,fields,modules){
 function mountCoreFish(){
  if(typeof SectionFish==='undefined'||!SectionFish.mount)return;
  const F=SectionFish;
+ // 四个核心详情容器在模板里带 hidden（挂载前防闪现）；fold() 只搬运不去 hidden，
+ // 移入详情弹层后整块不可见——折叠前统一去掉。只处理这四个静态容器：
+ // schedule-pool-detail 的 hidden 由 renderSchedulePage 动态管理，不在此列。
+ for(const id of ['core-status-detail','core-fields-detail','core-modules-detail','core-logs-detail']){const n=$(id);if(n)n.hidden=false}
  F.mount('core-status','初始化状态',$('core-status-box'),d=>coreSummaryText(d),d=>[['登记版本',d?.init?.plugin_version||'—',''],['最近运行',d?.init?.last_run_at?clock(d.init.last_run_at,true):'—','']],[F.fold('登记与预检原文',[$('core-status-detail')])]);
  F.mount('core-fields','初始化字段',$('core-fields-box'),d=>coreSummaryText(d),()=>[['数据来源','init_registry.json + 数据目录产物','只读，不依赖 init 运行。']],[F.fold('各字段初始化产物原文',[$('core-fields-detail')])]);
  F.mount('core-modules','各模块状态',$('core-modules-box'),d=>`${(d?.init?.modules||[]).length} 个模块`,()=>[['状态来源','配置投影','']],[F.fold('模块状态明细',[$('core-modules-detail')])]);
- F.mount('core-logs','模块日志',$('core-logs-box'),d=>{const m=d?.init?.modules||[];const e=m.reduce((a,x)=>a+(num(x.error_count)||0),0);return e?`${e} 条模块报错`:'最近日志无模块报错'},()=>[['口径','bounded 日志尾 · 按 module 聚合','只展示有界尾片段。']],[F.fold('具体报错记录',[$('core-logs-detail')])]);
+ F.mount('core-logs','模块日志',$('core-logs-box'),d=>{const m=d?.init?.modules||[];const e=m.reduce((a,x)=>a+(num(x.error_count)||0),0);return e?`${e} 条模块报错`:'最近日志无模块报错'},()=>[['口径','有界日志尾 · 按模块聚合','只展示有界尾片段。']],[F.fold('具体报错记录',[$('core-logs-detail')])]);
 }
 
 function dayView(){return data?.day?.available&&data.day.date===selectedDay?data.day:null}

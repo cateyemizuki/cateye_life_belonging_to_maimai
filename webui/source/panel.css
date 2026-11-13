@@ -621,6 +621,12 @@ html[data-embedded=true] .mast-side{padding-right:10px}
 .core-box{min-width:0}
 .core-box .core-fields{display:flex;flex-direction:column;gap:10px}
 .core-field-affects{font-size:12px;line-height:1.5;color:var(--maibot-muted);margin:-2px 0 8px}
+/* 字段卡片人话摘要：沿用卡片 12px 正文口径与 note 弱化色；min-width:0+anywhere 保证
+   移动端单列（.core-box .core-fields 纵排 / ≤700px 1fr）长摘要不溢出。人设摘要两行
+   截断（后端已限 40 字，title 给全文），不撑高卡片。 */
+.core-field-summary{display:flex;flex-direction:column;gap:3px;margin:0 0 8px;font-size:12px;line-height:1.5;min-width:0;overflow-wrap:anywhere}
+.core-field-summary .note{font-size:11.5px}
+.core-field-digest{color:var(--maibot-muted);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
 .core-modules{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
 .core-module-row{display:flex;flex-direction:column;gap:7px;padding:10px;border:1px solid var(--maibot-border);border-radius:10px;background:var(--maibot-surface);transition:border-color .18s,transform .18s}
 .core-module-row:hover{border-color:var(--maibot-primary);transform:translateY(-1px)}

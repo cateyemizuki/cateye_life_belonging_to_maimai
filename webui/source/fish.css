@@ -50,7 +50,10 @@ body.fish-locked{overflow:hidden}
 .fish-popup-body>.fish-section{grid-column:1/-1}
 .fish-popup-summary{font-size:14px;line-height:1.8;margin:0 0 12px;overflow-wrap:anywhere;grid-column:1/-1}
 .fish-meta-row{display:grid;grid-template-columns:minmax(100px,.9fr) minmax(0,1.2fr);align-items:start;gap:8px;padding:8px 0;border-bottom:1px solid var(--maibot-border);font-size:12.5px;overflow-wrap:anywhere}
-.fish-meta-row>span:last-child{text-align:right}
+/* 390px 孤字修复：值列右对齐不变，追加 text-wrap:pretty——支持的浏览器避免末行只剩
+   一两个字的孤行（overflow-wrap:anywhere 的紧急断行仍兜底）；不支持时按原样换行，
+   列宽/对齐/其余行观感零变化。口径文案本身已同步精简（panel.js mountCoreFish）。 */
+.fish-meta-row>span:last-child{text-align:right;text-wrap:pretty}
 .fish-meta-row .note{font-size:11px;color:var(--maibot-muted)}
 .fish-fold{margin:12px 0 0;border-top:1px solid var(--maibot-border);padding-top:2px;grid-column:1/-1}
 .fish-fold .fish-changes,.fish-fold.fish-changes{grid-column:auto}
