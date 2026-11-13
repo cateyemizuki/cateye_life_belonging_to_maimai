@@ -349,9 +349,13 @@ class AutoInitDriver:
                 next_retry_at=retry_at.isoformat(timespec="seconds") if retry_at else None,
                 details={"last_failed_at": entry.get("last_failed_at")})
         stage_force = bool(force) if force is not None else False
+        # registry 为真源（2026-11-13）：登记未初始化 → 强制重 init，不信任业务层旧标记
+        # （旧 emotion_config.initialized=true 但 persona 已变/旧格式时，阶段会误跳过致死循环）。
+        registry_uninitialized = not bool(entry.get("initialized"))
         try:
             result = await self.service.run_stage(
-                name, manual=manual, force=bool(forced_by_version or stage_force))
+                name, manual=manual,
+                force=bool(forced_by_version or stage_force or registry_uninitialized))
         except asyncio.CancelledError:
             # 取消不记失败：登记保持调用前状态（false 字段下次自然重试）。
             raise
