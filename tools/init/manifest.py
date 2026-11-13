@@ -214,7 +214,8 @@ def validate_emotion(ctx: ValidationContext) -> bool:
         return False
     for vector_name in ("anchor", "offset"):
         vector = _mapping(params.get(vector_name))
-        if vector is None or not all(_number(vector.get(axis)) for axis in ("v", "a", "d")):
+        # 轴名为 valence/arousal/dominance（emotion params.to_dict 口径，2026-11-13 修正旧 v/a/d 误用）
+        if vector is None or not all(_number(vector.get(axis)) for axis in ("valence", "arousal", "dominance")):
             return False
     if not _number(params.get("positive_gain")) or not _number(params.get("negative_decay")):
         return False

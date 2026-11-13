@@ -849,7 +849,31 @@ class InitService:
     # ------------------------------------------------------------------
     # 阶段 1：情绪
     # ------------------------------------------------------------------
+    def _emotion_legacy_format(self) -> bool:
+        """旧格式判定（用户裁定 2026-11-13）：params 标记 initialized=true 但 anchor/offset
+        三轴（valence/arousal/dominance）无效（null/缺轴/非数）→ True，应判未初始化强制重 init。
+        文件缺失/标记 false/格式有效 → False（交既有标记逻辑）。"""
+        try:
+            raw = json.loads((self.data_dir / "emotion_config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        params = raw.get("params") if isinstance(raw, Mapping) else None
+        if not isinstance(params, Mapping) or not bool(params.get("initialized", False)):
+            return False
+        for name in ("anchor", "offset"):
+            vec = params.get(name)
+            if not isinstance(vec, Mapping):
+                return True
+            for axis in ("valence", "arousal", "dominance"):
+                v = vec.get(axis)
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    return True
+        return False
+
     def _emotion_initialized(self) -> Optional[bool]:
+        # 旧格式直接判未初始化（不信任旧 initialized 标记，强制重 init）
+        if self._emotion_legacy_format():
+            return False
         if self._emotion_status_provider is not None:
             try:
                 return _coerce_initialized(self._emotion_status_provider())
