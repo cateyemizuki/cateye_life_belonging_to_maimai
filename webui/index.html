@@ -2278,7 +2278,10 @@ const Bubble=(()=>{
      取消/丢坐标回原位不落盘（同挂件）。
    - 镜像翻转（2026-11-03 追加，同挂件语义）：贴左必翻、贴右不翻（朝向屏幕内），
      自由摆放按中心 x 是否在左半屏判定；翻转态随锚点落盘（fl 字段）并随恢复重现。
-   - 不消费 maimai_interaction 数值参数；位置存取失败（隐私模式等）退化为会话内记忆。 */
+   - 不消费 maimai_interaction 数值参数；位置存取失败（隐私模式等）退化为会话内记忆。
+   - 边缘吸附与强制释放（2026-11-14 旧版遗留修复）：松手瞬间距视口边缘 ≤28px 即贴齐最近边
+     （EDGE_SNAP_PX，仅 settle 判定、拖拽中不吸附，走既有 left/top .16s 过渡）；document
+     pointerleave/mouseleave 与既有 blur/visibilitychange/pointercancel 一并强制收尾，杜绝卡死。 */
 const Bear=(()=>{
   const root=document.getElementById('maimai-bear');
   // finding #4（2026-11-04）：stub 补 no-op reanchor，与真实接口口径一致（调用方虽已判空）。
@@ -2287,6 +2290,13 @@ const Bear=(()=>{
   const POS_KEY='maimai-bear-pos';
   const CLICK_SQ=100;                                    // 位移平方 <100（<10px）= 点按
   const SNAP={L:.20,R:.20,B:.30,T:0};                    // 吸附区比例（挂件 v3 默认 10/10/15 偏小，2026-11-03 按反馈加大）；T=0 顶边禁用
+  // 边缘就近吸附阈值（2026-11-14，旧版遗留修复①）：松手瞬间桌宠任一边距视口边缘 ≤28px，
+  // 立即贴齐「最近的那条边」（该轴锚点距离归 0）。只在 settle（pointerup 收尾）判定——
+  // onMove 拖拽过程只钳制不吸附；贴齐位移由 .maimai-bear 既有 left/top .16s ease 过渡平滑
+  // 完成（applyPos 写 left/top 前先读 offsetWidth 强制回流，过渡必生效）。比例吸附区 SNAP
+  // 仍作远离边缘时的兜底；就近吸附覆盖四条边（含顶边——气泡 place 已支持顶位翻到下方），
+  // 与 SNAP.T=0 关闭的「顶部比例区」语义不冲突。
+  const EDGE_SNAP_PX=28;
   let enabled=false,detailMode=false,drag=null,flip=false;
   let memPos=null;                                       // localStorage 不可用时的会话内兜底
   const clamp=(v,lo,hi)=>Math.min(hi,Math.max(lo,v));
@@ -2334,6 +2344,20 @@ const Bear=(()=>{
       vt:footY>b.B?'bottom':SNAP.T>0&&top<b.T?'top':null,vd:0};
     if(p.h)p.hd=p.h==='left'?left:v.w-left-w;else p.hd=left;
     if(p.vt)p.vd=p.vt==='bottom'?v.h-top-h:top;else p.vd=top;
+    // 就近吸附（修复①）：四边距离取阈值内最近者，贴齐该边（距离归 0，覆盖比例区算出的锚点
+    // 距离）。left/top 已钳制在视口内，四边距离恒 ≥0；并列时按 L/R/T/B 顺序取先者。另一轴
+    // 仍按上面的比例区锚点语义保留，不做额外吸附。
+    const dL=left,dR=v.w-left-w,dT=top,dB=v.h-top-h;
+    let near=null;
+    for(const it of [['L',dL],['R',dR],['T',dT],['B',dB]]){
+      if(it[1]<=EDGE_SNAP_PX&&(!near||it[1]<near[1]))near=it;
+    }
+    if(near){
+      if(near[0]==='L'){p.h='left';p.hd=0}
+      else if(near[0]==='R'){p.h='right';p.hd=0}
+      else if(near[0]==='T'){p.vt='top';p.vd=0}
+      else{p.vt='bottom';p.vd=0}
+    }
     // 翻转判定（同挂件 settle）：贴左翻、贴右正，自由位看中心 x 与半屏线
     flip=p.h==='left'?true:p.h==='right'?false:cx<v.w/2;
     p.fl=flip;
@@ -2380,6 +2404,13 @@ const Bear=(()=>{
   // 窗口失焦/页面隐藏时拖拽不可能再收到抬起：按取消收尾（回原位、不落盘）。
   window.addEventListener('blur',()=>{if(drag&&drag.active)endDrag(null,true)});
   document.addEventListener('visibilitychange',()=>{if(document.hidden&&drag&&drag.active)endDrag(null,true)});
+  // 鼠标移出页面（document pointerleave/mouseleave，2026-11-14 旧版遗留修复②）：强制结束拖拽。
+  // 与 blur/visibilitychange 同口径按「取消」收尾——回锚点位、不落盘，清 is-dragging/is-pressed
+  // 与 document 级 move/up/cancel 监听，杜绝桌宠卡在「持续被按住」。Bear 拖拽未用 setPointerCapture
+  // （靠 document 捕获阶段监听），无指针捕获需释放，清标志位+撤监听即等效。mouseleave 兜底旧浏览器。
+  const onLeave=()=>{if(drag&&drag.active)endDrag(null,true)};
+  document.addEventListener('pointerleave',onLeave);
+  document.addEventListener('mouseleave',onLeave);
   img.addEventListener('pointerdown',e=>{
     if(!enabled||detailMode||(e.pointerType==='mouse'&&e.button!==0))return;
     if(drag&&drag.active)endDrag(null,true);             // 上一次拖拽未收尾（丢抬起）：先取消再开新的
