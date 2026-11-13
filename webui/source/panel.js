@@ -70,6 +70,7 @@ function renderQzoneVideoChips(){const box=$('qzone-video-chips');if(!box)return
 // 核心页（初始化）：解析状态视图 + 输出原文视图。data.init 来自 planning/dashboard._init_summary
 // （registry 解析状态为唯一真源；raw 原文来自 init_last_report.json 逐字段合并）。零模型调用。
 function coreBadge(f){if(f.initialized)return['已初始化','ok'];if(num(f.attempts)>0)return['失败 '+count(f.attempts)+' 次','bad'];return['待初始化','pending']}
+const CORE_FIELD_AFFECTS={emotion:'心情与情绪表达：语气、分享欲与情绪驱动的反应',events:'活动事件库：日程能安排哪些活动',state_sleep:'生活状态与作息：精力/饥饿/专注等状态与睡眠恢复',frequency:'主动频率：bot 主动找你/回复的频繁程度',video_interest:'视频兴趣：看什么视频与兴趣话题',companion_disposition:'联系倾向：主动联系的时机与想念表达',activity_preferences:'日程偏好：活动排序与休闲/社交等倾向'};
 function coreSummaryText(d){const i=d?.init;if(!i||!i.available)return '初始化数据暂不可用';return `已初始化 ${i.summary?.initialized??0}/${i.summary?.total??0} 字段`}
 function renderCore(){
  const init=data?.init,setT=(id,v)=>{const e=$(id);if(e)e.textContent=String(v??'—')};
@@ -92,6 +93,7 @@ function renderCore(){
  $('core-fields').replaceChildren(...fields.map(f=>{
   const [badgeText,cls]=coreBadge(f),card=el('article','core-field '+cls),head=el('div','core-field-head');
   head.append(el('h3','',f.label||f.field),el('span','pill '+cls,badgeText));card.append(head);
+  if(CORE_FIELD_AFFECTS[f.field])card.append(el('div','core-field-affects',CORE_FIELD_AFFECTS[f.field]));
   const meta=el('div','core-field-meta');meta.append(el('span','note','尝试 '+count(f.attempts)+' 次'));
   if(f.validated_at)meta.append(el('span','note','校验 '+clock(f.validated_at,true)));
   card.append(meta);
