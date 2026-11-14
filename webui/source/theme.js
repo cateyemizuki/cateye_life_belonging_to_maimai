@@ -246,10 +246,13 @@ document.body.append(lbmPill);
 document.documentElement.setAttribute('data-lbm-pill','');
 
 function lbmSyncButton(){
- lbmPillName.textContent=LBM_SKIN_NAMES[lbmSkin];
+ /* 2026-11-15：可见文案与 title 固定为「切换主题」（不再随皮肤变）；当前/下一个
+    主题信息保留在 aria-label 供屏幕阅读器使用。pill 宽度由 lbmPosition 实测
+    offsetWidth 并算 --lbm-pill-lane，常量文案自动适配，无需改 CSS。 */
+ lbmPillName.textContent='切换主题';
  const next=LBM_SKINS[(LBM_SKINS.indexOf(lbmSkin)+1)%LBM_SKINS.length];
  lbmPill.dataset.skin=lbmSkin;
- lbmPill.title='主题切换：点击循环 A 精致 → C 仪表盘。当前：'+LBM_SKIN_NAMES[lbmSkin]+'，下一个：'+LBM_SKIN_NAMES[next]+'（选择本地记忆，默认 A）';
+ lbmPill.title='切换主题';
  lbmPill.setAttribute('aria-label','当前主题：'+LBM_SKIN_NAMES[lbmSkin]+'；点击切换到'+LBM_SKIN_NAMES[next]);
 }
 

@@ -1077,24 +1077,27 @@ html:root[data-lbm-theme=c][data-theme=dark]{
 }
 html:root[data-lbm-theme=c]{--maibot-radius:12px!important}
 html[data-lbm-theme=c][data-embedded] .card.maibot-card{border-radius:12px!important}
-html[data-lbm-theme=c] body{font-size:13px;line-height:1.55}
+/* 2026-11-15 缩放基准统一批：C 的尺寸令牌（字号/内容宽/导航列/间距）抬回 A 的
+   有效基线，切换主题不再改变 apparent 大小；配色/质感/圆角/阴影令牌一律不动。
+   宽度不再自锁 max-width，回落 panel.css 级联（1360px / ≥1600px 1760px）。 */
+html[data-lbm-theme=c] body{font-size:14px;line-height:1.6}
 html[data-lbm-theme=c] body:after{display:none}
-html[data-lbm-theme=c] .shell{max-width:1440px;padding:14px clamp(14px,2.4vw,28px) 12px}
+html[data-lbm-theme=c] .shell{padding:24px clamp(16px,3vw,40px) 16px}
 html[data-lbm-theme=c] .mast{padding:9px 14px;margin:0 0 12px;border:1px solid var(--dash-hairline);border-radius:var(--dash-radius);background:var(--maibot-surface);backdrop-filter:none;box-shadow:var(--dash-shadow)}
 html[data-lbm-theme=c][data-embedded=true] .mast{background:var(--maibot-surface);border:1px solid var(--dash-hairline);box-shadow:var(--dash-shadow);padding:8px 12px;margin:0 0 12px}
-html[data-lbm-theme=c] button{min-height:32px;padding:5px 12px;font-size:12.5px;border-radius:8px}
+html[data-lbm-theme=c] button{min-height:34px;padding:5px 12px;font-size:12.5px;border-radius:8px}
 html[data-lbm-theme=c] .toolbar{gap:6px}
 html[data-lbm-theme=c] .toolbar .status{font-size:11.5px;padding:4px 10px;border-color:var(--dash-hairline);background:var(--maibot-soft)}
 html[data-lbm-theme=c] #updated,html[data-lbm-theme=c] .connectionline{font-size:11px;color:var(--maibot-muted)}
 html[data-lbm-theme=c] .brand .eyebrow{font-size:9px;letter-spacing:.16em}
-html[data-lbm-theme=c] h1{font-size:19px;letter-spacing:-.01em}
-html[data-lbm-theme=c] .mark{width:38px;height:38px;border-radius:10px}
+html[data-lbm-theme=c] h1{font-size:22px;letter-spacing:-.01em}
+html[data-lbm-theme=c] .mark{width:46px;height:46px;border-radius:10px}
 html[data-lbm-theme=c] #notice{display:flex;align-items:baseline;gap:8px;padding:6px 12px;margin:0 0 10px;font-size:11.5px;line-height:1.5;border-radius:9px;border:1px solid color-mix(in oklch,var(--hunger) 38%,transparent);border-left:3px solid var(--hunger);background:color-mix(in oklch,var(--hunger) 9%,var(--maibot-surface))}
 html[data-lbm-theme=c] #notice:before{content:"▲";flex:none;font-size:9px;color:var(--hunger)}
 html[data-lbm-theme=c] #notice.error{border-color:color-mix(in oklch,var(--maibot-danger) 42%,transparent);border-left-color:var(--maibot-danger);background:color-mix(in oklch,var(--maibot-danger) 8%,var(--maibot-surface));color:var(--maibot-danger)}
 html[data-lbm-theme=c] #notice.error:before{color:var(--maibot-danger)}
-html[data-lbm-theme=c] .panel-layout{grid-template-columns:168px minmax(0,1fr);gap:16px;scrollbar-gutter:stable}
-html[data-lbm-theme=c][data-embedded=true] .panel-layout{grid-template-columns:168px minmax(0,1fr);gap:16px}
+html[data-lbm-theme=c] .panel-layout{grid-template-columns:132px minmax(0,1fr);gap:18px;scrollbar-gutter:stable}
+html[data-lbm-theme=c][data-embedded=true] .panel-layout{grid-template-columns:96px minmax(0,1fr);gap:16px}
 html[data-lbm-theme=c] .panel-tabs{gap:2px;padding:0 12px 0 0;border-right:1px solid var(--dash-hairline);background:transparent}
 html[data-lbm-theme=c][data-theme=dark] .panel-tabs{background:transparent}
 html[data-lbm-theme=c] .panel-tabs:before{content:"导航 · NAV";display:block;font-size:9px;font-weight:650;letter-spacing:.18em;color:var(--maibot-muted);opacity:.75;padding:3px 12px 7px}
@@ -1117,49 +1120,49 @@ html[data-lbm-theme=c] .date-controls input{min-height:28px;font-size:11.5px;bor
 html[data-lbm-theme=c] .range{gap:2px;padding:3px;border:1px solid var(--dash-hairline);border-radius:9px;background:var(--maibot-soft)}
 html[data-lbm-theme=c] .range button{min-height:26px;padding:2px 10px;border:0;border-radius:7px;font-size:11.5px;background:transparent;color:var(--maibot-muted)}
 html[data-lbm-theme=c] .range button[aria-pressed=true]{background:var(--maibot-surface);color:var(--maibot-primary);font-weight:650;box-shadow:0 1px 2px oklch(20% .02 165 / .12)}
-html[data-lbm-theme=c] .card{border-radius:var(--dash-radius);border:1px solid var(--dash-hairline);background:var(--maibot-surface);box-shadow:var(--dash-shadow);padding:14px 16px;transition:border-color .15s ease}
+html[data-lbm-theme=c] .card{border-radius:var(--dash-radius);border:1px solid var(--dash-hairline);background:var(--maibot-surface);box-shadow:var(--dash-shadow);padding:20px;transition:border-color .15s ease}
 html[data-lbm-theme=c][data-theme=dark] .card{background:var(--maibot-surface)}
-html[data-lbm-theme=c] .cardtop{margin-bottom:10px;gap:8px}
-html[data-lbm-theme=c] .card h2{font-size:13px;font-weight:650;letter-spacing:.01em}
+html[data-lbm-theme=c] .cardtop{margin-bottom:14px;gap:8px}
+html[data-lbm-theme=c] .card h2{font-size:14.5px;font-weight:650;letter-spacing:.01em}
 html[data-lbm-theme=c] .heading-icon{width:14px;height:14px;stroke:var(--maibot-primary);opacity:.75}
-html[data-lbm-theme=c] .sectionline{margin:14px 0 8px;align-items:baseline}
-html[data-lbm-theme=c] .sectionline h2{font-size:11.5px;font-weight:650;letter-spacing:.08em;color:var(--maibot-muted)}
+html[data-lbm-theme=c] .sectionline{margin:20px 0 10px;align-items:baseline}
+html[data-lbm-theme=c] .sectionline h2{font-size:12px;font-weight:650;letter-spacing:.08em;color:var(--maibot-muted)}
 html[data-lbm-theme=c] .sectionline h2::before{width:3px;height:11px;border-radius:2px;background:var(--maibot-primary);opacity:.9}
-html[data-lbm-theme=c] .note{font-size:11.5px}
+html[data-lbm-theme=c] .note{font-size:12px}
 html[data-lbm-theme=c] .pill{font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:999px;border-color:var(--dash-hairline);background:var(--maibot-soft)}
 html[data-lbm-theme=c] .pill.ok{background:color-mix(in oklch,var(--maibot-primary) 13%,transparent);border-color:color-mix(in oklch,var(--maibot-primary) 45%,transparent);color:var(--maibot-primary)}
 html[data-lbm-theme=c] .pill.bad{background:color-mix(in oklch,var(--maibot-danger) 12%,transparent);border-color:color-mix(in oklch,var(--maibot-danger) 45%,transparent);color:var(--maibot-danger)}
 html[data-lbm-theme=c] .pill.pending{background:color-mix(in oklch,var(--hunger) 13%,transparent);border-color:color-mix(in oklch,var(--hunger) 45%,transparent);color:var(--hunger)}
 html[data-lbm-theme=c] .empty{border-radius:10px}
-html[data-lbm-theme=c] .hero{grid-template-columns:1.6fr 1fr;gap:12px}
-html[data-lbm-theme=c] .hero>.card{min-height:176px}
+html[data-lbm-theme=c] .hero{grid-template-columns:1.6fr 1fr;gap:14px}
+html[data-lbm-theme=c] .hero>.card{min-height:210px}
 html[data-lbm-theme=c] .hero-scene:before{opacity:.97}
-html[data-lbm-theme=c] .hero-scene .activityname{font-size:26px;line-height:1.3;letter-spacing:-.02em;margin:4px 0 10px;max-width:88%;overflow-wrap:normal;word-break:normal;text-wrap:balance}
-html[data-lbm-theme=c] .activitymeta{font-size:11px;gap:4px 10px}
+html[data-lbm-theme=c] .hero-scene .activityname{font-size:32px;line-height:1.3;letter-spacing:-.02em;margin:4px 0 10px;max-width:88%;overflow-wrap:normal;word-break:normal;text-wrap:balance}
+html[data-lbm-theme=c] .activitymeta{font-size:11.5px;gap:4px 10px}
 html[data-lbm-theme=c] .progress{height:6px;border-radius:99px;margin-top:auto}
-html[data-lbm-theme=c] .splitline{font-size:10.5px;margin-top:6px}
+html[data-lbm-theme=c] .splitline{font-size:11.5px;margin-top:6px}
 html[data-lbm-theme=c] #current-percent{font-size:11px;padding:2px 9px;border-radius:999px}
 html[data-lbm-theme=c] .companionmain{align-items:center}
-html[data-lbm-theme=c] .tier{font-size:20px;font-weight:700;letter-spacing:-.01em}
-html[data-lbm-theme=c] .score{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}
+html[data-lbm-theme=c] .tier{font-size:25px;font-weight:700;letter-spacing:-.01em}
+html[data-lbm-theme=c] .score{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums}
 html[data-lbm-theme=c] .smallstats{margin-top:12px;padding-top:10px;gap:8px}
 html[data-lbm-theme=c] .smallstats .note{font-size:10.5px}
-html[data-lbm-theme=c] .smallstats strong{font-size:12px;font-variant-numeric:tabular-nums}
-html[data-lbm-theme=c] .metrics{gap:10px}
-html[data-lbm-theme=c] .metric.maibot-card{padding:12px 14px}
+html[data-lbm-theme=c] .smallstats strong{font-size:13px;font-variant-numeric:tabular-nums}
+html[data-lbm-theme=c] .metrics{gap:12px}
+html[data-lbm-theme=c] .metric.maibot-card{padding:14px 16px}
 html[data-lbm-theme=c] .metric:hover{border-color:color-mix(in srgb,var(--mc,var(--maibot-primary)) 42%,var(--dash-hairline))}
 html[data-lbm-theme=c] .metrichead{display:flex;align-items:center;justify-content:space-between;gap:8px}
 html[data-lbm-theme=c] .metrichead h3{font-size:11.5px;font-weight:550;color:var(--maibot-muted);margin:0}
-html[data-lbm-theme=c] .metricicon{width:26px;height:26px;border-radius:8px}
-html[data-lbm-theme=c] .metricicon svg{width:15px;height:15px}
-html[data-lbm-theme=c] .metricvalue{font-size:28px;font-weight:700;letter-spacing:-.025em;font-variant-numeric:tabular-nums lining-nums;margin:2px 0 0}
+html[data-lbm-theme=c] .metricicon{width:29px;height:29px;border-radius:8px}
+html[data-lbm-theme=c] .metricicon svg{width:18px;height:18px}
+html[data-lbm-theme=c] .metricvalue{font-size:30px;font-weight:700;letter-spacing:-.025em;font-variant-numeric:tabular-nums lining-nums;margin:2px 0 0}
 html[data-lbm-theme=c] .metric .meter{height:4px;margin:8px 0 7px;border-radius:99px}
 html[data-lbm-theme=c] .metricfoot{gap:6px}
 html[data-lbm-theme=c] .metric .note{font-size:10.5px}
-html[data-lbm-theme=c] .metrictrend{font-size:10px;padding:1px 6px;background:var(--maibot-soft);color:var(--maibot-muted)}
+html[data-lbm-theme=c] .metrictrend{font-size:10.5px;padding:1px 6px;background:var(--maibot-soft);color:var(--maibot-muted)}
 html[data-lbm-theme=c] .observations{margin-top:10px;gap:6px}
-html[data-lbm-theme=c] .observation{font-size:10.5px;padding:3px 10px;border-color:var(--dash-hairline);background:var(--maibot-surface)}
-html[data-lbm-theme=c] .now-duo{gap:12px;margin-top:12px}
+html[data-lbm-theme=c] .observation{font-size:11px;padding:3px 10px;border-color:var(--dash-hairline);background:var(--maibot-surface)}
+html[data-lbm-theme=c] .now-duo{gap:14px;margin-top:14px}
 html[data-lbm-theme=c] #emotion-card .tier{font-size:17px}
 html[data-lbm-theme=c] .vadbars{gap:6px;margin-top:10px}
 html[data-lbm-theme=c] .vadbar{grid-template-columns:32px minmax(0,1fr) auto;gap:8px}
@@ -1170,7 +1173,10 @@ html[data-lbm-theme=c] .legend{gap:10px;min-height:22px}
 html[data-lbm-theme=c] .legend button{font-size:10.5px}
 html[data-lbm-theme=c] #referee-health{font-size:10.5px}
 html[data-lbm-theme=c] .sleepstats{gap:10px;padding-bottom:10px}
-html[data-lbm-theme=c] .bignum{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+html[data-lbm-theme=c] .bignum{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+/* 睡眠大数字对齐 A：panel.css:15 .sleep-combined .bignum=23px(0,2,0)，若不加这条
+   scoped 规则，上面 (0,2,1) 的 26px 会压过它，造成 C 睡眠数字反而比 A 大 3px。 */
+html[data-lbm-theme=c] .sleep-combined .bignum{font-size:23px}
 html[data-lbm-theme=c] .sleep-combined .sleepgraph{min-height:0}
 html[data-lbm-theme=c] .sleep-combined .sleepgraph svg{max-height:96px}
 html[data-lbm-theme=c] #sleep-forecast{font-size:10.5px}
@@ -1190,13 +1196,13 @@ html[data-lbm-theme=c] .schedule-page-actions button{min-width:26px;min-height:2
 html[data-lbm-theme=c] .vtime-item{padding:8px 0;font-size:12px}
 html[data-lbm-theme=c] .vtime-item>time{font-size:10.5px}
 html[data-lbm-theme=c] .vtime-body h3{font-size:12.5px}
-html[data-lbm-theme=c] .vtime-badge{font-size:10px;padding:1px 6px}
+html[data-lbm-theme=c] .vtime-badge{font-size:10.5px;padding:1px 6px}
 html[data-lbm-theme=c] .vtime-change{font-size:10.5px}
 html[data-lbm-theme=c] .activityrow{padding:9px 0;font-size:11.5px;gap:9px}
 html[data-lbm-theme=c] .activityrow h3{font-size:12px}
 html[data-lbm-theme=c] .statechange{font-size:10.5px}
 html[data-lbm-theme=c] .drawreason{font-size:10px;max-width:180px}
-html[data-lbm-theme=c] .rowbadge{font-size:10px;padding:1px 7px}
+html[data-lbm-theme=c] .rowbadge{font-size:10.5px;padding:1px 7px}
 html[data-lbm-theme=c] .list{scrollbar-width:thin}
 @media(min-width:1000px){
   html[data-lbm-theme=c] #panel-schedule .schedule-record{height:calc(100vh - 252px);min-height:400px;gap:4px 14px}
@@ -1210,7 +1216,7 @@ html[data-lbm-theme=c] .chart .empty{min-height:220px}
 html[data-lbm-theme=c] .estimate-key{font-size:10px}
 html[data-lbm-theme=c] .samplewrap{max-height:260px}
 html[data-lbm-theme=c] .maibot-table{font-size:11.5px}
-html[data-lbm-theme=c] .maibot-table th{font-size:10px;letter-spacing:.06em;font-weight:650;color:var(--maibot-muted)}
+html[data-lbm-theme=c] .maibot-table th{font-size:11px;letter-spacing:.06em;font-weight:650;color:var(--maibot-muted)}
 html[data-lbm-theme=c] .maibot-table td{font-variant-numeric:tabular-nums}
 html[data-lbm-theme=c] #emotion-history-card{margin-top:12px}
 html[data-lbm-theme=c] #emotion-history-chart{min-height:220px}
@@ -1229,7 +1235,7 @@ html[data-lbm-theme=c] .usage-card-range button{min-height:26px;padding:2px 10px
 html[data-lbm-theme=c] .usage-card-metrics{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:8px}
 html[data-lbm-theme=c] .usage-card-metrics .usage-metric{padding:10px 12px;border-radius:10px;border-color:var(--dash-hairline);background:var(--maibot-surface);gap:4px}
 html[data-lbm-theme=c] .usage-card-metrics .usage-metric .note{font-size:10.5px}
-html[data-lbm-theme=c] .usage-card-metrics .usage-value{font-size:22px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums lining-nums}
+html[data-lbm-theme=c] .usage-card-metrics .usage-value{font-size:clamp(16px,2.3vw,25px);font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums lining-nums}
 html[data-lbm-theme=c] #usage-split{font-size:10.5px;margin-top:8px}
 html[data-lbm-theme=c] #usage-top{margin-top:8px;gap:6px}
 html[data-lbm-theme=c] #usage-top>span{font-size:10.5px;padding:2px 9px;border-radius:999px;border:1px solid var(--dash-hairline);background:var(--maibot-soft);font-variant-numeric:tabular-nums}
@@ -1311,14 +1317,16 @@ html[data-lbm-theme=c] .fish-changelist .change-why{font-size:10px}
 html[data-lbm-theme=c] .fish-fold .list{max-height:240px}
 html[data-lbm-theme=c] .fish-fold .samplewrap{max-height:230px}
 html[data-lbm-theme=c] .fish-fold .bignum{font-size:18px}
-html[data-lbm-theme=c] footer{margin-top:12px;padding:8px 0 2px 150px;border-top:1px solid var(--dash-hairline);font-size:10.5px}
+html[data-lbm-theme=c] footer{margin-top:12px;padding:8px 0 2px 150px;border-top:1px solid var(--dash-hairline);font-size:11px}
 @media(max-width:1199px){
-  html[data-lbm-theme=c] .hero-scene .activityname{font-size:24px}
+  html[data-lbm-theme=c] .hero-scene .activityname{font-size:32px}
 }
 @media(max-width:1000px){
   html[data-lbm-theme=c] .hero{grid-template-columns:1.4fr 1fr}
-  html[data-lbm-theme=c] .hero-scene .activityname{font-size:23px}
-  html[data-lbm-theme=c] .metricvalue{font-size:25px}
+  html[data-lbm-theme=c] .hero-scene .activityname{font-size:32px}
+  /* A 在 701–1000px 带的有效 metricvalue=30px：panel.css:266（30px，无媒体查询）
+     源顺序晚于 panel.css:5/:39 的 28/25px 且同特异性，媒体查询不加特异性 → 30px 胜出。 */
+  html[data-lbm-theme=c] .metricvalue{font-size:30px}
   html[data-lbm-theme=c] .datebar{flex-direction:column;align-items:flex-start;gap:8px}
 }
 @media(max-width:900px){
@@ -1326,17 +1334,17 @@ html[data-lbm-theme=c] footer{margin-top:12px;padding:8px 0 2px 150px;border-top
   html[data-lbm-theme=c] .core-modules{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media(max-width:700px){
-  html[data-lbm-theme=c] .shell{padding:10px 10px 8px}
+  html[data-lbm-theme=c] .shell{padding:16px 14px 12px}
   html[data-lbm-theme=c] button{min-height:38px}
   html[data-lbm-theme=c] .mast{padding:8px 10px;gap:8px}
   html[data-lbm-theme=c][data-embedded=true] .mast{padding:7px 10px;margin:0 0 10px}
   html[data-lbm-theme=c] .toolbar{gap:5px}
   html[data-lbm-theme=c] .toolbar .status{font-size:10.5px;padding:3px 8px}
-  html[data-lbm-theme=c] .toolbar button{min-height:34px;padding:4px 10px;font-size:11.5px}
+  html[data-lbm-theme=c] .toolbar button{min-height:38px;padding:4px 10px;font-size:12px}
   html[data-lbm-theme=c] #updated{font-size:10px}
   html[data-lbm-theme=c] #notice{font-size:10.5px;padding:5px 10px;margin:0 0 8px}
-  html[data-lbm-theme=c] .panel-layout{grid-template-columns:60px minmax(0,1fr);gap:10px}
-  html[data-lbm-theme=c][data-embedded=true] .panel-layout{grid-template-columns:60px minmax(0,1fr);gap:10px}
+  html[data-lbm-theme=c] .panel-layout{grid-template-columns:56px minmax(0,1fr);gap:8px}
+  html[data-lbm-theme=c][data-embedded=true] .panel-layout{grid-template-columns:56px minmax(0,1fr);gap:10px}
   html[data-lbm-theme=c] .panel-tabs{padding:0 6px 0 0}
   html[data-lbm-theme=c] .panel-tabs:before{display:none}
   html[data-lbm-theme=c] .panel-tabs button{flex-direction:column;justify-content:center;gap:1px;font-size:9.5px;padding:6px 2px;min-height:52px;border-radius:8px}
@@ -1345,19 +1353,25 @@ html[data-lbm-theme=c] footer{margin-top:12px;padding:8px 0 2px 150px;border-top
   html[data-lbm-theme=c] .datebar{padding:6px 10px;margin:0 0 8px}
   html[data-lbm-theme=c] .date-controls{gap:4px}
   html[data-lbm-theme=c] .date-controls button{min-height:32px}
-  html[data-lbm-theme=c] .card{padding:12px 13px}
-  html[data-lbm-theme=c] .hero{grid-template-columns:1fr;gap:10px}
-  html[data-lbm-theme=c] .hero>.card{min-height:0}
+  html[data-lbm-theme=c] .card{padding:16px}
+  html[data-lbm-theme=c] .cardtop{margin-bottom:12px}
+  html[data-lbm-theme=c] .sectionline{margin:16px 0 8px}
+  html[data-lbm-theme=c] .hero{grid-template-columns:1fr;gap:14px}
+  html[data-lbm-theme=c] .hero>.card{min-height:188px}
   html[data-lbm-theme=c] .hero-scene{min-height:148px}
-  html[data-lbm-theme=c] .hero-scene .activityname{font-size:21px;max-width:100%}
+  html[data-lbm-theme=c] .hero-scene .activityname{font-size:24px;max-width:100%}
   html[data-lbm-theme=c] .hero-scene .activitymeta{max-width:100%}
   html[data-lbm-theme=c] .metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
   html[data-lbm-theme=c] .metrics .metric:last-child{grid-column:1/-1}
-  html[data-lbm-theme=c] .metric.maibot-card{padding:10px 12px}
-  html[data-lbm-theme=c] .metricvalue{font-size:24px}
-  html[data-lbm-theme=c] .now-duo{grid-template-columns:1fr;gap:10px;margin-top:10px}
+  html[data-lbm-theme=c] .metric.maibot-card{padding:12px 14px}
+  html[data-lbm-theme=c] .metricvalue{font-size:25px}
+  html[data-lbm-theme=c] .now-duo{grid-template-columns:1fr;gap:14px;margin-top:14px}
   html[data-lbm-theme=c] .smallstats{margin-top:10px;padding-top:8px}
   html[data-lbm-theme=c] .sleep-combined{display:block}
+  /* 移动端睡眠大数字对齐 A（themes.css:194 html[a] .bignum=22px）；scoped 规则压过
+     桌面 .sleep-combined .bignum=23px，避免 C 移动端比 A 大 1px。 */
+  html[data-lbm-theme=c] .bignum{font-size:22px}
+  html[data-lbm-theme=c] .sleep-combined .bignum{font-size:22px}
   html[data-lbm-theme=c] .schedule-pager{padding:4px 8px}
   html[data-lbm-theme=c] .schedule-page-actions button{min-width:32px;min-height:32px;width:32px;height:32px}
   html[data-lbm-theme=c] .usage-card-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -1366,16 +1380,16 @@ html[data-lbm-theme=c] footer{margin-top:12px;padding:8px 0 2px 150px;border-top
   html[data-lbm-theme=c] .health dl{grid-template-columns:1fr;gap:2px}
   html[data-lbm-theme=c] .health dd{margin-bottom:7px}
   html[data-lbm-theme=c] .core-modules{grid-template-columns:repeat(2,minmax(0,1fr))}
-  html[data-lbm-theme=c] footer{padding:7px 0 2px;margin-top:10px}
+  html[data-lbm-theme=c] footer{padding:7px 0 2px;margin-top:10px;font-size:10.5px}
   html[data-lbm-theme=c] .maimai-bear{bottom:calc(34px + env(safe-area-inset-bottom))}
   html[data-lbm-theme=c] .maimai-peek{bottom:calc(34px + env(safe-area-inset-bottom))}
   html[data-lbm-theme=c] .maimai-autopin{bottom:calc(76px + env(safe-area-inset-bottom))}
   html[data-lbm-theme=c] .fish-popup-body{padding:11px 13px}
 }
 @media(max-width:420px){
-  html[data-lbm-theme=c] .metricvalue{font-size:22px}
+  html[data-lbm-theme=c] .metricvalue{font-size:23px}
   html[data-lbm-theme=c] .metric .note{font-size:10px}
-  html[data-lbm-theme=c] .hero-scene .activityname{font-size:20px}
+  html[data-lbm-theme=c] .hero-scene .activityname{font-size:22px}
 }
 
 /* ════════════════════════ 切换器（非皮肤 · 不受 data-lbm-theme 作用域） ════════════════════════
@@ -2923,14 +2937,16 @@ const Bubble=(()=>{
    - 捏捏：按住加 .is-pressed（scaleY(.88) scaleX(1.05)），松开去掉，由 transform
      transition .22s cubic-bezier(.34,1.56,.64,1) 过冲弹回；原点贴底中心。
    - 拖动：按住即拖（位移 <10px 算点按），拖动中 .is-dragging 关过渡；松手按
-     吸附区归位（左右 10%、底 15%、顶边禁用——同挂件 v3 默认），锚点以
+     吸附区归位（左右 20%、底 30%、顶边禁用——SNAP 现值），锚点以
      「贴边+净距离」存 localStorage('maimai-bear-pos')，窗口缩放按锚点重算；
      取消/丢坐标回原位不落盘（同挂件）；强制释放则就地落位（见下「边缘吸附与强制释放」）。
    - 镜像翻转（2026-11-03 追加，同挂件语义）：贴左必翻、贴右不翻（朝向屏幕内），
      自由摆放按中心 x 是否在左半屏判定；翻转态随锚点落盘（fl 字段）并随恢复重现。
    - 不消费 maimai_interaction 数值参数；位置存取失败（隐私模式等）退化为会话内记忆。
-   - 边缘吸附与强制释放（2026-11-14 旧版遗留修复）：松手瞬间距视口边缘 ≤42px 即贴齐最近边
-     （EDGE_SNAP_PX，仅 settle（pointerup/强制释放）判定、拖拽中不吸附，走既有 left/top .16s 过渡）；
+   - 边缘吸附与强制释放（2026-11-14 旧版遗留修复；2026-11-15 收窄为仅左右）：松手瞬间距视口
+     左/右边缘 ≤42px 即贴齐最近的左右边（EDGE_SNAP_PX，仅 settle（pointerup/强制释放）判定、
+     拖拽中不吸附，走既有 left/top .16s 过渡）；上下边缘不做就近吸附，垂直锚点完全由比例区
+     SNAP 决定（底 30% 区锚底但保留真实间距、顶区禁用）；
      document pointerleave/mouseleave 与既有 blur/visibilitychange/pointercancel 一并强制收尾：
      提交拖拽中的 live left/top 就地落位 + 同规则边缘吸附，绝不回弹本次拖拽起点，杜绝卡死。 */
 const Bear=(()=>{
@@ -2941,12 +2957,12 @@ const Bear=(()=>{
   const POS_KEY='maimai-bear-pos';
   const CLICK_SQ=100;                                    // 位移平方 <100（<10px）= 点按
   const SNAP={L:.20,R:.20,B:.30,T:0};                    // 吸附区比例（挂件 v3 默认 10/10/15 偏小，2026-11-03 按反馈加大）；T=0 顶边禁用
-  // 边缘就近吸附阈值（2026-11-14，旧版遗留修复①；同日微调①：28→42，触发范围调大一半）：
-  // 松手瞬间桌宠任一边距视口边缘 ≤42px，立即贴齐「最近的那条边」（该轴锚点距离归 0）。
-  // 只在 settle（pointerup/强制释放收尾）判定——onMove 拖拽过程只钳制不吸附；贴齐位移由
-  // .maimai-bear 既有 left/top .16s ease 过渡平滑完成（applyPos 写 left/top 前先读 offsetWidth
-  // 强制回流，过渡必生效）。比例吸附区 SNAP 仍作远离边缘时的兜底；就近吸附覆盖四条边
-  // （含顶边——气泡 place 已支持顶位翻到下方），与 SNAP.T=0 关闭的「顶部比例区」语义不冲突。
+  // 边缘就近吸附阈值（2026-11-14，旧版遗留修复①；同日微调①：28→42，触发范围调大一半；
+  // 2026-11-15 收窄为仅左右两边）：松手瞬间桌宠距视口左/右边缘 ≤42px，立即贴齐「最近的
+  // 那条左右边」（水平锚点距离归 0）。只在 settle（pointerup/强制释放收尾）判定——onMove
+  // 拖拽过程只钳制不吸附；贴齐位移由 .maimai-bear 既有 left/top .16s ease 过渡平滑完成
+  // （applyPos 写 left/top 前先读 offsetWidth 强制回流，过渡必生效）。上下边缘不吸附：
+  // 垂直锚点完全由比例区 SNAP 决定（底 30% 区锚底、保留真实间距 vd，顶区 T=0 禁用）。
   const EDGE_SNAP_PX=42;
   let enabled=false,detailMode=false,drag=null,flip=false;
   let memPos=null;                                       // localStorage 不可用时的会话内兜底
@@ -2995,19 +3011,17 @@ const Bear=(()=>{
       vt:footY>b.B?'bottom':SNAP.T>0&&top<b.T?'top':null,vd:0};
     if(p.h)p.hd=p.h==='left'?left:v.w-left-w;else p.hd=left;
     if(p.vt)p.vd=p.vt==='bottom'?v.h-top-h:top;else p.vd=top;
-    // 就近吸附（修复①）：四边距离取阈值内最近者，贴齐该边（距离归 0，覆盖比例区算出的锚点
-    // 距离）。left/top 已钳制在视口内，四边距离恒 ≥0；并列时按 L/R/T/B 顺序取先者。另一轴
-    // 仍按上面的比例区锚点语义保留，不做额外吸附。
-    const dL=left,dR=v.w-left-w,dT=top,dB=v.h-top-h;
+    // 就近吸附（修复①；2026-11-15 收窄为仅左右）：左右距离取阈值内最近者，贴齐该边
+    // （水平锚点距离归 0）。left/top 已钳制在视口内，距离恒 ≥0；并列时按 L/R 顺序取先者。
+    // 垂直轴不做就近吸附，完全按上面的比例区锚点语义保留（底 30% 区锚底、顶区禁用）。
+    const dL=left,dR=v.w-left-w;
     let near=null;
-    for(const it of [['L',dL],['R',dR],['T',dT],['B',dB]]){
+    for(const it of [['L',dL],['R',dR]]){
       if(it[1]<=EDGE_SNAP_PX&&(!near||it[1]<near[1]))near=it;
     }
     if(near){
       if(near[0]==='L'){p.h='left';p.hd=0}
-      else if(near[0]==='R'){p.h='right';p.hd=0}
-      else if(near[0]==='T'){p.vt='top';p.vd=0}
-      else{p.vt='bottom';p.vd=0}
+      else{p.h='right';p.hd=0}
     }
     // 翻转判定（同挂件 settle）：贴左翻、贴右正，自由位看中心 x 与半屏线
     flip=p.h==='left'?true:p.h==='right'?false:cx<v.w/2;
@@ -4266,10 +4280,13 @@ document.body.append(lbmPill);
 document.documentElement.setAttribute('data-lbm-pill','');
 
 function lbmSyncButton(){
- lbmPillName.textContent=LBM_SKIN_NAMES[lbmSkin];
+ /* 2026-11-15：可见文案与 title 固定为「切换主题」（不再随皮肤变）；当前/下一个
+    主题信息保留在 aria-label 供屏幕阅读器使用。pill 宽度由 lbmPosition 实测
+    offsetWidth 并算 --lbm-pill-lane，常量文案自动适配，无需改 CSS。 */
+ lbmPillName.textContent='切换主题';
  const next=LBM_SKINS[(LBM_SKINS.indexOf(lbmSkin)+1)%LBM_SKINS.length];
  lbmPill.dataset.skin=lbmSkin;
- lbmPill.title='主题切换：点击循环 A 精致 → C 仪表盘。当前：'+LBM_SKIN_NAMES[lbmSkin]+'，下一个：'+LBM_SKIN_NAMES[next]+'（选择本地记忆，默认 A）';
+ lbmPill.title='切换主题';
  lbmPill.setAttribute('aria-label','当前主题：'+LBM_SKIN_NAMES[lbmSkin]+'；点击切换到'+LBM_SKIN_NAMES[next]);
 }
 

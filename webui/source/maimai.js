@@ -256,14 +256,16 @@ const Bubble=(()=>{
    - 捏捏：按住加 .is-pressed（scaleY(.88) scaleX(1.05)），松开去掉，由 transform
      transition .22s cubic-bezier(.34,1.56,.64,1) 过冲弹回；原点贴底中心。
    - 拖动：按住即拖（位移 <10px 算点按），拖动中 .is-dragging 关过渡；松手按
-     吸附区归位（左右 10%、底 15%、顶边禁用——同挂件 v3 默认），锚点以
+     吸附区归位（左右 20%、底 30%、顶边禁用——SNAP 现值），锚点以
      「贴边+净距离」存 localStorage('maimai-bear-pos')，窗口缩放按锚点重算；
      取消/丢坐标回原位不落盘（同挂件）；强制释放则就地落位（见下「边缘吸附与强制释放」）。
    - 镜像翻转（2026-11-03 追加，同挂件语义）：贴左必翻、贴右不翻（朝向屏幕内），
      自由摆放按中心 x 是否在左半屏判定；翻转态随锚点落盘（fl 字段）并随恢复重现。
    - 不消费 maimai_interaction 数值参数；位置存取失败（隐私模式等）退化为会话内记忆。
-   - 边缘吸附与强制释放（2026-11-14 旧版遗留修复）：松手瞬间距视口边缘 ≤42px 即贴齐最近边
-     （EDGE_SNAP_PX，仅 settle（pointerup/强制释放）判定、拖拽中不吸附，走既有 left/top .16s 过渡）；
+   - 边缘吸附与强制释放（2026-11-14 旧版遗留修复；2026-11-15 收窄为仅左右）：松手瞬间距视口
+     左/右边缘 ≤42px 即贴齐最近的左右边（EDGE_SNAP_PX，仅 settle（pointerup/强制释放）判定、
+     拖拽中不吸附，走既有 left/top .16s 过渡）；上下边缘不做就近吸附，垂直锚点完全由比例区
+     SNAP 决定（底 30% 区锚底但保留真实间距、顶区禁用）；
      document pointerleave/mouseleave 与既有 blur/visibilitychange/pointercancel 一并强制收尾：
      提交拖拽中的 live left/top 就地落位 + 同规则边缘吸附，绝不回弹本次拖拽起点，杜绝卡死。 */
 const Bear=(()=>{
@@ -274,12 +276,12 @@ const Bear=(()=>{
   const POS_KEY='maimai-bear-pos';
   const CLICK_SQ=100;                                    // 位移平方 <100（<10px）= 点按
   const SNAP={L:.20,R:.20,B:.30,T:0};                    // 吸附区比例（挂件 v3 默认 10/10/15 偏小，2026-11-03 按反馈加大）；T=0 顶边禁用
-  // 边缘就近吸附阈值（2026-11-14，旧版遗留修复①；同日微调①：28→42，触发范围调大一半）：
-  // 松手瞬间桌宠任一边距视口边缘 ≤42px，立即贴齐「最近的那条边」（该轴锚点距离归 0）。
-  // 只在 settle（pointerup/强制释放收尾）判定——onMove 拖拽过程只钳制不吸附；贴齐位移由
-  // .maimai-bear 既有 left/top .16s ease 过渡平滑完成（applyPos 写 left/top 前先读 offsetWidth
-  // 强制回流，过渡必生效）。比例吸附区 SNAP 仍作远离边缘时的兜底；就近吸附覆盖四条边
-  // （含顶边——气泡 place 已支持顶位翻到下方），与 SNAP.T=0 关闭的「顶部比例区」语义不冲突。
+  // 边缘就近吸附阈值（2026-11-14，旧版遗留修复①；同日微调①：28→42，触发范围调大一半；
+  // 2026-11-15 收窄为仅左右两边）：松手瞬间桌宠距视口左/右边缘 ≤42px，立即贴齐「最近的
+  // 那条左右边」（水平锚点距离归 0）。只在 settle（pointerup/强制释放收尾）判定——onMove
+  // 拖拽过程只钳制不吸附；贴齐位移由 .maimai-bear 既有 left/top .16s ease 过渡平滑完成
+  // （applyPos 写 left/top 前先读 offsetWidth 强制回流，过渡必生效）。上下边缘不吸附：
+  // 垂直锚点完全由比例区 SNAP 决定（底 30% 区锚底、保留真实间距 vd，顶区 T=0 禁用）。
   const EDGE_SNAP_PX=42;
   let enabled=false,detailMode=false,drag=null,flip=false;
   let memPos=null;                                       // localStorage 不可用时的会话内兜底
@@ -328,19 +330,17 @@ const Bear=(()=>{
       vt:footY>b.B?'bottom':SNAP.T>0&&top<b.T?'top':null,vd:0};
     if(p.h)p.hd=p.h==='left'?left:v.w-left-w;else p.hd=left;
     if(p.vt)p.vd=p.vt==='bottom'?v.h-top-h:top;else p.vd=top;
-    // 就近吸附（修复①）：四边距离取阈值内最近者，贴齐该边（距离归 0，覆盖比例区算出的锚点
-    // 距离）。left/top 已钳制在视口内，四边距离恒 ≥0；并列时按 L/R/T/B 顺序取先者。另一轴
-    // 仍按上面的比例区锚点语义保留，不做额外吸附。
-    const dL=left,dR=v.w-left-w,dT=top,dB=v.h-top-h;
+    // 就近吸附（修复①；2026-11-15 收窄为仅左右）：左右距离取阈值内最近者，贴齐该边
+    // （水平锚点距离归 0）。left/top 已钳制在视口内，距离恒 ≥0；并列时按 L/R 顺序取先者。
+    // 垂直轴不做就近吸附，完全按上面的比例区锚点语义保留（底 30% 区锚底、顶区禁用）。
+    const dL=left,dR=v.w-left-w;
     let near=null;
-    for(const it of [['L',dL],['R',dR],['T',dT],['B',dB]]){
+    for(const it of [['L',dL],['R',dR]]){
       if(it[1]<=EDGE_SNAP_PX&&(!near||it[1]<near[1]))near=it;
     }
     if(near){
       if(near[0]==='L'){p.h='left';p.hd=0}
-      else if(near[0]==='R'){p.h='right';p.hd=0}
-      else if(near[0]==='T'){p.vt='top';p.vd=0}
-      else{p.vt='bottom';p.vd=0}
+      else{p.h='right';p.hd=0}
     }
     // 翻转判定（同挂件 settle）：贴左翻、贴右正，自由位看中心 x 与半屏线
     flip=p.h==='left'?true:p.h==='right'?false:cx<v.w/2;
