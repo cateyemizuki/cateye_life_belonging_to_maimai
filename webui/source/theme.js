@@ -1,46 +1,53 @@
 /* LBM_THEME_SWITCHER */
-/* 临时主题对比切换器（2026-11-14 主题对比批）
-   用途：三版设计评估皮肤（A 精致原风格 / B 暖纸手账 / C 数据仪表盘）落地为
-   可切换主题，供同页对比。右上角常驻紧凑 pill，点击循环 原版→A→B→C→原版；
-   写 document.documentElement.dataset.lbmTheme（原版=移除属性），localStorage
-   （键 lbmTheme）持久化并在加载时恢复，默认原版。明暗仍随宿主/离线 data-theme。
-   选定后移除切换器并默认化所选主题：删本文件与 themes.css 中未选皮肤、把选中
-   皮肤令牌并入基线（见 CHANGELOG「临时主题对比切换器批」）。
+/* 主题切换器（2026-11-14 主题对比批 → 同日主题精简批）
+   用途：两版保留皮肤（A 精致原风格 / C 数据仪表盘）可切换。右上角常驻紧凑
+   pill，点击循环 A→C→A；写 document.documentElement.dataset.lbmTheme，
+   localStorage（键 lbmTheme）持久化并在加载时恢复，默认 A。旧值迁移：存储为
+   ''（原版）/'b'（手账）/非法值时一律落到 'a' 并写回，'a'/'c' 保留。明暗仍随
+   宿主/离线 data-theme。原版与 B 手账已移除（见 CHANGELOG「主题精简批」）；
+   切换按钮暂留，最终选定后移除切换器并默认化所选主题。
 
    装配：经 LBM_EXTENSIONS token 注入 panel.js IIFE 内部、排在 maimai.js/fish.js/
    layout_fix.js 之后，共享闭包（$/el 等），不重声明既有 const；整体独立 IIFE，
-   additive，不改既有函数。皮肤行为脚本忠实提取自三版设计素材（A _variant_a.js、
-   B _override_block.html 内层脚本去掉错误探针、C work/variant-c.js），全部按
-   当前激活皮肤门控：非激活皮肤的观察器回调直接返回；切换时先 lbmResetShared()
-   还原各皮肤留下的内联痕迹（概括条原始色/meta 行内 display/datebar 可见性/
-   路径 title），再应用新皮肤，避免跨皮肤颜色键失配与残留。 */
+   additive，不改既有函数。皮肤行为脚本忠实提取自设计素材（A _variant_a.js、
+   C work/variant-c.js），全部按当前激活皮肤门控：非激活皮肤的观察器回调直接
+   返回；切换时先 lbmResetShared() 清除两版皮肤留下的内联痕迹（概括条原始色/
+   meta 行内 display 与去重类/datebar 可见性/路径 title），再应用目标皮肤，
+   避免跨皮肤颜色键失配与残留。不再有「原版=无痕迹」态，加载即应用 A。 */
 (()=>{
 'use strict';
-const LBM_SKINS=['','a','b','c'];
-const LBM_SKIN_NAMES={'':'原版','a':'A · 精致','b':'B · 手账','c':'C · 仪表盘'};
+const LBM_SKINS=['a','c'];
+const LBM_SKIN_NAMES={'a':'A · 精致','c':'C · 仪表盘'};
 const LBM_SKIN_KEY='lbmTheme';
-let lbmSkin=(()=>{try{const v=localStorage.getItem(LBM_SKIN_KEY);return LBM_SKINS.includes(v)?v:''}catch(e){return ''}})();
+let lbmSkin=(()=>{
+ let v=null;
+ try{v=localStorage.getItem(LBM_SKIN_KEY)}catch(e){}
+ if(LBM_SKINS.includes(v))return v;
+ /* 旧值迁移：''（原版）/'b'（手账）/非法/缺失 → 'a'，并写回清除旧值 */
+ try{localStorage.setItem(LBM_SKIN_KEY,'a')}catch(e){}
+ return 'a';
+})();
 const lbmActive=s=>lbmSkin===s;
 
-/* ── 共享重置：切换前还原皮肤脚本的内联痕迹（原版=无痕迹） ───────────────── */
+/* ── 共享重置：切换前清除两版皮肤的内联痕迹，再应用目标 ─────────────────── */
 function lbmResetShared(){
- /* 概括条色段 → 捕获的原始内联色（见下方 capture 观察器）。A 写 oklch、B/C 写
-    var(--ov-*)，三版画家都只认原始 hex/rgb 键，不先还原则跨皮肤切换失配。 */
+ /* 概括条色段 → 捕获的原始内联色（见下方 capture 观察器）。A 写 oklch、C 写
+    var(--ov-*)，两版画家都只认原始 hex/rgb 键，不先还原则跨皮肤切换失配。 */
  try{
   const track=$('overview-track');
   if(track)for(const seg of track.querySelectorAll('.overview-seg')){
    if(seg.dataset.lbmBase!==undefined)seg.style.background=seg.dataset.lbmBase;
   }
  }catch(e){}
- /* B/C 的「数据来源」去重用内联 display:none 隐藏通用行 */
- try{for(const row of document.querySelectorAll('.fish-meta-row'))row.style.display=''}catch(e){}
+ /* C 的「数据来源」去重用内联 display:none 隐藏通用行；A 用 va-meta-dupe 类 */
+ try{for(const row of document.querySelectorAll('.fish-meta-row')){row.style.display='';row.classList.remove('va-meta-dupe')}}catch(e){}
  /* C 的 S2 会在娱乐 tab 隐藏 datebar；按 panel.js activateTab 同口径还原 */
  try{
   const tab=document.querySelector('[role=tab][aria-selected="true"]');
   const key=tab?tab.dataset.tab:'now';
   const db=$('datebar');if(db)db.hidden=key==='now'||key==='system'||key==='core';
  }catch(e){}
- /* 皮肤补的 title 全文（原版无） */
+ /* 皮肤补的 title 全文 */
  try{for(const id of['core-registry-path','notice']){const n=$(id);if(n)n.removeAttribute('title')}}catch(e){}
 }
 
@@ -137,98 +144,6 @@ const lbmA=(()=>{
   try{watchMeta()}catch(e){}
   try{updateScroll()}catch(e){}
   try{const rp=$('core-registry-path');if(rp)rp.title=rp.textContent||''}catch(e){}
- }
- return {init,apply};
-})();
-
-/* ── 皮肤 B 行为（源 _override_block.html 内层脚本，去掉①错误探针） ────────── */
-const lbmB=(()=>{
- /* A2 概括条 → 手账令牌（探针元素把原始 hex 归一成 rgb 键） */
- const OV_HEX={sleep:'#5b6ee1',rest:'#8a9df0',idle:'#9aa5b1',meal:'#e8a13c',work:'#3d8bfd',exercise:'#2fbf71',entertainment:'#e05fa0',daily_routine:'#4fb8c9',social:'#8f6fe8',free_time:'#67c98f',watch:'#c9a227',game:'#ef7d3a',leisure:'#58b89a',social_maintenance:'#b085e0',activity:'#4a90d9',transition:'#8a8f98'};
- const OV_FALLBACK='#7a8288';
- let ovMap=null;
- function buildOvMap(){
-  if(ovMap)return ovMap;
-  ovMap={};
-  const probe=document.createElement('i');probe.style.display='none';document.body.appendChild(probe);
-  const key=hex=>{probe.style.background='';probe.style.background=hex;return probe.style.backgroundColor};
-  for(const g in OV_HEX)ovMap[key(OV_HEX[g])]='var(--ov-'+g+')';
-  ovMap[key(OV_FALLBACK)]='var(--ov-fallback)';
-  probe.remove();
-  return ovMap;
- }
- function remapOverview(){
-  if(!lbmActive('b'))return;
-  const track=$('overview-track');if(!track)return;
-  const map=buildOvMap();
-  const segs=track.querySelectorAll('.overview-seg');
-  for(let i=0;i<segs.length;i++){
-   const s=segs[i];if(s.classList.contains('planned'))continue;
-   const cur=s.style.backgroundColor;const to=map[cur];
-   if(to&&s.style.background!==to)s.style.background=to;
-  }
- }
- /* A4 千分位（幂等：\d{4,} 不匹配已带逗号的串） */
- function groupDigits(root){
-  if(!root)return;
-  const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,null);
-  let n;
-  while((n=walker.nextNode())){
-   const t=n.nodeValue;
-   if(/\d{4,}/.test(t)){
-    const nt=t.replace(/\d{4,}/g,m=>Number(m).toLocaleString('en-US'));
-    if(nt!==t)n.nodeValue=nt;
-   }
-  }
- }
- /* A7「数据来源」去重：保留板块专属行，内联隐藏通用行（切换时由重置还原） */
- function labelOf(row){
-  const cap=row.querySelector('span');
-  if(!cap)return '';
-  const n=cap.firstChild;
-  return n&&n.nodeType===3?(n.textContent||'').trim():(cap.textContent||'').trim();
- }
- function dedupeMeta(){
-  if(!lbmActive('b'))return;
-  const meta=document.querySelector('#section-fish-popover .fish-metadata');if(!meta)return;
-  const sourceRows=[];
-  meta.querySelectorAll('.fish-meta-row').forEach(row=>{if(labelOf(row)==='数据来源')sourceRows.push(row)});
-  if(sourceRows.length>1)sourceRows.forEach(row=>{
-   const val=row.querySelector('span:last-child');
-   const generic=val&&/生活引擎|导入快照/.test(val.textContent||'');
-   row.style.display=generic?'none':'';
-  });
- }
- /* S3 详情入口折线下 → 滚入视口 */
- function clampEntry(){
-  const home=document.querySelector('#section-fish-popover')?document.querySelector('.fish-peek-home'):null;
-  if(!home)return;
-  const r=home.getBoundingClientRect();
-  if(r.top<8||r.bottom>innerHeight-8)home.scrollIntoView({block:'center',behavior:'auto'});
- }
- /* A8/A5 title 全文 */
- function setTitle(id){const n=$(id);if(n&&n.textContent)n.title=n.textContent}
- function init(){
-  const watch=(node,opts,fn)=>{
-   if(!node||node.getAttribute('data-lbm-watch')==='1')return;
-   node.setAttribute('data-lbm-watch','1');
-   new MutationObserver(()=>{try{fn()}catch(e){}}).observe(node,opts);
-  };
-  try{watch($('overview-track'),{childList:true},remapOverview)}catch(e){}
-  try{for(const id of['usage-top','usage-split'])watch($(id),{childList:true,subtree:true,characterData:true},()=>{if(lbmActive('b'))groupDigits($(id))})}catch(e){}
-  try{for(const id of['core-registry-path','notice'])watch($(id),{childList:true,subtree:true,characterData:true},()=>{if(lbmActive('b'))setTitle(id)})}catch(e){}
-  try{watch(document.querySelector('#section-fish-popover .fish-metadata'),{childList:true,subtree:true,characterData:true},dedupeMeta)}catch(e){}
-  try{document.addEventListener('lbm:detail-open',()=>{
-   if(!lbmActive('b'))return;
-   requestAnimationFrame(()=>{try{dedupeMeta()}catch(e){}try{clampEntry()}catch(e){}});
-  })}catch(e){}
- }
- function apply(){
-  if(!lbmActive('b'))return;
-  try{remapOverview()}catch(e){}
-  try{groupDigits($('usage-top'));groupDigits($('usage-split'))}catch(e){}
-  try{setTitle('core-registry-path');setTitle('notice')}catch(e){}
-  try{dedupeMeta()}catch(e){}
  }
  return {init,apply};
 })();
@@ -333,10 +248,9 @@ document.documentElement.setAttribute('data-lbm-pill','');
 function lbmSyncButton(){
  lbmPillName.textContent=LBM_SKIN_NAMES[lbmSkin];
  const next=LBM_SKINS[(LBM_SKINS.indexOf(lbmSkin)+1)%LBM_SKINS.length];
- lbmPill.dataset.skin=lbmSkin||'none';
- lbmPill.dataset.none=lbmSkin?'0':'1';
- lbmPill.title='临时主题对比切换器：点击循环 原版 → A 精致 → B 手账 → C 仪表盘。当前：'+LBM_SKIN_NAMES[lbmSkin]+'，下一个：'+LBM_SKIN_NAMES[next]+'（选择本地记忆，默认原版）';
- lbmPill.setAttribute('aria-label','当前对比主题：'+LBM_SKIN_NAMES[lbmSkin]+'；点击切换到'+LBM_SKIN_NAMES[next]);
+ lbmPill.dataset.skin=lbmSkin;
+ lbmPill.title='主题切换：点击循环 A 精致 → C 仪表盘。当前：'+LBM_SKIN_NAMES[lbmSkin]+'，下一个：'+LBM_SKIN_NAMES[next]+'（选择本地记忆，默认 A）';
+ lbmPill.setAttribute('aria-label','当前主题：'+LBM_SKIN_NAMES[lbmSkin]+'；点击切换到'+LBM_SKIN_NAMES[next]);
 }
 
 /* 定位：默认右上角；详情打开时若与面板/关闭按钮相交 → 移到面板右侧或左侧
@@ -383,11 +297,10 @@ function lbmQueuePos(){
 /* ── 切换：写 root 属性 + 持久化 + 重置 + 应用 + 重校准 ─────────────────────── */
 function lbmSetSkin(next,persist=true){
  lbmSkin=next;
- const root=document.documentElement;
- if(next)root.dataset.lbmTheme=next;else delete root.dataset.lbmTheme;
+ document.documentElement.dataset.lbmTheme=next;
  if(persist){try{localStorage.setItem(LBM_SKIN_KEY,next)}catch(e){}}
  lbmResetShared();
- if(next==='a')lbmA.apply();else if(next==='b')lbmB.apply();else if(next==='c')lbmC.apply();
+ if(next==='a')lbmA.apply();else if(next==='c')lbmC.apply();
  lbmSyncButton();
  lbmPosition();
  /* 皮肤切换改变 mast/详情面板尺寸：让 fish.js（resize 重校准）与布局层补算 */
@@ -395,8 +308,9 @@ function lbmSetSkin(next,persist=true){
 }
 lbmPill.onclick=()=>lbmSetSkin(LBM_SKINS[(LBM_SKINS.indexOf(lbmSkin)+1)%LBM_SKINS.length]);
 
-/* ── 装配：观察器一次性安装（门控），恢复持久化选择，接线定位触发 ─────────── */
-lbmA.init();lbmB.init();lbmC.init();
+/* ── 装配：观察器一次性安装（门控），恢复持久化选择（迁移后必为 a/c），
+      接线定位触发 ─────────────────────────────────────────────────────── */
+lbmA.init();lbmC.init();
 lbmSetSkin(lbmSkin,false);
 window.addEventListener('resize',lbmQueuePos);
 window.addEventListener('scroll',lbmQueuePos,{passive:true,capture:true});

@@ -819,8 +819,9 @@ body.fish-locked{overflow:hidden}
   #core-logs-detail{grid-template-columns:minmax(0,1fr)}
 }
 </style><style id="host-theme"></style><style id="lbm-themes">/* ============================================================================
-   LBM 临时主题对比皮肤（2026-11-14 主题对比批）
-   三版设计评估皮肤落地为可切换主题：html[data-lbm-theme="a|b|c"]，无属性=原版。
+   LBM 主题皮肤（2026-11-14 主题对比批 → 同日主题精简批）
+   两版保留皮肤落地为可切换主题：html[data-lbm-theme="a|c"]，默认 A（theme.js
+   加载即应用 A；原版与 B 手账已移除，见 CHANGELOG「主题精简批」）。
    切换器与持久化见 theme.js；本文件由 build_webui.py 注入模板 #host-theme 之后
    的 <style id="lbm-themes">（宿主 c.styles 与晚追加 themeStyle 之前/同特异性时
    以更高特异性胜出）。明暗随宿主/离线 data-theme，用复合选择器适配。
@@ -833,11 +834,11 @@ body.fish-locked{overflow:hidden}
      合并进复合选择器。
    - 详情弹层列几何（双列 grid / display:contents / meta auto 宽 / core 详情
      真双列 / 面板自适应宽度）已并入基线 fish.css 布局层，对所有主题生效；
-     各版皮肤剥离了与之重复的几何声明（A 单列、B display:block、C 包装跨列、
-     meta 列宽与右对齐），忠实还原三版预览的最终观感（预览中布局层末位胜出）。
-   - 圆角策略（还原预览）：A/B 沿用 design-guard 锁定的 20px（B 用
-     var(--maibot-radius) 继承）；C 以 html:root[data-lbm-theme=c] 更高特异性
-     + !important 反压守卫为 12px（variant-c.css:51–52 的落地形态）。
+     各版皮肤剥离了与之重复的几何声明（A 单列、C 包装跨列、meta 列宽与右对齐），
+     忠实还原预览的最终观感（预览中布局层末位胜出）。
+   - 圆角策略（还原预览）：A 沿用 design-guard 锁定的 20px；C 以
+     html:root[data-lbm-theme=c] 更高特异性 + !important 反压守卫为 12px
+     （variant-c.css:51–52 的落地形态）。
    ========================================================================== */
 
 /* ════════════════════════ 皮肤 A · 精致原风格（表现层精修） ════════════════════════ */
@@ -1030,275 +1031,6 @@ html[data-lbm-theme=a] body.fish-locked .maimai-bear{opacity:.4;transition:opaci
   html[data-lbm-theme=a] .hero-scene .activityname{font-size:22px}
 }
 html[data-lbm-theme=a]:not([data-theme=dark]) .maibot-table tbody tr:nth-child(even){background:color-mix(in srgb,var(--maibot-soft) 38%,transparent)}
-
-/* ════════════════════════ 皮肤 B · 暖纸浅色 · 生活手账 ════════════════════════ */
-html:root[data-lbm-theme=b]{
-  color-scheme:light;
-  --maibot-background:oklch(96.2% .021 88);
-  --maibot-surface:oklch(99% .013 92 / .97);
-  --maibot-foreground:oklch(31% .035 165);
-  --maibot-muted:oklch(47% .028 158);
-  --maibot-soft:oklch(93.4% .026 88);
-  --maibot-border:oklch(83% .032 86 / .92);
-  --maibot-primary:oklch(45% .085 168);
-  --maibot-danger:oklch(51% .16 28);
-  --energy:oklch(50% .11 165);
-  --hunger:oklch(57% .14 55);
-  --focus:oklch(51% .10 245);
-  --stress:oklch(53% .12 350);
-  --social:oklch(51% .09 200);
-  --debt:oklch(53% .14 30);
-  /* 手账专属令牌 */
-  --b-paper-edge:oklch(88% .03 86);
-  --b-ink:oklch(31% .035 165);
-  --b-tape:oklch(78% .09 88 / .55);
-  --b-tape-line:oklch(70% .1 80 / .35);
-  --b-stitch:oklch(60% .06 165 / .5);
-  --b-shadow-1:0 1px 2px oklch(40% .04 80 / .10);
-  --b-shadow-2:0 10px 30px -6px oklch(40% .05 80 / .16);
-  --b-shadow-card:var(--b-shadow-1),var(--b-shadow-2);
-  --b-serif:Georgia,"Times New Roman","Source Han Serif SC","Noto Serif SC","Songti SC",STSong,SimSun,serif;
-  --maibot-font-display:var(--b-serif);
-  --panel-shadow:var(--b-shadow-card);
-  --rf-hairline:color-mix(in srgb,var(--maibot-border) 78%,transparent);
-  /* 日程概括条·手账色（A2：与令牌同源，随主题） */
-  --ov-sleep:oklch(55% .10 265);--ov-rest:oklch(68% .08 265);
-  --ov-idle:oklch(72% .02 86);--ov-meal:oklch(66% .13 70);
-  --ov-work:oklch(55% .11 245);--ov-exercise:oklch(58% .11 155);
-  --ov-entertainment:oklch(60% .13 350);--ov-daily_routine:oklch(60% .09 200);
-  --ov-social:oklch(58% .11 310);--ov-free_time:oklch(64% .10 150);
-  --ov-watch:oklch(64% .12 85);--ov-game:oklch(64% .14 50);
-  --ov-leisure:oklch(60% .09 170);--ov-social_maintenance:oklch(66% .09 310);
-  --ov-activity:oklch(58% .10 235);--ov-transition:oklch(66% .02 86);
-  --ov-fallback:oklch(62% .03 86);
-  --overview-planned:oklch(86% .03 86);
-}
-html:root[data-lbm-theme=b][data-theme=dark]{
-  color-scheme:dark;
-  --maibot-background:oklch(21.5% .024 160);
-  --maibot-surface:oklch(26.5% .027 160 / .96);
-  --maibot-foreground:oklch(92% .024 90);
-  --maibot-muted:oklch(75% .03 120);
-  --maibot-soft:oklch(31.5% .03 160);
-  --maibot-border:oklch(44% .035 160 / .82);
-  --maibot-primary:oklch(80% .10 165);
-  --maibot-danger:oklch(74% .13 28);
-  --energy:oklch(78% .11 165);
-  --hunger:oklch(80% .12 70);
-  --focus:oklch(78% .10 245);
-  --stress:oklch(78% .10 350);
-  --social:oklch(78% .08 200);
-  --debt:oklch(78% .12 30);
-  --b-paper-edge:oklch(38% .03 160);
-  --b-ink:oklch(92% .024 90);
-  --b-tape:oklch(70% .07 88 / .30);
-  --b-tape-line:oklch(78% .08 80 / .22);
-  --b-stitch:oklch(70% .06 165 / .45);
-  --b-shadow-1:0 1px 2px oklch(0% 0 0 / .30);
-  --b-shadow-2:0 12px 34px -8px oklch(0% 0 0 / .45);
-  --b-shadow-card:var(--b-shadow-1),var(--b-shadow-2);
-  --rf-hairline:color-mix(in srgb,var(--maibot-border) 80%,transparent);
-  --ov-sleep:oklch(72% .09 265);--ov-rest:oklch(78% .07 265);
-  --ov-idle:oklch(64% .02 120);--ov-meal:oklch(80% .12 75);
-  --ov-work:oklch(74% .10 245);--ov-exercise:oklch(76% .11 155);
-  --ov-entertainment:oklch(76% .12 350);--ov-daily_routine:oklch(76% .09 200);
-  --ov-social:oklch(76% .10 310);--ov-free_time:oklch(78% .10 150);
-  --ov-watch:oklch(80% .12 88);--ov-game:oklch(78% .13 55);
-  --ov-leisure:oklch(76% .09 170);--ov-social_maintenance:oklch(80% .08 310);
-  --ov-activity:oklch(76% .10 235);--ov-transition:oklch(66% .02 120);
-  --ov-fallback:oklch(70% .03 120);
-  --overview-planned:oklch(38% .03 160);
-}
-html[data-lbm-theme=b] body{font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;letter-spacing:.005em}
-html[data-lbm-theme=b] h1{font-family:var(--b-serif);font-weight:700;letter-spacing:.01em;font-size:25px}
-html[data-lbm-theme=b] h2{font-family:var(--b-serif);font-weight:700;letter-spacing:.01em}
-html[data-lbm-theme=b] .card h2{font-size:16px}
-html[data-lbm-theme=b] h3{font-weight:650}
-html[data-lbm-theme=b] .eyebrow{font-family:var(--b-serif);font-style:italic;font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--maibot-muted)}
-html[data-lbm-theme=b] .activityname{font-family:var(--b-serif);font-weight:700;letter-spacing:.01em;overflow-wrap:normal;word-break:normal;line-break:strict;text-wrap:balance}
-html[data-lbm-theme=b] .tier{font-family:var(--b-serif);font-weight:700;letter-spacing:.01em}
-html[data-lbm-theme=b] .score,html[data-lbm-theme=b] .metricvalue,html[data-lbm-theme=b] .bignum{font-family:var(--b-serif);font-variant-numeric:oldstyle-nums tabular-nums;letter-spacing:0}
-html[data-lbm-theme=b] .metricvalue{font-weight:700;font-size:34px}
-html[data-lbm-theme=b] .bignum{font-weight:700}
-html[data-lbm-theme=b] .note{letter-spacing:.01em}
-html[data-lbm-theme=b] .sectionline h2{font-family:var(--b-serif);font-size:15px;letter-spacing:.06em;text-transform:none;color:var(--maibot-foreground);font-weight:700}
-html[data-lbm-theme=b] .sectionline h2::before{width:5px;height:16px;border-radius:3px;background:var(--maibot-primary);opacity:1}
-html[data-lbm-theme=b] body:before{
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
-  background-size:140px;opacity:.05;mix-blend-mode:multiply}
-html[data-lbm-theme=b][data-theme=dark] body:before{opacity:.07;mix-blend-mode:overlay}
-html[data-lbm-theme=b] body:after{
-  background:
-    radial-gradient(1100px 480px at 88% -12%,color-mix(in srgb,var(--hunger) 9%,transparent),transparent 62%),
-    radial-gradient(900px 460px at -8% 112%,color-mix(in srgb,var(--maibot-primary) 9%,transparent),transparent 60%)}
-html[data-lbm-theme=b] .mast{align-items:center;gap:16px;padding:14px 20px;border:1px solid var(--rf-hairline);
-  border-radius:var(--maibot-radius);background:linear-gradient(180deg,color-mix(in srgb,var(--maibot-surface) 97%,#fff),var(--maibot-surface));
-  box-shadow:var(--b-shadow-card);backdrop-filter:blur(10px)}
-html[data-lbm-theme=b] .mast-side{order:-1;flex-direction:column;align-items:flex-start;gap:3px;justify-content:flex-start}
-html[data-lbm-theme=b] .toolbar{order:1}
-html[data-lbm-theme=b] .connectionline{text-align:left;margin-top:0;font-family:var(--b-serif);font-style:italic;font-size:11.5px}
-html[data-lbm-theme=b] .brand{gap:12px}
-html[data-lbm-theme=b] .mark{width:44px;height:44px;border-radius:13px;border:1px solid color-mix(in srgb,var(--maibot-primary) 40%,transparent);
-  color:#fdfbf5;background:linear-gradient(140deg,var(--maibot-primary),color-mix(in srgb,var(--maibot-primary) 62%,var(--energy)));
-  box-shadow:var(--b-shadow-1)}
-html[data-lbm-theme=b][data-theme=dark] .mark{color:#0f231b}
-html[data-lbm-theme=b] .brandtext .eyebrow{font-size:9.5px}
-html[data-lbm-theme=b][data-embedded=true] .mark,html[data-lbm-theme=b][data-embedded=true] .brandtext{display:block}
-html[data-lbm-theme=b][data-embedded=true] .mast{background:linear-gradient(180deg,color-mix(in srgb,var(--maibot-surface) 97%,#fff),var(--maibot-surface));
-  border:1px solid var(--rf-hairline);box-shadow:var(--b-shadow-card);backdrop-filter:blur(10px);padding:12px 18px;margin:0 0 14px}
-html[data-lbm-theme=b][data-embedded=true] .mast-side{padding-right:0}
-html[data-lbm-theme=b] .banner{display:flex;align-items:center;gap:8px;padding:7px 13px;margin:0 0 12px;font-size:12px;
-  border:1px solid color-mix(in srgb,var(--hunger) 38%,var(--maibot-border));border-left:3px solid var(--hunger);
-  border-radius:11px;background:color-mix(in srgb,var(--hunger) 8%,var(--maibot-surface));
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-html[data-lbm-theme=b] .banner:before{content:"✎";flex:none;font-size:12px;color:var(--hunger);opacity:.9}
-html[data-lbm-theme=b] .banner.error{border-left-color:var(--maibot-danger);color:var(--maibot-danger)}
-html[data-lbm-theme=b] .banner.error:before{content:"!";font-weight:700;color:var(--maibot-danger)}
-html[data-lbm-theme=b] .panel-layout{grid-template-columns:132px minmax(0,1fr);gap:18px}
-html[data-lbm-theme=b][data-embedded=true] .panel-layout{grid-template-columns:132px minmax(0,1fr);gap:18px}
-html[data-lbm-theme=b] .panel-tabs{counter-reset:tabidx;border-right:0;padding:6px 12px 6px 0;position:sticky;top:12px;
-  background:transparent;box-shadow:none}
-html[data-lbm-theme=b] .panel-tabs:before{content:"";position:absolute;top:0;bottom:0;right:0;width:3px;
-  border-right:1px solid var(--maibot-border);border-left:1px solid var(--maibot-border);opacity:.7}
-html[data-lbm-theme=b] .panel-tabs button{counter-increment:tabidx;position:relative;gap:8px;padding:10px 12px;border-radius:12px;
-  font-size:14px;font-weight:600;color:var(--maibot-muted);border:1px solid transparent;white-space:nowrap;transition:background .18s,color .18s,border-color .18s}
-html[data-lbm-theme=b] .panel-tabs button .tab-glyph{font-size:0;margin:0;width:20px;flex:none;text-align:center}
-html[data-lbm-theme=b] .panel-tabs button .tab-glyph:before{content:counter(tabidx,decimal-leading-zero);font:italic 700 13px/1 var(--b-serif);
-  font-variant-numeric:normal;color:var(--maibot-muted);opacity:.75}
-html[data-lbm-theme=b] .panel-tabs button:hover{background:color-mix(in srgb,var(--maibot-soft) 70%,transparent);color:var(--maibot-foreground)}
-html[data-lbm-theme=b] .panel-tabs [aria-selected=true]{background:var(--maibot-primary);color:#fdfbf5;border-color:transparent;
-  box-shadow:var(--b-shadow-1),0 6px 16px -6px color-mix(in srgb,var(--maibot-primary) 55%,transparent)}
-html[data-lbm-theme=b][data-theme=dark] .panel-tabs [aria-selected=true]{color:#0f231b}
-html[data-lbm-theme=b] .panel-tabs [aria-selected=true] .tab-glyph:before{color:inherit;opacity:.9}
-html[data-lbm-theme=b] .panel-tabs [aria-selected=true]:after{content:"";position:absolute;right:-13px;top:50%;translate:0 -50%;
-  width:7px;height:7px;border-radius:50%;background:var(--maibot-primary);box-shadow:0 0 0 3px var(--maibot-background)}
-html[data-lbm-theme=b] .card{border:1px solid var(--rf-hairline);border-radius:var(--maibot-radius);
-  background:linear-gradient(180deg,color-mix(in srgb,var(--maibot-surface) 97%,#fff),var(--maibot-surface));
-  box-shadow:var(--b-shadow-card);padding:20px}
-html[data-lbm-theme=b][data-theme=dark] .card{background:linear-gradient(180deg,color-mix(in srgb,var(--maibot-surface) 96%,#fff 4%),var(--maibot-surface))}
-html[data-lbm-theme=b] .cardtop{margin-bottom:15px}
-html[data-lbm-theme=b] .heading-icon{stroke:var(--maibot-primary);opacity:.85}
-html[data-lbm-theme=b] .hero-scene{isolation:isolate}
-html[data-lbm-theme=b] .hero-scene:after{content:"";position:absolute;top:-3px;right:30px;width:96px;height:26px;z-index:3;
-  background:repeating-linear-gradient(45deg,var(--b-tape) 0 7px,var(--b-tape-line) 7px 9px);
-  border-left:1px dashed color-mix(in srgb,var(--b-tape-line) 80%,transparent);
-  border-right:1px dashed color-mix(in srgb,var(--b-tape-line) 80%,transparent);
-  rotate:-4deg;box-shadow:0 2px 6px oklch(40% .04 80 / .18);pointer-events:none;opacity:.92}
-html[data-lbm-theme=b] .hero-scene:before{opacity:.9}
-html[data-lbm-theme=b] .hero-scene .activityname{max-width:80%;font-size:31px}
-html[data-lbm-theme=b][data-theme=dark] .hero-scene:before{opacity:.82}
-html[data-lbm-theme=b] .observation{border:1px dashed var(--b-stitch);background:color-mix(in srgb,var(--maibot-soft) 55%,var(--maibot-surface));
-  border-radius:999px;padding:5px 11px}
-html[data-lbm-theme=b] .observation::before{background:var(--maibot-primary);opacity:.8}
-html[data-lbm-theme=b] .summarychips>span{border:1px dashed var(--b-stitch);background:color-mix(in srgb,var(--maibot-soft) 45%,var(--maibot-surface));border-radius:999px}
-html[data-lbm-theme=b] .metric.maibot-card{padding:16px 17px;position:relative;border-left:3px solid var(--mc,var(--maibot-primary))}
-html[data-lbm-theme=b] .metricicon{width:32px;height:32px;border-radius:10px;background:color-mix(in srgb,var(--mc,var(--maibot-primary)) 14%,transparent);color:var(--mc,var(--maibot-muted))}
-html[data-lbm-theme=b] .metric .meter{height:6px;border-radius:99px;background:color-mix(in srgb,var(--maibot-soft) 80%,var(--maibot-border))}
-html[data-lbm-theme=b] .metric .meter>i{border-radius:99px}
-html[data-lbm-theme=b] .metrictrend{font-family:var(--b-serif);font-style:italic;border:1px solid var(--rf-hairline);background:var(--maibot-surface)}
-html[data-lbm-theme=b] .metrichead .note{font-weight:650;letter-spacing:.02em}
-html[data-lbm-theme=b] button{border-radius:12px;border:1px solid var(--maibot-border);background:var(--maibot-surface);transition:background .16s,border-color .16s,color .16s}
-html[data-lbm-theme=b] button:hover{background:var(--maibot-soft);border-color:color-mix(in srgb,var(--maibot-primary) 35%,var(--maibot-border))}
-html[data-lbm-theme=b] .toolbar button{border-color:var(--rf-hairline)}
-html[data-lbm-theme=b] .pill{border-radius:999px;border:1px solid var(--rf-hairline);background:color-mix(in srgb,var(--maibot-soft) 60%,var(--maibot-surface));font-weight:600;letter-spacing:.02em}
-html[data-lbm-theme=b] .rowbadge,html[data-lbm-theme=b] .vtime-badge{border-radius:999px}
-html[data-lbm-theme=b] #current-percent{border:0;background:var(--maibot-primary);color:#fdfbf5;font-family:var(--b-serif);font-weight:700;padding:3px 11px}
-html[data-lbm-theme=b][data-theme=dark] #current-percent{color:#0f231b}
-html[data-lbm-theme=b] .progress{height:8px;background:color-mix(in srgb,var(--maibot-soft) 80%,var(--maibot-border))}
-html[data-lbm-theme=b] .progress>i{background:linear-gradient(90deg,var(--maibot-primary),color-mix(in srgb,var(--maibot-primary) 70%,var(--energy)))}
-html[data-lbm-theme=b] .shell{padding-bottom:26px}
-html[data-lbm-theme=b] footer{justify-content:center;text-align:center;margin-top:16px;padding-top:12px;
-  border-top:1px solid var(--rf-hairline);font-family:var(--b-serif);font-style:italic;letter-spacing:.04em}
-html[data-lbm-theme=b] .panel-layout{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--maibot-primary) 42%,transparent) transparent;
-  box-shadow:inset 0 -22px 20px -22px color-mix(in srgb,var(--maibot-background) 92%,transparent)}
-html[data-lbm-theme=b] .panel-layout::-webkit-scrollbar{width:9px}
-html[data-lbm-theme=b] .panel-layout::-webkit-scrollbar-track{background:transparent}
-html[data-lbm-theme=b] .panel-layout::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--maibot-primary) 38%,transparent);border-radius:99px;border:2px solid var(--maibot-background)}
-html[data-lbm-theme=b] .panel-layout::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--maibot-primary) 60%,transparent)}
-@media(max-width:700px){
-  html[data-lbm-theme=b][data-embedded=true] .panel-layout{grid-template-columns:58px minmax(0,1fr);gap:9px}
-}
-html[data-lbm-theme=b] body:has(#tab-mood[aria-selected=true]) .datebar{display:none}
-html[data-lbm-theme=b] .schedule-pager{padding:5px 12px;margin:0 0 10px;border-radius:11px;background:color-mix(in srgb,var(--maibot-soft) 45%,var(--maibot-surface))}
-html[data-lbm-theme=b] .schedule-page-caption strong{font-family:var(--b-serif);font-size:13px}
-html[data-lbm-theme=b] .schedule-page-actions button{min-width:32px;min-height:30px;border-radius:9px}
-html[data-lbm-theme=b] .overview-track{height:32px;border-radius:10px;border:1px solid var(--rf-hairline);background:color-mix(in srgb,var(--maibot-soft) 60%,var(--maibot-surface))}
-html[data-lbm-theme=b] .overview-seg{border-radius:3px}
-html[data-lbm-theme=b] .overview-scale{font-family:var(--b-serif);font-style:italic}
-html[data-lbm-theme=b] .vtime:before{background:var(--maibot-border)}
-html[data-lbm-theme=b] .vtime-item.active{background:color-mix(in srgb,var(--maibot-primary) 8%,transparent);border-radius:12px}
-html[data-lbm-theme=b] .timeline-card{border-left:3px solid color-mix(in srgb,var(--maibot-primary) 45%,var(--maibot-border))}
-html[data-lbm-theme=b] .core-path{word-break:normal;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;
-  font-size:11px;opacity:.8;cursor:help}
-html[data-lbm-theme=b] .core-field{border-radius:13px;border-left-width:3px}
-html[data-lbm-theme=b] .core-field.ok{border-left-color:var(--maibot-primary)}
-html[data-lbm-theme=b] .core-module-row{border-radius:12px}
-html[data-lbm-theme=b] .core-meter>i{background:linear-gradient(90deg,var(--maibot-primary),color-mix(in srgb,var(--maibot-primary) 70%,var(--energy)))}
-html[data-lbm-theme=b] .core-raw-pre{border-radius:11px}
-html[data-lbm-theme=b] .usage-detail .usage-metric{border-radius:11px;background:color-mix(in srgb,var(--maibot-soft) 55%,var(--maibot-surface));border:1px solid var(--rf-hairline)}
-html[data-lbm-theme=b] .usage-detail .usage-value{font-family:var(--b-serif);font-variant-numeric:oldstyle-nums tabular-nums}
-html[data-lbm-theme=b] .bucket{border-radius:14px}
-html[data-lbm-theme=b] .fish-panel{border:1px solid var(--rf-hairline);border-radius:var(--maibot-radius);
-  background:linear-gradient(180deg,color-mix(in srgb,var(--maibot-surface) 98%,#fff),var(--maibot-surface));
-  box-shadow:0 20px 60px -12px oklch(20% .03 80 / .4)}
-html[data-lbm-theme=b] .fish-popup-heading{border-bottom:1px solid var(--rf-hairline);padding:14px 17px 12px}
-html[data-lbm-theme=b] .fish-popup-heading h2{font-family:var(--b-serif);font-size:17px}
-html[data-lbm-theme=b] .fish-close{border-radius:10px}
-html[data-lbm-theme=b] .fish-popup-body{padding:15px 18px 18px;scrollbar-width:thin;
-  scrollbar-color:color-mix(in srgb,var(--maibot-primary) 42%,transparent) transparent}
-html[data-lbm-theme=b] .fish-popup-body::-webkit-scrollbar{width:8px}
-html[data-lbm-theme=b] .fish-popup-body::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--maibot-primary) 38%,transparent);border-radius:99px}
-html[data-lbm-theme=b] .fish-popup-summary{font-size:14px;line-height:1.8;margin:0 0 12px}
-html[data-lbm-theme=b] .fish-meta-row{padding:8px 0;font-size:12.5px;border-bottom:1px solid var(--rf-hairline)}
-html[data-lbm-theme=b] .fish-meta-row:last-child{border-bottom:0}
-html[data-lbm-theme=b] .fish-fold{border-top:1px solid var(--rf-hairline);margin-top:14px}
-html[data-lbm-theme=b] .fish-fold>.fish-fold-title{font-family:var(--b-serif);color:var(--maibot-primary)}
-html[data-lbm-theme=b] .fish-tail-tip{background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),var(--maibot-background);border-color:var(--rf-hairline)}
-html[data-lbm-theme=b] .fish-overlay:before{background:color-mix(in srgb,var(--maibot-background) 30%,transparent)}
-html[data-lbm-theme=b][data-theme=dark] .fish-overlay:before{background:color-mix(in srgb,var(--maibot-background) 40%,transparent)}
-html[data-lbm-theme=b] .maimai-bear.is-above{z-index:880}
-html[data-lbm-theme=b] .maimai-bear-img{filter:drop-shadow(0 8px 10px oklch(30% .04 80 / .28))}
-@media(max-width:700px){
-  html[data-lbm-theme=b] .shell{padding:16px 12px 20px}
-  html[data-lbm-theme=b] .mast{padding:10px 13px;gap:10px}
-  html[data-lbm-theme=b][data-embedded=true] .mast{padding:9px 12px;margin:0 0 10px}
-  html[data-lbm-theme=b] .mark{width:36px;height:36px;border-radius:11px}
-  html[data-lbm-theme=b] .mark svg{width:20px;height:20px}
-  html[data-lbm-theme=b] h1{font-size:18px}
-  html[data-lbm-theme=b] .brandtext .eyebrow{font-size:8px;letter-spacing:.12em}
-  html[data-lbm-theme=b] .connectionline{font-size:10px}
-  html[data-lbm-theme=b] .toolbar button{min-height:34px;padding:6px 10px;font-size:12px}
-  html[data-lbm-theme=b] .toolbar .status{padding:5px 9px;font-size:11px}
-  html[data-lbm-theme=b] .banner{font-size:11px;padding:6px 10px;margin:0 0 9px}
-  html[data-lbm-theme=b] .panel-tabs{padding:4px 7px 4px 0}
-  html[data-lbm-theme=b] .panel-tabs button{flex-direction:column;gap:2px;padding:7px 2px;min-height:52px;font-size:10px;border-radius:10px}
-  html[data-lbm-theme=b] .panel-tabs button .tab-glyph{width:auto}
-  html[data-lbm-theme=b] .panel-tabs button .tab-glyph:before{font-size:12px}
-  html[data-lbm-theme=b] .panel-tabs [aria-selected=true]:after{right:-8px;width:5px;height:5px}
-  html[data-lbm-theme=b] .hero-scene .activityname{font-size:23px;max-width:78%;text-wrap:balance}
-  html[data-lbm-theme=b] .hero-scene:after{width:74px;height:21px;right:18px}
-  html[data-lbm-theme=b] .metricvalue{font-size:28px}
-  html[data-lbm-theme=b] .card{padding:16px}
-  html[data-lbm-theme=b] .datebar{margin-bottom:10px;gap:10px}
-  html[data-lbm-theme=b] .datebar strong{font-size:12px}
-  html[data-lbm-theme=b] .date-controls button,html[data-lbm-theme=b] .date-controls label{font-size:11px}
-  html[data-lbm-theme=b] .date-controls button{min-height:34px;padding:5px 8px}
-  html[data-lbm-theme=b] .range button{min-height:32px;padding:4px 8px;font-size:11px}
-  html[data-lbm-theme=b] .estimate-key{font-size:10px;gap:8px}
-  html[data-lbm-theme=b] footer{font-size:10px;margin-top:12px}
-  html[data-lbm-theme=b] .maimai-bear{bottom:12px}
-}
-@media(max-width:420px){
-  html[data-lbm-theme=b] .metricvalue{font-size:25px}
-  html[data-lbm-theme=b] .hero-scene .activityname{font-size:21px}
-}
-html[data-lbm-theme=b] .list,html[data-lbm-theme=b] .samplewrap,html[data-lbm-theme=b] .core-raw-pre,html[data-lbm-theme=b] .sleep-archive #sleep-list{scrollbar-width:thin;
-  scrollbar-color:color-mix(in srgb,var(--maibot-primary) 40%,transparent) transparent}
-html[data-lbm-theme=b] .list::-webkit-scrollbar,html[data-lbm-theme=b] .samplewrap::-webkit-scrollbar,html[data-lbm-theme=b] .core-raw-pre::-webkit-scrollbar,html[data-lbm-theme=b] .sleep-archive #sleep-list::-webkit-scrollbar{width:7px;height:7px}
-html[data-lbm-theme=b] .list::-webkit-scrollbar-thumb,html[data-lbm-theme=b] .samplewrap::-webkit-scrollbar-thumb,html[data-lbm-theme=b] .core-raw-pre::-webkit-scrollbar-thumb,html[data-lbm-theme=b] .sleep-archive #sleep-list::-webkit-scrollbar-thumb{
-  background:color-mix(in srgb,var(--maibot-primary) 36%,transparent);border-radius:99px}
-html[data-lbm-theme=b] .list::-webkit-scrollbar-thumb:hover,html[data-lbm-theme=b] .samplewrap::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--maibot-primary) 58%,transparent)}
-html[data-lbm-theme=b] button:focus-visible,html[data-lbm-theme=b] input:focus-visible,html[data-lbm-theme=b] [role=tab]:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:2px}
 
 /* ════════════════════════ 皮肤 C · 现代数据仪表盘 ════════════════════════ */
 html:root[data-lbm-theme=c]{
@@ -1649,12 +1381,12 @@ html[data-lbm-theme=c] footer{margin-top:12px;padding:8px 0 2px 150px;border-top
 /* ════════════════════════ 切换器（非皮肤 · 不受 data-lbm-theme 作用域） ════════════════════════
    常驻右上 pill（theme.js 创建 #lbm-theme-switcher）：z-index 970 高于详情遮罩
    900 与 usage 固定态 960（panel.css:321），低于详情内 info-tooltip 1010。
-   ID 特异性压过各皮肤的全局 button 规则，四态外观一致、随当前令牌自适应。
+   ID 特异性压过各皮肤的全局 button 规则，两态外观一致、随当前令牌自适应。
    --lbm-pill-lane 由 theme.js 实测写入：pill 与 mast 水平重叠时给 mast 的两个
    子项让出右侧空档，避免盖住品牌区/工具条。不能直接收窄 .mast——panel.css
    PR-RESPONSIVE-MAST 的 .mast{width:100%} 会锁死宽度（margin 只外溢不收缩），
    且收窄整框会破坏与下方内容的右缘对齐；子项 margin 在 flex 横排/折行下都生效，
-   同时覆盖皮肤 B 的 order 反转（toolbar 在右）与移动端折行。
+   同时覆盖移动端折行。
    详情打开时 theme.js 把 pill 移到面板侧边或右下角，永不遮挡 .fish-close。 */
 html[data-lbm-pill] .mast-side{margin-right:var(--lbm-pill-lane,0px)}
 html[data-lbm-pill] .toolbar{margin-right:var(--lbm-pill-lane,0px)}
@@ -1663,7 +1395,6 @@ html[data-lbm-pill] .toolbar{margin-right:var(--lbm-pill-lane,0px)}
 #lbm-theme-switcher:focus-visible{outline:3px solid var(--maibot-primary);outline-offset:2px}
 #lbm-theme-switcher .lbm-pill-icon{font-size:12px;line-height:1;color:var(--maibot-primary)}
 #lbm-theme-switcher .lbm-pill-name{font-variant-numeric:tabular-nums}
-#lbm-theme-switcher[data-none="1"] .lbm-pill-icon{color:var(--maibot-muted)}
 @media(max-width:700px){#lbm-theme-switcher{height:32px;padding:0 11px;font-size:11px}}
 @media(prefers-reduced-motion:reduce){#lbm-theme-switcher{transition:none}}
 </style></head><body class="maibot-page"><main class="shell">
@@ -4288,48 +4019,55 @@ const SectionFish=(()=>{
   else setTimeout(apply,0);
 })();
 /* LBM_THEME_SWITCHER */
-/* 临时主题对比切换器（2026-11-14 主题对比批）
-   用途：三版设计评估皮肤（A 精致原风格 / B 暖纸手账 / C 数据仪表盘）落地为
-   可切换主题，供同页对比。右上角常驻紧凑 pill，点击循环 原版→A→B→C→原版；
-   写 document.documentElement.dataset.lbmTheme（原版=移除属性），localStorage
-   （键 lbmTheme）持久化并在加载时恢复，默认原版。明暗仍随宿主/离线 data-theme。
-   选定后移除切换器并默认化所选主题：删本文件与 themes.css 中未选皮肤、把选中
-   皮肤令牌并入基线（见 CHANGELOG「临时主题对比切换器批」）。
+/* 主题切换器（2026-11-14 主题对比批 → 同日主题精简批）
+   用途：两版保留皮肤（A 精致原风格 / C 数据仪表盘）可切换。右上角常驻紧凑
+   pill，点击循环 A→C→A；写 document.documentElement.dataset.lbmTheme，
+   localStorage（键 lbmTheme）持久化并在加载时恢复，默认 A。旧值迁移：存储为
+   ''（原版）/'b'（手账）/非法值时一律落到 'a' 并写回，'a'/'c' 保留。明暗仍随
+   宿主/离线 data-theme。原版与 B 手账已移除（见 CHANGELOG「主题精简批」）；
+   切换按钮暂留，最终选定后移除切换器并默认化所选主题。
 
    装配：经 LBM_EXTENSIONS token 注入 panel.js IIFE 内部、排在 maimai.js/fish.js/
    layout_fix.js 之后，共享闭包（$/el 等），不重声明既有 const；整体独立 IIFE，
-   additive，不改既有函数。皮肤行为脚本忠实提取自三版设计素材（A _variant_a.js、
-   B _override_block.html 内层脚本去掉错误探针、C work/variant-c.js），全部按
-   当前激活皮肤门控：非激活皮肤的观察器回调直接返回；切换时先 lbmResetShared()
-   还原各皮肤留下的内联痕迹（概括条原始色/meta 行内 display/datebar 可见性/
-   路径 title），再应用新皮肤，避免跨皮肤颜色键失配与残留。 */
+   additive，不改既有函数。皮肤行为脚本忠实提取自设计素材（A _variant_a.js、
+   C work/variant-c.js），全部按当前激活皮肤门控：非激活皮肤的观察器回调直接
+   返回；切换时先 lbmResetShared() 清除两版皮肤留下的内联痕迹（概括条原始色/
+   meta 行内 display 与去重类/datebar 可见性/路径 title），再应用目标皮肤，
+   避免跨皮肤颜色键失配与残留。不再有「原版=无痕迹」态，加载即应用 A。 */
 (()=>{
 'use strict';
-const LBM_SKINS=['','a','b','c'];
-const LBM_SKIN_NAMES={'':'原版','a':'A · 精致','b':'B · 手账','c':'C · 仪表盘'};
+const LBM_SKINS=['a','c'];
+const LBM_SKIN_NAMES={'a':'A · 精致','c':'C · 仪表盘'};
 const LBM_SKIN_KEY='lbmTheme';
-let lbmSkin=(()=>{try{const v=localStorage.getItem(LBM_SKIN_KEY);return LBM_SKINS.includes(v)?v:''}catch(e){return ''}})();
+let lbmSkin=(()=>{
+ let v=null;
+ try{v=localStorage.getItem(LBM_SKIN_KEY)}catch(e){}
+ if(LBM_SKINS.includes(v))return v;
+ /* 旧值迁移：''（原版）/'b'（手账）/非法/缺失 → 'a'，并写回清除旧值 */
+ try{localStorage.setItem(LBM_SKIN_KEY,'a')}catch(e){}
+ return 'a';
+})();
 const lbmActive=s=>lbmSkin===s;
 
-/* ── 共享重置：切换前还原皮肤脚本的内联痕迹（原版=无痕迹） ───────────────── */
+/* ── 共享重置：切换前清除两版皮肤的内联痕迹，再应用目标 ─────────────────── */
 function lbmResetShared(){
- /* 概括条色段 → 捕获的原始内联色（见下方 capture 观察器）。A 写 oklch、B/C 写
-    var(--ov-*)，三版画家都只认原始 hex/rgb 键，不先还原则跨皮肤切换失配。 */
+ /* 概括条色段 → 捕获的原始内联色（见下方 capture 观察器）。A 写 oklch、C 写
+    var(--ov-*)，两版画家都只认原始 hex/rgb 键，不先还原则跨皮肤切换失配。 */
  try{
   const track=$('overview-track');
   if(track)for(const seg of track.querySelectorAll('.overview-seg')){
    if(seg.dataset.lbmBase!==undefined)seg.style.background=seg.dataset.lbmBase;
   }
  }catch(e){}
- /* B/C 的「数据来源」去重用内联 display:none 隐藏通用行 */
- try{for(const row of document.querySelectorAll('.fish-meta-row'))row.style.display=''}catch(e){}
+ /* C 的「数据来源」去重用内联 display:none 隐藏通用行；A 用 va-meta-dupe 类 */
+ try{for(const row of document.querySelectorAll('.fish-meta-row')){row.style.display='';row.classList.remove('va-meta-dupe')}}catch(e){}
  /* C 的 S2 会在娱乐 tab 隐藏 datebar；按 panel.js activateTab 同口径还原 */
  try{
   const tab=document.querySelector('[role=tab][aria-selected="true"]');
   const key=tab?tab.dataset.tab:'now';
   const db=$('datebar');if(db)db.hidden=key==='now'||key==='system'||key==='core';
  }catch(e){}
- /* 皮肤补的 title 全文（原版无） */
+ /* 皮肤补的 title 全文 */
  try{for(const id of['core-registry-path','notice']){const n=$(id);if(n)n.removeAttribute('title')}}catch(e){}
 }
 
@@ -4426,98 +4164,6 @@ const lbmA=(()=>{
   try{watchMeta()}catch(e){}
   try{updateScroll()}catch(e){}
   try{const rp=$('core-registry-path');if(rp)rp.title=rp.textContent||''}catch(e){}
- }
- return {init,apply};
-})();
-
-/* ── 皮肤 B 行为（源 _override_block.html 内层脚本，去掉①错误探针） ────────── */
-const lbmB=(()=>{
- /* A2 概括条 → 手账令牌（探针元素把原始 hex 归一成 rgb 键） */
- const OV_HEX={sleep:'#5b6ee1',rest:'#8a9df0',idle:'#9aa5b1',meal:'#e8a13c',work:'#3d8bfd',exercise:'#2fbf71',entertainment:'#e05fa0',daily_routine:'#4fb8c9',social:'#8f6fe8',free_time:'#67c98f',watch:'#c9a227',game:'#ef7d3a',leisure:'#58b89a',social_maintenance:'#b085e0',activity:'#4a90d9',transition:'#8a8f98'};
- const OV_FALLBACK='#7a8288';
- let ovMap=null;
- function buildOvMap(){
-  if(ovMap)return ovMap;
-  ovMap={};
-  const probe=document.createElement('i');probe.style.display='none';document.body.appendChild(probe);
-  const key=hex=>{probe.style.background='';probe.style.background=hex;return probe.style.backgroundColor};
-  for(const g in OV_HEX)ovMap[key(OV_HEX[g])]='var(--ov-'+g+')';
-  ovMap[key(OV_FALLBACK)]='var(--ov-fallback)';
-  probe.remove();
-  return ovMap;
- }
- function remapOverview(){
-  if(!lbmActive('b'))return;
-  const track=$('overview-track');if(!track)return;
-  const map=buildOvMap();
-  const segs=track.querySelectorAll('.overview-seg');
-  for(let i=0;i<segs.length;i++){
-   const s=segs[i];if(s.classList.contains('planned'))continue;
-   const cur=s.style.backgroundColor;const to=map[cur];
-   if(to&&s.style.background!==to)s.style.background=to;
-  }
- }
- /* A4 千分位（幂等：\d{4,} 不匹配已带逗号的串） */
- function groupDigits(root){
-  if(!root)return;
-  const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,null);
-  let n;
-  while((n=walker.nextNode())){
-   const t=n.nodeValue;
-   if(/\d{4,}/.test(t)){
-    const nt=t.replace(/\d{4,}/g,m=>Number(m).toLocaleString('en-US'));
-    if(nt!==t)n.nodeValue=nt;
-   }
-  }
- }
- /* A7「数据来源」去重：保留板块专属行，内联隐藏通用行（切换时由重置还原） */
- function labelOf(row){
-  const cap=row.querySelector('span');
-  if(!cap)return '';
-  const n=cap.firstChild;
-  return n&&n.nodeType===3?(n.textContent||'').trim():(cap.textContent||'').trim();
- }
- function dedupeMeta(){
-  if(!lbmActive('b'))return;
-  const meta=document.querySelector('#section-fish-popover .fish-metadata');if(!meta)return;
-  const sourceRows=[];
-  meta.querySelectorAll('.fish-meta-row').forEach(row=>{if(labelOf(row)==='数据来源')sourceRows.push(row)});
-  if(sourceRows.length>1)sourceRows.forEach(row=>{
-   const val=row.querySelector('span:last-child');
-   const generic=val&&/生活引擎|导入快照/.test(val.textContent||'');
-   row.style.display=generic?'none':'';
-  });
- }
- /* S3 详情入口折线下 → 滚入视口 */
- function clampEntry(){
-  const home=document.querySelector('#section-fish-popover')?document.querySelector('.fish-peek-home'):null;
-  if(!home)return;
-  const r=home.getBoundingClientRect();
-  if(r.top<8||r.bottom>innerHeight-8)home.scrollIntoView({block:'center',behavior:'auto'});
- }
- /* A8/A5 title 全文 */
- function setTitle(id){const n=$(id);if(n&&n.textContent)n.title=n.textContent}
- function init(){
-  const watch=(node,opts,fn)=>{
-   if(!node||node.getAttribute('data-lbm-watch')==='1')return;
-   node.setAttribute('data-lbm-watch','1');
-   new MutationObserver(()=>{try{fn()}catch(e){}}).observe(node,opts);
-  };
-  try{watch($('overview-track'),{childList:true},remapOverview)}catch(e){}
-  try{for(const id of['usage-top','usage-split'])watch($(id),{childList:true,subtree:true,characterData:true},()=>{if(lbmActive('b'))groupDigits($(id))})}catch(e){}
-  try{for(const id of['core-registry-path','notice'])watch($(id),{childList:true,subtree:true,characterData:true},()=>{if(lbmActive('b'))setTitle(id)})}catch(e){}
-  try{watch(document.querySelector('#section-fish-popover .fish-metadata'),{childList:true,subtree:true,characterData:true},dedupeMeta)}catch(e){}
-  try{document.addEventListener('lbm:detail-open',()=>{
-   if(!lbmActive('b'))return;
-   requestAnimationFrame(()=>{try{dedupeMeta()}catch(e){}try{clampEntry()}catch(e){}});
-  })}catch(e){}
- }
- function apply(){
-  if(!lbmActive('b'))return;
-  try{remapOverview()}catch(e){}
-  try{groupDigits($('usage-top'));groupDigits($('usage-split'))}catch(e){}
-  try{setTitle('core-registry-path');setTitle('notice')}catch(e){}
-  try{dedupeMeta()}catch(e){}
  }
  return {init,apply};
 })();
@@ -4622,10 +4268,9 @@ document.documentElement.setAttribute('data-lbm-pill','');
 function lbmSyncButton(){
  lbmPillName.textContent=LBM_SKIN_NAMES[lbmSkin];
  const next=LBM_SKINS[(LBM_SKINS.indexOf(lbmSkin)+1)%LBM_SKINS.length];
- lbmPill.dataset.skin=lbmSkin||'none';
- lbmPill.dataset.none=lbmSkin?'0':'1';
- lbmPill.title='临时主题对比切换器：点击循环 原版 → A 精致 → B 手账 → C 仪表盘。当前：'+LBM_SKIN_NAMES[lbmSkin]+'，下一个：'+LBM_SKIN_NAMES[next]+'（选择本地记忆，默认原版）';
- lbmPill.setAttribute('aria-label','当前对比主题：'+LBM_SKIN_NAMES[lbmSkin]+'；点击切换到'+LBM_SKIN_NAMES[next]);
+ lbmPill.dataset.skin=lbmSkin;
+ lbmPill.title='主题切换：点击循环 A 精致 → C 仪表盘。当前：'+LBM_SKIN_NAMES[lbmSkin]+'，下一个：'+LBM_SKIN_NAMES[next]+'（选择本地记忆，默认 A）';
+ lbmPill.setAttribute('aria-label','当前主题：'+LBM_SKIN_NAMES[lbmSkin]+'；点击切换到'+LBM_SKIN_NAMES[next]);
 }
 
 /* 定位：默认右上角；详情打开时若与面板/关闭按钮相交 → 移到面板右侧或左侧
@@ -4672,11 +4317,10 @@ function lbmQueuePos(){
 /* ── 切换：写 root 属性 + 持久化 + 重置 + 应用 + 重校准 ─────────────────────── */
 function lbmSetSkin(next,persist=true){
  lbmSkin=next;
- const root=document.documentElement;
- if(next)root.dataset.lbmTheme=next;else delete root.dataset.lbmTheme;
+ document.documentElement.dataset.lbmTheme=next;
  if(persist){try{localStorage.setItem(LBM_SKIN_KEY,next)}catch(e){}}
  lbmResetShared();
- if(next==='a')lbmA.apply();else if(next==='b')lbmB.apply();else if(next==='c')lbmC.apply();
+ if(next==='a')lbmA.apply();else if(next==='c')lbmC.apply();
  lbmSyncButton();
  lbmPosition();
  /* 皮肤切换改变 mast/详情面板尺寸：让 fish.js（resize 重校准）与布局层补算 */
@@ -4684,8 +4328,9 @@ function lbmSetSkin(next,persist=true){
 }
 lbmPill.onclick=()=>lbmSetSkin(LBM_SKINS[(LBM_SKINS.indexOf(lbmSkin)+1)%LBM_SKINS.length]);
 
-/* ── 装配：观察器一次性安装（门控），恢复持久化选择，接线定位触发 ─────────── */
-lbmA.init();lbmB.init();lbmC.init();
+/* ── 装配：观察器一次性安装（门控），恢复持久化选择（迁移后必为 a/c），
+      接线定位触发 ─────────────────────────────────────────────────────── */
+lbmA.init();lbmC.init();
 lbmSetSkin(lbmSkin,false);
 window.addEventListener('resize',lbmQueuePos);
 window.addEventListener('scroll',lbmQueuePos,{passive:true,capture:true});
