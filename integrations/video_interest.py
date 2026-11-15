@@ -615,7 +615,7 @@ class VideoInterestService:
             result = await self._llm(
                 prompt, task_name=self._task_name,
                 temperature=INTEREST_TEMPERATURE, strict_params=True,
-                event=INTEREST_LLM_EVENT, with_identity=True)
+                event=INTEREST_LLM_EVENT, with_identity=True, validator=lambda text: parse_interest_answer(text) is not None)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

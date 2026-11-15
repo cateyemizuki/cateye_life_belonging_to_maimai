@@ -1,0 +1,74 @@
+{
+  "rows": [
+    {
+      "name": "睡觉",
+      "anchor": "sleep",
+      "start": 0,
+      "end": "sleep_span",
+      "goal": "sleep",
+      "priority": "high",
+      "min": "sleep_span",
+      "max": "sleep_span",
+      "interruptibility": 0.05,
+      "hardness": "hard",
+      "condition": "sleep"
+    },
+    {
+      "name": "起床洗漱",
+      "anchor": "wake",
+      "start": 0,
+      "end": 30,
+      "goal": "daily_routine",
+      "priority": "medium",
+      "min": 15,
+      "max": 30,
+      "interruptibility": 0.9
+    },
+    {
+      "name": "早餐",
+      "anchor": "wake",
+      "start": 0,
+      "end": 120,
+      "goal": "meal",
+      "priority": "medium",
+      "min": 15,
+      "max": 40,
+      "interruptibility": 0.9
+    },
+    {
+      "name": "午餐",
+      "anchor": "mid",
+      "start": -90,
+      "end": 90,
+      "goal": "meal",
+      "priority": "medium",
+      "min": 20,
+      "max": 45,
+      "interruptibility": 0.9
+    },
+    {
+      "name": "自由安排",
+      "anchor": "wake",
+      "start": 150,
+      "end": "awake_end_minus_330",
+      "goal": "free_time",
+      "priority": "low",
+      "min": 30,
+      "max": 90,
+      "interruptibility": 0.95,
+      "min_awake": 480
+    },
+    {
+      "name": "晚餐",
+      "anchor": "awake_end",
+      "start": -300,
+      "end": -180,
+      "goal": "meal",
+      "priority": "medium",
+      "min": 20,
+      "max": 45,
+      "interruptibility": 0.9,
+      "min_awake": 360
+    }
+  ]
+}

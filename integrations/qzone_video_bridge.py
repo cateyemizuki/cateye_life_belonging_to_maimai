@@ -1435,11 +1435,21 @@ class QzoneVideoBridge:
                 'recent_qzone_topics': state.get('recent_qzone_topics') or [],
                 'available_assets': available_assets or [],
                 'max_assets': max_assets}
+        available_ids = {str(a.get('asset_id')) for a in (available_assets or [])
+                         if isinstance(a, dict) and ASSET_ID.fullmatch(str(a.get('asset_id') or ''))}
+        def acceptable(text):
+            doc = strict_json(text)
+            if not isinstance(doc, dict):return False
+            selected = doc.get('asset_ids', [])
+            if not isinstance(selected, list) or len(selected) > max_assets:return False
+            if any(str(sid) not in available_ids for sid in selected):return False
+            delay = number(doc.get('delay_minutes'), -1)
+            return delay >= (5 if doc.get('action') == 'defer' else 0)
         try:
             reply = await self._generate(
                 QZONE_VIDEO_POLICY + json.dumps(body, ensure_ascii=False),
                 task_name=self._task() or 'utils', temperature=0.3, strict_params=True,
-                event='qzone_video_decision')
+                event='qzone_video_decision', validator=acceptable)
             if not getattr(reply, 'ok', False):
                 return fallback
             doc = strict_json(getattr(reply, 'text', ''))
@@ -1468,7 +1478,9 @@ class QzoneVideoBridge:
                     'delay_minutes': (clamp_delay_minutes(doc['action'], delay)
                                       if doc['action'] in ('defer', 'post') else 0),
                     'asset_ids': selected,
-                    'reason': clean(doc.get('reason'), 300) or '未提供具体理由'}
+                    'reason': clean(doc.get('reason'), 300) or '未提供具体理由',
+                    'used_template': bool(getattr(reply, 'used_template', False)),
+                    'template_name': getattr(reply, 'template_name', '')}
         except asyncio.CancelledError:
             raise
         except Exception:

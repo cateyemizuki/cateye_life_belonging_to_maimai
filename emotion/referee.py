@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional, Tuple
 
 from core.json_payload import extract_json_payload
@@ -63,6 +64,15 @@ def _clip_prompt_body(text: str, max_chars: int, keep_recent: bool) -> str:
 def _parse_json_loose(text: str) -> Optional[Dict[str, Any]]:
     """宽松 JSON 解析（复核 P1-12：统一走 core.json_payload，含 think/围栏/前导+ 兜底）。"""
     return extract_json_payload(text)
+
+
+def _valid_delta(text, limit):
+    data = _parse_json_loose(text)
+    values = data.get("delta_vad") if isinstance(data, dict) else None
+    return isinstance(values, dict) and all(
+        isinstance(values.get(key), (int, float)) and not isinstance(values[key], bool)
+        and math.isfinite(values[key]) and abs(values[key]) <= limit
+        for key in ("valence", "arousal", "dominance"))
 
 
 def _delta_from(data: Any, limit: float) -> Optional[VADState]:
@@ -128,7 +138,7 @@ async def ask_sleep_referee(llm: Any, *, persona: str, vad: VADState, emotion_lo
     # 用户提示词不再重复人设（persona 形参保留兼容，渲染传空防旧模板 KeyError）。
     response = await llm.generate(prompt, module="emotion", task_name=task_name,
                                   temperature=0.4, event="emotion_sleep_referee",
-                                  with_identity=True)
+                                  with_identity=True, validator=lambda text: _valid_delta(text, limit))
     data = _parse_json_loose(response)
     if data is None or "delta_vad" not in data:
         return None
@@ -264,7 +274,7 @@ async def evaluate_daily_settlement(llm: Any, summary: str, current_vad: Optiona
         ),
         module="emotion", task_name=task_name, temperature=0.2,
         event="emotion_daily_settlement",
-        with_identity=True,
+        with_identity=True, validator=lambda text: _valid_delta(text, limit),
     )
     data = _parse_json_loose(response)
     if not isinstance(data, dict) or "delta_vad" not in data:

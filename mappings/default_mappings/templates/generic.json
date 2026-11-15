@@ -1,0 +1,11 @@
+{
+  "event": "generic",
+  "title": "保守默认结果",
+  "tier": "small",
+  "format": "text",
+  "light": true,
+  "required": [],
+  "kind": "generic",
+  "ok": false,
+  "response": "暂时没有可用结果"
+}

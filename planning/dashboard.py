@@ -35,12 +35,14 @@ def _row(row: Any) -> dict[str, Any]:
     if not isinstance(row, dict):
         return {}
     result = {key: str(row[key])[:160] for key in
-              ('name', 'goal_type', 'status', 'source', 'attention_mode', 'schedule_date', 'hardness')
+              ('name', 'goal_type', 'status', 'source', 'attention_mode', 'schedule_date', 'hardness',
+               'template_name', 'template_title', 'template_reason')
               if row.get(key) is not None}
     for key in ('start_minute', 'end_minute', 'planned_start_minute', 'planned_end_minute',
                 'actual_start_minute', 'actual_end_minute', 'day_offset', 'progress'):
         if key in row:
             result[key] = _number(row[key])
+    if row.get('template_used') is True:result['template_used'] = True
     start = result.get('planned_start_minute', result.get('start_minute'))
     end = result.get('planned_end_minute', result.get('end_minute'))
     result['time_label'] = ' — '.join(format_day_minute(int(v)) if v is not None else '待定'
@@ -1381,7 +1383,7 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
     video['available'] = bool(recent_ok or interests_ok)
     result['video'] = video
     try:
-        from core.monitoring import usage_summary, runtime_health
+        from core.monitoring import usage_summary, runtime_health, decorate_usage_rows
         data_dir = ctx.data_dir
         if data_dir:
             result['usage'] = usage_summary(data_dir, now, usage_hours)
@@ -1390,6 +1392,7 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
                 result['usage']['rows_page'] = LLMUsageTracker(data_dir).rows(
                     usage_hours, now=now, limit=int(usage_rows_limit),
                     offset=max(0, int(usage_rows_offset or 0)))
+                decorate_usage_rows(result['usage']['rows_page']['rows'],result['usage']['generation_logs'])
         result['health'] = runtime_health(plugin, now)
     except Exception:
         pass

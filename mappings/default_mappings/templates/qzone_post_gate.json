@@ -1,0 +1,11 @@
+{
+  "event": "qzone_post_gate",
+  "title": "空间发布默认通行",
+  "tier": "small",
+  "format": "decision",
+  "light": true,
+  "required": [],
+  "kind": "qzone_post_gate",
+  "ok": true,
+  "response": "是|采用默认判定，仍遵守发送范围、预算与睡眠限制"
+}

@@ -1,0 +1,11 @@
+{
+  "event": "video_watch_description",
+  "title": "视频描述暂不可用",
+  "tier": "small",
+  "format": "text",
+  "light": true,
+  "required": [],
+  "kind": "video_watch_description",
+  "ok": false,
+  "response": "暂时没有可用的内容描述"
+}

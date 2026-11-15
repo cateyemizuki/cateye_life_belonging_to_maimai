@@ -280,6 +280,10 @@ class VideoWatchService:
         except Exception as exc:
             llm_result = None
             visual["summary_error"] = f"画面理解调用异常：{exc}"
+        if getattr(llm_result, "used_template", False):
+            visual["fallback_text"] = str(llm_result.text)
+            visual["template_name"] = llm_result.template_name
+            visual["summary_source"] = "template_unavailable"
         ok = getattr(llm_result, "ok", False)
         if ok:
             visual["summary"] = str(getattr(llm_result, "text", "") or "")
@@ -370,6 +374,10 @@ class VideoWatchService:
             response = await self._llm_generate_detailed(
                 prompt, task_name=task_name, temperature=0.4, strict_params=True,
                 event="video_watch_description")
+            if getattr(response, "used_template", False):
+                result["content_description_fallback"] = str(response.text)
+                result["content_description_source"] = "template_unavailable"
+                result["content_description_template"] = response.template_name
             text = str(getattr(response, "text", "") or "").strip()
             if not getattr(response, "ok", False) or not text:
                 raise ValueError(str(getattr(response, "error", "") or "模型未返回可用描述"))
@@ -427,6 +435,10 @@ class VideoWatchService:
         except Exception as exc:
             llm_result = None
             result["impression_error"] = f"观后感生成异常：{exc}"
+        if getattr(llm_result, "used_template", False):
+            result["impression_fallback"] = str(llm_result.text)
+            result["impression_source"] = "template_unavailable"
+            result["impression_template"] = llm_result.template_name
         if getattr(llm_result, "ok", False):
             result["impression"] = str(getattr(llm_result, "text", "") or "")
             result["impression_task"] = task_name or "utils"

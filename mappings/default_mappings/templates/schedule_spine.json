@@ -1,0 +1,15 @@
+{
+  "event": "schedule_spine",
+  "title": "基础作息日程",
+  "tier": "medium",
+  "format": "json",
+  "light": false,
+  "required": [
+    "intentions"
+  ],
+  "kind": "schedule_spine",
+  "ok": true,
+  "response": {
+    "use_schedule_template": true
+  }
+}

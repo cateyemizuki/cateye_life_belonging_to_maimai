@@ -1,0 +1,15 @@
+{
+  "event": "schedule_events",
+  "title": "日常小事件",
+  "tier": "large",
+  "format": "json",
+  "light": false,
+  "required": [
+    "events"
+  ],
+  "kind": "events",
+  "ok": true,
+  "response": {
+    "events": []
+  }
+}

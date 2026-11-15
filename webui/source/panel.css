@@ -638,3 +638,17 @@ html[data-embedded=true] .mast-side{padding-right:10px}
 .core-log-row{border:1px solid color-mix(in oklch,var(--maibot-danger) 30%,transparent);border-left:3px solid var(--maibot-danger);border-radius:10px;background:var(--maibot-surface);padding:11px 13px}
 .core-log-event{margin-top:7px;font-size:12px;line-height:1.5;color:var(--maibot-danger);word-break:break-word;font-family:var(--maibot-font-mono)}
 @media(max-width:900px){.core-cols{grid-template-columns:1fr}.core-modules{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* 3.18.1: generation outcomes share one layout in all dashboard styles. */
+.usage-level-counts,.generation-log-head{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.generation-log-head{justify-content:space-between}.generation-log-head label{font-size:12px}
+#usage-level-filter{padding:5px 8px;border:1px solid var(--maibot-border);border-radius:7px;color:inherit;background:var(--maibot-surface)}
+.usage-level,.usage-template{display:inline-block;padding:2px 6px;border-radius:5px;background:var(--maibot-soft);font-size:11px;overflow-wrap:anywhere}
+.usage-level[data-level=info]{color:var(--maibot-primary)}
+.usage-level[data-level=warn],.usage-template{color:#885211;background:#f7e9cf}
+.usage-level[data-level=error]{color:var(--maibot-danger);border:1px solid currentColor}
+[data-theme=dark] .usage-level[data-level=warn],[data-theme=dark] .usage-template{color:#f0cb91;background:#44331d}
+.generation-logs{list-style:none;padding:0;margin:0;max-height:440px;overflow:auto}
+.generation-log{display:grid;grid-template-columns:minmax(125px,.8fr) minmax(0,3fr);gap:8px 14px;border-top:1px solid var(--maibot-border);padding:10px 0;font-size:12px;overflow-wrap:anywhere}
+.generation-log-context{display:flex;align-items:flex-start;flex-direction:column;gap:5px}.generation-log p{margin:4px 0}
+@media(max-width:540px){.generation-log{grid-template-columns:1fr}.generation-log-context{flex-direction:row;align-items:center;flex-wrap:wrap}}

@@ -1,0 +1,17 @@
+{
+  "event": "video_interest",
+  "title": "沿用已有兴趣或空默认值",
+  "tier": "large",
+  "format": "json",
+  "light": false,
+  "required": [
+    "keywords"
+  ],
+  "kind": "video_interest",
+  "ok": false,
+  "response": {
+    "keywords": [],
+    "topics": [],
+    "answer": ""
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "event": "affection_review",
+  "title": "好感度保持不变",
+  "tier": "small",
+  "format": "json",
+  "light": true,
+  "required": [
+    "delta"
+  ],
+  "kind": "affection_review",
+  "ok": true,
+  "response": {
+    "event": "",
+    "delta": 0.0,
+    "tag": "normal"
+  }
+}

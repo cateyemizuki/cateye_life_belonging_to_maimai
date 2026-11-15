@@ -30,9 +30,19 @@ class ShareEvaluator:
         # PR-AUDIT（3.16.1 PR-1）：人设由 LLMService with_identity=True 统一注入 system
         # 前缀（生产接线 plugin.py），body 不再序列化 persona；persona_provider 注入保留兼容。
         body={'state':self._state(),'video':facts,'allowed_audiences':audiences[:8]}
+        valid={r['stream_id'] for r in audiences[:8]}
+        def acceptable(text):
+            doc=strict_json(text)
+            if not isinstance(doc,dict):return False
+            target=doc.get('target_stream_id','')
+            if (target and target not in valid) or (doc.get('action')=='share' and target not in valid):return False
+            updates=doc.get('profile_topics',{})
+            if not isinstance(updates,dict) or any(key not in valid or not isinstance(value,list) for key,value in updates.items()):return False
+            delay=number(doc.get('delay_seconds'),-1)
+            return 300<=delay<=3600 if doc.get('action')=='defer' else delay==0
         try:
             reply=await self._generate(POLICY+json.dumps(body,ensure_ascii=False),
-                task_name=self._task() or 'utils',temperature=0.3,strict_params=True,event='video_share_evaluation')
+                task_name=self._task() or 'utils',temperature=0.3,strict_params=True,event='video_share_evaluation',validator=acceptable)
             if not getattr(reply,'ok',False):return fallback
             doc=strict_json(getattr(reply,'text',''))
             if not isinstance(doc,dict):return fallback
@@ -45,6 +55,8 @@ class ShareEvaluator:
             updates=doc.get('profile_topics')
             updates={k:v for k,v in updates.items() if k in valid and isinstance(v,list)} if isinstance(updates,dict) else {}
             return {'action':action,'target_stream_id':target,'reason':clean(doc.get('reason'),300) or '未提供具体理由',
-                    'delay_seconds':max(300,min(3600,delay)) if action=='defer' else 0,'profile_topics':updates}
+                    'delay_seconds':max(300,min(3600,delay)) if action=='defer' else 0,'profile_topics':updates,
+                    'used_template':bool(getattr(reply,'used_template',False)),
+                    'template_name':getattr(reply,'template_name','')}
         except asyncio.CancelledError:raise
         except Exception:return fallback

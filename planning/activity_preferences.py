@@ -572,6 +572,15 @@ class ActivityPreferencesService:
         batch = needed[:self._batch_size]
         prompt = self._build_prompt(batch, include_traits=include_traits)
         event_tag = _EVENT_TAG_PROFILE if include_traits else _EVENT_TAG_SCORE
+        def acceptable(response):
+            from core.llm_templates import parse_json
+            document = parse_json(response)
+            parsed = self._parse_response(response, batch, include_traits=include_traits)
+            return (len(document.get("activities",[])) == len(batch)
+                    and all(isinstance(item,dict) and item.get("reason_code") in REASON_CODES for item in document["activities"])
+                    and len(parsed["entries"]) == len(batch)
+                    and (not include_traits or parsed["traits"] is not None))
+        remaining_attempts = DAILY_REQUEST_LIMIT - self._requests_today
         # 请求计数在发送前落账（含发出后失败）；热重载恢复不重置。
         self._requests_today += 1
         self._total_requests += 1
@@ -580,12 +589,16 @@ class ActivityPreferencesService:
             result = await self._llm.generate_detailed(
                 prompt, module="planning", task_name="utils",
                 with_identity=True, event=event_tag,
-                timeout_ms=REQUEST_TIMEOUT_MS, temperature=0.4)
+                timeout_ms=REQUEST_TIMEOUT_MS, temperature=0.4, validator=acceptable,
+                max_attempts=remaining_attempts)
         except Exception as exc:
             self._backoff_until = self._now() + timedelta(minutes=BACKOFF_MINUTES)
             self._save()
             self._log("planning.preferences_request_failed", error=str(exc))
             return {"status": "failed", "error": str(exc), "pending": len(needed)}
+        extra_attempts = max(0, int(getattr(result, "attempts", 1) or 1) - 1)
+        self._requests_today += extra_attempts
+        self._total_requests += extra_attempts
         tokens = int(getattr(result, "total_tokens", None) or 0)
         self._total_tokens += max(0, tokens)
         if not getattr(result, "ok", False):

@@ -342,6 +342,9 @@ class ScheduleGenerator:
         min_intentions = _int("min_intentions", 3, 1)
         if min_intentions > max_intentions:
             min_intentions = max_intentions
+        advanced = getattr(getattr(self._plugin, "config", None), "schedule_advanced", None)
+        try:rounds = max(1, min(20, int(getattr(advanced, "max_rounds", 6))))
+        except (TypeError, ValueError):rounds = 6
         return {
             "min_intentions": min_intentions,
             "max_intentions": max_intentions,
@@ -350,7 +353,7 @@ class ScheduleGenerator:
             "history_messages": _int("spine_history_messages", 12, 0),
             "knowledge_limit": _int("spine_knowledge_limit", 3, 0),
 
-            "max_rounds": max(1, int(getattr(getattr(getattr(self._plugin, "config", None), "schedule_advanced", None), "max_rounds", 6))),
+            "max_rounds": rounds,
             "over_limit_auto_trim": _over_limit_trim(self._plugin),
         }
 
@@ -389,7 +392,7 @@ class ScheduleGenerator:
             personality=personality, lover_name=lover_name, wake_time=wake_time,
             sleep_time=sleep_time, min_activities=params["min_intentions"],
             max_activities=params["max_intentions"], timeout_seconds=timeout_seconds,
-            use_multi_round=False, max_rounds=1, quality_threshold=1.0,
+            use_multi_round=True, max_rounds=params["max_rounds"], quality_threshold=1.0,
             enable_detailed_description=True, min_description_length=15,
             max_description_length=25,
             custom_prompt=custom_prompt, recent_schedule_days=params["recent_days"],
@@ -417,43 +420,71 @@ class ScheduleGenerator:
         )
 
         rows: List[Dict[str, Any]] = []
-        last_error: Optional[Exception] = None
-        # intention_multi_round=true 时最多 2 次同提示重试（结构校验：拿到可用意图即收），
-        # 不带反馈重试、不跑质量评分（设计 §4.2：单轮、结构校验、不强制重试）
-        for _ in range(params["max_rounds"]):
+        previous = ""
+        fallback_used = False
+        fallback_reason = ""
+
+        def acceptable(response):
+            from core.llm_templates import parse_json
+            document = parse_json(response)
+            raw = document if isinstance(document,list) else document.get("intentions",document.get("schedule_items",[]))
+            intentions = self._parse_spine_response(response)
+            if len(raw) != len(intentions):return False
+            if len(intentions) > params["max_intentions"] and not params.get("over_limit_auto_trim"):
+                return False
+            for item in intentions:
+                window = item.get("window")
+                if not isinstance(window,(tuple,list)) or len(window)!=2 or any(parse_hhmm(str(value),-1)<0 for value in window):return False
+            candidate = [self._spine_intention_to_row(item, date) for item in intentions]
+            if not candidate or any(row is None for row in candidate):return False
+            candidate = self._ensure_spine_sleep_intent(candidate, date, wake_time, sleep_time,
+                max_intentions=params["max_intentions"], no_sleep_mode=no_sleep_mode)
+            return len(candidate) >= params["min_intentions"]
+
+        # Quality rounds refine a valid candidate. Failure retries belong exclusively
+        # to LLMService; a failed round ends refinement and keeps the last valid plan.
+        for index in range(params["max_rounds"]):
+            round_prompt = prompt
+            if previous:
+                round_prompt += ("\n\n这是第 " + str(index + 1) + " 轮日程完善。检查上一轮与作息、约定、"
+                    "意图数量及时间窗口是否一致，保留合理安排，输出完整的修订 JSON。\n上一轮：\n" + previous)
             try:
-                response = await self._call_llm(prompt, gen_config, event="schedule_spine")
-            except LLMError as exc:
-                # 配额耗尽 / 速率限制属致命错误，不再重试
-                last_error = exc
-                break
+                response = await self._call_llm(round_prompt, gen_config, event="schedule_spine",
+                    validator=acceptable, fallback_context={"previous_response": previous})
+                if getattr(response, "used_template", False):
+                    fallback_used = True
+                    fallback_reason = str(getattr(response, "fallback_reason", ""))[:200]
+                    break
+                if not acceptable(response):
+                    fallback_used = True
+                    fallback_reason = "本轮日程未通过结构校验"
+                    break
+                previous = str(response)
+                rows = self._spine_rows_from_intentions(self._parse_spine_response(response), date, params)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                last_error = exc
-                continue
-            try:
-                rows = self._spine_rows_from_intentions(
-                    self._parse_spine_response(response), date, params)
-            except Exception as exc:
-                last_error = exc
-                rows = []
-                continue
-            if rows:
+                fallback_used = True
+                fallback_reason = type(exc).__name__
                 break
         if rows:
-            # 锚点护栏：睡觉意图缺失（且非无睡眠模式）时补一条模板睡觉意图（hard）
             rows = self._ensure_spine_sleep_intent(rows, date, wake_time, sleep_time,
-                                                   max_intentions=params["max_intentions"],
-                                                   no_sleep_mode=no_sleep_mode)
+                max_intentions=params["max_intentions"], no_sleep_mode=no_sleep_mode)
+            if fallback_used:
+                for row in rows:
+                    row.setdefault("parameters", {}).update(template_used=True, template_name="schedule_spine",
+                        template_title="上一轮有效日程", template_reason=fallback_reason)
         else:
-            if last_error is not None:
-                logger.warning("spine LLM 生成失败（%s），使用模板 spine 兜底", last_error)
-            else:
-                logger.warning("spine LLM 响应无有效意图，使用模板 spine 兜底")
-            rows = self._build_spine_fallback(
-                date, wake_time=wake_time, sleep_time=sleep_time,
+            fallback_used = True
+            logger.warning("spine LLM 生成失败，使用基础作息模板：%s", fallback_reason)
+            rows = self._build_spine_fallback(date, wake_time=wake_time, sleep_time=sleep_time,
                 no_sleep_mode=no_sleep_mode, max_intentions=params["max_intentions"])
-            if entry_reason == REASON_SCHEDULED:
-                entry_reason = REASON_FALLBACK
+            for row in rows:
+                row["parameters"]["template_reason"] = fallback_reason
+        if fallback_used and entry_reason == REASON_SCHEDULED:
+            entry_reason = REASON_FALLBACK
+        rows = self._ensure_spine_sleep_intent(rows, date, wake_time, sleep_time,
+            max_intentions=params["max_intentions"], no_sleep_mode=no_sleep_mode)
 
         if apply:
             self.apply_schedule_items(rows, date, consume_commitments=True,
@@ -634,6 +665,8 @@ class ScheduleGenerator:
         rows.append(cls._spine_row(date, "睡觉", sleep_min, sleep_min + span, "sleep",
                                    "high", span, span, hardness="hard",
                                    interruptibility=0.05))
+        rows[-1]["parameters"].update(template_used=True,template_name="schedule_spine",
+                                      template_title="作息锚点补齐",template_reason="生成结果未包含睡眠锚点")
         rows.sort(key=lambda it: int(it["start_minute"]))
         try:
             cap = max(1, int(max_intentions))
@@ -687,60 +720,13 @@ class ScheduleGenerator:
         }
 
     @staticmethod
-    def _build_spine_fallback(
-        date: str,
-        *,
-        wake_time: str = "07:00",
-        sleep_time: str = "23:00",
-        no_sleep_mode: bool = False,
-        max_intentions: int = 6,
-    ) -> List[Dict[str, Any]]:
-        """模板 spine 兜底（LLM 全轮失败 / 空响应；不重试多轮，设计 §4.4）。
-
-        口径（behavior 183 守卫同源）：锚定 ``[schedule]`` 生效作息锚点生成
-        睡觉/起床/三餐 + 1 个通用意图——**禁硬编码时刻**，所有钟点一律
-        ``parse_hhmm(wake_time/sleep_time)`` 同链同源派生（早餐锚起床、午餐锚日间
-        三分点、晚餐锚入睡前3~5小时）；跨午夜作息（sleep <= wake）的清醒跨度经
-        :func:`ring_minutes_ahead` 环距计算，不手写 −1440。
-        """
-        wake_min = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
-        sleep_min = parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES)
-        # 清醒跨度（环距；常规作息 = sleep−wake，跨午夜 = wake−sleep+1440；退化 = 全天）
-        awake_span = ring_minutes_ahead(sleep_min, wake_min) or DAY_MINUTES
-        awake_end = wake_min + awake_span  # = sleep_min（常规）或 sleep_min+1440（跨午夜）
-
-        def row(name: str, start: int, end: int, goal_type: str, priority: str,
-                min_minutes: int, max_minutes: int, interruptibility: float,
-                hardness: str = "soft") -> Dict[str, Any]:
-            return ScheduleGenerator._spine_row(
-                date, name, start, end, goal_type, priority,
-                min_minutes, max_minutes, interruptibility=interruptibility, hardness=hardness)
-
-        rows: List[Dict[str, Any]] = []
-        if not no_sleep_mode:
-            span = max(180, min(720, ring_minutes_ahead(wake_min, sleep_min)))
-            # 睡眠锚点分类与正常生成/缺项补齐统一为 hard（P1）；显示类别由 WebUI
-            # 按 goal_type 独立标"作息参考"，不随生成路径成败改变（P2/P3）。
-            rows.append(row("睡觉", sleep_min, sleep_min + span, "sleep", "high",
-                            span, span, 0.05, hardness="hard"))
-        rows.append(row("起床洗漱", wake_min, wake_min + 30, "daily_routine", "medium", 15, 30, 0.9))
-        rows.append(row("早餐", wake_min, wake_min + 120, "meal", "medium", 15, 40, 0.9))
-        mid = wake_min + awake_span // 3
-        rows.append(row("午餐", max(wake_min, mid - 90), min(awake_end, mid + 90),
-                        "meal", "medium", 20, 45, 0.9))
-        if awake_span >= 480:
-            rows.append(row("自由安排", wake_min + 150, awake_end - 330,
-                            "free_time", "low", 30, 90, 0.95))
-        if awake_span >= 360:
-            rows.append(row("晚餐", awake_end - 300, awake_end - 180,
-                            "meal", "medium", 20, 45, 0.9))
-        if len(rows) > max_intentions:
-            # 截断保睡觉（硬锚点）：睡觉行 + 起始的 (max-1) 条
-            sleep_rows = [r for r in rows if r["goal_type"] == "sleep"]
-            others = [r for r in rows if r["goal_type"] != "sleep"]
-            rows = sleep_rows + others[: max(0, max_intentions - len(sleep_rows))]
-        rows.sort(key=lambda it: int(it["start_minute"]))
-        return rows
+    def _build_spine_fallback(date: str, *, wake_time: str = "07:00", sleep_time: str = "23:00",
+                              no_sleep_mode: bool = False, max_intentions: int = 6) -> List[Dict[str, Any]]:
+        """Read the external template and render it against the active cycle anchors."""
+        from core.llm_templates import schedule_rows
+        return schedule_rows(date, wake_min=parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES),
+            sleep_min=parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES), no_sleep_mode=no_sleep_mode,
+            max_intentions=max_intentions, row_builder=ScheduleGenerator._spine_row)
 
     # ============================================================
     # 配置装配
@@ -953,42 +939,12 @@ class ScheduleGenerator:
             logger.debug(f"知识库检索失败: {exc}")
             base.knowledge_context = ""
 
-    async def _call_llm(
-        self,
-        prompt: str,
-        gen_config: ScheduleGeneratorConfig,
-        *,
-        event: str = "schedule_spine",
-    ) -> str:
-        """调用 LLM（走 core.llm_utils.LLMService，带任务路由 + 调用日志）。
-
-        ``event`` = 消耗账本（core/llm_usage.py）的调用点标签：spine 分支传
-        ``schedule_spine``。PR8 3.0.0 清退旧 daily 生成链后本方法只剩 spine 唯一
-        调用点（依据 = 用户 2026-10-27 授权直接清理），恒返回原始文本——解析由
-        spine 自包含的 :meth:`_parse_spine_response` 承担（旧 ``parse`` 参数与
-        ``_parse_response`` 已随 daily 链删除）。人设经 ``with_identity=True``
-        以宿主同款开头注入 system_prompt（共享前缀缓存），用户提示词不再带人设。
-        """
-        task_name = gen_config.llm_task_name
-        temperature = float(self._raw_of(gen_config).get("temperature", 0.85))
-        timeout_ms = int(float(gen_config.generation_timeout) * 1000)
-
-        response = await asyncio.wait_for(
-            self._llm.generate(
-                prompt,
-                task_name=task_name,
-                temperature=temperature,
-
-                timeout_ms=timeout_ms,
-                module="planning",
-                event=event,
-                with_identity=True,
-            ),
-            timeout=float(gen_config.generation_timeout) + 15.0,
-        )
-        if not response:
-            raise LLMError("LLM 调用失败（空响应）")
-        return response
+    async def _call_llm(self, prompt: str, gen_config: ScheduleGeneratorConfig, *,
+                        event: str = "schedule_spine", validator=None, fallback_context=None) -> str:
+        return await self._llm.generate(prompt, task_name=gen_config.llm_task_name,
+            temperature=float(self._raw_of(gen_config).get("temperature", .85)),
+            timeout_ms=int(float(gen_config.generation_timeout)*1000), module="planning",
+            event=event, with_identity=True, validator=validator, fallback_context=fallback_context)
 
     # ============================================================
     # 约定匹配

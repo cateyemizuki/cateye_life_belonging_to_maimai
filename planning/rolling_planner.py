@@ -317,6 +317,10 @@ def extract_spine_intents(items: Any) -> List[Dict[str, Any]]:
             "end_minute": int(item.get("end_minute") or 0),
             "day_offset": item.get("day_offset"),
         })
+        if params.get("template_used") or item.get("entry_reason") == "fallback_template":
+            out[-1].update(template_used=True,template_name=str(params.get("template_name") or "schedule_spine"),
+                           template_title=str(params.get("template_title") or "基础作息日程"),
+                           template_reason=str(params.get("template_reason") or ""))
     return out
 
 

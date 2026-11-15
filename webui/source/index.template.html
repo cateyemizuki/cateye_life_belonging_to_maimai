@@ -41,11 +41,17 @@
   <p class="note" id="usage-detail-split"></p>
   <h4>调用结果</h4>
   <div id="usage-buckets" class="bucket-grid"></div>
+  <div id="usage-level-counts" class="usage-level-counts" aria-label="调用日志级别"></div>
  </section>
  <section class="usage-section" aria-labelledby="usage-models-heading">
   <h3 id="usage-models-heading">模块与模型</h3>
   <p class="note" id="usage-models-hint">按模块展示各模型的调用与 Token。</p>
   <div id="usage-models"></div>
+ </section>
+ <section class="usage-section" aria-labelledby="generation-logs-heading">
+  <div class="generation-log-head"><h3 id="generation-logs-heading">生成日志与模板</h3><label>级别 <select id="usage-level-filter"><option value="">全部级别</option><option value="info">info · 正常</option><option value="warn">warn · 警告</option><option value="error">error · 失败</option></select></label></div>
+  <p class="note">输出消耗警告：大档 16,000 · 中档 10,000 · 小档 4,000 Token。日志包含重试和模板记录，模板不增加调用次数或 Token。</p>
+  <div id="generation-logs"></div>
  </section>
  <section class="usage-section usage-details" id="usage-details">
   <h3>逐笔记录</h3>

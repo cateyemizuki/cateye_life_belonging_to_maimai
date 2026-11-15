@@ -351,7 +351,10 @@ class InitiativeMemory:
                     h, l = float(h), float(l)
                     if not (math.isfinite(h) and math.isfinite(l) and 2 <= h <= 24 and 0 <= l <= 1):
                         raise ValueError('out of bounds')
-                    profile.update(anchor_hours=h, loneliness=l, source='persona_llm')
+                    profile.update(anchor_hours=h, loneliness=l,
+                        source='template' if getattr(text,'used_template',False) else 'persona_llm')
+                    if getattr(text,'used_template',False):
+                        profile['fallback_reason'] = getattr(text,'fallback_reason','generation_unavailable')
                 except asyncio.CancelledError:
                     raise
                 except Exception:

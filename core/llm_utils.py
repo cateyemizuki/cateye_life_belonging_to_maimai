@@ -49,10 +49,10 @@ def prepare_prompt_arg(prompt: Any, system_prompt: str = "") -> Any:
     """按宿主约定把 str prompt + system 转成消息列表（唯一构造点）。"""
     if not system_prompt:
         return prompt
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": prompt},
-    ]
+    system = {"role": "system", "content": system_prompt}
+    if isinstance(prompt, (list, tuple)) and all(isinstance(item, dict) and "role" in item for item in prompt):
+        return [system, *prompt]
+    return [system, {"role": "user", "content": prompt}]
 
 
 def prompt_payload_bytes(prompt_arg: Any) -> int:
@@ -90,7 +90,7 @@ def classify_llm_error(error: Any, error_code: Any = None) -> str:
 
 @dataclass(frozen=True)
 class LLMResult:
-    """单次（含内部降级）LLM 调用的请求关联详细结果。
+    """一次统一生成（可含有界重试）的请求关联详细结果。
 
     所有字段都来自本次调用自己的返回，不使用共享 ``last_error``/``last_usage``；
     ``request_id`` 用于并发排查。``attempts`` 是真正发给宿主的模型请求次数
@@ -123,8 +123,16 @@ class LLMResult:
     receipt: Optional[Any] = None
     #: 3.17.6（PR-REMOVE-POOLCAP E_LLM 诊断）：宿主若回传 finish_reason 则透传
     #: （现行宿主 capability payload 无此字段 → 空串；截断诊断另有 completion_tokens
-    #: 触顶启发式兜底）。只读诊断，不参与业务判断。
+    #: 触顶启发式兜底）。统一策略用明确 length 标志触发一次格式修复。
     finish_reason: str = ""
+    used_template: bool = False
+    template_name: str = ""
+    template_title: str = ""
+    fallback_reason: str = ""
+    level: str = "info"
+    tier: str = "small"
+    warning_threshold: int = 4000
+    policy_group_id: str = ""
 
 
 def extract_cache_usage(result: Any) -> tuple[Optional[int], Optional[int]]:
@@ -311,6 +319,7 @@ class LLMService:
             self._usage_tracker = None
         #: 统一入口（懒建：LLMService 保留薄壳签名，内部唯一出口在 tools.llm_gateway）
         self._llm_gateway: Optional[Any] = None
+        self._generation_policy: Optional[Any] = None
 
     def _gateway(self) -> Any:
         """懒建 Gateway（避免 core 与 tools 的模块级循环导入）。"""
@@ -337,38 +346,19 @@ class LLMService:
         if gateway is not None:
             gateway.update_task(self._task_name, self._model_name)
 
-    async def generate(
-        self,
-        prompt: str,
-        *,
-        module: str = "",
-        system_prompt: str = "",
-        task_name: str = "",
-        temperature: float = 0.7,
-        timeout_ms: Optional[int] = None,
-        event: str = "unspecified",
-        model: str = "",
-        strict_params: bool = False,
-        with_identity: bool = False,
-        max_tokens: Optional[int] = None,
-    ) -> str:
-        """生成文本；失败/异常统一返回空串（旧契约不变，统一入口在 Gateway）。
-
-        ``module`` = 调用方业务模块（planning/emotion/qzone/companion/video/core）；
-        缺失时 Gateway 记 ``unknown`` 并留 warning。``strict_params`` 仅给需要
-        「单请求 + 参数不漂移」的调用方（事件库），语义与旧版逐字一致。
-        ``with_identity=True`` 时把宿主同款人设开头拼到 system_prompt 最前，共享前缀缓存。
-        ``max_tokens``（3.17.6）：显式输出上限 override；None = 沿用宿主任务/模型
-        配置（旧语义）。调用方负责有界夹取，Gateway 只透传。
-        """
-        result = await self.generate_detailed(
-            prompt, module=module, system_prompt=system_prompt,
-            task_name=task_name, temperature=temperature,
-            timeout_ms=timeout_ms, event=event, model=model,
-            strict_params=strict_params, with_identity=with_identity,
-            max_tokens=max_tokens,
-        )
-        return result.text
+    async def generate(self, prompt: Any, *, module: str = "", system_prompt: str = "",
+                       task_name: str = "", temperature: float = .7,
+                       timeout_ms: Optional[int] = None, event: str = "unspecified",
+                       model: str = "", strict_params: bool = False, with_identity: bool = False,
+                       max_tokens: Optional[int] = None, validator=None, fallback_context=None,
+                       tier: Optional[str] = None, light: Optional[bool] = None,
+                       max_attempts: Optional[int] = None) -> str:
+        from core.llm_policy import GeneratedText
+        result=await self.generate_detailed(prompt,module=module,system_prompt=system_prompt,
+            task_name=task_name,temperature=temperature,timeout_ms=timeout_ms,event=event,model=model,
+            strict_params=strict_params,with_identity=with_identity,validator=validator,
+            fallback_context=fallback_context,tier=tier,light=light,max_attempts=max_attempts)
+        return GeneratedText(result)
 
     async def _resolve_identity_prefix(self) -> str:
         """读宿主 bot.nickname / bot.alias_names / personality.personality 组装人设开头。"""
@@ -381,39 +371,46 @@ class LLMService:
             name, aliases, persona = "", [], ""
         return build_host_identity_prefix(name, aliases, persona)
 
-    async def generate_detailed(
-        self,
-        prompt: str,
-        *,
-        module: str = "",
-        system_prompt: str = "",
-        task_name: str = "",
-        temperature: float = 0.7,
-        timeout_ms: Optional[int] = None,
-        event: str = "unspecified",
-        model: str = "",
-        strict_params: bool = False,
-        with_identity: bool = False,
-        max_tokens: Optional[int] = None,
-    ) -> LLMResult:
-        """生成文本并返回本次请求关联的详细结果（委托 tools.llm_gateway）。
-
-        路由/降级/失败三态与旧实现逐字一致；新增 ``module`` 进入账本 v2，
-        ``LLMResult.receipt`` 携带模块、缓存命中与耗时等对账字段。
-        ``with_identity=True``：system_prompt 前置宿主同款人设开头（名称+别名+全文人设），
-        与宿主 reply 系统提示词共享前缀缓存；人设不再截断。
-        ``max_tokens``（3.17.6）：显式输出上限 override（宿主 SDK/能力层支持，
-        显式值优先于任务/模型配置）；None = 旧语义。调用方负责有界夹取。
-        """
+    async def generate_detailed(self, prompt: Any, *, module: str = "", system_prompt: str = "",
+                                task_name: str = "", temperature: float = .7,
+                                timeout_ms: Optional[int] = None, event: str = "unspecified",
+                                model: str = "", strict_params: bool = False,
+                                with_identity: bool = False, max_tokens: Optional[int] = None,
+                                validator=None, fallback_context=None, tier: Optional[str] = None,
+                                light: Optional[bool] = None, max_attempts: Optional[int] = None) -> LLMResult:
+        """统一调用出口：默认不设置输出上限；格式修复上限由策略单独控制。"""
         if with_identity:
-            identity = await self._resolve_identity_prefix()
-            system_prompt = identity + (f"\n\n{system_prompt}" if system_prompt else "")
-        return await self._gateway().generate_detailed(
-            prompt, module=module, system_prompt=system_prompt,
-            task_name=task_name, temperature=temperature,
-            timeout_ms=timeout_ms, event=event, model=model,
-            strict_params=strict_params, max_tokens=max_tokens,
-        )
+            identity=await self._resolve_identity_prefix()
+            system_prompt=identity+(f"\n\n{system_prompt}" if system_prompt else "")
+        async def invoke(*,max_tokens,timeout_ms,attempt,task_name):
+            payload=prompt
+            if attempt:
+                reminder="请重新检查输出，只返回完整结果，保持任务要求的格式与字段，不输出思考过程。"
+                if isinstance(payload,str):payload=payload+"\n\n"+reminder
+                elif isinstance(payload,list):payload=[*payload,{"role":"user","content":reminder}]
+            return await self._gateway().generate_once(payload,module=module,system_prompt=system_prompt,
+                task_name=task_name,temperature=temperature,timeout_ms=timeout_ms,event=event,model=model,
+                strict_params=strict_params,max_tokens=max_tokens,prefer_task=attempt>0)
+        return await self._policy().run(invoke,event=event,module=module,task_name=task_name or self._task_name,
+            validator=validator,fallback_context=fallback_context,tier=tier,light=light,
+            timeout_ms=timeout_ms,max_attempts=max_attempts)
+
+    def _policy(self):
+        from core.llm_policy import GenerationPolicy
+        if getattr(self,"_generation_policy",None) is None:
+            self._generation_policy=GenerationPolicy(self._record_generation)
+        return self._generation_policy
+
+    def _record_generation(self,**entry):
+        logger=getattr(self,"_call_logger",None)
+        if logger is None:
+            data_dir=getattr(getattr(self._ctx,"paths",None),"data_dir",None)
+            if data_dir:
+                from core.diag import LLMCallLogger
+                logger=LLMCallLogger(data_dir,enabled=True,retention_days=30)
+                self._call_logger=logger
+        recorder=getattr(logger,"record_generation",None)
+        if callable(recorder):recorder(**entry)
 
     def _exception_result(self, exc: BaseException, *, event: str, task: str,
                           request_id: str, attempts: int, category: str,
@@ -549,20 +546,10 @@ class LLMService:
                     "image_url": {"url": f"data:image/png;base64,{extra}"},
                 })
         message = [{"role": "user", "content": content}]
-        try:
-            result = await self._gateway().generate_messages(
-                message, module=module, task_name=str(task_name or self._task_name),
-                temperature=temperature, event=event)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._log(event, str(task_name or self._task_name), False, "", str(e))
-            try:
-                self._ctx.logger.warning(f"视觉理解调用异常: {e}")
-            except Exception:
-                pass
-            return ""
-        return result.text
+        result=await self.generate_detailed(message,module=module,task_name=task_name or self._task_name,
+                                            temperature=temperature,event=event)
+        from core.llm_policy import GeneratedText
+        return GeneratedText(result)
 
     def _log(self, event: str, task: str, success: bool, response: str = "", error: str = "") -> None:
         if self._call_logger is not None:
@@ -570,8 +557,3 @@ class LLMService:
                 self._call_logger.record(event=event, task=task, success=success, response=response, error=error)
             except Exception:
                 pass
-
-    async def generate_or_fallback(self, prompt: str, fallback: str, **kwargs: Any) -> str:
-        text = await self.generate(prompt, **kwargs)
-        text = text.strip()
-        return text if text else fallback

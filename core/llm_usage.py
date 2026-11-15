@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from .llm_templates import usage_level
 
 logger = logging.getLogger(__name__)
 
@@ -475,6 +476,8 @@ class LLMUsageTracker:
                         if include_rows:
                             rows.append({
                                 "ts": row.ts, "module": module, "event": row.event,
+                                "request_id": row.request_id,
+                                **usage_level(row.event, row.success, row.completion, row.abandoned),
                                 "task_name": row.task_name, "model": model,
                                 "prompt": row.prompt, "completion": row.completion,
                                 "tokens": count, "cache_hit": row.cache_hit,

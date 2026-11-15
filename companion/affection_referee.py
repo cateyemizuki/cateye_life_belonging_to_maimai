@@ -208,7 +208,7 @@ async def evaluate_conversation_delta(
     data = _parse_json_loose(response)
     if data is None or "delta" not in data:
         return None
-    event = _clean_text(data.get("event"), 30) or "日常闲聊"
+    event = "模板回退" if getattr(response,"used_template",False) else (_clean_text(data.get("event"), 30) or "日常闲聊")
     tag = _clean_text(data.get("tag"), 16).lower()
     if tag not in REVIEW_TAGS:
         tag = "normal"

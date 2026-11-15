@@ -101,36 +101,7 @@ ALLOWED_GOAL_TYPES = frozenset({"daily_routine", "rest", "social", "entertainmen
 #: 事件生成 LLM 调用点标签（接线工人需把 schedule_events 登记到
 #: core/llm_usage.py 的 EVENT_MODULE_MAP → planning）
 LLM_EVENT_NAME = "schedule_events"
-LLM_FALLBACK_TASK = "utils"
 EVENT_GENERATION_TEMPERATURE = GENERATION_TEMPERATURE
-#: 3.17.6（PR-REMOVE-POOLCAP §2.5 E_LLM 截断修复）：事件生成显式 override
-#: max_tokens——按本时段 requested 条数动态：下限 2000（全量验证 dwfrun-bebdbd00：
-#: 16-24 段 9 事件需 ~999 completion tokens，max_tokens=2000 5/5 全绿、800 截断），
-#: 每条 220 tokens，封顶 6000（有界不无界放大；单段请求上限 12+12=24 → 5280）。
-#: 宿主链路支持显式 override 且优先于任务/模型配置（SDK ctx.llm.generate →
-#: 宿主 llm.generate capability → _resolve_effective_max_tokens）。
-EVENT_LLM_MAX_TOKENS_FLOOR = 2000
-EVENT_LLM_TOKENS_PER_EVENT = 220
-EVENT_LLM_MAX_TOKENS_CAP = 6000
-
-
-def event_generation_max_tokens(requested: int) -> int:
-    """事件生成输出上限（有界）：min(6000, max(2000, requested*220))。"""
-    return min(EVENT_LLM_MAX_TOKENS_CAP,
-               max(EVENT_LLM_MAX_TOKENS_FLOOR,
-                   max(0, int(requested)) * EVENT_LLM_TOKENS_PER_EVENT))
-
-
-def _response_truncated(result: Any, max_tokens_sent: Optional[int]) -> bool:
-    """截断判定：finish_reason=length 明示优先；宿主不回传 finish_reason 时
-    以 completion_tokens 触顶（>= 本次发送的 max_tokens）启发式兜底。"""
-    if str(getattr(result, "finish_reason", "") or "").strip().lower() == "length":
-        return True
-    completion = getattr(result, "completion_tokens", None)
-    return bool(max_tokens_sent and completion is not None
-                and int(completion) >= int(max_tokens_sent))
-
-
 def _callable_accepts(fn: Any, name: str) -> bool:
     """旧测试桩兼容：签名含 name 或 **kwargs 才传新参数（无法内省按支持处理）。"""
     import inspect
@@ -922,7 +893,7 @@ class EventCatalogStore:
                     "state_deltas": {k: float(v) for k, v in dict(raw.get("state_deltas") or {}).items()},
                     "templates": [str(x) for x in raw.get("templates") or ()],
                     "enabled": True,
-                    "source": "llm",
+                    "source": "template" if raw.get("source") == "template" else "llm",
                     "pool_kind": raw['pool_kind'],
                     "generation_id": document['generation_id'],
                     # PR-FIX-SLOT（3.17.4）：装载必须携带时段标签，否则
@@ -1748,57 +1719,28 @@ class EventCatalogService:
         self._last_refresh = result
         return result
 
-    async def _call_llm_once(self, prompt: Any, *, task_name: str,
-                             temperature: float,
-                             max_tokens: Optional[int] = None) -> LLMResult:
-        """发出恰好一次生成请求；详细结果可用时走同一响应的 LLMResult。
-
-        3.17.6（E_LLM 截断修复）：max_tokens 显式 override（有界，调用方按
-        requested 计算）；旧测试桩签名不接受时不传（兼容，不改单次请求语义）。
-        """
+    async def _call_llm_once(self, prompt: Any, *, task_name: str, temperature: float,
+                             validator=None, fallback_context=None) -> LLMResult:
+        """One policy invocation; the common service owns all attempts and fallback."""
         detailed = getattr(self._llm, "generate_detailed", None)
+        extra = {}
+        target = detailed if callable(detailed) else self._llm.generate
+        for key, value in (("validator", validator), ("fallback_context", fallback_context)):
+            if _callable_accepts(target, key):extra[key] = value
+        args = dict(system_prompt=prompt.system_prompt, task_name=task_name, temperature=temperature,
+                    module="planning", event=LLM_EVENT_NAME, with_identity=True, **extra)
         if callable(detailed):
-            extra: Dict[str, Any] = {}
-            if max_tokens is not None and _callable_accepts(detailed, "max_tokens"):
-                extra["max_tokens"] = int(max_tokens)
-            return await detailed(
-                prompt.prompt,
-                system_prompt=prompt.system_prompt,
-                task_name=task_name,
-                temperature=temperature,
+            return await detailed(prompt.prompt, strict_params=True, **args)
+        text = await target(prompt.prompt, **args)
+        return LLMResult(ok=bool(text), text=str(text or ""), category="ok" if text else "empty",
+                         task_name=task_name, request_sent=True, consumed=True, attempts=1)
 
-                module="planning",
-                event=LLM_EVENT_NAME,
-                strict_params=True,
-                with_identity=True,
-                **extra,
-            )
-        # 兼容旧测试桩：只有字符串返回，无 usage/错误分类；失败一律保守记账。
-        text = await self._llm.generate(
-            prompt.prompt,
-            system_prompt=prompt.system_prompt,
-            task_name=task_name,
-            temperature=temperature,
-
-            module="planning",
-            event=LLM_EVENT_NAME,
-            with_identity=True,
-        )
-        text = str(text or "").strip()
-        return LLMResult(ok=bool(text), text=text,
-                         category="ok" if text else "empty",
-                         task_name=task_name, request_sent=True, consumed=True,
-                         attempts=1)
-
-    async def _attempt_llm(self, prompt: Any, *, task_name: str,
-                           temperature: float, now: datetime,
-                           max_tokens: Optional[int] = None) -> Tuple[LLMResult, int]:
-        """No plugin limit or precharge; accumulate only host-reported usage."""
+    async def _attempt_llm(self, prompt: Any, *, task_name: str, temperature: float,
+                           now: datetime, validator=None, fallback_context=None) -> Tuple[LLMResult, int]:
         result = await self._call_llm_once(prompt, task_name=task_name, temperature=temperature,
-                                           max_tokens=max_tokens)
+            validator=validator, fallback_context=fallback_context)
         spent = max(0, int(result.total_tokens)) if result.usage_available and result.total_tokens is not None else 0
-        if result.usage_available:
-            self._record_tokens(spent, now)
+        if result.usage_available:self._record_tokens(spent, now)
         return result, spent
 
     async def _refresh_locked(self, cfg: EventCatalogConfig, manual: bool,
@@ -1826,6 +1768,7 @@ class EventCatalogService:
         events, hashes, models, failures = [], [], [], []
         charged = 0
         model_calls = 0
+        template_slots = []
         from core.llm_utils import over_limit_trim_enabled
         trim = over_limit_trim_enabled(self._config)
         for slot_index, slot in enumerate(TIME_SLOTS):
@@ -1837,54 +1780,35 @@ class EventCatalogService:
             prompt = build_event_prompt(persona=persona, recent_schedule_names=recent_schedule,
                 existing_event_names=reserved_names + [e.get('name', '') for e in events],
                 count=requested, min_count=1, time_slot=slot, no_puzzle=cfg.no_puzzle)
-            # 3.17.6（E_LLM 截断修复）：按本时段 requested 动态、有界地显式
-            # override max_tokens（宿主任务配置不足时不再截断 JSON）。
-            slot_max_tokens = event_generation_max_tokens(requested)
+            names_now = reserved_names + [e.get('name', '') for e in events]
+            ids_now = reserved_ids | {e['event_id'] for e in events}
+            event_validator = self._validator if self._custom_validator else EventCatalogValidator()
+            def acceptable(response):
+                rows = parse_events_response(response)
+                if len(rows) != requested and not (trim and len(rows) > requested):
+                    return False
+                seen_names, seen_ids = set(names_now), set(ids_now)
+                for row in rows[:requested]:
+                    if event_validator.validate_event(row, reserved_ids=seen_ids,
+                            reserved_names=seen_names, recent_names=recent_events):return False
+                    seen_names.add(row['name']);seen_ids.add(row['event_id'])
+                return True
             try:
                 chosen, spent = await self._attempt_llm(prompt, task_name=cfg.task_name,
-                    temperature=EVENT_GENERATION_TEMPERATURE, now=now,
-                    max_tokens=slot_max_tokens)
+                    temperature=EVENT_GENERATION_TEMPERATURE, now=now, validator=acceptable,
+                    fallback_context={'slot':slot,'requested':requested,'reserved_names':names_now})
                 charged += spent
                 model_calls += max(0, int(chosen.attempts or 0))
-                # A declared-but-missing task sent no model request; resolve its normal fallback.
-                if chosen.category == 'task_missing' and cfg.task_name != LLM_FALLBACK_TASK:
-                    chosen, spent = await self._attempt_llm(prompt, task_name=LLM_FALLBACK_TASK,
-                        temperature=EVENT_GENERATION_TEMPERATURE, now=now,
-                        max_tokens=slot_max_tokens)
-                    charged += spent
-                    model_calls += max(0, int(chosen.attempts or 0))
-                if not chosen.ok or not str(chosen.text or '').strip():
-                    if _response_truncated(chosen, slot_max_tokens):
-                        failures.append(f'{slot}: 输出被 max_tokens 截断（finish_reason=length '
-                                        f'或 completion_tokens 触顶 {slot_max_tokens}），需增大上限')
-                    else:
-                        failures.append(f'{slot}: 模型未返回可用事件（{chosen.category}）')
+                if not chosen.ok or not acceptable(chosen.text):
+                    failures.append(f'{slot}: 模型或模板未返回符合配额的事件')
                     continue
-                try:
-                    rows = parse_events_response(chosen.text)
-                except EventPromptError as exc:
-                    # 3.17.6：截断诊断明示——finish_reason=length（宿主回传时）
-                    # 或 completion_tokens 触顶本次发送的 max_tokens → JSON 被截断。
-                    if _response_truncated(chosen, slot_max_tokens):
-                        failures.append(f'{slot}: 输出被 max_tokens 截断致 JSON 不可解析'
-                                        f'（finish_reason=length 或 completion_tokens 触顶 '
-                                        f'{slot_max_tokens}），需增大上限：{exc}')
-                    else:
-                        failures.append(f'{slot}: 生成响应不可用（{exc}）')
-                    continue
-                if len(rows) < 1:
-                    failures.append(f'{slot}: 模型未返回事件')
-                    continue
-                if len(rows) > requested:
-                    if trim:
-                        rows = rows[:requested]  # 超量裁剪兜底：取前N条，维持按索引分池语义
-                    else:
-                        failures.append(f'{slot}: 返回条数不在1-{requested}内')
-                        continue
+                rows = parse_events_response(chosen.text)[:requested]
+                if chosen.used_template:template_slots.append(slot)
                 for i, row in enumerate(rows):
                     item = _normalize_event(row)
                     item['pool_kind'] = 'reusable' if i < reusable_n else 'one_shot'
                     item['time_slot'] = slot
+                    item['source'] = 'template' if chosen.used_template else 'llm'
                     events.append(item)
                 hashes.append(prompt.prompt_hash)
                 models.append(str(getattr(self._llm, 'model_name', '') or ''))
@@ -1897,7 +1821,8 @@ class EventCatalogService:
             return self._failed('E_LLM', '；'.join(failures), manual=manual,
                                 tokens=charged, called_llm=model_calls > 0)
         document = {
-            'version': CATALOG_VERSION, 'source': 'llm', 'model': ','.join(models),
+            'version': CATALOG_VERSION, 'source': 'template' if template_slots else 'llm',
+            'template_slots': template_slots, 'model': ','.join(models),
             'generation_id': 'generation_' + uuid4().hex,
             'generated_at': now.isoformat(timespec='seconds'),
             'next_update_at': (now + timedelta(days=self._next_interval_days(cfg))).isoformat(timespec='seconds'),

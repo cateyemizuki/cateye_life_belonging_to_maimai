@@ -68,7 +68,7 @@ class ScheduleGeneratorConfig:
 
         # === 多轮生成配置 ===
         self.use_multi_round = config_dict.get('use_multi_round', True)
-        self.max_rounds = config_dict.get('max_rounds', 2)
+        self.max_rounds = config_dict.get('max_rounds', 6)
         self.quality_threshold = config_dict.get('quality_threshold', 0.85)
 
         # === 模型配置 ===
@@ -141,8 +141,8 @@ class ScheduleGeneratorConfig:
             )
 
         # 验证多轮生成参数
-        if self.max_rounds < 1 or self.max_rounds > 5:
-            raise ValueError(f"max_rounds 必须在1-5之间，当前值: {self.max_rounds}")
+        if self.max_rounds < 1 or self.max_rounds > 20:
+            raise ValueError(f"max_rounds 必须在1-20之间，当前值: {self.max_rounds}")
 
         if not 0.0 <= self.quality_threshold <= 1.0:
             raise ValueError(

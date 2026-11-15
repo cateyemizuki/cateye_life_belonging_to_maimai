@@ -23,6 +23,56 @@ def _usage_count(value):
     try:return max(0,int(value))
     except (TypeError,ValueError,OverflowError):return None
 
+def generation_logs(data_dir,now,hours=24,limit=200):
+    """Read only bounded policy metadata; raw prompts/responses never leave the log."""
+    hours=max(1,min(720,int(hours)));budget=2*1024*1024;records=[];truncated=False
+    for offset in range(min(31,(hours+23)//24+1)):
+        path=Path(data_dir)/'llm_logs'/('llm_calls_'+(now-timedelta(days=offset)).strftime('%Y-%m-%d')+'.jsonl')
+        if budget<=0:truncated=True;break
+        try:size=path.stat().st_size
+        except OSError:continue
+        rows,cut=tail_records(path,budget);budget-=min(size,budget);truncated=truncated or cut
+        for row in rows:
+            if row.get('kind')!='generation':continue
+            try:
+                at=datetime.fromisoformat(str(row.get('time','')))
+                if at.tzinfo is None:at=at.replace(tzinfo=now.tzinfo)
+                if not now-timedelta(hours=hours)<=at<=now:continue
+            except (ValueError,TypeError):continue
+            record={'time':at.isoformat(),'level':row.get('level') if row.get('level') in ('info','warn','error') else 'info',
+                    'used_template':row.get('used_template') is True}
+            for name in ('event','module','task','model','category','group_id','request_id','tier','template_name','template_title'):
+                record[name]=str(row.get(name) or '')[:160]
+            for name in ('message','fallback_reason'):record[name]=str(row.get(name) or '')[:400]
+            for name in ('completion_tokens','warning_threshold','attempt','max_tokens'):record[name]=_usage_count(row.get(name))
+            records.append(record)
+    records=[row for _index,row in sorted(enumerate(records),key=lambda item:(item[1]['time'],item[0]),reverse=True)]
+    counts={level:sum(row['level']==level for row in records) for level in ('info','warn','error')}
+    return {'rows':records[:limit],'counts':counts,'truncated':truncated or len(records)>limit}
+
+
+def decorate_usage_rows(rows,logs):
+    """Join semantic outcomes to request IDs without adding calls or changing tokens."""
+    from .llm_templates import usage_level
+    by_id={row['request_id']:row for row in logs if row.get('request_id')}
+    templates={row['group_id']:row for row in logs if row.get('used_template') and row.get('group_id')}
+    last={}
+    for row in logs:
+        if row.get('request_id') and row.get('group_id'):
+            candidate=(row.get('attempt') or 0,row['request_id'])
+            if candidate[0]>=last.get(row['group_id'],(-1,''))[0]:last[row['group_id']]=candidate
+    for row in rows:
+        row.update(usage_level(row.get('event'),row.get('success'),row.get('completion'),row.get('abandoned')))
+        match=by_id.get(row.get('request_id'))
+        if match:
+            for field in ('level','tier','warning_threshold'):row[field]=match[field]
+            template=templates.get(match.get('group_id'))
+            if template and last.get(match.get('group_id'),(-1,''))[1]==row.get('request_id'):
+                row.update(used_template=True,template_name=template['template_name'],
+                           template_title=template['template_title'],fallback_reason=template['fallback_reason'])
+    return rows
+
+
 def usage_summary(data_dir,now,hours=24):
     """按窗口聚合 LLM 账本：模型 / 子模块 / token 拆分 / 缓存 / 四桶。
 
@@ -31,7 +81,10 @@ def usage_summary(data_dir,now,hours=24):
     event 映射。W-09 只增拆分覆盖率字段（``*_reported_calls`` / ``split_tokens`` /
     ``split_coverage``），不改 ``tokens`` 原语义。
     """
+    logs=generation_logs(data_dir,now,hours)
     rows,truncated=tail_records(Path(data_dir)/'llm_usage_events.jsonl',2*1024*1024)
+    decorate_usage_rows(rows,logs['rows'])
+    level_counts={level:0 for level in ('info','warn','error')}
     models={};model_calls={};modules={};module_calls={};matrix={}
     calls=unknown=0;tokens=verified_tokens=unverified_tokens=0
     prompt_total=completion_total=cache_hit_total=cache_miss_total=0
@@ -49,7 +102,7 @@ def usage_summary(data_dir,now,hours=24):
             if at.tzinfo is None:at=at.replace(tzinfo=now.tzinfo)
             if not now-timedelta(hours=hours)<=at<=now:continue
             count=reported_token_count(row);model=str(row.get('model') or '未返回模型名')[:120]
-            calls+=1;tokens+=count
+            calls+=1;tokens+=count;level_counts[row['level']]+=1
             bucket=usage_bucket_of(row);buckets[bucket]['calls']+=1;buckets[bucket]['tokens']+=count
             # 「缺少来源」改名「缺用量来源调用」：口径 = usage_source != host_reported
             # 或 usage_present 不为真（旧行无该字段 → 一律计入）。旧键名兼容输出，
@@ -90,6 +143,9 @@ def usage_summary(data_dir,now,hours=24):
             'split_coverage':(round((prompt_total+completion_total)/tokens,4) if tokens>0 else None),
             'model_calls':model_calls,'module_calls':module_calls,'matrix':matrix,
             'abandoned_calls':abandoned_calls,'unknown_module_calls':unknown_module_calls,
+            'level_counts':level_counts,'generation_logs':logs['rows'],
+            'generation_log_counts':logs['counts'],'generation_logs_truncated':logs['truncated'],
+            'warning_thresholds':{'large':16000,'medium':10000,'small':4000},
             'terms':USAGE_TERMS,
             'note':'只统计宿主回传的Token；缺失时只计调用，不推算。调用次数包含失败。'}
 

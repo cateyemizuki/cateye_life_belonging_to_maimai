@@ -1,0 +1,19 @@
+{
+  "event": "qzone_video_decision",
+  "title": "暂缓空间视频分享",
+  "tier": "small",
+  "format": "json",
+  "light": true,
+  "required": [
+    "action",
+    "delay_minutes"
+  ],
+  "kind": "qzone_video_decision",
+  "ok": true,
+  "response": {
+    "action": "defer",
+    "delay_minutes": 30,
+    "reason": "暂时无法完成分享判断",
+    "asset_ids": []
+  }
+}

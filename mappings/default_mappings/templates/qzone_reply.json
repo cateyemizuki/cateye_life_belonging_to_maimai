@@ -1,0 +1,11 @@
+{
+  "event": "qzone_reply",
+  "title": "简短评论回复",
+  "tier": "small",
+  "format": "text",
+  "light": true,
+  "required": [],
+  "kind": "qzone_reply",
+  "ok": true,
+  "response": "收到，我看到了"
+}

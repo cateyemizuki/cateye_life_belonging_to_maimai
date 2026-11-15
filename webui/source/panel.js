@@ -704,6 +704,10 @@ function renderSchedule(){
  const day=selectedDay||sch.date||dayText(data?.generated_at);
  const counts=[['completed_count','已完成'],['interrupted_count','已中断']].map(([k,l])=>l+' '+(summary[k]??'—'));
  text('episode-count',episodes.length+' 项记录');text('intent-count',intents.length+' 项意图');
+ let templateNote=$('schedule-template-note');
+ if(!templateNote){templateNote=el('p','banner');templateNote.id='schedule-template-note';$('intents').before(templateNote)}
+ const templateNames=[...new Set(intents.filter(row=>row.template_used).map(row=>row.template_title||'基础作息日程'))];
+ templateNote.hidden=!templateNames.length;templateNote.textContent=templateNames.length?'这份日程含模板内容：'+templateNames.join('、'):'';
  $('day-summary').replaceChildren(...counts.map(label=>el('span','',label)));
  text('schedule-detail-summary',day+' · '+episodes.length+' 项活动记录 · '+counts.join(' · '));
  function rows(target,list,actual){
@@ -727,6 +731,7 @@ function renderSchedule(){
    // 3.17.7 改进1：行程记录右侧小号灰色抽取原因（仅实际 episode 带该字段时显示）
    const rowend=el('div','rowendcol');
    if(actual&&row.draw_reason_zh)rowend.append(el('span','drawreason',row.draw_reason_zh));
+   if(!actual&&row.template_used){const badge=el('span','rowbadge usage-template','模板');badge.title=[row.template_title,row.template_reason].filter(Boolean).join(' · ');rowend.append(badge)}
    rowend.append(el('span','rowbadge',actual?episodeLabel(row.status):(row.goal_type==='sleep'?'作息参考':row.hardness==='hard'?'硬约定':'意图')));
    // 1A（3.17.8）：跨日续段（前日溢出投影，00:00 起）/跨午夜原行（结束保留「次日」口径）标注。
    if(actual&&row.cross_day_continuation)rowend.append(el('span','rowbadge crossdaybadge','跨日续段'));
@@ -810,6 +815,30 @@ function usageMetric(tag,label,value,term,tipLeft){
  item.append(caption,el(tag==='dt'?'dd':'strong','usage-value',value));
  return item;
 }
+let usageLevelFilter='';
+function levelBadge(level,label){
+ const badge=el('span','usage-level',label||({info:'info · 正常',warn:'warn · 警告',error:'error · 失败'}[level]||'级别未记录'));
+ badge.dataset.level=level;return badge;
+}
+function recordLevel(row){return row.level||((row.abandoned||row.success===false)?'error':row.success===true?'info':'')}
+function renderGenerationLogs(){
+ const usage=data?.usage||{},target=$('generation-logs');
+ const all=Array.isArray(usage.generation_logs)?usage.generation_logs:[],rows=all.filter(row=>!usageLevelFilter||row.level===usageLevelFilter);
+ target.replaceChildren(el('p','note',`最近日志 ${rows.length} 条${usage.generation_logs_truncated?' · 有界片段':''}`));
+ if(!rows.length){target.append(el('p','usage-empty note',all.length?'当前级别暂无日志。':'这个统计范围内暂无统一生成日志。'));return}
+ const list=el('ol','generation-logs');
+ for(const row of rows){
+  const item=el('li','generation-log'),head=el('div','generation-log-context');
+  head.append(el('time','note',clock(row.time,true)),levelBadge(row.level));
+  const body=el('div'),title=el('strong','usage-name',row.used_template?'使用模板：'+(row.template_title||row.template_name||'默认模板'):row.message||'生成记录');
+  body.append(title,el('p','note',[usageModuleLabel(row.module),row.event,row.task].filter(Boolean).join(' · ')));
+  if(row.used_template)body.append(el('p','note','原因：'+(row.fallback_reason||'生成未完成')));
+  else if(num(row.completion_tokens)!==null)body.append(el('span','note',`输出 ${usageCount(row.completion_tokens)} Token · ${{large:'大',medium:'中',small:'小'}[row.tier]||'小'}档阈值 ${usageCount(row.warning_threshold)}`));
+  item.append(head,body);list.append(item);
+ }
+ target.append(list);
+}
+$('usage-level-filter').onchange=event=>{usageLevelFilter=event.target.value;renderGenerationLogs();renderUsageRows()};
 function renderUsageOverview(usage){
  const terms=usageTerms();
  const metrics=[
@@ -827,6 +856,8 @@ function renderUsageOverview(usage){
   const tokens=usageCount(bucket.tokens);card.append(el('span','note',tokens==='—'?'用量未记录':tokens+' Token'));
   return card;
  }));
+ const levels=usage.level_counts||{};
+ $('usage-level-counts').replaceChildren(...['info','warn','error'].map(level=>levelBadge(level,level+' '+usageCount(levels[level]))));
  text('usage-period',usageWindow(usage));text('usage-source',imported?'离线快照':'宿主用量记录');
  const updated=$('usage-updated');
  updated.textContent=date(data.generated_at)?clock(data.generated_at,true):'更新时间未记录';
@@ -878,7 +909,7 @@ function renderUsage(){
   // 3.17.7 改进3：仅「缓存命中」（主页最右 chip）详细描述改左侧防出框；其余 chip 保持右侧
   const box=usageMetric('span',label,value,usageTerms()[key],key==='cache_hit_tokens');return box;
  }));
- renderUsageOverview(usage);renderUsageModules(usage);syncUsageRange();
+ renderUsageOverview(usage);renderUsageModules(usage);renderGenerationLogs();syncUsageRange();
  if(imported||!live)renderUsageRows();
  // W-01 摘要回填：主卡补 Top3 模块与可拆分口径（纯前端按已有 prompt/completion 字段估算，
  // 宿主未回传拆分时显示 —，不造假 0；P1 的 W-09 落后端 split_coverage 字段后再换权威口径）。
@@ -999,7 +1030,8 @@ function usageRecord(row){
  }
  const outcome=el('div','usage-record-outcome');
  const status=row.abandoned?'已放弃':row.success===true?'成功':row.success===false?'失败':'未知';
- const badge=el('span','usage-status',status);badge.dataset.status=status;
+ const badge=levelBadge(recordLevel(row),recordLevel(row)==='warn'?'warn · 超出预期':recordLevel(row)==='error'?'error · 失败':status);
+ if(row.used_template){const template=el('span','usage-template','模板：'+(row.template_title||row.template_name||'默认'));template.title=row.fallback_reason||'';outcome.append(template)}
  outcome.append(badge);
  if(count(row.duration_ms)!=='—')outcome.append(el('span','note',usageCount(row.duration_ms)+' ms'));
  item.append(context,model,tokens,outcome);return item;
@@ -1008,7 +1040,7 @@ function renderUsageRows(){
  const target=$('usage-rows');
  renderUsageFilter();
  if(imported||!live){target.replaceChildren(el('p','usage-empty note','离线快照只包含汇总用量。'));return}
- const rows=usageRowsAll.filter(row=>!usageFilter||row.module===usageFilter);
+ const rows=usageRowsAll.filter(row=>(!usageFilter||row.module===usageFilter)&&(!usageLevelFilter||recordLevel(row)===usageLevelFilter));
  const stats=el('p','note usage-record-count',
   (usageFilter?'匹配 '+usageCount(rows.length)+' 条 · ':'')+
   '已读取 '+usageCount(usageRowsAll.length)+' / '+usageCount(usageRowsTotal)+' 条');
