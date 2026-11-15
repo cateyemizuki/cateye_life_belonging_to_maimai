@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 
+from .llm_types import LLMResult
 from .generation_evidence import request_scope
 from .llm_templates import (FormatFailure, SemanticFailure, THRESHOLDS,
                             definition, fallback, validate)
@@ -70,7 +71,6 @@ class GenerationPolicy:
             # The invocation adapter converts host errors to LLMResult. A timeout
             # around the whole job also must resolve to a template, not escape it.
             except (asyncio.TimeoutError,TimeoutError):
-                from .llm_utils import LLMResult
                 failure='生成等待已到期'
                 result=LLMResult(False,'','timeout',error=failure,module=module,event=event,
                                  task_name=route,request_id=scope.get('request_id',''),request_sent=True,consumed=True,attempts=1)
@@ -134,7 +134,6 @@ class GenerationPolicy:
             await self._sleep(delay)
         if last is None:
             # An invocation that consumed the entire timeout is still a failed call.
-            from .llm_utils import LLMResult
             last=LLMResult(False,'','timeout',error=failure,module=module,event=event,task_name=route)
         template=fallback(event,fallback_context)
         self._record(event=event,module=module,task=route,level='warn',message='已使用'+template['title'],

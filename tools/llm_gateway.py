@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from dataclasses import dataclass
 from typing import Any, Optional
 
 from core.llm_usage import (
@@ -25,35 +24,13 @@ from core.llm_usage import (
     MODULE_VALUES,
     normalize_module,
 )
-from core.llm_utils import (
-    LLMResult,
+from core.llm_types import LLMResult, LLMReceipt
+from core.llm_payload import (
     classify_llm_error,
     extract_cache_usage,
     extract_usage,
     prepare_prompt_arg,
 )
-
-
-@dataclass(frozen=True)
-class LLMReceipt:
-    """一次调用（含内部回退）的对账凭据；只读，不参与业务判断。"""
-
-    ok: bool
-    module: str
-    event: str
-    task_name: str
-    model: str
-    prompt_tokens: Optional[int] = None
-    completion_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
-    cache_hit_tokens: Optional[int] = None
-    cache_miss_tokens: Optional[int] = None
-    duration_ms: int = 0
-    attempts: int = 0
-    request_id: str = ""
-    category: str = ""
-    error: str = ""
-    schema: int = 2
 
 
 def receipt_of(result: Any, *, module: str, event: str, task: str,

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from core.llm_utils import llm_task_name_of
 from core.time_utils import parse_hhmm
@@ -139,17 +139,6 @@ class ScheduleAutoScheduler:
         wake = parse_hhmm(str(getattr(cfg, "wake_time", "") or ""), _DEFAULT_WAKE_MINUTES)
         sleep = parse_hhmm(str(getattr(cfg, "sleep_time", "") or ""), _DEFAULT_SLEEP_MINUTES)
         return wake, sleep
-
-    def _day_items(self, date_str: str) -> List[Dict[str, Any]]:
-        """当日（帧）日程条目；ScheduleDB 不可得/读失败 → 空表（回退入睡锚点，B4）。"""
-        db = getattr(self.plugin, "_db", None)
-        if db is None:
-            return []
-        try:
-            return list(db.get_day_schedule(date_str))
-        except Exception as exc:
-            logger.debug(f"读取当日日程失败（{date_str}）：{exc}")
-            return []
 
     def _due_minutes_in_frame(self, frame_start: datetime, cfg: Any) -> int:
         """兼容分钟查询；DST 日帧按实际经过分钟返回。"""
