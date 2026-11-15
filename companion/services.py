@@ -272,9 +272,9 @@ class CompanionServices:
         admin = getattr(cfg, "admin", None)
         if admin is not None:
             if self.llm_logger is not None:
-                self.llm_logger.update_settings(admin.llm_log_enabled, admin.log_retention_days)
+                self.llm_logger.update_settings(True, 30)
             if self.decision_logger is not None:
-                self.decision_logger.update_settings(admin.decision_log_enabled, admin.log_retention_days)
+                self.decision_logger.update_settings(True, 30)
 
     # ------------------------------------------------------------------
     # 事件订阅挂点（M0：登记于此，M3+ 消费者按需 subscribe 并存入 _event_unsubs）

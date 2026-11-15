@@ -50,7 +50,7 @@ from .event_catalog_config import EventCatalogConfig, derive_pool_cap, resolve_c
 from .event_pools import POOL_VERSION, normalize_cycle, allocate_pools, catalog_write_guard
 from .event_prompt import (GENERATION_TEMPERATURE,
                            EventPromptError, build_event_prompt,
-                           build_json_schema, parse_events_response)
+                           parse_events_response)
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +62,6 @@ EVENT_ID_PREFIX = "llm_"
 EVENT_ID_RE = re.compile(r"^llm_[a-z0-9_]{2,48}$")
 #: 同事件 4 小时内不重复（A.7；与 rolling_planner 旧逻辑一致）
 RANDOM_EVENT_DEDUP_MINUTES = 240
-MIN_GENERATED_EVENTS = 3
-MAX_GENERATED_EVENTS = 8
 # P4（2026-11-09 滚动日程计划 §4/§7.2）：生成时长从 5–30 扩到自然区间 3–120
 # （与初始 JSON 库同口径；默认内容仍主要 5–60，由提示词引导）。提示/schema/
 # 校验/采样/展示同步——不再把读书/听音乐等长放松压短。生成数量与刷新周期不变。
@@ -247,9 +245,6 @@ class EventCatalogValidator:
     """附录 B.1.4 全量校验。命中任一错误 → 文档不得替换旧库。"""
 
     def __init__(self, *, builtin_count: Optional[int] = None,
-                 max_generated_events: int = MAX_GENERATED_EVENTS,
-                 max_pool_events: Optional[int] = None,
-                 enforce_pool_cap: bool = True,
                  period_limits: Optional[Sequence[int]] = None,
                  reusable_limits: Optional[Sequence[int]] = None,
                  one_shot_limits: Optional[Sequence[int]] = None) -> None:
@@ -257,9 +252,6 @@ class EventCatalogValidator:
         派生上限（内置数 + 六键配额和）；旧调用方显式传值时按 deprecated 覆盖
         尊重（仅兼容旧测试/旧装配，生产装配不再传）。"""
         self.builtin_count = len(BUILTIN_EVENTS) if builtin_count is None else int(builtin_count)
-        self.max_generated_events = max(1,
-                                        min(MAX_GENERATED_EVENTS, int(max_generated_events)))
-        self.enforce_pool_cap = bool(enforce_pool_cap)
         from .event_slots import TIME_SLOTS
         from .event_catalog_config import (DEFAULT_REUSABLE_00_08, DEFAULT_REUSABLE_08_16,
                                            DEFAULT_REUSABLE_16_24, DEFAULT_ONE_SHOT_00_08,
@@ -284,11 +276,8 @@ class EventCatalogValidator:
         # 3.17.6（PR-REMOVE-POOLCAP）：池上限默认派生 = 内置 + 六键配额和，
         # 永远与配额自洽（生成项数==配额和时不触发总量拒绝）。显式传值 =
         # deprecated 覆盖（旧测试/旧装配兼容），生产路径不再传。
-        if max_pool_events is None:
-            self.max_pool_events = derive_pool_cap(
-                self.builtin_count, self.reusable_limits, self.one_shot_limits)
-        else:
-            self.max_pool_events = max(1, int(max_pool_events))
+        self.max_pool_events = derive_pool_cap(
+            self.builtin_count, self.reusable_limits, self.one_shot_limits)
 
     # ---- 单事件 ----
     def validate_event(self, event: Any, *, index: Optional[int] = None,
@@ -442,6 +431,7 @@ class EventCatalogValidator:
                     errors.append(ValidationError('E_COUNT', f'{kind} 条数超过 {pool_cap}', 'events'))
             from .event_slots import TIME_SLOTS
             slot_counts = {slot: 0 for slot in TIME_SLOTS}
+            by_pool_slot = {(kind, slot): 0 for kind in ("reusable", "one_shot") for slot in TIME_SLOTS}
             for e in events:
                 if not isinstance(e, dict):
                     continue
@@ -451,16 +441,21 @@ class EventCatalogValidator:
                                                   'time_slot', str(e.get('event_id') or '')))
                 else:
                     slot_counts[ts] += 1
+                    pair = (e.get("pool_kind"), ts)
+                    if pair in by_pool_slot:
+                        by_pool_slot[pair] += 1
             for slot in TIME_SLOTS:
                 if slot_counts[slot] > self.period_limits[slot]:
                     errors.append(ValidationError('E_COUNT',
                                                   f'{slot} 时段 {slot_counts[slot]} 条超过上限 {self.period_limits[slot]}',
                                                   'events'))
-        elif not (MIN_GENERATED_EVENTS <= len(events) <= self.max_generated_events):
-            errors.append(ValidationError(
-                "E_COUNT", f"生成条数需 {MIN_GENERATED_EVENTS}-{self.max_generated_events}，"
-                f"实际 {len(events)}", "events"))
-        if (dual or self.enforce_pool_cap) and self.builtin_count + len(events) > self.max_pool_events:
+            for kind, limits in (("reusable", self.reusable_limits), ("one_shot", self.one_shot_limits)):
+                for index, slot in enumerate(TIME_SLOTS):
+                    if by_pool_slot[(kind, slot)] > limits[index]:
+                        errors.append(ValidationError("E_COUNT", f"{slot} {kind} 超过本时段配额 {limits[index]}", "events"))
+        elif len(events) > sum(self.period_limits.values()):
+            errors.append(ValidationError("E_COUNT", "生成数量超过时段配额合计", "events"))
+        if self.builtin_count + len(events) > self.max_pool_events:
             errors.append(ValidationError(
                 "E_COUNT", f"内置池 {self.builtin_count} + 生成 {len(events)} 超过总池上限 "
                 f"{self.max_pool_events}", "events"))
@@ -719,9 +714,6 @@ class EventCatalogStore:
 
     def __init__(self, path: Any, *, builtin: Optional[Sequence[Mapping[str, Any]]] = None,
                  validator: Optional[EventCatalogValidator] = None,
-                 max_generated_events: int = MAX_GENERATED_EVENTS,
-                 max_pool_events: Optional[int] = None,
-                 enforce_pool_cap: bool = True,
                  tz: Optional[timezone] = None,
                  load_on_init: bool = True) -> None:
         """``max_pool_events`` 已退役（3.17.6）：None = 装载时按 validator 配额
@@ -729,15 +721,11 @@ class EventCatalogStore:
         self.path = Path(path)
         self._write_lock = threading.RLock()
         self._tz = tz
-        self._pool_cap_override = None if max_pool_events is None else max(1, int(max_pool_events))
-        self._enforce_pool_cap = bool(enforce_pool_cap)
         self._builtin = tuple(self._normalize_builtin(builtin) if builtin is not None
                               else builtin_events())
         self._validator = validator or EventCatalogValidator(
             builtin_count=len(self._builtin),
-            max_generated_events=max_generated_events,
-            max_pool_events=max_pool_events,
-            enforce_pool_cap=enforce_pool_cap)
+        )
         self._snapshot = self._fallback("missing")
         # 运行时事件门控（2026-11-04 刷视频功能批）：event_key -> bool；
         # None = 不设闸（旧行为）。闸是动态配置读数，不进快照/不改用户文件。
@@ -752,9 +740,7 @@ class EventCatalogStore:
             self.reload()
 
     def _pool_cap(self) -> int:
-        """运行期池上限：deprecated 显式覆盖优先，否则派生（内置 + 六键配额和）。"""
-        if self._pool_cap_override is not None:
-            return self._pool_cap_override
+        """运行期池容量由内置事件数与六项配额合计派生。"""
         return derive_pool_cap(len(self._builtin),
                                self._validator.reusable_limits,
                                self._validator.one_shot_limits)
@@ -950,18 +936,14 @@ class EventCatalogStore:
                 valid.append(normalized)
 
             pool_truncated = 0
-            if self._enforce_pool_cap:
-                # 3.17.6（PR-REMOVE-POOLCAP）：上限派生 = 内置 + validator 六键
-                # 配额和（装载时求值，随配额自洽）；合法生成项（==配额和）不再
-                # 被独立总上限截断。显式 deprecated 覆盖仅旧测试/旧装配使用。
-                pool_cap = self._pool_cap()
-                slots = max(0, pool_cap - len(self._builtin))
-                if len(valid) > slots:
-                    pool_truncated = len(valid) - slots
-                    logger.warning("event_catalog: 生成项 %d 条 + 内置 %d 条超过总池上限 %d，"
-                                   "运行期保留前 %d 条生成项（文件不重写）",
-                                   len(valid), len(self._builtin), pool_cap, slots)
-                    valid = valid[:slots]
+            pool_cap = self._pool_cap()
+            slots = max(0, pool_cap - len(self._builtin))
+            if len(valid) > slots:
+                pool_truncated = len(valid) - slots
+                logger.warning("event_catalog: 生成项 %d 条 + 内置 %d 条超过总池上限 %d，"
+                               "运行期保留前 %d 条生成项（文件不重写）",
+                               len(valid), len(self._builtin), pool_cap, slots)
+                valid = valid[:slots]
 
             next_update_at = document.get("next_update_at")
             if not isinstance(next_update_at, str) or not next_update_at.strip():
@@ -1319,15 +1301,14 @@ class EventCatalogService:
         # 派生（实际初始池数 + 六键配额和），与三时段配额永远自洽。
         self._validator = validator or EventCatalogValidator(
             builtin_count=len(combined_builtin),
-            max_generated_events=cfg.max_generated_events,
             reusable_limits=cfg.reusable_limits,
             one_shot_limits=cfg.one_shot_limits)
         self._custom_validator = validator is not None
         self.store = store or EventCatalogStore(
             catalog_path, builtin=combined_builtin, validator=self._validator,
-            max_generated_events=cfg.max_generated_events, tz=self._tz,
+            tz=self._tz,
             # mode=off：构造期就不读生成库（off 只用初始池；不删不改用户文件）
-            load_on_init=cfg.mode != "off")
+            load_on_init=True)
         # D1：联动小事件独立权重乘数（[planning_events]，默认全 1.0）。
         self._apply_weight_multipliers()
         self._lock = asyncio.Lock()
@@ -1556,7 +1537,7 @@ class EventCatalogService:
         snap = self.store.snapshot
         last = self._last_refresh
         return {
-            "mode": cfg.mode,
+            "mode": "auto",
             "path": str(self.store.path),
             "file_exists": self.store.path.exists(),
             "loaded": bool(snap.document) or bool(snap.active_events),
@@ -1606,7 +1587,6 @@ class EventCatalogService:
             "task_name": cfg.task_name,
             "min_interval_days": cfg.min_interval_days,
             "max_interval_days": cfg.max_interval_days,
-            "max_generated_events": cfg.max_generated_events,
             "max_pool_events": cfg.max_pool_events,
             "auto_running": bool(self._task is not None and not self._task.done()),
             "last_refresh": (None if last is None else {
@@ -1619,7 +1599,7 @@ class EventCatalogService:
     def status_text(self) -> str:
         snap = self.store.snapshot
         cfg = self._current_config()
-        parts = [f"事件库模式：{cfg.mode}",
+        parts = ["小事件池：自动更新",
                  f"目录版本：{snap.catalog_version}",
                  f"生成事件：{len(snap.generated_events)} 条 / 内置：{len(snap.builtin_events)} 条"]
         if snap.next_update_at:
@@ -1667,7 +1647,7 @@ class EventCatalogService:
             # 立即重建快照，保证 refresh 在 mode=off/未到期提前返回时也不会
             # 留下「_builtin 已换、snapshot 仍旧」的不一致；off 仍不读生成库。
             try:
-                mode = self._current_config().mode
+                mode = "auto"
             except Exception:
                 mode = "off"
             if mode == "off":
@@ -1694,8 +1674,7 @@ class EventCatalogService:
         try:
             self._apply_weight_multipliers()
             self._reload_initial_events()
-            if self._current_config().mode == "off":
-                return self.store.use_builtin_only("mode_off")
+
             return self.store.reload()
         except Exception as exc:
             logger.warning("event_catalog: reload 失败（保留旧快照）：%s", exc)
@@ -1759,18 +1738,13 @@ class EventCatalogService:
         self._apply_weight_multipliers()
         self._reload_initial_events()
         cfg = self._current_config()
-        if cfg.mode == "off":
-            result = self._skipped("mode_off", manual=manual)
-        elif not manual and cfg.mode != "auto":
-            result = self._skipped("mode_not_auto", manual=manual)
-        else:
-            now_dt = self._now(now)
-            try:
-                async with self._lock:
-                    result = await self._refresh_locked(cfg, manual, now_dt)
-            except Exception as exc:  # 绝不拖挂插件
-                logger.warning("event_catalog: refresh 异常（旧库保留）：%s", exc)
-                result = self._failed("E_INTERNAL", str(exc), manual=manual)
+        now_dt = self._now(now)
+        try:
+            async with self._lock:
+                result = await self._refresh_locked(cfg, manual, now_dt)
+        except Exception as exc:  # 绝不拖挂插件
+            logger.warning("event_catalog: refresh 异常（旧库保留）：%s", exc)
+            result = self._failed("E_INTERNAL", str(exc), manual=manual)
         self._last_refresh = result
         return result
 
@@ -1931,7 +1905,7 @@ class EventCatalogService:
             'events': events, 'consumed': {},
         }
         validator = self._validator if self._custom_validator else EventCatalogValidator(
-            builtin_count=len(builtin), max_generated_events=cfg.max_generated_events,
+            builtin_count=len(builtin),
             reusable_limits=cfg.reusable_limits, one_shot_limits=cfg.one_shot_limits)
         validation = validator.validate_document(document, reserved_ids=reserved_ids,
             reserved_names=reserved_names, recent_names=recent_events)
@@ -1940,8 +1914,7 @@ class EventCatalogService:
                 errors=tuple(validation.lines), reason='E_VALIDATION',
                 catalog_version=self.store.catalog_version, next_update_at=self.store.next_update_at,
                 events_count=0, tokens_used=charged, called_llm=model_calls > 0)
-        current_mode = self._current_config().mode
-        if self._stopping or current_mode == 'off' or current_mode != cfg.mode:
+        if self._stopping:
             return self._failed('E_MODE_CHANGED', '生成期间模式已变化，保留旧事件库', manual=manual,
                                 tokens=charged, called_llm=model_calls > 0)
         if self.store.file_fingerprint() != start_fp:
@@ -1965,18 +1938,22 @@ class EventCatalogService:
     async def auto_check(self, now: Optional[datetime] = None) -> Optional[RefreshResult]:
         """每日最多一次、到期、清醒/非睡眠/无硬约定才生成；失败当日不重试。"""
         cfg = self._current_config()
-        if cfg.mode != "auto":
-            return None
         now_dt = self._now(now)
-        if self._auto_attempted_today(now_dt):
+        empty = not self.store.generated_events and cfg.period_limit_total > 0
+        last_empty = getattr(self, "_empty_attempt_at", None)
+        if empty and last_empty is not None and (now_dt - last_empty).total_seconds() < 300:
             return None
-        if not self._due(now_dt):
+        if not empty and self._auto_attempted_today(now_dt):
+            return None
+        if not empty and not self._due(now_dt):
             return None
         allowed, reason = self._gate(now_dt)
         if not allowed:
             return self._skipped(reason, manual=False)
         if self._lock.locked():
             return None
+        if empty:
+            self._empty_attempt_at = now_dt
         self._mark_auto_attempt(now_dt)  # 先记当日尝试：失败也不在当天重试
         result = await self.refresh(manual=False, now=now_dt)
         if result is not None and result.status == "failed":
@@ -1994,16 +1971,12 @@ class EventCatalogService:
         """
         try:
             cfg = self._current_config()
-            if cfg.mode == "off":
-                self.store.use_builtin_only("mode_off")
-                await self.stop()
-                logger.info("event_catalog: mode=off（不读生成库、不启动后台）")
-                return
+
             self.reload()
-            if cfg.auto_enabled and self._auto_gate is None and not self._allow_ungated_auto:
+            if self._auto_gate is None and not self._allow_ungated_auto:
                 logger.warning("event_catalog: mode=auto 但未提供 auto_gate，自动生成将保持跳过"
                                "（fail-closed；接线时需注入清醒/睡眠/硬约定闸）")
-            if cfg.auto_enabled and self._task is None:
+            if self._task is None:
                 self._stopping = False
                 self._task = asyncio.create_task(self._auto_loop())
                 logger.info("event_catalog: 自动事件库检查已启动（每 %ss 检查一次）",
@@ -2091,7 +2064,7 @@ def _normalize_event(raw: Any) -> Any:
 __all__ = [
     "BUILTIN_EVENTS", "CatalogSnapshot", "EventCatalogService", "EventCatalogStore",
     "EventCatalogValidator", "RefreshResult", "ValidationError", "ValidationResult",
-    "build_json_schema", "builtin_events", "compute_catalog_version",
+    "builtin_events", "compute_catalog_version",
     "resolve_event_weight_multipliers",
     "resolve_video_share_to_target_probability",
     "resolve_state_deltas", "state_affinity",

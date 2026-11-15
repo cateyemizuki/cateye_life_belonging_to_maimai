@@ -391,7 +391,8 @@ class AffectionReviewer:
         """对方称呼（供裁判理解「对方是谁」）：只给关系词或中性称谓；[target] 段已删，cfg.target 不存在，QQ 不再包含。"""
         cfg = getattr(self._plugin, "config", None)
         target = getattr(cfg, "target", None)
-        qq = str(getattr(target, "target_qq", "") or "").strip()
+        from core.targeting import target_qq_of
+        qq = target_qq_of(cfg)
         has_qq = bool(qq) and qq not in ("0", "123456789")
         word = str(getattr(self._relation(), "word", "") or "")
         if has_qq and word:

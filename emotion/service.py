@@ -65,7 +65,6 @@ EVAL_QUOTA_PRIVATE = "private"
 EVAL_QUOTA_GROUP = "group"
 DEFAULT_PRIVATE_EVAL_QUOTA = 6
 DEFAULT_GROUP_EVAL_QUOTA = 4
-DEFAULT_EVAL_QUOTA_PARTITION_ENABLED = True
 
 
 class _EvalQuotaTicket(str):
@@ -110,8 +109,7 @@ def build_emotion_state_machine(cfg: Any, params: Optional[EmotionParams],
     默认关 → 与改动前完全相同的 ``EmotionStateMachine``（同一参数、同一衰减公式）；
     仅显式开启才换成向人设锚点收敛的子类，不改变其它任何结算语义。
     """
-    if bool(getattr(cfg, "decay_to_persona_anchor", False)):
-        return _AnchorDecayStateMachine(params=params, decay_rate=decay_rate)
+    return _AnchorDecayStateMachine(params=params, decay_rate=decay_rate)
     return EmotionStateMachine(params=params, decay_rate=decay_rate)
 #: episode 片段的消息条数 / 字符数上限（超出时保留**最近**的往来并在头部标注省略）
 EPISODE_SEGMENT_MAX_MESSAGES = 40
@@ -744,25 +742,9 @@ class EmotionService:
 
     # ── 评估模式与日上限（T7；REGISTRY §二.3 / §二.5，两模式共用一个计数）──
     def _evaluate_mode(self) -> str:
-        """当前回复后评估模式：``episode``（默认）/ ``per_reply`` / ``off``。
-
-        ``evaluate_mode`` 的值**≠出厂默认**时以其为准（非法值回落 episode，防手改配置写坏）；
-        保持出厂值（或没写）时按旧布尔 ``evaluate_on_reply`` 迁移（true→episode / false→off）。
-        2026-10-11 裁决（DEV_GUIDE 6.5-H）：弃 ``model_fields_set`` 信任——宿主把出厂默认
-        merge 进配置后 fields_set 不能区分"配过/没配过"（与 auto_scheduler 的"值≠默认"口径
-        统一）；代价是显式写回默认值时会退回旧布尔迁移，属已登记的口径取舍。
-        """
-        cfg = getattr(self._plugin.config, "emotion", None)
-        configured = str(getattr(cfg, "evaluate_mode", "") or "").strip().lower()
-        factory_default = "episode"
-        fields = getattr(type(cfg), "model_fields", None) if cfg is not None else None
-        field = fields.get("evaluate_mode") if isinstance(fields, dict) else None
-        if field is not None:
-            factory_default = str(getattr(field, "default", "") or "episode").strip().lower() or "episode"
-        if configured and configured != factory_default:
-            return configured if configured in EVALUATE_MODES else "episode"
-        legacy = self._emotion_cfg("evaluate_on_reply", True)
-        return "episode" if bool(legacy) else "off"
+        """episode / per_reply / off 是评估方式的唯一配置。"""
+        mode = str(self._emotion_cfg("evaluate_mode", "episode") or "episode").strip().lower()
+        return mode if mode in EVALUATE_MODES else "episode"
 
     def _evaluate_max_per_day(self) -> int:
         """情绪评估每日上限（次，夹 [0, 200]；0 = 当日不评估）。"""
@@ -787,18 +769,6 @@ class EmotionService:
                                               EVAL_QUOTA_GROUP: 0}
         return day, int(self._episode_state.get("eval_count") or 0)
 
-    def _eval_quota_partition_enabled(self) -> bool:
-        """4.3b 分区开关（``internal_tuning.json[emotion].emotion_quota_partition_enabled``，
-        默认 True；经 EmotionSectionConfig 同名只读 property 桥接，不占用户 schema）。
-
-        缺键/异常 → True（默认分区）；关 = 私聊/群聊共用 ``evaluate_max_per_day``
-        单一池（旧行为），分区计数仍照常记录，便于重新开启后按当日真实用量续算。
-        """
-        try:
-            return bool(self._emotion_cfg("emotion_quota_partition_enabled",
-                                          DEFAULT_EVAL_QUOTA_PARTITION_ENABLED))
-        except Exception:
-            return DEFAULT_EVAL_QUOTA_PARTITION_ENABLED
 
     def _eval_quota_caps(self) -> Tuple[int, int]:
         """4.3b 分区上限 ``(private, group)``（夹 [0,200]；缺配置回退 6/4）。
@@ -912,7 +882,7 @@ class EmotionService:
         cap = self._evaluate_max_per_day()
         category = self._eval_stream_category(
             session_id or str(getattr(self, "_eval_session_hint", "") or ""))
-        partition_enabled = self._eval_quota_partition_enabled()
+        partition_enabled = True
         category_key = f"{day}|{category}"
         if used + reserved >= cap:
             self._log_decision(

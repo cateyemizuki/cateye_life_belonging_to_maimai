@@ -301,21 +301,22 @@ class ScheduleGenerator:
         return written
 
     def _replace_with_entry(self, date: str, items: List[Dict[str, Any]], reason: str) -> int:
-        """进账漏斗（§31.2，R7 = 用户 2026-10-23 第二轮直派）：写库前先经
-        ``planning.cycle_state.enter_schedule_cycle`` 算包络并 rotate（四种 reason 同用），
-        再 ``replace_day_schedule`` 落库行级盖戳。轮换与决策日志 best-effort，写库路径
-        不因状态层失败中断。"""
-        plugin = self._plugin
-        stamps = enter_schedule_cycle(
-            getattr(plugin, "_data_dir", None), date, items, reason=reason,
-            decision_logger=getattr(plugin, "_decision_logger", None),
-            **entry_context_from_plugin(plugin),
-        )
-        return self._db.replace_day_schedule(
+        """先保存日程，再登记周期；未来日程只进入待接替区。"""
+        from .cycle_state import envelope_minutes
+        stamps = envelope_minutes(items)
+        written = self._db.replace_day_schedule(
             date, items, entry_reason=reason,
             cycle_start_ts=(stamps[0] if stamps else None),
             cycle_end_ts=(stamps[1] if stamps else None),
         )
+        if written:
+            plugin = self._plugin
+            enter_schedule_cycle(
+                getattr(plugin, "_data_dir", None), date, items, reason=reason,
+                decision_logger=getattr(plugin, "_decision_logger", None),
+                **entry_context_from_plugin(plugin),
+            )
+        return written
 
     # ============================================================
     # spine 日意图分支（2026-10-25 滚动化改造新增；R7 依据 = 用户 2026-10-25 直派，
@@ -349,7 +350,7 @@ class ScheduleGenerator:
             "history_messages": _int("spine_history_messages", 12, 0),
             "knowledge_limit": _int("spine_knowledge_limit", 3, 0),
 
-            "use_multi_round": bool(getattr(cfg, "intention_multi_round", False)),
+            "max_rounds": max(1, int(getattr(getattr(getattr(self._plugin, "config", None), "schedule_advanced", None), "max_rounds", 6))),
             "over_limit_auto_trim": _over_limit_trim(self._plugin),
         }
 
@@ -419,7 +420,7 @@ class ScheduleGenerator:
         last_error: Optional[Exception] = None
         # intention_multi_round=true 时最多 2 次同提示重试（结构校验：拿到可用意图即收），
         # 不带反馈重试、不跑质量评分（设计 §4.2：单轮、结构校验、不强制重试）
-        for _ in range(2 if params["use_multi_round"] else 1):
+        for _ in range(params["max_rounds"]):
             try:
                 response = await self._call_llm(prompt, gen_config, event="schedule_spine")
             except LLMError as exc:

@@ -240,7 +240,7 @@ class GroupAttentionService:
 
     def _section(self) -> Any:
         config = getattr(self._plugin, "config", None)
-        return getattr(config, "experimental", None)
+        return getattr(config, "feature_tuning", None)
 
     def _cfg_value(self, key: str) -> Any:
         section = self._section()
@@ -251,14 +251,8 @@ class GroupAttentionService:
         return _GA_DEFAULTS.get(key)
 
     def enabled(self) -> bool:
-        """总开关（默认关；读取失败按关处理 = 旧行为）。"""
-        try:
-            section = self._section()
-            if section is None:
-                return False
-            return bool(getattr(section, "group_attention_decay_enabled", False))
-        except Exception:
-            return False
+        """该功能始终启用；可用性由运行时能力检查决定。"""
+        return True
 
     def sample_size(self) -> int:
         return int(_clamp(self._cfg_value("sample_size"), 3, 200, default=20))

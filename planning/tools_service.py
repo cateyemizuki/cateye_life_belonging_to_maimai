@@ -104,7 +104,7 @@ class ToolsService:
             "min_activities": cfg.min_intentions,
             "max_activities": cfg.max_intentions,
             "timeout_seconds": adv.generation_timeout,
-            "use_multi_round": cfg.intention_multi_round,
+            "use_multi_round": True,
             "max_rounds": adv.max_rounds,
             "quality_threshold": adv.quality_threshold,
             "enable_detailed_description": cfg.enable_detailed_description,

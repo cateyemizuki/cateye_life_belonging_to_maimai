@@ -472,10 +472,8 @@ class ProactiveService:
         return values, problems
 
     def _target_qq(self) -> str:
-        """目标陪伴对象 QQ（空/占位返回空串）。"""
-        section = getattr(getattr(self._plugin, "config", None), "patrol", None)
-        raw = str(getattr(section, "target_qq", "") or "").strip()
-        return "" if raw in ("", "0", "123456789") else raw
+        from core.targeting import target_qq_of
+        return target_qq_of(getattr(self._plugin, "config", None))
 
     def _companion_enabled(self) -> bool:
         """陪伴模块是否启用（目标私聊的早/晚安由陪伴模块开关兜底；读不到按启用）。"""
@@ -3581,11 +3579,8 @@ class ProactiveService:
             projector = getattr(patrol, "_readonly_cycle_anchor", None)
             if callable(projector):
                 try:
-                    staged = True
-                    gate = getattr(patrol, "_miss_stage_escalation_enabled", None)
-                    if callable(gate):
-                        staged = bool(gate())
-                    anchor, projected = projector(now_dt, last, staged=staged)
+
+                    anchor, projected = projector(now_dt, last)
                     if anchor is not None:
                         hours = max(0.0, float(projected or 0.0))
                 except Exception:
@@ -3607,14 +3602,13 @@ class ProactiveService:
                         now_dt = now_dt.replace(tzinfo=anchor.tzinfo)
                 hours = max(0.0, (now_dt - anchor).total_seconds() / 3600.0)
             if hours > STAGE4_SILENCE_HOURS:
-                sleep_enabled = getattr(patrol, "_miss_sleep_excluded_enabled", None)
-                if callable(sleep_enabled) and sleep_enabled():
-                    sleeper = getattr(patrol, "_sleep_hours_between", None)
-                    if callable(sleeper):
-                        try:
-                            hours = max(0.0, hours - float(sleeper(anchor, now_dt) or 0.0))
-                        except Exception:
-                            logger.debug("阶段查询睡眠扣除失败（按自然时长）", exc_info=True)
+
+                sleeper = getattr(patrol, "_sleep_hours_between", None)
+                if callable(sleeper):
+                    try:
+                        hours = max(0.0, hours - float(sleeper(anchor, now_dt) or 0.0))
+                    except Exception:
+                        logger.debug("阶段查询睡眠扣除失败（按自然时长）", exc_info=True)
             return (4 if hours > STAGE4_SILENCE_HOURS else 0), hours
         except Exception:
             logger.debug("目标沉默阶段只读查询失败（按非阶段 4 处理）", exc_info=True)

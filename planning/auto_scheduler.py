@@ -1,6 +1,6 @@
 """每日定时生成循环。
 
-日程总开关启用后，按 generate_at 自动生成下一日意图。每天至多成功一次，
+日程总开关启用后，按本夜入睡点提前生成下一日意图。每天至多成功一次，
 失败退避后重试；不直接发送聊天消息。生成时刻按起床锚点形成的日程日换算，
 并限制在下一日起点之前至少30分钟。已退役的相对延迟及旧绝对时刻不参与判定。
 """
@@ -46,23 +46,6 @@ def clamp_due_minutes(due_minutes: int) -> int:
     return min(int(due_minutes), DAY_MINUTES - GENERATE_LEAD_MINUTES)
 
 
-def generate_at_minutes(cfg: Any) -> int:
-    """spine 固定生成时刻（``[schedule].generate_at``，HH:MM）→ 钟点分钟数。
-
-    PR8 3.0.0（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP1 步骤 7）：
-    spine 为唯一生成路线，本值**无条件生效**（不再要求 ``[schedule].spine_mode``）；
-    空串/非法 HH:MM 固定回落 ``00:30``（= ``generate_at`` 出厂缺省口径），
-    不再沿用旧「最后 end + 延迟」生成时机（旧 daily 链已清退，无旧口径可沿用）。
-
-    设计 §9.1 警告：spine 稀疏意图的最后 end 很早（如 15:00），沿用「最后 end + 延迟」
-    会在当天傍晚就过早生成次日——所以必须用固定时刻触发。
-    """
-    raw = str(getattr(cfg, "generate_at", "") or "").strip()
-    minutes = parse_hhmm(raw, -1)
-    if minutes < 0:
-        logger.debug("generate_at 留空/非法（%r），固定回落 00:30", raw)
-        return parse_hhmm("00:30", 30)
-    return minutes
 
 
 
@@ -140,9 +123,7 @@ class ScheduleAutoScheduler:
         return section_or_default(self.plugin, 'schedule', ScheduleSectionConfig)
 
     def _describe_timing(self, cfg: Any) -> str:
-        """启动日志用的口径描述（不参与判定；PR8 3.0.0 起 spine 唯一路线，恒固定时刻）。"""
-        return (f"日程：每天 {str(getattr(cfg, 'generate_at', '') or '').strip() or '00:30'} "
-                f"固定生成日意图（仍受新一天起点前 {GENERATE_LEAD_MINUTES} 分钟硬约束）")
+        return f"日意图在本夜入睡参考前 {GENERATE_LEAD_MINUTES} 分钟生成，当前日程结束后接替"
 
     def _anchors(self, cfg: Any) -> Tuple[int, int]:
         """``(wake_minutes, sleep_minutes)`` 作息锚点（F16；缺省/非法 07:00 / 23:00）。"""
@@ -162,16 +143,25 @@ class ScheduleAutoScheduler:
             return []
 
     def _due_minutes_in_frame(self, frame_start: datetime, cfg: Any) -> int:
-        """当日帧内的到期分钟数 = spine 固定生成时刻的帧内位置（≤ 新一天起点 − 30 分钟钳制）。
-
-        PR8 3.0.0（依据 = 用户 2026-10-27 授权直接清理）：spine 为唯一生成路线，
-        ``generate_at`` 无条件生效；留空/非法在 :func:`generate_at_minutes`
-        内固定回落 ``00:30``。设计 §9.1：勿用稀疏意图的最后 end 触发，否则会过早生成
-        次日（旧「最后 end + 延迟」/绝对时刻兼容口径已随 daily 链清退，不再参与判定；
-        退役字段仅在配置迁移入口丢弃）。
-        """
-        wake_min = self._anchors(cfg)[0]
-        return clamp_due_minutes(in_frame_minutes(generate_at_minutes(cfg), wake_min))
+        """每次检查重新读取入睡参考，采用最早允许入睡点以覆盖高债提前睡。"""
+        wake_min, sleep_min = self._anchors(cfg)
+        sleep_at = frame_start + timedelta(minutes=in_frame_minutes(sleep_min, wake_min))
+        engine = getattr(self.plugin, "_sleep_engine", None)
+        try:
+            reference = sleep_at - timedelta(hours=1)
+            window = engine.dynamic_window(reference) if engine is not None else None
+            earliest = getattr(window, "start", None)
+            if isinstance(earliest, datetime):
+                if frame_start.tzinfo is None and earliest.tzinfo is not None:
+                    earliest = earliest.replace(tzinfo=None)
+                elif frame_start.tzinfo is not None and earliest.tzinfo is None:
+                    earliest = earliest.replace(tzinfo=frame_start.tzinfo)
+                if frame_start <= earliest < frame_start + timedelta(days=1):
+                    sleep_at = min(sleep_at, earliest)
+        except Exception:
+            logger.debug("动态睡眠窗不可得，使用配置入睡锚点", exc_info=True)
+        due = int((sleep_at - frame_start).total_seconds() / 60) - GENERATE_LEAD_MINUTES
+        return max(0, clamp_due_minutes(due))
 
     def _due_for_frame(self, frame_start: datetime, cfg: Any) -> Tuple[str, datetime]:
         """某「日程日」帧对应的 ``(目标日, 到期时刻)``（**目标日** = 帧起点 +1 天 = 新一天）。"""
@@ -241,7 +231,7 @@ class ScheduleAutoScheduler:
                     continue
 
                 wait_seconds = max(15.0, self._seconds_until_next(now, cfg))
-                await asyncio.sleep(wait_seconds)
+                await asyncio.sleep(min(60.0, wait_seconds))
 
             except asyncio.CancelledError:
                 break
@@ -280,6 +270,11 @@ class ScheduleAutoScheduler:
                 rows = list(db.get_day_schedule(target) or [])
                 from .rolling_planner import extract_spine_intents
                 if extract_spine_intents(rows):
+                    from .cycle_state import enter_schedule_cycle, entry_context_from_plugin, REASON_SCHEDULED
+                    enter_schedule_cycle(getattr(self.plugin, "_data_dir", None), target, rows,
+                        reason=REASON_SCHEDULED,
+                        decision_logger=getattr(self.plugin, "_decision_logger", None),
+                        **entry_context_from_plugin(self.plugin))
                     logger.info(f"{target} 已有 {len(rows)} 个 spine 日程，跳过自动生成")
                     return True
                 logger.info(f"{target} 为旧非 spine 日表（{len(rows)} 行），按 3.0.0 重建 spine 日程")
@@ -306,7 +301,7 @@ class ScheduleAutoScheduler:
                 min_activities=cfg.min_intentions,
                 max_activities=cfg.max_intentions,
                 timeout_seconds=adv.generation_timeout,
-                use_multi_round=cfg.intention_multi_round,
+                use_multi_round=True,
                 max_rounds=adv.max_rounds,
                 quality_threshold=adv.quality_threshold,
                 enable_detailed_description=cfg.enable_detailed_description,

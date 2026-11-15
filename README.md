@@ -14,9 +14,9 @@
 
 ## 配置入口
 
-- 宿主 WebUI 插件配置为唯一入口；当前 schema **22 段 268 字段、2 隐藏**（3.17.37：新增 `[video_autonomous]` 视频自主观看段 4 键 `min_views/min_replies/min_coins/min_favorites`——日程主动观看的候选数据门槛（播放量默认 50000，评论/投币/收藏默认 0=不检查），**只约束日程触发的自主选片，工具点播不受任何阈值影响**；评论/投币/收藏仅候选阶段真实可得时参与检查（搜索路缺失即跳过）。`[video_share]` 的 `video_share_quality_gate/threshold` 经核对消费方（仅 Qzone 发布桥）保留原段不迁移，观看侧另设独立统计阈值。3.17.36：新增 `[legacy_compat]` 旧版兼容段 3 键 `snowluma_http_host/port/token`，`[qzone]` 移出 `napcat_http_*` 3 键——跨段改名**值搬运**，段 +1、字段净 ±0；`[llm].over_limit_auto_trim` 默认改关。3.17.33：新增 `[planning_events]` 3 键、`[patrol].miss_sleep_excluded`、`[planning_proactive].greeting_night_require_morning_chain`；Gemini 配置批再增 15 键：`[life_state]` 3、`[patrol]` 4、`[planning_proactive]` 1、`[affection]` 1、`[emotion]` 3、`[prompts]` 1、`[video_share]` 2；配置默认值轮再增 `[emotion].emotion_quota_partition_enabled` 1 键，配额分区总开关从 `internal_tuning` 移回用户 schema；3.17.34 `[experimental]` 段 41 键 = B1 F1 群注意力 10 + B2 F3 转场拖延 16 + B3 F4 社交边界 13 + B4 bpp 联动/群电量 2 − 2026-11-12 结构审计批移除未实现开关 `transition_procrastination_event_branch` 1 + 裁决批 F5 抑饿 1；裁决 3 将 F1/F3/F4/B4 四开关默认转正为开，裁决 2 将段序改为 plugin 第一、experimental 第二）。段键（**按 WebUI 实际渲染序**，即各段 `__ui_order__` 升序、同序按声明序稳定排序）：`plugin / experimental / patrol / screen / affection / schedule / schedule_advanced / planning_proactive / planning_events / emotion / life_state / qzone / qzone_video / legacy_compat / video_watch / video_autonomous / video_share / llm / prompts / admin / dashboard_display / maimai_interaction`。`[qzone]` → `[qzone_video]`（空间视频候选）→ `[legacy_compat]`（旧版兼容）三段渲染相邻（2026-11-14 段序修正批，无版本递增：qzone_video 16→10、legacy_compat 17→11，video_watch 起其余段整体顺延 +2、彼此相对顺序不变）。`[video_autonomous]`（视频自主观看）与 `[video_watch]`/`[video_share]` 同为 `__ui_order__=12`，声明序插在两者之间 → 渲染序 video_watch → video_autonomous → video_share。`[legacy_compat]`（旧版兼容）：SnowLuma 2.0.0 及以上版本无需配置本段；低于 2.0.0 的 SnowLuma 需要配置，且仅当适配器直连 get_cookies 失效时才会读取。
+- 宿主 WebUI 插件配置为唯一入口；3.18.0 共 **21 段、203 字段（2 隐藏）**。常规功能直接启用，群注意力、转场与社交边界的内部参数保留在 `mappings/internal_tuning.json`。
 - 起步最少配置：`[patrol] target_qq`（陪伴对象；占位值 = 不主动私聊任何人）、`[admin] admin_users`（管理员；留空 = 仅本机控制台）。QQ 空间另需 `[qzone] enabled` 与 SnowLuma 适配器；屏幕感知另需 `[screen] enabled` 与 cateye 统一连接插件。
-- 退役旧键（`spine_mode`、`[life_state]` 旧开关组、patrol 旧主动键、event_catalog 独立段键、`[qzone_video].attach_source` 等）升级时纯 pop、不做值搬运、不再出现在 WebUI；事件库配置已平铺进 `[schedule] event_catalog_mode` 与三时段双池配额键。例外：`[qzone].napcat_http_host/port/token` 于 3.17.36 改名为 `[legacy_compat].snowluma_http_host/port/token`，升级时**值搬运**（新段显式非空值优先），旧键不再出现在 WebUI。
+- 配置升级会清除已退役键；用户有效值优先。小事件更新周期的旧上下限合并为一个区间，实验参数保留在内部调参表，用户自定义映射与初始事件不会被升级覆盖。
 - 用户映射表在 `mappings/` 表层（8 张，不随包更新覆盖），出厂种子在 `mappings/default_mappings/`；详见下文「自定义映射表」。
 
 ## 已知限制
@@ -67,21 +67,31 @@
 
 1. 把插件目录放进 MaiBot 的 `plugins/`（目录名建议 `cateye_life_belonging_to_maimai`）。
 2. 重启 MaiBot，或在插件管理里重载插件。
-3. 在 WebUI 的「陪伴模块」里填写 `target_qq`（`[patrol]`）。保持默认占位值 `123456789` 时不会主动私聊任何人，`/lbm_mai_*` 命令不可用；管理员命令仍由 `admin_users` 决定。
-4. 如需从 QQ 使用管理员命令，在「管理与日志」（`[admin]`）里填上你的 QQ 号；留空时仅本机控制台可用。
+3. 在「陪伴模块」填写 `target_qq`；留空时使用宿主命令设置 `plugin.permission` 中唯一的 QQ 管理员。多人、非 QQ 或未配置时保持未配置，不猜选私聊对象。
+4. 「管理与日志」的管理员列表留空时跟随陪伴目标；陪伴目标也留空时按上条规则读取宿主管理员。无法确定对象时仅本机控制台可用。告状接收人留空也跟随同一目标。
 5. 依赖 `httpx` 与 `Pillow`。Pillow 只用于渲染日程图与状态图，缺失或渲染失败时自动降级为纯文本。
 
-屏幕感知、QQ空间、周结大事记保留独立开关；事件库使用日程段的`event_catalog_mode`控制，off只取内置池。日程总开关启用后，生成/跨日/意图分类和注入优化固定适用，生活状态只使用目标趋近结算，正常睡眠始终动态。午休只对QQ空间按真实活动静默。
+屏幕感知、QQ 空间、周结大事记保留独立开关。小事件池始终按周期自动更新，空白时立即尝试补充；仍遵守清醒、睡眠与硬约定保护。日程总开关启用后，生活状态使用目标趋近结算，正常睡眠使用动态睡眠引擎。
 
 屏幕感知默认只看主屏（`[screen] scope=main`，与旧版行为一致）；TA 常在副屏上干活时可改 `all`——对端（cateye 统一连接插件 v1.1.0+）多屏时逐屏抓取，全部截图一次交给视觉模型分屏概述；对端过旧、单屏客户端或负载超限自动降级时，`all` 退化为只看主屏，与 `main` 等价。
 
 **前置条件**：QQ 空间需要 SnowLuma 适配器（NapCat 画像不支持 QZone API）；屏幕感知需要「cateye 统一连接插件」且对方电脑上的客户端在线。目标私聊流解析不到时，插件每 60 秒重试一次，期间不会有任何主动消息；先与目标 QQ 互发一条消息通常即可解析到。
 
-WebUI 段键对照见上文「配置入口」（22 段，按实际渲染序：插件/实验性功能/陪伴模块/屏幕感知/好感度/日程系统/日程系统·高级设置/日程主动行为/事件与分享概率/情绪系统/生活状态/QQ 空间/空间视频候选/旧版兼容/视频观看/视频自主观看/视频自主分享/LLM 调用/提示词（高级）/管理与日志/数据展示/麦麦互动）；事件库不再是独立段，配置平铺进 `[schedule]`。
+WebUI 共 21 个分组：插件/陪伴模块/屏幕感知/好感度/日程系统/日程系统·高级设置/日程主动行为/事件与分享概率/情绪系统/生活状态/QQ 空间/空间视频候选/旧版兼容/视频观看/视频自主观看/视频自主分享/LLM 调用/提示词（高级）/管理与日志/数据展示/麦麦互动。小事件池配置平铺在 `[schedule]`。
 
 ## 工具主动私聊（已移除）
 
 `lbm_mai_lover_send_message` 已于2026-11-03移除：它曾可绕过主动预算/冷却直发私聊（P0缺口），现删除注册以关闭该路径。persona主动发言经巡检→人格化主动回合，受每日预算与冷却守卫；2026-11-04起告状工具发送也经预算闸门（冷却落盘跨热重载）。`[prompts].tool_send_message*` 死配置位已于2026-11-04删除（旧配置值静默忽略，无行为）。
+
+## 3.18.0 配置与日程交替
+
+日意图以本夜睡眠参考为锚点，提前 30 分钟生成。动态睡眠允许提前入睡时，生成也随最早入睡点提前。新日程先保存到对应日期，当前周期保持到今日日程结束；真实醒来会同步接替后的周期起点。重载后仍能恢复待接替状态。赖床上限时刻保留。
+
+想念扣除睡眠、阶梯想念、弹性主动预算、阶梯还债、情绪分区配额、好感折减/回充、真实观看兴趣反馈、群注意力、转场与社交边界直接启用。情绪自动评估只使用 `evaluate_mode`。日意图默认最多六轮，内部调参表中的已有自定义值保留。
+
+模型与决策日志始终记录，保留 30 天。检测到 bpp 插件时，打字等待完全交给对方；旧版 bpp 不支持联动时不重复等待，未安装 bpp 时保留本插件的打字时延设置。
+
+右上角「切换主题」在 A/C 两个主题间切换。两版密度与缩放一致，桌宠松开拖拽时只吸附左右边缘。
 
 ## 生活面板详情
 
@@ -125,7 +135,7 @@ WebUI 段键对照见上文「配置入口」（22 段，按实际渲染序：�
 
 - **唯一总开关 `[schedule] enabled`（默认 `true`）**：开启时同时装配 spine 日意图、滚动运行时、生活状态与睡眠引擎；关闭时**仅日程链**停止（不生成、不注入、日程主动链不开口，工具/命令回「日程未启用」），**不会回落到旧全天生成路线**；陪伴、QQ 空间、情绪等独立模块仍按各自开关运行。
 - **不再存在的旧入口**：旧 daily 生成/校验/质量评分/响应解析链、`lbm_update_schedule_v4` 工具别名、`lbm_nap_lie_in` 赖床工具、`/lbm_emotion_init` 独立命令（统一并入 `/lbm ops init emotion`）、`lbm_get_schedule_info` 的 `lover_day` / `goals` 旧视图、按活动切换强制主动开口的旧链。
-- **独立控制**：`[schedule] event_catalog_mode`（事件库生成）、`[schedule] no_sleep_mode`（无睡眠模式）保留；旧情绪速率调制和午休静默开关退役。
+- **独立控制**：`[schedule] no_sleep_mode` 仍可关闭睡眠；小事件池保持自动更新。
 - **数据兼容**：`life_state.json`、日程库 `schedule.db` 与用户数据**不清空、不批量改写已执行历史**；当前/未来仅有旧非 spine 日表的日期，可把旧行归档后重建 spine 日意图（非破坏性，旧记录仍可追溯）。旧日表行不再被当作当前活动来源。
 - **回滚**：3.0.0 是破坏性清理，没有「改回旧开关」的回退路线；需要旧行为请回退插件版本与配置备份。
 
@@ -184,7 +194,7 @@ WebUI 段键对照见上文「配置入口」（22 段，按实际渲染序：�
 
 ### 事件库（可选，默认 off）
 
-- `[schedule] event_catalog_mode` = `off`（只用内置池）/`manual`（仅手动刷新）/`auto`（到期后台生成）。
+- 小事件池始终自动更新。六项配额分别控制 00–08、08–16、16–24 的可复用与一次性事件数量；每项 0–12，0 表示不生成。可复用事件可重复安排，一次性事件完成后本周期不再使用。
 - 生成数量由三时段「可复用 / 一次性」六键配额决定（每段每池 0–12）；池上限 = 内置数 + 配额和（派生，3.17.6 起独立总配额 `max_pool_events` 已退役）；内置池至少 3 条兜底、生成项 `llm_` 前缀、全量校验通过才替换。
 - 事件文件写坏/缺失/版本不认识时回退内置池并保留 `.bak`，不会覆盖你的用户文件。
 
@@ -243,8 +253,8 @@ WebUI 段键对照见上文「配置入口」（22 段，按实际渲染序：�
 | `[schedule] enabled` | `true` | **日程唯一总开关**：开 = spine + 滚动运行时 + 生活状态 + 睡眠引擎；关 = 全部停止、无旧路线回落 |
 | `[schedule] wake_time` / `sleep_time` | `07:00` / `23:00` | 起床、入睡锚点：spine 生成与作息周期的基准 |
 | `[schedule] no_sleep_mode` | `false` | 无睡眠模式：睡眠窗内不生成任何活动、不主动开口 |
-| `[patrol] target_qq` | `123456789` | 陪伴对象 QQ；占位值 = 不主动私聊、`/lbm_mai_*` 不可用 |
-| `[admin] admin_users` | `[]` | 管理员 QQ；留空 = 仅本机控制台 |
+| `[patrol] target_qq` | 空 | 陪伴 QQ；留空读取宿主唯一 QQ 管理员，无法唯一确定时不启用目标私聊 |
+| `[admin] admin_users` | `[]` | 命令管理员；留空跟随陪伴目标，最终回退宿主唯一 QQ 管理员 |
 | `[patrol] relation_type` | `恋人` | bot 与对方的关系，影响口吻与档位名称 |
 | QQ空间午休静默 | 始终适用 | 只静默真实午休，不依据意图预先静默 |
 | `[planning_proactive] greeting_morning_enabled` / `greeting_night_enabled` | `true` / `true` | 早安、晚安总开关 |
@@ -270,7 +280,7 @@ WebUI 段键对照见上文「配置入口」（22 段，按实际渲染序：�
 | `[legacy_compat] snowluma_http_host` / `snowluma_http_port` / `snowluma_http_token` | `""` | 旧版兼容（3.17.36，原 `[qzone] napcat_http_*` 值搬运改名）：SnowLuma 2.0.0 及以上无需配置；低于 2.0.0 才需填。仅适配器直连 get_cookies 失效时才读取；仅限回环地址 |
 | `[patrol] daily_max_speak` | `5` | 每日主动预算上限，只统计巡检与想念 |
 | `[life_state] emotion_modulation_enabled` | `false` | 情绪-生活双向调制（独立于日程总开关） |
-| `[schedule] event_catalog_mode` | `off` | 事件库：`off` / `manual` / `auto` |
+| `[schedule] event_catalog_refresh_cycle` | `5-8` | 小事件池每次更新后的随机间隔（天）；可复用/一次性各分三个时段配置生成数量 |
 | `[video_watch] enabled` | `true` | 内置视频观看模块总开关（关 = 工具如实返回未启用、watch_bili 事件不可 roll、日程刷视频跳过；3.2.0 起运行时门控即时生效） |
 | `[video_watch] visual_enabled` | `true` | 画面采样（本机无 ffmpeg 或 vlm 任务不可用时如实降级为文本来源） |
 | `[video_autonomous] min_views` | `50000` | 日程主动观看播放量门槛：低于此值的候选不主动看；0=不检查。**只影响日程触发的自主选片，工具点播不受约束**（3.17.37） |
@@ -341,7 +351,7 @@ data/plugins/cateye.life_belonging_to_maimai/
 
 - 本次运行接口可见8个命令和8个工具；该接口不包含全部Hook/API，不把交互入口数当作完整注册总数。
 - 声明 **17 项**宿主能力。
-配置以宿主运行schema为准：3.17.37 为 22 段 268 字段、2 隐藏（3.17.37 新增 `[video_autonomous]` 4 键 `min_views/min_replies/min_coins/min_favorites`，段 +1、字段 +4，渲染序插在 video_watch 与 video_share 之间；3.17.36 新增 `[legacy_compat]` 3 键、`[qzone]` 移出 `napcat_http_*` 3 键，段 +1、字段净 ±0；`[experimental]` 段共 41 键 = B1 F1 10 + B2 F3 16 + B3 F4 13 + B4 联动 2 − 2026-11-12 结构审计批移除的未实现开关 1 + 裁决批 F5 抑饿 1；段序 plugin 第一、experimental 第二，`[qzone]` → `[qzone_video]` → `[legacy_compat]` 三段渲染相邻（2026-11-14 段序修正，不再垫底）；F1/F3/F4/B4 四开关默认转正为开）；结算参数使用settlement_params_json，形象使用fish/human。历史字段变动见 CHANGELOG 与 union/20261106_配置项完整变动报告.md，实验配置迁移见 union/20261111_实验配置迁移映射.md。
+配置以宿主运行 schema 为准：3.18.0 共 21 段、203 字段、2 隐藏。`[qzone]`、`[qzone_video]`、`[legacy_compat]` 相邻；视频观看、自主观看、自主分享相邻。配置改名与退役记录见 CHANGELOG。
 - 用户可编辑表 **8 张**（七张映射表+内部调参表）：出厂种子在 `mappings/default_mappings/`（随包分发、随版本更新），你的实际数据区是 `mappings/`（表层，不随包覆盖）；首次使用缺表会从种子自动补齐。另有插件自动读写的用户数据文件 `mappings/generated_events.json`（事件库）。
 
 ## 许可

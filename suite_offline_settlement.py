@@ -109,8 +109,7 @@ class OfflineSettlementService:
     def settle_offline_gap(self, life: Any, planner: Any, *,
                            engine_claimed: bool,
                            plan_settlement_fn: Optional[Callable[..., Any]] = None,
-                           baseline_hours: float = 8.0,
-                           repay_v2: bool = True) -> None:
+                           baseline_hours: float = 8.0) -> None:
         """冷启动离线 gap 收口（离线睡眠补全 A2 编排，2026-10-29；本方法不抛异常）。
 
         步序（指令 ①）：LifeState 冷启动已把原始离线 gap 暂存为 pending（A1）→
@@ -155,20 +154,11 @@ class OfflineSettlementService:
         # False 必须真走旧公式，不能被计划函数的默认值兜成 v2。旧签名策略函数
         # （回归用例注入）没有 repay_v2 形参时自动退回旧调用。
         try:
-            accepts_repay = True
-            try:
-                params = inspect.signature(plan_fn).parameters
-                accepts_repay = ("repay_v2" in params
-                                 or any(p.kind is p.VAR_KEYWORD for p in params.values()))
-            except (TypeError, ValueError):
-                accepts_repay = True
             kwargs: Dict[str, Any] = {}
             if float(baseline_hours) != 8.0:
                 # 复核 P0-4：基准非默认时透传（默认 8.0 保持旧二元调用，兼容
                 # 回归用例注入的旧签名策略函数）
                 kwargs["baseline_hours"] = float(baseline_hours)
-            if accepts_repay:
-                kwargs["repay_v2"] = bool(repay_v2)
             plan = plan_fn(gap, debt_before, **kwargs) if kwargs else plan_fn(gap, debt_before)
         except Exception as exc:
             self._warn("离线结算计划生成失败（回退旧冷启动漂移）：%s", exc)

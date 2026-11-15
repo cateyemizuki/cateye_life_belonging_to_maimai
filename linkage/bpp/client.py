@@ -61,10 +61,27 @@ class PostProcessBridge:
     # ------------------------------------------------------------------
 
     def enabled(self) -> bool:
-        """``[experimental].bpp_bridge_enabled``（主开关；2026-11-12 裁决 3 起默认 True）。"""
-        section = getattr(getattr(self._plugin, "config", None), "experimental", None)
-        value = getattr(section, "bpp_bridge_enabled", False)
-        return bool(value) if value is not None else False
+        """该功能始终启用；可用性由运行时能力检查决定。"""
+        return True
+
+    async def installed(self) -> Optional[bool]:
+        """按插件 ID 探测；未知时保守停止本插件的打字等待。"""
+        try:
+            result = await asyncio.wait_for(
+                self._plugin.ctx.component.list_registered_plugins(), timeout=0.5)
+            if isinstance(result, dict):
+                if result.get("success") is False:
+                    return None
+                result = result.get("plugins", result)
+            if isinstance(result, dict):
+                return BPP_PLUGIN_ID in result
+            if isinstance(result, (list, tuple)):
+                ids = [entry.get("id", entry.get("plugin_id", entry.get("name", "")))
+                       if isinstance(entry, dict) else str(entry) for entry in result]
+                return BPP_PLUGIN_ID in ids
+        except Exception:
+            pass
+        return None
 
     # ------------------------------------------------------------------
     # 调用面

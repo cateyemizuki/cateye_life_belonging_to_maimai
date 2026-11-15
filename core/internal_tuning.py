@@ -18,11 +18,15 @@ TOML schema 移入 ``mappings/internal_tuning.json``（表层用户数据区）+
 - 坏值口径：单键类型不符 → 该键回退出厂默认（告警一次），不整表拒绝；
   整表解析失败 → 全量内置默认（表层文件原地不动，红线同 mapping_dir）。
 
-2026-11-12 结构审计批（R8）：实验期镜像段/键（``group_attention`` 9 /
-``transition`` 16 / ``boundary`` 12 / ``life_state.group_chat_social_drain_per_reply``
-/ ``emotion.emotion_quota_partition_enabled``，共 39 键）**不再写入用户 J 表种子**，
-只保留在本文件的 :data:`INTERNAL_TUNING_DEFAULTS` 作为「转正后迁移目标 + 运行期
-兜底」代码常量（实验期运行期只读 ``[experimental]`` pydantic 字段）。
+2026-11-12 结构审计批（R8）：实验期镜像段/键曾不写入用户 J 表种子。
+3.18.0（2026-11-15 用户裁决）：experimental 全部转正——``[experimental]`` 段退役，
+参数键降级本表（``group_attention`` / ``transition`` / ``boundary`` 三段与
+``life_state.group_chat_social_drain_per_reply`` 重新进入种子视图，用户可现场微调）；
+五个开关退役（行为恒开，``suite_config`` 以只读服务视图桥接既有消费点）。
+``transition.enabled`` 与 ``procrastination_event_branch`` 仍不进种子：前者是退役
+开关的代码常量（planning.transition.DEFAULTS 依赖该键存在），后者是未实现预留。
+``emotion.emotion_quota_partition_enabled`` 镜像键随用户裁决移除（分区为唯一路径，
+emotion/service.py 的 DEFAULT_EVAL_QUOTA_PARTITION_ENABLED 常量承担默认）。
 :data:`SEED_OMITTED_SECTIONS` / :data:`SEED_OMITTED_KEYS` /
 :func:`seed_entries` 是种子视图的唯一裁量点。
 
@@ -69,7 +73,7 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "spine_knowledge_limit": 3,
     },
     "schedule_advanced": {
-        "max_rounds": 2,
+        "max_rounds": 6,
         "quality_threshold": 0.85,
         "generation_timeout": 180.0,
         "recent_schedule_days": 3,
@@ -143,7 +147,7 @@ INTERNAL_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         # schema 叶子；默认 True（私聊 6/群聊 4 分区），False = 回旧单一共享池。
         # 2026-11-11 配置默认值轮已移回用户 schema（[emotion].emotion_quota_partition_enabled
         # 真实 Field）；2026-11-12（R8）：本键不再写入用户 J 表种子。
-        "emotion_quota_partition_enabled": True,
+
         # 3.17.33 每日情绪兜底结算（用户直派）：白天配额可能被用光，日终再结算一次。
         # 内部调参（J 类），不占用户 schema 叶子；缺键 = 默认开启 / 23:50 / 摘要 800 字。
         # ``daily_settlement_minute`` = 当日第几分钟（1430 = 23:50）。
@@ -224,12 +228,11 @@ _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 #: 2026-11-12 结构审计批（R8）：实验期镜像段——运行期只读 ``[experimental]``，
 #: 不写入用户 J 表种子（避免零效果的双入口）；仍保留在
 #: :data:`INTERNAL_TUNING_DEFAULTS` 作为转正迁移目标与运行期兜底。
-SEED_OMITTED_SECTIONS = frozenset({"group_attention", "transition", "boundary"})
+SEED_OMITTED_SECTIONS = frozenset()
 
 #: 实验期镜像单键（段 → 键集合；同上：代码常量保留，种子不落）。
 SEED_OMITTED_KEYS: Dict[str, frozenset] = {
-    "life_state": frozenset({"group_chat_social_drain_per_reply"}),
-    "emotion": frozenset({"emotion_quota_partition_enabled"}),
+    "transition": frozenset({"enabled", "procrastination_event_branch"}),
 }
 
 
@@ -465,3 +468,53 @@ def merge_captured(captured: Dict[str, Dict[str, Any]], *, root_dir: Any = None)
         _atomic_write_json(path, raw)
         _CACHE["key"] = None  # 落盘后失效读取缓存
     return added
+
+
+_FEATURE_PARAMETERS = {'group_attention_sample_size': ('group_attention', 'sample_size'),
+ 'group_attention_decay_window_minutes': ('group_attention', 'decay_window_minutes'),
+ 'group_attention_silence_weight': ('group_attention', 'silence_weight'),
+ 'group_attention_mismatch_weight': ('group_attention', 'mismatch_weight'),
+ 'group_attention_step_per_tick': ('group_attention', 'step_per_tick'),
+ 'group_attention_recover_step_per_tick': ('group_attention', 'recover_step_per_tick'),
+ 'group_attention_planner_hint_min_multiplier': ('group_attention', 'planner_hint_min_multiplier'),
+ 'group_attention_planner_hint_interval_minutes': ('group_attention',
+                                                   'planner_hint_interval_minutes'),
+ 'group_attention_quiet_group_grace_minutes': ('group_attention', 'quiet_group_grace_minutes'),
+ 'transition_window_min': ('transition', 'window_min'),
+ 'transition_window_max': ('transition', 'window_max'),
+ 'transition_procrastination_prob': ('transition', 'procrastination_prob'),
+ 'transition_delay_minutes': ('transition', 'delay_minutes'),
+ 'transition_delay_jitter_minutes': ('transition', 'delay_jitter_minutes'),
+ 'transition_daily_buffer_limit': ('transition', 'daily_buffer_limit'),
+ 'transition_daily_procrastination_limit': ('transition', 'daily_procrastination_limit'),
+ 'transition_low_focus_types': ('transition', 'low_focus_types'),
+ 'transition_high_focus_types': ('transition', 'high_focus_types'),
+ 'transition_boundary_margin_minutes': ('transition', 'boundary_margin_minutes'),
+ 'transition_focus_target': ('transition', 'focus_target'),
+ 'transition_focus_tau_min': ('transition', 'focus_tau_min'),
+ 'transition_confess_probability': ('transition', 'confess_probability'),
+ 'transition_confess_min_interval_minutes': ('transition', 'confess_min_interval_minutes'),
+ 'social_boundary_refusal_energy_threshold': ('boundary', 'refusal_energy_threshold'),
+ 'social_boundary_refusal_stress_threshold': ('boundary', 'refusal_stress_threshold'),
+ 'social_boundary_refusal_mental_floor': ('boundary', 'refusal_mental_floor'),
+ 'social_boundary_deep_work_types': ('boundary', 'deep_work_types'),
+ 'social_boundary_deep_work_modes': ('boundary', 'deep_work_modes'),
+ 'social_boundary_group_line_interval_minutes': ('boundary', 'group_line_interval_minutes'),
+ 'social_boundary_wait_hint_enabled': ('boundary', 'wait_hint_enabled'),
+ 'social_boundary_wait_hint_min_seconds': ('boundary', 'wait_hint_min_seconds'),
+ 'social_boundary_wait_hint_max_seconds': ('boundary', 'wait_hint_max_seconds'),
+ 'social_boundary_wait_hint_cooldown_minutes': ('boundary', 'wait_hint_cooldown_minutes'),
+ 'social_boundary_fragment_hint_probability': ('boundary', 'fragment_hint_probability'),
+ 'social_boundary_rhythm_short_reply_probability': ('boundary', 'rhythm_short_reply_probability'),
+ 'group_chat_social_drain_per_reply': ('life_state', 'group_chat_social_drain_per_reply')}
+
+
+class FeatureTuning:
+    """转正功能的参数从同一内部调参表活读，不再提供实验开关。"""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            section, key = _FEATURE_PARAMETERS[name]
+        except KeyError:
+            raise AttributeError(name) from None
+        return tuning_value(section, key)

@@ -516,7 +516,7 @@ class RollingPlanner:
         except Exception:
             return transition_rules.TransitionParams()
         return transition_rules.TransitionParams.from_section(
-            getattr(cfg, "experimental", None))
+            getattr(cfg, "feature_tuning", None))
 
     def _transition_usage_store(self) -> "transition_rules.TransitionUsageStore":
         if self._transition_usage is None:

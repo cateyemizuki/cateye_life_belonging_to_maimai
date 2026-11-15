@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from core.targeting import admin_users_of
 from datetime import datetime
 from typing import Any, ClassVar, Dict
 
@@ -154,7 +155,7 @@ class QzoneComponentsMixin:
     def _qz_is_admin(self, user_id: str, is_local_operator: bool) -> bool:
         if is_local_operator:
             return True
-        admins = {str(a).rsplit(":", 1)[-1] for a in self.config.admin.admin_users}
+        admins = {str(a).rsplit(":", 1)[-1] for a in admin_users_of(self.config)}
         # 默认拒绝：未配置管理员时 QQ 侧一律拒绝（本机控制台仍可用）
         return bool(admins) and str(user_id).rsplit(":", 1)[-1] in admins
 

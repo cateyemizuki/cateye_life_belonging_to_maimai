@@ -1,5 +1,17 @@
 # 更新日志（CHANGELOG）
 
+## 3.18.0（2026-11-15）配置精简与睡眠点生成
+
+- 移除用户裁定的配置与额外 12 项开关，清理无效分支和旧单池/旧赖床工具辅助代码；常规功能直接启用，实验参数迁入内部调参表。
+- 小事件池始终自动更新，空白立即尝试生成；六项时段/池配额是唯一数量权威；更新周期合并为 `event_catalog_refresh_cycle`，默认 `5-8` 天。
+- 目标 QQ 默认留空，使用宿主 `plugin.permission` 中唯一的 QQ 管理员；其他空管理员配置跟随陪伴目标。多人、非 QQ、无配置均不猜选身份。
+- 日意图按动态睡眠参考提前生成，默认最多六轮；新日程落库后进入持久待接替区，在旧日程结束或真实醒来时接替，避免跨午夜提前替换。赖床硬上限保留。
+- 日志始终记录并保留 30 天；打字等待按 bpp 插件 ID 自动让位，旧版无联动能力时停止额外等待。
+- 配置说明面向初次使用者，去除界面内变动记录；群聊与私聊的名单模式排在名单之前。schema 21 段、203 字段、2 隐藏；版本双号 3.18.0。
+- 修复旧分组内部参数在默认种子写入前的捕获顺序，保留显式新值与旧自定义区间。
+- 本批不包含 LLM 统一重试与模板日志（下一批），也不改变尚未开始的跨午夜意图在零点的候选可见性。
+
+
 ## 主题精简批（2026-11-14，无版本递增）
 
 把主题从「原版/A/B/C」精简为**只保留 A 与 C 两版**，切换按钮暂留，默认 A。**① theme.js**：`LBM_SKINS` 改 `['a','c']`、`LBM_SKIN_NAMES` 移除 `''`（原版）与 `'b'`（手账）；默认主题改 `'a'`，循环 A→C→A；localStorage（键 `lbmTheme`）旧值迁移——存储为 `''`/`'b'`/非法/缺失一律落到 `'a'` 并写回清除旧值，`'a'`/`'c'` 保留；按钮 title/aria 文案同步（「主题切换：点击循环 A 精致 → C 仪表盘…默认 A」），移除原版态 `data-none` 标记与 `dataset.skin||'none'` 兜底；皮肤 B 行为块（`lbmB` 整段 IIFE，约 90 行）删除，装配只 `lbmA.init()/lbmC.init()` 与对应 apply；`lbmSetSkin` 恒写 `document.documentElement.dataset.lbmTheme`（不再有无属性的原版态），加载即应用 A；共享重置 `lbmResetShared` 语义改为「切换前清除两版皮肤痕迹再应用目标」——概括条还原捕获的原始内联色、meta 行内 `display` 还原**并清除 A 的 `va-meta-dupe` 去重类**、datebar 按 `activateTab` 口径还原、`core-registry-path`/`notice` 的 title 移除。**② themes.css**：删除 `[data-lbm-theme="b"]` 整块（含其明暗令牌适配、纸纹/胶带/衬线/滚动条等全部规则与媒体查询，269 行/22,385 字符），保留 a/c 两块；移除原版态 `#lbm-theme-switcher[data-none="1"]` 规则；头部与切换器注释同步两版口径（四态→两态、删 B order 反转描述）。**③ index.template.html**：核查无原版/B 相关文案（pill 为 JS 创建，模板仅 `{{THEMES_CSS}}` slot 与 `<style id="lbm-themes">`），无需改动。**④ 文档**：README「WebUI 生活面板」切换器条目改写为两版口径并记本批。**不破坏**：明暗随宿主/离线 `data-theme`（A/C 复合选择器未动，冒烟实测 A 的 `--va-track` 明暗取值不同）、详情布局基线修正（`fish.css` 布局层与 `layout_fix.js` 未动）、桌宠（`maimai.js` 未动）、tab/小鱼气泡交互（`panel.js`/`fish.js` 未动）——`git diff` 确认非主题源文件逐字节未改。**红线保留**：只改主题相关文件，不动桌宠/配置逻辑，不 git commit、未部署生产。**测试**：`python -I -B tools/build_webui.py` 通过且**幂等**（两次构建 SHA-256 一致 `552e0292…`，产物 1,221,473 字节）；产物内嵌脚本 `new Function` 语法编译通过、无残留 `{{SLOT}}`；`themes.css`/`theme.js`/产物无 `data-lbm-theme=b`/`lbmB`/`data-none` 真实残留（`lbmBase` 为概括条捕获机制，非皮肤 B）。无头浏览器冒烟（Chrome `--headless=new --virtual-time-budget=2500`，离线无桥页，注入错误收集 + localStorage 种子 + 断言）：**12/12 断言通过**——fresh/`''`/`'b'`/非法值均迁移到 `a` 并写回、`'a'`/`'c'` 保留、循环 A→C→A、按钮文案正确、无 `data-none`、明暗随 `data-theme`、全场景零运行时错误（无 `lbmB` ReferenceError）；并以 `git show HEAD:webui/index.html` 原版产物做基线对照（原版默认「原版」/`data-none=true`），证明精简确实生效。冒烟脚本与逐场景 dump 留痕于工作区 `.lbm_smoke/`（仓库外）。真实宿主前台窗口/动画态与桌宠·tab·小鱼气泡的交互冒烟本批未跑（静态精简 + 离线无桥冒烟已覆盖主题逻辑与零错误），建议部署前按对比批口径在宿主复测。

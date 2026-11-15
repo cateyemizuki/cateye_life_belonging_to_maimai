@@ -85,6 +85,10 @@ class BppLinkageAdapter:
             return None
         return await client.claim(stream_id, text, directive)
 
+    async def installed(self) -> Optional[bool]:
+        client = self._resolve_client()
+        return await client.installed() if client is not None else None
+
     async def typing_owner(self, stream_id: Any) -> Optional[str]:
         """只读查询当前打字归属（``status``，不会创建认领）。"""
         client = self._resolve_client()

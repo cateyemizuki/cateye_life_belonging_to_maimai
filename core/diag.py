@@ -112,7 +112,7 @@ class DecisionLogger:
     ACTION_SPOKEN = "spoken"
     ACTION_INFO = "info"
 
-    def __init__(self, data_dir: Path, enabled: bool = True, retention_days: int = 3,
+    def __init__(self, data_dir: Path, enabled: bool = True, retention_days: int = 30,
                  record_skips: bool = True) -> None:
         self._dir = Path(data_dir) / "decision_logs"
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -196,7 +196,7 @@ class DecisionLogger:
 
 
 class LLMCallLogger:
-    def __init__(self, data_dir: Path, enabled: bool = True, retention_days: int = 3) -> None:
+    def __init__(self, data_dir: Path, enabled: bool = True, retention_days: int = 30) -> None:
         self._dir = Path(data_dir) / "llm_logs"
         self._dir.mkdir(parents=True, exist_ok=True)
         self._enabled = enabled

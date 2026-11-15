@@ -65,9 +65,6 @@ def _text(item: Any) -> str:
     return ""
 
 
-def target_mode(value: Any) -> str:
-    """Unknown/missing values always keep the prompt-only behavior."""
-    return "deep" if value in ("deep", "深度处理") else "shallow"
 
 
 @dataclass(frozen=True)
@@ -354,13 +351,6 @@ def append_proactive_notice(payload_key: str, payload: list[Any],
     return None
 
 
-@dataclass
-class _Request:
-    created: float
-    task_id: str
-    target: ReplyTarget | None
-    mode: str
-    target_user: str
 
 
 class ProactiveReplyTargets:
@@ -371,59 +361,17 @@ class ProactiveReplyTargets:
     a correlation key. Overlapping requests with different bindings are never
     rewritten; identical target/mode bindings remain safe after cancellation.
     """
-    def __init__(self) -> None:
-        self._pending: dict[tuple[Any, ...], list[_Request]] = {}
 
-    @staticmethod
-    def _key(kwargs: dict[str, Any]) -> tuple[Any, ...] | None:
-        stream = kwargs.get("session_id")
-        count = kwargs.get("selected_history_count")
-        reason = kwargs.get("selection_reason")
-        if not isinstance(stream, str) or not stream or type(count) is not int or not isinstance(reason, str):
-            return None
-        return stream, count, reason
 
     def before(self, kwargs: dict[str, Any], *, stream_id: str, target_user: str,
-               mode: Any, now_ms: float | None = None) -> dict[str, Any] | None:
-        cutoff = time.monotonic() - 900
-        self._pending = {key: fresh for key, rows in self._pending.items()
-                         if (fresh := [row for row in rows if row.created >= cutoff])}
-        key = self._key(kwargs)
+               now_ms: float | None = None) -> dict[str, Any] | None:
+        """主动任务只附加真实激活提示，不重写回复目标。"""
         items = kwargs.get("items")
-        target = None
-        task_id = ""
-        updated = items
-        if stream_id and target_user and kwargs.get("session_id") == stream_id and isinstance(items, list):
-            updated, target, task_id = prepare_request(items, stream_id, target_user, now_ms=now_ms)
-        if key is not None:
-            rows = self._pending.setdefault(key, [])
-            rows.append(_Request(time.monotonic(), task_id, target, target_mode(mode), target_user))
-            if len(self._pending) > 128:
-                self._pending.pop(next(iter(self._pending)))
+        if not (stream_id and target_user and kwargs.get("session_id") == stream_id and isinstance(items, list)):
+            return None
+        updated, _target, _task_id = prepare_request(items, stream_id, target_user, now_ms=now_ms)
         return {**kwargs, "items": updated} if updated is not items else None
 
     def after(self, kwargs: dict[str, Any], *, stream_id: str, target_user: str) -> tuple[dict[str, Any] | None, int]:
-        key = self._key(kwargs)
-        if key is None:
-            return None, 0
-        rows = self._pending.pop(key, [])
-        # Missing after hooks (cancellation/failure) must not block a later request
-        # with the SAME binding. Distinct bindings remain genuinely ambiguous.
-        bindings = {(row.mode, row.target_user, bool(row.task_id),
-                     row.target.message_id if row.target else None) for row in rows}
-        if len(bindings) > 1:
-            self._pending[key] = [_Request(row.created, "", None, "shallow", "") for row in rows[1:]]
-            return None, 0
-        if len(rows) > 1:
-            self._pending[key] = rows[1:]
-        if not rows or not stream_id or kwargs.get("session_id") != stream_id or not target_user:
-            return None, 0
-        request = rows[0]
-        if (request.mode != "deep" or not request.task_id or request.target is None
-                or request.target_user != target_user or time.monotonic() - request.created > 900):
-            return None, 0
-        # PR-PROACTIVE-REPLY（3.17.2）：task_id 命中即插件主动激活轮——不再强制
-        # reply 的 msg_id 指向上下文里可能过时的用户消息（宿主会据该 msg_id 渲染
-        # 「你想要回复的消息是…」过时目标指令）。目标指令改写改由 replyer
-        # before_model_request 钩子完成；deep 绑定管线保留以兼容配置与钩子契约。
+        """保留钩子接口；目标指令由 replyer 的专用钩子处理。"""
         return None, 0

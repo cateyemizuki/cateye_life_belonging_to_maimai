@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from core.targeting import admin_users_of
 from typing import Any, ClassVar, Dict, List
 
 from maibot_sdk import API, HookHandler, Tool
@@ -225,7 +226,7 @@ class PlanningComponentsMixin:
     def _init_admin_users(self) -> Any:
         """``[admin].admin_users``（读不到 → 空列表 = 仅本机控制台可执行）。"""
         try:
-            return list(getattr(getattr(self.config, "admin", None), "admin_users", None) or [])
+            return admin_users_of(self.config)
         except Exception:
             return []
 

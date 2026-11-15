@@ -39,15 +39,9 @@ def resolve_maintainer_qq(target_qq: Any, admin_users: Any = None,
         qq = normalize_qq(value)
         if qq and qq != PLACEHOLDER_QQ:
             return qq
-    if isinstance(admin_users, (str, int)):
-        admin_users = [admin_users]
-    if not isinstance(admin_users, (list, tuple)):
-        return ""
-    for entry in admin_users:
-        qq = normalize_qq(entry)
-        if qq and qq != PLACEHOLDER_QQ:
-            return qq
-    return ""
+    from core.targeting import unique_qq_admin
+    return unique_qq_admin(admin_users)
+
 
 
 def cooldown_check(now_ts: float, last_ts: float, cooldown_minutes: Any) -> tuple[bool, int]:

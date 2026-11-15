@@ -242,7 +242,7 @@ def approach_value(x_now: float, target: float, tau_min: float, dt_min: float) -
     return target + (float(x_now) - target) * math.exp(-float(dt_min) / float(tau_min))
 
 
-def target_chat_affinity_factor(affinity: Any, *, enabled: bool = True) -> float:
+def target_chat_affinity_factor(affinity: Any) -> float:
     """目标私聊好感折减系数 ``max(0.1, 1 - 0.9 × affinity / 200)``（纯函数）。
 
     - ``enabled=False``（``[life_state].social_battery_affinity_discount`` 关）→ 恒 1.0；
@@ -250,8 +250,6 @@ def target_chat_affinity_factor(affinity: Any, *, enabled: bool = True) -> float
       （系数 1.0），但生产路径在好感读数不可得时**不进入折减**（见
       :func:`target_chat_social_delta` 的 ``affinity=None`` 分支）。
     """
-    if not enabled:
-        return 1.0
     score = max(0.0, min(TARGET_CHAT_AFFINITY_SCORE_MAX, _finite(affinity, 0.0)))
     return max(TARGET_CHAT_DISCOUNT_FLOOR,
                1.0 - TARGET_CHAT_AFFINITY_DISCOUNT_SPAN
@@ -261,8 +259,6 @@ def target_chat_affinity_factor(affinity: Any, *, enabled: bool = True) -> float
 def target_chat_social_delta(drain: Any, *, target_private: bool,
                              affinity: Any = None,
                              social_battery: Any = None,
-                             discount_enabled: bool = True,
-                             recharge_enabled: bool = True,
                              valence: Any = None) -> Dict[str, Any]:
     """目标陪伴私聊单次真实回复的社交电量增量（纯函数，P1-NUM-2）。
 
@@ -293,9 +289,7 @@ def target_chat_social_delta(drain: Any, *, target_private: bool,
     reason = "not_target_private"
     discount_applied = False
     if target_private:
-        if not discount_enabled:
-            reason = "discount_disabled"
-        elif score is None:
+        if score is None:
             reason = "affinity_unavailable"
         else:
             factor = target_chat_affinity_factor(score)
@@ -305,7 +299,7 @@ def target_chat_social_delta(drain: Any, *, target_private: bool,
     relaxed = (valence is not None
                and _finite(valence, -1.0) >= TARGET_CHAT_RELAXED_VALENCE)
     recharge = 0.0
-    if (target_private and recharge_enabled and score is not None
+    if (target_private and score is not None
             and score >= TARGET_CHAT_RECHARGE_MIN_SCORE and relaxed):
         recharge = TARGET_CHAT_RECHARGE_PER_REPLY
         if social_battery is not None:

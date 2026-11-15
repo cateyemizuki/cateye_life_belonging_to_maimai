@@ -95,13 +95,6 @@ class VideoWatchSectionConfig(PluginConfigBase):
     # 真实看完的视频（B1 observed/watched_video）+ 观后感倾向小步长渐变兴趣权重，
     # 饱和封顶（±50%×人设基线）、半衰期衰减、保留探索槽；单次观看不重写人格。
     # 关 = 现状逐字（纯人设+日程问询，不读不写证据层）。
-    interest_watch_feedback_enabled: bool = Field(
-        default=True,
-        description="真实观看兴趣反馈（看完的视频小步长渐变兴趣权重，有饱和上限并保留探索；关=纯人设基线，现状不变）",
-        json_schema_extra={"label": "真实观看兴趣反馈",
-                           **_ui_i18n("Watch-driven interest feedback",
-                                      "Real watches gently evolve interest weights with saturation and exploration; off = persona baseline only.")},
-    )
     interest_watch_half_life_days: int = Field(
         default=7, ge=1, le=30,
         description="观看累积兴趣分的指数衰减半衰期（天）；长期不再看的话题权重缓慢回落",

@@ -331,26 +331,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             for source in (captured_disk, captured_incoming):
                 for sec, keys in source.items():
                     captured_all.setdefault(sec, {}).update(keys)
-            merge_captured(captured_all, root_dir=_PLUGIN_DIR)
+            if captured_all:
+                merge_captured(captured_all, root_dir=_PLUGIN_DIR)
         except Exception:
             pass  # 捕获/落盘失败不阻塞宿主；聚合校验器入口仍会 pop 旧键
-        try:
-            from planning.event_catalog_config import migrate_legacy_event_catalog
-
-            def _migrate_ec(payload: Any) -> Any:
-                if not isinstance(payload, dict) or not isinstance(payload.get("event_catalog"), dict):
-                    return payload
-                before = payload["event_catalog"]
-                after = migrate_legacy_event_catalog(before)
-                if after is before:
-                    return payload
-                out = dict(payload)
-                out["event_catalog"] = after
-                return out
-
-            incoming = _migrate_ec(incoming)
-        except Exception:
-            pass  # 迁移失败不阻塞宿主；段级校验器仍会再尝试一次
         # PR8 3.0.0（R7 依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP2 落点 B）：
         # 退役路线/运行期开关键（:data:`LEGACY_ROUTE_KEYS` + nap 两键）的 raw 前置 pop，
         # 仿 ``_migrate_ec`` 先例对 **原始输入与磁盘抢救结果各做一次**——宿主重建+抢救会把
@@ -385,13 +369,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 抢救可能把磁盘里的 J 类旧键并回输入（_merge_disk_values 对已删键无类型参照）：
         # 同口径在 SDK merge 前 pop；捕获值已由上方磁盘通道落盘，此处只清键。
         rescued, _rescued_tuning_captured = migrate_internal_tuning(rescued)
-        try:
-            migrated_rescued = _migrate_ec(rescued)
-            if migrated_rescued is not rescued:
-                rescued = migrated_rescued
-                rescued_changed = True
-        except Exception:
-            pass
         rescued_popped = _pop_retired_keys(rescued)
         if rescued_popped is not rescued:
             rescued = rescued_popped
@@ -442,11 +419,13 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._plugin_root = _PLUGIN_DIR
 
         cfg = self.config
+        from core.targeting import refresh_host_target
+        await refresh_host_target(self)
         # 公共基础设施（三个服务束共享的实例，缺省时它们会自建兜底）
-        self._decision_logger = DecisionLogger(data_dir, enabled=cfg.admin.decision_log_enabled,
-                                               retention_days=cfg.admin.log_retention_days)
-        self._llm_logger = LLMCallLogger(data_dir, enabled=cfg.admin.llm_log_enabled,
-                                         retention_days=cfg.admin.log_retention_days)
+        self._decision_logger = DecisionLogger(data_dir, enabled=True,
+                                               retention_days=30)
+        self._llm_logger = LLMCallLogger(data_dir, enabled=True,
+                                         retention_days=30)
         self._db = ScheduleDB(data_dir / "schedule.db")
         # 好感度：运行期动态读 [affection] 段（热重载即时生效）+ 决策日志留痕；
         # 预设表/描述表由 CompanionServices 装配时装载（mappings/，只读一遍）
@@ -458,7 +437,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._llm = LLMService(
             self.ctx, task_name=llm_task_name_of(cfg),
             call_logger=self._llm_logger, config_provider=lambda: self.config,
-            usage_keep_hours=int(getattr(cfg.llm, "usage_retention_hours", 720) or 720),
+            usage_keep_hours=720,
             usage_default_window_hours=int(
                 getattr(cfg.llm, "usage_default_window_hours", 720) or 720))
         # 缓存窗口在 [schedule_advanced]（2026-10-10 段拆分）
@@ -788,6 +767,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope == "bot":
             await self._refresh_persona()
+            from core.targeting import refresh_host_target
+            await refresh_host_target(self)
+            self._stream_id = await self._resolve_target_stream()
+            self._apply_target(target_qq_of(self.config), self._stream_id)
             return
         if scope != "self":
             return
@@ -820,6 +803,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self._bg_started = False
             return
         # 目标 QQ 变化 → 重新解析 stream
+        from core.targeting import refresh_host_target
+        await refresh_host_target(self)
         self._stream_id = await self._resolve_target_stream()
         self._apply_target(target_qq_of(cfg), self._stream_id)
         # 生活状态热启用（R7 滚动化改造；PR8 3.0.0 门控 = [schedule].enabled）：首次
@@ -1189,15 +1174,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # （[life_state].sleep_debt_repay_v2，配置默认 True）——离线补眠默认与
         # 在线一致走阶梯还债；读不到配置时同样回退 True（在线默认口径），
         # 历史回放需显式把配置/参数置 False（旧公式逐字不变）。
-        try:
-            life_cfg = getattr(self.config, "life_state", None)
-            repay_v2 = bool(getattr(life_cfg, "sleep_debt_repay_v2", True))
-        except Exception:
-            repay_v2 = True
         self._offline_settlement_service().settle_offline_gap(
             life, planner, engine_claimed=engine_claimed,
             plan_settlement_fn=plan_offline_settlement,
-            baseline_hours=baseline, repay_v2=repay_v2)
+            baseline_hours=baseline)
 
     def _apply_offline_settlement(self, life: Any, planner: Any, plan: Dict[str, Any]) -> None:
         """应用一次离线睡眠结算（薄委托；调用方保证恰好一次，编排体见 suite_offline_settlement）。"""
@@ -1555,6 +1535,13 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         planner = getattr(self, "_rolling_planner", None)
         if planner is None:
             return
+        try:
+            from planning.cycle_state import activate_pending_cycle, entry_context_from_plugin
+            activate_pending_cycle(getattr(self, "_data_dir", None),
+                decision_logger=getattr(self, "_decision_logger", None),
+                **entry_context_from_plugin(self))
+        except Exception:
+            self.ctx.logger.warning("待接替日程检查失败，保留当前周期", exc_info=True)
         prepared = self._sleep_prepare(planner)
         sleep_rates = (prepared or {}).get("rates")
         snapshot = self._life_tick_state(planner, sleep_rates=sleep_rates)
@@ -1675,7 +1662,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 # PR-C2：真实观看证据只读来源（B1 索引 watched_video）+ 两键
                 # 动态读 [video_watch]（热重载即时生效；读失败服务侧保守降级）
                 watch_evidence_provider=self._interest_watch_evidence_rows,
-                feedback_enabled_provider=self._interest_watch_feedback_enabled,
                 half_life_days_provider=self._interest_watch_half_life_days,
                 logger=self.ctx.logger)
             # 3.3：分享质量门槛只读兴趣权重（不触发刷新/LLM）；保存引用供 provider
@@ -1708,12 +1694,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception:
             return []
 
-    def _interest_watch_feedback_enabled(self) -> bool:
-        try:
-            return bool(getattr(self.config.video_watch,
-                                'interest_watch_feedback_enabled', True))
-        except Exception:
-            return False  # 配置不可读保守停用反馈（兴趣退回纯人设基线）
 
     def _interest_watch_half_life_days(self) -> int:
         try:

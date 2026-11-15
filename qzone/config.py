@@ -161,8 +161,7 @@ class QzoneSectionConfig(PluginConfigBase):
 
 
 class QzoneVideoSectionConfig(PluginConfigBase):
-    """空间视频候选与判定（PR-A0：记录与影子判定留痕；PR-A1：auto 额外提取高清非拼图
-    截图资产；PR-A2：auto 经完整门控发布来源可信的视频图文说说，shadow 仍只留痕）。"""
+    '空间视频候选与判定（PR-A0：记录与影子判定留痕；PR-A1：auto 额外提取高清非拼图'
 
     __ui_label__ = "空间视频候选"
     __ui_icon__ = "video"
@@ -263,9 +262,7 @@ class QzoneVideoSectionConfig(PluginConfigBase):
 
 
 class LegacyCompatSectionConfig(PluginConfigBase):
-    """SnowLuma 2.0.0 及以上版本无需配置本段；低于 2.0.0 的 SnowLuma 需要配置。
-    旧版 Snowluma HTTP cookie 降级通道（原 [qzone] napcat_http_*，3.17.36 改名搬段）：
-    仅当适配器直连 get_cookies 失效时才读取本段，直连成功路径永不触碰。"""
+    '无法直接获取 QQ 空间登录信息时，设置可用的 Snowluma HTTP 连接。'
 
     __ui_label__ = "旧版兼容"
     __ui_icon__ = "history"

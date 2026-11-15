@@ -320,7 +320,6 @@ class VideoInterestService:
                  task_name: str = "utils",
                  now_provider: Optional[Callable[[], float]] = None,
                  watch_evidence_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None,
-                 feedback_enabled_provider: Optional[Callable[[], bool]] = None,
                  half_life_days_provider: Optional[Callable[[], int]] = None) -> None:
         self._path = Path(store_dir) / INTEREST_FILE_NAME
         self._attempt_path = Path(store_dir) / "video_interest_attempt.json"
@@ -332,7 +331,6 @@ class VideoInterestService:
         self._task_name = str(task_name or "utils")
         self._now_provider = now_provider
         self._watch_evidence_provider = watch_evidence_provider
-        self._feedback_enabled_provider = feedback_enabled_provider
         self._half_life_days_provider = half_life_days_provider
         self._lock = asyncio.Lock()
 
@@ -394,14 +392,6 @@ class VideoInterestService:
             return default
 
     # ---- PR-C2：真实观看反馈（evidence_weights 层；0 LLM，确定性规则）----
-    def watch_feedback_enabled(self) -> bool:
-        """[video_watch].interest_watch_feedback_enabled；未注入默认开，读失败保守关。"""
-        if self._feedback_enabled_provider is None:
-            return True
-        try:
-            return bool(self._feedback_enabled_provider())
-        except Exception:
-            return False
 
     def _half_life_days(self) -> int:
         value = WATCH_HALF_LIFE_DAYS_DEFAULT
@@ -442,7 +432,7 @@ class VideoInterestService:
         - 开关关闭/无兴趣文档/无证据来源 → 0（零写盘，现状逐字）。
         返回本次新应用的观看行数。失败只告警不抛（纯旁路，不拖挂观看主链路）。
         """
-        if not self.watch_feedback_enabled():
+        if not True:
             return 0
         doc = self.load()
         if doc is None:
@@ -520,7 +510,7 @@ class VideoInterestService:
             return {}
         terms = (doc.get("evidence_weights") or {}).get("terms") or {}
         moment = self._now() if now is None else float(now)
-        enabled = self.watch_feedback_enabled()
+        enabled = True
         out: Dict[str, float] = {}
         for keyword in doc.get("keywords") or []:
             term = str(keyword).lower()
@@ -538,7 +528,7 @@ class VideoInterestService:
 
     def _watch_evidence_lines(self) -> List[str]:
         """问询提示词变量区的真实观看证据摘要（B1 recent watched_video ≤5）。"""
-        if not self.watch_feedback_enabled():
+        if not True:
             return []
         lines: List[str] = []
         for row in self._watch_rows()[:WATCH_EVIDENCE_PROMPT_LIMIT]:
@@ -923,7 +913,7 @@ class BiliCandidateSource:
             return self.snapshot()
         # PR-C2：关键词按最终权重（persona_base + bounded watch_score）排序；
         # 开关关闭 → 不读权重、排序/打分/池构成与旧版逐字一致。
-        feedback_on = self._interest.watch_feedback_enabled()
+        feedback_on = True
         weights = self._interest.effective_weights() if feedback_on else {}
         if feedback_on and weights:
             keywords = sorted(keywords, key=lambda k: -weights.get(k, PERSONA_BASE_WEIGHT))
