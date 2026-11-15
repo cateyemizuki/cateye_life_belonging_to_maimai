@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 
+from .generation_evidence import request_scope
 from .llm_templates import (FormatFailure, SemanticFailure, THRESHOLDS,
                             definition, fallback, validate)
 
@@ -55,13 +56,16 @@ class GenerationPolicy:
             remaining=None if deadline is None else max(0,deadline-time.monotonic())
             if remaining is not None and remaining<.02:
                 failure='生成等待已到期';break
+            scope={'group_id':group_id,'attempt':len(results)+1}
+            scope_token=request_scope.set(scope)
             try:
                 operation=invoke(max_tokens=next_limit,timeout_ms=int(remaining*1000) if remaining is not None else timeout_ms,
                                  attempt=len(results),task_name=route)
                 result=await asyncio.wait_for(operation,remaining) if remaining is not None else await operation
             except asyncio.CancelledError:
                 self._record(event=event,module=module,task=route,level='error',message='生成已取消',
-                             category='cancelled',group_id=group_id,tier=tier,warning_threshold=threshold)
+                             category='cancelled',group_id=group_id,request_id=scope.get('request_id',''),
+                             attempt=len(results)+1,tier=tier,warning_threshold=threshold)
                 raise
             # The invocation adapter converts host errors to LLMResult. A timeout
             # around the whole job also must resolve to a template, not escape it.
@@ -69,7 +73,14 @@ class GenerationPolicy:
                 from .llm_utils import LLMResult
                 failure='生成等待已到期'
                 result=LLMResult(False,'','timeout',error=failure,module=module,event=event,
-                                 task_name=route,request_sent=True,consumed=True,attempts=1)
+                                 task_name=route,request_id=scope.get('request_id',''),request_sent=True,consumed=True,attempts=1)
+            except Exception:
+                self._record(event=event,module=module,task=route,level='error',message='生成执行异常',
+                             category='exception',group_id=group_id,request_id=scope.get('request_id',''),
+                             attempt=len(results)+1,tier=tier,warning_threshold=threshold)
+                raise
+            finally:
+                request_scope.reset(scope_token)
             last=result;results.append(result)
             error_kind='';failure=''
             if result.ok:
@@ -127,7 +138,7 @@ class GenerationPolicy:
             last=LLMResult(False,'','timeout',error=failure,module=module,event=event,task_name=route)
         template=fallback(event,fallback_context)
         self._record(event=event,module=module,task=route,level='warn',message='已使用'+template['title'],
-                     category='template',group_id=group_id,tier=tier,warning_threshold=threshold,
+                     category='template',group_id=group_id,request_id=last.request_id,tier=tier,warning_threshold=threshold,
                      used_template=True,template_name=template['name'],template_title=template['title'],
                      fallback_reason=failure or '生成未完成',attempt=len(results),completion_tokens=None)
         answer=self._aggregate(last,results)

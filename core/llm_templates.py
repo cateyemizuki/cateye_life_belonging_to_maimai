@@ -158,7 +158,8 @@ def fallback(event: str,context: dict|None=None) -> dict:
             while name in reserved:
                 variant+=1;tail=str(variant);name=(prefix+base)[:10-len(tail)]+tail
             reserved.add(name)
-            rows.append({**pool['event'],'event_id':f'llm_tpl_{slot.replace("-","_")}_{index}_{suffix}',
+            rows.append({**pool['event'],'source':'template','origin_kind':'template',
+                         'template_used':True,'template_name':'schedule_events','template_title':spec['title'],'event_id':f'llm_tpl_{slot.replace("-","_")}_{index}_{suffix}',
                          'name':name,'templates':[phrase.format(name=base) for phrase in pool['phrases']]})
         response={'events':rows}
     if event=='schedule_spine' and context.get('previous_response'):

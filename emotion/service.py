@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import hashlib
 import logging
 import math
@@ -27,6 +28,7 @@ from . import descriptions, mapping_override
 from . import daily_settlement
 from . import presentation
 from . import state_store
+from . import external_receipts
 from .bridge import apply_template_events
 from .referee import (ask_sleep_referee, derive_params_from_persona,
                       evaluate_daily_settlement, evaluate_reply_delta)
@@ -319,6 +321,7 @@ class EmotionService:
         if state.get("params"):
             self._machine.params = self._machine.params.from_dict(state.get("params"))
         self._machine.load_dict({**state, "params": self._machine.params.to_dict()})
+        self._external_event_receipts = external_receipts.restore(self._machine, state)
 
         self._persona = str(getattr(plugin, "_personality", "") or "")
         self._lover_name = str(getattr(plugin, "_lover_name", "") or "麦麦")
@@ -468,6 +471,8 @@ class EmotionService:
         盘上已有的 ``applied_sleep_date``（醒沿结算的"本周期已结算"标记，状态机
         ``to_dict`` 不含该键）——否则 episode 冲刷/日切等任意共用出口都会把它抹掉。
         """
+        receipts = getattr(self, "_external_event_receipts", None)
+        external_state = external_receipts.snapshot(self._machine, receipts) if receipts else None
         state = state_store.build_document(
             self._machine.to_dict(),
             self._episode_state,
@@ -475,6 +480,7 @@ class EmotionService:
             pending_overhaul=getattr(self, "_pending_overhaul", None),
             sleep_period=getattr(self, "_sleep_period", None),
             applying_cycle=getattr(self, "_saving_sleep_cycle", ""),
+            external_events=external_state,
         )
         # 4.3b：分区计数与 episode 同文件持久化（state_store 只管 episode 三键，
         # 这里合入顶层 eval_partition；状态机 load_dict 忽略未知键，向后兼容）。
@@ -487,6 +493,8 @@ class EmotionService:
             }
         if not state_store.write_document(self._state_path, state, writer=save_json_atomic):
             return False
+        if external_state is not None:
+            self._external_event_receipts = external_state["receipts"]
         try:
             from .observations import EmotionObservations
             from planning.time_utils import TimezoneManager
@@ -1636,7 +1644,8 @@ class EmotionService:
                               is_target: Optional[bool] = None,
                               session_id: str = "",
                               event_id: str = "",
-                              episode_id: str = "") -> Dict[str, Any]:
+                              episode_id: str = "",
+                              idempotency_key: str = "") -> Dict[str, Any]:
         """倍率 → ±0.5 硬限幅 → 入账 → 决策日志（evaluate_reply 与外部事件共用）。
 
         三层倍率与裁剪前/后值全部落 decision_logs（§6.3-7）：``k``（调用方 K）/
@@ -1647,9 +1656,16 @@ class EmotionService:
         定稿 §4.1.2）：life.episode_* 反馈侧的调用方留痕，只落 decision_logs 与返回值，
         不参与任何判定；旧调用方不传即逐字保持原行为。
 
+        ``idempotency_key`` 单独启用持久去重：回执与 VAD/冻结队列原子保存；
+        保存失败撤回内存，调用方可重试。它不改变 event_id 的留痕契约。
+
         跨来源去重（§2.4.6 A3）在入账前判定：命中返回 ``duplicate_cross_source`` 且不写
         emotion_log / 不发 emotion.updated（口径见 :meth:`dedup_policy`）。
         """
+        key = str(idempotency_key or "").strip()
+        receipts = getattr(self, "_external_event_receipts", {})
+        if key and key in receipts:
+            return {"ok": False, "reason": "duplicate_idempotency", "idempotency_key": key}
         skip = self._dedup_skip_result(source, session_id, event_text)
         if skip is not None:
             return skip
@@ -1657,15 +1673,38 @@ class EmotionService:
             delta, multiplier)
         # PR-C1 H4：结算点同步登记短期原因（source_ref=来源:流:事件摘要哈希，不存正文；
         # 账本只作解释，不参与 VAD 数值——有无登记 VAD 结果逐字一致）。
-        self._machine.record_event(
-            event_text or "外部事件", applied,
-            source_ref=self._reason_source_ref(source, session_id, event_text),
-            ttl_hours=self._reason_ttl_hours())
-        self._save_state()
+        before_machine = deepcopy(self._machine.__dict__) if key else None
+        before_receipts = deepcopy(receipts) if key else None
+        try:
+            self._machine.record_event(
+                event_text or "外部事件", applied,
+                source_ref=self._reason_source_ref(source, session_id, event_text),
+                ttl_hours=self._reason_ttl_hours())
+            if key:
+                receipts = dict(receipts)
+                receipt = {"state": "applied"}
+                if self._machine.frozen:
+                    event = self._machine.pending_events[-1]
+                    event._external_receipt_key = key
+                    receipt = {"state": "queued", "event": event.to_dict()}
+                receipts[key] = receipt
+                self._external_event_receipts = receipts
+            saved = self._save_state()
+            if key and saved is False:
+                raise RuntimeError("稳定情绪事件状态持久化失败")
+        except Exception:
+            if not key:
+                raise
+            self._machine.__dict__.clear()
+            self._machine.__dict__.update(before_machine)
+            self._external_event_receipts = before_receipts
+            logger.warning("稳定情绪事件提交失败：已恢复内存，等待重试", exc_info=True)
+            return {"ok": False, "reason": "persistence_failed", "idempotency_key": key}
         self._log_decision(
             "emotion.external_event", trigger_type="emotion", reason=str(event_text or "")[:120],
             source=str(source or ""), session_id=str(session_id or ""),
             event_id=str(event_id or ""), episode_id=str(episode_id or ""),
+            idempotency_key=key,
             is_target=(bool(is_target) if is_target is not None else None), tier=self.affection_tier(),
             target_bonus=round(self.target_bonus(), 4),
             non_target_multiplier=round(self.non_target_multiplier(), 4),
@@ -1679,6 +1718,7 @@ class EmotionService:
                 "k": round(float(multiplier), 4), "global_multiplier": round(global_mul, 4),
                 "clipped": bool(clipped), "event_id": str(event_id or ""),
                 "episode_id": str(episode_id or ""),
+                "idempotency_key": key,
                 "dedup": {**self.dedup_policy(), "duplicate": False}}
 
     async def record_external_event(self, source: str, description: str,
@@ -1687,7 +1727,8 @@ class EmotionService:
                                     multiplier: float = 1.0,
                                     session_id: str = "",
                                     event_id: str = "",
-                                    episode_id: str = "") -> Dict[str, Any]:
+                                    episode_id: str = "",
+                                    idempotency_key: str = "") -> Dict[str, Any]:
         """统一外部事件入口（§4.2 行 1 / §6.2 A）。
 
         - ``delta`` 给出模板增量 → 直接 ``record_event``（×multiplier）；
@@ -1705,6 +1746,8 @@ class EmotionService:
           不传即逐字保持原行为；
         - 跨来源去重先于 LLM 评估判定：命中返回 ``{"ok": False,
           "reason": "duplicate_cross_source", "dedup": {...}}``，不调 LLM、不入账；
+        - ``idempotency_key`` 可选稳定幂等键；重复返回 ``duplicate_idempotency``，
+          持久化失败返回 ``persistence_failed``。旧 event_id 仍只留痕；
         - 最终增量经 ±:data:`EVENT_DELTA_CLAMP` 硬限幅后入账，三层倍率与裁剪前/后
           值落 decision_logs（§6.3-7）；
         - **模板增量分支的同步核心 = :meth:`record_external_event_sync`**（2026-10-26 并发
@@ -1725,7 +1768,7 @@ class EmotionService:
             # 模板增量（或「无增量且不调 LLM」的旧非法调用）→ 同步核心；成功后再发布
             outcome = self.record_external_event_sync(
                 source, description, delta, multiplier=multiplier, session_id=session_id,
-                event_id=event_id, episode_id=episode_id)
+                event_id=event_id, episode_id=episode_id, idempotency_key=idempotency_key)
             if outcome.get("ok"):
                 await self.publish_external_updated()
             return outcome
@@ -1754,7 +1797,8 @@ class EmotionService:
         event_text = str(llm_event or "").strip()[:60] or event_text
         outcome = self._apply_external_delta(event_text, delta_before, source=source,
                                              multiplier=k, llm=True, session_id=session_id,
-                                             event_id=event_id, episode_id=episode_id)
+                                             event_id=event_id, episode_id=episode_id,
+                                             idempotency_key=idempotency_key)
         if outcome.get("ok"):
             await self.publish_external_updated()
         return outcome
@@ -1764,7 +1808,8 @@ class EmotionService:
                                    multiplier: float = 1.0,
                                    session_id: str = "",
                                    event_id: str = "",
-                                   episode_id: str = "") -> Dict[str, Any]:
+                                   episode_id: str = "",
+                                   idempotency_key: str = "") -> Dict[str, Any]:
         """**同步**模板增量入账核心（无 await / 无 LLM / 不发布事件）。
 
         存在理由（2026-10-26 VAD 并发修复）：``record_external_event`` 在入账后 ``await``
@@ -1795,7 +1840,8 @@ class EmotionService:
         delta_before = VADState(delta.valence, delta.arousal, delta.dominance).clipped()
         return self._apply_external_delta(event_text, delta_before, source=source,
                                           multiplier=k, llm=False, session_id=session_id,
-                                          event_id=event_id, episode_id=episode_id)
+                                          event_id=event_id, episode_id=episode_id,
+                                          idempotency_key=idempotency_key)
 
     def preview_external_delta(self, delta: VADState, *, multiplier: float = 1.0
                                ) -> Dict[str, Any]:

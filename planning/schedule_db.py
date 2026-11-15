@@ -217,6 +217,14 @@ class ScheduleDB:
     CREATE INDEX IF NOT EXISTS idx_goals_created_at ON goals(created_at);
     CREATE INDEX IF NOT EXISTS idx_goals_chat_status ON goals(chat_id, status);
     CREATE INDEX IF NOT EXISTS idx_goals_chat_status_time ON goals(chat_id, status, created_at);
+    CREATE TABLE IF NOT EXISTS commitment_outbox (
+        event_id TEXT PRIMARY KEY,
+        commitment_id TEXT NOT NULL UNIQUE,
+        outcome TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        delivered_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
     """
 
@@ -495,13 +503,14 @@ class ScheduleDB:
             self._archive_day_rows_locked(schedule_date, reason, now)
             self._conn.execute("DELETE FROM schedule_items WHERE schedule_date = ?", (schedule_date,))
             for item in items:
+                item_id = str(item.get("item_id") or uuid.uuid4().hex)
                 self._conn.execute(
                     "INSERT INTO schedule_items(item_id, schedule_date, name, description, goal_type,"
                     " priority, start_minute, end_minute, day_offset, parameters, created_at, updated_at,"
                     " cycle_start_ts, cycle_end_ts, entry_reason)"
                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        str(item.get("item_id") or uuid.uuid4().hex),
+                        item_id,
                         schedule_date,
                         str(item.get("name") or "未命名活动")[:100],
                         str(item.get("description") or "")[:200],
@@ -518,6 +527,24 @@ class ScheduleDB:
                         reason,
                     ),
                 )
+                # “排入计划”与完成分离，并与日表同事务提交。active 保留给睡眠/执行查询。
+                params = item.get("parameters") or {}
+                commitment_id = str(params.get("commitment_id") or "")
+                if commitment_id:
+                    goal = self._conn.execute(
+                        "SELECT parameters FROM goals WHERE goal_id=? AND goal_type='pending_commitment' AND status='active'",
+                        (commitment_id,),
+                    ).fetchone()
+                    if goal is not None:
+                        goal_params = json.loads(goal["parameters"] or "{}")
+                        goal_params["commitment_plan"] = {
+                            "schedule_date": schedule_date,
+                            "item_id": item_id,
+                            "start_minute": int(item.get("start_minute") or 0),
+                            "end_minute": int(item.get("end_minute") or 60),
+                        }
+                        self._conn.execute("UPDATE goals SET parameters=?, updated_at=? WHERE goal_id=?",
+                                           (json.dumps(goal_params, ensure_ascii=False), now, commitment_id))
         # 事务提交后再通知（睡眠 loop 即时重检；不进事务、不影响写库结果）
         self._notify_schedule_change(reason)
         return len(items)
@@ -719,6 +746,49 @@ class ScheduleDB:
                 f"UPDATE goals SET {', '.join(set_clauses)} WHERE goal_id = ?", params
             )
             return cur.rowcount > 0
+
+    def settle_commitment(self, commitment_id: str, outcome: str,
+                          payload: Dict[str, Any]) -> bool:
+        """结算事实和待发事件同事务提交；稳定 ID 的条件更新只允许一次结算。"""
+        if outcome not in ("kept", "broken"):
+            raise ValueError("invalid commitment outcome")
+        now = _now_iso()
+        event_id = f"commitment:{commitment_id}:settled"
+        data = dict(payload, event_id=event_id, commitment_id=commitment_id)
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT parameters FROM goals WHERE goal_id=? AND goal_type='pending_commitment' AND status='active'",
+                (commitment_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            params = json.loads(row["parameters"] or "{}")
+            params["commitment_outcome"] = outcome
+            params["commitment_settled_at"] = now
+            changed = self._conn.execute(
+                "UPDATE goals SET status='completed', parameters=?, updated_at=? WHERE goal_id=? AND status='active'",
+                (json.dumps(params, ensure_ascii=False), now, commitment_id),
+            ).rowcount
+            if not changed:
+                return False
+            self._conn.execute(
+                "INSERT INTO commitment_outbox(event_id, commitment_id, outcome, payload, created_at) VALUES(?,?,?,?,?)",
+                (event_id, commitment_id, outcome, json.dumps(data, ensure_ascii=False), now),
+            )
+        return True
+
+    def pending_commitment_events(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT event_id, outcome, payload FROM commitment_outbox WHERE delivered_at IS NULL ORDER BY created_at, event_id"
+            ).fetchall()
+        return [{"event_id": row["event_id"], "outcome": row["outcome"],
+                 "payload": json.loads(row["payload"])} for row in rows]
+
+    def acknowledge_commitment_event(self, event_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE commitment_outbox SET delivered_at=? WHERE event_id=? AND delivered_at IS NULL",
+                               (_now_iso(), event_id))
 
     def delete_goal(self, goal_id: str) -> bool:
         with self._lock, self._conn:

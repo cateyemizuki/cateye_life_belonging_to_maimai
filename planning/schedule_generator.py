@@ -18,7 +18,7 @@ PR8 3.0.0 清退（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审�
 - 构造 ``ScheduleGenerator(db, llm)``；
 - ``generate_daily_schedule(date, *, personality, lover_name, wake_time, sleep_time,
   min_activities, max_activities, timeout_seconds) -> list[dict]``；
-- 未来约定（pending_commitment）与日程项的最接近时间窗匹配（apply_schedule_items）。
+- 未来约定按稳定 ID 合并，明确时间的硬约定由代码补齐（apply_schedule_items）。
 """
 
 from __future__ import annotations
@@ -162,7 +162,7 @@ class ScheduleGenerator:
 
         Args:
             date: 目标日期（``YYYY-MM-DD``；提示词日期取当天，日程落库按此键）。
-            apply: True=落库并做约定匹配/消费；False=仅生成（仍写入日程表以便查询）。
+            apply: 兼容参数；两种取值均写入日表并保留硬约定，计划阶段不结算约定。
             reason: 进账原因（§31.2 血缘，R7 = 用户 2026-10-23 第二轮直派）：例行生成
                 缺省 ``scheduled_generate``；regenerate 指令链透传 ``regenerate``；
                 LLM 失败走模板 spine 兜底时改 ``fallback_template``（仅对例行生成路径，
@@ -181,6 +181,7 @@ class ScheduleGenerator:
             personality=personality, lover_name=lover_name,
             wake_time=wake_time, sleep_time=sleep_time,
             timeout_seconds=timeout_seconds, custom_prompt=custom_prompt,
+            enable_detailed_description=enable_detailed_description,
             timezone=timezone, llm_task_name=llm_task_name,
             temperature=temperature, bot_profile=bot_profile,
             no_sleep_mode=no_sleep_mode, apply=apply, reason=reason,
@@ -208,16 +209,11 @@ class ScheduleGenerator:
         apply: bool = True,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
-        """重生成某天（默认今天）日程：先清空已有日程，再走标准生成管线。
+        """重生成某天（默认今天）日程：候选完成后事务替换，生成期间保留旧表。
 
         ``extra_prompt`` 会临时并入 custom_prompt（本实现按调用装配配置，无需还原）。
         """
         date = date or datetime.now().strftime("%Y-%m-%d")
-        # §31.2 血缘：进账前旧日行归档（先删后写场景的"旧日行"即本次进账所替换者；R7 2026-10-23）
-        removed = self._db.delete_day_schedule(date, archive_reason=REASON_REGENERATE)
-        if removed:
-            logger.info("已清理 %s 的 %d 个旧日程，开始重新生成", date, removed)
-
         base_custom = str(kwargs.pop("custom_prompt", "") or "")
         merged = f"{base_custom}\n\n{extra_prompt}".strip() if (base_custom or extra_prompt) else ""
         return await self.generate_daily_schedule(
@@ -233,30 +229,12 @@ class ScheduleGenerator:
         consume_commitments: bool = True,
         reason: str = REASON_SCHEDULED,
     ) -> int:
-        """把日程条目落库（start/end 分钟已换算 + 约定匹配注入）。
+        """确定性合并约定后发布日表；生成计划从不结算兑现或违约。
 
-        步骤：
-        1. ``_match_commitments_to_items``：把当日 pending_commitments 一对一映射到
-           条目（时间差 ≤30 分钟优先，其次标题子串），注入 ``is_commitment`` 元数据
-           （ProactiveService 据此用强指令兑现约定）；
-        2. ``_replace_with_entry`` 整体写入（进账漏斗：先算包络并 rotate，再写库盖戳；
-           §31.2，R7 = 用户 2026-10-23 第二轮直派）；
-        3. 成功后消费（标记 COMPLETED）当日约定。
-
-        Args:
-            reason: 进账原因（四种之一，§31.2 血缘）：例行生成缺省 ``scheduled_generate``；
-                regenerate 指令链 ``regenerate``；bot 工具（赖床）``tool_edit``；模板
-                兜底 ``fallback_template``。未按新管线传原因的旧调用方/直调按缺省值。
-                **行级盖戳与四变量轮换全部由代码完成，LLM 不参与**。
-
-        Returns:
-            写入条数。
+        ``consume_commitments`` 仅保留旧调用签名。约定保持 active，执行/到期路径
+        按稳定 ID 结算；约定读取或合并失败必须中断，不能发布遗漏硬约定的计划。
         """
-        commitment_meta: Dict[int, Dict[str, Any]] = {}
-        try:
-            commitment_meta = self._match_commitments_to_items(items, date)
-        except Exception as exc:
-            logger.warning("约定→日程项 匹配失败（不影响落库）: %s", exc, exc_info=True)
+        commitment_meta = self._match_commitments_to_items(items, date)
 
         for idx, meta in commitment_meta.items():
             if idx < len(items):
@@ -283,22 +261,7 @@ class ScheduleGenerator:
                             params["commitment_time_shifted_from"] = old_start
                 items[idx]["parameters"] = params
 
-        written = self._replace_with_entry(date, items, reason)
-
-        if consume_commitments and written:
-            try:
-                # 匹配到日程项的约定 = 兑现（kept），未匹配 = 违约（broken）——随消费事件上报（M0）
-                matched_titles = {
-                    str(meta.get("commitment_title") or "")
-                    for meta in commitment_meta.values() if meta.get("commitment_title")
-                }
-                consumed = self.goal_manager.consume_pending_commitments(
-                    date, matched_titles=matched_titles)
-                if consumed:
-                    logger.info("已消费 %d 条 %s 的未来约定", len(consumed), date)
-            except Exception as exc:
-                logger.warning("消费未来约定失败: %s", exc, exc_info=True)
-        return written
+        return self._replace_with_entry(date, items, reason)
 
     def _replace_with_entry(self, date: str, items: List[Dict[str, Any]], reason: str) -> int:
         """先保存日程，再登记周期；未来日程只进入待接替区。"""
@@ -366,6 +329,7 @@ class ScheduleGenerator:
         wake_time: str = "07:00",
         sleep_time: str = "23:00",
         timeout_seconds: float = 120.0,
+        enable_detailed_description: bool = True,
         custom_prompt: str = "",
         timezone: str = "Asia/Shanghai",
         llm_task_name: str = "",
@@ -387,13 +351,15 @@ class ScheduleGenerator:
           锚定 [schedule] 作息锚点、禁硬编码时刻），不强制重试多轮。
         """
         params = self._spine_params()
+        if not enable_detailed_description:
+            params["max_described"] = 0
         entry_reason = str(reason or REASON_SCHEDULED)
         gen_config = ScheduleGeneratorConfig(self._build_config_dict(
             personality=personality, lover_name=lover_name, wake_time=wake_time,
             sleep_time=sleep_time, min_activities=params["min_intentions"],
             max_activities=params["max_intentions"], timeout_seconds=timeout_seconds,
             use_multi_round=True, max_rounds=params["max_rounds"], quality_threshold=1.0,
-            enable_detailed_description=True, min_description_length=15,
+            enable_detailed_description=enable_detailed_description, min_description_length=15,
             max_description_length=25,
             custom_prompt=custom_prompt, recent_schedule_days=params["recent_days"],
             history_message_limit=params["history_messages"],
@@ -413,6 +379,8 @@ class ScheduleGenerator:
         await self._load_async_contexts(base, gen_config, date)
 
         schema = base.build_spine_schema(params["min_intentions"], params["max_intentions"])
+        if not enable_detailed_description:
+            schema["properties"]["intentions"]["items"]["properties"].pop("note", None)
         prompt = base.build_spine_prompt(
             schema,
             min_intentions=params["min_intentions"], max_intentions=params["max_intentions"],
@@ -459,8 +427,14 @@ class ScheduleGenerator:
                     fallback_used = True
                     fallback_reason = "本轮日程未通过结构校验"
                     break
-                previous = str(response)
-                rows = self._spine_rows_from_intentions(self._parse_spine_response(response), date, params)
+                intentions = self._parse_spine_response(response)
+                if not enable_detailed_description:
+                    for intention in intentions:
+                        intention.pop("note", None)
+                        intention.pop("description", None)
+                previous = (str(response) if enable_detailed_description
+                            else json.dumps({"intentions": intentions}, ensure_ascii=False))
+                rows = self._spine_rows_from_intentions(intentions, date, params)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -475,6 +449,9 @@ class ScheduleGenerator:
                     row.setdefault("parameters", {}).update(template_used=True, template_name="schedule_spine",
                         template_title="上一轮有效日程", template_reason=fallback_reason)
         else:
+            if entry_reason == REASON_REGENERATE and self._db.has_day_schedule(date):
+                # 旧日表仍可使用时，失败的重新生成不能用模板把它覆盖。
+                raise LLMError(f"重新生成未取得有效候选，保留旧日表: {date} ({fallback_reason})")
             fallback_used = True
             logger.warning("spine LLM 生成失败，使用基础作息模板：%s", fallback_reason)
             rows = self._build_spine_fallback(date, wake_time=wake_time, sleep_time=sleep_time,
@@ -486,11 +463,12 @@ class ScheduleGenerator:
         rows = self._ensure_spine_sleep_intent(rows, date, wake_time, sleep_time,
             max_intentions=params["max_intentions"], no_sleep_mode=no_sleep_mode)
 
-        if apply:
-            self.apply_schedule_items(rows, date, consume_commitments=True,
-                                      reason=entry_reason)
-        else:
-            self._replace_with_entry(date, rows, entry_reason)
+        if not enable_detailed_description:
+            # 清理模型或模板的修饰描述；硬约定必要事实由 apply 阶段确定性合并保留。
+            for row in rows:
+                row["description"] = ""
+                row.setdefault("parameters", {}).pop("note", None)
+        self.apply_schedule_items(rows, date, consume_commitments=False, reason=entry_reason)
         logger.info("spine 日意图生成完成：%s 共 %d 条", date, len(rows))
         # P3（2026-11-09 §14.4）：日意图成功更新 → 合并安排偏好增量批次（fire-and-
         # forget，非阻塞；受每日 ≤4/退避/忙闲门控；普通滚动 tick 不走此入口）。
@@ -955,28 +933,14 @@ class ScheduleGenerator:
         items: List[Dict[str, Any]],
         today_str: str,
     ) -> Dict[int, Dict[str, Any]]:
-        """把当日 pending_commitments 一对一匹配到日程条目。
+        """按稳定 ID（旧模型输出仅允许完整同名）绑定，补齐明确时间的硬约定。
 
-        LLM 生成日程时不会显式标记哪个条目来自约定，本方法在落库前按以下规则映射：
-        1. 优先按时间匹配：约定 ``time="HH:MM"`` 与条目起始分钟差 ≤ 30 分钟；
-        2. 若约定无时间，按标题子串匹配（约定 title 出现在 name/description 中）；
-        3. 一对一约束：每个约定只匹配一个条目，每个条目最多接收一个约定。
-
-        Returns:
-            ``{item_index: {"is_commitment": True, "commitment_title": ..., ...}}``。
+        时间邻近不是身份。固定 item_id 使重排/重启仍指向同一约定，不把旁边的
+        活动挪成约定，也不因模型漏排而丢失用户承诺。soft 仍只作窗口意图。
         """
         pending = self.goal_manager.get_pending_commitments(today_str)
         if not pending:
             return {}
-
-        def _item_start_minutes(it: Dict[str, Any]) -> Optional[int]:
-            start = it.get("start_minute")
-            if start is not None:
-                return int(start)
-            slot = it.get("time_slot")
-            if slot:
-                return _parse_minutes(slot, -1)
-            return None
 
         result: Dict[int, Dict[str, Any]] = {}
         used_item_idx: set = set()
@@ -996,43 +960,34 @@ class ScheduleGenerator:
 
             best_idx: Optional[int] = None
 
-            # 规则 1：按时间匹配（≤ 30 分钟）
-            if commit_time and ":" in commit_time:
-                try:
-                    th, tm = commit_time.split(":", 1)
-                    commit_minutes = int(th) * 60 + int(tm)
-                except ValueError:
-                    commit_minutes = None
-                if commit_minutes is not None:
-                    best_diff = 31
-                    for idx, it in enumerate(items):
-                        if idx in used_item_idx:
-                            continue
-                        item_minutes = _item_start_minutes(it)
-                        if item_minutes is None:
-                            continue
-                        diff = abs(item_minutes - commit_minutes)
-                        if diff < best_diff:
-                            best_diff = diff
-                            best_idx = idx
-
-            # 规则 2：标题子串匹配（兜底）
+            # ID 优先；同一 ID 出现多次也只保留一个活动。
+            for idx, it in enumerate(items):
+                if idx not in used_item_idx and str((it.get("parameters") or {}).get("commitment_id") or "") == commit_id:
+                    best_idx = idx
+                    break
             if best_idx is None and commit_title:
                 for idx, it in enumerate(items):
                     if idx in used_item_idx:
                         continue
-                    haystack = f"{it.get('name') or ''}{it.get('description') or ''}"
-                    if commit_title in haystack:
+                    bound = str((it.get("parameters") or {}).get("commitment_id") or "")
+                    if not bound and str(it.get("name") or "").strip() == commit_title:
                         best_idx = idx
                         break
 
+            minute = _parse_minutes(commit_time, -1)
+            if best_idx is None and commit_hardness == "hard" and minute >= 0:
+                best_idx = len(items)
+                items.append({
+                    "name": commit_title, "description": commit_notes,
+                    "goal_type": "daily_routine", "priority": "high",
+                    "start_minute": minute, "end_minute": minute + 60,
+                    "parameters": {"spine": True, "min_minutes": 15, "max_minutes": 60,
+                                   "priority": "high", "interruptibility": 0.0},
+                })
             if best_idx is None:
-                logger.warning(
-                    "约定 %r 未在日程项中找到对应活动（time=%s）",
-                    commit_title, commit_time or "未指定",
-                )
                 continue
 
+            items[best_idx]["item_id"] = f"commitment:{commit_id}"
             result[best_idx] = {
                 "is_commitment": True,
                 "commitment_title": commit_title,
@@ -1048,4 +1003,15 @@ class ScheduleGenerator:
             used_item_idx.add(best_idx)
             logger.info("约定 %r → 日程项[%d] %r", commit_title, best_idx, items[best_idx].get("name"))
 
+        # 同 ID 的重复模型行不能产生多份执行意图；保留已绑定的一份。
+        duplicate_indices = {
+            idx for idx, item in enumerate(items)
+            if idx not in used_item_idx and str((item.get("parameters") or {}).get("commitment_id") or "")
+            in {str(meta["commitment_id"]) for meta in result.values()}
+        }
+        if duplicate_indices:
+            kept = [(idx, item) for idx, item in enumerate(items) if idx not in duplicate_indices]
+            remap = {old: new for new, (old, _) in enumerate(kept)}
+            items[:] = [item for _, item in kept]
+            result = {remap[idx]: meta for idx, meta in result.items()}
         return result

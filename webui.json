@@ -54,6 +54,17 @@
               "type": "integer",
               "minimum": 0,
               "required": false
+            },
+            "usage_rows_level": {
+              "type": "string",
+              "required": false,
+              "max_length": 7,
+              "choices": ["", "info", "warn", "error", "unknown"]
+            },
+            "usage_rows_module": {
+              "type": "string",
+              "required": false,
+              "max_length": 80
             }
           }
         }

@@ -23,7 +23,7 @@
 - 无日程 fail-safe（§31.1）：四变量缺失/非法 → 回退 ``[schedule]`` 两键构造本周期边界
   并打 ``anchored=True``（含按当前时间推今晚），**只在内存构造、不写盘**——真实条目
   一旦进账即以 anchored=False 覆盖；
-- 写盘失败 best-effort 不阻断（状态层任何异常都不影响主写库路径，可空降级）。
+- 周期写盘失败必须保留发布重试；进账漏斗抛 CyclePublicationError，日表不回滚。
 
 纯模块边界（§31.2 血缘、§24.2 同款）：只依赖 ``planning.schedule_items``（夜晚睡眠条目
 共享口径）与 ``planning.time_utils``（时区/日帧助手），无插件/宿主依赖；时间换算一律经
@@ -60,6 +60,15 @@ from .schedule_items import is_night_sleep_item
 from .time_utils import DAY_MINUTES, TimezoneManager
 
 logger = logging.getLogger(__name__)
+
+
+class CyclePublicationError(RuntimeError):
+    """日表已写入，但周期尚未发布完成；调用方必须保留重试。"""
+
+    def __init__(self, schedule_date: str, stage: str):
+        self.schedule_date = schedule_date
+        self.stage = stage
+        super().__init__(f"日程周期发布未完成: date={schedule_date}, stage={stage}")
 
 #: 状态文件名（data_dir 下）
 STATE_FILE = "schedule_cycle_state.json"
@@ -590,7 +599,7 @@ def rotate(new_start: Any, new_end: Any, reason: str, *, data_dir: Any,
     - end≤start 环 / 数值非法：例行 = 一并拒绝替换；同日 = 告警仍轮换（消费侧 loader 有
       ``end>start`` 兜底，不会把病态窗带出）；
     - 状态文件缺失（首次进账/桩）：缺旧窗则跳过重叠/跳天判据，直接记录新轮；
-    - **写盘失败 best-effort 不阻断**（``applied`` 仍 = True，message 标注写盘失败）。
+    - 写盘失败返回 ``applied=False``，进账漏斗据此要求发布重试。
     """
     reasons = (REASON_TOOL_EDIT, REASON_REGENERATE, REASON_SCHEDULED, REASON_FALLBACK)
     normalized_reason = str(reason or "").strip()
@@ -671,7 +680,7 @@ def rotate(new_start: Any, new_end: Any, reason: str, *, data_dir: Any,
                            anchor=label, deviation_minutes=ring_distance)
                 warnings.append(f"{label}锚点偏差 {ring_distance} 分钟（已告警）")
 
-    # ④ 轮换写入（本轮→上轮、新→本轮；写盘失败 best-effort）
+    # ④ 轮换写入（本轮→上轮、新→本轮；只有持久化成功才确认轮换）
     next_state = CycleState(
         previous_cycle_start=old_start,
         previous_cycle_end=old_end,
@@ -694,10 +703,10 @@ def rotate(new_start: Any, new_end: Any, reason: str, *, data_dir: Any,
                 f"~{format_epoch_clock(new_end_value, tz_name)}")
         _log_cycle(decision_logger, "info", text, event="cycle_rotate", entry_reason=normalized_reason)
         return RotationResult(applied=True, reason=normalized_reason, message=text)
-    text = f"{tail_text}周期轮换（四变量已换，写盘失败 best-effort）：reason={normalized_reason}"
-    _log_cycle(decision_logger, "info", text, event="cycle_rotate_write_failed",
+    text = f"{tail_text}周期轮换写盘失败，保留旧周期等待重试：reason={normalized_reason}"
+    _log_cycle(decision_logger, "skip", text, event="cycle_rotate_write_failed",
                entry_reason=normalized_reason)
-    return RotationResult(applied=True, reason=normalized_reason, message=text)
+    return RotationResult(applied=False, reason=normalized_reason, message=text)
 
 
 def entry_context_from_plugin(plugin: Any, *, fallback_wake: str = "",
@@ -730,6 +739,8 @@ def enter_schedule_cycle(data_dir: Any, schedule_date: str, items: Iterable[Any]
     返回 ``None`` = 包络不可得（全睡眠/无 awake 条目/缺分钟），调用方按"不轮换、盖戳空"
     处理（db 层存 NULL）。``data_dir`` 为空（桩/缺数据目录）→ 只算包络、不轮换（测试
     桩与理想降级面；行级盖戳不受影响）。
+    pending/current 持久化或轮换失败抛 CyclePublicationError，已有日表可在重试时
+    幂等补齐周期，不需要再次生成或归档。
     """
     envelope = envelope_minutes(items)
     if envelope is None:
@@ -758,9 +769,14 @@ def enter_schedule_cycle(data_dir: Any, schedule_date: str, items: Iterable[Any]
             still_active = isinstance(old_end, (int, float)) and moment.timestamp() < old_end
             if future_frame and (still_active or moment.timestamp() < start_epoch):
                 pending = _pending_cycles(data_dir)
+                previous = pending.get(str(schedule_date))
+                if (isinstance(previous, dict) and previous.get("start") == start_epoch
+                        and previous.get("end") == end_epoch):
+                    return envelope
                 pending[str(schedule_date)] = {"start": start_epoch, "end": end_epoch, "reason": reason}
                 if not _save_pending_cycles(data_dir, pending):
-                    logger.warning("新日程已保存，待接替周期记录失败；后续生成检查会重建")
+                    logger.warning("新日程已保存，待接替周期记录失败: date=%s；等待发布重试", schedule_date)
+                    raise CyclePublicationError(schedule_date, "pending")
                 _log_cycle(decision_logger, "info", "新日程已备好，等待当前日程结束后接替",
                            event="cycle_pending", entry_reason=reason, schedule_date=schedule_date)
                 return envelope
@@ -776,9 +792,16 @@ def enter_schedule_cycle(data_dir: Any, schedule_date: str, items: Iterable[Any]
             if wake_epoch is not None and wake_epoch > 0:
                 start_epoch = float(wake_epoch)
                 source = START_SOURCE_ACTUAL_WAKE
-            rotate(start_epoch, end_epoch, reason, data_dir=data_dir, cfg_wake=cfg_wake,
+            # 已发布日表的重试/重启只确认现有周期，不能再次轮换 previous 窗口。
+            if (current is not None and current_frame == str(schedule_date)
+                    and current.current_cycle_start == start_epoch
+                    and current.current_cycle_end == end_epoch):
+                return envelope
+            result = rotate(start_epoch, end_epoch, reason, data_dir=data_dir, cfg_wake=cfg_wake,
                    cfg_sleep=cfg_sleep, tz_name=tz_name, decision_logger=decision_logger,
                    now=now, start_source=source, start_date=str(schedule_date or ""))
+            if not result.applied:
+                raise CyclePublicationError(schedule_date, "current")
     return envelope
 
 

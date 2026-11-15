@@ -181,6 +181,9 @@ class LLMGateway:
         """一次 RPC 请求；插件级重试由 LLMService 的统一策略独占。"""
         started=time.monotonic();module_name=self._validate_module(module)
         request_id=uuid.uuid4().hex;task=str(task_name or self._task_name or "utils")
+        from core.generation_evidence import request_scope
+        scope=request_scope.get()
+        if scope is not None:scope['request_id']=request_id
         override=str(model or (self._model_name if not prefer_task and not strict_params else "") or "")
         payload=prepare_prompt_arg(prompt,system_prompt)
         try:
@@ -196,7 +199,8 @@ class LLMGateway:
             try:self._prompt_optimizer.observe(result,task=task,event=event,model=override,timeout_ms=timeout_ms,hinted=hinted)
             except Exception:pass
         except asyncio.CancelledError:
-            self.record_abandoned(module=module_name,event=event,task=task,reason="cancelled")
+            self.record_abandoned(module=module_name,event=event,task=task,reason="cancelled",request_id=request_id,
+                                  duration_ms=int((time.monotonic()-started)*1000))
             raise
         except (asyncio.TimeoutError,TimeoutError) as exc:
             return self._exception_result(exc,event=event,task=task,request_id=request_id,attempts=1,
@@ -208,12 +212,12 @@ class LLMGateway:
             strict_params=strict_params,requested_model=override,module=module_name,started=started)
 
     def record_abandoned(self, *, module: str, event: str, task: str,
-                         reason: str = "abandoned") -> None:
+                         reason: str = "abandoned", request_id: str = "", duration_ms: int = 0) -> None:
         """记录「插件放弃但宿主可能已计费」的调用（v1 账差主因）。"""
         record_response(
             self._usage_tracker, event=event, module=module, task=task,
             result={"success": False, "error": reason}, success=False,
-            duration_ms=0, attempts=1, degraded=True, abandoned=True)
+            duration_ms=duration_ms, attempts=1, degraded=True, abandoned=True,request_id=request_id)
 
     def _record_exception_usage(self, *, event: str, task: str, module: str,
                                 request_id: str, attempts: int, duration_ms: int,

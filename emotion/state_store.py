@@ -21,6 +21,7 @@ from typing import Any, Dict
 from core.storage import save_json_atomic
 
 from . import sleep_cache
+from .external_receipts import STATE_KEY as EXTERNAL_RECEIPTS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,13 @@ def parse_episode_state(raw: Any) -> Dict[str, Any]:
 
 def build_document(machine_state: Dict[str, Any], episode: Dict[str, Any], *,
                    previous: Any, pending_overhaul: Any, sleep_period: Any,
-                   applying_cycle: str) -> Dict[str, Any]:
+                   applying_cycle: str, external_events: Any = None) -> Dict[str, Any]:
     """构建待写状态文档（纯函数；不读文件、不写文件）。"""
     state = machine_state
+    if external_events is not None:
+        state[EXTERNAL_RECEIPTS_KEY] = external_events
+    elif isinstance(previous, dict) and EXTERNAL_RECEIPTS_KEY in previous:
+        state[EXTERNAL_RECEIPTS_KEY] = previous[EXTERNAL_RECEIPTS_KEY]
     state["episode"] = {
         "last_eval_ts": {str(k): round(float(v), 3)
                          for k, v in episode["last_eval_ts"].items()},

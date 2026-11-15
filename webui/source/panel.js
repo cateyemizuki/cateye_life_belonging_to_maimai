@@ -454,9 +454,11 @@ function schedulePageInfo(){return schedulePages[schedulePage]}
 // 旧快照无 origin_kind → 历史来源未记录（不猜它来自今天的 JSON）。
 function poolOriginLabel(item,key){
  if(key==='recovery')return '';
- if(key==='generated')return '模型生成 · 周期内可复用';
- if(key==='one_shot')return '模型生成 · 一次性小目标';
- if(key==='consumed')return '模型生成 · 已消耗';
+ const template=item.template_used||item.source==='template'||item.origin_kind==='template'||String(item.event_id||'').startsWith('llm_tpl_');
+ const generatedOrigin=template?'模板内容':(item.source==='llm'||item.origin_kind==='llm_generated')?'模型生成':'历史来源未记录';
+ if(key==='generated')return generatedOrigin+' · 周期内可复用';
+ if(key==='one_shot')return generatedOrigin+' · 一次性小目标';
+ if(key==='consumed')return generatedOrigin+' · 已消耗';
  const ok=item.origin_kind;
  if(ok==='code_builtin'||(!ok&&(item.event_id==='watch_bili'||item.event_id==='browse_qq')))return '代码内置 · 模块联动';
  if(ok==='json_file')return 'JSON · 状态调节';
@@ -514,6 +516,8 @@ function renderSchedulePool(key){
    const origin=el('li','schedule-pool-row');
    const source=el('span','note',ol);
    const details=[];
+   if(item.template_used)details.push('模板：'+(item.template_title||item.template_name||'小事件模板'));
+   if(item.template_reason)details.push('回退原因：'+item.template_reason);
    if(item.source_file)details.push('文件：'+item.source_file);
    if(item.definition_version)details.push('定义版本：'+item.definition_version);
    if(num(item.cooldown_minutes)>0)details.push('冷却：'+item.cooldown_minutes+' 分钟');
@@ -550,6 +554,13 @@ function renderConsumedEvents(){
   note.title=fullClock(item.consumed_at)+'；本周期不会再抽到这条事件。';
   const end=el('span','poolrowend');end.append(note);
   if(item.time_slot)end.append(el('span','rowbadge slotbadge',item.time_slot));
+  const origin=poolOriginLabel(item,'consumed');
+  if(origin)end.append(el('span','rowbadge originbadge',origin));
+  const template=item.template_used||item.source==='template'||item.origin_kind==='template'||String(item.event_id||'').startsWith('llm_tpl_');
+  if(template){
+   const badge=el('span','rowbadge usage-template','模板：'+(item.template_title||item.template_name||'小事件模板'));
+   badge.title=item.template_reason||'';end.append(badge);
+  }
   row.append(el('strong','',item.name||'未命名条目'),end);target.append(row);
  }
  if(!target.children.length)target.append(el('li','note',Array.isArray(rows)?'本周期暂无消耗记录':'当前快照未包含消耗记录'));
@@ -799,6 +810,7 @@ function renderRecentPosts(q){const box=$('qzone-recent-posts');if(!box)return;c
  if(!rows.length){empty(box,q.available?'最近没有已确认的说说':'空间状态暂不可用',q.available?'发送成功的日程说说与视频分享会在这里留下记录。':'空间模块就绪后展示。');return}
  box.replaceChildren(...rows.map(row=>{const item=el('div','sleeprow qzone-post'),main=el('div');main.append(el('strong','',row.content||'（空内容）'),el('div','note',(num(row.created_at)!==null?clock(row.created_at*1000,true):'时间未记录')+(num(row.image_count)!==null&&row.image_count>0?' · 配图 '+row.image_count+' 张':'')));item.append(main,el('span','rowbadge postsource',row.source==='视频分享'?'视频分享':'日程说说'));return item}))}
 const usageCount=value=>group(count(value));
+const usageTokenLabel=(value,reported)=>num(reported)===0?'未回传':usageCount(value)+' Token';
 const usageModuleLabels=new Map(Object.entries({planning:'日程',emotion:'情绪',companion:'陪伴',qzone:'空间',video:'视频',unknown:'未标注模块'}));
 const usageModuleLabel=module=>usageModuleLabels.get(module)||String(module);
 function usageWindow(usage){
@@ -817,15 +829,15 @@ function usageMetric(tag,label,value,term,tipLeft){
 }
 let usageLevelFilter='';
 function levelBadge(level,label){
- const badge=el('span','usage-level',label||({info:'info · 正常',warn:'warn · 警告',error:'error · 失败'}[level]||'级别未记录'));
+ const badge=el('span','usage-level',label||({info:'info · 正常',warn:'warn · 警告',error:'error · 失败',unknown:'校验结果未记录'}[level]||'级别未记录'));
  badge.dataset.level=level;return badge;
 }
-function recordLevel(row){return row.level||((row.abandoned||row.success===false)?'error':row.success===true?'info':'')}
+function recordLevel(row){return row.level||((row.abandoned||row.success===false)?'error':'unknown')}
 function renderGenerationLogs(){
  const usage=data?.usage||{},target=$('generation-logs');
  const all=Array.isArray(usage.generation_logs)?usage.generation_logs:[],rows=all.filter(row=>!usageLevelFilter||row.level===usageLevelFilter);
- target.replaceChildren(el('p','note',`最近日志 ${rows.length} 条${usage.generation_logs_truncated?' · 有界片段':''}`));
- if(!rows.length){target.append(el('p','usage-empty note',all.length?'当前级别暂无日志。':'这个统计范围内暂无统一生成日志。'));return}
+ target.replaceChildren(el('p','note',`展示日志 ${rows.length} 条 / 已读 ${usage.generation_logs_total??all.length} 条${(usage.generation_logs_read_truncated||(usage.generation_logs_read_truncated==null&&usage.generation_logs_truncated))?' · 语义日志读取有界':''}${usage.generation_logs_display_truncated?' · 首屏日志已截取':''}`));
+ if(!rows.length){target.append(el('p','usage-empty note',all.length?'当前展示片段中暂无该级别日志，可在逐笔记录中查看。':'这个统计范围内暂无统一生成日志。'));return}
  const list=el('ol','generation-logs');
  for(const row of rows){
   const item=el('li','generation-log'),head=el('div','generation-log-context');
@@ -838,12 +850,12 @@ function renderGenerationLogs(){
  }
  target.append(list);
 }
-$('usage-level-filter').onchange=event=>{usageLevelFilter=event.target.value;renderGenerationLogs();renderUsageRows()};
+$('usage-level-filter').onchange=event=>{usageLevelFilter=event.target.value;renderGenerationLogs();resetUsageRows(true);loadUsageRows()};
 function renderUsageOverview(usage){
  const terms=usageTerms();
  const metrics=[
   ['调用次数',usageCount(usage.calls),terms.calls],
-  ['宿主回传 Token',usageCount(usage.tokens),terms.tokens],
+  ['宿主回传 Token',reportedTokens(usage.tokens,usage.total_reported_calls),terms.tokens],
   ['输入 Token',reportedTokens(usage.prompt_tokens,usage.prompt_reported_calls),terms.prompt_tokens],
   ['输出 Token',reportedTokens(usage.completion_tokens,usage.completion_reported_calls),terms.completion_tokens],
   ['缓存命中',reportedTokens(usage.cache_hit_tokens,usage.cache_reported_calls),terms.cache_hit_tokens],
@@ -853,11 +865,11 @@ function renderUsageOverview(usage){
  const buckets=usage.buckets||{};
  replaceInfoChildren($('usage-buckets'),...[['host_reported','用量已回传'],['success_no_usage','成功 · 缺用量'],['failed','失败'],['legacy','旧记录']].map(([key,label])=>{
   const bucket=buckets[key]||{},card=usageMetric('span',label,usageCount(bucket.calls),terms[key]);
-  const tokens=usageCount(bucket.tokens);card.append(el('span','note',tokens==='—'?'用量未记录':tokens+' Token'));
+  const tokens=usageCount(bucket.tokens);card.append(el('span','note',tokens==='—'?'用量未记录':usageTokenLabel(bucket.tokens,bucket.reported_calls)));
   return card;
  }));
  const levels=usage.level_counts||{};
- $('usage-level-counts').replaceChildren(...['info','warn','error'].map(level=>levelBadge(level,level+' '+usageCount(levels[level]))));
+ $('usage-level-counts').replaceChildren(...['info','warn','error','unknown'].map(level=>levelBadge(level,(level==='unknown'?'校验结果未记录':level)+' '+usageCount(levels[level]))));
  text('usage-period',usageWindow(usage));text('usage-source',imported?'离线快照':'宿主用量记录');
  const updated=$('usage-updated');
  updated.textContent=date(data.generated_at)?clock(data.generated_at,true):'更新时间未记录';
@@ -871,7 +883,7 @@ function renderUsageModules(usage){
   const list=el('ul','usage-model-list');
   for(const [model,cell] of entries.sort(([,a],[,b])=>(b?.tokens||0)-(a?.tokens||0))){
    const item=el('li'),name=el('span','usage-name',model),stats=el('span','usage-amounts');
-   stats.append(el('span','note',usageCount(cell?.calls)+' 次'),el('strong','',usageCount(cell?.tokens)+' Token'));
+   stats.append(el('span','note',usageCount(cell?.calls)+' 次'),el('strong','',usageTokenLabel(cell?.tokens,cell?.reported_calls)));
    item.append(name,stats);list.append(item);
   }
   return list;
@@ -881,7 +893,7 @@ function renderUsageModules(usage){
   // 3.17.33：用量模块常显（不再用 details/summary 折叠）。
   const group=el('section','usage-module'),heading=el('div','usage-module-head'),totals=el('span','usage-amounts');
   group.dataset.module=module;
-  totals.append(el('span','note',usageCount(usage.module_calls?.[module])+' 次'),el('strong','',usageCount(usage.modules?.[module])+' Token'));
+  totals.append(el('span','note',usageCount(usage.module_calls?.[module])+' 次'),el('strong','',usageTokenLabel(usage.modules?.[module],usage.module_reported_calls?.[module])));
   heading.append(el('span','usage-name',usageModuleLabel(module)),totals);
   const records=el('button','usage-module-records','查看该模块的记录');
   records.type='button';records.disabled=imported||!live;records.onclick=()=>showUsageRecords(module);
@@ -890,7 +902,7 @@ function renderUsageModules(usage){
  }
  const fallback=Object.entries(usage.models||{});
  if(!sorted.length&&fallback.length){
-  container.append(models(fallback.map(([model,tokens])=>[model,{tokens,calls:usage.model_calls?.[model]}])));
+  container.append(models(fallback.map(([model,tokens])=>[model,{tokens,calls:usage.model_calls?.[model],reported_calls:usage.model_reported_calls?.[model]}])));
  }
  if(!container.hasChildNodes())container.append(el('p','usage-empty note','这个统计范围内暂无模型用量。'));
  text('usage-models-hint',sorted.length?'按模块展示各模型的调用与 Token。':fallback.length?'这份记录按模型汇总。':'');
@@ -898,9 +910,9 @@ function renderUsageModules(usage){
 }
 function renderUsage(){
  const usage=data.usage||{},health=data.health||{};
- text('usage-window',usageWindow(usage)+(usage.truncated?' · 有界日志片段':''));
+ text('usage-window',usageWindow(usage)+(usage.truncated?' · 有界日志片段':'')+(usage.semantic_evidence_truncated?' · 部分校验历史未读到':''));
  const metrics=[
-  ['调用次数',usageCount(usage.calls),'calls'],['宿主回传 Token',usageCount(usage.tokens),'tokens'],
+  ['调用次数',usageCount(usage.calls),'calls'],['宿主回传 Token',reportedTokens(usage.tokens,usage.total_reported_calls),'tokens'],
   ['输入 Token',reportedTokens(usage.prompt_tokens,usage.prompt_reported_calls),'prompt_tokens'],
   ['输出 Token',reportedTokens(usage.completion_tokens,usage.completion_reported_calls),'completion_tokens'],
   ['缓存命中',reportedTokens(usage.cache_hit_tokens,usage.cache_reported_calls),'cache_hit_tokens'],
@@ -926,7 +938,7 @@ function renderUsage(){
  text('usage-detail-split',coverage===null?$('usage-split').textContent:
   '输入与输出共回传 '+usageCount(usage.split_tokens)+' Token · 覆盖总量 '+Math.round(coverage*1000)/10+'%');
  const missing=usageCount(usage.missing_usage_source_calls);
- text('usage-note','调用次数包含失败响应。Token 仅统计宿主回传的用量。'+
+ text('usage-note','调用次数包含失败、异常和取消请求。模板日志不另计请求或 Token。Token 仅统计宿主回传的用量。'+
   (missing==='—'?'':' 缺少完整用量或旧标记的调用 '+missing+' 次，可能与失败重叠。'));
  // W-17（2026-11-03）：错误计数带最近一次时间与归属（后端只增 last_error_at/scope），
  // 并指路宿主日志页；原始日志正文不上页面。
@@ -992,9 +1004,10 @@ function syncUsageRange(){
  }
 }
 let usageRowsOffset=0,usageRowsTotal=0,usageRowsTruncated=false,usageRowsLoading=false,usageRowsSeq=0;
-function resetUsageRows(){
+let usageRowFilterSupported=true,usageRowsReadTruncated=false,usageRowsEvidenceTruncated=false;
+function resetUsageRows(preserveFilters=false){
  usageRowsSeq++;usageRowsLoaded=false;usageRowsLoading=false;usageRowsAll=[];
- usageRowsOffset=usageRowsTotal=0;usageRowsTruncated=false;usageFilter='';
+ usageRowsOffset=usageRowsTotal=0;usageRowsTruncated=false;usageRowsReadTruncated=false;usageRowsEvidenceTruncated=false;if(!preserveFilters)usageFilter='';
  $('usage-rows').replaceChildren();
 }
 function renderUsageFilter(){
@@ -1010,7 +1023,7 @@ function renderUsageFilter(){
  $('usage-record-filter').hidden=imported||!live||!modules.size;
 }
 function showUsageRecords(module){
- usageFilter=module;
+ usageFilter=module;resetUsageRows(true);
  renderUsageFilter();
  // 逐笔记录区常显，不再有 summary/open 可切换；只负责按模块过滤并加载。
  loadUsageRows();
@@ -1030,7 +1043,8 @@ function usageRecord(row){
  }
  const outcome=el('div','usage-record-outcome');
  const status=row.abandoned?'已放弃':row.success===true?'成功':row.success===false?'失败':'未知';
- const badge=levelBadge(recordLevel(row),recordLevel(row)==='warn'?'warn · 超出预期':recordLevel(row)==='error'?'error · 失败':status);
+ const badge=levelBadge(recordLevel(row),recordLevel(row)==='warn'?'warn · 超出预期':recordLevel(row)==='error'?'error · 失败':recordLevel(row)==='unknown'?'校验结果未记录':status);
+ if(row.semantic_status==='unrecorded'&&recordLevel(row)!=='unknown')outcome.append(el('span','note','校验结果未记录'));
  if(row.used_template){const template=el('span','usage-template','模板：'+(row.template_title||row.template_name||'默认'));template.title=row.fallback_reason||'';outcome.append(template)}
  outcome.append(badge);
  if(count(row.duration_ms)!=='—')outcome.append(el('span','note',usageCount(row.duration_ms)+' ms'));
@@ -1042,13 +1056,15 @@ function renderUsageRows(){
  if(imported||!live){target.replaceChildren(el('p','usage-empty note','离线快照只包含汇总用量。'));return}
  const rows=usageRowsAll.filter(row=>(!usageFilter||row.module===usageFilter)&&(!usageLevelFilter||recordLevel(row)===usageLevelFilter));
  const stats=el('p','note usage-record-count',
-  (usageFilter?'匹配 '+usageCount(rows.length)+' 条 · ':'')+
-  '已读取 '+usageCount(usageRowsAll.length)+' / '+usageCount(usageRowsTotal)+' 条');
+  ((usageFilter||usageLevelFilter)?(usageRowFilterSupported?'窗口内匹配 ':'仅筛已读片段 ')+usageCount(usageRowFilterSupported?usageRowsTotal:rows.length)+' 条 · ':'')+
+  '已读取 '+usageCount(usageRowsAll.length)+' / '+usageCount(usageRowsTotal)+' 条'+
+  (usageRowsReadTruncated?' · 用量账本读取有界，窗口计数为已读片段':'')+
+  (usageRowsEvidenceTruncated?' · 部分语义历史未读到，校验结果保留未记录':''));
  stats.setAttribute('role','status');target.replaceChildren(stats);
  if(rows.length){
   const list=el('ol','usage-records');
   list.append(...rows.map(usageRecord));target.append(list);
- }else target.append(el('p','usage-empty note',usageFilter?'已读取的记录中暂无该模块的调用。':'暂无逐笔记录。'));
+ }else target.append(el('p','usage-empty note',(usageFilter||usageLevelFilter)?(usageRowFilterSupported?'当前窗口已读范围内暂无匹配调用。':'已读取的记录中暂无匹配调用，可继续加载。'):'暂无逐笔记录。'));
  if(usageRowsTruncated){
   const more=el('button','usage-more','加载更多记录');
   more.type='button';more.onclick=()=>{more.disabled=true;loadUsageRows(true)};
@@ -1066,12 +1082,21 @@ async function loadUsageRows(append=false){
  else target.querySelector('.usage-row-error')?.remove();
  try{
   const params={hours,...(usageParamSupported?{usage_hours:usageHours}:{}),usage_rows_limit:50,usage_rows_offset:append?usageRowsOffset:0,...(selectedDay?{day:selectedDay}:{})};
-  const result=await deadline(window.maibot.query('summary',params));
+  const filtered=usageRowFilterSupported&&(usageFilter||usageLevelFilter);
+  const filterParams=filtered?{...(usageFilter?{usage_rows_module:usageFilter}:{}),...(usageLevelFilter?{usage_rows_level:usageLevelFilter}:{})}:{};
+  let result;
+  try{result=await deadline(window.maibot.query('summary',{...params,...filterParams}))}
+  catch(error){
+   if(!filtered||!/422|usage_rows_level|usage_rows_module|参数|parameter|unsupported|not supported/i.test(String(error?.message||error)))throw error;
+   usageRowFilterSupported=false;result=await deadline(window.maibot.query('summary',params));
+  }
   if(seq!==usageRowsSeq)return;
   const page=result?.usage?.rows_page;
+  if(filtered&&(!page?.filters||page.filters.level!==usageLevelFilter||page.filters.module!==usageFilter))usageRowFilterSupported=false;
   if(!Array.isArray(page?.rows))throw Error('缺少逐笔记录');
   usageRowsAll=append?usageRowsAll.concat(page.rows):page.rows;
-  usageRowsOffset=usageRowsAll.length;
+  usageRowsOffset=(num(page.offset)??(append?usageRowsOffset:0))+page.rows.length;
+  usageRowsReadTruncated=Boolean(page.read_truncated);usageRowsEvidenceTruncated=Boolean(page.semantic_evidence_truncated);
   usageRowsTotal=num(page.total)??usageRowsOffset;
   usageRowsTruncated=Boolean(page.truncated&&page.rows.length);
   usageRowsLoaded=true;renderUsageRows();
@@ -1101,7 +1126,7 @@ async function changeUsageRange(event){
 }
 $('usage-range').onclick=changeUsageRange;
 $('usage-detail-range').onclick=changeUsageRange;
-$('usage-module-filter').onchange=e=>{usageFilter=e.target.value;loadUsageRows()};
+$('usage-module-filter').onchange=e=>{usageFilter=e.target.value;resetUsageRows(true);loadUsageRows()};
 // 3.17.33：逐笔记录区不再折叠，原 details toggle 懒加载改为详情打开事件触发。
 document.addEventListener('lbm:detail-open',event=>{if(event.detail?.key==='usage')loadUsageRows()});
 $('samples-toggle').onclick=()=>{const open=$('samples').hidden;$('samples').hidden=!open;$('samples-toggle').setAttribute('aria-expanded',String(open));text('samples-toggle',open?'收起采样值':'查看采样值')};
@@ -1205,7 +1230,7 @@ function renderTimeline(){
  root.append(list);
 }
 
-function usageTerms(){return {calls:'收到宿主响应的请求数，包含失败；未收到响应的本地异常不计入。',tokens:'宿主明确回传的文本处理量（含只有总量的调用）。缺失时只计调用，不推算。',prompt_tokens:'宿主回传的输入 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',completion_tokens:'宿主回传的输出 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',cache_hit_tokens:'宿主回传的 prompt 缓存命中 Token；「未回传」表示没有任何一行携带该字段，此时无法区分真 0 与未报。',split_coverage:'可拆分覆盖率 =（输入+输出）/ 宿主回报总量；覆盖率低说明较多调用未回传拆分字段，不代表数据出错。',missing_usage_source_calls:'缺少完整宿主用量或新标记的调用，可与失败重叠；它本身不代表失败。',host_reported:'宿主返回成功响应及完整usage。',success_no_usage:'success=true，但宿主未回传完整usage。',failed:'宿主返回失败响应。',legacy:'升级前没有success和usage_present标记的记录。'}}
+function usageTerms(){return {calls:'已发出的请求数，包含失败、异常和取消；模板日志不另计请求。',tokens:'宿主明确回传的文本处理量（含只有总量的调用）。缺失时只计调用，不推算。',prompt_tokens:'宿主回传的输入 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',completion_tokens:'宿主回传的输出 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',cache_hit_tokens:'宿主回传的 prompt 缓存命中 Token；「未回传」表示没有任何一行携带该字段，此时无法区分真 0 与未报。',split_coverage:'可拆分覆盖率 =（输入+输出）/ 宿主回报总量；覆盖率低说明较多调用未回传拆分字段，不代表数据出错。',missing_usage_source_calls:'缺少完整宿主用量或新标记的调用，可与失败重叠；它本身不代表失败。',host_reported:'宿主返回成功响应及完整usage。',success_no_usage:'success=true，但宿主未回传完整usage。',failed:'宿主返回失败响应。',legacy:'升级前没有success和usage_present标记的记录。'}}
 let infoSequence=0;
 function replaceInfoChildren(target,...nodes){const old=[...target.querySelectorAll('.info-button')],index=old.indexOf(document.activeElement),wasOpen=index>=0&&old[index].getAttribute('aria-expanded')==='true';target.replaceChildren(...nodes);if(index>=0){const next=target.querySelectorAll('.info-button')[index];if(next){next.focus({preventScroll:true});if(!wasOpen)next.onblur()}}}
 function infoTip(explanation,tipLeft){

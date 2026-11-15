@@ -200,6 +200,15 @@ def _schedule_pools(planning: Any, model: Any, now: datetime, read: Any,
                 'consumption_status': str((row.get('consumption') or {}).get('status') or '')[:24],
                 'consumed_at': str((row.get('consumption') or {}).get('picked_at') or '')[:48],
                 'time_slot': _event_slot_label(row)}
+            provenance=raw_provenance.get(str(row.get('event_id') or row.get('key') or ''),{})
+            template=(row.get('template_used') is True or provenance.get('template_used') is True or row.get('source')=='template'
+                      or str(row.get('event_id') or '').startswith('llm_tpl_'))
+            item['source']=str(row.get('source') or '')[:24]
+            item['template_used']=template
+            if template:
+                item.update(origin_kind='template',template_name=str(row.get('template_name') or provenance.get('template_name') or 'schedule_events')[:80],
+                            template_title=str(row.get('template_title') or provenance.get('template_title') or '小事件模板')[:120],
+                            template_reason=str(row.get('template_reason') or provenance.get('template_reason') or '')[:200])
             pref = preference(row)
             if pref is not None:
                 item['preference'] = pref
@@ -211,6 +220,9 @@ def _schedule_pools(planning: Any, model: Any, now: datetime, read: Any,
 
     catalog = getattr(planning, 'event_catalog', None)
     snapshot = read('小事件库暂不可读', lambda: catalog.store.snapshot, None) if catalog else None
+    document=getattr(snapshot,'document',{}) or {}
+    raw_provenance={str(row.get('event_id') or ''):row for row in document.get('events',[])
+                    if isinstance(row,dict) and row.get('event_id')}
     resume = getattr(model, 'resume_candidates', None)
     paused = read('恢复池暂不可读', lambda: resume(now), []) if callable(resume) else []
     builtin_rows = snapshot.builtin_events if snapshot else RANDOM_EVENT_POOL
@@ -802,6 +814,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
                          usage_hours: int = 720,
                          usage_rows_limit: int = 0,
                          usage_rows_offset: int = 0,
+                         usage_rows_level: str = '', usage_rows_module: str = '',
                          now: datetime | None = None, day: str = "") -> dict[str, Any]:
     """只读生活面板投影。
 
@@ -930,7 +943,7 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
             'window_start', 'window_end', 'earliest_wake', 'latest_wake', 'phase_minutes',
             'onset_reason', 'decision', 'nap_reason', 'interruption') if key in dynamic_sleep}
     result.update(_extension_summary(plugin, now, hours, usage_hours,
-                                     usage_rows_limit, usage_rows_offset))
+                                     usage_rows_limit, usage_rows_offset,usage_rows_level,usage_rows_module))
     if future_state:
         result['warnings'].append('状态时间晚于当前时钟，请核对服务器时间')
     if history.get('clock_regressed'):
@@ -967,6 +980,15 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
             if reduced[-1].get('at') != points[-1].get('at'):
                 reduced.append(points[-1])
             series.update(points=reduced, downsampled=True)
+        elif len(result.get('usage', {}).get('generation_logs', [])) > 10:
+            usage=result['usage']
+            usage['generation_logs']=usage['generation_logs'][:max(10,len(usage['generation_logs'])//2)]
+            usage['generation_logs_truncated']=True
+            usage['generation_logs_display_truncated']=True
+        elif len(result.get('usage', {}).get('rows_page', {}).get('rows', [])) > 10:
+            page=result['usage']['rows_page']
+            page['rows']=page['rows'][:max(10,len(page['rows'])//2)]
+            page['truncated']=True
         elif result['schedule']['intents']:
             result['schedule']['intents'] = result['schedule']['intents'][:len(result['schedule']['intents'])//2]
         elif len(result.get('day', {}).get('state_history', {}).get('points', [])) > 60:
@@ -1259,7 +1281,8 @@ def _init_summary(plugin: Any, now: datetime) -> dict[str, Any]:
 
 def _extension_summary(plugin: Any, now: datetime, hours: int,
                        usage_hours: int = 720, usage_rows_limit: int = 0,
-                       usage_rows_offset: int = 0) -> dict[str, Any]:
+                       usage_rows_offset: int = 0, usage_rows_level: str = '',
+                       usage_rows_module: str = '') -> dict[str, Any]:
     """Independent module projections; never propagate raw event descriptions/logs."""
     result: dict[str, Any] = {'emotion': {'available': False}, 'qzone': {'available': False},
                               'qzone_video': {'available': False}, 'usage': {}, 'health': {},
@@ -1383,16 +1406,15 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
     video['available'] = bool(recent_ok or interests_ok)
     result['video'] = video
     try:
-        from core.monitoring import usage_summary, runtime_health, decorate_usage_rows
+        from core.monitoring import usage_summary, runtime_health
         data_dir = ctx.data_dir
         if data_dir:
-            result['usage'] = usage_summary(data_dir, now, usage_hours)
+            result['usage'] = usage_summary(data_dir, now, usage_hours,include_rows=int(usage_rows_limit or 0)>0)
             if int(usage_rows_limit or 0) > 0:
-                from core.llm_usage import LLMUsageTracker
-                result['usage']['rows_page'] = LLMUsageTracker(data_dir).rows(
-                    usage_hours, now=now, limit=int(usage_rows_limit),
-                    offset=max(0, int(usage_rows_offset or 0)))
-                decorate_usage_rows(result['usage']['rows_page']['rows'],result['usage']['generation_logs'])
+                from core.llm_usage import usage_rows_page
+                result['usage']['rows_page'] = usage_rows_page(result['usage'],limit=int(usage_rows_limit),
+                    offset=max(0, int(usage_rows_offset or 0)),level=usage_rows_level,module=usage_rows_module)
+                result['usage'].pop('rows',None)
         result['health'] = runtime_health(plugin, now)
     except Exception:
         pass

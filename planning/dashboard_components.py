@@ -8,9 +8,13 @@ class LifeDashboardComponentsMixin:
     async def life_dashboard(self, hours: int = 24, usage_hours: int = 720,
                              usage_rows_limit: int = 0,
                              usage_rows_offset: int = 0,
+                             usage_rows_level: str = "",
+                             usage_rows_module: str = "",
                              day: str = "") -> dict:
         """``day``（可选，YYYY-MM-DD）：非空 → 结果附加 day 键（单日足迹/意图/睡眠/序列）；
         空串/非法 → 与既有 hours 路径逐字一致（非法值按空串处理并带 warning 字段）。"""
         return build_life_dashboard(self, hours=hours, usage_hours=usage_hours,
                                     usage_rows_limit=usage_rows_limit,
-                                    usage_rows_offset=usage_rows_offset, day=day)
+                                    usage_rows_offset=usage_rows_offset,
+                                    usage_rows_level=usage_rows_level,
+                                    usage_rows_module=usage_rows_module, day=day)

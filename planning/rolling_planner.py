@@ -309,6 +309,7 @@ def extract_spine_intents(items: Any) -> List[Dict[str, Any]]:
             "priority": str(params.get("priority") or item.get("priority") or "medium").strip().lower(),
             "hardness": "hard" if str(params.get("hardness") or "soft").strip().lower() == "hard" else "soft",
             "commitment_hardness": str(params.get("commitment_hardness") or "").strip().lower(),
+            "commitment_id": str(params.get("commitment_id") or ""),
             "min_minutes": int(_as_number(params.get("min_minutes"), 0.0) or 0.0),
             "max_minutes": int(_as_number(params.get("max_minutes"), 0.0) or 0.0),
             "interruptibility": _clamp(itp if itp is not None else 0.5),
@@ -983,6 +984,8 @@ class RollingPlanner:
         cur = minutes_of_now(now)
         report.update({"date": date, "cur_minute": cur})
         self._roll_daily_counters(date)
+        # 从持久执行行恢复约定结算；失败保留 active，下个 tick/重启继续补扫。
+        self._reconcile_commitments(now)
 
         # 步 1：状态快照（PR2 定稿 §3/§4.1.4：planner 不再单独调用 life.tick——
         # 状态推进统一由 plugin tick 编排，编排方先 life.tick（含 VAD 调制）再经
@@ -1236,6 +1239,13 @@ class RollingPlanner:
         except Exception:
             logger.warning('随机事件结果未补记，已消费事件不返池', exc_info=True)
 
+    def _reconcile_commitments(self, now: datetime) -> None:
+        if self._goal_manager is not None:
+            try:
+                self._goal_manager.reconcile_commitments(now, grace_minutes=HARD_COMMITMENT_GRACE_MINUTES)
+            except Exception:
+                logger.warning("约定执行结算未完成，保留待重试", exc_info=True)
+
     def _finish_episode(self, episode: Dict[str, Any], now: datetime,
                         snapshot: Any, *, actual_end_minute: Optional[int] = None,
                         reason: str = "") -> None:
@@ -1254,6 +1264,8 @@ class RollingPlanner:
         extra_meta: Optional[Dict[str, Any]] = {"close_reason": reason} if reason else None
         if not self._db.finish(eid, actual_end_minute=end, metadata=extra_meta):
             return
+        if (episode.get("metadata") or {}).get("commitment_id"):
+            self._reconcile_commitments(now)
         self._finish_event_claim(episode, 'completed', reason=reason)
         # PR-B2：活动完成 → 父目标完成（不长留待办）；无父目标零动作
         self._settle_parent_goal(episode, "completed")
@@ -1360,6 +1372,10 @@ class RollingPlanner:
             if we <= ws:
                 continue
             item_key = c["item_id"]
+            commitment_id = str(c.get("commitment_id") or "")
+            # 新日表的 item_id 稳定；也兼容按真实 ID 记录的执行行。
+            if commitment_id and commitment_id in recorded:
+                continue
             current = self._safe_active_episode()
             if cur >= ws and cur < we and item_key not in recorded:
                 # 到点：抢占当前 episode（可抢占——硬约定优先级最高）
@@ -1410,6 +1426,7 @@ class RollingPlanner:
                     source="commitment", planned_start_minute=ws, planned_end_minute=we,
                     interruptibility=c["interruptibility"],
                     metadata={"commitment_item_id": item_key,
+                              "commitment_id": commitment_id,
                               "close_reason": "missed_hard_commitment"})
                 if eid:
                     self._db.abandon(eid, reason="missed_hard_commitment",
@@ -1426,11 +1443,14 @@ class RollingPlanner:
         try:
             rows = self._db.episodes_today(date)
         except Exception:
-            return ids
+            logger.warning("读取约定执行记录失败，本拍保留旧执行状态", exc_info=True)
+            raise
         for row in rows:
             meta = row.get("metadata")
             if isinstance(meta, dict) and meta.get("commitment_item_id"):
                 ids.add(str(meta["commitment_item_id"]))
+            if isinstance(meta, dict) and meta.get("commitment_id"):
+                ids.add(str(meta["commitment_id"]))
         return ids
 
     def _start_commitment(self, intent: Dict[str, Any], date: str, cur: int,
@@ -1452,7 +1472,9 @@ class RollingPlanner:
                 late_progress=self._cfg_float("late_attention_progress",
                                               DEFAULT_LATE_ATTENTION_PROGRESS)),
             state_before=self._state_brief(snapshot),
-            metadata={"commitment_item_id": intent["item_id"], "trigger": "hard_commitment"},
+            metadata={"commitment_item_id": intent["item_id"],
+                      "commitment_id": str(intent.get("commitment_id") or ""),
+                      "trigger": "hard_commitment"},
         )
         if eid:
             self._handle_squeezed_active(pre_active, now, eid)
@@ -2061,6 +2083,7 @@ class RollingPlanner:
             "profile_key": c["goal_type"], "window": (c["start_minute"], c["end_minute"]),
             "resume_of": None, "resume_bonus": 0.0,
             "intent_item_id": c["item_id"], "note": c.get("note", ""),
+            "commitment_id": str(c.get("commitment_id") or ""),
         }
 
     # ── 打分（§5.2 公式逐字）─────────────────────────────────────────────
@@ -2577,6 +2600,8 @@ class RollingPlanner:
                                         cand, snapshot, cur, date)}
         if cand.get("intent_item_id"):
             metadata["intent_item_id"] = cand["intent_item_id"]
+        if cand.get("commitment_id"):
+            metadata["commitment_id"] = cand["commitment_id"]
         if cand.get("note"):
             metadata["note"] = cand["note"]
         if extra_metadata:
@@ -2595,6 +2620,9 @@ class RollingPlanner:
             origin = self._db.get_episode(str(cand["resume_of"])) or {}
             origin_meta = (origin.get("metadata")
                            if isinstance(origin.get("metadata"), dict) else {})
+            for key in ("commitment_id", "commitment_item_id", "intent_item_id"):
+                if origin_meta.get(key):
+                    metadata[key] = origin_meta[key]
             # PR2.5 修复（2026-10-26），交接 §五.18 D1：origin 已按 close-active 路径
             # 应用过 deltas（state_deltas_applied 标记在案）→ 不再透传 event_key，恢复行
             # 关闭时不会二次应用（防双应用沿用同一标记口径）。

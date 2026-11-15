@@ -402,6 +402,10 @@ class LLMService:
         return self._generation_policy
 
     def _record_generation(self,**entry):
+        from core.generation_evidence import record_outcome
+        entry.setdefault('evidence_id',uuid.uuid4().hex)
+        data_dir=getattr(getattr(self._ctx,"paths",None),"data_dir",None)
+        record_outcome(data_dir,entry)
         logger=getattr(self,"_call_logger",None)
         if logger is None:
             data_dir=getattr(getattr(self._ctx,"paths",None),"data_dir",None)
@@ -460,14 +464,14 @@ class LLMService:
             return LLMUsageTracker(None).summary(window)
 
     def usage_rows(self, hours: int = 0, *, limit: int = 50,
-                   offset: int = 0) -> Dict[str, Any]:
+                   offset: int = 0, level: str = '', module: str = '') -> Dict[str, Any]:
         """逐笔明细（WebUI 分页用）；账本缺失 → 空页。"""
         window = int(hours or getattr(self, "_default_window_hours", DEFAULT_USAGE_WINDOW_HOURS))
         tracker = getattr(self, "_usage_tracker", None)
         if tracker is None:
             tracker = LLMUsageTracker(None)
         try:
-            return tracker.rows(window, limit=limit, offset=offset)
+            return tracker.rows(window, limit=limit, offset=offset,level=level,module=module)
         except Exception:
             return {"window_hours": window, "total": 0, "offset": 0,
                     "limit": limit, "rows": [], "truncated": False}

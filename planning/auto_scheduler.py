@@ -20,7 +20,8 @@ from .config import (
     ScheduleSectionConfig,
     section_or_default,
 )
-from .time_utils import DAY_MINUTES
+from .time_utils import (DAY_MINUTES, TimezoneManager, wall_time as _wall_time,
+                         elapsed_seconds as _elapsed_seconds, shift_elapsed as _shift_elapsed)
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +60,9 @@ def schedule_day_start(now: datetime, wake_minutes: int) -> datetime:
 
     例：wake 07:00 时，00:30 仍属**前一天**的帧（帧跨越午夜），07:00 之后属当天。
     """
-    start = now.replace(hour=int(wake_minutes) // 60, minute=int(wake_minutes) % 60,
-                        second=0, microsecond=0)
-    if start > now:
-        start -= timedelta(days=1)
+    start = _wall_time(now.date(), wake_minutes, now.tzinfo)
+    if _elapsed_seconds(start, now) > 0:
+        start = _wall_time(now.date() - timedelta(days=1), wake_minutes, now.tzinfo)
     return start
 
 
@@ -122,6 +122,15 @@ class ScheduleAutoScheduler:
         """唯一生成时刻来自日程基础配置。"""
         return section_or_default(self.plugin, 'schedule', ScheduleSectionConfig)
 
+    def _clock(self) -> TimezoneManager:
+        advanced = (section_or_default(self.plugin, "schedule_advanced", ScheduleAdvancedSectionConfig)
+                    if getattr(self.plugin, "config", None) is not None else ScheduleAdvancedSectionConfig())
+        return TimezoneManager(advanced.timezone)
+
+    def _local_time(self, value: Optional[datetime] = None) -> datetime:
+        """唯一调度时钟；注入的 naive 时间按配置时区墙钟解释。"""
+        return self._clock().to_local(value)
+
     def _describe_timing(self, cfg: Any) -> str:
         return f"日意图在本夜入睡参考前 {GENERATE_LEAD_MINUTES} 分钟生成，当前日程结束后接替"
 
@@ -143,30 +152,39 @@ class ScheduleAutoScheduler:
             return []
 
     def _due_minutes_in_frame(self, frame_start: datetime, cfg: Any) -> int:
-        """每次检查重新读取入睡参考，采用最早允许入睡点以覆盖高债提前睡。"""
+        """兼容分钟查询；DST 日帧按实际经过分钟返回。"""
+        local_start = self._local_time(frame_start)
+        return int(_elapsed_seconds(self._due_at_for_frame(local_start, cfg), local_start) / 60)
+
+    def _due_at_for_frame(self, frame_start: datetime, cfg: Any) -> datetime:
+        """每次重读最早允许入睡点，锚点按配置区日历、提前量按真实秒计算。"""
         wake_min, sleep_min = self._anchors(cfg)
-        sleep_at = frame_start + timedelta(minutes=in_frame_minutes(sleep_min, wake_min))
+        sleep_at = _wall_time(frame_start.date(), wake_min + in_frame_minutes(sleep_min, wake_min),
+                              frame_start.tzinfo)
+        next_start = _wall_time(frame_start.date() + timedelta(days=1), wake_min, frame_start.tzinfo)
         engine = getattr(self.plugin, "_sleep_engine", None)
         try:
-            reference = sleep_at - timedelta(hours=1)
+            reference = _shift_elapsed(sleep_at, -3600)
             window = engine.dynamic_window(reference) if engine is not None else None
             earliest = getattr(window, "start", None)
             if isinstance(earliest, datetime):
-                if frame_start.tzinfo is None and earliest.tzinfo is not None:
-                    earliest = earliest.replace(tzinfo=None)
-                elif frame_start.tzinfo is not None and earliest.tzinfo is None:
-                    earliest = earliest.replace(tzinfo=frame_start.tzinfo)
-                if frame_start <= earliest < frame_start + timedelta(days=1):
-                    sleep_at = min(sleep_at, earliest)
+                earliest = self._local_time(earliest)
+                if (_elapsed_seconds(earliest, frame_start) >= 0
+                        and _elapsed_seconds(earliest, next_start) < 0
+                        and _elapsed_seconds(earliest, sleep_at) < 0):
+                    sleep_at = earliest
         except Exception:
             logger.debug("动态睡眠窗不可得，使用配置入睡锚点", exc_info=True)
-        due = int((sleep_at - frame_start).total_seconds() / 60) - GENERATE_LEAD_MINUTES
-        return max(0, clamp_due_minutes(due))
+        due = _shift_elapsed(sleep_at, -GENERATE_LEAD_MINUTES * 60)
+        cap = _shift_elapsed(next_start, -GENERATE_LEAD_MINUTES * 60)
+        return max((frame_start, min((due, cap), key=lambda dt: dt.timestamp())),
+                   key=lambda dt: dt.timestamp())
 
     def _due_for_frame(self, frame_start: datetime, cfg: Any) -> Tuple[str, datetime]:
         """某「日程日」帧对应的 ``(目标日, 到期时刻)``（**目标日** = 帧起点 +1 天 = 新一天）。"""
+        frame_start = self._local_time(frame_start)
         target_date = (frame_start.date() + timedelta(days=1)).strftime("%Y-%m-%d")
-        due_at = frame_start + timedelta(minutes=self._due_minutes_in_frame(frame_start, cfg))
+        due_at = self._due_at_for_frame(frame_start, cfg)
         return target_date, due_at
 
     def _pending_generation(self, now: datetime, cfg: Any) -> Tuple[str, datetime]:
@@ -175,11 +193,13 @@ class ScheduleAutoScheduler:
         顺延只可能发生在"本帧目标日刚生成过"的场景（每日至多一次），故两帧足够；
         到期时刻用**目标日的上一帧**（该帧的日程已存在）计算，与生产时序一致。
         """
+        now = self._local_time(now)
         frame_start = schedule_day_start(now, self._anchors(cfg)[0])
         target_date, due_at = self._due_for_frame(frame_start, cfg)
         if self._last_schedule_date != target_date:
             return target_date, due_at
-        return self._due_for_frame(frame_start + timedelta(days=1), cfg)
+        next_start = _wall_time(frame_start.date() + timedelta(days=1), self._anchors(cfg)[0], now.tzinfo)
+        return self._due_for_frame(next_start, cfg)
 
     def _is_time_due(self, now: datetime, target_date: str, due_at: datetime) -> bool:
         """到期判定（B2）：目标日**尚未生成**，且当前时刻已到/已过它的到期时刻。
@@ -188,12 +208,13 @@ class ScheduleAutoScheduler:
         ``_last_schedule_date`` 已记该目标日 → 不再触发（跨日由 :meth:`_pending_generation`
         推进到下一帧，重新判定）。
         """
-        return self._last_schedule_date != target_date and now >= due_at
+        return (self._last_schedule_date != target_date
+                and _elapsed_seconds(self._local_time(now), self._local_time(due_at)) >= 0)
 
     def _seconds_until_next(self, now: datetime, cfg: Any) -> float:
         """距下一个待生成目标日到期还有多少秒（已到期未生成 → 1s，交给到期判定立刻触发）。"""
         _target_date, due_at = self._pending_generation(now, cfg)
-        return max(1.0, (due_at - now).total_seconds())
+        return max(1.0, _elapsed_seconds(due_at, self._local_time(now)))
 
     # ------------------------------------------------------------
     # 定时循环
@@ -203,7 +224,7 @@ class ScheduleAutoScheduler:
         """定时任务循环：计算下次执行时间并等待；单次失败不影响后续执行（结构不变）。"""
         while self.is_running:
             try:
-                now = datetime.now()
+                now = self._local_time()
                 cfg = self._timing_view()
                 target_date, due_at = self._pending_generation(now, cfg)
 
@@ -245,7 +266,7 @@ class ScheduleAutoScheduler:
 
     def _target_date_for(self, now: Optional[datetime] = None) -> str:
         """缺省目标日：按 wake 锚点口径推出的"新一天"（``_generate_today_schedule`` 直调用）。"""
-        now = now or datetime.now()
+        now = self._local_time(now)
         cfg = section_or_default(self.plugin, "schedule", ScheduleSectionConfig)
         frame_start = schedule_day_start(now, self._anchors(cfg)[0])
         return (frame_start.date() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -270,9 +291,15 @@ class ScheduleAutoScheduler:
                 rows = list(db.get_day_schedule(target) or [])
                 from .rolling_planner import extract_spine_intents
                 if extract_spine_intents(rows):
-                    from .cycle_state import enter_schedule_cycle, entry_context_from_plugin, REASON_SCHEDULED
+                    from .cycle_state import (enter_schedule_cycle, entry_context_from_plugin,
+                        REASON_SCHEDULED, REASON_REGENERATE, REASON_TOOL_EDIT, REASON_FALLBACK)
+                    reasons = {REASON_SCHEDULED, REASON_REGENERATE, REASON_TOOL_EDIT, REASON_FALLBACK}
+                    # Resume the persisted publication, including same-day edits,
+                    # without turning it into a new scheduled rotation.
+                    entry_reason = next((str(row.get("entry_reason")) for row in rows
+                                         if row.get("entry_reason") in reasons), REASON_SCHEDULED)
                     enter_schedule_cycle(getattr(self.plugin, "_data_dir", None), target, rows,
-                        reason=REASON_SCHEDULED,
+                        reason=entry_reason,
                         decision_logger=getattr(self.plugin, "_decision_logger", None),
                         **entry_context_from_plugin(self.plugin))
                     logger.info(f"{target} 已有 {len(rows)} 个 spine 日程，跳过自动生成")

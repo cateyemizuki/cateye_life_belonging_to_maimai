@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from .llm_templates import usage_level
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +228,7 @@ class LLMUsageTracker:
 
     def __init__(self, data_dir: Any, *, keep_hours: int = KEEP_HOURS) -> None:
         self._path: Optional[Path] = Path(data_dir) / "llm_usage_events.jsonl" if data_dir else None
-        self._keep_hours = max(1, int(keep_hours))
+        self._keep_hours = max(1, min(KEEP_HOURS, int(keep_hours)))
         self._writes_since_prune = 0
         self._last_prune_day: Optional[str] = None
 
@@ -269,7 +268,11 @@ class LLMUsageTracker:
             return
         total = self._total_of(prompt_tokens, completion_tokens, total_tokens,
                                usage_available)
+        from .generation_evidence import request_scope
+        scope=request_scope.get() or {}
         entry = {
+            "generation_group_id": str(scope.get("group_id") or ""),
+            "generation_attempt": scope.get("attempt"),
             "schema": 2,
             "ts": datetime.now().isoformat(timespec="seconds"),
             "module": str(module or ""),
@@ -345,7 +348,10 @@ class LLMUsageTracker:
                         continue
                     ts = str((entry or {}).get("ts") or "")
                     try:
-                        fresh = bool(ts) and datetime.fromisoformat(ts) >= cutoff
+                        at = datetime.fromisoformat(ts)
+                        # Imported/legacy ledgers can contain aware timestamps; compare actual instants.
+                        boundary = cutoff.astimezone(at.tzinfo) if at.tzinfo is not None else cutoff
+                        fresh = bool(ts) and at >= boundary
                     except (ValueError, TypeError):
                         fresh = False
                     if fresh:
@@ -391,140 +397,29 @@ class LLMUsageTracker:
         ``split_tokens`` / ``split_coverage``（拆分覆盖率，tokens=0 时为 None）。
         文件缺失/损坏 → 空账本（不抛异常）。
         """
-        window_hours = max(1, int(hours or DEFAULT_USAGE_WINDOW_HOURS))
-        clock = now or datetime.now()
-        window_start = clock - timedelta(hours=window_hours)
-        calls = 0
-        tokens = 0
-        prompt_total = completion_total = cache_hit_total = cache_miss_total = 0
-        # W-09（2026-11-03）只增字段：有多少行宿主明确回传了输入/输出拆分与缓存字段。
-        # 没有它，"总量 ≠ 输入+输出"与"缓存命中 0"会被读成数据错误或真 0。
-        prompt_reported = completion_reported = cache_reported = 0
-        missing_calls = 0
-        abandoned_calls = 0
-        unknown_module_calls = 0
-        schema1_calls = 0  # F4：schema 口径的旧格式行数（区别于字段口径的 legacy 桶）
-        buckets = empty_buckets()
-        models: Dict[str, int] = {}
-        model_calls: Dict[str, int] = {}
-        modules: Dict[str, int] = {}
-        module_calls: Dict[str, int] = {}
-        matrix: Dict[str, Dict[str, Dict[str, int]]] = {}
-        rows: List[Dict[str, Any]] = []
-        if self._path is not None and self._path.exists():
-            try:
-                with open(self._path, "r", encoding="utf-8") as handle:
-                    for line in handle:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        ts = str((entry or {}).get("ts") or "")
-                        try:
-                            at = datetime.fromisoformat(ts)
-                            if at.tzinfo is None and clock.tzinfo is not None:
-                                at = at.replace(tzinfo=clock.tzinfo)
-                            elif at.tzinfo is not None and clock.tzinfo is None:
-                                at = at.replace(tzinfo=None)
-                            if at < window_start or at > clock:
-                                continue
-                        except (ValueError, TypeError):
-                            continue
-                        calls += 1
-                        count = reported_token_count(entry)
-                        tokens += count
-                        if missing_usage_source(entry):
-                            missing_calls += 1
-                        bucket = usage_bucket_of(entry)
-                        buckets[bucket]["calls"] += 1
-                        buckets[bucket]["tokens"] += count
-                        row = _row_of(entry)
-                        if row is None:
-                            continue
-                        if row.abandoned:
-                            abandoned_calls += 1
-                        if row.schema < 2:
-                            schema1_calls += 1
-                        if row.module == MODULE_UNKNOWN:
-                            unknown_module_calls += 1
-                        if row.prompt is not None:
-                            prompt_total += row.prompt
-                            prompt_reported += 1
-                        if row.completion is not None:
-                            completion_total += row.completion
-                            completion_reported += 1
-                        if row.cache_hit is not None or row.cache_miss is not None:
-                            cache_reported += 1
-                        if row.cache_hit is not None:
-                            cache_hit_total += row.cache_hit
-                        if row.cache_miss is not None:
-                            cache_miss_total += row.cache_miss
-                        model = row.model
-                        if model:
-                            models[model] = models.get(model, 0) + count
-                            model_calls[model] = model_calls.get(model, 0) + 1
-                        module = row.module
-                        modules[module] = modules.get(module, 0) + count
-                        module_calls[module] = module_calls.get(module, 0) + 1
-                        cell = matrix.setdefault(module, {}).setdefault(
-                            model or "未知模型", {"calls": 0, "tokens": 0})
-                        cell["calls"] += 1
-                        cell["tokens"] += count
-                        if include_rows:
-                            rows.append({
-                                "ts": row.ts, "module": module, "event": row.event,
-                                "request_id": row.request_id,
-                                **usage_level(row.event, row.success, row.completion, row.abandoned),
-                                "task_name": row.task_name, "model": model,
-                                "prompt": row.prompt, "completion": row.completion,
-                                "tokens": count, "cache_hit": row.cache_hit,
-                                "cache_miss": row.cache_miss,
-                                "duration_ms": row.duration_ms, "attempts": row.attempts,
-                                "success": row.success, "abandoned": row.abandoned,
-                            })
-            except OSError:
-                logger.debug("LLM 用量记录读取失败（忽略）", exc_info=True)
-        rows.sort(key=lambda row: str(row.get("ts") or ""), reverse=True)
-        return {
-            "calls": calls, "tokens": tokens, "models": models,
-            "modules": modules, "has_usage": tokens > 0, "terms": USAGE_TERMS,
-            "buckets": buckets, "missing_usage_source_calls": missing_calls,
-            "window_hours": window_hours,
-            "window_start": window_start.isoformat(timespec="seconds"),
-            "prompt_tokens": prompt_total,
-            "completion_tokens": completion_total,
-            "cache_hit_tokens": cache_hit_total,
-            "cache_miss_tokens": cache_miss_total,
-            # W-09 只增字段（不改 tokens 原语义）：拆分覆盖率 = (输入+输出)/宿主总量，
-            # tokens=0 或无可比口径时为 None；前端据此把"未回传拆分"与真 0 分开。
-            "prompt_reported_calls": prompt_reported,
-            "completion_reported_calls": completion_reported,
-            "cache_reported_calls": cache_reported,
-            "split_tokens": prompt_total + completion_total,
-            "split_coverage": (
-                round((prompt_total + completion_total) / tokens, 4) if tokens > 0 else None
-            ),
-            "module_calls": module_calls,
-            "model_calls": model_calls,
-            "matrix": matrix,
-            "abandoned_calls": abandoned_calls,
-            "unknown_module_calls": unknown_module_calls,
-            "schema1_calls": schema1_calls,
-            "rows": rows,
-        }
+        from .monitoring import usage_summary
+        return usage_summary(self._path.parent if self._path else None,
+                             now or datetime.now(),hours or DEFAULT_USAGE_WINDOW_HOURS,
+                             include_rows=include_rows)
 
     def rows(self, hours: int = DEFAULT_USAGE_WINDOW_HOURS, *,
              now: Optional[datetime] = None,
-             limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+             limit: int = 50, offset: int = 0, level: str = '', module: str = '') -> Dict[str, Any]:
         """逐笔明细（分页；不塞进首屏 payload）。"""
         data = self.summary(hours, now=now, include_rows=True)
-        all_rows = data["rows"]
-        start = max(0, int(offset or 0))
-        count = max(1, min(200, int(limit or 50)))
-        page = all_rows[start:start + count]
-        return {"window_hours": data["window_hours"], "total": len(all_rows),
-                "offset": start, "limit": count, "rows": page,
-                "truncated": len(all_rows) > start + len(page)}
+        return usage_rows_page(data,limit=limit,offset=offset,level=level,module=module)
+
+
+def usage_rows_page(data,*,limit=50,offset=0,level='',module=''):
+    """Filter the exact summary projection before paging; no second read or reclassification."""
+    level=level if level in ('info','warn','error','unknown') else ''
+    module=str(module or '')[:80]
+    all_rows=[row for row in data['rows'] if (not level or row['level']==level)
+              and (not module or row['module']==module)]
+    start=max(0,int(offset or 0));count=max(1,min(200,int(limit or 50)))
+    page=all_rows[start:start+count]
+    return {'window_hours':data['window_hours'],'total':len(all_rows),
+            'unfiltered_total':len(data['rows']),'offset':start,'limit':count,'rows':page,
+            'truncated':len(all_rows)>start+len(page),'read_truncated':data['truncated'],
+            'semantic_evidence_truncated':data['semantic_evidence_truncated'],
+            'filters':{'level':level,'module':module},'level_counts':data['level_counts']}
