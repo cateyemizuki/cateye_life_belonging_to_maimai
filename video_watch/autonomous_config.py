@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
-"""video_autonomous 配置分组（3.17.37 视频自主观看批：日程主动观看的数据过滤）。
+"""video_autonomous 配置：自主观看开关、日程机会、单段/每日额度及候选质量。
 
-承载「bot 日程触发的主动视频观看」的候选数据门槛。与 [video_watch]（观看机制：
-采样/队列/观后感）、[video_share]（观看后的分享投递）职责分离：本段只管「主动
-观看前按视频公开数据筛掉低热度候选」，**不影响工具点播**——用户经
-``lbm_watch_bili_video`` 直接给链接/BV 的查看走 service.submit，从不经过候选
-prepare/pick，故本段任何阈值都不约束工具路径（分叉点之后、仅主动侧加闸）。
+与 [video_watch]（观看机制：采样/队列/观后感）、[video_share]（观看后的分享投递）
+分工：本段控制属性日程、旧内置事件与闲暇顺便观看的自主发起，不控制工具点播。
+用户经 ``lbm_watch_bili_video`` 直接给链接/BV 的查看仍只受 video_watch.enabled
+与观看服务自身约束，不消耗本段的自主场次/分钟额度。
 
-口径（与 integrations/video_interest.py 候选源一致）：
+生产默认：每日总 8 场、专属日程 4 场、240 分钟；闲暇日程独立每日 3 场，
+每个明确闲暇 episode 只掷一次 10% 概率；单段连续观看最多 10 支。
+这些值均从本段配置读取，调整配置不需要修改协调器中的旧兼容常量。
+
+候选质量口径（与 integrations/video_interest.py 一致）：
 - 阈值只作用于日程/空隙/调试命令触发的**自主选片**（BiliCandidateSource.prepare/pick）；
 - 每项阈值 0 = 不检查该项；播放量默认 50000，其余三项默认 0（保守，不预设压低观看量）；
 - 评论/投币/收藏仅在候选阶段**真实可得**时参与检查（popular 响应自带 stat）；
@@ -29,7 +32,7 @@ from core.i18n import ui_i18n as _ui_i18n
 
 
 class VideoAutonomousSectionConfig(PluginConfigBase):
-    """日程触发的主动视频观看：按播放量/评论/投币/收藏筛掉低热度候选。只影响自主选片，工具点播不受任何阈值约束。"""
+    """自主观看开关、日程机会与额度，以及公开数据质量门槛；工具点播独立。"""
 
     __ui_label__ = "视频自主观看"
     __ui_icon__ = "tv"
@@ -38,6 +41,27 @@ class VideoAutonomousSectionConfig(PluginConfigBase):
     # 渲染序 video_watch → video_autonomous → video_share（稳定排序）。
     __ui_order__ = 12
     __ui_i18n__: ClassVar[dict] = {"en": {"title": "Autonomous video watching"}}
+
+    enabled: bool = Field(default=True, description="启用属性日程、内置刷视频事件及闲暇顺便观看；关闭后工具点播仍由视频观看总开关独立控制。",
+        json_schema_extra={"label":"启用自主观看"})
+    schedule_casual_enabled: bool = Field(default=True, description="明确闲暇、可中断的普通日程，每段只判断一次是否顺便看一支；独立于活动模块属性null。",
+        json_schema_extra={"label":"闲暇日程顺便看一支"})
+    schedule_casual_probability: float = Field(default=.10, ge=0, le=1, description="每段符合条件的日程只掷一次，结果落盘；不是每次tick重试。",
+        json_schema_extra={"label":"每段日程观看概率","step":.05})
+    schedule_casual_daily_limit: int = Field(default=3, ge=0, le=30, description="每日闲暇日程顺便观看的场次上限；每段最多一支，0关闭。",
+        json_schema_extra={"label":"每日顺便观看上限"})
+    schedule_max_videos: int = Field(default=10, ge=1, le=100, description="同一刷视频属性日程最多提交多少支真实候选；仍受该段剩余时间、总额度、睡眠与聊天守护。",
+        json_schema_extra={"label":"单段刷视频最多支数"})
+    daily_session_limit: int = Field(default=8, ge=0, le=100, description="所有自主观看合计每日场次上限；一段连续刷视频只计一场，0关闭。",
+        json_schema_extra={"label":"每日自主观看总场次"})
+    daily_dedicated_limit: int = Field(default=4, ge=0, le=100, description="每日刷视频属性日程及旧内置刷视频事件的场次上限。",
+        json_schema_extra={"label":"每日刷视频日程上限"})
+    daily_minutes_limit: int = Field(default=240, ge=0, le=1440, description="每日自主观看预留分钟总上限，取消或结束时按真实处理用时结算；工具点播不计入。",
+        json_schema_extra={"label":"每日自主观看分钟上限"})
+    daily_gap_limit: int = Field(default=2, ge=0, le=30, description="没有活动日程时的空隙冲浪每日场次上限；与普通日程顺便观看分别计数。",
+        json_schema_extra={"label":"每日空隙观看上限"})
+    gap_min_interval_minutes: int = Field(default=60, ge=0, le=1440, description="无日程的两场空隙冲浪启动间隔；不限制每段日程只掷一次的顺便观看。",
+        json_schema_extra={"label":"空隙观看最短间隔（分钟）"})
 
     min_views: int = Field(
         default=50000, ge=0, le=100000000,

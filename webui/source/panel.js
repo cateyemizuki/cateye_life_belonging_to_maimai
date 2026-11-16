@@ -7,7 +7,7 @@ if(window.maibot)document.documentElement.dataset.embedded='true';
 const $=id=>document.getElementById(id),NS='http://www.w3.org/2000/svg';
 const spec=[['energy','精力','↑ 更有活力','EN'],['hunger','饥饿','↑ 更饿','HU'],['focus','专注','↑ 更能集中','FO'],['stress','压力','↑ 更紧绷','ST'],['social_battery','社交电量','↑ 更愿意交流','SO']];
 const colors={energy:'--energy',hunger:'--hunger',focus:'--focus',stress:'--stress',social_battery:'--social',sleep_debt:'--debt',valence:'--energy',arousal:'--focus',dominance:'--stress'},labels=Object.fromEntries(spec.map(s=>[s[0],s[1]]));labels.sleep_debt='睡眠债';labels.valence='愉悦';labels.arousal='唤醒';labels.dominance='掌控';
-const selected=new Set(spec.map(s=>s[0]));let data=null,hours=24,usageHours=(()=>{try{const v=Number(localStorage.getItem('lbmUsageHours'));return [24,168,720].includes(v)?v:720}catch(e){return 720}})(),usageRowsLoaded=false,usageRowsAll=[],usageFilter="",usageParamSupported=true,busy=false,live=false,timer=null,failures=0,points=[],imported=false,zoom=null,selectedDay="",activeTab="now",requestSeq=0,lastSuccessAt=0,lastError="",freshnessTimer=null,importSeq=0;
+const selected=new Set(spec.map(s=>s[0]));let data=null,hours=24,emotionHours=24,emotionZoom=null,usageHours=(()=>{try{const v=Number(localStorage.getItem('lbmUsageHours'));return [24,168,720].includes(v)?v:720}catch(e){return 720}})(),usageRowsLoaded=false,usageRowsAll=[],usageFilter="",usageParamSupported=true,busy=false,live=false,timer=null,failures=0,points=[],imported=false,zoom=null,selectedDay="",activeTab="now",requestSeq=0,lastSuccessAt=0,lastError="",freshnessTimer=null,importSeq=0;
 const num=v=>typeof v==='number'&&Number.isFinite(v)?v:null,pct=v=>num(v)===null?'—':Math.round(Math.max(0,Math.min(1,v))*100),fix=(v,d=1)=>num(v)===null?'—':v.toFixed(d),text=(id,s)=>{$(id).textContent=String(s??'—')};
 // 次数展示口径：有限非负整数及等价数字字符串（5 / 5.0 / "5.0"）→ 整数；null/空/非法 → —。
 // 不四舍五入业务值，非整数异常按缺失展示，不改底层值。
@@ -24,6 +24,30 @@ function minute(v){if(num(v)===null)return '—';const t=Math.floor(v),d=Math.fl
 // 数据侧 planning/time_utils.format_day_minute 已对 >=1440 的分钟能标「次日」；
 // 这里只兜住数据里仍用 0 点环表示跨午夜段的情形，不改业务值。
 function spanEnd(start,end){const s=num(start),e=num(end);return e===null?null:(s!==null&&e<s?e+1440:e)}
+// 纯显示名称：不修改活动原名、记录或模型输入。
+function displayActivityName(row,context={}){
+ const original=String(row?.name||context.fallback||'未命名活动'),kind=String(row?.goal_type||''),meta=row?.metadata||{};
+ const nap=(kind==='sleep'||kind==='rest'||kind==='daily_routine')&&(/午睡|午休|小憩|打盹|小睡/.test(original)||meta.kind==='nap');
+ if(nap)return '午休';
+ if(kind==='sleep'||(['daily_routine','rest',''].includes(kind)&&/睡觉|睡眠|安睡/.test(original)))return '晚安，世界';
+ if(kind!=='meal')return original;
+ let at=Number.isFinite(row?.actual_start_minute)?row.actual_start_minute:null;
+ if(at===null&&row?.started_at){
+  const raw=row.started_at,local=typeof raw==='string'?raw.match(/^\d{4}-\d{2}-\d{2}[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$/):null,instant=new Date(typeof raw==='number'&&Math.abs(raw)<1e11?raw*1000:raw);
+  if(local&&Number(local[1])<24&&Number(local[2])<60)at=Number(local[1])*60+Number(local[2]);
+  else if(Number.isFinite(+instant))try{const parts=new Intl.DateTimeFormat('en-GB',{timeZone:context.timezone||'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(instant);at=Number(parts.find(p=>p.type==='hour').value)*60+Number(parts.find(p=>p.type==='minute').value)}catch{}
+ }
+ if(at===null)at=Number.isFinite(row?.start_minute)?row.start_minute:Number.isFinite(row?.planned_start_minute)?row.planned_start_minute:null;
+ if(at===null)return original;
+ at=((at%1440)+1440)%1440;
+ return at>=300&&at<660?'早餐':at>=660&&at<900?'午餐':at>=900&&at<1260?'晚餐':'宵夜';
+}
+function activityNameNode(tag,cls,row,fallback){const node=el(tag,cls,displayActivityName(row,{timezone:data?.timezone,fallback}));if(row?.name){node.title='原名：'+row.name;node.dataset.originalName=row.name}return node}
+const ACTIVITY_ATTRIBUTE_I18N={zh:{'activity.watch_video':'刷视频','activity.browse_qq':'刷QQ'}};
+function activityAttributeBadges(row){const group=el('div','activity-attributes'),raw=Object.prototype.hasOwnProperty.call(row||{},'activity_attributes')?row.activity_attributes:row?.parameters?.activity_attributes??row?.metadata?.activity_attributes;
+ if(Array.isArray(raw))for(const key of ['watch_video','browse_qq'])if(raw.includes(key)){const token='activity.'+key,badge=el('span','rowbadge activity-attribute',ACTIVITY_ATTRIBUTE_I18N.zh[token]);badge.dataset.i18nKey=token;group.append(badge)}
+ group.hidden=!group.childElementCount;return group;
+}
 function empty(target,title,desc){const box=el('div','empty');box.append(el('strong','',title),el('span','note',desc));target.replaceChildren(box)}
 function notice(message,error=false){$('notice').hidden=!message;$('notice').classList.toggle('error',error);text('notice',message)}
 function connection(label,status=''){$('connection').className='status '+status;text('connection-label',label)}
@@ -32,7 +56,7 @@ for(const[key,label,direction,code]of spec){const card=el('article','card maibot
 function trendFor(key){const rows=(lifeSeries().points||[]).filter(p=>!p.estimated&&num(p[key])!==null);if(rows.length<2)return null;const a=rows[rows.length-2],b=rows[rows.length-1];return {d:num(b[key])-num(a[key]),at:b.at}}
 function assess(key,value){if(num(value)===null)return '状态暂不可用';const levels={energy:[[.15,'精疲力竭'],[.35,'有些疲惫'],[.65,'精力尚可'],[.85,'精力充沛'],[2,'活力十足']],hunger:[[.25,'不太饿'],[.5,'稍有饥饿'],[.7,'有些饿了'],[.85,'很饿'],[2,'需要进食']],focus:[[.15,'注意力涣散'],[.35,'难以集中'],[.6,'专注一般'],[.85,'专注良好'],[2,'高度专注']],stress:[[.15,'很放松'],[.35,'比较平静'],[.6,'有些紧绷'],[.8,'压力较高'],[2,'压力很高']],social_battery:[[.15,'更想独处'],[.35,'社交电量偏低'],[.65,'愿意交流'],[.85,'社交电量充足'],[2,'交流意愿很高']]};return levels[key].find(([limit])=>Math.max(0,Math.min(1,value))<limit)[1]}
 function render(){const s=data.state||{},sch=data.schedule||{},cur=sch.current,co=data.companion||{};connection(imported?'离线快照':data.stale||data.warnings?.length?'已连接 · 留意数据':'实时连接',imported||data.stale||data.warnings?.length?'warn':'live');const updatedLabel=(imported?'快照时间 ':'更新于 ')+clock(data.generated_at,true)+' · '+(data.timezone||'');text('updated',updatedLabel);$('updated').title=updatedLabel;
-text('current-kind',cur?(cur.goal_type==='sleep'?(data.sleep?.current?.asleep?'睡眠中':'准备入睡'):'进行中'):sch.enabled?(sch.runtime_ready?'空闲':'未就绪'):'未启用');text('current-name',cur?.name||(sch.enabled?(sch.runtime_ready?'此刻空闲':'生活日程正在准备'):'日程未启用'));const meta=$('current-meta');meta.replaceChildren();if(cur){
+text('current-kind',cur?(cur.goal_type==='sleep'?(data.sleep?.current?.asleep?'睡眠中':'准备入睡'):'进行中'):sch.enabled?(sch.runtime_ready?'空闲':'未就绪'):'未启用');text('current-name',(cur?displayActivityName(cur,{timezone:data?.timezone}):'')||(sch.enabled?(sch.runtime_ready?'此刻空闲':'生活日程正在准备'):'日程未启用'));$('current-name').title=cur?.name?'原名：'+cur.name:'';const meta=$('current-meta');meta.replaceChildren();if(cur){meta.append(activityAttributeBadges(cur));
  // W-08 时间语义（2026-11-03）：计划结束时间消费后端 planned_end_minute（跨午夜由
  // spanEnd 补次日；后端 _row 另给 time_label 供详情层展示），进度基准注明「按本轮
  // 活动」，让 34% 之类的分母可解释——不去掩饰与日意图时段的差异。
@@ -239,29 +263,30 @@ function sleepChartSegments(day){
  return out;
 }
 function chart(target,rows,keys,max=1,height=260,min=0){
- target.replaceChildren();const day=dayView(),sleepSegments=sleepChartSegments(day);
- const dayBounds=selectedDay&&day? [Number(date(day.window_start)),Number(date(day.window_end))]:null;
+ target.replaceChildren();const moodChart=target.id==='emotion-history-chart',chartZoom=moodChart?emotionZoom:zoom,chartHours=moodChart?emotionHours:hours,dayScoped=!moodChart&&Boolean(selectedDay);
+ const day=moodChart?null:dayView(),sleepSegments=sleepChartSegments(day);
+ const dayBounds=dayScoped&&day? [Number(date(day.window_start)),Number(date(day.window_end))]:null;
  if(!rows.length&&!sleepSegments.length){empty(target,'还没有这段时间的记录','真实采样到来后，曲线会在这里慢慢展开。');return}
  if(!keys.length){empty(target,'曲线已隐藏','点击图例选择想看的状态。');return}
  const w=Math.max(280,Math.min(1100,target.clientWidth||1000)),l=38,r=18,top=22,bottom=52;
  const nowMs=Number(date(data?.generated_at));
- let t0=zoom?.[0]??dayBounds?.[0]??Number(date(rows[0]?.at)),t1=zoom?.[1]??dayBounds?.[1]??Number(date(rows.at(-1)?.at));
+ let t0=chartZoom?.[0]??dayBounds?.[0]??Number(date(rows[0]?.at)),t1=chartZoom?.[1]??dayBounds?.[1]??Number(date(rows.at(-1)?.at));
  // 行内没有点（离线/睡眠尾段）时不再取到 NaN：回退到睡眠段边界或当前统计窗口。
  if(!rows.length){
-  const winStart=Number.isFinite(nowMs)?nowMs-hours*3600000:-Infinity;
-  const bands=sleepSegments.filter(segment=>selectedDay||!Number.isFinite(nowMs)||(segment.end>=winStart&&segment.start<=nowMs));
+  const winStart=Number.isFinite(nowMs)?nowMs-chartHours*3600000:-Infinity;
+  const bands=sleepSegments.filter(segment=>dayScoped||!Number.isFinite(nowMs)||(segment.end>=winStart&&segment.start<=nowMs));
   if(bands.length){
    t0=Math.max(Math.min(...bands.map(segment=>segment.start)),winStart);
    t1=Math.min(Math.max(...bands.map(segment=>segment.end)),Number.isFinite(nowMs)?nowMs:Infinity);
   }
   if(!Number.isFinite(t0)||!Number.isFinite(t1)||t1<=t0){
-   if(Number.isFinite(nowMs)){t1=nowMs;t0=nowMs-hours*3600000}else{t0=0;t1=1}
+   if(Number.isFinite(nowMs)){t1=nowMs;t0=nowMs-chartHours*3600000}else{t0=0;t1=1}
   }
  }else if(!Number.isFinite(t0)||!Number.isFinite(t1)||t1<=t0)t1=t0+300000;
  // 睡眠段可延伸到最后一个真实点之后（离线尾段）：只在未缩放/未选日时扩到段尾，
  // 且限制在当前 hours 窗口内，避免把 7 天前的离线会话拉进 24h 图。
- if(sleepSegments.length&&!zoom&&!dayBounds&&Number.isFinite(nowMs)){
-  const winStart=nowMs-hours*3600000;
+ if(sleepSegments.length&&!chartZoom&&!dayBounds&&Number.isFinite(nowMs)){
+  const winStart=nowMs-chartHours*3600000;
   for(const segment of sleepSegments){
    if(segment.end<winStart||segment.start>nowMs)continue;
    const bandStart=Math.max(segment.start,winStart),bandEnd=Math.min(segment.end,nowMs);
@@ -270,14 +295,14 @@ function chart(target,rows,keys,max=1,height=260,min=0){
   }
  }
  const lastRow=rows.at(-1),tailSleeping=Boolean(lastRow&&(lastRow.sleeping===true||lastRow.frozen===true));
- if(tailSleeping&&!zoom&&!dayBounds&&Number.isFinite(nowMs)&&nowMs>t1)t1=nowMs;
+ if(tailSleeping&&!chartZoom&&!dayBounds&&Number.isFinite(nowMs)&&nowMs>t1)t1=nowMs;
  const span=Math.max(300000,t1-t0),x=t=>l+(t-t0)/span*(w-l-r),y=v=>height-bottom-Math.max(0,Math.min(1,(v-min)/(max-min)))*(height-top-bottom),step=document.documentElement.dataset.dashboardStyle==='millennium';
  const root=svg('svg',{viewBox:`0 0 ${w} ${height}`,role:'img',tabindex:'0','aria-label':min<0?'情绪 VAD 趋势，纵轴 −1 到 1':max===1?'生活状态趋势，纵轴百分比，拖动或双指缩放；按 Escape 重置':'睡眠债趋势，纵轴小时'});
  // PR-UI-DETAIL（3.17.21）§1C：VAD（min<0）为事件驱动不规则采样，>15min 间隔是常态而非缺测。
  const sparseVad=min<0;
  // S2-6/3.17.33：只有可见的「心情变化」图强制实线；生活状态/睡眠债/隐藏 VAD 图保持原口径。
  const solidMood=target.id==='emotion-history-chart';
- const chartTitle=solidMood?'实线为真实观察，缺口直接连线；圆点为真实采样点；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':sparseVad?'实线为真实观察；圆点为真实采样点；点线为采样缺口连线（两端真实，未插入估算点）；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':'实线为真实观察；虚线为中间缺口估算；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。';
+ const chartTitle=solidMood?'实线为真实观察，缺口直接连线；悬停或轻点查看真实采样点与数值；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':sparseVad?'实线为真实观察；圆点为真实采样点；点线为采样缺口连线（两端真实，未插入估算点）；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':'实线为真实观察；虚线为中间缺口估算；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。';
  root.style.userSelect='none';root.append(svg('title',{},chartTitle));
  const clipId=target.id+'-clip',hatchId=target.id+'-hatch',defs=svg('defs'),clip=svg('clipPath',{id:clipId});clip.append(svg('rect',{x:l,y:top,width:w-l-r,height:height-top-bottom}));defs.append(clip);
  const hatch=svg('pattern',{id:hatchId,patternUnits:'userSpaceOnUse',width:8,height:8,patternTransform:'rotate(45)'});hatch.append(svg('line',{x1:0,y1:0,x2:0,y2:8,stroke:'var(--focus)','stroke-width':2,opacity:.18}));defs.append(hatch);root.append(defs);
@@ -291,7 +316,7 @@ function chart(target,rows,keys,max=1,height=260,min=0){
  root.append(under);
  for(let i=0;i<=4;i++){const yy=y(min+(max-min)*i/4);root.append(svg('line',{x1:l,x2:w-r,y1:yy,y2:yy,stroke:'var(--maibot-border)','stroke-width':step?1.5:.8,'stroke-dasharray':step?'none':'3 3'}),svg('text',{x:l-9,y:yy+4,'text-anchor':'end',fill:'var(--maibot-muted)','font-size':11},min===0&&max===1?i*25:Number((min+(max-min)*i/4).toFixed(2))))}
  root.append(svg('line',{x1:l,x2:l,y1:top,y2:height-bottom,stroke:'var(--maibot-border)'}),svg('line',{x1:l,x2:w-r,y1:height-bottom,y2:height-bottom,stroke:'var(--maibot-border)'}));
- const ticks=w<600?4:7;for(let i=0;i<ticks;i++){const at=t0+span*i/(ticks-1),xx=x(at),yy=height-bottom+15;root.append(svg('text',{x:xx,y:yy,transform:`rotate(-35 ${xx} ${yy})`,'text-anchor':'end',fill:'var(--maibot-muted)','font-size':11},clock(new Date(at).toISOString(),!selectedDay&&hours>24)))}
+ const ticks=w<600?4:7;for(let i=0;i<ticks;i++){const at=t0+span*i/(ticks-1),xx=x(at),yy=height-bottom+15;root.append(svg('text',{x:xx,y:yy,transform:`rotate(-35 ${xx} ${yy})`,'text-anchor':'end',fill:'var(--maibot-muted)','font-size':11},clock(new Date(at).toISOString(),!dayScoped&&chartHours>24)))}
  const curves=svg('g',{'clip-path':`url(#${clipId})`});
  const downsampled=solidMood?true:((target.id==='vad-chart'||target.id==='emotion-history-chart')?vadSeries().downsampled:lifeSeries().downsampled);
  // 心情图：相邻真实采样点之间直接连实线——不因 gap_before / >15min 间隔断开（不改原数组）。
@@ -320,7 +345,7 @@ function chart(target,rows,keys,max=1,height=260,min=0){
     if(prevP&&(p.gap_before||(!downsampled&&Number(date(p.at))-Number(date(prevP.at))>900000)))edges.push(`M${x(Number(date(prevP.at)))} ${y(prevP[key])}L${x(Number(date(p.at)))} ${y(p[key])}`);
     prevP=p}
    if(edges.length&&!solidMood){const bridge=svg('path',{d:edges.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':1.5,'stroke-dasharray':'2 4',opacity:.6,'data-gap-bridge':key});bridge.append(svg('title',{},'采样缺口连线：两端均为真实观察，未插入估算点'));curves.append(bridge)}
-   for(const p of rows){if(p.estimated||num(p[key])===null)continue;const dot=svg('circle',{cx:x(Number(date(p.at))),cy:y(p[key]),r:2.5,fill:`var(${colors[key]})`,'data-real-point':key});dot.append(svg('title',{},clock(p.at,true)+' · 真实观察'));curves.append(dot)}
+   for(const p of (solidMood?[]:rows)){if(p.estimated||num(p[key])===null)continue;const dot=svg('circle',{cx:x(Number(date(p.at))),cy:y(p[key]),r:2.5,fill:`var(${colors[key]})`,'data-real-point':key});dot.append(svg('title',{},clock(p.at,true)+' · 真实观察'));curves.append(dot)}
   }
   if(!sparseVad&&rows.length===1&&num(rows[0][key])!==null)curves.append(svg('circle',{cx:x(Number(date(rows[0].at))),cy:y(rows[0][key]),r:3,fill:`var(${colors[key]})`}))
  }
@@ -328,24 +353,26 @@ function chart(target,rows,keys,max=1,height=260,min=0){
  // A bounded set of actual episode boundaries, using their own calendar date.
  if(target.id==='history-chart')for(const ep of (dayRows().episodes||[]).slice(-24)){
   if(num(ep.actual_start_minute)===null)continue;const at=zonedMidnight(ep.schedule_date||selectedDay||data.schedule.date||dayText(data.generated_at))+ep.actual_start_minute*60000;if(at<t0||at>t1)continue;
-  const xx=x(at),g=svg('g',{'data-activity-boundary':'true'});g.append(svg('line',{x1:xx,x2:xx,y1:top+12,y2:height-bottom,stroke:'var(--maibot-muted)','stroke-dasharray':'2 5',opacity:.25}),svg('text',{x:xx,y:top-7,'text-anchor':'middle','font-size':12,fill:'var(--maibot-muted)'},ep.goal_type==='sleep'?'☾':'▴'),svg('title',{},`${ep.name||'活动开始'} · ${minute(ep.actual_start_minute)}`));root.append(g)
+  const xx=x(at),g=svg('g',{'data-activity-boundary':'true'});g.append(svg('line',{x1:xx,x2:xx,y1:top+12,y2:height-bottom,stroke:'var(--maibot-muted)','stroke-dasharray':'2 5',opacity:.25}),svg('text',{x:xx,y:top-7,'text-anchor':'middle','font-size':12,fill:'var(--maibot-muted)'},ep.goal_type==='sleep'?'☾':'▴'),svg('title',{},`${displayActivityName(ep,{timezone:data?.timezone,fallback:'活动开始'})} · ${minute(ep.actual_start_minute)}`));root.append(g)
  }
  const nowAt=Number(date(data.generated_at));if(nowAt>=t0&&nowAt<=t1){const xx=x(nowAt);root.append(svg('line',{x1:xx,x2:xx,y1:top,y2:height-bottom,stroke:'var(--maibot-primary)','stroke-width':1,'stroke-dasharray':'4 3','data-now':'true'}),svg('text',{x:Math.max(l+24,Math.min(w-r-12,xx-4)),y:top-7,'text-anchor':'end',fill:'var(--maibot-primary)','font-size':10},'当前快照'))}
- const cross=svg('line',{x1:l,x2:l,y1:top,y2:height-bottom,stroke:'var(--maibot-muted)','stroke-dasharray':'3 3',visibility:'hidden'}),brush=svg('rect',{x:l,y:top,width:0,height:height-top-bottom,fill:'var(--maibot-primary)',opacity:.12,visibility:'hidden'});root.append(cross,brush);target.append(root);
+ const hoverPoints=svg('g',{'data-hover-points':'true',visibility:'hidden'});if(moodChart)for(const key of keys)hoverPoints.append(svg('circle',{r:3.5,fill:`var(${colors[key]})`,'data-hover-point':key}));root.append(hoverPoints);
+ const cross=svg('line',{'data-hover-cursor':'true',x1:l,x2:l,y1:top,y2:height-bottom,stroke:'var(--maibot-muted)','stroke-dasharray':'3 3',visibility:'hidden'}),brush=svg('rect',{x:l,y:top,width:0,height:height-top-bottom,fill:'var(--maibot-primary)',opacity:.12,visibility:'hidden'});root.append(cross,brush);target.append(root);
  const tip=el('div','tooltip');tip.hidden=true;target.append(tip);let drag=null;const pointers=new Map();let pinch=null;
  const coordinate=e=>{const b=root.getBoundingClientRect();return Math.max(l,Math.min(w-r,(e.clientX-b.left)/b.width*w))};
- function applyZoom(a,b){if(b-a<300000)return;zoom=[Math.max(t0,a),Math.min(t1,b)];$('zoom-reset').hidden=false;drawHistory()}
+ function applyZoom(a,b){if(b-a<300000)return;const next=[Math.max(t0,a),Math.min(t1,b)];if(moodChart){emotionZoom=next;renderEmotionHistory()}else{zoom=next;$('zoom-reset').hidden=false;drawHistory()}}
+ const resetChartZoom=()=>moodChart?resetEmotionZoom():resetZoom();
  root.onpointermove=e=>{const box=root.getBoundingClientRect(),pos=coordinate(e),at=t0+(pos-l)/(w-l-r)*span;if(pointers.has(e.pointerId))pointers.set(e.pointerId,pos);
   if(pinch&&pointers.size>=2){e.preventDefault();return}
   if(drag!==null){brush.setAttribute('x',Math.min(drag,pos));brush.setAttribute('width',Math.abs(pos-drag));brush.setAttribute('visibility','visible');return}
-  if(!rows.length)return;const p=rows.reduce((best,item)=>Math.abs(Number(date(item.at))-at)<Math.abs(Number(date(best.at))-at)?item:best,rows[0]),xx=x(Number(date(p.at)));cross.setAttribute('x1',xx);cross.setAttribute('x2',xx);cross.setAttribute('visibility','visible');tip.replaceChildren(el('strong','',clock(p.at,true)+(p.estimated?' · 估算':' · 真实观察')),...keys.map(k=>el('div','',`${labels[k]} ${min<0?fix(p[k],2):max===1?pct(p[k])+'%':fix(p[k])+'h'}`)));tip.hidden=false;tip.style.left=Math.max(0,Math.min(box.width-190,e.clientX-box.left+12))+'px';tip.style.top='8px'
+  if(!rows.length)return;const p=rows.reduce((best,item)=>Math.abs(Number(date(item.at))-at)<Math.abs(Number(date(best.at))-at)?item:best,rows[0]),xx=x(Number(date(p.at)));cross.setAttribute('x1',xx);cross.setAttribute('x2',xx);cross.setAttribute('visibility','visible');if(moodChart){hoverPoints.setAttribute('visibility','visible');for(const dot of hoverPoints.children){const key=dot.dataset.hoverPoint;dot.setAttribute('cx',xx);dot.setAttribute('cy',y(p[key]));dot.setAttribute('visibility',num(p[key])===null?'hidden':'visible')}}tip.replaceChildren(el('strong','',clock(p.at,true)+(p.estimated?' · 估算':' · 真实观察')),...keys.map(k=>el('div','',`${labels[k]} ${min<0?fix(p[k],2):max===1?pct(p[k])+'%':fix(p[k])+'h'}`)));tip.hidden=false;tip.style.left=Math.max(0,Math.min(box.width-190,e.clientX-box.left+12))+'px';tip.style.top='8px'
  };
- root.onpointerleave=()=>{tip.hidden=true;cross.setAttribute('visibility','hidden')};
- root.onpointerdown=e=>{if(e.button!==0&&e.pointerType!=='touch')return;pointers.set(e.pointerId,coordinate(e));root.setPointerCapture(e.pointerId);tip.hidden=true;if(pointers.size===2){const vals=[...pointers.values()];pinch={distance:Math.abs(vals[1]-vals[0]),middle:(vals[1]+vals[0])/2};drag=null}else if(e.pointerType!=='touch')drag=coordinate(e)};
+ root.onpointerleave=e=>{if(moodChart&&e.pointerType==='touch')return;tip.hidden=true;cross.setAttribute('visibility','hidden');hoverPoints.setAttribute('visibility','hidden')};
+ root.onpointerdown=e=>{if(e.button!==0&&e.pointerType!=='touch')return;pointers.set(e.pointerId,coordinate(e));root.setPointerCapture(e.pointerId);tip.hidden=true;hoverPoints.setAttribute('visibility','hidden');if(pointers.size===2){const vals=[...pointers.values()];pinch={distance:Math.abs(vals[1]-vals[0]),middle:(vals[1]+vals[0])/2};drag=null}else if(e.pointerType!=='touch')drag=coordinate(e)};
  root.onpointerup=e=>{if(pinch&&pointers.size>=2){const vals=[...pointers.values()],factor=pinch.distance/Math.max(12,Math.abs(vals[1]-vals[0])),center=t0+(pinch.middle-l)/(w-l-r)*span;pointers.clear();pinch=null;applyZoom(center-span*factor/2,center+span*factor/2);return}
-  pointers.delete(e.pointerId);if(drag===null)return;const end=coordinate(e),first=drag;drag=null;brush.setAttribute('visibility','hidden');if(Math.abs(end-first)>12)applyZoom(t0+(Math.min(first,end)-l)/(w-l-r)*span,t0+(Math.max(first,end)-l)/(w-l-r)*span)
+  pointers.delete(e.pointerId);if(drag===null){if(moodChart&&e.pointerType==='touch')root.onpointermove(e);return;}const end=coordinate(e),first=drag;drag=null;brush.setAttribute('visibility','hidden');if(Math.abs(end-first)>12)applyZoom(t0+(Math.min(first,end)-l)/(w-l-r)*span,t0+(Math.max(first,end)-l)/(w-l-r)*span)
  };
- root.onpointercancel=()=>{drag=null;pinch=null;pointers.clear();brush.setAttribute('visibility','hidden')};root.ondblclick=resetZoom;root.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();resetZoom()}};
+ root.onpointercancel=()=>{drag=null;pinch=null;pointers.clear();brush.setAttribute('visibility','hidden')};root.ondblclick=resetChartZoom;root.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();resetChartZoom()}};
 }
 
 // W-15：zoom 状态由 drawHistory 消费；睡眠债/VAD 图各自在所属 tab 激活时（activateTab
@@ -357,28 +384,17 @@ function renderSamples(){const wrap=$('samples');if(!points.length){empty(wrap,'
  // W-11：口径可见——表格固定展示最近 60 条，说明行写明当前筛选范围的总点数。
  const colh=t=>{const h=el('th','',t);h.setAttribute('scope','col');return h};
  const table=el('table','maibot-table'),head=el('tr'),thead=el('thead'),body=el('tbody');for(const label of['采样时间',...spec.map(s=>s[1]),'睡眠债','来源'])head.append(colh(label));thead.append(head);for(const p of points.slice(-60).reverse()){const row=el('tr');row.append(el('td','',clock(p.at,true)));for(const[k]of spec)row.append(el('td','',pct(p[k])));row.append(el('td','',fix(p.sleep_debt)+'h'),el('td','',(p.estimated?'估算 · 中间缺口':({start:'启动观察',tick:'生活采样',sleep:'睡眠采样',episode:'活动边界',wake:'醒来结算',sleep_settlement:'睡眠结算'}[p.reason]||'状态观察'))));body.append(row)}table.append(thead,body);wrap.replaceChildren(el('p','note',`显示最近 60 条 · 当前范围共 ${points.length} 点`),table)}
-// 历史心情变化（PR-FIXED-CHROME 3.17.15，规格§1G）：VAD 曲线复用 chart()+vadSeries()
-// （data.emotion.history.points，量程 −1..1），跟随历史页 range（hours）/zoom/selectedDay
-// （与 history-chart 同口径，经 drawHistory 挂入既有重渲染链）。情绪不可用/旧快照无
-// emotion.history → 空态「暂无心情记录」降级，不报错。此刻页 vad-chart 保留不动。
-function emotionHistoryPoints(){const series=vadSeries(),all=Array.isArray(series.points)?series.points.filter(p=>date(p.at)):[],end=date(data?.generated_at);
- let rows=all.filter(p=>selectedDay||!end||(+date(p.at)>=+end-hours*3600000&&+date(p.at)<=+end));
- if(zoom)rows=rows.filter(p=>+date(p.at)>=zoom[0]&&+date(p.at)<=zoom[1]);return {rows,downsampled:series.downsampled}}
+// 心情与状态使用独立范围/缩放；日历日期筛选仅用于状态与日程。
+function emotionHistoryPoints(){const series=data?.emotion?.history||{},all=Array.isArray(series.points)?series.points.filter(p=>date(p.at)):[],end=date(data?.generated_at);
+ let rows=all.filter(p=>!end||(+date(p.at)>=+end-emotionHours*3600000&&+date(p.at)<=+end));
+ if(emotionZoom)rows=rows.filter(p=>+date(p.at)>=emotionZoom[0]&&+date(p.at)<=emotionZoom[1]);return {rows,downsampled:series.downsampled}}
+function resetEmotionZoom(){emotionZoom=null;renderEmotionHistory()}
 function renderEmotionHistory(){const target=$('emotion-history-chart');if(!target)return;const {rows,downsampled}=emotionHistoryPoints();
- if(!rows.length){empty(target,'暂无心情记录','情绪记录就绪后，愉悦/唤醒/掌控曲线会在这里展开。');text('emotion-history-info','暂无心情记录');renderEmotionSamples([]);return}
+ text('emotion-history-caption',`最近 ${emotionHours} 小时 · 愉悦 / 唤醒 / 掌控 · 范围与缩放独立`);
+ if(!rows.length){empty(target,'暂无心情记录','情绪记录就绪后，愉悦/唤醒/掌控曲线会在这里展开。');text('emotion-history-info','暂无心情记录');return}
  chart(target,rows,['valence','arousal','dominance'],1,260,-1);
- // PR-UI-DETAIL（3.17.21）§1C：真实/估算口径分开陈述（按日视图含 _fill_small_gaps
- // 估算填充），估算不计入真实采样点数——沿用既有 estimated 口径，不造假点。
  const realCount=rows.filter(p=>!p.estimated).length,estCount=rows.length-realCount;
- text('emotion-history-info',`${realCount} 个真实心情采样点${estCount?` · ${estCount} 个估算点（不计入真实）`:''}${downsampled?' · 已抽样显示':''} · 量程 −1 到 1`);renderEmotionSamples(rows)}
-function renderEmotionSamples(rows){const wrap=$('emotion-history-samples');if(!wrap)return;
- if(!rows.length){empty(wrap,'暂无心情采样','这里只显示实际记录。');return}
- const colh=t=>{const h=el('th','',t);h.setAttribute('scope','col');return h};
- const table=el('table','maibot-table'),head=el('tr'),thead=el('thead'),body=el('tbody');
- for(const label of['采样时间','愉悦','唤醒','掌控'])head.append(colh(label));thead.append(head);
- // PR-UI-DETAIL（3.17.21）§1C：估算填充行在时间列显式标注「估算」，不冒充真实记录。
- for(const p of rows.slice(-60).reverse()){const row=el('tr');row.append(el('td','',clock(p.at,true)+(p.estimated?' · 估算':'')),el('td','',fix(p.valence,2)),el('td','',fix(p.arousal,2)),el('td','',fix(p.dominance,2)));body.append(row)}
- table.append(thead,body);wrap.replaceChildren(el('p','note',`显示最近 60 条 · 当前范围共 ${rows.length} 点`),table)}
+ text('emotion-history-info',`${realCount} 个真实心情采样点${estCount?` · ${estCount} 个估算点（不计入真实）`:''}${downsampled?' · 已抽样显示':''} · 量程 −1 到 1`)}
 // 睡眠债迷你曲线（W-01 主卡微型预览，48–64px）：只呈现趋势、无数值轴（数值在三项统计里）；
 // 全量交互曲线 #debt-chart 仍在详情层（D4：摘要+微型预览+详情全量），两者不共享 DOM。
 function sparkDebt(target,rows){
@@ -497,12 +513,12 @@ function renderSchedulePool(key){
   }
  }
  for(const item of items){
-  const row=el('li','schedule-pool-row'),name=item.name||'未命名条目';
+  const row=el('li','schedule-pool-row'),name=displayActivityName(item,{timezone:data?.timezone,fallback:'未命名条目'});
   const min=num(item.min_minutes),max=num(item.max_minutes);
   const period=key==='recovery'?
    [item.schedule_date,num(item.progress)===null?'':'完成 '+pct(item.progress)+'%'].filter(Boolean).join(' · '):
    min===null?'时长未记录':max===null||min===max?min+' 分钟':min+'–'+max+' 分钟';
-  row.append(el('strong','',name));
+  row.append(activityNameNode('strong','',item,'未命名条目'),activityAttributeBadges(item));
   // 3.17.7 改进2：右侧时段 badge；P4：来源 badge + 偏好 badge
   const end=el('span','poolrowend');
   if(period)end.append(el('span','note',period));
@@ -533,7 +549,7 @@ function renderSchedulePool(key){
     (key==='one_shot'?'最终抽中即消耗，启动失败或被打断也不返池。':
      key==='generated'?'遵守原有去重间隔，可在周期内再次发生。':
      key==='builtin'?'初始池：代码联动项关联对应模块与独立预算；JSON 项为状态调节。事件描述是虚拟日程，不是真实聊天或外部操作。':'');
-   origin.append(el('strong','',name),source);
+   origin.append(activityNameNode('strong','',item,'未命名条目'),source);
    origins.append(origin);
   }
  }
@@ -561,7 +577,7 @@ function renderConsumedEvents(){
    const badge=el('span','rowbadge usage-template','模板：'+(item.template_title||item.template_name||'小事件模板'));
    badge.title=item.template_reason||'';end.append(badge);
   }
-  row.append(el('strong','',item.name||'未命名条目'),end);target.append(row);
+  row.append(activityNameNode('strong','',item,'未命名条目'),activityAttributeBadges(item),end);target.append(row);
  }
  if(!target.children.length)target.append(el('li','note',Array.isArray(rows)?'本周期暂无消耗记录':'当前快照未包含消耗记录'));
 }
@@ -641,11 +657,11 @@ function overviewShowTip(node,lines){
 }
 function overviewTipLines(seg){
  const row=seg.row;
- if(seg.kind==='planned')return[row.name||'未命名意图',minute(seg.a)+' → '+minute(seg.b),'计划 · 未滚动'];
+ if(seg.kind==='planned')return[displayActivityName(row,{timezone:data?.timezone,fallback:'未命名意图'}),minute(seg.a)+' → '+minute(seg.b),'计划 · 未滚动'];
  const start=num(row.actual_start_minute)??num(row.planned_start_minute);
  const rawEnd=num(row.actual_end_minute);
  const endText=row.status==='active'&&rawEnd===null?'此刻':minute(spanEnd(start,rawEnd??num(row.planned_end_minute)));
- const lines=[row.name||'未命名活动',minute(start)+' → '+endText,source(row.source)+' · '+episodeLabel(row.status)];
+ const lines=[displayActivityName(row,{timezone:data?.timezone}),minute(start)+' → '+endText,source(row.source)+' · '+episodeLabel(row.status)];
  if(row.cross_day_continuation)lines.push('跨日续段 · 原属 '+(row.schedule_date||'前一日'));
  else if(row.crosses_midnight)lines.push('跨日');
  return lines;
@@ -683,7 +699,7 @@ function renderActivityOverview(sch){
  // 计划灰在底层、实际色段覆盖其上；同层按 start 排序（重叠续段与今日行正常并列，不去重伪造）。
  segs.sort((x,y)=>(x.kind==='planned'?0:1)-(y.kind==='planned'?0:1)||x.a-y.a);
  for(const seg of segs){
-  const node=el('button','overview-seg '+seg.kind);node.type='button';
+  const node=el('button','overview-seg '+seg.kind);node.type='button';node.title=seg.row.name?'原名：'+seg.row.name:'';
   node.style.left=(seg.a/1440*100)+'%';
   node.style.width=((seg.b-seg.a)/1440*100)+'%';
   node.style.background=seg.kind==='planned'?'var(--overview-planned)':overviewColor(seg.row.goal_type);
@@ -733,7 +749,8 @@ function renderSchedule(){
    const end=actual?(row.actual_end_minute??(active?null:row.planned_end_minute)):row.end_minute;
    const box=el('div','activityrow'+(active?' active':'')),center=el('div');
    const separator=row.idleGap?' 至 ':' → ';
-   center.append(el('h3','',row.name||'未命名活动'),el('div','note',minute(start)+separator+(active?'此刻':minute(spanEnd(start,end)))+(actual?' · '+source(row.source):'')));
+   center.append(activityNameNode('h3','',row),el('div','note',minute(start)+separator+(active?'此刻':minute(spanEnd(start,end)))+(actual?' · '+source(row.source):'')));
+   center.append(activityAttributeBadges(row));
    if(row.idleSegments)center.append(idleRunDetails(row));
    if(actual&&row.state_before&&row.state_after){
     const changes=spec.filter(([k])=>num(row.state_before[k])!==null&&num(row.state_after[k])!==null&&Math.abs(row.state_after[k]-row.state_before[k])>=.01).slice(0,3).map(([k,l])=>l+' '+pct(row.state_before[k])+'→'+pct(row.state_after[k]));
@@ -792,10 +809,20 @@ function videoRecentMeta(row){
  const first=num(row?.first_watched_at);
  return [row?.bvid||'BV 未记录','来源 '+videoSourceLabel(row?.source),'首次观看 '+(first===null||first<=0?'未记录':clock(first*1000,true))].join(' · ');
 }
+let entertainmentPage=0,videoItemPage=0,postItemPage=0;
+function safeMediaUrl(value){if(typeof value!=='string')return null;let input=value.trim();if(input.startsWith('//'))input='https:'+input;if(!/^https?:\/\//i.test(input))return null;try{const url=new URL(input),host=url.hostname.toLowerCase(),allowed=host==='qpic.cn'||['.hdslb.com','.biliimg.com','.qpic.cn','.photo.store.qq.com','.gtimg.cn','.gtimg.com'].some(suffix=>host.endsWith(suffix));if(!allowed||url.username||url.password)return null;if(url.protocol==='http:')url.protocol='https:';return url.protocol==='https:'?url.href:null}catch{return null}}
+function mediaImage(value,alt,cls=''){const frame=el('div','media-image '+cls),url=safeMediaUrl(value);if(!url){frame.append(el('span','note','图片未记录'));return frame}const image=el('img');image.src=url;image.alt=alt;image.loading='lazy';image.decoding='async';image.referrerPolicy='no-referrer';image.onerror=()=>frame.replaceChildren(el('span','note','图片暂时无法加载'));frame.append(image);return frame}
+function mediaTime(value){const input=typeof value==='number'&&Math.abs(value)<1e11?value*1000:value;return date(input)?clock(input,true):'未记录'}
+function videoMetricIcon(kind){const root=svg('svg',{viewBox:'0 0 24 24',width:22,height:22,fill:'none',stroke:'currentColor','stroke-width':1.65,'aria-hidden':'true'});const paths={likes:'M8 10v11H4V10h4Zm0 0 5-7c2 0 2 2 1 6h5c2 0 2 2 1 4l-2 7H8',coins:'M20 12c0 5-4 9-9 9S2 17 2 12s4-9 9-9 9 4 9 9ZM8 8h6M11 7v10M8 16h6M20 7c3 3 3 7 0 10',favorites:'m12 3 2.8 5.7 6.3.9-4.5 4.4 1 6.2-5.6-2.9-5.6 2.9 1-6.2-4.5-4.4 6.3-.9Z'};root.append(svg('path',{d:paths[kind],'stroke-linejoin':'round','stroke-linecap':'round'}));return root}
+function renderVideoRecord(row){const card=el('article','video-record');card.append(mediaImage(row.cover,row.title||'视频封面','video-cover'),el('h3','media-title',row.title||'标题未记录'),el('div','note videometa',videoRecentMeta(row)));const impression=el('div','video-impression');const impressionText=['template_unavailable','unavailable'].includes(row.impression_provenance)?null:row.impression;impression.append(el('h3','',row.impression_provenance==='metadata_only'?'感想 · 基于元信息':impressionText&&row.impression_provenance!=='understood_content'?'感想 · 来源未记录':'观后感'),el('p','',impressionText||'观后感未记录'));card.append(impression);const metrics=el('div','video-metrics');for(const [key,label]of [['likes','点赞'],['coins','投币'],['favorites','收藏']]){const stat=el('div','video-metric');stat.append(videoMetricIcon(key),el('span','note',label),el('strong','',count(row.metrics?.[key])==='—'?'未记录':count(row.metrics[key])));metrics.append(stat)}card.append(metrics);const provenance=row.metrics_provenance,origin=provenance==='watch_snapshot'?'观看时记录':provenance==='backfilled_current'?'历史补录 · 当前数据':'数据来源未记录';card.append(el('p','note media-provenance',origin+' · 采集时间 '+mediaTime(row.metrics_captured_at)),el('p','note','最近观看 '+mediaTime(row.watched_at)));return card}
+function renderEntertainmentPages(){const video=entertainmentPage===0;$('entertainment-video').hidden=!video;$('entertainment-posts').hidden=video;$('entertainment-prev').disabled=video;$('entertainment-next').disabled=!video;text('entertainment-page-label',video?'视频 · 1 / 2':'动态 · 2 / 2');text('entertainment-prev',video?'上一页':'上一页：视频');text('entertainment-next',video?'下一页：动态':'下一页')}
 function renderMood(){const v=data.video||{};
+ renderEntertainmentPages();
  const videoRecentBox=$('video-recent'),recent=Array.isArray(v.recent)?v.recent.slice(0,10):[];
+ videoItemPage=Math.max(0,Math.min(videoItemPage,recent.length-1));
  text('video-recent-count',v.available?recent.length+' 条':'—');
- if(videoRecentBox){if(recent.length){videoRecentBox.replaceChildren(...recent.map(row=>{const box=el('div','sleeprow videorrow'),info=el('div');info.append(el('strong','',row.title||'标题未记录'),el('div','note videometa',videoRecentMeta(row)));const latest=el('span','note',num(row.watched_at)!==null?clock(row.watched_at*1000,true):'—');latest.title='最近观看时间';box.append(info,latest);return box}))}else empty(videoRecentBox,v.available?'最近没有看完的视频':'视频信息暂不可用',v.available?'看完的视频会在这里留下记录。':'视频观看模块就绪后展示。')}
+ text('video-item-page',recent.length?`${videoItemPage+1} / ${recent.length}`:'暂无记录');$('video-item-prev').disabled=videoItemPage<=0;$('video-item-next').disabled=videoItemPage>=recent.length-1;
+ if(videoRecentBox){if(recent.length)videoRecentBox.replaceChildren(renderVideoRecord(recent[videoItemPage]));else empty(videoRecentBox,v.available?'最近没有看完的视频':'视频信息暂不可用',v.available?'看完的视频会在这里留下记录。':'视频观看模块就绪后展示。')}
  const interestBox=$('video-interests'),interests=Array.isArray(v.interests)?v.interests.slice(0,8):[];
  if(interestBox){if(interests.length){const max=Math.max(...interests.map(row=>num(row.weight)??0),.001);interestBox.replaceChildren(...interests.map(row=>{const box=el('div','interestrow'),head=el('div','interesthead'),w=num(row.weight),bar=el('div','meter'),fill=el('i');fill.style.background='var(--focus)';fill.style.width=(w===null?0:Math.max(0,Math.min(1,w/max))*100)+'%';bar.append(fill);head.append(el('strong','',row.topic||'未知话题'),el('span','note',fix(w,2)));box.append(head,bar);return box}))}else empty(interestBox,'暂无兴趣话题',v.available?'兴趣文档生成后展示。':'视频观看模块就绪后展示。')}
  const q=data.qzone||{};text('qzone-enabled',q.available?(q.enabled?'已启用':'未启用'):'未就绪');const cookie=q.cookie_health||{},cookieLabels={not_checked:'尚未检查登录状态',not_logged_in:'尚未登录空间',expired:'登录凭据过期或不完整',adapter_unavailable:'适配器暂不可用',network_error:'网络暂不可用',ready:'登录凭据已获取',cached:'使用本地缓存，尚未确认'};
@@ -806,9 +833,16 @@ function renderMood(){const v=data.video||{};
 // 空间最近动态（3.17.15）：data.qzone.recent_posts（dashboard 只读投影，≤5 条已确认
 // 发送）。纯文本 el() 构造，来源 badge（日程说说/视频分享）；旧快照无 recent_posts →
 // 空态降级，不造假。created_at 为 epoch 秒（clock 按毫秒解析故 ×1000）。
-function renderRecentPosts(q){const box=$('qzone-recent-posts');if(!box)return;const rows=Array.isArray(q.recent_posts)?q.recent_posts.slice(0,5):[];
- if(!rows.length){empty(box,q.available?'最近没有已确认的说说':'空间状态暂不可用',q.available?'发送成功的日程说说与视频分享会在这里留下记录。':'空间模块就绪后展示。');return}
- box.replaceChildren(...rows.map(row=>{const item=el('div','sleeprow qzone-post'),main=el('div');main.append(el('strong','',row.content||'（空内容）'),el('div','note',(num(row.created_at)!==null?clock(row.created_at*1000,true):'时间未记录')+(num(row.image_count)!==null&&row.image_count>0?' · 配图 '+row.image_count+' 张':'')));item.append(main,el('span','rowbadge postsource',row.source==='视频分享'?'视频分享':'日程说说'));return item}))}
+function renderRecentPosts(q){const box=$('qzone-recent-posts');if(!box)return;const source=Array.isArray(q.posts)?q.posts:q.recent_posts,rows=Array.isArray(source)?source.slice(0,20):[];
+ postItemPage=Math.max(0,Math.min(postItemPage,rows.length-1));text('post-item-page',rows.length?`${postItemPage+1} / ${rows.length}`:'暂无记录');$('post-item-prev').disabled=postItemPage<=0;$('post-item-next').disabled=postItemPage>=rows.length-1;
+ if(!rows.length){empty(box,q.available?'最近没有已确认的说说':'空间状态暂不可用',q.available?'发送成功的说说会在这里留下记录。':'空间模块就绪后展示。');return}
+ const row=rows[postItemPage],item=el('article','qzone-post-record'),images=Array.isArray(row.images)?row.images:[];
+ item.append(el('p','post-text',row.text||row.content||'（文案未记录）'));
+ if(images.length){const gallery=el('div','post-images');for(const [index,url]of images.entries())gallery.append(mediaImage(url,`动态配图 ${index+1}`));item.append(gallery)}else item.append(el('p','note',num(row.image_count)>0?'原记录有配图，图片地址未记录':'无配图记录'));
+ item.append(el('p','note',mediaTime(row.created_at)+(row.source?' · '+row.source:'')));box.replaceChildren(item)}
+$('entertainment-prev').onclick=()=>{entertainmentPage=0;renderEntertainmentPages()};$('entertainment-next').onclick=()=>{entertainmentPage=1;renderEntertainmentPages()};
+$('video-item-prev').onclick=()=>{videoItemPage=Math.max(0,videoItemPage-1);renderMood()};$('video-item-next').onclick=()=>{videoItemPage++;renderMood()};
+$('post-item-prev').onclick=()=>{postItemPage=Math.max(0,postItemPage-1);renderMood()};$('post-item-next').onclick=()=>{postItemPage++;renderMood()};
 const usageCount=value=>group(count(value));
 const usageTokenLabel=(value,reported)=>num(reported)===0?'未回传':usageCount(value)+' Token';
 const usageModuleLabels=new Map(Object.entries({planning:'日程',emotion:'情绪',companion:'陪伴',qzone:'空间',video:'视频',unknown:'未标注模块'}));
@@ -962,7 +996,7 @@ async function refresh(manual=false){
  const seq=++requestSeq;busy=true;clearTimeout(timer);lastError='';$('refresh').setAttribute('aria-busy','true');updateFreshness();
  try{
   let result;
-  const baseParams={hours,...(selectedDay?{day:selectedDay}:{})};
+  const baseParams={hours:Math.max(hours,emotionHours),...(selectedDay?{day:selectedDay}:{})};
   if(usageParamSupported){
    try{result=validateSnapshot(await deadline(window.maibot.query('summary',{...baseParams,usage_hours:usageHours})))}
    catch(first){
@@ -1130,7 +1164,10 @@ $('usage-module-filter').onchange=e=>{usageFilter=e.target.value;resetUsageRows(
 // 3.17.33：逐笔记录区不再折叠，原 details toggle 懒加载改为详情打开事件触发。
 document.addEventListener('lbm:detail-open',event=>{if(event.detail?.key==='usage')loadUsageRows()});
 $('samples-toggle').onclick=()=>{const open=$('samples').hidden;$('samples').hidden=!open;$('samples-toggle').setAttribute('aria-expanded',String(open));text('samples-toggle',open?'收起采样值':'查看采样值')};
-$('emotion-samples-toggle').onclick=()=>{const open=$('emotion-history-samples').hidden;$('emotion-history-samples').hidden=!open;$('emotion-samples-toggle').setAttribute('aria-expanded',String(open));text('emotion-samples-toggle',open?'收起采样值':'查看采样值')};
+$('emotion-range').onclick=e=>{const button=e.target.closest('button[data-emotion-hours]');if(!button)return;emotionHours=Number(button.dataset.emotionHours);emotionZoom=null;for(const option of $('emotion-range').querySelectorAll('[data-emotion-hours]'))option.setAttribute('aria-pressed',String(Number(option.dataset.emotionHours)===emotionHours));if(live&&!imported)refresh(true);else if(data)renderEmotionHistory()};
+$('emotion-zoom-in').onclick=()=>{const {rows}=emotionHistoryPoints();if(!rows.length)return;const a=emotionZoom?.[0]??Number(date(rows[0].at)),b=emotionZoom?.[1]??Number(date(rows.at(-1).at)),mid=(a+b)/2;emotionZoom=[mid-(b-a)/4,mid+(b-a)/4];renderEmotionHistory()};
+$('emotion-zoom-out').onclick=resetEmotionZoom;
+document.addEventListener('pointerdown',event=>{const graph=$('emotion-history-chart');if(!graph||graph.contains(event.target))return;const tip=graph.querySelector('.tooltip');if(tip)tip.hidden=true;for(const mark of graph.querySelectorAll('[data-hover-points],[data-hover-cursor]'))mark.setAttribute('visibility','hidden')});
 $('export').onclick=()=>{if(!data)return;$('snapshot-text').value=JSON.stringify(data);$('snapshot-panel').hidden=false;$('snapshot-panel').scrollIntoView({block:'start'})};$('snapshot-close').onclick=()=>$('snapshot-panel').hidden=true;$('snapshot-select').onclick=()=>{$('snapshot-text').focus();$('snapshot-text').select()};
 // W-04：嵌入态「更多」菜单收纳导出快照——离线页不显示菜单（保留原导出按钮），
 // 两个入口共用同一处理；Esc/点击外部关闭，aria-expanded 同步。
@@ -1212,13 +1249,13 @@ function renderTimeline(){
   const node=el('article','vtime-item '+(fixed?'planned':'actual')+(active?' active':'')+(!fixed&&row.status==='interrupted'?' interrupted':''));
   node.setAttribute('role','listitem');
   const body=el('div','vtime-body'),head=el('div','vtime-head');
-  head.append(el('h3','',row.name||'未命名活动'),el('span','vtime-badge',fixed?(row.goal_type==='sleep'?'作息参考':'固定意图'):episodeLabel(row.status)));
+  head.append(activityNameNode('h3','',row),el('span','vtime-badge',fixed?(row.goal_type==='sleep'?'作息参考':'固定意图'):episodeLabel(row.status)));
   // 1A（3.17.8）：续段时间显示 00:00→HH:MM（投影已 0 起），来源沿用 source()；
   // 跨午夜原行结束时间保留 minute() 的「次日 HH:MM」口径，另加「跨日」badge。
   if(!fixed&&row.cross_day_continuation)head.append(el('span','vtime-badge crossdaybadge','跨日续段'));
   else if(!fixed&&row.crosses_midnight)head.append(el('span','vtime-badge crossdaybadge','跨日'));
   const origin=fixed?(row.origin==='archived'?'历史计划归档':'日计划'):source(row.source);
-  body.append(head,el('p','note',minute(start)+separator+(active?'此刻':end===null?'待定':minute(end))+' · '+origin));
+  body.append(head,activityAttributeBadges(row),el('p','note',minute(start)+separator+(active?'此刻':end===null?'待定':minute(end))+' · '+origin));
   if(row.idleSegments)body.append(idleRunDetails(row));
   if(!fixed&&row.state_before&&row.state_after){
    const changes=spec.filter(([k])=>num(row.state_before[k])!==null&&num(row.state_after[k])!==null&&Math.abs(row.state_after[k]-row.state_before[k])>=.01).slice(0,3).map(([k,l])=>l+' '+pct(row.state_before[k])+'%→'+pct(row.state_after[k])+'%');

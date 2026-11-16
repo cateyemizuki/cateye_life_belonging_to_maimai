@@ -45,6 +45,8 @@ from .cycle_state import (REASON_FALLBACK, REASON_REGENERATE, REASON_SCHEDULED,
 from .schedule_db import ScheduleDB
 from .schedule_items import is_night_sleep_item
 from .time_utils import DAY_MINUTES, ring_minutes_ahead
+from .activity_attributes import (ATTRIBUTE_KEY, activity_module_guard, attribute_batch_prompt,
+                                  decode_attribute_batch)
 
 logger = logging.getLogger(__name__)
 
@@ -234,12 +236,19 @@ class ScheduleGenerator:
         ``consume_commitments`` 仅保留旧调用签名。约定保持 active，执行/到期路径
         按稳定 ID 结算；约定读取或合并失败必须中断，不能发布遗漏硬约定的计划。
         """
+        self._merge_pending_commitments(items, date)
+        return self._replace_with_entry(date, items, reason)
+
+    def _merge_pending_commitments(self, items: List[Dict[str, Any]], date: str) -> None:
+        """只构造候选；异步属性标注前后均可调用，不越过事务发布点。"""
         commitment_meta = self._match_commitments_to_items(items, date)
 
         for idx, meta in commitment_meta.items():
             if idx < len(items):
                 params = dict(items[idx].get("parameters") or {})
                 params.update(meta)
+                if meta.get("commitment_hardness") == "hard":
+                    params[ATTRIBUTE_KEY] = None
                 # 用户 2026-10-27 最终裁定：明确 time 的 hard 约定**原时刻固定**——
                 # 即使 LLM/近窗匹配把条目放在 09:50，也拉回 pending 的 10:00；soft 仍可窗口调度。
                 if (meta.get("commitment_hardness") == "hard"
@@ -260,8 +269,6 @@ class ScheduleGenerator:
                         if old_start != commit_minute:
                             params["commitment_time_shifted_from"] = old_start
                 items[idx]["parameters"] = params
-
-        return self._replace_with_entry(date, items, reason)
 
     def _replace_with_entry(self, date: str, items: List[Dict[str, Any]], reason: str) -> int:
         """先保存日程，再登记周期；未来日程只进入待接替区。"""
@@ -468,6 +475,10 @@ class ScheduleGenerator:
             for row in rows:
                 row["description"] = ""
                 row.setdefault("parameters", {}).pop("note", None)
+        # 最终候选含硬约定与模板就绪后才做一批属性标注；不在多轮生成里重复调用。
+        self._merge_pending_commitments(rows, date)
+        await self._annotate_activity_attributes(rows, gen_config)
+        # 标注等待期间可能新增硬约定；同步 apply 再合并，新增硬约定保守 null。
         self.apply_schedule_items(rows, date, consume_commitments=False, reason=entry_reason)
         logger.info("spine 日意图生成完成：%s 共 %d 条", date, len(rows))
         # P3（2026-11-09 §14.4）：日意图成功更新 → 合并安排偏好增量批次（fire-and-
@@ -480,6 +491,38 @@ class ScheduleGenerator:
                 logger.debug("日程偏好增量刷新触发失败（忽略）", exc_info=True)
         await self._publish("schedule.generated", date=date, items=len(rows))
         return rows
+
+    async def _annotate_activity_attributes(self, items: List[Dict[str, Any]],
+                                            gen_config: ScheduleGeneratorConfig) -> None:
+        """统一轻量 LLM 策略的一次批量作业；任何失败保留显式 null，不猜额外行为。"""
+        for item in items:
+            item.setdefault("parameters", {})[ATTRIBUTE_KEY] = None
+        if not items:
+            return
+        count = len(items)
+
+        def acceptable(response):
+            try:
+                decode_attribute_batch(response, count)
+                return True
+            except (TypeError, ValueError):
+                return False
+
+        try:
+            response = await self._call_llm(attribute_batch_prompt(items), gen_config,
+                event="schedule_activity_attributes", validator=acceptable,
+                fallback_context={"factory": lambda: {"activities": [
+                    {"index": index, ATTRIBUTE_KEY: None} for index in range(count)]}})
+            if getattr(response, "used_template", False):
+                return  # 编辑过的模板也不能在失败路径中主动启用模块。
+            labels = decode_attribute_batch(response, count)
+            for index, value in labels.items():
+                if not activity_module_guard(items[index]):
+                    items[index]["parameters"][ATTRIBUTE_KEY] = value
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("活动属性标注未完成，保留 null: %s", type(exc).__name__)
 
     @staticmethod
     def _parse_spine_response(response: str) -> List[Dict[str, Any]]:

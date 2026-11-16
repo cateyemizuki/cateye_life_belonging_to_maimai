@@ -231,6 +231,9 @@ class QzoneService:
         #: PR-RELIABILITY（3.17.17 §1E）：评论提醒触发异常告警节流（tid → 上次告警 epoch 秒）
         self._comment_trigger_warn_at: Dict[str, float] = {}
         self._publish_ledger = PublishLedger()
+        self._post_media = None
+        self._post_media_next_at = 0.0
+        self._post_media_task = None
         self._publish_lock = asyncio.Lock()
         self._send_ambiguous = False
         #: §18.4 发帖判定历史（deque，最多 20 条，最新在前；进程内、热重载清零——调试用途）
@@ -273,6 +276,8 @@ class QzoneService:
         #: §18.4 冷却锚点（**只在发送成功后更新**，落盘跨热重载；ISO 字符串）
         self._state.setdefault("last_post_at", "")
         self._publish_ledger = PublishLedger(Path(data_dir) / "qzone_publish_receipts.json")
+        from .post_media import PostMediaStore
+        self._post_media = PostMediaStore(Path(data_dir) / "qzone_post_media.json")
 
     def set_target(self, stream_id: str) -> None:
         """目标私聊 stream（新评论主动提醒用）。"""
@@ -396,6 +401,9 @@ class QzoneService:
             status = "sent" if result else "uncertain" if self._send_ambiguous else "retry_wait"
             self._publish_ledger.finish(preview["key"], status, result=result,
                                         error="" if result else "outcome_unknown" if self._send_ambiguous else "unavailable")
+            if status == 'sent':
+                self._post_media_next_at = 0.0
+                self._kick_post_media_refresh()
             return result
 
     async def _post_moment_once(self, text: str, *, images: Optional[List[bytes]] = None,
@@ -1250,6 +1258,63 @@ class QzoneService:
                 pass
         self._event_unsubs.clear()
 
+    def recent_posts(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Confirmed own posts only; dashboard reads never fetch or publish."""
+        store = getattr(self, '_post_media', None)
+        rows = self._publish_ledger.recent_sent(limit)
+        return [{**row, **(store.images_for(row.get('tid', '')) if store is not None
+                          else {'images': [], 'images_captured_at': None})} for row in rows]
+
+    def _kick_post_media_refresh(self) -> None:
+        if getattr(self, '_post_media', None) is None:
+            return
+        task = getattr(self, '_post_media_task', None)
+        if task is not None and not task.done():
+            return
+        try:
+            self._post_media_task = asyncio.get_running_loop().create_task(self._refresh_post_media())
+        except RuntimeError:
+            return
+
+    async def _refresh_post_media(self) -> None:
+        """Bounded read metadata refresh, separate from the publish acknowledgement."""
+        store = getattr(self, '_post_media', None)
+        now = time.time()
+        if store is None or now < getattr(self, '_post_media_next_at', 0.0):
+            return
+        rows = self._publish_ledger.recent_sent(20)
+        known = {str(row.get('tid')) for row in rows if row.get('tid')}
+        if not known:
+            return
+        self._post_media_next_at = now + 900
+        try:
+            feeds = await asyncio.wait_for(self.list_my_moments(20), timeout=10)
+            feeds = feeds[:20] if isinstance(feeds, list) else []
+            from .post_media import image_urls
+            with_images = {str(row.get('tid') or row.get('id') or '') for row in feeds
+                           if isinstance(row, dict) and image_urls(row)}
+            missing = {str(row.get('tid')) for row in rows
+                       if row.get('tid') and row.get('image_count') and str(row['tid']) not in with_images}
+            if not feeds or missing:
+                try:
+                    extra = await asyncio.wait_for(self.list_own_feeds_with_comments(20), timeout=10)
+                    if isinstance(extra, list):
+                        feeds.extend(extra[:20])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._log('skip', trigger_type='qzone_preview', reason='动态补图暂不可用：' + type(exc).__name__)
+            if not store.merge(feeds, known, time.time()):
+                self._log('skip', trigger_type='qzone_preview', reason='动态图片记录保存失败，下次重试')
+                self._post_media_next_at = now + 120
+            elif any(row.get('image_count') and not store.images_for(row.get('tid', ''))['images'] for row in rows):
+                self._post_media_next_at = now + 120
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._post_media_next_at = now + 120
+            self._log('skip', trigger_type='qzone_preview', reason='动态图片读取暂不可用：' + type(exc).__name__)
+
     # ---- 循环 ----
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -1260,6 +1325,14 @@ class QzoneService:
     async def stop(self) -> None:
         self._unregister_event_subscriptions()
         self._stop_event.set()
+        media_task = getattr(self, '_post_media_task', None)
+        if media_task is not None and not media_task.done():
+            media_task.cancel()
+            try:
+                await media_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._post_media_task = None
         if self._task is not None:
             self._task.cancel()
             try:
@@ -1332,6 +1405,7 @@ class QzoneService:
         if self._actual_nap(now):
             self._record_decision('skip', gate='nap_quiet', reason='实际午休/小睡中，空间静默')
             return
+        self._kick_post_media_refresh()
         await self._process_delivery_queue(now)
         # 按日程发说说
         if cfg.daily_max_posts > 0 and self.posts_today() < cfg.daily_max_posts and cfg.post_by_schedule:

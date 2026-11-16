@@ -4,7 +4,8 @@
 
 流水线（2026-11-01 B 计划 §6 的诚实实现；B2 起含有界画面采样）：
 1. 规范 BV（父侧已规范化，此处复核）；
-2. 公开 view API 获取元信息（标题/UP主/时长/简介）——失效/需登录/受限按
+2. 公开 view API 获取原标题/UP主/时长/简介、封面及可得统计；快照时间记录真实API读取时刻，
+   与父侧任务受理时间/后处理完成时间区分。失效/需登录/受限按
    真实错误码归类，不编造；
 3. 时长上限校验：超出预算的视频明确拒绝，不宣称能完整观看；
 4. 公开字幕（CC）文本抓取（可选，拿不到就如实标注缺失）；
@@ -116,7 +117,10 @@ def _fetch_metadata(bvid: str) -> dict:
         reason = _VIEW_API_ERRORS.get(code, f"接口返回 code={code}")
         raise LookupError(f"视频不可观看：{reason}")
     data = payload.get("data") or {}
+    from video_watch.metadata import metadata_snapshot
+    snapshot=metadata_snapshot(data)
     return {
+        **snapshot,
         "bvid": str(data.get("bvid") or bvid),
         "aid": str(data.get("aid") or ""),
         **_selected_page(data),
@@ -690,9 +694,11 @@ def run(spec: dict, result_path: Path) -> None:
     result = {
         "task_id": task_id,
         "status": "completed",
-        "video": {k: video[k] for k in ("bvid", "aid", "cid", "title", "uploader",
+        "video": {k: video.get(k) for k in ("bvid", "aid", "cid", "title", "uploader",
                                         "duration_seconds", "url", "page_number",
-                                        "page_count", "page_title", "desc")},
+                                        "page_count", "page_title", "desc","pic","cover","metrics","metrics_captured_at","metrics_provenance")},
+        "cover":video.get("cover"),"metrics":video.get("metrics"),
+        "metrics_captured_at":video.get("metrics_captured_at"),"metrics_provenance":"watch_snapshot",
         "watched_range": {
             "mode": "sampled_frames" if visual_completed else "text_sources",
             "detail": (source_detail + "，并做等间隔画面采样"

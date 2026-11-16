@@ -96,10 +96,10 @@ const Bubble=(()=>{
   function scheduleText(){                               // 现在要干嘛 / 一会去干嘛
     try{
       const sch=(data&&data.schedule)||{};
-      if(sch.current&&sch.current.name)return '我正在「'+sch.current.name+'」呢';
+      if(sch.current&&sch.current.name)return '我正在「'+displayActivityName(sch.current,{timezone:data?.timezone})+'」呢';
       const intents=Array.isArray(sch.intents)?sch.intents:[];
       const next=intents.find(r=>r&&r.name&&r.status==='planned');
-      if(next)return '一会我要去「'+next.name+'」啦';
+      if(next)return '一会我要去「'+displayActivityName(next,{timezone:data?.timezone})+'」啦';
     }catch(e){}
     return '';
   }

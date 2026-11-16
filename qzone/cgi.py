@@ -394,11 +394,13 @@ class QzoneWebClient:
                     if isinstance(sub, dict):
                         _push(sub, parent_tid)
                 _push(c, None)
+            from .post_media import image_urls
             feeds.append({
                 "tid": str(msg.get("tid") or ""),
                 "content": str(msg.get("content") or ""),
                 "created_time": str(msg.get("created_time") or ""),
                 "comments": comments,
+                "images": image_urls(msg),
             })
         return feeds
 

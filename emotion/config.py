@@ -58,7 +58,8 @@ class EmotionSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "回复后评估模式",
             "hint": 'episode 按一段连续会话评估，调用次数较少；per_reply 每次回复后评估；off 停止自动评估。',
-            **_ui_i18n("Evaluate mode", "episode: evaluate one idle session segment at a time."),
+            **_ui_i18n("Evaluate mode", "episode: evaluate one idle session segment at a time.",
+                       choices={"episode": "按会话片段评估", "per_reply": "逐条回复评估", "off": "关闭"}),
         },
     )
     # 2026-11-04 配置精简轮（J 类）：episode_idle_minutes 移入

@@ -40,10 +40,12 @@ class VideoWatchSectionConfig(PluginConfigBase):
 
     source_mode: Literal["stream", "download"] = Field(
         default="stream", description="stream：直连媒体按时间点读取，不先下载全片；download：显式下载后抽帧，受下载保护值限制；失败不会暗中切换全量下载。",
-        json_schema_extra={"label": "媒体读取方式"})
+        json_schema_extra={"label": "媒体读取方式", **_ui_i18n("Media source",
+                           choices={"stream": "直接读取视频流", "download": "下载后读取"})})
     sampling_mode: Literal["seek", "paced"] = Field(
         default="seek", description="seek：尽快按时间点抽帧；paced：按真实播放时间逐点采样。两者均单任务、低优先级、单解码线程。",
-        json_schema_extra={"label": "采样节奏"})
+        json_schema_extra={"label": "采样节奏", **_ui_i18n("Sampling pace",
+                           choices={"seek": "按时间点快速采样", "paced": "按播放节奏采样"})})
     sample_interval_seconds: int = Field(
         default=10, ge=5, le=600, description="每隔多少秒取一帧；不静默稀释采样。预计帧数=向上取整(视频秒数/间隔)与最小采样数取较大值，每16帧拼一张图片。",
         json_schema_extra={"label": "采样间隔（秒）"})
@@ -55,7 +57,7 @@ class VideoWatchSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "最多提交拼图数"})
 
     cache_retention_days: int = Field(
-        default=15, ge=1, le=365, description="观看记忆保存天数，自结果保存起计算，读取不延长；仅缓存BV号和文字结果，过期后清理。",
+        default=15, ge=1, le=365, description="文字观看记忆保存天数，自结果保存起计算，读取与元信息补录均不延长。文字缓存只保存BV号和文字结果；封面、公开计数及采集来源作为公开元信息另存，过期文字缓存会清理。",
         json_schema_extra={"label": "观看记忆保留天数"})
 
     enabled: bool = Field(

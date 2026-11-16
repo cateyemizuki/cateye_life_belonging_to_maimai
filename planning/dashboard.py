@@ -7,6 +7,8 @@ from datetime import datetime, time as dt_time, timedelta
 from typing import Any
 
 from core.plugin_context import PluginContext
+from core.activity_attributes import normalize_activity_attributes
+from core.media_urls import public_image_url
 
 from .time_utils import TimezoneManager, format_day_minute
 from .life_history import FIELDS, MAX_POINTS, SAMPLE_SECONDS
@@ -30,6 +32,31 @@ def _number(value: Any) -> float | None:
     return None
 
 
+def _video_recent_row(row: dict) -> dict:
+    metrics = row.get('metrics')
+    metrics = metrics if isinstance(metrics, dict) else {}
+    captured = _number(row.get('metrics_captured_at'))
+    if captured is None and isinstance(raw_time := row.get('metrics_captured_at'), str):
+        try:
+            datetime.fromisoformat(raw_time)
+            captured = raw_time[:80]
+        except ValueError:
+            pass
+    return {'bvid': str(row.get('bvid') or '')[:20],
+            'title': str(row.get('title') or '')[:500],
+            'watched_at': _number(row.get('watched_at')),
+            'source': str(row.get('source') or '')[:32],
+            'first_watched_at': _number(row.get('first_watched_at')),
+            'cover': public_image_url(row.get('cover')),
+            'impression': str(row.get('impression') or '')[:5000],
+            'impression_provenance': str(row.get('impression_provenance') or '')[:40],
+            'understanding_status': str(row.get('understanding_status') or '')[:40],
+            'metrics': {key: value if type(value := metrics.get(key)) is int and value >= 0 else None
+                        for key in ('likes', 'coins', 'favorites')},
+            'metrics_captured_at': captured,
+            'metrics_provenance': str(row.get('metrics_provenance') or '')[:40]}
+
+
 def _row(row: Any) -> dict[str, Any]:
     """Explicit fields keep prompt metadata, user IDs and chat text out of the UI."""
     if not isinstance(row, dict):
@@ -43,6 +70,11 @@ def _row(row: Any) -> dict[str, Any]:
         if key in row:
             result[key] = _number(row[key])
     if row.get('template_used') is True:result['template_used'] = True
+    # Only module identifiers cross the UI boundary; never expose arbitrary params/metadata.
+    for details in (row, row.get('parameters'), row.get('metadata')):
+        if isinstance(details, dict) and 'activity_attributes' in details:
+            result['activity_attributes'] = normalize_activity_attributes(details['activity_attributes'])
+            break
     start = result.get('planned_start_minute', result.get('start_minute'))
     end = result.get('planned_end_minute', result.get('end_minute'))
     result['time_label'] = ' — '.join(format_day_minute(int(v)) if v is not None else '待定'
@@ -1043,7 +1075,8 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]
         ledger = getattr(service, '_publish_ledger', None)
         if ledger is None or not hasattr(ledger, 'recent_sent'):
             return []
-        rows = ledger.recent_sent(5)
+        getter = getattr(service, 'recent_posts', None)
+        rows = getter(5) if callable(getter) else ledger.recent_sent(5)
         if not isinstance(rows, list):
             return []
     except Exception:
@@ -1063,7 +1096,12 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]
         if not isinstance(row, dict):
             continue
         tid = str(row.get('tid') or '')
+        images = row.get('images') if isinstance(row.get('images'), list) else []
         out.append({'content': str(row.get('content') or ''),
+                    'text': str(row.get('content') or ''),
+                    'images': [url for raw in images[:4]
+                               if (url := public_image_url(raw))],
+                    'images_captured_at': _number(row.get('images_captured_at')),
                     'created_at': row.get('created_at'),
                     'tid': tid,
                     'image_count': row.get('image_count', 0),
@@ -1319,6 +1357,7 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
             # PR-FIXED-CHROME（3.17.15）：娱乐面板「最近动态」只读投影（≤5 条已确认
             # 发送）。独立 try 降级——recent_posts 读取失败不影响 qzone 头部额度芯片。
             result['qzone']['recent_posts'] = _qzone_recent_posts(service, ctx)
+            result['qzone']['posts'] = result['qzone']['recent_posts']
     except Exception:
         result['qzone'] = {'available': False, 'reason': 'projection_unavailable'}
     # PR-D1（H10）：空间视频候选/资产/回执计数投影（只读；系统板块计数芯片数据源）。
@@ -1360,13 +1399,7 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
         watch = getattr(plugin, '_video_watch', None)
         if watch is not None:
             rows = watch.recent_videos(10)
-            video['recent'] = [
-                {'bvid': str(row.get('bvid') or '')[:20],
-                 'title': str(row.get('title') or '')[:120],
-                 'watched_at': _number(row.get('watched_at')),
-                 'source': str(row.get('source') or '')[:32],
-                 'first_watched_at': _number(row.get('first_watched_at'))}
-                for row in (rows or [])[:10] if isinstance(row, dict)]
+            video['recent'] = [_video_recent_row(row) for row in (rows or [])[:10] if isinstance(row, dict)]
             recent_ok = True
     except Exception:
         video['recent'] = []

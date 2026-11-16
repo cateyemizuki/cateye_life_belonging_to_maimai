@@ -380,7 +380,7 @@ from suite_prompts import (
 # prompts 12→14、event_catalog（服务视图）12→14、admin 13→15、
 # dashboard_display 14→16、maimai_interaction 15→17。只改 __ui_order__ 与注释/文档，
 # 段数/字段数/隐藏数/默认值/迁移/版本号均不变。
-SUPPORTED_CONFIG_VERSION = "3.18.2"
+SUPPORTED_CONFIG_VERSION = "3.18.3"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -793,9 +793,10 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
     )
     preset: Literal["fish", "human"] = Field(
         default="human",
-        description="fish=萨卡班麦麦；human=麦麦",
-        json_schema_extra={"label": "形象预设", "hint": "fish=萨卡班麦麦；human=麦麦",
-                           **_ui_i18n("Mascot preset", "fish = Sakabamai; human = Maimai.")},
+        description="选择萨卡班麦麦或麦麦作为面板形象。",
+        json_schema_extra={"label": "形象预设", "hint": "选择喜欢的面板形象。",
+                           **_ui_i18n("Mascot preset", "Choose Sakabamai or Maimai.",
+                                      choices={"fish": "萨卡班麦麦", "human": "麦麦"})},
     )
     mascot_size_px: int = Field(
         default=144, ge=48, le=192,

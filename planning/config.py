@@ -499,7 +499,8 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "群聊名单模式",
             "hint": "默认黑名单（留空即全群生效，符合「群里本来就该活跃」的直觉）",
-            **_ui_i18n("Group list mode", "blacklist (default) or whitelist."),
+            **_ui_i18n("Group list mode", "blacklist (default) or whitelist.",
+                       choices={"blacklist": "黑名单", "whitelist": "白名单"}),
         },
     )
     proactive_group_ids: List[str] = Field(
@@ -524,7 +525,8 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "私聊名单模式",
             "hint": "默认白名单（留空即不打扰任何其他私聊，避免误伤）",
-            **_ui_i18n("Private list mode", "whitelist (default) or blacklist."),
+            **_ui_i18n("Private list mode", "whitelist (default) or blacklist.",
+                       choices={"blacklist": "黑名单", "whitelist": "白名单"}),
         },
     )
     proactive_private_ids: List[str] = Field(

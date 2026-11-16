@@ -697,7 +697,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def _shutdown_chain(self) -> None:
         """串行停机链（F2：每步独立防御；总超时预算由 on_unload 的 wait_for 控制）。"""
         # Stop single-flight integration work before any service/database teardown.
-        for task_name in ("_video_watch_sync_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task", "_auto_init_task"):
+        for task_name in ("_video_watch_sync_task", "_video_watch_poll_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task", "_auto_init_task"):
             task = getattr(self, task_name, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -1621,11 +1621,16 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 db = getattr(self, "_db", None)
                 return db.get_episode(episode_id) if db is not None else None
 
+            from integrations.video_autonomy import remaining_episode_minutes
             coord = VideoWatchCoordinator(
                 self._data_dir, self._call_watch_api, _active, _by_id,
                 logger=self.ctx.logger,
                 attention=getattr(self, "_attention", None),
-                quota=SurfQuotaLedger(self._data_dir, day_provider=self._surf_day),
+                quota=SurfQuotaLedger(self._data_dir,day_provider=self._surf_day,
+                    config_provider=lambda:self.config.video_autonomous),
+                config_provider=lambda:self.config.video_autonomous,
+                automatic_guard=self._video_automation_allowed,
+                episode_remaining=lambda episode:remaining_episode_minutes(episode,self._surf_now()),
                 share_recorder=getattr(self, "_share_recorder", None),
                 # 2026-11-04 刷视频功能批：候选准备（兴趣TTL检查+公开排行榜）先于
                 # next_candidate 同步 pick；联动变化 → 回复倍率刷新（结束即恢复）
@@ -1672,7 +1677,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 # 3.17.37 视频自主观看批：主动侧候选数据门槛（[video_autonomous]）。
                 # 惰性读段（热重载即时生效）；只约束本候选源的自主选片，工具点播
                 # （service.submit 直传 BV）不经 prepare/pick，不受任何阈值影响。
-                stat_gate_provider=lambda: getattr(self.config, "video_autonomous", None))
+                stat_gate_provider=lambda: getattr(self.config,"video_autonomous",None),
+                selection_path=self._data_dir/"video_watch/video_selection.json")
             self._video_candidate_source_obj = source
         return source
 
@@ -2473,6 +2479,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     def _video_state_changed(self) -> None:
         self._request_surf_frequency_refresh()
         self._kick_video_completion()
+        self._kick_video_watch_sync(maintenance=False)
 
     def _kick_video_completion(self) -> None:
         if getattr(self, "_is_unloading", False):
@@ -2711,7 +2718,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
     def _video_automation_allowed(self, episode_id: str) -> bool:
         allowed, _ = self._autonomous_context()
-        if not allowed or not episode_id:
+        if not allowed or not episode_id or not bool(getattr(self.config.video_autonomous,'enabled',True)):
             return False
         lease = self._attention.current()
         if not lease or lease.get("holder") != f"schedule:{episode_id}":
@@ -2724,30 +2731,50 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             # 即不再允许 gap 任务启动/续跑，协调器侧同步收尾）
             return self._db.active_episode() is None
         active = self._db.active_episode() or {}
-        return (active.get("episode_id") == episode_id
-                and (active.get("metadata") or {}).get("event_key") == "watch_bili")
+        if active.get('episode_id')!=episode_id:return False
+        from integrations.video_autonomy import episode_watch_kind,casual_eligible,remaining_episode_minutes
+        remaining=remaining_episode_minutes(active,self._surf_now())
+        if remaining is not None and remaining<=0:return False
+        if episode_watch_kind(active)=='dedicated':return True
+        return (casual_eligible(active)
+                and bool(getattr(self.config.video_autonomous,'schedule_casual_enabled',True)))
 
 
 
 
-    def _kick_video_watch_sync(self) -> None:
-        """单飞调度：上一拍联动未结束时不再叠加（有界；异常只告警）。"""
-        self._kick_video_completion()
-        pending = getattr(self, "_video_watch_sync_task", None)
-        if pending is not None and not pending.done():
-            return
-        try:
-            async def sync_with_maintenance():
-                await self._small_event_actions.tick(self._db.active_episode())
-                await self._video_watch.maintain_cache()
-                await self._video_coordinator().sync()
-            self._video_watch_sync_task = asyncio.get_running_loop().create_task(
-                sync_with_maintenance())
-        except Exception as exc:
+    def _kick_video_watch_sync(self, *, maintenance: bool = True) -> None:
+        """Drain completion-driven work without waiting for the five-minute life tick."""
+        if getattr(self,'_is_unloading',False):return
+        self._video_watch_sync_dirty=True
+        if maintenance:self._video_watch_maintenance_dirty=True
+        pending=getattr(self,'_video_watch_sync_task',None)
+        if pending is not None and not pending.done():return
+        async def run():
             try:
-                self.ctx.logger.warning("刷视频联动调度失败（忽略）：%s", exc)
-            except Exception:
-                pass
+                while self._video_watch_sync_dirty and not getattr(self,'_is_unloading',False):
+                    self._video_watch_sync_dirty=False
+                    if getattr(self,'_video_watch_maintenance_dirty',False):
+                        self._video_watch_maintenance_dirty=False
+                        await self._small_event_actions.tick(self._db.active_episode())
+                        await self._video_watch.maintain_cache()
+                    await self._video_coordinator().sync()
+                    # Completion recording happens inside sync; evaluate only after that fact exists.
+                    self._kick_share_delivery()
+                self._ensure_video_watch_poll()
+            except asyncio.CancelledError:raise
+            except Exception as exc:self.ctx.logger.warning('刷视频联动调度失败：%s',type(exc).__name__)
+        try:self._video_watch_sync_task=asyncio.get_running_loop().create_task(run())
+        except RuntimeError:return
+
+    def _ensure_video_watch_poll(self) -> None:
+        pending=getattr(self,'_video_watch_poll_task',None)
+        if pending is not None and not pending.done():return
+        if not self._video_coordinator().needs_poll():return
+        async def poll():
+            while not getattr(self,'_is_unloading',False) and self._video_coordinator().needs_poll():
+                await asyncio.sleep(2)
+                self._kick_video_watch_sync(maintenance=False)
+        self._video_watch_poll_task=asyncio.get_running_loop().create_task(poll())
 
     def _life_tick_state(self, planner: Any, sleep_rates: Any = None) -> dict[str, Any] | None:
         """Single state integrator; sleep engine owns the asleep signal."""

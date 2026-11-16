@@ -264,7 +264,7 @@ class QzoneVideoSectionConfig(PluginConfigBase):
 class LegacyCompatSectionConfig(PluginConfigBase):
     '无法直接获取 QQ 空间登录信息时，设置可用的 Snowluma HTTP 连接。'
 
-    __ui_label__ = "旧版兼容"
+    __ui_label__ = "旧版兼容（适用于2.0.0以前的snowluma）"
     __ui_icon__ = "history"
     # 段序紧跟 [qzone_video]（__ui_order__=10）之后：qzone(9) → qzone_video(10) →
     # legacy_compat(11) 三段渲染相邻（2026-11-14 段序修正批，原 16/17 垫底已废）。

@@ -10,12 +10,17 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict, Mapping, Optional
 
 
-def ui_i18n(en_label: str, en_hint: str = "") -> dict:
+def ui_i18n(en_label: str, en_hint: str = "", *,
+            choices: Optional[Mapping[Any, str]] = None) -> dict:
     """字段级英文翻译（并入 pydantic ``json_schema_extra``）。"""
     entry: Dict[str, str] = {"label": en_label}
     if en_hint:
         entry["hint"] = en_hint
-    return {"i18n": {"en": entry}}
+    locales = {"en": entry}
+    if choices:
+        # SDK 只透传平面 i18n 字符串；choices 本身始终保留 Literal 的机器值。
+        locales["zh"] = {f"choice.{value}": label for value, label in choices.items()}
+    return {"i18n": locales}

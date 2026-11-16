@@ -10,13 +10,16 @@
   本模块不读 video_watch 的私有配置/任务目录；
 - 观看能力不可用时如实标记「观看能力不可用」，绝不拖挂生活 tick
   （计划 §3：不阻塞其他日程）；
-- 关联唯一：一个 episode 至多一个观看任务；每拍不重复提交；
-- 25–55 分钟是 episode 内「连续看多支视频」的实际观看预算：任务完成后同一拍
-  续投下一支，达到计划时长/55 分钟或 episode 结束即停止；额度只在首次提交
-  入账（续投不重复申请），取消/中断按实际观看结算或退款；
-- 活动结束/被抢占/取消 → 取消进行中的任务（共享任务取消语义由端口契约保证，
-  不误杀其他调用者的任务）；晚到的真实完成结果照实存档
-  （不重开 episode、不回填结束时间、不自行发消息）。
+- 关联唯一：同一 episode 在同一时刻只推进一个观看任务；可串行续投多支，不重复提交；
+- 专属观看按 25–55 分钟口径约束单场预算，同时核对日程实际剩余时间；完成事件
+  驱动续投，不等待生活 tick。生产单段最多 10 支，达到配置支数/时长或 episode
+  结束即停止；同场只首次预留额度，结束时按真实任务处理用时结算；
+- 独立 casual 路径只在明确闲暇时为每个原日程意图持久化一次概率结果，最多看一支；
+  恢复与跨日沿用原意图身份及累计支数；无原计划身份的小事件回退原 episode 链身份；
+  无日程的 gap 路径保留自己的冷却和每日额度，三类均受自主开关与注意力门守护；
+- 活动结束/被抢占/聊天让位 → 释放本 episode 的自动 owner，不终止已受理任务
+  或误杀共享任务；晚到的真实完成结果照实存档（不重开 episode、不回填结束时间、
+  不自行发消息）。用户显式取消仍按观看服务的任务取消契约执行。
 """
 
 from __future__ import annotations
@@ -34,6 +37,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from core.coerce import to_float as _as_float, to_int as _as_int
+from integrations.video_autonomy import (config_value,quota_limits,episode_watch_kind,casual_eligible,EpisodeOpportunities)
+from integrations.video_watch_budget import IntentWatchLedger,watch_budget_identity
 
 #: 刷视频事件的 event 标识（event_catalog.BUILTIN_EVENTS / RANDOM_EVENT_POOL 同口径）
 WATCH_EVENT_KEY = "watch_bili"
@@ -43,8 +48,8 @@ WATCH_SESSION_MIN_MINUTES = 25
 WATCH_SESSION_MAX_MINUTES = 55
 #: task_history 保留条数（有界；每续投一支归档一条旧任务摘要）
 WATCH_CONTINUE_MAX_TASKS = 8
-#: 同一 episode 内绝对提交上限（防无限续投的兜底；主停止条件是 episode 结束
-#: 或到达计划时长/55 分钟上限，见 :meth:`VideoWatchCoordinator._can_continue_watching`）
+#: 未注入配置的旧独立调用提交上限；生产读取 video_autonomous.schedule_max_videos
+#: （默认 10）。同场还受 episode 结束及实际剩余时间/单场预算约束。
 WATCH_CONTINUE_MAX_SUBMITS = 20
 #: 续投/首次选片时，因「候选时长 > 剩余预算」而跳过的最多候选数（防一次抽干候选池）
 WATCH_CANDIDATE_FIT_ATTEMPTS = 5
@@ -56,22 +61,23 @@ _CLOSED_KEEP_DAYS = 7
 _CLOSED_MAX_ENTRIES = 100
 
 # ----------------------------------------------------------------------
-# S1b 冲浪额度（冲浪计划书 §3.2/§3.3）：以下**均为建议默认值**（计划书初值，
-# 非实测结论）；装配侧若要外化到配置，改常量取值即可，判定口径不变。
-#: 每日自动观看（SURF）总场次上限
+# SURF_* 的 3/120/2 保留旧独立调用的兼容口径，不是生产配置默认。
+# 实际额度由 video_autonomy.quota_limits 与注入的配置 provider 统一解析；
+# plugin 装配读取 video_autonomous，生产默认总 8 场/240 分钟、专属 4 场。
+# 以下兼容数值不作为生产调参入口；单场 dedicated 时长常量仍用于预算夹取。
+#: 旧独立调用兼容总场次值（生产使用 daily_session_limit）
 SURF_MAX_TOTAL_SESSIONS = 3
-#: 每日自动观看总时长上限（分钟）：与 25–55 分钟 episode 同口径的上限值——
-#: 2 场 dedicated（各至多 55 分钟）+ 1 场 gap（10 分钟）= 120，有明确天花板，
-#: 不随单场计划时长无限放大。
+#: 旧独立调用兼容总分钟值（生产使用 daily_minutes_limit，默认 240）；
+#: 同场预留与结算由 SurfQuotaLedger 负责，续投不会重复申请一场。
 SURF_MAX_TOTAL_MINUTES = 120
 #: 单场 dedicated 的入账上限（分钟）：与 watch_bili episode 的 25–55 分钟同口径；
 #: 实际入账取 episode 计划时长（25–55），不足 55 时不按 55 虚记。
 SURF_MAX_DEDICATED_MINUTES = WATCH_SESSION_MAX_MINUTES
-#: 「间隔冲浪」（gap）每日场次上限
+#: 旧独立调用兼容 gap 场次值（生产使用 daily_gap_limit）
 SURF_MAX_GAP_SESSIONS = 2
-#: 「专属冲浪」（dedicated）每日场次上限
+#: 旧独立调用兼容 dedicated 场次值（生产使用 daily_dedicated_limit）
 SURF_MAX_DEDICATED_SESSIONS = 2
-#: gap 两场启动的最小间隔（秒）；60 分钟（计划书 §3.2 建议）
+#: 旧独立调用兼容 gap 间隔值；生产使用 gap_min_interval_minutes（默认 60）
 GAP_MIN_INTERVAL_SECONDS = 3600
 
 # ── 2026-11-04 刷视频功能批：空隙冲浪（gap）触发与候选准备（内部常量）──────
@@ -79,7 +85,7 @@ GAP_MIN_INTERVAL_SECONDS = 3600
 GAP_TRIGGER_PROBABILITY = 0.10
 #: 两次 gap 掷点/重试的最小间隔（秒；防每拍刷屏掷点，与额度 60 分钟门叠加）
 GAP_ROLL_COOLDOWN_SECONDS = 1800
-#: gap 单场入账时长（分钟；比 dedicated 的 20 分钟短——空隙看看口径）
+#: gap 单场预留时长（分钟）；独立 casual 按候选时长及日程剩余时间预留
 GAP_SESSION_MINUTES = 10.0
 #: 候选准备（兴趣检查+公开接口抓取）总超时（秒；单飞 sync 内异步执行）
 CANDIDATE_PREPARE_TIMEOUT_SECONDS = 120.0
@@ -120,7 +126,7 @@ def _default_day() -> str:
 def _empty_quota(day: str) -> Dict[str, Any]:
     """当日账本零值（字段口径见计划书 §3.3）。"""
     return {"date": str(day), "sessions_used": 0, "minutes_used": 0.0,
-            "gap_used": 0, "dedicated_used": 0, "last_start_epoch": None}
+            "gap_used": 0, "dedicated_used": 0, "casual_used":0, "last_start_epoch": None}
 
 
 class SurfQuotaLedger:
@@ -135,14 +141,20 @@ class SurfQuotaLedger:
     """
 
     #: 分场景计数字段：kind -> 账本字段
-    _KIND_FIELD = {"gap": "gap_used", "dedicated": "dedicated_used"}
+    _KIND_FIELD = {"gap": "gap_used", "dedicated": "dedicated_used", "casual":"casual_used"}
 
     def __init__(self, store_dir: Path, day_provider: Optional[Callable[[], str]] = None,
-                 clock: Optional[Callable[[], float]] = None) -> None:
+                 clock: Optional[Callable[[], float]] = None, config_provider: Any = None) -> None:
         self._path = Path(store_dir) / "surf_quota.json"
         self._day_provider = day_provider or _default_day  # 缺省：本地 date
         self._clock = clock
+        self._config_provider=config_provider
         self._lock = threading.RLock()  # reserve_once shares the same counter owner
+
+    def limits(self):
+        try:config=self._config_provider() if callable(self._config_provider) else None
+        except Exception:config=None
+        return quota_limits(config,legacy=self._config_provider is None)
 
     # ---- 内部 ----
     def _now(self, now: Any = None) -> float:
@@ -160,6 +172,7 @@ class SurfQuotaLedger:
             out["minutes_used"] = max(0.0, _as_float(doc.get("minutes_used")))
             out["gap_used"] = max(0, _as_int(doc.get("gap_used")))
             out["dedicated_used"] = max(0, _as_int(doc.get("dedicated_used")))
+            out["casual_used"] = max(0, _as_int(doc.get("casual_used")))
             last = doc.get("last_start_epoch")
             out["last_start_epoch"] = None if last is None else _as_float(last)
             if isinstance(doc.get("claims"), dict):
@@ -172,15 +185,15 @@ class SurfQuotaLedger:
     # ---- 对外面 ----
     def snapshot(self) -> Dict[str, Any]:
         """当日账本只读快照（字段：date/sessions_used/minutes_used/gap_used/
-        dedicated_used/last_start_epoch）。"""
+        dedicated_used/casual_used/last_start_epoch；另含逐 episode claims）。"""
         with self._lock:
             return dict(self._load())
 
     def try_consume(self, kind: str, minutes: float, now: Any = None) -> bool:
-        """申请入账一场（kind ∈ "gap"/"dedicated"）：全部检查通过才入账并返回 True。
+        """申请入账一场（kind ∈ "gap"/"dedicated"/"casual"）：全部检查通过才入账并返回 True。
 
         检查口径：当日总场次、当日总分钟（本次时长须放得下）、分场景场次、
-        gap 的 60 分钟启动间隔（对照 ``last_start_epoch``）；未知 kind 不入账。
+        gap 的配置启动间隔（对照 ``last_start_epoch``；默认 60 分钟）；未知 kind 不入账。
         任一不过 → False 且账本不变（调用方按「本拍不启动」处理）。
         """
         kind = str(kind or "")
@@ -192,10 +205,10 @@ class SurfQuotaLedger:
         with self._lock:
             doc = self._load()
             # 1) 余量门控（总场次/总时长/分场景/间隔）与纯函数同口径
-            if surf_gate_check(kind, doc, at) is not None:
+            if surf_gate_check(kind, doc, at,limits=self.limits()) is not None:
                 return False
             # 2) 本场时长是否放得进当日剩余额度（纯函数无 minutes 入参，由账本校验）
-            if float(doc["minutes_used"]) + need_minutes > SURF_MAX_TOTAL_MINUTES:
+            if float(doc["minutes_used"]) + need_minutes > self.limits()["daily_minutes_limit"]:
                 return False
             doc["sessions_used"] = int(doc["sessions_used"]) + 1
             doc["minutes_used"] = round(float(doc["minutes_used"]) + need_minutes, 3)
@@ -242,7 +255,7 @@ class SurfQuotaLedger:
                 doc[field] = max(0, int(doc[field]) - 1)
             doc["minutes_used"] = max(0.0, float(doc["minutes_used"]) - reserved)
             # 2026-11-04 模块评估问题5：整场退款还原启动间隔锚点（claim 已记录
-            # previous_start），gap 60 分钟门不再从被退款的申请时刻起算。
+            # previous_start），gap 配置间隔不再从被退款的申请时刻起算。
             # 保守守卫：若此前已有更晚的真实启动（last_start_epoch 晚于本 claim
             # 的登记时刻），不覆盖那次启动的锚点。
             started = claim.get("started_at")
@@ -290,48 +303,26 @@ class SurfQuotaLedger:
             return True
 
 
-def surf_gate_check(kind: str, quota_snapshot: Dict[str, Any], now: float) -> Optional[str]:
-    """SURF 启动门控（纯函数，计划书 §3.3/§4.2）：返回中文拒绝原因，None=放行。
-
-    ``quota_snapshot`` 取自 :meth:`SurfQuotaLedger.snapshot`（当日账本快照）；
-    本函数只判断「还有没有余量」，单场时长是否放得下由账本 try_consume 另查
-    （签名不含 minutes）。判定口径与账本入账共用同一组常量，避免两处漂移。
-    """
-    kind = str(kind or "")
-    if kind not in SurfQuotaLedger._KIND_FIELD:
-        return f"未知冲浪类型「{kind}」（仅支持 gap / dedicated）"
-    q = quota_snapshot if isinstance(quota_snapshot, dict) else {}
-    used_n = _as_int(q.get("sessions_used"))
-    used_m = _as_float(q.get("minutes_used"))
-    gap_n = _as_int(q.get("gap_used"))
-    ded_n = _as_int(q.get("dedicated_used"))
-    at = _as_float(now)
-    if used_n >= SURF_MAX_TOTAL_SESSIONS:
-        return (f"今日自动观看场次已用完（{used_n}/{SURF_MAX_TOTAL_SESSIONS} 场，"
-                f"剩余 0 场；时长还剩 {max(0.0, SURF_MAX_TOTAL_MINUTES - used_m):g} 分钟）")
-    if used_m >= SURF_MAX_TOTAL_MINUTES:
-        return (f"今日自动观看时长已用完（{used_m:g}/{SURF_MAX_TOTAL_MINUTES:g} 分钟，"
-                f"剩余 0 分钟；场次还剩 {SURF_MAX_TOTAL_SESSIONS - used_n} 场）")
-    if kind == "gap" and gap_n >= SURF_MAX_GAP_SESSIONS:
-        return (f"今日「间隔冲浪」场次已用完（{gap_n}/{SURF_MAX_GAP_SESSIONS} 场，"
-                f"剩余 0 场；总场次还剩 {SURF_MAX_TOTAL_SESSIONS - used_n} 场、"
-                f"时长还剩 {max(0.0, SURF_MAX_TOTAL_MINUTES - used_m):g} 分钟）")
-    if kind == "dedicated" and ded_n >= SURF_MAX_DEDICATED_SESSIONS:
-        return (f"今日「专属冲浪」场次已用完（{ded_n}/{SURF_MAX_DEDICATED_SESSIONS} 场，"
-                f"剩余 0 场；总场次还剩 {SURF_MAX_TOTAL_SESSIONS - used_n} 场、"
-                f"时长还剩 {max(0.0, SURF_MAX_TOTAL_MINUTES - used_m):g} 分钟）")
-    last = q.get("last_start_epoch")
-    if kind == "gap" and last is not None:
-        elapsed = at - _as_float(last)
-        if elapsed < GAP_MIN_INTERVAL_SECONDS:
-            wait_min = int(math.ceil((GAP_MIN_INTERVAL_SECONDS - elapsed) / 60.0))
-            return (f"距上次自动观看不足 {GAP_MIN_INTERVAL_SECONDS // 60} 分钟"
-                    f"（已过 {max(0, int(elapsed)) // 60} 分钟，还需约 {max(1, wait_min)} 分钟）")
+def surf_gate_check(kind: str, quota_snapshot: Dict[str, Any], now: float, *, limits=None) -> Optional[str]:
+    """One quota interpretation for the ledger and its coordinator, including casual watches."""
+    limits=limits or quota_limits(legacy=True)
+    q=quota_snapshot if isinstance(quota_snapshot,dict) else {}
+    if kind not in SurfQuotaLedger._KIND_FIELD:return '未知冲浪类型'
+    sessions=_as_int(q.get('sessions_used'));minutes=_as_float(q.get('minutes_used'))
+    if sessions>=limits['daily_session_limit']:return f"今日自动观看场次已用完（{sessions}/{limits['daily_session_limit']} 场）"
+    if minutes>=limits['daily_minutes_limit']:return f"今日自动观看时长已用完（{minutes:g}/{limits['daily_minutes_limit']} 分钟）"
+    field=SurfQuotaLedger._KIND_FIELD[kind]
+    cap=limits[{'gap':'daily_gap_limit','dedicated':'daily_dedicated_limit','casual':'schedule_casual_daily_limit'}[kind]]
+    used=_as_int(q.get(field))
+    if used>=cap:return f"今日{kind}观看场次已用完（{used}/{cap} 场）"
+    last=q.get('last_start_epoch');interval=limits['gap_min_interval_minutes']*60
+    if kind=='gap' and last is not None and float(now)-_as_float(last)<interval:
+        return f"距上次自动观看不足 {limits['gap_min_interval_minutes']} 分钟"
     return None
 
 
 class VideoWatchCoordinator:
-    """刷视频 episode ↔ 公共观看接口的联动协调器（单飞 tick 调用）。"""
+    """刷视频 episode ↔ 公共观看接口协调器；完成事件、短轮询与生活 tick 单飞推进。"""
 
     def __init__(self, store_dir: Path, api_caller: ApiCaller,
                  get_active_episode: Callable[[], Optional[Dict[str, Any]]],
@@ -342,8 +333,17 @@ class VideoWatchCoordinator:
                  candidate_preparer: Optional[Callable[[], Awaitable[Any]]] = None,
                  frequency_refresh: Optional[Callable[[], None]] = None,
                  rng: Optional[random.Random] = None,
-                 clock: Optional[Callable[[], float]] = None) -> None:
+                 clock: Optional[Callable[[], float]] = None,
+                 config_provider: Any = None, automatic_guard: Any = None,
+                 episode_remaining: Any = None) -> None:
         self._links_path = Path(store_dir) / "video_watch_links.json"
+        self._opportunities=EpisodeOpportunities(Path(store_dir)/"video_episode_opportunities.json")
+        self._intent_usage=IntentWatchLedger(Path(store_dir)/"video_intent_usage.sqlite3")
+        self._budget_seeded=set()
+        self._config_provider=config_provider
+        self._automatic_guard=automatic_guard
+        self._episode_remaining=episode_remaining
+        self._sync_lock=asyncio.Lock()
         self._api = api_caller
         #: S1b（冲浪计划书 §4.2/§3.3）注入的注意力租约/额度账本；None = 门控直放行，
         #: 保持既有测试/未装配场景行为（注意力权威由装配根传入，本模块不造单例）
@@ -548,9 +548,10 @@ class VideoWatchCoordinator:
 
     # ------------------------------------------------------------------
     async def sync(self) -> None:
-        """每拍一次的联动推进（单飞 task 内执行；任何异常不外泄）。"""
+        """单飞联动推进；完成事件可立即再推进，异常隔离，不等待生活 tick。"""
         try:
-            await self._sync_inner()
+            async with self._sync_lock:
+                await self._sync_inner()
         except Exception as exc:
             if self._log:
                 self._log.warning("刷视频联动推进失败（忽略，不影响其他日程）：%s", exc)
@@ -558,7 +559,7 @@ class VideoWatchCoordinator:
     async def _sync_inner(self) -> None:
         links_doc = self._load_links()
         links: Dict[str, Any] = links_doc.get("links") or {}
-        changed = False
+        changed = self._reconcile_budget_receipts(links)
 
         # 1) 已链接 episode 的收尾：非 active（已结束/被抢占/取消）→ 取消任务 + 落账
         active = self._get_active_episode() or {}
@@ -603,8 +604,8 @@ class VideoWatchCoordinator:
                 entry, result,
                 assume_completed=str(entry.get("stage") or "") in
                 ("completed", "cached_completed"))
-            # 中断/抢占/放弃：按实际观看结算（未开始 → 全额退款）；自然完成按计划
-            # 时长保留（本场就是按 episode 计划入账的）。任务本身不取消，继续跑完。
+            # 中断/抢占/放弃按真实任务用时结算（未开始则退款）；自然结束不在此重复结算。
+            # 这里只释放自动 owner，已受理任务仍可继续处理，由晚到轮询补归档。
             if task_id and status in ("interrupted", "paused", "abandoned", "cancelled"):
                 self._settle_quota(episode_id, entry, reason=f"episode_{status}")
             # 复核修复（3.17.33）：释放 owner 不等于任务终止（manager 继续跑完）——
@@ -620,7 +621,7 @@ class VideoWatchCoordinator:
             metadata = active.get("metadata") if isinstance(active.get("metadata"), dict) else {}
             event_key = str(metadata.get("event_key") or "")
             entry = links.get(active_id)
-            if event_key == WATCH_EVENT_KEY:
+            if self._enabled() and episode_watch_kind(active)=="dedicated":
                 if not isinstance(entry, dict):
                     entry = {}
                     links[active_id] = entry
@@ -634,7 +635,19 @@ class VideoWatchCoordinator:
                     # watch_bili episode 内续投下一支候选，实际观看连续到 25–55 分钟。
                     await self._continue_watching(active_id, entry, active)
                     changed = True
-            # 3) 已链接进行中 → 有界状态轮询（每拍一次，不忙轮询）
+            elif self._enabled() and not isinstance(entry,dict) and casual_eligible(active):
+                if config_value(self._config(),'schedule_casual_enabled',True) and self._casual_context_ready(active_id):
+                    probability=max(0.0,min(1.0,_as_float(config_value(self._config(),'schedule_casual_probability',.10))))
+                    hit,budget_key=self._roll_intent_once(active_id,active,links,probability)
+                    if hit is not True and self._attention is not None:self._attention.release(f'schedule:{active_id}')
+                    if hit is not None:
+                        entry={'scenario':'casual','budget_key':budget_key,'started_at':self._now(),'closed':not hit,
+                               'stage':'opportunity_missed' if not hit else 'preparing'}
+                        links[active_id]=entry;changed=True
+                        if hit:
+                            remaining=self._remaining_episode(active)
+                            await self._start_watching(active_id,entry,kind='casual',session_minutes=remaining or GAP_SESSION_MINUTES)
+            # 3) 已链接任务 → 本次同步只查一次状态，完成事件可另触发下一次同步
             if isinstance(entry, dict) and entry.get("task_id") and not entry.get("closed") \
                     and str(entry.get("stage")) not in ("completed", "unavailable", "skipped", "failed_submit"):
                 progressed = await self._poll_status(active_id, entry)
@@ -645,6 +658,8 @@ class VideoWatchCoordinator:
                 if entry.get("closed") and self._can_continue_watching(entry):
                     await self._continue_watching(active_id, entry, active)
                     progressed = True
+                if entry.get("closed") and entry.get("closed_reason")=="task_completed" and not self._can_continue_watching(entry):
+                    self._settle_quota(active_id,entry,reason="session_completed")
                 changed = changed or progressed
 
         # 3.5) gap 冲浪条目轮询（2026-11-04 刷视频功能批）：日程恢复即收尾；
@@ -680,7 +695,7 @@ class VideoWatchCoordinator:
             changed = changed or progressed
 
         # 3.6) 空闲 gap 触发（无活动 episode 才掷点；概率/冷却/额度三重门）
-        if not active_id:
+        if not active_id and self._enabled():
             changed = await self._maybe_gap_surf(links) or changed
 
         # 3.7) detached 轻量轮询：租约撤销/日程收尾后任务由 manager 继续跑完，
@@ -707,6 +722,107 @@ class VideoWatchCoordinator:
                         self._log.warning("刷视频联动后的频率刷新失败（忽略）：%s", exc)
 
     # ------------------------------------------------------------------
+    def _config(self):
+        try:return self._config_provider() if callable(self._config_provider) else None
+        except Exception:return None
+
+    def _enabled(self):
+        return bool(config_value(self._config(),'enabled',True))
+
+    def _limits(self):
+        getter=getattr(self._quota,'limits',None)
+        return getter() if callable(getter) else quota_limits(self._config(),legacy=self._config_provider is None)
+
+    def _watch_limit(self,kind):
+        return 1 if kind=='casual' else max(1,min(100,_as_int(config_value(self._config(),'schedule_max_videos',WATCH_CONTINUE_MAX_SUBMITS))))
+
+    def _prepare_intent_budget(self,episode_id,entry,links=None):
+        active=self._get_active_episode() or {}
+        episode=active if active.get('episode_id')==episode_id else self._get_episode(episode_id)
+        episode=episode if isinstance(episode,dict) else {'episode_id':episode_id}
+        identity=watch_budget_identity(episode,self._get_episode)
+        if identity is None:raise ValueError('watch_budget_identity_unavailable')
+        links=links if links is not None else self._load_links().get('links',{})
+        key=entry.get('budget_key') or identity['key']
+        # A saved parent association retains the original date even after old episode pruning.
+        if not entry.get('budget_key') and identity.get('intent_item_id'):
+            for alias in identity['aliases']:
+                old=(links.get(alias) or {}).get('budget_key')
+                if old:
+                    try:parts=json.loads(old)
+                    except (ValueError,TypeError):continue
+                    if len(parts)==3 and parts[0]=='intent' and parts[2]==identity['intent_item_id']:key=old
+        entry['budget_key']=key
+        if key in self._budget_seeded:return key
+        try:
+            with self._opportunities.path.open(encoding='utf-8') as stream:old_rolls=json.load(stream)
+            roll_unknown=not isinstance(old_rolls,dict)
+            if roll_unknown:old_rolls={}
+        except FileNotFoundError:old_rolls={};roll_unknown=False
+        except (OSError,ValueError):old_rolls={};roll_unknown=True
+        aliases=set(identity['aliases'])
+        for eid,old in links.items():
+            if not isinstance(old,dict) or old.get('budget_key'):continue
+            row=self._get_episode(eid)
+            other=watch_budget_identity(row,self._get_episode) if isinstance(row,dict) and row.get('episode_id')==eid else None
+            if eid not in aliases and (other is None or other['key']!=key):continue
+            ids={str(item.get('task_id')) for item in old.get('task_history',[]) if isinstance(item,dict) and item.get('task_id')}
+            if old.get('task_id'):ids.add(str(old['task_id']))
+            chance=old_rolls.get(eid)
+            if chance is None and old.get('scenario')=='casual':
+                chance={'at':old.get('started_at'),'hit':old.get('stage')!='opportunity_missed'}
+            self._intent_usage.seed_legacy(key,eid,task_ids=ids,reported_count=_as_int(old.get('submitted_count')),
+                chance=chance,now=self._now())
+            aliases.add(eid)
+        for eid in aliases:
+            if isinstance(old_rolls.get(eid),dict):
+                self._intent_usage.seed_legacy(key,eid,reported_count=0,chance=old_rolls[eid],now=self._now())
+        if roll_unknown:self._intent_usage.seed_legacy(key,'legacy_chance_unknown',chance={'hit':None},now=self._now())
+        self._budget_seeded.add(key)
+        return key
+
+    def _roll_intent_once(self,episode_id,active,links,probability):
+        try:
+            entry={};key=self._prepare_intent_budget(episode_id,entry,links)
+            return self._intent_usage.roll_once(key,probability,rng=self._rng,now=self._now()),key
+        except Exception as exc:
+            if self._log:self._log.warning('日程观看机会账不可核验，本次不掷点：%s',type(exc).__name__)
+            return None,''
+
+    def _reconcile_budget_receipts(self,links):
+        changed=False
+        for entry in links.values():
+            if not isinstance(entry,dict) or not entry.get('budget_key') or not entry.get('budget_reservation'):continue
+            try:
+                if entry.get('task_id'):
+                    facts=self._intent_usage.confirm(entry['budget_key'],entry['budget_reservation'],entry['task_id'],now=self._now())
+                    entry['intent_submitted_count']=facts['accepted_count']
+                elif entry.get('budget_release_pending'):
+                    self._intent_usage.reject(entry['budget_key'],entry['budget_reservation'])
+                else:continue
+                entry.pop('budget_reservation',None);entry.pop('budget_release_pending',None);entry.pop('counter_unconfirmed',None);changed=True
+            except Exception:continue  # The durable pending slot keeps this intent frozen.
+        return changed
+
+    def _casual_context_ready(self,episode_id):
+        if self._attention is not None:
+            lease=self._attention.try_acquire_surf(f'schedule:{episode_id}')
+            if not lease:return False
+        if callable(self._automatic_guard) and not self._automatic_guard(episode_id):
+            if self._attention is not None:self._attention.release(f'schedule:{episode_id}')
+            return False
+        return True
+
+    def _remaining_episode(self,episode):
+        if callable(self._episode_remaining):
+            try:return self._episode_remaining(episode)
+            except Exception:return 0.0
+        return None
+
+    def needs_poll(self):
+        return any(isinstance(row,dict) and row.get('task_id') and (not row.get('closed') or row.get('detached'))
+                   for row in self._load_links().get('links',{}).values())
+
     def _release_surf(self, episode_id: str, entry: Dict[str, Any]) -> None:
         if self._attention is not None and entry.get("lease"):
             self._attention.release(f"schedule:{episode_id}")
@@ -731,16 +847,16 @@ class VideoWatchCoordinator:
     def _session_budget_minutes(entry: Dict[str, Any]) -> Optional[float]:
         """episode 内实际观看预算（分钟）：优先 episode 计划时长，回退已入账时长。
 
-        25–55 的实际持续时间以本预算为准——续投只在预算内进行，达到计划时长或
-        55 分钟上限即停止（不再是「只写 planned_end」）。
+        dedicated 使用 25–55 分钟预算口径；gap/casual 沿用各自预留时长。
+        选片另核对日程剩余时间；只有 dedicated 可在支数与时长限制内续投。
         """
         target = _as_float(entry.get("session_target_minutes"))
         if target <= 0:
             target = _as_float(entry.get("reserved_minutes"))
         if target <= 0:
             return None
-        return max(float(WATCH_SESSION_MIN_MINUTES),
-                   min(float(WATCH_SESSION_MAX_MINUTES), float(target)))
+        return (max(0.0,float(target)) if entry.get("scenario") in ("gap","casual") else
+                max(float(WATCH_SESSION_MIN_MINUTES),min(float(WATCH_SESSION_MAX_MINUTES),float(target))))
 
     def _remaining_watch_minutes(self, entry: Dict[str, Any]) -> Optional[float]:
         """本 episode 剩余观看预算（分钟）；预算未知 → None（不做候选时长过滤）。"""
@@ -760,6 +876,9 @@ class VideoWatchCoordinator:
         """
         pick = first_pick
         remaining = self._remaining_watch_minutes(entry)
+        active=self._get_active_episode() or {}
+        actual_remaining=self._remaining_episode(active) if active.get("episode_id")==entry.get("episode_id") else None
+        if actual_remaining is not None:remaining=min(remaining,actual_remaining) if remaining is not None else actual_remaining
         for attempt in range(WATCH_CANDIDATE_FIT_ATTEMPTS):
             candidate = pick.get("candidate") if isinstance(pick, dict) else None
             if not isinstance(candidate, dict):
@@ -775,11 +894,17 @@ class VideoWatchCoordinator:
     def _can_continue_watching(self, entry: Dict[str, Any],
                                now: Optional[float] = None) -> bool:
         """上一个视频自然看完且 episode 仍活跃、仍在时长预算内 → 续投下一支。"""
+        if entry.get("scenario") in ("gap","casual") or not self._enabled():return False
         if str(entry.get("closed_reason") or "") != "task_completed":
             return False
         if entry.get("detached") or entry.get("cached"):
             return False
-        if int(entry.get("submitted_count") or 0) >= WATCH_CONTINUE_MAX_SUBMITS:
+        limit=max(1,min(100,_as_int(config_value(self._config(),"schedule_max_videos",WATCH_CONTINUE_MAX_SUBMITS))))
+        if entry.get('budget_key'):
+            try:usage=self._intent_usage.snapshot(entry['budget_key'])
+            except Exception:return False
+            if usage['pending_count'] or usage['accepted_count']>=limit:return False
+        elif int(entry.get("submitted_count") or 0) >= limit:
             return False
         budget = self._session_budget_minutes(entry)
         if budget is not None:
@@ -866,8 +991,8 @@ class VideoWatchCoordinator:
         不重新申请额度（同一 episode 已在首次提交时入账）；保留 ``reserved_minutes``、
         ``session_target_minutes``、``watch_started_at``（实际观看预算的起点）与
         ``started_at``，仅替换 task/bvid/stage；task_history 上限
-        ``WATCH_CONTINUE_MAX_TASKS``（task_history 有界），提交次数上限
-        ``WATCH_CONTINUE_MAX_SUBMITS`` 只作兜底。
+        ``WATCH_CONTINUE_MAX_TASKS``（task_history 有界）；生产提交上限读取
+        ``schedule_max_videos``，旧独立调用才回退 ``WATCH_CONTINUE_MAX_SUBMITS``。
         """
         history = entry.get("task_history")
         if not isinstance(history, list):
@@ -893,6 +1018,8 @@ class VideoWatchCoordinator:
         if entry.pop("detached_skip_once", False):
             return False  # 收尾当拍不额外轮询（与旧行为一致），下一拍再补
         task_id = str(entry.get("task_id") or "")
+        if self._now()-_as_float(entry.get("detached_last_poll"))<300:return False
+        entry["detached_last_poll"]=self._now()
         polls = int(entry.get("detached_polls") or 0) + 1
         entry["detached_polls"] = polls
         try:
@@ -906,7 +1033,7 @@ class VideoWatchCoordinator:
                 self._settle_quota(episode_id, entry,
                                    reason="detached_poll_exhausted")
                 return True
-            return False
+            return True
         stage = str(receipt.get("status") or "")
         if entry.get("task_started_at") is None:
             started = receipt.get("started_at")
@@ -938,15 +1065,16 @@ class VideoWatchCoordinator:
             entry["closed_reason"] = entry.get("closed_reason") or "detached_poll_exhausted"
             self._settle_quota(episode_id, entry, reason="detached_poll_exhausted")
             return True
-        return changed
+        return True
 
     async def _start_watching(self, episode_id: str, entry: Dict[str, Any],
                               kind: str = "dedicated", *, force_debug: bool = False,
                               session_minutes: Optional[float] = None) -> None:
         entry.setdefault("started_at", self._now())
+        entry["episode_id"]=episode_id
         # 场景标记（S2 频率倍率读 entry["scenario"]：dedicated=0.45 / gap=0.70；
         # 2026-11-04 前此处未写标记，dedicated 曾被误读成 gap 倍率）
-        entry["scenario"] = "gap" if kind == "gap" else "dedicated"
+        entry["scenario"] = kind if kind in ("gap","casual") else "dedicated"
         # 本 episode 的实际观看预算（分钟）：episode 计划 25–55 优先；gap 按空隙口径；
         # dedicated 无计划信息时取 55 上限（不再固定 20 分钟）。续投沿用同一预算起点。
         planned_minutes = (float(session_minutes) if session_minutes is not None
@@ -958,6 +1086,7 @@ class VideoWatchCoordinator:
         entry["session_target_minutes"] = planned_minutes
         reserved = False
         accepted = False
+        budget_token=None
         phase = "candidate"
         retryable = False
         try:
@@ -971,6 +1100,16 @@ class VideoWatchCoordinator:
                     entry.update(stage="skipped", reason="聊天占用或覆盖面未确立，不开始自动观看")
                     return
                 entry["lease"] = lease
+            if not self._enabled() and not force_debug:
+                entry.update(stage='skipped',reason='自主观看已关闭');return
+            if callable(self._automatic_guard) and not force_debug and not self._automatic_guard(episode_id):
+                entry.update(stage='skipped',reason='当前活动、睡眠或真实聊天不允许自主观看');return
+            if kind in ('dedicated','casual'):
+                budget_key=self._prepare_intent_budget(episode_id,entry)
+                usage=self._intent_usage.snapshot(budget_key)
+                entry['intent_submitted_count']=usage['accepted_count']
+                if usage['pending_count'] or usage['accepted_count']>=self._watch_limit(kind):
+                    entry.update(stage='skipped',reason='日程观看上限已到或已有受理结果待确认');return
             # 候选准备（兴趣 TTL 检查 + 公开排行榜抓取；失败不阻断——next_candidate
             # 会如实返回 no_candidate 原因，绝不编造 BV 号）
             if self._candidate_preparer is not None:
@@ -998,15 +1137,18 @@ class VideoWatchCoordinator:
                 entry.update(stage="skipped", reason="选片期间聊天开始")
                 return
             # 同一 episode 首次提交才入账；episode 内续投/忙后重试沿用原 claim。
-            # 入账口径 = episode 计划时长（25–55），不再被日总额度夹到 30 分钟；
-            # 放不下就如实跳过本拍，不虚记也不缩水。
+            # dedicated 按 25–55 分钟口径预留；casual 随后取候选与日程剩余时长。
+            # 同时检查配置的日总额度，放不下就如实跳过，不虚记或重复申请。
             if self._quota is not None and not entry.get("reserved_minutes"):
                 snap = self._quota.snapshot()
-                gate = surf_gate_check(kind, snap, self._now())
+                gate = surf_gate_check(kind, snap, self._now(),limits=self._limits())
                 used_m = _as_float(snap.get("minutes_used"))
-                if gate is None and used_m + planned_minutes > SURF_MAX_TOTAL_MINUTES:
+                if kind=="casual":
+                    planned_minutes=max(.01,min(planned_minutes,_as_float(candidate.get("duration_seconds"))/60 or planned_minutes))
+                    entry["session_target_minutes"]=planned_minutes
+                if gate is None and used_m + planned_minutes > self._limits()["daily_minutes_limit"]:
                     gate = (f"今日自动观看时长不足（本场需 {planned_minutes:g} 分钟，"
-                            f"今日仅剩 {max(0.0, SURF_MAX_TOTAL_MINUTES - used_m):g} 分钟）")
+                            f"今日仅剩 {max(0.0, self._limits()['daily_minutes_limit'] - used_m):g} 分钟）")
                 if gate:
                     entry.update(stage="skipped", reason=gate)
                     return
@@ -1017,11 +1159,19 @@ class VideoWatchCoordinator:
                     entry.update(stage="skipped", reason="自动观看额度不足或本事件已申请")
                     return
                 entry["reserved_minutes"] = planned_minutes
+            if callable(self._automatic_guard) and not force_debug and not self._automatic_guard(episode_id):
+                entry.update(stage="skipped",reason="候选准备后活动或聊天状态已变化");return
+            if kind in ('dedicated','casual'):
+                claim=self._intent_usage.reserve(entry['budget_key'],episode_id,self._watch_limit(kind),now=self._now())
+                budget_token=claim['token']
+                if not budget_token:
+                    entry.update(stage='skipped',reason=claim['reason']);return
+                entry['budget_reservation']=budget_token
             phase = "submit"
             # PR-WATCH：debug 强制路径以 source="debug" 送达观看服务——submit 注意力闸
             # 与运行期守卫因 source!="schedule" 自然放行；端口缺省仍 schedule（其余路径不变）。
             receipt = await self._api(action="submit", video=str(candidate["bvid"]),
-                                      purpose=("空隙刷视频" if kind == "gap" else "日程刷视频"),
+                                      purpose=("空隙刷视频" if kind == "gap" else "日程顺便看视频" if kind=="casual" else "日程刷视频"),
                                       episode_id=episode_id,
                                       **({"source": "debug"} if force_debug else {}))
             if receipt.get("success") and receipt.get("cached"):
@@ -1041,11 +1191,29 @@ class VideoWatchCoordinator:
             entry.update(task_id=str(receipt["task_id"]), bvid=str(candidate["bvid"]),
                          stage=str(receipt.get("status") or "queued"),
                          cached=bool(receipt.get("cached")))
-            entry["submitted_count"] = int(entry.get("submitted_count") or 0) + 1
+            receipt_ids=set(entry.get('receipt_task_ids') or [])
+            if str(receipt['task_id']) not in receipt_ids:
+                receipt_ids.add(str(receipt['task_id']))
+                entry["submitted_count"] = int(entry.get("submitted_count") or 0) + 1
+            entry['receipt_task_ids']=sorted(receipt_ids)
+            accepted=True
+            if budget_token:
+                try:
+                    facts=self._intent_usage.confirm(entry['budget_key'],budget_token,str(receipt['task_id']),now=self._now())
+                    entry['intent_submitted_count']=facts['accepted_count']
+                    entry.pop('budget_reservation',None)
+                except Exception:entry['counter_unconfirmed']=True
             if not entry.get("watch_started_at"):
                 # 实际观看预算起点：任务真正受理时（而非早前被忙闲跳过的拍）。
                 entry["watch_started_at"] = self._now()
             accepted = True
+        except asyncio.CancelledError:
+            entry.update(stage='submit_uncertain' if phase=='submit' else 'cancelled',closed=True)
+            if phase=='submit':
+                entry['submit_uncertain']=True
+                document=self._load_links();document.setdefault('links',{})[episode_id]=entry;self._save_links(document)
+            elif reserved:self._refund_reservation(episode_id,entry)
+            raise
         except Exception as exc:
             entry.update(stage="failed_submit" if phase == "submit" else "unavailable",
                          reason=("提交失败：" if phase == "submit" else "观看能力不可用：") + str(exc)[:160])
@@ -1055,6 +1223,15 @@ class VideoWatchCoordinator:
             if reserved and phase != "submit":
                 self._refund_reservation(episode_id, entry)
         finally:
+            if not accepted and budget_token:
+                if entry.get('submit_uncertain'):
+                    try:self._intent_usage.mark_uncertain(entry['budget_key'],budget_token)
+                    except Exception:pass  # An unresolved reservation already blocks another submission.
+                else:
+                    try:
+                        self._intent_usage.reject(entry['budget_key'],budget_token)
+                        entry.pop('budget_reservation',None)
+                    except Exception:entry['budget_release_pending']=True
             if not accepted:
                 entry["closed"] = not retryable
                 self._release_surf(episode_id, entry)
@@ -1142,8 +1319,15 @@ class VideoWatchCoordinator:
         return True
 
     async def _poll_status(self, episode_id: str, entry: Dict[str, Any]) -> bool:
-        """有界状态轮询；S1b 起每次先核对 SURF 租约（撤销即取消任务并收尾）。"""
+        """单次有界状态轮询；核对上下文与 SURF 租约，失效时释放本方 owner 并收尾。"""
         task_id = str(entry.get("task_id") or "")
+        if callable(self._automatic_guard) and not entry.get('forced_debug'):
+            if not self._automatic_guard(episode_id):
+                try:await self._api(action='cancel',task_id=task_id,owner=f'schedule:{episode_id}')
+                except Exception:pass
+                entry.update(stage='revoked_by_context',closed=True,closed_reason='revoked_by_context',detached=True)
+                self._release_surf(episode_id,entry)
+                return True
         # S1b（计划书 §4.2）：直接对话让位 CHAT → 租约版本失效 → 不冒充仍在观看
         if self._attention is not None and entry.get("lease"):
             try:
@@ -1170,8 +1354,7 @@ class VideoWatchCoordinator:
         try:
             receipt = await self._api(action="status", task_id=task_id)
         except Exception as exc:
-            entry["stage"] = "unavailable"
-            entry["reason"] = f"观看能力不可用：{str(exc)[:200]}"
+            entry['poll_error']='观看状态暂不可核验：'+type(exc).__name__
             return True
         if not receipt.get("success"):
             return False

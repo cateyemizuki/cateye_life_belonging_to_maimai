@@ -12,7 +12,7 @@
   core/internal_tuning.py 的默认值表不在本批文件边界内，新增 JSON 键会被其
   校验器丢弃，故按用户规格取「内部常量」路径）；文档落盘
   ``store_dir/video_interest.json``，热重载重建实例后读盘即沿用、不重询；
-- 候选先取公开 popular；无匹配时按偏好词做至多两次公开关键词搜索。
+- 候选先取公开 popular，并有界覆盖全部兴趣词的公开关键词搜索；按词短缓存。
   仅采用接口真实返回的 BV，空结果/接口拒绝如实降级，不编造视频；
 - 去重口径 = 已看历史 ∪ 文字缓存 ∪ 活跃任务（由装配根注入
   ``excluded_bvids`` 只读回调，= video_watch manager.excluded_bvids）；
@@ -20,7 +20,8 @@
   （话题 → persona_base + watch_score），真实观看（B1 observed/watched_video
   + 观后感确定性倾向）小步长渐变、饱和封顶（±50%×base）、半衰期衰减；
   单次偶然观看不重写人格（persona_base/LLM 关键词集合不受反馈改写）；
-  候选按最终权重排序并保留 ≥30% 排行榜探索槽；开关关闭 = 现状逐字。
+  候选按话题分层、结合渐变权重公平抽样，抑制近期同类连续占用；有真实候选时
+  保留公开热门探索槽。自主开关由协调器统一门控，不另设反馈开关。
 
 降级纪律（失败不编造）：
 - 兴趣询问失败/解析失败 → 有过期旧文档则沿用旧兴趣（标 stale_fallback，
@@ -37,6 +38,7 @@ import asyncio
 import json
 import html
 import logging
+import math
 import os
 import re
 import time
@@ -77,7 +79,7 @@ CANDIDATE_POOL_LIMIT = 10
 
 # ── PR-C2（2026-11-07 真实观看驱动的兴趣演变，计划书 §5 H7）────────────────
 # 红线：单次偶然观看不重写人格；喜好渐变、有饱和上限、保留探索。
-# 步长/饱和/探索占比为内部常量（规格 §2 只新增两个配置键：开关与半衰期）。
+# 步长/饱和/探索占比为内部常量；半衰期由 video_watch 配置，自主开关归协调器。
 #: 人设基线权重：LLM 问询所得每个关键词的隐式基础分（现状无数值权重，取 1.0；
 #: 观看反馈绝不改写 persona_base——只有 LLM 刷新能换关键词集合本身）
 PERSONA_BASE_WEIGHT = 1.0
@@ -91,7 +93,7 @@ WATCH_SCORE_CAP_RATIO = 0.5
 WATCH_HALF_LIFE_DAYS_DEFAULT = 7
 WATCH_HALF_LIFE_MIN = 1
 WATCH_HALF_LIFE_MAX = 30
-#: 候选池探索槽占比下限（规格 §1「如 ≥30%」；内部常量，排行榜热度序 = 既有探索路径）
+#: 有真实探索候选时预留的池内槽位比例；探索候选同样按话题分层并受质量/去重门约束
 EXPLORE_POOL_RATIO = 0.3
 #: evidence 层容量上限（话题数 / 已应用观看幂等键数，防文档失控）
 MAX_EVIDENCE_TERMS = 32
@@ -429,7 +431,7 @@ class VideoInterestService:
           不改写 persona_base、不动 LLM 关键词集合）；
         - 观后感确定性关键词判倾向：正向 +小步长 / 中性最小探索步长 / 负面降权；
           watch_score 饱和封顶 ±50%×persona_base；更新前先按半衰期衰减；
-        - 开关关闭/无兴趣文档/无证据来源 → 0（零写盘，现状逐字）。
+        - 无兴趣文档/无证据来源 → 0，不为缺失证据补造观看反馈。
         返回本次新应用的观看行数。失败只告警不抛（纯旁路，不拖挂观看主链路）。
         """
         if not True:
@@ -503,7 +505,7 @@ class VideoInterestService:
     def effective_weights(self, now: Optional[float] = None) -> Dict[str, float]:
         """最终权重 = persona_base + bounded(衰减后 watch_score)（每个现有关键词）。
 
-        开关关闭 → 全部等于基线（现状：等权，排序逐字不变）；无文档 → {}。
+        没有该词的真实观看证据时使用人设基线；无可用兴趣文档时返回 {}。
         """
         doc = self.load()
         if not doc:
@@ -552,8 +554,8 @@ class VideoInterestService:
         stale_fallback（询问失败，沿用过期旧文档）/ unavailable（从无可用文档）。
         """
         async with self._lock:
-            # PR-C2：先把新增的真实观看事实增量折算进证据层（幂等；开关关闭/
-            # 无证据来源零写盘），再读缓存——询问提示词与候选权重都用最新证据。
+            # 先把新增真实观看事实幂等折算进证据层；无证据来源不写新反馈。
+            # 再读缓存，询问提示词与候选权重使用同一份最新证据。
             self.apply_watch_feedback()
             cached = self.load()
             now = self._now()
@@ -642,12 +644,12 @@ class VideoInterestService:
 
 
 class BiliCandidateSource:
-    """兴趣 → 公开排行榜 → 关键词匹配 → 去重 → 有界候选池。
+    """兴趣 → 热门/全兴趣词搜索 → 质量与去重 → 话题分层候选池。
 
     用法（video_schedule 协调器驱动）：episode/gap 启动时先 ``await prepare()``
     （异步：兴趣检查 + 网络抓取），再经观看端口 ``next_candidate`` 同步
     ``pick()``（service.handle_action 对 next_candidate 是同步调用面）。
-    ``fetch_json`` 可注入（离线测试）；缺省用 httpx 异步抓取 popular。
+    ``fetch_json`` 可注入（离线测试）；缺省用 httpx 抓取热门与有界关键词搜索，逐词短缓存。
     """
 
     def __init__(self, interest: VideoInterestService, *,
@@ -655,7 +657,10 @@ class BiliCandidateSource:
                  logger: Any = None,
                  fetch_json: Optional[Callable[[str], Any]] = None,
                  now_provider: Optional[Callable[[], float]] = None,
-                 stat_gate_provider: Optional[Callable[[], Any]] = None) -> None:
+                 stat_gate_provider: Optional[Callable[[], Any]] = None,
+                 selection_path: Any = None, rng: Any = None) -> None:
+        from integrations.video_selection import TopicSampler
+        self._sampler=TopicSampler(selection_path,rng=rng)
         self._interest = interest
         self._excluded_bvids = excluded_bvids
         self._log = logger if logger is not None else logging.getLogger(__name__)
@@ -676,6 +681,8 @@ class BiliCandidateSource:
         self._search_available = False
         self._search_blocked_until = 0.0
         self._search_error = ""
+        self._search_errors = {}
+        self._queried_keywords = []
 
     def _now(self) -> float:
         try:
@@ -854,17 +861,22 @@ class BiliCandidateSource:
         return result
 
     async def _keyword_items(self, keywords: List[str], excluded: set[str]) -> List[Dict[str, Any]]:
-        """排行榜无匹配才检索至多两个偏好词；失败/空结果短缓存，无模型调用。"""
+        """覆盖全部有界兴趣词；失败/空结果短缓存，限流退避，不增加模型调用。"""
         fetch = self._fetch_json or self._default_fetch
         items = []
         self._search_available = False
         if self._now() < self._search_blocked_until:
             return items
         self._search_error = ""
-        for keyword in keywords[:2]:
+        self._search_errors={}
+        self._queried_keywords=[]
+        for keyword in self._sampler.search_order(keywords[:MAX_KEYWORDS]):
+            self._queried_keywords.append(keyword)
             cached = self._search_cache.get(keyword)
             if cached is not None and 0 <= self._now()-cached[0] < POPULAR_CACHE_SECONDS:
                 normalized = cached[1]
+                cached_error=cached[2] if len(cached)>2 else ""
+                if cached_error:self._search_errors[keyword]=cached_error;self._search_error=cached_error
             else:
                 url = SEARCH_API_URL + "?" + urlencode({"search_type":"video", "keyword":keyword, "page":1, "page_size":10})
                 try:
@@ -875,16 +887,15 @@ class BiliCandidateSource:
                     status = getattr(getattr(exc, "response", None), "status_code", None)
                     self._search_error = f"http_{status}" if status else type(exc).__name__
                     self._log.warning("视频关键词检索不可用：%s（HTTP %s）", type(exc).__name__, status or "unknown")
+                    self._search_errors[keyword]=self._search_error
                     normalized = None
                     if status in (412, 429):
                         self._search_blocked_until = self._now() + POPULAR_CACHE_SECONDS
-                self._search_cache[keyword] = (self._now(), normalized)
+                self._search_cache[keyword] = (self._now(), normalized,self._search_errors.get(keyword,""))
                 self._search_cache = dict(list(self._search_cache.items())[-16:])
             if normalized is not None:
                 self._search_available = True
                 items.extend(normalized)
-                if any(row["bvid"] not in excluded and MIN_CANDIDATE_DURATION_SECONDS <= row["duration_seconds"] <= MAX_CANDIDATE_DURATION_SECONDS for row in normalized):
-                    break  # 已有可用结果，不为凑满候选继续请求其他关键词。
             if self._now() < self._search_blocked_until:
                 break
         return items
@@ -911,8 +922,8 @@ class BiliCandidateSource:
         if not keywords:
             self._reason = "interest_unavailable"
             return self.snapshot()
-        # PR-C2：关键词按最终权重（persona_base + bounded watch_score）排序；
-        # 开关关闭 → 不读权重、排序/打分/池构成与旧版逐字一致。
+        # 渐变权重影响话题选择，不按该类别的视频数量放大概率。
+        # 搜索轮转覆盖全部有界兴趣词，不因首个高权重词有结果就停止。
         feedback_on = True
         weights = self._interest.effective_weights() if feedback_on else {}
         if feedback_on and weights:
@@ -927,81 +938,44 @@ class BiliCandidateSource:
                 self._log.warning("去重集合读取失败（保守不推荐）：%s", exc)
             self._reason = "dedup_unavailable"
             return self.snapshot()
-        matched: List[Dict[str, Any]] = []
-        seen: set = set()
-        eligible_count = 0
-        excluded_count = 0
-        for item in items:
-            duration = int(item.get("duration_seconds") or 0)
-            if not (MIN_CANDIDATE_DURATION_SECONDS <= duration <= MAX_CANDIDATE_DURATION_SECONDS):
+        # Search every bounded interest keyword, even when one popular category already matches.
+        # Failed or blocked searches remain visible; no fabricated categories fill the gaps.
+        search=await self._keyword_items(keywords,excluded)
+        matched=[];exploration=[];seen=set();eligible_count=excluded_count=interest_stat_rejected=0
+        for item in [*items,*search]:
+            bvid=item['bvid']
+            if bvid in seen:continue
+            seen.add(bvid)
+            duration=int(item.get('duration_seconds') or 0)
+            if not MIN_CANDIDATE_DURATION_SECONDS<=duration<=MAX_CANDIDATE_DURATION_SECONDS:continue
+            eligible_count+=1
+            if bvid in excluded:excluded_count+=1;continue
+            haystack=' '.join(str(item.get(key) or '') for key in ('title','tname','desc','uploader')).lower()
+            hits=[key for key in keywords if key in haystack]
+            retrieval=str(item.get('retrieval_keyword') or '')
+            if not self._passes_stat_gate(item):
+                if hits or retrieval in keywords:interest_stat_rejected+=1
                 continue
-            if item["bvid"] in seen:
-                continue
-            seen.add(item["bvid"])
-            eligible_count += 1
-            if item["bvid"] in excluded:
-                excluded_count += 1
-                continue
-            haystack = " ".join((item.get("title", ""), item.get("tname", ""),
-                                 item.get("desc", ""), item.get("uploader", ""))).lower()
-            hits = [k for k in keywords if k in haystack]
-            if not hits:
-                continue
-            score = (sum(weights.get(k, PERSONA_BASE_WEIGHT) for k in hits)
-                     if feedback_on else len(hits))
-            matched.append({**item, "matched_keywords": hits, "_score": score})
+            score=max([weights.get(key,PERSONA_BASE_WEIGHT) for key in hits]+[weights.get(retrieval,1.0) if retrieval else 0])
+            candidate={**item,'matched_keywords':hits,'_score':score}
+            is_interest=bool(hits or retrieval in keywords)
+            candidate=self._sampler.annotate(candidate,keywords,weights,explore=not is_interest)
+            (matched if is_interest else exploration).append(candidate)
         if not matched:
-            search_seen = set()
-            for item in await self._keyword_items(keywords, excluded):
-                bvid = item["bvid"]
-                if bvid in excluded or bvid in search_seen:
-                    continue
-                search_seen.add(bvid)
-                if not MIN_CANDIDATE_DURATION_SECONDS <= item["duration_seconds"] <= MAX_CANDIDATE_DURATION_SECONDS:
-                    continue
-                haystack = " ".join((item["title"],item["tname"],item["desc"],item["uploader"])).lower()
-                hits = [k for k in keywords if k in haystack]
-                # 搜索相关性来自接口检索词，不伪称标题包含该整句关键词。
-                search_score = ((sum(weights.get(k, PERSONA_BASE_WEIGHT) for k in hits) if hits else 1.0)
-                                if feedback_on else max(1, len(hits)))
-                matched.append({**item,"matched_keywords":hits,"_score":search_score})
-        if not matched:
-            # 如实区分：合格候选全被去重排除 vs 兴趣关键词无匹配（都不编造 BV）
-            self._reason = ("candidate_search_rate_limited" if self._search_error in ("http_412", "http_429") else "candidate_fetch_failed" if not popular_available and not self._search_available else "all_candidates_watched"
-                            if eligible_count > 0 and excluded_count == eligible_count
-                            else "interest_no_match")
+            self._pool=[]
+            self._reason=('candidate_search_rate_limited' if self._search_error in ('http_412','http_429') else
+                          'candidate_fetch_failed' if not popular_available and not self._search_available else
+                          'all_candidates_watched' if eligible_count and excluded_count==eligible_count else
+                          'candidate_below_stat_threshold' if interest_stat_rejected else 'interest_no_match')
             return self.snapshot()
-        # 3.17.37 视频自主观看批：主动侧数据门槛（[video_autonomous]）。在关键词
-        # 匹配之后、排序入池之前过滤——低热度候选不进池；全部被拒 → 如实 no_candidate。
-        # 只作用于本候选源（日程/空隙/调试自主选片），工具点播不经此路径。
-        matched = [c for c in matched if self._passes_stat_gate(c)]
-        if not matched:
-            self._reason = "candidate_below_stat_threshold"
-            return self.snapshot()
-        matched.sort(key=lambda c: (-c["_score"], -int(c.get("views") or 0)))
-        selected = matched[:CANDIDATE_POOL_LIMIT]
-        if feedback_on and len(matched) > CANDIDATE_POOL_LIMIT:
-            # PR-C2 探索槽：池超出上限时，≤70% 槽位给兴趣权重头部，其余 ≥30%
-            # 槽位按既有排行榜热度序补入（不被兴趣权重垄断，保留探索）；
-            # 候选不超上限时全部入池（与旧版一致，只是排序含权重）。
-            exploit_n = max(1, int(CANDIDATE_POOL_LIMIT * (1.0 - EXPLORE_POOL_RATIO)))
-            selected = matched[:exploit_n]
-            chosen_bvids = {c["bvid"] for c in selected}
-            for candidate in sorted(matched, key=lambda c: -int(c.get("views") or 0)):
-                if len(selected) >= CANDIDATE_POOL_LIMIT:
-                    break
-                if candidate["bvid"] not in chosen_bvids:
-                    selected.append(candidate)
-                    chosen_bvids.add(candidate["bvid"])
-            for candidate in matched:  # 热度序去重后仍不足再按权重序补齐
-                if len(selected) >= CANDIDATE_POOL_LIMIT:
-                    break
-                if candidate["bvid"] not in chosen_bvids:
-                    selected.append(candidate)
-                    chosen_bvids.add(candidate["bvid"])
-        self._pool = [{k: v for k, v in c.items() if k != "_score"}
-                      for c in selected]
-        self._reason = ""
+        exploration_slots=max(1,math.ceil(CANDIDATE_POOL_LIMIT*EXPLORE_POOL_RATIO)) if exploration else 0
+        selected=self._sampler.balanced_pool(matched,CANDIDATE_POOL_LIMIT-exploration_slots)
+        selected+=self._sampler.balanced_pool(exploration,exploration_slots)
+        chosen={row['bvid'] for row in selected}
+        if len(selected)<CANDIDATE_POOL_LIMIT:
+            selected+=self._sampler.balanced_pool([row for row in [*matched,*exploration] if row['bvid'] not in chosen],CANDIDATE_POOL_LIMIT-len(selected))
+        self._pool=[{key:value for key,value in row.items() if key!='_score'} for row in selected]
+        self._reason=''
         return self.snapshot()
 
     def pick(self) -> Dict[str, Any]:
@@ -1023,7 +997,8 @@ class BiliCandidateSource:
                 self._log.warning("挑选时去重集合读取失败（保守不推荐）：%s", exc)
             return {"success": True, "candidate": None, "reason": "dedup_unavailable"}
         while self._pool:
-            candidate = self._pool.pop(0)
+            try:candidate=self._sampler.choose(self._pool)
+            except OSError:return {"success":True,"candidate":None,"reason":"selection_persistence_failed"}
             if str(candidate.get("bvid") or "") in excluded:
                 continue
             if not self._passes_stat_gate(candidate):
@@ -1035,7 +1010,9 @@ class BiliCandidateSource:
     def snapshot(self) -> Dict[str, Any]:
         return {"prepared_at": self._prepared_at, "pool_size": len(self._pool),
                 "reason": self._reason, "interest_status": self._last_interest_status,
-                "search_error": self._search_error,
+                "search_error": self._search_error,"search_errors":dict(self._search_errors),
+                "queried_keywords":list(self._queried_keywords),
+                "topic_counts":{topic:sum(row.get("selection_topic")==topic for row in self._pool) for topic in {row.get("selection_topic") for row in self._pool}},
                 "keywords": list((self._interest.load() or {}).get("keywords") or [])}
 
 

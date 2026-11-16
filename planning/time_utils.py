@@ -7,8 +7,8 @@ utils/energy_model.py（照搬合并；C1 裁决以本侧能量曲线为唯一�
     - 旧格式: [hour, hour]，hour 取 0-23
     - 新格式: [minutes, minutes]，minutes 取 0-1440（跨夜时 end 可 > 1440）
 
-分层约定：core/time_utils.py 只保留纯时间函数（parse_hhmm / minutes_of_now /
-hours_between）；planning 侧的时间/窗口/能量函数集中在本模块。
+分层约定：纯时间与 DST 墙钟/真实秒函数统一归 core/time_utils.py；
+本模块重导出原公共名称，保留规划侧时区管理、窗口与能量函数。
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import logging
 from datetime import datetime, timedelta, tzinfo
 from typing import Any, List, Optional, Tuple, Union
 
-from core.time_utils import parse_hhmm
+from core.time_utils import parse_hhmm, wall_time, elapsed_seconds, shift_elapsed
 
 logger = logging.getLogger(__name__)
 
@@ -71,40 +71,6 @@ class TimezoneManager:
             return value.astimezone(self._tz)
         localized = wall_time(value.date(), value.hour * 60 + value.minute, self._tz)
         return localized.replace(second=value.second, microsecond=value.microsecond)
-
-
-def wall_time(day: Any, minutes: int, tz: Any) -> datetime:
-    """按当地日历重建锚点；DST 缺口向后归一，重复钟点取首次。"""
-    wall = datetime(day.year, day.month, day.day) + timedelta(minutes=int(minutes))
-    if tz is None:
-        return wall
-    localize = getattr(tz, "localize", None)
-    if callable(localize):
-        # TimezoneManager 的 pytz 降级也保持与 zoneinfo 相同的缺口/重复钟点策略。
-        from pytz import AmbiguousTimeError, NonExistentTimeError
-        try:
-            aware = localize(wall, is_dst=None)
-        except AmbiguousTimeError:
-            aware = min((localize(wall, is_dst=True), localize(wall, is_dst=False)),
-                        key=lambda dt: dt.timestamp())
-        except NonExistentTimeError:
-            aware = localize(wall, is_dst=False)
-    else:
-        aware = wall.replace(tzinfo=tz)
-    return datetime.fromtimestamp(aware.timestamp(), tz)
-
-
-def elapsed_seconds(later: datetime, earlier: datetime) -> float:
-    """aware 时间按真实秒比较，避免同 tzinfo 的减法忽略 DST/fold。"""
-    if later.tzinfo is not None and earlier.tzinfo is not None:
-        return later.timestamp() - earlier.timestamp()
-    return (later - earlier).total_seconds()
-
-
-def shift_elapsed(value: datetime, seconds: float) -> datetime:
-    if value.tzinfo is not None:
-        return datetime.fromtimestamp(value.timestamp() + seconds, value.tzinfo)
-    return value + timedelta(seconds=seconds)
 
 
 def tzinfo_of(timezone_str: str) -> Optional[tzinfo]:

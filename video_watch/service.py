@@ -2,8 +2,9 @@
 
 职责：装配 :class:`video_watch.manager.WatchTaskManager`（一条观看流水线）、
 对 AI 工具 ``watch_bili_video`` 与 integrations/video_schedule 日程编排提供
-同一动作面（core.contracts.VideoWatchPort）、在结果落缓存前完成父侧加工
-（画面摘要 vlm 调用 + 文本观后感，均经注入的宿主 LLM 面，只记实际 usage）。
+同一动作面（core.contracts.VideoWatchPort）。worker 完成后先存去帧快照，再做父侧
+画面摘要与文本观后感并回填；均经注入的宿主 LLM 面，只记实际 usage。
+加载与维护还会异步补齐旧观看元信息，仅读公开 API，不重看、不调用 VLM。
 
 边界（B 计划 §1/§5 逐条）：
 - 看视频与发消息分离：观看完成**绝不**自动向任何群/私聊发送消息；
@@ -84,6 +85,9 @@ class VideoWatchService:
         # 空间启用时给绝对 asset_dir；None/空 = worker 零开销，不提取）
         self._qzone_assets_provider = qzone_assets_provider
         self._manager: Optional[WatchTaskManager] = None
+        self._metadata_task=None
+        from .metadata import MetadataBackfill
+        self._metadata_backfill=MetadataBackfill(self._data_dir/"metadata_backfill.json")
 
     # ---- 生命周期（on_load / on_unload 各一次；热重载 = 全量重载重建实例）----
     def start(self) -> Optional[WatchTaskManager]:
@@ -127,7 +131,21 @@ class VideoWatchService:
             self._logger.info("视频观看模块已加载（队列=%d，任务时限=%ds）",
                               self._int_of("queue_capacity", 3),
                               self._int_of("task_deadline_seconds", 900))
+        self.kick_metadata_backfill()
         return self._manager
+
+    def kick_metadata_backfill(self):
+        if self._manager is None:return
+        from .metadata import needs_metadata
+        if not any(needs_metadata(row) for row in self._manager._store.load_history() if row.get("status")=="completed"):return
+        if self._metadata_task is not None and not self._metadata_task.done():return
+        async def fill():
+            try:await self._metadata_backfill.run_batch(self._manager._store)
+            except asyncio.CancelledError:raise
+            except Exception as exc:
+                if self._logger:self._logger.warning('视频元信息补录失败，保留现有记录：%s',type(exc).__name__)
+        try:self._metadata_task=asyncio.get_running_loop().create_task(fill())
+        except RuntimeError:return
 
     async def stop(self) -> None:
         """停机（S0 生命周期修复）：真正取消任务泵并终止在跑 worker——不只是丢引用。
@@ -135,6 +153,10 @@ class VideoWatchService:
         卸载/热重载后不再有本模块的泵轮询或父侧模型调用；队列/进行中任务保留
         台账，下次装配 ``_recover()`` 如实标记 ``interrupted_by_restart``。
         """
+        if self._metadata_task is not None and not self._metadata_task.done():
+            self._metadata_task.cancel()
+            try:await self._metadata_task
+            except asyncio.CancelledError:pass
         manager = self._manager
         self._manager = None
         if manager is not None:
@@ -284,7 +306,7 @@ class VideoWatchService:
             visual["fallback_text"] = str(llm_result.text)
             visual["template_name"] = llm_result.template_name
             visual["summary_source"] = "template_unavailable"
-        ok = getattr(llm_result, "ok", False)
+        ok = getattr(llm_result,"ok",False) and not getattr(llm_result,"used_template",False)
         if ok:
             visual["summary"] = str(getattr(llm_result, "text", "") or "")
             visual["understanding_status"] = "completed" if visual["summary"].strip() else "failed"
@@ -439,7 +461,7 @@ class VideoWatchService:
             result["impression_fallback"] = str(llm_result.text)
             result["impression_source"] = "template_unavailable"
             result["impression_template"] = llm_result.template_name
-        if getattr(llm_result, "ok", False):
+        if getattr(llm_result,"ok",False) and not getattr(llm_result,"used_template",False):
             result["impression"] = str(getattr(llm_result, "text", "") or "")
             result["impression_task"] = task_name or "utils"
             result["impression_mode"] = mode
@@ -451,6 +473,7 @@ class VideoWatchService:
 
     # ---- 内部 ----
     async def maintain_cache(self) -> None:
+        self.kick_metadata_backfill()
         import time
         now = time.monotonic()
         if now < getattr(self, "_next_cache_cleanup", 0) or self._manager is None:
@@ -504,7 +527,9 @@ class VideoWatchService:
                 finished_at = float(finished_at) if finished_at is not None else None
             except (TypeError, ValueError):
                 finished_at = None
+            from .metadata import presentation
             out.append({
+                **presentation(row),
                 "bvid": bvid,
                 "title": video.get("title") or row.get("title"),
                 # 展示/筛选口径：观看时间取任务发起（入队/受理）时刻。
