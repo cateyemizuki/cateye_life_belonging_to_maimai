@@ -41,11 +41,9 @@ function lbmResetShared(){
  }catch(e){}
  /* C 的「数据来源」去重用内联 display:none 隐藏通用行；A 用 va-meta-dupe 类 */
  try{for(const row of document.querySelectorAll('.fish-meta-row')){row.style.display='';row.classList.remove('va-meta-dupe')}}catch(e){}
- /* C 的 S2 会在娱乐 tab 隐藏 datebar；按 panel.js activateTab 同口径还原 */
+ /* 两版主题都沿用面板页头：娱乐替换右侧控件，日期状态保留。 */
  try{
-  const tab=document.querySelector('[role=tab][aria-selected="true"]');
-  const key=tab?tab.dataset.tab:'now';
-  const db=$('datebar');if(db)db.hidden=key==='now'||key==='system'||key==='core';
+  syncPageHeader();
  }catch(e){}
  /* 皮肤补的 title 全文 */
  try{for(const id of['core-registry-path','notice']){const n=$(id);if(n)n.removeAttribute('title')}}catch(e){}
@@ -177,11 +175,10 @@ const lbmC=(()=>{
    if(u!==t)spans[i].textContent=u;
   }
  }
- /* S2 娱乐 tab 的 datebar 无效 → 选中娱乐时隐藏 */
+ /* 共用页头由面板控制；娱乐保留标题并替换右侧日期控件。 */
  function syncDatebar(){
   if(!lbmActive('c'))return;
-  const mood=$('tab-mood'),db=$('datebar');
-  if(mood&&db&&mood.getAttribute('aria-selected')==='true')db.hidden=true;
+  syncPageHeader();
  }
  function dedupeMeta(){
   if(!lbmActive('c'))return;

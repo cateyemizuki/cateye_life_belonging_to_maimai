@@ -10,11 +10,14 @@ class LifeDashboardComponentsMixin:
                              usage_rows_offset: int = 0,
                              usage_rows_level: str = "",
                              usage_rows_module: str = "",
-                             day: str = "") -> dict:
+                             day: str = "", video_recent_limit: int = 9,
+                             post_recent_limit: int = 9) -> dict:
         """``day``（可选，YYYY-MM-DD）：非空 → 结果附加 day 键（单日足迹/意图/睡眠/序列）；
         空串/非法 → 与既有 hours 路径逐字一致（非法值按空串处理并带 warning 字段）。"""
         return build_life_dashboard(self, hours=hours, usage_hours=usage_hours,
                                     usage_rows_limit=usage_rows_limit,
                                     usage_rows_offset=usage_rows_offset,
                                     usage_rows_level=usage_rows_level,
-                                    usage_rows_module=usage_rows_module, day=day)
+                                    usage_rows_module=usage_rows_module, day=day,
+                                    video_recent_limit=video_recent_limit,
+                                    post_recent_limit=post_recent_limit)

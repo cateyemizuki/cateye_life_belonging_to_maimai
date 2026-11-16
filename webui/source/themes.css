@@ -197,7 +197,7 @@ html[data-lbm-theme=a] body.fish-locked .maimai-bear{opacity:.4;transition:opaci
   html[data-lbm-theme=a] .datebar strong{font-size:12px;margin-top:0}
   html[data-lbm-theme=a] .date-controls button{min-height:36px;padding:5px 9px;font-size:11.5px}
   html[data-lbm-theme=a] .date-controls input{min-height:36px}
-  html[data-lbm-theme=a] .panel-body:has(#panel-mood:not([hidden]))>#datebar{display:none}
+
   html[data-lbm-theme=a] .schedule-pager{margin-bottom:10px}
   html[data-lbm-theme=a] .core-path{font-size:10px}
   html[data-lbm-theme=a] footer{font-size:10.5px;margin-top:12px}

@@ -11,7 +11,7 @@ import time
 from urllib.parse import urlsplit,urlunsplit
 
 BV=re.compile(r'^BV[A-Za-z0-9]{10}$')
-METRICS=('likes','coins','favorites')
+METRICS=('likes','coins','favorites','views')
 
 
 def count(value):
@@ -39,7 +39,7 @@ def metadata_snapshot(data,*,provenance='watch_snapshot',captured_at=None):
     supplied=data.get('metrics') if isinstance(data.get('metrics'),dict) else {}
     return {'title':str(data.get('title') or '').strip()[:400],
             'cover':safe_cover(data.get('cover') or data.get('pic')),
-            'metrics':{name:count(supplied.get(name,stat.get(key))) for name,key in (('likes','like'),('coins','coin'),('favorites','favorite'))},
+            'metrics':{name:count(supplied.get(name,stat.get(key))) for name,key in (('likes','like'),('coins','coin'),('favorites','favorite'),('views','view'))},
             'metrics_captured_at':captured_at or datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'metrics_provenance':provenance}
 
@@ -48,6 +48,14 @@ def presentation(row):
     video=row.get('video') if isinstance(row.get('video'),dict) else {}
     visual=row.get('visual') if isinstance(row.get('visual'),dict) else {}
     metrics=row.get('metrics') if isinstance(row.get('metrics'),dict) else video.get('metrics') if isinstance(video.get('metrics'),dict) else {}
+    captured=row.get('metrics_captured_at') or video.get('metrics_captured_at')
+    provenance=str(row.get('metrics_provenance') or video.get('metrics_provenance') or 'unrecorded')
+    sources=row.get('metrics_field_provenance') if isinstance(row.get('metrics_field_provenance'),dict) else video.get('metrics_field_provenance')
+    sources=sources if isinstance(sources,dict) else {}
+    times=row.get('metrics_field_captured_at') if isinstance(row.get('metrics_field_captured_at'),dict) else video.get('metrics_field_captured_at')
+    times=times if isinstance(times,dict) else {}
+    field_sources={name:str(sources.get(name) or provenance) for name in METRICS if count(metrics.get(name)) is not None}
+    field_times={name:times.get(name,captured if field_sources[name]==provenance else None) for name in field_sources}
     return {'title':str(video.get('title') or row.get('title') or '').strip()[:400],
             'cover':safe_cover(row.get('cover') or video.get('cover') or video.get('pic')),
             'impression':None if row.get('impression_source')=='template_unavailable' else str(row.get('impression') or '').strip()[:2000] or None,
@@ -55,8 +63,8 @@ def presentation(row):
                 'understood_content' if row.get('impression') and (visual.get('understanding_status')=='completed' or len(str(row.get('subtitle_text') or ''))>=40) else
                 'metadata_only' if row.get('impression') else 'unavailable',
             'metrics':{name:count(metrics.get(name)) for name in METRICS},
-            'metrics_captured_at':row.get('metrics_captured_at') or video.get('metrics_captured_at'),
-            'metrics_provenance':str(row.get('metrics_provenance') or video.get('metrics_provenance') or 'unrecorded')}
+            'metrics_captured_at':captured,'metrics_provenance':provenance,
+            'metrics_field_provenance':field_sources,'metrics_field_captured_at':field_times}
 
 
 def merge_missing(row,snapshot):
@@ -74,10 +82,17 @@ def merge_missing(row,snapshot):
     if added:
         out['metrics']=values
         provenance=str(snapshot.get('metrics_provenance') or 'unrecorded')
-        out['metrics_field_provenance']={**{name:original['metrics_provenance'] for name in METRICS if original['metrics'][name] is not None},
-                                          **{name:provenance for name in added}}
-        out['metrics_captured_at']=snapshot.get('metrics_captured_at')
-        out['metrics_provenance']=provenance
+        source_fields=snapshot.get('metrics_field_provenance') if isinstance(snapshot.get('metrics_field_provenance'),dict) else {}
+        time_fields=snapshot.get('metrics_field_captured_at') if isinstance(snapshot.get('metrics_field_captured_at'),dict) else {}
+        out['metrics_field_provenance']={**original['metrics_field_provenance'],
+            **{name:str(source_fields.get(name) or provenance) for name in added}}
+        out['metrics_field_captured_at']={**original['metrics_field_captured_at'],
+            **{name:time_fields.get(name,snapshot.get('metrics_captured_at')) for name in added}}
+        # Extending an existing three-metric snapshot with views must not redate its real values.
+        views_only=set(added)=={'views'} and all(original['metrics'][name] is not None for name in ('likes','coins','favorites'))
+        if not views_only:
+            out['metrics_captured_at']=snapshot.get('metrics_captured_at')
+            out['metrics_provenance']=provenance
         changed=True
     return out,changed
 

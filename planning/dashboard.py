@@ -32,16 +32,30 @@ def _number(value: Any) -> float | None:
     return None
 
 
+MEDIA_METRICS = ('views', 'likes', 'coins', 'favorites')
+
+
+def _media_limit(value: Any) -> int:
+    return max(1, min(18, value)) if type(value) is int else 9
+
+
+def _media_capture_time(value: Any) -> float | str | None:
+    captured = _number(value)
+    if captured is None and isinstance(value, str):
+        try:
+            datetime.fromisoformat(value)
+            captured = value[:80]
+        except ValueError:
+            pass
+    return captured
+
+
 def _video_recent_row(row: dict) -> dict:
     metrics = row.get('metrics')
     metrics = metrics if isinstance(metrics, dict) else {}
-    captured = _number(row.get('metrics_captured_at'))
-    if captured is None and isinstance(raw_time := row.get('metrics_captured_at'), str):
-        try:
-            datetime.fromisoformat(raw_time)
-            captured = raw_time[:80]
-        except ValueError:
-            pass
+    captured = _media_capture_time(row.get('metrics_captured_at'))
+    sources = row.get('metrics_field_provenance') if isinstance(row.get('metrics_field_provenance'), dict) else {}
+    times = row.get('metrics_field_captured_at') if isinstance(row.get('metrics_field_captured_at'), dict) else {}
     return {'bvid': str(row.get('bvid') or '')[:20],
             'title': str(row.get('title') or '')[:500],
             'watched_at': _number(row.get('watched_at')),
@@ -52,9 +66,11 @@ def _video_recent_row(row: dict) -> dict:
             'impression_provenance': str(row.get('impression_provenance') or '')[:40],
             'understanding_status': str(row.get('understanding_status') or '')[:40],
             'metrics': {key: value if type(value := metrics.get(key)) is int and value >= 0 else None
-                        for key in ('likes', 'coins', 'favorites')},
+                        for key in MEDIA_METRICS},
             'metrics_captured_at': captured,
-            'metrics_provenance': str(row.get('metrics_provenance') or '')[:40]}
+            'metrics_provenance': str(row.get('metrics_provenance') or '')[:40],
+            'metrics_field_provenance': {key: str(sources[key])[:40] for key in MEDIA_METRICS if isinstance(sources.get(key), str)},
+            'metrics_field_captured_at': {key: _media_capture_time(times[key]) for key in MEDIA_METRICS if key in times}}
 
 
 def _row(row: Any) -> dict[str, Any]:
@@ -847,7 +863,8 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
                          usage_rows_limit: int = 0,
                          usage_rows_offset: int = 0,
                          usage_rows_level: str = '', usage_rows_module: str = '',
-                         now: datetime | None = None, day: str = "") -> dict[str, Any]:
+                         now: datetime | None = None, day: str = "",
+                         video_recent_limit: int = 9, post_recent_limit: int = 9) -> dict[str, Any]:
     """只读生活面板投影。
 
     ``day``（可选，``YYYY-MM-DD``）：非空 → 结果附加 ``day`` 键（单日投影，
@@ -975,7 +992,8 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
             'window_start', 'window_end', 'earliest_wake', 'latest_wake', 'phase_minutes',
             'onset_reason', 'decision', 'nap_reason', 'interruption') if key in dynamic_sleep}
     result.update(_extension_summary(plugin, now, hours, usage_hours,
-                                     usage_rows_limit, usage_rows_offset,usage_rows_level,usage_rows_module))
+                                     usage_rows_limit, usage_rows_offset,usage_rows_level,usage_rows_module,
+                                     _media_limit(video_recent_limit), _media_limit(post_recent_limit)))
     if future_state:
         result['warnings'].append('状态时间晚于当前时钟，请核对服务器时间')
     if history.get('clock_regressed'):
@@ -1049,6 +1067,8 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
                 if len(rows) > 8:
                     pools[k] = rows[:max(8, len(rows)//2)]
             pools['pools_truncated'] = True
+        elif _reduce_media_history(result):
+            pass
         else:
             # Independent projections must never trap the read handler in a size loop.
             result.update(emotion={'available': False, 'reason': 'payload_limit'},
@@ -1062,7 +1082,29 @@ def build_life_dashboard(plugin: Any, *, hours: int = 24,
     return result
 
 
-def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]]:
+def _reduce_media_history(result: dict) -> bool:
+    """Keep full text in returned cards; trim oldest records to respect the host envelope."""
+    qzone = result.get('qzone') or {}
+    video = result.get('video') or {}
+    posts = qzone.get('posts') or []
+    clips = video.get('recent') or []
+    candidates = [(len(json.dumps(rows[-1],ensure_ascii=False)),kind,rows)
+                  for kind,rows in (('post',posts),('video',clips)) if isinstance(rows,list) and len(rows)>1]
+    if not candidates:
+        return False
+    _,kind,rows = max(candidates,key=lambda entry:entry[0])
+    rows.pop()
+    if kind=='post':
+        qzone['recent_posts'] = posts[:5]
+        qzone['posts_truncated'] = True
+        qzone['posts_returned'] = len(posts)
+    else:
+        video['recent_truncated'] = True
+        video['recent_returned'] = len(clips)
+    return True
+
+
+def _qzone_recent_posts(service: Any, ctx: PluginContext, limit: int = 5) -> list[dict[str, Any]]:
     """PR-FIXED-CHROME（3.17.15）：空间「最近动态」只读投影（≤5 条已确认发送）。
 
     数据源 ``PublishLedger.recent_sent(5)``（status=sent 按 created_at 降序，content
@@ -1076,7 +1118,8 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]
         if ledger is None or not hasattr(ledger, 'recent_sent'):
             return []
         getter = getattr(service, 'recent_posts', None)
-        rows = getter(5) if callable(getter) else ledger.recent_sent(5)
+        limit = _media_limit(limit)
+        rows = getter(limit) if callable(getter) else ledger.recent_sent(limit)
         if not isinstance(rows, list):
             return []
     except Exception:
@@ -1092,7 +1135,7 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext) -> list[dict[str, Any]
     except Exception:
         video_tids = set()
     out: list[dict[str, Any]] = []
-    for row in rows[:5]:
+    for row in rows[:limit]:
         if not isinstance(row, dict):
             continue
         tid = str(row.get('tid') or '')
@@ -1320,7 +1363,8 @@ def _init_summary(plugin: Any, now: datetime) -> dict[str, Any]:
 def _extension_summary(plugin: Any, now: datetime, hours: int,
                        usage_hours: int = 720, usage_rows_limit: int = 0,
                        usage_rows_offset: int = 0, usage_rows_level: str = '',
-                       usage_rows_module: str = '') -> dict[str, Any]:
+                       usage_rows_module: str = '', video_recent_limit: int = 9,
+                       post_recent_limit: int = 9) -> dict[str, Any]:
     """Independent module projections; never propagate raw event descriptions/logs."""
     result: dict[str, Any] = {'emotion': {'available': False}, 'qzone': {'available': False},
                               'qzone_video': {'available': False}, 'usage': {}, 'health': {},
@@ -1356,8 +1400,10 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
                                  'cookie_health', 'delivery', 'last_post_at', 'cooldown_minutes')}}
             # PR-FIXED-CHROME（3.17.15）：娱乐面板「最近动态」只读投影（≤5 条已确认
             # 发送）。独立 try 降级——recent_posts 读取失败不影响 qzone 头部额度芯片。
-            result['qzone']['recent_posts'] = _qzone_recent_posts(service, ctx)
-            result['qzone']['posts'] = result['qzone']['recent_posts']
+            result['qzone']['posts'] = _qzone_recent_posts(service, ctx, _media_limit(post_recent_limit))
+            result['qzone']['recent_posts'] = result['qzone']['posts'][:5]
+            result['qzone']['posts_limit'] = _media_limit(post_recent_limit)
+            result['qzone']['posts_returned'] = len(result['qzone']['posts'])
     except Exception:
         result['qzone'] = {'available': False, 'reason': 'projection_unavailable'}
     # PR-D1（H10）：空间视频候选/资产/回执计数投影（只读；系统板块计数芯片数据源）。
@@ -1398,8 +1444,11 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
     try:
         watch = getattr(plugin, '_video_watch', None)
         if watch is not None:
-            rows = watch.recent_videos(10)
-            video['recent'] = [_video_recent_row(row) for row in (rows or [])[:10] if isinstance(row, dict)]
+            limit = _media_limit(video_recent_limit)
+            rows = watch.recent_videos(limit)
+            video['recent'] = [_video_recent_row(row) for row in (rows or [])[:limit] if isinstance(row, dict)]
+            video['recent_limit'] = limit
+            video['recent_returned'] = len(video['recent'])
             recent_ok = True
     except Exception:
         video['recent'] = []
