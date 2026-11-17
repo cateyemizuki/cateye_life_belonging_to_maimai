@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-from core.targeting import admin_users_of
 from datetime import datetime
 from typing import Any, ClassVar, Dict
 
@@ -111,7 +110,7 @@ class QzoneComponentsMixin:
         del text
         args = str((kwargs.get("matched_groups") or {}).get("life_args") or "").strip()
         sub, *rest = args.split(maxsplit=1) if args else ("", "")
-        admin = self._qz_is_admin(str(user_id), bool(is_local_operator))
+        admin = self._qz_is_admin(str(user_id), bool(is_local_operator), platform=str(kwargs.get("platform") or ""))
         if sub in ("help", ""):
             reply = self._qz_help_text()
         elif sub == "status":
@@ -147,17 +146,16 @@ class QzoneComponentsMixin:
             user_id=str(kwargs.get("user_id", "") or ""),
             is_local_operator=bool(kwargs.get("is_local_operator", False)),
             matched_groups={"life_args": life_args},
+            platform=str(kwargs.get("platform") or ""),
         )
 
     # ------------------------------------------------------------
     # 私有助手
     # ------------------------------------------------------------
-    def _qz_is_admin(self, user_id: str, is_local_operator: bool) -> bool:
-        if is_local_operator:
-            return True
-        admins = {str(a).rsplit(":", 1)[-1] for a in admin_users_of(self.config)}
-        # 默认拒绝：未配置管理员时 QQ 侧一律拒绝（本机控制台仍可用）
-        return bool(admins) and str(user_id).rsplit(":", 1)[-1] in admins
+    def _qz_is_admin(self, user_id: str, is_local_operator: bool, *, platform: str = "") -> bool:
+        from core.targeting import command_admin
+        return command_admin(self.config, platform=platform, user_id=user_id,
+                             is_local_operator=is_local_operator)
 
     def _qz_help_text(self) -> str:
         return (
