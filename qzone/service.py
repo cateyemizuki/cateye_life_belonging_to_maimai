@@ -383,23 +383,10 @@ class QzoneService:
             old = self._publish_ledger.rows.get(preview["key"], {})
             if old.get("status") == "sent" and time.time() - float(old.get("updated_at", 0)) < 86400:
                 return dict(old.get("result") or {}) or None
-            if dispatch_allowed is not None and not dispatch_allowed():
+            if not self._dispatch_gate(datetime.now(), enforce_daily_limit=enforce_daily_limit,
+                                       recheck_gates=recheck_gates, dispatch_allowed=dispatch_allowed):
                 self._send_ambiguous = False
                 return None
-            if enforce_daily_limit or recheck_gates:
-                cfg = self._qzone_cfg()
-                if not bool(getattr(cfg, "enabled", True)) or not self._time_gates(datetime.now())[0]:
-                    self._send_ambiguous = False
-                    return None
-            if enforce_daily_limit:
-                # PR-A3：锁内复检共享额度（分发串行点），并发触发器不抢额度、不超额。
-                cfg = self._qzone_cfg()
-                limit = int(getattr(cfg, "daily_max_posts", 0) or 0)
-                if limit <= 0 or self.posts_today() >= limit:
-                    self._send_ambiguous = False
-                    self._log("skip", trigger_type="qzone_post",
-                              reason="共享每日额度已用尽（发布锁内复检，确定未发）")
-                    return None
             allowed, receipt = self._publish_ledger.begin(preview)
             if not allowed:
                 if receipt.get("status") == "sent":
@@ -678,55 +665,13 @@ class QzoneService:
         LLM 严判把关；夜间睡觉条目天然落在静默窗内，白天午睡由午休静默/LLM 闸承接。
         """
         cfg = self._qzone_cfg()
-        # 闸 0a：睡眠引擎判定仍在睡（晚醒真实状态）→ 不发；日程端点在醒来时写回真实醒点，
-        # 晚醒区间内窗口还写着旧 07:00 锚点，只看窗口会提前发帖（PR3 复核 2026-10-27）。
-        try:
-            gate = _companion_gate_of(self._plugin) or _PatrolGateShim(self._plugin)
-            if gate.sleep_engine_asleep(now):
-                self._record_decision("skip", gate="silence", reason="睡眠引擎判定仍在睡")
-                return False
-        except Exception:
-            pass
-        # 闸 0：静默时段（2026-10-20 起恒复用 [schedule] 作息，与陪伴静默同一真源；
-        # _tick 外层已有同口径早退，此处保证链自足可单测）
-        silence_start, silence_end = _sleep_silence_window(self._plugin)
-        if is_in_time_window(silence_start, silence_end,
-                             now.strftime("%H:%M"), invalid_result=True):
-            self._record_decision("skip", gate="silence", reason="静默时段（跟随日程作息）")
-            return False
-        # 闸 1：无活动 → 不发（最保守兜底；activity_type 维度拦截已按 2026-10-20 指示移除）
         activity = self._schedule.find_current_activity(date, now, include_sleep=True)
-        if activity is None and getattr(cfg, "require_activity", True):
-            # PR8 3.0.0（规则 6）：find_current_activity runtime-only——日程关断（
-            # [schedule].enabled=false）时 skip 理由如实「日程未启用」，不冒充「无活动」。
-            reason = ("日程未启用（[schedule].enabled=false）" if not self._schedule_enabled()
-                      else "当前无日程活动（含睡眠）")
-            self._record_decision("skip", gate="no_activity", reason=reason)
-            return False
-        # 闸 2：午休静默（2026-10-20 用户指示：nap_quiet_enabled 由陪伴巡检扩展到空间——
-        # 午休/小睡条目中不发说说、不监听评论；判定与 companion.patrol 同源——D3 起经
-        # 组合根公共门面，不导入 companion）
-        if self._actual_nap(now):
-            self._record_decision('skip', gate='nap_quiet', reason='实际午休/小睡中，空间静默')
+        if not self._time_gates(now, activity=activity, require_activity=getattr(cfg, "require_activity", True))[0]:
             return False
         activity = activity or {}
         activity_name = str(activity.get("name") or activity.get("description") or "自由活动")
-        # 闸 3：冷却（锚点只在发送成功后更新；失败不重置）
-        remain_minutes = self._cooldown_remain_minutes(now)
-        if remain_minutes > 0:
-            self._record_decision("skip", gate="cooldown",
-                                  reason=f"冷却中（剩余约 {remain_minutes} 分钟）")
+        if not (await self._judge_post_gate(activity, now))[0]:
             return False
-        # 闸 4：LLM 严判（可关；只认回复首字符「是/否」，格式异常一律按否）
-        if bool(getattr(cfg, "post_llm_gate_enabled", True)):
-            allowed, reason, answer = await self._llm_post_gate(activity, now)
-            if not allowed:
-                self._record_decision("skip", gate="llm",
-                                      reason=f"LLM 严判不发（{reason or '未说明'}）",
-                                      llm_answer=answer)
-                return False
-            self._record_decision("pass", gate="llm",
-                                  reason=f"LLM 严判通过（{reason or '未说明'}）", llm_answer=answer)
         # 闸 5：可选掷骰（LLM 通过后的概率上限，防误判刷屏；1.0 = 不掷骰）
         max_chance = self._clamp_float(getattr(cfg, "post_max_chance", 1.0), 1.0, 0.0, 1.0)
         if max_chance < 1.0 and random.random() > max_chance:
@@ -753,49 +698,58 @@ class QzoneService:
         allowed, reason = self._time_gates(now)
         if not allowed:
             return False, reason
-        # LLM 严判（可关；与判定链闸 4 同口径，调用异常保守按不发）
-        cfg = self._qzone_cfg()
-        if bool(getattr(cfg, "post_llm_gate_enabled", True)):
-            try:
-                activity = self._schedule.find_current_activity(today, now)
-            except Exception:
-                activity = None
-            allowed, llm_reason, answer = await self._llm_post_gate(activity, now)
-            if not allowed:
-                reason = f"LLM 严判不发（{llm_reason or '未说明'}）"
-                self._record_decision("skip", gate="llm", reason=reason, llm_answer=answer)
-                return False, reason
-            self._record_decision("pass", gate="llm",
-                                  reason=f"LLM 严判通过（{llm_reason or '未说明'}）", llm_answer=answer)
-        return True, ""
-
-    def _time_gates(self, now: datetime) -> Tuple[bool, str]:
-        """Check local live facts at dispatch without repeating the model decision."""
         try:
-            if self._companion_gate().sleep_engine_asleep(now):
-                reason = "睡眠引擎判定仍在睡"
-                self._record_decision("skip", gate="silence", reason=reason)
-                return False, reason
+            activity = self._schedule.find_current_activity(today, now)
         except Exception:
-            pass
-        # 闸 0：静默窗（恒复用 [schedule] 作息，与陪伴静默同一真源）
-        silence_start, silence_end = _sleep_silence_window(self._plugin)
-        if is_in_time_window(silence_start, silence_end,
-                             now.strftime("%H:%M"), invalid_result=True):
-            reason = "静默时段（跟随日程作息，整夜不发说说）"
-            self._record_decision("skip", gate="silence", reason=reason)
-            return False, reason
-        # 午休静默（与 _tick 同口径：条目命中 + 意图行时间窗提前静默）
-        if self._actual_nap(now):
-            self._record_decision('skip', gate='nap_quiet', reason='实际午休/小睡中，空间静默')
-            return False, "实际午休/小睡中"
-        # 冷却（锚点只在发送成功后更新；与判定链闸 3 同口径）
-        remain_minutes = self._cooldown_remain_minutes(now)
-        if remain_minutes > 0:
-            reason = f"冷却中（剩余约 {remain_minutes} 分钟）"
-            self._record_decision("skip", gate="cooldown", reason=reason)
-            return False, reason
-        return True, ""
+            activity = None
+        return await self._judge_post_gate(activity, now)
+
+    def _time_gates(self, now: datetime, *, activity: Any = None,
+                    require_activity: bool = False) -> Tuple[bool, str]:
+        """Collect local facts once; the pure policy owns the ordering and reasons."""
+        from .decision import post_rule_rejection
+        try:
+            asleep = bool(self._companion_gate().sleep_engine_asleep(now))
+        except Exception:
+            asleep = False
+        start, end = _sleep_silence_window(self._plugin)
+        quiet = is_in_time_window(start, end, now.strftime("%H:%M"), invalid_result=True)
+        gate, reason = post_rule_rejection(
+            asleep=asleep, quiet=quiet, actual_nap=self._actual_nap(now),
+            cooldown_minutes=self._cooldown_remain_minutes(now),
+            require_activity=require_activity, has_activity=activity is not None,
+            schedule_enabled=self._schedule_enabled())
+        if gate:
+            self._record_decision("skip", gate=gate, reason=reason)
+        return not gate, reason
+
+    def _dispatch_gate(self, now: datetime, *, enforce_daily_limit: bool,
+                       recheck_gates: bool, dispatch_allowed: Any) -> bool:
+        """The one final guard, called while holding the publish lock."""
+        if dispatch_allowed is not None and not dispatch_allowed():
+            return False
+        cfg = self._qzone_cfg()
+        if enforce_daily_limit or recheck_gates:
+            if not bool(getattr(cfg, "enabled", True)) or not self._time_gates(now)[0]:
+                return False
+        if enforce_daily_limit and self.posts_remaining() <= 0:
+            self._log("skip", trigger_type="qzone_post",
+                      reason="共享每日额度已用尽（发布锁内复检，确定未发）")
+            return False
+        return True
+
+    def posts_remaining(self) -> int:
+        cfg = self._qzone_cfg()
+        return max(0, int(getattr(cfg, "daily_max_posts", 0) or 0) - self.posts_today())
+
+    async def _judge_post_gate(self, activity: Any, now: datetime) -> Tuple[bool, str]:
+        if not bool(getattr(self._qzone_cfg(), "post_llm_gate_enabled", True)):
+            return True, ""
+        allowed, reason, answer = await self._llm_post_gate(activity, now)
+        message = f"LLM 严判通过（{reason or '未说明'}）" if allowed else f"LLM 严判不发（{reason or '未说明'}）"
+        self._record_decision("pass" if allowed else "skip", gate="llm",
+                              reason=message, llm_answer=answer)
+        return allowed, "" if allowed else message
 
     def _actual_nap(self, now: datetime) -> bool:
         """Qzone alone is quiet during an actual nap, never a skipped intention."""
@@ -851,7 +805,7 @@ class QzoneService:
         allowed, reason = parse_llm_decision(answer)
         return allowed, reason, str(answer or "")[:80]
 
-    def _cooldown_remain_minutes(self, now: datetime) -> int:
+    def _cooldown_remain_minutes(self, now: datetime, *, retry: bool = False) -> int:
         """距冷却结束还有几分钟（0 = 可发）。锚点 = ``last_post_at``（成功发送才更新）。
 
         锚点缺失/损坏 → 不冷却（fail-open，交 LLM 闸兜底；不让坏状态永久锁死发帖）；
@@ -859,7 +813,7 @@ class QzoneService:
         """
         minutes = int(self._clamp_float(
             getattr(self._qzone_cfg(), "post_cooldown_minutes", 0), 0.0, 0.0, 1440.0))
-        if minutes <= 0:
+        if minutes <= 0 and not retry:
             return 0
         anchor = str(self._state.get("last_post_at") or "")
         if not anchor:
@@ -867,7 +821,9 @@ class QzoneService:
         try:
             last = datetime.fromisoformat(anchor)
         except ValueError:
-            return 0
+            return max(1, minutes) if retry else 0
+        if retry and (last.tzinfo is None) != (now.tzinfo is None):
+            return max(1, minutes)
         # PR-FIX-TZ（3.17.3）：锚点由 datetime.now().isoformat() 写入（naive 本地墙钟），
         # 闸2 复检 now 为业务时区 aware → 统一 tz 后再相减，消除 TypeError 导致的
         # 「门控复检异常（保守不发）」；冷却语义（回拨保守/损坏 fail-open）不变。
@@ -877,7 +833,7 @@ class QzoneService:
             last = last.astimezone().replace(tzinfo=None)
         elapsed = (now - last).total_seconds() / 60.0
         if elapsed < 0:
-            return minutes
+            return max(1, minutes) if retry else minutes
         remaining = minutes - elapsed
         return int(math.ceil(remaining)) if remaining > 0 else 0
 
@@ -1400,14 +1356,9 @@ class QzoneService:
         cfg = self._qzone_cfg()
         if not bool(getattr(cfg, "enabled", False)):
             return
-        limit = int(getattr(cfg, "daily_max_posts", 0) or 0)
-        if limit <= 0 or self.posts_today() >= limit:
+        if self.posts_remaining() <= 0:
             return
-        last = self._state.get("last_post_at")
-        try:
-            if last and (now-datetime.fromisoformat(last)).total_seconds() < max(0, int(getattr(cfg,"post_cooldown_minutes",0) or 0))*60:
-                return
-        except (ValueError, TypeError):
+        if self._cooldown_remain_minutes(now, retry=True) > 0:
             return
         for row in list(self._publish_ledger.rows.values()):
             if row.get("status") == "retry_wait" and int(row.get("attempts",0)) < 2 \
@@ -1437,7 +1388,7 @@ class QzoneService:
         self._kick_post_media_refresh()
         await self._process_delivery_queue(now)
         # 按日程发说说
-        if cfg.daily_max_posts > 0 and self.posts_today() < cfg.daily_max_posts and cfg.post_by_schedule:
+        if self.posts_remaining() > 0 and cfg.post_by_schedule:
             # M4（§6.2 D）：发帖判定 = post_rate × mood_effect.post_rate；
             # V<−0.6 且 emotion_filter（默认 true）→ 本轮跳过发帖（低落不硬营业），记 skip 原因。
             base_post_rate = self._clamp_float(getattr(cfg, "post_rate", 1.0), 1.0, 0.0, 1.0)

@@ -95,7 +95,7 @@ class QzoneComponentsMixin:
         qz = getattr(self, "_qzone", None)
         if qz is None:
             return 0
-        return max(0, self.config.qzone.daily_max_posts - qz.posts_today())
+        return qz.posts_remaining()
 
     # ============================================================
     # 空间/生活组 handler（2026-11-13 双语根命令注册表引用）

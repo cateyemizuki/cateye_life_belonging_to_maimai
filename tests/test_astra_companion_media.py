@@ -333,10 +333,8 @@ async def watch_debit_atomicity(folder):
             raise OSError("synthetic write failure")
         write(path, document)
     with patch.object(video_schedule,"_atomic_write",fail_on_claim):
-        try:
+        with unittest.TestCase().assertRaises(OSError):
             quota.reserve_once(eid,"dedicated",10)
-        except OSError:
-            pass
     first = quota.snapshot()
     fresh = SurfQuotaLedger(folder,day_provider=lambda:DAY,clock=lambda:NOW)
     retried = fresh.reserve_once(eid,"dedicated",10)
@@ -695,7 +693,36 @@ async def protected_asset_and_pending_fact(folder):
         assert ledger.get_candidate(ids["with-asset"])
 
 
+async def qzone_policy_equivalence(folder):
+    from qzone.decision import post_rule_rejection
+    from itertools import product
+    for asleep, quiet, missing, nap, cooling in product((False, True), repeat=5):
+        gate, reason = post_rule_rejection(
+            asleep=asleep, quiet=quiet, require_activity=missing, has_activity=not missing,
+            actual_nap=nap, cooldown_minutes=7 if cooling else 0)
+        expected = ("silence" if asleep or quiet else "no_activity" if missing else
+                    "nap_quiet" if nap else "cooldown" if cooling else "")
+        assert gate == expected
+        assert bool(reason) == bool(gate)
+
+    config = NS(qzone=NS(enabled=True, daily_max_posts=2, post_cooldown_minutes=120,
+                        post_llm_gate_enabled=False, require_activity=False), schedule=NS(enabled=True))
+    service = QzoneService(NS(), config, NS(find_current_activity=lambda *args, **kw: None), NS())
+    now = datetime(2026, 6, 4, 12)
+    service._state["last_post_at"] = "2026-06-04T11:00:00"
+    with patch("qzone.service._sleep_silence_window", return_value=("23:00", "07:00")):
+        assert not (await service.check_post_gates(now))[0]
+        assert not await service._post_gate_chain("2026-06-04", now)
+        assert not service._dispatch_gate(now, enforce_daily_limit=True,
+                                          recheck_gates=False, dispatch_allowed=None)
+        assert service._cooldown_remain_minutes(now, retry=True) == 60
+    service._state["last_post_at"] = "unknown"
+    assert service._cooldown_remain_minutes(now) == 0
+    assert service._cooldown_remain_minutes(now, retry=True) > 0
+
+
 CASES = [
+    "qzone_policy_equivalence",
     "share_limits", "wrong_manual_receipt", "profile_count", "interrupted_eval", "cancel_cache",
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",
