@@ -106,6 +106,8 @@ class PlanningComponentsMixin:
             stream_id=stream_id,
             user_id=str(kwargs.get("user_id", "") or ""),
             is_local_operator=bool(kwargs.get("is_local_operator", False)),
+            platform=str(kwargs.get("platform", "") or ""),
+            group_id=str(kwargs.get("group_id", "") or ""),
         )
 
     async def plan_command_planning(

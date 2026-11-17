@@ -726,7 +726,7 @@ def _build_day_view(plugin: Any, *, cfg: Any, tz_name: str, now: datetime, day: 
                         []) if ready else []
     if not isinstance(session_rows, list):
         session_rows = []
-    day_sessions = [_sleep_session_view(row) for row in session_rows]
+    day_sessions = [_sleep_session_view(row) for row in session_rows[:16]]
     # 大间隙估算段（§2.5）：completed 会话 → estimated 睡眠段（虚线/斜纹渲染用）；
     # 独立分键承载，绝不混入 sessions 真实行，summary.sleep_minutes 口径不变。
     estimated_segments = read('该日睡眠估算段暂不可读',
@@ -1247,7 +1247,7 @@ def _init_field_data(data_dir: Any, plugin_root: Any, field: str, config: Any) -
 
 def _module_status(plugin: Any, module: str) -> str:
     cfg = getattr(plugin, 'config', None)
-    section = {'planning': 'schedule', 'emotion': 'emotion', 'companion': 'companion',
+    section = {'planning': 'schedule', 'emotion': 'emotion', 'companion': 'patrol',
                'qzone': 'qzone', 'integrations': 'video_watch'}.get(module)
     if section is None:
         return '运行中'

@@ -176,10 +176,8 @@ def _tz_now(tz_name: str) -> datetime:
 def _epoch_for_date(day: _date, day_minute: int, tz_name: str = "") -> float:
     """日期 + 日帧分钟（允许 >1440 = 次日环节点）→ epoch 秒（时区按 :data:`tz_name`）。"""
     tz = _tzinfo_of(tz_name)
-    base = datetime(day.year, day.month, day.day)
-    if tz is not None:
-        base = base.replace(tzinfo=tz)
-    return base.timestamp() + int(day_minute) * 60
+    from core.time_utils import wall_time
+    return wall_time(day, day_minute, tz).timestamp()
 
 
 def day_cycle_epochs(schedule_date: str, start_minute: Any, end_minute: Any,
@@ -435,7 +433,7 @@ def record_actual_wake(data_dir: Any, *, schedule_date: str, wake_epoch: Any,
         text = "真实醒来记录无效（epoch/日帧缺失）：不更新周期"
         _log_cycle(decision_logger, "skip", text, event="cycle_refuse",
                    entry_reason=START_SOURCE_ACTUAL_WAKE)
-        return RotationResult(applied=False, reason=START_SOURCE_ACTUAL_WAKE, message=text)
+        return RotationResult(applied=False, reason=START_SOURCE_ACTUAL_WAKE, message=text, durable=False)
     state = _read_state(data_dir) if data_dir is not None else None
     if state is None:
         state = anchored_state(cfg_wake, cfg_sleep, tz_name, now)
@@ -502,7 +500,7 @@ def record_actual_wake(data_dir: Any, *, schedule_date: str, wake_epoch: Any,
                wake_clock=format_epoch_clock(wake_value, tz_name))
     if not written:
         text += "（写盘失败 best-effort）"
-    return RotationResult(applied=True, reason=START_SOURCE_ACTUAL_WAKE, message=text)
+    return RotationResult(applied=True, reason=START_SOURCE_ACTUAL_WAKE, message=text, durable=written)
 
 
 # ============================================================
@@ -566,6 +564,7 @@ class RotationResult:
     applied: bool
     reason: str = ""
     message: str = ""
+    durable: bool = True
 
 
 def _log_cycle(decision_logger: Any, action: str, reason_text: str, **fields: Any) -> None:
@@ -706,7 +705,7 @@ def rotate(new_start: Any, new_end: Any, reason: str, *, data_dir: Any,
     text = f"{tail_text}周期轮换写盘失败，保留旧周期等待重试：reason={normalized_reason}"
     _log_cycle(decision_logger, "skip", text, event="cycle_rotate_write_failed",
                entry_reason=normalized_reason)
-    return RotationResult(applied=False, reason=normalized_reason, message=text)
+    return RotationResult(applied=False, reason=normalized_reason, message=text, durable=False)
 
 
 def entry_context_from_plugin(plugin: Any, *, fallback_wake: str = "",

@@ -43,12 +43,15 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
+from copy import deepcopy
 import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from core.storage import save_json_atomic
+from core.time_utils import elapsed_seconds
 
 from .time_utils import DAY_MINUTES, TimezoneManager
 from .life_history import LifeStateHistory
@@ -159,6 +162,9 @@ class LifeStateService:
         #: ``planning.offline_sleep.plan_offline_settlement`` 用原始值做。
         self._pending_offline_gap_seconds: Optional[float] = None
         self._episode_receipts: dict[str, str] = {}
+        self._offline_receipts: dict[str, dict] = {}
+        self._cold_integrated_at: Optional[datetime] = None
+        self._recovered_sleep: dict[str, str] = {}
         # A graceful stop is an observed-alive checkpoint, not a state integration tick.
         self._last_observed_at: Optional[datetime] = None
         self._pending_awake_before_offline_seconds: float = 0.0
@@ -262,11 +268,13 @@ class LifeStateService:
         # 钳制补算一遍；此处**不落盘**——文件保留旧 last_tick_at，进程在结算前崩溃
         # 重启时可重算同一段 gap（离线段不丢）。
         now = self._now()
+        self._cold_integrated_at = self._last_tick_at
         self._pending_offline_gap_seconds = self._raw_offline_gap_seconds(now)
         if self._last_observed_at is not None and self._last_tick_at is not None:
-            if self._last_tick_at <= self._last_observed_at <= now:
-                self._pending_awake_before_offline_seconds = (self._last_observed_at-self._last_tick_at).total_seconds()
-                self._pending_offline_gap_seconds = (now-self._last_observed_at).total_seconds()
+            if (elapsed_seconds(self._last_observed_at, self._last_tick_at) >= 0
+                    and elapsed_seconds(now, self._last_observed_at) >= 0):
+                self._pending_awake_before_offline_seconds = elapsed_seconds(self._last_observed_at, self._last_tick_at)
+                self._pending_offline_gap_seconds = elapsed_seconds(now, self._last_observed_at)
         # Clear only in memory; until settlement saves, a crash can still retry the original file.
         self._last_observed_at = None
         self._last_tick_at = now
@@ -321,6 +329,12 @@ class LifeStateService:
         receipts = raw.get('episode_receipts')
         if isinstance(receipts, dict):
             self._episode_receipts = {str(k): str(v) for k,v in list(receipts.items())[-4096:]}
+        offline = raw.get("offline_sleep_receipts")
+        if isinstance(offline, dict):
+            self._offline_receipts = {str(k): v for k,v in offline.items() if isinstance(v, dict)}
+        recovery = raw.get("recovered_sleep")
+        if isinstance(recovery, dict):
+            self._recovered_sleep = dict(recovery)
         diag = raw.get("settlement_diag")
         if isinstance(diag, list):
             self._settlement_diag = [dict(entry) for entry in diag
@@ -332,7 +346,7 @@ class LifeStateService:
         if self._last_tick_at is None:
             return 0.0
         try:
-            seconds = (now - self._last_tick_at).total_seconds()
+            seconds = elapsed_seconds(now, self._last_tick_at)
         except TypeError:  # naive/aware 混撞（防御性；_aware 已归一，理论不可达）
             return 0.0
         if seconds <= 0:
@@ -350,7 +364,7 @@ class LifeStateService:
         if self._last_tick_at is None:
             return None
         try:
-            seconds = (now - self._last_tick_at).total_seconds()
+            seconds = elapsed_seconds(now, self._last_tick_at)
         except TypeError:  # naive/aware 混撞（防御性；_aware 已归一，理论不可达）
             return None
         if seconds <= 0:
@@ -569,6 +583,149 @@ class LifeStateService:
             self._settlement_entry("sleep", dt_min, None, now, result, loss),
             cap=_diag_cap_of(params))
 
+    @contextmanager
+    def _atomic_recovery(self):
+        names = (
+            "_state",
+            "_sleep_debt",
+            "_updated_at",
+            "_last_tick_at",
+            "_last_observed_at",
+            "_last_sleep_at",
+            "_sleep_started_at",
+            "_sleep_segment_started_at",
+            "_sleep_interrupted",
+            "_last_wake_reason",
+            "_sleep_wake_target",
+            "_sleep_lie_in_cap",
+            "_continuous_sleep_minutes",
+            "_settlement_diag",
+            "_episode_receipts",
+            "_offline_receipts",
+            "_recovered_sleep",
+        )
+        previous = {key: deepcopy(getattr(self, key)) for key in names}
+        try:
+            yield
+            if not self.save():
+                raise OSError("sleep recovery persistence failed")
+        except Exception:
+            for key, value in previous.items():
+                setattr(self, key, value)
+            raise
+
+    def recover_open_sleep(
+        self,
+        session_id: str,
+        started: datetime,
+        until: datetime,
+        interrupted_at: Optional[datetime] = None,
+        *,
+        wake_reason: str = "",
+        debt_after: Optional[float] = None,
+    ) -> None:
+        """Recover only the unintegrated portion of this known, still-open session."""
+        checkpoint = self._cold_integrated_at
+        if checkpoint is None:
+            return
+        # Until the replacement is durable, subsequent writes must keep the original cursor.
+        self._last_tick_at = checkpoint
+        if elapsed_seconds(until, checkpoint) < 0:
+            return
+        start = max((checkpoint, started), key=lambda value: value.timestamp())
+        start = min((start, until), key=lambda value: value.timestamp())
+        sleep_end = until
+        if interrupted_at is not None:
+            sleep_end = max(
+                (start, min((until, interrupted_at), key=lambda v: v.timestamp())),
+                key=lambda v: v.timestamp(),
+            )
+        with self._atomic_recovery():
+            before = min(DT_MAX_MINUTES, max(0.0, elapsed_seconds(start, checkpoint) / 60))
+            asleep = min(DT_MAX_MINUTES, max(0.0, elapsed_seconds(sleep_end, start) / 60))
+            after = min(DT_MAX_MINUTES, max(0.0, elapsed_seconds(until, sleep_end) / 60))
+            if before:
+                self._apply_awake_v2(before, None, start)
+            if asleep:
+                self._apply_sleep_v2(asleep, sleep_end)
+            if after:
+                self._apply_awake_v2(after, None, until)
+            self._last_tick_at = self._updated_at = until
+            self._last_observed_at = None
+            self._recovered_sleep = {"session_id": session_id, "through": until.isoformat()}
+            if wake_reason and debt_after is not None:
+                self._sleep_debt = max(0.0, min(SLEEP_DEBT_MAX, float(debt_after)))
+                self._last_sleep_at = until
+                self._last_wake_reason = wake_reason
+                self._sleep_started_at = self._sleep_segment_started_at = None
+                self._sleep_wake_target = self._sleep_lie_in_cap = None
+                self._continuous_sleep_minutes = 0.0
+                self._sleep_interrupted = False
+        self._cold_integrated_at = None
+        self._pending_offline_gap_seconds = None
+        self._pending_awake_before_offline_seconds = 0.0
+        self._capture_history("sleep_recovered", force=True)
+
+    def apply_offline_awake_once(self, *, receipt_id: str, minutes: float, observed_at: datetime) -> None:
+        """Settle an awake gap and its cursor atomically without changing past sleep facts."""
+        if not receipt_id:
+            raise ValueError("offline receipt id required")
+        if receipt_id in self._episode_receipts:
+            return
+        moment = self._now(observed_at)
+        with self._atomic_recovery():
+            if minutes > 0:
+                self._apply_awake_v2(min(float(minutes), DT_MAX_MINUTES), None, moment)
+            self._last_tick_at = self._updated_at = moment
+            self._last_observed_at = None
+            self._episode_receipts[receipt_id] = moment.isoformat()
+            self._episode_receipts = dict(list(self._episode_receipts.items())[-4096:])
+        self._cold_integrated_at = None
+        self._capture_history("offline_awake", force=True)
+
+    def apply_offline_sleep_once(
+        self,
+        *,
+        receipt_id: str,
+        wake_at: datetime,
+        awake_minutes: float,
+        effective_hours: float,
+        sleep_debt_before: float,
+        sleep_debt_after: float,
+    ) -> dict:
+        """Commit a classified offline interval, its endpoints, wake fields and receipt once."""
+        if not receipt_id:
+            raise ValueError("offline receipt id required")
+        previous = self._offline_receipts.get(receipt_id)
+        if previous is not None:
+            return dict(previous)
+        wake = self._now(wake_at)
+        with self._atomic_recovery():
+            legacy_applied = receipt_id in self._episode_receipts
+            if awake_minutes > 0 and not legacy_applied:
+                self._apply_awake_v2(min(float(awake_minutes), DT_MAX_MINUTES), None, wake)
+            start_energy = self._state["energy"]
+            if not legacy_applied and effective_hours > 0:
+                self._sleep_debt = max(0.0, min(SLEEP_DEBT_MAX, sleep_debt_before))
+                self._apply_sleep_v2(min(float(effective_hours) * 60, DT_MAX_MINUTES), wake)
+                if self._settlement_diag:
+                    self._settlement_diag[-1]["kind"] = "offline_sleep"
+            self._sleep_debt = max(0.0, min(SLEEP_DEBT_MAX, sleep_debt_after))
+            self._last_sleep_at = self._last_tick_at = self._updated_at = wake
+            self._last_wake_reason = "offline_reconnect"
+            self._sleep_started_at = self._sleep_segment_started_at = None
+            self._sleep_wake_target = self._sleep_lie_in_cap = self._last_observed_at = None
+            self._sleep_interrupted = False
+            self._continuous_sleep_minutes = 0.0
+            endpoints = {"energy_start": start_energy, "energy_end": self._state["energy"]}
+            self._offline_receipts[receipt_id] = endpoints
+            self._offline_receipts = dict(list(self._offline_receipts.items())[-512:])
+            self._episode_receipts[receipt_id] = wake.isoformat()
+            self._episode_receipts = dict(list(self._episode_receipts.items())[-4096:])
+        self._cold_integrated_at = None
+        self._capture_history("offline_sleep", force=True)
+        return dict(endpoints)
+
     def apply_offline_awake(self, dt_min: float) -> Dict[str, Any]:
         """Advance an offline awake interval with the sole target-approach model."""
         try:
@@ -636,6 +793,7 @@ class LifeStateService:
             for key, value in previous.items():
                 setattr(self, key, value)
             raise
+        self._cold_integrated_at = None
         self._capture_history("sleep" if sleep_rates is not None else "tick")
         return self.snapshot()
 
@@ -679,9 +837,9 @@ class LifeStateService:
             status = str(episode.get("status") or episode.get("event") or "completed").strip().lower()
             finished = status in ("completed", "ended", "done", "finish", "finished")
             if finished and ptype == "meal":
-                self._last_meal_at = now
+                self._last_meal_at = max((self._last_meal_at or now, now), key=lambda dt: dt.timestamp())
             elif finished and ptype == "rest":
-                self._last_break_at = now
+                self._last_break_at = max((self._last_break_at or now, now), key=lambda dt: dt.timestamp())
             deltas = episode.get("state_deltas")
             if isinstance(deltas, dict):
                 for key in STATE_FIELDS:
@@ -694,7 +852,7 @@ class LifeStateService:
                         applied[key] = number
         if applied:
             pre_clamp = {key: float(self._state[key]) for key in STATE_FIELDS}
-            self._updated_at = now
+            self._updated_at = max((self._updated_at or now, now), key=lambda dt: dt.timestamp())
             self._clamp_all()
             loss = {key: round(pre_clamp[key] - float(self._state[key]), 8)
                     for key in STATE_FIELDS
@@ -714,7 +872,7 @@ class LifeStateService:
                 raise OSError("episode state persistence failed")
             self._capture_history("episode", force=True)
             return self.snapshot()
-        self._updated_at = now
+        self._updated_at = max((self._updated_at or now, now), key=lambda dt: dt.timestamp())
         self._clamp_all()
         if not self.save():
             raise OSError("episode state persistence failed")
@@ -964,6 +1122,10 @@ class LifeStateService:
             document["settlement_diag"] = self._settlement_diag
         if getattr(self, "_episode_receipts", None):
             document["episode_receipts"] = self._episode_receipts
+        if getattr(self, "_offline_receipts", None):
+            document["offline_sleep_receipts"] = self._offline_receipts
+        if getattr(self, "_recovered_sleep", None):
+            document["recovered_sleep"] = self._recovered_sleep
         return document
 
     def save(self) -> bool:

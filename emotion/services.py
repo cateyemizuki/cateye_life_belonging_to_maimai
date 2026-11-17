@@ -333,11 +333,14 @@ class EmotionServices:
 
     async def start(self) -> None:
         """启动睡眠检测循环（模块总开关关闭时不启动，热重载由循环内门控兜底）。"""
+        await self.sync_background()
+
+    async def sync_background(self) -> None:
         self._register_event_subscriptions()
-        if not self.is_enabled():
-            self._plugin.ctx.logger.info("情绪模块已停用（emotion.enabled=false），循环未启动")
-            return
-        self.service.start()
+        if self.is_enabled():
+            self.service.start()
+        elif self.service._task is not None or self.service._bg_tasks:
+            await self.service.stop()
 
     async def stop(self) -> None:
         self._unregister_event_subscriptions()

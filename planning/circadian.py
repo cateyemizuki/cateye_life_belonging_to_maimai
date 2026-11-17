@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from math import cos, isfinite, pi
 from statistics import median
+from core.time_utils import wall_time, shift_elapsed, elapsed_seconds
 
 
 def bounded(value, low, high, default=0):
@@ -24,14 +25,17 @@ class NightWindow:
 
 def night_window(now, sleep_minute, wake_minute, drift):
     """Select the night containing now, or the next one in local wall time."""
-    delta = timedelta(minutes=bounded(drift, 0, 90, 45))
-    for day in (-1, 0, 1):
-        midnight = datetime.combine(now.date() + timedelta(days=day), time.min, now.tzinfo)
-        bedtime = midnight + timedelta(minutes=sleep_minute)
-        wake = midnight + timedelta(minutes=wake_minute + (1440 if wake_minute <= sleep_minute else 0))
-        if now < wake + delta or day == 1:
-            return NightWindow(bedtime, wake, bedtime - delta, bedtime + delta,
-                               max(bedtime, wake - delta), wake + delta)
+    delta_seconds = 60 * bounded(drift, 0, 90, 45)
+    for offset in (-1, 0, 1):
+        day = now.date() + timedelta(days=offset)
+        bedtime = wall_time(day, sleep_minute, now.tzinfo)
+        wake = wall_time(day, wake_minute + (1440 if wake_minute <= sleep_minute else 0), now.tzinfo)
+        latest = shift_elapsed(wake, delta_seconds)
+        if elapsed_seconds(now, latest) < 0 or offset == 1:
+            return NightWindow(bedtime, wake, shift_elapsed(bedtime, -delta_seconds),
+                               shift_elapsed(bedtime, delta_seconds),
+                               max((bedtime, shift_elapsed(wake, -delta_seconds)), key=lambda dt: dt.timestamp()),
+                               latest)
 
 
 def circadian_sleepiness(local_minute, peak_minute):

@@ -56,6 +56,7 @@ class PlanningServices:
         self._plugin = plugin
         self._ctx = PluginContext(plugin)
         self._started = False
+        self._background_lock = asyncio.Lock()
         self._bg_tasks: List[asyncio.Task] = []
         #: 进程内事件总线（M0；plugin._bus 在服务束构造前已就绪，可空降级）
         self.bus = self._ctx.bus
@@ -482,9 +483,20 @@ class PlanningServices:
                 await service.start()
         except Exception as exc:
             logger.warning("事件库启动失败（保持只读）：%s", exc)
-        if not bool(getattr(self._plugin.config.schedule, "enabled", True)):
-            logger.info("日程规划模块已停用（schedule.enabled=false），后台循环未启动")
-            return
+        await self.sync_background()
+
+    async def sync_background(self) -> None:
+        """Reconcile optional workers without disturbing independent catalog/commitment subscriptions."""
+        async with self._background_lock:
+            enabled = self._started and bool(getattr(self._plugin.config.schedule, "enabled", True))
+            if enabled and not self._bg_tasks:
+                self.cleanup.reset_stop_event()
+                self.proactive.reset_stop_event()
+                await self._start_workers()
+            elif not enabled and self._bg_tasks:
+                await self._stop_workers()
+
+    async def _start_workers(self) -> None:
         # PR6（定稿 §4.5）：启动即校准目标频率，**不等**第一次活动切换；目标未解析/
         # 开关关闭/SDK 失败都只记日志，绝不拖挂启动（校准口内部已有可读返回）。
         try:
@@ -517,6 +529,12 @@ class PlanningServices:
             await self.stop_event_catalog()
         except Exception:
             pass
+        self._started = False
+        await self.sync_background()
+        close_goal_manager()
+        logger.info("PlanningServices 已停止")
+
+    async def _stop_workers(self) -> None:
         try:
             await self.proactive.stop()
         except Exception:
@@ -534,9 +552,6 @@ class PlanningServices:
             except (asyncio.CancelledError, Exception):
                 pass
         self._bg_tasks.clear()
-        self._started = False
-        close_goal_manager()
-        logger.info("PlanningServices 已停止")
 
     # ------------------------------------------------------------
     # 组件转发入口（components.py 的 Mixin 方法委托到这里）

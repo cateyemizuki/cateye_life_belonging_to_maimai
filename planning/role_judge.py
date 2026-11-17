@@ -106,16 +106,27 @@ def _parse_json_loose(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _infer_future_date(raw_date: str, today_str: str) -> str:
-    """LLM 未给出具体日期时，按「明天/后天」等关键词推断。"""
+def requested_date(value: Any, today_str: str) -> Optional[str]:
+    """Resolve a date from the tool or the accepted role decision before persistence."""
+    text = str(value or "").strip()
     try:
-        today = datetime.strptime(today_str, "%Y-%m-%d")
+        return datetime.fromisoformat(text).date().isoformat()
     except ValueError:
-        return today_str
-    for keyword, offset in _RELATIVE_DATE_OFFSETS.items():
-        if keyword in (raw_date or ""):
-            return (today + timedelta(days=offset)).strftime("%Y-%m-%d")
-    return today_str
+        pass
+    for fmt in ("%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            pass
+    for keyword in sorted(_RELATIVE_DATE_OFFSETS, key=len, reverse=True):
+        if keyword in text:
+            today = datetime.strptime(today_str, "%Y-%m-%d").date()
+            return (today + timedelta(days=_RELATIVE_DATE_OFFSETS[keyword])).isoformat()
+    return None
+
+
+def _infer_future_date(raw_date: str, today_str: str) -> str:
+    return requested_date(raw_date, today_str) or today_str
 
 
 def _build_judge_prompt(
@@ -220,6 +231,7 @@ async def judge_schedule_request(
         return None
 
     decision = str(parsed.get("decision", "") or "").strip().lower()
+    parsed["decision"] = decision
     if decision not in _VALID_DECISIONS:
         logger.info(f"角色裁判返回未知 decision={decision}，按 reject 处理")
         parsed["decision"] = "reject"
@@ -231,6 +243,8 @@ async def judge_schedule_request(
     parsed.setdefault("raw_date", "")
 
     # 补全 future 分支的日期推断
-    if parsed["decision"] == "future" and not str(parsed.get("date") or "").strip():
-        parsed["date"] = _infer_future_date(str(parsed.get("raw_date", "")), today_str)
+    if parsed["decision"] == "future":
+        date_text = parsed.get("date") or parsed.get("raw_date")
+        if date_text:
+            parsed["date"] = requested_date(date_text, today_str) or str(date_text)
     return parsed

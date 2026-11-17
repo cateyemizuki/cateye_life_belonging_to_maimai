@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .cycle_state import REASON_LEGACY
+from core.time_utils import parse_hhmm
 from .time_utils import DAY_MINUTES, TimezoneManager
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,9 @@ CREATE INDEX IF NOT EXISTS idx_episodes_status
     ON activity_episodes(status);
 CREATE INDEX IF NOT EXISTS idx_episodes_resume
     ON activity_episodes(resume_of);
+CREATE TABLE IF NOT EXISTS life_episode_outbox (
+    episode_id TEXT PRIMARY KEY, happened_at TEXT NOT NULL, payload TEXT NOT NULL
+);
 """
 
 # 附加约束（超出附录三索引，保守裁量）：表达式部分唯一索引强制「任意时刻最多一个
@@ -473,7 +477,7 @@ class ScheduleDB:
                      now, archive_reason),
                 )
                 archived += 1
-            except (sqlite3.SqliteError, IndexError, TypeError, KeyError):
+            except (sqlite3.Error, IndexError, TypeError, KeyError):
                 continue
         return archived
 
@@ -500,6 +504,28 @@ class ScheduleDB:
         end_stamp = int(cycle_end_ts) if cycle_end_ts is not None else stamps[1]
         reason = str(entry_reason or REASON_LEGACY)
         with self._lock, self._conn:
+            original_ids = tuple(item.get("item_id") for item in items)
+            # Resolve outstanding edits inside the write transaction. A model round or
+            # caller may have taken its candidate snapshot before an acceptance/cancellation.
+            self._conn.execute("BEGIN IMMEDIATE")
+            goals = self._conn.execute("SELECT goal_id,status,parameters FROM goals "
+                                       "WHERE goal_type='pending_commitment' AND status IN ('active','cancelled')").fetchall()
+            statuses = {goal["goal_id"]: goal["status"] for goal in goals
+                        if self._object(goal["parameters"]).get("commitment_date") == schedule_date
+                        and (goal["status"] == "active" or
+                             self._object(goal["parameters"]).get("commitment_cancelled_at"))}
+            items[:] = [item for item in items if statuses.get(str((item.get("parameters") or {}).get(
+                "commitment_id") or "")) != "cancelled"]
+            incoming = {str((item.get("parameters") or {}).get("commitment_id") or "") for item in items}
+            for row in self.get_day_schedule(schedule_date):
+                cid = str((row.get("parameters") or {}).get("commitment_id") or "")
+                if cid and statuses.get(cid) == "active" and cid not in incoming and (
+                        row["parameters"].get("commitment_hardness") == "hard"):
+                    items.append(row)
+                    incoming.add(cid)
+            if tuple(item.get("item_id") for item in items) != original_ids:
+                from .cycle_state import envelope_minutes
+                start_stamp, end_stamp = envelope_minutes(items) or (None, None)
             self._archive_day_rows_locked(schedule_date, reason, now)
             self._conn.execute("DELETE FROM schedule_items WHERE schedule_date = ?", (schedule_date,))
             for item in items:
@@ -548,6 +574,39 @@ class ScheduleDB:
         # 事务提交后再通知（睡眠 loop 即时重检；不进事务、不影响写库结果）
         self._notify_schedule_change(reason)
         return len(items)
+
+    def adjust_day_once(self, receipt_id: str, date: str, adjust: Callable) -> bool:
+        """Persist changed intensity parameters and the stable morning receipt in one commit."""
+        if not receipt_id:
+            raise ValueError("offline morning receipt id required")
+        key = "offline_morning:" + receipt_id
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if self._conn.execute("SELECT 1 FROM metadata WHERE key=?", (key,)).fetchone():
+                return True
+            rows = self.get_day_schedule(date)
+            updates = [(after, before) for after, before in zip(adjust(rows), rows) if after != before]
+            now = _now_iso()
+            if updates:
+                self._archive_day_rows_locked(date, "morning_wake_adjust", now)
+            for after, before in updates:
+                self._conn.execute(
+                    "UPDATE schedule_items SET parameters=?,updated_at=? WHERE item_id=?",
+                    (json.dumps(after["parameters"], ensure_ascii=False), now, before["item_id"]),
+                )
+            self._conn.execute("INSERT INTO metadata(key,value) VALUES(?,?)", (key, now))
+        if updates:
+            self._notify_schedule_change("morning_wake_adjust")
+        return True
+
+    def update_cycle_stamps(self, date: str, stamps: Optional[tuple[int, int]]) -> None:
+        if stamps is None:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE schedule_items SET cycle_start_ts=?,cycle_end_ts=? WHERE schedule_date=?",
+                (*stamps, date),
+            )
 
     def get_archived_day_schedule(self, schedule_date: str,
                                   limit: int = 100) -> List[Dict[str, Any]]:
@@ -795,6 +854,189 @@ class ScheduleDB:
             cur = self._conn.execute("DELETE FROM goals WHERE goal_id = ?", (goal_id,))
             return cur.rowcount > 0
 
+    def accept_timed_commitment(
+        self,
+        date: str,
+        name: str,
+        when: str,
+        *,
+        notes: str,
+        reason: str,
+        source: str,
+        duration: int,
+        activity_type: str,
+        priority: str,
+        publish_today: bool,
+        existing_goal_id: Optional[str] = None,
+    ) -> str:
+        """Commit the goal and its row together when its day is already published."""
+        start = parse_hhmm(when, -1)
+        if start < 0:
+            raise ValueError("invalid commitment time")
+        clock = f"{start // 60:02d}:{start % 60:02d}"
+        item_params = {
+            "hardness": "hard",
+            "hard": True,
+            "hard_source": source,
+            "time": clock,
+            "commitment_date": date,
+            "source": "user_request",
+            "notes": notes,
+            "reason": reason,
+            "commitment_lifecycle": 1,
+            "duration_minutes": duration,
+            "activity_type": activity_type,
+            "activity_priority": priority,
+        }
+        now = _now_iso()
+        with self._lock, self._conn:
+            # Serialize the lookup with competing processes as well as threads.
+            self._conn.execute("BEGIN IMMEDIATE")
+            existing = self._conn.execute(
+                "SELECT goal_id, parameters FROM goals WHERE goal_type='pending_commitment' "
+                "AND status='active' AND chat_id='global' AND name=?",
+                (name,),
+            ).fetchall()
+            goal_id = next(
+                (
+                    row["goal_id"]
+                    for row in existing
+                    if (existing_goal_id is None or row["goal_id"] == existing_goal_id)
+                    and self._same_timed_commitment(row["parameters"], date, start)
+                ),
+                None,
+            )
+            if existing_goal_id is not None and goal_id is None:
+                return ""  # Cancelled or settled between the repair query and its write.
+            if goal_id is None:
+                goal_id = str(uuid.uuid4())
+                self._conn.execute(
+                    "INSERT INTO goals(goal_id,name,description,goal_type,priority,creator_id,chat_id,"
+                    "status,created_at,parameters,updated_at) VALUES(?,?,?,'pending_commitment',"
+                    "'medium','system','global','active',?,?,?)",
+                    (goal_id, name, notes or name, now, json.dumps(item_params, ensure_ascii=False), now),
+                )
+            else:
+                old = next(row for row in existing if row["goal_id"] == goal_id)
+                item_params = {**self._object(old["parameters"]), **item_params}
+            if publish_today or self.has_day_schedule(date):
+                item_id = f"commitment:{goal_id}"
+                end = start + duration
+                parameters = {
+                    "spine": True,
+                    "min_minutes": min(15, duration),
+                    "max_minutes": duration,
+                    "priority": priority,
+                    "interruptibility": 0.0,
+                    "hardness": "hard",
+                    "is_commitment": True,
+                    "commitment_hardness": "hard",
+                    "commitment_source": source,
+                    "commitment_id": goal_id,
+                    "commitment_title": name,
+                    "commitment_notes": notes,
+                    "commitment_reason": reason,
+                    "commitment_time": clock,
+                    "commitment_time_fixed": start,
+                    "activity_attributes": None,
+                }
+                self._conn.execute(
+                    "INSERT INTO schedule_items(item_id,schedule_date,name,description,goal_type,priority,"
+                    "start_minute,end_minute,day_offset,parameters,created_at,updated_at,entry_reason) "
+                    "VALUES(?,?,?,?,?,?,?,?,0,?,?,?,'tool_edit') "
+                    "ON CONFLICT(item_id) DO UPDATE SET description=excluded.description,goal_type=excluded.goal_type,"
+                    "priority=excluded.priority,end_minute=excluded.end_minute,parameters=excluded.parameters,"
+                    "updated_at=excluded.updated_at",
+                    (
+                        item_id,
+                        date,
+                        name,
+                        notes,
+                        activity_type,
+                        priority,
+                        start,
+                        end,
+                        json.dumps(parameters, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                item_params["commitment_plan"] = {
+                    "item_id": item_id,
+                    "schedule_date": date,
+                    "start_minute": start,
+                    "end_minute": end,
+                }
+            self._conn.execute(
+                "UPDATE goals SET parameters=?, updated_at=? WHERE goal_id=?",
+                (json.dumps(item_params, ensure_ascii=False), now, goal_id),
+            )
+        self._notify_schedule_change("commitment_added")
+        return goal_id
+
+    @staticmethod
+    def _object(value: Any) -> dict:
+        try:
+            obj = json.loads(value or "{}")
+            return obj if isinstance(obj, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+
+    @staticmethod
+    def _same_timed_commitment(raw: str, date: str, minute: int) -> bool:
+        params = ScheduleDB._object(raw)
+        return (
+            params.get("commitment_date") == date
+            and params.get("hardness") != "soft"
+            and parse_hhmm(str(params.get("time") or ""), -1) == minute
+        )
+
+    def cancel_commitment(self, identifier: str, *, when: datetime) -> Optional[bool]:
+        """None denotes an ordinary goal/item. Cancellation never emits a broken event."""
+        now = _now_iso()
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            item = self._conn.execute(
+                "SELECT parameters FROM schedule_items WHERE item_id=?", (identifier,)
+            ).fetchone()
+            linked = json.loads(item["parameters"] or "{}").get("commitment_id") if item else None
+            goal_id = linked or identifier.removeprefix("commitment:")
+            goal = self._conn.execute(
+                "SELECT status,parameters FROM goals WHERE goal_id=? AND goal_type='pending_commitment'",
+                (goal_id,),
+            ).fetchone()
+            if goal is None:
+                return None
+            if goal["status"] != "active":
+                return False
+            params = json.loads(goal["parameters"] or "{}")
+            params["commitment_cancelled_at"] = now
+            date = params.get("commitment_date")
+            self._conn.execute(
+                "UPDATE goals SET status='cancelled',parameters=?,updated_at=? WHERE goal_id=?",
+                (json.dumps(params, ensure_ascii=False), now, goal_id),
+            )
+            rows = self._conn.execute(
+                "SELECT item_id,parameters FROM schedule_items WHERE schedule_date=?", (date,)
+            ).fetchall()
+            for row in rows:
+                if (
+                    row["item_id"] == f"commitment:{goal_id}"
+                    or json.loads(row["parameters"] or "{}").get("commitment_id") == goal_id
+                ):
+                    self._conn.execute("DELETE FROM schedule_items WHERE item_id=?", (row["item_id"],))
+            active = self.active_episode()
+            if active and (active.get("metadata") or {}).get("commitment_id") == goal_id:
+                end = (
+                    when.date() - datetime.fromisoformat(active["schedule_date"]).date()
+                ).days * DAY_MINUTES
+                end += when.hour * 60 + when.minute
+                self._close_active_episodes_locked(
+                    "commitment_cancelled", end, when.isoformat(), "commitment_cancelled"
+                )
+        self._notify_schedule_change("commitment_removed")
+        return True
+
     def delete_goals_by_status(self, status: str, older_than: Optional[datetime] = None) -> int:
         """按状态删除目标（可选只删 older_than 之前创建的）。"""
         query = "DELETE FROM goals WHERE status = ?"
@@ -888,6 +1130,37 @@ class ScheduleDB:
             return 1.0
         return min(cls._clamp_progress(used / planned_span), _EPISODE_PROGRESS_CAP)
 
+    def _queue_life_effect_locked(self, row: Any, status: str, happened_at: str) -> None:
+        meta = self._object(row["metadata"])
+        if (
+            not meta.get("state_deltas")
+            and not meta.get("event_key")
+            and not meta.get("event_id")
+            and not (status == "completed" and row["goal_type"] in ("meal", "rest"))
+        ):
+            return
+        payload = {
+            "goal_type": row["goal_type"],
+            "status": status,
+            "episode_id": row["episode_id"],
+            "metadata": meta,
+        }
+        self._conn.execute(
+            "INSERT OR IGNORE INTO life_episode_outbox VALUES(?,?,?)",
+            (row["episode_id"], happened_at, json.dumps(payload, ensure_ascii=False)),
+        )
+
+    def pending_life_effects(self, limit: int = 128) -> list[tuple[datetime, dict]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT happened_at,payload FROM life_episode_outbox ORDER BY rowid LIMIT ?", (limit,)
+            ).fetchall()
+        return [(datetime.fromisoformat(r["happened_at"]), json.loads(r["payload"])) for r in rows]
+
+    def acknowledge_life_effect(self, episode_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM life_episode_outbox WHERE episode_id=?", (episode_id,))
+
     def _close_active_episodes_locked(self, closed_by: str,
                                       actual_end_minute: Optional[int],
                                       now: str, close_reason: str) -> int:
@@ -901,7 +1174,7 @@ class ScheduleDB:
         closed = 0
         rows = self._conn.execute(
             "SELECT episode_id, planned_start_minute, planned_end_minute, actual_start_minute,"
-            " progress, metadata FROM activity_episodes WHERE status = 'active'"
+            " goal_type, progress, metadata FROM activity_episodes WHERE status = 'active'"
         ).fetchall()
         for row in rows:
             end = actual_end_minute if actual_end_minute is not None else row["planned_end_minute"]
@@ -924,9 +1197,11 @@ class ScheduleDB:
                      ),
                      now, row["episode_id"]),
                 )
+                self._queue_life_effect_locked(row, "interrupted", now)
                 closed += 1
             except sqlite3.Error as e:
-                logger.warning("schedule_db: 关闭 active episode 失败（不抛）：%s", e)
+                logger.warning("关闭活动与登记结算失败，整笔事务撤回：%s", e)
+                raise
         return closed
 
     def _insert_episode_locked(self, *, episode_id: str, schedule_date: str, day_offset: Any,
@@ -1105,6 +1380,8 @@ class ScheduleDB:
                      self._merge_json_text(row["metadata"], extra_metadata),
                      now, episode_id, row["status"]),
                 )
+                if to_status == "completed" and (extra_metadata or {}).get("life_settlement_at"):
+                    self._queue_life_effect_locked(row, to_status, extra_metadata["life_settlement_at"])
             return True
         except (sqlite3.Error, ValueError, TypeError) as e:
             logger.warning("schedule_db: episode %s -> %s 写入失败（不抛）：%s",
@@ -1213,6 +1490,7 @@ class ScheduleDB:
         self,
         episode_id: str,
         *,
+        schedule_date: Optional[str] = None,
         planned_start_minute: Optional[int] = None,
         planned_end_minute: Optional[int] = None,
         actual_start_minute: Optional[int] = None,
@@ -1252,8 +1530,8 @@ class ScheduleDB:
                 self._close_active_episodes_locked(new_id, actual_start, now,
                                                    "superseded_by_resume")
                 self._insert_episode_locked(
-                    episode_id=new_id, schedule_date=row["schedule_date"],
-                    day_offset=row["day_offset"], source="resume", name=row["name"],
+                    episode_id=new_id, schedule_date=schedule_date or row["schedule_date"],
+                    day_offset=(0 if schedule_date else row["day_offset"]), source="resume", name=row["name"],
                     goal_type=row["goal_type"], property_id=row["property_id"],
                     planned_start=planned_start, planned_end=planned_end,
                     actual_start=actual_start, status="active",
@@ -1435,34 +1713,127 @@ class ScheduleDB:
             logger.warning("schedule_db: sleep_sessions 行解析失败（不抛）：%s", e)
             return False
         try:
-            now = _now_iso()
-            metadata = row.get("metadata")
-            if isinstance(metadata, dict):
-                metadata = json.dumps(metadata, ensure_ascii=False)
             with self._lock, self._conn:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO sleep_sessions("
-                    "session_id, schedule_date, planned_start_minute, planned_end_minute,"
-                    " actual_start_minute, actual_end_minute, wake_reason,"
-                    " continuous_minutes, interruption_count, energy_start, energy_end,"
-                    " sleep_debt_before, sleep_debt_after, quality, metadata,"
-                    " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (str(row.get("session_id") or ""), str(row.get("schedule_date") or ""),
-                     int(row.get("planned_start_minute") or 0),
-                     int(row.get("planned_end_minute") or 0),
-                     row.get("actual_start_minute"), row.get("actual_end_minute"),
-                     row.get("wake_reason"),
-                     int(row.get("continuous_minutes") or 0),
-                     int(row.get("interruption_count") or 0),
-                     row.get("energy_start"), row.get("energy_end"),
-                     row.get("sleep_debt_before"), row.get("sleep_debt_after"),
-                     row.get("quality"), metadata,
-                     str(row.get("created_at") or now), str(row.get("updated_at") or now)),
-                )
+                self._write_sleep_session_locked(row)
             return True
         except (sqlite3.Error, ValueError, TypeError) as e:
             logger.warning("schedule_db: upsert_sleep_session 失败（不抛）：%s", e)
             return False
+
+    def _write_sleep_session_locked(self, row: dict) -> None:
+        now = _now_iso()
+        metadata = row.get("metadata")
+        if isinstance(metadata, dict):
+            metadata = json.dumps(metadata, ensure_ascii=False)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO sleep_sessions("
+            "session_id, schedule_date, planned_start_minute, planned_end_minute,"
+            " actual_start_minute, actual_end_minute, wake_reason,"
+            " continuous_minutes, interruption_count, energy_start, energy_end,"
+            " sleep_debt_before, sleep_debt_after, quality, metadata,"
+            " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(row.get("session_id") or ""),
+                str(row.get("schedule_date") or ""),
+                int(row.get("planned_start_minute") or 0),
+                int(row.get("planned_end_minute") or 0),
+                row.get("actual_start_minute"),
+                row.get("actual_end_minute"),
+                row.get("wake_reason"),
+                int(row.get("continuous_minutes") or 0),
+                int(row.get("interruption_count") or 0),
+                row.get("energy_start"),
+                row.get("energy_end"),
+                row.get("sleep_debt_before"),
+                row.get("sleep_debt_after"),
+                row.get("quality"),
+                metadata,
+                str(row.get("created_at") or now),
+                str(row.get("updated_at") or now),
+            ),
+        )
+
+    def commit_offline_sleep(self, session: dict, *, episode_id: str, label: str, metadata: dict) -> bool:
+        """Atomically materialize a completed, proven offline interval without a transient active row."""
+        date = session["schedule_date"]
+        start = int(session["actual_start_minute"])
+        end = int(session["actual_end_minute"])
+        created = datetime.fromisoformat(session["created_at"])
+        if not episode_id or end < start or session.get("wake_reason") != "offline_reconnect":
+            raise ValueError("invalid offline sleep interval")
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            existing = self._conn.execute(
+                "SELECT wake_reason FROM sleep_sessions WHERE session_id=?", (session["session_id"],)
+            ).fetchone()
+            if existing and existing["wake_reason"] != "offline_reconnect":
+                raise ValueError("offline interval conflicts with an existing sleep session")
+            footprint = self._conn.execute(
+                "SELECT episode_id, status FROM activity_episodes WHERE episode_id=? AND source='offline'",
+                (episode_id,),
+            ).fetchone()
+            if footprint is None:
+                legacy = self._conn.execute(
+                    "SELECT episode_id,status,metadata FROM activity_episodes "
+                    "WHERE schedule_date=? AND source='offline' AND actual_start_minute=? "
+                    "AND (actual_end_minute=? OR (status='active' AND planned_end_minute=?))",
+                    (date, start, end, end),
+                ).fetchall()
+                footprint = next(
+                    (r for r in legacy if json.loads(r["metadata"] or "{}").get("offline_settlement")), None
+                )
+            if existing and footprint and footprint["status"] == "completed":
+                return True
+            if not existing and footprint is None:
+                active = self.active_episode()
+                if active:
+                    actual_end = (
+                        created.date() - datetime.fromisoformat(active["schedule_date"]).date()
+                    ).days * DAY_MINUTES
+                    actual_end += created.hour * 60 + created.minute
+                    origin = active.get("actual_start_minute")
+                    if origin is not None and actual_end >= origin:
+                        self._close_active_episodes_locked(
+                            "offline_gap", actual_end, created.isoformat(), "offline_gap_settlement"
+                        )
+            if not existing:
+                self._write_sleep_session_locked(session)
+            if footprint is None:
+                self._insert_episode_locked(
+                    episode_id=episode_id,
+                    schedule_date=date,
+                    day_offset=None,
+                    source="offline",
+                    name=label,
+                    goal_type="sleep",
+                    property_id=None,
+                    planned_start=start,
+                    planned_end=end,
+                    actual_start=start,
+                    status="completed",
+                    progress=0.95,
+                    interruptibility=None,
+                    switch_cost=None,
+                    attention_mode=None,
+                    interrupted_by=None,
+                    resume_of=None,
+                    state_before=None,
+                    metadata=dict(metadata, offline_settlement=True),
+                    now=session["created_at"],
+                )
+                self._conn.execute(
+                    "UPDATE activity_episodes SET actual_end_minute=?,updated_at=? WHERE episode_id=?",
+                    (end, session["updated_at"], episode_id),
+                )
+            elif footprint["status"] == "active":
+                self._conn.execute(
+                    "UPDATE activity_episodes SET status='completed',actual_end_minute=?,"
+                    "progress=0.95,updated_at=? WHERE episode_id=?",
+                    (end, session["updated_at"], footprint["episode_id"]),
+                )
+            elif footprint["status"] != "completed":
+                raise ValueError("offline footprint has conflicting terminal state")
+        return True
 
     def finish_sleep_session(self, session_id: str, **fields: Any) -> bool:
         """收尾一条睡眠会话（只更新白名单列；metadata 合并而非覆盖）。"""
@@ -1521,6 +1892,13 @@ class ScheduleDB:
         except sqlite3.Error as e:
             logger.warning("schedule_db: query_sleep_sessions 失败（不抛）：%s", e)
             return []
+
+    def get_sleep_session(self, session_id: str) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM sleep_sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+        return self._sleep_session_row(row) if row is not None else None
 
     def open_sleep_session(self) -> Optional[Dict[str, Any]]:
         """未结束（actual_end_minute IS NULL）的最近一条会话（重启恢复用）。"""

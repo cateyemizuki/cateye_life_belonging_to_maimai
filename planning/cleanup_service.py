@@ -109,6 +109,10 @@ class CleanupService:
     # 停止控制
     # ------------------------------------------------------------
 
+    def reset_stop_event(self) -> None:
+        """Called after previous workers have fully stopped."""
+        self._stop_event.clear()
+
     async def stop(self) -> None:
         """通知所有循环停止。"""
         self._stop_event.set()

@@ -22,6 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from core.time_utils import parse_hhmm
 from .schedule_db import ScheduleDB
 from .time_utils import TimezoneManager, wall_time, elapsed_seconds, shift_elapsed
 
@@ -344,6 +345,8 @@ class GoalManager:
         notes: str = "",
         reason: str = "",
         creator_id: str = "system",
+        hardness: Optional[str] = None,
+        hard_source: str = "",
     ) -> Goal:
         """添加一条未来约定（日期归一化，格式不统一也能正确匹配）。"""
         normalized_date = _normalize_commitment_date(commitment_date, self._clock().get_now())
@@ -355,6 +358,8 @@ class GoalManager:
             "source": "user_request",
             "commitment_lifecycle": 1,
         }
+        if hardness in ("soft", "hard"):
+            parameters.update(hardness=hardness, hard=hardness == "hard", hard_source=hard_source)
         goal = self.create_goal(
             name=title,
             description=notes or title,
@@ -418,6 +423,19 @@ class GoalManager:
             except (TypeError, ValueError):
                 logger.warning("约定到期信息无效，保留待处理: id=%s", goal.goal_id)
                 continue
+            # Recover unexpired, explicitly timed appointments from older releases which
+            # stored the goal but had already generated its day. Never reconstruct past activity.
+            minute = parse_hhmm(str(params.get("time") or ""), -1)
+            if (not plan and params.get("commitment_lifecycle") and params.get("hardness") != "soft"
+                    and minute >= 0 and day >= moment.date() and elapsed_seconds(end_at, moment) > 0
+                    and self.db.has_day_schedule(date)):
+                self.db.accept_timed_commitment(date, goal.name, str(params["time"]),
+                    notes=str(params.get("notes") or ""), reason=str(params.get("reason") or ""),
+                    source=str(params.get("hard_source") or "user_request"),
+                    duration=max(1, int(params.get("duration_minutes") or 60)),
+                    activity_type=str(params.get("activity_type") or "daily_routine"),
+                    priority=str(params.get("activity_priority") or "high"), publish_today=False,
+                    existing_goal_id=goal.goal_id)
             if elapsed_seconds(base, moment) > 0:
                 continue
             if date not in episodes_by_date:
@@ -603,6 +621,11 @@ class GoalManager:
         2026-10-27 用户批准：删除约定要**立即撤销**原提前唤醒 → 删除成功后通知
         内部重检口（``request_life_recheck`` 链），由睡眠引擎按当前有效约定重算。
         """
+        cancellation = self.db.cancel_commitment(goal_id, when=self._clock().get_now())
+        if cancellation is not None:
+            if cancellation:
+                self._notify_change("commitment_removed")
+            return cancellation
         if self.db.get_goal(goal_id) is not None:
             deleted = self.db.delete_goal(goal_id)
         else:

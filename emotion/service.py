@@ -298,6 +298,8 @@ class EmotionService:
             self._machine.params = self._machine.params.from_dict(state.get("params"))
         self._machine.load_dict({**state, "params": self._machine.params.to_dict()})
         self._external_event_receipts = external_receipts.restore(self._machine, state)
+        daily = state.get("daily_settlement")
+        self._daily_settlement_state = dict(daily) if isinstance(daily, dict) else None
 
         self._persona = str(getattr(plugin, "_personality", "") or "")
         self._lover_name = str(getattr(plugin, "_lover_name", "") or "麦麦")
@@ -467,6 +469,9 @@ class EmotionService:
                 EVAL_QUOTA_PRIVATE: int(partition.get(EVAL_QUOTA_PRIVATE) or 0),
                 EVAL_QUOTA_GROUP: int(partition.get(EVAL_QUOTA_GROUP) or 0),
             }
+        daily = getattr(self, "_daily_settlement_state", None)
+        if isinstance(daily, dict) and daily.get("last_date"):
+            state["daily_settlement"] = dict(daily)
         if not state_store.write_document(self._state_path, state, writer=save_json_atomic):
             return False
         if external_state is not None:
@@ -2507,6 +2512,10 @@ class EmotionService:
                                 "last_attempt_at": now.isoformat(), "error_class": ""}
         vad = self._machine.effective_vad()  # 裁判接收已应用偏移的值（§九.3）
         requested_period = self._sleep_period
+        engine = self._sleep_engine_handle()
+        getter = getattr(engine, "sleep_status", None)
+        status = (getter(now) or {}) if callable(getter) else {}
+        session_id = str(status.get("session_id") or "") if status.get("asleep") else ""
         result = await ask_sleep_referee(
             self._llm(),
             persona=self._persona_text(), vad=vad,
@@ -2532,7 +2541,7 @@ class EmotionService:
         self._referee_health["last_success_at"] = now.isoformat()
         delta, reasons = result
         cached = {
-            "delta": delta, "reasons": reasons, "sleep_hours": hours,
+            "delta": delta, "reasons": reasons, "sleep_hours": hours, "session_id": session_id,
             # §2.4 摘要快照：`sleep_hours` 是**计划**整夜时长（裁判输入），
             # `actual_sleep_hours` 是**此刻**窗口内按扰段并集扣减后的实际值（醒沿应用时会重算，
             # 以届时归档为准——缓存只作对照留痕）。
@@ -2771,18 +2780,32 @@ class EmotionService:
                 return ticket
         return None
 
-    def _save_daily_settlement_state(self, date_key: str, mode: str,
-                                     points: int, catch_up: bool) -> None:
-        """记下已结算日期（内存立即生效；落盘失败只留痕，不影响本次入账）。"""
-        state = {"last_date": str(date_key), "mode": str(mode),
-                 "points": int(points), "catch_up": bool(catch_up),
-                 "at": datetime.now().isoformat(timespec="seconds")}
-        self._daily_settlement_state = state
-        if not daily_settlement.save_state(self._daily_settlement_path(), **state):
-            logger.warning("每日兜底结算日期状态落盘失败（内存去重仍生效；重启后可能重复结算）")
+    @staticmethod
+    def _daily_receipt(date_key: str, mode: str, points: int, catch_up: bool) -> dict:
+        return {
+            "last_date": date_key,
+            "mode": mode,
+            "points": int(points),
+            "catch_up": bool(catch_up),
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def _save_daily_settlement_state(self, date_key: str, mode: str, points: int, catch_up: bool) -> bool:
+        previous = self._daily_settlement_memory_state()
+        self._daily_settlement_state = self._daily_receipt(date_key, mode, points, catch_up)
+        if self._save_state() is False:
+            self._daily_settlement_state = previous
+            return False
+        self._mirror_daily_receipt()
+        return True
+
+    def _mirror_daily_receipt(self) -> None:
+        """Legacy readers can use this mirror. The atomic VAD document owns the cursor."""
+        if not daily_settlement.save_state(self._daily_settlement_path(), **self._daily_settlement_state):
+            logger.warning("每日情绪结算副本暂未写入，主状态已记录")
 
     async def _apply_daily_settlement(self, now: datetime, date_key: str,
-                                      catch_up: bool, max_chars: int) -> Dict[str, Any]:
+                                      catch_up: bool, max_chars: int) -> Optional[Dict[str, Any]]:
         """执行一次兜底结算：压缩摘要 → （配额可用时）一次 LLM → 否则 rule → 入账留痕。"""
         rows = daily_settlement.points_for_date(self._daily_settlement_points(), date_key)
         quota = self._daily_settlement_quota_snapshot(date_key, now)
@@ -2808,8 +2831,7 @@ class EmotionService:
                 reason=(f"每日情绪兜底结算（no_data）：{date_key} 无采样点，"
                         f"跳过结算{'（补结算）' if catch_up else ''}"),
                 **entry)
-            self._save_daily_settlement_state(date_key, "no_data", 0, catch_up)
-            return entry
+            return entry if self._save_daily_settlement_state(date_key, "no_data", 0, catch_up) else None
         current = self._machine.effective_vad()
         delta: Optional[VADState] = None
         mode = "rule"
@@ -2835,9 +2857,17 @@ class EmotionService:
         if delta is None:
             anchor = getattr(getattr(self._machine, "params", None), "anchor", None)
             delta = daily_settlement.rule_delta(current, summary["mean"], anchor)
+        if self.is_frozen():
+            return None
+        previous_receipt = self._daily_settlement_memory_state()
+        self._daily_settlement_state = self._daily_receipt(date_key, mode, int(summary["count"]), catch_up)
         outcome = self._apply_external_delta(
             f"每日情绪兜底结算（{date_key}{'，补结算' if catch_up else ''}）",
-            delta, source="daily_settlement", multiplier=1.0, llm=(mode == "llm"))
+            delta, source="daily_settlement", multiplier=1.0, llm=(mode == "llm"),
+            idempotency_key=f"daily_settlement:{date_key}")
+        if not outcome.get("ok"):
+            self._daily_settlement_state = previous_receipt
+            return None
         applied = outcome.get("delta") if isinstance(outcome, dict) else None
         entry: Dict[str, Any] = {
             "date": date_key,
@@ -2859,7 +2889,7 @@ class EmotionService:
             reason=(f"每日情绪兜底结算（{mode}）：{date_key} 采样 {summary['count']} 点，"
                     f"{'补结算' if catch_up else '当日结算'}"),
             **entry)
-        self._save_daily_settlement_state(date_key, mode, int(summary["count"]), catch_up)
+        self._mirror_daily_receipt()
         await self._publish("emotion.updated", **self._updated_payload("daily_settlement"))
         return entry
 
@@ -3007,6 +3037,12 @@ class EmotionService:
         cycle_key = str(cached.get("cycle_key") or "")
         # §2.4/A4：恢复系数输入 = 实际睡着时长（窗口总长 − 打扰区间并集），不是缓存里的计划时长
         window_stats = self._sleep_window_summary(now, period, cycle_key)
+        session_id = str(cached.get("session_id") or "")
+        fetch_session = getattr(self._sleep_engine_handle(), "settled_sleep_summary", None)
+        if session_id and callable(fetch_session):
+            actual = fetch_session(session_id)
+            if actual:
+                window_stats = actual
         actual_hours = float(window_stats["actual_sleep_hours"])
         ref = cached.get("computed_at") or now  # 入睡时刻（日期基准：R=入睡日-1，E=入睡日+1）
         query = self._schedule_query()

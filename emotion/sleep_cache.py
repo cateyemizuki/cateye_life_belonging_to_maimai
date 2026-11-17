@@ -40,6 +40,8 @@ def encode(cached: dict, period: tuple) -> dict:
     out = {"version": VERSION, "cycle_key": str(cached["cycle_key"]),
            "period": [start.isoformat(), end.isoformat()],
            "computed_at": cached["computed_at"].isoformat()}
+    if cached.get("session_id"):
+        out["session_id"] = str(cached["session_id"])[:128]
     for name in ("delta", "r_yesterday", "e_tomorrow"):
         out[name] = cached.get(name, VADState()).to_dict()
     out["reasons"] = {axis: str(cached.get("reasons", {}).get(axis, ""))[:300] for axis in AXES}
@@ -70,6 +72,8 @@ def decode(raw: Any, now: datetime):
                 or not start <= computed <= now or now - computed > TTL):
             return None
         cached = {"cycle_key": key, "computed_at": computed}
+        if isinstance(raw.get("session_id"), str) and len(raw["session_id"]) <= 128:
+            cached["session_id"] = raw["session_id"]
         for name in ("delta", "r_yesterday", "e_tomorrow"):
             vector = raw[name]
             cached[name] = VADState(**{axis: _number(vector[axis], -1, 1) for axis in AXES})

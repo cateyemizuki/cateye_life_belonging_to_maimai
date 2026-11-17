@@ -677,6 +677,11 @@ class RollingPlanner:
     def dynamic_sleep(self) -> bool:
         return bool(getattr(self._sleep_engine, "dynamic_enabled", False))
 
+    def _no_sleep_mode(self) -> bool:
+        provider = self._config_provider
+        config = provider() if callable(provider) else provider
+        return bool(getattr(getattr(config, "schedule", None), "no_sleep_mode", False))
+
     def _engine_enabled(self) -> bool:
         engine = self._sleep_engine
         if engine is None:
@@ -821,6 +826,11 @@ class RollingPlanner:
                              actual_end_minute=end,
                              reason=f"sleep_engine_{reason}" if reason else "sleep_engine")
         return True
+
+    def apply_offline_morning_once(self, *, receipt_id: str, wake_at: datetime, sleep_hours: float) -> bool:
+        day = self._tz.to_local(wake_at).date().isoformat()
+        return self._db.adjust_day_once(receipt_id, day, lambda rows: adjust_spine_for_morning(
+            rows, sleep_hours, 0.0, wake_at))
 
     def apply_morning_spine_adjustment(self, now: Optional[datetime] = None, *,
                                        sleep_hours: Any, wake_delay_minutes: Any = 0,
@@ -990,12 +1000,18 @@ class RollingPlanner:
         report.update({"date": date, "cur_minute": cur})
         self._roll_daily_counters(date)
         # 从持久执行行恢复约定结算；失败保留 active，下个 tick/重启继续补扫。
+        self._replay_life_effects()
         self._reconcile_commitments(now)
 
         # 步 1：状态快照（PR2 定稿 §3/§4.1.4：planner 不再单独调用 life.tick——
         # 状态推进统一由 plugin tick 编排，编排方先 life.tick（含 VAD 调制）再经
         # life_snapshot 传入；不传快照（旧调用/单测）保持原行为，由本方法推进）
         current = self._safe_active_episode()
+        if self._no_sleep_mode() and current and current.get("goal_type") == "sleep":
+            self._finish_episode(current, now, self._life.snapshot(),
+                                 actual_end_minute=self._episode_frame_minute(current, now),
+                                 reason="no_sleep_mode")
+            current = self._safe_active_episode()
         if life_snapshot is None:
             snapshot = self._life.tick(
                 now, active_profile=self.resolve_profile_key(active_profile, current))
@@ -1045,7 +1061,8 @@ class RollingPlanner:
             if self._roll_nap(date, cur, now, snapshot, current, report):
                 return
         elif current is None and self._in_sleep_ring(cur):
-            self._start_sleep_episode(date, cur, now, snapshot, report)
+            if not self._no_sleep_mode():
+                self._start_sleep_episode(date, cur, now, snapshot, report)
             return  # 睡眠环内不安排任何其他活动（验收：睡眠窗内不安排主动活动）
 
         # 步 4：当前 episode 终结判定（饥饿跨阈值 + 节流通过 → 提前收尾去吃饭）
@@ -1199,10 +1216,12 @@ class RollingPlanner:
             if deltas:
                 episode_payload["state_deltas"] = deltas
             self._life.apply_episode(episode_payload, now=now)
+            if callable(getattr(self._db, "acknowledge_life_effect", None)):
+                self._db.acknowledge_life_effect(eid)
             applied = True
         except Exception as exc:
             logger.warning("rolling_planner: 被挤行状态入账失败（episode=%s）：%s", eid, exc)
-        marks: Dict[str, Any] = {"close_active_handled": True}
+        marks: Dict[str, Any] = {"close_active_handled": applied}
         if deltas is not None and applied:
             marks["state_deltas_applied"] = True
         try:
@@ -1244,6 +1263,23 @@ class RollingPlanner:
         except Exception:
             logger.warning('随机事件结果未补记，已消费事件不返池', exc_info=True)
 
+    def _replay_life_effects(self) -> None:
+        pending = getattr(self._db, "pending_life_effects", None)
+        if not callable(pending):
+            return
+        for happened_at, payload in pending():
+            try:
+                deltas = self._random_event_deltas(payload.get("metadata"), self._event_catalog)
+                if deltas:
+                    payload["state_deltas"] = deltas
+                self._life.apply_episode(payload, now=happened_at)
+                if deltas:
+                    self._db.update_episode_metadata(payload["episode_id"], {"state_deltas_applied": True})
+                self._db.acknowledge_life_effect(payload["episode_id"])
+            except Exception:
+                logger.warning("活动生活状态仍待补账：%s", payload.get("episode_id"), exc_info=True)
+                break
+
     def _reconcile_commitments(self, now: datetime) -> None:
         if self._goal_manager is not None:
             try:
@@ -1266,7 +1302,9 @@ class RollingPlanner:
         # 在 except-pass 内——应用抛错即永久漏记且无日志。现改为**先应用后标记**，
         # 应用失败留 warning 且不盖标记（后续回放路径仍有机会补应用）。
         deltas = self._random_event_deltas(episode.get("metadata"), self._event_catalog)
-        extra_meta: Optional[Dict[str, Any]] = {"close_reason": reason} if reason else None
+        extra_meta = {"life_settlement_at": now.isoformat()}
+        if reason:
+            extra_meta["close_reason"] = reason
         if not self._db.finish(eid, actual_end_minute=end, metadata=extra_meta):
             return
         if (episode.get("metadata") or {}).get("commitment_id"):
@@ -1282,6 +1320,8 @@ class RollingPlanner:
             if deltas:
                 payload["state_deltas"] = deltas
             self._life.apply_episode(payload, now=now)
+            if callable(getattr(self._db, "acknowledge_life_effect", None)):
+                self._db.acknowledge_life_effect(eid)
             applied = True
         except Exception as exc:
             logger.warning("rolling_planner: episode 关闭状态入账失败（episode=%s）：%s", eid, exc)
@@ -1366,7 +1406,7 @@ class RollingPlanner:
                             snapshot: Any, report: Dict[str, Any]) -> None:
         intents = self._spine_intents_cached(date)
         commitments = [i for i in intents if i["hardness"] == "hard"
-                       and not (self.dynamic_sleep and is_night_sleep_item(i) and not is_named_nap(i))]
+                       and not ((self.dynamic_sleep or self._no_sleep_mode()) and is_night_sleep_item(i) and not is_named_nap(i))]
         if not commitments:
             return
         recorded = self._commitment_recorded_ids(date)
@@ -1470,6 +1510,7 @@ class RollingPlanner:
         eid = self._db.start_episode(
             schedule_date=date, name=intent["name"], goal_type=intent["goal_type"],
             source="commitment", planned_start_minute=ws, planned_end_minute=we,
+            actual_start_minute=cur,
             day_offset=intent.get("day_offset"),
             interruptibility=intent["interruptibility"], switch_cost=1.0,
             attention_mode=derive_attention_mode(
@@ -2680,6 +2721,7 @@ class RollingPlanner:
                         metadata[key] = origin_meta[key]
             eid = self._db.resume(
                 str(cand["resume_of"]),
+                schedule_date=date,
                 planned_start_minute=cur,
                 planned_end_minute=cur + duration,
                 actual_start_minute=cur, attention_mode=attention,

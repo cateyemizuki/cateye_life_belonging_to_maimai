@@ -70,7 +70,8 @@ class EmotionComponentsMixin:
         if svc is None or not self._emo_module_enabled():
             await self.ctx.send.text("情绪模块未启用或未初始化。", stream_id)
             return True, "emotion disabled", True
-        if not self._qz_is_admin(str(kwargs.get("user_id") or ""), bool(kwargs.get("is_local_operator"))):
+        if not self._qz_is_admin(str(kwargs.get("user_id") or ""), bool(kwargs.get("is_local_operator")),
+                                 platform=str(kwargs.get("platform") or "")):
             await self.ctx.send.text("权限不足：仅管理员可查看/修改情绪参数。", stream_id)
             return True, "没有权限", True
         args = str((kwargs.get("matched_groups") or {}).get("emo_args") or "").strip().lower()

@@ -37,7 +37,7 @@ from .config import (
 from .activity_properties import resolve_property
 from .cycle_state import REASON_TOOL_EDIT  # §31.2 进账血缘；R7 2026-10-23
 from .goal_manager import get_goal_manager
-from .role_judge import judge_schedule_request
+from .role_judge import judge_schedule_request, requested_date
 from .rolling_planner import extract_spine_intents
 from .schedule_generator import ScheduleGenerator
 from .time_utils import (DAY_MINUTES, TimezoneManager, format_day_minute,
@@ -852,13 +852,18 @@ class ToolsService:
         except Exception:
             logger.debug("request_life_recheck 调用失败（忽略）", exc_info=True)
 
-    async def _apply_future_decision(self, parsed: Dict[str, Any], description: str,
-                                     today_str: str, today: datetime,
-                                     layers: Dict[str, bool],
-                                     commitment: Dict[str, Any]) -> Dict[str, Any]:
+    async def _apply_future_decision(
+        self,
+        parsed: Dict[str, Any],
+        description: str,
+        today_str: str,
+        today: datetime,
+        layers: Dict[str, bool],
+        commitment: Dict[str, Any],
+    ) -> Dict[str, Any]:
         """decision=future：写 pending_commitment（未来仍走约定）并记 hardness。"""
-        target_date = str(parsed.get("date") or commitment.get("date") or today_str)
-        if target_date <= today_str:
+        target_date = requested_date(parsed.get("date") or commitment.get("date"), today_str)
+        if not target_date or target_date <= today_str:
             return {
                 "type": "schedule_unchanged",
                 "content": f"注意：未来约定日期 {target_date} 无效，日程不变",
@@ -867,64 +872,54 @@ class ToolsService:
         when = str(parsed.get("time") or commitment.get("time") or "")
         note = str(parsed.get("notes") or commitment.get("notes") or "")
         reason = str(parsed.get("reason") or "")
-        goal = get_goal_manager().add_pending_commitment(
-            commitment_date=target_date,
-            title=title,
-            time=when,
-            notes=note,
-            reason=reason,
-        )
-        goal_id = str(getattr(goal, "goal_id", "") or "")
-        hard, hard_source = self.detect_hard_commitment(
-            description, commitment=commitment)
-        if layers["enabled"]:
-            # 显式 hardness 贯通（2026-10-27 用户裁定）：soft 也落库，hard 代码强制
-            # 不被 LLM 降级；生成侧/planner 据此保持 soft 不硬化、hard 固定时间。
-            params = dict(getattr(goal, "parameters", None) or {})
-            params.update({
-                "hardness": "hard" if hard else "soft",
-                "hard": bool(hard),
-                "hard_source": hard_source,
-                "source": str(params.get("source") or "user_request"),
-            })
-            try:
-                get_goal_manager().update_goal(goal_id, parameters=params)
-            except Exception as exc:
-                logger.warning("未来约定 hardness 落库失败（约定本身已写入）: %s", exc)
-            goal = get_goal_manager().get_goal(goal_id) or goal
-            await self._request_life_recheck("commitment_written")
-            hardness_label = "硬约定" if hard else "软约定"
-            when_label = f"｜{when}" if when else ""
-            content = (
-                f"已记录 {target_date} 的约定：{title}（{hardness_label}{when_label}｜"
-                f"约定ID={goal_id}）"
+        hard, hard_source = self.detect_hard_commitment(description, commitment=commitment)
+        manager = get_goal_manager()
+        minute = parse_hhmm(when, -1)
+        if hard and minute >= 0:
+            goal_id = manager.db.accept_timed_commitment(
+                target_date,
+                title,
+                when,
+                notes=note,
+                reason=reason,
+                source=hard_source,
+                duration=60,
+                activity_type="daily_routine",
+                priority="high",
+                publish_today=False,
             )
-            if note:
-                content += f"\n备注：{note}"
-            if reason:
-                content += f"\n理由：{reason}"
-            return {
-                "type": "schedule_committed",
-                "content": content,
-                "goal_id": goal_id,
-                "intent_id": goal_id,
-                "hardness": "hard" if hard else "soft",
-                "effective_time": f"{target_date} {when}".strip(),
-            }
-        # 旧行为分支（新层恒开，正常装配不可达；骨架插件兜底）：约定已写入，文案与旧版逐字一致
+            self._refresh_commitment_cycle(target_date)
+        else:
+            goal = manager.add_pending_commitment(
+                commitment_date=target_date,
+                title=title,
+                time=when,
+                notes=note,
+                reason=reason,
+                hardness="hard" if hard else "soft",
+                hard_source=hard_source,
+            )
+            goal_id = goal.goal_id
         await self._request_life_recheck("commitment_written")
         return {
             "type": "schedule_committed",
-            "content": (
-                f"已记录 {target_date} 的约定：{parsed.get('title')}\n"
-                f"{('备注：' + parsed.get('notes')) if parsed.get('notes') else ''}\n"
-                f"{('理由：' + reason) if reason else ''}"
-            ).strip(),
+            "goal_id": goal_id,
+            "intent_id": goal_id,
+            "content": f"已记录 {target_date} 的约定：{title}（{'硬约定' if hard else '软约定'}｜{when}）"
+            + (f"\\n备注：{note}" if note else "")
+            + (f"\\n理由：{reason}" if reason else ""),
+            "hardness": "hard" if hard else "soft",
+            "effective_time": f"{target_date} {when}".strip(),
         }
 
-    async def _apply_today_decision(self, parsed: Dict[str, Any], description: str,
-                                    today_str: str, now: datetime,
-                                    intent: Dict[str, Any]) -> Dict[str, Any]:
+    def _refresh_commitment_cycle(self, date: str) -> None:
+        generator = self._get_generator()
+        if generator is not None:
+            generator.confirm_commitment_publication(date)
+
+    async def _apply_today_decision(
+        self, parsed: Dict[str, Any], description: str, today_str: str, now: datetime, intent: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """decision=today：新层开时写/更新今日 spine 意图（硬约定代码强制 hardness=hard）。"""
         name = str(intent.get("name") or parsed.get("title") or description[:40]).strip()
         goal_type = str(intent.get("goal_type") or "").strip() or "daily_routine"
@@ -935,17 +930,40 @@ class ToolsService:
         hard, hard_source = self.detect_hard_commitment(description, intent=intent)
         hardness = "hard" if hard else "soft"
         note = str(parsed.get("notes") or intent.get("note") or "").strip()
-        written = self._upsert_spine_intent(
-            date=today_str, name=name, goal_type=goal_type, priority=priority,
-            hardness=hardness, start_minute=start_minute, end_minute=end_minute, note=note)
-        if written is None:
-            return {"type": "error",
-                    "content": "日程生成器不可用（插件未完成初始化），今日意图未写入"}
+        if hard:
+            when = f"{start_minute // 60:02d}:{start_minute % 60:02d}"
+            goal_id = get_goal_manager().db.accept_timed_commitment(
+                today_str,
+                name,
+                when,
+                notes=note,
+                reason=str(parsed.get("reason") or ""),
+                source=hard_source,
+                duration=end_minute - start_minute,
+                activity_type=goal_type,
+                priority=priority,
+                publish_today=True,
+            )
+            intent_id = f"commitment:{goal_id}"
+            self._refresh_commitment_cycle(today_str)
+        else:
+            written = self._upsert_spine_intent(
+                date=today_str,
+                name=name,
+                goal_type=goal_type,
+                priority=priority,
+                hardness=hardness,
+                start_minute=start_minute,
+                end_minute=end_minute,
+                note=note,
+            )
+            if written is None:
+                return {"type": "error", "content": "日程生成器不可用，今日意图未写入"}
+            intent_id = goal_id = written["item_id"]
         await self._request_life_recheck("schedule_intent_written")
-        intent_id = written["item_id"]
         window = f"{format_day_minute(start_minute)}-{format_day_minute(end_minute)}"
         hardness_label = "硬约定" if hard else "软意图"
-        content = (f"已更新今日意图：{name}（{hardness_label}｜{window}｜意图ID={intent_id}）")
+        content = f"已更新今日意图：{name}（{hardness_label}｜{window}｜意图ID={intent_id}）"
         if note:
             content += f"\n备注：{note}"
         if hard:
@@ -954,7 +972,7 @@ class ToolsService:
             "type": "schedule_intent_updated",
             "content": content,
             "intent_id": intent_id,
-            "goal_id": intent_id,
+            "goal_id": goal_id,
             "hardness": hardness,
             "hard_source": hard_source,
             "effective_time": f"{today_str} {format_day_minute(start_minute)}",
