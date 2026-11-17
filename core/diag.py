@@ -225,7 +225,7 @@ class LLMCallLogger:
             "event": event,
             "task": task,
             "success": success,
-            "response": (response or "")[:4000],
+            "response": "" if event in ("cateye_screen_describe", "describe_image") else (response or "")[:4000],
             "error": (error or "")[:400],
         }
         try:
@@ -244,7 +244,7 @@ class LLMCallLogger:
 
     def record_generation(self, **fields: Any) -> None:
         """生成策略日志单独标记，供 WebUI 读取；不重复计入 Token 账本。"""
-        entry={"time":datetime.now().isoformat(timespec="seconds"),"kind":"generation",**fields}
+        entry={"time":datetime.now().astimezone().isoformat(timespec="seconds"),"kind":"generation",**fields}
         entry["level"]=entry.get("level") if entry.get("level") in ("info","warn","error") else "info"
         for name in ("message","fallback_reason"):
             if name in entry:entry[name]=str(entry[name])[:400]

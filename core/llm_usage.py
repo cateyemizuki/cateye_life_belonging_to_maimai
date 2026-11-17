@@ -22,7 +22,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -275,7 +275,7 @@ class LLMUsageTracker:
             "generation_group_id": str(scope.get("group_id") or ""),
             "generation_attempt": scope.get("attempt"),
             "schema": 2,
-            "ts": datetime.now().isoformat(timespec="seconds"),
+            "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
             "module": str(module or ""),
             "event": str(event or ""),
             "task_name": str(task_name or ""),
@@ -333,7 +333,7 @@ class LLMUsageTracker:
         path = self._path
         if path is None or not path.exists():
             return
-        cutoff = datetime.now() - timedelta(hours=self._keep_hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=self._keep_hours)
         kept: List[str] = []
         changed = False
         try:
@@ -349,10 +349,9 @@ class LLMUsageTracker:
                         continue
                     ts = str((entry or {}).get("ts") or "")
                     try:
-                        at = datetime.fromisoformat(ts)
-                        # Imported/legacy ledgers can contain aware timestamps; compare actual instants.
-                        boundary = cutoff.astimezone(at.tzinfo) if at.tzinfo is not None else cutoff
-                        fresh = bool(ts) and at >= boundary
+                        # Legacy naive records represent wall time in the writing host's timezone.
+                        at = datetime.fromisoformat(ts).astimezone(timezone.utc)
+                        fresh = at >= cutoff
                     except (ValueError, TypeError):
                         fresh = False
                     if fresh:

@@ -127,8 +127,7 @@ class ScreenPerceptionService:
             )
             if self._screen_store.publish(sid, text):
                 self._last_stream_id = sid
-                logger.info("屏幕旁白已挂入注入缓存（stream=%s，%s）：%s",
-                            sid, peek.status, text)
+                logger.info("屏幕旁白已挂入注入缓存（%s）", peek.status)
                 return True
             return False
         except Exception as e:  # 锦上添花，绝不阻塞触发

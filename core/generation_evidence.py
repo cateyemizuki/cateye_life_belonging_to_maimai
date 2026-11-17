@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 def record_outcome(data_dir, entry):
     if not data_dir:
         return
-    now = datetime.now()
+    now = datetime.now().astimezone()
     folder = Path(data_dir) / "llm_generation_outcomes"
     try:
         folder.mkdir(parents=True, exist_ok=True)

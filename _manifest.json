@@ -61,7 +61,8 @@
     "api.call",
     "database.get",
     "emoji.get_by_description",
-    "component.list_registered_plugins"
+    "component.list_registered_plugins",
+    "component.reload_plugin"
   ],
   "i18n": {
     "default_locale": "zh-CN",

@@ -43,6 +43,38 @@ def admin_users_of(config: Any) -> list[str]:
     return [target] if target else []
 
 
+def command_admin(config: Any, *, platform: str, user_id: str, is_local_operator: bool) -> bool:
+    """Command identities come from the host envelope, independently of chat text."""
+    if is_local_operator is True:
+        return True
+    caller = qq_id(user_id)
+    if str(platform or "").strip().lower() != "qq" or not caller:
+        return False
+    return any(qq_id(candidate) == caller for candidate in admin_users_of(config))
+
+
+def command_stream_allowed(config: Any, *, stream_id: str, platform: str, user_id: str,
+                           group_id: str, is_local_operator: bool) -> bool:
+    if is_local_operator is True:
+        return True
+    entries = getattr(getattr(config, "admin", None), "allowed_streams", ()) or ()
+    allowed = {str(entry).strip() for entry in entries if str(entry).strip()}
+    if not allowed or any(entry.lower() == "all" for entry in allowed):
+        return True
+    sid = str(stream_id or "").strip()
+    if not sid:
+        return False
+    candidates = {sid, "session:" + sid}
+    platform = str(platform or "").strip().lower()
+    group = str(group_id or "").strip()
+    user = str(user_id or "").strip()
+    if platform and group:
+        candidates.add(f"{platform}:group:{group}")
+    elif platform and user:
+        candidates.add(f"{platform}:private:{user}")
+    return not allowed.isdisjoint(candidates)
+
+
 async def refresh_host_target(plugin: Any) -> None:
     """活读宿主命令管理员，不将解析结果写回 TOML。失败时清除旧缓存。"""
     section = getattr(getattr(plugin, "config", None), "patrol", None)

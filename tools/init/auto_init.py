@@ -378,10 +378,9 @@ class AutoInitDriver:
                 name, manual=manual, force=force,
                 version=version, version_fields=version_fields))
         # 处理完字段后写回版本（preflight 失败不写，避免丢掉版本重 init 信号）。
-        try:
-            self.registry.set_plugin_version(version)
-        except Exception as exc:
-            self._log.warning("init_registry 写回版本失败（忽略）：%s", exc)
+        if not fields and self.registry.load().get("plugin_version") != version:
+            if not self.registry.set_plugin_version(version):
+                self._log.warning("init_registry 版本未能保存，保留原升级位点")
         return AutoInitReport(
             manual=manual, plugin_version=version,
             registry_path=str(self.registry.path),
@@ -467,7 +466,13 @@ class AutoInitDriver:
                                 message=message, errors=errors, validated=False,
                                 attempts=int(state.get("attempts") or 0),
                                 details=dict(getattr(stage, "details", {}) or {}))
-        self.registry.mark_true(name, version)
+        if not self.registry.mark_true(name, version):
+            message = "产物已通过校验，初始化登记写入失败，字段待确认"
+            self._log.warning("初始化字段 %s：%s", name, message)
+            return FieldOutcome(name, "failed", stage_status=stage_status,
+                                message=message, errors=(message,), validated=True,
+                                attempts=int(entry.get("attempts") or 0),
+                                details=dict(getattr(stage, "details", {}) or {}))
         state = self.registry.field_state(name)
         return FieldOutcome(
             name, "success", stage_status=stage_status,

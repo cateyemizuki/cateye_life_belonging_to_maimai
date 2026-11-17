@@ -22,7 +22,7 @@
 
 from __future__ import annotations
 
-from core.targeting import admin_users_of
+from core.targeting import command_admin, command_stream_allowed
 import asyncio
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
@@ -51,25 +51,6 @@ class CommandRootComponentsMixin:
     # ------------------------------------------------------------------
     # 权限口径（与既有 admin_users / 本机控制台一致）
     # ------------------------------------------------------------------
-    def _cmd_is_admin(self, user_id: str, is_local_operator: bool = False) -> bool:
-        """优先复用 qzone Mixin 的 ``_qz_is_admin``；孤立宿主下按同口径回退。"""
-        checker = getattr(self, "_qz_is_admin", None)
-        if callable(checker):
-            try:
-                return bool(checker(str(user_id or ""), bool(is_local_operator)))
-            except Exception:
-                return False
-        if is_local_operator:
-            return True
-        try:
-            admins = {
-                str(item).rsplit(":", 1)[-1]
-                for item in admin_users_of(self.config)
-            }
-        except Exception:
-            admins = set()
-        return bool(admins) and str(user_id or "").rsplit(":", 1)[-1] in admins
-
     # ------------------------------------------------------------------
     # 根命令
     # ------------------------------------------------------------------
@@ -96,6 +77,10 @@ class CommandRootComponentsMixin:
     # ------------------------------------------------------------------
     async def _cmd_root_entry(self, lang: str, kwargs: Dict[str, Any]) -> tuple:
         stream_id = str(kwargs.get("stream_id", "") or "")
+        platform = str(kwargs.get("platform") or "").strip().lower()
+        group_id = str(kwargs.get("group_id") or "").strip()
+        user_id = str(kwargs.get("user_id") or "").strip()
+        local = kwargs.get("is_local_operator") is True
         parsed: ParsedCommand = DISPATCHER.parse(lang, extract_root_args(lang, kwargs))
 
         async def _send_text(text: str) -> None:
@@ -106,9 +91,12 @@ class CommandRootComponentsMixin:
 
         ctx = DispatchContext(
             stream_id=stream_id,
-            user_id=str(kwargs.get("user_id", "") or ""),
-            is_local_operator=bool(kwargs.get("is_local_operator", False)),
-            is_admin=self._cmd_is_admin,
+            user_id=user_id, platform=platform, group_id=group_id, is_local_operator=local,
+            is_admin=lambda uid, trusted: command_admin(
+                self.config, platform=platform, user_id=uid, is_local_operator=trusted),
+            stream_allowed=command_stream_allowed(
+                self.config, stream_id=stream_id, platform=platform, user_id=user_id,
+                group_id=group_id, is_local_operator=local),
             resolve=lambda name: getattr(self, name, None),
             send_text=_send_text,
             send_overview=_send_overview,

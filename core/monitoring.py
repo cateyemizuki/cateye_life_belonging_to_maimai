@@ -1,6 +1,6 @@
 """Bounded, redacted read projections for the dashboard and overnight evidence."""
 import json
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 def tail_records(path,budget=512*1024):
@@ -26,12 +26,17 @@ def _usage_count(value):
 def generation_logs(data_dir,now,hours=24,limit=200,*,include_all=False):
     """Read bounded evidence; the display cap never limits request association."""
     hours=max(1,min(720,int(hours)));records=[];truncated=False
+    until = now.astimezone(timezone.utc)
+    since = until - timedelta(hours=hours)
+    # Writers, including old versions, rotate files by the host's local calendar.
+    last_day = until.astimezone().date()
+    first_day = since.astimezone().date()
     if data_dir:
         # Separate budgets prevent optional raw diagnostics from crowding out compact evidence.
         for folder,prefix in (('llm_generation_outcomes','generation_'),('llm_logs','llm_calls_')):
             budget=2*1024*1024
-            for offset in range(min(31,(hours+23)//24+1)):
-                path=Path(data_dir)/folder/(prefix+(now-timedelta(days=offset)).strftime('%Y-%m-%d')+'.jsonl')
+            for offset in range((last_day-first_day).days+1):
+                path=Path(data_dir)/folder/(prefix+(last_day-timedelta(days=offset)).isoformat()+'.jsonl')
                 try:size=path.stat().st_size
                 except OSError:continue
                 if budget<=0:truncated=True;break
@@ -39,10 +44,8 @@ def generation_logs(data_dir,now,hours=24,limit=200,*,include_all=False):
                 for row in rows:
                     if row.get('kind')!='generation':continue
                     try:
-                        at=datetime.fromisoformat(str(row.get('time','')))
-                        if at.tzinfo is None:at=at.replace(tzinfo=now.tzinfo)
-                        elif now.tzinfo is None:at=at.replace(tzinfo=None)
-                        if not now-timedelta(hours=hours)<=at<=now:continue
+                        at=datetime.fromisoformat(str(row.get('time',''))).astimezone(timezone.utc)
+                        if not since<=at<=until:continue
                     except (ValueError,TypeError):continue
                     record={'time':at.isoformat(),'level':row.get('level') if row.get('level') in ('info','warn','error') else 'unknown',
                             'used_template':row.get('used_template') is True}
@@ -116,6 +119,8 @@ def usage_summary(data_dir,now,hours=24,*,include_rows=False):
     ``split_coverage``），不改 ``tokens`` 原语义。
     """
     hours=max(1,min(720,int(hours)))
+    until = now.astimezone(timezone.utc)
+    since = until - timedelta(hours=hours)
     logs=generation_logs(data_dir,now,hours,include_all=True)
     rows,truncated=tail_records(Path(data_dir)/'llm_usage_events.jsonl',2*1024*1024) if data_dir else ([],False)
     decorate_usage_rows(rows,logs['_all_rows'])
@@ -135,10 +140,8 @@ def usage_summary(data_dir,now,hours=24,*,include_rows=False):
     buckets=empty_buckets()
     for row in rows:
         try:
-            at=datetime.fromisoformat(str(row.get('ts','')))
-            if at.tzinfo is None:at=at.replace(tzinfo=now.tzinfo)
-            elif now.tzinfo is None:at=at.replace(tzinfo=None)
-            if not now-timedelta(hours=hours)<=at<=now:continue
+            at=datetime.fromisoformat(str(row.get('ts',''))).astimezone(timezone.utc)
+            if not since<=at<=until:continue
             count=reported_token_count(row);model=str(row.get('model') or '未返回模型名')[:120]
             if (_usage_count(row.get('schema')) or 1)<2:schema1_calls+=1
             calls+=1;tokens+=count;level_counts[row['level']]+=1
@@ -191,7 +194,7 @@ def usage_summary(data_dir,now,hours=24,*,include_rows=False):
             'host_reported_tokens':verified_tokens,
             'modules':modules,'window_hours':hours,'truncated':truncated,
             'semantic_evidence_truncated':logs['read_truncated'],
-            'has_usage':tokens>0,'window_start':(now-timedelta(hours=hours)).isoformat(timespec='seconds'),
+            'has_usage':tokens>0,'window_start':since.isoformat(timespec='seconds'),
             'schema1_calls':schema1_calls,'rows':sorted(projected,key=lambda row:row['ts'],reverse=True),
             'missing_usage_source_calls':unknown,'missing_usage_source_tokens':unverified_tokens,
             'buckets':buckets,
