@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from core.time_utils import parse_hhmm
 from .schedule_db import ScheduleDB
@@ -373,6 +373,32 @@ class GoalManager:
         self._notify_change("commitment_added")
         return goal
 
+    def accept_timed_commitment(
+        self, date: str, title: str, when: str, *,
+        notes: str = "", reason: str = "", source: str = "user_request",
+        duration: int = 60, activity_type: str = "daily_routine", priority: str = "high",
+        publish_today: bool = False, existing_goal_id: Optional[str] = None,
+        publication: Optional[Callable[[str], None]] = None,
+    ) -> Optional[Goal]:
+        """Accept or repair a stable hard commitment and confirm its resulting publication.
+
+        The database owns identity matching and the atomic goal/day-row write. A repair
+        returns None if cancellation won the transaction. Publication errors propagate,
+        retaining the accepted goal for the existing retry/reconciliation path.
+        """
+        goal_id = self.db.accept_timed_commitment(
+            date, title, when, notes=notes, reason=reason, source=source,
+            duration=duration, activity_type=activity_type, priority=priority,
+            publish_today=publish_today, existing_goal_id=existing_goal_id)
+        if not goal_id:
+            return None
+        stored = self.db.get_goal(goal_id)
+        if stored is None:
+            raise RuntimeError("accepted commitment has no persistent goal")
+        if publication is not None:
+            publication(date)
+        return Goal.from_dict(stored)
+
     def get_pending_commitments(self, commitment_date: Optional[str] = None) -> List[Goal]:
         """查询未来约定（仅 status=active；commitment_date 留空 = 今天）。"""
         if commitment_date is None:
@@ -429,7 +455,7 @@ class GoalManager:
             if (not plan and params.get("commitment_lifecycle") and params.get("hardness") != "soft"
                     and minute >= 0 and day >= moment.date() and elapsed_seconds(end_at, moment) > 0
                     and self.db.has_day_schedule(date)):
-                self.db.accept_timed_commitment(date, goal.name, str(params["time"]),
+                self.accept_timed_commitment(date, goal.name, str(params["time"]),
                     notes=str(params.get("notes") or ""), reason=str(params.get("reason") or ""),
                     source=str(params.get("hard_source") or "user_request"),
                     duration=max(1, int(params.get("duration_minutes") or 60)),

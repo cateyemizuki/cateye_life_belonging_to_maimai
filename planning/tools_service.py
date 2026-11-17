@@ -876,19 +876,10 @@ class ToolsService:
         manager = get_goal_manager()
         minute = parse_hhmm(when, -1)
         if hard and minute >= 0:
-            goal_id = manager.db.accept_timed_commitment(
-                target_date,
-                title,
-                when,
-                notes=note,
-                reason=reason,
-                source=hard_source,
-                duration=60,
-                activity_type="daily_routine",
-                priority="high",
-                publish_today=False,
-            )
-            self._refresh_commitment_cycle(target_date)
+            goal = manager.accept_timed_commitment(
+                target_date, title, when, notes=note, reason=reason, source=hard_source,
+                publication=self._refresh_commitment_cycle)
+            goal_id = goal.goal_id
         else:
             goal = manager.add_pending_commitment(
                 commitment_date=target_date,
@@ -932,20 +923,13 @@ class ToolsService:
         note = str(parsed.get("notes") or intent.get("note") or "").strip()
         if hard:
             when = f"{start_minute // 60:02d}:{start_minute % 60:02d}"
-            goal_id = get_goal_manager().db.accept_timed_commitment(
-                today_str,
-                name,
-                when,
-                notes=note,
-                reason=str(parsed.get("reason") or ""),
-                source=hard_source,
-                duration=end_minute - start_minute,
-                activity_type=goal_type,
-                priority=priority,
-                publish_today=True,
-            )
-            intent_id = f"commitment:{goal_id}"
-            self._refresh_commitment_cycle(today_str)
+            goal = get_goal_manager().accept_timed_commitment(
+                today_str, name, when, notes=note, reason=str(parsed.get("reason") or ""),
+                source=hard_source, duration=end_minute - start_minute,
+                activity_type=goal_type, priority=priority, publish_today=True,
+                publication=self._refresh_commitment_cycle)
+            goal_id = goal.goal_id
+            intent_id = goal.parameters["commitment_plan"]["item_id"]
         else:
             written = self._upsert_spine_intent(
                 date=today_str,
