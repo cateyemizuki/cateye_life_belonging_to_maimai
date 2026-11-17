@@ -1064,19 +1064,9 @@ class VideoWatchCoordinator:
             # （revoked_by_chat / episode_* 需要保留给面板与测试判定）。
             entry["detached_stage"] = stage
         if stage in ("completed", "failed", "cancelled"):
-            if stage == "completed":
-                # 晚到完成：补记录分享候选与结果（manager 已完成即时入库）。
-                result = await self._archive_if_completed(entry, task_id, episode_id=episode_id)
-                self._accumulate_watch(entry, result or dict(receipt, status="completed"))
-            self._settle_quota(episode_id, entry, reason=f"task_{stage}", finished_at=receipt.get("finished_at"))
-            entry["stage"] = stage
-            entry["detached"] = False
-            entry["detached_finished"] = True
-            entry["closed"] = True
-            entry["closed_reason"] = f"task_{stage}"
+            await self._finish_watch_task(episode_id, entry, receipt, detached=True)
             if self._log:
-                self._log.info("刷视频事件 %s：脱离 owner 后任务终态 %s，已补归档",
-                               episode_id, stage)
+                self._log.info("刷视频事件 %s：脱离 owner 后任务终态 %s，已补归档", episode_id, stage)
             return True
         if polls >= _DETACHED_MAX_POLLS:
             entry["detached"] = False
@@ -1387,20 +1377,29 @@ class VideoWatchCoordinator:
             if self._log and stage in ("running", "completed", "failed", "cancelled"):
                 self._log.info("观看任务 %s 阶段：%s", task_id, stage)
             if stage in ("completed", "failed", "cancelled"):
-                if stage == "completed":
-                    result = await self._archive_if_completed(entry, task_id, episode_id=episode_id)
-                    self._accumulate_watch(entry, result or dict(receipt, status="completed"))
-                    if entry.get("scenario") in ("gap", "casual"):
-                        self._settle_quota(episode_id, entry, reason="session_completed")
-                else:
-                    # 取消/失败：按实际观看结算（未开始 → 全额退款），不再固定扣 20 分钟。
-                    self._settle_quota(episode_id, entry, reason=f"task_{stage}", finished_at=receipt.get("finished_at"))
-                self._release_surf(episode_id, entry)
-                entry["closed"] = True
-                entry["closed_reason"] = f"task_{stage}"
+                await self._finish_watch_task(episode_id, entry, receipt)
                 return True
             return True
         return False
+
+    async def _finish_watch_task(self, episode_id: str, entry: Dict[str, Any],
+                                 receipt: Dict[str, Any], *, detached: bool = False) -> None:
+        """Close a confirmed worker terminal. Dedicated live sessions decide continuation upstream."""
+        stage = str(receipt["status"])
+        task_id = str(entry.get("task_id") or "")
+        if stage == "completed":
+            result = await self._archive_if_completed(entry, task_id, episode_id=episode_id)
+            self._accumulate_watch(entry, result or dict(receipt, status="completed"))
+        if stage != "completed" or detached:
+            self._settle_quota(episode_id, entry, reason=f"task_{stage}",
+                               finished_at=receipt.get("finished_at"))
+        elif entry.get("scenario") in ("gap", "casual"):
+            self._settle_quota(episode_id, entry, reason="session_completed")
+        self._release_surf(episode_id, entry)
+        if detached:
+            entry["detached"] = False
+            entry["detached_finished"] = True
+        entry.update(stage=stage, closed=True, closed_reason=f"task_{stage}")
 
     async def _archive_if_completed(self, entry: Dict[str, Any], task_id: str,
                                     episode_id: str = "") -> Optional[Dict[str, Any]]:

@@ -721,7 +721,49 @@ async def qzone_policy_equivalence(folder):
     assert service._cooldown_remain_minutes(now, retry=True) > 0
 
 
+async def watch_terminal_equivalence(folder):
+    from itertools import product
+    for scenario, stage, detached in product(("dedicated", "gap", "casual"),
+                                             ("completed", "failed", "cancelled"), (False, True)):
+        case_dir = folder / f"{scenario}-{stage}-{detached}"
+        case_dir.mkdir()
+        quota = SurfQuotaLedger(case_dir, day_provider=lambda: DAY, clock=lambda: NOW)
+        assert quota.reserve_once("episode", scenario, 10)
+        status = {"success": True, "status": stage, "started_at": NOW-120, "finished_at": NOW}
+        async def api(action, **kwargs):
+            if action == "status":
+                return dict(status)
+            if action == "result":
+                return {"success": True, "result": {**status, "video": {"bvid": A, "title": "fixture"}}}
+            raise AssertionError(action)
+        released = []
+        attention = NS(lease_valid=lambda _: True, release=lambda owner: released.append(owner))
+        coordinator = VideoWatchCoordinator(case_dir, api, lambda: {}, lambda _: {},
+                                             quota=quota, clock=lambda: NOW, attention=attention)
+        entry = {"scenario": scenario, "task_id": "t", "stage": "running", "quota_day": DAY,
+                 "reserved_minutes": 10, "session_target_minutes": 10, "lease": {"kind": "surf"}}
+        if detached:
+            entry.update(detached=True, closed=True)
+            assert await coordinator._poll_detached("episode", entry)
+        else:
+            assert await coordinator._poll_status("episode", entry)
+        assert entry["stage"] == stage and entry["closed"] and entry["closed_reason"] == "task_" + stage
+        assert not entry.get("lease")
+        assert released == ["schedule:episode"]
+        if stage == "completed" and scenario == "dedicated" and not detached:
+            assert quota.snapshot()["minutes_used"] == 10 and entry["reserved_minutes"] == 10
+        else:
+            assert quota.snapshot()["minutes_used"] == 2 and entry["settled_minutes"] == 2
+        if stage == "completed":
+            assert entry["watched_minutes_accumulated"] == 2
+        else:
+            assert not entry.get("result")
+        if detached:
+            assert entry["detached_finished"] and not entry["detached"]
+
+
 CASES = [
+    "watch_terminal_equivalence",
     "qzone_policy_equivalence",
     "share_limits", "wrong_manual_receipt", "profile_count", "interrupted_eval", "cancel_cache",
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
