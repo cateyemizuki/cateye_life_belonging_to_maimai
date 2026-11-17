@@ -352,6 +352,8 @@ class QzoneVideoLedger:
                 receipt_id TEXT NOT NULL DEFAULT '',
                 UNIQUE(bvid,task_id));
               CREATE INDEX IF NOT EXISTS candidate_due ON candidates(status,next_eval_at);
+              CREATE TABLE IF NOT EXISTS retired_watches(bvid TEXT NOT NULL,task_id TEXT NOT NULL,
+                PRIMARY KEY(bvid,task_id));
               CREATE TABLE IF NOT EXISTS assets(
                 asset_id TEXT PRIMARY KEY,bvid TEXT NOT NULL,cid TEXT NOT NULL DEFAULT '',
                 task_id TEXT NOT NULL,timestamp_seconds REAL NOT NULL DEFAULT 0,
@@ -432,8 +434,25 @@ class QzoneVideoLedger:
         if not str(task_id or ''):
             return False
         with self._transaction() as db:
-            if db.execute('SELECT count(*) FROM candidates').fetchone()[0] >= CANDIDATE_CAPACITY:
+            if db.execute("SELECT 1 FROM retired_watches WHERE bvid=? AND task_id=? "
+                          "UNION ALL SELECT 1 FROM candidates WHERE bvid=? AND task_id=? LIMIT 1",
+                          (facts["bvid"], task_id, facts["bvid"], task_id)).fetchone():
                 return False
+            if db.execute('SELECT count(*) FROM candidates').fetchone()[0] >= CANDIDATE_CAPACITY:
+                retired = db.execute("""SELECT candidate_id,bvid,task_id FROM candidates AS c
+                    WHERE expires_at<=? AND (status IN ('expired','rejected','pending','deferred','evaluated')
+                    OR (status='posted' AND json_valid(decision_json) AND json_extract(decision_json,'$.fact_sync')='ok'))
+                    AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.task_id=c.task_id)
+                    AND NOT EXISTS (SELECT 1 FROM publish_attempts p WHERE p.candidate_id=c.candidate_id
+                                    AND (p.status IN ('claimed','sending','uncertain')
+                                         OR (p.status='sent' AND c.status!='posted')))
+                    ORDER BY expires_at LIMIT 32""", (now,)).fetchall()
+                if not retired:
+                    return False
+                db.executemany("INSERT OR IGNORE INTO retired_watches VALUES (?,?)",
+                               [(r["bvid"], r["task_id"]) for r in retired])
+                db.executemany("DELETE FROM candidates WHERE candidate_id=?", [(r["candidate_id"],) for r in retired])
+
             cursor = db.execute(
                 "INSERT OR IGNORE INTO candidates(candidate_id,bvid,task_id,episode_id,facts_json,"
                 "status,created_at,expires_at,next_eval_at) VALUES(?,?,?,?,?,'pending',?,?,?)",
@@ -866,7 +885,11 @@ class QzoneVideoLedger:
                     'WHERE bvid=? AND watched_generation=? AND channel=?',
                     (attempt_id, str(candidate_id), now, str(bvid), str(watched_generation), str(channel)))
                 return {'status': 'claimed', 'attempt_id': attempt_id}
-            if db.execute('SELECT count(*) FROM publish_attempts').fetchone()[0] >= ATTEMPT_CAPACITY:
+            if db.execute("SELECT 1 FROM retired_watches WHERE bvid=? AND task_id=?",
+                          (bvid, watched_generation)).fetchone():
+                return {'status': 'blocked', 'reason': 'retired_watch'}
+            # Keep confirmed receipts for idempotence; only outstanding operations need an active slot.
+            if db.execute("SELECT count(*) FROM publish_attempts WHERE status IN ('claimed','sending','uncertain')").fetchone()[0] >= ATTEMPT_CAPACITY:
                 return {'status': 'blocked', 'reason': 'receipt_capacity'}
             attempt_id = 'qva_' + uuid.uuid4().hex
             db.execute(
@@ -1743,6 +1766,11 @@ class QzoneVideoBridge:
             return {'status': 'released', 'reason': 'caption_failed', 'next': outcome}
         # 分发前写 request_key（=post_moment preview key，经注入端口计算）并置 sending
         # （崩溃残留 → 启动恢复 uncertain）。端口缺省留空：幂等仍由唯一键保证。
+        if not self._publish_ready() or self._now() >= number(candidate.get('expires_at')):
+            await asyncio.to_thread(self.ledger.unclaim_assets, claimed)
+            await asyncio.to_thread(self.ledger.finish_attempt, attempt_id, 'rejected', self._now(), reason='gate_changed_before_dispatch')
+            await asyncio.to_thread(self.ledger.defer_publish, cid, self._now() + GATE_RETRY_SECONDS)
+            return {'status': 'gate_rejected', 'reason': 'gate_changed_before_dispatch'}
         request_key = ''
         if self._preview_key is not None:
             try:

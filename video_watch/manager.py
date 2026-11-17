@@ -762,7 +762,8 @@ class WatchTaskManager:
         task["result_cache_mode"] = self._result_mode_token(result)
         self._store.upsert_task(task)
         try:
-            self._store.save_cache(str(task.get("bvid")), result)
+            if final:
+                self._store.save_cache(str(task.get("bvid")), result)
         except OSError as exc:
             # 缓存失败不能抹掉真实任务终态或触发重复观看。
             if self._log:

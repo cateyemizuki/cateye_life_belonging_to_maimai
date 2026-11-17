@@ -35,6 +35,8 @@ v1 字段原地保留（§5.3）：``habits``（memory_manager 的底层存储�
 
 from __future__ import annotations
 
+from copy import deepcopy
+from uuid import uuid4
 import json
 import logging
 import time
@@ -383,8 +385,15 @@ class AffectionManager:
         config_provider: Any = None,
         decision_logger: Any = None,
         bus: Any = None,
+        target_bound: bool = False,
     ) -> None:
-        self._path = Path(data_dir) / "affection_memory.json"
+        self._data_dir = Path(data_dir)
+        self._target_bound = target_bound
+        self._binding_checked = False
+        self._owner_qq = ""
+        self.binding_generation = 0
+        self._pending_writes = {}
+        self._path = None if target_bound else self._data_dir / "affection_memory.json"
         self._dirty = False
         self._last_flush = 0.0
         #: 运行期动态配置来源：可调用对象（返回顶层配置或 [affection] 段）或配置对象本身
@@ -397,7 +406,7 @@ class AffectionManager:
         #: 当前生效预设名（companion/services 按 [patrol].relation_type 同步；默认「恋人」）
         self._preset_name: str = affection_presets.BUILTIN_PRESET_NAMES[0]
 
-        loaded, status = _read_json_file(self._path)
+        loaded, status = _read_json_file(self._path) if self._path is not None else ({}, "missing")
         if status == "corrupt":
             logger.warning("好感档案 JSON 损坏，已按全新档案处理并重建：%s", self._path)
             loaded = {}
@@ -417,6 +426,78 @@ class AffectionManager:
     # ------------------------------------------------------------------
     # 生效预设（区间/标签/代表分的唯一来源：companion/affection_presets）
     # ------------------------------------------------------------------
+    def _legacy_owner(self, legacy: Path) -> str:
+        """Freeze the ownership evidence before this run can replace its routing binding."""
+        from core.targeting import qq_id
+        marker = self._data_dir / "affection_profiles" / "legacy_binding.json"
+        saved, status = _read_json_file(marker)
+        if status == "corrupt":
+            raise ValueError("旧档归属记录暂不可核验，保留原文件")
+        if status == "ok":
+            return qq_id(saved.get("owner_qq"))
+        old, status = _read_json_file(legacy)
+        if status != "ok":
+            return ""
+        scope, scope_status = _read_json_file(self._data_dir / "screen_target_scope.json")
+        initiative, initiative_status = _read_json_file(self._data_dir / "initiative_state.json")
+        owners = set()
+        if old.get("owner_qq"):
+            owners.add(qq_id(old["owner_qq"]))
+        if scope.get("stream_id") and scope.get("target_qq"):
+            owners.add(qq_id(scope["target_qq"]))
+        cycles = initiative.get("cycles", {})
+        if isinstance(cycles, dict):
+            owners.update(qq_id(key) for key in cycles)
+        trusted = (next(iter(owners)) if len(owners) == 1 and
+                   "corrupt" not in (scope_status, initiative_status) else "")
+        if not save_json_atomic(marker, {"owner_qq": trusted}):
+            raise OSError("无法保存旧关系档案的归属记录")
+        return trusted
+
+    def bind_target(self, value: str) -> bool:
+        """Keep the manager identity while selecting the one QQ-owned profile."""
+        from core.targeting import qq_id
+        owner = qq_id(value)
+        if self._target_bound and self._binding_checked and owner == self._owner_qq and (self._path is not None or not owner):
+            return False
+        if self._path is not None and self._dirty:
+            self.flush()
+            if self._dirty:
+                self._pending_writes[self._path] = self._state
+        self._target_bound = True
+        self._owner_qq = ""
+        self.binding_generation += 1
+        self._path = None
+        self._dirty = False
+        self._state, _ = _build_state({})
+        legacy = self._data_dir / "affection_memory.json"
+        legacy_owner = self._legacy_owner(legacy) if legacy.exists() else ""
+        self._binding_checked = True
+        if not owner:
+            return True
+        path = self._data_dir / "affection_profiles" / (owner + ".json")
+        raw, status = _read_json_file(path)
+        buffered = self._pending_writes.get(path)
+        if buffered is not None:
+            raw, status = buffered, "ok"
+        if status == "corrupt" or (status == "ok" and raw.get("owner_qq") != owner):
+            raise ValueError("关系档案归属或格式异常，保留原文件")
+        if status == "missing" and legacy_owner == owner:
+            raw, status = _read_json_file(legacy)
+            if status != "ok":
+                raise OSError("旧关系档案暂不可读")
+        state, migrated = _build_state(raw)
+        state["owner_qq"] = owner
+        if (buffered is not None or not path.exists() or migrated) and not save_json_atomic(path, state):
+            raise OSError("目标关系档案无法保存")
+        self._pending_writes.pop(path, None)
+        self._path, self._state, self._owner_qq = path, state, owner
+        return True
+
+    def matches_target(self, value: str) -> bool:
+        from core.targeting import qq_id
+        return not self._target_bound or bool(self._owner_qq and qq_id(value) == self._owner_qq)
+
     def set_preset_name(self, name: Any) -> None:
         """同步当前关系预设名（companion/services 按 [patrol].relation_type 调用）。
 
@@ -460,7 +541,7 @@ class AffectionManager:
 
     def is_enabled(self) -> bool:
         """[affection] enabled：false 时好感系统停用（不记账/不衰减/不重估；§19.4 语义变更）。"""
-        return self._cfg_bool("enabled", True)
+        return (not self._target_bound or bool(self._owner_qq)) and self._cfg_bool("enabled", True)
 
     def emotion_modulation_enabled(self) -> bool:
         """B2 情绪调制开关（[affection] emotion_modulation，默认开；关时乘数恒 1.0）。"""
@@ -823,6 +904,75 @@ class AffectionManager:
             logger.warning("好感事件日志超过上限 %d 条，已丢弃最旧 %d 条", self.EVENT_LOG_LIMIT, overflow)
         self._mark_dirty()
 
+    def review_batch(self, day: str, now: datetime, stats: dict) -> dict:
+        """Freeze only this bounded daily-review input. Later arrivals remain live."""
+        pending = self._state.get("pending_review")
+        if pending is not None:
+            if (not isinstance(pending, dict) or not pending.get("id") or not pending.get("day")
+                    or not isinstance(pending.get("stats"), dict) or type(pending.get("rounds")) is not int
+                    or not isinstance(pending.get("events"), list) or not all(
+                        isinstance(row, dict) and row.get("review_id") for row in pending["events"])):
+                raise ValueError("待评关系快照损坏，保留原文件")
+            return deepcopy(pending)
+        previous = self._state.get("prev_day_event_log") or {}
+        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        entries = []
+        if now.hour < 5 and previous.get("date") == yesterday:
+            entries.extend(previous.get("entries") or [])
+        entries.extend(self._state.get("event_log") or [])
+        entries = [row for row in entries if isinstance(row, dict)][-2*self.EVENT_LOG_LIMIT:]
+        for row in entries:
+            row.setdefault("review_id", uuid4().hex)
+        pending = {"id": uuid4().hex, "day": day, "events": deepcopy(entries),
+                   "stats": dict(stats), "rounds": self.cycle_rounds()}
+        self._state["pending_review"] = pending
+        self._dirty = True
+        self.flush()
+        if self._dirty or self._path is None:
+            self._state.pop("pending_review", None)
+            raise OSError("无法保存待评关系快照")
+        return deepcopy(pending)
+
+    def finish_review_batch(self, batch: dict, parsed: dict, *, now=None):
+        """Atomically apply one model verdict and consume only its own evidence."""
+        if (self._state.get("pending_review") or {}).get("id") != batch["id"]:
+            return None
+        from .affection_events import record_rule_event
+        before = deepcopy(self._state)
+        dirty, last_flush, bus = self._dirty, self._last_flush, self._bus
+        day = batch["day"]
+        try:
+            self._last_flush, self._bus = float("inf"), None
+            entry = record_rule_event(self, "daily_review", parsed["delta_score"],
+                                      f"关系日结：{parsed['tone'] or '今日关系温度未知'}",
+                                      key=batch["id"])
+            kept = self.append_impressions(parsed["impressions"], date=day, now=now)
+            self.set_tone(parsed["tone"], date=day, now=now)
+            self.record_daily_summary(date=day, tone=parsed["tone"], delta=entry.get("applied", 0), now=now)
+            ids = {row["review_id"] for row in batch["events"]}
+            previous = self._state.get("prev_day_event_log") or {}
+            for owner, field in ((self._state, "event_log"), (previous, "entries")):
+                if field in owner:
+                    owner[field] = [row for row in owner[field] if row.get("review_id") not in ids
+                                    and not (row.get("kind") == "daily_review" and row.get("key") == batch["id"])]
+            if previous and not previous.get("entries"):
+                self._state.pop("prev_day_event_log", None)
+            self._state["cycle_rounds"] = max(0, self.cycle_rounds() - batch["rounds"])
+            self.update_review_state(daily_reviewed_date=day)
+            del self._state["pending_review"]
+            if not save_json_atomic(self._path, self._state):
+                raise OSError("关系日结无法持久化")
+        except BaseException:
+            self._state = before
+            self._dirty, self._last_flush = dirty, last_flush
+            raise
+        finally:
+            self._bus = bus
+        self._dirty, self._last_flush = False, time.monotonic()
+        if before.get("tier") != self.tier():
+            self._publish_tier_changed(int(before["tier"]), self.tier(), self.score(), reason="daily_review")
+        return entry, kept, len(ids)
+
     def clear_event_log(self) -> int:
         """清空当日事件日志（关系日结应用成功后调用，§5.4）。返回清掉的条数。"""
         removed = len(self._state.get("event_log", []) or [])
@@ -1156,7 +1306,10 @@ class AffectionManager:
             self.flush()
 
     def flush(self) -> None:
-        if not self._dirty:
+        for path, state in list(self._pending_writes.items()):
+            if save_json_atomic(path, state):
+                self._pending_writes.pop(path, None)
+        if not self._dirty or self._path is None:
             return
         if save_json_atomic(self._path, self._state):
             self._dirty = False

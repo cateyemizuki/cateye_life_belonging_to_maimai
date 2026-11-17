@@ -69,7 +69,7 @@ class QzoneComponentsMixin:
             # 2026-10-14 用户指示：手动路径同样按 [qzone].image_mode 配图（跟随 Maizone 行为；
             # off/取图失败 → 纯文本，配图永不阻断发布）
             images = await qz.collect_moment_images(text)
-            result = await qz.post_moment(text, images=images)
+            result = await qz.post_moment(text, images=images, enforce_daily_limit=True)
             if result:
                 suffix = f"（配图 {len(images)} 张）" if images else ""
                 return {"success": True, "content": f"已发说说：{text}{suffix}",
@@ -247,7 +247,7 @@ class QzoneComponentsMixin:
             # 2026-10-14 用户指示：手动路径同样按 [qzone].image_mode 配图（跟随 Maizone 行为；
             # off/取图失败 → 纯文本，配图永不阻断发布）
             images = await qz.collect_moment_images(text)
-            result = await qz.post_moment(text, images=images)
+            result = await qz.post_moment(text, images=images, recheck_gates=True)
             if result:
                 suffix = f"，配图 {len(images)} 张" if images else ""
                 return f"已发表（tid={result.get('tid', '')}{suffix}）。"
@@ -271,8 +271,10 @@ class QzoneComponentsMixin:
             feed = feeds[feed_idx]
             fid = str(feed.get("tid") or "")
             if comment_idx is None:
-                comment_id = await qz.comment_moment(fid, content)
-                return "已评论。" if comment_id is not None else "评论失败。"
+                receipt = await qz.comment_receipt(fid, content)
+                if receipt["state"] == "unknown":
+                    return "评论结果待核对，请先查看空间中的评论记录。"
+                return "已评论。" if receipt["state"] == "accepted" else "评论未提交。"
             comments = feed.get("comments") or []
             if not (0 <= comment_idx < len(comments)):
                 return "评论序号超出范围，先 /lbm qzone comments 查看。"

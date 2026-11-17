@@ -33,32 +33,49 @@ def _is_screen_tool(definition: Any) -> bool:
 
 
 def screen_registration_stream(plugin: Any) -> str:
-    """注册先于 on_load：只使用上次由宿主解析、且仍属于当前目标的绑定。"""
+    """Recover a verified single stream with the same source of authority."""
+    from core.targeting import qq_id
     try:
         path = Path(plugin.ctx.paths.data_dir) / "screen_target_scope.json"
         if path.stat().st_size > 4096:
             return ""
         saved = json.loads(path.read_text(encoding="utf-8"))
-        target = target_qq_of(plugin.config)
-        if target in ("", "0", "123456789") or saved.get("target_qq") != target:
+        owner = qq_id(saved.get("target_qq"))
+        if not owner:
+            return ""
+        explicit = str(getattr(plugin.config.patrol, "target_qq", "") or "").strip()
+        if explicit:
+            if qq_id(explicit) != owner:
+                return ""
+        elif saved.get("basis") != "host_admin":
             return ""
         return str(saved.get("stream_id") or "").strip()
-    except Exception:
+    except (OSError, ValueError, AttributeError, TypeError):
         return ""
 
 
-def remember_screen_target(plugin: Any, target_qq: str, stream_id: str) -> None:
-    """仅保存会话绑定，不写配置；未知目标在注册阶段保持无工具。"""
+def remember_screen_target(plugin: Any, target_qq: str, stream_id: str) -> bool:
+    from core.targeting import qq_id
     try:
-        if not stream_id or target_qq in ("", "0", "123456789"):
-            return
-        if screen_registration_stream(plugin) == stream_id:
-            return
         path = Path(plugin.ctx.paths.data_dir) / "screen_target_scope.json"
-        if not save_json_atomic(path, {"target_qq": target_qq, "stream_id": stream_id}):
-            logger.warning("屏幕工具会话绑定保存失败；未就绪时不会注册工具")
-    except Exception as exc:
-        logger.warning("屏幕工具会话绑定未保存（%s）；未就绪时不会注册工具", type(exc).__name__)
+        explicit = str(getattr(plugin.config.patrol, "target_qq", "") or "").strip()
+        owner = qq_id(target_qq)
+        stream = str(stream_id or "").strip()
+        if owner and stream and target_qq_of(plugin.config) == owner:
+            binding = {"target_qq": owner, "stream_id": stream,
+                       "basis": "explicit" if explicit else "host_admin"}
+        else:
+            binding = {"target_qq": "", "stream_id": "", "basis": ""}
+        if path.is_file() and path.stat().st_size <= 4096:
+            try:
+                if json.loads(path.read_text(encoding="utf-8")) == binding:
+                    return True
+            except ValueError:
+                pass
+        return bool(save_json_atomic(path, binding))
+    except (OSError, ValueError, TypeError, AttributeError):
+        logger.warning("屏幕工具会话绑定未保存，等待下次核验", exc_info=True)
+        return False
 
 
 class ScreenToolsMixin:
@@ -70,6 +87,8 @@ class ScreenToolsMixin:
             return False
 
     def _screen_tool_allowed_checked(self, context: dict[str, Any]) -> bool:
+        if not getattr(self, "_screen_scope_ready", True):
+            return False
         config = getattr(self, "config", None)
         if not bool(getattr(getattr(config, "plugin", None), "enabled", False)):
             return False

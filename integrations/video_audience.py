@@ -83,6 +83,42 @@ class AudienceProfiles:
         target=self._target() or {}
         return {'stream_id':str(target.get('stream_id') or ''),'user_id':str(target.get('user_id') or '')}
 
+    async def _day_activity(self, route, profile, day_start, day_key, now, minimum):
+        """Count non-bot messages from midnight, independently of the recent topic window."""
+        same_day = profile.get('activity_day') == day_key
+        count = int(profile.get('day_non_bot_count', 0)) if same_day else 0
+        if count >= minimum:
+            return count
+        cursor = number(profile.get('activity_cursor'), day_start) if same_day else day_start
+        boundary_ids = set(profile.get('activity_boundary_ids') or []) if same_day else set()
+        # Inclusive cursor, so equal-time messages are deduped by stable message ID.
+        limit = min(minimum - count, 256) + len(boundary_ids)
+        page = rows(await self._messages(route['stream_id'], str(cursor), str(now),
+                                         limit=max(1, limit), limit_mode='earliest',
+                                         filter_mai=True), 'messages')
+        seen = set()
+        newest = cursor
+        last_ids = set(boundary_ids)
+        for row in page:
+            mid = str(row.get('message_id') or row.get('id') or '')
+            stamp = message_epoch(row.get('time', row.get('timestamp')))
+            if not mid or not cursor <= stamp <= now or mid in seen:
+                continue
+            seen.add(mid)
+            if stamp > newest:
+                newest, last_ids = stamp, set()
+            if stamp == newest:
+                last_ids.add(mid)
+            info = row.get('message_info') or {}
+            user = info.get('user_info') or row.get('user_info') or {}
+            sender = str(row.get('user_id') or user.get('user_id') or '')
+            if (mid not in boundary_ids and not row.get('is_self') and not row.get('is_mai')
+                    and not (sender and sender == route.get('account_id'))):
+                count += 1
+        profile.update(activity_day=day_key, activity_cursor=newest, activity_boundary_ids=sorted(last_ids),
+                       day_count_is_lower_bound=len(page) >= limit)
+        return count
+
     async def collect(self,now:float)->list[dict]:
         routes=await self.routes();out=[]
         cfg=self._config();interval=max(300,float(getattr(cfg,'profile_refresh_minutes',30))*60)
@@ -93,7 +129,8 @@ class AudienceProfiles:
             sid=route['stream_id'];old=await asyncio.to_thread(self.ledger.profile, sid);profile=dict(old)
             recent=[]
             refresh_after=min(interval,300) if old.get('coverage')!='ok' else interval
-            if not old or now-number(old.get('checked_at'))>=refresh_after:
+            needs_day_count = route['kind'] == 'group' and threshold > 0
+            if not old or now-number(old.get('checked_at'))>=refresh_after or (needs_day_count and old.get('activity_day') != day_key):
                 try:
                     start=max(now-7*86400,number(old.get('cursor'))-2) if old else now-7*86400
                     data=rows(await self._messages(sid,str(start),str(now),limit=80,
@@ -117,7 +154,10 @@ class AudienceProfiles:
                     cursor=max([number(old.get('cursor')),*(x[0] for x in normalized)])
                     # 按日累计非bot消息（跨刷新累加、日切重置），供群活跃门槛使用。
                     prior_count=int(old.get('day_non_bot_count',0)) if old.get('day_key')==day_key else 0
-                    day_count=prior_count+sum(1 for x in new if not x[3] and x[0]>=day_start)
+                    if needs_day_count:
+                        day_count = await self._day_activity(route, profile, day_start, day_key, now, threshold)
+                    else:
+                        day_count=prior_count+sum(1 for x in new if not x[3] and x[0]>=day_start)
                     profile.update(checked_at=now,cursor=cursor,coverage='partial' if old and len(data)>=80 else 'ok',
                         history_scope='incremental' if old else 'latest_80',
                         coverage_start=min((x[0] for x in normalized),default=start),
@@ -145,7 +185,8 @@ class AudienceProfiles:
             out.append({**route,'topics':profile.get('topics') or [],'recent':recent,
                 'as_of':profile.get('checked_at'),'last_message_at':profile.get('last_message_at'),
                 'message_count':profile.get('message_count',0),'recent_rate':profile.get('recent_rate',0),
-                'last_bot_at':profile.get('last_bot_at',0),'day_non_bot_count':stored_count,'fingerprint':digest})
+                'last_bot_at':profile.get('last_bot_at',0),'day_non_bot_count':stored_count,
+                'day_count_is_lower_bound':bool(profile.get('day_count_is_lower_bound')), 'fingerprint':digest})
             if len(out)>=12:break
         return out
 

@@ -267,6 +267,8 @@ async def run_daily_review(
     except Exception as exc:  # 宿主异常一律静默（失败哲学）
         logger.debug("关系日结裁判请求失败（跳过本轮）：%s", exc)
         return None
+    if getattr(response, "used_template", False):
+        return None
     data = _parse_json_loose(response)
     if data is None or not any(key in data for key in ("delta_score", "impressions", "tone")):
         return None
@@ -329,6 +331,7 @@ class AffectionReviewer:
         #: 后台任务（采样请求 / 延迟日结）；close() 统一取消
         self._pending: set = set()
         self._daily_task: Optional[asyncio.Task] = None
+        self._daily_lock = asyncio.Lock()
 
     # ---- 配置 / 上下文（全部判空降级，配置热重载即时生效）----
     def _cfg(self, name: str, default: Any) -> Any:
@@ -515,6 +518,7 @@ class AffectionReviewer:
             if llm is None:
                 return {"ok": False, "reason": "no_llm"}
             tier_label, tier_desc = self._tier_context()
+            binding = getattr(self._affection, "binding_generation", 0)
             parsed = await evaluate_conversation_delta(
                 llm,
                 recent_messages=list(self._recent_messages),
@@ -523,6 +527,8 @@ class AffectionReviewer:
                 mood_text=self._mood_text(), task_name=self._task_name(),
                 plugin=self._plugin,
             )
+            if binding != getattr(self._affection, "binding_generation", 0) or not self._review_enabled():
+                return {"ok": False, "reason": "binding_changed_or_disabled"}
             if parsed is None:
                 self._log("affection.review_skipped", trigger_type="affection",
                           reason="llm_failed", kind="llm_review")
@@ -623,6 +629,13 @@ class AffectionReviewer:
 
     async def perform_daily_review(self, *, date: str = "",
                                    now: Optional[datetime] = None) -> Dict[str, Any]:
+        binding = getattr(self._affection, "binding_generation", 0)
+        async with self._daily_lock:
+            if binding != getattr(self._affection, "binding_generation", 0):
+                return {"ok": False, "reason": "binding_changed"}
+            return await self._perform_daily_review(date=date, now=now)
+
+    async def _perform_daily_review(self, *, date: str, now: Optional[datetime]) -> Dict[str, Any]:
         """执行一次关系日结：LLM → 入账 delta → 追加 impressions/tone → 清空 event_log。
 
         失败（请求失败/输出垃圾）静默跳过：不清空 event_log、不追加印象、不落
@@ -636,16 +649,22 @@ class AffectionReviewer:
         state = self._affection.review_state(now=now)
         if str(state.get("daily_reviewed_date") or "") == day:
             return {"ok": False, "reason": "already_reviewed"}
+        binding = getattr(self._affection, "binding_generation", 0)
+        stamp = now or datetime.now()
+        try:
+            batch = self._affection.review_batch(day, stamp, self._build_stats(now=stamp))
+        except (OSError, ValueError):
+            return {"ok": False, "reason": "storage_unavailable"}
+        day = batch["day"]
         llm = self._llm_service()
         if llm is None:
             return {"ok": False, "reason": "no_llm"}
-
         tier_label, tier_desc = self._tier_context()
         try:
             parsed = await run_daily_review(
                 llm,
-                event_log=self._review_event_log(now=now),
-                stats=self._build_stats(now=now),
+                event_log=batch["events"],
+                stats=batch["stats"],
                 impressions=self._affection.impressions(),
                 date=day, lover_name=self._lover_name(), target_label=self._target_label(),
                 persona=self._persona(), tier_label=tier_label, tier_desc=tier_desc,
@@ -662,26 +681,15 @@ class AffectionReviewer:
                       reason="llm_failed", date=day)
             return {"ok": False, "reason": "llm_failed"}
 
-        # 1) delta 走既有入账入口（独立于 kind 上限，受 §5.5 日累计限幅）
-        entry = record_rule_event(self._affection, "daily_review", parsed["delta_score"],
-                                  f"关系日结：{parsed['tone'] or '今日关系温度未知'}")
-        # 2) 追加 impressions（≤3 条/次、滚动 10 条、7 天过期）→ 写 tone
-        kept = self._affection.append_impressions(parsed["impressions"], date=day, now=now)
-        self._affection.set_tone(parsed["tone"], date=day, now=now)
-        # 2.5) M6 周结大事记（默认关，纯规则零 LLM 成本）：失败只记 debug，绝不影响日结主流程
+        if binding != getattr(self._affection, "binding_generation", 0) or not self._review_enabled() or not self._affection_enabled() or not self._patrol_enabled():
+            return {"ok": False, "reason": "binding_changed_or_disabled"}
         try:
-            self._affection.record_daily_summary(
-                date=day, tone=parsed["tone"], delta=parsed["delta_score"], now=now)
-        except Exception as exc:
-            logger.debug("周结大事记记录失败（忽略）：%s", exc)
-        # 3) 清空当日 event_log；复核 P0-2：结算成功同时消费上一日归档并清零
-        #    作息周期累计轮数（失败不落，下个 sleep 边沿重试仍能读到完整周期）
-        removed = self._affection.clear_event_log()
-        self._affection.clear_prev_day_event_log()
-        self._affection.reset_cycle_rounds()
-        # 4) 仅成功（JSON 解析成功并已入账）才落「当日已日结」；失败保持未落，
-        #    以便下个 sleep 边沿重试（宿主验证日实证：失败即落 date 会静默吞掉第二次边沿）
-        self._affection.update_review_state(daily_reviewed_date=day)
+            completed = self._affection.finish_review_batch(batch, parsed, now=now)
+        except OSError:
+            return {"ok": False, "reason": "storage_unavailable"}
+        if completed is None:
+            return {"ok": False, "reason": "already_reviewed"}
+        entry, kept, removed = completed
         self._log("affection.daily_review", trigger_type="affection",
                   reason=parsed["tone"] or "关系日结", date=day,
                   requested=round(parsed["delta_score"], 4), applied=entry.get("applied"),
@@ -695,6 +703,12 @@ class AffectionReviewer:
     # ------------------------------------------------------------------
     # 生命周期（服务束 stop() 调用）
     # ------------------------------------------------------------------
+    def reset_target(self) -> None:
+        self.close()
+        self._recent_messages.clear()
+        self._rounds_date = ""
+        self._sample_counter = 0
+
     def close(self) -> None:
         """取消未执行的后台任务（幂等；服务束 stop() 时调用）。"""
         for task in list(self._pending):

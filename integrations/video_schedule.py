@@ -189,47 +189,41 @@ class SurfQuotaLedger:
         with self._lock:
             return dict(self._load())
 
-    def try_consume(self, kind: str, minutes: float, now: Any = None) -> bool:
-        """申请入账一场（kind ∈ "gap"/"dedicated"/"casual"）：全部检查通过才入账并返回 True。
-
-        检查口径：当日总场次、当日总分钟（本次时长须放得下）、分场景场次、
-        gap 的配置启动间隔（对照 ``last_start_epoch``；默认 60 分钟）；未知 kind 不入账。
-        任一不过 → False 且账本不变（调用方按「本拍不启动」处理）。
-        """
-        kind = str(kind or "")
+    def _reserve_minutes(self, doc: dict, kind: str, minutes: float, at: float) -> bool:
         field = self._KIND_FIELD.get(kind)
-        if field is None:
-            return False  # 未知类型：保守拒绝，不写账
-        at = self._now(now)
-        need_minutes = max(0.0, _as_float(minutes))
+        limits = self.limits()
+        if field is None or surf_gate_check(kind, doc, at, limits=limits) is not None:
+            return False
+        if doc["minutes_used"] + minutes > limits["daily_minutes_limit"]:
+            return False
+        doc["sessions_used"] += 1
+        doc["minutes_used"] = round(doc["minutes_used"] + minutes, 3)
+        doc[field] += 1
+        doc["last_start_epoch"] = at
+        return True
+
+    def try_consume(self, kind: str, minutes: float, now: Any = None) -> bool:
         with self._lock:
             doc = self._load()
-            # 1) 余量门控（总场次/总时长/分场景/间隔）与纯函数同口径
-            if surf_gate_check(kind, doc, at,limits=self.limits()) is not None:
+            if not self._reserve_minutes(doc, kind, max(0.0, _as_float(minutes)), self._now(now)):
                 return False
-            # 2) 本场时长是否放得进当日剩余额度（纯函数无 minutes 入参，由账本校验）
-            if float(doc["minutes_used"]) + need_minutes > self.limits()["daily_minutes_limit"]:
-                return False
-            doc["sessions_used"] = int(doc["sessions_used"]) + 1
-            doc["minutes_used"] = round(float(doc["minutes_used"]) + need_minutes, 3)
-            doc[field] = int(doc[field]) + 1
-            doc["last_start_epoch"] = at
             _atomic_write(self._path, doc)
             return True
 
     def reserve_once(self, episode_id: str, kind: str, minutes: float) -> bool:
-        """A durable claim prevents a reload between debit and task linking from replaying it."""
+        """Persist the debit and its owner in the same atomic replacement."""
         with self._lock:
             doc = self._load()
-            if episode_id in doc.get("claims", {}):
+            claims = doc.setdefault("claims", {})
+            if episode_id in claims:
                 return False
+            at = self._now()
             previous = doc.get("last_start_epoch")
-            if not self.try_consume(kind, minutes):
+            amount = max(0.0, _as_float(minutes))
+            if not self._reserve_minutes(doc, kind, amount, at):
                 return False
-            doc = self._load()
-            doc.setdefault("claims", {})[episode_id] = {
-                "kind": kind, "minutes": minutes, "state": "reserved",
-                "previous_start": previous, "started_at": self._now()}
+            claims[episode_id] = {"kind": kind, "minutes": amount, "state": "reserved",
+                                  "previous_start": previous, "started_at": at}
             _atomic_write(self._path, doc)
             return True
 
@@ -281,7 +275,7 @@ class SurfQuotaLedger:
             return True
 
     def settle(self, episode_id: str, watched_minutes: float,
-               now: Any = None) -> bool:
+               now: Any = None, *, expected_day: str = "") -> bool:
         """按实际观看结算一场已预留的额度（取消/失败/中断，幂等）。
 
         - only ``state=reserved`` is settled; a second call returns False and never
@@ -293,6 +287,8 @@ class SurfQuotaLedger:
         episode_id = str(episode_id or "")
         with self._lock:
             doc = self._load()
+            if expected_day and doc["date"] != expected_day:
+                return False
             claim = doc.get("claims", {}).get(episode_id)
             if not claim or claim.get("state") != "reserved":
                 return False
@@ -606,7 +602,7 @@ class VideoWatchCoordinator:
                 ("completed", "cached_completed"))
             # 中断/抢占/放弃按真实任务用时结算（未开始则退款）；自然结束不在此重复结算。
             # 这里只释放自动 owner，已受理任务仍可继续处理，由晚到轮询补归档。
-            if task_id and status in ("interrupted", "paused", "abandoned", "cancelled"):
+            if entry.get("result"):
                 self._settle_quota(episode_id, entry, reason=f"episode_{status}")
             # 复核修复（3.17.33）：释放 owner 不等于任务终止（manager 继续跑完）——
             # 保留轻量轮询到终态，晚到完成的分享候选/结果仍能归档。
@@ -683,7 +679,10 @@ class VideoWatchCoordinator:
                 entry["closed"] = True
                 entry["closed_reason"] = "schedule_resumed"
                 self._release_surf(gap_id, entry)
-                await self._archive_if_completed(entry, str(entry["task_id"]), episode_id=gap_id)
+                archived = await self._archive_if_completed(entry, str(entry["task_id"]), episode_id=gap_id)
+                if archived is not None:
+                    self._accumulate_watch(entry, archived)
+                    self._settle_quota(gap_id, entry, reason="session_completed")
                 if self._should_detach_poll(entry, str(entry["task_id"])):
                     entry["detached"] = True
                     entry["detached_skip_once"] = True
@@ -708,6 +707,13 @@ class VideoWatchCoordinator:
             changed = changed or progressed
 
         # 4) 链接库收口（有界）
+        # Reconcile terminal links written by earlier versions or a failed settlement write.
+        for eid, entry in links.items():
+            if (isinstance(entry, dict) and entry.get("closed") and not entry.get("detached")
+                    and entry.get("reserved_minutes") and entry.get("result")
+                    and not entry.get("submit_uncertain")
+                    and (eid != active_id or not self._can_continue_watching(entry))):
+                changed = self._settle_quota(eid, entry, reason="session_completed") or changed
         if changed:
             self._compact(links)
             links_doc["links"] = links
@@ -897,7 +903,7 @@ class VideoWatchCoordinator:
         if entry.get("scenario") in ("gap","casual") or not self._enabled():return False
         if str(entry.get("closed_reason") or "") != "task_completed":
             return False
-        if entry.get("detached") or entry.get("cached"):
+        if entry.get("detached") or entry.get("detached_finished") or entry.get("cached"):
             return False
         limit=max(1,min(100,_as_int(config_value(self._config(),"schedule_max_videos",WATCH_CONTINUE_MAX_SUBMITS))))
         if entry.get('budget_key'):
@@ -945,8 +951,8 @@ class VideoWatchCoordinator:
         entry["watched_minutes_accumulated"] = round(total, 2)
 
     def _settle_quota(self, episode_id: str, entry: Dict[str, Any],
-                      *, reason: str = "") -> bool:
-        """取消/失败/中断时按实际观看结算（或退款），不再固定扣 20 分钟。
+                      *, reason: str = "", finished_at: Any = None) -> bool:
+        """按任务的实际处理时间结算关联场次。
 
         实际观看起点取任务真正开始处理的时刻（manager status 的 started_at）；
         缺失（仍在排队/任务未启动）→ 按 0 分钟结算 = 全额退款，绝不把排队时间
@@ -961,16 +967,29 @@ class VideoWatchCoordinator:
         started = _as_float(entry.get("task_started_at"))
         watched = _as_float(entry.get("watched_minutes_accumulated"))
         if started > 0:
-            watched += max(0.0, (self._now() - started) / 60.0)
+            stopped = _as_float(finished_at) or self._now()
+            watched += max(0.0, (stopped - started) / 60.0)
         try:
-            done = bool(settle(episode_id, watched))
+            if isinstance(self._quota, SurfQuotaLedger):
+                done = bool(settle(episode_id, watched, expected_day=entry.get("quota_day") or ""))
+            else:
+                done = bool(settle(episode_id, watched))
         except Exception as exc:
             if self._log:
                 self._log.warning("观看额度结算失败（忽略，不二次扣账）：%s", exc)
             return False
-        if not done:
-            return False
         reserved = _as_float(entry.get("reserved_minutes"))
+        if not done:
+            # Crash after quota commit but before link-file replace: adopt the existing receipt.
+            if not isinstance(self._quota, SurfQuotaLedger):
+                return False
+            snapshot = self._quota.snapshot()
+            if entry.get("quota_day") and entry["quota_day"] != snapshot.get("date"):
+                return False
+            claim = (snapshot.get("claims") or {}).get(episode_id) or {}
+            if claim.get("state") != "settled":
+                return False
+            watched = _as_float(claim.get("settled_minutes"))
         entry["settled_minutes"] = round(max(0.0, min(reserved, watched)), 2)
         entry["settled_reason"] = reason or "task_settled"
         entry.pop("reserved_minutes", None)
@@ -1048,12 +1067,11 @@ class VideoWatchCoordinator:
             if stage == "completed":
                 # 晚到完成：补记录分享候选与结果（manager 已完成即时入库）。
                 result = await self._archive_if_completed(entry, task_id, episode_id=episode_id)
-                self._accumulate_watch(entry, result)
-            else:
-                # 脱离 owner 后才失败/取消：同样按实际观看结算/退款。
-                self._settle_quota(episode_id, entry, reason=f"task_{stage}")
+                self._accumulate_watch(entry, result or dict(receipt, status="completed"))
+            self._settle_quota(episode_id, entry, reason=f"task_{stage}", finished_at=receipt.get("finished_at"))
             entry["stage"] = stage
             entry["detached"] = False
+            entry["detached_finished"] = True
             entry["closed"] = True
             entry["closed_reason"] = f"task_{stage}"
             if self._log:
@@ -1159,6 +1177,7 @@ class VideoWatchCoordinator:
                     entry.update(stage="skipped", reason="自动观看额度不足或本事件已申请")
                     return
                 entry["reserved_minutes"] = planned_minutes
+                entry["quota_day"] = snap.get("date")
             if callable(self._automatic_guard) and not force_debug and not self._automatic_guard(episode_id):
                 entry.update(stage="skipped",reason="候选准备后活动或聊天状态已变化");return
             if kind in ('dedicated','casual'):
@@ -1370,10 +1389,12 @@ class VideoWatchCoordinator:
             if stage in ("completed", "failed", "cancelled"):
                 if stage == "completed":
                     result = await self._archive_if_completed(entry, task_id, episode_id=episode_id)
-                    self._accumulate_watch(entry, result)
+                    self._accumulate_watch(entry, result or dict(receipt, status="completed"))
+                    if entry.get("scenario") in ("gap", "casual"):
+                        self._settle_quota(episode_id, entry, reason="session_completed")
                 else:
                     # 取消/失败：按实际观看结算（未开始 → 全额退款），不再固定扣 20 分钟。
-                    self._settle_quota(episode_id, entry, reason=f"task_{stage}")
+                    self._settle_quota(episode_id, entry, reason=f"task_{stage}", finished_at=receipt.get("finished_at"))
                 self._release_surf(episode_id, entry)
                 entry["closed"] = True
                 entry["closed_reason"] = f"task_{stage}"

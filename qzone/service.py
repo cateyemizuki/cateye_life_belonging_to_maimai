@@ -322,6 +322,7 @@ class QzoneService:
         ]
         if cached:
             candidates.sort(key=lambda row: row[0] != cached)
+        write_action = kind in {"send", "comment", "like", "unlike", "delete", "set_right"}
         if kind == "send":
             self._send_ambiguous = False
         last_error = ""
@@ -333,24 +334,27 @@ class QzoneService:
                     resp = await self._ctx.api.call(api_name, params=params)
             except Exception as e:
                 last_error = f"{api_name}: {e}"
-                if kind == "send" and not definitely_unavailable(e):
-                    self._send_ambiguous = True
-                    return False, None, "发布结果待核对（动作未返回确定回执）"
+                if write_action and not definitely_unavailable(e):
+                    if kind == "send":
+                        self._send_ambiguous = True
+                    return False, None, "写入结果待核对（动作未返回确定回执）"
                 continue
             ok, data, err = self._unwrap(resp)
             if ok:
                 self._channel_cache[kind] = channel
                 return True, data, ""
-            if kind == "send" and not definitely_unavailable(err):
-                self._send_ambiguous = True
-                return False, None, "发布结果待核对（适配器未给出可确认回执）"
+            if write_action and not definitely_unavailable(err):
+                if kind == "send":
+                    self._send_ambiguous = True
+                return False, None, "写入结果待核对（适配器未给出可确认回执）"
             last_error = f"{api_name}: {err}"
         return False, None, last_error or "所有调用通道均不可用（检查 SnowLuma 适配器）"
 
     # ---- 说说读写 ----
     async def post_moment(self, text: str, *, images: Optional[List[bytes]] = None,
                           ugc_right: int = 1, require_images: bool = False,
-                          enforce_daily_limit: bool = False) -> Optional[Dict[str, Any]]:
+                          enforce_daily_limit: bool = False,
+                          recheck_gates: bool = False, dispatch_allowed: Any = None) -> Optional[Dict[str, Any]]:
         """Serialize publishing and persist intent before dispatch; never replay uncertainty.
 
         ``require_images``（PR-A2，默认 False 逐字保持普通说说基线）：True 时图片为硬性
@@ -376,11 +380,22 @@ class QzoneService:
                 return None
         preview = preview_post(text, images, visibility)
         async with self._publish_lock:
+            old = self._publish_ledger.rows.get(preview["key"], {})
+            if old.get("status") == "sent" and time.time() - float(old.get("updated_at", 0)) < 86400:
+                return dict(old.get("result") or {}) or None
+            if dispatch_allowed is not None and not dispatch_allowed():
+                self._send_ambiguous = False
+                return None
+            if enforce_daily_limit or recheck_gates:
+                cfg = self._qzone_cfg()
+                if not bool(getattr(cfg, "enabled", True)) or not self._time_gates(datetime.now())[0]:
+                    self._send_ambiguous = False
+                    return None
             if enforce_daily_limit:
                 # PR-A3：锁内复检共享额度（分发串行点），并发触发器不抢额度、不超额。
                 cfg = self._qzone_cfg()
                 limit = int(getattr(cfg, "daily_max_posts", 0) or 0)
-                if limit > 0 and self.posts_today() >= limit:
+                if limit <= 0 or self.posts_today() >= limit:
                     self._send_ambiguous = False
                     self._log("skip", trigger_type="qzone_post",
                               reason="共享每日额度已用尽（发布锁内复检，确定未发）")
@@ -389,6 +404,7 @@ class QzoneService:
             if not allowed:
                 if receipt.get("status") == "sent":
                     return dict(receipt.get("result") or {}) or None
+                self._send_ambiguous = receipt.get("status") in ("sending", "uncertain")
                 self._log("skip", trigger_type="qzone_post", reason="发布已排队或结果待核对，不重复发送",
                           delivery_state=str(receipt.get("status") or "unknown"))
                 return None
@@ -505,29 +521,31 @@ class QzoneService:
         msglist = data.get("msglist")
         return [m for m in msglist if isinstance(m, dict)] if isinstance(msglist, list) else []
 
-    async def comment_moment(self, tid: str, content: str, *, target_uin: str = "") -> Optional[str]:
-        """评论一条说说（普通评论，非楼中楼；target_uin 省略=自己空间）。
-
-        优先 SnowLuma 动作通道，失败回退 Web CGI 直连；返回 comment_id（尽力而为）或 None。"""
+    async def comment_receipt(self, tid: str, content: str, *, target_uin: str = "") -> dict:
         if not tid or not content.strip():
-            return None
-        params: Dict[str, Any] = {"tid": str(tid), "content": content.strip()}
+            return {"state": "rejected"}
+        params = {"tid": str(tid), "content": content.strip()}
         if target_uin:
             params["target_uin"] = str(target_uin)
-        ok, data, err = await self.call_action("comment", params)
-        comment_id = str((data or {}).get("comment_id") or "") if ok and isinstance(data, dict) else ""
-        if not ok and self._cookie_manager is not None:
-            client = await self._cookie_manager.get_client()
-            if client is not None:
-                owner = str(target_uin or client.uin)
-                if await client.comment(str(tid), owner, content.strip()):
-                    ok = True  # CGI 已发出；comment_id 保持空串（该端点不回传）
-                else:
-                    err = f"{err}; CGI 直连也失败"
-        if not comment_id and not ok:
-            self._log("skip", trigger_type="qzone_reply", reason=f"评论失败 tid={tid}: {err}")
-            return None
-        return comment_id
+        ok, data, error = await self.call_action("comment", params)
+        if ok:
+            comment_id = str(data.get("comment_id") or "") if isinstance(data, dict) else ""
+            return {"state": "accepted", "comment_id": comment_id}
+        if not definitely_unavailable(error):
+            return {"state": "unknown"}
+        client = await self._cookie_manager.get_client() if self._cookie_manager is not None else None
+        if client is None:
+            return {"state": "rejected"}
+        try:
+            acknowledged = await client.comment(str(tid), str(target_uin or client.uin), content.strip())
+        except Exception:
+            acknowledged = False
+        return {"state": "accepted", "comment_id": ""} if acknowledged else {"state": "unknown"}
+
+    async def comment_moment(self, tid: str, content: str, *, target_uin: str = "") -> Optional[str]:
+        """Legacy callers receive an ID (possibly empty) only for acknowledged comments."""
+        receipt = await self.comment_receipt(tid, content, target_uin=target_uin)
+        return receipt.get("comment_id") if receipt["state"] == "accepted" else None
 
     async def reply_to_comment(self, fid: str, comment_qq: str, nickname: str,
                                comment_tid: int | str, content: str) -> bool:
@@ -566,7 +584,7 @@ class QzoneService:
         if target_uin:
             params["target_uin"] = str(target_uin)
         ok, _, err = await self.call_action("like", params)
-        if not ok and self._cookie_manager is not None:
+        if not ok and definitely_unavailable(err) and self._cookie_manager is not None:
             client = await self._cookie_manager.get_client()
             if client is not None:
                 ok = await client.like(str(tid), str(target_uin or client.uin))
@@ -678,7 +696,7 @@ class QzoneService:
             return False
         # 闸 1：无活动 → 不发（最保守兜底；activity_type 维度拦截已按 2026-10-20 指示移除）
         activity = self._schedule.find_current_activity(date, now, include_sleep=True)
-        if activity is None:
+        if activity is None and getattr(cfg, "require_activity", True):
             # PR8 3.0.0（规则 6）：find_current_activity runtime-only——日程关断（
             # [schedule].enabled=false）时 skip 理由如实「日程未启用」，不冒充「无活动」。
             reason = ("日程未启用（[schedule].enabled=false）" if not self._schedule_enabled()
@@ -691,7 +709,8 @@ class QzoneService:
         if self._actual_nap(now):
             self._record_decision('skip', gate='nap_quiet', reason='实际午休/小睡中，空间静默')
             return False
-        activity_name = str(activity.get("name") or activity.get("description") or "活动")
+        activity = activity or {}
+        activity_name = str(activity.get("name") or activity.get("description") or "自由活动")
         # 闸 3：冷却（锚点只在发送成功后更新；失败不重置）
         remain_minutes = self._cooldown_remain_minutes(now)
         if remain_minutes > 0:
@@ -731,7 +750,27 @@ class QzoneService:
         """
         now = now or datetime.now()
         today = now.strftime("%Y-%m-%d")
-        # 闸 0a：睡眠引擎判定仍在睡（晚醒真实状态；与判定链同口径，异常时由静默窗兜底）
+        allowed, reason = self._time_gates(now)
+        if not allowed:
+            return False, reason
+        # LLM 严判（可关；与判定链闸 4 同口径，调用异常保守按不发）
+        cfg = self._qzone_cfg()
+        if bool(getattr(cfg, "post_llm_gate_enabled", True)):
+            try:
+                activity = self._schedule.find_current_activity(today, now)
+            except Exception:
+                activity = None
+            allowed, llm_reason, answer = await self._llm_post_gate(activity, now)
+            if not allowed:
+                reason = f"LLM 严判不发（{llm_reason or '未说明'}）"
+                self._record_decision("skip", gate="llm", reason=reason, llm_answer=answer)
+                return False, reason
+            self._record_decision("pass", gate="llm",
+                                  reason=f"LLM 严判通过（{llm_reason or '未说明'}）", llm_answer=answer)
+        return True, ""
+
+    def _time_gates(self, now: datetime) -> Tuple[bool, str]:
+        """Check local live facts at dispatch without repeating the model decision."""
         try:
             if self._companion_gate().sleep_engine_asleep(now):
                 reason = "睡眠引擎判定仍在睡"
@@ -756,20 +795,6 @@ class QzoneService:
             reason = f"冷却中（剩余约 {remain_minutes} 分钟）"
             self._record_decision("skip", gate="cooldown", reason=reason)
             return False, reason
-        # LLM 严判（可关；与判定链闸 4 同口径，调用异常保守按不发）
-        cfg = self._qzone_cfg()
-        if bool(getattr(cfg, "post_llm_gate_enabled", True)):
-            try:
-                activity = self._schedule.find_current_activity(today, now)
-            except Exception:
-                activity = None
-            allowed, llm_reason, answer = await self._llm_post_gate(activity, now)
-            if not allowed:
-                reason = f"LLM 严判不发（{llm_reason or '未说明'}）"
-                self._record_decision("skip", gate="llm", reason=reason, llm_answer=answer)
-                return False, reason
-            self._record_decision("pass", gate="llm",
-                                  reason=f"LLM 严判通过（{llm_reason or '未说明'}）", llm_answer=answer)
         return True, ""
 
     def _actual_nap(self, now: datetime) -> bool:
@@ -1227,9 +1252,12 @@ class QzoneService:
                 with_identity=True,
             )
             reply_text = reply_text.strip()
-            if reply_text and await self.comment_moment(tid, reply_text):
-                self._mark_processed(tid, int(comment_id) if comment_id.isdigit() else 0)
-                self._log("trigger", trigger_type="qzone_reply", reason=f"已回复 {commenter} 的评论")
+            if reply_text:
+                receipt = await self.comment_receipt(tid, reply_text)
+                if receipt["state"] in ("accepted", "unknown"):
+                    self._mark_processed(tid, int(comment_id) if comment_id.isdigit() else 0)
+                if receipt["state"] == "accepted":
+                    self._log("trigger", trigger_type="qzone_reply", reason=f"已回复 {commenter} 的评论")
 
     @staticmethod
     def _extract_comments(moment: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1385,7 +1413,8 @@ class QzoneService:
             if row.get("status") == "retry_wait" and int(row.get("attempts",0)) < 2 \
                     and float(row.get("retry_at",0)) <= now.timestamp() \
                     and row.get("image_count") == 0 and int(row.get("characters",0)) <= 5000:
-                await self.post_moment(str(row.get("content") or ""), ugc_right=int(row.get("visibility",1)))
+                await self.post_moment(str(row.get("content") or ""), ugc_right=int(row.get("visibility",1)),
+                                       enforce_daily_limit=True)
                 break  # One queued attempt per existing scheduler tick.
 
     async def _tick(self) -> None:

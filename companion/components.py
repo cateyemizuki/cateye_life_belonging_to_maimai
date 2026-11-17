@@ -670,6 +670,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             user_id = extract_user_id_from_message(message)
             target_qq = self._mai_target_qq()
             is_target = bool(user_id and target_qq and user_id == target_qq)
+            matches = getattr(companion.affection, "matches_target", None)
+            if is_target and callable(matches) and not matches(target_qq):
+                return
             if message.get("is_notify"):
                 # is_notify（撤回/戳一戳等通知，只入库不触发回复）：仅按 target 私聊口径
                 # 低成本刷新 last_user_msg_time（沉默检测/想念与主动冷却），不触发
@@ -680,10 +683,13 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             # 群聊里非 target 的发言不上报（群流水会刷爆决策日志）；其余消息带上判定结果
             if is_group is True and not is_target:
                 return
+            generation = getattr(companion.affection, "binding_generation", 0)
             await self._mai_publish_message_received(companion, is_target=is_target,
                                                      stream_kind=stream_kind)
             if is_target and stream_kind != "group":
                 # 会话类型未知时按私聊兜底（与旧实现一致：group_info 缺失视为私聊）
+                if generation != getattr(companion.affection, "binding_generation", 0) or (callable(matches) and not matches(self._mai_target_qq())):
+                    return
                 now = datetime.now()
                 companion.affection.update_last_user_msg_time(now)
                 # 2026-11-11 P1-AFF-1：Bot 30 分钟内发过早/晚安 + 本条是回敬问候
@@ -1636,6 +1642,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         relation_word = getattr(relation, "word", None) or "恋人"
         target_label = f"QQ {target_qq}" if target_qq else relation_word
         affection = companion.affection
+        matches = getattr(affection, "matches_target", None)
+        if callable(matches) and not matches(target_qq):
+            return ""
         # M1 注入接线：好感后缀改读 v2 5 档档位描述（经 relation profile；
         # 关系档案缺失时回退 affection 的「恋人」5 档基底文案）。habits 通道不在此处。
         tier = affection.tier()
