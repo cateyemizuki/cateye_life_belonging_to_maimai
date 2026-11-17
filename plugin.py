@@ -261,7 +261,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception:
             screen_enabled = False
         screen_stream = screen_registration_stream(self) if screen_enabled else ""
-        self._registered_screen_stream = screen_stream
+        self._target_lifecycle().declare(screen_stream)
         if not hasattr(self, "_screen_scope_ready"):
             self._screen_scope_ready = False
 
@@ -656,7 +656,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def on_unload(self) -> None:
         self._is_unloading = True
         self._screen_scope_ready = False
-        await self._cancel_owned_task("_screen_reload_task")
+        await self._target_lifecycle().stop()
         # F2（2026-11-04 评估）：停机链加总超时预算（宿主 plugin.shutdown 预算 5s，
         # 此处 4s 留余量）+ 逐步防御；任一步挂起不再拖满宿主预算被 terminate。
         # 关键落盘（life_state/affection/db close）移入下方保底尾段——超时/异常
@@ -884,7 +884,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         from companion.screen_tools import remember_screen_target
         saved = remember_screen_target(self, target_qq, stream_id)
         self._screen_scope_ready = bool(target_qq and stream_id)
-        self._screen_binding_saved = saved is True
+        self._target_lifecycle().bound(stream_id, saved=saved is True)
         self._queue_screen_registration_reload()
         # PR6（2026-10-27 共享接线）：目标解析成功/切换后**立即**校准目标频率，
         # 不等第一次活动切换。本方法是 sync 装配口：绝不在此 await，也不创建
@@ -892,40 +892,35 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._schedule_target_frequency_calibration()
 
     def _queue_screen_registration_reload(self) -> None:
-        """The SDK registers tools before on_load and only exposes a whole-plugin refresh."""
-        if (getattr(self, "_screen_load_in_progress", False)
-                or getattr(self, "_is_unloading", False)
-                or not getattr(self, "_screen_binding_saved", False)
-                or not hasattr(self, "_registered_screen_stream")):
+        """Publish scope changes after startup has completed."""
+        if getattr(self, "_screen_load_in_progress", False):
             return
         from companion.screen_config import screen_config_of
         enabled = (self.config.plugin.enabled and self.config.patrol.enabled
                    and screen_config_of(self.config).tool_enabled)
-        desired = str(getattr(self, "_stream_id", "") or "") if enabled else ""
-        if desired == self._registered_screen_stream:
-            return
-        pending = getattr(self, "_screen_reload_task", None)
-        if pending is not None and not pending.done():
-            return
-        if getattr(self, "_screen_reload_requested_for", None) == desired:
-            return
-        reload_plugin = getattr(getattr(self.ctx, "component", None), "reload_plugin", None)
-        if not callable(reload_plugin):
-            self.ctx.logger.warning("目标私聊范围变更，请在插件管理中重新加载以刷新屏幕工具")
-            return
-        self._screen_reload_requested_for = desired
+        self._target_lifecycle().refresh_screen(enabled=bool(enabled))
 
-        async def refresh_registration() -> None:
-            try:
-                response = await reload_plugin(plugin_name="cateye.life_belonging_to_maimai")
-                if response is False or (isinstance(response, dict) and response.get("success") is False):
-                    self.ctx.logger.warning("屏幕工具声明刷新未成功，可在插件管理中重新加载")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._warn_quiet("屏幕工具声明刷新失败，可在插件管理中重新加载：%s", exc)
-
-        self._screen_reload_task = asyncio.get_running_loop().create_task(refresh_registration())
+    def _target_lifecycle(self):
+        from linkage.screen.registration import TargetBindingCoordinator
+        coordinator = getattr(self, "_target_binding_coordinator", None)
+        if coordinator is None:
+            ctx = getattr(self, "ctx", None)
+            component = getattr(ctx, "component", None)
+            reloader = getattr(component, "reload_plugin", None)
+            def commit_binding(target: str, stream: str) -> None:
+                self._stream_id = stream
+                self._apply_target(target, stream)
+            coordinator = TargetBindingCoordinator(
+                config_provider=lambda: self.config,
+                lookup_user=lambda user: self.ctx.chat.get_stream_by_user_id(user_id=user),
+                private_streams=lambda: self.ctx.chat.get_private_streams(),
+                apply_target=commit_binding,
+                is_unloading=lambda: bool(getattr(self, "_is_unloading", False)),
+                reload_plugin=reloader if callable(reloader) else None,
+                logger=getattr(ctx, "logger", None),
+            )
+            self._target_binding_coordinator = coordinator
+        return coordinator
 
     def _schedule_target_frequency_calibration(self) -> None:
         """在 sync 装配口安全排队一次频率校准（单飞：旧 task 先取消再重建）。"""
@@ -3174,44 +3169,12 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     # stream 解析（companion 巡检与 qzone 提醒共用的目标会话）
     # ------------------------------------------------------------------
     async def _refresh_target_binding(self, *, clear_unresolved: bool = True) -> str:
-        config = self.config
-        target = target_qq_of(config)
-        revision = getattr(self, "_target_lookup_revision", 0) + 1
-        self._target_lookup_revision = revision
-        stream = await self._resolve_target_stream()
-        if (revision != self._target_lookup_revision or config is not self.config
-                or target != target_qq_of(self.config) or getattr(self, "_is_unloading", False)):
-            return ""
-        if stream or clear_unresolved:
-            self._stream_id = stream
-            self._apply_target(target, stream)
-        return stream
+        return await self._target_lifecycle().refresh(
+            resolve=lambda: self._resolve_target_stream(), clear_unresolved=clear_unresolved)
 
     async def _resolve_target_stream(self) -> str:
         """解析目标 QQ 的私聊 stream_id；失败返回空串（后台重试循环接管）。"""
-        target_qq = target_qq_of(self.config)
-        from core.targeting import private_qq_stream
-        if not target_qq or target_qq == "123456789":
-            return ""  # 占位号不解析
-        try:
-            info = await self.ctx.chat.get_stream_by_user_id(user_id=target_qq)
-            if isinstance(info, dict) and info.get("success") is not False:
-                stream = private_qq_stream(info.get("stream") or info, target_qq, queried_by_user=True)
-                if stream:
-                    return stream
-        except Exception:
-            pass
-        try:  # 回退：遍历私聊流
-            streams = await self.ctx.chat.get_private_streams()
-            if isinstance(streams, dict):
-                streams = streams.get("streams") or streams.get("data") or []
-            for s in streams or []:
-                stream = private_qq_stream(s, target_qq)
-                if stream:
-                    return stream
-        except Exception:
-            pass
-        return ""
+        return await self._target_lifecycle().resolve()
 
     async def _cancel_owned_task(self, name: str) -> None:
         task = getattr(self, name, None)
