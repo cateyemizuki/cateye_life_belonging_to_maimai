@@ -183,23 +183,42 @@ class EmotionStateMachine:
         return drained
 
     # ── 结算 ────────────────────────────────────────────────
-    def apply_daily_decay(self, now: Optional[datetime] = None) -> float:
-        """日常小周期指数衰减：VAD = VAD · exp(-decay_rate·Δt)。返回衰减因子。
+    def _decay_target(self) -> VADState:
+        """基础状态机回归中性；服务装配的子类回归人设锚点。"""
+        return VADState()
 
-        冻结期（睡眠中）暂停衰减并恒返回 1.0（``last_update`` 不推进，解冻时统一推进，
-        避免醒后补算整夜衰减）。
-        """
+    def _decay_factor(self, now: datetime) -> float:
         if self.frozen:
             return 1.0
-        now = now or datetime.now()
-        hours = (now - self.last_update).total_seconds() / 3600.0
+        previous = self.last_update
+        # naive 仍按宿主本地时间解释；用真实时刻之差跨过 DST 重复/跳过的小时，
+        # 避免同一 tzinfo 的 datetime 相减按墙钟计算而漏扣或多扣。
+        hours = (now.timestamp() - previous.timestamp()) / 3600.0
         if hours <= 0:
             return 1.0
-        factor = math.exp(-self.decay_rate * hours)
-        self.vad_raw.valence *= factor
-        self.vad_raw.arousal *= factor
-        self.vad_raw.dominance *= factor
-        self.last_update = now
+        return math.exp(-self.decay_rate * hours)
+
+    def _project_raw(self, factor: float) -> VADState:
+        target = self._decay_target()
+        return VADState(*(
+            _clip(getattr(target, axis) + (getattr(self.vad_raw, axis) - getattr(target, axis)) * factor)
+            for axis in ("valence", "arousal", "dominance")
+        ))
+
+    def projected_raw(self, now: Optional[datetime] = None) -> VADState:
+        """只计算此刻的清醒衰减，不修改原始值、时间、水位或持久状态。"""
+        return self._project_raw(self._decay_factor(now or datetime.now()))
+
+    def apply_daily_decay(self, now: Optional[datetime] = None) -> float:
+        """推进清醒指数衰减；与只读投影共用公式，事件/周期不会重复扣减同一时段。
+
+        冻结或时钟回拨时不推进；解冻时另行重置时钟，睡眠时段不补扣。
+        """
+        now = now or datetime.now()
+        factor = self._decay_factor(now)
+        if factor < 1.0:
+            self.vad_raw = self._project_raw(factor)
+            self.last_update = now
         return factor
 
     def record_event(self, event_description: str, delta: VADState, *, now: Optional[datetime] = None,
@@ -243,16 +262,17 @@ class EmotionStateMachine:
                                       salience=salience)
         return self.vad_raw
 
-    def effective_vad(self) -> VADState:
-        """对外呈现的最终 VAD = 裁剪(原始 + 静态偏移) 后按符号应用乘数（乘数只作用于 V）。"""
+    def effective_vad(self, now: Optional[datetime] = None) -> VADState:
+        """只读投影至此刻，再加静态偏移及 V 乘数；读取不落盘、不推进任何状态。"""
         p = self.params
-        v = _clip(self.vad_raw.valence + p.offset.valence)
+        raw = self.projected_raw(now)
+        v = _clip(raw.valence + p.offset.valence)
         if v > 0:
             v = _clip(v * p.positive_gain)
         elif v < 0:
             v = _clip(v * p.negative_decay)
-        a = _clip(self.vad_raw.arousal + p.offset.arousal)
-        d = _clip(self.vad_raw.dominance + p.offset.dominance)
+        a = _clip(raw.arousal + p.offset.arousal)
+        d = _clip(raw.dominance + p.offset.dominance)
         return VADState(v, a, d)
 
     # ── 睡眠期大修 ──────────────────────────────────────────
@@ -266,7 +286,7 @@ class EmotionStateMachine:
 
         公式（设计文档 §十.7 + SYNERGY §3.1 / MAINTENANCE_PLAN §4.2）::
 
-            raw = 锚点 + (原始 − 锚点) × 恢复系数(睡眠时长倒U，恒 ≥0.3)
+            raw = 锚点 + (原始 − 锚点) × (1 − 恢复系数(睡眠时长倒U，恒 ≥0.3))
                   + ΔVAD裁判(±delta_limit，动态限幅)
                   + R_yesterday × w1 + E_tomorrow × w2 + clamp(约定净兑现 × w3)
 
@@ -279,6 +299,7 @@ class EmotionStateMachine:
         """
         now = now or datetime.now()
         factor = max(MIN_SLEEP_RECOVERY_FACTOR, sleep_recovery_factor(sleep_hours))
+        remaining = 1.0 - factor
         residual = _clamp_state(r_yesterday, SCHEDULE_TONE_CLAMP)
         expectation = _clamp_state(e_tomorrow, SCHEDULE_TONE_CLAMP)
         try:
@@ -291,13 +312,13 @@ class EmotionStateMachine:
         anchor = self.params.anchor
         before = self.vad_raw.to_dict()
         self.vad_raw = VADState(
-            _clip(anchor.valence + (self.vad_raw.valence - anchor.valence) * factor
+            _clip(anchor.valence + (self.vad_raw.valence - anchor.valence) * remaining
                   + delta.valence + residual.valence * SLEEP_RESIDUAL_WEIGHT
                   + expectation.valence * SLEEP_EXPECTATION_WEIGHT + commitment),
-            _clip(anchor.arousal + (self.vad_raw.arousal - anchor.arousal) * factor
+            _clip(anchor.arousal + (self.vad_raw.arousal - anchor.arousal) * remaining
                   + delta.arousal + residual.arousal * SLEEP_RESIDUAL_WEIGHT
                   + expectation.arousal * SLEEP_EXPECTATION_WEIGHT),
-            _clip(anchor.dominance + (self.vad_raw.dominance - anchor.dominance) * factor
+            _clip(anchor.dominance + (self.vad_raw.dominance - anchor.dominance) * remaining
                   + delta.dominance + residual.dominance * SLEEP_RESIDUAL_WEIGHT
                   + expectation.dominance * SLEEP_EXPECTATION_WEIGHT),
         )

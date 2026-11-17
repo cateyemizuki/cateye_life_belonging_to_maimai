@@ -11,6 +11,7 @@
   "ok": true,
   "response": {
     "event": "",
+    "impact": "routine",
     "delta_vad": {
       "valence": 0.0,
       "arousal": 0.0,

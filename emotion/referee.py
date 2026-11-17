@@ -4,7 +4,7 @@
 - 睡眠裁判：客观数据（当前 VAD、当天情绪日志、前后日日程、睡眠时长）→
   ΔVAD_sleep = ±(0.4+0.4×[schedule_advanced].emotion_influence)，缺省调用兼容 ±0.8；
 - 人设初始化：人设经 with_identity 全文注入 system_prompt → 锚点/静态偏移/乘数四组参数（带数值约束）；
-- 回复增量评估：该轮回复文本（+用户侧最后一条消息上下文，§4.2 行 2）→ 事件摘要 + ΔVAD（±0.5）。
+- 回复增量评估：交流内容 → 事件摘要 + ΔVAD，按实际影响分级限幅（±0.02/0.10/0.30）。
 所有返回都经代码层二次校验与裁剪（LLM 数值感知失真的兜底，§十二.1）。
 """
 
@@ -43,6 +43,32 @@ DAILY_SETTLEMENT_DELTA_LIMIT = 0.3
 REPLY_TEXT_PROMPT_CHARS = 600
 #: 保留最近正文时在头部补的省略标注（让模型知道前面还有更早的往来，不是交流的开头）
 REPLY_TEXT_OMIT_MARK = "…（较早往来已省略）\n"
+
+# 只校准自动交流评估；睡眠、每日结算及外部确定性事件保留各自限幅。
+# 缺少 impact 的旧 JSON / 兜底模板也按 routine 处理，避免旧模型输出继续累积高情绪。
+REPLY_IMPACT_LIMITS = {"routine": 0.02, "meaningful": 0.10, "major": 0.30}
+
+
+def _reply_delta_from(data: Dict[str, Any]) -> Optional[VADState]:
+    """按实际影响限幅，正负对称；兼容旧输出和缺失轴的零增量。"""
+    impact = data.get("impact")
+    limit = REPLY_IMPACT_LIMITS.get(impact, 0.02) if isinstance(impact, str) else 0.02
+    inner = data.get("delta_vad", data)
+    if not isinstance(inner, dict):
+        return None
+    axes = []
+    for key in ("valence", "arousal", "dominance"):
+        raw = inner.get(key, 0.0)
+        if isinstance(raw, bool):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(value):
+            return None
+        axes.append(_clip(value, -limit, limit))
+    return VADState(*axes)
 
 
 def _clip_prompt_body(text: str, max_chars: int, keep_recent: bool) -> str:
@@ -211,7 +237,8 @@ async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_na
 
     ``user_message`` 是评估上下文增强（§4.2 行 2 / §七 M3 行）：该聊天流最近一条
     用户消息文本，由调用方反查后传入；拿不到时留空（prompt 里以占位说明），
-    评估仍只输出有界增量（±0.5），模型始终看不到绝对 VAD（§6.3-6）。
+    评估仍只输出有界增量，模型始终看不到绝对 VAD（§6.3-6）。普通交流每轴
+    ±0.02，明确实际影响 ±0.10，重大事实/冲突 ±0.30；旧输出缺 impact 按普通交流。
 
     ``reply_max_chars`` / ``reply_keep_recent``：待评估正文的 prompt 预算与裁剪方向。
     缺省（600 字、保留头部）是 per_reply 旧语义，调用方不改则逐字不变；片段制
@@ -237,7 +264,7 @@ async def evaluate_reply_delta(llm: Any, reply_text: str, persona: str, lover_na
     if data is None:
         return None
     event = str(data.get("event") or "")[:60]
-    delta = _delta_from(data, 0.5)
+    delta = _reply_delta_from(data)
     if delta is None:          # F1：数值位非法 → 按评估失败处理（返回 None）
         return None
     return event, delta

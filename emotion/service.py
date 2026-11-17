@@ -6,7 +6,6 @@ import asyncio
 from copy import deepcopy
 import hashlib
 import logging
-import math
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -80,39 +79,16 @@ class _EvalQuotaTicket(str):
 
 
 class _AnchorDecayStateMachine(EmotionStateMachine):
-    """4.3a：清醒衰减向人设锚点收敛（仅 ``decay_to_persona_anchor`` 开启时装配）。
+    """清醒衰减与睡眠恢复均以人设锚点为基准，投影与推进共用基类公式。"""
 
-    与睡眠大修同一基准线 ``params.anchor``：``VAD = A + (VAD-A)·e^{-k·Δt}``。
-    默认关闭时本类不实例化，旧轨迹（向 0 衰减）逐字不变。
-    """
-
-    def apply_daily_decay(self, now: Optional[datetime] = None) -> float:
-        if self.frozen:
-            return 1.0
-        now = now or datetime.now()
-        hours = (now - self.last_update).total_seconds() / 3600.0
-        if hours <= 0:
-            return 1.0
-        factor = math.exp(-self.decay_rate * hours)
-        anchor = self.params.anchor
-        self.vad_raw = VADState(
-            _clip(anchor.valence + (self.vad_raw.valence - anchor.valence) * factor),
-            _clip(anchor.arousal + (self.vad_raw.arousal - anchor.arousal) * factor),
-            _clip(anchor.dominance + (self.vad_raw.dominance - anchor.dominance) * factor),
-        )
-        self.last_update = now
-        return factor
+    def _decay_target(self) -> VADState:
+        return self.params.anchor
 
 
 def build_emotion_state_machine(cfg: Any, params: Optional[EmotionParams],
                                 decay_rate: float) -> EmotionStateMachine:
-    """按 ``[emotion].decay_to_persona_anchor`` 装配状态机（4.3a）。
-
-    默认关 → 与改动前完全相同的 ``EmotionStateMachine``（同一参数、同一衰减公式）；
-    仅显式开启才换成向人设锚点收敛的子类，不改变其它任何结算语义。
-    """
+    """装配向人设锚点回归的状态机；cfg 形参保留给既有调用方。"""
     return _AnchorDecayStateMachine(params=params, decay_rate=decay_rate)
-    return EmotionStateMachine(params=params, decay_rate=decay_rate)
 #: episode 片段的消息条数 / 字符数上限（超出时保留**最近**的往来并在头部标注省略）
 EPISODE_SEGMENT_MAX_MESSAGES = 40
 EPISODE_SEGMENT_MAX_CHARS = 3000
@@ -310,7 +286,7 @@ class EmotionService:
                                 self._mapping_result.counts())
 
         cfg = getattr(plugin.config, "emotion", None)
-        # 4.3a：decay_to_persona_anchor 默认关 → 与原实现完全相同的状态机。
+        # 清醒与睡眠共用人设锚点；加载保留原始值，不人为重置现有情绪。
         self._machine = build_emotion_state_machine(
             cfg,
             EmotionParams.from_dict((load_json(self._config_path, {}) or {}).get("params")),
@@ -503,7 +479,7 @@ class EmotionService:
                 history = self._observations = EmotionObservations(self._state_path.with_name("emotion_observations.json"))
             timezone_name = getattr(getattr(self._plugin.config, "schedule_advanced", None), "timezone", "Asia/Shanghai")
             observed_at = TimezoneManager(timezone_name or "Asia/Shanghai").get_now()
-            history.sample(observed_at, self._machine.effective_vad().to_dict(), bool(self._machine.frozen))
+            history.sample(observed_at, self._machine.effective_vad(observed_at).to_dict(), bool(self._machine.frozen))
         except Exception:
             # F6（2026-11-04 模块评估）：观测旁路故障留一次性诊断（旁路隔离不变，
             # 不影响 VAD 结算）；每次落盘都会采样，重复告警会刷屏，故只警告一次。
@@ -1733,7 +1709,7 @@ class EmotionService:
 
         - ``delta`` 给出模板增量 → 直接 ``record_event``（×multiplier）；
         - ``delta`` 为 None 且 ``use_llm=True`` → 走既有 :func:`evaluate_reply_delta`
-          有界评估（±0.5；裁判/评估看不到绝对 VAD，§6.3-6；与回复评估共用节流）；
+          按实际影响分级限幅（±0.02/0.10/0.30；看不到绝对 VAD，与回复评估共用节流）；
         - ``multiplier`` 是调用方按 §6.2 A 算好的 K（target = 1+档位加成 /
           非 target = non_target_multiplier）；入口再统一乘 ``global_event_multiplier``，
           即 ``final_delta = delta × global_event_multiplier × K``；
@@ -2618,7 +2594,7 @@ class EmotionService:
         today = now.strftime("%Y-%m-%d")
         if not self.is_frozen():
             try:
-                self._machine.sample_daily_v(today, float(self._machine.effective_vad().valence))
+                self._machine.sample_daily_v(today, float(self._machine.effective_vad(now).valence))
             except Exception:
                 pass
         if self._machine.low_mood_checked_date == today:
@@ -3131,6 +3107,14 @@ class EmotionService:
         self._retain_sleep_receipt(self._pending_overhaul)
         return await self._apply_cached_overhaul(now) or {"ok": False, "reason": "大修应用失败"}
 
+    def _tick_daily_decay(self, now: Optional[datetime] = None) -> None:
+        """睡眠边沿处理之后推进清醒时间；沿既有检测间隔落盘并采样历史。
+
+        此入口不产生事件、不调用模型、不消费评估配额。只读呈现另走纯投影。
+        """
+        if self._machine.apply_daily_decay(now) < 1.0:
+            self._save_state()
+
     async def _loop(self) -> None:
         """睡眠检测循环：进 sleep 条目 → 冻结+缓存大修；离开 → 应用缓存并解冻（M5）。
 
@@ -3142,6 +3126,7 @@ class EmotionService:
             try:
                 if self._enabled():
                     await self._check_and_overhaul()
+                    self._tick_daily_decay()
                     await self.flush_idle_episodes()
             except Exception:
                 # F1（2026-11-04 模块评估 P1-10）：捕获必留痕——原 except-pass 使
@@ -3281,8 +3266,8 @@ class EmotionService:
             period = self._sleep_period
             applied = await self._apply_cached_overhaul(now)     # M5：应用缓存并解冻
             # 顺序理由（附录 §2.3 上限注释）：大修是"夜里决定次日情绪的主语"，被打扰的暖意叠加
-            # 在**大修结果之上**；若在大修前入账，会被 (raw − anchor) × recovery_factor 的向锚点
-            # 收敛稀释（且恒被下界 0.3~0.85 的系数打折），与"净正合计整夜入账"的口径不符。
+            # 在**大修结果之上**；若在大修前入账，会随睡前残差一起被
+            # (1 − recovery_factor) 打折，与"净正合计整夜入账"的口径不符。
             # 无打扰周期 → 结算内部返回 None（不入账、不落 settled 日志）。
             if ended_cycle:
                 settle_key = str(applied.get("cycle_key") or "") if applied else ""
@@ -3339,6 +3324,9 @@ class EmotionService:
         # 顺序约束（REGISTRY §二.4）：先冲刷全部未结片段，再冻结/跑睡眠裁判——冲刷的入账
         # 发生在冻结前才会进当天 emotion_log（冻结期事件只入队），裁判的日志输入才完整
         await self.flush_all_episodes(reason="sleep_entry")
+        # 睡眠入口可能是夜间重载：只补到本周期入睡边界，不能把已睡时长当清醒衰减。
+        # 若片段事件已推进到更晚的时刻，状态机的回拨保护保持该值，不重复扣减。
+        self._machine.apply_daily_decay(min(now, period_start))
         self._machine.freeze(now)                        # M5：冻结（事件只入队、暂停衰减/结算）
         # R7 = 用户 2026-10-24 直派：no_sleep_mode 夜窗兜底只 freeze + flush——跳过裁判
         # （不打 ask_sleep_referee、不建缓存），大修改延迟到新日程进账（schedule.generated）
