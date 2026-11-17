@@ -631,8 +631,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             return
 
         # 目标私聊 stream 解析（失败则后台重试）
-        self._stream_id = await self._resolve_target_stream()
-        self._apply_target(target_qq_of(cfg), self._stream_id)
+        await self._refresh_target_binding()
         # 生活状态装配（R7 滚动化改造，2026-10-25 用户直派；PR8 3.0.0 起门控 =
         # [schedule].enabled 唯一总开关）：false 时不实例化任何新服务；失败告警回退、
         # 绝不拖挂插件加载（_setup_life_services 内保底）
@@ -782,8 +781,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             await self._refresh_persona()
             from core.targeting import refresh_host_target
             await refresh_host_target(self)
-            self._stream_id = await self._resolve_target_stream()
-            self._apply_target(target_qq_of(self.config), self._stream_id)
+            await self._refresh_target_binding()
             self._ensure_stream_retry()
             return
         if scope != "self":
@@ -827,8 +825,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 目标 QQ 变化 → 重新解析 stream
         from core.targeting import refresh_host_target
         await refresh_host_target(self)
-        self._stream_id = await self._resolve_target_stream()
-        self._apply_target(target_qq_of(cfg), self._stream_id)
+        await self._refresh_target_binding()
         # 生活状态热启用（R7 滚动化改造；PR8 3.0.0 门控 = [schedule].enabled）：首次
         # 置真时此处补装配，再挂 tick 循环（_start_bg 的 _bg_started 守卫会早退，故单独 _ensure）
         self._setup_life_services()
@@ -1162,9 +1159,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                         engine._cfg_int("sleep_hard_commitment_lead_minutes", 30),  # noqa: SLF001
                         engine._wake_check_seconds())  # noqa: SLF001
             except Exception as exc:
-                engine = None
+                if engine is None or getattr(engine, "recovery_pending", False) is not True:
+                    engine = None
                 try:
-                    self.ctx.logger.warning("睡眠引擎装配失败（本次不启用引擎，睡眠态未就绪）：%s", exc)
+                    self.ctx.logger.warning("睡眠引擎装配未完成，已认领的会话留待恢复：%s", exc)
                 except Exception:
                     pass
             # 离线睡眠补全收口（LifeState 冷启动 pending gap 恰好一次消费；任何异常
@@ -3175,17 +3173,32 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     # ------------------------------------------------------------------
     # stream 解析（companion 巡检与 qzone 提醒共用的目标会话）
     # ------------------------------------------------------------------
+    async def _refresh_target_binding(self, *, clear_unresolved: bool = True) -> str:
+        config = self.config
+        target = target_qq_of(config)
+        revision = getattr(self, "_target_lookup_revision", 0) + 1
+        self._target_lookup_revision = revision
+        stream = await self._resolve_target_stream()
+        if (revision != self._target_lookup_revision or config is not self.config
+                or target != target_qq_of(self.config) or getattr(self, "_is_unloading", False)):
+            return ""
+        if stream or clear_unresolved:
+            self._stream_id = stream
+            self._apply_target(target, stream)
+        return stream
+
     async def _resolve_target_stream(self) -> str:
         """解析目标 QQ 的私聊 stream_id；失败返回空串（后台重试循环接管）。"""
         target_qq = target_qq_of(self.config)
+        from core.targeting import private_qq_stream
         if not target_qq or target_qq == "123456789":
             return ""  # 占位号不解析
         try:
             info = await self.ctx.chat.get_stream_by_user_id(user_id=target_qq)
-            payload = info.get("stream") if isinstance(info, dict) else None
-            payload = payload or info
-            if isinstance(payload, dict) and payload.get("stream_id"):
-                return str(payload["stream_id"])
+            if isinstance(info, dict) and info.get("success") is not False:
+                stream = private_qq_stream(info.get("stream") or info, target_qq, queried_by_user=True)
+                if stream:
+                    return stream
         except Exception:
             pass
         try:  # 回退：遍历私聊流
@@ -3193,8 +3206,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             if isinstance(streams, dict):
                 streams = streams.get("streams") or streams.get("data") or []
             for s in streams or []:
-                if isinstance(s, dict) and str(s.get("user_id") or "") == target_qq and s.get("stream_id"):
-                    return str(s["stream_id"])
+                stream = private_qq_stream(s, target_qq)
+                if stream:
+                    return stream
         except Exception:
             pass
         return ""
@@ -3220,10 +3234,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         while not self._stop_event.is_set():
             if not self.config.plugin.enabled or self._companion.patrol.has_target():
                 return
-            stream_id = await self._resolve_target_stream()
+            stream_id = await self._refresh_target_binding(clear_unresolved=False)
             if stream_id:
-                self._stream_id = stream_id
-                self._apply_target(target_qq_of(self.config), stream_id)
                 await self._companion.sync_background()
                 self.ctx.logger.info("目标 stream 解析成功：%s", stream_id)
                 return

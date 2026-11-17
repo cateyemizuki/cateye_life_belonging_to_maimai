@@ -25,6 +25,21 @@ def unique_qq_admin(values: Any) -> str:
     return next(iter(identities)) if len(identities) == 1 else ""
 
 
+def private_qq_stream(row: Any, target_qq: str, *, queried_by_user: bool = False) -> str:
+    """Accept the host's scoped lookup; reject conflicting platform, group or user metadata."""
+    if not isinstance(row, dict) or row.get("success") is False:
+        return ""
+    if str(row.get("platform") or "qq").strip().lower() != "qq":
+        return ""
+    if (row.get("group_id") or row.get("is_group_session") is True
+            or str(row.get("chat_type") or "").lower() == "group"):
+        return ""
+    owner = str(row.get("user_id") or "").strip()
+    if owner != target_qq and (owner or not queried_by_user):
+        return ""
+    return str(row.get("stream_id") or "").strip()
+
+
 def target_qq_of(config: Any) -> str:
     config = getattr(config, "config", config)
     section = getattr(config, "patrol", None)

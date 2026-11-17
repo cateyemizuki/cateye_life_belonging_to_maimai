@@ -49,6 +49,9 @@ class ArchitectureCases(unittest.TestCase):
     def test_registry_failure_report(self):
         self.run_case("case_registry_failure_report")
 
+    def test_upgrade_invalidation_failure_preserves_version(self):
+        self.run_case("case_upgrade_invalidation_failure_preserves_version")
+
     def test_day_session_boundary(self):
         self.run_case("case_day_session_boundary")
 
@@ -57,6 +60,9 @@ class ArchitectureCases(unittest.TestCase):
 
     def test_reload_waiter_cancellation(self):
         self.run_case("case_reload_waiter_cancellation")
+
+    def test_changed_target_rejects_old_route(self):
+        self.run_case("case_changed_target_rejects_old_route")
 
     def run_case(self, name):
         proc = subprocess.run(
@@ -268,6 +274,34 @@ async def case_engine_claim_survives_retry(root):
     p._rolling_planner.tick.assert_not_called()
 
 
+async def case_changed_target_rejects_old_route(root):
+    from plugin import CateyeSuitePlugin
+    from core.targeting import private_qq_stream
+
+    p = object.__new__(CateyeSuitePlugin)
+    p.config = NS(patrol=NS(target_qq="10203"))
+    p._apply_target = Mock()
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def lookup():
+        entered.set()
+        await resume.wait()
+        return "old-private-stream"
+
+    p._resolve_target_stream = lookup
+    task = asyncio.create_task(p._refresh_target_binding())
+    await entered.wait()
+    p.config = NS(patrol=NS(target_qq="40506"))
+    resume.set()
+    assert await task == ""
+    p._apply_target.assert_not_called()
+    assert private_qq_stream({"stream_id": "s", "platform": "telegram", "user_id": "10203"}, "10203") == ""
+    assert private_qq_stream({"stream_id": "s", "group_id": "g", "user_id": "10203"}, "10203") == ""
+    assert private_qq_stream({"stream_id": "s", "user_id": "40506"}, "10203") == ""
+    assert private_qq_stream({"stream_id": "s", "user_id": "10203", "platform": "qq"}, "10203") == "s"
+
+
 async def case_no_sleep_gap_is_idempotent(root):
     from planning.schedule_db import ScheduleDB
     from planning.life_state import LifeStateService
@@ -402,6 +436,16 @@ async def case_registry_failure_report(root):
         result = await driver.run(manual=True, fields=["video_interest"])
     assert result.outcomes[0].status == "failed"
     assert reg.field_state("video_interest")["initialized"] is False
+
+
+async def case_upgrade_invalidation_failure_preserves_version(root):
+    from tools.init.auto_init import compute_need
+    driver, reg = init_driver(root)
+    with patch.object(reg, "invalidate", return_value=False):
+        result = await driver.run(manual=True)
+    assert result.outcomes[0].status == "failed"
+    assert "activity_preferences" in compute_need(reg.load(), "3.18.7")
+    assert reg.load()["plugin_version"] == "3.17.33"
 
 
 async def case_day_session_boundary(root):
