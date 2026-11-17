@@ -150,7 +150,7 @@ class LLMService:
                     keep_hours=int(usage_keep_hours or KEEP_HOURS))
         except Exception:
             self._usage_tracker = None
-        #: 统一入口（懒建：LLMService 保留薄壳签名，内部唯一出口在 tools.llm_gateway）
+        #: Shared infrastructure owns transport and billing; the service supplies generation policy.
         self._llm_gateway: Optional[Any] = None
         self._generation_policy: Optional[Any] = None
 
@@ -158,7 +158,7 @@ class LLMService:
         """懒建 Gateway，保留按需初始化与实例复用。"""
         gateway = getattr(self, "_llm_gateway", None)
         if gateway is None:
-            from tools.llm_gateway import LLMGateway
+            from core.llm_gateway import LLMGateway
             gateway = LLMGateway(
                 self._ctx,
                 task_name=getattr(self, "_task_name", "utils"),

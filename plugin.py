@@ -1741,7 +1741,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             from integrations.video_interest import BiliCandidateSource, VideoInterestService
             interest = VideoInterestService(
                 self._data_dir / "video_watch",
-                # LLM 唯一入口：LLMService → tools/llm_gateway；module="video"
+                # LLM 唯一入口：LLMService → core/llm_gateway；module="video"
                 # （MODULE_VALUES 枚举无 video_interest，event 维度区分兴趣询问）
                 llm_generate_detailed=lambda *args, **kwargs: self._llm.generate_detailed(
                     *args, module="video", **kwargs),
@@ -2130,7 +2130,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 # 信号（门槛开启时保守不分享，绝不虚构信号）。
                 quality_config_provider=lambda: self.config.video_share,
                 quality_signal_provider=self._video_share_quality_signals,
-                # LLM 唯一入口：LLMService → tools/llm_gateway；module='qzone'（发布面归属）
+                # LLM 唯一入口：LLMService → core/llm_gateway；module='qzone'（发布面归属）
                 # PR-AUDIT（3.16.1 PR-1）：判定/文案两链路人设统一经 with_identity 进 system
                 # 前缀；body 不再序列化 persona（module='qzone' 发布面归属不变）。
                 generate=lambda *a, **kw: self._llm.generate_detailed(*a, module='qzone', with_identity=True, **kw),

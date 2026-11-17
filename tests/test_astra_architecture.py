@@ -22,6 +22,9 @@ class ArchitectureCases(unittest.TestCase):
     def test_module_config_sync(self):
         self.run_case("case_module_config_sync")
 
+    def test_gateway_imports_share_patches(self):
+        self.run_case("case_gateway_imports_share_patches")
+
     def test_trusted_command_policy(self):
         self.run_case("case_trusted_command_policy")
 
@@ -118,6 +121,33 @@ async def case_module_config_sync(root):
     p._companion.sync_background.assert_awaited_once()
     p._qzone.start.assert_called_once()
     p._companion.patrol.start.assert_not_called()
+
+
+async def case_gateway_imports_share_patches(root):
+    import ast
+    import tools.llm_gateway as legacy
+    import core.llm_gateway as current
+    from core.llm_utils import LLMService
+    assert legacy is current
+    assert legacy.LLMGateway is current.LLMGateway
+    assert legacy.receipt_of is current.receipt_of
+    assert legacy.record_response is current.record_response
+    assert legacy.LLMReceipt is current.LLMReceipt
+    for source in (SOURCE / "core").rglob("*.py"):
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8-sig"))):
+            assert not (isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0]=="tools")
+            if isinstance(node, ast.Import):
+                assert all(name.name.split(".")[0]!="tools" for name in node.names)
+    ctx=NS(paths=NS(data_dir=root),logger=Mock(),llm=NS(generate=AsyncMock(return_value={"success":True,"response":"ready","total_tokens":3})))
+    service=LLMService(ctx)
+    replacement=Mock()
+    with patch.object(legacy,"LLMGateway",return_value=replacement):
+        assert service._gateway() is replacement
+    gateway=current.LLMGateway(ctx)
+    with patch.object(legacy,"record_response") as record:
+        result=await gateway.generate_once("fixture",module="planning")
+        assert result.ok and result.total_tokens==3
+        record.assert_called_once()
 
 
 async def case_trusted_command_policy(root):
