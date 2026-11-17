@@ -2953,7 +2953,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     "interruption_count": session.interruption_count,
                     "quality": session.quality,
                     "effective_sleep_hours": session.effective_sleep_hours,
-                    "hard_commitment_start": (session.metadata or {}).get("hard_commitment_start"),
                 }
             return {
                 "session": session,
@@ -3000,11 +2999,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 session.interruption_count = fields["interruption_count"]
                 session.quality = fields["quality"]
                 session.effective_sleep_hours = fields["effective_sleep_hours"]
-                hard = fields.get("hard_commitment_start")
-                if hard is None:
-                    (session.metadata or {}).pop("hard_commitment_start", None)
-                else:
-                    session.metadata["hard_commitment_start"] = hard
+                # Observed commitment identity/time is external fact, retained across an integration retry.
             return True
         except Exception:
             return False
@@ -3015,7 +3010,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         if engine is None or not isinstance(prepared, dict):
             return {}
         try:
-            energy = snapshot.get("energy") if isinstance(snapshot, dict) else None
+            energy = snapshot.get("sleep_boundary_energy", snapshot.get("energy")) if isinstance(snapshot, dict) else None
             result = engine.commit_tick(energy=energy)
             if isinstance(result, dict) and result.get("woke"):
                 session = getattr(engine, "_session", None)  # noqa: SLF001 - 同源会话读

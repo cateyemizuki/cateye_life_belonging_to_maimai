@@ -373,12 +373,13 @@ async def case_sleep_tick_retry_respects_boundary(root):
         def get_now(self):
             return self.current
 
-    def fixture(path):
+    def fixture(path, known=True):
         path.mkdir()
         clock = Clock()
         cfg = CateyeSuiteConfig()
         db = ScheduleDB(path / "schedule.db")
         life = LifeStateService(path / "life.json", timezone_manager=clock)
+        life._sleep_debt = 2.0
         life.tick(beginning)
         bus = Mock()
         engine = SleepEngine(
@@ -392,7 +393,9 @@ async def case_sleep_tick_retry_respects_boundary(root):
         planner.tick = Mock(return_value={})
         planner.apply_morning_spine_adjustment = Mock()
         db.start_episode("2026-11-17", "sleep", "sleep", "rolling", 1380, 1920)
-        engine.prepare_tick(beginning, sleep_episode=db.active_episode(), hard_commitment_start=hard)
+        engine.prepare_tick(
+            beginning, sleep_episode=db.active_episode(), hard_commitment_start=hard if known else None
+        )
         engine.commit_tick(beginning)
         p = object.__new__(CateyeSuitePlugin)
         p.ctx = NS(logger=Mock())
@@ -413,6 +416,8 @@ async def case_sleep_tick_retry_respects_boundary(root):
 
     p, clock, bus = fixture(root / "failed")
     control, control_clock, _ = fixture(root / "control")
+    late, late_clock, _ = fixture(root / "late", known=False)
+    learned, learned_clock, _ = fixture(root / "learned", known=False)
     try:
         before = p._life_state.snapshot()
         with patch.object(p._life_state, "save", return_value=False):
@@ -431,15 +436,36 @@ async def case_sleep_tick_retry_respects_boundary(root):
         control._life_tick_once()
         control_clock.current = clock.current
         control._life_tick_once()
+        assert p._sleep_engine._session.energy_end == control._sleep_engine._session.energy_end
+        assert p._sleep_engine._session.energy_end > p._life_state.snapshot()["energy"]
         for field in ("energy", "focus", "stress", "social_battery", "hunger", "sleep_debt"):
             assert abs(p._life_state.snapshot()[field] - control._life_state.snapshot()[field]) < 1e-7, field
         settled = p._life_state.snapshot()
         p._life_tick_once()
         assert p._life_state.snapshot() == settled
         assert sum(call.args[0] == "life.sleep_woke" for call in bus.publish_soon.call_args_list) == 1
+        with patch.object(learned._life_state, "save", return_value=False):
+            for offset in (-2, 0, 5, 10):
+                learned_clock.current = boundary + timedelta(minutes=offset)
+                learned._life_tick_once()
+        learned_clock.current = clock.current
+        learned._life_tick_once()
+        assert learned._sleep_engine._session.closed_at == boundary
+        assert learned._sleep_engine._session.energy_end == control._sleep_engine._session.energy_end
+        for field in ("energy", "focus", "stress", "social_battery", "hunger", "sleep_debt"):
+            assert abs(learned._life_state.snapshot()[field] - control._life_state.snapshot()[field]) < 1e-7
+        first_observed = boundary + timedelta(minutes=20)
+        late_clock.current = first_observed
+        with patch.object(late._life_state, "save", return_value=False):
+            late._life_tick_once()
+        late_clock.current += timedelta(minutes=5)
+        late._life_tick_once()
+        assert late._sleep_engine._session.closed_at == first_observed
     finally:
         p._db.close()
         control._db.close()
+        late._db.close()
+        learned._db.close()
 
 
 async def case_changed_target_rejects_old_route(root):

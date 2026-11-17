@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from core.storage import save_json_atomic
-from core.time_utils import elapsed_seconds
+from core.time_utils import elapsed_seconds, shift_elapsed
 
 from .time_utils import DAY_MINUTES, TimezoneManager
 from .life_history import LifeStateHistory
@@ -771,17 +771,30 @@ class LifeStateService:
         dt_min = self._dt_minutes(now)
         previous = {key: deepcopy(getattr(self, key)) for key in
                     ('_state', '_sleep_debt', '_last_tick_at', '_updated_at', '_settlement_diag')}
+        boundary_energy = None
         try:
             if dt_min > 0:
                 if sleep_rates is not None:
                     raw_span = sleep_rates.get('elapsed_sleep_minutes', dt_min)
                     span = (float(raw_span) if isinstance(raw_span, (int, float))
                             and not isinstance(raw_span, bool) and math.isfinite(raw_span) else 0.0)
-                    asleep = max(0.0, min(dt_min, span))
-                    if dt_min > asleep:
-                        self._apply_awake_v2(dt_min - asleep, active_profile, now)
+                    raw_after = sleep_rates.get("awake_after_sleep_minutes", 0.0)
+                    after = (float(raw_after) if isinstance(raw_after, (int, float))
+                             and not isinstance(raw_after, bool) and math.isfinite(raw_after) else 0.0)
+                    after = max(0.0, min(dt_min, after))
+                    asleep = max(0.0, min(dt_min - after, span))
+                    before = max(0.0, dt_min - asleep - after)
+                    sleep_until = shift_elapsed(now, -after * 60.0)
+                    if before:
+                        self._apply_awake_v2(before, active_profile, sleep_until)
                     if asleep:
-                        self._apply_sleep_v2(asleep, now)
+                        self._apply_sleep_v2(asleep, sleep_until)
+                    boundary_energy = self._state["energy"]
+                    debt_after = sleep_rates.get("sleep_debt_after")
+                    if isinstance(debt_after, (int, float)) and not isinstance(debt_after, bool):
+                        self._sleep_debt = max(0.0, min(SLEEP_DEBT_MAX, float(debt_after)))
+                    if after:
+                        self._apply_awake_v2(after, active_profile, now)
                 else:
                     self._apply_awake_v2(dt_min, active_profile, now)
             self._last_tick_at = now
@@ -795,7 +808,10 @@ class LifeStateService:
             raise
         self._cold_integrated_at = None
         self._capture_history("sleep" if sleep_rates is not None else "tick")
-        return self.snapshot()
+        snapshot = self.snapshot()
+        if boundary_energy is not None:
+            snapshot["sleep_boundary_energy"] = boundary_energy
+        return snapshot
 
 
     def apply_episode(self, episode: Any, now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -931,8 +947,10 @@ class LifeStateService:
         self._sleep_wake_target = None
         self._sleep_lie_in_cap = None
         self._last_sleep_at = now_dt
-        self._last_tick_at = now_dt
-        self._updated_at = now_dt
+        through = self._last_tick_at
+        observed = now_dt if through is None else max((now_dt, through), key=lambda dt: dt.timestamp())
+        self._last_tick_at = observed
+        self._updated_at = observed
         self._clamp_all()
         self.save()
         self._capture_history("wake", force=True)
