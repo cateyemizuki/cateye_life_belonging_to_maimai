@@ -70,6 +70,9 @@ class ArchitectureCases(unittest.TestCase):
     def test_screen_registration_refresh(self):
         self.run_case("case_screen_registration_refresh")
 
+    def test_component_metadata_before_context(self):
+        self.run_case("case_component_metadata_before_context")
+
     def test_reload_waiter_cancellation(self):
         self.run_case("case_reload_waiter_cancellation")
 
@@ -776,6 +779,68 @@ async def case_screen_registration_refresh(root):
     for _ in range(5):
         await asyncio.sleep(0)
     ctx.component.reload_plugin.assert_awaited_once()
+
+
+async def case_component_metadata_before_context(root):
+    from plugin import CateyeSuitePlugin, create_plugin
+    from companion.screen_tools import SCREEN_TOOL_NAME
+    from core.targeting import refresh_host_target
+    from suite_config import CateyeSuiteConfig
+
+    def context(instance):
+        value = getattr(instance, "_fixture_context", None)
+        if value is None:
+            raise RuntimeError("Plugin context has not been bound")
+        return value
+
+    def names(instance):
+        rows = instance.get_components()
+        assert not hasattr(instance, "_target_binding_coordinator")
+        assert any(row.get("name") == "/lbm" for row in rows)
+        return {row.get("name"): row for row in rows}
+
+    ctx = NS(
+        plugin_id="fixture.precontext",
+        paths=NS(data_dir=root),
+        config=NS(get=AsyncMock(return_value=["qq:10203"])),
+        component=NS(reload_plugin=AsyncMock(return_value={"success": True})),
+        logger=Mock(),
+    )
+    with patch.object(CateyeSuitePlugin, "ctx", property(context), create=True):
+        plugin = create_plugin()
+        assert SCREEN_TOOL_NAME not in names(plugin)
+        plugin.config = CateyeSuiteConfig()
+        plugin.config.screen.tool_enabled = True
+        assert SCREEN_TOOL_NAME not in names(plugin)
+        plugin._fixture_context = ctx
+        assert SCREEN_TOOL_NAME not in names(plugin)
+        await refresh_host_target(plugin)
+        plugin._companion = Mock()
+        plugin._qzone = Mock()
+        plugin._schedule_target_frequency_calibration = Mock()
+        plugin._resolve_target_stream = AsyncMock(return_value="verified-private")
+        await plugin._refresh_target_binding()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        ctx.component.reload_plugin.assert_awaited_once_with(plugin_name="fixture.precontext")
+
+        # Host registration with an already-bound context reuses only the verified single stream.
+        loaded = create_plugin()
+        loaded.config = CateyeSuiteConfig()
+        loaded.config.screen.tool_enabled = True
+        loaded._fixture_context = ctx
+        declaration = names(loaded)[SCREEN_TOOL_NAME]
+        assert declaration["chat_scope"] == "private"
+        assert declaration["allowed_session"] == ["verified-private"]
+        await refresh_host_target(loaded)
+        loaded._companion = Mock()
+        loaded._qzone = Mock()
+        loaded._schedule_target_frequency_calibration = Mock()
+        loaded._resolve_target_stream = AsyncMock(return_value="verified-private")
+        await loaded._refresh_target_binding()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        ctx.component.reload_plugin.assert_awaited_once()
 
 
 def run_isolated(name):

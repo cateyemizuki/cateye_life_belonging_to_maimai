@@ -261,8 +261,18 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                                   and screen_config_of(self.config).tool_enabled)
         except Exception:
             screen_enabled = False
-        screen_stream = screen_registration_stream(self) if screen_enabled else ""
-        self._target_lifecycle().declare(screen_stream)
+        screen_stream = ""
+        if screen_enabled:
+            try:
+                context = self.ctx
+            except (AttributeError, RuntimeError):
+                context = None
+            if context is not None:
+                screen_stream = screen_registration_stream(self)
+        self._declared_screen_stream = screen_stream
+        coordinator = getattr(self, "_target_binding_coordinator", None)
+        if coordinator is not None:
+            coordinator.declare(screen_stream)
         if not hasattr(self, "_screen_scope_ready"):
             self._screen_scope_ready = False
 
@@ -929,6 +939,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 reload_plugin=reloader if callable(reloader) else None,
                 logger=getattr(ctx, "logger", None),
             )
+            declared = getattr(self, "_declared_screen_stream", None)
+            if declared is not None:
+                coordinator.declare(declared)
             self._target_binding_coordinator = coordinator
         return coordinator
 
