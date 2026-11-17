@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 import uuid
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .schedule_db import ScheduleDB
-from .time_utils import TimezoneManager
+from .time_utils import TimezoneManager, wall_time, elapsed_seconds, shift_elapsed
 
 logger = logging.getLogger(__name__)
 
@@ -193,13 +194,26 @@ class GoalManager:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = db if db is not None else ScheduleDB(self.data_dir / db_name)
         self.tz_manager = TimezoneManager()
+        self._clock_provider: Optional[Any] = None
         #: 进程内事件总线（M0；由 PlanningServices 装配时绑定，未绑定=静默跳过事件）
         self._bus: Optional[Any] = None
+        self._commitment_required_owners: tuple[str, ...] = ()
+        self._commitment_dispatch_task = None
+        self._commitment_dispatch_lock = asyncio.Lock()
         logger.debug("GoalManager 初始化完成，数据库: %s", self.data_dir / db_name)
 
-    def bind_event_bus(self, bus: Optional[Any]) -> None:
-        """绑定事件总线（M0 装配点；允许 None=不发事件，兼容独立测试）。"""
+    def bind_event_bus(self, bus: Optional[Any], *, required_owners: tuple[str, ...] = ()) -> None:
+        """装配必要消费者；缺任一消费者时保留 outbox，默认兼容独立调用。"""
         self._bus = bus
+        self._commitment_required_owners = tuple(required_owners)
+
+    def bind_clock_provider(self, provider: Optional[Any]) -> None:
+        """动态获取配置区时钟；独立构造仍回退既有 tz_manager。"""
+        self._clock_provider = provider
+
+    def _clock(self) -> TimezoneManager:
+        provider = getattr(self, "_clock_provider", None)
+        return provider() if callable(provider) else self.tz_manager
 
     # ---- 变更通知（睡眠 loop 内部重检口；PR3 复核 2026-10-27）----
     def set_change_listener(self, listener: Optional[Any]) -> None:
@@ -332,13 +346,14 @@ class GoalManager:
         creator_id: str = "system",
     ) -> Goal:
         """添加一条未来约定（日期归一化，格式不统一也能正确匹配）。"""
-        normalized_date = _normalize_commitment_date(commitment_date, self.tz_manager.get_now())
+        normalized_date = _normalize_commitment_date(commitment_date, self._clock().get_now())
         parameters = {
             "commitment_date": normalized_date,
             "time": time,
             "notes": notes,
             "reason": reason,
             "source": "user_request",
+            "commitment_lifecycle": 1,
         }
         goal = self.create_goal(
             name=title,
@@ -356,9 +371,9 @@ class GoalManager:
     def get_pending_commitments(self, commitment_date: Optional[str] = None) -> List[Goal]:
         """查询未来约定（仅 status=active；commitment_date 留空 = 今天）。"""
         if commitment_date is None:
-            commitment_date = self.tz_manager.get_now().strftime("%Y-%m-%d")
+            commitment_date = self._clock().get_now().strftime("%Y-%m-%d")
         else:
-            commitment_date = _normalize_commitment_date(commitment_date, self.tz_manager.get_now())
+            commitment_date = _normalize_commitment_date(commitment_date, self._clock().get_now())
         candidates = self.get_all_goals(chat_id="global", status=GoalStatus.ACTIVE)
         return [
             g for g in candidates
@@ -368,38 +383,107 @@ class GoalManager:
 
     def consume_pending_commitments(self, commitment_date: str,
                                    *, matched_titles: Optional[Any] = None) -> List[Goal]:
-        """消费指定日期的全部未消费约定（标记 COMPLETED，保留审计）。
+        """兼容旧入口：排入计划不能消费约定，实际结算由 reconcile_commitments 驱动。"""
+        return []
 
-        Args:
-            commitment_date: 约定日期（YYYY-MM-DD）。
-            matched_titles: 本次日程生成中已匹配到日程项的约定标题集合（M0 新增，默认 None）。
-                None=未知匹配结果（按兑现上报）；非 None 时未匹配的约定上报为违约。
-                消费事件：``schedule.commitment_kept`` / ``schedule.commitment_broken``（附录 A）。
+    def reconcile_commitments(self, now: Optional[datetime] = None, *, grace_minutes: int = 10) -> int:
+        """按持久执行证据/到期补扫结算；重启、重排及上次写库失败均可安全重试。
+
+        仅处理新生命周期或已排入新日表的 active 约定，既有 completed 历史不倒写。
+        completed episode 才是兑现证据；仍在执行的约定即使超过窗口也等待完成。
         """
-        consumed = self.get_pending_commitments(commitment_date)
-        for goal in consumed:
-            self.db.update_goal(goal.goal_id, status=GoalStatus.COMPLETED.value)
-        if consumed:
-            logger.info("已消费 %d 条 %s 的未来约定", len(consumed), commitment_date)
-            self._publish_commitments(consumed, matched_titles)
-        return consumed
-
-    def _publish_commitments(self, consumed: List[Goal], matched_titles: Optional[Any]) -> None:
-        """按匹配结果逐条上报约定兑现/违约（M0；无总线时静默）。"""
-        known = None if matched_titles is None else {str(t) for t in matched_titles}
-        for goal in consumed:
+        clock = self._clock()
+        moment = clock.to_local(now)
+        settled = 0
+        goals = self.db.get_all_goals(chat_id="global", status="active")
+        episodes_by_date: Dict[str, List[Dict[str, Any]]] = {}
+        for row in goals:
+            if row.get("goal_type") != "pending_commitment":
+                continue
+            goal = Goal.from_dict(row)
             params = goal.parameters or {}
+            plan = params.get("commitment_plan") or {}
+            if not plan and not params.get("commitment_lifecycle"):
+                continue
+            date = str(plan.get("schedule_date") or params.get("commitment_date") or "")
+            try:
+                day = datetime.strptime(date, "%Y-%m-%d").date()
+                base = wall_time(day, 0, clock._tz)
+                end = int(plan.get("end_minute") or 0)
+                if not end:
+                    pieces = str(params.get("time") or "").split(":")
+                    end = int(pieces[0]) * 60 + int(pieces[1]) + 60 if len(pieces) == 2 else 1440
+                end_at = wall_time(day, end, clock._tz)
+                due = shift_elapsed(end_at, grace_minutes * 60)
+            except (TypeError, ValueError):
+                logger.warning("约定到期信息无效，保留待处理: id=%s", goal.goal_id)
+                continue
+            if elapsed_seconds(base, moment) > 0:
+                continue
+            if date not in episodes_by_date:
+                episodes_by_date[date] = self.db.episodes_today(date)
+            evidence = []
+            for episode in episodes_by_date[date]:
+                meta = episode.get("metadata") or {}
+                if (str(meta.get("commitment_id") or "") == goal.goal_id
+                        or (plan.get("item_id") and plan["item_id"] in
+                            (meta.get("commitment_item_id"), meta.get("intent_item_id")))):
+                    evidence.append(episode)
+            completed = any(e.get("status") == "completed" and e.get("actual_start_minute") is not None
+                            and e.get("actual_end_minute") is not None
+                            and elapsed_seconds(wall_time(day, int(e["actual_end_minute"]), clock._tz), moment) <= 0
+                            for e in evidence)
+            active = any(e.get("status") == "active" for e in evidence)
+            if not completed and (elapsed_seconds(moment, due) < 0 or active):
+                continue
+            kept = completed
             title = str(goal.name or "").strip()
             when = str(params.get("time") or "").strip()
             notes = str(params.get("notes") or "").strip()
-            kept = True if known is None else title in known
-            self._publish_soon(
-                "schedule.commitment_kept" if kept else "schedule.commitment_broken",
-                summary=f"{title}（{when}）" if when else title,
-                commitment=title, time=when, notes=notes,
-                date=str(params.get("commitment_date") or ""),
-                matched=kept,
-            )
+            if self.db.settle_commitment(goal.goal_id, "kept" if kept else "broken", {
+                "summary": f"{title}（{when}）" if when else title,
+                "commitment": title, "time": when, "notes": notes,
+                "date": str(params.get("commitment_date") or ""), "matched": kept,
+            }):
+                settled += 1
+        self._schedule_commitment_dispatch()
+        return settled
+
+    def _schedule_commitment_dispatch(self) -> None:
+        if self._bus is None or (self._commitment_dispatch_task is not None
+                                 and not self._commitment_dispatch_task.done()):
+            return
+        try:
+            self._commitment_dispatch_task = asyncio.get_running_loop().create_task(self.flush_commitment_events())
+        except RuntimeError:
+            pass  # 同步独立调用保留 outbox，下一次运行中的 tick 继续发送。
+
+    async def flush_commitment_events(self) -> int:
+        """确认发布后再确认 outbox；发布/确认失败保留，稳定 event_id 供订阅方幂等。"""
+        if self._bus is None:
+            return 0
+        delivered = 0
+        async with self._commitment_dispatch_lock:
+            try:
+                for event in self.db.pending_commitment_events():
+                    confirmed = getattr(self._bus, "publish_confirmed", None)
+                    name = "schedule.commitment_" + event["outcome"]
+                    required = self._commitment_required_owners
+                    if callable(confirmed):
+                        options = {"required_owners": required} if required else {}
+                        if not await confirmed(name, source="planning", **options, **event["payload"]):
+                            logger.warning("约定结算订阅者尚未全部确认: event_id=%s", event["event_id"])
+                            continue
+                    else:
+                        if required:
+                            logger.warning("约定总线不支持必要消费者确认，保留 outbox: event_id=%s", event["event_id"])
+                            continue
+                        await self._bus.publish(name, source="planning", **event["payload"])
+                    self.db.acknowledge_commitment_event(event["event_id"])
+                    delivered += 1
+            except Exception:
+                logger.warning("约定结算事件发布未完成，保留 outbox 等待重试", exc_info=True)
+        return delivered
 
     # ============================================================
     # 日程 Goal 合成视图（schedule_items → 带 time_window 的 Goal）
@@ -435,7 +519,7 @@ class GoalManager:
     def _synthesized_schedule_goals(self, dates: Optional[List[str]] = None) -> List[Goal]:
         """把今天（及可选昨天）的日程条目合成为 Goal 列表。"""
         if dates is None:
-            now = self.tz_manager.get_now()
+            now = self._clock().get_now()
             today = now.strftime("%Y-%m-%d")
             yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
             dates = [today, yesterday]
@@ -453,7 +537,7 @@ class GoalManager:
     ) -> List[Goal]:
         """获取指定日期的日程 Goal（含跨夜参数；按 (name, time_window) 去重）。"""
         if date_str is None:
-            date_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
+            date_str = self._clock().get_now().strftime("%Y-%m-%d")
 
         target_dates = {date_str}
         if include_yesterday:
@@ -530,7 +614,7 @@ class GoalManager:
 
     def _schedule_item_ids(self) -> set:
         """今日日程条目的 item_id 集合（合成 Goal 的写回路由）。"""
-        now = self.tz_manager.get_now()
+        now = self._clock().get_now()
         today = now.strftime("%Y-%m-%d")
         yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
         ids = set()
@@ -557,7 +641,7 @@ class GoalManager:
 
     def cleanup_old_goals(self, days: int = 30) -> int:
         """清理 days 天前的已完成 / 已取消目标。"""
-        cutoff_date = self.tz_manager.get_now() - timedelta(days=days)
+        cutoff_date = self._clock().get_now() - timedelta(days=days)
         completed_count = self.db.delete_goals_by_status(
             status=GoalStatus.COMPLETED.value, older_than=cutoff_date
         )

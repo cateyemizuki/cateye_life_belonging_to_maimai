@@ -300,9 +300,15 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 2026-10-27 用户裁定：规范 max_generated_events 显式值（含 8）优先于旧
         # max_events；必须在本方法即将调用的 SDK「merge 出厂默认 → 校验」之前，对
         # **原始输入**先搬迁旧键，否则默认 8 一旦 merge 进来就无法再靠值判断显式性。
-        from core.config_migration import migrate_display_config, migrate_internal_tuning
+        from core.config_migration import (
+            migrate_display_config,
+            migrate_internal_tuning,
+            migrate_legacy_compat_config,
+        )
         from companion.screen_config import migrate_screen_config, rescue_screen_config
-        incoming = rescue_screen_config(migrate_display_config(config_data),
+        # 3.17.36：[qzone].napcat_http_* → [legacy_compat].snowluma_http_* 跨段改名
+        # 值搬运（原始输入通道；磁盘抢救结果在下方同口径再搬一次）。
+        incoming = rescue_screen_config(migrate_legacy_compat_config(migrate_display_config(config_data)),
                                        _read_config_file(_os.path.join(_PLUGIN_DIR, _CONFIG_FILE_NAME)))
         # 3.1.0 配置精简轮（J 类 40 项）：旧 TOML 内部调参键的捕获值必须在 SDK
         # 「merge 出厂默认 → 校验」**之前**落盘 mappings/internal_tuning.json——
@@ -325,26 +331,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             for source in (captured_disk, captured_incoming):
                 for sec, keys in source.items():
                     captured_all.setdefault(sec, {}).update(keys)
-            merge_captured(captured_all, root_dir=_PLUGIN_DIR)
+            if captured_all:
+                merge_captured(captured_all, root_dir=_PLUGIN_DIR)
         except Exception:
             pass  # 捕获/落盘失败不阻塞宿主；聚合校验器入口仍会 pop 旧键
-        try:
-            from planning.event_catalog_config import migrate_legacy_event_catalog
-
-            def _migrate_ec(payload: Any) -> Any:
-                if not isinstance(payload, dict) or not isinstance(payload.get("event_catalog"), dict):
-                    return payload
-                before = payload["event_catalog"]
-                after = migrate_legacy_event_catalog(before)
-                if after is before:
-                    return payload
-                out = dict(payload)
-                out["event_catalog"] = after
-                return out
-
-            incoming = _migrate_ec(incoming)
-        except Exception:
-            pass  # 迁移失败不阻塞宿主；段级校验器仍会再尝试一次
         # PR8 3.0.0（R7 依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP2 落点 B）：
         # 退役路线/运行期开关键（:data:`LEGACY_ROUTE_KEYS` + nap 两键）的 raw 前置 pop，
         # 仿 ``_migrate_ec`` 先例对 **原始输入与磁盘抢救结果各做一次**——宿主重建+抢救会把
@@ -373,17 +363,12 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
         incoming = _pop_retired_keys(incoming)
         rescued, rescued_changed = _rescue_config_from_disk(incoming)
-        rescued = migrate_screen_config(migrate_display_config(rescued))
+        # 3.17.36：磁盘抢救会把 [qzone].napcat_http_* 旧键带回（_merge_disk_values
+        # 对已删键无类型参照）——在 SDK merge 之前搬进 [legacy_compat].snowluma_http_*。
+        rescued = migrate_legacy_compat_config(migrate_screen_config(migrate_display_config(rescued)))
         # 抢救可能把磁盘里的 J 类旧键并回输入（_merge_disk_values 对已删键无类型参照）：
         # 同口径在 SDK merge 前 pop；捕获值已由上方磁盘通道落盘，此处只清键。
         rescued, _rescued_tuning_captured = migrate_internal_tuning(rescued)
-        try:
-            migrated_rescued = _migrate_ec(rescued)
-            if migrated_rescued is not rescued:
-                rescued = migrated_rescued
-                rescued_changed = True
-        except Exception:
-            pass
         rescued_popped = _pop_retired_keys(rescued)
         if rescued_popped is not rescued:
             rescued = rescued_popped
@@ -434,11 +419,13 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._plugin_root = _PLUGIN_DIR
 
         cfg = self.config
+        from core.targeting import refresh_host_target
+        await refresh_host_target(self)
         # 公共基础设施（三个服务束共享的实例，缺省时它们会自建兜底）
-        self._decision_logger = DecisionLogger(data_dir, enabled=cfg.admin.decision_log_enabled,
-                                               retention_days=cfg.admin.log_retention_days)
-        self._llm_logger = LLMCallLogger(data_dir, enabled=cfg.admin.llm_log_enabled,
-                                         retention_days=cfg.admin.log_retention_days)
+        self._decision_logger = DecisionLogger(data_dir, enabled=True,
+                                               retention_days=30)
+        self._llm_logger = LLMCallLogger(data_dir, enabled=True,
+                                         retention_days=30)
         self._db = ScheduleDB(data_dir / "schedule.db")
         # 好感度：运行期动态读 [affection] 段（热重载即时生效）+ 决策日志留痕；
         # 预设表/描述表由 CompanionServices 装配时装载（mappings/，只读一遍）
@@ -450,7 +437,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._llm = LLMService(
             self.ctx, task_name=llm_task_name_of(cfg),
             call_logger=self._llm_logger, config_provider=lambda: self.config,
-            usage_keep_hours=int(getattr(cfg.llm, "usage_retention_hours", 720) or 720),
+            usage_keep_hours=720,
             usage_default_window_hours=int(
                 getattr(cfg.llm, "usage_default_window_hours", 720) or 720))
         # 缓存窗口在 [schedule_advanced]（2026-10-10 段拆分）
@@ -521,11 +508,21 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 与群聊电量口径都与 3.17.33 逐字一致（2026-11-12 裁决 3 起默认 True）。
         self._bpp_bridge = self._companion.bpp_bridge
         register_adapter(self._bpp_bridge)
+        # 旧版兼容（3.17.36）：[legacy_compat] snowluma_http_* 改惰性访问器装配——
+        # 只有 cookie 降级通道 2（Snowluma HTTP，仅 <2.0.0 的 SnowLuma 需要）真正
+        # 执行时才读取本段；适配器直连成功路径永不触碰（包括不读其值）。
+        # 每次调用重取 self.config：SDK 热重载整体替换配置实例后即时生效。
+        def _legacy_compat_http() -> tuple:
+            sec = getattr(self.config, "legacy_compat", None)
+            return (
+                str(getattr(sec, "snowluma_http_host", "") or ""),
+                str(getattr(sec, "snowluma_http_port", "") or ""),
+                str(getattr(sec, "snowluma_http_token", "") or ""),
+            )
+
         self._qzone_cookies = QzoneCookieManager(
             self.ctx, data_dir,
-            napcat_http_host=cfg.qzone.napcat_http_host,
-            napcat_http_port=cfg.qzone.napcat_http_port,
-            napcat_http_token=cfg.qzone.napcat_http_token,
+            legacy_http_provider=_legacy_compat_http,
         )
         # 第二实参为配置实例（服务读 .qzone 段）；另显式传 plugin：bus/emotion 动态属性与
         # 热重载配置（plugin.config 每次重取，SDK 热重载会整体替换配置实例）都挂在插件对象上
@@ -700,7 +697,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def _shutdown_chain(self) -> None:
         """串行停机链（F2：每步独立防御；总超时预算由 on_unload 的 wait_for 控制）。"""
         # Stop single-flight integration work before any service/database teardown.
-        for task_name in ("_video_watch_sync_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task", "_auto_init_task"):
+        for task_name in ("_video_watch_sync_task", "_video_watch_poll_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task", "_auto_init_task"):
             task = getattr(self, task_name, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -770,6 +767,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope == "bot":
             await self._refresh_persona()
+            from core.targeting import refresh_host_target
+            await refresh_host_target(self)
+            self._stream_id = await self._resolve_target_stream()
+            self._apply_target(target_qq_of(self.config), self._stream_id)
             return
         if scope != "self":
             return
@@ -802,6 +803,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self._bg_started = False
             return
         # 目标 QQ 变化 → 重新解析 stream
+        from core.targeting import refresh_host_target
+        await refresh_host_target(self)
         self._stream_id = await self._resolve_target_stream()
         self._apply_target(target_qq_of(cfg), self._stream_id)
         # 生活状态热启用（R7 滚动化改造；PR8 3.0.0 门控 = [schedule].enabled）：首次
@@ -1171,15 +1174,10 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # （[life_state].sleep_debt_repay_v2，配置默认 True）——离线补眠默认与
         # 在线一致走阶梯还债；读不到配置时同样回退 True（在线默认口径），
         # 历史回放需显式把配置/参数置 False（旧公式逐字不变）。
-        try:
-            life_cfg = getattr(self.config, "life_state", None)
-            repay_v2 = bool(getattr(life_cfg, "sleep_debt_repay_v2", True))
-        except Exception:
-            repay_v2 = True
         self._offline_settlement_service().settle_offline_gap(
             life, planner, engine_claimed=engine_claimed,
             plan_settlement_fn=plan_offline_settlement,
-            baseline_hours=baseline, repay_v2=repay_v2)
+            baseline_hours=baseline)
 
     def _apply_offline_settlement(self, life: Any, planner: Any, plan: Dict[str, Any]) -> None:
         """应用一次离线睡眠结算（薄委托；调用方保证恰好一次，编排体见 suite_offline_settlement）。"""
@@ -1537,6 +1535,13 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         planner = getattr(self, "_rolling_planner", None)
         if planner is None:
             return
+        try:
+            from planning.cycle_state import activate_pending_cycle, entry_context_from_plugin
+            activate_pending_cycle(getattr(self, "_data_dir", None),
+                decision_logger=getattr(self, "_decision_logger", None),
+                **entry_context_from_plugin(self))
+        except Exception:
+            self.ctx.logger.warning("待接替日程检查失败，保留当前周期", exc_info=True)
         prepared = self._sleep_prepare(planner)
         sleep_rates = (prepared or {}).get("rates")
         snapshot = self._life_tick_state(planner, sleep_rates=sleep_rates)
@@ -1616,11 +1621,16 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 db = getattr(self, "_db", None)
                 return db.get_episode(episode_id) if db is not None else None
 
+            from integrations.video_autonomy import remaining_episode_minutes
             coord = VideoWatchCoordinator(
                 self._data_dir, self._call_watch_api, _active, _by_id,
                 logger=self.ctx.logger,
                 attention=getattr(self, "_attention", None),
-                quota=SurfQuotaLedger(self._data_dir, day_provider=self._surf_day),
+                quota=SurfQuotaLedger(self._data_dir,day_provider=self._surf_day,
+                    config_provider=lambda:self.config.video_autonomous),
+                config_provider=lambda:self.config.video_autonomous,
+                automatic_guard=self._video_automation_allowed,
+                episode_remaining=lambda episode:remaining_episode_minutes(episode,self._surf_now()),
                 share_recorder=getattr(self, "_share_recorder", None),
                 # 2026-11-04 刷视频功能批：候选准备（兴趣TTL检查+公开排行榜）先于
                 # next_candidate 同步 pick；联动变化 → 回复倍率刷新（结束即恢复）
@@ -1657,14 +1667,18 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 # PR-C2：真实观看证据只读来源（B1 索引 watched_video）+ 两键
                 # 动态读 [video_watch]（热重载即时生效；读失败服务侧保守降级）
                 watch_evidence_provider=self._interest_watch_evidence_rows,
-                feedback_enabled_provider=self._interest_watch_feedback_enabled,
                 half_life_days_provider=self._interest_watch_half_life_days,
                 logger=self.ctx.logger)
             # 3.3：分享质量门槛只读兴趣权重（不触发刷新/LLM）；保存引用供 provider
             # 惰性读取，避免每次判分都重建服务。
             self._video_interest = interest
             source = BiliCandidateSource(
-                interest, excluded_bvids=self._video_excluded_bvids, logger=self.ctx.logger)
+                interest, excluded_bvids=self._video_excluded_bvids, logger=self.ctx.logger,
+                # 3.17.37 视频自主观看批：主动侧候选数据门槛（[video_autonomous]）。
+                # 惰性读段（热重载即时生效）；只约束本候选源的自主选片，工具点播
+                # （service.submit 直传 BV）不经 prepare/pick，不受任何阈值影响。
+                stat_gate_provider=lambda: getattr(self.config,"video_autonomous",None),
+                selection_path=self._data_dir/"video_watch/video_selection.json")
             self._video_candidate_source_obj = source
         return source
 
@@ -1686,12 +1700,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception:
             return []
 
-    def _interest_watch_feedback_enabled(self) -> bool:
-        try:
-            return bool(getattr(self.config.video_watch,
-                                'interest_watch_feedback_enabled', True))
-        except Exception:
-            return False  # 配置不可读保守停用反馈（兴趣退回纯人设基线）
 
     def _interest_watch_half_life_days(self) -> int:
         try:
@@ -2471,6 +2479,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     def _video_state_changed(self) -> None:
         self._request_surf_frequency_refresh()
         self._kick_video_completion()
+        self._kick_video_watch_sync(maintenance=False)
 
     def _kick_video_completion(self) -> None:
         if getattr(self, "_is_unloading", False):
@@ -2709,7 +2718,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
     def _video_automation_allowed(self, episode_id: str) -> bool:
         allowed, _ = self._autonomous_context()
-        if not allowed or not episode_id:
+        if not allowed or not episode_id or not bool(getattr(self.config.video_autonomous,'enabled',True)):
             return False
         lease = self._attention.current()
         if not lease or lease.get("holder") != f"schedule:{episode_id}":
@@ -2722,30 +2731,50 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             # 即不再允许 gap 任务启动/续跑，协调器侧同步收尾）
             return self._db.active_episode() is None
         active = self._db.active_episode() or {}
-        return (active.get("episode_id") == episode_id
-                and (active.get("metadata") or {}).get("event_key") == "watch_bili")
+        if active.get('episode_id')!=episode_id:return False
+        from integrations.video_autonomy import episode_watch_kind,casual_eligible,remaining_episode_minutes
+        remaining=remaining_episode_minutes(active,self._surf_now())
+        if remaining is not None and remaining<=0:return False
+        if episode_watch_kind(active)=='dedicated':return True
+        return (casual_eligible(active)
+                and bool(getattr(self.config.video_autonomous,'schedule_casual_enabled',True)))
 
 
 
 
-    def _kick_video_watch_sync(self) -> None:
-        """单飞调度：上一拍联动未结束时不再叠加（有界；异常只告警）。"""
-        self._kick_video_completion()
-        pending = getattr(self, "_video_watch_sync_task", None)
-        if pending is not None and not pending.done():
-            return
-        try:
-            async def sync_with_maintenance():
-                await self._small_event_actions.tick(self._db.active_episode())
-                await self._video_watch.maintain_cache()
-                await self._video_coordinator().sync()
-            self._video_watch_sync_task = asyncio.get_running_loop().create_task(
-                sync_with_maintenance())
-        except Exception as exc:
+    def _kick_video_watch_sync(self, *, maintenance: bool = True) -> None:
+        """Drain completion-driven work without waiting for the five-minute life tick."""
+        if getattr(self,'_is_unloading',False):return
+        self._video_watch_sync_dirty=True
+        if maintenance:self._video_watch_maintenance_dirty=True
+        pending=getattr(self,'_video_watch_sync_task',None)
+        if pending is not None and not pending.done():return
+        async def run():
             try:
-                self.ctx.logger.warning("刷视频联动调度失败（忽略）：%s", exc)
-            except Exception:
-                pass
+                while self._video_watch_sync_dirty and not getattr(self,'_is_unloading',False):
+                    self._video_watch_sync_dirty=False
+                    if getattr(self,'_video_watch_maintenance_dirty',False):
+                        self._video_watch_maintenance_dirty=False
+                        await self._small_event_actions.tick(self._db.active_episode())
+                        await self._video_watch.maintain_cache()
+                    await self._video_coordinator().sync()
+                    # Completion recording happens inside sync; evaluate only after that fact exists.
+                    self._kick_share_delivery()
+                self._ensure_video_watch_poll()
+            except asyncio.CancelledError:raise
+            except Exception as exc:self.ctx.logger.warning('刷视频联动调度失败：%s',type(exc).__name__)
+        try:self._video_watch_sync_task=asyncio.get_running_loop().create_task(run())
+        except RuntimeError:return
+
+    def _ensure_video_watch_poll(self) -> None:
+        pending=getattr(self,'_video_watch_poll_task',None)
+        if pending is not None and not pending.done():return
+        if not self._video_coordinator().needs_poll():return
+        async def poll():
+            while not getattr(self,'_is_unloading',False) and self._video_coordinator().needs_poll():
+                await asyncio.sleep(2)
+                self._kick_video_watch_sync(maintenance=False)
+        self._video_watch_poll_task=asyncio.get_running_loop().create_task(poll())
 
     def _life_tick_state(self, planner: Any, sleep_rates: Any = None) -> dict[str, Any] | None:
         """Single state integrator; sleep engine owns the asleep signal."""

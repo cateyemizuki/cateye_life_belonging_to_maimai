@@ -24,7 +24,9 @@ class VideoWatchSectionConfig(PluginConfigBase):
 
     __ui_label__ = "视频观看"
     __ui_icon__ = "video"
-    __ui_order__ = 10
+    # 2026-11-14 段序修正批：qzone_video/legacy_compat 插到 qzone 之后（10/11），
+    # 本段与 video_autonomous/video_share 整体顺延 10→12，彼此相对顺序不变。
+    __ui_order__ = 12
 
     @model_validator(mode="before")
     @classmethod
@@ -38,10 +40,12 @@ class VideoWatchSectionConfig(PluginConfigBase):
 
     source_mode: Literal["stream", "download"] = Field(
         default="stream", description="stream：直连媒体按时间点读取，不先下载全片；download：显式下载后抽帧，受下载保护值限制；失败不会暗中切换全量下载。",
-        json_schema_extra={"label": "媒体读取方式"})
+        json_schema_extra={"label": "媒体读取方式", **_ui_i18n("Media source",
+                           choices={"stream": "直接读取视频流", "download": "下载后读取"})})
     sampling_mode: Literal["seek", "paced"] = Field(
         default="seek", description="seek：尽快按时间点抽帧；paced：按真实播放时间逐点采样。两者均单任务、低优先级、单解码线程。",
-        json_schema_extra={"label": "采样节奏"})
+        json_schema_extra={"label": "采样节奏", **_ui_i18n("Sampling pace",
+                           choices={"seek": "按时间点快速采样", "paced": "按播放节奏采样"})})
     sample_interval_seconds: int = Field(
         default=10, ge=5, le=600, description="每隔多少秒取一帧；不静默稀释采样。预计帧数=向上取整(视频秒数/间隔)与最小采样数取较大值，每16帧拼一张图片。",
         json_schema_extra={"label": "采样间隔（秒）"})
@@ -53,7 +57,7 @@ class VideoWatchSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "最多提交拼图数"})
 
     cache_retention_days: int = Field(
-        default=15, ge=1, le=365, description="观看记忆保存天数，自结果保存起计算，读取不延长；仅缓存BV号和文字结果，过期后清理。",
+        default=15, ge=1, le=365, description="文字观看记忆保存天数，自结果保存起计算，读取与元信息补录均不延长。文字缓存只保存BV号和文字结果；封面、公开计数及采集来源作为公开元信息另存，过期文字缓存会清理。",
         json_schema_extra={"label": "观看记忆保留天数"})
 
     enabled: bool = Field(
@@ -93,13 +97,6 @@ class VideoWatchSectionConfig(PluginConfigBase):
     # 真实看完的视频（B1 observed/watched_video）+ 观后感倾向小步长渐变兴趣权重，
     # 饱和封顶（±50%×人设基线）、半衰期衰减、保留探索槽；单次观看不重写人格。
     # 关 = 现状逐字（纯人设+日程问询，不读不写证据层）。
-    interest_watch_feedback_enabled: bool = Field(
-        default=True,
-        description="真实观看兴趣反馈（看完的视频小步长渐变兴趣权重，有饱和上限并保留探索；关=纯人设基线，现状不变）",
-        json_schema_extra={"label": "真实观看兴趣反馈",
-                           **_ui_i18n("Watch-driven interest feedback",
-                                      "Real watches gently evolve interest weights with saturation and exploration; off = persona baseline only.")},
-    )
     interest_watch_half_life_days: int = Field(
         default=7, ge=1, le=30,
         description="观看累积兴趣分的指数衰减半衰期（天）；长期不再看的话题权重缓慢回落",

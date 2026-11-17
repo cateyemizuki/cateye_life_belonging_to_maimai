@@ -497,8 +497,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     async def mai_hook_proactive_reply_target(self, **kwargs: Any) -> dict[str, Any]:
         modified = self._mai_reply_target_guard().before(
             kwargs, stream_id=self._mai_reply_target_stream(),
-            target_user=target_qq_of(self.config),
-            mode=getattr(getattr(self.config, "patrol", None), "proactive_reply_target_mode", "浅处理"))
+            target_user=target_qq_of(self.config))
         return {"action": "continue", **({"modified_kwargs": modified} if modified is not None else {})}
 
     @HookHandler(
@@ -736,8 +735,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         任何异常静默降级，绝不影响消息接收链。
         """
         try:
-            if not self._mai_section_flag("affection", "exchange_events_enabled", True):
-                return
+
             kind = classify_greeting_exchange(_message_plain_text(message))
             if kind is None:
                 return
@@ -1206,42 +1204,28 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         )
 
     async def _mai_apply_typing_delay_with_bridge(self, kwargs: dict[str, Any]) -> None:
-        """B4：bpp 认领 + 按 ``typing_owner`` 让位打字（v2 §6.3/§6.4）。
-
-        单一所有者判据是 ``typing_owner`` 而不是 ``accepted``：
-
-        - bpp 生效（``active=True``，无论接受/拒绝认领）→ 返回的 owner 恒为 ``bpp``
-          → life 不施加任何打字等待（bpp 会按段模拟）；
-        - bpp 未安装/未激活/API 超时/无响应 → 不跳过，照常走
-          :meth:`_mai_apply_typing_delay`（与 3.17.33 逐字一致）；
-        - 主开关 ``[experimental].bpp_bridge_enabled`` 关 → 连 API 都不调用。
-
-        ``release`` 只用于空回复清理；被接受的认领必须留给 bpp 在同一轮的
-        ``before_post_process`` 消费（TTL 兜底），因此这里**不**立即释放。
-
-        R1（结构审计批）：桥接已迁 ``linkage/bpp/``（适配器 ``cateye_bpp``），
-        这里只经注册表 ``get_adapter`` 查询；未登记/未装配按 None 降级，
-        照常施加打字时延（fail-open，与迁移前逐字一致）。
-        """
+        """检测到 bpp 就把打字等待交给它；旧版无接口时不模拟打字。"""
         bridge = get_adapter("cateye_bpp")
-        reply_stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
-        reply_text = str(kwargs.get("response") or "").strip()
-        typing_owner = ""
-        if bridge is not None:
-            try:
-                if bridge.enabled():
-                    if reply_text:
-                        claim = await bridge.claim(
-                            reply_stream, reply_text, self._mai_bridge_directive(reply_stream))
-                        typing_owner = str((claim or {}).get("typing_owner") or "").lower()
-                    elif reply_stream:
-                        # 回复为空（纯工具调用/异常空串）：清掉上一轮可能残留的认领。
-                        await bridge.release(stream_id=reply_stream)
-            except Exception:
-                typing_owner = ""  # 认领失败 → life 接管（fail-open，不劣化）
-        if typing_owner == "bpp":
+        if bridge is None:
+            # 未装配无法核实对侧是否存在，保守跳过等待。
             return
-        await self._mai_apply_typing_delay(kwargs)
+        try:
+            installed = await bridge.installed()
+        except Exception:
+            installed = None
+        if installed is False:
+            await self._mai_apply_typing_delay(kwargs)
+            return
+        stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
+        text = str(kwargs.get("response") or "").strip()
+        try:
+            if text:
+                await bridge.claim(stream, text, self._mai_bridge_directive(stream))
+            elif stream:
+                await bridge.release(stream_id=stream)
+        except Exception:
+            pass
+        # 已安装或能力查询失败都不退回宿主等待，避免 bpp 与 life 叠加时延。
 
     def _mai_bridge_directive(self, session_id: str) -> dict[str, Any]:
         """本轮交给 bpp 的策略元数据（首期只有碎片化提示是否命中）。
@@ -1396,8 +1380,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 # B4（v2 §6.5）：群聊真实回复消耗社交电量，仅当主开关开启且
                 # session_kinds 明确判定群聊（未知 → 不扣，fail-open）。目标私聊
                 # 分支逐字不变；其他私聊维持 0。
-                if (bool(self._mai_section_attr("experimental", "bpp_bridge_enabled", False))
-                        and companion.session_kinds.is_group(reply_stream) is True):
+                if (companion.session_kinds.is_group(reply_stream) is True):
                     self._mai_group_social_drain(reply_stream, kwargs)
                 return  # 仅陪伴目标私聊（群聊/其他私聊不计，F6 同口径）
             last_trigger = companion.patrol.get_last_trigger_time()
@@ -1461,10 +1444,6 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 target_private=True,  # 本方法仅处理目标私聊（上方流比对）
                 affinity=affinity,
                 social_battery=current_social,
-                discount_enabled=self._mai_life_state_flag(
-                    "social_battery_affinity_discount", True),
-                recharge_enabled=self._mai_life_state_flag(
-                    "target_chat_social_recharge", True),
                 valence=valence,
             )
             delta = float(settlement.get("delta") or 0.0)
@@ -1516,7 +1495,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             import time as _time
             try:
                 group_drain = float(self._mai_section_attr(
-                    "experimental", "group_chat_social_drain_per_reply", 0.02))
+                    "feature_tuning", "group_chat_social_drain_per_reply", 0.02))
             except (TypeError, ValueError):
                 group_drain = 0.02
             if (group_drain != group_drain
@@ -1877,22 +1856,10 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             pass
 
     async def _harass_maintainer_qq(self) -> str:
-        """按优先级解析目标；只有前两级未配置时才只读请求宿主。"""
-        cfg = getattr(self, "config", None)
-        direct = getattr(getattr(cfg, "admin", None), "harass_report_target_qq", "")
-        companion = getattr(getattr(cfg, "patrol", None), "target_qq", "")
-        target = resolve_maintainer_qq(direct, companion_target_qq=companion)
-        if target:
-            return target
-        # 可选宿主全局管理员接口；当前宿主未提供该字段时返回空列表。
-        # 不以插件 admin.admin_users 冒充宿主全局管理员。
-        try:
-            admins = await self.ctx.config.get("permissions.admin_users", [])
-            if isinstance(admins, dict):
-                admins = admins.get("value") if admins.get("success") is True else []
-        except Exception:
-            return ""
-        return resolve_maintainer_qq(direct, admins, companion)
+        """告状显式对象 → 陪伴目标（陪伴目标已负责唯一宿主管理员回退）。"""
+        from core.targeting import qq_id
+        direct = getattr(getattr(self.config, "admin", None), "harass_report_target_qq", "")
+        return qq_id(direct) if str(direct or "").strip() else target_qq_of(self.config)
 
     async def _harass_resolve_stream(self, qq: str) -> str:
         """维护者私聊 stream 解析（形态照 plugin._resolve_target_stream :392-414）：
@@ -2798,7 +2765,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         llm_logger = getattr(companion, "llm_logger", None) if companion else None
         if llm_logger is None or not llm_logger.enabled:
             await self._diag_reply(stream_id,
-                                   "LLM 调用日志未启用（配置 [admin] llm_log_enabled = true 后开始记录）。")
+                                   "尚无 LLM 调用记录。")
             return True, "日志未启用", True
 
         entries = llm_logger.read_entries(days)
@@ -2816,7 +2783,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         decision_logger = getattr(companion, "decision_logger", None) if companion else None
         if decision_logger is None or not decision_logger.enabled:
             await self._diag_reply(stream_id,
-                                   "主动行为日志未启用（配置 [admin] decision_log_enabled = true 后开始记录）。")
+                                   "尚无主动行为记录。")
             return True, "日志未启用", True
 
         entries = decision_logger.read_entries(days)

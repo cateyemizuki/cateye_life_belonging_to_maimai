@@ -19,13 +19,16 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from core.diag import DecisionLogger, LLMCallLogger
 from core.llm_utils import LLMService, llm_task_name_of
 from core.plugin_context import PluginContext
+from core.storage import save_json_atomic
 from planning.schedule_query import ScheduleQuery
 
 from .affection import AffectionManager
@@ -272,9 +275,9 @@ class CompanionServices:
         admin = getattr(cfg, "admin", None)
         if admin is not None:
             if self.llm_logger is not None:
-                self.llm_logger.update_settings(admin.llm_log_enabled, admin.log_retention_days)
+                self.llm_logger.update_settings(True, 30)
             if self.decision_logger is not None:
-                self.decision_logger.update_settings(admin.decision_log_enabled, admin.log_retention_days)
+                self.decision_logger.update_settings(True, 30)
 
     # ------------------------------------------------------------------
     # 事件订阅挂点（M0：登记于此，M3+ 消费者按需 subscribe 并存入 _event_unsubs）
@@ -321,16 +324,62 @@ class CompanionServices:
     def _record_commitment_event(self, kind: str, payload: Any) -> None:
         """把一条约定事件记为好感规则事件（payload 不可用时静默降级）。
 
-        去重键取 ``commitment``（回退 ``summary``），配合规则表的 ``per_key_once``
-        实现「每约定 1 次」；好感关闭（enabled=false）时规则事件层自行跳过。
+        优先稳定约定 ID，旧事件仍按标题回退。稳定结算回执与好感状态同文件提交，
+        不依赖会被日切/日结清理的 event_log；失败抛出供结算 outbox 重试。
         """
         data = payload if isinstance(payload, dict) else {}
-        key = str(data.get("commitment") or data.get("summary") or "").strip()
+        commitment_id = str(data.get("commitment_id") or "").strip()
+        key = commitment_id or str(data.get("commitment") or data.get("summary") or "").strip()
         desc = str(data.get("summary") or data.get("commitment") or "").strip()
+        stable_event = str(data.get("event_id") or "")
+        if commitment_id and stable_event == f"commitment:{commitment_id}:settled":
+            self._record_stable_commitment(kind, desc, key, stable_event)
+            return
         try:
             record_rule_event(self.affection, kind, None, desc, key=key)
         except Exception as exc:
             logger.debug("好感约定事件 %s 记录失败（忽略）：%s", kind, exc)
+
+    def _record_stable_commitment(self, kind: str, desc: str, key: str, event_id: str) -> None:
+        """同一同步区提交好感变动与回执；旧规则事件不走此事务。"""
+        manager = self.affection
+        if manager is None:
+            raise RuntimeError("好感约定消费者尚未就绪")
+        if not manager.is_enabled():
+            return
+        state = getattr(manager, "_state", None)
+        if not isinstance(state, dict) or getattr(manager, "_path", None) is None:
+            raise RuntimeError("好感约定消费者无可持久化状态")
+        receipts = state.get("commitment_receipts")
+        if isinstance(receipts, dict) and event_id in receipts:
+            return
+        before = deepcopy(state)
+        dirty, last_flush = manager._dirty, manager._last_flush
+        bus = manager._bus
+        try:
+            # 规则内部有多次 _mark_dirty；避免只写 score、尚未写回执的中间状态。
+            manager._last_flush = float("inf")
+            manager._bus = None  # 档位事件也等本次状态真正提交后再发布。
+            result = record_rule_event(manager, kind, None, desc, key=key)
+            if not isinstance(result, dict) or result.get("reason") in ("no_manager", "unknown_kind"):
+                raise RuntimeError("好感约定规则未受理")
+            manager._state.setdefault("commitment_receipts", {})[event_id] = {
+                "kind": kind, "applied": float(result.get("applied") or 0.0),
+                "reason": str(result.get("reason") or ""),
+            }
+            if not save_json_atomic(manager._path, manager._state):
+                raise RuntimeError("好感约定状态持久化失败")
+        except BaseException:
+            manager._state = before
+            manager._dirty, manager._last_flush = dirty, last_flush
+            raise
+        finally:
+            manager._bus = bus
+        manager._dirty = False
+        manager._last_flush = time.monotonic()
+        if before.get("tier") != manager.tier():
+            manager._publish_tier_changed(int(before["tier"]), manager.tier(), manager.score(),
+                                          reason=f"rule_event:{kind}")
 
     def _unregister_event_subscriptions(self) -> None:
         """订阅注销挂点（stop() 调用）：执行并清空全部反订阅闭包。"""

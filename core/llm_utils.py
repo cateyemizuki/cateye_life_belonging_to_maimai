@@ -24,10 +24,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 import uuid
-from dataclasses import dataclass
 from collections.abc import Sequence
 from typing import Any, Callable, Dict, Optional
 
@@ -38,169 +35,13 @@ from core.llm_usage import (
 )
 
 
-#: 只有宿主明确表示「任务路由不存在」才允许调用方做一次 utils 回退。
-TASK_MISSING_CODES = frozenset({"task_missing", "unknown_task"})
-#: 官方文档（v1.3.2 附录 B）唯一给出的任务解析失败文案：反引号 + 「的模型配置」。
-#: 具体模型不存在是「未找到名为 'xxx' 的模型」（无「的模型配置」），绝不能当任务缺失。
-_TASK_MISSING_MESSAGE_RE = re.compile(r"未找到名为\s*`[^`]*`\s*的模型配置")
-
-
-def prepare_prompt_arg(prompt: Any, system_prompt: str = "") -> Any:
-    """按宿主约定把 str prompt + system 转成消息列表（唯一构造点）。"""
-    if not system_prompt:
-        return prompt
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": prompt},
-    ]
-
-
-def prompt_payload_bytes(prompt_arg: Any) -> int:
-    """实际传给 SDK 的 prompt 载荷 UTF-8 字节数（不含 RPC 封包）。"""
-    if isinstance(prompt_arg, str):
-        return len(prompt_arg.encode("utf-8"))
-    try:
-        text = json.dumps(prompt_arg, ensure_ascii=False, separators=(",", ":"))
-    except (TypeError, ValueError):
-        text = str(prompt_arg)
-    return len(text.encode("utf-8"))
-
-
-
-
-
-def classify_llm_error(error: Any, error_code: Any = None) -> str:
-    """把宿主错误归类为 ``task_missing`` / ``timeout`` / ``general_error``。
-
-    任务缺失只认两种有依据的信号：结构化错误码 ``task_missing``/``unknown_task``，
-    或官方文档给出的任务解析文案（反引号 + 「的模型配置」）。不做「未找到」之类的
-    含糊子串匹配，避免把具体模型名不存在误判为任务不存在。
-    """
-    code = str(error_code or "").strip().lower()
-    if code in TASK_MISSING_CODES:
-        return "task_missing"
-    text = str(error or "")
-    if _TASK_MISSING_MESSAGE_RE.search(text):
-        return "task_missing"
-    lowered = text.lower()
-    if "timeout" in lowered or "timed out" in lowered or "超时" in text:
-        return "timeout"
-    return "general_error"
-
-
-@dataclass(frozen=True)
-class LLMResult:
-    """单次（含内部降级）LLM 调用的请求关联详细结果。
-
-    所有字段都来自本次调用自己的返回，不使用共享 ``last_error``/``last_usage``；
-    ``request_id`` 用于并发排查。``attempts`` 是真正发给宿主的模型请求次数
-    （任务解析失败未发出模型请求时为 0），``request_sent``/``consumed`` 供预算层判断
-    是否可安全释放预占。
-    """
-
-    ok: bool
-    text: str
-    category: str
-    request_id: str = ""
-    error: str = ""
-    task_name: str = ""
-    model: str = ""
-    reasoning: str = ""
-    prompt_tokens: Optional[int] = None
-    completion_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
-    usage_available: bool = False
-    request_sent: bool = False
-    consumed: bool = False
-    attempts: int = 0
-    strict_params: bool = False
-    #: 账本 v2（2026-11-02）：模块/事件/缓存/耗时与不可变回执；旧调用方零感知
-    module: str = ""
-    event: str = ""
-    cache_hit_tokens: Optional[int] = None
-    cache_miss_tokens: Optional[int] = None
-    duration_ms: int = 0
-    receipt: Optional[Any] = None
-    #: 3.17.6（PR-REMOVE-POOLCAP E_LLM 诊断）：宿主若回传 finish_reason 则透传
-    #: （现行宿主 capability payload 无此字段 → 空串；截断诊断另有 completion_tokens
-    #: 触顶启发式兜底）。只读诊断，不参与业务判断。
-    finish_reason: str = ""
-
-
-def extract_cache_usage(result: Any) -> tuple[Optional[int], Optional[int]]:
-    """读 prompt 缓存命中/未命中（宿主字段或 OpenAI 风格 details）。
-
-    供应商未回传时返回 ``(None, None)``，与「真 0」区分；不推算。
-    """
-    if not isinstance(result, dict):
-        return None, None
-    usage = result.get("usage")
-    sources = [result]
-    if isinstance(usage, dict):
-        sources.append(usage)
-        details = usage.get("prompt_tokens_details")
-        if isinstance(details, dict):
-            sources.append(details)
-    details_top = result.get("prompt_tokens_details")
-    if isinstance(details_top, dict):
-        sources.append(details_top)
-
-    def pick(names: tuple[str, ...]) -> Optional[int]:
-        for source in sources:
-            for name in names:
-                if source.get(name) is not None:
-                    return _optional_int(source.get(name))
-        return None
-
-    hit = pick(("prompt_cache_hit_tokens", "cache_hit_tokens", "cached_tokens"))
-    miss = pick(("prompt_cache_miss_tokens", "cache_miss_tokens"))
-    return hit, miss
-
-
-def _optional_int(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or value is None:
-        return None
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def extract_usage(result: Any) -> tuple[Optional[int], Optional[int], Optional[int], bool, bool]:
-    """从宿主结果读真实 usage：兼容顶层字段与 OpenAI 风格 ``usage`` 子字典。
-
-    返回 ``(prompt, completion, total, available, usage_present)``。
-    - ``available`` 只在 total 可得，或 prompt/completion 同时可得时为 True；
-      部分字段缺失时保持 None，不用插件估算补足。
-    - ``usage_present``（2026-10-29 口径修正新增位）：宿主响应里是否存在可识别的
-      用量字段——**字段在场即真，含 0 值**（宿主失败响应常带 ``total_tokens: 0``，
-      旧口径把它当"可用"，是失败被记成 host_reported 0 的根因）。成败不再由
-      usage 推断：失败归失败桶由 ``success`` 布尔承担（见 :meth:`_record_usage`）。
-    """
-    if not isinstance(result, dict):
-        return None, None, None, False, False
-    usage = result.get("usage")
-    sources = (result, usage if isinstance(usage, dict) else {})
-    usage_present = isinstance(usage, dict) and bool(usage)
-
-    def pick(names: tuple[str, ...]) -> Optional[int]:
-        nonlocal usage_present
-        for source in sources:
-            for name in names:
-                if source.get(name) is not None:
-                    usage_present = True
-                    value = _optional_int(source.get(name))
-                    if value is not None:
-                        return value
-        return None
-
-    prompt = pick(("prompt_tokens", "prompt_token_count", "input_tokens"))
-    completion = pick(("completion_tokens", "completion_token_count", "output_tokens"))
-    total = pick(("total_tokens", "total_token_count"))
-    if total is None and prompt is not None and completion is not None:
-        total = prompt + completion
-    available = total is not None
-    return prompt, completion, total, available, usage_present
+# Compatibility imports intentionally alias the canonical classes/functions.
+from core.llm_types import LLMResult, LLMReceipt
+from core.llm_payload import (
+    TASK_MISSING_CODES, _TASK_MISSING_MESSAGE_RE, _optional_int,
+    prepare_prompt_arg, prompt_payload_bytes, classify_llm_error,
+    extract_cache_usage, extract_usage,
+)
 
 
 def _llm_section(config_or_plugin: Any) -> Any:
@@ -212,9 +53,9 @@ def _llm_section(config_or_plugin: Any) -> Any:
 
 
 def over_limit_trim_enabled(config_or_plugin: Any) -> bool:
-    """``[llm].over_limit_auto_trim``（默认 True）：超限生成结果自动裁剪兜底开关。"""
+    """``[llm].over_limit_auto_trim``（3.17.36 起默认 False）：超限生成结果自动裁剪兜底开关。"""
     section = _llm_section(config_or_plugin)
-    return bool(getattr(section, "over_limit_auto_trim", True))
+    return bool(getattr(section, "over_limit_auto_trim", False))
 
 
 def build_host_identity_prefix(bot_name: Any, alias_names: Any, personality: Any) -> str:
@@ -311,9 +152,10 @@ class LLMService:
             self._usage_tracker = None
         #: 统一入口（懒建：LLMService 保留薄壳签名，内部唯一出口在 tools.llm_gateway）
         self._llm_gateway: Optional[Any] = None
+        self._generation_policy: Optional[Any] = None
 
     def _gateway(self) -> Any:
-        """懒建 Gateway（避免 core 与 tools 的模块级循环导入）。"""
+        """懒建 Gateway，保留按需初始化与实例复用。"""
         gateway = getattr(self, "_llm_gateway", None)
         if gateway is None:
             from tools.llm_gateway import LLMGateway
@@ -337,38 +179,19 @@ class LLMService:
         if gateway is not None:
             gateway.update_task(self._task_name, self._model_name)
 
-    async def generate(
-        self,
-        prompt: str,
-        *,
-        module: str = "",
-        system_prompt: str = "",
-        task_name: str = "",
-        temperature: float = 0.7,
-        timeout_ms: Optional[int] = None,
-        event: str = "unspecified",
-        model: str = "",
-        strict_params: bool = False,
-        with_identity: bool = False,
-        max_tokens: Optional[int] = None,
-    ) -> str:
-        """生成文本；失败/异常统一返回空串（旧契约不变，统一入口在 Gateway）。
-
-        ``module`` = 调用方业务模块（planning/emotion/qzone/companion/video/core）；
-        缺失时 Gateway 记 ``unknown`` 并留 warning。``strict_params`` 仅给需要
-        「单请求 + 参数不漂移」的调用方（事件库），语义与旧版逐字一致。
-        ``with_identity=True`` 时把宿主同款人设开头拼到 system_prompt 最前，共享前缀缓存。
-        ``max_tokens``（3.17.6）：显式输出上限 override；None = 沿用宿主任务/模型
-        配置（旧语义）。调用方负责有界夹取，Gateway 只透传。
-        """
-        result = await self.generate_detailed(
-            prompt, module=module, system_prompt=system_prompt,
-            task_name=task_name, temperature=temperature,
-            timeout_ms=timeout_ms, event=event, model=model,
-            strict_params=strict_params, with_identity=with_identity,
-            max_tokens=max_tokens,
-        )
-        return result.text
+    async def generate(self, prompt: Any, *, module: str = "", system_prompt: str = "",
+                       task_name: str = "", temperature: float = .7,
+                       timeout_ms: Optional[int] = None, event: str = "unspecified",
+                       model: str = "", strict_params: bool = False, with_identity: bool = False,
+                       max_tokens: Optional[int] = None, validator=None, fallback_context=None,
+                       tier: Optional[str] = None, light: Optional[bool] = None,
+                       max_attempts: Optional[int] = None) -> str:
+        from core.llm_policy import GeneratedText
+        result=await self.generate_detailed(prompt,module=module,system_prompt=system_prompt,
+            task_name=task_name,temperature=temperature,timeout_ms=timeout_ms,event=event,model=model,
+            strict_params=strict_params,with_identity=with_identity,validator=validator,
+            fallback_context=fallback_context,tier=tier,light=light,max_attempts=max_attempts)
+        return GeneratedText(result)
 
     async def _resolve_identity_prefix(self) -> str:
         """读宿主 bot.nickname / bot.alias_names / personality.personality 组装人设开头。"""
@@ -381,39 +204,50 @@ class LLMService:
             name, aliases, persona = "", [], ""
         return build_host_identity_prefix(name, aliases, persona)
 
-    async def generate_detailed(
-        self,
-        prompt: str,
-        *,
-        module: str = "",
-        system_prompt: str = "",
-        task_name: str = "",
-        temperature: float = 0.7,
-        timeout_ms: Optional[int] = None,
-        event: str = "unspecified",
-        model: str = "",
-        strict_params: bool = False,
-        with_identity: bool = False,
-        max_tokens: Optional[int] = None,
-    ) -> LLMResult:
-        """生成文本并返回本次请求关联的详细结果（委托 tools.llm_gateway）。
-
-        路由/降级/失败三态与旧实现逐字一致；新增 ``module`` 进入账本 v2，
-        ``LLMResult.receipt`` 携带模块、缓存命中与耗时等对账字段。
-        ``with_identity=True``：system_prompt 前置宿主同款人设开头（名称+别名+全文人设），
-        与宿主 reply 系统提示词共享前缀缓存；人设不再截断。
-        ``max_tokens``（3.17.6）：显式输出上限 override（宿主 SDK/能力层支持，
-        显式值优先于任务/模型配置）；None = 旧语义。调用方负责有界夹取。
-        """
+    async def generate_detailed(self, prompt: Any, *, module: str = "", system_prompt: str = "",
+                                task_name: str = "", temperature: float = .7,
+                                timeout_ms: Optional[int] = None, event: str = "unspecified",
+                                model: str = "", strict_params: bool = False,
+                                with_identity: bool = False, max_tokens: Optional[int] = None,
+                                validator=None, fallback_context=None, tier: Optional[str] = None,
+                                light: Optional[bool] = None, max_attempts: Optional[int] = None) -> LLMResult:
+        """统一调用出口：默认不设置输出上限；格式修复上限由策略单独控制。"""
         if with_identity:
-            identity = await self._resolve_identity_prefix()
-            system_prompt = identity + (f"\n\n{system_prompt}" if system_prompt else "")
-        return await self._gateway().generate_detailed(
-            prompt, module=module, system_prompt=system_prompt,
-            task_name=task_name, temperature=temperature,
-            timeout_ms=timeout_ms, event=event, model=model,
-            strict_params=strict_params, max_tokens=max_tokens,
-        )
+            identity=await self._resolve_identity_prefix()
+            system_prompt=identity+(f"\n\n{system_prompt}" if system_prompt else "")
+        async def invoke(*,max_tokens,timeout_ms,attempt,task_name):
+            payload=prompt
+            if attempt:
+                reminder="请重新检查输出，只返回完整结果，保持任务要求的格式与字段，不输出思考过程。"
+                if isinstance(payload,str):payload=payload+"\n\n"+reminder
+                elif isinstance(payload,list):payload=[*payload,{"role":"user","content":reminder}]
+            return await self._gateway().generate_once(payload,module=module,system_prompt=system_prompt,
+                task_name=task_name,temperature=temperature,timeout_ms=timeout_ms,event=event,model=model,
+                strict_params=strict_params,max_tokens=max_tokens,prefer_task=attempt>0)
+        return await self._policy().run(invoke,event=event,module=module,task_name=task_name or self._task_name,
+            validator=validator,fallback_context=fallback_context,tier=tier,light=light,
+            timeout_ms=timeout_ms,max_attempts=max_attempts)
+
+    def _policy(self):
+        from core.llm_policy import GenerationPolicy
+        if getattr(self,"_generation_policy",None) is None:
+            self._generation_policy=GenerationPolicy(self._record_generation)
+        return self._generation_policy
+
+    def _record_generation(self,**entry):
+        from core.generation_evidence import record_outcome
+        entry.setdefault('evidence_id',uuid.uuid4().hex)
+        data_dir=getattr(getattr(self._ctx,"paths",None),"data_dir",None)
+        record_outcome(data_dir,entry)
+        logger=getattr(self,"_call_logger",None)
+        if logger is None:
+            data_dir=getattr(getattr(self._ctx,"paths",None),"data_dir",None)
+            if data_dir:
+                from core.diag import LLMCallLogger
+                logger=LLMCallLogger(data_dir,enabled=True,retention_days=30)
+                self._call_logger=logger
+        recorder=getattr(logger,"record_generation",None)
+        if callable(recorder):recorder(**entry)
 
     def _exception_result(self, exc: BaseException, *, event: str, task: str,
                           request_id: str, attempts: int, category: str,
@@ -463,14 +297,14 @@ class LLMService:
             return LLMUsageTracker(None).summary(window)
 
     def usage_rows(self, hours: int = 0, *, limit: int = 50,
-                   offset: int = 0) -> Dict[str, Any]:
+                   offset: int = 0, level: str = '', module: str = '') -> Dict[str, Any]:
         """逐笔明细（WebUI 分页用）；账本缺失 → 空页。"""
         window = int(hours or getattr(self, "_default_window_hours", DEFAULT_USAGE_WINDOW_HOURS))
         tracker = getattr(self, "_usage_tracker", None)
         if tracker is None:
             tracker = LLMUsageTracker(None)
         try:
-            return tracker.rows(window, limit=limit, offset=offset)
+            return tracker.rows(window, limit=limit, offset=offset,level=level,module=module)
         except Exception:
             return {"window_hours": window, "total": 0, "offset": 0,
                     "limit": limit, "rows": [], "truncated": False}
@@ -549,20 +383,10 @@ class LLMService:
                     "image_url": {"url": f"data:image/png;base64,{extra}"},
                 })
         message = [{"role": "user", "content": content}]
-        try:
-            result = await self._gateway().generate_messages(
-                message, module=module, task_name=str(task_name or self._task_name),
-                temperature=temperature, event=event)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._log(event, str(task_name or self._task_name), False, "", str(e))
-            try:
-                self._ctx.logger.warning(f"视觉理解调用异常: {e}")
-            except Exception:
-                pass
-            return ""
-        return result.text
+        result=await self.generate_detailed(message,module=module,task_name=task_name or self._task_name,
+                                            temperature=temperature,event=event)
+        from core.llm_policy import GeneratedText
+        return GeneratedText(result)
 
     def _log(self, event: str, task: str, success: bool, response: str = "", error: str = "") -> None:
         if self._call_logger is not None:
@@ -570,8 +394,3 @@ class LLMService:
                 self._call_logger.record(event=event, task=task, success=success, response=response, error=error)
             except Exception:
                 pass
-
-    async def generate_or_fallback(self, prompt: str, fallback: str, **kwargs: Any) -> str:
-        text = await self.generate(prompt, **kwargs)
-        text = text.strip()
-        return text if text else fallback

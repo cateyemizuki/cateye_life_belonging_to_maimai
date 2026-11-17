@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+from core.targeting import admin_users_of
 import asyncio
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
@@ -63,8 +64,7 @@ class CommandRootComponentsMixin:
         try:
             admins = {
                 str(item).rsplit(":", 1)[-1]
-                for item in (getattr(getattr(self.config, "admin", None),
-                                     "admin_users", None) or [])
+                for item in admin_users_of(self.config)
             }
         except Exception:
             admins = set()

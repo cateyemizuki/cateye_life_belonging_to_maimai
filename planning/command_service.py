@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from core.targeting import admin_users_of
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -145,7 +146,7 @@ class CommandService:
 
         # 权限检查：默认拒绝——admin_users 未配置时仅本机控制台可用
         if not self._check_permission(user_id, is_local_operator):
-            if not (self._admin_cfg() and self._admin_cfg().admin_users):
+            if not (admin_users_of(self._plugin.config)):
                 await self._send(
                     stream_id,
                     "尚未配置管理员：请在插件配置 [管理与日志] 的 admin_users 中"
@@ -208,7 +209,7 @@ class CommandService:
         if not candidate:
             return False
         admin = self._admin_cfg()
-        admin_users = list(getattr(admin, "admin_users", None) or []) if admin else []
+        admin_users = admin_users_of(self._plugin.config)
         return any(_id_part(str(entry)) == candidate for entry in admin_users)
 
     # ------------------------------------------------------------

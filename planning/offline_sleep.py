@@ -84,8 +84,7 @@ def classify_offline_gap(seconds: Any) -> str:
 
 
 def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0,
-                            *, baseline_hours: Any = 8.0,
-                            repay_v2: bool = True) -> Dict[str, Any]:
+                            *, baseline_hours: Any = 8.0) -> Dict[str, Any]:
     """按分级生成一次离线睡眠结算计划（纯函数；不触状态/不落盘/不发事件）。
 
     Args:
@@ -157,14 +156,12 @@ def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0,
     sleep_debt_after = debt_before
     if category == "long" and effective_hours >= min(DEBT_SETTLE_MIN_HOURS, baseline):
         sleep_debt_after = settle_sleep_debt(debt_before, effective_hours,
-                                             baseline_hours=baseline,
-                                             repay_v2=bool(repay_v2))
+                                             baseline_hours=baseline)
         debt_settled = True
     elif category == "overlong":
         # 有效时长恒 = 10h：同 long 按整晚规则、按 10h 口径结算
         sleep_debt_after = settle_sleep_debt(debt_before, effective_hours,
-                                             baseline_hours=baseline,
-                                             repay_v2=bool(repay_v2))
+                                             baseline_hours=baseline)
         debt_settled = True
 
     gains = integrate_sleep_gains(
@@ -195,6 +192,6 @@ def plan_offline_settlement(gap_seconds: Any, sleep_debt_before: Any = 0.0,
             "unrecorded_note": UNRECORDED_NOTE if unrecorded_seconds > 0 else "",
             # 3.17.33 复核修复：与在线会话 metadata.debt_repay_v2 同口径，便于
             # 回放/排障区分「旧公式」与「阶梯还债」。
-            "debt_repay_v2": bool(repay_v2),
+            "debt_repay_v2": True,
         },
     }

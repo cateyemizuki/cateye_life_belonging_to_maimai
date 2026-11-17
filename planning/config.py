@@ -191,26 +191,6 @@ class ScheduleSectionConfig(EventCatalogFields):
     # spine_knowledge_limit 移入 mappings/internal_tuning.json[schedule]（内部上下文
     # 容量）。旧 TOML 键经 migrate_internal_tuning 值搬运；同名只读 property 见类尾。
 
-    intention_multi_round: bool = Field(
-        default=False,
-        description="日意图生成失败时最多再尝试一轮",
-        json_schema_extra={
-            "label": "多轮生成日意图",
-            **_ui_i18n("Daily intentions: multi-round"),
-        },
-    )
-    generate_at: str = Field(
-        default="00:30",
-        description="每天生成日意图的固定时刻（HH:MM），无条件生效；"
-                    "留空或非法值固定回落 00:30",
-        json_schema_extra={
-            "label": "日意图生成时刻",
-            "hint": "HH:MM；留空/非法 = 回落 00:30（设计 §9.1：勿用稀疏意图的最后 end 触发，会过早生成次日）",
-            "pattern": r"^\d{2}:\d{2}$",
-            **_ui_i18n("Daily intentions: generate at",
-                       "Fixed daily HH:MM for 日意图 generation; empty/invalid falls back to 00:30."),
-        },
-    )
     # PR8 3.0.0：``planning_daily_token_budget`` 预留键位已退役（自述「熔断策略本阶段
     # 未启用」的自造预留键；依据 = 用户 2026-10-27 授权直接清理 + 逐符号审定清单 WP3）。
     # 2026-10-29：事件库输出长度与Token额度也交回宿主，旧键只忽略。
@@ -470,11 +450,7 @@ class ScheduleAdvancedSectionConfig(PluginConfigBase):
 
 
 class PlanningProactiveSectionConfig(PluginConfigBase):
-    """设置早/午/晚安问候、发送时间和群聊或私聊名单；想念在陪伴模块设置。
-
-    2026-11-04 主动行为重写新增两个用户可感知字段：``greeting_morning_latest``
-    （早安有界上限时刻）与 ``greeting_noon_enabled``（中午问好开关，仅目标陪伴私聊）。
-    """
+    '设置早/午/晚安问候、发送时间和群聊或私聊名单；想念在陪伴模块设置。'
 
     __ui_label__ = "日程主动行为"
     __ui_icon__ = "notifications_active"
@@ -508,7 +484,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         description="陪伴目标私聊的回复倍率固定为1.0；关闭后与其他会话一样按活动调整。",
         json_schema_extra={
             "label": "目标私聊频率恒 1",
-            "hint": "默认开：陪伴对象私聊不被学习/工作活动压低频率；关 = 全部按旧的活动属性因子",
+            "hint": '开启后陪伴目标私聊保持正常回复频率；关闭后也随当前活动调整，工作或学习时可能少说话。',
             **_ui_i18n("Target chat frequency = 1.0",
                        "Keep the target companion private chat at 1.0 regardless of the "
                        "current activity; off = legacy per-activity factors everywhere."),
@@ -516,6 +492,17 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     )
 
     # ── 名单系统（群聊 / 私聊）───────────────────────────────
+    proactive_group_list_mode: Literal["blacklist", "whitelist"] = Field(
+        default="blacklist",
+        description="群聊名单模式：黑名单 = 名单内的群不生效（留空 = 全部生效）；"
+                    "白名单 = 只有名单内的群生效（留空 = 全部不生效）",
+        json_schema_extra={
+            "label": "群聊名单模式",
+            "hint": "默认黑名单（留空即全群生效，符合「群里本来就该活跃」的直觉）",
+            **_ui_i18n("Group list mode", "blacklist (default) or whitelist.",
+                       choices={"blacklist": "黑名单", "whitelist": "白名单"}),
+        },
+    )
     proactive_group_ids: List[str] = Field(
         default_factory=list,
         description='群聊名单（填**裸群号**如 ["123456"]，也接受 group:/qq:group:（群）'
@@ -531,14 +518,15 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
                        'default mode = blacklist with empty list = all groups.'),
         },
     )
-    proactive_group_list_mode: Literal["blacklist", "whitelist"] = Field(
-        default="blacklist",
-        description="群聊名单模式：黑名单 = 名单内的群不生效（留空 = 全部生效）；"
-                    "白名单 = 只有名单内的群生效（留空 = 全部不生效）",
+    proactive_private_list_mode: Literal["blacklist", "whitelist"] = Field(
+        default="whitelist",
+        description="私聊名单模式：白名单 = 只有名单内的私聊生效（留空 = 都不生效）；"
+                    "黑名单 = 名单内的私聊不生效（留空 = 全部生效）",
         json_schema_extra={
-            "label": "群聊名单模式",
-            "hint": "默认黑名单（留空即全群生效，符合「群里本来就该活跃」的直觉）",
-            **_ui_i18n("Group list mode", "blacklist (default) or whitelist."),
+            "label": "私聊名单模式",
+            "hint": "默认白名单（留空即不打扰任何其他私聊，避免误伤）",
+            **_ui_i18n("Private list mode", "whitelist (default) or blacklist.",
+                       choices={"blacklist": "黑名单", "whitelist": "白名单"}),
         },
     )
     proactive_private_ids: List[str] = Field(
@@ -554,16 +542,6 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
             **_ui_i18n("Private list",
                        'QQ IDs, bare or prefixed (private:/qq:private:/qq:); '
                        'default mode = whitelist with empty list = no other privates.'),
-        },
-    )
-    proactive_private_list_mode: Literal["blacklist", "whitelist"] = Field(
-        default="whitelist",
-        description="私聊名单模式：白名单 = 只有名单内的私聊生效（留空 = 都不生效）；"
-                    "黑名单 = 名单内的私聊不生效（留空 = 全部生效）",
-        json_schema_extra={
-            "label": "私聊名单模式",
-            "hint": "默认白名单（留空即不打扰任何其他私聊，避免误伤）",
-            **_ui_i18n("Private list mode", "whitelist (default) or blacklist."),
         },
     )
 
@@ -618,8 +596,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     # 只作用于群聊晚安；群聊早安硬闸/必要性与其他私聊阈值均不受本键影响。
     greeting_night_require_morning_chain: bool = Field(
         default=True,
-        description="群聊晚安是否要求本群本轮已发过早安（连锁）：开 = 旧行为；"
-                    "关 = 群晚安不再要求当日群早安（解耦），预算/夜间/冷却等其余闸门不变",
+        description='开启后，群聊仅在本轮已发送早安时发送晚安；关闭后群晚安可独立触发。预算、睡眠与冷却限制仍然生效。',
         json_schema_extra={
             "label": "群聊晚安要求早安连锁",
             "hint": "默认开：群晚安要等本群早安开口；关 = 群晚安与群早安解耦"
@@ -646,9 +623,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
         default=20,
         ge=0,
         le=59,
-        description="午安触发时刻的随机抖动窗（分钟）：在 12:00–13:00 窗口内为当日午安生成"
-                    "带随机浮动的触发时刻（抖动开启时至少推迟 1 分钟，绝不整点），避免每天"
-                    " 12:00:00 准点打卡；0 = 窗口开启即触发（旧行为）；上限 59 防止推出窗口",
+        description='在每天 12:00–13:00 内，让午安随机推迟 1 至此数值分钟。0 表示窗口开启即尝试触发；最多 59 分钟。',
         json_schema_extra={
             "label": "午安抖动窗(分钟)",
             "hint": "默认 20：当日触发时刻在 12:01–12:20 内随机浮动（设置 N 即 12:01–12:N，"
@@ -874,15 +849,7 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
 
 
 class PlanningEventsSectionConfig(PluginConfigBase):
-    """单独调整看视频 / 刷 QQ 小事件的抽取权重，以及视频分享到陪伴目标的概率。
-
-    默认值全部为 1.0 = 与既有行为逐字一致（零行为变化）。两个权重乘数只在
-    ``event_catalog.EventCatalogStore.pick_event`` 的权重计算处生效，互不影响；
-    取值在运行期钳制到 ``[0.1, 10.0]``（非法/非有限数按 1.0）。视频分享概率
-    键已接到自然触发点（``integrations/video_share_scheduler.py`` 的
-    ``VideoSocialService._deliver``，仅陪伴目标私聊），1.0 = 不额外过滤；
-    既有预算/夜间/冷却/静默闸保持优先。
-    """
+    '单独调整看视频 / 刷 QQ 小事件的抽取权重，以及视频分享到陪伴目标的概率。'
 
     __ui_label__ = "事件与分享概率"
     __ui_icon__ = "sparkles"
@@ -1157,44 +1124,9 @@ class LifeStateSectionConfig(PluginConfigBase):
     )
     # 2026-11-11 Gemini 批：睡眠债弹性还债（报告 §4.2 P0-NUM-1）。
     # 只切换还款公式，不改欠债累积、上限与既有状态数值；关闭 = 旧公式逐字不变。
-    sleep_debt_repay_v2: bool = Field(
-        default=True,
-        description="睡眠债弹性还债：多睡时按阶梯清偿（超额前 2 小时全额、超出部分折半），"
-                    "不再单次封顶 1 小时；长期欠债可经周末补觉真正还清",
-        json_schema_extra={
-            "label": "睡眠债弹性还债",
-            "hint": "默认开：补觉越多还得越多（无 1 小时硬顶）；关 = 恢复旧公式（单次最多还 1 小时）",
-            **_ui_i18n("Elastic sleep-debt repayment",
-                       "Tiered repayment without the legacy 1-hour hard cap; off = old formula."),
-        },
-    )
 
     # ── 社交电量的对象特异性（2026-11-11 Gemini 批，报告 §4.1 P1-NUM-2）────
     # 只影响目标陪伴私聊的社交电量结算；公共群聊/其他私聊保持既有消耗。
-    social_battery_affinity_discount: bool = Field(
-        default=True,
-        description="目标私聊社交电量折减：与陪伴目标私聊时按好感度折减社交电量消耗"
-                    "（好感越高折减越多），避免「和喜欢的人聊天反而被耗空」",
-        json_schema_extra={
-            "label": "目标私聊电量折减",
-            "hint": "默认开：只作用于目标陪伴私聊；群聊与其他私聊的消耗口径不变；关 = 不折减",
-            **_ui_i18n("Affinity-based social drain discount",
-                       "Reduce social-battery drain in the target private chat by affection; "
-                       "off = no discount."),
-        },
-    )
-    target_chat_social_recharge: bool = Field(
-        default=True,
-        description="高好感目标私聊微量回血：好感达到高档后，与陪伴目标轻松私聊可微量恢复社交电量，"
-                    "模拟亲密关系的情感疗愈；关闭 = 目标私聊最多只折减消耗、不回血",
-        json_schema_extra={
-            "label": "目标私聊微量回血",
-            "hint": "默认开：仅高好感目标私聊生效且幅度很小；关 = 不正向恢复，只保留折减",
-            **_ui_i18n("Target-chat social recharge",
-                       "High-affinity target private chat may slightly recharge social battery; "
-                       "off = discount only."),
-        },
-    )
 
     # ── J 类内部调参（只读桥接 → mappings/internal_tuning.json[life_state]）────
     @property

@@ -472,10 +472,8 @@ class ProactiveService:
         return values, problems
 
     def _target_qq(self) -> str:
-        """目标陪伴对象 QQ（空/占位返回空串）。"""
-        section = getattr(getattr(self._plugin, "config", None), "patrol", None)
-        raw = str(getattr(section, "target_qq", "") or "").strip()
-        return "" if raw in ("", "0", "123456789") else raw
+        from core.targeting import target_qq_of
+        return target_qq_of(getattr(self._plugin, "config", None))
 
     def _companion_enabled(self) -> bool:
         """陪伴模块是否启用（目标私聊的早/晚安由陪伴模块开关兜底；读不到按启用）。"""
@@ -1190,6 +1188,35 @@ class ProactiveService:
         attr = "morning_drift" if kind == GREETING_MORNING else "night_drift"
         return _parse_drift(getattr(cfg_p, attr, None))
 
+    @staticmethod
+    def _greeting_observe_until(kind: str, deadline: float, fire_at: float,
+                                morning_cap: Optional[float] = None) -> float:
+        """晚醒后漂移越过首活动期限时，保留到早安硬上限的等待窗。
+
+        否则上界恰等于漂移点，60 秒轮询只能在精确同一瞬间发送。普通早安
+        仍以首活动期限为界；漂移点不改、不重抽，晚安沿用原观测窗。
+        """
+        observe_until = max(deadline, fire_at)
+        if kind == GREETING_MORNING and morning_cap is not None:
+            if deadline <= fire_at < morning_cap:
+                return morning_cap
+            observe_until = min(observe_until, morning_cap)
+        return observe_until
+
+    def _pending_greeting_observe_until(self, entry: Dict[str, Any],
+                                        cycle: CycleState) -> float:
+        """纯读兼容旧 pending 零宽窗，供推进与诊断共用；终结任务不复活。"""
+        observe_until = float(entry.get("observe_until", entry["deadline"]) or entry["deadline"])
+        if (entry.get("kind") == GREETING_MORNING
+                and entry.get("status") == GREETING_STATUS_PENDING
+                and observe_until == float(entry["fire_at"])):
+            cap = entry.get("morning_cap")
+            if cap is None:
+                cap = self._morning_cap_ts(cycle)
+            return self._greeting_observe_until(
+                GREETING_MORNING, float(entry["deadline"]), float(entry["fire_at"]), cap)
+        return observe_until
+
     def _roll_greeting(self, stream_id: str, category: str, kind: str, cycle: CycleState,
                        now: datetime, now_ts: float, date_str: str) -> Dict[str, Any]:
         """掷点（§31.1 周期化）：每 ``(stream_id, cycle_start, kind)`` 只掷一次——同流同周期
@@ -1201,11 +1228,11 @@ class ProactiveService:
           醒来后 0~N 分钟）；
         - 晚安 = 晚安期限 − ``randint(a,b)``（期限 = **current_cycle_end** = 入睡时刻，跨 0 点
           照取——晚飞泻点恒落在本次日程清醒区间内，不会跨过入睡界）。
-        - **观测窗 = ``[min(基准, 漂移点), max(期限, 漂移点)]``**（既有公式保留；窗体仅含掷点，
-          判定窗 = §31.1 闸门矩阵的周期窗，二者分离）。
+        - 观测窗一般为 ``[min(基准, 漂移点), max(期限, 漂移点)]``；晚醒早安的漂移点
+          达到首活动期限且仍早于硬上限时，窗尾延至硬上限，避免零宽发送窗。
 
-        纯内存、不落盘（热重载后允许重掷）；跨 0 点窗按绝对 epoch 处理（§31.2：不折回）。
-        掷点时观测窗已整段关掉（``now ≥ 观测窗上界``）→ 记 ``abandoned(window_closed)``
+        pending 落盘恢复同一漂移；跨 0 点窗按绝对 epoch 处理（§31.2：不折回）。
+        掷点时观测窗已整段关掉（``now > 观测窗上界``）→ 记 ``abandoned(window_closed)``
         （该周期不再评估该流该 kind；structural irreversible case，区别于观测流内越界的
         ``deadline`` 钳制放弃）。
         """
@@ -1213,6 +1240,11 @@ class ProactiveService:
         key = (stream_id, cycle_key, kind)
         entry = self._greeting_rolls.get(key)
         if entry is not None:
+            if kind == GREETING_MORNING and entry.get("status") == GREETING_STATUS_PENDING:
+                observe_until = self._pending_greeting_observe_until(entry, cycle)
+                if observe_until != entry.get("observe_until"):
+                    entry["observe_until"] = observe_until
+                    self._save_greeting_rolls()
             # P2（2026-11-09）：本夜目标更新时复用已抽漂移量重算尚未发出的触发点；
             # 已执行/被拒绝/结果未知的任务不重抽、不重发。
             if kind == GREETING_NIGHT and entry.get("status") == GREETING_STATUS_PENDING:
@@ -1236,12 +1268,10 @@ class ProactiveService:
         fire_at = baseline_ts + offset if kind == GREETING_MORNING else deadline_ts - offset
         # 观测窗：[min(基准, 漂移点), max(期限, 漂移点)]——保证掷点永远落在窗内
         observe_from = min(baseline_ts, fire_at)
-        observe_until = max(deadline_ts, fire_at)
         # 早安有界（2026-11-04）：观测窗上界再与生效上限取 min——漂移点即使落在上限
         # 之后，也不得在上限后开口（_advance_greeting 另有 morning_cap 钳制双保险）。
         morning_cap = self._morning_cap_ts(cycle) if kind == GREETING_MORNING else None
-        if morning_cap is not None:
-            observe_until = min(observe_until, morning_cap)
+        observe_until = self._greeting_observe_until(kind, deadline_ts, fire_at, morning_cap)
         entry = {
             "stream_id": stream_id,
             "category": category,
@@ -1867,7 +1897,8 @@ class ProactiveService:
             if cap_ts is not None and now_ts > cap_ts:
                 self._abandon_greeting(entry, "morning_cap")
                 return
-        observe_until = float(entry.get("observe_until", entry["deadline"]) or entry["deadline"])
+        observe_until = self._pending_greeting_observe_until(entry, cycle)
+        entry["observe_until"] = observe_until
         # ① 越界钳制（§31.1 通则①「不得界后道早安/晚安」）
         if now_ts > observe_until:
             self._abandon_greeting(entry, "deadline")
@@ -2629,8 +2660,7 @@ class ProactiveService:
             conclusion = "取不到（缺消息查询能力，宁不发）"
         else:
             if entry is not None:
-                observe_until = float(entry.get("observe_until")
-                                      or entry.get("deadline") or now_ts)
+                observe_until = self._pending_greeting_observe_until(entry, cycle)
                 fire_at = float(entry.get("fire_at") or 0) or None
                 fire_lo = fire_hi = fire_at
             else:
@@ -2643,12 +2673,8 @@ class ProactiveService:
                 else:
                     fire_lo = deadline - drift_hi * 60.0
                     fire_hi = deadline - drift_lo * 60.0
-                observe_until = max(deadline, fire_hi)
-                if kind == GREETING_MORNING:
-                    # 早安有界（2026-11-04）：诊断窗与主链同口径（上限取早）
-                    cap = self._morning_cap_ts(cycle)
-                    if cap is not None:
-                        observe_until = min(observe_until, cap)
+                cap = self._morning_cap_ts(cycle) if kind == GREETING_MORNING else None
+                observe_until = self._greeting_observe_until(kind, deadline, fire_hi, cap)
             remaining_minutes = max(0, int((observe_until - now_ts) / 60.0))
             timing = self._greeting_timing_text(entry=entry, now_ts=now_ts,
                                                 fire_lo=fire_lo or 0.0,
@@ -3581,11 +3607,8 @@ class ProactiveService:
             projector = getattr(patrol, "_readonly_cycle_anchor", None)
             if callable(projector):
                 try:
-                    staged = True
-                    gate = getattr(patrol, "_miss_stage_escalation_enabled", None)
-                    if callable(gate):
-                        staged = bool(gate())
-                    anchor, projected = projector(now_dt, last, staged=staged)
+
+                    anchor, projected = projector(now_dt, last)
                     if anchor is not None:
                         hours = max(0.0, float(projected or 0.0))
                 except Exception:
@@ -3607,14 +3630,13 @@ class ProactiveService:
                         now_dt = now_dt.replace(tzinfo=anchor.tzinfo)
                 hours = max(0.0, (now_dt - anchor).total_seconds() / 3600.0)
             if hours > STAGE4_SILENCE_HOURS:
-                sleep_enabled = getattr(patrol, "_miss_sleep_excluded_enabled", None)
-                if callable(sleep_enabled) and sleep_enabled():
-                    sleeper = getattr(patrol, "_sleep_hours_between", None)
-                    if callable(sleeper):
-                        try:
-                            hours = max(0.0, hours - float(sleeper(anchor, now_dt) or 0.0))
-                        except Exception:
-                            logger.debug("阶段查询睡眠扣除失败（按自然时长）", exc_info=True)
+
+                sleeper = getattr(patrol, "_sleep_hours_between", None)
+                if callable(sleeper):
+                    try:
+                        hours = max(0.0, hours - float(sleeper(anchor, now_dt) or 0.0))
+                    except Exception:
+                        logger.debug("阶段查询睡眠扣除失败（按自然时长）", exc_info=True)
             return (4 if hours > STAGE4_SILENCE_HOURS else 0), hours
         except Exception:
             logger.debug("目标沉默阶段只读查询失败（按非阶段 4 处理）", exc_info=True)

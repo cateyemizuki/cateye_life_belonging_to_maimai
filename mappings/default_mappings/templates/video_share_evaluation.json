@@ -1,0 +1,21 @@
+{
+  "event": "video_share_evaluation",
+  "title": "暂缓聊天视频分享",
+  "tier": "small",
+  "format": "json",
+  "light": true,
+  "required": [
+    "action",
+    "target_stream_id",
+    "delay_seconds"
+  ],
+  "kind": "video_share_evaluation",
+  "ok": true,
+  "response": {
+    "action": "defer",
+    "target_stream_id": "",
+    "delay_seconds": 1800,
+    "reason": "暂时无法完成分享判断",
+    "profile_topics": {}
+  }
+}

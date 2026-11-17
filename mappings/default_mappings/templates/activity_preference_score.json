@@ -1,0 +1,15 @@
+{
+  "event": "activity_preference_score",
+  "title": "中性活动评分",
+  "tier": "medium",
+  "format": "json",
+  "light": false,
+  "required": [
+    "activities"
+  ],
+  "kind": "preferences",
+  "ok": false,
+  "response": {
+    "activities": []
+  }
+}

@@ -7,7 +7,8 @@ class VideoShareSectionConfig(PluginConfigBase):
     """根据真实观看内容和允许聊天的近期话题，自主判断是否分享视频。"""
     __ui_label__ = "视频自主分享"
     __ui_icon__ = "share-2"
-    __ui_order__ = 10
+    # 2026-11-14 段序修正批：随 video_watch/video_autonomous 整体顺延 10→12。
+    __ui_order__ = 12
     __ui_i18n__: ClassVar[dict] = {"en": {"title": "Video social sharing"}}
 
     mode: Literal["关闭", "影子模式", "自动分享"] = Field(

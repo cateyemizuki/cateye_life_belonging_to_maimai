@@ -1,0 +1,20 @@
+{
+  "event": "role_judge",
+  "title": "保持现有日程",
+  "tier": "small",
+  "format": "json",
+  "light": true,
+  "required": [
+    "decision"
+  ],
+  "kind": "role_judge",
+  "ok": true,
+  "response": {
+    "decision": "reject",
+    "title": "",
+    "date": "",
+    "time": "",
+    "notes": "",
+    "reason": "暂时无法判断，保持现有安排"
+  }
+}

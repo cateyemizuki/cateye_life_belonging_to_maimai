@@ -106,7 +106,6 @@ SLEEP_DEBT_REPAY_FULL_HOURS = 2.0
 #: 超出全额段后的还债折扣（0.5 = 每多睡 1h 还 0.5h）。
 SLEEP_DEBT_REPAY_PARTIAL_RATE = 0.5
 #: 开关缺省（与 planning/config.py Field 默认一致：v2 开）。
-DEFAULT_SLEEP_DEBT_REPAY_V2 = True
 
 
 # ======================================================================
@@ -222,8 +221,7 @@ def sleep_quality(interrupted_minutes: Any, total_sleep_minutes: Any) -> float:
     return max(0.0, min(1.0, 1.0 - interrupted / total))
 
 
-def sleep_debt_delta(actual_hours: Any, baseline_hours: Any = 8.0, *,
-                     repay_v2: bool = False) -> float:
+def sleep_debt_delta(actual_hours: Any, baseline_hours: Any = 8.0) -> float:
     """单次睡眠的债务增量（不 clamp，clamp 在 :func:`settle_sleep_debt`）。
 
     复核 P0-4：零债基准参数化（默认 8.0 保持旧行为）——用户配置窗口短于 8h
@@ -247,8 +245,6 @@ def sleep_debt_delta(actual_hours: Any, baseline_hours: Any = 8.0, *,
     """
     hours = _clamp(actual_hours, 0.0, 240.0, 0.0)
     baseline = _clamp(baseline_hours, 4.0, 12.0, 8.0)
-    if not repay_v2:
-        return max(0.0, baseline - hours) * 0.5 - min(1.0, max(0.0, hours - baseline))
     deficit = max(0.0, baseline - hours)
     excess = max(0.0, hours - baseline)
     full = min(excess, SLEEP_DEBT_REPAY_FULL_HOURS)
@@ -258,8 +254,7 @@ def sleep_debt_delta(actual_hours: Any, baseline_hours: Any = 8.0, *,
 
 
 def settle_sleep_debt(debt_before: Any, actual_hours: Any,
-                      baseline_hours: Any = 8.0, *,
-                      repay_v2: bool = False) -> float:
+                      baseline_hours: Any = 8.0) -> float:
     """一次性睡眠债结算：``clamp(before + delta, 0, 12)``（只应在会话结束时调用）。
 
     ``repay_v2=False``（默认）保持旧公式；在线引擎按配置开关传 ``True`` 走
@@ -267,8 +262,7 @@ def settle_sleep_debt(debt_before: Any, actual_hours: Any,
     """
     before = _clamp(debt_before, 0.0, SLEEP_DEBT_MAX, 0.0)
     return max(0.0, min(SLEEP_DEBT_MAX,
-                        before + sleep_debt_delta(actual_hours, baseline_hours,
-                                                  repay_v2=repay_v2)))
+                        before + sleep_debt_delta(actual_hours, baseline_hours)))
 
 
 def debt_baseline_hours(sleep_minute: Any, wake_minute: Any) -> float:
@@ -1933,11 +1927,9 @@ class SleepEngine:
                                        session.metadata.get("wake_min"))
         # 2026-11-11 Gemini 批（报告 §4.2 P0-NUM-1）：弹性还债开关。默认开；
         # 关 = settle_sleep_debt 旧公式逐字不变；总上限 12h 两侧一致。
-        repay_v2 = self._cfg_bool("sleep_debt_repay_v2", DEFAULT_SLEEP_DEBT_REPAY_V2)
-        debt_after = settle_sleep_debt(debt_before, actual_hours, baseline_hours=baseline,
-                                       repay_v2=repay_v2)
+        debt_after = settle_sleep_debt(debt_before, actual_hours, baseline_hours=baseline)
         session.metadata["debt_baseline_hours"] = round(baseline, 4)
-        session.metadata["debt_repay_v2"] = bool(repay_v2)
+        session.metadata["debt_repay_v2"] = True
         session.actual_end_minute = self._frame_minutes(now, session.schedule_date)
         session.wake_reason = reason
         session.continuous_minutes = int(round(

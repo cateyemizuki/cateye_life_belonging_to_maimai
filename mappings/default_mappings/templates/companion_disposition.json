@@ -1,0 +1,17 @@
+{
+  "event": "companion_disposition",
+  "title": "中性联系倾向",
+  "tier": "large",
+  "format": "json",
+  "light": false,
+  "required": [
+    "anchor_hours",
+    "loneliness"
+  ],
+  "kind": "companion_disposition",
+  "ok": true,
+  "response": {
+    "anchor_hours": 6.0,
+    "loneliness": 0.5
+  }
+}

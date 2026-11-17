@@ -237,8 +237,7 @@ def _stage_probability(hours: float, anchor: float, stage: int,
 
 
 def evaluate_miss(hours: float, anchor: float, loneliness: float,
-                  energy: Any, social: Any, valence: Any, *,
-                  staged: bool = False) -> MissDecision:
+                  energy: Any, social: Any, valence: Any) -> MissDecision:
     """Silence creates need; low social energy reduces ability to speak.
 
     ``staged=False``（默认）保持 3.17.33 及以前的逐字契约：概率按单拍上限 .35 计算，
@@ -254,12 +253,12 @@ def evaluate_miss(hours: float, anchor: float, loneliness: float,
         return MissDecision(False, 0, 'invalid_time')
     anchor = max(2.0, min(24.0, anchor))
     loneliness = max(0.0, min(1.0, loneliness))
-    stage = miss_stage(hours, anchor) if staged else 0
+    stage = miss_stage(hours, anchor)
     if hours < anchor:
         return MissDecision(False, 0, 'before_personality_anchor', hours, stage=stage)
-    if staged and stage <= 0:
+    if stage <= 0:
         return MissDecision(False, 0, 'outside_stage_window', hours)
-    if staged and stage == 4:
+    if stage == 4:
         # 阶段 4 的归因必须稳定：放在容量/动机门槛之前，低电量或负情绪也不会把
         # reason 盖成 low_communication_capacity / motivation_below_threshold。
         return MissDecision(False, 0.0, 'stage4_delegated_to_daily_tasks', hours,
@@ -281,11 +280,7 @@ def evaluate_miss(hours: float, anchor: float, loneliness: float,
     if motivation < threshold:
         return MissDecision(False, 0, 'motivation_below_threshold', hours, motivation, capacity,
                             stage)
-    if staged:
-        p = _stage_probability(hours, anchor, stage, loneliness, emotion)
-    else:
-        p = min(.35, (.08 + .22 * (motivation - threshold) / max(.1, 1. - threshold))
-                * math.sqrt(capacity))
+    p = _stage_probability(hours, anchor, stage, loneliness, emotion)
     return MissDecision(True, p, 'candidate', hours, motivation, capacity, stage)
 
 
@@ -356,7 +351,10 @@ class InitiativeMemory:
                     h, l = float(h), float(l)
                     if not (math.isfinite(h) and math.isfinite(l) and 2 <= h <= 24 and 0 <= l <= 1):
                         raise ValueError('out of bounds')
-                    profile.update(anchor_hours=h, loneliness=l, source='persona_llm')
+                    profile.update(anchor_hours=h, loneliness=l,
+                        source='template' if getattr(text,'used_template',False) else 'persona_llm')
+                    if getattr(text,'used_template',False):
+                        profile['fallback_reason'] = getattr(text,'fallback_reason','generation_unavailable')
                 except asyncio.CancelledError:
                     raise
                 except Exception:

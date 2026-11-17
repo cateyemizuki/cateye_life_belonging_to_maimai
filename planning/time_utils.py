@@ -7,17 +7,17 @@ utils/energy_model.py（照搬合并；C1 裁决以本侧能量曲线为唯一�
     - 旧格式: [hour, hour]，hour 取 0-23
     - 新格式: [minutes, minutes]，minutes 取 0-1440（跨夜时 end 可 > 1440）
 
-分层约定：core/time_utils.py 只保留纯时间函数（parse_hhmm / minutes_of_now /
-hours_between）；planning 侧的时间/窗口/能量函数集中在本模块。
+分层约定：纯时间与 DST 墙钟/真实秒函数统一归 core/time_utils.py；
+本模块重导出原公共名称，保留规划侧时区管理、窗口与能量函数。
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from typing import Any, List, Optional, Tuple, Union
 
-from core.time_utils import parse_hhmm
+from core.time_utils import parse_hhmm, wall_time, elapsed_seconds, shift_elapsed
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,17 @@ class TimezoneManager:
         if self._tz is not None:
             return datetime.now(self._tz)
         return datetime.now()
+
+    def to_local(self, value: Optional[datetime] = None) -> datetime:
+        """aware 转到配置时区；naive 按该区墙钟解释，DST 规则与日程锚点相同。"""
+        if value is None:
+            return self.get_now()
+        if self._tz is None:
+            return value.astimezone().replace(tzinfo=None) if value.tzinfo is not None else value
+        if value.tzinfo is not None:
+            return value.astimezone(self._tz)
+        localized = wall_time(value.date(), value.hour * 60 + value.minute, self._tz)
+        return localized.replace(second=value.second, microsecond=value.microsecond)
 
 
 def tzinfo_of(timezone_str: str) -> Optional[tzinfo]:

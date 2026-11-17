@@ -355,7 +355,7 @@ const SectionFish=(()=>{
   }
  }
  const safeTime=(value)=>value?clock(value,true):'暂无记录';
- mount('current','当前活动',$('hero-scene'),d=>d.schedule?.current?.name||'暂无正在进行的活动',d=>[['活动来源',source(d.schedule?.current?.source),'只显示实际处于进行状态的活动，计划意图不等于已发生。'],['计划时段',d.schedule?.current?.time_label||'暂无记录','后端给出的本轮计划起止（time_label）；跨午夜段已标「次日」，与时间线「计划」行同口径。'],['进度基准','按本轮活动计划','进度由生活引擎按本轮计划时长与已用时计算；日意图时段可能不同，两者不一致时以本卡片口径为准。'],['状态时间',safeTime(d.state?.updated_at),fullClock(d.state?.updated_at)]]);
+ mount('current','当前活动',$('hero-scene'),d=>d.schedule?.current?displayActivityName(d.schedule.current,{timezone:d.timezone}):'暂无正在进行的活动',d=>[['活动来源',source(d.schedule?.current?.source),'只显示实际处于进行状态的活动，计划意图不等于已发生。'],['计划时段',d.schedule?.current?.time_label||'暂无记录','后端给出的本轮计划起止（time_label）；跨午夜段已标「次日」，与时间线「计划」行同口径。'],['进度基准','按本轮活动计划','进度由生活引擎按本轮计划时长与已用时计算；日意图时段可能不同，两者不一致时以本卡片口径为准。'],['状态时间',safeTime(d.state?.updated_at),fullClock(d.state?.updated_at)]]);
  const companionCard=$('tier').closest('article');mount('companion','陪伴',companionCard,d=>d.companion?.available?`${d.companion.tier_label||'关系记录'} · 今日主动 ${count(d.companion.speak_count)} / ${count(d.companion.daily_limit)}`:'暂无陪伴记录',d=>[['巡检时间',safeTime(d.companion?.last_tick_at),fullClock(d.companion?.last_tick_at)],['今日主动','巡检与想念合并统计','早安、晚安单独展示。']]);
  mount('state','身心状态',$('metrics'),d=>d.state_available?'五项状态反映当前快照；饥饿与压力越高，需求越明显。':'暂无生活状态记录',d=>[['采样间隔','约 5 分钟','正常tick每5分钟至多采样一次，另保留活动和醒沿观察。'],['更新时间',safeTime(d.state?.updated_at),fullClock(d.state?.updated_at)],['精神状态',num(d.state?.mental_state)===null?'暂无记录':pct(d.state.mental_state)+'%','由精力×专注×(1−压力)得到；专注为0表示注意力涣散，压力为0表示放松。']],[],['grid','metrics']);
  const historyCard=$('history-chart').closest('section');

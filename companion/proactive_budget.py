@@ -284,10 +284,6 @@ class ProactiveBudget:
             daily_int = 5
         return max(0, daily_int)
 
-    def _elasticity_enabled(self) -> bool:
-        cfg = self._config()
-        patrol = getattr(cfg, "patrol", None)
-        return bool(getattr(patrol, "budget_elasticity_enabled", False))
 
     def set_elasticity_provider(self, provider: Any) -> None:
         """装配期注入弹性信号源（可调用 → dict）；不传 provider 即保持基础预算。"""
@@ -342,7 +338,7 @@ class ProactiveBudget:
         """
         base = self.base_cap()
         reasons: list[str] = []
-        if self._elasticity_enabled() and base > 0:
+        if base > 0:
             signals = self._elasticity_signals()
             affection_value = signals.get("affection")
             if affection_value is None:
@@ -369,7 +365,7 @@ class ProactiveBudget:
         # 硬上限：base+2，且不越过配置字段的 50 上限；base 本身异常超限时不被弹性压低。
         hard_cap = max(base, min(base + bonus, self.ELASTIC_ABSOLUTE_MAX))
         return {"base": base, "bonus": hard_cap - base, "cap": hard_cap,
-                "reasons": reasons, "enabled": self._elasticity_enabled()}
+                "reasons": reasons, "enabled": True}
 
     def cap(self) -> int:
         """目标陪伴私聊的每日主动打扰上限（基础预算 + 有界弹性）。

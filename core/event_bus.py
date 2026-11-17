@@ -121,6 +121,26 @@ class EventBus:
         _pending_tasks.add(task)
         task.add_done_callback(_pending_tasks.discard)
 
+    async def publish_confirmed(self, event: str, *, required_owners: Tuple[str, ...] = (),
+                                **payload: Any) -> bool:
+        """Confirm that every currently registered handler completed this attempt.
+
+        Durable publishers keep their outbox item when there are no subscribers or
+        when a handler failed. A later retry may reach a handler twice, so durable
+        consumers must use the publisher's stable event ID for idempotency.
+        When required_owners is supplied, every named consumer must be registered
+        before any handler runs; partial startup or teardown cannot acknowledge it.
+        The existing ``publish`` result and exception-isolation policy stay intact.
+        """
+        name = str(event or "").strip()
+        subscribers = list(self._subscribers.get(name) or ())
+        expected = len(subscribers)
+        required = {str(owner).strip() for owner in required_owners if str(owner).strip()}
+        if not expected or not required.issubset({owner for owner, _ in subscribers}):
+            return False
+        delivered = await self.publish(name, **payload)
+        return delivered == expected
+
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------

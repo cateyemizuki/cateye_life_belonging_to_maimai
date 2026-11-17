@@ -8,10 +8,15 @@ list_3 楼中楼），配合 emotion_cgi_re_feeds 的 commentId/commentUin 字�
 「回复自己动态下别人的评论」。
 
 cookie 获取（多级降级，与 Maizone 相同思路）：
-1. 适配器 API：adapter.napcat.account.get_cookies（domain=user.qzone.qq.com，
-   官方 SnowLuma/NapCat 适配器均暴露；影子适配器可走 action.call 透传）；
-2. NapCat HTTP 服务器 POST /get_cookies（备选，需在 NapCat 开 http server；
-   http 明文且携带 Bearer token，**仅限回环地址**，勿指向局域网/公网）；
+1. 适配器 API（SnowLuma 直连）：adapter.napcat.account.get_cookies
+   （domain=user.qzone.qq.com，官方 SnowLuma/NapCat 适配器均暴露；影子适配器可走
+   action.call 透传）；
+2. Snowluma HTTP 服务器 POST /get_cookies（**旧版兼容**通道，仅低于 2.0.0 的
+   SnowLuma 需要，配置在 [legacy_compat] snowluma_http_host/port/token；
+   http 明文且携带 Bearer token，**仅限回环地址**，勿指向局域网/公网）。
+   **惰性读取**（3.17.36）：本通道只在直连通道 1 失效后才执行，配置经
+   legacy_http_provider 访问器在**本通道内**才读取——直连成功路径永不触碰
+   [legacy_compat]（包括不读其值）；
 3. 本地 cookies.json 文件回退。
 刷新节流：1 小时内不重复拉取（内存时间戳 + 文件回退）。
 
@@ -30,7 +35,7 @@ import time
 from datetime import datetime
 from core.storage import save_json_atomic
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -87,16 +92,16 @@ class QzoneCookieManager:
         ctx: Any,
         data_dir: Path,
         *,
-        napcat_http_host: str = "",
-        napcat_http_port: str = "",
-        napcat_http_token: str = "",
+        legacy_http_provider: Optional[Callable[[], Tuple[str, str, str]]] = None,
         refresh_interval_hours: float = 1.0,
     ) -> None:
         self._ctx = ctx
         self._path = Path(data_dir) / "qzone_cookies.json"
-        self._http_host = napcat_http_host
-        self._http_port = napcat_http_port
-        self._http_token = napcat_http_token
+        #: 旧版兼容（[legacy_compat] snowluma_http_*）惰性访问器（3.17.36）：
+        #: 返回 (host, port, token)。只在降级通道 2（_fetch_via_snowluma_http）
+        #: 真正执行时才调用——直连成功路径永不读取旧版兼容配置（含不读其值）。
+        #: None = 未装配旧版通道（等价于三键全空）。
+        self._legacy_http_provider = legacy_http_provider
         self._refresh_interval = max(0.25, float(refresh_interval_hours)) * 3600
         self._last_refresh = 0.0
         self._api_channel = ""  # 命中的适配器通道
@@ -142,13 +147,22 @@ class QzoneCookieManager:
             self._failed("not_logged_in")
         return None
 
-    async def _fetch_via_napcat_http(self) -> Optional[Dict[str, str]]:
-        if not (self._http_host and self._http_port):
+    async def _fetch_via_snowluma_http(self) -> Optional[Dict[str, str]]:
+        # 惰性读取（3.17.36）：本通道只在直连（适配器 get_cookies / action.call）
+        # 失效后才会执行到这里——此刻才经访问器读取 [legacy_compat] 段配置。
+        if self._legacy_http_provider is None:
             return None
-        url = f"http://{self._http_host}:{self._http_port}/get_cookies"
+        try:
+            host, port, token = self._legacy_http_provider()
+        except Exception:
+            return None
+        host, port, token = str(host or ""), str(port or ""), str(token or "")
+        if not (host and port):
+            return None
+        url = f"http://{host}:{port}/get_cookies"
         headers = {"Content-Type": "application/json", "User-Agent": _UA}
-        if self._http_token:
-            headers["Authorization"] = f"Bearer {self._http_token}"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         try:
             async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
                 resp = await client.post(url, json={"domain": COOKIE_DOMAIN}, headers=headers)
@@ -195,7 +209,7 @@ class QzoneCookieManager:
         if not force and self._last_attempt and time.monotonic()-self._last_attempt < 60:
             return self._cached
         self._last_attempt = time.monotonic()
-        for fetcher in (self._fetch_via_adapter, self._fetch_via_napcat_http, self._load_local):
+        for fetcher in (self._fetch_via_adapter, self._fetch_via_snowluma_http, self._load_local):
             try:
                 cookies = await fetcher() if asyncio.iscoroutinefunction(fetcher) else fetcher()
             except Exception:
@@ -380,11 +394,13 @@ class QzoneWebClient:
                     if isinstance(sub, dict):
                         _push(sub, parent_tid)
                 _push(c, None)
+            from .post_media import image_urls
             feeds.append({
                 "tid": str(msg.get("tid") or ""),
                 "content": str(msg.get("content") or ""),
                 "created_time": str(msg.get("created_time") or ""),
                 "comments": comments,
+                "images": image_urls(msg),
             })
         return feeds
 

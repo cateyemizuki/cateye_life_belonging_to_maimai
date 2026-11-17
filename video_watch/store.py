@@ -5,6 +5,7 @@
     tasks.json              任务台账（含进行中任务；重启恢复的依据；终态按保留期+容量裁剪）
     history.json            观看记忆（仅真实完成的任务；分享扩展字段预留）
     cache/{bvid}.json       仅BV和文字结果；默认保存后15天过期，读取不续期
+    metadata_cache.json     安全封面与真实统计的旁路补充，不修改文字缓存的mtime/期限
     jobs/{task_id}/         单任务的 spec/progress/result 与临时媒体（随终态裁剪同步清理）
 
 写入一律「临时文件 + os.replace」原子落盘；读取失败按损坏处理（返回默认值，
@@ -61,13 +62,14 @@ def read_json(path: Path, default: Any) -> Any:
 
 
 class WatchStore:
-    """tasks/history/cache 三个 JSON 面的读写门面（进程内互斥）。"""
+    """任务、历史、文字缓存与元信息旁路的持久读写门面（进程内互斥）。"""
 
     def __init__(self, data_dir: Path, cache_retention_days: int = 15) -> None:
         self._dir = Path(data_dir)
         self._tasks_path = self._dir / "tasks.json"
         self._history_path = self._dir / "history.json"
         self._cache_dir = self._dir / "cache"
+        self._metadata_path=self._dir/"metadata_cache.json"
         self._lock = threading.RLock()
         self._cache_retention_seconds = max(1, int(cache_retention_days)) * 86400
         try:
@@ -212,6 +214,52 @@ class WatchStore:
             if self._cache_dir.is_symlink():
                 return
             self._write_text_cache(bvid, text, time.time())
+            if isinstance(result,dict):
+                from .metadata import presentation
+                snapshot=presentation(result)
+                if snapshot['metrics_provenance']=='watch_snapshot':
+                    data=read_json(self._metadata_path,{})
+                    if not isinstance(data,dict):data={}
+                    data[bvid]=snapshot
+                    atomic_write_json(self._metadata_path,dict(list(data.items())[-500:]))
+                else:self._merge_metadata_cache(bvid,snapshot)
+
+    def _merge_metadata_cache(self,bvid,metadata):
+        from .metadata import merge_missing
+        data=read_json(self._metadata_path,{})
+        if not isinstance(data,dict):data={}
+        existing=data.get(bvid) or {}
+        merged,changed=merge_missing(existing,metadata)
+        if changed:
+            data[bvid]=merged
+            atomic_write_json(self._metadata_path,dict(list(data.items())[-500:]))
+        return changed
+
+    def load_metadata_cache(self,bvid):
+        """Supplemental metadata never renews the BV/text cache's actual expiry."""
+        with self._lock:
+            if self.load_cache(bvid) is None:return None
+            data=read_json(self._metadata_path,{})
+            return data.get(bvid) if isinstance(data,dict) else None
+
+    def update_video_metadata(self,bvid,snapshot,*,task_id=None):
+        """Fill missing presentation fields only; preserve all history/expiry/receipt anchors."""
+        from .metadata import merge_missing
+        if not re.fullmatch(r'BV[A-Za-z0-9]{10}',str(bvid)):return False
+        with self._lock:
+            document=read_json(self._history_path,None)
+            if not isinstance(document,dict) or not isinstance(document.get('watched'),list):return False
+            changed=False;found=False
+            for index,row in enumerate(document['watched']):
+                if not isinstance(row,dict) or row.get('bvid')!=bvid or (task_id and row.get('task_id')!=task_id):continue
+                found=True
+                updated,did_change=merge_missing(row,snapshot)
+                if did_change:document['watched'][index]=updated;changed=True
+            if not found:return False
+            if changed:atomic_write_json(self._history_path,document)
+            # A metadata-only side index leaves cache bytes and mtime (the TTL anchor) untouched.
+            self._merge_metadata_cache(bvid,snapshot)
+            return changed
 
     def _write_text_cache(self, bvid: str, text: str, saved_at: float) -> None:
         path = self.cache_path(bvid)

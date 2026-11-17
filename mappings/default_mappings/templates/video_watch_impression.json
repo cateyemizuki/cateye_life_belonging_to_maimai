@@ -1,0 +1,11 @@
+{
+  "event": "video_watch_impression",
+  "title": "暂不形成观后感",
+  "tier": "small",
+  "format": "text",
+  "light": true,
+  "required": [],
+  "kind": "video_watch_impression",
+  "ok": false,
+  "response": "暂时没有足够信息形成观后感"
+}

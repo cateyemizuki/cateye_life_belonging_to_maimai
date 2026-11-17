@@ -626,7 +626,7 @@ class InitService:
             # switches 键名保留（诊断 details/摘要消费），取值同源自 schedule.enabled。
             "life_state_enabled": _as_bool(_field(cfg, "schedule", "enabled", True)),
             "sleep_engine_enabled": _as_bool(_field(cfg, "schedule", "enabled", True)),
-            "event_catalog_mode": str(_field(cfg, "event_catalog", "mode", "off") or "off"),
+            "event_catalog_mode": "auto",
             "frequency_always_one": _as_bool(freq_value, default=True),
             "frequency_switch_explicit": freq_value is not None,
         }

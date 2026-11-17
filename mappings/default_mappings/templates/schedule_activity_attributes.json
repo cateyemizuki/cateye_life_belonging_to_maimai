@@ -1,0 +1,10 @@
+{
+  "event": "schedule_activity_attributes",
+  "title": "保守活动属性",
+  "tier": "small",
+  "format": "json",
+  "light": true,
+  "required": ["activities"],
+  "ok": true,
+  "response": {"activities": []}
+}

@@ -1,0 +1,22 @@
+<!-- lbm-document-status: 当前维护 -->
+> 文档状态：**当前维护** · 整理日期：2026-11-16
+> 适用源码：3.18.3
+> 当前说明：[README](../README.md) · [完整文档清单](../DOCUMENTATION.md)
+
+# 内置视频观看
+
+本模块从 cateye 自有本机原型 `cateye_bili_watch` 迁入，原型提交为 **cad3d2d2b9e49d7a6c7cc35f1b8764b82e97d60f**，manifest 声明 MIT。原型没有 Git remote，未核实公开仓库地址；不制造 GitHub 链接。早期迁入 `bv/store/manager/worker`，之后增加真实视觉采样、来源说明、公开元数据、观后感、兴趣与分享集成。
+
+观看机制由本模块持有单一任务队列、worker、结果与缓存；`integrations/` 只做自主选片和行为编排，不复制媒体处理或模型分析流水线。
+
+`video_watch.enabled` 是工具与自主观看共用的总开关，`video_autonomous.enabled` 只控制自主入口。工具点播不经过自主候选热度门槛或自主日额度。自主专门日程可以在剩余时间与支数内连续选片，闲暇日程最多一支且每段只判断一次，均受真实忙闲、睡眠、硬约定、聊天与额度守护。
+
+一次概率和最多支数以原计划 `schedule_date + intent_item_id` 累计，暂停/恢复出现新 episode 不重掷或重给上限；没有原计划身份时才回退实际 episode，并沿 `resume_of` 继承。`integrations/video_watch_budget.py` 的独立 `data_dir/video_intent_usage.sqlite3` 只存机会、预占与确认受理的任务事实，不另持日程状态。每日 SurfQuotaLedger 和运行 owner 仍跟随实际 episode；受理未知时冻结预占，不计为已观看。
+
+明确 `watch_video` 日程的 `brief` 注意力只减少聊天响应，不中止自身续片；稍后响应、硬约定、睡眠、低可中断性、显式忙碌和真实来信仍阻止。该例外不用于顺便观看或浏览 QQ。剩余活动时间使用真实时间差处理夏令时跳跃与回拨，不以裸钟面分钟相减。
+
+真实观看结果记录实际读取范围与视觉/字幕证据；仅有标题简介不等于完成内容理解。`watched_at` 的观看记录时间与 `metrics_captured_at` 的公开统计采集时间分别展示；后台缺项补录不改原观看时间、保留期或外部发送回执，也不发起理解模型或重新观看。
+
+当前明确指定多P视频的 `p>1` 会拒绝，不能把单P结果冒充整个合集。解码、网络或视觉任务不可用时如实返回阶段与来源，不自动下载全片补救，也不编造音频转写。
+
+解码器渠道与二进制许可单列于[第三方说明](../THIRD_PARTY.md)，不把 imageio 包装器许可当成具体 FFmpeg 构建许可。操作、出厂配额与隐私边界见[根 README](../README.md)。

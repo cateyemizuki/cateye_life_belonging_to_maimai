@@ -112,7 +112,7 @@ class DecisionLogger:
     ACTION_SPOKEN = "spoken"
     ACTION_INFO = "info"
 
-    def __init__(self, data_dir: Path, enabled: bool = True, retention_days: int = 3,
+    def __init__(self, data_dir: Path, enabled: bool = True, retention_days: int = 30,
                  record_skips: bool = True) -> None:
         self._dir = Path(data_dir) / "decision_logs"
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -196,7 +196,7 @@ class DecisionLogger:
 
 
 class LLMCallLogger:
-    def __init__(self, data_dir: Path, enabled: bool = True, retention_days: int = 3) -> None:
+    def __init__(self, data_dir: Path, enabled: bool = True, retention_days: int = 30) -> None:
         self._dir = Path(data_dir) / "llm_logs"
         self._dir.mkdir(parents=True, exist_ok=True)
         self._enabled = enabled
@@ -241,6 +241,20 @@ class LLMCallLogger:
     def read_entries(self, days: Optional[int] = None) -> list[dict[str, Any]]:
         """读取最近 N 天的调用记录（按时间升序）；None = 整个保留期。"""
         return _read_entries_ascending(self._dir, "llm_calls", self._retention_days, days)
+
+    def record_generation(self, **fields: Any) -> None:
+        """生成策略日志单独标记，供 WebUI 读取；不重复计入 Token 账本。"""
+        entry={"time":datetime.now().isoformat(timespec="seconds"),"kind":"generation",**fields}
+        entry["level"]=entry.get("level") if entry.get("level") in ("info","warn","error") else "info"
+        for name in ("message","fallback_reason"):
+            if name in entry:entry[name]=str(entry[name])[:400]
+        try:
+            path=self._dir/f"llm_calls_{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+            with path.open("a",encoding="utf-8") as stream:stream.write(json.dumps(entry,ensure_ascii=False)+"\n")
+        except OSError:
+            return
+        if time.monotonic()-self._last_cleanup>_CLEANUP_INTERVAL_SECONDS:
+            self._last_cleanup=time.monotonic();self.cleanup()
 
     def cleanup(self) -> int:
         """删除超过保留天数的日志文件，返回删除数量。"""

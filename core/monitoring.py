@@ -23,7 +23,91 @@ def _usage_count(value):
     try:return max(0,int(value))
     except (TypeError,ValueError,OverflowError):return None
 
-def usage_summary(data_dir,now,hours=24):
+def generation_logs(data_dir,now,hours=24,limit=200,*,include_all=False):
+    """Read bounded evidence; the display cap never limits request association."""
+    hours=max(1,min(720,int(hours)));records=[];truncated=False
+    if data_dir:
+        # Separate budgets prevent optional raw diagnostics from crowding out compact evidence.
+        for folder,prefix in (('llm_generation_outcomes','generation_'),('llm_logs','llm_calls_')):
+            budget=2*1024*1024
+            for offset in range(min(31,(hours+23)//24+1)):
+                path=Path(data_dir)/folder/(prefix+(now-timedelta(days=offset)).strftime('%Y-%m-%d')+'.jsonl')
+                try:size=path.stat().st_size
+                except OSError:continue
+                if budget<=0:truncated=True;break
+                rows,cut=tail_records(path,budget);budget-=min(size,budget);truncated=truncated or cut
+                for row in rows:
+                    if row.get('kind')!='generation':continue
+                    try:
+                        at=datetime.fromisoformat(str(row.get('time','')))
+                        if at.tzinfo is None:at=at.replace(tzinfo=now.tzinfo)
+                        elif now.tzinfo is None:at=at.replace(tzinfo=None)
+                        if not now-timedelta(hours=hours)<=at<=now:continue
+                    except (ValueError,TypeError):continue
+                    record={'time':at.isoformat(),'level':row.get('level') if row.get('level') in ('info','warn','error') else 'unknown',
+                            'used_template':row.get('used_template') is True}
+                    for name in ('event','module','task','model','category','group_id','request_id','tier','template_name','template_title','evidence_id'):
+                        record[name]=str(row.get(name) or '')[:160]
+                    for name in ('message','fallback_reason'):record[name]=str(row.get(name) or '')[:400]
+                    for name in ('completion_tokens','warning_threshold','attempt','max_tokens'):record[name]=_usage_count(row.get(name))
+                    records.append(record)
+    # New rows share an evidence ID across the durable journal and optional diagnostics.
+    unique={}
+    for record in records:
+        key=record['evidence_id'] or json.dumps(record,sort_keys=True,ensure_ascii=False)
+        unique.setdefault(key,record)
+    records=sorted(unique.values(),key=lambda row:(row['time'],row.get('attempt') or 0),reverse=True)
+    counts={level:sum(row['level']==level for row in records) for level in ('info','warn','error','unknown')}
+    result={'rows':records[:limit],'counts':counts,'truncated':truncated or len(records)>limit,
+            'read_truncated':truncated,'display_truncated':len(records)>limit,'total':len(records)}
+    if include_all:result['_all_rows']=records
+    return result
+
+
+def decorate_usage_rows(rows,logs):
+    """One semantic projection for aggregation and every page; never changes billing."""
+    from .llm_templates import usage_level
+    by_id={};templates={};last={}
+    rank={'unknown':-1,'info':0,'warn':1,'error':2}
+    for evidence in logs:
+        request=evidence.get('request_id');group=evidence.get('group_id')
+        if evidence.get('used_template') and group:templates.setdefault(group,evidence)
+        if request and not evidence.get('used_template'):
+            previous=by_id.get(request)
+            if previous is None or rank.get(evidence.get('level'),-1)>rank.get(previous.get('level'),-1):
+                by_id[request]=evidence
+            if group:
+                candidate=(evidence.get('attempt') or 0,evidence.get('time') or '',request)
+                if candidate>last.get(group,(-1,'','')):last[group]=candidate
+    for row in rows:
+        prior={key:row[key] for key in ('level','tier','warning_threshold','semantic_status','semantic_category')
+               if key in row} if row.get('semantic_status')=='recorded' else {}
+        base=usage_level(row.get('event'),row.get('success'),row.get('completion') if row.get('usage_source')=='host_reported' or row.get('usage_present') is True else None,row.get('abandoned'))
+        # A successful host response says nothing about validation of its content.
+        if base['level']=='info' or (row.get('success') is None and not row.get('abandoned')):base['level']='unknown'
+        row.update(base,semantic_status='unrecorded')
+        match=by_id.get(row.get('request_id'))
+        if match:
+            row['semantic_status']='recorded'
+            if row.get('success') is not False and not row.get('abandoned'):row['level']=match.get('level','unknown')
+            for field in ('tier','warning_threshold'):
+                if match.get(field) is not None:row[field]=match[field]
+            row['semantic_category']=match.get('category','')
+            group=match.get('group_id')
+        else:
+            # Compatibility callers may decorate an already-projected page with a display fragment.
+            # Missing evidence in that fragment must not erase a previously recorded judgment.
+            row.update(prior)
+            group=row.get('generation_group_id')
+        template=templates.get(group)
+        if template and (template.get('request_id')==row.get('request_id') or
+                         (not template.get('request_id') and last.get(group,(-1,'',''))[2]==row.get('request_id'))):
+            row.update(used_template=True,template_name=template['template_name'],
+                       template_title=template['template_title'],fallback_reason=template['fallback_reason'])
+    return rows
+
+
+def usage_summary(data_dir,now,hours=24,*,include_rows=False):
     """按窗口聚合 LLM 账本：模型 / 子模块 / token 拆分 / 缓存 / 四桶。
 
     与 :meth:`core.llm_usage.LLMUsageTracker.summary` 保持同口径；这里额外保留
@@ -31,8 +115,14 @@ def usage_summary(data_dir,now,hours=24):
     event 映射。W-09 只增拆分覆盖率字段（``*_reported_calls`` / ``split_tokens`` /
     ``split_coverage``），不改 ``tokens`` 原语义。
     """
-    rows,truncated=tail_records(Path(data_dir)/'llm_usage_events.jsonl',2*1024*1024)
+    hours=max(1,min(720,int(hours)))
+    logs=generation_logs(data_dir,now,hours,include_all=True)
+    rows,truncated=tail_records(Path(data_dir)/'llm_usage_events.jsonl',2*1024*1024) if data_dir else ([],False)
+    decorate_usage_rows(rows,logs['_all_rows'])
+    level_counts={level:0 for level in ('info','warn','error','unknown')}
+    projected=[];schema1_calls=0
     models={};model_calls={};modules={};module_calls={};matrix={}
+    model_reported={};module_reported={};total_reported=0
     calls=unknown=0;tokens=verified_tokens=unverified_tokens=0
     prompt_total=completion_total=cache_hit_total=cache_miss_total=0
     # W-09（2026-11-03）只增字段：与 LLMUsageTracker.summary 同口径，记录多少行
@@ -40,17 +130,22 @@ def usage_summary(data_dir,now,hours=24):
     prompt_reported=completion_reported=cache_reported=0
     abandoned_calls=unknown_module_calls=0
     from .llm_usage import (module_of_event,usage_bucket_of,missing_usage_source,
-                            empty_buckets,reported_token_count,USAGE_TERMS,MODULE_UNKNOWN)
+                            empty_buckets,reported_token_count,USAGE_TERMS,MODULE_UNKNOWN,entry_module)
     # 四桶并列输出（2026-10-29 §2.2 口径）：正常回传/成功但无用量/失败/legacy（旧行）。
     buckets=empty_buckets()
     for row in rows:
         try:
             at=datetime.fromisoformat(str(row.get('ts','')))
             if at.tzinfo is None:at=at.replace(tzinfo=now.tzinfo)
+            elif now.tzinfo is None:at=at.replace(tzinfo=None)
             if not now-timedelta(hours=hours)<=at<=now:continue
             count=reported_token_count(row);model=str(row.get('model') or '未返回模型名')[:120]
-            calls+=1;tokens+=count
+            if (_usage_count(row.get('schema')) or 1)<2:schema1_calls+=1
+            calls+=1;tokens+=count;level_counts[row['level']]+=1
             bucket=usage_bucket_of(row);buckets[bucket]['calls']+=1;buckets[bucket]['tokens']+=count
+            available=row.get('usage_source')=='host_reported'
+            if available:total_reported+=1
+            buckets[bucket]['reported_calls']=buckets[bucket].get('reported_calls',0)+int(available)
             # 「缺少来源」改名「缺用量来源调用」：口径 = usage_source != host_reported
             # 或 usage_present 不为真（旧行无该字段 → 一律计入）。旧键名兼容输出，
             # 新键名并列给出，渲染端下一工作流切换。
@@ -59,16 +154,30 @@ def usage_summary(data_dir,now,hours=24):
             else:verified_tokens+=count
             models[model]=models.get(model,0)+count
             model_calls[model]=model_calls.get(model,0)+1
-            module=str(row.get('module') or '') or module_of_event(row.get('event'))
+            module=entry_module(row)
             if module==MODULE_UNKNOWN:unknown_module_calls+=1
             modules[module]=modules.get(module,0)+count
             module_calls[module]=module_calls.get(module,0)+1
-            cell=matrix.setdefault(module,{}).setdefault(model,{'calls':0,'tokens':0})
-            cell['calls']+=1;cell['tokens']+=count
-            prompt=_usage_count(row.get('prompt'))
-            completion=_usage_count(row.get('completion'))
-            cache_hit=_usage_count(row.get('cache_hit'))
-            cache_miss=_usage_count(row.get('cache_miss'))
+            cell=matrix.setdefault(module,{}).setdefault(model,{'calls':0,'tokens':0,'reported_calls':0})
+            cell['calls']+=1;cell['tokens']+=count;cell['reported_calls']+=int(available)
+            model_reported[model]=model_reported.get(model,0)+int(available)
+            module_reported[module]=module_reported.get(module,0)+int(available)
+            reported=row.get('usage_source')=='host_reported' or row.get('usage_present') is True
+            prompt=_usage_count(row.get('prompt')) if reported else None
+            completion=_usage_count(row.get('completion')) if reported else None
+            cache_hit=_usage_count(row.get('cache_hit')) if reported else None
+            cache_miss=_usage_count(row.get('cache_miss')) if reported else None
+            if include_rows:
+                item={key:row.get(key) for key in ('event','task_name','request_id','success','abandoned',
+                      'level','tier','warning_threshold','semantic_status','semantic_category','used_template',
+                      'template_name','template_title','fallback_reason')}
+                item['used_template']=row.get('used_template') is True
+                item.update(ts=at.isoformat(),module=module,model=str(row.get('model') or '')[:120],
+                            prompt=prompt,completion=completion,tokens=count,cache_hit=cache_hit,
+                            cache_miss=cache_miss,duration_ms=_usage_count(row.get('duration_ms')),
+                            attempts=_usage_count(row.get('attempts')),usage_present=row.get('usage_present') is True,
+                            usage_source=str(row.get('usage_source') or ''))
+                projected.append(item)
             if prompt is not None:prompt_total+=prompt;prompt_reported+=1
             if completion is not None:completion_total+=completion;completion_reported+=1
             if cache_hit is not None or cache_miss is not None:cache_reported+=1
@@ -76,9 +185,14 @@ def usage_summary(data_dir,now,hours=24):
             if cache_miss is not None:cache_miss_total+=cache_miss
             if row.get('abandoned') is True:abandoned_calls+=1
         except (ValueError,TypeError,OverflowError):continue
-    return {'calls':calls,'tokens':tokens,'models':dict(sorted(models.items(),key=lambda r:r[1],reverse=True)[:30]),
+    for bucket in buckets.values():bucket.setdefault('reported_calls',0)
+    return {'calls':calls,'tokens':tokens,'total_reported_calls':total_reported,
+            'model_reported_calls':model_reported,'module_reported_calls':module_reported,'models':dict(sorted(models.items(),key=lambda r:r[1],reverse=True)[:30]),
             'host_reported_tokens':verified_tokens,
             'modules':modules,'window_hours':hours,'truncated':truncated,
+            'semantic_evidence_truncated':logs['read_truncated'],
+            'has_usage':tokens>0,'window_start':(now-timedelta(hours=hours)).isoformat(timespec='seconds'),
+            'schema1_calls':schema1_calls,'rows':sorted(projected,key=lambda row:row['ts'],reverse=True),
             'missing_usage_source_calls':unknown,'missing_usage_source_tokens':unverified_tokens,
             'buckets':buckets,
             'prompt_tokens':prompt_total,'completion_tokens':completion_total,
@@ -90,6 +204,11 @@ def usage_summary(data_dir,now,hours=24):
             'split_coverage':(round((prompt_total+completion_total)/tokens,4) if tokens>0 else None),
             'model_calls':model_calls,'module_calls':module_calls,'matrix':matrix,
             'abandoned_calls':abandoned_calls,'unknown_module_calls':unknown_module_calls,
+            'level_counts':level_counts,'generation_logs':logs['rows'],
+            'generation_log_counts':logs['counts'],'generation_logs_truncated':logs['truncated'],
+            'generation_logs_read_truncated':logs['read_truncated'],
+            'generation_logs_display_truncated':logs['display_truncated'],'generation_logs_total':logs['total'],
+            'warning_thresholds':{'large':16000,'medium':10000,'small':4000},
             'terms':USAGE_TERMS,
             'note':'只统计宿主回传的Token；缺失时只计调用，不推算。调用次数包含失败。'}
 

@@ -1,0 +1,18 @@
+{
+  "event": "affection_daily_review",
+  "title": "关系日结保持不变",
+  "tier": "medium",
+  "format": "json",
+  "light": false,
+  "required": [
+    "delta_score"
+  ],
+  "kind": "affection_daily_review",
+  "ok": true,
+  "response": {
+    "delta_score": 0.0,
+    "impressions": [],
+    "tone": "",
+    "reason": ""
+  }
+}

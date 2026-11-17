@@ -7,7 +7,7 @@ if(window.maibot)document.documentElement.dataset.embedded='true';
 const $=id=>document.getElementById(id),NS='http://www.w3.org/2000/svg';
 const spec=[['energy','精力','↑ 更有活力','EN'],['hunger','饥饿','↑ 更饿','HU'],['focus','专注','↑ 更能集中','FO'],['stress','压力','↑ 更紧绷','ST'],['social_battery','社交电量','↑ 更愿意交流','SO']];
 const colors={energy:'--energy',hunger:'--hunger',focus:'--focus',stress:'--stress',social_battery:'--social',sleep_debt:'--debt',valence:'--energy',arousal:'--focus',dominance:'--stress'},labels=Object.fromEntries(spec.map(s=>[s[0],s[1]]));labels.sleep_debt='睡眠债';labels.valence='愉悦';labels.arousal='唤醒';labels.dominance='掌控';
-const selected=new Set(spec.map(s=>s[0]));let data=null,hours=24,usageHours=(()=>{try{const v=Number(localStorage.getItem('lbmUsageHours'));return [24,168,720].includes(v)?v:720}catch(e){return 720}})(),usageRowsLoaded=false,usageRowsAll=[],usageFilter="",usageParamSupported=true,busy=false,live=false,timer=null,failures=0,points=[],imported=false,zoom=null,selectedDay="",activeTab="now",requestSeq=0,lastSuccessAt=0,lastError="",freshnessTimer=null,importSeq=0;
+const selected=new Set(spec.map(s=>s[0]));let data=null,hours=24,emotionHours=24,emotionZoom=null,mediaColumns=estimateMediaColumns(),lastRequestedMediaLimit=0,mediaRefreshPending=false,mediaResizeTimer=null,usageHours=(()=>{try{const v=Number(localStorage.getItem('lbmUsageHours'));return [24,168,720].includes(v)?v:720}catch(e){return 720}})(),usageRowsLoaded=false,usageRowsAll=[],usageFilter="",usageParamSupported=true,busy=false,live=false,timer=null,failures=0,points=[],imported=false,zoom=null,selectedDay="",activeTab="now",requestSeq=0,lastSuccessAt=0,lastError="",freshnessTimer=null,importSeq=0;
 const num=v=>typeof v==='number'&&Number.isFinite(v)?v:null,pct=v=>num(v)===null?'—':Math.round(Math.max(0,Math.min(1,v))*100),fix=(v,d=1)=>num(v)===null?'—':v.toFixed(d),text=(id,s)=>{$(id).textContent=String(s??'—')};
 // 次数展示口径：有限非负整数及等价数字字符串（5 / 5.0 / "5.0"）→ 整数；null/空/非法 → —。
 // 不四舍五入业务值，非整数异常按缺失展示，不改底层值。
@@ -24,6 +24,30 @@ function minute(v){if(num(v)===null)return '—';const t=Math.floor(v),d=Math.fl
 // 数据侧 planning/time_utils.format_day_minute 已对 >=1440 的分钟能标「次日」；
 // 这里只兜住数据里仍用 0 点环表示跨午夜段的情形，不改业务值。
 function spanEnd(start,end){const s=num(start),e=num(end);return e===null?null:(s!==null&&e<s?e+1440:e)}
+// 纯显示名称：不修改活动原名、记录或模型输入。
+function displayActivityName(row,context={}){
+ const original=String(row?.name||context.fallback||'未命名活动'),kind=String(row?.goal_type||''),meta=row?.metadata||{};
+ const nap=(kind==='sleep'||kind==='rest'||kind==='daily_routine')&&(/午睡|午休|小憩|打盹|小睡/.test(original)||meta.kind==='nap');
+ if(nap)return '午休';
+ if(kind==='sleep'||(['daily_routine','rest',''].includes(kind)&&/睡觉|睡眠|安睡/.test(original)))return '晚安，世界';
+ if(kind!=='meal')return original;
+ let at=Number.isFinite(row?.actual_start_minute)?row.actual_start_minute:null;
+ if(at===null&&row?.started_at){
+  const raw=row.started_at,local=typeof raw==='string'?raw.match(/^\d{4}-\d{2}-\d{2}[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$/):null,instant=new Date(typeof raw==='number'&&Math.abs(raw)<1e11?raw*1000:raw);
+  if(local&&Number(local[1])<24&&Number(local[2])<60)at=Number(local[1])*60+Number(local[2]);
+  else if(Number.isFinite(+instant))try{const parts=new Intl.DateTimeFormat('en-GB',{timeZone:context.timezone||'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(instant);at=Number(parts.find(p=>p.type==='hour').value)*60+Number(parts.find(p=>p.type==='minute').value)}catch{}
+ }
+ if(at===null)at=Number.isFinite(row?.start_minute)?row.start_minute:Number.isFinite(row?.planned_start_minute)?row.planned_start_minute:null;
+ if(at===null)return original;
+ at=((at%1440)+1440)%1440;
+ return at>=300&&at<660?'早餐':at>=660&&at<900?'午餐':at>=900&&at<1260?'晚餐':'宵夜';
+}
+function activityNameNode(tag,cls,row,fallback){const node=el(tag,cls,displayActivityName(row,{timezone:data?.timezone,fallback}));if(row?.name){node.title='原名：'+row.name;node.dataset.originalName=row.name}return node}
+const ACTIVITY_ATTRIBUTE_I18N={zh:{'activity.watch_video':'刷视频','activity.browse_qq':'刷QQ'}};
+function activityAttributeBadges(row){const group=el('div','activity-attributes'),raw=Object.prototype.hasOwnProperty.call(row||{},'activity_attributes')?row.activity_attributes:row?.parameters?.activity_attributes??row?.metadata?.activity_attributes;
+ if(Array.isArray(raw))for(const key of ['watch_video','browse_qq'])if(raw.includes(key)){const token='activity.'+key,badge=el('span','rowbadge activity-attribute',ACTIVITY_ATTRIBUTE_I18N.zh[token]);badge.dataset.i18nKey=token;group.append(badge)}
+ group.hidden=!group.childElementCount;return group;
+}
 function empty(target,title,desc){const box=el('div','empty');box.append(el('strong','',title),el('span','note',desc));target.replaceChildren(box)}
 function notice(message,error=false){$('notice').hidden=!message;$('notice').classList.toggle('error',error);text('notice',message)}
 function connection(label,status=''){$('connection').className='status '+status;text('connection-label',label)}
@@ -32,7 +56,7 @@ for(const[key,label,direction,code]of spec){const card=el('article','card maibot
 function trendFor(key){const rows=(lifeSeries().points||[]).filter(p=>!p.estimated&&num(p[key])!==null);if(rows.length<2)return null;const a=rows[rows.length-2],b=rows[rows.length-1];return {d:num(b[key])-num(a[key]),at:b.at}}
 function assess(key,value){if(num(value)===null)return '状态暂不可用';const levels={energy:[[.15,'精疲力竭'],[.35,'有些疲惫'],[.65,'精力尚可'],[.85,'精力充沛'],[2,'活力十足']],hunger:[[.25,'不太饿'],[.5,'稍有饥饿'],[.7,'有些饿了'],[.85,'很饿'],[2,'需要进食']],focus:[[.15,'注意力涣散'],[.35,'难以集中'],[.6,'专注一般'],[.85,'专注良好'],[2,'高度专注']],stress:[[.15,'很放松'],[.35,'比较平静'],[.6,'有些紧绷'],[.8,'压力较高'],[2,'压力很高']],social_battery:[[.15,'更想独处'],[.35,'社交电量偏低'],[.65,'愿意交流'],[.85,'社交电量充足'],[2,'交流意愿很高']]};return levels[key].find(([limit])=>Math.max(0,Math.min(1,value))<limit)[1]}
 function render(){const s=data.state||{},sch=data.schedule||{},cur=sch.current,co=data.companion||{};connection(imported?'离线快照':data.stale||data.warnings?.length?'已连接 · 留意数据':'实时连接',imported||data.stale||data.warnings?.length?'warn':'live');const updatedLabel=(imported?'快照时间 ':'更新于 ')+clock(data.generated_at,true)+' · '+(data.timezone||'');text('updated',updatedLabel);$('updated').title=updatedLabel;
-text('current-kind',cur?(cur.goal_type==='sleep'?(data.sleep?.current?.asleep?'睡眠中':'准备入睡'):'进行中'):sch.enabled?(sch.runtime_ready?'空闲':'未就绪'):'未启用');text('current-name',cur?.name||(sch.enabled?(sch.runtime_ready?'此刻空闲':'生活日程正在准备'):'日程未启用'));const meta=$('current-meta');meta.replaceChildren();if(cur){
+text('current-kind',cur?(cur.goal_type==='sleep'?(data.sleep?.current?.asleep?'睡眠中':'准备入睡'):'进行中'):sch.enabled?(sch.runtime_ready?'空闲':'未就绪'):'未启用');text('current-name',(cur?displayActivityName(cur,{timezone:data?.timezone}):'')||(sch.enabled?(sch.runtime_ready?'此刻空闲':'生活日程正在准备'):'日程未启用'));$('current-name').title=cur?.name?'原名：'+cur.name:'';const meta=$('current-meta');meta.replaceChildren();if(cur){meta.append(activityAttributeBadges(cur));
  // W-08 时间语义（2026-11-03）：计划结束时间消费后端 planned_end_minute（跨午夜由
  // spanEnd 补次日；后端 _row 另给 time_label 供详情层展示），进度基准注明「按本轮
  // 活动」，让 34% 之类的分母可解释——不去掩饰与日意图时段的差异。
@@ -70,8 +94,35 @@ function renderQzoneVideoChips(){const box=$('qzone-video-chips');if(!box)return
 // 核心页（初始化）：解析状态视图 + 输出原文视图。data.init 来自 planning/dashboard._init_summary
 // （registry 解析状态为唯一真源；raw 原文来自 init_last_report.json 逐字段合并）。零模型调用。
 function coreBadge(f){if(f.initialized)return['已初始化','ok'];if(num(f.attempts)>0)return['失败 '+count(f.attempts)+' 次','bad'];return['待初始化','pending']}
+// init 运行结果状态 → 中文（auto_init.FieldOutcome.status 与 StageResult.status 的并集；
+// 未知值原样展示，不猜译）。
+const CORE_RAW_STATUS={success:'成功',failed:'失败',backoff:'退避',blocked:'跳过',skipped:'跳过'};
+// 小时数展示：保留一位小数、整数不带 .0（睡眠债/联系锚点同口径）。
+const coreHours=v=>num(v)===null?'—':String(Math.round(v*10)/10);
 const CORE_FIELD_AFFECTS={emotion:'心情与情绪表达：语气、分享欲与情绪驱动的反应',events:'活动事件库：日程能安排哪些活动',state_sleep:'生活状态与作息：精力/饥饿/专注等状态与睡眠恢复',frequency:'主动频率：bot 主动找你/回复的频繁程度',video_interest:'视频兴趣：看什么视频与兴趣话题',companion_disposition:'联系倾向：主动联系的时机与想念表达',activity_preferences:'日程偏好：活动排序与休闲/社交等倾向'};
 function coreSummaryText(d){const i=d?.init;if(!i||!i.available)return '初始化数据暂不可用';return `已初始化 ${i.summary?.initialized??0}/${i.summary?.total??0} 字段`}
+// 外部字段卡片的人话摘要：只消费后端 _init_field_data 已聚合的 summary，不重算业务值。
+// 单位与后端一致：sleep_debt/anchor_hours 为小时，loneliness 0–1，增益/衰减为倍率。
+// 产物缺失给含蓄提示而非空白；数字缺失按既有 count/fix 口径展示 —。
+function coreFieldBrief(f){
+ const d=f.data||{},s=d.summary||{},box=el('div','core-field-summary');
+ if(!d.exists){box.append(el('span','note','初始化产物尚未生成，完成后这里会补充摘要。'));return box}
+ const lines=[];
+ switch(f.field){
+  case 'events':lines.push('事件 '+count(s.event_count)+' 条');break;
+  case 'video_interest':lines.push('关键词 '+count(s.keyword_count)+' 个');break;
+  case 'state_sleep':lines.push('睡眠债 '+coreHours(s.sleep_debt)+' h');break;
+  case 'companion_disposition':lines.push('锚点 '+coreHours(s.anchor_hours)+'h · 孤独感 '+(num(s.loneliness)===null?'—':s.loneliness.toFixed(2)));break;
+  case 'activity_preferences':lines.push('活动 '+count(s.activity_count)+' · 特质 '+count(s.trait_count));break;
+  case 'emotion':{
+   if(s.persona_digest){const dg=el('span','core-field-digest','人设 · '+s.persona_digest);dg.title=s.persona_digest;box.append(dg)}
+   lines.push('增益 '+fix(s.positive_gain,2)+' · 衰减 '+fix(s.negative_decay,2));break}
+  case 'frequency':lines.push(s.target_frequency_always_one===false?'配置项 · 目标频率随校准变化':'配置项 · 目标频率恒为 1');break;
+ }
+ if(!lines.length&&!box.childElementCount){box.append(el('span','note','产物已就位，摘要待补充。'));return box}
+ for(const t of lines)box.append(el('span','',t));
+ return box;
+}
 function renderCore(){
  const init=data?.init,setT=(id,v)=>{const e=$(id);if(e)e.textContent=String(v??'—')};
  if(!init||!init.available){
@@ -94,6 +145,7 @@ function renderCore(){
   const [badgeText,cls]=coreBadge(f),card=el('article','core-field '+cls),head=el('div','core-field-head');
   head.append(el('h3','',f.label||f.field),el('span','pill '+cls,badgeText));card.append(head);
   if(CORE_FIELD_AFFECTS[f.field])card.append(el('div','core-field-affects',CORE_FIELD_AFFECTS[f.field]));
+  card.append(coreFieldBrief(f));
   const meta=el('div','core-field-meta');meta.append(el('span','note','尝试 '+count(f.attempts)+' 次'));
   if(f.validated_at)meta.append(el('span','note','校验 '+clock(f.validated_at,true)));
   card.append(meta);
@@ -131,7 +183,25 @@ function renderCoreDetails(init,fields,modules){
    block.append(meta);
    if(d.summary&&Object.keys(d.summary).length)block.append(el('pre','core-raw-pre',JSON.stringify(d.summary,null,2)));
    if(d.preview)block.append(el('pre','core-raw-pre',d.preview));
-   if(f.raw&&f.raw.message){block.append(el('div','core-raw-label','最近运行'));block.append(el('pre','core-raw-pre',f.raw.message))}
+   // 原始输出完整展示：message 之外，errors/details 非空也要可见；
+   // status/stage_status/run_at 作为元信息行（后端 _init_summary 逐字段合并自 init_last_report）。
+   const r=f.raw;
+   if(r){
+    const errs=Array.isArray(r.errors)?r.errors.filter(Boolean):[];
+    const det=r.details&&typeof r.details==='object'&&!Array.isArray(r.details)?r.details:null;
+    const detKeys=det?Object.keys(det):[];
+    if(r.message||errs.length||detKeys.length||r.status||r.stage_status||r.run_at){
+     block.append(el('div','core-raw-label','最近运行'));
+     const rmeta=el('div','core-field-meta');
+     if(r.status)rmeta.append(el('span','note','状态 '+(CORE_RAW_STATUS[r.status]||r.status)));
+     if(r.stage_status)rmeta.append(el('span','note','阶段 '+(CORE_RAW_STATUS[r.stage_status]||r.stage_status)));
+     if(r.run_at)rmeta.append(el('span','note','运行 '+clock(r.run_at,true)));
+     if(rmeta.childElementCount)block.append(rmeta);
+     if(r.message)block.append(el('pre','core-raw-pre',r.message));
+     if(errs.length){block.append(el('div','core-raw-label','报错原文'));block.append(el('pre','core-raw-pre core-raw-err',errs.join('\n')))}
+     if(detKeys.length){block.append(el('div','core-raw-label','运行明细'));block.append(el('pre','core-raw-pre',JSON.stringify(det,null,2)))}
+    }
+   }
    return block}));
  const md=$('core-modules-detail');if(md)md.replaceChildren(...modules.map(m=>{
    const row=el('div','core-module-row'),left=el('div','core-module-name');
@@ -148,10 +218,14 @@ function renderCoreDetails(init,fields,modules){
 function mountCoreFish(){
  if(typeof SectionFish==='undefined'||!SectionFish.mount)return;
  const F=SectionFish;
+ // 四个核心详情容器在模板里带 hidden（挂载前防闪现）；fold() 只搬运不去 hidden，
+ // 移入详情弹层后整块不可见——折叠前统一去掉。只处理这四个静态容器：
+ // schedule-pool-detail 的 hidden 由 renderSchedulePage 动态管理，不在此列。
+ for(const id of ['core-status-detail','core-fields-detail','core-modules-detail','core-logs-detail']){const n=$(id);if(n)n.hidden=false}
  F.mount('core-status','初始化状态',$('core-status-box'),d=>coreSummaryText(d),d=>[['登记版本',d?.init?.plugin_version||'—',''],['最近运行',d?.init?.last_run_at?clock(d.init.last_run_at,true):'—','']],[F.fold('登记与预检原文',[$('core-status-detail')])]);
  F.mount('core-fields','初始化字段',$('core-fields-box'),d=>coreSummaryText(d),()=>[['数据来源','init_registry.json + 数据目录产物','只读，不依赖 init 运行。']],[F.fold('各字段初始化产物原文',[$('core-fields-detail')])]);
  F.mount('core-modules','各模块状态',$('core-modules-box'),d=>`${(d?.init?.modules||[]).length} 个模块`,()=>[['状态来源','配置投影','']],[F.fold('模块状态明细',[$('core-modules-detail')])]);
- F.mount('core-logs','模块日志',$('core-logs-box'),d=>{const m=d?.init?.modules||[];const e=m.reduce((a,x)=>a+(num(x.error_count)||0),0);return e?`${e} 条模块报错`:'最近日志无模块报错'},()=>[['口径','bounded 日志尾 · 按 module 聚合','只展示有界尾片段。']],[F.fold('具体报错记录',[$('core-logs-detail')])]);
+ F.mount('core-logs','模块日志',$('core-logs-box'),d=>{const m=d?.init?.modules||[];const e=m.reduce((a,x)=>a+(num(x.error_count)||0),0);return e?`${e} 条模块报错`:'最近日志无模块报错'},()=>[['口径','有界日志尾 · 按模块聚合','只展示有界尾片段。']],[F.fold('具体报错记录',[$('core-logs-detail')])]);
 }
 
 function dayView(){return data?.day?.available&&data.day.date===selectedDay?data.day:null}
@@ -189,29 +263,30 @@ function sleepChartSegments(day){
  return out;
 }
 function chart(target,rows,keys,max=1,height=260,min=0){
- target.replaceChildren();const day=dayView(),sleepSegments=sleepChartSegments(day);
- const dayBounds=selectedDay&&day? [Number(date(day.window_start)),Number(date(day.window_end))]:null;
+ target.replaceChildren();const moodChart=target.id==='emotion-history-chart',chartZoom=moodChart?emotionZoom:zoom,chartHours=moodChart?emotionHours:hours,dayScoped=!moodChart&&Boolean(selectedDay);
+ const day=moodChart?null:dayView(),sleepSegments=sleepChartSegments(day);
+ const dayBounds=dayScoped&&day? [Number(date(day.window_start)),Number(date(day.window_end))]:null;
  if(!rows.length&&!sleepSegments.length){empty(target,'还没有这段时间的记录','真实采样到来后，曲线会在这里慢慢展开。');return}
  if(!keys.length){empty(target,'曲线已隐藏','点击图例选择想看的状态。');return}
  const w=Math.max(280,Math.min(1100,target.clientWidth||1000)),l=38,r=18,top=22,bottom=52;
  const nowMs=Number(date(data?.generated_at));
- let t0=zoom?.[0]??dayBounds?.[0]??Number(date(rows[0]?.at)),t1=zoom?.[1]??dayBounds?.[1]??Number(date(rows.at(-1)?.at));
+ let t0=chartZoom?.[0]??dayBounds?.[0]??Number(date(rows[0]?.at)),t1=chartZoom?.[1]??dayBounds?.[1]??Number(date(rows.at(-1)?.at));
  // 行内没有点（离线/睡眠尾段）时不再取到 NaN：回退到睡眠段边界或当前统计窗口。
  if(!rows.length){
-  const winStart=Number.isFinite(nowMs)?nowMs-hours*3600000:-Infinity;
-  const bands=sleepSegments.filter(segment=>selectedDay||!Number.isFinite(nowMs)||(segment.end>=winStart&&segment.start<=nowMs));
+  const winStart=Number.isFinite(nowMs)?nowMs-chartHours*3600000:-Infinity;
+  const bands=sleepSegments.filter(segment=>dayScoped||!Number.isFinite(nowMs)||(segment.end>=winStart&&segment.start<=nowMs));
   if(bands.length){
    t0=Math.max(Math.min(...bands.map(segment=>segment.start)),winStart);
    t1=Math.min(Math.max(...bands.map(segment=>segment.end)),Number.isFinite(nowMs)?nowMs:Infinity);
   }
   if(!Number.isFinite(t0)||!Number.isFinite(t1)||t1<=t0){
-   if(Number.isFinite(nowMs)){t1=nowMs;t0=nowMs-hours*3600000}else{t0=0;t1=1}
+   if(Number.isFinite(nowMs)){t1=nowMs;t0=nowMs-chartHours*3600000}else{t0=0;t1=1}
   }
  }else if(!Number.isFinite(t0)||!Number.isFinite(t1)||t1<=t0)t1=t0+300000;
  // 睡眠段可延伸到最后一个真实点之后（离线尾段）：只在未缩放/未选日时扩到段尾，
  // 且限制在当前 hours 窗口内，避免把 7 天前的离线会话拉进 24h 图。
- if(sleepSegments.length&&!zoom&&!dayBounds&&Number.isFinite(nowMs)){
-  const winStart=nowMs-hours*3600000;
+ if(sleepSegments.length&&!chartZoom&&!dayBounds&&Number.isFinite(nowMs)){
+  const winStart=nowMs-chartHours*3600000;
   for(const segment of sleepSegments){
    if(segment.end<winStart||segment.start>nowMs)continue;
    const bandStart=Math.max(segment.start,winStart),bandEnd=Math.min(segment.end,nowMs);
@@ -220,14 +295,14 @@ function chart(target,rows,keys,max=1,height=260,min=0){
   }
  }
  const lastRow=rows.at(-1),tailSleeping=Boolean(lastRow&&(lastRow.sleeping===true||lastRow.frozen===true));
- if(tailSleeping&&!zoom&&!dayBounds&&Number.isFinite(nowMs)&&nowMs>t1)t1=nowMs;
+ if(tailSleeping&&!chartZoom&&!dayBounds&&Number.isFinite(nowMs)&&nowMs>t1)t1=nowMs;
  const span=Math.max(300000,t1-t0),x=t=>l+(t-t0)/span*(w-l-r),y=v=>height-bottom-Math.max(0,Math.min(1,(v-min)/(max-min)))*(height-top-bottom),step=document.documentElement.dataset.dashboardStyle==='millennium';
  const root=svg('svg',{viewBox:`0 0 ${w} ${height}`,role:'img',tabindex:'0','aria-label':min<0?'情绪 VAD 趋势，纵轴 −1 到 1':max===1?'生活状态趋势，纵轴百分比，拖动或双指缩放；按 Escape 重置':'睡眠债趋势，纵轴小时'});
  // PR-UI-DETAIL（3.17.21）§1C：VAD（min<0）为事件驱动不规则采样，>15min 间隔是常态而非缺测。
  const sparseVad=min<0;
  // S2-6/3.17.33：只有可见的「心情变化」图强制实线；生活状态/睡眠债/隐藏 VAD 图保持原口径。
  const solidMood=target.id==='emotion-history-chart';
- const chartTitle=solidMood?'实线为真实观察，缺口直接连线；圆点为真实采样点；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':sparseVad?'实线为真实观察；圆点为真实采样点；点线为采样缺口连线（两端真实，未插入估算点）；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':'实线为真实观察；虚线为中间缺口估算；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。';
+ const chartTitle=solidMood?'实线为真实观察，缺口直接连线；悬停或轻点查看真实采样点与数值；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':sparseVad?'实线为真实观察；圆点为真实采样点；点线为采样缺口连线（两端真实，未插入估算点）；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。':'实线为真实观察；虚线为中间缺口估算；斜纹为离线睡眠估算。拖动选择、双指缩放，Escape 或双击重置。';
  root.style.userSelect='none';root.append(svg('title',{},chartTitle));
  const clipId=target.id+'-clip',hatchId=target.id+'-hatch',defs=svg('defs'),clip=svg('clipPath',{id:clipId});clip.append(svg('rect',{x:l,y:top,width:w-l-r,height:height-top-bottom}));defs.append(clip);
  const hatch=svg('pattern',{id:hatchId,patternUnits:'userSpaceOnUse',width:8,height:8,patternTransform:'rotate(45)'});hatch.append(svg('line',{x1:0,y1:0,x2:0,y2:8,stroke:'var(--focus)','stroke-width':2,opacity:.18}));defs.append(hatch);root.append(defs);
@@ -241,7 +316,7 @@ function chart(target,rows,keys,max=1,height=260,min=0){
  root.append(under);
  for(let i=0;i<=4;i++){const yy=y(min+(max-min)*i/4);root.append(svg('line',{x1:l,x2:w-r,y1:yy,y2:yy,stroke:'var(--maibot-border)','stroke-width':step?1.5:.8,'stroke-dasharray':step?'none':'3 3'}),svg('text',{x:l-9,y:yy+4,'text-anchor':'end',fill:'var(--maibot-muted)','font-size':11},min===0&&max===1?i*25:Number((min+(max-min)*i/4).toFixed(2))))}
  root.append(svg('line',{x1:l,x2:l,y1:top,y2:height-bottom,stroke:'var(--maibot-border)'}),svg('line',{x1:l,x2:w-r,y1:height-bottom,y2:height-bottom,stroke:'var(--maibot-border)'}));
- const ticks=w<600?4:7;for(let i=0;i<ticks;i++){const at=t0+span*i/(ticks-1),xx=x(at),yy=height-bottom+15;root.append(svg('text',{x:xx,y:yy,transform:`rotate(-35 ${xx} ${yy})`,'text-anchor':'end',fill:'var(--maibot-muted)','font-size':11},clock(new Date(at).toISOString(),!selectedDay&&hours>24)))}
+ const ticks=w<600?4:7;for(let i=0;i<ticks;i++){const at=t0+span*i/(ticks-1),xx=x(at),yy=height-bottom+15;root.append(svg('text',{x:xx,y:yy,transform:`rotate(-35 ${xx} ${yy})`,'text-anchor':'end',fill:'var(--maibot-muted)','font-size':11},clock(new Date(at).toISOString(),!dayScoped&&chartHours>24)))}
  const curves=svg('g',{'clip-path':`url(#${clipId})`});
  const downsampled=solidMood?true:((target.id==='vad-chart'||target.id==='emotion-history-chart')?vadSeries().downsampled:lifeSeries().downsampled);
  // 心情图：相邻真实采样点之间直接连实线——不因 gap_before / >15min 间隔断开（不改原数组）。
@@ -270,7 +345,7 @@ function chart(target,rows,keys,max=1,height=260,min=0){
     if(prevP&&(p.gap_before||(!downsampled&&Number(date(p.at))-Number(date(prevP.at))>900000)))edges.push(`M${x(Number(date(prevP.at)))} ${y(prevP[key])}L${x(Number(date(p.at)))} ${y(p[key])}`);
     prevP=p}
    if(edges.length&&!solidMood){const bridge=svg('path',{d:edges.join(''),fill:'none',stroke:`var(${colors[key]})`,'stroke-width':1.5,'stroke-dasharray':'2 4',opacity:.6,'data-gap-bridge':key});bridge.append(svg('title',{},'采样缺口连线：两端均为真实观察，未插入估算点'));curves.append(bridge)}
-   for(const p of rows){if(p.estimated||num(p[key])===null)continue;const dot=svg('circle',{cx:x(Number(date(p.at))),cy:y(p[key]),r:2.5,fill:`var(${colors[key]})`,'data-real-point':key});dot.append(svg('title',{},clock(p.at,true)+' · 真实观察'));curves.append(dot)}
+   for(const p of (solidMood?[]:rows)){if(p.estimated||num(p[key])===null)continue;const dot=svg('circle',{cx:x(Number(date(p.at))),cy:y(p[key]),r:2.5,fill:`var(${colors[key]})`,'data-real-point':key});dot.append(svg('title',{},clock(p.at,true)+' · 真实观察'));curves.append(dot)}
   }
   if(!sparseVad&&rows.length===1&&num(rows[0][key])!==null)curves.append(svg('circle',{cx:x(Number(date(rows[0].at))),cy:y(rows[0][key]),r:3,fill:`var(${colors[key]})`}))
  }
@@ -278,24 +353,26 @@ function chart(target,rows,keys,max=1,height=260,min=0){
  // A bounded set of actual episode boundaries, using their own calendar date.
  if(target.id==='history-chart')for(const ep of (dayRows().episodes||[]).slice(-24)){
   if(num(ep.actual_start_minute)===null)continue;const at=zonedMidnight(ep.schedule_date||selectedDay||data.schedule.date||dayText(data.generated_at))+ep.actual_start_minute*60000;if(at<t0||at>t1)continue;
-  const xx=x(at),g=svg('g',{'data-activity-boundary':'true'});g.append(svg('line',{x1:xx,x2:xx,y1:top+12,y2:height-bottom,stroke:'var(--maibot-muted)','stroke-dasharray':'2 5',opacity:.25}),svg('text',{x:xx,y:top-7,'text-anchor':'middle','font-size':12,fill:'var(--maibot-muted)'},ep.goal_type==='sleep'?'☾':'▴'),svg('title',{},`${ep.name||'活动开始'} · ${minute(ep.actual_start_minute)}`));root.append(g)
+  const xx=x(at),g=svg('g',{'data-activity-boundary':'true'});g.append(svg('line',{x1:xx,x2:xx,y1:top+12,y2:height-bottom,stroke:'var(--maibot-muted)','stroke-dasharray':'2 5',opacity:.25}),svg('text',{x:xx,y:top-7,'text-anchor':'middle','font-size':12,fill:'var(--maibot-muted)'},ep.goal_type==='sleep'?'☾':'▴'),svg('title',{},`${displayActivityName(ep,{timezone:data?.timezone,fallback:'活动开始'})} · ${minute(ep.actual_start_minute)}`));root.append(g)
  }
  const nowAt=Number(date(data.generated_at));if(nowAt>=t0&&nowAt<=t1){const xx=x(nowAt);root.append(svg('line',{x1:xx,x2:xx,y1:top,y2:height-bottom,stroke:'var(--maibot-primary)','stroke-width':1,'stroke-dasharray':'4 3','data-now':'true'}),svg('text',{x:Math.max(l+24,Math.min(w-r-12,xx-4)),y:top-7,'text-anchor':'end',fill:'var(--maibot-primary)','font-size':10},'当前快照'))}
- const cross=svg('line',{x1:l,x2:l,y1:top,y2:height-bottom,stroke:'var(--maibot-muted)','stroke-dasharray':'3 3',visibility:'hidden'}),brush=svg('rect',{x:l,y:top,width:0,height:height-top-bottom,fill:'var(--maibot-primary)',opacity:.12,visibility:'hidden'});root.append(cross,brush);target.append(root);
+ const hoverPoints=svg('g',{'data-hover-points':'true',visibility:'hidden'});if(moodChart)for(const key of keys)hoverPoints.append(svg('circle',{r:3.5,fill:`var(${colors[key]})`,'data-hover-point':key}));root.append(hoverPoints);
+ const cross=svg('line',{'data-hover-cursor':'true',x1:l,x2:l,y1:top,y2:height-bottom,stroke:'var(--maibot-muted)','stroke-dasharray':'3 3',visibility:'hidden'}),brush=svg('rect',{x:l,y:top,width:0,height:height-top-bottom,fill:'var(--maibot-primary)',opacity:.12,visibility:'hidden'});root.append(cross,brush);target.append(root);
  const tip=el('div','tooltip');tip.hidden=true;target.append(tip);let drag=null;const pointers=new Map();let pinch=null;
  const coordinate=e=>{const b=root.getBoundingClientRect();return Math.max(l,Math.min(w-r,(e.clientX-b.left)/b.width*w))};
- function applyZoom(a,b){if(b-a<300000)return;zoom=[Math.max(t0,a),Math.min(t1,b)];$('zoom-reset').hidden=false;drawHistory()}
+ function applyZoom(a,b){if(b-a<300000)return;const next=[Math.max(t0,a),Math.min(t1,b)];if(moodChart){emotionZoom=next;renderEmotionHistory()}else{zoom=next;$('zoom-reset').hidden=false;drawHistory()}}
+ const resetChartZoom=()=>moodChart?resetEmotionZoom():resetZoom();
  root.onpointermove=e=>{const box=root.getBoundingClientRect(),pos=coordinate(e),at=t0+(pos-l)/(w-l-r)*span;if(pointers.has(e.pointerId))pointers.set(e.pointerId,pos);
   if(pinch&&pointers.size>=2){e.preventDefault();return}
   if(drag!==null){brush.setAttribute('x',Math.min(drag,pos));brush.setAttribute('width',Math.abs(pos-drag));brush.setAttribute('visibility','visible');return}
-  if(!rows.length)return;const p=rows.reduce((best,item)=>Math.abs(Number(date(item.at))-at)<Math.abs(Number(date(best.at))-at)?item:best,rows[0]),xx=x(Number(date(p.at)));cross.setAttribute('x1',xx);cross.setAttribute('x2',xx);cross.setAttribute('visibility','visible');tip.replaceChildren(el('strong','',clock(p.at,true)+(p.estimated?' · 估算':' · 真实观察')),...keys.map(k=>el('div','',`${labels[k]} ${min<0?fix(p[k],2):max===1?pct(p[k])+'%':fix(p[k])+'h'}`)));tip.hidden=false;tip.style.left=Math.max(0,Math.min(box.width-190,e.clientX-box.left+12))+'px';tip.style.top='8px'
+  if(!rows.length)return;const p=rows.reduce((best,item)=>Math.abs(Number(date(item.at))-at)<Math.abs(Number(date(best.at))-at)?item:best,rows[0]),xx=x(Number(date(p.at)));cross.setAttribute('x1',xx);cross.setAttribute('x2',xx);cross.setAttribute('visibility','visible');if(moodChart){hoverPoints.setAttribute('visibility','visible');for(const dot of hoverPoints.children){const key=dot.dataset.hoverPoint;dot.setAttribute('cx',xx);dot.setAttribute('cy',y(p[key]));dot.setAttribute('visibility',num(p[key])===null?'hidden':'visible')}}tip.replaceChildren(el('strong','',clock(p.at,true)+(p.estimated?' · 估算':' · 真实观察')),...keys.map(k=>el('div','',`${labels[k]} ${min<0?fix(p[k],2):max===1?pct(p[k])+'%':fix(p[k])+'h'}`)));tip.hidden=false;tip.style.left=Math.max(0,Math.min(box.width-190,e.clientX-box.left+12))+'px';tip.style.top='8px'
  };
- root.onpointerleave=()=>{tip.hidden=true;cross.setAttribute('visibility','hidden')};
- root.onpointerdown=e=>{if(e.button!==0&&e.pointerType!=='touch')return;pointers.set(e.pointerId,coordinate(e));root.setPointerCapture(e.pointerId);tip.hidden=true;if(pointers.size===2){const vals=[...pointers.values()];pinch={distance:Math.abs(vals[1]-vals[0]),middle:(vals[1]+vals[0])/2};drag=null}else if(e.pointerType!=='touch')drag=coordinate(e)};
+ root.onpointerleave=e=>{if(moodChart&&e.pointerType==='touch')return;tip.hidden=true;cross.setAttribute('visibility','hidden');hoverPoints.setAttribute('visibility','hidden')};
+ root.onpointerdown=e=>{if(e.button!==0&&e.pointerType!=='touch')return;pointers.set(e.pointerId,coordinate(e));root.setPointerCapture(e.pointerId);tip.hidden=true;hoverPoints.setAttribute('visibility','hidden');if(pointers.size===2){const vals=[...pointers.values()];pinch={distance:Math.abs(vals[1]-vals[0]),middle:(vals[1]+vals[0])/2};drag=null}else if(e.pointerType!=='touch')drag=coordinate(e)};
  root.onpointerup=e=>{if(pinch&&pointers.size>=2){const vals=[...pointers.values()],factor=pinch.distance/Math.max(12,Math.abs(vals[1]-vals[0])),center=t0+(pinch.middle-l)/(w-l-r)*span;pointers.clear();pinch=null;applyZoom(center-span*factor/2,center+span*factor/2);return}
-  pointers.delete(e.pointerId);if(drag===null)return;const end=coordinate(e),first=drag;drag=null;brush.setAttribute('visibility','hidden');if(Math.abs(end-first)>12)applyZoom(t0+(Math.min(first,end)-l)/(w-l-r)*span,t0+(Math.max(first,end)-l)/(w-l-r)*span)
+  pointers.delete(e.pointerId);if(drag===null){if(moodChart&&e.pointerType==='touch')root.onpointermove(e);return;}const end=coordinate(e),first=drag;drag=null;brush.setAttribute('visibility','hidden');if(Math.abs(end-first)>12)applyZoom(t0+(Math.min(first,end)-l)/(w-l-r)*span,t0+(Math.max(first,end)-l)/(w-l-r)*span)
  };
- root.onpointercancel=()=>{drag=null;pinch=null;pointers.clear();brush.setAttribute('visibility','hidden')};root.ondblclick=resetZoom;root.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();resetZoom()}};
+ root.onpointercancel=()=>{drag=null;pinch=null;pointers.clear();brush.setAttribute('visibility','hidden')};root.ondblclick=resetChartZoom;root.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();resetChartZoom()}};
 }
 
 // W-15：zoom 状态由 drawHistory 消费；睡眠债/VAD 图各自在所属 tab 激活时（activateTab
@@ -307,28 +384,17 @@ function renderSamples(){const wrap=$('samples');if(!points.length){empty(wrap,'
  // W-11：口径可见——表格固定展示最近 60 条，说明行写明当前筛选范围的总点数。
  const colh=t=>{const h=el('th','',t);h.setAttribute('scope','col');return h};
  const table=el('table','maibot-table'),head=el('tr'),thead=el('thead'),body=el('tbody');for(const label of['采样时间',...spec.map(s=>s[1]),'睡眠债','来源'])head.append(colh(label));thead.append(head);for(const p of points.slice(-60).reverse()){const row=el('tr');row.append(el('td','',clock(p.at,true)));for(const[k]of spec)row.append(el('td','',pct(p[k])));row.append(el('td','',fix(p.sleep_debt)+'h'),el('td','',(p.estimated?'估算 · 中间缺口':({start:'启动观察',tick:'生活采样',sleep:'睡眠采样',episode:'活动边界',wake:'醒来结算',sleep_settlement:'睡眠结算'}[p.reason]||'状态观察'))));body.append(row)}table.append(thead,body);wrap.replaceChildren(el('p','note',`显示最近 60 条 · 当前范围共 ${points.length} 点`),table)}
-// 历史心情变化（PR-FIXED-CHROME 3.17.15，规格§1G）：VAD 曲线复用 chart()+vadSeries()
-// （data.emotion.history.points，量程 −1..1），跟随历史页 range（hours）/zoom/selectedDay
-// （与 history-chart 同口径，经 drawHistory 挂入既有重渲染链）。情绪不可用/旧快照无
-// emotion.history → 空态「暂无心情记录」降级，不报错。此刻页 vad-chart 保留不动。
-function emotionHistoryPoints(){const series=vadSeries(),all=Array.isArray(series.points)?series.points.filter(p=>date(p.at)):[],end=date(data?.generated_at);
- let rows=all.filter(p=>selectedDay||!end||(+date(p.at)>=+end-hours*3600000&&+date(p.at)<=+end));
- if(zoom)rows=rows.filter(p=>+date(p.at)>=zoom[0]&&+date(p.at)<=zoom[1]);return {rows,downsampled:series.downsampled}}
+// 心情与状态使用独立范围/缩放；日历日期筛选仅用于状态与日程。
+function emotionHistoryPoints(){const series=data?.emotion?.history||{},all=Array.isArray(series.points)?series.points.filter(p=>date(p.at)):[],end=date(data?.generated_at);
+ let rows=all.filter(p=>!end||(+date(p.at)>=+end-emotionHours*3600000&&+date(p.at)<=+end));
+ if(emotionZoom)rows=rows.filter(p=>+date(p.at)>=emotionZoom[0]&&+date(p.at)<=emotionZoom[1]);return {rows,downsampled:series.downsampled}}
+function resetEmotionZoom(){emotionZoom=null;renderEmotionHistory()}
 function renderEmotionHistory(){const target=$('emotion-history-chart');if(!target)return;const {rows,downsampled}=emotionHistoryPoints();
- if(!rows.length){empty(target,'暂无心情记录','情绪记录就绪后，愉悦/唤醒/掌控曲线会在这里展开。');text('emotion-history-info','暂无心情记录');renderEmotionSamples([]);return}
+ text('emotion-history-caption',`最近 ${emotionHours} 小时 · 愉悦 / 唤醒 / 掌控 · 范围与缩放独立`);
+ if(!rows.length){empty(target,'暂无心情记录','情绪记录就绪后，愉悦/唤醒/掌控曲线会在这里展开。');text('emotion-history-info','暂无心情记录');return}
  chart(target,rows,['valence','arousal','dominance'],1,260,-1);
- // PR-UI-DETAIL（3.17.21）§1C：真实/估算口径分开陈述（按日视图含 _fill_small_gaps
- // 估算填充），估算不计入真实采样点数——沿用既有 estimated 口径，不造假点。
  const realCount=rows.filter(p=>!p.estimated).length,estCount=rows.length-realCount;
- text('emotion-history-info',`${realCount} 个真实心情采样点${estCount?` · ${estCount} 个估算点（不计入真实）`:''}${downsampled?' · 已抽样显示':''} · 量程 −1 到 1`);renderEmotionSamples(rows)}
-function renderEmotionSamples(rows){const wrap=$('emotion-history-samples');if(!wrap)return;
- if(!rows.length){empty(wrap,'暂无心情采样','这里只显示实际记录。');return}
- const colh=t=>{const h=el('th','',t);h.setAttribute('scope','col');return h};
- const table=el('table','maibot-table'),head=el('tr'),thead=el('thead'),body=el('tbody');
- for(const label of['采样时间','愉悦','唤醒','掌控'])head.append(colh(label));thead.append(head);
- // PR-UI-DETAIL（3.17.21）§1C：估算填充行在时间列显式标注「估算」，不冒充真实记录。
- for(const p of rows.slice(-60).reverse()){const row=el('tr');row.append(el('td','',clock(p.at,true)+(p.estimated?' · 估算':'')),el('td','',fix(p.valence,2)),el('td','',fix(p.arousal,2)),el('td','',fix(p.dominance,2)));body.append(row)}
- table.append(thead,body);wrap.replaceChildren(el('p','note',`显示最近 60 条 · 当前范围共 ${rows.length} 点`),table)}
+ text('emotion-history-info',`${realCount} 个真实心情采样点${estCount?` · ${estCount} 个估算点（不计入真实）`:''}${downsampled?' · 已抽样显示':''} · 量程 −1 到 1`)}
 // 睡眠债迷你曲线（W-01 主卡微型预览，48–64px）：只呈现趋势、无数值轴（数值在三项统计里）；
 // 全量交互曲线 #debt-chart 仍在详情层（D4：摘要+微型预览+详情全量），两者不共享 DOM。
 function sparkDebt(target,rows){
@@ -404,9 +470,11 @@ function schedulePageInfo(){return schedulePages[schedulePage]}
 // 旧快照无 origin_kind → 历史来源未记录（不猜它来自今天的 JSON）。
 function poolOriginLabel(item,key){
  if(key==='recovery')return '';
- if(key==='generated')return '模型生成 · 周期内可复用';
- if(key==='one_shot')return '模型生成 · 一次性小目标';
- if(key==='consumed')return '模型生成 · 已消耗';
+ const template=item.template_used||item.source==='template'||item.origin_kind==='template'||String(item.event_id||'').startsWith('llm_tpl_');
+ const generatedOrigin=template?'模板内容':(item.source==='llm'||item.origin_kind==='llm_generated')?'模型生成':'历史来源未记录';
+ if(key==='generated')return generatedOrigin+' · 周期内可复用';
+ if(key==='one_shot')return generatedOrigin+' · 一次性小目标';
+ if(key==='consumed')return generatedOrigin+' · 已消耗';
  const ok=item.origin_kind;
  if(ok==='code_builtin'||(!ok&&(item.event_id==='watch_bili'||item.event_id==='browse_qq')))return '代码内置 · 模块联动';
  if(ok==='json_file')return 'JSON · 状态调节';
@@ -445,12 +513,12 @@ function renderSchedulePool(key){
   }
  }
  for(const item of items){
-  const row=el('li','schedule-pool-row'),name=item.name||'未命名条目';
+  const row=el('li','schedule-pool-row'),name=displayActivityName(item,{timezone:data?.timezone,fallback:'未命名条目'});
   const min=num(item.min_minutes),max=num(item.max_minutes);
   const period=key==='recovery'?
    [item.schedule_date,num(item.progress)===null?'':'完成 '+pct(item.progress)+'%'].filter(Boolean).join(' · '):
    min===null?'时长未记录':max===null||min===max?min+' 分钟':min+'–'+max+' 分钟';
-  row.append(el('strong','',name));
+  row.append(activityNameNode('strong','',item,'未命名条目'),activityAttributeBadges(item));
   // 3.17.7 改进2：右侧时段 badge；P4：来源 badge + 偏好 badge
   const end=el('span','poolrowend');
   if(period)end.append(el('span','note',period));
@@ -464,6 +532,8 @@ function renderSchedulePool(key){
    const origin=el('li','schedule-pool-row');
    const source=el('span','note',ol);
    const details=[];
+   if(item.template_used)details.push('模板：'+(item.template_title||item.template_name||'小事件模板'));
+   if(item.template_reason)details.push('回退原因：'+item.template_reason);
    if(item.source_file)details.push('文件：'+item.source_file);
    if(item.definition_version)details.push('定义版本：'+item.definition_version);
    if(num(item.cooldown_minutes)>0)details.push('冷却：'+item.cooldown_minutes+' 分钟');
@@ -479,7 +549,7 @@ function renderSchedulePool(key){
     (key==='one_shot'?'最终抽中即消耗，启动失败或被打断也不返池。':
      key==='generated'?'遵守原有去重间隔，可在周期内再次发生。':
      key==='builtin'?'初始池：代码联动项关联对应模块与独立预算；JSON 项为状态调节。事件描述是虚拟日程，不是真实聊天或外部操作。':'');
-   origin.append(el('strong','',name),source);
+   origin.append(activityNameNode('strong','',item,'未命名条目'),source);
    origins.append(origin);
   }
  }
@@ -500,7 +570,14 @@ function renderConsumedEvents(){
   note.title=fullClock(item.consumed_at)+'；本周期不会再抽到这条事件。';
   const end=el('span','poolrowend');end.append(note);
   if(item.time_slot)end.append(el('span','rowbadge slotbadge',item.time_slot));
-  row.append(el('strong','',item.name||'未命名条目'),end);target.append(row);
+  const origin=poolOriginLabel(item,'consumed');
+  if(origin)end.append(el('span','rowbadge originbadge',origin));
+  const template=item.template_used||item.source==='template'||item.origin_kind==='template'||String(item.event_id||'').startsWith('llm_tpl_');
+  if(template){
+   const badge=el('span','rowbadge usage-template','模板：'+(item.template_title||item.template_name||'小事件模板'));
+   badge.title=item.template_reason||'';end.append(badge);
+  }
+  row.append(activityNameNode('strong','',item,'未命名条目'),activityAttributeBadges(item),end);target.append(row);
  }
  if(!target.children.length)target.append(el('li','note',Array.isArray(rows)?'本周期暂无消耗记录':'当前快照未包含消耗记录'));
 }
@@ -580,11 +657,11 @@ function overviewShowTip(node,lines){
 }
 function overviewTipLines(seg){
  const row=seg.row;
- if(seg.kind==='planned')return[row.name||'未命名意图',minute(seg.a)+' → '+minute(seg.b),'计划 · 未滚动'];
+ if(seg.kind==='planned')return[displayActivityName(row,{timezone:data?.timezone,fallback:'未命名意图'}),minute(seg.a)+' → '+minute(seg.b),'计划 · 未滚动'];
  const start=num(row.actual_start_minute)??num(row.planned_start_minute);
  const rawEnd=num(row.actual_end_minute);
  const endText=row.status==='active'&&rawEnd===null?'此刻':minute(spanEnd(start,rawEnd??num(row.planned_end_minute)));
- const lines=[row.name||'未命名活动',minute(start)+' → '+endText,source(row.source)+' · '+episodeLabel(row.status)];
+ const lines=[displayActivityName(row,{timezone:data?.timezone}),minute(start)+' → '+endText,source(row.source)+' · '+episodeLabel(row.status)];
  if(row.cross_day_continuation)lines.push('跨日续段 · 原属 '+(row.schedule_date||'前一日'));
  else if(row.crosses_midnight)lines.push('跨日');
  return lines;
@@ -622,7 +699,7 @@ function renderActivityOverview(sch){
  // 计划灰在底层、实际色段覆盖其上；同层按 start 排序（重叠续段与今日行正常并列，不去重伪造）。
  segs.sort((x,y)=>(x.kind==='planned'?0:1)-(y.kind==='planned'?0:1)||x.a-y.a);
  for(const seg of segs){
-  const node=el('button','overview-seg '+seg.kind);node.type='button';
+  const node=el('button','overview-seg '+seg.kind);node.type='button';node.title=seg.row.name?'原名：'+seg.row.name:'';
   node.style.left=(seg.a/1440*100)+'%';
   node.style.width=((seg.b-seg.a)/1440*100)+'%';
   node.style.background=seg.kind==='planned'?'var(--overview-planned)':overviewColor(seg.row.goal_type);
@@ -654,6 +731,10 @@ function renderSchedule(){
  const day=selectedDay||sch.date||dayText(data?.generated_at);
  const counts=[['completed_count','已完成'],['interrupted_count','已中断']].map(([k,l])=>l+' '+(summary[k]??'—'));
  text('episode-count',episodes.length+' 项记录');text('intent-count',intents.length+' 项意图');
+ let templateNote=$('schedule-template-note');
+ if(!templateNote){templateNote=el('p','banner');templateNote.id='schedule-template-note';$('intents').before(templateNote)}
+ const templateNames=[...new Set(intents.filter(row=>row.template_used).map(row=>row.template_title||'基础作息日程'))];
+ templateNote.hidden=!templateNames.length;templateNote.textContent=templateNames.length?'这份日程含模板内容：'+templateNames.join('、'):'';
  $('day-summary').replaceChildren(...counts.map(label=>el('span','',label)));
  text('schedule-detail-summary',day+' · '+episodes.length+' 项活动记录 · '+counts.join(' · '));
  function rows(target,list,actual){
@@ -668,7 +749,8 @@ function renderSchedule(){
    const end=actual?(row.actual_end_minute??(active?null:row.planned_end_minute)):row.end_minute;
    const box=el('div','activityrow'+(active?' active':'')),center=el('div');
    const separator=row.idleGap?' 至 ':' → ';
-   center.append(el('h3','',row.name||'未命名活动'),el('div','note',minute(start)+separator+(active?'此刻':minute(spanEnd(start,end)))+(actual?' · '+source(row.source):'')));
+   center.append(activityNameNode('h3','',row),el('div','note',minute(start)+separator+(active?'此刻':minute(spanEnd(start,end)))+(actual?' · '+source(row.source):'')));
+   center.append(activityAttributeBadges(row));
    if(row.idleSegments)center.append(idleRunDetails(row));
    if(actual&&row.state_before&&row.state_after){
     const changes=spec.filter(([k])=>num(row.state_before[k])!==null&&num(row.state_after[k])!==null&&Math.abs(row.state_after[k]-row.state_before[k])>=.01).slice(0,3).map(([k,l])=>l+' '+pct(row.state_before[k])+'→'+pct(row.state_after[k]));
@@ -677,6 +759,7 @@ function renderSchedule(){
    // 3.17.7 改进1：行程记录右侧小号灰色抽取原因（仅实际 episode 带该字段时显示）
    const rowend=el('div','rowendcol');
    if(actual&&row.draw_reason_zh)rowend.append(el('span','drawreason',row.draw_reason_zh));
+   if(!actual&&row.template_used){const badge=el('span','rowbadge usage-template','模板');badge.title=[row.template_title,row.template_reason].filter(Boolean).join(' · ');rowend.append(badge)}
    rowend.append(el('span','rowbadge',actual?episodeLabel(row.status):(row.goal_type==='sleep'?'作息参考':row.hardness==='hard'?'硬约定':'意图')));
    // 1A（3.17.8）：跨日续段（前日溢出投影，00:00 起）/跨午夜原行（结束保留「次日」口径）标注。
    if(actual&&row.cross_day_continuation)rowend.append(el('span','rowbadge crossdaybadge','跨日续段'));
@@ -702,7 +785,7 @@ function renderHealth(){const h=data.history||{},s=data.schedule||{},health=data
  if(num(health.external_errors)>0)errBits.push(`其他模块错误 ${count(health.external_errors)}`);
  text('health-brief',(warnings.length?`数据可用 · ${warnings.length} 项提示`:'数据正常')+' · 最近更新 '+(data.generated_at?clock(data.generated_at,true):'—')+(errBits.length?' · '+errBits.join(' · '):'')+' · 来源、新鲜度与警告点左下角麦麦查看')}
 function validDay(value){return typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString().slice(0,10)===value}
-function validateSnapshot(v){const obj=x=>x&&typeof x==='object'&&!Array.isArray(x),rows=(x,max)=>Array.isArray(x)&&x.length<=max&&x.every(obj);if(!obj(v)||v.schema_version!==1||!obj(v.state)||!obj(v.schedule)||!obj(v.history)||!rows(v.history.points,2304)||!rows(v.schedule.episodes,120)||!rows(v.schedule.intents,80)||!(v.schedule.current===null||obj(v.schedule.current))||!obj(v.sleep)||!rows(v.sleep.sessions,320)||(v.sleep.estimated_segments!==undefined&&!rows(v.sleep.estimated_segments,320))||!Array.isArray(v.observations)||!v.observations.every(x=>typeof x==='string')||!Array.isArray(v.warnings)||!v.warnings.every(x=>typeof x==='string'))throw Error('文件不是受支持的生活面板快照');if(v.day?.available&&(!obj(v.day)||!validDay(v.day.date)||!date(v.day.window_start)||!date(v.day.window_end)||+date(v.day.window_end)<=+date(v.day.window_start)||!rows(v.day.footprint?.episodes??v.day.footprint?.items,120)||!rows(v.day.intent?.items,80)||!rows(v.day.state_history?.points,288)||!rows(v.day.vad_history?.points,288)||!rows(v.day.sleep?.sessions,8)||!rows(v.day.sleep?.estimated_segments,16)))throw Error('按日快照结构或记录数量不受支持');if(v.qzone?.delivery?.recent!==undefined&&!rows(v.qzone.delivery.recent,40))throw Error('发送回执快照结构不受支持');if(v.video!==undefined&&(!obj(v.video)||!rows(v.video.recent??[],10)||!rows(v.video.interests??[],8)))throw Error('视频信息快照结构不受支持');return v}
+function validateSnapshot(v){const obj=x=>x&&typeof x==='object'&&!Array.isArray(x),rows=(x,max)=>Array.isArray(x)&&x.length<=max&&x.every(obj);if(!obj(v)||v.schema_version!==1||!obj(v.state)||!obj(v.schedule)||!obj(v.history)||!rows(v.history.points,2304)||!rows(v.schedule.episodes,120)||!rows(v.schedule.intents,80)||!(v.schedule.current===null||obj(v.schedule.current))||!obj(v.sleep)||!rows(v.sleep.sessions,320)||(v.sleep.estimated_segments!==undefined&&!rows(v.sleep.estimated_segments,320))||!Array.isArray(v.observations)||!v.observations.every(x=>typeof x==='string')||!Array.isArray(v.warnings)||!v.warnings.every(x=>typeof x==='string'))throw Error('文件不是受支持的生活面板快照');if(v.day?.available&&(!obj(v.day)||!validDay(v.day.date)||!date(v.day.window_start)||!date(v.day.window_end)||+date(v.day.window_end)<=+date(v.day.window_start)||!rows(v.day.footprint?.episodes??v.day.footprint?.items,120)||!rows(v.day.intent?.items,80)||!rows(v.day.state_history?.points,288)||!rows(v.day.vad_history?.points,288)||!rows(v.day.sleep?.sessions,8)||!rows(v.day.sleep?.estimated_segments,16)))throw Error('按日快照结构或记录数量不受支持');if(v.qzone?.delivery?.recent!==undefined&&!rows(v.qzone.delivery.recent,40))throw Error('发送回执快照结构不受支持');if(v.video!==undefined&&(!obj(v.video)||!rows(v.video.recent??[],18)||!rows(v.video.interests??[],8)))throw Error('视频信息快照结构不受支持');return v}
 // W-15（2026-11-03）：原 renderModules 一次重建「心情与分享」+「系统」两个 tab 的
 // 内容、VAD 图与用量矩阵表；拆成 renderMood/renderUsage，各自只在所属 tab 激活时
 // 执行（由 renderActiveTab 调度），隐藏 tab 不再每 30 秒重建表格与 SVG。
@@ -726,10 +809,47 @@ function videoRecentMeta(row){
  const first=num(row?.first_watched_at);
  return [row?.bvid||'BV 未记录','来源 '+videoSourceLabel(row?.source),'首次观看 '+(first===null||first<=0?'未记录':clock(first*1000,true))].join(' · ');
 }
+let entertainmentPage=0,mediaReturnFocusKey=null;
+function estimateMediaColumns(){const width=innerWidth;return width<=620?1:width<=980?2:width<1650?3:width<2200?4:width<2800?5:6}
+function mediaRecordLimit(){return Math.max(3,Math.min(18,mediaColumns*3))}
+function queueMediaGridRefresh(){clearTimeout(mediaResizeTimer);mediaResizeTimer=setTimeout(()=>{if(imported||!live||mediaRecordLimit()===lastRequestedMediaLimit){mediaRefreshPending=false;return}if(busy){mediaRefreshPending=true;return}refresh(true)},150)}
+function syncMediaGrid(){const grid=entertainmentPage===0?$('video-recent'):$('qzone-recent-posts');let columns=estimateMediaColumns();if(activeTab==='mood'&&grid?.getBoundingClientRect().width>0){const tracks=getComputedStyle(grid).gridTemplateColumns;if(tracks&&tracks!=='none'&&!tracks.includes('repeat('))columns=tracks.trim().split(/\s+/).length}columns=Math.max(1,Math.min(6,columns));if(columns===mediaColumns)return;mediaColumns=columns;if(data&&activeTab==='mood')renderMood();if(!imported)queueMediaGridRefresh()}
+function safeMediaUrl(value){if(typeof value!=='string')return null;let input=value.trim();if(input.startsWith('//'))input='https:'+input;if(!/^https?:\/\//i.test(input))return null;try{const url=new URL(input),host=url.hostname.toLowerCase(),allowed=host==='qpic.cn'||['.hdslb.com','.biliimg.com','.qpic.cn','.photo.store.qq.com','.gtimg.cn','.gtimg.com'].some(suffix=>host.endsWith(suffix));if(!allowed||url.username||url.password)return null;if(url.protocol==='http:')url.protocol='https:';return url.protocol==='https:'?url.href:null}catch{return null}}
+function mediaImage(value,alt,cls=''){const frame=el('div','media-image '+cls),url=safeMediaUrl(value);if(!url){frame.append(el('span','note','图片未记录'));return frame}const image=el('img');image.src=url;image.alt=alt;image.loading='lazy';image.decoding='async';image.referrerPolicy='no-referrer';image.onerror=()=>frame.replaceChildren(el('span','note','图片暂时无法加载'));frame.append(image);return frame}
+function mediaTime(value){const input=typeof value==='number'&&Math.abs(value)<1e11?value*1000:value;return date(input)?clock(input,true):'未记录'}
+const MEDIA_METRICS=[['views','播放量'],['likes','点赞'],['coins','投币'],['favorites','收藏']];
+function mediaMetricInfo(row,key){const sources=row.metrics_field_provenance,times=row.metrics_field_captured_at,has=(object,name)=>object&&typeof object==='object'&&Object.prototype.hasOwnProperty.call(object,name),provenance=(has(sources,key)?sources[key]:row.metrics_provenance)||'unrecorded',captured=has(times,key)?times[key]:row.metrics_captured_at;const input=typeof captured==='number'&&Math.abs(captured)<1e11?captured*1000:captured;return{provenance,captured,epoch:date(input)?Number(date(input)):null,label:provenance==='watch_snapshot'?'观看时记录':provenance==='backfilled_current'?'历史补录 · 当前数据':'来源未记录'}}
+function videoMetricIcon(kind){const root=svg('svg',{viewBox:'0 0 24 24',width:22,height:22,fill:'none',stroke:'currentColor','stroke-width':1.65,'aria-hidden':'true'});const paths={views:'M3 7h18v13H3V7ZM8 3l4 4 4-4M10 10l6 4-6 3v-7Z',likes:'M8 10v11H4V10h4Zm0 0 5-7c2 0 2 2 1 6h5c2 0 2 2 1 4l-2 7H8',coins:'M20 12c0 5-4 9-9 9S2 17 2 12s4-9 9-9 9 4 9 9ZM8 8h6M11 7v10M8 16h6M20 7c3 3 3 7 0 10',favorites:'m12 3 2.8 5.7 6.3.9-4.5 4.4 1 6.2-5.6-2.9-5.6 2.9 1-6.2-4.5-4.4 6.3-.9Z'};root.append(svg('path',{d:paths[kind],'stroke-linejoin':'round','stroke-linecap':'round'}));return root}
+function mediaVideoKey(row){return'video:'+JSON.stringify([row.bvid||row.task_id||'',row.watched_at||''])}
+function mediaPostKey(row){return'post:'+(row.tid||row.record_id||JSON.stringify([row.created_at||'',row.text||row.content||'']))}
+function bindMediaCard(card,kind,row,key){card.classList.add('media-card');card.dataset.mediaKey=key;card.tabIndex=0;card.setAttribute('role','button');card.setAttribute('aria-haspopup','dialog');card.setAttribute('aria-label',(kind==='video'?'查看视频详情：':'查看动态详情：')+String(row.title||row.text||row.content||'未记录').slice(0,100));card.onclick=event=>{const control=event.target.closest('button,a,input,select,textarea,summary,[role="button"]');if(control&&control!==card)return;openMediaDetail(kind,row,key)};card.onkeydown=event=>{if(event.target===card&&(event.key==='Enter'||event.key===' ')){event.preventDefault();openMediaDetail(kind,row,key)}}}
+function renderVideoRecord(row,full=false){
+ const key=mediaVideoKey(row),card=el('article',full?'media-detail-video':'video-record');if(!full)bindMediaCard(card,'video',row,key);
+ const title=el('h3','media-title',row.title||'标题未记录');title.title=row.title||'标题未记录';const meta=el('div','note videometa',videoRecentMeta(row));meta.title=meta.textContent;
+ card.append(mediaImage(row.cover,row.title||'视频封面','video-cover'),title,meta);
+ const impression=el('div','video-impression'),impressionText=['template_unavailable','unavailable'].includes(row.impression_provenance)?null:row.impression;
+ impression.append(el('h3','',row.impression_provenance==='metadata_only'?'感想 · 基于元信息':impressionText&&row.impression_provenance!=='understood_content'?'感想 · 来源未记录':'观后感'),el('p','impression-text',impressionText||'观后感未记录'));card.append(impression);
+ const metrics=el('div','video-metrics'+(full?' detail-metrics':'')),origins=[];
+ for(const [kind,label]of MEDIA_METRICS){const stat=el('div','video-metric'),value=count(row.metrics?.[kind])==='—'?'未记录':count(row.metrics[kind]),info=mediaMetricInfo(row,kind);origins.push(info);stat.dataset.metric=kind;stat.title=label+' '+value+' · '+info.label+' · 采集时间 '+mediaTime(info.captured);stat.setAttribute('aria-label',stat.title);stat.append(videoMetricIcon(kind),el('span','note',label),el('strong','',value));if(full)stat.append(el('span','note metric-origin',info.label+' · 采集时间 '+mediaTime(info.captured)));metrics.append(stat)}card.append(metrics);
+ const split=new Set(origins.map(info=>JSON.stringify([info.provenance,info.epoch]))).size>1;
+ card.append(el('p','note media-provenance',split?'统计分次采集，详情查看':origins[0].label+' · 采集时间 '+mediaTime(origins[0].captured)),el('p','note media-watched-at','最近观看 '+mediaTime(row.watched_at)));return card;
+}
+function renderPostRecord(row,full=false){const key=mediaPostKey(row),item=el('article',full?'media-detail-post':'qzone-post-record'),images=Array.isArray(row.images)?row.images:[];if(!full)bindMediaCard(item,'post',row,key);item.append(el('p','post-text',row.text||row.content||'（文案未记录）'));
+ if(full){if(images.length){const gallery=el('div','post-images');for(const [index,url]of images.entries())gallery.append(mediaImage(url,`动态配图 ${index+1}`));item.append(gallery)}else item.append(el('p','note',num(row.image_count)>0?'原记录有配图，图片地址未记录':'无配图记录'))}
+ else{const preview=mediaImage(images[0],images.length?'动态首张配图':'无配图记录','post-cover');if(!images.length)preview.replaceChildren(el('span','note',num(row.image_count)>0?'原记录有配图，图片地址未记录':'无配图记录'));if(images.length>1)preview.append(el('span','post-image-count',images.length+' 张图片 · 详情查看'));item.append(preview)}
+ item.append(el('p','note post-meta',mediaTime(row.created_at)+(row.source?' · '+row.source:'')));return item}
+function openMediaDetail(kind,row,key){const dialog=$('media-detail-dialog');mediaReturnFocusKey=key;text('media-detail-title',kind==='video'?'视频详情':'动态详情');$('media-detail-body').replaceChildren(kind==='video'?renderVideoRecord(row,true):renderPostRecord(row,true));if(!dialog.open)dialog.showModal()}
+function closeMediaDetail(){if($('media-detail-dialog').open)$('media-detail-dialog').close()}
+$('media-detail-close').onclick=closeMediaDetail;
+$('media-detail-dialog').addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeMediaDetail()}});
+$('media-detail-dialog').addEventListener('close',()=>{const target=[...document.querySelectorAll('.media-card')].find(node=>node.dataset.mediaKey===mediaReturnFocusKey&&!node.closest('[hidden]'))||(!$('entertainment-controls').hidden?$(entertainmentPage===0?'entertainment-prev':'entertainment-next'):document.querySelector('[role="tab"][aria-selected="true"]'));target?.focus({preventScroll:true});mediaReturnFocusKey=null});
+$('media-detail-dialog').addEventListener('click',event=>{if(event.target!==event.currentTarget)return;const rect=event.currentTarget.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)closeMediaDetail()});
+function renderEntertainmentPages(){const video=entertainmentPage===0;$('entertainment-video').hidden=!video;$('entertainment-posts').hidden=video;$('entertainment-prev').setAttribute('aria-pressed',String(video));$('entertainment-next').setAttribute('aria-pressed',String(!video));text('entertainment-page-label',video?'1 / 2':'2 / 2')}
 function renderMood(){const v=data.video||{};
- const videoRecentBox=$('video-recent'),recent=Array.isArray(v.recent)?v.recent.slice(0,10):[];
+ renderEntertainmentPages();
+ const videoRecentBox=$('video-recent'),recent=Array.isArray(v.recent)?v.recent.slice(0,mediaRecordLimit()):[];
  text('video-recent-count',v.available?recent.length+' 条':'—');
- if(videoRecentBox){if(recent.length){videoRecentBox.replaceChildren(...recent.map(row=>{const box=el('div','sleeprow videorrow'),info=el('div');info.append(el('strong','',row.title||'标题未记录'),el('div','note videometa',videoRecentMeta(row)));const latest=el('span','note',num(row.watched_at)!==null?clock(row.watched_at*1000,true):'—');latest.title='最近观看时间';box.append(info,latest);return box}))}else empty(videoRecentBox,v.available?'最近没有看完的视频':'视频信息暂不可用',v.available?'看完的视频会在这里留下记录。':'视频观看模块就绪后展示。')}
+ if(videoRecentBox){if(recent.length)videoRecentBox.replaceChildren(...recent.map(row=>renderVideoRecord(row)));else empty(videoRecentBox,v.available?'最近没有看完的视频':'视频信息暂不可用',v.available?'看完的视频会在这里留下记录。':'视频观看模块就绪后展示。')}
  const interestBox=$('video-interests'),interests=Array.isArray(v.interests)?v.interests.slice(0,8):[];
  if(interestBox){if(interests.length){const max=Math.max(...interests.map(row=>num(row.weight)??0),.001);interestBox.replaceChildren(...interests.map(row=>{const box=el('div','interestrow'),head=el('div','interesthead'),w=num(row.weight),bar=el('div','meter'),fill=el('i');fill.style.background='var(--focus)';fill.style.width=(w===null?0:Math.max(0,Math.min(1,w/max))*100)+'%';bar.append(fill);head.append(el('strong','',row.topic||'未知话题'),el('span','note',fix(w,2)));box.append(head,bar);return box}))}else empty(interestBox,'暂无兴趣话题',v.available?'兴趣文档生成后展示。':'视频观看模块就绪后展示。')}
  const q=data.qzone||{};text('qzone-enabled',q.available?(q.enabled?'已启用':'未启用'):'未就绪');const cookie=q.cookie_health||{},cookieLabels={not_checked:'尚未检查登录状态',not_logged_in:'尚未登录空间',expired:'登录凭据过期或不完整',adapter_unavailable:'适配器暂不可用',network_error:'网络暂不可用',ready:'登录凭据已获取',cached:'使用本地缓存，尚未确认'};
@@ -740,10 +860,13 @@ function renderMood(){const v=data.video||{};
 // 空间最近动态（3.17.15）：data.qzone.recent_posts（dashboard 只读投影，≤5 条已确认
 // 发送）。纯文本 el() 构造，来源 badge（日程说说/视频分享）；旧快照无 recent_posts →
 // 空态降级，不造假。created_at 为 epoch 秒（clock 按毫秒解析故 ×1000）。
-function renderRecentPosts(q){const box=$('qzone-recent-posts');if(!box)return;const rows=Array.isArray(q.recent_posts)?q.recent_posts.slice(0,5):[];
- if(!rows.length){empty(box,q.available?'最近没有已确认的说说':'空间状态暂不可用',q.available?'发送成功的日程说说与视频分享会在这里留下记录。':'空间模块就绪后展示。');return}
- box.replaceChildren(...rows.map(row=>{const item=el('div','sleeprow qzone-post'),main=el('div');main.append(el('strong','',row.content||'（空内容）'),el('div','note',(num(row.created_at)!==null?clock(row.created_at*1000,true):'时间未记录')+(num(row.image_count)!==null&&row.image_count>0?' · 配图 '+row.image_count+' 张':'')));item.append(main,el('span','rowbadge postsource',row.source==='视频分享'?'视频分享':'日程说说'));return item}))}
+function renderRecentPosts(q){const box=$('qzone-recent-posts');if(!box)return;const source=Array.isArray(q.posts)?q.posts:q.recent_posts,rows=Array.isArray(source)?source.slice(0,mediaRecordLimit()):[];
+ if(!rows.length){empty(box,q.available?'最近没有已确认的说说':'空间状态暂不可用',q.available?'发送成功的说说会在这里留下记录。':'空间模块就绪后展示。');return}box.replaceChildren(...rows.map(row=>renderPostRecord(row)))}
+$('entertainment-prev').onclick=()=>{entertainmentPage=0;renderEntertainmentPages();syncMediaGrid()};$('entertainment-next').onclick=()=>{entertainmentPage=1;renderEntertainmentPages();syncMediaGrid()};
+window.addEventListener('resize',syncMediaGrid);
+if(typeof ResizeObserver!=='undefined'){const observer=new ResizeObserver(syncMediaGrid);observer.observe($('video-recent'));observer.observe($('qzone-recent-posts'))}
 const usageCount=value=>group(count(value));
+const usageTokenLabel=(value,reported)=>num(reported)===0?'未回传':usageCount(value)+' Token';
 const usageModuleLabels=new Map(Object.entries({planning:'日程',emotion:'情绪',companion:'陪伴',qzone:'空间',video:'视频',unknown:'未标注模块'}));
 const usageModuleLabel=module=>usageModuleLabels.get(module)||String(module);
 function usageWindow(usage){
@@ -760,11 +883,35 @@ function usageMetric(tag,label,value,term,tipLeft){
  item.append(caption,el(tag==='dt'?'dd':'strong','usage-value',value));
  return item;
 }
+let usageLevelFilter='';
+function levelBadge(level,label){
+ const badge=el('span','usage-level',label||({info:'info · 正常',warn:'warn · 警告',error:'error · 失败',unknown:'校验结果未记录'}[level]||'级别未记录'));
+ badge.dataset.level=level;return badge;
+}
+function recordLevel(row){return row.level||((row.abandoned||row.success===false)?'error':'unknown')}
+function renderGenerationLogs(){
+ const usage=data?.usage||{},target=$('generation-logs');
+ const all=Array.isArray(usage.generation_logs)?usage.generation_logs:[],rows=all.filter(row=>!usageLevelFilter||row.level===usageLevelFilter);
+ target.replaceChildren(el('p','note',`展示日志 ${rows.length} 条 / 已读 ${usage.generation_logs_total??all.length} 条${(usage.generation_logs_read_truncated||(usage.generation_logs_read_truncated==null&&usage.generation_logs_truncated))?' · 语义日志读取有界':''}${usage.generation_logs_display_truncated?' · 首屏日志已截取':''}`));
+ if(!rows.length){target.append(el('p','usage-empty note',all.length?'当前展示片段中暂无该级别日志，可在逐笔记录中查看。':'这个统计范围内暂无统一生成日志。'));return}
+ const list=el('ol','generation-logs');
+ for(const row of rows){
+  const item=el('li','generation-log'),head=el('div','generation-log-context');
+  head.append(el('time','note',clock(row.time,true)),levelBadge(row.level));
+  const body=el('div'),title=el('strong','usage-name',row.used_template?'使用模板：'+(row.template_title||row.template_name||'默认模板'):row.message||'生成记录');
+  body.append(title,el('p','note',[usageModuleLabel(row.module),row.event,row.task].filter(Boolean).join(' · ')));
+  if(row.used_template)body.append(el('p','note','原因：'+(row.fallback_reason||'生成未完成')));
+  else if(num(row.completion_tokens)!==null)body.append(el('span','note',`输出 ${usageCount(row.completion_tokens)} Token · ${{large:'大',medium:'中',small:'小'}[row.tier]||'小'}档阈值 ${usageCount(row.warning_threshold)}`));
+  item.append(head,body);list.append(item);
+ }
+ target.append(list);
+}
+$('usage-level-filter').onchange=event=>{usageLevelFilter=event.target.value;renderGenerationLogs();resetUsageRows(true);loadUsageRows()};
 function renderUsageOverview(usage){
  const terms=usageTerms();
  const metrics=[
   ['调用次数',usageCount(usage.calls),terms.calls],
-  ['宿主回传 Token',usageCount(usage.tokens),terms.tokens],
+  ['宿主回传 Token',reportedTokens(usage.tokens,usage.total_reported_calls),terms.tokens],
   ['输入 Token',reportedTokens(usage.prompt_tokens,usage.prompt_reported_calls),terms.prompt_tokens],
   ['输出 Token',reportedTokens(usage.completion_tokens,usage.completion_reported_calls),terms.completion_tokens],
   ['缓存命中',reportedTokens(usage.cache_hit_tokens,usage.cache_reported_calls),terms.cache_hit_tokens],
@@ -774,9 +921,11 @@ function renderUsageOverview(usage){
  const buckets=usage.buckets||{};
  replaceInfoChildren($('usage-buckets'),...[['host_reported','用量已回传'],['success_no_usage','成功 · 缺用量'],['failed','失败'],['legacy','旧记录']].map(([key,label])=>{
   const bucket=buckets[key]||{},card=usageMetric('span',label,usageCount(bucket.calls),terms[key]);
-  const tokens=usageCount(bucket.tokens);card.append(el('span','note',tokens==='—'?'用量未记录':tokens+' Token'));
+  const tokens=usageCount(bucket.tokens);card.append(el('span','note',tokens==='—'?'用量未记录':usageTokenLabel(bucket.tokens,bucket.reported_calls)));
   return card;
  }));
+ const levels=usage.level_counts||{};
+ $('usage-level-counts').replaceChildren(...['info','warn','error','unknown'].map(level=>levelBadge(level,(level==='unknown'?'校验结果未记录':level)+' '+usageCount(levels[level]))));
  text('usage-period',usageWindow(usage));text('usage-source',imported?'离线快照':'宿主用量记录');
  const updated=$('usage-updated');
  updated.textContent=date(data.generated_at)?clock(data.generated_at,true):'更新时间未记录';
@@ -790,7 +939,7 @@ function renderUsageModules(usage){
   const list=el('ul','usage-model-list');
   for(const [model,cell] of entries.sort(([,a],[,b])=>(b?.tokens||0)-(a?.tokens||0))){
    const item=el('li'),name=el('span','usage-name',model),stats=el('span','usage-amounts');
-   stats.append(el('span','note',usageCount(cell?.calls)+' 次'),el('strong','',usageCount(cell?.tokens)+' Token'));
+   stats.append(el('span','note',usageCount(cell?.calls)+' 次'),el('strong','',usageTokenLabel(cell?.tokens,cell?.reported_calls)));
    item.append(name,stats);list.append(item);
   }
   return list;
@@ -800,7 +949,7 @@ function renderUsageModules(usage){
   // 3.17.33：用量模块常显（不再用 details/summary 折叠）。
   const group=el('section','usage-module'),heading=el('div','usage-module-head'),totals=el('span','usage-amounts');
   group.dataset.module=module;
-  totals.append(el('span','note',usageCount(usage.module_calls?.[module])+' 次'),el('strong','',usageCount(usage.modules?.[module])+' Token'));
+  totals.append(el('span','note',usageCount(usage.module_calls?.[module])+' 次'),el('strong','',usageTokenLabel(usage.modules?.[module],usage.module_reported_calls?.[module])));
   heading.append(el('span','usage-name',usageModuleLabel(module)),totals);
   const records=el('button','usage-module-records','查看该模块的记录');
   records.type='button';records.disabled=imported||!live;records.onclick=()=>showUsageRecords(module);
@@ -809,7 +958,7 @@ function renderUsageModules(usage){
  }
  const fallback=Object.entries(usage.models||{});
  if(!sorted.length&&fallback.length){
-  container.append(models(fallback.map(([model,tokens])=>[model,{tokens,calls:usage.model_calls?.[model]}])));
+  container.append(models(fallback.map(([model,tokens])=>[model,{tokens,calls:usage.model_calls?.[model],reported_calls:usage.model_reported_calls?.[model]}])));
  }
  if(!container.hasChildNodes())container.append(el('p','usage-empty note','这个统计范围内暂无模型用量。'));
  text('usage-models-hint',sorted.length?'按模块展示各模型的调用与 Token。':fallback.length?'这份记录按模型汇总。':'');
@@ -817,9 +966,9 @@ function renderUsageModules(usage){
 }
 function renderUsage(){
  const usage=data.usage||{},health=data.health||{};
- text('usage-window',usageWindow(usage)+(usage.truncated?' · 有界日志片段':''));
+ text('usage-window',usageWindow(usage)+(usage.truncated?' · 有界日志片段':'')+(usage.semantic_evidence_truncated?' · 部分校验历史未读到':''));
  const metrics=[
-  ['调用次数',usageCount(usage.calls),'calls'],['宿主回传 Token',usageCount(usage.tokens),'tokens'],
+  ['调用次数',usageCount(usage.calls),'calls'],['宿主回传 Token',reportedTokens(usage.tokens,usage.total_reported_calls),'tokens'],
   ['输入 Token',reportedTokens(usage.prompt_tokens,usage.prompt_reported_calls),'prompt_tokens'],
   ['输出 Token',reportedTokens(usage.completion_tokens,usage.completion_reported_calls),'completion_tokens'],
   ['缓存命中',reportedTokens(usage.cache_hit_tokens,usage.cache_reported_calls),'cache_hit_tokens'],
@@ -828,7 +977,7 @@ function renderUsage(){
   // 3.17.7 改进3：仅「缓存命中」（主页最右 chip）详细描述改左侧防出框；其余 chip 保持右侧
   const box=usageMetric('span',label,value,usageTerms()[key],key==='cache_hit_tokens');return box;
  }));
- renderUsageOverview(usage);renderUsageModules(usage);syncUsageRange();
+ renderUsageOverview(usage);renderUsageModules(usage);renderGenerationLogs();syncUsageRange();
  if(imported||!live)renderUsageRows();
  // W-01 摘要回填：主卡补 Top3 模块与可拆分口径（纯前端按已有 prompt/completion 字段估算，
  // 宿主未回传拆分时显示 —，不造假 0；P1 的 W-09 落后端 split_coverage 字段后再换权威口径）。
@@ -845,7 +994,7 @@ function renderUsage(){
  text('usage-detail-split',coverage===null?$('usage-split').textContent:
   '输入与输出共回传 '+usageCount(usage.split_tokens)+' Token · 覆盖总量 '+Math.round(coverage*1000)/10+'%');
  const missing=usageCount(usage.missing_usage_source_calls);
- text('usage-note','调用次数包含失败响应。Token 仅统计宿主回传的用量。'+
+ text('usage-note','调用次数包含失败、异常和取消请求。模板日志不另计请求或 Token。Token 仅统计宿主回传的用量。'+
   (missing==='—'?'':' 缺少完整用量或旧标记的调用 '+missing+' 次，可能与失败重叠。'));
  // W-17（2026-11-03）：错误计数带最近一次时间与归属（后端只增 last_error_at/scope），
  // 并指路宿主日志页；原始日志正文不上页面。
@@ -869,7 +1018,7 @@ async function refresh(manual=false){
  const seq=++requestSeq;busy=true;clearTimeout(timer);lastError='';$('refresh').setAttribute('aria-busy','true');updateFreshness();
  try{
   let result;
-  const baseParams={hours,...(selectedDay?{day:selectedDay}:{})};
+  lastRequestedMediaLimit=mediaRecordLimit();const baseParams={hours:Math.max(hours,emotionHours),video_recent_limit:lastRequestedMediaLimit,post_recent_limit:lastRequestedMediaLimit,...(selectedDay?{day:selectedDay}:{})};
   if(usageParamSupported){
    try{result=validateSnapshot(await deadline(window.maibot.query('summary',{...baseParams,usage_hours:usageHours})))}
    catch(first){
@@ -887,7 +1036,7 @@ async function refresh(manual=false){
   if(seq!==requestSeq)return;
   data=result;imported=false;lastSuccessAt=Date.now();failures=0;lastError='';render();notice(data.warnings?.length?data.warnings.join('；'):'');
  }catch(error){if(seq!==requestSeq)return;failures++;lastError=String(error.message||error).slice(0,180);notice(`暂时无法更新：${lastError}。${data?'上次快照已保留。':'可稍后刷新。'}`,true)}
- finally{if(seq===requestSeq){busy=false;$('refresh').removeAttribute('aria-busy');$('refresh').disabled=false;updateFreshness();schedule()}}
+ finally{if(seq===requestSeq){busy=false;$('refresh').removeAttribute('aria-busy');$('refresh').disabled=false;updateFreshness();schedule();if(mediaRefreshPending){mediaRefreshPending=false;queueMediaGridRefresh()}}}
 }
 function schedule(){clearTimeout(timer);if(live&&!imported&&!document.hidden)timer=setTimeout(()=>refresh(),Math.min(300000,30000*2**Math.min(failures,4)))}
 // 宿主会把自身卡片探针的圆角采样进 :root{--maibot-radius} 与 .maibot-card{border-radius}。
@@ -911,9 +1060,10 @@ function syncUsageRange(){
  }
 }
 let usageRowsOffset=0,usageRowsTotal=0,usageRowsTruncated=false,usageRowsLoading=false,usageRowsSeq=0;
-function resetUsageRows(){
+let usageRowFilterSupported=true,usageRowsReadTruncated=false,usageRowsEvidenceTruncated=false;
+function resetUsageRows(preserveFilters=false){
  usageRowsSeq++;usageRowsLoaded=false;usageRowsLoading=false;usageRowsAll=[];
- usageRowsOffset=usageRowsTotal=0;usageRowsTruncated=false;usageFilter='';
+ usageRowsOffset=usageRowsTotal=0;usageRowsTruncated=false;usageRowsReadTruncated=false;usageRowsEvidenceTruncated=false;if(!preserveFilters)usageFilter='';
  $('usage-rows').replaceChildren();
 }
 function renderUsageFilter(){
@@ -929,7 +1079,7 @@ function renderUsageFilter(){
  $('usage-record-filter').hidden=imported||!live||!modules.size;
 }
 function showUsageRecords(module){
- usageFilter=module;
+ usageFilter=module;resetUsageRows(true);
  renderUsageFilter();
  // 逐笔记录区常显，不再有 summary/open 可切换；只负责按模块过滤并加载。
  loadUsageRows();
@@ -949,7 +1099,9 @@ function usageRecord(row){
  }
  const outcome=el('div','usage-record-outcome');
  const status=row.abandoned?'已放弃':row.success===true?'成功':row.success===false?'失败':'未知';
- const badge=el('span','usage-status',status);badge.dataset.status=status;
+ const badge=levelBadge(recordLevel(row),recordLevel(row)==='warn'?'warn · 超出预期':recordLevel(row)==='error'?'error · 失败':recordLevel(row)==='unknown'?'校验结果未记录':status);
+ if(row.semantic_status==='unrecorded'&&recordLevel(row)!=='unknown')outcome.append(el('span','note','校验结果未记录'));
+ if(row.used_template){const template=el('span','usage-template','模板：'+(row.template_title||row.template_name||'默认'));template.title=row.fallback_reason||'';outcome.append(template)}
  outcome.append(badge);
  if(count(row.duration_ms)!=='—')outcome.append(el('span','note',usageCount(row.duration_ms)+' ms'));
  item.append(context,model,tokens,outcome);return item;
@@ -958,15 +1110,17 @@ function renderUsageRows(){
  const target=$('usage-rows');
  renderUsageFilter();
  if(imported||!live){target.replaceChildren(el('p','usage-empty note','离线快照只包含汇总用量。'));return}
- const rows=usageRowsAll.filter(row=>!usageFilter||row.module===usageFilter);
+ const rows=usageRowsAll.filter(row=>(!usageFilter||row.module===usageFilter)&&(!usageLevelFilter||recordLevel(row)===usageLevelFilter));
  const stats=el('p','note usage-record-count',
-  (usageFilter?'匹配 '+usageCount(rows.length)+' 条 · ':'')+
-  '已读取 '+usageCount(usageRowsAll.length)+' / '+usageCount(usageRowsTotal)+' 条');
+  ((usageFilter||usageLevelFilter)?(usageRowFilterSupported?'窗口内匹配 ':'仅筛已读片段 ')+usageCount(usageRowFilterSupported?usageRowsTotal:rows.length)+' 条 · ':'')+
+  '已读取 '+usageCount(usageRowsAll.length)+' / '+usageCount(usageRowsTotal)+' 条'+
+  (usageRowsReadTruncated?' · 用量账本读取有界，窗口计数为已读片段':'')+
+  (usageRowsEvidenceTruncated?' · 部分语义历史未读到，校验结果保留未记录':''));
  stats.setAttribute('role','status');target.replaceChildren(stats);
  if(rows.length){
   const list=el('ol','usage-records');
   list.append(...rows.map(usageRecord));target.append(list);
- }else target.append(el('p','usage-empty note',usageFilter?'已读取的记录中暂无该模块的调用。':'暂无逐笔记录。'));
+ }else target.append(el('p','usage-empty note',(usageFilter||usageLevelFilter)?(usageRowFilterSupported?'当前窗口已读范围内暂无匹配调用。':'已读取的记录中暂无匹配调用，可继续加载。'):'暂无逐笔记录。'));
  if(usageRowsTruncated){
   const more=el('button','usage-more','加载更多记录');
   more.type='button';more.onclick=()=>{more.disabled=true;loadUsageRows(true)};
@@ -984,12 +1138,21 @@ async function loadUsageRows(append=false){
  else target.querySelector('.usage-row-error')?.remove();
  try{
   const params={hours,...(usageParamSupported?{usage_hours:usageHours}:{}),usage_rows_limit:50,usage_rows_offset:append?usageRowsOffset:0,...(selectedDay?{day:selectedDay}:{})};
-  const result=await deadline(window.maibot.query('summary',params));
+  const filtered=usageRowFilterSupported&&(usageFilter||usageLevelFilter);
+  const filterParams=filtered?{...(usageFilter?{usage_rows_module:usageFilter}:{}),...(usageLevelFilter?{usage_rows_level:usageLevelFilter}:{})}:{};
+  let result;
+  try{result=await deadline(window.maibot.query('summary',{...params,...filterParams}))}
+  catch(error){
+   if(!filtered||!/422|usage_rows_level|usage_rows_module|参数|parameter|unsupported|not supported/i.test(String(error?.message||error)))throw error;
+   usageRowFilterSupported=false;result=await deadline(window.maibot.query('summary',params));
+  }
   if(seq!==usageRowsSeq)return;
   const page=result?.usage?.rows_page;
+  if(filtered&&(!page?.filters||page.filters.level!==usageLevelFilter||page.filters.module!==usageFilter))usageRowFilterSupported=false;
   if(!Array.isArray(page?.rows))throw Error('缺少逐笔记录');
   usageRowsAll=append?usageRowsAll.concat(page.rows):page.rows;
-  usageRowsOffset=usageRowsAll.length;
+  usageRowsOffset=(num(page.offset)??(append?usageRowsOffset:0))+page.rows.length;
+  usageRowsReadTruncated=Boolean(page.read_truncated);usageRowsEvidenceTruncated=Boolean(page.semantic_evidence_truncated);
   usageRowsTotal=num(page.total)??usageRowsOffset;
   usageRowsTruncated=Boolean(page.truncated&&page.rows.length);
   usageRowsLoaded=true;renderUsageRows();
@@ -1019,11 +1182,14 @@ async function changeUsageRange(event){
 }
 $('usage-range').onclick=changeUsageRange;
 $('usage-detail-range').onclick=changeUsageRange;
-$('usage-module-filter').onchange=e=>{usageFilter=e.target.value;loadUsageRows()};
+$('usage-module-filter').onchange=e=>{usageFilter=e.target.value;resetUsageRows(true);loadUsageRows()};
 // 3.17.33：逐笔记录区不再折叠，原 details toggle 懒加载改为详情打开事件触发。
 document.addEventListener('lbm:detail-open',event=>{if(event.detail?.key==='usage')loadUsageRows()});
 $('samples-toggle').onclick=()=>{const open=$('samples').hidden;$('samples').hidden=!open;$('samples-toggle').setAttribute('aria-expanded',String(open));text('samples-toggle',open?'收起采样值':'查看采样值')};
-$('emotion-samples-toggle').onclick=()=>{const open=$('emotion-history-samples').hidden;$('emotion-history-samples').hidden=!open;$('emotion-samples-toggle').setAttribute('aria-expanded',String(open));text('emotion-samples-toggle',open?'收起采样值':'查看采样值')};
+$('emotion-range').onclick=e=>{const button=e.target.closest('button[data-emotion-hours]');if(!button)return;emotionHours=Number(button.dataset.emotionHours);emotionZoom=null;for(const option of $('emotion-range').querySelectorAll('[data-emotion-hours]'))option.setAttribute('aria-pressed',String(Number(option.dataset.emotionHours)===emotionHours));if(live&&!imported)refresh(true);else if(data)renderEmotionHistory()};
+$('emotion-zoom-in').onclick=()=>{const {rows}=emotionHistoryPoints();if(!rows.length)return;const a=emotionZoom?.[0]??Number(date(rows[0].at)),b=emotionZoom?.[1]??Number(date(rows.at(-1).at)),mid=(a+b)/2;emotionZoom=[mid-(b-a)/4,mid+(b-a)/4];renderEmotionHistory()};
+$('emotion-zoom-out').onclick=resetEmotionZoom;
+document.addEventListener('pointerdown',event=>{const graph=$('emotion-history-chart');if(!graph||graph.contains(event.target))return;const tip=graph.querySelector('.tooltip');if(tip)tip.hidden=true;for(const mark of graph.querySelectorAll('[data-hover-points],[data-hover-cursor]'))mark.setAttribute('visibility','hidden')});
 $('export').onclick=()=>{if(!data)return;$('snapshot-text').value=JSON.stringify(data);$('snapshot-panel').hidden=false;$('snapshot-panel').scrollIntoView({block:'start'})};$('snapshot-close').onclick=()=>$('snapshot-panel').hidden=true;$('snapshot-select').onclick=()=>{$('snapshot-text').focus();$('snapshot-text').select()};
 // W-04：嵌入态「更多」菜单收纳导出快照——离线页不显示菜单（保留原导出按钮），
 // 两个入口共用同一处理；Esc/点击外部关闭，aria-expanded 同步。
@@ -1046,7 +1212,7 @@ $('import').onchange=async e=>{
  catch(error){if(seq===importSeq&&epoch===requestSeq)notice(String(error.message||error),true)}
  finally{if(seq===importSeq){input.value='';schedule()}}
 };
-$('theme').onclick=()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';if(data)render()};document.addEventListener('visibilitychange',()=>{clearTimeout(timer);if(!document.hidden&&live)refresh()});window.addEventListener('maibot:context',()=>{context();if(data)render()});window.addEventListener('pagehide',()=>{clearTimeout(timer);clearInterval(freshnessTimer);requestSeq++});
+$('theme').onclick=()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';if(data)render()};document.addEventListener('visibilitychange',()=>{clearTimeout(timer);if(!document.hidden&&live)refresh()});window.addEventListener('maibot:context',()=>{context();if(data)render()});window.addEventListener('pagehide',()=>{clearTimeout(timer);clearTimeout(mediaResizeTimer);clearInterval(freshnessTimer);requestSeq++});
 const iconPaths={activity:'M3 12h4l3-8 4 16 3-8h4',heart:'M20 4c-3-2-6 0-8 2-2-2-5-4-8-2-6 5 4 12 8 15 4-3 14-10 8-15Z',moon:'M20 14A8 8 0 0 1 10 4a8 8 0 1 0 10 10Z',clock:'M12 8v5l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0',list:'M9 5h12M9 12h12M9 19h12M3 5h1M3 12h1M3 19h1',cloud:'M6 18h12a4 4 0 0 0 0-8 6 6 0 0 0-12-2 5 5 0 0 0 0 10',cpu:'M7 7h10v10H7ZM3 8h4M3 16h4M17 8h4M17 16h4M8 3v4M16 3v4M8 17v4M16 17v4',focus:'M8 3H3v5M16 3h5v5M3 16v5h5M21 16v5h-5M8 12h8M12 8v8',cup:'M4 4h12v9a6 6 0 0 1-12 0ZM16 6h2a3 3 0 0 1 0 6h-2M3 22h15',battery:'M2 6h18v12H2ZM20 10h2v4M6 9v6M10 9v6M14 9v6'};
 function makeIcon(path){const icon=svg('svg',{viewBox:'0 0 24 24',fill:'none',stroke:'currentColor','stroke-width':1.7,'stroke-linecap':'round','stroke-linejoin':'round',class:'heading-icon','aria-hidden':'true'});icon.append(svg('path',{d:iconPaths[path]||iconPaths.activity}));return icon}
 for(const heading of document.querySelectorAll('.card h2')){const label=heading.textContent;heading.prepend(makeIcon(/睡眠|恢复/.test(label)?'moon':/陪伴|心情/.test(label)?'heart':/模型/.test(label)?'cpu':/分享/.test(label)?'cloud':/意图|足迹|一起/.test(label)?'list':/起伏/.test(label)?'clock':'activity'))}
@@ -1057,7 +1223,8 @@ function dayText(value){const d=date(value)||new Date();const parts=new Intl.Dat
 function zonedMidnight(day){const target=Date.parse(day+'T00:00:00Z');let guess=target;const fmt=new Intl.DateTimeFormat('en-GB',{timeZone:data?.timezone||'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});for(let i=0;i<3;i++){const parts=Object.fromEntries(fmt.formatToParts(new Date(guess)).map(p=>[p.type,p.value]));const local=Date.UTC(+parts.year,+parts.month-1,+parts.day,+parts.hour,+parts.minute,+parts.second);guess+=target-local}return guess}
 function shiftDay(day,delta){return new Date(Date.parse(day+'T12:00:00Z')+delta*86400000).toISOString().slice(0,10)}
 function setDay(day){if(imported&&day&&data.day?.date!==day){notice('这份离线快照没有所选日期，保留原有记录。');$('history-day').value=selectedDay;return}selectedDay=day;zoom=null;$('zoom-reset').hidden=true;$('history-day').value=day;if(live&&!imported)refresh(true);else if(data){render();if(day&&data.day?.date!==day)notice('这份离线快照没有所选日期，仍展示快照中的记录。')}}
-function activateTab(key,focus=false){SectionFish.close();activeTab=key;$("datebar").hidden=key==="now"||key==="system"||key==="core";for(const b of document.querySelectorAll('[role=tab]')){const chosen=b.dataset.tab===key;b.setAttribute('aria-selected',String(chosen));b.tabIndex=chosen?0:-1;$('panel-'+b.dataset.tab).hidden=!chosen;if(chosen&&focus)b.focus()}if(data){updateDateLabel();computePoints();renderActiveTab()}}
+function syncPageHeader(){const mood=activeTab==='mood';$('datebar').hidden=['now','system','core'].includes(activeTab);$('datebar').dataset.view=activeTab;$('date-controls').hidden=mood;$('entertainment-controls').hidden=!mood}
+function activateTab(key,focus=false){SectionFish.close();activeTab=key;syncPageHeader();for(const b of document.querySelectorAll('[role=tab]')){const chosen=b.dataset.tab===key;b.setAttribute('aria-selected',String(chosen));b.tabIndex=chosen?0:-1;$('panel-'+b.dataset.tab).hidden=!chosen;if(chosen&&focus)b.focus()}if(data){updateDateLabel();computePoints();renderActiveTab()}}
 // 3.17.11 PR-TABS-LEFT：栏目改左侧纵向后方向键语义加上下（Down=下一栏/Up=上一栏），左右保留兼容；Home/End 与切换逻辑不变。
 for(const b of document.querySelectorAll('[role=tab]')){b.onclick=()=>activateTab(b.dataset.tab);b.onkeydown=e=>{const list=[...document.querySelectorAll('[role=tab]')],i=list.indexOf(b);let next=null;if(e.key==='ArrowDown'||e.key==='ArrowRight')next=list[(i+1)%list.length];if(e.key==='ArrowUp'||e.key==='ArrowLeft')next=list[(i+list.length-1)%list.length];if(e.key==='Home')next=list[0];if(e.key==='End')next=list.at(-1);if(next){e.preventDefault();activateTab(next.dataset.tab,true)}}}
 $('zoom-in').onclick=()=>{if(!points.length)return;const a=zoom?.[0]??Number(date(points[0].at)),b=zoom?.[1]??Number(date(points.at(-1).at)),mid=(a+b)/2;zoom=[mid-(b-a)/4,mid+(b-a)/4];$('zoom-reset').hidden=false;drawHistory()};$('zoom-out').onclick=resetZoom;
@@ -1065,9 +1232,10 @@ $('history-day').onchange=e=>setDay(e.target.value);$('date-today').onclick=()=>
 function updateDateLabel(){
  if(!data)return;
  const today=dayText(data.generated_at);let dayLabel;
- if(activeTab==='schedule')dayLabel=(selectedDay||data.schedule?.date||today)+' · 当日行程';
+ if(activeTab==='mood')dayLabel='近期娱乐与空间动态';
+ else if(activeTab==='schedule')dayLabel=(selectedDay||data.schedule?.date||today)+' · 当日行程';
  else if(selectedDay)dayLabel=selectedDay+(selectedDay===today?' · 今天':' · 历史记录');
- else dayLabel=activeTab==='mood'?'近期娱乐与空间动态':'此刻与最近时段';
+ else dayLabel='此刻与最近时段';
  text('selected-day-label',dayLabel);
 }
 function renderExtras(){
@@ -1105,13 +1273,13 @@ function renderTimeline(){
   const node=el('article','vtime-item '+(fixed?'planned':'actual')+(active?' active':'')+(!fixed&&row.status==='interrupted'?' interrupted':''));
   node.setAttribute('role','listitem');
   const body=el('div','vtime-body'),head=el('div','vtime-head');
-  head.append(el('h3','',row.name||'未命名活动'),el('span','vtime-badge',fixed?(row.goal_type==='sleep'?'作息参考':'固定意图'):episodeLabel(row.status)));
+  head.append(activityNameNode('h3','',row),el('span','vtime-badge',fixed?(row.goal_type==='sleep'?'作息参考':'固定意图'):episodeLabel(row.status)));
   // 1A（3.17.8）：续段时间显示 00:00→HH:MM（投影已 0 起），来源沿用 source()；
   // 跨午夜原行结束时间保留 minute() 的「次日 HH:MM」口径，另加「跨日」badge。
   if(!fixed&&row.cross_day_continuation)head.append(el('span','vtime-badge crossdaybadge','跨日续段'));
   else if(!fixed&&row.crosses_midnight)head.append(el('span','vtime-badge crossdaybadge','跨日'));
   const origin=fixed?(row.origin==='archived'?'历史计划归档':'日计划'):source(row.source);
-  body.append(head,el('p','note',minute(start)+separator+(active?'此刻':end===null?'待定':minute(end))+' · '+origin));
+  body.append(head,activityAttributeBadges(row),el('p','note',minute(start)+separator+(active?'此刻':end===null?'待定':minute(end))+' · '+origin));
   if(row.idleSegments)body.append(idleRunDetails(row));
   if(!fixed&&row.state_before&&row.state_after){
    const changes=spec.filter(([k])=>num(row.state_before[k])!==null&&num(row.state_after[k])!==null&&Math.abs(row.state_after[k]-row.state_before[k])>=.01).slice(0,3).map(([k,l])=>l+' '+pct(row.state_before[k])+'%→'+pct(row.state_after[k])+'%');
@@ -1123,7 +1291,7 @@ function renderTimeline(){
  root.append(list);
 }
 
-function usageTerms(){return {calls:'收到宿主响应的请求数，包含失败；未收到响应的本地异常不计入。',tokens:'宿主明确回传的文本处理量（含只有总量的调用）。缺失时只计调用，不推算。',prompt_tokens:'宿主回传的输入 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',completion_tokens:'宿主回传的输出 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',cache_hit_tokens:'宿主回传的 prompt 缓存命中 Token；「未回传」表示没有任何一行携带该字段，此时无法区分真 0 与未报。',split_coverage:'可拆分覆盖率 =（输入+输出）/ 宿主回报总量；覆盖率低说明较多调用未回传拆分字段，不代表数据出错。',missing_usage_source_calls:'缺少完整宿主用量或新标记的调用，可与失败重叠；它本身不代表失败。',host_reported:'宿主返回成功响应及完整usage。',success_no_usage:'success=true，但宿主未回传完整usage。',failed:'宿主返回失败响应。',legacy:'升级前没有success和usage_present标记的记录。'}}
+function usageTerms(){return {calls:'已发出的请求数，包含失败、异常和取消；模板日志不另计请求。',tokens:'宿主明确回传的文本处理量（含只有总量的调用）。缺失时只计调用，不推算。',prompt_tokens:'宿主回传的输入 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',completion_tokens:'宿主回传的输出 Token 总量；未回传拆分的调用不参与，因此与总量可能不等。',cache_hit_tokens:'宿主回传的 prompt 缓存命中 Token；「未回传」表示没有任何一行携带该字段，此时无法区分真 0 与未报。',split_coverage:'可拆分覆盖率 =（输入+输出）/ 宿主回报总量；覆盖率低说明较多调用未回传拆分字段，不代表数据出错。',missing_usage_source_calls:'缺少完整宿主用量或新标记的调用，可与失败重叠；它本身不代表失败。',host_reported:'宿主返回成功响应及完整usage。',success_no_usage:'success=true，但宿主未回传完整usage。',failed:'宿主返回失败响应。',legacy:'升级前没有success和usage_present标记的记录。'}}
 let infoSequence=0;
 function replaceInfoChildren(target,...nodes){const old=[...target.querySelectorAll('.info-button')],index=old.indexOf(document.activeElement),wasOpen=index>=0&&old[index].getAttribute('aria-expanded')==='true';target.replaceChildren(...nodes);if(index>=0){const next=target.querySelectorAll('.info-button')[index];if(next){next.focus({preventScroll:true});if(!wasOpen)next.onblur()}}}
 function infoTip(explanation,tipLeft){

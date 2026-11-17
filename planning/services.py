@@ -73,8 +73,9 @@ class PlanningServices:
 
         # GoalManager 单例（复用 plugin._db 的 SQLite 连接，避免双连接写竞争）
         self.goal_manager = get_goal_manager(str(data_dir), db=self._ctx.db)
+        self.goal_manager.bind_clock_provider(self._clock)
         # 约定消费事件（commitment_kept/broken）经总线上报（M0；无总线时静默跳过）
-        self.goal_manager.bind_event_bus(self.bus)
+        self.goal_manager.bind_event_bus(self.bus, required_owners=("companion", "emotion"))
 
         # 日程属性表装载（2026-10-21 §24.3 任务C：mappings/ 只在加载/重载读一遍）。
         # EmotionService/CompanionServices 同款模式：热重载 = 宿主重导入重跑 on_load → 自动重读；
@@ -291,14 +292,18 @@ class PlanningServices:
                     return []
         return []
 
+    def _clock(self) -> Any:
+        """与调度共用配置区；每次读取使热改配置立即进入约定结算。"""
+        from .time_utils import TimezoneManager
+        timezone_name = str(getattr(
+            getattr(getattr(self._plugin, "config", None), "schedule_advanced", None),
+            "timezone", "") or "Asia/Shanghai")
+        return TimezoneManager(timezone_name)
+
     def _now(self) -> datetime:
         """当前时间（时区真源与日程一致；异常回退系统本地时区）。"""
         try:
-            from .time_utils import TimezoneManager
-            tz_str = str(getattr(
-                getattr(getattr(self._plugin, "config", None), "schedule_advanced", None),
-                "timezone", "") or "") or "Asia/Shanghai"
-            return TimezoneManager(tz_str).get_now()
+            return self._clock().get_now()
         except Exception:
             return datetime.now().astimezone()
 

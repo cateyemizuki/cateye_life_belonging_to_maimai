@@ -208,7 +208,7 @@ async def evaluate_conversation_delta(
     data = _parse_json_loose(response)
     if data is None or "delta" not in data:
         return None
-    event = _clean_text(data.get("event"), 30) or "日常闲聊"
+    event = "模板回退" if getattr(response,"used_template",False) else (_clean_text(data.get("event"), 30) or "日常闲聊")
     tag = _clean_text(data.get("tag"), 16).lower()
     if tag not in REVIEW_TAGS:
         tag = "normal"
@@ -391,7 +391,8 @@ class AffectionReviewer:
         """对方称呼（供裁判理解「对方是谁」）：只给关系词或中性称谓；[target] 段已删，cfg.target 不存在，QQ 不再包含。"""
         cfg = getattr(self._plugin, "config", None)
         target = getattr(cfg, "target", None)
-        qq = str(getattr(target, "target_qq", "") or "").strip()
+        from core.targeting import target_qq_of
+        qq = target_qq_of(cfg)
         has_qq = bool(qq) and qq not in ("0", "123456789")
         word = str(getattr(self._relation(), "word", "") or "")
         if has_qq and word:

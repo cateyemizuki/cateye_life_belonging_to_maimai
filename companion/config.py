@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Dict, Literal, Tuple
 
-from pydantic import field_validator
+from pydantic import field_validator, PrivateAttr
 
 from maibot_sdk import Field, PluginConfigBase
 
@@ -65,20 +65,9 @@ RelationType = Literal[_relation_type_choices()]  # type: ignore[valid-type]
 
 
 def target_qq_of(config: Any) -> str:
-    """读陪伴对象 QQ（新位置 ``[patrol].target_qq``；旧 ``[target]`` 段由聚合迁移器搬运）。
-
-    对「plugin 实例 / 配置对象 / 骨架测试桩」三种形态都可空降级：一律返回**字符串**
-    （取不到返回空串），调用方自行判定占位值/空值。旧段兜底让尚未迁移的配置对象
-    在热重载窗口里也不会丢目标。
-    """
-    section = getattr(config, "patrol", None)
-    value = getattr(section, "target_qq", None)
-    if value is None:
-        legacy = getattr(config, "target", None)
-        value = getattr(legacy, "target_qq", None)
-    if value is None:
-        return ""
-    return str(value).strip()
+    """统一读取有效陪伴目标；空配置使用已解析的唯一宿主 QQ 管理员。"""
+    from core.targeting import target_qq_of as resolve_target
+    return resolve_target(config)
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +87,8 @@ class PatrolSectionConfig(PluginConfigBase):
                               "budget and screen awareness."}
     }
 
+    _host_qq_admin: str = PrivateAttr(default="")
+
     # ── 模块独立总开关 ───────────────────────────────────────
     enabled: bool = Field(
         default=True,
@@ -110,15 +101,20 @@ class PatrolSectionConfig(PluginConfigBase):
     )
 
     # ── 目标用户（原 [target] 段）────────────────────────────
-    target_qq: int = Field(
-        default=123456789,
-        description="陪伴对象的 QQ 号：主动聊天、想念、好感度、屏幕感知都只对这个私聊会话生效",
+    target_qq: str = Field(
+        default="",
+        description="陪伴对象的 QQ 号。留空时使用宿主命令设置中唯一的 QQ 管理员；管理员不唯一、不是 QQ 或未配置时，保持未配置且不主动私聊。",
         json_schema_extra={
             "label": "目标QQ（陪伴对象）",
-            "hint": "保持默认占位值 123456789 时插件不会主动私聊任何人",
+            "hint": "填写纯数字 QQ 号；留空自动读取唯一的宿主 QQ 管理员。无法确定对象时不启用目标私聊。",
             **_ui_i18n("Target QQ", "Proactive chat stays off while the placeholder is kept."),
         },
     )
+    @field_validator("target_qq", mode="before")
+    @classmethod
+    def _normalize_target_qq(cls, value: Any) -> str:
+        return str(value or "").strip()
+
     relation_type: RelationType = Field(
         default="恋人",
         description="目标用户是 bot 的谁：影响想念提示词、消息口吻、好感度档位名称与消息后缀；"
@@ -142,21 +138,7 @@ class PatrolSectionConfig(PluginConfigBase):
     )
 
     # ── 巡检循环 ─────────────────────────────────────────────
-    proactive_reply_target_mode: Literal["浅处理", "深度处理"] = Field(
-        default="浅处理",
-        description="陪伴私聊的插件主动任务的回复目标处理方式（3.17.2 起两种模式都只做主动激活提示，不再在执行reply前强制改写目标消息ID；"
-                    "replyer 侧会自动把宿主目标指令改写为主动激活文案）。保留不回复的选择，不影响普通来信回合。",
-        json_schema_extra={
-            "label": "主动回复目标处理",
-            "hint": "3.17.2 起浅/深处理均只加主动激活提示；replyer 目标指令由钩子自动改写，普通来信回合逐字不变。",
-            **_ui_i18n("Proactive reply target", "Since 3.17.2 both modes are prompt-only; the replyer hook rewrites the host target instruction on proactive turns."),
-        },
-    )
 
-    @field_validator("proactive_reply_target_mode", mode="before")
-    @classmethod
-    def _normalize_reply_target_mode(cls, value: Any) -> str:
-        return "深度处理" if value in ("deep", "深度处理") else "浅处理"
 
     proactive_trigger_enabled: bool = Field(
         default=True,
@@ -192,37 +174,8 @@ class PatrolSectionConfig(PluginConfigBase):
             **_ui_i18n("Enable miss trigger", "Off: never starts a chat out of missing someone."),
         },
     )
-    miss_sleep_excluded: bool = Field(
-        default=True,
-        description="想念判定用「清醒沉默时长」：从陪伴对象上次来信至今，扣除 sleep_sessions 里"
-                    "已收口的睡眠段（含离线补全的 offline_reconnect 会话）与 life_state 当前睡眠段；"
-                    "只有剩下的清醒时长达到人设锚点才进入想念候选。"
-                    "关闭 = 回到旧行为（直接按自然时长判定，睡眠也计入沉默）。",
-        json_schema_extra={
-            "label": "想念扣除睡眠",
-            "hint": "开 = 整夜/离线补的睡眠不算沉默，睡醒不会误报想念；关 = 按自然时长判定（旧行为）。"
-                    "睡眠段读不到时自动退回旧口径。",
-            **_ui_i18n("Exclude sleep from miss silence",
-                       "On: sleep segments (incl. offline-reconnect) do not count as silence. "
-                       "Off: legacy natural-time behavior."),
-        },
-    )
     # 2026-11-11 Gemini 批：阶梯想念（报告 §3.1 问题 1，P0-ACT-1）。
     # 只扩展沉默周期内的受理阶段，不改变状态门槛、预算与静默闸门。
-    miss_stage_escalation_enabled: bool = Field(
-        default=True,
-        description="阶梯想念：长沉默按阶段推进（轻度想念 → 挂念追问 → 直接追问去向），"
-                    "每个阶段独立受理一次；超过 120h 进入阶段 4（独立想念停发，"
-                    "早/午/晚安、刷QQ、视频等每日主动任务渗透式追问），用户真实回信回到阶段 0",
-        json_schema_extra={
-            "label": "阶梯想念",
-            "hint": "默认开：阶段越高语气越直接；>120h 不再独立想念，由每日主动任务带上追问；"
-                    "关 = 旧行为（同一沉默周期只想念一次）",
-            **_ui_i18n("Staged miss escalation",
-                       "Escalate miss outreach across silence stages instead of consuming the "
-                       "whole cycle on the first miss; off = legacy single-shot."),
-        },
-    )
     daily_max_speak: int = Field(
         default=5,
         ge=0,
@@ -235,28 +188,13 @@ class PatrolSectionConfig(PluginConfigBase):
         },
     )
     # 2026-11-11 Gemini 批：主动预算弹性（默认开，仍受硬上限基础预算 +2 约束）。
-    budget_elasticity_enabled: bool = Field(
-        default=True,
-        description="主动预算弹性：高好感/高情绪时允许在每日预算基础上小幅追加可选主动回合；"
-                    "默认开启，追加幅度仍受硬上限（基础预算 +2）；关闭 = 固定按每日预算执行（旧行为）",
-        json_schema_extra={
-            "label": "主动预算弹性",
-            "hint": "默认开：高好感/高 Valence/法定节假日命中最多 +2，绝不超过基础预算 +2，"
-                    "问候继续免预算；关 = 每日预算为硬上限（旧行为）",
-            **_ui_i18n("Elastic proactive budget",
-                       "On by default: a small extra optional proactive allowance in "
-                       "high-affinity/high-mood states, hard-capped at base + 2. "
-                       "Off: fixed daily budget."),
-        },
-    )
 
     # ── 回复时延（拟人化）────────────────────────────────────
     # 2026-11-11 Gemini 批（报告 §2.3）：在消息发送前按字数与精力加入自然延迟。
     # 只影响发送节奏，不改回复内容、预算与消息顺序；关闭 = 立即发送。
     typing_delay_enabled: bool = Field(
         default=True,
-        description="打字时延：回复发送前按字数与当前精力加入自然打字延迟，消除「机器人秒回」；"
-                    "关闭 = 生成完成后立即发送",
+        description='发送普通回复前模拟打字等待。检测到更好的消息后处理插件时完全交给对方；对方版本不支持联动时不额外等待。未安装对方时由本插件模拟。',
         json_schema_extra={
             "label": "打字时延",
             "hint": "默认开：精力越低越慢，并带小幅抖动；关 = 不额外等待",
@@ -442,18 +380,6 @@ class AffectionSectionConfig(PluginConfigBase):
     # ── 早晚安互动入账（2026-11-11 Gemini 批，报告 §3.2 问题 2 / P1-AFF-1）──
     # 只接通已定义的 morning_exchange / night_exchange 规则事件（各 +0.4、每日一次），
     # 不改规则事件表、日上限与衰减口径；关闭 = 早晚安只按普通聊天入账（旧行为）。
-    exchange_events_enabled: bool = Field(
-        default=True,
-        description="早晚安好感事件：用户与 bot 互道早安/晚安时触发 morning_exchange / "
-                    "night_exchange 规则事件（各 +0.4，每日一次），让日常仪式感真正入账",
-        json_schema_extra={
-            "label": "早晚安好感事件",
-            "hint": "默认开：只在成功互道且当日未重复时入账；关 = 早晚安按普通聊天计，不触发专属加分",
-            **_ui_i18n("Morning/night exchange events",
-                       "Wire the existing morning_exchange/night_exchange rule events into "
-                       "affection; off = ordinary chat only."),
-        },
-    )
     weekly_milestones_enabled: bool = Field(
         default=False,
         description="周结大事记：周日的日结后按最近 7 天关系温度与净变化汇总出 1~2 条里程碑，随好感注入展示",

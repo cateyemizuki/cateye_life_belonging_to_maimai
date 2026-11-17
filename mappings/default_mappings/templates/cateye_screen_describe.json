@@ -1,0 +1,11 @@
+{
+  "event": "cateye_screen_describe",
+  "title": "未能辨认屏幕",
+  "tier": "small",
+  "format": "text",
+  "light": true,
+  "required": [],
+  "kind": "cateye_screen_describe",
+  "ok": false,
+  "response": "看不清当前屏幕内容"
+}

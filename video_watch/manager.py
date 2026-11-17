@@ -4,7 +4,7 @@
 - **任务先回执**：submit 立即返回排队/受理状态，绝不阻塞工具 RPC 或日程 tick；
 - **串行有界**：同一时刻至多一个 worker 子进程，队列容量有界，满了如实拒绝；
 - **去重**：同 BV 的进行中任务只返回既有 task_id（任务关联唯一，不每拍重复提交）；
-- **缓存**：已完成任务的完整范围结果按 BV 复用（缓存命中直接返回结果）；
+- **缓存**：按 BV 复用已有文字记忆，不宣称重新观看；元信息旁路不延长文字缓存期限；
 - **预算**：总时限由父侧强制（deadline 到点 kill 子进程 → failed/timeout）；
 - **隔离诚实**：V1 采用「子进程 + 硬截止 + 进程树终止」的降级隔离，不做内存
   硬上限假称；Windows Job 对象等硬隔离留待生产加固（README 明确记录）；
@@ -103,6 +103,9 @@ class WatchTaskManager:
 
     def set_task_guard(self, guard: Callable[[Dict[str, Any]], bool]) -> None:
         self._task_guard = guard
+
+    def update_video_metadata(self,bvid,snapshot,*,task_id=None):
+        return self._store.update_video_metadata(bvid,snapshot,task_id=task_id)
 
     def set_state_listener(self, listener: Callable[[], None]) -> None:
         self._state_listener = listener
@@ -640,10 +643,13 @@ class WatchTaskManager:
         # 2026-11-10 刷视频批：worker 处理完立即视为看完并入库——先写缓存与历史，
         # 再跑观后感/画面摘要等父侧模型加工；后处理只回填字段，不改 watched_at。
         finished_at = float(result.get("finished_at") or time.time())
-        self._enforce_result_boundary(result)
-        task["result_cache_mode"] = self._result_mode_token(result)
-        self._persist_completed(task, result,
-                                self._completion_entry(task, result, finished_at),
+        # Persist a redacted independent snapshot; keep real frames only in memory for the VLM hook.
+        preliminary=dict(result)
+        if isinstance(result.get('visual'),dict):preliminary['visual']=dict(result['visual'])
+        self._enforce_result_boundary(preliminary)
+        task["result_cache_mode"] = self._result_mode_token(preliminary)
+        self._persist_completed(task, preliminary,
+                                self._completion_entry(task, preliminary, finished_at),
                                 append=True, final=False)
         # 观后感/画面摘要（可选）：经宿主 LLM 生成；S0 起纳入任务总截止——
         # 预算=剩余截止（上限 180s），耗尽/超时都如实标注并保留 worker 原始结果

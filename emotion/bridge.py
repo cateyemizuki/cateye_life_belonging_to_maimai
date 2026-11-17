@@ -172,11 +172,15 @@ class EmotionBridge:
         data = payload if isinstance(payload, dict) else {}
         summary = str(data.get("summary") or data.get("commitment") or "约定").strip()[:60]
         prefix = COMMITMENT_KEPT_PREFIX if kind == "kept" else COMMITMENT_BROKEN_PREFIX
+        commitment_id = str(data.get("commitment_id") or "").strip()
+        event_id = str(data.get("event_id") or "")
+        stable_key = event_id if commitment_id and event_id == f"commitment:{commitment_id}:settled" else ""
         result = await self._record(
             source=f"bridge:commitment_{kind}",
             description=f"{prefix}：{summary}",
             delta=delta,
             is_target=True,
+            idempotency_key=stable_key,
         )
         logger.debug("emotion bridge：commitment_%s summary=%r → ok=%s", kind, summary, result.get("ok"))
 
@@ -208,7 +212,8 @@ class EmotionBridge:
     # ------------------------------------------------------------------
     async def _record(self, *, source: str, description: str, delta: VADState,
                       is_target: Optional[bool] = None,
-                      multiplier: Optional[float] = None) -> Dict[str, Any]:
+                      multiplier: Optional[float] = None,
+                      idempotency_key: str = "") -> Dict[str, Any]:
         """统一入账：K 缺省按 §6.2 A 由 emotion 侧计算后传给 record_external_event。
 
         ``multiplier`` 显式给出时直接采用（空间评论 K=1 的口径，§6.2 G）；
@@ -216,13 +221,22 @@ class EmotionBridge:
         """
         service = self._service
         if service is None:
+            if idempotency_key:
+                raise RuntimeError("稳定约定情绪消费者尚未就绪")
             return {"ok": False, "reason": "no_service"}
         try:
             k = float(multiplier) if multiplier is not None \
                 else float(service.target_multiplier(bool(is_target)))
-            return await service.record_external_event(source=source, description=description,
-                                                       delta=delta, multiplier=k)
-        except Exception as exc:  # 桥自身绝不抛异常（总线已隔离，这里兜底）
+            options = {"idempotency_key": idempotency_key} if idempotency_key else {}
+            result = await service.record_external_event(source=source, description=description,
+                                                         delta=delta, multiplier=k, **options)
+            if (idempotency_key and not result.get("ok")
+                    and result.get("reason") not in ("disabled", "duplicate_idempotency")):
+                raise RuntimeError("稳定约定情绪入账失败：" + str(result.get("reason") or "unknown"))
+            return result
+        except Exception as exc:  # 稳定结算失败需由确认发布面感知；普通事件保持隔离。
+            if idempotency_key:
+                raise
             logger.debug("emotion bridge：%s 入账异常（忽略）：%s", source, exc)
             return {"ok": False, "reason": "error"}
 

@@ -21,10 +21,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
-from .event_catalog_config import (DEFAULT_MAX_GENERATED_EVENTS,
-                                   DEFAULT_MIN_GENERATED_EVENTS,
-                                   DEFAULT_TEMPERATURE,
-                                   EVENT_QUOTA_MAX)
+from .event_catalog_config import EVENT_QUOTA_MAX, DEFAULT_TEMPERATURE
+DEFAULT_REQUEST_COUNT = 8
+DEFAULT_REQUEST_MIN = 1
 
 #: prompt 上下文硬上限（system + user 字符数）
 PROMPT_MAX_CHARS = 1500
@@ -91,8 +90,8 @@ def _names_text(names: Iterable[Any], limit: int) -> Tuple[str, bool]:
 
 def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any] = (),
                        existing_event_names: Sequence[Any] = (),
-                       count: int = DEFAULT_MAX_GENERATED_EVENTS,
-                       pool_kind: str = 'reusable', min_count: int = DEFAULT_MIN_GENERATED_EVENTS,
+                       count: int = DEFAULT_REQUEST_COUNT,
+                       pool_kind: str = 'reusable', min_count: int = DEFAULT_REQUEST_MIN,
                        max_chars: int = PROMPT_MAX_CHARS, time_slot: str = "",
                        no_puzzle: bool = True) -> PromptBuildResult:
     """构造生成 prompt（≤ ``max_chars`` 字符，含 system）。
@@ -110,8 +109,8 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
     try:
         count_int = int(count)
     except (TypeError, ValueError):
-        count_int = DEFAULT_MAX_GENERATED_EVENTS
-    minimum = max(1, min(int(min_count), DEFAULT_MAX_GENERATED_EVENTS))
+        count_int = DEFAULT_REQUEST_COUNT
+    minimum = max(1, min(int(min_count), EVENT_QUOTA_MAX))
     if pool_kind not in ('reusable', 'one_shot'):
         raise ValueError('unknown generated pool kind')
     count_int = max(minimum,
@@ -169,50 +168,6 @@ def build_event_prompt(*, persona: Any = "", recent_schedule_names: Sequence[Any
                              truncated=truncated, prompt_hash=digest)
 
 
-def build_json_schema(count: int = DEFAULT_MAX_GENERATED_EVENTS) -> Dict[str, Any]:
-    """输出 JSON Schema（供未来宿主 response_format / 调试复用）。"""
-    try:
-        count_int = int(count)
-    except (TypeError, ValueError):
-        count_int = DEFAULT_MAX_GENERATED_EVENTS
-    count_int = max(DEFAULT_MIN_GENERATED_EVENTS,
-                    min(_BATCH_COUNT_MAX, count_int))
-    delta_props = {key: {"type": "number", "minimum": -0.08, "maximum": 0.08}
-                   for key in ("energy", "hunger", "focus", "stress", "social_battery")}
-    return {
-        "type": "object",
-        "required": ["events"],
-        "additionalProperties": False,
-        "properties": {
-            "events": {
-                "type": "array",
-                "minItems": DEFAULT_MIN_GENERATED_EVENTS,
-                "maxItems": count_int,
-                "items": {
-                    "type": "object",
-                    "required": ["event_id", "name", "goal_type", "min_minutes",
-                                 "max_minutes", "interruptibility", "weight",
-                                 "state_deltas", "templates"],
-                    "additionalProperties": True,
-                    "properties": {
-                        "event_id": {"type": "string", "pattern": "^llm_[a-z0-9_]+$"},
-                        "name": {"type": "string", "minLength": 2, "maxLength": 10},
-                        "goal_type": {"type": "string", "enum": list(_ALLOWED_GOAL_TYPES)},
-                        "min_minutes": {"type": "integer", "minimum": 3, "maximum": 120},
-                        "max_minutes": {"type": "integer", "minimum": 3, "maximum": 120},
-                        "interruptibility": {"type": "number", "minimum": 0, "maximum": 1},
-                        "weight": {"type": "number", "minimum": 0.1, "maximum": 1.0},
-                        "state_deltas": {"type": "object", "properties": delta_props,
-                                         "additionalProperties": False},
-                        "templates": {"type": "array", "minItems": 2, "maxItems": 3,
-                                      "items": {"type": "string", "minLength": 10,
-                                                "maxLength": 40}},
-                        "enabled": {"type": "boolean"},
-                    },
-                },
-            }
-        },
-    }
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL | re.IGNORECASE)

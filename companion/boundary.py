@@ -134,7 +134,7 @@ def _stamp(value: Any = None) -> float:
 
 
 def _exp_section(plugin: Any) -> Any:
-    return getattr(getattr(plugin, "config", None), "experimental", None)
+    return getattr(getattr(plugin, "config", None), "feature_tuning", None)
 
 
 def _cfg(plugin: Any, key: str, default: Any = None) -> Any:
@@ -428,11 +428,8 @@ class BoundaryService:
     # 配置 / 会话判定
     # ------------------------------------------------------------------
     def enabled(self) -> bool:
-        """总开关（默认关；读取失败按关处理 = 旧行为）。"""
-        try:
-            return bool(_cfg(self._plugin, "enabled", False))
-        except Exception:
-            return False
+        """该功能始终启用；可用性由运行时能力检查决定。"""
+        return True
 
     def _now(self, value: Any = None) -> float:
         if value is not None:

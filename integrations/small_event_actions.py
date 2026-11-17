@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Any
 import random
+from core.activity_attributes import activity_attributes_for_episode, activity_module_guard
 
 BROWSE_CONTACT_PROBABILITY = .20
 
@@ -15,8 +16,11 @@ class SmallEventActions:
         if not isinstance(episode, dict) or episode.get('status') not in (None, 'active', 'running'):
             return {'status': 'not_active'}
         meta = episode.get('metadata') or {}
-        if meta.get('event_key') != 'browse_qq':
+        if 'browse_qq' not in (activity_attributes_for_episode(episode) or ()):
             return {'status': 'not_browsing_qq'}
+        blocked = activity_module_guard(episode)
+        if blocked:
+            return {'status': 'blocked', 'reason': blocked}
         eid = str(episode.get('episode_id') or '')
         if not eid or meta.get('browse_contact_attempt'):
             return {'status': 'duplicate'}
@@ -28,7 +32,7 @@ class SmallEventActions:
         if not chosen:
             return {'status': status}
         result = await self._dispatch('browse_qq:' + eid, 'optional_contact',
-            '【可选动机·刷QQ】你正在闲下来刷QQ，可能想随口联系一下陪伴目标。'
+            '【可选动机·刷QQ】当前活动允许你顺便看看QQ，也可能想随口联系一下陪伴目标。'
             '没有新消息、没有指定话题，也不要求问候、询问、汇报日程或表达想念。'
             '结合已有上下文自行决定；没什么想说就不调用任何工具，直接结束。')
         self._mark(eid, {'browse_contact_attempt': str(result.get('status') or 'unknown')})

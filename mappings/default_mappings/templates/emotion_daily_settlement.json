@@ -1,0 +1,15 @@
+{
+  "event": "emotion_daily_settlement",
+  "title": "按既有规则结算心情",
+  "tier": "medium",
+  "format": "json",
+  "light": false,
+  "required": [
+    "delta_vad"
+  ],
+  "kind": "emotion_daily_settlement",
+  "ok": true,
+  "response": {
+    "use_rule_delta": true
+  }
+}

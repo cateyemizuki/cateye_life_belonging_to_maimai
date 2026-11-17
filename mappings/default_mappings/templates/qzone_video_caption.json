@@ -1,0 +1,11 @@
+{
+  "event": "qzone_video_caption",
+  "title": "视频分享简短说明",
+  "tier": "small",
+  "format": "text",
+  "light": true,
+  "required": [],
+  "kind": "qzone_video_caption",
+  "ok": true,
+  "response": "分享一个视频"
+}

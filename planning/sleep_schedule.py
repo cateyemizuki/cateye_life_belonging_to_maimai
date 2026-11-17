@@ -44,43 +44,10 @@ DEFAULT_LIE_IN_MAX_UNTIL = "12:00"
 # ======================================================================
 # 纯函数（与原 tools_service 同口径；迁移后 tools_service 委托本模块）
 # ======================================================================
-def parse_nap_target(value: Any) -> Optional[int]:
-    """赖床时间解析：容忍 ``HH:MM`` / ``H:MM`` / 纯小时数；非法/缺参 → None。
-
-    纯小时数按整点（``"9"`` → 09:00）；全角冒号容错；不抛异常。
-    """
-    raw = str(value if value is not None else "").strip().replace("：", ":")
-    if not raw:
-        return None
-    head, sep, tail = raw.partition(":")
-    try:
-        hour = int(head)
-        if not sep:
-            minute = 0                       # 纯小时数 → 整点
-        else:
-            if not tail.strip():
-                return None                  # "9:" 缺分钟
-            minute = int(tail)
-    except (TypeError, ValueError):
-        return None
-    if 0 <= hour <= 23 and 0 <= minute <= 59:
-        return hour * 60 + minute
-    return None
 
 
-def normalize_hhmm(value: Any, default: str = DEFAULT_LIE_IN_MAX_UNTIL) -> str:
-    """规范成 ``"HH:MM"`` 文本（非法回退 ``default``，再坏回 12:00）。"""
-    minute = parse_nap_target(value)
-    if minute is None:
-        minute = parse_nap_target(default)
-    if minute is None:
-        minute = parse_nap_target(DEFAULT_LIE_IN_MAX_UNTIL) or 12 * 60
-    return f"{minute // 60:02d}:{minute % 60:02d}"
 
 
-def lie_in_max_minutes(value: Any) -> int:
-    """``lie_in_max_until`` 配置值 → 当天分钟数（非法回退 12:00；钳制与提示同源）。"""
-    return parse_nap_target(normalize_hhmm(value)) or 12 * 60
 
 
 def find_sleep_item(items: Any) -> Optional[Dict[str, Any]]:
@@ -337,9 +304,9 @@ class SleepEndpointHook:
 
 __all__ = [
     "DEFAULT_LIE_IN_MAX_UNTIL", "EndpointUpdate",
-    "SleepEndpointHook", "find_sleep_item", "lie_in_max_minutes",
+    "SleepEndpointHook", "find_sleep_item",
     "nap_end_datetime", "nap_schedule_date",
-    "normalize_hhmm", "parse_nap_target",
+
     "postpone_items_for_lie_in", "update_sleep_endpoint",
 ]
 

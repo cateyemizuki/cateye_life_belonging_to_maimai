@@ -52,30 +52,14 @@ class EmotionSectionConfig(PluginConfigBase):
     # 2026-11-11 Gemini 批：清醒/睡眠回归基准统一（报告 §4.3 问题 1）。
     # 2026-11-11 配置默认值轮：默认改为开启（避免心情每天被拉向绝对中性、
     # 入睡又突然拉回人设的锯齿）；关闭 = 恢复旧行为（清醒向 0 中性衰减）。
-    decay_to_persona_anchor: bool = Field(
-        default=True,
-        description="清醒时情绪向人设锚点回归（与睡眠大修同一基准线），避免心情每天被拉向绝对中性、"
-                    "入睡又突然拉回人设的锯齿；默认开启，关闭 = 恢复旧行为（清醒向 0 中性衰减）",
-        json_schema_extra={
-            "label": "清醒回归人设锚点",
-            "hint": "默认开：清醒衰减与睡眠大修基准一致；关 = 向中性 0 回落（旧行为）",
-            **_ui_i18n("Awake decay to persona anchor",
-                       "On by default: awake decay converges to the persona VAD anchor like sleep "
-                       "overhaul. Off: legacy decay toward neutral zero."),
-        },
-    )
-    evaluate_on_reply: bool = Field(
-        default=True,
-        description="回复后情绪评估的兼容开关；已设置评估模式时使用评估模式。",
-        json_schema_extra={"label": "回复后评估增量", **_ui_i18n("Evaluate on reply")},
-    )
     evaluate_mode: Literal["episode", "per_reply", "off"] = Field(
         default="episode",
         description="情绪评估方式：episode在会话闲置后整段评估，per_reply逐回复评估（至少间隔60秒），off关闭。",
         json_schema_extra={
             "label": "回复后评估模式",
-            "hint": "episode 按会话片段整段评估（成本封顶）；per_reply 为旧每回复模式",
-            **_ui_i18n("Evaluate mode", "episode: evaluate one idle session segment at a time."),
+            "hint": 'episode 按一段连续会话评估，调用次数较少；per_reply 每次回复后评估；off 停止自动评估。',
+            **_ui_i18n("Evaluate mode", "episode: evaluate one idle session segment at a time.",
+                       choices={"episode": "按会话片段评估", "per_reply": "逐条回复评估", "off": "关闭"}),
         },
     )
     # 2026-11-04 配置精简轮（J 类）：episode_idle_minutes 移入
@@ -92,21 +76,6 @@ class EmotionSectionConfig(PluginConfigBase):
     # 2026-11-11 配置默认值轮：分区总开关从 internal_tuning 移回用户 WebUI schema
     # （emotion_quota_partition_enabled 真实 Field，默认 True = 分区）；
     # 关 = 回到 3.17.32 的单一共享池（只用 evaluate_max_per_day）。
-    emotion_quota_partition_enabled: bool = Field(
-        default=True,
-        description="情绪评估配额分区总开关：开 = 私聊/群聊各自独享配额（默认私聊 6/日、群聊 4/日，"
-                    "群聊不能侵占私聊）；关 = 回到旧共享池（只用评估每日上限，群聊可占满）；"
-                    "两种模式都仍受评估每日上限总封顶",
-        json_schema_extra={
-            "label": "评估配额分区",
-            "hint": "默认开：私聊 6/日、群聊 4/日分区，群聊活跃不占私聊额度；"
-                    "关 = 旧共享 10 次池（总上限仍生效）",
-            **_ui_i18n("Eval quota partition",
-                       "On by default: private chats get 6/day and group chats 4/day, "
-                       "so group activity cannot consume the private quota. "
-                       "Off: legacy shared pool capped by the daily evaluation limit."),
-        },
-    )
     private_eval_quota: int = Field(
         default=6,
         ge=0,
@@ -178,9 +147,7 @@ class EmotionSectionConfig(PluginConfigBase):
     )
     emotion_reason_inject_enabled: bool = Field(
         default=False,
-        description="在情绪底色注入后附最近一条未过期的高重要度原因摘要（因为…）；"
-                    "3.17.29 起默认关闭（复核 VAD-4.6：普通闲聊不再每轮携带具体原因，"
-                    "避免把背景心情重新变成话题；需要时可在面板开启）",
+        description='在回复提示中附上最近一条仍有效的重要情绪原因。默认关闭，避免普通闲聊反复围绕先前事件；开启后角色更容易延续相关话题。',
         json_schema_extra={"label": "注入情绪原因",
                            **_ui_i18n("Inject emotion reason",
                                       "Append at most one fresh reason summary to the mood injection.")},
@@ -188,7 +155,7 @@ class EmotionSectionConfig(PluginConfigBase):
     # ── A3 跨来源去重（§2.4.6：自动评估 ⇄ 工具上报，同一流+窗口只计一次）──────
     dedup_enabled: bool = Field(
         default=True,
-        description="跨来源去重：自动评估（replyer）与 emotion_report 工具对同一事件的重复入账只计一次（§2.4.6 A3）",
+        description='同一事件同时被自动评估与情绪上报工具记录时，只结算一次，避免重复影响心情。',
         json_schema_extra={"label": "跨来源去重", **_ui_i18n("Cross-source dedup")},
     )
     # J 类：dedup_window_seconds → internal_tuning.json[emotion]（内部阈值；类尾 property）。

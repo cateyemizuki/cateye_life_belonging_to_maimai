@@ -18,7 +18,7 @@ PR8 3.0.0 清退（依据 = 用户 2026-10-27 授权直接清理 + 逐符号审�
 - 构造 ``ScheduleGenerator(db, llm)``；
 - ``generate_daily_schedule(date, *, personality, lover_name, wake_time, sleep_time,
   min_activities, max_activities, timeout_seconds) -> list[dict]``；
-- 未来约定（pending_commitment）与日程项的最接近时间窗匹配（apply_schedule_items）。
+- 未来约定按稳定 ID 合并，明确时间的硬约定由代码补齐（apply_schedule_items）。
 """
 
 from __future__ import annotations
@@ -45,6 +45,8 @@ from .cycle_state import (REASON_FALLBACK, REASON_REGENERATE, REASON_SCHEDULED,
 from .schedule_db import ScheduleDB
 from .schedule_items import is_night_sleep_item
 from .time_utils import DAY_MINUTES, ring_minutes_ahead
+from .activity_attributes import (ATTRIBUTE_KEY, activity_module_guard, attribute_batch_prompt,
+                                  decode_attribute_batch)
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +164,7 @@ class ScheduleGenerator:
 
         Args:
             date: 目标日期（``YYYY-MM-DD``；提示词日期取当天，日程落库按此键）。
-            apply: True=落库并做约定匹配/消费；False=仅生成（仍写入日程表以便查询）。
+            apply: 兼容参数；两种取值均写入日表并保留硬约定，计划阶段不结算约定。
             reason: 进账原因（§31.2 血缘，R7 = 用户 2026-10-23 第二轮直派）：例行生成
                 缺省 ``scheduled_generate``；regenerate 指令链透传 ``regenerate``；
                 LLM 失败走模板 spine 兜底时改 ``fallback_template``（仅对例行生成路径，
@@ -181,6 +183,7 @@ class ScheduleGenerator:
             personality=personality, lover_name=lover_name,
             wake_time=wake_time, sleep_time=sleep_time,
             timeout_seconds=timeout_seconds, custom_prompt=custom_prompt,
+            enable_detailed_description=enable_detailed_description,
             timezone=timezone, llm_task_name=llm_task_name,
             temperature=temperature, bot_profile=bot_profile,
             no_sleep_mode=no_sleep_mode, apply=apply, reason=reason,
@@ -208,16 +211,11 @@ class ScheduleGenerator:
         apply: bool = True,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
-        """重生成某天（默认今天）日程：先清空已有日程，再走标准生成管线。
+        """重生成某天（默认今天）日程：候选完成后事务替换，生成期间保留旧表。
 
         ``extra_prompt`` 会临时并入 custom_prompt（本实现按调用装配配置，无需还原）。
         """
         date = date or datetime.now().strftime("%Y-%m-%d")
-        # §31.2 血缘：进账前旧日行归档（先删后写场景的"旧日行"即本次进账所替换者；R7 2026-10-23）
-        removed = self._db.delete_day_schedule(date, archive_reason=REASON_REGENERATE)
-        if removed:
-            logger.info("已清理 %s 的 %d 个旧日程，开始重新生成", date, removed)
-
         base_custom = str(kwargs.pop("custom_prompt", "") or "")
         merged = f"{base_custom}\n\n{extra_prompt}".strip() if (base_custom or extra_prompt) else ""
         return await self.generate_daily_schedule(
@@ -233,35 +231,24 @@ class ScheduleGenerator:
         consume_commitments: bool = True,
         reason: str = REASON_SCHEDULED,
     ) -> int:
-        """把日程条目落库（start/end 分钟已换算 + 约定匹配注入）。
+        """确定性合并约定后发布日表；生成计划从不结算兑现或违约。
 
-        步骤：
-        1. ``_match_commitments_to_items``：把当日 pending_commitments 一对一映射到
-           条目（时间差 ≤30 分钟优先，其次标题子串），注入 ``is_commitment`` 元数据
-           （ProactiveService 据此用强指令兑现约定）；
-        2. ``_replace_with_entry`` 整体写入（进账漏斗：先算包络并 rotate，再写库盖戳；
-           §31.2，R7 = 用户 2026-10-23 第二轮直派）；
-        3. 成功后消费（标记 COMPLETED）当日约定。
-
-        Args:
-            reason: 进账原因（四种之一，§31.2 血缘）：例行生成缺省 ``scheduled_generate``；
-                regenerate 指令链 ``regenerate``；bot 工具（赖床）``tool_edit``；模板
-                兜底 ``fallback_template``。未按新管线传原因的旧调用方/直调按缺省值。
-                **行级盖戳与四变量轮换全部由代码完成，LLM 不参与**。
-
-        Returns:
-            写入条数。
+        ``consume_commitments`` 仅保留旧调用签名。约定保持 active，执行/到期路径
+        按稳定 ID 结算；约定读取或合并失败必须中断，不能发布遗漏硬约定的计划。
         """
-        commitment_meta: Dict[int, Dict[str, Any]] = {}
-        try:
-            commitment_meta = self._match_commitments_to_items(items, date)
-        except Exception as exc:
-            logger.warning("约定→日程项 匹配失败（不影响落库）: %s", exc, exc_info=True)
+        self._merge_pending_commitments(items, date)
+        return self._replace_with_entry(date, items, reason)
+
+    def _merge_pending_commitments(self, items: List[Dict[str, Any]], date: str) -> None:
+        """只构造候选；异步属性标注前后均可调用，不越过事务发布点。"""
+        commitment_meta = self._match_commitments_to_items(items, date)
 
         for idx, meta in commitment_meta.items():
             if idx < len(items):
                 params = dict(items[idx].get("parameters") or {})
                 params.update(meta)
+                if meta.get("commitment_hardness") == "hard":
+                    params[ATTRIBUTE_KEY] = None
                 # 用户 2026-10-27 最终裁定：明确 time 的 hard 约定**原时刻固定**——
                 # 即使 LLM/近窗匹配把条目放在 09:50，也拉回 pending 的 10:00；soft 仍可窗口调度。
                 if (meta.get("commitment_hardness") == "hard"
@@ -283,39 +270,23 @@ class ScheduleGenerator:
                             params["commitment_time_shifted_from"] = old_start
                 items[idx]["parameters"] = params
 
-        written = self._replace_with_entry(date, items, reason)
-
-        if consume_commitments and written:
-            try:
-                # 匹配到日程项的约定 = 兑现（kept），未匹配 = 违约（broken）——随消费事件上报（M0）
-                matched_titles = {
-                    str(meta.get("commitment_title") or "")
-                    for meta in commitment_meta.values() if meta.get("commitment_title")
-                }
-                consumed = self.goal_manager.consume_pending_commitments(
-                    date, matched_titles=matched_titles)
-                if consumed:
-                    logger.info("已消费 %d 条 %s 的未来约定", len(consumed), date)
-            except Exception as exc:
-                logger.warning("消费未来约定失败: %s", exc, exc_info=True)
-        return written
-
     def _replace_with_entry(self, date: str, items: List[Dict[str, Any]], reason: str) -> int:
-        """进账漏斗（§31.2，R7 = 用户 2026-10-23 第二轮直派）：写库前先经
-        ``planning.cycle_state.enter_schedule_cycle`` 算包络并 rotate（四种 reason 同用），
-        再 ``replace_day_schedule`` 落库行级盖戳。轮换与决策日志 best-effort，写库路径
-        不因状态层失败中断。"""
-        plugin = self._plugin
-        stamps = enter_schedule_cycle(
-            getattr(plugin, "_data_dir", None), date, items, reason=reason,
-            decision_logger=getattr(plugin, "_decision_logger", None),
-            **entry_context_from_plugin(plugin),
-        )
-        return self._db.replace_day_schedule(
+        """先保存日程，再登记周期；未来日程只进入待接替区。"""
+        from .cycle_state import envelope_minutes
+        stamps = envelope_minutes(items)
+        written = self._db.replace_day_schedule(
             date, items, entry_reason=reason,
             cycle_start_ts=(stamps[0] if stamps else None),
             cycle_end_ts=(stamps[1] if stamps else None),
         )
+        if written:
+            plugin = self._plugin
+            enter_schedule_cycle(
+                getattr(plugin, "_data_dir", None), date, items, reason=reason,
+                decision_logger=getattr(plugin, "_decision_logger", None),
+                **entry_context_from_plugin(plugin),
+            )
+        return written
 
     # ============================================================
     # spine 日意图分支（2026-10-25 滚动化改造新增；R7 依据 = 用户 2026-10-25 直派，
@@ -341,6 +312,9 @@ class ScheduleGenerator:
         min_intentions = _int("min_intentions", 3, 1)
         if min_intentions > max_intentions:
             min_intentions = max_intentions
+        advanced = getattr(getattr(self._plugin, "config", None), "schedule_advanced", None)
+        try:rounds = max(1, min(20, int(getattr(advanced, "max_rounds", 6))))
+        except (TypeError, ValueError):rounds = 6
         return {
             "min_intentions": min_intentions,
             "max_intentions": max_intentions,
@@ -349,7 +323,7 @@ class ScheduleGenerator:
             "history_messages": _int("spine_history_messages", 12, 0),
             "knowledge_limit": _int("spine_knowledge_limit", 3, 0),
 
-            "use_multi_round": bool(getattr(cfg, "intention_multi_round", False)),
+            "max_rounds": rounds,
             "over_limit_auto_trim": _over_limit_trim(self._plugin),
         }
 
@@ -362,6 +336,7 @@ class ScheduleGenerator:
         wake_time: str = "07:00",
         sleep_time: str = "23:00",
         timeout_seconds: float = 120.0,
+        enable_detailed_description: bool = True,
         custom_prompt: str = "",
         timezone: str = "Asia/Shanghai",
         llm_task_name: str = "",
@@ -383,13 +358,15 @@ class ScheduleGenerator:
           锚定 [schedule] 作息锚点、禁硬编码时刻），不强制重试多轮。
         """
         params = self._spine_params()
+        if not enable_detailed_description:
+            params["max_described"] = 0
         entry_reason = str(reason or REASON_SCHEDULED)
         gen_config = ScheduleGeneratorConfig(self._build_config_dict(
             personality=personality, lover_name=lover_name, wake_time=wake_time,
             sleep_time=sleep_time, min_activities=params["min_intentions"],
             max_activities=params["max_intentions"], timeout_seconds=timeout_seconds,
-            use_multi_round=False, max_rounds=1, quality_threshold=1.0,
-            enable_detailed_description=True, min_description_length=15,
+            use_multi_round=True, max_rounds=params["max_rounds"], quality_threshold=1.0,
+            enable_detailed_description=enable_detailed_description, min_description_length=15,
             max_description_length=25,
             custom_prompt=custom_prompt, recent_schedule_days=params["recent_days"],
             history_message_limit=params["history_messages"],
@@ -409,6 +386,8 @@ class ScheduleGenerator:
         await self._load_async_contexts(base, gen_config, date)
 
         schema = base.build_spine_schema(params["min_intentions"], params["max_intentions"])
+        if not enable_detailed_description:
+            schema["properties"]["intentions"]["items"]["properties"].pop("note", None)
         prompt = base.build_spine_prompt(
             schema,
             min_intentions=params["min_intentions"], max_intentions=params["max_intentions"],
@@ -416,49 +395,91 @@ class ScheduleGenerator:
         )
 
         rows: List[Dict[str, Any]] = []
-        last_error: Optional[Exception] = None
-        # intention_multi_round=true 时最多 2 次同提示重试（结构校验：拿到可用意图即收），
-        # 不带反馈重试、不跑质量评分（设计 §4.2：单轮、结构校验、不强制重试）
-        for _ in range(2 if params["use_multi_round"] else 1):
+        previous = ""
+        fallback_used = False
+        fallback_reason = ""
+
+        def acceptable(response):
+            from core.llm_templates import parse_json
+            document = parse_json(response)
+            raw = document if isinstance(document,list) else document.get("intentions",document.get("schedule_items",[]))
+            intentions = self._parse_spine_response(response)
+            if len(raw) != len(intentions):return False
+            if len(intentions) > params["max_intentions"] and not params.get("over_limit_auto_trim"):
+                return False
+            for item in intentions:
+                window = item.get("window")
+                if not isinstance(window,(tuple,list)) or len(window)!=2 or any(parse_hhmm(str(value),-1)<0 for value in window):return False
+            candidate = [self._spine_intention_to_row(item, date) for item in intentions]
+            if not candidate or any(row is None for row in candidate):return False
+            candidate = self._ensure_spine_sleep_intent(candidate, date, wake_time, sleep_time,
+                max_intentions=params["max_intentions"], no_sleep_mode=no_sleep_mode)
+            return len(candidate) >= params["min_intentions"]
+
+        # Quality rounds refine a valid candidate. Failure retries belong exclusively
+        # to LLMService; a failed round ends refinement and keeps the last valid plan.
+        for index in range(params["max_rounds"]):
+            round_prompt = prompt
+            if previous:
+                round_prompt += ("\n\n这是第 " + str(index + 1) + " 轮日程完善。检查上一轮与作息、约定、"
+                    "意图数量及时间窗口是否一致，保留合理安排，输出完整的修订 JSON。\n上一轮：\n" + previous)
             try:
-                response = await self._call_llm(prompt, gen_config, event="schedule_spine")
-            except LLMError as exc:
-                # 配额耗尽 / 速率限制属致命错误，不再重试
-                last_error = exc
-                break
+                response = await self._call_llm(round_prompt, gen_config, event="schedule_spine",
+                    validator=acceptable, fallback_context={"previous_response": previous})
+                if getattr(response, "used_template", False):
+                    fallback_used = True
+                    fallback_reason = str(getattr(response, "fallback_reason", ""))[:200]
+                    break
+                if not acceptable(response):
+                    fallback_used = True
+                    fallback_reason = "本轮日程未通过结构校验"
+                    break
+                intentions = self._parse_spine_response(response)
+                if not enable_detailed_description:
+                    for intention in intentions:
+                        intention.pop("note", None)
+                        intention.pop("description", None)
+                previous = (str(response) if enable_detailed_description
+                            else json.dumps({"intentions": intentions}, ensure_ascii=False))
+                rows = self._spine_rows_from_intentions(intentions, date, params)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                last_error = exc
-                continue
-            try:
-                rows = self._spine_rows_from_intentions(
-                    self._parse_spine_response(response), date, params)
-            except Exception as exc:
-                last_error = exc
-                rows = []
-                continue
-            if rows:
+                fallback_used = True
+                fallback_reason = type(exc).__name__
                 break
         if rows:
-            # 锚点护栏：睡觉意图缺失（且非无睡眠模式）时补一条模板睡觉意图（hard）
             rows = self._ensure_spine_sleep_intent(rows, date, wake_time, sleep_time,
-                                                   max_intentions=params["max_intentions"],
-                                                   no_sleep_mode=no_sleep_mode)
+                max_intentions=params["max_intentions"], no_sleep_mode=no_sleep_mode)
+            if fallback_used:
+                for row in rows:
+                    row.setdefault("parameters", {}).update(template_used=True, template_name="schedule_spine",
+                        template_title="上一轮有效日程", template_reason=fallback_reason)
         else:
-            if last_error is not None:
-                logger.warning("spine LLM 生成失败（%s），使用模板 spine 兜底", last_error)
-            else:
-                logger.warning("spine LLM 响应无有效意图，使用模板 spine 兜底")
-            rows = self._build_spine_fallback(
-                date, wake_time=wake_time, sleep_time=sleep_time,
+            if entry_reason == REASON_REGENERATE and self._db.has_day_schedule(date):
+                # 旧日表仍可使用时，失败的重新生成不能用模板把它覆盖。
+                raise LLMError(f"重新生成未取得有效候选，保留旧日表: {date} ({fallback_reason})")
+            fallback_used = True
+            logger.warning("spine LLM 生成失败，使用基础作息模板：%s", fallback_reason)
+            rows = self._build_spine_fallback(date, wake_time=wake_time, sleep_time=sleep_time,
                 no_sleep_mode=no_sleep_mode, max_intentions=params["max_intentions"])
-            if entry_reason == REASON_SCHEDULED:
-                entry_reason = REASON_FALLBACK
+            for row in rows:
+                row["parameters"]["template_reason"] = fallback_reason
+        if fallback_used and entry_reason == REASON_SCHEDULED:
+            entry_reason = REASON_FALLBACK
+        rows = self._ensure_spine_sleep_intent(rows, date, wake_time, sleep_time,
+            max_intentions=params["max_intentions"], no_sleep_mode=no_sleep_mode)
 
-        if apply:
-            self.apply_schedule_items(rows, date, consume_commitments=True,
-                                      reason=entry_reason)
-        else:
-            self._replace_with_entry(date, rows, entry_reason)
+        if not enable_detailed_description:
+            # 清理模型或模板的修饰描述；硬约定必要事实由 apply 阶段确定性合并保留。
+            for row in rows:
+                row["description"] = ""
+                row.setdefault("parameters", {}).pop("note", None)
+        # 最终候选含硬约定与模板就绪后才做一批属性标注；不在多轮生成里重复调用。
+        self._merge_pending_commitments(rows, date)
+        await self._annotate_activity_attributes(rows, gen_config)
+        # 标注等待期间可能新增硬约定；同步 apply 再合并，新增硬约定保守 null。
+        self.apply_schedule_items(rows, date, consume_commitments=False, reason=entry_reason)
         logger.info("spine 日意图生成完成：%s 共 %d 条", date, len(rows))
         # P3（2026-11-09 §14.4）：日意图成功更新 → 合并安排偏好增量批次（fire-and-
         # forget，非阻塞；受每日 ≤4/退避/忙闲门控；普通滚动 tick 不走此入口）。
@@ -470,6 +491,38 @@ class ScheduleGenerator:
                 logger.debug("日程偏好增量刷新触发失败（忽略）", exc_info=True)
         await self._publish("schedule.generated", date=date, items=len(rows))
         return rows
+
+    async def _annotate_activity_attributes(self, items: List[Dict[str, Any]],
+                                            gen_config: ScheduleGeneratorConfig) -> None:
+        """统一轻量 LLM 策略的一次批量作业；任何失败保留显式 null，不猜额外行为。"""
+        for item in items:
+            item.setdefault("parameters", {})[ATTRIBUTE_KEY] = None
+        if not items:
+            return
+        count = len(items)
+
+        def acceptable(response):
+            try:
+                decode_attribute_batch(response, count)
+                return True
+            except (TypeError, ValueError):
+                return False
+
+        try:
+            response = await self._call_llm(attribute_batch_prompt(items), gen_config,
+                event="schedule_activity_attributes", validator=acceptable,
+                fallback_context={"factory": lambda: {"activities": [
+                    {"index": index, ATTRIBUTE_KEY: None} for index in range(count)]}})
+            if getattr(response, "used_template", False):
+                return  # 编辑过的模板也不能在失败路径中主动启用模块。
+            labels = decode_attribute_batch(response, count)
+            for index, value in labels.items():
+                if not activity_module_guard(items[index]):
+                    items[index]["parameters"][ATTRIBUTE_KEY] = value
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("活动属性标注未完成，保留 null: %s", type(exc).__name__)
 
     @staticmethod
     def _parse_spine_response(response: str) -> List[Dict[str, Any]]:
@@ -525,7 +578,9 @@ class ScheduleGenerator:
             if row is not None:
                 rows.append(row)
         max_int = int(params.get("max_intentions", 6))
-        if params.get("over_limit_auto_trim", True):
+        # 3.17.36：兜底默认与 [llm].over_limit_auto_trim 出厂默认同步改 False
+        # （正常路径 params 恒含该键，见 _spine_params 的 over_limit_auto_trim 写入）。
+        if params.get("over_limit_auto_trim", False):
             # 保尾裁剪：先按时间排序，超量时保留最晚的 N 条，晚间计划不被裁掉
             # （避免「晚上永不出现计划」）；睡眠锚点若被裁掉由后续护栏补回。
             rows.sort(key=lambda it: int(it["start_minute"]))
@@ -631,6 +686,8 @@ class ScheduleGenerator:
         rows.append(cls._spine_row(date, "睡觉", sleep_min, sleep_min + span, "sleep",
                                    "high", span, span, hardness="hard",
                                    interruptibility=0.05))
+        rows[-1]["parameters"].update(template_used=True,template_name="schedule_spine",
+                                      template_title="作息锚点补齐",template_reason="生成结果未包含睡眠锚点")
         rows.sort(key=lambda it: int(it["start_minute"]))
         try:
             cap = max(1, int(max_intentions))
@@ -684,60 +741,13 @@ class ScheduleGenerator:
         }
 
     @staticmethod
-    def _build_spine_fallback(
-        date: str,
-        *,
-        wake_time: str = "07:00",
-        sleep_time: str = "23:00",
-        no_sleep_mode: bool = False,
-        max_intentions: int = 6,
-    ) -> List[Dict[str, Any]]:
-        """模板 spine 兜底（LLM 全轮失败 / 空响应；不重试多轮，设计 §4.4）。
-
-        口径（behavior 183 守卫同源）：锚定 ``[schedule]`` 生效作息锚点生成
-        睡觉/起床/三餐 + 1 个通用意图——**禁硬编码时刻**，所有钟点一律
-        ``parse_hhmm(wake_time/sleep_time)`` 同链同源派生（早餐锚起床、午餐锚日间
-        三分点、晚餐锚入睡前3~5小时）；跨午夜作息（sleep <= wake）的清醒跨度经
-        :func:`ring_minutes_ahead` 环距计算，不手写 −1440。
-        """
-        wake_min = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
-        sleep_min = parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES)
-        # 清醒跨度（环距；常规作息 = sleep−wake，跨午夜 = wake−sleep+1440；退化 = 全天）
-        awake_span = ring_minutes_ahead(sleep_min, wake_min) or DAY_MINUTES
-        awake_end = wake_min + awake_span  # = sleep_min（常规）或 sleep_min+1440（跨午夜）
-
-        def row(name: str, start: int, end: int, goal_type: str, priority: str,
-                min_minutes: int, max_minutes: int, interruptibility: float,
-                hardness: str = "soft") -> Dict[str, Any]:
-            return ScheduleGenerator._spine_row(
-                date, name, start, end, goal_type, priority,
-                min_minutes, max_minutes, interruptibility=interruptibility, hardness=hardness)
-
-        rows: List[Dict[str, Any]] = []
-        if not no_sleep_mode:
-            span = max(180, min(720, ring_minutes_ahead(wake_min, sleep_min)))
-            # 睡眠锚点分类与正常生成/缺项补齐统一为 hard（P1）；显示类别由 WebUI
-            # 按 goal_type 独立标"作息参考"，不随生成路径成败改变（P2/P3）。
-            rows.append(row("睡觉", sleep_min, sleep_min + span, "sleep", "high",
-                            span, span, 0.05, hardness="hard"))
-        rows.append(row("起床洗漱", wake_min, wake_min + 30, "daily_routine", "medium", 15, 30, 0.9))
-        rows.append(row("早餐", wake_min, wake_min + 120, "meal", "medium", 15, 40, 0.9))
-        mid = wake_min + awake_span // 3
-        rows.append(row("午餐", max(wake_min, mid - 90), min(awake_end, mid + 90),
-                        "meal", "medium", 20, 45, 0.9))
-        if awake_span >= 480:
-            rows.append(row("自由安排", wake_min + 150, awake_end - 330,
-                            "free_time", "low", 30, 90, 0.95))
-        if awake_span >= 360:
-            rows.append(row("晚餐", awake_end - 300, awake_end - 180,
-                            "meal", "medium", 20, 45, 0.9))
-        if len(rows) > max_intentions:
-            # 截断保睡觉（硬锚点）：睡觉行 + 起始的 (max-1) 条
-            sleep_rows = [r for r in rows if r["goal_type"] == "sleep"]
-            others = [r for r in rows if r["goal_type"] != "sleep"]
-            rows = sleep_rows + others[: max(0, max_intentions - len(sleep_rows))]
-        rows.sort(key=lambda it: int(it["start_minute"]))
-        return rows
+    def _build_spine_fallback(date: str, *, wake_time: str = "07:00", sleep_time: str = "23:00",
+                              no_sleep_mode: bool = False, max_intentions: int = 6) -> List[Dict[str, Any]]:
+        """Read the external template and render it against the active cycle anchors."""
+        from core.llm_templates import schedule_rows
+        return schedule_rows(date, wake_min=parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES),
+            sleep_min=parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES), no_sleep_mode=no_sleep_mode,
+            max_intentions=max_intentions, row_builder=ScheduleGenerator._spine_row)
 
     # ============================================================
     # 配置装配
@@ -950,42 +960,12 @@ class ScheduleGenerator:
             logger.debug(f"知识库检索失败: {exc}")
             base.knowledge_context = ""
 
-    async def _call_llm(
-        self,
-        prompt: str,
-        gen_config: ScheduleGeneratorConfig,
-        *,
-        event: str = "schedule_spine",
-    ) -> str:
-        """调用 LLM（走 core.llm_utils.LLMService，带任务路由 + 调用日志）。
-
-        ``event`` = 消耗账本（core/llm_usage.py）的调用点标签：spine 分支传
-        ``schedule_spine``。PR8 3.0.0 清退旧 daily 生成链后本方法只剩 spine 唯一
-        调用点（依据 = 用户 2026-10-27 授权直接清理），恒返回原始文本——解析由
-        spine 自包含的 :meth:`_parse_spine_response` 承担（旧 ``parse`` 参数与
-        ``_parse_response`` 已随 daily 链删除）。人设经 ``with_identity=True``
-        以宿主同款开头注入 system_prompt（共享前缀缓存），用户提示词不再带人设。
-        """
-        task_name = gen_config.llm_task_name
-        temperature = float(self._raw_of(gen_config).get("temperature", 0.85))
-        timeout_ms = int(float(gen_config.generation_timeout) * 1000)
-
-        response = await asyncio.wait_for(
-            self._llm.generate(
-                prompt,
-                task_name=task_name,
-                temperature=temperature,
-
-                timeout_ms=timeout_ms,
-                module="planning",
-                event=event,
-                with_identity=True,
-            ),
-            timeout=float(gen_config.generation_timeout) + 15.0,
-        )
-        if not response:
-            raise LLMError("LLM 调用失败（空响应）")
-        return response
+    async def _call_llm(self, prompt: str, gen_config: ScheduleGeneratorConfig, *,
+                        event: str = "schedule_spine", validator=None, fallback_context=None) -> str:
+        return await self._llm.generate(prompt, task_name=gen_config.llm_task_name,
+            temperature=float(self._raw_of(gen_config).get("temperature", .85)),
+            timeout_ms=int(float(gen_config.generation_timeout)*1000), module="planning",
+            event=event, with_identity=True, validator=validator, fallback_context=fallback_context)
 
     # ============================================================
     # 约定匹配
@@ -996,28 +976,14 @@ class ScheduleGenerator:
         items: List[Dict[str, Any]],
         today_str: str,
     ) -> Dict[int, Dict[str, Any]]:
-        """把当日 pending_commitments 一对一匹配到日程条目。
+        """按稳定 ID（旧模型输出仅允许完整同名）绑定，补齐明确时间的硬约定。
 
-        LLM 生成日程时不会显式标记哪个条目来自约定，本方法在落库前按以下规则映射：
-        1. 优先按时间匹配：约定 ``time="HH:MM"`` 与条目起始分钟差 ≤ 30 分钟；
-        2. 若约定无时间，按标题子串匹配（约定 title 出现在 name/description 中）；
-        3. 一对一约束：每个约定只匹配一个条目，每个条目最多接收一个约定。
-
-        Returns:
-            ``{item_index: {"is_commitment": True, "commitment_title": ..., ...}}``。
+        时间邻近不是身份。固定 item_id 使重排/重启仍指向同一约定，不把旁边的
+        活动挪成约定，也不因模型漏排而丢失用户承诺。soft 仍只作窗口意图。
         """
         pending = self.goal_manager.get_pending_commitments(today_str)
         if not pending:
             return {}
-
-        def _item_start_minutes(it: Dict[str, Any]) -> Optional[int]:
-            start = it.get("start_minute")
-            if start is not None:
-                return int(start)
-            slot = it.get("time_slot")
-            if slot:
-                return _parse_minutes(slot, -1)
-            return None
 
         result: Dict[int, Dict[str, Any]] = {}
         used_item_idx: set = set()
@@ -1037,43 +1003,34 @@ class ScheduleGenerator:
 
             best_idx: Optional[int] = None
 
-            # 规则 1：按时间匹配（≤ 30 分钟）
-            if commit_time and ":" in commit_time:
-                try:
-                    th, tm = commit_time.split(":", 1)
-                    commit_minutes = int(th) * 60 + int(tm)
-                except ValueError:
-                    commit_minutes = None
-                if commit_minutes is not None:
-                    best_diff = 31
-                    for idx, it in enumerate(items):
-                        if idx in used_item_idx:
-                            continue
-                        item_minutes = _item_start_minutes(it)
-                        if item_minutes is None:
-                            continue
-                        diff = abs(item_minutes - commit_minutes)
-                        if diff < best_diff:
-                            best_diff = diff
-                            best_idx = idx
-
-            # 规则 2：标题子串匹配（兜底）
+            # ID 优先；同一 ID 出现多次也只保留一个活动。
+            for idx, it in enumerate(items):
+                if idx not in used_item_idx and str((it.get("parameters") or {}).get("commitment_id") or "") == commit_id:
+                    best_idx = idx
+                    break
             if best_idx is None and commit_title:
                 for idx, it in enumerate(items):
                     if idx in used_item_idx:
                         continue
-                    haystack = f"{it.get('name') or ''}{it.get('description') or ''}"
-                    if commit_title in haystack:
+                    bound = str((it.get("parameters") or {}).get("commitment_id") or "")
+                    if not bound and str(it.get("name") or "").strip() == commit_title:
                         best_idx = idx
                         break
 
+            minute = _parse_minutes(commit_time, -1)
+            if best_idx is None and commit_hardness == "hard" and minute >= 0:
+                best_idx = len(items)
+                items.append({
+                    "name": commit_title, "description": commit_notes,
+                    "goal_type": "daily_routine", "priority": "high",
+                    "start_minute": minute, "end_minute": minute + 60,
+                    "parameters": {"spine": True, "min_minutes": 15, "max_minutes": 60,
+                                   "priority": "high", "interruptibility": 0.0},
+                })
             if best_idx is None:
-                logger.warning(
-                    "约定 %r 未在日程项中找到对应活动（time=%s）",
-                    commit_title, commit_time or "未指定",
-                )
                 continue
 
+            items[best_idx]["item_id"] = f"commitment:{commit_id}"
             result[best_idx] = {
                 "is_commitment": True,
                 "commitment_title": commit_title,
@@ -1089,4 +1046,15 @@ class ScheduleGenerator:
             used_item_idx.add(best_idx)
             logger.info("约定 %r → 日程项[%d] %r", commit_title, best_idx, items[best_idx].get("name"))
 
+        # 同 ID 的重复模型行不能产生多份执行意图；保留已绑定的一份。
+        duplicate_indices = {
+            idx for idx, item in enumerate(items)
+            if idx not in used_item_idx and str((item.get("parameters") or {}).get("commitment_id") or "")
+            in {str(meta["commitment_id"]) for meta in result.values()}
+        }
+        if duplicate_indices:
+            kept = [(idx, item) for idx, item in enumerate(items) if idx not in duplicate_indices]
+            remap = {old: new for new, (old, _) in enumerate(kept)}
+            items[:] = [item for _, item in kept]
+            result = {remap[idx]: meta for idx, meta in result.items()}
         return result

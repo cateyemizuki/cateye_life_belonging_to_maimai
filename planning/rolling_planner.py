@@ -55,6 +55,7 @@ from .goal_manager import GoalStatus
 from .motives import MOTIVE_BONUS_RATIO
 from .sleep_engine import resolve_hard_commitment_start
 from .schedule_items import is_named_nap, is_night_sleep_item
+from core.activity_attributes import ATTRIBUTE_KEY, normalize_activity_attributes
 from .time_utils import (DAY_MINUTES, TimezoneManager, is_in_sleep_ring,
                          normalize_day_minutes, ring_minutes_ahead)
 
@@ -309,6 +310,7 @@ def extract_spine_intents(items: Any) -> List[Dict[str, Any]]:
             "priority": str(params.get("priority") or item.get("priority") or "medium").strip().lower(),
             "hardness": "hard" if str(params.get("hardness") or "soft").strip().lower() == "hard" else "soft",
             "commitment_hardness": str(params.get("commitment_hardness") or "").strip().lower(),
+            "commitment_id": str(params.get("commitment_id") or ""),
             "min_minutes": int(_as_number(params.get("min_minutes"), 0.0) or 0.0),
             "max_minutes": int(_as_number(params.get("max_minutes"), 0.0) or 0.0),
             "interruptibility": _clamp(itp if itp is not None else 0.5),
@@ -317,6 +319,12 @@ def extract_spine_intents(items: Any) -> List[Dict[str, Any]]:
             "end_minute": int(item.get("end_minute") or 0),
             "day_offset": item.get("day_offset"),
         })
+        if ATTRIBUTE_KEY in params:
+            out[-1][ATTRIBUTE_KEY] = normalize_activity_attributes(params[ATTRIBUTE_KEY])
+        if params.get("template_used") or item.get("entry_reason") == "fallback_template":
+            out[-1].update(template_used=True,template_name=str(params.get("template_name") or "schedule_spine"),
+                           template_title=str(params.get("template_title") or "基础作息日程"),
+                           template_reason=str(params.get("template_reason") or ""))
     return out
 
 
@@ -471,6 +479,8 @@ class RollingPlanner:
         self._nap_skipped_date: str = ""
         self._nap_date = ""
         self._nap_reason = ""
+        self._nap_evaluation: Dict[str, Any] = {}
+        self._nap_evaluation_key: Any = None
         #: F3 转场拖延（B2，2026-11-11 v2 §4）：跨拍 pending（进程内；跨日重置）。
         #: 默认关时不创建/不读/不写；内容 = date/buffer_used/delay_used/delay_until/
         #: procrastination/active/target_goal_type。
@@ -516,7 +526,7 @@ class RollingPlanner:
         except Exception:
             return transition_rules.TransitionParams()
         return transition_rules.TransitionParams.from_section(
-            getattr(cfg, "experimental", None))
+            getattr(cfg, "feature_tuning", None))
 
     def _transition_usage_store(self) -> "transition_rules.TransitionUsageStore":
         if self._transition_usage is None:
@@ -979,6 +989,8 @@ class RollingPlanner:
         cur = minutes_of_now(now)
         report.update({"date": date, "cur_minute": cur})
         self._roll_daily_counters(date)
+        # 从持久执行行恢复约定结算；失败保留 active，下个 tick/重启继续补扫。
+        self._reconcile_commitments(now)
 
         # 步 1：状态快照（PR2 定稿 §3/§4.1.4：planner 不再单独调用 life.tick——
         # 状态推进统一由 plugin tick 编排，编排方先 life.tick（含 VAD 调制）再经
@@ -1232,6 +1244,13 @@ class RollingPlanner:
         except Exception:
             logger.warning('随机事件结果未补记，已消费事件不返池', exc_info=True)
 
+    def _reconcile_commitments(self, now: datetime) -> None:
+        if self._goal_manager is not None:
+            try:
+                self._goal_manager.reconcile_commitments(now, grace_minutes=HARD_COMMITMENT_GRACE_MINUTES)
+            except Exception:
+                logger.warning("约定执行结算未完成，保留待重试", exc_info=True)
+
     def _finish_episode(self, episode: Dict[str, Any], now: datetime,
                         snapshot: Any, *, actual_end_minute: Optional[int] = None,
                         reason: str = "") -> None:
@@ -1250,6 +1269,8 @@ class RollingPlanner:
         extra_meta: Optional[Dict[str, Any]] = {"close_reason": reason} if reason else None
         if not self._db.finish(eid, actual_end_minute=end, metadata=extra_meta):
             return
+        if (episode.get("metadata") or {}).get("commitment_id"):
+            self._reconcile_commitments(now)
         self._finish_event_claim(episode, 'completed', reason=reason)
         # PR-B2：活动完成 → 父目标完成（不长留待办）；无父目标零动作
         self._settle_parent_goal(episode, "completed")
@@ -1356,6 +1377,10 @@ class RollingPlanner:
             if we <= ws:
                 continue
             item_key = c["item_id"]
+            commitment_id = str(c.get("commitment_id") or "")
+            # 新日表的 item_id 稳定；也兼容按真实 ID 记录的执行行。
+            if commitment_id and commitment_id in recorded:
+                continue
             current = self._safe_active_episode()
             if cur >= ws and cur < we and item_key not in recorded:
                 # 到点：抢占当前 episode（可抢占——硬约定优先级最高）
@@ -1406,6 +1431,7 @@ class RollingPlanner:
                     source="commitment", planned_start_minute=ws, planned_end_minute=we,
                     interruptibility=c["interruptibility"],
                     metadata={"commitment_item_id": item_key,
+                              "commitment_id": commitment_id,
                               "close_reason": "missed_hard_commitment"})
                 if eid:
                     self._db.abandon(eid, reason="missed_hard_commitment",
@@ -1422,11 +1448,14 @@ class RollingPlanner:
         try:
             rows = self._db.episodes_today(date)
         except Exception:
-            return ids
+            logger.warning("读取约定执行记录失败，本拍保留旧执行状态", exc_info=True)
+            raise
         for row in rows:
             meta = row.get("metadata")
             if isinstance(meta, dict) and meta.get("commitment_item_id"):
                 ids.add(str(meta["commitment_item_id"]))
+            if isinstance(meta, dict) and meta.get("commitment_id"):
+                ids.add(str(meta["commitment_id"]))
         return ids
 
     def _start_commitment(self, intent: Dict[str, Any], date: str, cur: int,
@@ -1448,7 +1477,10 @@ class RollingPlanner:
                 late_progress=self._cfg_float("late_attention_progress",
                                               DEFAULT_LATE_ATTENTION_PROGRESS)),
             state_before=self._state_brief(snapshot),
-            metadata={"commitment_item_id": intent["item_id"], "trigger": "hard_commitment"},
+            metadata={"commitment_item_id": intent["item_id"],
+                      "commitment_id": str(intent.get("commitment_id") or ""),
+                      ATTRIBUTE_KEY: None,
+                      "trigger": "hard_commitment"},
         )
         if eid:
             self._handle_squeezed_active(pre_active, now, eid)
@@ -1478,6 +1510,7 @@ class RollingPlanner:
         planned_end = self._planned_sleep_end(cur, wake_min, self._lie_in_cap_minute(),
                                               engine_on)
         metadata: Dict[str, Any] = {"trigger": "sleep_anchor",
+                                    ATTRIBUTE_KEY: None,
                                     "sleep_ring": f"{sleep_min}-{wake_min}"}
         if engine_on:
             metadata["sleep_engine"] = True
@@ -1536,6 +1569,7 @@ class RollingPlanner:
             return False
         if self._nap_date != date:
             self._nap_date, self._nap_reason = date, ""
+            self._nap_evaluation, self._nap_evaluation_key = {}, None
         rows = self._db.episodes_today(date)
         if any(is_named_nap(row)
                and row.get("actual_start_minute") is not None for row in rows):
@@ -1547,18 +1581,35 @@ class RollingPlanner:
             self._nap_skipped_date = date
             reason = self._nap_reason or "window_closed"
             self._sleep_engine.record_nap(date, reason)
-            self._log("rolling.nap_skipped", reason=reason)
+            self._log("rolling.nap_skipped", reason=reason, **self._nap_evaluation)
             return False
-        reason = nap_reason(now, self._sleep_engine.actual_wake_today(now),
+        woke_at = self._sleep_engine.actual_wake_today(now)
+        sleepiness = nap_reason(now, woke_at,
                             snapshot.get("energy"), snapshot.get("sleep_debt"))
+        reason = sleepiness
+        blocker = ""
         hard = self.sleep_hard_commitment_start(now)
         remaining = 15 * 60 + 30 - cur
         if hard:
             remaining = min(remaining, int((hard.timestamp() - now.timestamp()) // 60))
         if remaining < 15:
-            reason = "hard_commitment"
+            reason = blocker = "hard_commitment"
         elif current and (current.get("goal_type") != "idle" or current.get("source") == "commitment"):
-            reason = "busy"
+            reason = blocker = "busy"
+        # 原有门槛和活动优先级不变；拆开“不困”与“活动占用”，避免粗 busy 覆盖真实生理原因。
+        self._nap_evaluation = {
+            "evaluated_at": now.isoformat(), "sleepiness_reason": sleepiness,
+            "blocking_reason": blocker, "energy": snapshot.get("energy"),
+            "sleep_debt": snapshot.get("sleep_debt"),
+            "wake_elapsed_minutes": (round((now.timestamp() - woke_at.timestamp()) / 60, 2)
+                                     if isinstance(woke_at, datetime) else None),
+            "current_episode_id": str((current or {}).get("episode_id") or ""),
+            "current_goal_type": str((current or {}).get("goal_type") or ""),
+        }
+        evaluation_key = (sleepiness, blocker)
+        if evaluation_key != self._nap_evaluation_key:
+            self._log("rolling.nap_evaluated", reason=reason, **self._nap_evaluation)
+            self._nap_evaluation_key = evaluation_key
         self._nap_reason = reason
         self._sleep_engine.record_nap(date, reason)
         if reason != "ready":
@@ -1570,7 +1621,7 @@ class RollingPlanner:
             if self._safe_active_episode() is not None:
                 return False
         candidate = {"kind": "nap", "name": "午休", "goal_type": "rest",
-                     "profile_key": "rest", "interruptibility": .9}
+                     "profile_key": "rest", "interruptibility": .9, ATTRIBUTE_KEY: None}
         self._start_episode_for_candidate(candidate, min(20, remaining), date, cur, now,
                                           snapshot, [], self._day_rng(date), report)
         if (self._safe_active_episode() or {}).get("goal_type") == "rest":
@@ -2049,7 +2100,7 @@ class RollingPlanner:
 
     @staticmethod
     def _candidate_from_intent(c: Dict[str, Any], *, kind: str) -> Dict[str, Any]:
-        return {
+        candidate = {
             "kind": kind, "name": c["name"], "goal_type": c["goal_type"],
             "priority_score": PRIORITY_SCORES.get(c["priority"], PRIORITY_SCORES["medium"]),
             "min_minutes": c["min_minutes"], "max_minutes": c["max_minutes"],
@@ -2057,7 +2108,11 @@ class RollingPlanner:
             "profile_key": c["goal_type"], "window": (c["start_minute"], c["end_minute"]),
             "resume_of": None, "resume_bonus": 0.0,
             "intent_item_id": c["item_id"], "note": c.get("note", ""),
+            "commitment_id": str(c.get("commitment_id") or ""),
         }
+        if ATTRIBUTE_KEY in c:
+            candidate[ATTRIBUTE_KEY] = normalize_activity_attributes(c[ATTRIBUTE_KEY])
+        return candidate
 
     # ── 打分（§5.2 公式逐字）─────────────────────────────────────────────
     def _score_candidate(self, c: Dict[str, Any], snapshot: Any, cur: int,
@@ -2573,10 +2628,14 @@ class RollingPlanner:
                                         cand, snapshot, cur, date)}
         if cand.get("intent_item_id"):
             metadata["intent_item_id"] = cand["intent_item_id"]
+        if cand.get("commitment_id"):
+            metadata["commitment_id"] = cand["commitment_id"]
         if cand.get("note"):
             metadata["note"] = cand["note"]
         if extra_metadata:
             metadata.update(extra_metadata)
+        if ATTRIBUTE_KEY in cand:
+            metadata[ATTRIBUTE_KEY] = normalize_activity_attributes(cand[ATTRIBUTE_KEY])
         eid: Optional[str] = None
         if cand["kind"] == "event":
             # P1 统一入口（§5.1 步5/6）：先持久认领一次性，再启动；定义快照随
@@ -2591,6 +2650,11 @@ class RollingPlanner:
             origin = self._db.get_episode(str(cand["resume_of"])) or {}
             origin_meta = (origin.get("metadata")
                            if isinstance(origin.get("metadata"), dict) else {})
+            if ATTRIBUTE_KEY in origin_meta:
+                metadata[ATTRIBUTE_KEY] = normalize_activity_attributes(origin_meta[ATTRIBUTE_KEY])
+            for key in ("commitment_id", "commitment_item_id", "intent_item_id"):
+                if origin_meta.get(key):
+                    metadata[key] = origin_meta[key]
             # PR2.5 修复（2026-10-26），交接 §五.18 D1：origin 已按 close-active 路径
             # 应用过 deltas（state_deltas_applied 标记在案）→ 不再透传 event_key，恢复行
             # 关闭时不会二次应用（防双应用沿用同一标记口径）。

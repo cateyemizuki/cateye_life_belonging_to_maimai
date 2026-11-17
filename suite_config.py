@@ -8,7 +8,8 @@
                         planning_events（小事件权重乘数与分享概率）
   - companion/config.py 陪伴模块：patrol（含目标用户与屏幕感知）/ affection
   - suite_prompts.py    提示词集中模块：prompts
-  - qzone/config.py     QQ 空间：qzone / qzone_video（空间视频候选·影子模式，PR-A0）
+  - qzone/config.py     QQ 空间：qzone / qzone_video（空间视频候选·影子模式，PR-A0）/
+                        legacy_compat（旧版兼容：Snowluma HTTP cookie 降级，3.17.36）
   - emotion/config.py   情绪系统：emotion
 - 顶层只保留跨模块共享的基础段（plugin / admin）与新增的 LLM 调用段（llm），
   并把各子模块 section 扁平挂载为聚合模型的顶层字段（嵌套段 WebUI 不渲染）。
@@ -127,12 +128,17 @@ from planning.config import (
 )
 from planning.event_catalog_config import (
     EventCatalogSectionConfig,
-    migrate_legacy_event_catalog,
 )
-from qzone.config import QzoneSectionConfig, QzoneVideoSectionConfig
+from qzone.config import LegacyCompatSectionConfig, QzoneSectionConfig, QzoneVideoSectionConfig
+from video_watch.autonomous_config import VideoAutonomousSectionConfig
 from video_watch.config import VideoWatchSectionConfig
 from video_watch.share_config import VideoShareSectionConfig
-from core.config_migration import migrate_display_config, migrate_internal_tuning, migrate_release_config
+from core.config_migration import (
+    migrate_display_config,
+    migrate_internal_tuning,
+    migrate_legacy_compat_config,
+    migrate_release_config,
+)
 from core.i18n import ui_i18n as _ui_i18n
 from core.internal_tuning import (
     INTERNAL_TUNING_DEFAULTS,
@@ -354,7 +360,27 @@ from suite_prompts import (
 # 20 段 264 叶子（B1 F1 +10 / B2 F3 +16 / B3 F4 +13 / B4 +2），按 R6 双号同步递增。
 # 2026-11-12 结构审计批（R12）：移除未实现的 transition_procrastination_event_branch
 # 用户叶子（-1）→ [experimental] 40 键、schema 20 段 263 叶子 / 2 隐藏（J 类预留保留）。
-SUPPORTED_CONFIG_VERSION = "3.17.35"
+# 3.17.36（2026-11-14 配置体系批）：新增 [legacy_compat] 旧版兼容段 3 键
+# （snowluma_http_host/port/token），[qzone] 移出 napcat_http_* 3 键（跨段改名值搬运，
+# core.config_migration.migrate_legacy_compat_config + rescue_release_config 磁盘抢救）；
+# 段序 __ui_order__=17 紧跟 qzone_video（16）之后（2026-11-14 段序修正批已改
+# 11/10，见下方批注）；[llm].over_limit_auto_trim 默认
+# True→False（schema/getattr 兜底/消费侧 params 兜底同步）。schema 21 段 264 叶子 / 2 隐藏
+# （段 +1、叶子净 ±0），按 R6 双号同步递增。
+# 3.17.37（2026-11-14 视频自主观看批）：新增 [video_autonomous] 段 4 键
+# （min_views/min_replies/min_coins/min_favorites），承载日程主动观看的候选数据门槛；
+# 只约束主动选片（BiliCandidateSource.prepare/pick），工具点播不受影响。[video_share]
+# 的 quality_gate/threshold 经核对消费方（仅 Qzone 发布桥）保留原段不迁移，观看侧另设
+# 独立统计阈值。schema 21→22 段、264→268 叶子 / 2 隐藏（段 +1、叶子 +4），按 R6 双号同步递增。
+# 2026-11-14 段序修正批（无版本递增）：独立复核发现 qzone_video（order=16）与
+# legacy_compat（order=17）渲染垫底、不与 qzone（order=9）相邻。按用户要求三段
+# 「QQ空间 → 空间视频候选 → 旧版兼容」渲染相邻：qzone_video 16→10、legacy_compat
+# 17→11（qzone/config.py），qzone=9 不变；video_watch 起其余段整体顺延 +2、彼此
+# 相对顺序不变——video_watch/video_autonomous/video_share 10→12、llm 11→13、
+# prompts 12→14、event_catalog（服务视图）12→14、admin 13→15、
+# dashboard_display 14→16、maimai_interaction 15→17。只改 __ui_order__ 与注释/文档，
+# 段数/字段数/隐藏数/默认值/迁移/版本号均不变。
+SUPPORTED_CONFIG_VERSION = "3.18.5"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
@@ -583,17 +609,17 @@ class LlmSectionConfig(PluginConfigBase):
 
     __ui_label__ = "LLM 调用"
     __ui_icon__ = "cpu"
-    __ui_order__ = 11
+    __ui_order__ = 13  # 2026-11-14 段序修正批整体顺延（原 11）
     prompt_optimization_enabled: bool = Field(
         default=True,
         description="短任务出现多余思考输出后，后续请求追加一次直接输出提示；不增加重试或延长超时。",
         json_schema_extra={"label": "自动约束短任务输出"},
     )
     over_limit_auto_trim: bool = Field(
-        default=True,
-        description="生成结果超出条数上限时自动裁剪兜底（默认开）：小事件取前N条避免整批作废；日程按时间排序后保留末尾，晚间计划不被裁掉。关闭则小事件超量整批拒绝、日程沿用旧的输出序截断。",
+        default=False,
+        description='生成数量超过用户设置的上限时是否自动裁剪。开启后，小事件保留前 N 条，日程按时间排序保留末尾 N 条；关闭后，小事件超量整批拒绝，日程按模型输出顺序裁剪。',
         json_schema_extra={"label": "超限自动裁剪",
-                           **_ui_i18n("Auto-trim over-limit", "Gracefully trim over-limit generation results instead of failing; schedule keeps the tail (evening).")},
+                           **_ui_i18n("Auto-trim over-limit", "Gracefully trim over-limit generation results instead of failing; schedule keeps the tail (evening). Off by default.")},
     )
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "LLM Calls",
@@ -669,17 +695,6 @@ class LlmSectionConfig(PluginConfigBase):
         },
     )
 
-    usage_retention_hours: int = Field(
-        default=720,
-        ge=24,
-        le=720,
-        description="LLM 用量账本保留期（小时）：默认 720 = 30 天硬上限，只清理更早的行",
-        json_schema_extra={
-            "label": "用量账本保留期（小时）",
-            "hint": "默认 30 天；面板 24 小时 / 7 天 / 30 天三档都落在保留期内。调小后更早的记录会被清理",
-            **_ui_i18n("Usage ledger retention (hours)"),
-        },
-    )
     usage_default_window_hours: int = Field(
         default=720,
         ge=24,
@@ -710,49 +725,20 @@ class AdminSectionConfig(PluginConfigBase):
 
     __ui_label__ = "管理与日志"
     __ui_icon__ = "shield"
-    __ui_order__ = 13
+    __ui_order__ = 15  # 2026-11-14 段序修正批整体顺延（原 13）
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Admin & Logs", "description": "Command permissions and diagnostic logs."}
     }
 
     admin_users: List[str] = Field(
         default_factory=list,
-        description="命令管理员（QQ 号或 qq:123456 形式）；留空 = 仅本机控制台可用管理子命令",
+        description="可管理插件的 QQ 号列表，支持 qq:123456。留空使用陪伴目标；目标也留空时读取宿主唯一 QQ 管理员，无法确定时仅本机控制台可用。",
         json_schema_extra={"label": "管理员", **_ui_i18n("Admin users")},
     )
     allowed_streams: List[str] = Field(
         default_factory=list,
         description="命令/注入允许的会话（session_id）；留空 = 不限制",
         json_schema_extra={"label": "允许会话", **_ui_i18n("Allowed streams")},
-    )
-    llm_log_enabled: bool = Field(
-        default=True,
-        description="记录 LLM 调用日志（JSONL，按天分文件）",
-        json_schema_extra={
-            "label": "LLM 日志",
-            "hint": "排查「模型答非所问」时必看；按天滚动、默认保留 3 天",
-            **_ui_i18n("LLM log"),
-        },
-    )
-    decision_log_enabled: bool = Field(
-        default=True,
-        description="记录巡检/空间/规划决策日志（JSONL，按天分文件）",
-        json_schema_extra={
-            "label": "决策日志",
-            "hint": "排查「为什么没主动说话」时必看",
-            **_ui_i18n("Decision log"),
-        },
-    )
-    log_retention_days: int = Field(
-        default=3,
-        ge=1,
-        le=30,
-        description="日志保留天数",
-        json_schema_extra={
-            "label": "日志保留天数",
-            "hint": "超过天数的日志自动清理（1-30 天）",
-            **_ui_i18n("Log retention (days)"),
-        },
     )
     # ── 告状工具（2026-10-24 用户直派）：bot 受骚扰时向维护者转达 ──
     harass_report_enabled: bool = Field(
@@ -790,7 +776,7 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
 
     __ui_label__ = "麦麦互动"
     __ui_icon__ = "heart"
-    __ui_order__ = 15
+    __ui_order__ = 17  # 2026-11-14 段序修正批整体顺延（原 15）
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Maimai Interaction",
                "description": "Corner mascot and fullscreen detail look & feel (display-only)."}
@@ -807,9 +793,10 @@ class MaimaiInteractionSectionConfig(PluginConfigBase):
     )
     preset: Literal["fish", "human"] = Field(
         default="human",
-        description="fish=萨卡班麦麦；human=麦麦",
-        json_schema_extra={"label": "形象预设", "hint": "fish=萨卡班麦麦；human=麦麦",
-                           **_ui_i18n("Mascot preset", "fish = Sakabamai; human = Maimai.")},
+        description="选择萨卡班麦麦或麦麦作为面板形象。",
+        json_schema_extra={"label": "形象预设", "hint": "选择喜欢的面板形象。",
+                           **_ui_i18n("Mascot preset", "Choose Sakabamai or Maimai.",
+                                      choices={"fish": "萨卡班麦麦", "human": "麦麦"})},
     )
     mascot_size_px: int = Field(
         default=144, ge=48, le=192,
@@ -825,7 +812,7 @@ class DashboardDisplaySectionConfig(PluginConfigBase):
     """设置历史明细的条数和变化显示阈值。"""
     __ui_label__ = "数据展示"
     __ui_icon__ = "chart-line"
-    __ui_order__ = 14
+    __ui_order__ = 16  # 2026-11-14 段序修正批整体顺延（原 14）
 
     history_changes_limit: int = Field(
         default=30, ge=5, le=30,
@@ -849,500 +836,28 @@ class DashboardDisplaySectionConfig(PluginConfigBase):
 
 
 class EventCatalogServiceView(EventCatalogSectionConfig):
-    """``[event_catalog]`` 服务只读视图（不序列化、不出现在 WebUI 配置骨架）。
-
-    ``planning_events`` 只是把同一次配置快照里的 ``[planning_events]`` 段附挂给
-    ``EventCatalogService``（经 ``config_provider`` 动态读取乘数），避免事件库
-    服务为了两个权重乘数反向依赖装配根/插件实例。
-    """
+    '``[event_catalog]`` 服务只读视图（不序列化、不出现在 WebUI 配置骨架）。'
 
     planning_events: Any = None
 
 
 #: F1 参数默认值单一真源（与 internal_tuning 种子/迁移目标同名）
-_GA: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["group_attention"])
 
 #: F3 参数默认值单一真源（转正后目标 = internal_tuning.json [transition]）
-_TR: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["transition"])
 
 #: F4 参数默认值单一真源（转正后目标 = internal_tuning.json [boundary]）
-_BD: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["boundary"])
 
 #: 联动批参数默认值单一真源（转正后目标 = internal_tuning.json [life_state]）
-_LS: Dict[str, object] = dict(INTERNAL_TUNING_DEFAULTS["life_state"])
 
 
-class ExperimentalSectionConfig(PluginConfigBase):
-    """实验性功能（2026-11-12 用户裁决 3：F1/F3/F4/B4 四项默认转正开启）。
-
-    迁移提示：已转正项按 ``union/20261111_实验配置迁移映射.md`` 仍留在本段，
-    逐项关闭即回到 3.17.33 对应行为（专项含开/关双路径断言）。
-    """
-
-    __ui_label__ = "实验性功能"
-    __ui_icon__ = "flask"
-    __ui_order__ = 0
-    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
-        "en": {"title": "Experimental",
-               "description": "Experimental features. Promoted switches default to on "
-                              "(2026-11-12 ruling) and can be turned off to revert; "
-                              "the promotion plan is documented per key in the migration map."}
-    }
-
-    # ── F1 群注意力衰减（B1；v2 §3）────────────────────────────────
-    group_attention_decay_enabled: bool = Field(
-        default=True,
-        description="群注意力衰减：群话题与当前活动不搭、且 bot 很久没被点名/接话时，"
-                    "逐步降低该群的下发频率；被点名、目标用户发言或话题回到活动时逐步恢复。"
-                    "只调频率、不拦消息，回不回由 bot/planner 决定。",
-        json_schema_extra={
-            "label": "群注意力衰减",
-            "hint": "默认开（2026-11-12 转正）。开 = 只对 [planning_proactive] 群生效集生效；"
-                    "下限=宿主因子×0.5，睡眠完全豁免，目标私聊恒 1.0；安静群不衰减",
-            **_ui_i18n("Group attention decay",
-                       "Experimental: gradually lower reply frequency in groups whose topic "
-                       "doesn't match the current activity and where the bot hasn't been "
-                       "addressed for a while. Frequency only; never blocks messages."),
-        },
-    )
-    group_attention_sample_size: int = Field(
-        default=_GA["sample_size"], ge=3, le=200,
-        description="每群环形缓冲的消息条数（用于话题失配比例；少于 3 条不判定失配）",
-        json_schema_extra={
-            "label": "采样条数",
-            "hint": "默认 20；越大越稳、越迟钝",
-            **_ui_i18n("Sample size", "Messages kept per group for topic mismatch ratio."),
-        },
-    )
-    group_attention_decay_window_minutes: int = Field(
-        default=_GA["decay_window_minutes"], ge=1, le=1440,
-        description="「多久没被点名/没参与」的饱和窗（分钟）：达到该时长沉默分记为 1",
-        json_schema_extra={
-            "label": "衰减饱和窗(分钟)",
-            "hint": "默认 45；越短越容易衰减",
-            **_ui_i18n("Decay window (min)", "Silence window that saturates the attention score."),
-        },
-    )
-    group_attention_silence_weight: float = Field(
-        default=_GA["silence_weight"], ge=0.0, le=1.0,
-        description="失配分数中「沉默」占比（与话题权重共同决定目标乘数）",
-        json_schema_extra={
-            "label": "沉默权重",
-            "hint": "默认 0.45；与话题权重相加为 1 时目标最低到 0.5",
-            **_ui_i18n("Silence weight", "Weight of silence in the decay score."),
-        },
-    )
-    group_attention_mismatch_weight: float = Field(
-        default=_GA["mismatch_weight"], ge=0.0, le=1.0,
-        description="失配分数中「话题不搭」占比（与沉默权重共同决定目标乘数）",
-        json_schema_extra={
-            "label": "话题失配权重",
-            "hint": "默认 0.55；首期纯关键词判定、零 LLM",
-            **_ui_i18n("Mismatch weight", "Weight of topic mismatch in the decay score."),
-        },
-    )
-    group_attention_step_per_tick: float = Field(
-        default=_GA["step_per_tick"], ge=0.0, le=0.5,
-        description="每 60s 向下的最大步进（乘数从 1.0 到 0.5 约需 25 分钟，避免一次撞下限）",
-        json_schema_extra={
-            "label": "向下步进/拍",
-            "hint": "默认 0.02；调大衰减更快、更容易显得冷淡",
-            **_ui_i18n("Decay step per tick", "Maximum downward multiplier step every 60s."),
-        },
-    )
-    group_attention_recover_step_per_tick: float = Field(
-        default=_GA["recover_step_per_tick"], ge=0.0, le=0.5,
-        description="每 60s 向上的最大恢复步进（被点名/目标发言后不会瞬间满频）",
-        json_schema_extra={
-            "label": "恢复步进/拍",
-            "hint": "默认 0.05；调小恢复更慢",
-            **_ui_i18n("Recovery step per tick", "Maximum upward multiplier step every 60s."),
-        },
-    )
-    group_attention_planner_hint_min_multiplier: float = Field(
-        default=_GA["planner_hint_min_multiplier"], ge=0.0, le=1.0,
-        description="乘数低于该值才可能向 planner 注入一行【群聊注意力】状态",
-        json_schema_extra={
-            "label": "状态行阈值",
-            "hint": "默认 0.85；调到 1.0 = 只要衰减就提示",
-            **_ui_i18n("Planner hint threshold",
-                       "Only emit the planner attention line below this multiplier."),
-        },
-    )
-    group_attention_planner_hint_interval_minutes: int = Field(
-        default=_GA["planner_hint_interval_minutes"], ge=1, le=1440,
-        description="每个群两次【群聊注意力】状态行之间的最小间隔（分钟）",
-        json_schema_extra={
-            "label": "状态行间隔(分钟)",
-            "hint": "默认 30；只限流、不抢日程块、不受日程注入冷却吞并",
-            **_ui_i18n("Planner hint interval (min)",
-                       "Minimum interval between two attention lines in the same group."),
-        },
-    )
-    group_attention_quiet_group_grace_minutes: int = Field(
-        default=_GA["quiet_group_grace_minutes"], ge=1, le=1440,
-        description="该窗内无任何群消息/回复 → 视为安静群：目标乘数回 1.0、不继续衰减",
-        json_schema_extra={
-            "label": "安静群宽限(分钟)",
-            "hint": "默认 30；防止冷清群被越衰减越不敢说话",
-            **_ui_i18n("Quiet group grace (min)",
-                       "No messages within this window => quiet group, recover to 1.0."),
-        },
-    )
-
-    # ── F3 转场拖延（B2；v2 §4）────────────────────────────────────
-    transition_enabled: bool = Field(
-        default=_TR["enabled"],
-        description="转场拖延：从吃饭/娱乐/休息/待机切到工作/学习这类高反差切换时，"
-                    "先插 3–8 分钟惯性过渡窗（专注缓慢爬坡），并以 20% 概率把启动推迟"
-                    " 15 分钟；拖延后可低概率在聊天里随口提一句。只作用于软意图，"
-                    "硬约定/睡眠/吃饭锚点完全不碰。",
-        json_schema_extra={
-            "label": "转场拖延",
-            "hint": "默认开（2026-11-12 转正）。开 = 每次高反差软切换最多一次缓冲（日限 4）"
-                    "+ 一次拖延（日限 2）；idle 调度与对外口径不变",
-            **_ui_i18n("Transition drag",
-                       "Experimental: after a low-focus activity, insert a 3-8 minute "
-                       "transition window before work/study and occasionally delay the "
-                       "start. Soft intents only; commitments and sleep are untouched."),
-        },
-    )
-    transition_window_min: int = Field(
-        default=_TR["window_min"], ge=1, le=30,
-        description="惯性过渡窗最短分钟数（显式 duration，不受 transition 画像 min_block=5 限制）",
-        json_schema_extra={
-            "label": "过渡窗最短(分钟)",
-            "hint": "默认 3；剩余窗口不足该值时不插缓冲",
-            **_ui_i18n("Transition window min", "Minimum transition window length."),
-        },
-    )
-    transition_window_max: int = Field(
-        default=_TR["window_max"], ge=1, le=60,
-        description="惯性过渡窗最长分钟数",
-        json_schema_extra={
-            "label": "过渡窗最长(分钟)",
-            "hint": "默认 8；窗末 focus 约到 0.65，工作可用即可、不追求满值",
-            **_ui_i18n("Transition window max", "Maximum transition window length."),
-        },
-    )
-    transition_procrastination_prob: float = Field(
-        default=_TR["procrastination_prob"], ge=0.0, le=1.0,
-        description="每次高反差软意图启动前的拖延掷骰概率（独立种子，不耗 planner 主 RNG）",
-        json_schema_extra={
-            "label": "拖延概率",
-            "hint": "默认 0.20；缓冲分支优先，缓冲没插时才掷拖延",
-            **_ui_i18n("Procrastination probability",
-                       "Chance to delay a high-contrast soft intent start."),
-        },
-    )
-    transition_delay_minutes: int = Field(
-        default=_TR["delay_minutes"], ge=1, le=180,
-        description="拖延基准分钟数（实际值再叠加 ± 抖动，并按硬边界/窗口右界夹取）",
-        json_schema_extra={
-            "label": "推迟时长(分钟)",
-            "hint": "默认 15；放不进窗口就放弃拖延、按原路径启动",
-            **_ui_i18n("Delay minutes", "Base delay before starting the intent."),
-        },
-    )
-    transition_delay_jitter_minutes: int = Field(
-        default=_TR["delay_jitter_minutes"], ge=0, le=60,
-        description="推迟时长的随机抖动幅度（± 分钟）",
-        json_schema_extra={
-            "label": "推迟抖动(分钟)",
-            "hint": "默认 5；实际推迟 = 基准 ± 抖动，夹取后仍放不下则放弃",
-            **_ui_i18n("Delay jitter (min)", "Random +/- jitter on the delay."),
-        },
-    )
-    transition_daily_buffer_limit: int = Field(
-        default=_TR["daily_buffer_limit"], ge=0, le=20,
-        description="每日惯性过渡窗上限（跨 reload 由 transition_usage.json 保持，不刷额度）",
-        json_schema_extra={
-            "label": "过渡窗日限",
-            "hint": "默认 4；0 = 不插过渡窗（但拖延仍可单独生效）",
-            **_ui_i18n("Daily transition limit", "Maximum transition windows per day."),
-        },
-    )
-    transition_daily_procrastination_limit: int = Field(
-        default=_TR["daily_procrastination_limit"], ge=0, le=20,
-        description="每日拖延事件上限（跨 reload 持久）",
-        json_schema_extra={
-            "label": "拖延日限",
-            "hint": "默认 2；0 = 不拖延",
-            **_ui_i18n("Daily procrastination limit",
-                       "Maximum procrastination events per day."),
-        },
-    )
-    transition_low_focus_types: List[str] = Field(
-        default=_TR["low_focus_types"],
-        description="反差源活动类型（上一活动属于这些类型 → 视为低专注状态）",
-        json_schema_extra={
-            "label": "低专注类型",
-            "hint": "默认 meal/entertainment/rest/idle；只影响反差判定，不改任何画像",
-            **_ui_i18n("Low focus types",
-                       "Activity types considered low-focus for contrast detection."),
-        },
-    )
-    transition_high_focus_types: List[str] = Field(
-        default=_TR["high_focus_types"],
-        description="反差目标活动类型（软意图目标属于这些类型 → 可能插过渡窗/拖延）",
-        json_schema_extra={
-            "label": "高专注类型",
-            "hint": "默认 work/study；硬约定永不延迟、永不替换",
-            **_ui_i18n("High focus types",
-                       "Activity types considered high-focus targets."),
-        },
-    )
-    transition_boundary_margin_minutes: int = Field(
-        default=_TR["boundary_margin_minutes"], ge=0, le=60,
-        description="插过渡窗/拖延时距下一硬边界（或意图窗口右界）保留的余量分钟",
-        json_schema_extra={
-            "label": "边界余量(分钟)",
-            "hint": "默认 2；余量不足 window_min 时不插缓冲，放不下推迟时长时放弃拖延",
-            **_ui_i18n("Boundary margin (min)",
-                       "Safety margin kept before hard boundaries / intent window end."),
-        },
-    )
-    transition_focus_target: float = Field(
-        default=_TR["focus_target"], ge=0.0, le=1.0,
-        description="过渡窗内 focus 趋近目标（注入结算 v2 activity.transition.focus[0]）",
-        json_schema_extra={
-            "label": "过渡专注靶",
-            "hint": "默认 0.68；8 分钟窗末约到 0.65（起点 0.45~0.55 时），工作可用即可",
-            **_ui_i18n("Transition focus target",
-                       "Focus target approached during the transition window."),
-        },
-    )
-    transition_focus_tau_min: float = Field(
-        default=_TR["focus_tau_min"], ge=0.5, le=120.0,
-        description="过渡窗 focus 趋近时间常数（分钟；越小爬坡越快）",
-        json_schema_extra={
-            "label": "过渡专注时间常数(分钟)",
-            "hint": "默认 3.0；配合靶 0.68，窗末 focus 不低于 0.60",
-            **_ui_i18n("Transition focus tau (min)",
-                       "Time constant of the focus approach during the window."),
-        },
-    )
-    transition_confess_probability: float = Field(
-        default=_TR["confess_probability"], ge=0.0, le=1.0,
-        description="聊天时主动自我揭露「刚才拖延/发呆」的概率（按聊天流×日程段去重）",
-        json_schema_extra={
-            "label": "自我揭露概率",
-            "hint": "默认 0.10；同一流同一次过渡/拖延最多一次，同流两次至少隔 20 分钟",
-            **_ui_i18n("Self-disclosure probability",
-                       "Chance to mention the drag/loafing in chat, deduped per stream "
-                       "and episode."),
-        },
-    )
-    transition_confess_min_interval_minutes: int = Field(
-        default=_TR["confess_min_interval_minutes"], ge=0, le=1440,
-        description="同一聊天流两次自我揭露的最小间隔（分钟；在 episode 去重之上）",
-        json_schema_extra={
-            "label": "揭露最小间隔(分钟)",
-            "hint": "默认 20；只限流，不阻塞正常回复",
-            **_ui_i18n("Self-disclosure interval (min)",
-                       "Minimum interval between two disclosures in the same stream."),
-        },
-    )
-    # 2026-11-12 结构审计批（R12）：transition_procrastination_event_branch 是
-    # 预留未实现开关（开与不开行为一致），从用户 schema 移除，不占可见叶子；
-    # 保留在 INTERNAL_TUNING_DEFAULTS["transition"]（J 类预留，转正时再决定实现）。
-
-    # ── F4 社交边界（B3；v2 §5）────────────────────────────────────
-    social_boundary_enabled: bool = Field(
-        default=True,
-        description="社交边界：深工/睡眠时只在群聊里给 planner 一行状态（不拦消息、不延迟），"
-                    "目标私聊在高压/极疲惫时使用「可拒绝、可脆弱」的语气分支，"
-                    "并在忙时提示 planner 可用 wait 工具晚点回；碎片化只做提示词建议。",
-        json_schema_extra={
-            "label": "社交边界",
-            "hint": "默认开（2026-11-12 转正）。开 = 群状态行/私聊极端语气/wait 提示/碎片化提示；"
-                    "睡眠群仍是短慢软 + 原吵醒记账，不硬不回、不建账本",
-            **_ui_i18n("Social boundaries",
-                       "Experimental: when deep in work or asleep, state that in one "
-                       "planner line instead of blocking messages; in the target private "
-                       "chat, allow a boundary-respecting refusal/vulnerable tone. Never "
-                       "blocks or delays delivery."),
-        },
-    )
-    social_boundary_refusal_energy_threshold: float = Field(
-        default=_BD["refusal_energy_threshold"], ge=0.0, le=1.0,
-        description="目标私聊进入「脆弱」分支的精力阈值（energy 低于该值）",
-        json_schema_extra={
-            "label": "脆弱精力阈值",
-            "hint": "默认 0.25；与 mental_state 下限任一命中即可",
-            **_ui_i18n("Vulnerable energy threshold",
-                       "Energy below this enters the vulnerable tone branch."),
-        },
-    )
-    social_boundary_refusal_stress_threshold: float = Field(
-        default=_BD["refusal_stress_threshold"], ge=0.0, le=1.0,
-        description="目标私聊进入「拒绝」分支的压力阈值（stress 高于该值）",
-        json_schema_extra={
-            "label": "拒绝压力阈值",
-            "hint": "默认 0.80；高压优先于低精力选「拒绝」口径",
-            **_ui_i18n("Refusal stress threshold",
-                       "Stress above this enters the refusal tone branch."),
-        },
-    )
-    social_boundary_refusal_mental_floor: float = Field(
-        default=_BD["refusal_mental_floor"], ge=0.0, le=1.0,
-        description="目标私聊进入「脆弱」分支的 mental_state 下限（energy×focus×(1-stress)）",
-        json_schema_extra={
-            "label": "精神状态下限",
-            "hint": "默认 0.15；只读快照，不额外存状态",
-            **_ui_i18n("Mental state floor",
-                       "Derived mental_state below this enters the vulnerable branch."),
-        },
-    )
-    social_boundary_deep_work_types: List[str] = Field(
-        default=_BD["deep_work_types"],
-        description="深工活动类型（active goal_type 命中且 attention_mode 也命中才出群状态行）",
-        json_schema_extra={
-            "label": "深工活动类型",
-            "hint": "默认 work/study；只影响群状态行，不改日程/画像",
-            **_ui_i18n("Deep-work activity types",
-                       "Activity types considered deep work for the group state line."),
-        },
-    )
-    social_boundary_deep_work_modes: List[str] = Field(
-        default=_BD["deep_work_modes"],
-        description="深工注意力档（attention_mode 命中才视为不可分心；now 不算深工）",
-        json_schema_extra={
-            "label": "深工注意力档",
-            "hint": "默认 brief/later；now=随时可搭话，不出深工状态行",
-            **_ui_i18n("Deep-work attention modes",
-                       "Attention modes treated as non-interruptible deep work."),
-        },
-    )
-    social_boundary_group_line_interval_minutes: int = Field(
-        default=_BD["group_line_interval_minutes"], ge=1, le=1440,
-        description="同一群两次【此刻】边界状态行之间的最小间隔（分钟）",
-        json_schema_extra={
-            "label": "群状态行间隔(分钟)",
-            "hint": "默认 30；只限流，不抢日程块、不吞其他注入",
-            **_ui_i18n("Group boundary line interval",
-                       "Minimum interval between two group boundary lines."),
-        },
-    )
-    social_boundary_wait_hint_enabled: bool = Field(
-        default=_BD["wait_hint_enabled"],
-        description="是否向 planner 提示可用 wait 工具晚点回（宿主无 wait 工具时置 False）",
-        json_schema_extra={
-            "label": "wait 提示",
-            "hint": "默认开；只提示、不主动 wait，是否等由 planner 决定",
-            **_ui_i18n("Wait hint",
-                       "Mention that the planner may use the host wait tool."),
-        },
-    )
-    social_boundary_wait_hint_min_seconds: int = Field(
-        default=_BD["wait_hint_min_seconds"], ge=1, le=3600,
-        description="wait 提示的秒数下限",
-        json_schema_extra={
-            "label": "wait 秒数下限",
-            "hint": "默认 45；提示只生成 seconds，不生成 until（1.3.16 兼容）",
-            **_ui_i18n("Wait hint min seconds", "Lower bound of the suggested wait."),
-        },
-    )
-    social_boundary_wait_hint_max_seconds: int = Field(
-        default=_BD["wait_hint_max_seconds"], ge=1, le=3600,
-        description="wait 提示的秒数上限",
-        json_schema_extra={
-            "label": "wait 秒数上限",
-            "hint": "默认 180；与下限写反时按小值~大值夹取",
-            **_ui_i18n("Wait hint max seconds", "Upper bound of the suggested wait."),
-        },
-    )
-    social_boundary_wait_hint_cooldown_minutes: int = Field(
-        default=_BD["wait_hint_cooldown_minutes"], ge=0, le=1440,
-        description="同一聊天流两次 wait 提示的最小间隔（分钟）",
-        json_schema_extra={
-            "label": "wait 提示冷却(分钟)",
-            "hint": "默认 30；0 = 不冷却（仍受每轮一次限制）",
-            **_ui_i18n("Wait hint cooldown",
-                       "Minimum interval between two wait hints in one stream."),
-        },
-    )
-    social_boundary_fragment_hint_probability: float = Field(
-        default=_BD["fragment_hint_probability"], ge=0.0, le=1.0,
-        description="目标私聊追加「可以拆成两三条短句」提示的概率（只提示，不真分段）",
-        json_schema_extra={
-            "label": "碎片化提示概率",
-            "hint": "默认 0.20；按流×分钟稳定掷骰，首期不做真分段",
-            **_ui_i18n("Fragment hint probability",
-                       "Chance to suggest splitting a reply into short messages."),
-        },
-    )
-    social_boundary_rhythm_short_reply_probability: float = Field(
-        default=_BD["rhythm_short_reply_probability"], ge=0.0, le=1.0,
-        description="目标私聊追加「只回一个语气词/一句」提示的概率",
-        json_schema_extra={
-            "label": "短回复提示概率",
-            "hint": "默认 0.25；与碎片化提示独立掷骰",
-            **_ui_i18n("Short reply hint probability",
-                       "Chance to suggest a very short reply."),
-        },
-    )
-
-    # ── 联动批：bpp 认领让位 + 群社交电量（B4；v2 §6）──────────────
-    bpp_bridge_enabled: bool = Field(
-        default=True,
-        description="与「更好的消息后处理」(bpp) 联动：life 在发送前向 bpp 登记本轮认领，"
-                    "bpp 后处理接管生效时由它模拟打字、life 让位（避免双重等待）；"
-                    "同时开启群聊真实回复的社交电量消耗。bpp 未安装/未激活/超时 → "
-                    "life 照常自己模拟打字，绝不劣化。",
-        json_schema_extra={
-            "label": "bpp 联动",
-            "hint": "默认开（2026-11-12 转正）。开 = 认领让位 + 群电量；"
-                    "bpp 缺失/拒绝/超时仍走 life 原打字链，目标私聊折减/回充链逐字不变",
-            **_ui_i18n("bpp bridge",
-                       "Experimental: claim the reply round from the better-post-processing "
-                       "plugin so it owns typing simulation when active, and drain social "
-                       "battery for real group replies. Fails open to the old behavior."),
-        },
-    )
-    group_chat_social_drain_per_reply: float = Field(
-        default=_LS["group_chat_social_drain_per_reply"], ge=0.0, le=1.0,
-        description="群聊真实回复每次消耗的社交电量（不适用好感折减/回充；仅群回复且去重）",
-        json_schema_extra={
-            "label": "群回复电量消耗",
-            "hint": "默认 0.02；0 = 不消耗。目标私聊仍走原有折减/回充链，口径不变",
-            **_ui_i18n("Group reply social drain",
-                       "Social battery drained per real group reply; no affinity discount or "
-                       "recharge. 0 disables."),
-        },
-    )
-
-    # ── F5 广义抑饿（2026-11-12 用户裁决 2-A）──────────────────────
-    suppress_hunger_mention_enabled: bool = Field(
-        default=True,
-        description="抑制主动提饿：潜意识状态注入里追加一条广义禁令，不论当前是否命中"
-                    "饥饿语气分支，都不主动提及饥饿/食欲；对方问起才自然带过。"
-                    "关闭 = 只保留饥饿分支自身的「不主动提饿」措辞。",
-        json_schema_extra={
-            "label": "抑制主动提饿",
-            "hint": "默认开。开 = 回复/planner 两支潜意识状态注入都追加广义禁令；"
-                    "关 = 不追加，行为回到 3.17.34",
-            **_ui_i18n("Suppress hunger mentions",
-                       "Append a broad instruction to the subconscious state injection so "
-                       "the bot never brings up hunger on its own, whether or not the hungry "
-                       "tone branch is selected."),
-        },
-    )
 
 
 class CateyeSuiteConfig(PluginConfigBase):
-    """插件完整配置。
-
-    注意：子分组必须扁平挂为顶层字段（嵌套段 WebUI 不渲染）。
-    各 section 类定义在各子模块的 config.py / suite_prompts.py 中（模块化维护）；
-    ``[experimental]`` 段类（:class:`ExperimentalSectionConfig`）2026-11-12 起
-    直接定义在本模块（原顶层 experimental_config.py 已并入，R11）。
-    """
+    '插件完整配置。'
 
     # 2026-11-12 用户裁决 2：段序后移——plugin 第一、experimental 第二。
     # （原 2026-11-11「实验性配置集中置顶」随转正结束。）
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
-    experimental: ExperimentalSectionConfig = Field(default_factory=ExperimentalSectionConfig)
     patrol: PatrolSectionConfig = Field(default_factory=PatrolSectionConfig)
     screen: ScreenSectionConfig = Field(default_factory=ScreenSectionConfig)
     affection: AffectionSectionConfig = Field(default_factory=AffectionSectionConfig)
@@ -1355,12 +870,29 @@ class CateyeSuiteConfig(PluginConfigBase):
     qzone: QzoneSectionConfig = Field(default_factory=QzoneSectionConfig)
     qzone_video: QzoneVideoSectionConfig = Field(default_factory=QzoneVideoSectionConfig)
     video_watch: VideoWatchSectionConfig = Field(default_factory=VideoWatchSectionConfig)
+    # 3.17.37 视频自主观看段：日程主动观看的候选数据门槛（播放量/评论/投币/收藏）。
+    # 与 video_watch / video_share 同为 __ui_order__=12（2026-11-14 段序修正批
+    # 整体顺延，原 10）；声明序插在两者之间 →
+    # 渲染序 video_watch → video_autonomous → video_share（order 升序稳定排序）。
+    # 只约束主动选片（BiliCandidateSource.prepare/pick），工具点播不受影响。
+    video_autonomous: VideoAutonomousSectionConfig = Field(default_factory=VideoAutonomousSectionConfig)
     video_share: VideoShareSectionConfig = Field(default_factory=VideoShareSectionConfig)
     llm: LlmSectionConfig = Field(default_factory=LlmSectionConfig)
     prompts: PromptsSectionConfig = Field(default_factory=PromptsSectionConfig)
     admin: AdminSectionConfig = Field(default_factory=AdminSectionConfig)
     dashboard_display: DashboardDisplaySectionConfig = Field(default_factory=DashboardDisplaySectionConfig)
     maimai_interaction: MaimaiInteractionSectionConfig = Field(default_factory=MaimaiInteractionSectionConfig)
+    # 3.17.36 旧版兼容段：渲染序由 __ui_order__=11 决定（2026-11-14 段序修正批，
+    # 原 17 垫底），紧跟 qzone_video（order=10）、qzone（order=9）之后，三段渲染
+    # 相邻。声明序不决定渲染序：SDK 按 __ui_order__ 建 schema
+    # （maibot_sdk/config.py _build_section_schema），宿主前端按 order 升序稳定排序。
+    legacy_compat: LegacyCompatSectionConfig = Field(default_factory=LegacyCompatSectionConfig)
+
+    @property
+    def feature_tuning(self):
+        """已启用功能的内部参数视图；不写入用户配置。"""
+        from core.internal_tuning import FeatureTuning
+        return FeatureTuning()
 
     @property
     def event_catalog(self) -> EventCatalogSectionConfig:
@@ -1420,18 +952,16 @@ class CateyeSuiteConfig(PluginConfigBase):
         #      离线 model_validate 路径也不会把已删键写回 TOML。须在 migrate_display_config
         #      之后（旧 [maimai_interaction] 的 history_*_epsilon 先搬进本段再被摘出）。
         migrated, _tuning_captured = migrate_internal_tuning(migrated)
+        if _tuning_captured:
+            from core.internal_tuning import stage_captured
+            stage_captured(_tuning_captured)
         # Preserve canonical explicit defaults before the ancient layout cleaner
         # strips default-valued keys; legacy aliases must already be gone then.
         migrated = migrate_release_config(migrated)
-        # 0a) [event_catalog] 旧键 max_events → 规范字段 max_generated_events（2026-10-27 用户裁定）。
-        #     必须发生在「默认值填充之前」：宿主/SDK 先 merge 出厂默认，之后 pydantic 的
-        #     model_fields_set 会把每个字段都当显式值，段级 resolve_config 的「规范字段优先」
-        #     判据失效 → 只写 max_events=6 的旧配置会被默认 8 吞掉。此处按原始字典搬迁后
-        #     删旧键，落盘就是规范形态（幂等：第二次进入不再有 max_events）。
-        if "event_catalog" in migrated:
-            migrated["event_catalog"] = migrate_legacy_event_catalog(
-                migrated.get("event_catalog"),
-                (factory_defaults() or {}).get("event_catalog"))
+        # 0-r) 3.17.36 旧版兼容段：[qzone].napcat_http_* → [legacy_compat].snowluma_http_*
+        #      跨段改名值搬运（两分支共经；幂等——旧键搬完即 pop）。目标键等于出厂
+        #      默认 "" 视同缺位，merge 过默认的输入也能搬入旧值。
+        migrated = migrate_legacy_compat_config(migrated)
         # 0) 段内已删键清理——放在两个分支**都经过**的入口处（清旧键性质，与 already_migrated
         #    分支只清旧段同精神：不搬运、不回填）。2026-10-17 §19.4 / 复核 findings#4：
         #    v1 三档口径的 [affection].current_level 无法映射 0~200 新标度（§9.7 教训），

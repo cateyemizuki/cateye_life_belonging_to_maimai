@@ -1,0 +1,11 @@
+{
+  "event": "miss_confirm",
+  "title": "想念判断默认通行",
+  "tier": "small",
+  "format": "yesno",
+  "light": true,
+  "required": [],
+  "kind": "miss_confirm",
+  "ok": true,
+  "response": "Y"
+}

@@ -30,7 +30,7 @@ class ScreenSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "截图模糊半径", "hint": "数值越大，画面细节越模糊。", **ui_i18n("Screenshot blur")})
     scope: Literal["main", "all"] = Field(default="main", description="main 查看主屏，all 查看全部可用屏幕。",
         json_schema_extra={"label": "屏幕范围", "hint": "多屏需要本地客户端支持；负载过大时可能降级。",
-                           **ui_i18n("Screen scope")})
+                           **ui_i18n("Screen scope", choices={"main": "主屏幕", "all": "全部屏幕"})})
 
     @property
     def screen_timeout_seconds(self) -> float:

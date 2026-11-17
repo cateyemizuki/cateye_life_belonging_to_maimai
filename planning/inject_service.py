@@ -341,8 +341,8 @@ class InjectService:
         去重按 ``(聊天流, episode_id)`` + 同流最小间隔（:class:`ConfessionLedger`）。
         关 = 不读 DB、不建台账、返回空串（旧行为逐字不变；默认值 2026-11-12 起 True）。
         """
-        exp = getattr(getattr(self._plugin, "config", None), "experimental", None)
-        if exp is None or not bool(getattr(exp, "transition_enabled", False)):
+        exp = getattr(getattr(self._plugin, "config", None), "feature_tuning", None)
+        if exp is None:
             return ""
         db = getattr(self._plugin, "_db", None)
         if db is None:
@@ -701,15 +701,15 @@ class InjectService:
                     all_future_activities = life_ov["future"]
                 remaining_override = life_ov["remaining"]
                 life_lines = self._life_block_lines(
-                    life_view, life_ov, subconscious=self._state_subconscious_style(),
+                    life_view, life_ov, subconscious=True,
                     bot_name=self._bot_name(),
-                    suppress_hunger_mention=self._suppress_hunger_mention())
+                    suppress_hunger_mention=True)
                 if live_gate_enabled:
                     life_lines_slim = self._life_block_lines(
                         life_view, life_ov, slim=True,
-                        subconscious=self._state_subconscious_style(),
+                        subconscious=True,
                         bot_name=self._bot_name(),
-                        suppress_hunger_mention=self._suppress_hunger_mention())
+                        suppress_hunger_mention=True)
 
             # 无当前活动不再静默早退（N1-2）：照常走「分类 → 决策 → 模板路由」，
             # 模板侧自动切到空活动变体（兜底文案 = suite_prompts 内部键 inject_no_activity）。
@@ -1365,19 +1365,11 @@ class InjectService:
                     time=time_str, name=name,
                 ).strip()
                 lines.append(f"{bot_name}接下来：{line}")
-            if self._state_subconscious_style():
-                # 潜意识风格：问当前只如实说活动，状态用语气体现、不逐项汇报
-                current_hint = render(
-                    INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT,
-                    fallback=INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT,
-                    bot_name=bot_name,
-                )
-            else:
-                current_hint = render(
-                    prompt(self._plugin, "inject_hint_current"),
-                    fallback=INJECT_HINT_CURRENT_DEFAULT,
-                    bot_name=bot_name,
-                )
+            current_hint = render(
+                INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT,
+                fallback=INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT,
+                bot_name=bot_name,
+            )
             lines.extend(["", current_hint])
         else:
             if context_continue_inject:
@@ -1448,26 +1440,7 @@ class InjectService:
             section = getattr(getattr(self._plugin, "config", None), "prompts", None)
         return section
 
-    def _state_subconscious_style(self) -> bool:
-        """``[prompts].state_subconscious_style``（出厂默认 True；段缺失按默认）。"""
-        section = self._prompts_section()
-        if section is None:
-            return True
-        value = getattr(section, "state_subconscious_style", True)
-        return True if value is None else bool(value)
 
-    def _suppress_hunger_mention(self) -> bool:
-        """F5（用户裁决 2-A）：``[experimental].suppress_hunger_mention_enabled``。
-
-        出厂默认 True；段缺失/异常同样按 True（与 pydantic 默认同口径）——
-        该禁令只是语气约束，取不到配置时宁可多压一句，也不让状态上下文诱发提饿；
-        显式关闭则完全不追加（旧文本逐字不变）。
-        """
-        section = getattr(getattr(self._plugin, "config", None), "experimental", None)
-        if section is None:
-            return True
-        value = getattr(section, "suppress_hunger_mention_enabled", True)
-        return True if value is None else bool(value)
 
     def _life_state_snapshot(self) -> Dict[str, float]:
         """只读状态快照（精力/饥饿/社交电量/专注/压力/精神派生）；缺失/异常 → 空 dict。
@@ -1671,35 +1644,25 @@ class InjectService:
                 bot_name=bot_name,
                 time=time_str, name=name,
             )
-        if self._state_subconscious_style():
-            # 内部固定模板（不新增用户 schema 键）：数据原样保留，口径改为语气约束
-            tone_rule = self._subconscious_tone_rule(session_id)
-            if tone_rule:
-                # 语气分支带 {bot_name} 占位（极端分支已在 boundary 内渲染，重复渲染无副作用）
-                tone_rule = render(tone_rule, fallback=tone_rule, bot_name=bot_name)
-            # F5（用户裁决 2-A）：无论命中哪个语气分支（含极端/平稳），开关开时
-            # 都追加一条广义抑饿禁令——状态数据里的「有点饿」本身可能诱发主动提饿。
-            if self._suppress_hunger_mention():
-                hunger_ban = render(
-                    SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
-                    fallback=SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
-                    bot_name=bot_name,
-                )
-                tone_rule = f"{tone_rule}\n{hunger_ban}" if tone_rule else hunger_ban
-            text = render(
-                INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
-                fallback=INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
-                bot_name=bot_name,
-                state_line=state_line, energy=energy_desc,
-                tone_rule=tone_rule, next_line=next_line,
-            )
-        else:
-            text = render(
-                prompt(self._plugin, "inject_replyer_status"),
-                fallback=INJECT_REPLYER_STATUS_DEFAULT,
-                bot_name=bot_name,
-                state_line=state_line, energy=energy_desc, next_line=next_line,
-            )
+        tone_rule = self._subconscious_tone_rule(session_id)
+        if tone_rule:
+            # 语气分支带 {bot_name} 占位（极端分支已在 boundary 内渲染，重复渲染无副作用）
+            tone_rule = render(tone_rule, fallback=tone_rule, bot_name=bot_name)
+        # F5（用户裁决 2-A）：无论命中哪个语气分支（含极端/平稳），开关开时
+        # 都追加一条广义抑饿禁令——状态数据里的「有点饿」本身可能诱发主动提饿。
+        hunger_ban = render(
+            SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
+            fallback=SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
+            bot_name=bot_name,
+        )
+        tone_rule = f"{tone_rule}\n{hunger_ban}" if tone_rule else hunger_ban
+        text = render(
+            INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
+            fallback=INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
+            bot_name=bot_name,
+            state_line=state_line, energy=energy_desc,
+            tone_rule=tone_rule, next_line=next_line,
+        )
         hints = self._boundary_reply_hints(session_id)
         return f"{text}\n" + "\n".join(hints) if hints else text
 

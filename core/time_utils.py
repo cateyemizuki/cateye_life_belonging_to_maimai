@@ -1,13 +1,14 @@
 """时间工具：HH:MM 解析与分钟换算等纯时间函数。
 
 R0-C2：窗口类判定（is_in_time_window）已迁至 planning/time_utils.py，
-本模块只保留纯时间函数；core 不依赖 planning。
+本模块统一纯时间与 DST 墙钟/真实秒函数；core 不依赖 planning。
 """
 
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Any
 
 
 def parse_hhmm(value: str, default_minutes: int = 0) -> int:
@@ -61,3 +62,37 @@ def parse_hours_range(value: object, default: tuple[float, float] = (4.0, 8.0)) 
         low, high = (low, high) if low <= high else (high, low)
         return max(0.0, low), max(0.0, high)
     return default
+
+
+def wall_time(day: Any, minutes: int, tz: Any) -> datetime:
+    """按当地日历重建锚点；DST 缺口向后归一，重复钟点取首次。"""
+    wall = datetime(day.year, day.month, day.day) + timedelta(minutes=int(minutes))
+    if tz is None:
+        return wall
+    localize = getattr(tz, "localize", None)
+    if callable(localize):
+        # TimezoneManager 的 pytz 降级也保持与 zoneinfo 相同的缺口/重复钟点策略。
+        from pytz import AmbiguousTimeError, NonExistentTimeError
+        try:
+            aware = localize(wall, is_dst=None)
+        except AmbiguousTimeError:
+            aware = min((localize(wall, is_dst=True), localize(wall, is_dst=False)),
+                        key=lambda dt: dt.timestamp())
+        except NonExistentTimeError:
+            aware = localize(wall, is_dst=False)
+    else:
+        aware = wall.replace(tzinfo=tz)
+    return datetime.fromtimestamp(aware.timestamp(), tz)
+
+
+def elapsed_seconds(later: datetime, earlier: datetime) -> float:
+    """aware 时间按真实秒比较，避免同 tzinfo 的减法忽略 DST/fold。"""
+    if later.tzinfo is not None and earlier.tzinfo is not None:
+        return later.timestamp() - earlier.timestamp()
+    return (later - earlier).total_seconds()
+
+
+def shift_elapsed(value: datetime, seconds: float) -> datetime:
+    if value.tzinfo is not None:
+        return datetime.fromtimestamp(value.timestamp() + seconds, value.tzinfo)
+    return value + timedelta(seconds=seconds)

@@ -1,0 +1,27 @@
+{
+  "event": "emotion_init",
+  "title": "中性情绪参数",
+  "tier": "large",
+  "format": "json",
+  "light": false,
+  "required": [
+    "anchor"
+  ],
+  "kind": "emotion_init",
+  "ok": true,
+  "response": {
+    "anchor": {
+      "valence": 0.0,
+      "arousal": 0.0,
+      "dominance": 0.0
+    },
+    "offset": {
+      "valence": 0.0,
+      "arousal": 0.0,
+      "dominance": 0.0
+    },
+    "positive_gain": 1.0,
+    "negative_decay": 1.0,
+    "reasons": {}
+  }
+}

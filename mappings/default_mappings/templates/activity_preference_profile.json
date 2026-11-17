@@ -1,0 +1,17 @@
+{
+  "event": "activity_preference_profile",
+  "title": "中性活动偏好",
+  "tier": "large",
+  "format": "json",
+  "light": false,
+  "required": [
+    "traits",
+    "activities"
+  ],
+  "kind": "preferences",
+  "ok": false,
+  "response": {
+    "traits": {},
+    "activities": []
+  }
+}

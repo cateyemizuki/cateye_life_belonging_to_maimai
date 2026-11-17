@@ -1,0 +1,11 @@
+{
+  "event": "qzone_post",
+  "title": "简短日常说说",
+  "tier": "medium",
+  "format": "text",
+  "light": false,
+  "required": [],
+  "kind": "qzone_post",
+  "ok": true,
+  "response": "给今天留一点轻松的空隙。"
+}

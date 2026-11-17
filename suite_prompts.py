@@ -52,10 +52,8 @@ COMPANION_MISS_CONFIRM_DEFAULT = (
 )
 
 #: 日程巡检（活动分享）触发 reason（占位符：{lover_name} / {activity}）
-COMPANION_ACTIVITY_REASON_DEFAULT = "【触发原因·日程巡检】{lover_name}现在在{activity}，可以分享一句。"
 
 #: 日常搭话触发 reason（占位符：{lover_name}）
-COMPANION_DAILY_REASON_DEFAULT = "【触发原因·日常巡检】没什么特别的事，可以自然闲聊一句。"
 
 #: 陪伴对象电脑屏幕截图的视觉理解提示词（随截图发给 vlm 任务）
 SCREEN_DESCRIBE_DEFAULT = (
@@ -859,7 +857,7 @@ class PromptsSectionConfig(PluginConfigBase):
 
     __ui_label__ = "提示词（高级）"
     __ui_icon__ = "message-square"
-    __ui_order__ = 12
+    __ui_order__ = 14  # 2026-11-14 段序修正批整体顺延（原 12）
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {"title": "Prompts (Advanced)",
                "description": "Customize wording and additional schedule preferences; internal protocols are maintained by the plugin."}
@@ -867,18 +865,6 @@ class PromptsSectionConfig(PluginConfigBase):
 
     # ── 状态注入风格（2026-11-11 Gemini 批，报告 §2.2/§5.2）──────────
     # 只改变状态行的表达范式，不改状态数值与注入开关；关闭 = 旧版直白汇报口径。
-    state_subconscious_style: bool = Field(
-        default=True,
-        description="状态潜意识化：把精力/社交电量等状态改写为语气与篇幅约束（禁止直接复述状态词），"
-                    "让状态自然渗透而不是每句都汇报「我累了」",
-        json_schema_extra={
-            "label": "状态潜意识化提示词",
-            "hint": "默认开：状态只影响语气、字数与节奏，不要求模型念出状态；关 = 旧版直白状态注入",
-            **_ui_i18n("Subconscious state styling",
-                       "Express state through tone and length instead of reporting status words; "
-                       "off = legacy explicit state injection."),
-        },
-    )
 
     # ── 陪伴模块 ─────────────────────────────────────────────
     companion_miss_reason: str = Field(
@@ -886,18 +872,6 @@ class PromptsSectionConfig(PluginConfigBase):
         description="想念触发时给 planner 的说明（占位符：{lover_name} {relation} {hours}）",
         json_schema_extra={"label": "想念·触发说明", "rows": 3,
                            **_ui_i18n("Miss trigger reason")},
-    )
-    companion_activity_reason: str = Field(
-        default=COMPANION_ACTIVITY_REASON_DEFAULT,
-        description="【已停用】旧日程巡检分享触发说明，现版本无消费方；保留字段仅为兼容存量配置（复核 P0-7 标注）",
-        json_schema_extra={"label": "巡检·日程分享（已停用）", "rows": 2,
-                           **_ui_i18n("Activity patrol reason")},
-    )
-    companion_daily_reason: str = Field(
-        default=COMPANION_DAILY_REASON_DEFAULT,
-        description="【已停用】旧日常搭话触发说明，现版本无消费方；保留字段仅为兼容存量配置（复核 P0-7 标注）",
-        json_schema_extra={"label": "巡检·日常搭话（已停用）", "rows": 2,
-                           **_ui_i18n("Daily patrol reason")},
     )
     screen_describe: str = Field(
         default=SCREEN_DESCRIBE_DEFAULT,
@@ -971,8 +945,6 @@ class PromptsSectionConfig(PluginConfigBase):
 PROMPT_FALLBACKS: Dict[str, str] = {
     'companion_miss_reason': COMPANION_MISS_REASON_DEFAULT,
     'companion_miss_confirm': COMPANION_MISS_CONFIRM_DEFAULT,
-    'companion_activity_reason': COMPANION_ACTIVITY_REASON_DEFAULT,
-    'companion_daily_reason': COMPANION_DAILY_REASON_DEFAULT,
     'screen_describe': SCREEN_DESCRIBE_DEFAULT,
     'screen_narration': SCREEN_NARRATION_DEFAULT,
     'screen_narration_offline': SCREEN_NARRATION_OFFLINE_DEFAULT,

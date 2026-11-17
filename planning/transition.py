@@ -145,7 +145,7 @@ class TransitionParams:
         if window_max < window_min:
             window_max = window_min
         return cls(
-            enabled=bool(raw("enabled", DEFAULTS["enabled"])),
+            enabled=True,
             window_min=window_min,
             window_max=window_max,
             procrastination_prob=_clamp_float(
@@ -413,7 +413,7 @@ def transition_focus_override(config: Any) -> Optional[Tuple[float, float]]:
     与 ``[life_state].settlement_params_json`` 的覆盖同路生效（热重载经
     组合根 ``_sync_life_settlement`` 重新推送）。
     """
-    exp = getattr(config, "experimental", None)
+    exp = getattr(config, "feature_tuning", None)
     if exp is None:
         return None
     try:
