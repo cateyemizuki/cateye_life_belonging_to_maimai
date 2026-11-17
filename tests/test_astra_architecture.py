@@ -22,6 +22,12 @@ class ArchitectureCases(unittest.TestCase):
     def test_module_config_sync(self):
         self.run_case("case_module_config_sync")
 
+    def test_four_failed_ticks_hold_business_progress(self):
+        self.run_case("case_four_failed_ticks_hold_business_progress")
+
+    def test_sleep_tick_retry_respects_boundary(self):
+        self.run_case("case_sleep_tick_retry_respects_boundary")
+
     def test_gateway_imports_share_patches(self):
         self.run_case("case_gateway_imports_share_patches")
 
@@ -310,6 +316,130 @@ async def case_engine_claim_survives_retry(root):
     p._life_tick_once()
     p._settle_offline_gap.assert_called_once_with(p._life_state, p._rolling_planner, engine_claimed=True)
     p._rolling_planner.tick.assert_not_called()
+
+
+async def case_four_failed_ticks_hold_business_progress(root):
+    from plugin import CateyeSuitePlugin
+
+    p = object.__new__(CateyeSuitePlugin)
+    p.ctx = NS(logger=Mock())
+    p.config = NS(life_state=NS())
+    p._rolling_planner = NS(tick=Mock(return_value={}))
+    p._sleep_engine = NS(recovery_pending=False)
+    p._sleep_prepare = Mock(return_value={"asleep": True, "rates": {"elapsed_sleep_minutes": 5}})
+    p._life_tick_state = Mock(return_value=None)
+    p._rollback_sleep_tick = Mock(return_value=True)
+    p._sleep_commit = Mock(return_value={})
+    for name in (
+        "_kick_video_watch_sync",
+        "_kick_share_delivery",
+        "_kick_qzone_video_eval",
+        "_kick_preference_refresh",
+    ):
+        setattr(p, name, Mock())
+    for _ in range(4):
+        p._life_tick_once()
+    assert p._rollback_sleep_tick.call_count == 4
+    p._sleep_commit.assert_not_called()
+    p._rolling_planner.tick.assert_not_called()
+    p._kick_share_delivery.assert_not_called()
+    p._life_tick_state.return_value = {"energy": 0.8}
+    p._life_tick_once()
+    p._sleep_commit.assert_called_once()
+    p._rolling_planner.tick.assert_called_once()
+    assert p._sleep_tick_failures == 0
+
+
+async def case_sleep_tick_retry_respects_boundary(root):
+    from zoneinfo import ZoneInfo
+    from planning.life_state import LifeStateService
+    from planning.schedule_db import ScheduleDB
+    from planning.sleep_engine import SleepEngine
+    from planning.rolling_planner import RollingPlanner
+    from planning.time_utils import TimezoneManager
+    from suite_config import CateyeSuiteConfig
+    from plugin import CateyeSuitePlugin
+
+    zone = ZoneInfo("Asia/Shanghai")
+    beginning = datetime(2026, 11, 17, 23, tzinfo=zone)
+    boundary = datetime(2026, 11, 18, 7, tzinfo=zone)
+    hard = boundary + timedelta(minutes=30)
+
+    class Clock(TimezoneManager):
+        def __init__(self):
+            super().__init__("Asia/Shanghai")
+            self.current = beginning
+
+        def get_now(self):
+            return self.current
+
+    def fixture(path):
+        path.mkdir()
+        clock = Clock()
+        cfg = CateyeSuiteConfig()
+        db = ScheduleDB(path / "schedule.db")
+        life = LifeStateService(path / "life.json", timezone_manager=clock)
+        life.tick(beginning)
+        bus = Mock()
+        engine = SleepEngine(
+            config_provider=cfg, session_store=db, life_state=life, timezone_manager=clock, event_bus=bus
+        )
+        planner = RollingPlanner(
+            db, life, sleep_engine=engine, config_provider=cfg, timezone_manager=clock, data_dir=path
+        )
+        engine._episode_closer = planner.close_sleep_episode
+        planner.sleep_hard_commitment_start = Mock(return_value=hard)
+        planner.tick = Mock(return_value={})
+        planner.apply_morning_spine_adjustment = Mock()
+        db.start_episode("2026-11-17", "sleep", "sleep", "rolling", 1380, 1920)
+        engine.prepare_tick(beginning, sleep_episode=db.active_episode(), hard_commitment_start=hard)
+        engine.commit_tick(beginning)
+        p = object.__new__(CateyeSuitePlugin)
+        p.ctx = NS(logger=Mock())
+        p.config = cfg
+        p._db = db
+        p._life_state = life
+        p._rolling_planner = planner
+        p._sleep_engine = engine
+        p._record_actual_wake_cycle = Mock(return_value=True)
+        for name in (
+            "_kick_video_watch_sync",
+            "_kick_share_delivery",
+            "_kick_qzone_video_eval",
+            "_kick_preference_refresh",
+        ):
+            setattr(p, name, Mock())
+        return p, clock, bus
+
+    p, clock, bus = fixture(root / "failed")
+    control, control_clock, _ = fixture(root / "control")
+    try:
+        before = p._life_state.snapshot()
+        with patch.object(p._life_state, "save", return_value=False):
+            for offset in (-2, 0, 5, 10):
+                clock.current = boundary + timedelta(minutes=offset)
+                p._life_tick_once()
+        assert p._life_state.snapshot() == before
+        assert not p._sleep_engine._session.closed
+        p._rolling_planner.tick.assert_not_called()
+        assert all(call.args[0] != "life.sleep_woke" for call in bus.publish_soon.call_args_list)
+        clock.current = boundary + timedelta(minutes=20)
+        p._life_tick_once()
+        assert p._sleep_engine._session.closed
+        assert p._sleep_engine._session.closed_at == boundary
+        control_clock.current = boundary
+        control._life_tick_once()
+        control_clock.current = clock.current
+        control._life_tick_once()
+        for field in ("energy", "focus", "stress", "social_battery", "hunger", "sleep_debt"):
+            assert abs(p._life_state.snapshot()[field] - control._life_state.snapshot()[field]) < 1e-7, field
+        settled = p._life_state.snapshot()
+        p._life_tick_once()
+        assert p._life_state.snapshot() == settled
+        assert sum(call.args[0] == "life.sleep_woke" for call in bus.publish_soon.call_args_list) == 1
+    finally:
+        p._db.close()
+        control._db.close()
 
 
 async def case_changed_target_rejects_old_route(root):
@@ -648,6 +778,7 @@ async def case_reload_waiter_cancellation(root):
     p = object.__new__(CateyeSuitePlugin)
     p._stream_id = "verified"
     p.config = NS(plugin=NS(enabled=True), patrol=NS(enabled=True), screen=NS(tool_enabled=True))
+    p.config.plugin.id = "different.user.supplied.name"
 
     async def sdk_reload(*, plugin_name):
         # The SDK sends a cap.call frame, then waits on its own runner-side future.
@@ -655,13 +786,14 @@ async def case_reload_waiter_cancellation(root):
         await asyncio.Future()
 
     p.ctx = NS(component=NS(reload_plugin=sdk_reload), logger=Mock())
+    p.ctx.plugin_id = "fixture.copy"
     p._target_lifecycle().declare("")
     p._target_lifecycle().bound("verified", saved=True)
     p._shutdown_chain = AsyncMock()
     p._stop_life_services = Mock()
 
     async def host():
-        assert await commands.get() == "cateye.life_belonging_to_maimai"
+        assert await commands.get() == "fixture.copy"
         await p.on_unload()  # Local awaiter is cancelled; no cancellation frame goes to the host.
         stopped.set()
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from typing import Any, ClassVar, Dict, Iterable, Optional
 
 # ── 宿主运行时导入引导（勿删）──────────────────────────────────────────
@@ -615,7 +616,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._life_tick_loop_ref: Any = None
         self._life_tick_task: asyncio.Task | None = None
         self._life_cleanup_date = ""
-        # P4 残余面（2026-11-04）：睡眠拍失败回滚快照与连续失败计数（有界重试 3 拍）
+        # Sleep state retries preserve the integration cursor until persistence succeeds.
         self._sleep_tick_rollback: Any = None
         self._sleep_tick_failures = 0
         # PR6（2026-10-27）：目标频率校准的单飞 task 与「无 loop 时挂起」标记
@@ -907,6 +908,14 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             ctx = getattr(self, "ctx", None)
             component = getattr(ctx, "component", None)
             reloader = getattr(component, "reload_plugin", None)
+            plugin_id = str(getattr(ctx, "plugin_id", "") or "").strip()
+            if not plugin_id:
+                import json
+                try:
+                    plugin_id = str(json.loads(
+                        (Path(_PLUGIN_DIR) / "_manifest.json").read_text(encoding="utf-8")).get("id") or "")
+                except (OSError, ValueError, TypeError):
+                    plugin_id = ""
             def commit_binding(target: str, stream: str) -> None:
                 self._stream_id = stream
                 self._apply_target(target, stream)
@@ -916,6 +925,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 private_streams=lambda: self.ctx.chat.get_private_streams(),
                 apply_target=commit_binding,
                 is_unloading=lambda: bool(getattr(self, "_is_unloading", False)),
+                plugin_id=plugin_id,
                 reload_plugin=reloader if callable(reloader) else None,
                 logger=getattr(ctx, "logger", None),
             )
@@ -1624,27 +1634,16 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             return
         sleep_rates = (prepared or {}).get("rates")
         snapshot = self._life_tick_state(planner, sleep_rates=sleep_rates)
-        # P4 残余面（planning-state 请求，2026-11-04）：prepared 处于睡眠且
-        # snapshot=None（life.tick 失败）→ 跳过 commit 并回滚引擎本拍推进，
-        # 下一拍 prepare 重新覆盖本段区间，使睡眠增量可重试（引擎钟已在
-        # prepare_tick 内推进，不回滚则本拍增量丢失——丢而非重）。有界重试：
-        # 连续 3 拍失败后回退旧行为（照常 commit），避免觉醒链被永久冻结。
-        sleep_tick_failed = (isinstance(prepared, dict) and bool(prepared.get("asleep"))
-                             and sleep_rates is not None and snapshot is None)
-        if sleep_tick_failed:
+        # Business progress requires the life state and its integration cursor to be durable.
+        if snapshot is None:
             self._sleep_tick_failures = int(getattr(self, "_sleep_tick_failures", 0)) + 1
-        else:
-            self._sleep_tick_failures = 0
-        if (sleep_tick_failed and self._sleep_tick_failures <= 3
-                and self._rollback_sleep_tick()):
-            try:
-                self.ctx.logger.warning("睡眠拍状态推进失败（第 %d/3 次）：已回滚引擎本拍推进，"
-                                        "下一拍重放本段区间", self._sleep_tick_failures)
-            except Exception:
-                pass
-            commit = {}
-        else:
-            commit = self._sleep_commit(prepared, snapshot)
+            rolled_back = self._rollback_sleep_tick()
+            if self._sleep_tick_failures == 1 or self._sleep_tick_failures % 12 == 0:
+                self.ctx.logger.warning("生活状态保存失败，暂停本拍业务推进，等待重试（次数=%d，睡眠回滚=%s）",
+                                        self._sleep_tick_failures, rolled_back)
+            return
+        self._sleep_tick_failures = 0
+        commit = self._sleep_commit(prepared, snapshot)
         if commit.get("woke"):
             # 2026-10-27 用户批准：周期起点同步真实醒来时刻（早醒/晚醒都按真实时刻；
             # 意图计划时间保持不动；后续编辑/再生成复用同一标记）
@@ -1658,10 +1657,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     self.ctx.logger.warning("晨间 spine 调整失败（忽略）：%s", exc)
                 except Exception:
                     pass
-        if snapshot is not None:
-            report = planner.tick(life_snapshot=snapshot) or {}
-        else:
-            report = planner.tick() or {}
+        report = planner.tick(life_snapshot=snapshot) or {}
         # B 计划（2026-11-01 §5）：刷视频事件联动公共观看接口（单飞 task，失败不拖挂主循环）
         self._kick_video_watch_sync()
         # S3：分享候选投递（有到期候选且预算/间隔满足才真正发送；单飞）
@@ -2956,6 +2952,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     "continuous_minutes": session.continuous_minutes,
                     "interruption_count": session.interruption_count,
                     "quality": session.quality,
+                    "effective_sleep_hours": session.effective_sleep_hours,
                     "hard_commitment_start": (session.metadata or {}).get("hard_commitment_start"),
                 }
             return {
@@ -2976,7 +2973,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         """回滚引擎本拍推进（P4 残余面：睡眠期 life.tick 失败 → 增量可重试）。
 
         仅当 prepare 前后会话同一（未发生会话启动/切换）且快照可得时执行；
-        否则保守不回滚（返回 False，调用方回退旧 commit 行为）。回滚后下一拍
+        否则返回 False，调用方仍停止本拍业务推进。回滚后下一拍
         prepare 从原 ``_last_tick_at`` 重新积分，覆盖失败拍区间——life.tick 若
         未推进自身钟（应用前异常）则 dt 与速率区间重新对齐；恰好一次语义由
         life 侧增量门与引擎 prepared 重放键保证，不双记账。
@@ -3002,6 +2999,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 session.continuous_minutes = fields["continuous_minutes"]
                 session.interruption_count = fields["interruption_count"]
                 session.quality = fields["quality"]
+                session.effective_sleep_hours = fields["effective_sleep_hours"]
                 hard = fields.get("hard_commitment_start")
                 if hard is None:
                     (session.metadata or {}).pop("hard_commitment_start", None)

@@ -8,8 +8,6 @@ from typing import Any, Awaitable, Callable
 
 from core.targeting import private_qq_stream, target_qq_of
 
-PLUGIN_ID = "cateye.life_belonging_to_maimai"
-
 
 class TargetBindingCoordinator:
     """Own in-flight target revisions and one host registration refresh per binding."""
@@ -22,6 +20,7 @@ class TargetBindingCoordinator:
         private_streams: Callable[[], Awaitable[Any]],
         apply_target: Callable[[str, str], None],
         is_unloading: Callable[[], bool],
+        plugin_id: str,
         reload_plugin: Callable[..., Awaitable[Any]] | None,
         logger: Any,
     ) -> None:
@@ -30,6 +29,7 @@ class TargetBindingCoordinator:
         self._private_streams = private_streams
         self._apply_target = apply_target
         self._is_unloading = is_unloading
+        self._plugin_id = plugin_id
         self._reload_plugin = reload_plugin
         self._logger = logger or logging.getLogger(__name__)
         self._revision = 0
@@ -97,7 +97,7 @@ class TargetBindingCoordinator:
             return
         if self._reload_requested_for == desired:
             return
-        if self._reload_plugin is None:
+        if self._reload_plugin is None or not self._plugin_id:
             self._logger.warning("目标私聊范围变更，请在插件管理中重新加载以刷新屏幕工具")
             return
         self._reload_requested_for = desired
@@ -105,7 +105,7 @@ class TargetBindingCoordinator:
 
     async def _refresh_declaration(self) -> None:
         try:
-            response = await self._reload_plugin(plugin_name=PLUGIN_ID)
+            response = await self._reload_plugin(plugin_name=self._plugin_id)
             if response is False or (isinstance(response, dict) and response.get("success") is False):
                 self._logger.warning("屏幕工具声明刷新未成功，可在插件管理中重新加载")
         except asyncio.CancelledError:
