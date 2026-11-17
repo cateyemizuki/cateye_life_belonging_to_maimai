@@ -37,6 +37,9 @@ class ArchitectureCases(unittest.TestCase):
     def test_engine_claim_survives_retry(self):
         self.run_case("case_engine_claim_survives_retry")
 
+    def test_life_receipt_then_journal_retry(self):
+        self.run_case("case_life_receipt_then_journal_retry")
+
     def test_usage_window_is_instant_based(self):
         self.run_case("case_usage_window_is_instant_based")
 
@@ -371,6 +374,53 @@ async def case_morning_failure_is_recoverable(root):
         db.close()
 
 
+async def case_life_receipt_then_journal_retry(root):
+    from planning.schedule_db import ScheduleDB
+    from planning.life_state import LifeStateService
+    from planning.offline_sleep import plan_offline_settlement
+    from suite_offline_settlement import OfflineSettlementService
+    import suite_offline_settlement as offline
+
+    db = ScheduleDB(root / "state.db")
+    bus = Mock()
+    kwargs = dict(
+        db=db,
+        data_dir=root,
+        config_provider=lambda: NS(schedule_advanced=NS(timezone="UTC")),
+        wake_recorder=Mock(return_value=True),
+        event_bus_provider=lambda: bus,
+    )
+    try:
+        life = LifeStateService(root / "life.json", timezone_str="UTC")
+        plan = {**plan_offline_settlement(2 * 3600, 1), "wake_at": datetime.now(timezone.utc).isoformat()}
+        service = OfflineSettlementService(**kwargs)
+        original = offline.save_json_atomic
+        calls = 0
+
+        def fail_second(path, value):
+            nonlocal calls
+            calls += 1
+            return False if calls == 2 else original(path, value)
+
+        with patch.object(offline, "save_json_atomic", side_effect=fail_second):
+            assert service.apply_offline_settlement(life, Mock(), plan) is False
+        first = life.snapshot()
+        assert db._conn.execute("SELECT count(*) FROM sleep_sessions").fetchone()[0] == 1
+        assert not bus.publish_soon.called
+        recovered = OfflineSettlementService(**kwargs)
+        reloaded = LifeStateService(root / "life.json", timezone_str="UTC")
+        assert recovered.apply_offline_settlement(reloaded, Mock(), plan)
+        for name in ("energy", "hunger", "focus", "stress", "social_battery", "sleep_debt"):
+            assert reloaded.snapshot()[name] == first[name], name
+        assert (
+            db._conn.execute("SELECT count(*) FROM activity_episodes WHERE source='offline'").fetchone()[0]
+            == 1
+        )
+        assert bus.publish_soon.call_count == 1
+    finally:
+        db.close()
+
+
 async def case_failed_screen_receipt(root):
     from linkage.screen.cateye_client import CateyeClient
     from core.llm_utils import LLMService
@@ -440,6 +490,7 @@ async def case_registry_failure_report(root):
 
 async def case_upgrade_invalidation_failure_preserves_version(root):
     from tools.init.auto_init import compute_need
+
     driver, reg = init_driver(root)
     with patch.object(reg, "invalidate", return_value=False):
         result = await driver.run(manual=True)
