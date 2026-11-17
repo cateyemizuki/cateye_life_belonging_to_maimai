@@ -948,7 +948,10 @@ class AffectionManager:
                                       key=batch["id"])
             kept = self.append_impressions(parsed["impressions"], date=day, now=now)
             self.set_tone(parsed["tone"], date=day, now=now)
-            self.record_daily_summary(date=day, tone=parsed["tone"], delta=entry.get("applied", 0), now=now)
+            try:
+                self.record_daily_summary(date=day, tone=parsed["tone"], delta=entry.get("applied", 0), now=now)
+            except Exception as exc:
+                logger.debug("周结大事记记录失败（核心日结继续）：%s", exc, exc_info=True)
             ids = {row["review_id"] for row in batch["events"]}
             previous = self._state.get("prev_day_event_log") or {}
             for owner, field in ((self._state, "event_log"), (previous, "entries")):

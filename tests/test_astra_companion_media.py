@@ -762,7 +762,41 @@ async def watch_terminal_equivalence(folder):
             assert entry["detached_finished"] and not entry["detached"]
 
 
+async def optional_weekly_summary_failure(folder):
+    manager = AffectionManager(folder)
+    manager.sync_daily()
+    manager.append_event_entry({"kind": "chat_round", "desc": "submitted"})
+    manager.bump_cycle_rounds()
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def verdict(*args, **kwargs):
+        entered.set()
+        await finish.wait()
+        return {"delta_score": 2, "tone": "平静", "impressions": [{"text": "synthetic"}], "reason": "合成"}
+
+    reviewer = AffectionReviewer(NS(config=NS()), manager, llm=NS())
+    day = datetime.now().date().isoformat()
+    with patch("companion.affection_referee.run_daily_review", verdict), patch.object(
+        manager, "record_daily_summary", side_effect=RuntimeError("optional weekly summary failed")
+    ):
+        task = asyncio.create_task(reviewer.perform_daily_review(date=day))
+        await entered.wait()
+        manager.append_event_entry({"kind": "chat_round", "desc": "arrived later"})
+        manager.bump_cycle_rounds()
+        finish.set()
+        result = await task
+    assert result["ok"] and manager.score() == 62
+    assert [row["desc"] for row in manager.event_log()] == ["arrived later"]
+    assert manager.cycle_rounds() == 1 and manager.impressions()[-1]["text"] == "synthetic"
+    restored = AffectionManager(folder)
+    assert restored.score() == 62 and restored.review_state()["daily_reviewed_date"] == day
+    again = AffectionReviewer(NS(config=NS()), restored, llm=NS())
+    assert (await again.perform_daily_review(date=day))["reason"] == "already_reviewed"
+    assert restored.score() == 62 and [row["desc"] for row in restored.event_log()] == ["arrived later"]
+
+
 CASES = [
+    "optional_weekly_summary_failure",
     "watch_terminal_equivalence",
     "qzone_policy_equivalence",
     "share_limits", "wrong_manual_receipt", "profile_count", "interrupted_eval", "cancel_cache",
