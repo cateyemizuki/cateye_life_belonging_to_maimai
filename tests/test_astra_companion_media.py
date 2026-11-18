@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace as NS
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, Mock
 
 ROOT = Path(os.environ.get('CATEYE_TEST_DIR') or Path(__file__).resolve().parents[1]).resolve()
 
@@ -320,6 +320,66 @@ async def qzone_activity_toggle(folder):
         sent = await svc.generate_and_post_by_schedule("2024-01-01", datetime(2024,1,1,12),post_rate=1)
     hist = svc._decision_history.last()
     assert sent and svc.generate_moment_text.await_count == 1, hist
+
+
+async def qzone_caption_uses_current_facts(folder):
+    from qzone.publish_guard import preview_post
+
+    history = "明天试菜排第一个，今天散步已经开始想菜单"
+    similar = "沿着小路慢慢散步，走到拐角时风刚好停了一阵。"
+    new_waiting = "玩明日方舟时总想把关卡路线再琢磨一遍"
+    now = datetime.now()
+    schedule = NS(find_current_activity=Mock(return_value={"name": "预定去试菜", "status": "planned"}))
+    config = NS(qzone=NS(), schedule=NS(enabled=True),
+                prompts=NS(qzone_post="正在：{activity}，请写一条动态"))
+    llm = NS(generate=AsyncMock(side_effect=[history, new_waiting]))
+    q = QzoneService(NS(), config, schedule, llm)
+    q.list_my_moments = AsyncMock(side_effect=AssertionError("history reached generation"))
+    for text in (history, similar):
+        preview = preview_post(text)
+        q._publish_ledger.rows[preview["key"]] = {
+            **preview, "created_at": now.timestamp()-10, "status": "sent",
+        }
+    assert await q.generate_moment_text(now.date().isoformat(), now) == new_waiting
+    assert llm.generate.await_count == 2
+    for call in llm.generate.await_args_list:
+        prompt = call.args[0]
+        assert "此刻没有进行中的活动记录" in prompt and "预定去试菜" not in prompt
+        assert history not in prompt and similar not in prompt
+
+    schedule.find_current_activity.return_value = {"name": "散步", "status": "active"}
+    llm.generate.reset_mock(side_effect=True)
+    llm.generate.side_effect = [similar.rstrip("。") + "呀", "明日轮到我先试吃"]
+    assert await q.generate_moment_text(now.date().isoformat(), now) == ""
+    assert llm.generate.await_count == 2
+    assert "正在：散步" in llm.generate.await_args.args[0]
+    assert q._decision_history.last()["gate"] == "future_claim"
+
+
+async def qzone_duplicate_checked_before_dispatch(folder):
+    from qzone.publish_guard import preview_post
+
+    now = datetime.now().timestamp()
+    post = "沿着小路慢慢散步，走到拐角时风刚好停了一阵。"
+    duplicate = "沿着小路慢慢散步，走到拐角时风刚好停了一阵呀！"
+    q = QzoneService(NS(), NS(qzone=NS()), NS(), NS())
+    q._dispatch_gate = Mock(return_value=True)
+    q._post_moment_once = AsyncMock(return_value={"tid": "fresh"})
+    q._kick_post_media_refresh = Mock()
+    previous = preview_post(post)
+    q._publish_ledger.rows[previous["key"]] = {
+        **previous, "created_at": now-20, "updated_at": now-20, "status": "sent",
+    }
+    waiting = preview_post(duplicate)
+    q._publish_ledger.rows[waiting["key"]] = {
+        **waiting, "created_at": now-5, "updated_at": now-5, "status": "retry_wait",
+    }
+    assert await q.post_moment(duplicate, enforce_daily_limit=True) is None
+    q._post_moment_once.assert_not_awaited()
+    assert q._publish_ledger.rows[waiting["key"]]["status"] == "failed"
+    assert q._decision_history.last()["gate"] == "duplicate"
+    assert await q.post_moment("沿河散步，转弯遇到一排刚开花的木棉。", enforce_daily_limit=True) == {"tid": "fresh"}
+    q._post_moment_once.assert_awaited_once()
 
 
 async def watch_debit_atomicity(folder):
@@ -798,7 +858,7 @@ async def optional_weekly_summary_failure(folder):
 CASES = [
     "optional_weekly_summary_failure",
     "watch_terminal_equivalence",
-    "qzone_policy_equivalence",
+    "qzone_policy_equivalence", "qzone_caption_uses_current_facts", "qzone_duplicate_checked_before_dispatch",
     "share_limits", "wrong_manual_receipt", "profile_count", "interrupted_eval", "cancel_cache",
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",

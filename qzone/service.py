@@ -33,6 +33,7 @@ import base64
 import logging
 import math
 import random
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -178,25 +179,12 @@ NEUTRAL_MOOD_EFFECT: Dict[str, Any] = {
     "intent_hint": "",
 }
 
-#: PR-D1（H9）：主题记忆有界读取——B1 索引 published/qzone_posted recent ≤5
-#: （与 A2 文案防复读 CAPTION_RECENT_LIMIT 同口径）；不新建表，复用 B1。
-THEME_RECENT_LIMIT = 5
-#: PR-D1：主题摘要合并去重后的总行数上限（索引 ≤5 + 自己说说 ≤5，有界不拖挂 prompt）
-THEME_BLOCK_MAX_LINES = 8
-#: PR-D1：公开/私密分域防御过滤——含这些标记的摘要绝不进空间公开 prompt
-#: （B1 正常不存聊天正文；此为写入方失守时的第二道闸，保守宁缺毋滥）。
-_PRIVATE_MARKERS = ("私聊", "群聊")
-#: PR-D1：主题块稳定规则前缀（规则前置、事实变量后置；3.9.1 前缀缓存口径）。
-#: 红线措辞：记得自己发过 ≠ 别人看过/点赞过；跨渠道独立表达不混淆接收者。
-QZONE_THEME_BLOCK_HEADER = (
-    "【近期自己的空间主题】以下是你自己已在空间公开发布的内容事实"
-    "（记得自己发过≠别人看过或点赞过，不要声称任何人的浏览/点赞/评论反馈）。\n"
-    "避免自我复读：不重复同样的措辞与内容；允许主题自然延续——"
-    "连续几天对同一兴趣可以递进出新角度、新进展，而不是原样重发。\n"
-    "这里只面向空间公开读者：不提及私聊/群聊里的人与内容；"
-    "聊天里分享过什么与空间发过什么是两回事，各自独立表达、不混淆接收者。"
+# 日程文案只记录眼下的生活。未来约定属于独立的已确认事实来源。
+_FUTURE_DAY = re.compile(r"明天|明日(?!方舟)|明早|明晚|明晨|后天|翌日|下周|下星期|下个月")
+_CURRENT_POST_RULE = (
+    "只写此刻有依据的活动和感受。未经证实的后续安排、他人的行为和环境细节不写入正文。"
+    "写不出新的事实时，可以简单表达当下感受。"
 )
-
 
 class QzoneService:
     def __init__(
@@ -386,6 +374,12 @@ class QzoneService:
             if not self._dispatch_gate(datetime.now(), enforce_daily_limit=enforce_daily_limit,
                                        recheck_gates=recheck_gates, dispatch_allowed=dispatch_allowed):
                 self._send_ambiguous = False
+                return None
+            if enforce_daily_limit and self._publish_ledger.has_recent_duplicate(text, time.time()):
+                if old.get("status") == "retry_wait":
+                    self._publish_ledger.finish(preview["key"], "failed", error="duplicate_content")
+                self._send_ambiguous = False
+                self._record_decision("skip", gate="duplicate", reason="文案与近期已确认发布的动态重复")
                 return None
             allowed, receipt = self._publish_ledger.begin(preview)
             if not allowed:
@@ -610,6 +604,10 @@ class QzoneService:
             return 0
         return int(counter.get("count") or 0)
 
+    def _current_post_activity(self, date: str, now: datetime, *, include_sleep: bool = False) -> Optional[Dict[str, Any]]:
+        activity = self._schedule.find_current_activity(date, now, include_sleep=include_sleep)
+        return activity if activity and activity.get("status") == "active" else None
+
     async def generate_and_post_by_schedule(self, date: str, now: datetime,
                                             post_rate: Optional[float] = None) -> bool:
         """按日程生成文案并发表（自动发帖路径）。返回是否发出。
@@ -622,7 +620,7 @@ class QzoneService:
         → 掷骰；MaiTrace v3.1 移植）→ 生成文案 → 收集配图 → 发表。
         """
         cfg = self._qzone_cfg()
-        activity = self._schedule.find_current_activity(date, now)
+        activity = self._current_post_activity(date, now)
         if cfg.require_activity and activity is None:
             # PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单，规则 6）：
             # find_current_activity 已 runtime-only——日程关断时 skip 理由如实「日程未启用」，
@@ -665,7 +663,7 @@ class QzoneService:
         LLM 严判把关；夜间睡觉条目天然落在静默窗内，白天午睡由午休静默/LLM 闸承接。
         """
         cfg = self._qzone_cfg()
-        activity = self._schedule.find_current_activity(date, now, include_sleep=True)
+        activity = self._current_post_activity(date, now, include_sleep=True)
         if not self._time_gates(now, activity=activity, require_activity=getattr(cfg, "require_activity", True))[0]:
             return False
         activity = activity or {}
@@ -874,97 +872,45 @@ class QzoneService:
                       reason=f"配图收集为空（{mode.strip().lower()}），发纯文本")
         return images
 
-    async def _recent_theme_lines(self) -> List[str]:
-        """PR-D1（H9）：近期自己空间主题的只读摘要行（稳定顺序：索引新→旧，再说说列表序）。
-
-        来源只有两处（跨渠道分域）：
-        - B1 经历索引 ``published/qzone_posted`` recent ≤5（空间发布事实；不消费
-          watched_video/聊天分享等其它渠道事实，不混淆接收者）；
-        - 既有 ``list_my_moments`` 有界读取 ≤5（A2 已接的同源端口；``is_private``
-          的仅自己可见合并不进公开 prompt）。
-        隐私红线：含私聊/群聊标记的摘要一律过滤（第二道闸）。索引缺失/开关关闭/
-        读取失败/说说列表失败 → 对应来源空降级，绝不拖挂文案生成。零副作用。
-        """
-        lines: List[str] = []
-        seen: set = set()
-
-        def _add(text: Any) -> None:
-            summary = str(text or "").strip()[:120]
-            if not summary or summary in seen:
-                return
-            if any(marker in summary for marker in _PRIVATE_MARKERS):
-                return
-            seen.add(summary)
-            lines.append(summary)
-
-        index = getattr(self._plugin, "_experience_index", None)
-        if index is not None:
-            enabled = True
-            checker = getattr(self._plugin, "_experience_enabled", None)
-            if callable(checker):
-                try:
-                    enabled = bool(checker())
-                except Exception:
-                    enabled = False  # 开关不可读保守不消费（与 B1 消费口同口径）
-            if enabled:
-                try:
-                    rows = index.recent(kinds=["qzone_posted"], limit=THEME_RECENT_LIMIT)
-                except Exception:
-                    rows = []
-                for row in rows or []:
-                    # 防御复核：只认 published 层（平台明确成功回执），其它真伪层不进。
-                    if isinstance(row, dict) and str(row.get("type") or "") == "published":
-                        _add(row.get("summary"))
-        try:
-            moments = await self.list_my_moments(num=THEME_RECENT_LIMIT)
-        except Exception:
-            moments = []
-        for moment in moments or []:
-            if isinstance(moment, dict) and not moment.get("is_private"):
-                _add(moment.get("content"))
-        return lines[:THEME_BLOCK_MAX_LINES]
-
     async def generate_moment_text(self, date: str, now: datetime) -> str:
-        activity = self._schedule.find_current_activity(date, now)
-        # PR8 3.0.0（规则 6）：find_current_activity runtime-only——日程关断时占位描述
-        # 如实「日程未启用」，不再用「自由活动」冒充；enabled=true 空闲时保留原文案。
-        activity_desc = (self._schedule.format_activity_line(activity, now) if activity else
-                         ("日程未启用" if not self._schedule_enabled() else "自由活动"))
+        activity = self._current_post_activity(date, now)
+        activity_desc = str(activity.get("name") or "活动名称未记录") if activity else "此刻没有进行中的活动记录"
         prompt = render(
             prompt_of(self._plugin, "qzone_post"),
             fallback=QZONE_POST_PROMPT,
-            # 复核 P0-7：传真实身份——存量旧定制模板含 {lover_name}/{personality}
-            # 占位，传空会渲染出「你是「」，人设：」；新默认模板无占位不受影响。
+            # 兼容包含身份占位符的旧配置模板。
             lover_name=self._lover_name,
             personality=self._personality,
             date=date,
             time=now.strftime("%H:%M"),
             activity=activity_desc,
         )
-        # M4（§6.2 D / B8）：说说随当日情绪定调（拼一行 mood_text；情绪不可得时不拼）
+        prompt = f"{prompt}\n{_CURRENT_POST_RULE}"
         mood_line = self._mood_line("请让这条说说的语气与心情保持一致")
         if mood_line:
             prompt = f"{prompt}\n{mood_line}"
-        # PR-D1（H9）：近期自己空间主题摘要（变量区末尾追加；稳定规则前缀 + 事实行后置）。
-        # 空索引/空说说 → 不注入，prompt 与旧行为一致（空降级）；防复读/自然延续规则
-        # 同时写在 QZONE_POST_DEFAULT 稳定模板里，定制模板丢占位也不丢规则底线。
-        theme_lines = await self._recent_theme_lines()
-        if theme_lines:
-            prompt = (f"{prompt}\n{QZONE_THEME_BLOCK_HEADER}\n"
-                      + "\n".join(f"- {line}" for line in theme_lines))
-        # 人设经 with_identity 以宿主同款开头注入 system_prompt（共享前缀缓存）；
-        # 复核 P0-7：lover_name/personality 同时传真实值渲染，存量旧定制模板的
-        # 残留占位不再渲染为空（新默认模板无占位，行为不变）。
-        text = await self._llm.generate(
-            prompt,
-            task_name=purpose_task(self._plugin, "qzone", default="utils"),
-            temperature=0.8,
-
-            module="qzone",
-            event="qzone_post",
-            with_identity=True,
-        )
-        return text.strip().strip('"“”')
+        for attempt in range(2):
+            request = prompt
+            if attempt:
+                request += "\n请从当前活动另写一个新角度，省略将来的安排，只输出正文。"
+            response = await self._llm.generate(
+                request,
+                task_name=purpose_task(self._plugin, "qzone", default="utils"),
+                temperature=0.8,
+                module="qzone",
+                event="qzone_post",
+                with_identity=True,
+            )
+            text = str(response or "").strip().strip('"“”')
+            if not text:
+                return ""
+            if _FUTURE_DAY.search(text):
+                self._record_decision("skip", gate="future_claim", reason="日程文案包含未核实的未来日期")
+            elif self._publish_ledger.has_recent_duplicate(text, now.timestamp()):
+                self._record_decision("skip", gate="duplicate", reason="文案与近期已确认发布的动态重复")
+            else:
+                return text
+        return ""
 
     # ---- 评论监听与回复 ----
     async def reply_comments(self) -> int:

@@ -2109,7 +2109,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     'check_post_gates': qzone.check_post_gates,
                     'posts_today': qzone.posts_today,
                     'daily_max_posts': lambda: int(getattr(self.config.qzone, 'daily_max_posts', 0) or 0),
-                    'list_my_moments': qzone.list_my_moments,
                     'send_ambiguous': lambda: bool(getattr(qzone, '_send_ambiguous', False)),
                     'now_dt': self._surf_now,
                     'append_fact': self._append_qzone_video_fact,

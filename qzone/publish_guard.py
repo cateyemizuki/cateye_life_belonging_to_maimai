@@ -1,6 +1,8 @@
 """Bounded durable publish receipts. An uncertain send is never blindly replayed."""
 from __future__ import annotations
 import hashlib,json,time
+from difflib import SequenceMatcher
+from unicodedata import normalize
 from pathlib import Path
 from typing import Any
 from core.storage import save_json_atomic
@@ -13,6 +15,10 @@ def preview_post(text: str,images: Any=None,visibility: int=1) -> dict[str,Any]:
     digests=[hashlib.sha256(bytes(img)).hexdigest() for img in (images or [])[:4] if isinstance(img,(bytes,bytearray)) and img]
     key=hashlib.sha256(json.dumps([clean,digests,int(visibility)],ensure_ascii=False).encode()).hexdigest()
     return {'key':key,'content':clean[:5000],'characters':len(clean),'image_count':len(digests),'visibility':int(visibility)}
+
+def _comparable_text(value: str) -> str:
+    return "".join(c for c in normalize("NFKC", value[:600]).casefold() if c.isalnum())
+
 
 def definitely_unavailable(message: Any) -> bool:
     text=''.join(str(message or '').lower().split())
@@ -85,6 +91,23 @@ class PublishLedger:
                         'tid':str(result.get('tid','') or ''),
                         'image_count':int(images) if isinstance(images,(int,float)) else 0})
         return out
+    def has_recent_duplicate(self, text: str, now: float) -> bool:
+        """Compare automatic drafts with confirmed receipts within a bounded history."""
+        draft = _comparable_text(text)
+        if not draft:
+            return False
+        for row in self.recent_sent(20):
+            at = row.get("created_at")
+            if at is None or not 0 <= now - at <= 7 * 86400:
+                continue
+            previous = _comparable_text(row["content"])
+            if draft == previous or (
+                min(len(draft), len(previous)) >= 16
+                and SequenceMatcher(None, previous, draft, autojunk=False).ratio() >= 0.82
+            ):
+                return True
+        return False
+
     def summary(self):
         counts={}
         for row in self.rows.values():counts[row.get('status','unknown')]=counts.get(row.get('status','unknown'),0)+1
