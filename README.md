@@ -11,7 +11,7 @@ MaiBot 的生活与陪伴插件。让麦麦按人设安排日常，根据精力�
 
 ## 安装
 
-需要 MaiBot **1.0.0–1.99.99**、MaiBot SDK **2.8.0–2.99.99**，以及 `httpx>=0.24.0`、`Pillow>=9.0.0`。
+需要 MaiBot **1.0.0–1.4.6**、MaiBot SDK **2.8.0–2.23.0**，以及 `httpx>=0.24.0`、`Pillow>=9.0.0`。使用 MaiBot 1.0.0 的原版依赖锁时，先将 SDK 升级到支持范围。
 
 在 MaiBot 根目录下载插件：
 
@@ -25,7 +25,7 @@ git clone https://github.com/cateyemizuki/cateye_life_belonging_to_maimai.git pl
 uv pip install "httpx>=0.24.0" "Pillow>=9.0.0"
 ```
 
-随后通过宿主加载插件，在 WebUI 的「插件扩展」中打开「属于麦麦的生活」。更新时保留 `config.toml`、宿主数据目录和自定义映射，更新源码后重新加载插件。
+随后通过宿主加载插件。支持插件自定义页面的宿主可在 WebUI 打开「属于麦麦的生活」。在 MaiBot 1.0.0 上可用 `/lbm plan list` 和 `/lbm status dashboard` 查看日程和生活状态。更新时保留 `config.toml`、宿主数据目录和自定义映射，更新源码后重新加载插件。
 
 模型任务默认使用文本任务 `replyer`、`utils`，视频和屏幕画面理解使用视觉任务 `vlm`，可在插件配置中调整。视频抽帧还需要可用的 FFmpeg；缺少解码器或视觉任务时，结果会标明降级来源。
 
