@@ -378,10 +378,16 @@ class AutoInitDriver:
                 name, manual=manual, force=force,
                 version=version, version_fields=version_fields))
         # 处理完字段后写回版本（preflight 失败不写，避免丢掉版本重 init 信号）。
-        try:
-            self.registry.set_plugin_version(version)
-        except Exception as exc:
-            self._log.warning("init_registry 写回版本失败（忽略）：%s", exc)
+        # Every required field must be either committed at this version or durably invalidated.
+        # A failed invalidation must leave the global upgrade boundary unchanged.
+        saved_document = self.registry.load()
+        upgrade_accounted = all(
+            not bool((saved_document["fields"].get(name) or {}).get("initialized"))
+            or (saved_document["fields"].get(name) or {}).get("version") == version
+            for name in version_fields)
+        if not fields and upgrade_accounted and saved_document.get("plugin_version") != version:
+            if not self.registry.set_plugin_version(version):
+                self._log.warning("init_registry 版本未能保存，保留原升级位点")
         return AutoInitReport(
             manual=manual, plugin_version=version,
             registry_path=str(self.registry.path),
@@ -394,7 +400,10 @@ class AutoInitDriver:
         forced_by_version = name in version_fields and bool(entry.get("initialized"))
         if forced_by_version:
             # 版本升级重 init：先落 false（崩溃后下次加载继续重试），attempts 归零。
-            self.registry.invalidate(name)
+            if not self.registry.invalidate(name):
+                return FieldOutcome(name, "failed", message="升级初始化的待处理登记写入失败",
+                                    errors=("保留原升级位点，等待登记可写后重试",),
+                                    attempts=int(entry.get("attempts") or 0))
             entry = self.registry.field_state(name)
         if not manual and not retry_allowed(entry, self._now()):
             retry_at = next_retry_at(entry)
@@ -467,7 +476,13 @@ class AutoInitDriver:
                                 message=message, errors=errors, validated=False,
                                 attempts=int(state.get("attempts") or 0),
                                 details=dict(getattr(stage, "details", {}) or {}))
-        self.registry.mark_true(name, version)
+        if not self.registry.mark_true(name, version):
+            message = "产物已通过校验，初始化登记写入失败，字段待确认"
+            self._log.warning("初始化字段 %s：%s", name, message)
+            return FieldOutcome(name, "failed", stage_status=stage_status,
+                                message=message, errors=(message,), validated=True,
+                                attempts=int(entry.get("attempts") or 0),
+                                details=dict(getattr(stage, "details", {}) or {}))
         state = self.registry.field_state(name)
         return FieldOutcome(
             name, "success", stage_status=stage_status,

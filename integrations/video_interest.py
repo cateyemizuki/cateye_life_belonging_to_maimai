@@ -941,17 +941,23 @@ class BiliCandidateSource:
         # Search every bounded interest keyword, even when one popular category already matches.
         # Failed or blocked searches remain visible; no fabricated categories fill the gaps.
         search=await self._keyword_items(keywords,excluded)
-        matched=[];exploration=[];seen=set();eligible_count=excluded_count=interest_stat_rejected=0
-        for item in [*items,*search]:
-            bvid=item['bvid']
-            if bvid in seen:continue
-            seen.add(bvid)
+        # Retain authoritative popular statistics and every bounded search match for the same BV.
+        by_bvid = {item['bvid']: dict(item) for item in items}
+        retrieved = {}
+        for item in search:
+            bvid = item['bvid']
+            by_bvid.setdefault(bvid, dict(item))
+            keyword = str(item.get('retrieval_keyword') or '')
+            if keyword in keywords:
+                retrieved.setdefault(bvid, set()).add(keyword)
+        matched=[];exploration=[];eligible_count=excluded_count=interest_stat_rejected=0
+        for bvid, item in by_bvid.items():
             duration=int(item.get('duration_seconds') or 0)
             if not MIN_CANDIDATE_DURATION_SECONDS<=duration<=MAX_CANDIDATE_DURATION_SECONDS:continue
             eligible_count+=1
             if bvid in excluded:excluded_count+=1;continue
             haystack=' '.join(str(item.get(key) or '') for key in ('title','tname','desc','uploader')).lower()
-            hits=[key for key in keywords if key in haystack]
+            hits=[key for key in keywords if key in haystack or key in retrieved.get(bvid, ())]
             retrieval=str(item.get('retrieval_keyword') or '')
             if not self._passes_stat_gate(item):
                 if hits or retrieval in keywords:interest_stat_rejected+=1

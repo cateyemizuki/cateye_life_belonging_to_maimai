@@ -670,6 +670,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             user_id = extract_user_id_from_message(message)
             target_qq = self._mai_target_qq()
             is_target = bool(user_id and target_qq and user_id == target_qq)
+            matches = getattr(companion.affection, "matches_target", None)
+            if is_target and callable(matches) and not matches(target_qq):
+                return
             if message.get("is_notify"):
                 # is_notify（撤回/戳一戳等通知，只入库不触发回复）：仅按 target 私聊口径
                 # 低成本刷新 last_user_msg_time（沉默检测/想念与主动冷却），不触发
@@ -680,10 +683,13 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             # 群聊里非 target 的发言不上报（群流水会刷爆决策日志）；其余消息带上判定结果
             if is_group is True and not is_target:
                 return
+            generation = getattr(companion.affection, "binding_generation", 0)
             await self._mai_publish_message_received(companion, is_target=is_target,
                                                      stream_kind=stream_kind)
             if is_target and stream_kind != "group":
                 # 会话类型未知时按私聊兜底（与旧实现一致：group_info 缺失视为私聊）
+                if generation != getattr(companion.affection, "binding_generation", 0) or (callable(matches) and not matches(self._mai_target_qq())):
+                    return
                 now = datetime.now()
                 companion.affection.update_last_user_msg_time(now)
                 # 2026-11-11 P1-AFF-1：Bot 30 分钟内发过早/晚安 + 本条是回敬问候
@@ -1636,6 +1642,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         relation_word = getattr(relation, "word", None) or "恋人"
         target_label = f"QQ {target_qq}" if target_qq else relation_word
         affection = companion.affection
+        matches = getattr(affection, "matches_target", None)
+        if callable(matches) and not matches(target_qq):
+            return ""
         # M1 注入接线：好感后缀改读 v2 5 档档位描述（经 relation profile；
         # 关系档案缺失时回退 affection 的「恋人」5 档基底文案）。habits 通道不在此处。
         tier = affection.tier()
@@ -1760,7 +1769,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if not allowed and not caller_group:
             # 私聊兜底：stream 重建但调用者确为目标用户本人（命令面白名单机制同口径）
             allowed = bool(caller_stream) and self._is_authorized_command_user(
-                caller_user, bool(kwargs.get("is_local_operator", False)))
+                caller_user, bool(kwargs.get("is_local_operator", False)),
+                platform=str(kwargs.get("platform") or ""))
         if not allowed:
             self._mai_log_proactive_event(
                 action="skip", reason="tool_scope_denied", trigger_type="affection",
@@ -1991,31 +2001,22 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     # Commands
     # ==================================================================
 
-    def _is_authorized_command_user(self, user_id: str, is_local_operator: bool = False) -> bool:
-        """校验命令触发者是否有权使用 /lbm_mai_* 命令。
-
-        规则：本机控制台操作员天然放行；其余仅白名单 target_qq 本人可用
-        （兼容 ``qq:123456`` 平台前缀写法）。target_qq 为占位默认值/无效值时
-        一律拒绝（默认拒绝）。
-        """
+    def _is_authorized_command_user(self, user_id: str, is_local_operator: bool = False,
+                                    *, platform: str = "") -> bool:
+        from core.targeting import qq_id
         if is_local_operator:
             return True
-        try:
-            target_qq = target_qq_of(self.config)
-        except Exception:
+        if str(platform or "").strip().lower() != "qq":
             return False
-        if not target_qq or target_qq in ("0", _PLACEHOLDER_QQ):
-            return False
-        candidate = str(user_id or "").strip()
-        if not candidate:
-            return False
-        return candidate in (target_qq, f"qq:{target_qq}")
+        target = target_qq_of(self.config)
+        return bool(target and qq_id(user_id) == target)
 
     async def _authorize_command(self, kwargs: dict[str, Any]) -> bool:
         """命令权限守卫：无权限时发送提示并返回 False。"""
         if self._is_authorized_command_user(
             str(kwargs.get("user_id", "") or ""),
             bool(kwargs.get("is_local_operator", False)),
+            platform=str(kwargs.get("platform") or ""),
         ):
             return True
         stream_id = str(kwargs.get("stream_id", "") or "")
@@ -2157,7 +2158,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         """
         stream_id = str(kwargs.get("stream_id", "") or "")
         if not self._qz_is_admin(str(kwargs.get("user_id") or ""),
-                                 bool(kwargs.get("is_local_operator", False))):
+                                 bool(kwargs.get("is_local_operator", False)),
+                                 platform=str(kwargs.get("platform") or "")):
             await self._diag_reply(stream_id, "权限不足：仅管理员可用诊断命令。")
             return True, "没有权限", True
 
@@ -2226,7 +2228,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         文本档末行追加配置摘要（A5：mai_config Tool 并入此处；读配置异常则跳过该行）。
         """
         if not self._qz_is_admin(str(kwargs.get("user_id") or ""),
-                                 bool(kwargs.get("is_local_operator", False))):
+                                 bool(kwargs.get("is_local_operator", False)),
+                                 platform=str(kwargs.get("platform") or "")):
             try:
                 await self.ctx.send.text("权限不足：仅管理员可用 状态/面板。",
                                          str(kwargs.get("stream_id", "") or ""))

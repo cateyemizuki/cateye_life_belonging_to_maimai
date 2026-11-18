@@ -123,6 +123,10 @@ class OptionalActionCoordinator:
             self._attempts = {}
             self._corrupt = True
 
+    def receipt_status(self, stream: str, key: str) -> str:
+        row = self._attempts.get(f"{stream}:{key}") or {}
+        return str(row.get("status") or "")
+
     def permission(self) -> tuple[bool, str]:
         if self._corrupt:
             return False, 'receipt_storage_corrupt'

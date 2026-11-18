@@ -156,11 +156,12 @@ class CateyeClient:
         selected = self._select_screens(screens)
         description = await self._describe_screens([s["image_base64"] for s in selected],
                                                    len(selected), len(screens))
-        if not description:
+        receipt = getattr(description, "result", None)
+        if not description or (receipt is not None and (not receipt.ok or receipt.used_template)):
             self._ctx.logger.info("屏幕截图视觉理解失败（宿主可能不支持图片输入），本轮按「没看清」处理")
             return ScreenPeek(PEEK_FAILED)
 
-        self._ctx.logger.info(f"陪伴对象电脑状态（{now.strftime('%H:%M')}，{len(selected)}/{len(screens)} 屏）：{description}")
+        self._ctx.logger.info(f"屏幕视觉描述已完成（{now.strftime('%H:%M')}，{len(selected)}/{len(screens)} 屏）")
         return ScreenPeek(PEEK_OK, description)
 
     async def is_connected(self) -> bool:

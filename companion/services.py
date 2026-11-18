@@ -133,6 +133,7 @@ class CompanionServices:
                 self._data_dir,
                 config_provider=lambda: plugin.config,
                 decision_logger=self._ctx.decision_logger,
+                target_bound=True,
             )
         )
         # 好感 v2 档位变化事件需要总线（plugin._bus 在服务束构造前已就绪，可空降级）
@@ -245,6 +246,20 @@ class CompanionServices:
 
     def set_target(self, target_qq: str, stream_id: str) -> None:
         """目标会话解析结果透传给巡检器（stream 解析成功/变化时调用）。"""
+        previous = getattr(self.patrol, "_target_qq", "")
+        if previous != target_qq:
+            reviewer = getattr(self, "reviews", None)
+            if reviewer is not None:
+                reviewer.reset_target()
+            screen = getattr(self, "screen_store", None)
+            if screen is not None:
+                screen.discard()
+        try:
+            self.affection.bind_target(target_qq)
+        except (OSError, ValueError):
+            self.patrol.set_target("", "")
+            logger.error("无法绑定陪伴目标的关系档案，保留原档并暂停陪伴", exc_info=True)
+            return
         self.patrol.set_target(target_qq, stream_id)
 
     def sync_from_config(self) -> None:
@@ -409,6 +424,14 @@ class CompanionServices:
             self.patrol.start()
         elif not patrol_enabled:
             self.plugin.ctx.logger.info('陪伴模块已停用（patrol.enabled=false），巡检循环未启动')
+
+    async def sync_background(self) -> None:
+        """Reconcile only the patrol loop; event subscriptions remain with start/stop."""
+        section = getattr(self.plugin.config, "patrol", None)
+        if getattr(section, "enabled", True) and self.patrol.has_target():
+            self.patrol.start()
+        else:
+            await self.patrol.stop()
 
     async def stop(self) -> None:
         """停止服务束：停巡检、清身份缓存、丢弃待注入旁白、强写好感度。"""

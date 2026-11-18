@@ -42,6 +42,8 @@ class ShareLedger:
             db.execute("UPDATE attempts SET status='rejected',reason='preparation_interrupted_no_send' WHERE status='preparing'")
             db.execute("UPDATE attempts SET status='uncertain',reason='recovered_inflight' WHERE status='sending'")
             db.execute("UPDATE attempts SET history='uncertain' WHERE history='appending'")
+            db.execute("UPDATE videos SET status='skipped',reason='evaluation_limit' "
+                       "WHERE status IN ('evaluating','deferred') AND eval_count>=3")
             db.execute("UPDATE videos SET status='deferred',next_at=next_at+1800,reason='evaluation_interrupted' WHERE status='evaluating'")
 
     @contextmanager
@@ -129,7 +131,9 @@ class ShareLedger:
         with self._transaction() as db:
             if not self._clock(db,now):return None
             db.execute("UPDATE videos SET status='expired',reason='ttl' WHERE expires<=? AND status IN ('observed','deferred','queued','evaluated')",(now,))
-            row=db.execute("SELECT * FROM videos WHERE status IN ('observed','deferred','queued') AND next_at<=? AND expires>? ORDER BY CASE status WHEN 'queued' THEN 0 ELSE 1 END,created LIMIT 1",(now,now)).fetchone()
+            row=db.execute("SELECT * FROM videos WHERE (status='queued' OR "
+                "(status IN ('observed','deferred') AND eval_count<3)) AND next_at<=? AND expires>? "
+                "ORDER BY CASE status WHEN 'queued' THEN 0 ELSE 1 END,created LIMIT 1",(now,now)).fetchone()
             return self._video(row)
 
     def begin_evaluation(self,bvid:str,now:float)->bool:

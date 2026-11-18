@@ -54,6 +54,24 @@ def parse_llm_decision(answer: Any) -> Tuple[bool, str]:
     return False, f"格式异常: {clean[:30]}"
 
 
+def post_rule_rejection(*, asleep: bool, quiet: bool, actual_nap: bool,
+                        cooldown_minutes: int, require_activity: bool = False,
+                        has_activity: bool = True, schedule_enabled: bool = True) -> Tuple[str, str]:
+    """Pure priority order for the live posting rules shared by all publishing paths."""
+    if asleep:
+        return "silence", "睡眠引擎判定仍在睡"
+    if quiet:
+        return "silence", "静默时段（跟随日程作息，整夜不发说说）"
+    if require_activity and not has_activity:
+        reason = "当前无日程活动（含睡眠）" if schedule_enabled else "日程未启用（[schedule].enabled=false）"
+        return "no_activity", reason
+    if actual_nap:
+        return "nap_quiet", "实际午休/小睡中，空间静默"
+    if cooldown_minutes > 0:
+        return "cooldown", f"冷却中（剩余约 {cooldown_minutes} 分钟）"
+    return "", ""
+
+
 class DecisionHistory:
     """发帖判定历史（带 maxlen 的 deque，最新在前）。
 

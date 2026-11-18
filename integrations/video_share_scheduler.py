@@ -41,7 +41,7 @@ def boosted_limits(limits: dict, multiplier: float) -> dict:
     for key in ('daily_limit', 'stream_daily_limit'):
         if key in out:
             try:
-                out[key] = max(1, int(math.ceil(float(out[key]) * multiplier)))
+                out[key] = max(0, int(math.ceil(float(out[key]) * multiplier)))
             except (TypeError, ValueError):
                 pass
     if 'min_interval_hours' in out:
@@ -169,8 +169,16 @@ class VideoSocialService:
             if candidate is None:
                 return {'status': 'no_candidate'}
             if mode == '自动分享':
+                # Before choosing an audience, reject only when even the largest allowed
+                # target budget cannot accommodate this video. Claim rechecks the actual route.
+                upper = self._limits()
+                if getattr(cfg, 'include_companion', True) and self._probability is not None:
+                    try:
+                        upper = boosted_limits(upper, target_share_multiplier(self._probability(), is_target=True))
+                    except Exception:
+                        pass
                 reason = await asyncio.to_thread(
-                    self.ledger.capacity_reason, now, self._day(), self._limits(), bvid=candidate['bvid'])
+                    self.ledger.capacity_reason, now, self._day(), upper, bvid=candidate['bvid'])
                 if reason:
                     await asyncio.to_thread(self.ledger.postpone, candidate['bvid'], reason, now, 1800)
                     return {'status': 'deferred', 'reason': reason}
@@ -315,9 +323,9 @@ class VideoSocialService:
         except Exception:
             current = []
         # 只比身份键：群改名/昵称变化不应误判为撤授权；账号或流变化仍会挡住。
-        ident = {k: selected.get(k) for k in ('stream_id', 'account_id', 'kind')}
+        identity_fields = ('stream_id', 'account_id', 'kind', 'user_id', 'group_id')
         route = next((r for r in current
-                      if {k: r.get(k) for k in ('stream_id', 'account_id', 'kind')} == ident), None)
+                      if all(r.get(k) == selected.get(k) for k in identity_fields)), None)
         if self._config().mode != '自动分享' or route is None:
             await asyncio.to_thread(self.ledger.postpone, bvid, 'consent_or_route_changed', self._now(), 300, reevaluate=True)
             return {'status': 'deferred'}
@@ -329,7 +337,7 @@ class VideoSocialService:
         # losing processes must not reserve/release over another owner's slot.
         claim = await asyncio.to_thread(
             self.ledger.claim, bvid, route['stream_id'], 'auto', 'auto:' + uuid.uuid4().hex,
-            self._now(), self._day(), self._limits())
+            self._now(), self._day(), boosted_limits(self._limits(), self._target_multiplier(route)))
         if claim['status'] != 'claimed':
             if claim['status'] == 'duplicate':
                 await asyncio.to_thread(
@@ -468,8 +476,14 @@ class ManualVideoShares:
             key = hashlib.sha256((send_stream + '|' + request_id).encode()).hexdigest() if request_id else ''
             now = self._now()
             prior = await asyncio.to_thread(ledger.request_receipt, key)
+            if prior and prior.get('bvid') != bvid:
+                return {'success': False, 'bvid': bvid, 'error_class': 'request_conflict',
+                        'content': '这次请求已用于另一个视频，本次视频未提交。'}
             if prior is None:
                 prior = await asyncio.to_thread(ledger.recent_stream_receipt, send_stream, now)
+                if prior and prior.get('bvid') != bvid:
+                    return {'success': False, 'bvid': bvid, 'error_class': 'stream_cooldown',
+                            'content': '当前聊天刚有一次视频分享，本次视频未提交。'}
             if prior:
                 return attempt_result(prior, duplicate=True)
             recent = {}
@@ -491,9 +505,12 @@ class ManualVideoShares:
             claim = await asyncio.to_thread(
                 ledger.claim, selected['bvid'], send_stream, 'manual', key, now, self._day(), {}, preparing=True)
             if claim['status'] == 'duplicate':
+                if claim['attempt'].get('bvid') != bvid:
+                    return {'success': False, 'bvid': bvid, 'error_class': 'request_conflict',
+                            'content': '该请求对应另一个视频，本次视频未提交。'}
                 return attempt_result(claim['attempt'], duplicate=True)
             if claim['status'] != 'claimed':
-                return {'success': False, 'error_class': claim.get('reason'),
+                return {'success': False, 'bvid': bvid, 'error_class': claim.get('reason'),
                         'content': '分享防重或状态检查未放行，本次不发送。'}
             attempt = claim['attempt_id']
             try:

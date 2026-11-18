@@ -21,7 +21,7 @@ class VideoShareSectionConfig(PluginConfigBase):
         default=True, description="允许所有已注册且可路由的QQ群作为自动分享候选，仍受群活跃门槛、静默与额度约束，评估器自主决定是否分享。关闭后仅陪伴私聊与额外允许的聊天可候选。",
         json_schema_extra={"label": "允许所有群"})
     allowed_chats: list[str] = Field(
-        default_factory=list, description="在允许所有群之外精确追加的聊天，每项使用group:群号或private:QQ号；只接受已存在且可路由的QQ会话。allow_all_groups关闭时此项与陪伴私聊决定候选范围。",
+        default_factory=list, description="额外允许的已注册QQ群，每项使用 group:群号。自动私聊分享只面向已启用的陪伴目标；其他 private:QQ号不加入候选。",
         json_schema_extra={"label": "额外允许的聊天"})
     min_group_daily_messages: int = Field(default=100, ge=0, le=100000,
         description="群当日非bot消息数低于此值时不建立/更新该群画像、也不纳入分享候选，以节省token并避免误发不活跃小群；0关闭门槛。陪伴私聊不受此限。",
@@ -49,11 +49,8 @@ class VideoShareSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "分享判断任务"})
     # 2026-11-11 Gemini 批：分享质量门槛（默认关，避免压低现有分享量）。
     video_share_quality_gate: bool = Field(default=False,
-        description="自动视频分享质量门槛：开启后在既有相关性判断之外再按质量分过滤，低质量候选不投递；"
-                    "默认关，保持当前分享量与用户要求的提升口径",
-        json_schema_extra={"label": "分享质量门槛",
-            "hint": "默认关；开启后低于门槛值的候选不会自动分享，手动分享不受影响"})
+        description="QQ 空间视频候选的质量门槛；开启后由空间视频评估与发布链检查质量分。",
+        json_schema_extra={"label": "空间视频质量门槛", "hint": "默认关闭。聊天视频卡片使用独立的相关性判断。"})
     video_share_quality_threshold: float = Field(default=0.55, ge=0.0, le=1.0,
-        description="自动视频分享质量门槛值（0~1）：质量分低于该值不自动分享；仅在「分享质量门槛」开启时生效",
-        json_schema_extra={"label": "质量门槛值", "step": 0.05,
-            "hint": "默认 0.55；门槛开启后才参与过滤"})
+        description="QQ 空间视频候选达到该质量分才可通过空间质量门槛（0~1）。",
+        json_schema_extra={"label": "空间视频质量阈值", "step": 0.05})

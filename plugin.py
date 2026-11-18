@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from typing import Any, ClassVar, Dict, Iterable, Optional
 
 # ── 宿主运行时导入引导（勿删）──────────────────────────────────────────
@@ -256,10 +257,24 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception:
             harass_enabled = True
         try:
-            screen_enabled = bool(screen_config_of(self.config).tool_enabled)
+            screen_enabled = bool(self.config.plugin.enabled and self.config.patrol.enabled
+                                  and screen_config_of(self.config).tool_enabled)
         except Exception:
             screen_enabled = False
-        screen_stream = screen_registration_stream(self) if screen_enabled else ""
+        screen_stream = ""
+        if screen_enabled:
+            try:
+                context = self.ctx
+            except (AttributeError, RuntimeError):
+                context = None
+            if context is not None:
+                screen_stream = screen_registration_stream(self)
+        self._declared_screen_stream = screen_stream
+        coordinator = getattr(self, "_target_binding_coordinator", None)
+        if coordinator is not None:
+            coordinator.declare(screen_stream)
+        if not hasattr(self, "_screen_scope_ready"):
+            self._screen_scope_ready = False
 
         def keep(info):
             name = info.get("name") if isinstance(info, dict) else getattr(info, "name", None)
@@ -412,6 +427,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     # ------------------------------------------------------------------
     async def on_load(self) -> None:
         self._is_unloading = False
+        self._screen_load_in_progress = True
+        self._screen_scope_ready = False
         data_dir = self.ctx.paths.data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
         self._data_dir = data_dir
@@ -431,6 +448,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 预设表/描述表由 CompanionServices 装配时装载（mappings/，只读一遍）
         self._affection = AffectionManager(
             data_dir, config_provider=lambda: self.config, decision_logger=self._decision_logger,
+            target_bound=True,
         )
         # config_provider：judge() 等在调用时动态读顶层配置（[judge] 段热更新即时生效）
         # 任务名统一读 [llm].task_name（2026-10-10 起 LLM 调用参数集中在 [llm] 段）
@@ -608,7 +626,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._life_tick_loop_ref: Any = None
         self._life_tick_task: asyncio.Task | None = None
         self._life_cleanup_date = ""
-        # P4 残余面（2026-11-04）：睡眠拍失败回滚快照与连续失败计数（有界重试 3 拍）
+        # Sleep state retries preserve the integration cursor until persistence succeeds.
         self._sleep_tick_rollback: Any = None
         self._sleep_tick_failures = 0
         # PR6（2026-10-27）：目标频率校准的单飞 task 与「无 loop 时挂起」标记
@@ -620,11 +638,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self.ctx.logger.info("插件未启用（plugin.enabled=false），仅加载组件")
             # preflight 登记 disabled 状态（整体不 init；区别于业务字段失败）。
             self._start_auto_init()
+            self._screen_load_in_progress = False
             return
 
         # 目标私聊 stream 解析（失败则后台重试）
-        self._stream_id = await self._resolve_target_stream()
-        self._apply_target(target_qq_of(cfg), self._stream_id)
+        await self._refresh_target_binding()
         # 生活状态装配（R7 滚动化改造，2026-10-25 用户直派；PR8 3.0.0 起门控 =
         # [schedule].enabled 唯一总开关）：false 时不实例化任何新服务；失败告警回退、
         # 绝不拖挂插件加载（_setup_life_services 内保底）
@@ -634,6 +652,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self.ctx.logger.info("属于麦麦的生活已加载 v%s（目标=%s，stream=%s）",
                              SUPPORTED_CONFIG_VERSION, target_qq_of(cfg) or "未配置",
                              self._stream_id or "待解析")
+        self._screen_load_in_progress = False
+        self._queue_screen_registration_reload()
 
     def _start_auto_init(self) -> None:
         """非阻塞启动加载自动初始化（单飞/退避/逐字段校验；异常静默降级）。"""
@@ -646,6 +666,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
     async def on_unload(self) -> None:
         self._is_unloading = True
+        self._screen_scope_ready = False
+        await self._target_lifecycle().stop()
         # F2（2026-11-04 评估）：停机链加总超时预算（宿主 plugin.shutdown 预算 5s，
         # 此处 4s 留余量）+ 逐步防御；任一步挂起不再拖满宿主预算被 terminate。
         # 关键落盘（life_state/affection/db close）移入下方保底尾段——超时/异常
@@ -697,7 +719,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def _shutdown_chain(self) -> None:
         """串行停机链（F2：每步独立防御；总超时预算由 on_unload 的 wait_for 控制）。"""
         # Stop single-flight integration work before any service/database teardown.
-        for task_name in ("_video_watch_sync_task", "_video_watch_poll_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task", "_auto_init_task"):
+        for task_name in ("_video_watch_sync_task", "_video_watch_poll_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task", "_auto_init_task", "_preference_refresh_task"):
             task = getattr(self, task_name, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -766,15 +788,17 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope == "bot":
+            self._screen_scope_ready = False
             await self._refresh_persona()
             from core.targeting import refresh_host_target
             await refresh_host_target(self)
-            self._stream_id = await self._resolve_target_stream()
-            self._apply_target(target_qq_of(self.config), self._stream_id)
+            await self._refresh_target_binding()
+            self._ensure_stream_retry()
             return
         if scope != "self":
             return
         cfg = self.config
+        self._screen_scope_ready = False
         # F6（2026-11-04 评估）：视频服务随 plugin.enabled 总开关停摆——热关闭插件
         # 时 manager 一并停机（工具面如实回执「未启用」），与 on_load 门控同口径。
         if cfg.plugin.enabled and cfg.video_watch.enabled:
@@ -786,7 +810,14 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._llm.update_task(llm_task_name_of(cfg))
         self._companion.sync_from_config()
         if not cfg.plugin.enabled:
+            stop = getattr(self, "_stop_event", None)
+            if stop is not None:
+                stop.set()
+            await self._cancel_owned_task("_auto_init_task")
+            await self._cancel_owned_task("_preference_refresh_task")
+            await self._cancel_owned_task("_stream_retry_task")
             await self._qzone.stop()
+            await self._emotion.stop()
             await self._companion.stop()
             await self._planning.stop()
             # PR6：插件停用时取消未完成的频率校准
@@ -805,8 +836,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # 目标 QQ 变化 → 重新解析 stream
         from core.targeting import refresh_host_target
         await refresh_host_target(self)
-        self._stream_id = await self._resolve_target_stream()
-        self._apply_target(target_qq_of(cfg), self._stream_id)
+        await self._refresh_target_binding()
         # 生活状态热启用（R7 滚动化改造；PR8 3.0.0 门控 = [schedule].enabled）：首次
         # 置真时此处补装配，再挂 tick 循环（_start_bg 的 _bg_started 守卫会早退，故单独 _ensure）
         self._setup_life_services()
@@ -823,8 +853,23 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             self._emotion.sync_from_config()
         except Exception:
             pass
-        await self._start_bg()
-        self._ensure_life_tick_task()
+        if self._bg_started:
+            await self._planning.sync_background()
+            await self._companion.sync_background()
+            await self._emotion.sync_background()
+            if cfg.qzone.enabled:
+                self._qzone.start()
+            else:
+                await self._qzone.stop()
+        else:
+            await self._start_bg()
+            self._start_auto_init()
+        if cfg.schedule.enabled:
+            self._ensure_life_tick_task()
+        else:
+            await self._cancel_owned_task("_preference_refresh_task")
+            await self._stop_life_tick_task()
+        self._ensure_stream_retry()
         # PR4（2026-10-27）：事件库模式随配置热更新切换（off/manual/auto 三态；复用同一
         # 实例，只 start/stop 后台；关闭中的在飞生成按保守结果保留旧库）
         try:
@@ -840,10 +885,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             await self._calibrate_target_frequency()
         except Exception:
             pass
-        if self._stream_id:
-            self._companion.patrol.start()
-        if not cfg.qzone.enabled:
-            await self._qzone.stop()
 
     # ------------------------------------------------------------------
     # 装配助手
@@ -852,11 +893,57 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._companion.set_target(target_qq, stream_id)
         self._qzone.set_target(stream_id)
         from companion.screen_tools import remember_screen_target
-        remember_screen_target(self, target_qq, stream_id)
+        saved = remember_screen_target(self, target_qq, stream_id)
+        self._screen_scope_ready = bool(target_qq and stream_id)
+        self._target_lifecycle().bound(stream_id, saved=saved is True)
+        self._queue_screen_registration_reload()
         # PR6（2026-10-27 共享接线）：目标解析成功/切换后**立即**校准目标频率，
         # 不等第一次活动切换。本方法是 sync 装配口：绝不在此 await，也不创建
         # 无法回收的裸协程（无 loop / 未装配 → 记 pending，由 flush 口补发）。
         self._schedule_target_frequency_calibration()
+
+    def _queue_screen_registration_reload(self) -> None:
+        """Publish scope changes after startup has completed."""
+        if getattr(self, "_screen_load_in_progress", False):
+            return
+        from companion.screen_config import screen_config_of
+        enabled = (self.config.plugin.enabled and self.config.patrol.enabled
+                   and screen_config_of(self.config).tool_enabled)
+        self._target_lifecycle().refresh_screen(enabled=bool(enabled))
+
+    def _target_lifecycle(self):
+        from linkage.screen.registration import TargetBindingCoordinator
+        coordinator = getattr(self, "_target_binding_coordinator", None)
+        if coordinator is None:
+            ctx = getattr(self, "ctx", None)
+            component = getattr(ctx, "component", None)
+            reloader = getattr(component, "reload_plugin", None)
+            plugin_id = str(getattr(ctx, "plugin_id", "") or "").strip()
+            if not plugin_id:
+                import json
+                try:
+                    plugin_id = str(json.loads(
+                        (Path(_PLUGIN_DIR) / "_manifest.json").read_text(encoding="utf-8")).get("id") or "")
+                except (OSError, ValueError, TypeError):
+                    plugin_id = ""
+            def commit_binding(target: str, stream: str) -> None:
+                self._stream_id = stream
+                self._apply_target(target, stream)
+            coordinator = TargetBindingCoordinator(
+                config_provider=lambda: self.config,
+                lookup_user=lambda user: self.ctx.chat.get_stream_by_user_id(user_id=user),
+                private_streams=lambda: self.ctx.chat.get_private_streams(),
+                apply_target=commit_binding,
+                is_unloading=lambda: bool(getattr(self, "_is_unloading", False)),
+                plugin_id=plugin_id,
+                reload_plugin=reloader if callable(reloader) else None,
+                logger=getattr(ctx, "logger", None),
+            )
+            declared = getattr(self, "_declared_screen_stream", None)
+            if declared is not None:
+                coordinator.declare(declared)
+            self._target_binding_coordinator = coordinator
+        return coordinator
 
     def _schedule_target_frequency_calibration(self) -> None:
         """在 sync 装配口安全排队一次频率校准（单飞：旧 task 先取消再重建）。"""
@@ -1090,20 +1177,21 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                         engine._cfg_int("sleep_hard_commitment_lead_minutes", 30),  # noqa: SLF001
                         engine._wake_check_seconds())  # noqa: SLF001
             except Exception as exc:
-                engine = None
+                if engine is None or getattr(engine, "recovery_pending", False) is not True:
+                    engine = None
                 try:
-                    self.ctx.logger.warning("睡眠引擎装配失败（本次不启用引擎，睡眠态未就绪）：%s", exc)
+                    self.ctx.logger.warning("睡眠引擎装配未完成，已认领的会话留待恢复：%s", exc)
                 except Exception:
                     pass
             # 离线睡眠补全收口（LifeState 冷启动 pending gap 恰好一次消费；任何异常
             # 内部自吞并回退旧冷启动行为，绝不拖挂装配/插件加载）。认领语义 = 引擎
             # 恢复出**未关闭**睡眠会话（restore 也可能复活已关闭的「已醒提供者」到
             # lie-in 上限——那不持有离线段，不算认领）。
-            self._settle_offline_gap(
-                life, planner,
-                engine_claimed=bool(engine is not None and getattr(engine, "enabled", False)
-                                    and restored is not None
-                                    and not bool(getattr(restored, "closed", False))))
+            self._offline_engine_claimed = bool(engine is not None and engine.enabled and (
+                getattr(engine, "recovery_pending", False) is True
+                or (restored is not None and not bool(getattr(restored, "closed", False)))))
+            self._offline_work_pending = self._settle_offline_gap(
+                life, planner, engine_claimed=self._offline_engine_claimed) is False
             model = LifeScheduleReadModel(
                 self._db, life_state=life, planner=planner,
                 config_provider=lambda: self.config, timezone_str=timezone_str)
@@ -1147,12 +1235,13 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 wake_recorder=self._record_actual_wake_cycle,
                 event_bus_provider=lambda: getattr(self, "_bus", None),
                 logger_provider=lambda: getattr(getattr(self, "ctx", None), "logger", None),
-                settlement_v2_module=settlement_v2)
+                settlement_v2_module=settlement_v2,
+                data_dir=getattr(self, "_data_dir", None))
             self._offline_settlement = service
         return service
 
     def _settle_offline_gap(self, life: Any, planner: Any, *,
-                            engine_claimed: bool) -> None:
+                            engine_claimed: bool) -> bool:
         """冷启动离线 gap 收口（薄委托；编排体见 suite_offline_settlement，不抛异常）。
 
         保留原方法名与签名：_setup_life_services 装配点与 scratch 离线用例
@@ -1174,7 +1263,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         # （[life_state].sleep_debt_repay_v2，配置默认 True）——离线补眠默认与
         # 在线一致走阶梯还债；读不到配置时同样回退 True（在线默认口径），
         # 历史回放需显式把配置/参数置 False（旧公式逐字不变）。
-        self._offline_settlement_service().settle_offline_gap(
+        return self._offline_settlement_service().settle_offline_gap(
             life, planner, engine_claimed=engine_claimed,
             plan_settlement_fn=plan_offline_settlement,
             baseline_hours=baseline)
@@ -1374,6 +1463,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
     def _stop_life_services(self) -> None:
         """生活状态停机：落盘 life_state.json（best-effort；tick 每拍已存，此处兜底收尾）。"""
+        if getattr(self, "_offline_work_pending", False):
+            # Preserve the last durable observation until the journal can be saved and replayed.
+            return
         engine = getattr(self, "_sleep_engine", None)
         if engine is not None:
             try:
@@ -1535,6 +1627,14 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         planner = getattr(self, "_rolling_planner", None)
         if planner is None:
             return
+        if getattr(self, "_offline_work_pending", False):
+            engine = getattr(self, "_sleep_engine", None)
+            claimed = (getattr(self, "_offline_engine_claimed", False)
+                       or getattr(engine, "recovery_pending", False) is True)
+            self._offline_work_pending = self._settle_offline_gap(
+                self._life_state, planner, engine_claimed=claimed) is False
+            if self._offline_work_pending:
+                return
         try:
             from planning.cycle_state import activate_pending_cycle, entry_context_from_plugin
             activate_pending_cycle(getattr(self, "_data_dir", None),
@@ -1543,29 +1643,20 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception:
             self.ctx.logger.warning("待接替日程检查失败，保留当前周期", exc_info=True)
         prepared = self._sleep_prepare(planner)
+        if getattr(getattr(self, "_sleep_engine", None), "recovery_pending", False) is True:
+            return
         sleep_rates = (prepared or {}).get("rates")
         snapshot = self._life_tick_state(planner, sleep_rates=sleep_rates)
-        # P4 残余面（planning-state 请求，2026-11-04）：prepared 处于睡眠且
-        # snapshot=None（life.tick 失败）→ 跳过 commit 并回滚引擎本拍推进，
-        # 下一拍 prepare 重新覆盖本段区间，使睡眠增量可重试（引擎钟已在
-        # prepare_tick 内推进，不回滚则本拍增量丢失——丢而非重）。有界重试：
-        # 连续 3 拍失败后回退旧行为（照常 commit），避免觉醒链被永久冻结。
-        sleep_tick_failed = (isinstance(prepared, dict) and bool(prepared.get("asleep"))
-                             and sleep_rates is not None and snapshot is None)
-        if sleep_tick_failed:
+        # Business progress requires the life state and its integration cursor to be durable.
+        if snapshot is None:
             self._sleep_tick_failures = int(getattr(self, "_sleep_tick_failures", 0)) + 1
-        else:
-            self._sleep_tick_failures = 0
-        if (sleep_tick_failed and self._sleep_tick_failures <= 3
-                and self._rollback_sleep_tick()):
-            try:
-                self.ctx.logger.warning("睡眠拍状态推进失败（第 %d/3 次）：已回滚引擎本拍推进，"
-                                        "下一拍重放本段区间", self._sleep_tick_failures)
-            except Exception:
-                pass
-            commit = {}
-        else:
-            commit = self._sleep_commit(prepared, snapshot)
+            rolled_back = self._rollback_sleep_tick()
+            if self._sleep_tick_failures == 1 or self._sleep_tick_failures % 12 == 0:
+                self.ctx.logger.warning("生活状态保存失败，暂停本拍业务推进，等待重试（次数=%d，睡眠回滚=%s）",
+                                        self._sleep_tick_failures, rolled_back)
+            return
+        self._sleep_tick_failures = 0
+        commit = self._sleep_commit(prepared, snapshot)
         if commit.get("woke"):
             # 2026-10-27 用户批准：周期起点同步真实醒来时刻（早醒/晚醒都按真实时刻；
             # 意图计划时间保持不动；后续编辑/再生成复用同一标记）
@@ -1579,10 +1670,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     self.ctx.logger.warning("晨间 spine 调整失败（忽略）：%s", exc)
                 except Exception:
                     pass
-        if snapshot is not None:
-            report = planner.tick(life_snapshot=snapshot) or {}
-        else:
-            report = planner.tick() or {}
+        report = planner.tick(life_snapshot=snapshot) or {}
         # B 计划（2026-11-01 §5）：刷视频事件联动公共观看接口（单飞 task，失败不拖挂主循环）
         self._kick_video_watch_sync()
         # S3：分享候选投递（有到期候选且预算/间隔满足才真正发送；单飞）
@@ -1657,7 +1745,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             from integrations.video_interest import BiliCandidateSource, VideoInterestService
             interest = VideoInterestService(
                 self._data_dir / "video_watch",
-                # LLM 唯一入口：LLMService → tools/llm_gateway；module="video"
+                # LLM 唯一入口：LLMService → core/llm_gateway；module="video"
                 # （MODULE_VALUES 枚举无 video_interest，event 维度区分兴趣询问）
                 llm_generate_detailed=lambda *args, **kwargs: self._llm.generate_detailed(
                     *args, module="video", **kwargs),
@@ -1910,7 +1998,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         if prefs is None:
             return
         try:
-            import asyncio
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
@@ -1925,10 +2012,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     self.ctx.logger.debug('日程偏好增量评估失败（忽略）：%s', type(exc).__name__)
                 except Exception:
                     pass
-        try:
-            loop.create_task(_run())
-        except Exception:
-            pass
+        task = getattr(self, "_preference_refresh_task", None)
+        if task is None or task.done():
+            self._preference_refresh_task = loop.create_task(_run())
 
     def _record_video_result(self, result: dict, episode_id: str) -> bool:
         """观看完成双路记录（PR-A0）：聊天分享候选 + 空间视频候选，互不拖累。
@@ -2018,7 +2104,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     # PR-A3：视频自动发布路径经发布锁内共享额度复检（与日程普通说说同一把锁，
                     # 并发不超额）；包装注入而非改桥端口签名，A2 裸桥/桩注入契约不变。
                     'post_moment': lambda *a, _qz=qzone, **kw: _qz.post_moment(
-                        *a, enforce_daily_limit=True, **kw),
+                        *a, enforce_daily_limit=True,
+                        dispatch_allowed=lambda: self.config.qzone_video.mode == "auto", **kw),
                     'check_post_gates': qzone.check_post_gates,
                     'posts_today': qzone.posts_today,
                     'daily_max_posts': lambda: int(getattr(self.config.qzone, 'daily_max_posts', 0) or 0),
@@ -2047,7 +2134,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 # 信号（门槛开启时保守不分享，绝不虚构信号）。
                 quality_config_provider=lambda: self.config.video_share,
                 quality_signal_provider=self._video_share_quality_signals,
-                # LLM 唯一入口：LLMService → tools/llm_gateway；module='qzone'（发布面归属）
+                # LLM 唯一入口：LLMService → core/llm_gateway；module='qzone'（发布面归属）
                 # PR-AUDIT（3.16.1 PR-1）：判定/文案两链路人设统一经 with_identity 进 system
                 # 前缀；body 不再序列化 persona（module='qzone' 发布面归属不变）。
                 generate=lambda *a, **kw: self._llm.generate_detailed(*a, module='qzone', with_identity=True, **kw),
@@ -2790,7 +2877,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
 
 
-    def _record_actual_wake_cycle(self, when: Any = None) -> None:
+    def _record_actual_wake_cycle(self, when: Any = None) -> bool:
         """真实醒来 → 周期四变量 ``cycle_start``（2026-10-27 用户批准；best-effort）。
 
         - 只写「本帧真实醒来」标记（``current_start_source=actual_wake`` +
@@ -2801,7 +2888,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         """
         data_dir = getattr(self, "_data_dir", None)
         if data_dir is None:
-            return
+            return False
         try:
             from planning.cycle_state import (entry_context_from_plugin,
                                               record_actual_wake)
@@ -2811,16 +2898,18 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             wake_at = when
             if not isinstance(wake_at, datetime):
                 wake_at = TimezoneManager(tz_name).get_now()
-            record_actual_wake(
+            result = record_actual_wake(
                 str(data_dir), schedule_date=wake_at.strftime("%Y-%m-%d"),
                 wake_epoch=wake_at.timestamp(), reason="engine_wake", tz_name=tz_name,
                 cfg_wake=ctx.get("cfg_wake", ""), cfg_sleep=ctx.get("cfg_sleep", ""),
                 decision_logger=getattr(self, "_decision_logger", None), now=wake_at)
+            return bool(result.durable)
         except Exception as exc:
             try:
                 self.ctx.logger.warning("真实醒来同步周期起点失败（忽略）：%s", exc)
             except Exception:
                 pass
+            return False
 
     def _sleep_prepare(self, planner: Any) -> dict[str, Any] | None:
         """睡眠引擎拍前准备（PR3，定稿 §3.1 步 2；未装配/关 → None 旧路径）。
@@ -2876,7 +2965,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                     "continuous_minutes": session.continuous_minutes,
                     "interruption_count": session.interruption_count,
                     "quality": session.quality,
-                    "hard_commitment_start": (session.metadata or {}).get("hard_commitment_start"),
+                    "effective_sleep_hours": session.effective_sleep_hours,
                 }
             return {
                 "session": session,
@@ -2896,7 +2985,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         """回滚引擎本拍推进（P4 残余面：睡眠期 life.tick 失败 → 增量可重试）。
 
         仅当 prepare 前后会话同一（未发生会话启动/切换）且快照可得时执行；
-        否则保守不回滚（返回 False，调用方回退旧 commit 行为）。回滚后下一拍
+        否则返回 False，调用方仍停止本拍业务推进。回滚后下一拍
         prepare 从原 ``_last_tick_at`` 重新积分，覆盖失败拍区间——life.tick 若
         未推进自身钟（应用前异常）则 dt 与速率区间重新对齐；恰好一次语义由
         life 侧增量门与引擎 prepared 重放键保证，不双记账。
@@ -2922,11 +3011,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 session.continuous_minutes = fields["continuous_minutes"]
                 session.interruption_count = fields["interruption_count"]
                 session.quality = fields["quality"]
-                hard = fields.get("hard_commitment_start")
-                if hard is None:
-                    (session.metadata or {}).pop("hard_commitment_start", None)
-                else:
-                    session.metadata["hard_commitment_start"] = hard
+                session.effective_sleep_hours = fields["effective_sleep_hours"]
+                # Observed commitment identity/time is external fact, retained across an integration retry.
             return True
         except Exception:
             return False
@@ -2937,7 +3023,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         if engine is None or not isinstance(prepared, dict):
             return {}
         try:
-            energy = snapshot.get("energy") if isinstance(snapshot, dict) else None
+            energy = snapshot.get("sleep_boundary_energy", snapshot.get("energy")) if isinstance(snapshot, dict) else None
             result = engine.commit_tick(energy=energy)
             if isinstance(result, dict) and result.get("woke"):
                 session = getattr(engine, "_session", None)  # noqa: SLF001 - 同源会话读
@@ -3070,7 +3156,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         if self.config.qzone.enabled:
             self._qzone.start()
         await self._emotion.start()
-        self._bg_tasks.append(asyncio.create_task(self._stream_retry_loop()))
+        self._ensure_stream_retry()
         self._ensure_life_tick_task()
         self._bg_started = True
 
@@ -3088,40 +3174,38 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     # ------------------------------------------------------------------
     # stream 解析（companion 巡检与 qzone 提醒共用的目标会话）
     # ------------------------------------------------------------------
+    async def _refresh_target_binding(self, *, clear_unresolved: bool = True) -> str:
+        return await self._target_lifecycle().refresh(
+            resolve=lambda: self._resolve_target_stream(), clear_unresolved=clear_unresolved)
+
     async def _resolve_target_stream(self) -> str:
         """解析目标 QQ 的私聊 stream_id；失败返回空串（后台重试循环接管）。"""
-        target_qq = target_qq_of(self.config)
-        if not target_qq or target_qq == "123456789":
-            return ""  # 占位号不解析
-        try:
-            info = await self.ctx.chat.get_stream_by_user_id(user_id=target_qq)
-            payload = info.get("stream") if isinstance(info, dict) else None
-            payload = payload or info
-            if isinstance(payload, dict) and payload.get("stream_id"):
-                return str(payload["stream_id"])
-        except Exception:
-            pass
-        try:  # 回退：遍历私聊流
-            streams = await self.ctx.chat.get_private_streams()
-            if isinstance(streams, dict):
-                streams = streams.get("streams") or streams.get("data") or []
-            for s in streams or []:
-                if isinstance(s, dict) and str(s.get("user_id") or "") == target_qq and s.get("stream_id"):
-                    return str(s["stream_id"])
-        except Exception:
-            pass
-        return ""
+        return await self._target_lifecycle().resolve()
+
+    async def _cancel_owned_task(self, name: str) -> None:
+        task = getattr(self, name, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            setattr(self, name, None)
+
+    def _ensure_stream_retry(self) -> None:
+        if getattr(self, "_stream_id", "") or not self.config.plugin.enabled:
+            return
+        pending = getattr(self, "_stream_retry_task", None)
+        if pending is None or pending.done():
+            self._bg_tasks = [task for task in getattr(self, "_bg_tasks", []) if not task.done()]
+            self._stream_retry_task = asyncio.create_task(self._stream_retry_loop())
+            self._bg_tasks.append(self._stream_retry_task)
 
     async def _stream_retry_loop(self) -> None:
         """stream 未解析时每 60 秒重试；解析到则启动巡检循环。"""
         while not self._stop_event.is_set():
             if not self.config.plugin.enabled or self._companion.patrol.has_target():
                 return
-            stream_id = await self._resolve_target_stream()
+            stream_id = await self._refresh_target_binding(clear_unresolved=False)
             if stream_id:
-                self._stream_id = stream_id
-                self._apply_target(target_qq_of(self.config), stream_id)
-                self._companion.patrol.start()
+                await self._companion.sync_background()
                 self.ctx.logger.info("目标 stream 解析成功：%s", stream_id)
                 return
             try:

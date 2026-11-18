@@ -814,6 +814,11 @@ class PatrolService:
 
     # ---- 目标会话与人设 ----
     def set_target(self, target_qq: str, stream_id: str) -> None:
+        if getattr(self, "_target_qq", "") != target_qq:
+            self._last_trigger_time = None
+            self._last_trigger_intent = ""
+            self._last_miss_claim_kind = ""
+            self._target_display_name = ""
         self._target_qq = target_qq
         self._stream_id = stream_id
 
@@ -1076,12 +1081,18 @@ class PatrolService:
         for row in expired:
             if not isinstance(row, dict) or str(row.get('intent') or '') != 'missing':
                 continue
-            expired_key = str(row.get('key') or '')
-            if expired_key and current_key and expired_key != current_key:
-                continue  # 旧沉默周期的回执：不得退回新周期 claim
-            # 阶梯想念：本周期可能同时存在多个阶段的 claim；release 只退 pending 类，
-            # spoken/unknown 终态不会被回滚（InitiativeMemory.release 的既有契约）。
-            for kind in (self._open_miss_claim_kinds() or ['miss']):
+            if row.get("stream") and row["stream"] != self._stream_id:
+                continue
+            expired_key = str(row.get("key") or "")
+            if not current_key:
+                continue
+            available = self._open_miss_claim_kinds()
+            if expired_key == current_key:
+                # Old rows lack a stage: release only an unambiguous pending owner.
+                kinds = available if len(available) == 1 else []
+            else:
+                kinds = [kind for kind in available if expired_key == f"{current_key}:{kind}"]
+            for kind in kinds:
                 self._initiative_memory.release(self._target_qq, kind)
         return len(expired)
 
@@ -1090,6 +1101,7 @@ class PatrolService:
     # ------------------------------------------------------------------
     async def _tick(self) -> None:
         cfg = self._patrol_cfg()
+        binding = (self._target_qq, self._stream_id, getattr(self._affection, "binding_generation", 0))
         now = datetime.now()
         self._last_tick_at = now
         fields: dict[str, Any] = {}
@@ -1243,14 +1255,24 @@ class PatrolService:
         if random.random() >= probability:
             done('dice')
             return
+        if binding != (self._target_qq, self._stream_id, getattr(self._affection, "binding_generation", 0)):
+            done("target_changed")
+            return
+        cycle_key = 'miss:' + str(cycle['anchor'])
+        legacy_status = getattr(coordinator, "receipt_status", None)
+        if callable(legacy_status) and legacy_status(self._stream_id, cycle_key) in ('confirmed', 'unknown', 'pending_reply') and not any(str(k).startswith('miss:s') for k in claims):
+            done("legacy_stage_unresolved")
+            return
         if not self._initiative_memory.claim(self._target_qq, last, now, claim_kind,
                                              status='pending_reply'):
             done('recovery_or_cycle_claim')
             return
         self._last_miss_claim_kind = claim_kind
-        key = 'miss:' + str(cycle['anchor'])
+        key = f"{cycle_key}:{claim_kind}"
         success = await self._trigger_missing(hours, key=key, share_topic=share_topic,
                                               stage=decision.stage)
+        if binding != (self._target_qq, self._stream_id, getattr(self._affection, "binding_generation", 0)):
+            return
         if success:
             # 入队只代表宿主受理；claim 保持 pending_reply，等 after_response 确认
             # （mark_miss_spoken）或 _reconcile_stale_optional_actions 超时退回。
@@ -1275,8 +1297,9 @@ class PatrolService:
         if str(share_topic or '').strip():
             reason = (f"{reason}{EXPERIENCE_SHARE_TOPIC_PREFIX}{str(share_topic).strip()}"
                       f"{EXPERIENCE_SHARE_TOPIC_SUFFIX}")
+        binding = (self._target_qq, getattr(self._affection, "binding_generation", 0))
         result = await self._trigger_planner('missing', reason, key=key, stage=stage)
-        if result:
+        if result and binding == (self._target_qq, getattr(self._affection, "binding_generation", 0)):
             self._affection.set_miss_sent()
         return result
 
@@ -1326,6 +1349,7 @@ class PatrolService:
         # P1-8：入队不再预扣发言计数；预算/计数后移到 after_response 的实际发言确认。
         # 2026-11-11 四阶段渗透：阶段号随 turn 落盘，replyer 钩子据此注入阶段 1~3
         # 的追问强度（此前只用于 reason 文案，turn.miss_stage 恒 0 → 文案永不生效）。
+        binding = (self._target_qq, self._stream_id, getattr(self._affection, "binding_generation", 0))
         turn_id = register_turn(self._config, self._stream_id,
                       'miss' if intent == 'missing' else 'patrol_chat', reason,
                       miss_stage=stage)
@@ -1339,6 +1363,9 @@ class PatrolService:
             discard_turn(self._config, turn_id)
             self._discard_screen_narration()
             logger.warning('主动回合触发异常（按未知交付处理）', exc_info=True)
+            return False
+        if binding != (self._target_qq, self._stream_id, getattr(self._affection, "binding_generation", 0)):
+            discard_turn(self._config, turn_id)
             return False
         status = str(result.get('status') or '') if isinstance(result, dict) else ''
         self._last_trigger_status = status
@@ -1365,7 +1392,14 @@ class PatrolService:
         if service is None:
             return
         # 评审修复（3.17.16）：仅真实发布才标记，触发失败 discard 不误删他轮旁白
-        self._screen_published = bool(await service.publish_narration(self._stream_id))
+        stream = self._stream_id
+        generation = getattr(self._affection, "binding_generation", 0)
+        published = bool(await service.publish_narration(stream))
+        if stream != self._stream_id or generation != getattr(self._affection, "binding_generation", 0):
+            if published:
+                service.discard(stream)
+            return
+        self._screen_published = published
 
     def _discard_screen_narration(self) -> None:
         """触发未入队则撤掉旁白（委托 linkage 屏幕感知服务；服务缺失回退直清缓存）。

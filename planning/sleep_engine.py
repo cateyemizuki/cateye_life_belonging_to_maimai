@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from .time_utils import DAY_MINUTES, TimezoneManager, normalize_day_minutes
+from .time_utils import DAY_MINUTES, TimezoneManager, normalize_day_minutes, elapsed_seconds, shift_elapsed, wall_time
 from .schedule_items import is_night_sleep_item
 from .circadian import (bounded, circadian_sleepiness, night_window, onset_band,
                        phase_shift, sleep_score)
@@ -315,12 +315,11 @@ def next_occurrence(after: datetime, minute_of_day: Any, *,
                     inclusive: bool = False) -> datetime:
     """``after`` 之后（默认严格晚于）最近的钟点时刻（跨午夜/非默认作息通用）。"""
     minute = normalize_day_minutes(minute_of_day)
-    base = after.replace(hour=minute // 60, minute=minute % 60, second=0, microsecond=0)
-    if inclusive and base == after:
+    base = wall_time(after.date(), minute, after.tzinfo)
+    distance = elapsed_seconds(base, after)
+    if distance > 0 or (inclusive and distance == 0):
         return base
-    while base <= after:
-        base = base + timedelta(days=1)
-    return base
+    return wall_time(after.date() + timedelta(days=1), minute, after.tzinfo)
 
 
 @dataclass(frozen=True)
@@ -349,7 +348,7 @@ def hard_commitment_deadline(hard_commitment_start: Optional[datetime],
         return None
     lead = max(0.0, _clamp(lead_minutes, 0.0, 240.0,
                            DEFAULT_HARD_COMMITMENT_LEAD_MINUTES))
-    return hard_commitment_start - timedelta(minutes=lead)
+    return shift_elapsed(hard_commitment_start, -lead * 60)
 
 
 def wake_decision(now: datetime, *, energy: Any, earliest_wake: datetime,
@@ -386,14 +385,14 @@ def wake_decision(now: datetime, *, energy: Any, earliest_wake: datetime,
     hard_due = hard_commitment_deadline(hard_commitment_start,
                                         hard_commitment_lead_minutes)
     # 1) 上限必起 / 硬约定（最早截止优先；同刻硬约定优先）
-    if now >= lie_in_cap:
-        if hard_due is not None and hard_due <= lie_in_cap and now >= hard_due:
+    if elapsed_seconds(now, lie_in_cap) >= 0:
+        if hard_due is not None and elapsed_seconds(hard_due, lie_in_cap) <= 0 and elapsed_seconds(now, hard_due) >= 0:
             return WakeDecision(True, "hard_commitment", hard_due)
         return WakeDecision(True, "lie_in_cap", lie_in_cap)
-    if hard_due is not None and now >= hard_due:
+    if hard_due is not None and elapsed_seconds(now, hard_due) >= 0:
         return WakeDecision(True, "hard_commitment", hard_due)
     # 2) 最早起床前不因阈值醒（硬约定/上限已在上方先行判定）
-    if now < earliest_wake:
+    if elapsed_seconds(now, earliest_wake) < 0:
         return WakeDecision(False, None, None)
     # 3) 阈值（按复检节流）；最小有效睡眠保护只 gate 本分支（规格 §1C）
     if check_due and _clamp(energy, 0.0, 1.0, 0.0) >= _clamp(
@@ -449,21 +448,21 @@ def resolve_hard_commitment_start(intents: Iterable[Any], frame_date: str,
             continue
         if start < (0 if allow_midnight else 1) or end <= start:
             continue
-        start_at = midnight + timedelta(minutes=start)
-        if start_at <= after:
+        start_at = wall_time(midnight.date(), start, after.tzinfo)
+        if elapsed_seconds(start_at, after) <= 0:
             if not include_active:
                 continue
-            end_at = midnight + timedelta(minutes=end)
-            if after >= end_at:
+            end_at = wall_time(midnight.date(), end, after.tzinfo)
+            if elapsed_seconds(after, end_at) >= 0:
                 continue  # 窗口已结束：不是本拍有效的正式起床依据
-            if horizon is not None and start_at > horizon:
+            if horizon is not None and elapsed_seconds(start_at, horizon) > 0:
                 continue
-            if best is None or start_at < best:
+            if best is None or elapsed_seconds(start_at, best) < 0:
                 best = start_at
             continue
-        if horizon is not None and start_at > horizon:
+        if horizon is not None and elapsed_seconds(start_at, horizon) > 0:
             continue
-        if best is None or start_at < best:
+        if best is None or elapsed_seconds(start_at, best) < 0:
             best = start_at
     return best
 # ======================================================================
@@ -482,8 +481,8 @@ class InterruptionRecord:
 
     def total_interrupted_minutes(self, now: datetime) -> float:
         total = float(self.interrupted_minutes)
-        if self.interrupted and self.last_note_at is not None and now > self.last_note_at:
-            total += (now - self.last_note_at).total_seconds() / 60.0
+        if self.interrupted and self.interrupt_started_at is not None:
+            total += max(0.0, elapsed_seconds(now, self.interrupt_started_at)) / 60.0
         return max(0.0, total)
 
 
@@ -522,41 +521,41 @@ class SleepClock:
 
     def continuous_minutes(self, now: datetime) -> float:
         start = self.record.segment_started_at
-        if start is None or now <= start:
+        if start is None or elapsed_seconds(now, start) <= 0:
             return 0.0
-        return (now - start).total_seconds() / 60.0
+        return elapsed_seconds(now, start) / 60.0
 
     # -- 推进 ----------------------------------------------------------
     def advance(self, now: datetime, threshold_minutes: float) -> AdvanceResult:
         record = self.record
         if record.segment_started_at is None:
             record.segment_started_at = now
-        before_hours = max(0.0, (now - record.segment_started_at).total_seconds() / 3600.0)
+        before_hours = max(0.0, elapsed_seconds(now, record.segment_started_at) / 3600.0)
         reset = False
         threshold = max(0.0, _clamp(threshold_minutes, 0.0, 240.0,
                                     DEFAULT_INTERRUPT_MIN_MINUTES))
         if record.interrupted:
             last = record.last_note_at or record.interrupt_started_at or now
-            gap = (now - last).total_seconds() / 60.0
+            gap = elapsed_seconds(now, last) / 60.0
             if gap >= threshold:
                 # 确认清醒 ≥ 阈值：连续段归零，再入睡从最低档开始
                 if record.interrupt_started_at is not None:
                     record.interrupted_minutes += max(
-                        0.0, (now - record.interrupt_started_at).total_seconds() / 60.0)
+                        0.0, elapsed_seconds(now, record.interrupt_started_at) / 60.0)
                 record.interrupted = False
                 record.interrupt_started_at = None
                 record.last_note_at = None
                 record.segment_started_at = now
                 reset = True
-            elif now > last:
+            elif elapsed_seconds(now, last) > 0:
                 # 阈值内又睡着：本段打扰结束（段不重置），打扰时长按到本拍计
                 if record.interrupt_started_at is not None:
                     record.interrupted_minutes += max(
-                        0.0, (now - record.interrupt_started_at).total_seconds() / 60.0)
+                        0.0, elapsed_seconds(now, record.interrupt_started_at) / 60.0)
                 record.interrupted = False
                 record.interrupt_started_at = None
                 record.last_note_at = None
-        after_hours = max(0.0, (now - record.segment_started_at).total_seconds() / 3600.0)
+        after_hours = max(0.0, elapsed_seconds(now, record.segment_started_at) / 3600.0)
         return AdvanceResult(
             continuous_hours_before=before_hours,
             continuous_hours_after=after_hours,
@@ -576,12 +575,12 @@ class SleepClock:
         reset = False
         if record.interrupted:
             last = record.last_note_at or record.interrupt_started_at or now
-            gap = (now - last).total_seconds() / 60.0
+            gap = elapsed_seconds(now, last) / 60.0
             if gap >= threshold:
                 # 上一段清醒已确认：截断连续段并开新打扰段
                 if record.interrupt_started_at is not None:
                     record.interrupted_minutes += max(
-                        0.0, (now - record.interrupt_started_at).total_seconds() / 60.0)
+                        0.0, elapsed_seconds(now, record.interrupt_started_at) / 60.0)
                 record.segment_started_at = now
                 record.interrupt_started_at = now
                 record.interruption_count += 1
@@ -800,6 +799,7 @@ class SleepEngine:
         self._last_prepared_key: Optional[str] = None
         self._last_tick_at: Optional[datetime] = None
         self._last_continuous_hours: float = 0.0
+        self.recovery_pending = False
         self._last_threshold_check_at: Optional[datetime] = None
         self._prepared: Optional[Dict[str, Any]] = None
         self._warning: Optional[str] = None
@@ -1088,7 +1088,7 @@ class SleepEngine:
             midnight = datetime.strptime(frame_date, "%Y-%m-%d").replace(tzinfo=now.tzinfo)
         except (TypeError, ValueError):
             return now.hour * 60 + now.minute
-        return int((now - midnight).total_seconds() // 60)
+        return (now.date() - midnight.date()).days * DAY_MINUTES + now.hour * 60 + now.minute
 
     @staticmethod
     def _frame_date_at(moment: datetime) -> str:
@@ -1216,6 +1216,25 @@ class SleepEngine:
             "closed_at": self._iso(session.closed_at),
         }
 
+    def settled_sleep_summary(self, session_id: str) -> Optional[dict]:
+        """Return observed, closed-session duration for the exact cached emotion cycle."""
+        session = self._session
+        if session is None or session.session_id != session_id:
+            getter = getattr(self._store, "get_sleep_session", None)
+            row = getter(session_id) if callable(getter) else None
+            session = SleepSession.from_row(row) if row else None
+        if session is None or not session.closed or session.metadata.get("no_sleep_mode"):
+            return None
+        meta = session.metadata
+        if "actual_sleep_hours" not in meta or "total_window_minutes" not in meta:
+            return None
+        return {
+            "actual_sleep_hours": float(meta["actual_sleep_hours"]),
+            "sleep_window_minutes": float(meta["total_window_minutes"]),
+            "interrupted_minutes": float(meta.get("interrupted_minutes") or 0),
+            "interrupt_count": int(session.interruption_count),
+        }
+
     def _resolve_hard_commitment(self, provided: Any, session: Any) -> Optional[datetime]:
         """硬约定来源合并（2026-10-27 用户批准）。
 
@@ -1225,6 +1244,7 @@ class SleepEngine:
         if provided is NO_HARD_COMMITMENT:
             if session is not None:
                 session.metadata.pop("hard_commitment_start", None)
+                session.metadata.pop("hard_commitment_known_at", None)
             return None
         if isinstance(provided, datetime):
             return provided
@@ -1394,7 +1414,7 @@ class SleepEngine:
             else:
                 dynamic = None
         planned_start = self._frame_minutes(now, frame_date)
-        span_minutes = int((earliest_wake - now).total_seconds() // 60)
+        span_minutes = self._frame_minutes(earliest_wake, frame_date) - planned_start
         try:
             planned_end = int((episode or {}).get("planned_end_minute")
                               or planned_start + span_minutes)
@@ -1516,7 +1536,12 @@ class SleepEngine:
         if session is None:
             session = self._restore_recent_closed(current)
         if session is None:
-            return self._restore_from_life_state(current)
+            session = self._restore_from_life_state(current)
+            if self._no_sleep_mode():
+                return None
+            if session is not None:
+                self._recover_open_session(session, current)
+            return session
         self._reconcile_recorded_wake(session, current)
         if session.earliest_wake_at is None:
             session.earliest_wake_at = next_occurrence(
@@ -1532,7 +1557,61 @@ class SleepEngine:
         # the already elapsed segment again in the next ordinary tick.
         self._last_continuous_hours = self._clock.continuous_minutes(current) / 60.0
         self._prepared = None
+        if not session.closed and self._no_sleep_mode():
+            # The ordinary coordinator settles an awake gap. The next prepare retires
+            # this legacy row without inventing a recovery or a wake notification.
+            return None
+        if not session.closed:
+            self._recover_open_session(session, current)
         return session
+
+    def _recover_open_session(self, session: SleepSession, current: datetime) -> None:
+        recover = getattr(self._life, "recover_open_sleep", None)
+        started = self._aware(self._parse(session.metadata.get("sleep_started_at")), current)
+        if not callable(recover) or started is None:
+            return
+        cutoff = self._aware(session.lie_in_cap_at, current)
+        hard = self._aware(self._parse(session.metadata.get("hard_commitment_start")), current)
+        hard_due = hard_commitment_deadline(
+            hard, self._cfg_float("sleep_hard_commitment_lead_minutes", DEFAULT_HARD_COMMITMENT_LEAD_MINUTES)
+        )
+        known_at = self._aware(self._parse(session.metadata.get("hard_commitment_known_at")), current)
+        if hard_due is not None and known_at is not None:
+            hard_due = max((hard_due, known_at), key=lambda dt: dt.timestamp())
+        reason = "lie_in_cap"
+        if hard_due is not None and (cutoff is None or elapsed_seconds(hard_due, cutoff) < 0):
+            cutoff, reason = hard_due, "hard_commitment"
+        end = current if cutoff is None else min((current, cutoff), key=lambda dt: dt.timestamp())
+        end = max((started, end), key=lambda dt: dt.timestamp())
+        closing = cutoff is not None and elapsed_seconds(current, cutoff) >= 0
+        kwargs = {}
+        if closing:
+            hours = (
+                max(
+                    0.0,
+                    elapsed_seconds(end, started) / 60 - self._clock.record.total_interrupted_minutes(end),
+                )
+                / 60
+            )
+            before = session.sleep_debt_before if session.sleep_debt_before is not None else self._debt_now()
+            baseline = debt_baseline_hours(
+                session.metadata.get("sleep_min"), session.metadata.get("wake_min")
+            )
+            kwargs = {
+                "wake_reason": reason,
+                "debt_after": settle_sleep_debt(before, hours, baseline_hours=baseline),
+            }
+        try:
+            recover(session.session_id, started, end, self._clock.record.interrupt_started_at, **kwargs)
+        except OSError:
+            self.recovery_pending = True
+            logger.warning("已认领的睡眠恢复写盘失败，保留积分游标等待重试", exc_info=True)
+            return
+        self.recovery_pending = False
+        self._last_tick_at = end
+        self._last_continuous_hours = self._clock.continuous_minutes(end) / 60
+        if closing:
+            self._close_session(end, reason)
 
     def _restore_clock(self, session: SleepSession, current: datetime) -> None:
         """Restore the segment and interruption record, rather than restart its clock."""
@@ -1721,6 +1800,10 @@ class SleepEngine:
         结果（``replayed=True``），不会二次推进连续段或二次积分。
         """
         current = self._now(now)
+        if self.recovery_pending and self._session is not None:
+            self._recover_open_session(self._session, current)
+            if self.recovery_pending:
+                raise OSError("open sleep recovery pending")
         result: Dict[str, Any] = {
             "active": False, "session_id": None, "asleep": False, "rates": None,
             "continuous_hours": 0.0, "continuous_minutes": 0,
@@ -1731,6 +1814,17 @@ class SleepEngine:
         }
         if not self.enabled:
             result["reason"] = "disabled"
+            return result
+        if no_sleep_mode or self._no_sleep_mode():
+            session = self._session
+            if session is not None and not session.closed:
+                session.actual_end_minute = self._frame_minutes(current, session.schedule_date)
+                session.closed_at = current
+                session.wake_reason = "no_sleep_mode"
+                session.metadata["no_sleep_mode"] = True
+                self._save_session()
+            self._prepared = None
+            result["reason"] = "no_sleep_mode"
             return result
         if self._session is not None and self._session.closed:
             goal_type = str((sleep_episode or {}).get("goal_type") or "").strip().lower()
@@ -1760,12 +1854,31 @@ class SleepEngine:
             replayed = dict(self._prepared)
             replayed["replayed"] = True
             return replayed
+        # A deadline known before this interval cannot accrue sleep while persistence retries.
+        # A newly supplied, already overdue appointment still wakes at the observation time.
+        cached_hard = self._aware(self._parse(session.metadata.get("hard_commitment_start")), current)
+        effective_hard = self._aware(self._resolve_hard_commitment(hard_commitment_start, session), current)
+        cutoff = self._aware(session.lie_in_cap_at, current)
+        if effective_hard is not None:
+            if cached_hard is None or elapsed_seconds(cached_hard, effective_hard) != 0:
+                session.metadata["hard_commitment_known_at"] = current.isoformat()
+            hard_due = hard_commitment_deadline(effective_hard, self._cfg_float(
+                "sleep_hard_commitment_lead_minutes", DEFAULT_HARD_COMMITMENT_LEAD_MINUTES))
+            known_at = self._aware(self._parse(session.metadata.get("hard_commitment_known_at")), current)
+            if known_at is not None:
+                hard_due = max((hard_due, known_at), key=lambda dt: dt.timestamp())
+            cutoff = hard_due if cutoff is None else min((cutoff, hard_due), key=lambda dt: dt.timestamp())
+        sleep_until = current
+        if cutoff is not None and elapsed_seconds(current, cutoff) > 0:
+            sleep_until = min((current, max((cutoff, self._last_tick_at or current),
+                                           key=lambda dt: dt.timestamp())), key=lambda dt: dt.timestamp())
+        awake_after = max(0.0, elapsed_seconds(current, sleep_until) / 60.0)
         # dt：距上一拍（钳 [0, 24h]；时钟回拨/重复时刻 → 0，不积分不判醒）
         dt_min = 0.0
-        if self._last_tick_at is not None and current > self._last_tick_at:
-            dt_min = min((current - self._last_tick_at).total_seconds() / 60.0,
+        if self._last_tick_at is not None and elapsed_seconds(current, self._last_tick_at) > 0:
+            dt_min = min(elapsed_seconds(current, self._last_tick_at) / 60.0,
                          float(DAY_MINUTES))
-        advance = self._clock.advance(current, self._interrupt_threshold())
+        advance = self._clock.advance(sleep_until, self._interrupt_threshold())
         self._last_tick_at = current
         h_after = advance.continuous_hours_after
         if advance.reset or dt_min <= 0:
@@ -1775,8 +1888,8 @@ class SleepEngine:
         self._last_continuous_hours = h_after
         started_at = self._aware(self._parse(session.metadata.get("sleep_started_at")), current)
         total_session_minutes = 0.0
-        if started_at is not None and current > started_at:
-            total_session_minutes = (current - started_at).total_seconds() / 60.0
+        if started_at is not None and elapsed_seconds(sleep_until, started_at) > 0:
+            total_session_minutes = elapsed_seconds(sleep_until, started_at) / 60.0
         quality = sleep_quality(advance.interrupted_minutes, total_session_minutes)
         # PR-SLEEP-RECOVERY（规格 §1A/C）：有效睡眠累计 = 会话总时长 − 打断扣除
         # （既有打断口径不变），供最小有效睡眠保护判定；随 _save_session 落盘。
@@ -1801,6 +1914,7 @@ class SleepEngine:
                 hunger_rate = stress_rate = 0.0
             rates = {
                 "elapsed_sleep_minutes": max(0.0, min(dt_min, (h_after - h_before) * 60.0)),
+                "awake_after_sleep_minutes": awake_after,
                 "energy_rate": max(-0.02, min(0.02, energy_rate)),
                 "focus_rate": max(-0.02, min(0.02, focus_rate)),
                 "hunger_rate": hunger_rate,
@@ -1814,12 +1928,10 @@ class SleepEngine:
         check_due = True
         if current >= earliest:
             last = self._last_threshold_check_at
-            if last is not None and (current - last).total_seconds() < check_seconds:
+            if last is not None and elapsed_seconds(current, last) < check_seconds:
                 check_due = False
             else:
                 self._last_threshold_check_at = current
-        effective_hard = self._aware(
-            self._resolve_hard_commitment(hard_commitment_start, session), current)
         dynamic = session.metadata.get("dynamic_sleep") or {}
         threshold = self._wake_threshold()
         if dynamic:
@@ -1841,11 +1953,16 @@ class SleepEngine:
             min_effective_hours=session.recovery_target_hours)
         if dynamic and decision.reason == "lie_in_cap" and dynamic.get("window_sets_cap"):
             decision = WakeDecision(True, "wake_window_end", decision.deadline)
+        if decision.awake and rates is not None:
+            debt_before = session.sleep_debt_before if session.sleep_debt_before is not None else self._debt_now()
+            baseline = debt_baseline_hours(session.metadata.get("sleep_min"), session.metadata.get("wake_min"))
+            rates["sleep_debt_after"] = settle_sleep_debt(
+                debt_before, session.effective_sleep_hours, baseline_hours=baseline)
         # 硬约定 lead 诊断（临时新建 < 提前量 → 立即醒 + 可诊断，**不**倒填准时）
         lead_minutes = self._cfg_float("sleep_hard_commitment_lead_minutes",
                                        DEFAULT_HARD_COMMITMENT_LEAD_MINUTES)
         lead_short = bool(effective_hard is not None
-                          and (effective_hard - current).total_seconds() / 60.0 < lead_minutes)
+                          and elapsed_seconds(effective_hard, current) / 60.0 < lead_minutes)
         self._hard_commitment_lead_short = lead_short
         # 只有「本次确实提供了有效约定」才写缓存；显式无约定已在 _resolve 里清除
         if isinstance(hard_commitment_start, datetime):
@@ -1860,6 +1977,7 @@ class SleepEngine:
             "quality": quality, "interrupted_minutes": advance.interrupted_minutes,
             "interruption_count": advance.interruption_count,
             "reset": bool(advance.reset), "wake": decision.to_dict(),
+            "wake_at": sleep_until.isoformat() if decision.awake else None,
             "no_sleep_mode": bool(no_sleep_mode),
             "reason": "prepared" if not no_sleep_mode else "no_sleep_mode",
             "dt_minutes": round(dt_min, 4),
@@ -1897,7 +2015,8 @@ class SleepEngine:
                       minutes=round(float(prepared.get("interrupted_minutes") or 0.0), 1))
         wake = prepared.get("wake") or {}
         if wake.get("awake"):
-            return self._close_session(current, str(wake.get("reason") or "manual"),
+            wake_at = self._aware(self._parse(prepared.get("wake_at")), current) or current
+            return self._close_session(wake_at, str(wake.get("reason") or "manual"),
                                        energy=energy, episode_id=episode_id)
         self._save_session()
         return {"committed": True, "woke": False, "reason": "sleeping"}
@@ -1914,7 +2033,7 @@ class SleepEngine:
             return {"committed": True, "woke": False, "reason": "already_closed",
                     "session_id": session.session_id}
         started_at = self._aware(self._parse(session.metadata.get("sleep_started_at")), now) or now
-        total_window_minutes = max(0.0, (now - started_at).total_seconds() / 60.0)
+        total_window_minutes = max(0.0, elapsed_seconds(now, started_at) / 60.0)
         interrupted = self._clock.record.total_interrupted_minutes(now)
         actual_sleep_minutes = max(0.0, total_window_minutes - interrupted)
         actual_hours = actual_sleep_minutes / 60.0
@@ -2032,8 +2151,8 @@ class SleepEngine:
         earliest = self._aware(self._parse(dynamic.get("wake_anchor"))
                                or session.earliest_wake_at, now)
         wake_delay = 0.0
-        if isinstance(earliest, datetime) and now > earliest:
-            wake_delay = (now - earliest).total_seconds() / 60.0
+        if isinstance(earliest, datetime) and elapsed_seconds(now, earliest) > 0:
+            wake_delay = elapsed_seconds(now, earliest) / 60.0
         return {"committed": True, "woke": True, "reason": reason,
                 "session_id": session.session_id,
                 "actual_sleep_hours": round(actual_hours, 4),

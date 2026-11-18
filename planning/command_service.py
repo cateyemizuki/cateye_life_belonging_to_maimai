@@ -108,11 +108,10 @@ class CommandService:
         新用户面统一走 :meth:`execute_action`（双语根命令注册表 handler 调用），
         业务分支、权限与输出完全共用 :meth:`_run_parts`。
         """
-        del platform, group_id  # 当前命令未使用，保留参数防止未来扩展
         groups = matched_groups or {}
         command_text = str(groups.get("planning_cmd", text) or "").strip()
         parts = command_text.split()
-        return await self._run_parts(parts, stream_id, user_id, is_local_operator)
+        return await self._run_parts(parts, stream_id, user_id, is_local_operator, platform, group_id)
 
     async def execute_action(
         self,
@@ -121,6 +120,8 @@ class CommandService:
         stream_id: str = "",
         user_id: str = "",
         is_local_operator: bool = False,
+        platform: str = "",
+        group_id: str = "",
     ) -> Tuple[bool, str, bool]:
         """新命令面入口：``/lbm plan <action> [args]`` / ``/麦麦生活 日程 <动作>``。
 
@@ -128,7 +129,7 @@ class CommandService:
         ``parts = [canonical, action, *args]`` 形态，复用全部既有子命令实现。
         """
         parts = ["/lbm plan", str(action or ""), *[str(item) for item in (args or [])]]
-        return await self._run_parts(parts, stream_id, user_id, is_local_operator)
+        return await self._run_parts(parts, stream_id, user_id, is_local_operator, platform, group_id)
 
     async def _run_parts(
         self,
@@ -136,6 +137,8 @@ class CommandService:
         stream_id: str,
         user_id: str,
         is_local_operator: bool,
+        platform: str = "",
+        group_id: str = "",
     ) -> Tuple[bool, str, bool]:
         """模块开关 → 管理员 → 会话白名单 → 子命令分发（旧/新入口共用）。"""
         # 模块独立总开关：停用期间命令不可用（提示配置位置）
@@ -157,9 +160,9 @@ class CommandService:
             return True, "没有权限", True
 
         # 白名单过滤（留空 = 全部允许）
-        admin = self._admin_cfg()
-        allowed_streams = list(getattr(admin, "allowed_streams", None) or []) if admin else []
-        if not is_stream_allowed(stream_id, allowed_streams):
+        from core.targeting import command_stream_allowed
+        if not command_stream_allowed(self._plugin.config, stream_id=stream_id, platform=platform,
+                                      user_id=user_id, group_id=group_id, is_local_operator=is_local_operator):
             await self._send(stream_id, "当前会话未启用日程功能")
             return True, "会话未启用", True
 
@@ -564,7 +567,7 @@ class CommandService:
         # 尝试作为索引处理
         if identifier.isdigit():
             idx = int(identifier) - 1
-            goals = goal_manager.get_all_goals()
+            goals = self._sort_schedule_goals(self._get_today_schedule_goals(goal_manager))
             if 0 <= idx < len(goals):
                 goal = goals[idx]
                 goal_id = goal.goal_id

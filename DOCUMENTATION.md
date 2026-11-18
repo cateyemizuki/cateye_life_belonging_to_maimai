@@ -1,6 +1,6 @@
 <!-- lbm-document-status: 当前维护 -->
-> 文档状态：**当前维护** · 整理日期：2026-11-16
-> 适用源码：3.18.3
+> 文档状态：**当前维护** · 整理日期：2026-11-18
+> 适用源码：3.18.7
 > 当前说明：[README](README.md) · [完整文档清单](DOCUMENTATION.md)
 
 # 源码文档清单
@@ -9,7 +9,7 @@
 
 | 文档 | 状态 | 说明 |
 | --- | --- | --- |
-| [CHANGELOG.md](CHANGELOG.md) | 历史验收 | 版本/验收时间线，主代理维护；仅文内各批当时事实 |
+| [CHANGELOG.md](CHANGELOG.md) | 历史验收 | 各版本的功能变化与历史说明 |
 | [companion/README.md](companion/README.md) | 当前维护 |  |
 | [CONFIGURATION.md](CONFIGURATION.md) | 当前维护 |  |
 | [core/README.md](core/README.md) | 当前维护 |  |
@@ -31,5 +31,6 @@
 | [qzone/README.md](qzone/README.md) | 当前维护 |  |
 | [README.md](README.md) | 当前维护 |  |
 | [THIRD_PARTY.md](THIRD_PARTY.md) | 当前维护 |  |
+| [tests/README.md](tests/README.md) | 当前维护 | 维护者回归入口与依赖 |
 | `UPLOAD_AGENT.md` | 历史方案 | 本地通用发布模板，不随源码分发；原文未动 |
 | [video_watch/README.md](video_watch/README.md) | 当前维护 |  |

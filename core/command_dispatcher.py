@@ -84,6 +84,9 @@ class DispatchContext:
     send_text: Optional[Callable[[str], Awaitable[Any]]] = None
     send_overview: Optional[Callable[[str], Awaitable[Any]]] = None
     logger: Any = None
+    platform: str = ""
+    group_id: str = ""
+    stream_allowed: bool = True
 
 
 class CommandDispatcher:
@@ -207,6 +210,11 @@ class CommandDispatcher:
                 await ctx.send_text(self.denial_text(parsed))
             return True, "没有权限", True
 
+        if not ctx.stream_allowed:
+            if ctx.send_text is not None:
+                await ctx.send_text("当前会话未启用生活插件命令")
+            return True, "会话未启用", True
+
         handler = ctx.resolve(command.handler) if ctx.resolve is not None else None
         if not callable(handler):
             if ctx.send_text is not None:
@@ -222,6 +230,8 @@ class CommandDispatcher:
             stream_id=ctx.stream_id,
             user_id=ctx.user_id,
             is_local_operator=bool(ctx.is_local_operator),
+            platform=ctx.platform,
+            group_id=ctx.group_id,
             lang=parsed.lang,
         )
         if isinstance(result, tuple) and len(result) == 3:

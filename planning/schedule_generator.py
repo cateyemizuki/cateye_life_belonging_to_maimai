@@ -260,7 +260,7 @@ class ScheduleGenerator:
                             old_end = int(items[idx].get("end_minute") or (commit_minute + 60))
                         except (TypeError, ValueError):
                             old_start, old_end = commit_minute, commit_minute + 60
-                        duration = max(15, old_end - old_start)
+                        duration = max(1, int(meta.get("commitment_duration") or max(15, old_end - old_start)))
                         items[idx]["start_minute"] = commit_minute
                         items[idx]["end_minute"] = commit_minute + duration
                         if items[idx].get("time_slot"):
@@ -269,6 +269,17 @@ class ScheduleGenerator:
                         if old_start != commit_minute:
                             params["commitment_time_shifted_from"] = old_start
                 items[idx]["parameters"] = params
+
+    def confirm_commitment_publication(self, date: str) -> None:
+        """Confirm the cycle for a day directly changed by an accepted commitment."""
+        rows = self.db.get_day_schedule(date)
+        if not rows:
+            return
+        from .cycle_state import REASON_TOOL_EDIT, envelope_minutes
+        stamps = envelope_minutes(rows)
+        self.db.update_cycle_stamps(date, stamps)
+        enter_schedule_cycle(getattr(self._plugin, "_data_dir", None), date, rows,
+                             reason=REASON_TOOL_EDIT, **entry_context_from_plugin(self._plugin))
 
     def _replace_with_entry(self, date: str, items: List[Dict[str, Any]], reason: str) -> int:
         """先保存日程，再登记周期；未来日程只进入待接替区。"""
@@ -676,7 +687,11 @@ class ScheduleGenerator:
         免睡模式（no_sleep_mode）下不补睡眠意图，与模板兜底路径同口径（P1 一致性）。
         """
         if no_sleep_mode:
-            return rows
+            from .time_utils import is_in_sleep_ring
+            wake = parse_hhmm(wake_time, _DEFAULT_WAKE_MINUTES)
+            bed = parse_hhmm(sleep_time, _DEFAULT_SLEEP_MINUTES)
+            return [row for row in rows if not is_night_sleep_item(row) and
+                    not is_in_sleep_ring(row.get("start_minute", 0), wake, bed)]
         for row in rows:
             if is_night_sleep_item(row):
                 return rows
@@ -1022,8 +1037,9 @@ class ScheduleGenerator:
                 best_idx = len(items)
                 items.append({
                     "name": commit_title, "description": commit_notes,
-                    "goal_type": "daily_routine", "priority": "high",
-                    "start_minute": minute, "end_minute": minute + 60,
+                    "goal_type": str(params.get("activity_type") or "daily_routine"),
+                    "priority": str(params.get("activity_priority") or "high"),
+                    "start_minute": minute, "end_minute": minute + int(params.get("duration_minutes") or 60),
                     "parameters": {"spine": True, "min_minutes": 15, "max_minutes": 60,
                                    "priority": "high", "interruptibility": 0.0},
                 })
@@ -1040,6 +1056,7 @@ class ScheduleGenerator:
                 "commitment_hardness": commit_hardness,
                 "commitment_source": commit_source,
                 "commitment_id": commit_id,
+                **({"commitment_duration": int(params["duration_minutes"])} if params.get("duration_minutes") else {}),
                 # 显式覆盖生成侧 hardness（soft 不硬化 / hard 不降级）
                 "hardness": commit_hardness,
             }

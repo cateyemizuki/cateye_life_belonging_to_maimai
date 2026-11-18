@@ -388,6 +388,10 @@ class ProactiveService:
         finally:
             logger.info("日程主动行为循环已退出")
 
+    def reset_stop_event(self) -> None:
+        """Called after previous workers have fully stopped."""
+        self._stop_event.clear()
+
     async def stop(self) -> None:
         """通知循环停止，并清空频率因子缓存（重启/重载后按当前配置重新校准）。
 

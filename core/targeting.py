@@ -25,6 +25,21 @@ def unique_qq_admin(values: Any) -> str:
     return next(iter(identities)) if len(identities) == 1 else ""
 
 
+def private_qq_stream(row: Any, target_qq: str, *, queried_by_user: bool = False) -> str:
+    """Accept the host's scoped lookup; reject conflicting platform, group or user metadata."""
+    if not isinstance(row, dict) or row.get("success") is False:
+        return ""
+    if str(row.get("platform") or "qq").strip().lower() != "qq":
+        return ""
+    if (row.get("group_id") or row.get("is_group_session") is True
+            or str(row.get("chat_type") or "").lower() == "group"):
+        return ""
+    owner = str(row.get("user_id") or "").strip()
+    if owner != target_qq and (owner or not queried_by_user):
+        return ""
+    return str(row.get("stream_id") or "").strip()
+
+
 def target_qq_of(config: Any) -> str:
     config = getattr(config, "config", config)
     section = getattr(config, "patrol", None)
@@ -41,6 +56,38 @@ def admin_users_of(config: Any) -> list[str]:
         return [str(value) for value in values]
     target = target_qq_of(config)
     return [target] if target else []
+
+
+def command_admin(config: Any, *, platform: str, user_id: str, is_local_operator: bool) -> bool:
+    """Command identities come from the host envelope, independently of chat text."""
+    if is_local_operator is True:
+        return True
+    caller = qq_id(user_id)
+    if str(platform or "").strip().lower() != "qq" or not caller:
+        return False
+    return any(qq_id(candidate) == caller for candidate in admin_users_of(config))
+
+
+def command_stream_allowed(config: Any, *, stream_id: str, platform: str, user_id: str,
+                           group_id: str, is_local_operator: bool) -> bool:
+    if is_local_operator is True:
+        return True
+    entries = getattr(getattr(config, "admin", None), "allowed_streams", ()) or ()
+    allowed = {str(entry).strip() for entry in entries if str(entry).strip()}
+    if not allowed or any(entry.lower() == "all" for entry in allowed):
+        return True
+    sid = str(stream_id or "").strip()
+    if not sid:
+        return False
+    candidates = {sid, "session:" + sid}
+    platform = str(platform or "").strip().lower()
+    group = str(group_id or "").strip()
+    user = str(user_id or "").strip()
+    if platform and group:
+        candidates.add(f"{platform}:group:{group}")
+    elif platform and user:
+        candidates.add(f"{platform}:private:{user}")
+    return not allowed.isdisjoint(candidates)
 
 
 async def refresh_host_target(plugin: Any) -> None:

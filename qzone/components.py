@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-from core.targeting import admin_users_of
 from datetime import datetime
 from typing import Any, ClassVar, Dict
 
@@ -69,7 +68,7 @@ class QzoneComponentsMixin:
             # 2026-10-14 用户指示：手动路径同样按 [qzone].image_mode 配图（跟随 Maizone 行为；
             # off/取图失败 → 纯文本，配图永不阻断发布）
             images = await qz.collect_moment_images(text)
-            result = await qz.post_moment(text, images=images)
+            result = await qz.post_moment(text, images=images, enforce_daily_limit=True)
             if result:
                 suffix = f"（配图 {len(images)} 张）" if images else ""
                 return {"success": True, "content": f"已发说说：{text}{suffix}",
@@ -96,7 +95,7 @@ class QzoneComponentsMixin:
         qz = getattr(self, "_qzone", None)
         if qz is None:
             return 0
-        return max(0, self.config.qzone.daily_max_posts - qz.posts_today())
+        return qz.posts_remaining()
 
     # ============================================================
     # 空间/生活组 handler（2026-11-13 双语根命令注册表引用）
@@ -111,7 +110,7 @@ class QzoneComponentsMixin:
         del text
         args = str((kwargs.get("matched_groups") or {}).get("life_args") or "").strip()
         sub, *rest = args.split(maxsplit=1) if args else ("", "")
-        admin = self._qz_is_admin(str(user_id), bool(is_local_operator))
+        admin = self._qz_is_admin(str(user_id), bool(is_local_operator), platform=str(kwargs.get("platform") or ""))
         if sub in ("help", ""):
             reply = self._qz_help_text()
         elif sub == "status":
@@ -147,17 +146,16 @@ class QzoneComponentsMixin:
             user_id=str(kwargs.get("user_id", "") or ""),
             is_local_operator=bool(kwargs.get("is_local_operator", False)),
             matched_groups={"life_args": life_args},
+            platform=str(kwargs.get("platform") or ""),
         )
 
     # ------------------------------------------------------------
     # 私有助手
     # ------------------------------------------------------------
-    def _qz_is_admin(self, user_id: str, is_local_operator: bool) -> bool:
-        if is_local_operator:
-            return True
-        admins = {str(a).rsplit(":", 1)[-1] for a in admin_users_of(self.config)}
-        # 默认拒绝：未配置管理员时 QQ 侧一律拒绝（本机控制台仍可用）
-        return bool(admins) and str(user_id).rsplit(":", 1)[-1] in admins
+    def _qz_is_admin(self, user_id: str, is_local_operator: bool, *, platform: str = "") -> bool:
+        from core.targeting import command_admin
+        return command_admin(self.config, platform=platform, user_id=user_id,
+                             is_local_operator=is_local_operator)
 
     def _qz_help_text(self) -> str:
         return (
@@ -247,7 +245,7 @@ class QzoneComponentsMixin:
             # 2026-10-14 用户指示：手动路径同样按 [qzone].image_mode 配图（跟随 Maizone 行为；
             # off/取图失败 → 纯文本，配图永不阻断发布）
             images = await qz.collect_moment_images(text)
-            result = await qz.post_moment(text, images=images)
+            result = await qz.post_moment(text, images=images, recheck_gates=True)
             if result:
                 suffix = f"，配图 {len(images)} 张" if images else ""
                 return f"已发表（tid={result.get('tid', '')}{suffix}）。"
@@ -271,8 +269,10 @@ class QzoneComponentsMixin:
             feed = feeds[feed_idx]
             fid = str(feed.get("tid") or "")
             if comment_idx is None:
-                comment_id = await qz.comment_moment(fid, content)
-                return "已评论。" if comment_id is not None else "评论失败。"
+                receipt = await qz.comment_receipt(fid, content)
+                if receipt["state"] == "unknown":
+                    return "评论结果待核对，请先查看空间中的评论记录。"
+                return "已评论。" if receipt["state"] == "accepted" else "评论未提交。"
             comments = feed.get("comments") or []
             if not (0 <= comment_idx < len(comments)):
                 return "评论序号超出范围，先 /lbm qzone comments 查看。"

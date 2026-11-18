@@ -556,6 +556,9 @@ class ActivityPreferencesService:
         needed, need_traits = self._collect_needed(
             defs, force=force, persona_changed=persona_changed,
             skip_keys=skip_keys)
+        if not self._enabled():
+            self._mark_pending(len(needed), "disabled", traits=need_traits)
+            return {"status": "disabled", "pending": len(needed)}
         include_traits = (need_traits if include_traits_override is None
                           else bool(include_traits_override and need_traits))
         if not needed and not include_traits:
