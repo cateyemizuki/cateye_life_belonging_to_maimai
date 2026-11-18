@@ -107,6 +107,8 @@ from suite_prompts import (
     SUBCONSCIOUS_TONE_HAPPY_DEFAULT,
     TRANSITION_CONFESSION_LINE_DEFAULT,
     SUBCONSCIOUS_TONE_HUNGRY_DEFAULT,
+    SUBCONSCIOUS_TONE_LOW_ENERGY_DEFAULT,
+    SUBCONSCIOUS_TONE_LOW_SOCIAL_DEFAULT,
     SUBCONSCIOUS_TONE_STEADY_DEFAULT,
     SUBCONSCIOUS_TONE_TIRED_DEFAULT,
     prompt,
@@ -1512,14 +1514,7 @@ class InjectService:
             return []
 
     def _subconscious_tone_rule(self, session_id: str = "") -> str:
-        """按当前状态选语气分支（极端状态 > 疲惫 > 饥饿 > 开心 > 平稳）。
-
-        F4（B3）：极端状态（stress>0.80 / energy<0.25 / mental_state<0.15）且为
-        目标私聊时，优先返回「拒绝/脆弱」分支（含人设底线）；其他会话继续走原
-        四分支，默认关时逐字不变。疲惫：精力 < 0.40 或社交电量 < 0.20；饥饿：
-        饥饿 >= 0.60；开心：精力 >= 0.72 或社交电量 >= 0.85 或情绪效价 >= 0.30。
-        数据缺失时落到平稳分支。
-        """
+        """优先使用目标私聊的极端状态边界，再按精力、社交、饥饿和心情调整语气。"""
         extreme = self._boundary_extreme_tone(session_id)
         if extreme:
             return extreme
@@ -1527,12 +1522,15 @@ class InjectService:
         energy = snapshot.get("energy")
         hunger = snapshot.get("hunger")
         social = snapshot.get("social_battery")
-        valence = self._emotion_valence()
-        if (energy is not None and energy < 0.40) or (
-                social is not None and social < 0.20):
+        if energy is not None and energy < 0.25:
             return SUBCONSCIOUS_TONE_TIRED_DEFAULT
+        if energy is not None and energy < 0.40:
+            return SUBCONSCIOUS_TONE_LOW_ENERGY_DEFAULT
+        if social is not None and social < 0.20:
+            return SUBCONSCIOUS_TONE_LOW_SOCIAL_DEFAULT
         if hunger is not None and hunger >= 0.60:
             return SUBCONSCIOUS_TONE_HUNGRY_DEFAULT
+        valence = self._emotion_valence()
         if (energy is not None and energy >= 0.72) or (
                 social is not None and social >= 0.85) or (
                 valence is not None and valence >= 0.30):

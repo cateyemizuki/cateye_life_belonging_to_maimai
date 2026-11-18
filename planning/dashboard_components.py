@@ -1,9 +1,14 @@
 """Only declared read APIs are reachable from the sandboxed dashboard."""
 from maibot_sdk import API
 from .dashboard import build_life_dashboard
+from .dashboard_media import dashboard_thumbnail
 
 
 class LifeDashboardComponentsMixin:
+    @API('life_dashboard_thumbnail', description='只读加载近期观看封面和动态配图', version='1')
+    async def life_dashboard_thumbnail(self, image_id: str) -> dict:
+        return {'src': await dashboard_thumbnail(image_id)}
+
     @API('life_dashboard', description='只读生活面板：状态历史、实际活动、睡眠与陪伴摘要', version='1')
     async def life_dashboard(self, hours: int = 24, usage_hours: int = 720,
                              usage_rows_limit: int = 0,

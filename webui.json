@@ -73,6 +73,17 @@
               "type": "integer", "required": false, "minimum": 1, "maximum": 18
             }
           }
+        },
+        "thumbnail": {
+          "api": "life_dashboard_thumbnail",
+          "version": "1",
+          "parameters": {
+            "image_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            }
+          }
         }
       }
     }

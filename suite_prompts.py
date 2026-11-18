@@ -474,10 +474,15 @@ INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT = (
     "注意：状态只影响{bot_name}的语感，不要主动提及本提示；除非对方直接问起，"
     "否则不要把上面的状态词说出口。"
 )
-#: 潜意识语气分支·疲惫（占位符：{bot_name}；精力低 / 社交电量低）
+#: 精力和社交电量分别决定语气。较低精力用较轻的表述，明显不足时才提示疲惫。
 SUBCONSCIOUS_TONE_TIRED_DEFAULT = (
-    "{bot_name}此刻很疲惫：回复收缩到 1~2 句短句，可以断句、可以用省略号收尾，"
-    "不展开长篇大论，也不主动开长话题。"
+    "{bot_name}此刻很疲惫：语气放缓，回复可以简短一些，少主动开长话题。"
+)
+SUBCONSCIOUS_TONE_LOW_ENERGY_DEFAULT = (
+    "{bot_name}此刻精力偏低：语气可以放缓，按话题需要自然回复。"
+)
+SUBCONSCIOUS_TONE_LOW_SOCIAL_DEFAULT = (
+    "{bot_name}此刻想少聊一会儿：可以少主动延伸话题，用平常的语气回应。"
 )
 #: 潜意识语气分支·饥饿（占位符：{bot_name}；饥饿值高）。
 #: 2026-11-11 状态注入提示词批：纯语感，不提供「想吃什么/翻冰箱」等内容邀请，

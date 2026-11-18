@@ -67,6 +67,15 @@ class ArchitectureCases(unittest.TestCase):
     def test_day_session_boundary(self):
         self.run_case("case_day_session_boundary")
 
+    def test_offline_sleep_labels(self):
+        self.run_case("case_offline_sleep_labels")
+
+    def test_separate_energy_and_social_tones(self):
+        self.run_case("case_separate_energy_and_social_tones")
+
+    def test_dashboard_image_references(self):
+        self.run_case("case_dashboard_image_references")
+
     def test_screen_registration_refresh(self):
         self.run_case("case_screen_registration_refresh")
 
@@ -691,6 +700,83 @@ async def case_upgrade_invalidation_failure_preserves_version(root):
     assert result.outcomes[0].status == "failed"
     assert "activity_preferences" in compute_need(reg.load(), "3.18.7")
     assert reg.load()["plugin_version"] == "3.17.33"
+
+
+async def case_offline_sleep_labels(root):
+    js = (SOURCE / "webui/source/panel.js").read_text(encoding="utf-8")
+    functions = js[js.index("function spanEnd("):js.index("function activityNameNode(")]
+    assertions = """
+const assert = require('node:assert/strict');
+const display = (start, end, overrides={}) => displayActivityName({
+    name:'睡觉', goal_type:'sleep', source:'offline',
+    actual_start_minute:start, actual_end_minute:end, ...overrides
+});
+assert.equal(display(981, 988), '小憩一会');
+assert.equal(display(981, 1011), '休息了一阵');
+assert.equal(display(1380, 60), '补了一觉');
+assert.equal(display(1380, 1740), '睡了个长觉');
+assert.equal(display(981, null), '离线休息');
+assert.equal(display(981, 988, { name:'补眠', source:'', wake_reason:'offline_reconnect' }), '小憩一会');
+assert.equal(display(1380, 1740, { source:'rolling' }), '晚安，世界');
+assert.equal(display(750, 780, { name:'午睡', source:'rolling' }), '午休');
+assert.equal(display(750, 780, { name:'散步', goal_type:'exercise' }), '散步');
+"""
+    subprocess.run(["node", "-e", "const num = v => Number.isFinite(v) ? v : null;\n"
+                    + functions + assertions], check=True)
+
+
+async def case_separate_energy_and_social_tones(root):
+    from planning.inject_service import InjectService
+
+    snapshot = {"energy": 0.6896, "social_battery": 0.0592}
+    service = NS(_life_state_snapshot=lambda: snapshot, _emotion_valence=lambda: 0.31,
+                 _boundary_extreme_tone=lambda _: "")
+    rule = InjectService._subconscious_tone_rule
+    assert "想少聊" in rule(service)
+    snapshot["energy"] = 0.30
+    assert "精力偏低" in rule(service) and "很疲惫" not in rule(service)
+    snapshot["energy"] = 0.24
+    assert "很疲惫" in rule(service)
+    service._boundary_extreme_tone = lambda _: "目标私聊边界"
+    assert rule(service, "target") == "目标私聊边界"
+
+
+async def case_dashboard_image_references(root):
+    import base64
+    from io import BytesIO
+
+    from PIL import Image
+
+    from planning.dashboard import _qzone_recent_posts, _video_recent_row
+    from planning.dashboard_components import LifeDashboardComponentsMixin
+    from planning import dashboard_media as media
+
+    cover = "https://i1.hdslb.com/test.png"
+    post = "https://pic.qpic.cn/test.png"
+    video = _video_recent_row({"cover": cover})
+    posts = _qzone_recent_posts(
+        NS(_publish_ledger=NS(recent_sent=lambda _: [{"images": [post]}])),
+        NS(qzone_video=None),
+    )
+    assert video["cover"] == cover and video["cover_id"]
+    assert posts[0]["images"] == [post] and posts[0]["image_ids"][0]
+    assert not _video_recent_row({"cover": "https://example.invalid/file.png"})["cover_id"]
+
+    source = BytesIO()
+    Image.new("RGB", (1280, 640), "red").save(source, "PNG")
+    dashboard = LifeDashboardComponentsMixin()
+    with patch.object(media, "_read_image", return_value=source.getvalue()) as read:
+        unknown = await dashboard.life_dashboard_thumbnail("0" * 64)
+        assert unknown == {"src": ""} and not read.called
+        for image_id in (video["cover_id"], posts[0]["image_ids"][0], video["cover_id"]):
+            result = await dashboard.life_dashboard_thumbnail(image_id)
+            mime, data = result["src"].split(",", 1)
+            raw = base64.b64decode(data, validate=True)
+            with Image.open(BytesIO(raw)) as thumbnail:
+                assert mime == "data:image/jpeg;base64"
+                assert thumbnail.format == "JPEG" and thumbnail.size == (720, 360)
+                assert len(raw) <= media.MAX_THUMBNAIL_BYTES
+        assert [call.args[0] for call in read.call_args_list] == [cover, post]
 
 
 async def case_day_session_boundary(root):

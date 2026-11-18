@@ -10,6 +10,7 @@ from core.plugin_context import PluginContext
 from core.activity_attributes import normalize_activity_attributes
 from core.media_urls import public_image_url
 
+from .dashboard_media import register_dashboard_image
 from .time_utils import TimezoneManager, format_day_minute
 from .life_history import FIELDS, MAX_POINTS, SAMPLE_SECONDS
 
@@ -56,12 +57,14 @@ def _video_recent_row(row: dict) -> dict:
     captured = _media_capture_time(row.get('metrics_captured_at'))
     sources = row.get('metrics_field_provenance') if isinstance(row.get('metrics_field_provenance'), dict) else {}
     times = row.get('metrics_field_captured_at') if isinstance(row.get('metrics_field_captured_at'), dict) else {}
+    cover = public_image_url(row.get('cover'))
     return {'bvid': str(row.get('bvid') or '')[:20],
             'title': str(row.get('title') or '')[:500],
             'watched_at': _number(row.get('watched_at')),
             'source': str(row.get('source') or '')[:32],
             'first_watched_at': _number(row.get('first_watched_at')),
-            'cover': public_image_url(row.get('cover')),
+            'cover': cover,
+            'cover_id': register_dashboard_image(cover),
             'impression': str(row.get('impression') or '')[:5000],
             'impression_provenance': str(row.get('impression_provenance') or '')[:40],
             'understanding_status': str(row.get('understanding_status') or '')[:40],
@@ -1140,10 +1143,11 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext, limit: int = 5) -> lis
             continue
         tid = str(row.get('tid') or '')
         images = row.get('images') if isinstance(row.get('images'), list) else []
+        urls = [url for raw in images[:4] if (url := public_image_url(raw))]
         out.append({'content': str(row.get('content') or ''),
                     'text': str(row.get('content') or ''),
-                    'images': [url for raw in images[:4]
-                               if (url := public_image_url(raw))],
+                    'images': urls,
+                    'image_ids': [register_dashboard_image(url) for url in urls],
                     'images_captured_at': _number(row.get('images_captured_at')),
                     'created_at': row.get('created_at'),
                     'tid': tid,
