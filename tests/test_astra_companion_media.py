@@ -90,8 +90,8 @@ def fixtures(folder, now=NOW, cfg=CFG):
     social = VideoSocialService(ledger, profiles, NS(evaluate=AsyncMock(return_value={
             "action": "share", "target_stream_id": ROUTE["stream_id"], "profile_topics": {}})),
         config_provider=lambda: cfg, clock=lambda: now, day=lambda: DAY,
-        prepare_card=AsyncMock(return_value={"success": True, "ark_json": "{}"}),
-        send_card=AsyncMock(return_value={"success": True}),
+        prepare_card=AsyncMock(return_value={"success": True, "card": {"title": "prepared fixture"}}),
+        send_card=AsyncMock(return_value={"success": True, "delivery_verified": True}),
         preflight=lambda *a: (True, ""), reserve=lambda *a: "", commit=lambda *a: True,
         release=lambda *a: True, append_context=AsyncMock(return_value={"success": True}),
         probability_provider=lambda: 2, roll=lambda: 0)
@@ -165,7 +165,7 @@ async def forced_share_debug_replay_and_unknown(folder):
     assert social._send.await_count == 3
 
     stamp[0] += 121
-    social._send.return_value = {"success": True}
+    social._send.return_value = {"success": True, "delivery_verified": True}
     opt = await manual.share_debug(stream, "five", user_id=user)
     assert opt["success"] and opt["bvid"] == A
     assert [row["bvid"] for row in pick.call_args.args[0]] == [A]
@@ -173,19 +173,37 @@ async def forced_share_debug_replay_and_unknown(folder):
     social.evaluator.evaluate.assert_not_called()
 
 
-async def private_card_test_statuses_are_distinct(folder):
+async def native_card_test_statuses_are_distinct(folder):
     from integrations.video_share_scheduler import attempt_result
     fixture = {"kind": "debug", "facts": {"bvid": A, "title": "Fixture"}}
-    confirmed = attempt_result({**fixture, "status": "accepted",
-                                "receipt": {"delivery_verified": True}})
-    missing = attempt_result({**fixture, "status": "uncertain",
-                              "receipt": {"error_class": "private_card_not_confirmed"}})
-    failed = attempt_result({**fixture, "status": "uncertain",
-                             "receipt": {"error_class": "private_card_readback_failed"}})
-    assert "服务器历史已确认" in confirmed["content"] and confirmed["success"]
-    assert "服务器历史里暂未查到" in missing["content"] and not missing["success"]
-    assert "暂时无法核对" in failed["content"] and not failed["success"]
-    assert missing["delivery_state"] == failed["delivery_state"] == "uncertain"
+    confirmed = attempt_result({**fixture, "status": "accepted", "receipt": {"delivery_verified": True}})
+    legacy = attempt_result({**fixture, "status": "accepted", "receipt": {"message_id": "-22"}}, duplicate=True)
+    assert "会话记录已确认" in confirmed["content"] and confirmed["success"]
+    assert "旧回执缺少" in legacy["content"] and not legacy["success"] and legacy["duplicate"]
+    for code, wording in (
+        ("qq_card_replaced", "版本过低的占位提示"),
+        ("card_history_unavailable", "暂时无法核对"),
+        ("card_not_confirmed", "暂未查到"),
+    ):
+        result = attempt_result({**fixture, "status": "uncertain", "receipt": {"error_class": code}})
+        assert wording in result["content"] and not result["success"] and result["delivery_state"] == "uncertain"
+    unsupported = attempt_result({**fixture, "status": "rejected",
+                                  "receipt": {"error_class": "card_action_unsupported"}})
+    assert "不支持原生图文卡片发送动作" in unsupported["content"] and not unsupported["success"]
+
+
+async def merely_accepted_native_card_is_uncertain(folder):
+    ledger, social = fixtures(folder)
+    service = ManualVideoShares(social, recent_provider=lambda: [{"bvid": A, "title": A}],
+                                clock=lambda: NOW, day=lambda: DAY)
+    social._send.return_value = {"success": True, "message_id": "-145"}
+    result = await service.share_debug(ROUTE["stream_id"], "one", user_id=ROUTE["user_id"])
+    assert not result["success"] and result["delivery_state"] == "uncertain"
+    replay = await service.share_debug(ROUTE["stream_id"], "one", user_id=ROUTE["user_id"])
+    assert replay["duplicate"] and replay["delivery_state"] == "uncertain"
+    social._send.assert_awaited_once()
+    social._append.assert_not_awaited()
+    assert ledger.unresolved_videos(ROUTE["stream_id"]) == {A}
 
 
 async def scoped_share_debug_planner_ticket(folder):
@@ -1262,7 +1280,7 @@ CASES = [
     "optional_weekly_summary_failure",
     "watch_terminal_equivalence",
     "qzone_policy_equivalence", "qzone_caption_uses_current_facts", "qzone_duplicate_checked_before_dispatch",
-    "share_limits", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "private_card_test_statuses_are_distinct", "scoped_share_debug_planner_ticket", "profile_count", "interrupted_eval", "cancel_cache",
+    "share_limits", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "native_card_test_statuses_are_distinct", "merely_accepted_native_card_is_uncertain", "scoped_share_debug_planner_ticket", "profile_count", "interrupted_eval", "cancel_cache",
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",
     "fallback_review", "candidate_overlap", "tiered_miss", "bound_legacy_upgrade",

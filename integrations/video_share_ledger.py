@@ -293,6 +293,7 @@ class ShareLedger:
         safe = {
             'message_id': str((receipt or {}).get('message_id') or '')[:160],
             'error_class': clean((receipt or {}).get('error_class'), 100),
+            'delivery_verified': status == 'accepted' and (receipt or {}).get('delivery_verified') is True,
         }
         with self._transaction() as db:
             old = db.execute("SELECT bvid,kind,status FROM attempts WHERE id=?", (attempt,)).fetchone()

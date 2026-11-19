@@ -1,7 +1,7 @@
-"""Compare the card builder with the installed adapter's OneBot share mapping."""
+"""Regression tests for the native URL-sharing action's content fields."""
+
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import sys
@@ -17,17 +17,10 @@ COVER = "https://i0.hdslb.com/bfs/archive/fixture.png"
 
 
 class VideoWebCardTests(unittest.TestCase):
-    def test_wire_shape_is_onebot_news_card(self):
-        # SnowLuma v2.2.1 message-parser.ts maps the scalar OneBot link-share
-        # fields url/title/content/image into this LightApp JSON object.
+    def test_documented_tuwen_action_fields(self):
         card = build_bili_web_card(bvid=VIDEO, title="实际标题", desc="视频介绍", pic_url=COVER)
-        self.assertEqual(json.loads(json.dumps(card)), {
-            "app": "com.tencent.structmsg",
-            "view": "news",
-            "prompt": "实际标题",
-            "meta": {"news": {
-                "title": "实际标题", "desc": "视频介绍", "jumpUrl": URL, "preview": COVER,
-            }},
+        self.assertEqual(card, {
+            "title": "实际标题", "desc": "视频介绍", "jump_url": URL, "preview_url": COVER,
         })
 
     def test_destination_is_derived_from_bv_only(self):
@@ -36,9 +29,9 @@ class VideoWebCardTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     build_bili_web_card(bvid=value, title="title")
         card = build_bili_web_card(bvid=VIDEO, title=" ", pic_url="//i0.hdslb.com/bfs/archive/fixture.png")
-        self.assertEqual(card["prompt"], VIDEO)
-        self.assertEqual(card["meta"]["news"]["jumpUrl"], URL)
-        self.assertEqual(card["meta"]["news"]["preview"], COVER)
+        self.assertEqual(card["title"], VIDEO)
+        self.assertEqual(card["jump_url"], URL)
+        self.assertEqual(card["preview_url"], COVER)
 
     def test_invalid_preview_is_omitted_without_altering_destination(self):
         for pic_url in (
@@ -46,12 +39,12 @@ class VideoWebCardTests(unittest.TestCase):
             "https://127.0.0.1/fixture.png",
             "https://i0.hdslb.com.example.com/fixture.png",
             "https://test:secret@i0.hdslb.com/fixture.png",
+            "",
         ):
             with self.subTest(pic_url=pic_url):
                 card = build_bili_web_card(bvid=VIDEO, title="title", pic_url=pic_url)
-                data = card["meta"]["news"]
-                self.assertEqual(data["jumpUrl"], URL)
-                self.assertEqual(data["preview"], "")
+                self.assertEqual(card["jump_url"], URL)
+                self.assertNotIn("preview_url", card)
 
 
 if __name__ == "__main__":

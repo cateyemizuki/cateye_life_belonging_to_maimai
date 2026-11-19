@@ -56,48 +56,54 @@ def boosted_limits(limits: dict, multiplier: float) -> dict:
     return out
 
 
+def _verified_card(receipt: object) -> bool:
+    return (isinstance(receipt, dict) and receipt.get('success') is True
+            and receipt.get('delivery_verified') is True and not receipt.get('uncertain'))
+
+
 def attempt_result(attempt: dict, *, duplicate: bool = False) -> dict:
     facts = attempt.get('facts') or {}
     bvid = attempt.get('bvid') or facts.get('bvid')
     title = facts.get('title') or attempt.get('title') or bvid
     state = attempt.get('status') or attempt.get('state') or 'uncertain'
-    accepted = state == 'accepted'
     receipt = attempt.get('receipt') or {}
     if isinstance(receipt, str):
         try:
             receipt = json.loads(receipt)
         except ValueError:
             receipt = {}
-    message_id = receipt.get('message_id') if isinstance(receipt, dict) else None
-    if attempt.get('kind') == 'debug':
-        reason = receipt.get('error_class') if isinstance(receipt, dict) else None
-        if accepted:
-            content = ('QQ 私聊的服务器历史已确认测试卡片。'
-                       if isinstance(receipt, dict) and receipt.get('delivery_verified') is True
-                       else '测试卡片已提交适配器。')
-        elif state == 'rejected':
-            content = {
-                'route_account_unverified': '未核验到当前会话的 QQ 登录账号，测试卡片未发送。',
-                'send_rejected': 'QQ 拒绝了这张测试卡片。',
-            }.get(reason, '测试卡片未发送。')
-        else:
-            content = {
-                'private_card_not_confirmed': 'QQ 私聊的服务器历史里暂未查到这张测试卡片。',
-                'private_card_readback_failed': '暂时无法核对 QQ 私聊的发送结果。',
-                'adapter_delivery_unconfirmed': 'QQ 未返回送达回执。请查看当前会话确认卡片是否出现。',
-            }.get(reason, '测试卡片的发送结果待确认，请查看当前会话。')
-    elif accepted:
-        content = (f'已向当前聊天提交B站视频卡片：《{title}》 {bvid}。适配器已受理，不等于对方已收到。'
-                   '需要谈内容时可用这个BV读取观看缓存，不必重新观看。')
+    if not isinstance(receipt, dict):
+        receipt = {}
+    verified = state == 'accepted' and receipt.get('delivery_verified') is True
+    reason = receipt.get('error_class')
+    if verified:
+        content = (f'QQ 会话记录已确认视频卡片：《{title}》 {bvid}。'
+                   '可以用 lbm_watch_bili_video 读取已保存的观看内容。')
+    elif state == 'accepted':
+        content = '旧回执缺少可核验的 QQ 卡片记录，不重复发送。'
+    elif attempt.get('kind') == 'debug' and state == 'rejected':
+        content = {
+            'route_account_unverified': '未核验到当前会话的 QQ 登录账号，测试卡片未发送。',
+            'send_rejected': 'QQ 拒绝了这张测试卡片。',
+            'card_action_unsupported': '当前 QQ 适配器不支持原生图文卡片发送动作，未发送。',
+        }.get(reason, '测试卡片未发送。')
+    elif attempt.get('kind') == 'debug':
+        content = {
+            'qq_card_replaced': 'QQ 会话里出现了版本过低的占位提示，未查到本次测试卡片。',
+            'card_history_unavailable': '暂时无法核对当前 QQ 会话的记录。',
+            'card_not_confirmed': 'QQ 会话记录里暂未查到这张测试卡片。',
+            'adapter_delivery_unconfirmed': 'QQ 未返回送达回执。请查看当前会话确认卡片是否出现。',
+            'private_card_not_confirmed': 'QQ 私聊的服务器历史里暂未查到这张测试卡片。',
+            'private_card_readback_failed': '暂时无法核对 QQ 私聊的发送结果。',
+        }.get(reason, '测试卡片的发送结果待确认，请查看当前会话。')
     else:
-        content = '尚无确定的发送成功回执，不声称已送达，不要反复调用工具补发。'
+        content = '当前回执缺少 QQ 会话记录对视频卡片的确认，请勿重复发送。'
     return {
-        'success': accepted, 'bvid': bvid, 'title': title, 'delivery_state': state,
-        'duplicate': duplicate, 'message_id': message_id, 'stop_after_execution': False,
-        'content': ('本次已处理，不重复发送。' if duplicate else '') + content,
-        **({'error_class': clean(receipt.get('error_class'), 100)}
-           if attempt.get('kind') == 'debug' and isinstance(receipt, dict) and receipt.get('error_class')
-           else {}),
+        'success': verified, 'bvid': bvid, 'title': title, 'delivery_state': state,
+        'delivery_verified': verified, 'duplicate': duplicate, 'message_id': receipt.get('message_id'),
+        'stop_after_execution': False,
+        'content': ('本次已处理。' if duplicate else '') + content,
+        **({'error_class': clean(reason, 100)} if attempt.get('kind') == 'debug' and reason else {}),
     }
 
 
@@ -153,9 +159,16 @@ class VideoSocialService:
         item = await asyncio.to_thread(self.ledger.claim_history, attempt)
         if item is None:
             return None
+        try:
+            proof = json.loads(item['receipt'])
+        except (ValueError, TypeError, KeyError):
+            proof = {}
+        if not isinstance(proof, dict) or proof.get('delivery_verified') is not True:
+            await asyncio.to_thread(self.ledger.finish_history, attempt, 'rejected')
+            return 'rejected'
         facts = item['facts']
-        text = (f"[视频分享事实:{attempt}] 本聊天已提交B站视频卡片：{facts['bvid']}《{facts['title']}》。"
-                "适配器已受理，未确认实际送达或阅读。这是已发生行为的记录，不是新任务，勿再次分享同一卡片。")
+        text = (f"[视频分享事实:{attempt}] QQ 会话记录已确认本聊天的视频卡片：{facts['bvid']}《{facts['title']}》。"
+                "这是已发生行为的记录，消息是否已读未确认。勿再次分享同一卡片。")
         try:
             reply = await self._append(item['stream'], text, attempt)
             state = 'synced' if isinstance(reply, dict) and reply.get('success') is True else 'rejected'
@@ -336,7 +349,8 @@ class VideoSocialService:
             raise
         except Exception:
             generated = {}
-        if not isinstance(generated, dict) or not generated.get('success'):
+        card = generated.get('card') if isinstance(generated, dict) and generated.get('success') is True else None
+        if not isinstance(card, dict) or not card:
             await asyncio.to_thread(
                 self.ledger.decide, bvid, {'action': 'do_not_share', 'reason': 'card_generation_failed'}, self._now())
             return {'status': 'rejected', 'reason': 'card_generation_failed'}
@@ -397,13 +411,13 @@ class VideoSocialService:
             self._release(token)
             raise  # No network send occurred; the persisted intent stays conservative.
         try:
-            receipt = await self._send(route, generated['ark_json'])
+            receipt = await self._send(route, card)
         except asyncio.CancelledError:
             await asyncio.to_thread(self.ledger.finish, attempt, 'uncertain', reason='send_cancelled')
             raise
         except Exception:
             receipt = {'uncertain': True, 'error_class': 'unknown'}
-        if isinstance(receipt, dict) and receipt.get('success') is True and not receipt.get('uncertain'):
+        if _verified_card(receipt):
             await asyncio.to_thread(self.ledger.finish, attempt, 'accepted', receipt)
             self._commit(token)
             self._settled.add(attempt)
@@ -702,7 +716,8 @@ class ManualVideoShares:
                 raise
             except Exception:
                 generated = {}
-            if not isinstance(generated, dict) or not generated.get('success'):
+            card = generated.get('card') if isinstance(generated, dict) and generated.get('success') is True else None
+            if not isinstance(card, dict) or not card:
                 await asyncio.to_thread(ledger.finish, attempt, 'rejected', reason='card_generation_failed')
                 return {'success': False, 'error_class': 'card_generation_failed', 'content': '卡片生成失败，未发送。'}
             try:
@@ -715,13 +730,13 @@ class ManualVideoShares:
                 return {'success': False, 'error_class': 'route_changed_no_send', 'content': '路由已变化，未发送。'}
             try:
                 receipt = await self.social._send(
-                    routes[0], generated['ark_json'], manual=True, **({'debug': True} if debug else {}))
+                    routes[0], card, manual=True, **({'debug': True} if debug else {}))
             except asyncio.CancelledError:
                 await asyncio.to_thread(ledger.finish, attempt, 'uncertain', reason='manual_send_cancelled')
                 raise
             except Exception:
                 receipt = {'uncertain': True}
-            if isinstance(receipt, dict) and receipt.get('success') is True and not receipt.get('uncertain'):
+            if _verified_card(receipt):
                 state = 'accepted'
             elif isinstance(receipt, dict) and receipt.get('not_sent') is True:
                 state = 'rejected'
