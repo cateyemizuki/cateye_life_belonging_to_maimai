@@ -1,100 +1,44 @@
-"""video_card —— B站视频卡片分享服务（2026-11-04 卡片分享改造）。
+"""Build one standard Bilibili link card and transport it through OneBot.
 
-构造配方与实测证据：union/20261104_B站视频卡片分享构造取证.md §3.3/§4、
-evidence/bili_ark_generated.json.txt（接收方消息库已核验送达）。
-
-链路（两步均经宿主透传，不走适配器常规消息管线——出站 segment_encoder
-无 json 段 builder，常规管线会把卡片降级为 [unsupported:json] 文本）::
-
-    ctx.api.call("adapter.napcat.action.call",
-                 action_name="get_mini_app_ark",
-                 params={type:"bili", title, desc, picUrl, jumpUrl})
-      → QQ 服务器生成全新 ark（新 token/跳转链，host 自动=调用账号）
-    ctx.api.call("adapter.napcat.action.call",
-                 action_name="send_private_msg",
-                 params={user_id, message:[{type:"json", data:{data:<ark JSON字符串>}}]})
-
-契约（与发现清单/任务指令逐条对应）：
-- 视频分享/转发一律卡片；**没有纯文本链接兜底**——卡片生成失败则不发送，
-  返回确定性失败回执并留诊断（调用方按「不分享」处理）；
-- 发送阶段异常/超时 = 结果不确定（uncertain=True），由调用方保守防重，
-  不盲重试（与 video_companion 既有投递语义一致）；
-- 本模块零业务导入（只标准库 + typing）：透传 API 面经 ``api_caller``
-  注入（装配侧传 ctx.api.call）；不自行决定收件人、不拥有预算状态——
-  主动预算的查询/预留/入账由装配侧按 companion 同口径接线（只有发往
-  目标陪伴私聊的主动打扰计数，proactive_budget 仍是唯一计数所有者）；
-- OneBot retcode=0 不等于协议层送达（取证第一轮重放教训）：回执只声称
-  「适配器已受理」，最终送达核验属验收事项，不在本服务伪造。
+The JSON segment goes via the adapter's raw action. Private sends are confirmed
+against unanchored QQ friend history, because SnowLuma can assign a local ID
+before receiving a real private sequence. No result triggers a second send.
 """
-
 from __future__ import annotations
 
 import asyncio
 import json
 import re
-from typing import Any, Awaitable, Callable, Dict, Optional
+import time
+from typing import Any, Awaitable, Callable, Dict, Iterator
 
-#: 透传 API 名（官方适配器 apis/support.py:249；无白名单、无段重编码）
+from integrations.video_web_card import build_bili_web_card
+
 PASSTHROUGH_API = "adapter.napcat.action.call"
-#: 规范视频页链接（卡片 jumpUrl；取证 §3.3：规范 BV 链比短链更稳）
-JUMP_URL_TEMPLATE = "https://www.bilibili.com/video/{bvid}"
-#: 卡片默认描述（取证实测配方用语；调用方可传真实分享理由覆盖）
-DEFAULT_CARD_DESC = "哔哩哔哩视频分享"
-#: 单步透传调用超时（秒）
 _CALL_TIMEOUT_SECONDS = 30.0
+_PRIVATE_HISTORY_TIMEOUT_SECONDS = 3.0
+_PRIVATE_HISTORY_DELAYS_SECONDS = (0.4, 0.9)
+_PRIVATE_HISTORY_COUNT = 12
 
-_BV_FULL_RE = re.compile(r"^BV[0-9A-Za-z]{10}$")
 _QQ_RE = re.compile(r"^[0-9]{5,12}$")
-_MINIAPP_CARD = "com.tencent.miniapp_01"
-_BILI_MINIAPP_ID = "1109937557"
+_MESSAGE_ID_RE = re.compile(r"-?[0-9]{1,20}\Z")
 
 ApiCaller = Callable[..., Awaitable[Any]]
 
 
-def _unwrap(resp: Any) -> tuple[bool, Any, str]:
-    """透传回执解包（与 qzone/service.py._unwrap 同口径）：成功取 data。"""
-    if resp is None:
-        return False, None, "无响应"
-    if isinstance(resp, dict) and resp.get("success") is False:
-        return False, None, str(resp.get("error") or "宿主调用失败")[:200]
-    if isinstance(resp, dict):
-        status = resp.get("status")
-        if status == "failed" or (isinstance(resp.get("retcode"), int) and resp["retcode"] != 0):
-            return False, None, str(resp.get("wording") or resp.get("msg")
-                                    or f"retcode={resp.get('retcode')}")[:200]
-        if status == "ok" or resp.get("retcode") == 0 or "data" in resp:
-            return True, resp.get("data"), ""
-    return True, resp, ""  # 未知形态按原样透传
-
-
-def _extract_ark(data: Any) -> Optional[Dict[str, Any]]:
-    """从 get_mini_app_ark 回执取卡片 JSON。
-
-    实测形态（evidence/bili_ark_generated.json.txt）：data={"data":{卡片}}；
-    兼容 data 本身即卡片 dict 的形态。卡片须含 app/meta 结构，否则视为不可用。
-    """
-    card = data
-    if isinstance(card, dict) and isinstance(card.get("data"), dict):
-        card = card["data"]
-    if isinstance(card, dict) and card and ("meta" in card or "app" in card):
-        return card
-    return None
-
-
-def _complete_bili_ark(card: Dict[str, Any], document_url: str) -> Dict[str, Any]:
-    """Supply missing document fields without changing the provider's launch data."""
-    meta = card.get("meta")
-    detail = meta.get("detail_1") if isinstance(meta, dict) else None
-    if (card.get("app") != _MINIAPP_CARD or not isinstance(detail, dict)
-            or str(detail.get("appid")) != _BILI_MINIAPP_ID):
-        return card
-
-    completed = dict(card)
-    document = detail.get("qqdocurl")
-    if document is None or (isinstance(document, str) and not document.strip()):
-        completed["meta"] = {**meta, "detail_1": {**detail, "qqdocurl": document_url}}
-    completed.setdefault("needShareCallBack", False)
-    return completed
+def _response_layers(response: Any) -> Iterator[Dict[str, Any]]:
+    """Walk bounded OneBot and SDK envelopes without accepting arbitrary nested data."""
+    current = response
+    for _ in range(6):
+        if not isinstance(current, dict):
+            break
+        yield current
+        if isinstance(current.get("data"), dict):
+            current = current["data"]
+        elif current.get("success") is True and isinstance(current.get("result"), dict):
+            current = current["result"]
+        else:
+            break
 
 
 def _adapter_delivery_unconfirmed(value: Any) -> bool:
@@ -112,6 +56,34 @@ def _unconfirmed_adapter_receipt() -> Dict[str, Any]:
             "error": "QQ 未返回可核验的消息回执，投递结果待确认"}
 
 
+def _onebot_failed(reply: Dict[str, Any]) -> bool:
+    retcode = reply.get("retcode")
+    return reply.get("status") == "failed" or (type(retcode) is int and retcode != 0)
+
+
+def _qq_message_id(value: Any) -> str:
+    if type(value) not in (int, str):
+        return ""
+    text = str(value)
+    return str(int(text)) if _MESSAGE_ID_RE.fullmatch(text) and int(text) else ""
+
+
+def _same_card(message: Any, card: Dict[str, Any]) -> bool:
+    if not isinstance(message, list):
+        return False
+    segments = [item for item in message if isinstance(item, dict) and item.get("type") == "json"]
+    if len(segments) != 1:
+        return False
+    data = segments[0].get("data")
+    body = data.get("data") if isinstance(data, dict) else None
+    if isinstance(body, str) and len(body) <= 65536:
+        try:
+            body = json.loads(body)
+        except (ValueError, RecursionError):
+            return False
+    return isinstance(body, dict) and body == card
+
+
 class VideoCardService:
     """B站卡片生成及已核验群/私聊路由；不拥有授权、额度或防重状态。"""
 
@@ -121,70 +93,20 @@ class VideoCardService:
         self._log = logger
         self._timeout = max(1.0, float(call_timeout_seconds))
 
-    def _warn(self, message: str) -> None:
-        if self._log is not None:
-            try:
-                self._log.warning(message)
-            except Exception:
-                pass
-
     async def generate_ark(self, *, bvid: str, title: str, desc: str = "",
                            pic_url: str = "") -> Dict[str, Any]:
-        """经 QQ 服务器生成卡片 ark；失败返回确定性失败（绝不发送兜底文本）。
-
-        返回 ``{"success": True, "ark_json": <str>}`` 或
-        ``{"success": False, "error_class": "card_generation_failed", "error": ...}``。
-        """
-        bvid = str(bvid or "").strip()
-        if not _BV_FULL_RE.fullmatch(bvid):
-            return {"success": False, "error_class": "card_generation_failed",
-                    "error": "无效 BV 号，不构造卡片"}
-        params = {
-            "type": "bili",
-            "title": str(title or "").strip() or bvid,
-            "desc": str(desc or "").strip() or DEFAULT_CARD_DESC,
-            "picUrl": str(pic_url or "").strip(),
-            "jumpUrl": JUMP_URL_TEMPLATE.format(bvid=bvid),
-        }
+        """在本地构造 QQ 标准网页分享卡片，正文落到规范 BV 视频页。"""
         try:
-            resp = await asyncio.wait_for(
-                self._api(PASSTHROUGH_API, action_name="get_mini_app_ark", params=params),
-                timeout=self._timeout)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # 生成阶段失败 = 确定未发送任何消息（无防重负担）
-            self._warn(f"视频卡片生成失败（{bvid}，不发送、无文本兜底）：{exc}")
-            return {"success": False, "error_class": "card_generation_failed",
-                    "error": f"get_mini_app_ark 调用失败：{str(exc)[:200]}"}
-        ok, data, err = _unwrap(resp)
-        if not ok:
-            self._warn(f"视频卡片生成被拒绝（{bvid}，不发送、无文本兜底）：{err}")
-            return {"success": False, "error_class": "card_generation_failed",
-                    "error": f"get_mini_app_ark 回执失败：{err}"}
-        card = _extract_ark(data)
-        if card is None:
-            self._warn(f"视频卡片回执无可用 ark 结构（{bvid}，不发送、无文本兜底）")
-            return {"success": False, "error_class": "card_generation_failed",
-                    "error": "get_mini_app_ark 未返回可用卡片结构"}
-        try:
-            completed = _complete_bili_ark(card, params["jumpUrl"])
-            ark_json = json.dumps(completed, ensure_ascii=False, separators=(",", ":"))
+            card = build_bili_web_card(bvid=bvid, title=title, desc=desc, pic_url=pic_url)
+            ark_json = json.dumps(card, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
             return {"success": False, "error_class": "card_generation_failed",
-                    "error": f"卡片 JSON 序列化失败：{exc}"}
+                    "error": f"卡片生成失败：{exc}"}
         return {"success": True, "ark_json": ark_json}
 
     async def send_video_card(self, *, user_id: Any, bvid: str, title: str,
                               desc: str = "", pic_url: str = "") -> Dict[str, Any]:
-        """生成并发送视频卡片到指定 QQ 私聊（收件人由装配侧决定）。
-
-        回执语义（与 video_companion 投递门一致）：
-        - 生成失败 → ``success=False``、确定未发送（调用方可安全丢弃候选）；
-        - 发送被适配器明确拒绝 → ``success=False``（确定性失败）；
-        - 发送阶段异常/超时 → ``success=False, uncertain=True``（保守防重）；
-        - ``success=True`` 仅表示适配器受理（retcode=0），不声称协议层送达。
-        """
+        """生成并发送视频卡片到指定 QQ 私聊（收件人由装配侧决定）。"""
         user = str(user_id or "").strip()
         if not _QQ_RE.fullmatch(user):
             return {"success": False, "error_class": "invalid_target",
@@ -192,50 +114,110 @@ class VideoCardService:
         generated = await self.generate_ark(bvid=bvid, title=title, desc=desc, pic_url=pic_url)
         if not generated.get("success"):
             return generated
-        receipt=await self.send_ark({'kind':'private','user_id':user},generated['ark_json'])
-        return {**receipt,'bvid':bvid}
+        receipt = await self.send_ark({"kind": "private", "user_id": user}, generated["ark_json"])
+        return {**receipt, "bvid": bvid}
+
+    async def _logged_in_account(self) -> str:
+        try:
+            response = await asyncio.wait_for(self._api(PASSTHROUGH_API, action_name="get_login_info", params={}),
+                                              timeout=self._timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return ""
+        for layer in _response_layers(response):
+            if layer.get("success") is False or _onebot_failed(layer):
+                return ""
+            account = str(layer.get("user_id") or "")
+            if _QQ_RE.fullmatch(account):
+                return account
+        return ""
+
+    async def _private_card_history(self, peer: str, account: str,
+                                    card: Dict[str, Any]) -> dict[str, int] | None:
+        """Read one roaming page. An anchored query could silently return local echoes."""
+        try:
+            response = await asyncio.wait_for(self._api(
+                PASSTHROUGH_API, action_name="get_friend_msg_history",
+                params={"user_id": int(peer), "count": _PRIVATE_HISTORY_COUNT},
+            ), timeout=min(self._timeout, _PRIVATE_HISTORY_TIMEOUT_SECONDS))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        for layer in _response_layers(response):
+            if layer.get("success") is False or _onebot_failed(layer):
+                return None
+            messages = layer.get("messages")
+            if not isinstance(messages, list):
+                continue
+            matches: dict[str, int] = {}
+            for row in messages[:_PRIVATE_HISTORY_COUNT]:
+                if (not isinstance(row, dict) or row.get("message_type") != "private"
+                        or str(row.get("user_id")) != account or str(row.get("target_id")) != peer):
+                    continue
+                sender = row.get("sender")
+                if isinstance(sender, dict) and str(sender.get("user_id")) != account:
+                    continue
+                receipt_id = _qq_message_id(row.get("message_id"))
+                if row.get("real_id") is not None and _qq_message_id(row["real_id"]) != receipt_id:
+                    continue
+                stamp, sequence = row.get("time"), row.get("message_seq")
+                if (receipt_id and type(stamp) is int and type(sequence) is int and sequence > 0
+                        and _same_card(row.get("message"), card)):
+                    matches[receipt_id] = stamp
+            return matches
+        return None
+
+    async def _confirm_private_card(
+        self, peer: str, account: str, card: Dict[str, Any], started: int, adapter_message_id: Any,
+    ) -> str:
+        """Empty success means the exact receipt and card appeared in QQ server history."""
+        receipt_id = _qq_message_id(adapter_message_id)
+        history_read = False
+        for delay in _PRIVATE_HISTORY_DELAYS_SECONDS:
+            await asyncio.sleep(delay)
+            matches = await self._private_card_history(peer, account, card)
+            if matches is None:
+                continue
+            history_read = True
+            stamp = matches.get(receipt_id)
+            if stamp is not None and started - 2 <= stamp <= int(time.time()) + 5:
+                return ""
+        return "private_card_not_confirmed" if history_read else "private_card_readback_failed"
 
     async def send_ark(self, route: Dict[str, Any], ark_json: str, *, before_send: Any = None) -> Dict[str, Any]:
-        """Send exactly one raw card; accepted is never a delivery assertion."""
-        kind=route.get('kind');field='group_id' if kind=='group' else 'user_id'
-        identifier=str(route.get(field) or '')
-        if kind not in ('group','private') or not _QQ_RE.fullmatch(identifier):
-            return {'success':False,'not_sent':True,'error_class':'invalid_target'}
+        """Send one raw JSON card. Private success requires a new matching QQ server record."""
+        kind = route.get("kind")
+        field = "group_id" if kind == "group" else "user_id"
+        identifier = str(route.get(field) or "")
+        if kind not in ("group", "private") or not _QQ_RE.fullmatch(identifier):
+            return {"success": False, "not_sent": True, "error_class": "invalid_target"}
         try:
-            card=json.loads(ark_json)
-            if not isinstance(card,dict) or not ('meta' in card or 'app' in card):raise ValueError()
-        except (TypeError,ValueError):
-            return {'success':False,'not_sent':True,'error_class':'invalid_card'}
-        # The adapter API is bound to one account and has no account selector.
-        # Verify registered-route ownership instead of silently sending from a
-        # different logged-in bot when the host contains multiple accounts.
-        account=str(route.get('account_id') or '')
-        if account:
-            try:
-                identity=await asyncio.wait_for(self._api(PASSTHROUGH_API,
-                    action_name='get_login_info',params={}),timeout=self._timeout)
-                actual=''
-                for _ in range(6):
-                    if not isinstance(identity,dict):break
-                    if identity.get('success') is False or identity.get('status')=='failed':break
-                    if type(identity.get('retcode')) is int and identity['retcode']!=0:break
-                    if identity.get('user_id') is not None:
-                        actual=str(identity['user_id']);break
-                    identity=identity.get('data')
-                if not actual or actual!=account:
-                    return {'success':False,'not_sent':True,'error_class':'route_account_unverified'}
-            except asyncio.CancelledError:raise
-            except Exception:
-                return {'success':False,'not_sent':True,'error_class':'route_account_unverified'}
+            card = json.loads(ark_json)
+            if not isinstance(card, dict) or not ("meta" in card or "app" in card):
+                raise ValueError()
+        except (TypeError, ValueError, RecursionError):
+            return {"success": False, "not_sent": True, "error_class": "invalid_card"}
+
+        # There is no sender-account selector on the raw adapter action.
+        account = str(route.get("account_id") or "")
+        actual = ""
+        if account or kind == "private":
+            actual = await self._logged_in_account()
+            if not actual or (account and actual != account):
+                return {"success": False, "not_sent": True, "error_class": "route_account_unverified"}
         if before_send is not None:
-            allowed,_reason=before_send()
-            if not allowed:return {'success':False,'not_sent':True,'error_class':'gate_changed'}
-        action='send_group_msg' if kind=='group' else 'send_private_msg'
-        params={field:int(identifier),'message':[{'type':'json','data':{'data':ark_json}}]}
+            allowed, _reason = before_send()
+            if not allowed:
+                return {"success": False, "not_sent": True, "error_class": "gate_changed"}
+
+        action = "send_group_msg" if kind == "group" else "send_private_msg"
+        params = {field: int(identifier), "message": [{"type": "json", "data": {"data": ark_json}}]}
+        started = int(time.time())
         try:
-            resp = await asyncio.wait_for(
-                self._api(PASSTHROUGH_API, action_name=action, params=params),
-                timeout=self._timeout)
+            response = await asyncio.wait_for(self._api(PASSTHROUGH_API, action_name=action, params=params),
+                                              timeout=self._timeout)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -243,22 +225,37 @@ class VideoCardService:
                 return _unconfirmed_adapter_receipt()
             return {"success": False, "uncertain": True, "error_class": "unknown",
                     "error": f"{action} 结果不确定：{type(exc).__name__}"}
-        accepted=False;message_id=None;current=resp
-        for _ in range(6):
-            if not isinstance(current,dict):break
-            if any(_adapter_delivery_unconfirmed(current.get(field))
+
+        accepted = False
+        message_id = None
+        for layer in _response_layers(response):
+            if any(_adapter_delivery_unconfirmed(layer.get(field))
                    for field in ("error", "wording", "message", "msg")):
                 return _unconfirmed_adapter_receipt()
-            ret=current.get('retcode')
-            if current.get('status')=='failed' or (type(ret) is int and ret!=0):
-                return {'success':False,'not_sent':True,'error_class':'send_rejected'}
-            if current.get('success') is False:
-                return {'success':False,'uncertain':True,'error_class':'unknown'}
-            accepted=accepted or current.get('status')=='ok' or type(ret) is int and ret==0 or current.get('sent') is True
-            mid=current.get('message_id')
-            if isinstance(mid,(str,int)) and not isinstance(mid,bool):message_id=mid
-            if current.get('success') is True and isinstance(current.get('data'),dict) and current['data'].get('message_id') is not None:
-                accepted=True
-            current=current.get('data')
-        if not accepted:return {'success':False,'uncertain':True,'error_class':'unknown'}
-        return {'success':True,'channel':'video_card','delivery_state':'accepted','message_id':message_id}
+            if _onebot_failed(layer):
+                return {"success": False, "not_sent": True, "error_class": "send_rejected"}
+            if layer.get("success") is False:
+                return {"success": False, "uncertain": True, "error_class": "unknown"}
+            retcode = layer.get("retcode")
+            accepted = (accepted or layer.get("status") == "ok" or (type(retcode) is int and retcode == 0)
+                        or layer.get("sent") is True or layer.get("success") is True)
+            mid = layer.get("message_id")
+            if type(mid) in (str, int):
+                message_id = mid
+        if not accepted:
+            return {"success": False, "uncertain": True, "error_class": "unknown"}
+        if not _qq_message_id(message_id):
+            return _unconfirmed_adapter_receipt()
+        result = {"success": True, "channel": "video_card", "delivery_state": "accepted", "message_id": message_id}
+        if kind == "private":
+            unconfirmed = await self._confirm_private_card(identifier, actual, card, started, message_id)
+            if unconfirmed:
+                detail = ("QQ 服务器历史中尚未找到这张私聊视频卡片" if unconfirmed == "private_card_not_confirmed"
+                          else "暂时无法读取 QQ 服务器私聊历史确认卡片")
+                log_debug = getattr(self._log, "debug", None)
+                if callable(log_debug):
+                    log_debug(f"私聊卡片确认结果：{unconfirmed}")
+                return {**_unconfirmed_adapter_receipt(), "error_class": unconfirmed,
+                        "error": detail, "message_id": message_id}
+            result["delivery_verified"] = True
+        return result

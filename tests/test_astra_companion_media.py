@@ -173,6 +173,21 @@ async def forced_share_debug_replay_and_unknown(folder):
     social.evaluator.evaluate.assert_not_called()
 
 
+async def private_card_test_statuses_are_distinct(folder):
+    from integrations.video_share_scheduler import attempt_result
+    fixture = {"kind": "debug", "facts": {"bvid": A, "title": "Fixture"}}
+    confirmed = attempt_result({**fixture, "status": "accepted",
+                                "receipt": {"delivery_verified": True}})
+    missing = attempt_result({**fixture, "status": "uncertain",
+                              "receipt": {"error_class": "private_card_not_confirmed"}})
+    failed = attempt_result({**fixture, "status": "uncertain",
+                             "receipt": {"error_class": "private_card_readback_failed"}})
+    assert "服务器历史已确认" in confirmed["content"] and confirmed["success"]
+    assert "服务器历史里暂未查到" in missing["content"] and not missing["success"]
+    assert "暂时无法核对" in failed["content"] and not failed["success"]
+    assert missing["delivery_state"] == failed["delivery_state"] == "uncertain"
+
+
 async def scoped_share_debug_planner_ticket(folder):
     from integrations.video_share_evaluator import SHARE_JUDGMENT_RULES
     from integrations.video_share_policy import DEBUG_PLANNER_KIND
@@ -1247,7 +1262,7 @@ CASES = [
     "optional_weekly_summary_failure",
     "watch_terminal_equivalence",
     "qzone_policy_equivalence", "qzone_caption_uses_current_facts", "qzone_duplicate_checked_before_dispatch",
-    "share_limits", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "scoped_share_debug_planner_ticket", "profile_count", "interrupted_eval", "cancel_cache",
+    "share_limits", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "private_card_test_statuses_are_distinct", "scoped_share_debug_planner_ticket", "profile_count", "interrupted_eval", "cancel_cache",
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",
     "fallback_review", "candidate_overlap", "tiered_miss", "bound_legacy_upgrade",

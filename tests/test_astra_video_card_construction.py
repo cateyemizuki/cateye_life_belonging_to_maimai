@@ -1,95 +1,140 @@
-"""Regression for the distinction between generated and transported Bili miniapp cards."""
+"""Exercise the standard Bili link card transport and private QQ read-back contract."""
 from __future__ import annotations
 
-from copy import deepcopy
 import json
 import os
 from pathlib import Path
 import sys
+import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.environ.get("CATEYE_TEST_DIR") or str(Path(__file__).resolve().parents[1]))
-from integrations.video_card import PASSTHROUGH_API, VideoCardService
+from integrations.video_card import VideoCardService
 
 
 BV = "BV0000000001"
 PAGE = "https://www.bilibili.com/video/" + BV
+PEER = "10001"
+BOT = "40001"
+MID = -171476788
 
 
-def provider_card():
-    return {
-        "ver": "1.0.0.19",
-        "app": "com.tencent.miniapp_01",
-        "view": "view_8C8E89B49BE609866298ADDFF2DBABA4",
-        "config": {"token": "provider-token"},
-        "meta": {"detail_1": {
-            "appid": "1109937557",
-            "appType": 0,
-            "url": "https://m.q.qq.com/a/s/provider-link",
-            "scene": 0,
-            "host": {"uin": 10001, "nick": "provider"},
-            "preview": "https://qq.ugcimg.cn/provider-preview",
-            "shareTemplateId": "8C8E89B49BE609866298ADDFF2DBABA4",
-            "shareTemplateData": {},
-        }},
-    }
+def raw_link():
+    return {"app": "com.tencent.structmsg", "view": "news", "meta": {"news": {"jumpUrl": PAGE}}}
+
+
+def okay(data):
+    return {"status": "ok", "retcode": 0, "data": data}
+
+
+def row(**overrides):
+    return {"message_type": "private", "message_id": MID, "real_id": MID,
+            "message_seq": 20, "time": int(time.time()), "user_id": int(BOT), "target_id": int(PEER),
+            "sender": {"user_id": int(BOT)}, "message": [{"type": "json", "data": {"data": json.dumps(raw_link())}}],
+            **overrides}
 
 
 class VideoCardConstructionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_generated_card_fills_missing_fields_without_touching_provider(self):
-        upstream = provider_card()
-        original = deepcopy(upstream)
-        api = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"data": upstream}})
-        result = await VideoCardService(api).generate_ark(bvid=BV, title="Example")
-        self.assertTrue(result["success"])
-        self.assertEqual(api.await_args.args, (PASSTHROUGH_API,))
-        self.assertEqual(api.await_args.kwargs["action_name"], "get_mini_app_ark")
-        self.assertEqual(api.await_args.kwargs["params"]["jumpUrl"], PAGE)
-        card = json.loads(result["ark_json"])
-        self.assertIs(card.pop("needShareCallBack"), False)
-        self.assertEqual(card["meta"]["detail_1"].pop("qqdocurl"), PAGE)
-        self.assertEqual(card, original)
-        self.assertEqual(upstream, original)
+    def setUp(self):
+        override = patch("integrations.video_card._PRIVATE_HISTORY_DELAYS_SECONDS", (0, 0))
+        override.start()
+        self.addCleanup(override.stop)
 
-    async def test_existing_provider_document_callback_and_scene_are_preserved(self):
-        upstream = provider_card()
-        upstream["meta"]["detail_1"].update(qqdocurl="https://b23.tv/provider-link", scene=1036)
-        upstream["needShareCallBack"] = True
-        api = AsyncMock(return_value={"status": "ok", "data": upstream})
-        result = await VideoCardService(api).generate_ark(bvid=BV, title="Example")
-        self.assertEqual(json.loads(result["ark_json"]), upstream)
-
-    async def test_non_bili_card_does_not_get_bili_metadata(self):
-        upstream = provider_card()
-        upstream["meta"]["detail_1"]["appid"] = "different-miniapp"
-        api = AsyncMock(return_value={"status": "ok", "data": upstream})
-        result = await VideoCardService(api).generate_ark(bvid=BV, title="Example")
-        self.assertEqual(json.loads(result["ark_json"]), upstream)
-
-    async def test_manual_share_constructs_once_and_raw_transport_keeps_bytes(self):
-        upstream = provider_card()
-        api = AsyncMock(side_effect=[
-            {"status": "ok", "data": upstream},
-            {"status": "ok", "data": {"message_id": 20001}},
-            {"status": "ok", "data": {"message_id": 20002}},
-        ])
+    async def test_generation_is_local_and_does_not_invoke_miniapp_signer(self):
+        api = AsyncMock()
         service = VideoCardService(api)
-        result = await service.send_video_card(user_id="10001", bvid=BV, title="Example")
+        result = await service.generate_ark(bvid=BV, title="Example")
         self.assertTrue(result["success"])
-        sent = api.await_args_list[1].kwargs
-        card = json.loads(sent["params"]["message"][0]["data"]["data"])
-        self.assertEqual(sent["action_name"], "send_private_msg")
-        self.assertEqual(card["meta"]["detail_1"]["qqdocurl"], PAGE)
-        self.assertIs(card["needShareCallBack"], False)
+        card = json.loads(result["ark_json"])
+        self.assertEqual(card["app"], "com.tencent.structmsg")
+        self.assertEqual(card["meta"]["news"]["jumpUrl"], PAGE)
+        failed = await service.generate_ark(bvid="invalid", title="Example")
+        self.assertFalse(failed["success"])
+        api.assert_not_awaited()
 
-        raw = json.dumps(upstream, indent=2)
-        transported = await service.send_ark({"kind": "group", "group_id": "10002"}, raw)
+    async def test_group_raw_transport_preserves_bytes_and_sdk_envelope(self):
+        raw = json.dumps(raw_link(), indent=2)
+        api = AsyncMock(return_value={"success": True, "data": {"message_id": MID}})
+        transported = await VideoCardService(api).send_ark({"kind": "group", "group_id": "10002"}, raw)
         self.assertTrue(transported["success"])
-        sent = api.await_args_list[2].kwargs
+        self.assertEqual(transported["message_id"], MID)
+        sent = api.await_args.kwargs
         self.assertEqual(sent["action_name"], "send_group_msg")
         self.assertEqual(sent["params"]["message"][0]["data"]["data"], raw)
+        self.assertEqual(api.await_count, 1)
 
+    async def test_group_ok_missing_message_id_is_not_confirmation(self):
+        for mid in (None, 0, "0"):
+            with self.subTest(mid=mid):
+                api = AsyncMock(return_value=okay({"message_id": mid}))
+                result = await VideoCardService(api).send_ark(
+                    {"kind": "group", "group_id": "10002"}, json.dumps(raw_link()),
+                )
+                self.assertFalse(result["success"])
+                self.assertTrue(result["uncertain"])
+                self.assertEqual(result["error_class"], "adapter_delivery_unconfirmed")
+                self.assertEqual(api.await_count, 1)
+
+    async def test_private_ok_missing_id_does_not_claim_to_read_history(self):
+        api = AsyncMock(side_effect=[okay({"user_id": BOT}), okay({"message_id": 0})])
+        result = await VideoCardService(api).send_ark({"kind": "private", "user_id": PEER}, json.dumps(raw_link()))
+        self.assertEqual(result["error_class"], "adapter_delivery_unconfirmed")
+        self.assertTrue(result["uncertain"])
+        self.assertEqual([call.kwargs["action_name"] for call in api.await_args_list],
+                         ["get_login_info", "send_private_msg"])
+
+    async def test_private_verifies_same_signed_message_after_index_lag(self):
+        api = AsyncMock(side_effect=[
+            {"success": True, "result": okay({"user_id": int(BOT)})},
+            {"success": True, "data": {"message_id": MID}},
+            okay({"messages": []}),
+            {"success": True, "result": okay({"messages": [row()]})},
+        ])
+        result = await VideoCardService(api).send_ark({"kind": "private", "user_id": PEER}, json.dumps(raw_link()))
+        self.assertTrue(result["success"])
+        self.assertTrue(result["delivery_verified"])
+        self.assertEqual(result["message_id"], MID)
+        actions = [call.kwargs["action_name"] for call in api.await_args_list]
+        self.assertEqual(actions, ["get_login_info", "send_private_msg", "get_friend_msg_history", "get_friend_msg_history"])
+        for call in api.await_args_list[2:]:
+            self.assertEqual(call.kwargs["params"]["user_id"], int(PEER))
+            self.assertNotIn("message_id", call.kwargs["params"])
+
+    async def test_private_success_with_only_synthetic_or_wrong_message_is_uncertain(self):
+        stored = [
+            row(message_id=2222, real_id=2222),
+            row(message_id=MID, user_id=12345),
+            row(message_id=MID, target_id=19999),
+            row(message_id=MID, sender={"user_id": 12345}),
+            row(message_id=MID, message_seq=0),
+            row(message_id=MID, time=int(time.time()) - 100),
+            row(message_id=MID, message=[{"type": "json", "data": {"data": json.dumps({"different": "card"})}}]),
+        ]
+        api = AsyncMock(side_effect=[
+            okay({"user_id": BOT}), okay({"message_id": MID}), okay({"messages": stored}), okay({"messages": []}),
+        ])
+        result = await VideoCardService(api).send_ark(
+            {"kind": "private", "user_id": PEER, "account_id": BOT}, json.dumps(raw_link()),
+        )
+        self.assertFalse(result["success"])
+        self.assertTrue(result["uncertain"])
+        self.assertNotIn("not_sent", result)
+        self.assertEqual(result["error_class"], "private_card_not_confirmed")
+        self.assertEqual(result["message_id"], MID)
+        self.assertEqual([call.kwargs["action_name"] for call in api.await_args_list].count("send_private_msg"), 1)
+
+    async def test_private_readback_failure_is_distinct(self):
+        api = AsyncMock(side_effect=[
+            okay({"user_id": BOT}), okay({"message_id": MID}),
+            {"status": "failed", "retcode": 1200}, RuntimeError("history unavailable"),
+        ])
+        result = await VideoCardService(api).send_ark(
+            {"kind": "private", "user_id": PEER, "account_id": BOT}, json.dumps(raw_link()),
+        )
+        self.assertFalse(result["success"])
+        self.assertTrue(result["uncertain"])
+        self.assertEqual(result["error_class"], "private_card_readback_failed")
 
     async def test_group_delivery_missing_receipt_stays_uncertain_for_adapter_envelopes(self):
         message = ("group message delivery was not confirmed: QQ returned no message receipt; "
@@ -103,7 +148,7 @@ class VideoCardConstructionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(wrapped=wrapped):
                 api = AsyncMock(return_value=wrapped)
                 result = await VideoCardService(api).send_ark(
-                    {"kind": "group", "group_id": "10002"}, json.dumps(provider_card()),
+                    {"kind": "group", "group_id": "10002"}, json.dumps(raw_link()),
                 )
                 self.assertFalse(result["success"])
                 self.assertTrue(result["uncertain"])
@@ -117,7 +162,7 @@ class VideoCardConstructionTests(unittest.IsolatedAsyncioTestCase):
         api = AsyncMock(side_effect=RuntimeError(
             "对端动作返回失败: action=send_group_msg message=QQ returned no message receipt"))
         result = await VideoCardService(api).send_ark(
-            {"kind": "group", "group_id": "10002"}, json.dumps(provider_card()),
+            {"kind": "group", "group_id": "10002"}, json.dumps(raw_link()),
         )
         self.assertTrue(result["uncertain"])
         self.assertEqual(result["error_class"], "adapter_delivery_unconfirmed")
@@ -126,7 +171,7 @@ class VideoCardConstructionTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_rejection_is_still_distinct(self):
         api = AsyncMock(return_value={"status": "failed", "retcode": 1200, "wording": "permission denied"})
         result = await VideoCardService(api).send_ark(
-            {"kind": "group", "group_id": "10002"}, json.dumps(provider_card()),
+            {"kind": "group", "group_id": "10002"}, json.dumps(raw_link()),
         )
         self.assertEqual(result, {"success": False, "not_sent": True, "error_class": "send_rejected"})
 

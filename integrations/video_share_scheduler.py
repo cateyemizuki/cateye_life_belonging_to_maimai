@@ -70,14 +70,22 @@ def attempt_result(attempt: dict, *, duplicate: bool = False) -> dict:
             receipt = {}
     message_id = receipt.get('message_id') if isinstance(receipt, dict) else None
     if attempt.get('kind') == 'debug':
+        reason = receipt.get('error_class') if isinstance(receipt, dict) else None
         if accepted:
-            content = '测试卡片已提交适配器。'
+            content = ('QQ 私聊的服务器历史已确认测试卡片。'
+                       if isinstance(receipt, dict) and receipt.get('delivery_verified') is True
+                       else '测试卡片已提交适配器。')
         elif state == 'rejected':
-            content = '测试卡片未发送。'
-        elif isinstance(receipt, dict) and receipt.get('error_class') == 'adapter_delivery_unconfirmed':
-            content = 'QQ 未返回送达回执。请查看当前会话确认卡片是否出现。'
+            content = {
+                'route_account_unverified': '未核验到当前会话的 QQ 登录账号，测试卡片未发送。',
+                'send_rejected': 'QQ 拒绝了这张测试卡片。',
+            }.get(reason, '测试卡片未发送。')
         else:
-            content = '测试卡片的发送结果待确认，请查看当前会话。'
+            content = {
+                'private_card_not_confirmed': 'QQ 私聊的服务器历史里暂未查到这张测试卡片。',
+                'private_card_readback_failed': '暂时无法核对 QQ 私聊的发送结果。',
+                'adapter_delivery_unconfirmed': 'QQ 未返回送达回执。请查看当前会话确认卡片是否出现。',
+            }.get(reason, '测试卡片的发送结果待确认，请查看当前会话。')
     elif accepted:
         content = (f'已向当前聊天提交B站视频卡片：《{title}》 {bvid}。适配器已受理，不等于对方已收到。'
                    '需要谈内容时可用这个BV读取观看缓存，不必重新观看。')

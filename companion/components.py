@@ -2260,7 +2260,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if executed and not result.get("success") and not result.get("duplicate") and not route_changed:
             try:
                 await self.ctx.send.text(
-                    content, stream, storage_message=False, sync_to_maisaka_history=False,
+                    "Planner 选择了分享。" + content, stream,
+                    storage_message=False, sync_to_maisaka_history=False,
                 )
             except Exception:
                 pass  # The delivery receipt is already durable; never retry it for a missing status.

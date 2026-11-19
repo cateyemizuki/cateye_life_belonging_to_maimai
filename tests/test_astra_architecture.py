@@ -262,7 +262,7 @@ async def case_trusted_command_policy(root):
                                  "content": "QQ 未返回送达回执。"}
     result = await p.mai_tool_confirm_debug_share(ticket="valid", stream_id="s-one", chat_id="s-one")
     assert result["success"] and result["stop_after_execution"] and result["delivery_state"] == "uncertain"
-    p.ctx.send.text.assert_awaited_once_with("QQ 未返回送达回执。", "s-one",
+    p.ctx.send.text.assert_awaited_once_with("Planner 选择了分享。QQ 未返回送达回执。", "s-one",
                                             storage_message=False, sync_to_maisaka_history=False)
 
 

@@ -380,7 +380,7 @@ from suite_prompts import (
 # prompts 12→14、event_catalog（服务视图）12→14、admin 13→15、
 # dashboard_display 14→16、maimai_interaction 15→17。只改 __ui_order__ 与注释/文档，
 # 段数/字段数/隐藏数/默认值/迁移/版本号均不变。
-SUPPORTED_CONFIG_VERSION = "3.18.13"
+SUPPORTED_CONFIG_VERSION = "3.18.14"
 
 #: 本轮（2026-10-10 配置整理轮）的段布局标记；写入 [plugin] layout_version 用于迁移幂等
 CURRENT_LAYOUT_VERSION = "2026-10-10"
