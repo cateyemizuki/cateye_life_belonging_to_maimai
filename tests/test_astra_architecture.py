@@ -227,7 +227,11 @@ async def case_trusted_command_policy(root):
     p.config.plugin = NS(enabled=True)
     p.config.video_watch = NS(enabled=True)
     test_share = AsyncMock(return_value={"success": True})
-    p._recent_video_share_service = lambda: NS(share_debug=test_share)
+    test_planner = AsyncMock(return_value={"success": True, "content": "Planner 分享判断调试已提交。"})
+    test_confirm = AsyncMock()
+    p._recent_video_share_service = lambda: NS(
+        share_debug=test_share, share_debug_planner=test_planner, share_debug_ticket=test_confirm,
+    )
     kwargs = {
         "matched_groups": {"root_args": "运维 分享 调试"},
         "platform": "qq", "user_id": "10203", "stream_id": "s-one",
@@ -240,7 +244,26 @@ async def case_trusted_command_policy(root):
     test_share.assert_awaited_once_with("s-one", "actual-ingress-id", group_id="", user_id="10203")
     await p._cmd_root_entry("en", {**kwargs, "matched_groups": {"root_args": "ops share debug 198765"}})
     assert test_share.await_count == 1
+    planner_args = {**kwargs, "matched_groups": {"root_args": "ops share debug planner"}}
+    await p._cmd_root_entry("en", {**planner_args, "user_id": "10456"})
+    test_planner.assert_not_awaited()
+    await p._cmd_root_entry("en", planner_args)
+    assert test_planner.await_args.args == ("s-one", "actual-ingress-id")
+    assert callable(test_planner.await_args.kwargs["trigger"])
+    p.ctx.send.text.assert_awaited_with("Planner 分享判断调试已提交。", "s-one",
+                                       storage_message=False, sync_to_maisaka_history=False)
+    assert test_share.await_count == 1
 
+    p.ctx.send.text.reset_mock()
+    test_confirm.return_value = {"success": False, "content": "未授权"}
+    failed = await p.mai_tool_confirm_debug_share(ticket="fake", stream_id="s-one", chat_id="s-one")
+    assert not failed["success"] and not p.ctx.send.text.await_count
+    test_confirm.return_value = {"debug_executed": True, "success": False, "delivery_state": "uncertain",
+                                 "content": "QQ 未返回送达回执。"}
+    result = await p.mai_tool_confirm_debug_share(ticket="valid", stream_id="s-one", chat_id="s-one")
+    assert result["success"] and result["stop_after_execution"] and result["delivery_state"] == "uncertain"
+    p.ctx.send.text.assert_awaited_once_with("QQ 未返回送达回执。", "s-one",
+                                            storage_message=False, sync_to_maisaka_history=False)
 
 
 async def case_offline_failure_replay_and_dst(root):

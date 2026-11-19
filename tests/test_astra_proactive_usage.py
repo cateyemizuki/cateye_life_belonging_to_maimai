@@ -135,6 +135,48 @@ class ProactiveUsageTests(unittest.IsolatedAsyncioTestCase):
         assert result["tool_calls"] == tool_calls
         self.record.assert_not_called()
 
+    async def test_card_debug_filters_native_functions_and_preserves_new_input(self):
+        from integrations.video_share_policy import DEBUG_CARD_TOOL, DEBUG_PLANNER_KIND
+
+        self.turn.update(kind=DEBUG_PLANNER_KIND, category="video_share")
+        queued = block("pt-123", "video_share")
+        queued["parts"][0]["text"] = queued["parts"][0]["text"].replace(
+            '"greeting_scope":"target"', '"lbm_card_debug":true,"lbm_card_ticket":"actual-proof"'
+        )
+        definitions = [{"type": "function", "function": {"name": name}} for name in
+                       ("reply", "wait", "lbm_share_recent_video", DEBUG_CARD_TOOL)]
+        request = {**self.planner, "tool_definitions": definitions}
+        before = await self.subject.planner_before({**request, "items": [queued]})
+        assert [item["function"]["name"] for item in before["tool_definitions"]] == ["wait", DEBUG_CARD_TOOL]
+        assert "actual-proof" not in before["items"][0]["parts"][0]["text"]
+        result = self.subject.planner_after({**self.planner, **self.usage, "output_items": [
+            call("lbm_share_recent_video", to_companion=True), call(DEBUG_CARD_TOOL, ticket="injected-by-model"),
+            call(DEBUG_CARD_TOOL),
+        ]})
+        assert result["output_items"] == [call(DEBUG_CARD_TOOL, ticket="actual-proof")]
+        assert self.record.call_args.kwargs["event"] == "proactive_video_share_planner"
+
+        await self.subject.planner_before({**request, "items": [queued]})
+        decline = self.subject.planner_after({**self.planner, **self.usage, "output_items": [
+            {"item_type": "AssistantMessageItem", "parts": [{"type": "text", "text": "I will skip."}]},
+            call("wait"), call(DEBUG_CARD_TOOL),
+        ]})
+        assert decline["output_items"] == [call("wait")]
+
+        incoming = {"item_type": "UserMessageItem", "parts": [{"type": "text", "text": "<message>latest</message>"}]}
+        ordinary = await self.subject.planner_before({**request, "items": [queued, incoming]})
+        assert ordinary["items"] == [incoming]
+        assert ordinary["tool_definitions"] == definitions[:-1]
+        reply = call("reply", chat_anlyze="ordinary")
+        assert self.subject.planner_after({**self.planner, **self.usage, "output_items": [reply]})["output_items"] == [reply]
+
+        legacy = {"role": "user", "content": queued["parts"][0]["text"]}
+        await self.subject.planner_before({**request, "messages": [legacy]})
+        legacy_response = self.subject.planner_after({**self.planner, **self.usage, "response": "No additional text.",
+              "tool_calls": [{"function": {"name": DEBUG_CARD_TOOL, "arguments": {}}}]})
+        assert legacy_response["response"] == ""
+        assert legacy_response["tool_calls"] == [{"function": {"name": DEBUG_CARD_TOOL, "arguments": {"ticket": "actual-proof"}}}]
+
     async def test_host_query_scope_and_subtotals(self):
         calls=self.subject.planner_after({"session_id":"s","output_items":[call(HOST_USAGE_TOOL,scope_proof="forged")]})
         proof=calls["output_items"][0]["tool_call"]["args"]["scope_proof"]

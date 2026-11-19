@@ -82,6 +82,8 @@ from companion.patrol import resolve_silence_window
 from .rolling_diag import render_rolling
 from integrations.video_share_diag import render_share
 from integrations.proactive_usage import HOST_USAGE_TOOL, ProactiveUsage, read_host_turn_usage
+from integrations.planner_proactive import dispatch_proactive
+from integrations.video_share_policy import DEBUG_CARD_TOOL
 from integrations.qzone_video_diag import render_qzone_video, qzone_video_diag_payload
 from .streams_diag import build_streams_records
 from core.diag import DecisionLogger
@@ -2209,23 +2211,61 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                                  platform: Any, group_id: Any, user_id: Any, message_id: Any) -> tuple:
         if not stream_id or str(platform or "").strip().lower() != "qq":
             return True, "视频分享调试仅可在已核验的当前 QQ 会话运行。", True
-        if len(args) != 1:
-            await self.ctx.send.text("用法：/lbm ops share debug", stream_id)
+        planner = len(args) == 2 and args[1].lower() == "planner"
+        if len(args) != 1 and not planner:
+            await self.ctx.send.text("用法：/lbm ops share debug [planner]", stream_id)
             return True, "参数错误", True
         if not (self.config.plugin.enabled and self.config.video_watch.enabled):
             await self.ctx.send.text("视频观看模块尚未启用。", stream_id)
             return True, "模块未启用", True
         try:
-            result = await self._recent_video_share_service().share_debug(
-                stream_id, str(message_id or "").strip(),
-                group_id=str(group_id or "").strip(), user_id=str(user_id or "").strip())
+            service = self._recent_video_share_service()
+            direct_args = (stream_id, str(message_id or "").strip())
+            context = {"group_id": str(group_id or "").strip(), "user_id": str(user_id or "").strip()}
+            if planner:
+                result = await service.share_debug_planner(
+                    *direct_args, **context, trigger=lambda **work: dispatch_proactive(self, **work))
+            else:
+                result = await service.share_debug(*direct_args, **context)
         except Exception:
-            result = {"success": False, "content": "视频分享调试未取得确定回执。"}
-        if result.get("success"):
-            return True, "视频卡片调试已提交", True
-        if not result.get("duplicate"):
-            await self.ctx.send.text(result.get("content") or "视频分享调试未发送。", stream_id)
-        return True, "视频卡片调试未取得新发送回执", True
+            result = {"success": False, "content": "视频分享调试结果待确认。"}
+        if not result.get("duplicate") and (planner or not result.get("success")):
+            await self.ctx.send.text(
+                result.get("content") or "视频分享调试未发送。", stream_id,
+                storage_message=False, sync_to_maisaka_history=False,
+            )
+        return True, result.get("content") or "视频卡片调试已处理", True
+
+    @Tool(
+        DEBUG_CARD_TOOL, platforms="qq", visibility="visible",
+        description="只用于当前由管理员发起的 Planner 视频测试。选择分享时调用一次，宿主钩子自动绑定测试卡片及当前会话。",
+        parameters={"ticket": {"type": "string", "description": "由宿主在调试轮自动填写"}},
+    )
+    async def mai_tool_confirm_debug_share(self, ticket: str = "", **kwargs: Any) -> dict:
+        stream = str(kwargs.get("chat_id") or "").strip()
+        claimed_stream = str(kwargs.get("stream_id") or kwargs.get("session_id") or stream)
+        if not stream or stream != claimed_stream:
+            return {"success": False, "content": "缺少可核验的调试会话。"}
+        if not (self.config.plugin.enabled and self.config.video_watch.enabled):
+            return {"success": False, "content": "视频观看模块未启用。"}
+        try:
+            result = await self._recent_video_share_service().share_debug_ticket(stream, ticket)
+        except Exception:
+            result = {"success": False, "content": "无法核验视频分享调试授权。"}
+        executed = bool(result.get("debug_executed"))
+        content = result.get("content") or "视频分享调试已处理。"
+        route_changed = result.get("error_class") in {
+            "debug_route_mismatch", "unknown_current_stream", "route_changed_no_send", "route_account_unverified",
+        }
+        if executed and not result.get("success") and not result.get("duplicate") and not route_changed:
+            try:
+                await self.ctx.send.text(
+                    content, stream, storage_message=False, sync_to_maisaka_history=False,
+                )
+            except Exception:
+                pass  # The delivery receipt is already durable; never retry it for a missing status.
+        return {"success": executed, "stop_after_execution": True, "content": content,
+                "delivery_state": result.get("delivery_state", "not_attempted")}
 
     async def mai_cmd_affection(self, **kwargs: Any) -> tuple[bool, str, bool]:
         companion = self._mai_companion()

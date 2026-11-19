@@ -13,12 +13,14 @@ from unicodedata import normalize
 
 from core.inject import CATEYE_PLUGIN_ID, pick_payload_key
 from integrations.proactive_reply_target import _header
+from integrations.video_share_policy import DEBUG_CARD_TOOL, DEBUG_PLANNER_KIND
 
 HOST_USAGE_TOOL = "lbm_host_turn_usage"
 HOST_REQUESTS = {"planner": "maisaka.planner", "replyer": "maisaka.replyer"}
 _REPLY_TOKEN = "_lbm_proactive_reply"
 _REPLY_MARKER = re.compile(r"\n\[lbm-proactive-reply:([0-9a-f]{32})\]\s*$")
 _TASK_META_PREFIX = "附加信息："
+_DEBUG_END_TOOLS = ("wait", "stop")
 _SCOPES = {"greeting": "planning", "video_share": "video", "video_completion": "video", "qzone_comment": "qzone"}
 
 
@@ -76,14 +78,37 @@ def _has_later_input(items, key):
         if not isinstance(item, dict):
             continue
         call = item.get("tool_call")
-        if isinstance(call, dict) and call.get("func_name") in ("stop", "wait"):
+        if isinstance(call, dict) and call.get("func_name") in (*_DEBUG_END_TOOLS, DEBUG_CARD_TOOL):
             return True
         if key == "messages":
             for call in item.get("tool_calls") or []:
                 func = call.get("function") if isinstance(call, dict) else None
-                if isinstance(func, dict) and func.get("name") in ("stop", "wait"):
+                if isinstance(func, dict) and func.get("name") in (*_DEBUG_END_TOOLS, DEBUG_CARD_TOOL):
                     return True
     return False
+
+
+def _tool_name(definition):
+    if not isinstance(definition, dict):
+        return ""
+    nested = definition.get("function")
+    return str((nested.get("name") if isinstance(nested, dict) else None) or definition.get("name") or "")
+
+
+def _hide_debug_ticket(item, key):
+    def strip(text):
+        return "\n".join(line for line in text.splitlines() if not line.startswith(_TASK_META_PREFIX))
+
+    if key == "messages":
+        content = item.get("content")
+        if isinstance(content, list):
+            return {**item, "content": [strip(part) if isinstance(part, str) else part for part in content]}
+        return {**item, "content": strip(content)}
+    return {**item, "parts": [
+        {**part, "text": strip(part["text"])}
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+        else part for part in item.get("parts", [])
+    ]}
 
 
 def _canonical_text(value):
@@ -175,6 +200,14 @@ class ProactiveUsage:
             turn = self._resolve(stream, task_id, metadata)
             active = not _has_later_input(payload[index + 1:], key)
             category = (turn or {}).get("category") or metadata.get("lbm_proactive_kind")
+            if metadata.get("lbm_card_debug") is True or (turn or {}).get("kind") == DEBUG_PLANNER_KIND:
+                proof = metadata.get("lbm_card_ticket")
+                if (not active or (turn or {}).get("kind") != DEBUG_PLANNER_KIND
+                        or not isinstance(proof, str) or not proof):
+                    visible[index] = None
+                    continue
+                visible[index] = _hide_debug_ticket(item, key)
+                turn = {**turn, "debug_card_ticket": proof}
             if category == "greeting":
                 scope = metadata.get("greeting_scope")
                 if turn:
@@ -192,24 +225,31 @@ class ProactiveUsage:
             if active and turn is not None and turn.get("tracked") is True:
                 identified = turn
         definitions = kwargs.get("tool_definitions")
+        debug = bool(identified and identified.get("kind") == DEBUG_PLANNER_KIND)
+        modified = {}
         if isinstance(definitions, list):
-            names = {str(tool.get("function", {}).get("name") or tool.get("name") or "")
-                     for tool in definitions if isinstance(tool, dict) and isinstance(tool.get("function", {}), dict)}
-            if not names.intersection(("reply", "wait", HOST_USAGE_TOOL)):
+            names = {_tool_name(tool) for tool in definitions}
+            if not names.intersection(("reply", "wait", HOST_USAGE_TOOL, DEBUG_CARD_TOOL)):
                 identified = None  # A host sub-agent may use the same prompt hooks.
+            if debug:
+                filtered = [tool for tool in definitions if _tool_name(tool) in (*_DEBUG_END_TOOLS, DEBUG_CARD_TOOL)]
+            else:
+                filtered = [tool for tool in definitions if _tool_name(tool) != DEBUG_CARD_TOOL]
+            if filtered != definitions:
+                modified["tool_definitions"] = filtered
         planner_key = self._planner_key(kwargs)
         old = self._planner.get(planner_key)
         claim = (PlannerClaim(self._clock(), identified, uuid.uuid4().hex) if identified else None)
-        # The host has no request ID on planner.before. Equal selection keys can
-        # overlap during cancellation/sub-agents, so omit attribution on ambiguity.
+        # An overlapping request cannot inherit a debug proof. An uncertain
+        # association also cannot reintroduce unrelated tools into a debug turn.
         if old is not None:
-            since, _, overlap = old
-            self._planner[planner_key] = (since, None, overlap + 1)
+            since, _, overlap, old_debug = old
+            self._planner[planner_key] = (since, None, overlap + 1, debug or old_debug)
         else:
-            self._planner[planner_key] = (self._clock(), claim, 1)
-        if any(item is None for item in visible):
-            return {**kwargs, key: [item for item in visible if item is not None]}
-        return kwargs
+            self._planner[planner_key] = (self._clock(), claim, 1, debug)
+        if visible != payload:
+            modified[key] = [item for item in visible if item is not None]
+        return {**kwargs, **modified} if modified else kwargs
 
     @staticmethod
     async def greeting_check(service, method, stream):
@@ -241,10 +281,11 @@ class ProactiveUsage:
         key = self._planner_key(kwargs)
         row = self._planner.get(key)
         claim = None
+        debug = False
         if row is not None:
-            since, claim, count = row
+            since, claim, count, debug = row
             if count > 1:
-                self._planner[key] = (since, None, count - 1)
+                self._planner[key] = (since, None, count - 1, debug)
             else:
                 self._planner.pop(key, None)
         if claim is not None and self._clock() - claim.at <= 300:
@@ -259,7 +300,31 @@ class ProactiveUsage:
                     return {**kwargs, "output_items": []} if output else kwargs
                 if not isinstance(output, list) and not kwargs.get("tool_calls") and kwargs.get("response"):
                     return {**kwargs, "response": ""}
+        if debug:
+            return self._debug_planner_output(kwargs, claim.turn.get("debug_card_ticket") if claim is not None else None)
         return self._rewrite_tool_calls(kwargs, stream, claim)
+
+    @staticmethod
+    def _debug_planner_output(kwargs, proof):
+        output = isinstance(kwargs.get("output_items"), list)
+        key, field = ("output_items", "tool_call") if output else ("tool_calls", "function")
+        selected = []
+        for item in kwargs.get(key) or []:
+            call = item.get(field) if isinstance(item, dict) else None
+            if not isinstance(call, dict):
+                continue
+            name = call.get("func_name" if output else "name")
+            if name in _DEBUG_END_TOOLS:
+                selected = [item]
+                break
+            if name == DEBUG_CARD_TOOL and proof:
+                # Use the host-associated ticket, never a proposed model argument.
+                args = "args" if output else "arguments"
+                selected = [{**item, field: {**call, args: {"ticket": proof}}}]
+                break
+        if output:
+            return {**kwargs, key: selected}
+        return {**kwargs, key: selected, "response": ""}
 
     def _rewrite_tool_calls(self, kwargs, stream, claim):
         key = "output_items" if isinstance(kwargs.get("output_items"), list) else "tool_calls"

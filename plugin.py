@@ -2407,7 +2407,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     def _social_release(self, token: str) -> bool:
         return True if token=='exempt' else self._proactive_budget.release_reservation(token)
 
-    async def _send_social_ark(self, route: dict, ark: str, *, manual: bool = False) -> dict:
+    async def _send_social_ark(self, route: dict, ark: str, *, manual: bool = False, debug: bool = False) -> dict:
         holder='video-social:'+route['stream_id']
         if not manual:
             allowed,reason=self._social_preflight(route,budget_reserved=True)
@@ -2420,7 +2420,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 if self.config.video_share.mode!='自动分享':return False,'自动分享已关闭'
                 return self._social_preflight(route,budget_reserved=True,own_holder=holder)
             receipt=await self._video_card.send_ark(route,ark,before_send=final_gate)
-            if receipt.get('success') is True and route['stream_id']==str(getattr(self,'_stream_id','') or ''):
+            if not debug and receipt.get('success') is True and route['stream_id']==str(getattr(self,'_stream_id','') or ''):
                 spoke_at=self._surf_now()
                 try:
                     self._companion.affection.note_optional_spoke(spoke_at)

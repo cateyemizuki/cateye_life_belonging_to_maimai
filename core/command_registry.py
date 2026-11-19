@@ -264,8 +264,8 @@ COMMANDS: Tuple[Command, ...] = (
             "Video-share ops: debug a random watched video, inspect status or clear a receipt",
             "视频分享运维：随机发送近期观看的视频测试卡片 / 查看状态 / 清空回执",
             "cmd_ops_share",
-            args_en="[debug|status|clear <id> confirm]",
-            args_cn="[调试|状态|清空 <id> 确认]"),
+            args_en="[debug [planner]|status|clear <id> confirm]",
+            args_cn="[调试 [规划]|状态|清空 <id> 确认]"),
 )
 
 HELP_COMMAND = Command(
@@ -284,6 +284,7 @@ ARG_ALIASES: Dict[str, str] = {
     "状态": "status",
     "清空": "clear",
     "调试": "debug",
+    "规划": "planner",
     "重置": "reset",
     "情绪": "emotion",
     "事件": "events",

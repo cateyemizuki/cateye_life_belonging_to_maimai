@@ -9,6 +9,7 @@ _CATEGORIES = {
     "night_greeting": "greeting",
     "greeting": "greeting",
     "video_share": "video_share",
+    "video_share_debug": "video_share",
     "video_completion": "video_completion",
     "miss": "missing",
     "missing": "missing",

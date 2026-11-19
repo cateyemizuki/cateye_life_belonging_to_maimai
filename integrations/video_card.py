@@ -97,6 +97,21 @@ def _complete_bili_ark(card: Dict[str, Any], document_url: str) -> Dict[str, Any
     return completed
 
 
+def _adapter_delivery_unconfirmed(value: Any) -> bool:
+    """Recognize SnowLuma's explicit no-receipt state, including the host's error wrapper."""
+    if not isinstance(value, str):
+        return False
+    message = value.casefold()
+    return ("qq returned no message receipt" in message
+            or "group message delivery was not confirmed" in message
+            or "群消息投递未确认" in message)
+
+
+def _unconfirmed_adapter_receipt() -> Dict[str, Any]:
+    return {"success": False, "uncertain": True, "error_class": "adapter_delivery_unconfirmed",
+            "error": "QQ 未返回可核验的消息回执，投递结果待确认"}
+
+
 class VideoCardService:
     """B站卡片生成及已核验群/私聊路由；不拥有授权、额度或防重状态。"""
 
@@ -224,11 +239,16 @@ class VideoCardService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if _adapter_delivery_unconfirmed(str(exc)):
+                return _unconfirmed_adapter_receipt()
             return {"success": False, "uncertain": True, "error_class": "unknown",
                     "error": f"{action} 结果不确定：{type(exc).__name__}"}
         accepted=False;message_id=None;current=resp
         for _ in range(6):
             if not isinstance(current,dict):break
+            if any(_adapter_delivery_unconfirmed(current.get(field))
+                   for field in ("error", "wording", "message", "msg")):
+                return _unconfirmed_adapter_receipt()
             ret=current.get('retcode')
             if current.get('status')=='failed' or (type(ret) is int and ret!=0):
                 return {'success':False,'not_sent':True,'error_class':'send_rejected'}

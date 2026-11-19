@@ -91,5 +91,45 @@ class VideoCardConstructionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["params"]["message"][0]["data"]["data"], raw)
 
 
+    async def test_group_delivery_missing_receipt_stays_uncertain_for_adapter_envelopes(self):
+        message = ("group message delivery was not confirmed: QQ returned no message receipt; "
+                   "check the conversation before retrying")
+        for wrapped in (
+            {"success": False, "error": "对端动作返回失败: action=send_group_msg message=" + message},
+            {"status": "failed", "retcode": 1200, "wording": message},
+            {"success": True, "data": {"status": "failed", "retcode": 1200, "message": message}},
+            {"success": False, "error": "群消息投递未确认: action=send_group_msg message_id=20003"},
+        ):
+            with self.subTest(wrapped=wrapped):
+                api = AsyncMock(return_value=wrapped)
+                result = await VideoCardService(api).send_ark(
+                    {"kind": "group", "group_id": "10002"}, json.dumps(provider_card()),
+                )
+                self.assertFalse(result["success"])
+                self.assertTrue(result["uncertain"])
+                self.assertNotIn("not_sent", result)
+                self.assertNotIn("message_id", result)
+                self.assertEqual(result["error_class"], "adapter_delivery_unconfirmed")
+                self.assertIn("QQ 未返回", result["error"])
+                self.assertEqual(api.await_count, 1)
+
+    async def test_raised_adapter_confirmation_error_stays_uncertain(self):
+        api = AsyncMock(side_effect=RuntimeError(
+            "对端动作返回失败: action=send_group_msg message=QQ returned no message receipt"))
+        result = await VideoCardService(api).send_ark(
+            {"kind": "group", "group_id": "10002"}, json.dumps(provider_card()),
+        )
+        self.assertTrue(result["uncertain"])
+        self.assertEqual(result["error_class"], "adapter_delivery_unconfirmed")
+        self.assertEqual(api.await_count, 1)
+
+    async def test_explicit_rejection_is_still_distinct(self):
+        api = AsyncMock(return_value={"status": "failed", "retcode": 1200, "wording": "permission denied"})
+        result = await VideoCardService(api).send_ark(
+            {"kind": "group", "group_id": "10002"}, json.dumps(provider_card()),
+        )
+        self.assertEqual(result, {"success": False, "not_sent": True, "error_class": "send_rejected"})
+
+
 if __name__ == "__main__":
     unittest.main()

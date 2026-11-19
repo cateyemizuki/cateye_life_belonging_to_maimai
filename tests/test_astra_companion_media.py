@@ -149,12 +149,16 @@ async def forced_share_debug_replay_and_unknown(folder):
     assert pick.call_count == recent.call_count == social._send.await_count == 2
     assert social._prepare.await_args.kwargs["pic_url"] == "https://i0.hdslb.com/cover-a.jpg"
 
-    regular = await manual.share(stream, "ordinary", video=B)
-    assert regular["error_class"] == "stream_cooldown"
+    # A direct test acknowledgment is not a social sharing fact or cooldown.
+    assert ledger.recent_stream_receipt(stream, stamp[0]) is None
+    assert ledger.pair_receipt(A, stream, stamp[0], manual=True) is None
+    assert not ledger.context_facts(stream, stamp[0])
+    social._append.assert_not_awaited()
     pick.side_effect = lambda pool: pool[-1]
-    social._send.return_value = {"uncertain": True}
+    social._send.return_value = {"uncertain": True, "error_class": "adapter_delivery_unconfirmed"}
     unknown = await manual.share_debug(stream, "three", user_id=user)
     assert unknown["bvid"] == B and unknown["delivery_state"] == "uncertain"
+    assert "QQ 未返回送达回执" in unknown["content"]
     unknown_replay = await manual.share_debug(stream, "three", user_id=user)
     assert unknown_replay["duplicate"] and unknown_replay["delivery_state"] == "uncertain"
     assert (await manual.share_debug(stream, "four", user_id=user))["error_class"] == "pending_delivery"
@@ -167,6 +171,58 @@ async def forced_share_debug_replay_and_unknown(folder):
     assert [row["bvid"] for row in pick.call_args.args[0]] == [A]
     assert ledger.unresolved_videos(stream) == {B}
     social.evaluator.evaluate.assert_not_called()
+
+
+async def scoped_share_debug_planner_ticket(folder):
+    from integrations.video_share_evaluator import SHARE_JUDGMENT_RULES
+    from integrations.video_share_policy import DEBUG_PLANNER_KIND
+
+    ledger, social = fixtures(folder)
+    stamp = [NOW]
+    recent = [{"bvid": A, "title": "真实候选", "impression": "片段摘要",
+               "impression_provenance": "understood_content"}]
+    context = {"user_id": ROUTE["user_id"]}
+    stream = ROUTE["stream_id"]
+    trigger = AsyncMock(return_value={"success": True, "task_id": "host-plan-task"})
+    manual = ManualVideoShares(social, recent_provider=lambda: recent, clock=lambda: stamp[0],
+                               day=lambda: DAY, chooser=lambda rows: rows[0])
+
+    result = await manual.share_debug_planner(stream, "cmd-1", **context, trigger=trigger)
+    assert result["success"] and "已提交" in result["content"]
+    native = trigger.await_args.kwargs
+    assert native["kind"] == DEBUG_PLANNER_KIND and native["stream_id"] == stream
+    assert SHARE_JUDGMENT_RULES in native["intent"] and "片段摘要" in native["intent"]
+    proof = native["metadata"]["lbm_card_ticket"]
+    assert native["metadata"]["lbm_card_debug"] is True and proof not in result["content"]
+    assert (await manual.share_debug_planner(stream, "cmd-1", **context, trigger=trigger))["duplicate"]
+    trigger.assert_awaited_once()
+    social._send.assert_not_awaited()
+    assert not (await manual.share_debug_ticket("wrong-session", proof))["success"]
+
+    confirmation = await manual.share_debug_ticket(stream, proof)
+    assert confirmation["success"] and confirmation["debug_executed"] and confirmation["bvid"] == A
+    assert not (await manual.share_debug_ticket(stream, proof))["success"]
+    social._send.assert_awaited_once()
+    social._append.assert_not_awaited()
+    assert not ledger.context_facts(stream, stamp[0])
+
+    await manual.share_debug_planner(stream, "cmd-account", **context, trigger=trigger)
+    changed = trigger.await_args.kwargs["metadata"]["lbm_card_ticket"]
+    social.profiles.routes.return_value = [{**ROUTE, "account_id": "changed"}]
+    assert (await manual.share_debug_ticket(stream, changed))["error_class"] == "debug_route_mismatch"
+    social.profiles.routes.return_value = [ROUTE]
+    await manual.share_debug_planner(stream, "cmd-expire", **context, trigger=trigger)
+    expired = trigger.await_args.kwargs["metadata"]["lbm_card_ticket"]
+    stamp[0] += 181
+    assert not (await manual.share_debug_ticket(stream, expired))["success"]
+    assert social._send.await_count == 1
+
+    # A replay after reopening the ledger cannot recreate a declined/expired test.
+    social.ledger = ShareLedger(folder / "shares.sqlite")
+    reopened = ManualVideoShares(social, recent_provider=lambda: recent,
+                                 clock=lambda: stamp[0], day=lambda: DAY, chooser=lambda rows: rows[0])
+    assert (await reopened.share_debug_planner(stream, "cmd-expire", **context, trigger=trigger))["duplicate"]
+    assert trigger.await_count == 3
 
 
 async def profile_count(folder):
@@ -1191,7 +1247,7 @@ CASES = [
     "optional_weekly_summary_failure",
     "watch_terminal_equivalence",
     "qzone_policy_equivalence", "qzone_caption_uses_current_facts", "qzone_duplicate_checked_before_dispatch",
-    "share_limits", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "profile_count", "interrupted_eval", "cancel_cache",
+    "share_limits", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "scoped_share_debug_planner_ticket", "profile_count", "interrupted_eval", "cancel_cache",
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",
     "fallback_review", "candidate_overlap", "tiered_miss", "bound_legacy_upgrade",
