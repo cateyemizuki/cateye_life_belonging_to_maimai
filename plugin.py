@@ -67,7 +67,7 @@ from suite_config import (
 from core.diag import DecisionLogger, LLMCallLogger
 from core.life_experience_index import LifeExperienceIndex
 from integrations.proactive_delivery import ProactiveDelivery, install_proactive_budget
-from tools.proactive_turn import discard_turn, register_turn
+from integrations.planner_proactive import dispatch_proactive
 from tools.command_components import CommandRootComponentsMixin
 from core.llm_utils import LLMService, llm_task_name_of
 from emotion.components import EmotionComponentsMixin
@@ -92,7 +92,7 @@ from integrations.video_completion import CompletionOutbox
 # R2（结构审计批，2026-11-12）：阶段 4 说话轮编排与拼接助手归 integrations；
 # 组合根只注入依赖与回调（模块纯 stdlib，零业务包 import，不新增 integrations↔tools 边）。
 from integrations.video_share_stage4_turn import (
-    VideoShareStage4Turn, stage4_context_fields, stage4_reason_suffix)
+    VideoShareStage4Turn, stage4_context_fields)
 from suite_offline_settlement import OfflineSettlementService
 from qzone.cgi import QzoneCookieManager
 from qzone.components import QzoneComponentsMixin
@@ -252,6 +252,15 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         from companion.screen_tools import SCREEN_TOOL_NAME, screen_registration_stream
         from companion.screen_config import screen_config_of
         components = super().get_components()
+        # Runner sets this before collecting components. Older hosts reject unknown Hooks.
+        version_parts = _os.getenv("MAIBOT_HOST_VERSION", "").strip().lstrip("vV").split(".")[:2]
+        host_version = (tuple(int(part) for part in version_parts)
+                        if len(version_parts) == 2 and all(part.isdecimal() for part in version_parts)
+                        else None)
+        reply_hook_versions = {
+            "mai_prepare_proactive_delivery": (1, 2),
+            "mai_prepare_proactive_segments": (1, 4),
+        }
         try:
             harass_enabled = bool(self.config.admin.harass_report_enabled)
         except Exception:
@@ -278,6 +287,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
 
         def keep(info):
             name = info.get("name") if isinstance(info, dict) else getattr(info, "name", None)
+            minimum = reply_hook_versions.get(name)
+            if minimum is not None and host_version is not None and host_version < minimum:
+                return False
             if name == HARASS_TOOL_NAME and not harass_enabled:
                 return False
             if name == SCREEN_TOOL_NAME:
@@ -595,7 +607,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._optional_actions = OptionalActionCoordinator(
             data_dir, self._optional_action_facts,
             lambda: getattr(getattr(self, '_bus', None), 'budget', None),
-            self.ctx.maisaka.proactive.trigger)
+            lambda **kwargs: dispatch_proactive(self, **kwargs))
         from integrations.small_event_actions import SmallEventActions
         self._small_event_actions = SmallEventActions(self._db.update_episode_metadata, self.optional_action)
         # PR-A0：双路并列记录（聊天分享 + 空间候选），各自 try/except 隔离——
@@ -2428,9 +2440,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         """装配：阶段 4 说话轮编排惰性单例（R2 结构审计批；组合根只注入依赖与回调）。
 
         编排本体在 :class:`integrations.video_share_stage4_turn.VideoShareStage4Turn`；
-        所有端口调用期解析（register/discard/文案拼接经本模块符号转发，保留既有
-        补丁接缝）；进程内幂等集在编排实例内（有界 64，与旧 ``_stage4_video_notified``
-        同语义：重启后由 accepted 终态自然不重放）。
+        该场景使用公共 Planner 调度入口，分享台账负责卡片的幂等。
         """
         turn = getattr(self, '_video_stage4_turn_obj', None)
         if turn is None:
@@ -2440,9 +2450,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 preflight=self._social_preflight,
                 stage4_context=self._stage4_context,
                 last_card_spoke_at=lambda: getattr(self, '_last_social_card_spoke_at', None),
-                trigger=lambda **kw: self.ctx.maisaka.proactive.trigger(**kw),
-                register=lambda *a, **kw: register_turn(self, *a, **kw),
-                discard=lambda turn_id: discard_turn(self, turn_id),
+                trigger=lambda **kwargs: dispatch_proactive(self, **kwargs),
                 append_prompt=lambda *a, **kw: append_stage4_miss_prompt(*a, **kw),
                 logger=lambda: self.ctx.logger)
             self._video_stage4_turn_obj = turn
@@ -2678,29 +2686,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         if stage == 4:
             intent = append_stage4_miss_prompt(
                 intent, hours=stage_hours, relation=stage_relation, is_video=True)
-        # PR-RELIABILITY（3.17.17 §1A）：登记前置到 trigger 调用前（宿主可能先构建
-        # replyer）；点播完成通知直接经宿主 trigger 激活 planner（全仓 grep 核定的
-        # 第三处宿主调用点）→ 统一登记 video_share；失败/异常 → discard 撤登记。
-        if stage == 4:
-            try:
-                turn_id = register_turn(self, stream_id, "video_share",
-                                        "video_watch_completion", miss_stage=4)
-            except TypeError:
-                # 登记簿尚未扩展 miss_stage 参数时保持旧登记（行为降级不中断通知）。
-                turn_id = register_turn(self, stream_id, "video_share",
-                                        "video_watch_completion")
-        else:
-            turn_id = register_turn(self, stream_id, "video_share", "video_watch_completion")
-        try:
-            reply = await self.ctx.maisaka.proactive.trigger(
-                stream_id=stream_id, intent=intent, reason="video_watch_completion",
-                metadata={"task_id": task_id, "delivery_kind": "requested_tool_result"})
-        except Exception:
-            discard_turn(self, turn_id)
-            raise
-        if not ((isinstance(reply, dict) and reply.get("success") is True) or reply is True):
-            discard_turn(self, turn_id)
-        return reply
+        return await dispatch_proactive(
+            self, stream_id=stream_id, kind="video_completion", key=task_id,
+            intent=intent, reason="video_watch_completion", miss_stage=stage,
+            metadata={"task_id": task_id, "delivery_kind": "requested_tool_result"},
+        )
 
     def _video_completion_sleep_gate(self) -> bool:
         """点播完成通知的睡眠闸：与 ``_autonomous_context`` 的睡眠口径同源。
@@ -2791,45 +2781,14 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             'relation': str(stage_context.get('relation') or '恋人'),
         }
 
-    async def optional_action(self, key: str, intent: str, reason: str, *, before: Any = None) -> dict:
+    async def optional_action(self, key: str, intent: str, reason: str, *,
+                              before: Any = None, miss_stage: int | None = None) -> dict:
         coordinator = getattr(self, '_optional_actions', None)
         if coordinator is None:
             return {'status': 'blocked', 'reason': 'not_assembled'}
-        # 2026-11-11 阶段 4（设计方案 §3.3 第 4 条）：发往陪伴目标私聊的每日主动任务
-        # 在装配根统一拼接深层想念尾缀（视频类用视频版）；非阶段 4 不调用拼接，
-        # reason 逐字不变。登记侧把 miss_stage=4 一并透传给 replyer 改写链。
-        try:
-            context = self._stage4_context()
-        except Exception:
-            context = {}
-        # R2（结构审计批）：阶段 4 拼接算法下沉 integrations/video_share_stage4_turn
-        # （标题标记幂等：调用方已拼过尾缀时不重复追加；视频类用视频版；非阶段 4
-        # reason 逐字不变——协调器侧同样按标题标记判重）。
-        reason, stage, stage_hours, stage_relation = stage4_reason_suffix(
-            reason, intent, context, append_prompt=append_stage4_miss_prompt)
-        # PR-RELIABILITY（3.17.17 §1A）：登记前置到 dispatch 前——刷QQ随口联系
-        # （SmallEventActions → optional_contact）不经过 patrol._trigger_planner，
-        # 在装配根统一登记 surf_chitchat；patrol 的 missing/patrol_chat 已由 patrol
-        # 侧登记，不重复。非 enqueued → discard 撤登记（不确定交付态不保留登记，
-        # 防重复改写；optional_action 回执的 unknown 防重复策略不受影响）。
-        turn_id = None
-        if str(intent) == 'optional_contact':
-            if stage == 4:
-                try:
-                    turn_id = register_turn(self, getattr(self, '_stream_id', ''),
-                                            'surf_chitchat', reason, miss_stage=4)
-                except TypeError:
-                    turn_id = register_turn(self, getattr(self, '_stream_id', ''),
-                                            'surf_chitchat', reason)
-            else:
-                turn_id = register_turn(self, getattr(self, '_stream_id', ''),
-                                        'surf_chitchat', reason)
-        result = await coordinator.dispatch(key, intent, reason, before=before)
+        result = await coordinator.dispatch(key, intent, reason, before=before, miss_stage=miss_stage)
         if result.get('status') == 'enqueued':
-            # Share one collision timestamp with greetings and other optional channels.
             self._affection.note_optional_spoke(self._surf_now())
-        elif turn_id is not None:
-            discard_turn(self, turn_id)
         return result
 
     async def _initialize_companion_disposition(self, *, force: bool = False) -> dict:

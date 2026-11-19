@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """PR-PROACTIVE-GATE（3.17.14）：主动激活统一入口——登记 → 分类 → 定制 reply 改写文案。
 
-插件所有激活 planner 的主动行为都经 :func:`register_turn` 登记到 plugin 级
+插件主动激活 Planner 的行为通过统一入口登记到 plugin 级
 :class:`ProactiveTurnRegistry`（原子持久化，热重载可恢复），replyer 钩子
 （companion.components._mai_apply_proactive_reply_rewrite）消费登记并按
 **chat_type（群聊 / 其他私聊 / 陪伴目标私聊）× kind（发起原因）** 取
@@ -15,17 +15,9 @@ trigger（宿主可能在 trigger 返回前就构建 replyer），触发失败�
 
 宿主触发调用点全仓 grep 核定（2026-11-08，optional_action / proactive.trigger /
 trigger_proactive）：
-1. planning/proactive_service._call_proactive_trigger —— 早安/晚安（_trigger_greeting）
-   与午安；kind=morning_greeting / night_greeting / noon_greeting。
-2. companion/patrol._trigger_planner → plugin.optional_action →
-   integrations/optional_action.OptionalActionCoordinator.dispatch（宿主 trigger 由
-   plugin.py 装配注入）；kind=miss / patrol_chat。
-3. plugin._notify_video_completion —— 点播完成通知直接 trigger；kind=video_share。
-4. qzone/service.poll_comments —— 空间新评论提醒直接 trigger；kind=other。
-另有 integrations/small_event_actions（刷QQ随口联系）经 plugin.optional_action 激活
-planner，不经过 patrol —— 在 plugin.optional_action 登记 kind=surf_chitchat。
-integrations/video_share_scheduler.VideoSocialService 的视频分享**直发卡片**
-（self._send），不激活 planner → 不登记（规格 §1B：仅直接发消息的路径不登记）。
+现由 integrations.planner_proactive.dispatch_proactive 统一登记并调用宿主。
+发起原因保留具体的早/午/晚时段与场景，同一会话按类别及业务键分别去重。
+视频分享直发卡片仍由分享台账管理；卡片后的 Planner 回合登记为视频分享。
 
 红线：本模块只登记事实与提供文案，不触碰预算/静默/好感门控，不调用
 increment_speak，不发送任何消息；registry 缺失/异常一律静默降级，触发行为本身
@@ -43,6 +35,7 @@ from typing import Any, Callable, Optional
 
 from core.storage import save_json_atomic
 from integrations.proactive_reply_target import PROACTIVE_REPLY_NOTICE
+from integrations.planner_proactive import proactive_category
 # 阶段 4 文案/清洗规则单一 owner = suite_prompts（提示词集中模块；companion
 # .miss_trigger / planning.proactive_service / integrations.optional_action 也转发
 # 同一份实现）。避免 tools 依赖 companion 包造成的循环导入，也避免两份表漂移
@@ -72,11 +65,14 @@ KIND_NIGHT_GREETING = "night_greeting"
 KIND_MISS = "miss"
 KIND_PATROL_CHAT = "patrol_chat"
 KIND_VIDEO_SHARE = "video_share"
+KIND_VIDEO_COMPLETION = "video_completion"
+KIND_QZONE_COMMENT = "qzone_comment"
 KIND_SURF_CHITCHAT = "surf_chitchat"
 KIND_OTHER = "other"
 TRIGGER_KINDS = (
     KIND_MORNING_GREETING, KIND_NOON_GREETING, KIND_NIGHT_GREETING,
-    KIND_MISS, KIND_PATROL_CHAT, KIND_VIDEO_SHARE, KIND_SURF_CHITCHAT, KIND_OTHER,
+    KIND_MISS, KIND_PATROL_CHAT, KIND_VIDEO_SHARE, KIND_VIDEO_COMPLETION,
+    KIND_SURF_CHITCHAT, KIND_QZONE_COMMENT, KIND_OTHER,
 )
 
 # ---- 提示词矩阵（确定性常量表；缺省按 chat_type 兜底） ----
@@ -95,16 +91,18 @@ PRIVATE_TARGET_FALLBACK_NOTICE = PROACTIVE_REPLY_NOTICE
 #: group / private_other 不细分 kind，统一走各自兜底。
 REWRITE_MATRIX: dict[tuple[str, str], str] = {
     (CHAT_TYPE_PRIVATE_TARGET, KIND_MORNING_GREETING):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。现在是早上，这次是主动向对方问早安，语气自然不机械",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。参考本轮提供的实际时间，自然表达问候",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_NOON_GREETING):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。现在是中午，这次是主动向对方问午安，语气自然不机械",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。参考本轮提供的实际时间，自然表达问候",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_NIGHT_GREETING):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。现在是晚上，这次是主动向对方道晚安，语气自然不机械",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。参考本轮提供的实际时间，自然表达问候",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_MISS):
         PRIVATE_TARGET_FALLBACK_NOTICE + "。这次是因为你想对方了主动开口；"
         "顺着你已经定下的方向自然说，不必刻意强调想念",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_VIDEO_SHARE):
         PRIVATE_TARGET_FALLBACK_NOTICE + "。刚看完视频想分享，自然地聊聊视频里的内容",
+    (CHAT_TYPE_PRIVATE_TARGET, KIND_VIDEO_COMPLETION):
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。按本轮点播的结果自然交流",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_SURF_CHITCHAT):
         PRIVATE_TARGET_FALLBACK_NOTICE + "。刷QQ看到有意思的想闲聊，轻松地搭句话",
 }
@@ -211,8 +209,7 @@ def rewrite_notice_for(chat_type: Any, kind: Any, *, miss_stage: int = 0) -> str
     """(chat_type, kind, miss_stage) → 改写文案；未登记组合按 chat_type 兜底。
 
     - ``CHAT_TYPE_PRIVATE_TARGET`` + ``KIND_MISS``：阶段 1/2/3 各注入对应追问强度；
-    - ``CHAT_TYPE_PRIVATE_TARGET`` 任意 kind：阶段 4 强制覆盖（剥离“不追问/轻松
-      寒暄”限制，先日常后沉默追问）；
+    - 目标私聊的阶段 4 提示用于想念或其他非问候回合；问候保留自然表达；
     - 阶段 0 / 其他 chat_type：逐字沿用 :data:`REWRITE_MATRIX` 与三态兜底
       （群聊/其他私聊绝不因阶段号被染色）。
 
@@ -221,7 +218,7 @@ def rewrite_notice_for(chat_type: Any, kind: Any, *, miss_stage: int = 0) -> str
     ct = str(chat_type or "")
     stage = _normalize_miss_stage(miss_stage)
     if ct == CHAT_TYPE_PRIVATE_TARGET:
-        if stage == 4:
+        if stage == 4 and proactive_category(kind) != "greeting":
             return STAGE4_DAILY_OVERLAY_NOTICE
         if stage in _STAGE_MISS_NOTICES and str(kind or "") == KIND_MISS:
             return _STAGE_MISS_NOTICES[stage]
@@ -279,13 +276,13 @@ def classify_stream(plugin: Any, stream_id: Any) -> str:
 
 
 class ProactiveTurnRegistry:
-    """plugin 级主动激活登记簿（≤32 条、TTL 10 分钟、原子持久化、损坏降级空）。
+    """plugin 级主动激活登记簿（≤128 条、TTL 10 分钟、原子持久化、损坏降级空）。
 
     只记录事实（谁/哪条流/为什么主动开口），不做任何门控与计数；持久化失败仅
     丢热重载恢复能力，内存登记照常工作。所有时间戳为 time.time() 浮点秒。
     """
 
-    MAX_TURNS = 32
+    MAX_TURNS = 128
     TTL_SECONDS = 600.0
     FILE_NAME = "proactive_turns.json"
 
@@ -324,6 +321,7 @@ class ProactiveTurnRegistry:
                 # 阶段号宽松兼容：旧快照无 miss_stage / 非法值 → 0，绝不因新字段
                 # 让整簿降级为空（登记簿仍须为旧版本可用）。
                 row["miss_stage"] = _normalize_miss_stage(row.get("miss_stage", 0))
+                row["category"] = proactive_category(row["kind"])
                 valid.append(row)
             self._turns = valid
             self._prune()
@@ -347,7 +345,8 @@ class ProactiveTurnRegistry:
 
     # ---- 登记 / 查询 / 消费 ----
     def register(self, stream_id: Any, kind: Any, reason: Any, summary: str = "", *,
-                 miss_stage: int = 0) -> str:
+                 miss_stage: int = 0, key: str | None = None,
+                 optional_key: str = "", optional_intent: str = "") -> str | None:
         """登记一次主动激活；返回 turn_id。分类失败保守按 private_other。
 
         ``miss_stage``（kw-only，默认 0）：阶梯想念/四阶段渗透的阶段号（0~4），
@@ -365,17 +364,55 @@ class ProactiveTurnRegistry:
             "stream_id": sid,
             "chat_type": chat_type,
             "kind": str(kind or KIND_OTHER),
+            "category": proactive_category(kind),
             "reason": str(reason or ""),
             "summary": str(summary or ""),
             "miss_stage": _normalize_miss_stage(miss_stage),
             "created_at": float(self._clock()),
             "consumed": False,
         }
+        if key is not None:
+            turn.update(key=str(key)[:240], optional_key=str(optional_key)[:240],
+                        optional_intent=str(optional_intent), tracked=True)
         with self._lock:
+            self._prune()
+            if key is not None and any(
+                row.get("tracked") is True
+                and (row.get("stream_id"), row.get("category"), row.get("key"))
+                == (sid, turn["category"], turn["key"])
+                for row in self._turns
+            ):
+                return None
             self._turns.append(turn)
             self._prune()
             self._save()
         return turn_id
+
+    def bind_host_task(self, turn_id: str, host_task_id: Any) -> None:
+        """Attach the host enqueue receipt to an already registered turn."""
+        if not isinstance(host_task_id, str) or not host_task_id or len(host_task_id) > 200:
+            return
+        with self._lock:
+            for row in self._turns:
+                if row.get("turn_id") == turn_id:
+                    row["host_task_id"] = host_task_id
+                    self._save()
+                    return
+
+    def identified(self, stream_id: Any, *, turn_id: str = "",
+                   host_task_id: str = "") -> Optional[dict[str, Any]]:
+        """Return a live turn only when its exact reference and stream agree."""
+        sid = str(stream_id or "").strip()
+        if not sid or not (turn_id or host_task_id):
+            return None
+        now = self._clock()
+        with self._lock:
+            matches = [row for row in self._turns
+                       if row.get("stream_id") == sid
+                       and (not turn_id or row.get("turn_id") == turn_id)
+                       and (not host_task_id or row.get("host_task_id") == host_task_id)
+                       and 0 <= now - float(row.get("created_at", 0)) <= self.TTL_SECONDS]
+            return dict(matches[0]) if len(matches) == 1 else None
 
     def active_for(self, stream_id: Any, window_seconds: float = 120.0) -> Optional[dict[str, Any]]:
         """最新未消费且窗内的登记（返回副本）；无则 None。"""
@@ -413,7 +450,8 @@ class ProactiveTurnRegistry:
                     return True
         return False
 
-    def claim(self, stream_id: Any, window_seconds: float = 120.0) -> Optional[dict[str, Any]]:
+    def claim(self, stream_id: Any, window_seconds: float = 120.0, *,
+              turn_id: str = "") -> Optional[dict[str, Any]]:
         """原子领取（PR-RELIABILITY 3.17.17 §1A）：单锁内查最新未消费窗内记录
         并立即标记 consumed 返回副本——并发 replyer 只有一个能领取成功，
         消除 active_for()+consume() 两步各自加锁的双改写竞态。
@@ -430,6 +468,10 @@ class ProactiveTurnRegistry:
             for turn in reversed(self._turns):
                 if turn.get("stream_id") != sid or turn.get("consumed"):
                     continue
+                if turn_id and turn.get("turn_id") != turn_id:
+                    continue
+                if not turn_id and turn.get("tracked") is True:
+                    continue  # Typed turns require the exact marker, even on a busy stream.
                 age = now - float(turn.get("created_at", 0))
                 if 0 <= age <= float(window_seconds):
                     turn["consumed"] = True

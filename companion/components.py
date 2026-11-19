@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import os
 import random
 import threading
 import time
@@ -80,6 +81,7 @@ from companion.harass_report import (
 from companion.patrol import resolve_silence_window
 from .rolling_diag import render_rolling
 from integrations.video_share_diag import render_share
+from integrations.proactive_usage import HOST_USAGE_TOOL, ProactiveUsage, read_host_turn_usage
 from integrations.qzone_video_diag import render_qzone_video, qzone_video_diag_payload
 from .streams_diag import build_streams_records
 from core.diag import DecisionLogger
@@ -444,6 +446,13 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             self._proactive_turn_registry = registry
             return registry
 
+    def _mai_proactive_usage(self) -> ProactiveUsage:
+        tracker = getattr(self, "_proactive_usage_correlation", None)
+        if tracker is None:
+            tracker = ProactiveUsage(self)
+            self._proactive_usage_correlation = tracker
+        return tracker
+
     def _mai_proactive_turn_yields_to_incoming(self, turn: dict[str, Any],
                                                payload_key: str, payload: list[Any]) -> bool:
         """红线让位：上下文最后真实来信比登记时间更新 → 按真实来信轮处理（不改写）。
@@ -488,34 +497,120 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     @HookHandler(
         "maisaka.planner.before_request",
         name="mai_lover_proactive_reply_target",
-        description="为陪伴私聊的本插件主动任务指定上下文中用户最后来信的回复目标",
+        description="核对例行问候、标记本插件主动轮并为陪伴私聊保留自然回复策略",
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
-        timeout_ms=1000,
+        timeout_ms=2500,
         error_policy=ErrorPolicy.SKIP,
     )
     async def mai_hook_proactive_reply_target(self, **kwargs: Any) -> dict[str, Any]:
+        prepared = await self._mai_proactive_usage().planner_before(kwargs)
         modified = self._mai_reply_target_guard().before(
-            kwargs, stream_id=self._mai_reply_target_stream(),
+            prepared, stream_id=self._mai_reply_target_stream(),
             target_user=target_qq_of(self.config))
+        if modified is None and prepared is not kwargs:
+            modified = prepared
         return {"action": "continue", **({"modified_kwargs": modified} if modified is not None else {})}
 
     @HookHandler(
         "maisaka.planner.after_response",
         name="mai_lover_proactive_reply_target_rewrite",
-        description="深度处理：仅将本插件陪伴主动回合的reply目标改为本轮用户最后来信",
+        description="按已识别的主动轮登记 Planner 用量并为执行 Tool 传递当前会话凭证",
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
         timeout_ms=1000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def mai_hook_proactive_reply_target_rewrite(self, **kwargs: Any) -> dict[str, Any]:
-        modified, count = self._mai_reply_target_guard().after(
-            kwargs, stream_id=self._mai_reply_target_stream(),
-            target_user=target_qq_of(self.config))
-        if count:
-            self.ctx.logger.info("陪伴主动回复目标深度处理：已纠正%d个reply调用", count)
-        return {"action": "continue", **({"modified_kwargs": modified} if modified is not None else {})}
+        annotated = self._mai_proactive_usage().planner_after(kwargs)
+        return {"action": "continue", **({"modified_kwargs": annotated} if annotated is not kwargs else {})}
+
+    @HookHandler(
+        "maisaka.replyer.before_request",
+        name="mai_identify_replyer_proactive",
+        description="识别由本插件主动 Planner 发起的 Replyer 请求",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=2500,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def mai_hook_proactive_replyer_request(self, **kwargs: Any) -> dict[str, Any]:
+        tracking = self._mai_proactive_usage()
+        prepared = tracking.reply_before(kwargs)
+        turn = tracking.reply_turn(prepared)
+        if turn and turn.get("category") == "greeting":
+            service = getattr(getattr(self, "_planning", None), "proactive", None)
+            scope = turn.get("greeting_scope")
+            sid = str(prepared.get("session_id") or "")
+            method = ("group_morning_proactive_allowed" if scope == "group" and turn.get("kind") == "morning_greeting"
+                      else "target_greeting_proactive_allowed" if scope == "target" else "")
+            if method and not await tracking.greeting_check(service, method, sid):
+                return {"action": "abort", "custom_result": {"reason": "本次例行问候已不符合发起条件"}}
+        return {"action": "continue", **({"modified_kwargs": prepared} if prepared is not kwargs else {})}
+
+    @HookHandler(
+        "maisaka.reply.before_post_process",
+        name="mai_prepare_proactive_delivery",
+        description="识别将交付的主动消息",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def mai_hook_before_proactive_delivery(self, **kwargs: Any) -> dict[str, Any]:
+        self._mai_proactive_usage().before_post_process(kwargs)
+        return {"action": "continue"}
+
+    @HookHandler(
+        "maisaka.reply.after_split",
+        name="mai_prepare_proactive_segments",
+        description="记录主动回复的分段摘要以核验送出",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def mai_hook_prepare_proactive_segments(self, **kwargs: Any) -> dict[str, Any]:
+        self._mai_proactive_usage().after_split(kwargs)
+        return {"action": "continue"}
+
+    @HookHandler(
+        "send_service.after_send",
+        name="mai_acknowledge_proactive_send",
+        description="依宿主成功发送的回执确认本插件已识别的主动行为",
+        mode=HookMode.OBSERVE,
+        order=HookOrder.LATE,
+        timeout_ms=3000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def mai_hook_acknowledge_proactive_send(self, **kwargs: Any) -> None:
+        receipt = self._mai_proactive_usage().confirm_sent(kwargs)
+        if receipt is None:
+            return
+        turn, sent_at = receipt
+        stream = turn["stream_id"]
+        if turn.get("category") == "greeting" and turn.get("greeting_scope") == "target":
+            service = getattr(getattr(self, "_planning", None), "proactive", None)
+            record = getattr(service, "record_target_greeting_sent", None)
+            if callable(record):
+                record(stream, sent_at)
+            return
+        key, intent = turn.get("optional_key"), turn.get("optional_intent")
+        companion = self._mai_companion()
+        if not key or not intent or companion is None or stream != self._mai_target_stream_id():
+            return
+        confirmation = await self._mai_confirm_optional_reply(stream, key=key, intent=intent)
+        if confirmation.get("status") != "confirmed":
+            return
+        companion.affection.increment_speak(1.0)
+        patrol = companion.patrol
+        if intent == "missing":
+            patrol.mark_miss_spoken()
+        if patrol.get_last_trigger_intent() == intent:
+            patrol.clear_last_trigger_time()
+        self._mai_log_proactive_event(
+            action=_ACTION_SPOKEN, reason="delivery_confirmed", trigger_type=intent,
+        )
 
     @HookHandler(
         "chat.receive.before_process",
@@ -992,8 +1087,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if not payload_key or not isinstance(payload, list):
             return None
         registry = self._mai_proactive_turns()
-        turn = None
-        if registry is not None and session_id:
+        tagged = self._mai_proactive_usage().reply_turn(kwargs)
+        turn = tagged
+        if turn is None and registry is not None and session_id:
             try:
                 # PR-RELIABILITY（3.17.17 §1A）：原子领取——单锁内查+消费一步完成，
                 # 并发 replyer 只有一个能拿到同一登记（旧 active_for+consume 两步竞态）。
@@ -1005,15 +1101,15 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             if self._mai_proactive_turn_yields_to_incoming(turn, payload_key, payload):
                 # 红线：触发后真实来信更新的轮逐字不变。release 回滚本轮领取
                 # （claimant 标识防误恢复），登记保留给真正的主动轮。
-                try:
-                    registry.release(turn.get("turn_id"), turn.get("claimed_by"))
-                except Exception:
-                    self.ctx.logger.debug("主动激活登记让位回滚失败（忽略）", exc_info=True)
+                if tagged is None and registry is not None:
+                    try:
+                        registry.release(turn.get("turn_id"), turn.get("claimed_by"))
+                    except Exception:
+                        self.ctx.logger.debug("主动激活登记让位回滚失败（忽略）", exc_info=True)
                 return None
-            # P1-8：本 turn 已确认是主动轮；给 after_response 留进程内标记，
-            # 只用于确认预算/发言数，避免把确认窗内的被动回复误算到主动回合。
-            self._mai_proactive_reply_marker = {"stream": session_id,
-                                                "at": time.time()}
+            # 仅旧轮需要按时间窗关联。新轮经精确标记和发送回执确认。
+            if tagged is None:
+                self._mai_proactive_reply_marker = {"stream": session_id, "at": time.time()}
             # 四阶段渗透（2026-11-11）：阶段号随 turn 透传——阶段 1~3 强化独立
             # 想念文案，阶段 4 对任意目标私聊日常主动轮强制覆盖（先日常后追问）。
             try:
@@ -1044,6 +1140,11 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 f"主动激活轮（kind={turn.get('kind')} chat_type={turn.get('chat_type')}）："
                 "未匹配到宿主目标指令段，已保守追加定制文案作为尾随锚点")
             return {**kwargs, payload_key: appended}
+        # 已登记的新任务没有精确回复凭证时不借用旧时间窗。
+        if registry is not None and session_id:
+            pending = registry.active_for(session_id)
+            if pending is not None and pending.get("tracked") is True:
+                return None
         # ---- 3.17.2 旧路径 fallback（registry 未命中：未登记路径/旧快照降级）----
         stream = self._mai_reply_target_stream()
         if not stream or session_id != stream:
@@ -1071,7 +1172,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             "陪伴主动激活轮：未匹配到宿主目标指令段，已保守追加主动激活文案作为尾随锚点")
         return {**kwargs, payload_key: appended}
 
-    async def _mai_confirm_optional_reply(self, reply_stream: str) -> dict[str, Any]:
+    async def _mai_confirm_optional_reply(self, reply_stream: str, *, key=None, intent=None) -> dict[str, Any]:
         """P1-8：把目标流上的真实回复回报给可选主动回合回执（提交预算预留）。
 
         协调器缺失/未装配 → ``not_assembled``；异常静默降级为 ``error``，绝不让
@@ -1082,7 +1183,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if not callable(confirm):
             return {"status": "not_assembled"}
         try:
-            result = await confirm(reply_stream)
+            result = (await confirm(reply_stream, key=key, intent=intent)
+                      if key is not None and intent is not None else await confirm(reply_stream))
             return result if isinstance(result, dict) else {"status": "unknown"}
         except Exception:
             self.ctx.logger.warning("可选主动回合预算确认失败（忽略）", exc_info=True)
@@ -1123,6 +1225,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         挂在本钩子上而不是新增第二个 HookHandler，是为保持注册面 15 个 hook 不变
         （门禁按组件数钉死）；工具/系统出站消息不经过 replyer 钩子，天然不加延迟。
         """
+        typed_turn = self._mai_proactive_usage().reply_after(kwargs)
         _tracker = getattr(self, "_attention_tracker", None)
         if _tracker is not None:
             # 复核 P0-6：与 note_reply_start 同口径传真实流 id，保证配对清计数。
@@ -1136,7 +1239,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         companion = self._mai_companion()
         if companion is None:
             return
-        self._mai_chat_social_drain(kwargs, companion)
+        if typed_turn is None:
+            self._mai_chat_social_drain(kwargs, companion)
         # 复核 P1-5：陪伴目标私聊的被动回复也登记「已发言」——原实现只在主动回合
         # 刷 last_speak_time，致 user_initiated 的 prev_user>last_speak 恒真被判
         # already_answered（沉默后再开口永久漏计）。
@@ -1156,6 +1260,12 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         marker_ok = (isinstance(marker, dict)
                      and str(marker.get("stream") or "") == _reply_stream
                      and time.time() - float(marker.get("at") or 0.0) <= 300.0)
+        if typed_turn is not None:
+            if _reply_stream and _reply_stream == _target_stream:
+                note = getattr(companion.affection, "note_bot_replied", None)
+                if callable(note):
+                    note(datetime.now())
+            return  # 成功发送由类型化回执确认，不消费其他行为的待确认条目。
         if marker_ok:
             self._mai_proactive_reply_marker = None
         confirmation: dict[str, Any] = {"status": "not_target"}
@@ -1732,6 +1842,33 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     # ==================================================================
     # Tools
     # ==================================================================
+
+    @Tool(
+        HOST_USAGE_TOOL,
+        description="读取本聊天的宿主 Planner 和 Replyer Token 账单。可按环节、最近分钟数或账单编号读取。",
+        parameters={
+            "stage": {"type": "string", "description": "planner、replyer 或 both"},
+            "minutes": {"type": "integer", "description": "查最近多少分钟，1–1440，默认 60"},
+            "limit": {"type": "integer", "description": "每个环节最多返回几条，1–20，默认 10"},
+            "record_id": {"type": "integer", "description": "可选的宿主账单编号"},
+            "scope_proof": {"type": "string", "description": "由当前 Planner 的宿主钩子填入"},
+        },
+    )
+    async def mai_tool_host_turn_usage(self, stage: str = "both", minutes: int = 60,
+                                       limit: int = 10, record_id: Optional[int] = None,
+                                       scope_proof: str = "", **kwargs: Any) -> dict[str, Any]:
+        stream = self._mai_proactive_usage().tool_stream(scope_proof)
+        if not stream:
+            return {"success": False, "error": "无法核验本次查询所在的会话。"}
+        version = os.getenv("MAIBOT_HOST_VERSION", "").lstrip("v").split(".")
+        if len(version) >= 2 and all(item.isdigit() for item in version[:2]):
+            if tuple(int(item) for item in version[:2]) < (1, 2):
+                return {"success": False, "error": "当前宿主版本未提供按会话查询的用量记录。"}
+        reader = getattr(getattr(self.ctx, "database", None), "get", None)
+        result = await read_host_turn_usage(reader, stream, stage, minutes, limit, record_id)
+        if result is None:
+            return {"success": False, "error": "宿主用量查询未完成，请核对查询参数和宿主支持情况。"}
+        return {"success": True, "content": _json.dumps(result, ensure_ascii=False)}
 
     @Tool(
         "lbm_mai_lover_affection",

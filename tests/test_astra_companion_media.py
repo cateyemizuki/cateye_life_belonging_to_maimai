@@ -647,6 +647,79 @@ async def video_share_checks_latest_exchange(folder):
     social._send.assert_not_awaited()
 
 
+async def typed_proactive_dispatch(folder):
+    from tools.proactive_turn import ProactiveTurnRegistry, rewrite_notice_for
+    from integrations.planner_proactive import dispatch_proactive
+
+    plugin = NS(_stream_id="private-a")
+    registry = ProactiveTurnRegistry(plugin, folder)
+    plugin._mai_proactive_turns = lambda: registry
+    seen = []
+
+    async def host(**kwargs):
+        meta = kwargs["metadata"]
+        entry = registry.identified(kwargs["stream_id"], turn_id=meta["lbm_turn_id"])
+        assert entry["category"] == meta["lbm_proactive_kind"]
+        assert registry.identified("different-chat", turn_id=meta["lbm_turn_id"]) is None
+        assert registry.claim(kwargs["stream_id"]) is None
+        seen.append(entry)
+        return {"success": True, "queued": True, "task_id": f"host-{len(seen)}"}
+
+    async def enqueue(kind, stream="private-a", key="same-business-key", trigger=host):
+        return await dispatch_proactive(plugin, stream_id=stream, kind=kind, key=key,
+                                        intent="test", reason="test", trigger=trigger, miss_stage=4)
+
+    result = await enqueue("morning_greeting")
+    assert result["success"] and registry.identified("private-a", host_task_id="host-1") == {
+        **seen[0], "host_task_id": "host-1"
+    }
+    assert (await enqueue("noon_greeting"))["duplicate"]
+    assert (await enqueue("noon_greeting", key="different-period"))["success"]
+    assert (await enqueue("morning_greeting", stream="another-chat"))["success"]
+    assert (await enqueue("miss"))["success"]
+    assert (await enqueue("video_share"))["success"]
+    assert (await enqueue("surf_chitchat"))["success"]
+    assert len(seen) == 6
+    assert [row["category"] for row in seen] == ["greeting", "greeting", "greeting", "missing", "video_share", "browse_qq"]
+    assert registry.claim("private-a", turn_id=result["lbm_turn_id"])["kind"] == "morning_greeting"
+    assert registry.claim("private-a", turn_id=result["lbm_turn_id"]) is None
+    assert "实际时间" in rewrite_notice_for("private_target", "morning_greeting", miss_stage=4)
+
+    rejected = AsyncMock(return_value={"success": False})
+    assert not (await enqueue("video_completion", trigger=rejected))["success"]
+    assert (await enqueue("video_completion"))["success"]
+
+    failed = AsyncMock(side_effect=TimeoutError("lost acknowledgement"))
+    try:
+        await enqueue("qzone_comment", trigger=failed)
+        raise AssertionError("ambiguous transport result must not report acceptance")
+    except TimeoutError:
+        pass
+    # A restart does not forget a potentially accepted enqueue.
+    registry = ProactiveTurnRegistry(plugin, folder)
+    assert (await enqueue("qzone_comment"))["duplicate"]
+    assert len(seen) == 7
+
+
+async def optional_actions_confirm_only_own_category(folder):
+    from integrations.optional_action import OptionalActionCoordinator
+
+    facts = lambda: {"enabled": True, "target_stream": "private-a", "coverage": "ok", "budget_remaining": 3}
+    reserved = iter(("miss-budget", "browse-budget"))
+    budget = NS(reserve=lambda *_: next(reserved),
+                release_reservation=Mock(return_value=True), commit_reservation=Mock(return_value=True))
+    trigger = AsyncMock(return_value={"success": True})
+    coordinator = OptionalActionCoordinator(folder, facts, lambda: budget, trigger)
+    assert (await coordinator.dispatch("same-key", "missing", "test"))["status"] == "enqueued"
+    assert (await coordinator.dispatch("same-key", "optional_contact", "test"))["status"] == "enqueued"
+    assert (await coordinator.confirm_reply("private-a"))["status"] == "no_pending"
+    assert (await coordinator.confirm_reply("private-a", key="same-key", intent="optional_contact"))["intent"] == "optional_contact"
+    budget.commit_reservation.assert_called_once_with("browse-budget")
+    assert (await coordinator.confirm_reply("private-a", key="same-key", intent="optional_contact"))["status"] == "no_pending"
+    assert (await coordinator.confirm_reply("private-a", key="same-key", intent="missing"))["intent"] == "missing"
+    assert [row.kwargs["kind"] for row in trigger.await_args_list] == ["miss", "surf_chitchat"]
+
+
 async def tiered_miss(folder):
     from companion.initiative_profile import InitiativeMemory
     from integrations.optional_action import OptionalActionCoordinator
@@ -683,11 +756,11 @@ async def tiered_miss(folder):
     patrol._discard_screen_narration=lambda:None
     patrol._log_decision=lambda **kw:None
     with patch("companion.patrol.datetime",Clock),patch("companion.patrol.random.random",return_value=0),\
-         patch("companion.patrol.register_turn",return_value="turn"),patch("companion.patrol.discard_turn"),\
          patch("integrations.optional_action.time.time",side_effect=lambda:epoch[0]):
         await patrol._tick()
         assert patrol._last_trigger_status == "enqueued"
-        await coordinator.confirm_reply("private-test")
+        turn_key = trigger.call_args.kwargs["optional_key"]
+        await coordinator.confirm_reply("private-test", key=turn_key, intent="missing")
         assert patrol.mark_miss_spoken()
         epoch[0]=anchor+30*3600
         await patrol._tick()
@@ -1078,6 +1151,7 @@ CASES = [
     "fallback_review", "candidate_overlap", "tiered_miss", "bound_legacy_upgrade",
     "video_companion_preferences_by_identity", "video_weighted_companion_mix", "video_share_checks_latest_exchange",
     "dashboard_manual_video_interests",
+    "typed_proactive_dispatch", "optional_actions_confirm_only_own_category",
     "contested_legacy_preserved", "late_review_ownership", "fallback_recovery_once",
     "previous_successful_cache", "detached_and_cross_midnight", "quota_reconciliation",
     "retired_watch_guards", "write_fallback_only_when_unsent",

@@ -895,6 +895,18 @@ async def case_component_metadata_before_context(root):
     with patch.object(CateyeSuitePlugin, "ctx", property(context), create=True):
         plugin = create_plugin()
         assert SCREEN_TOOL_NAME not in names(plugin)
+        for version, supports_preprocess, supports_split in (
+            ("1.0.0", False, False),
+            ("1.2.0", True, False),
+            ("v1.3.19", True, False),
+            ("v1.4.0", True, True),
+            ("1.4.6", True, True),
+        ):
+            with patch.dict(os.environ, {"MAIBOT_HOST_VERSION": version}):
+                registered = names(plugin)
+                assert ("mai_prepare_proactive_delivery" in registered) is supports_preprocess
+                assert ("mai_prepare_proactive_segments" in registered) is supports_split
+                assert "mai_acknowledge_proactive_send" in registered
         plugin.config = CateyeSuiteConfig()
         plugin.config.screen.tool_enabled = True
         assert SCREEN_TOOL_NAME not in names(plugin)

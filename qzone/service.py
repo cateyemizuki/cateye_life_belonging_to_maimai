@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.diag import DecisionLogger
 from core.llm_utils import LLMService, purpose_task
-from tools.proactive_turn import discard_turn, register_turn
+from integrations.planner_proactive import dispatch_proactive
 from suite_prompts import QZONE_POST_DEFAULT, QZONE_REPLY_DEFAULT
 from suite_prompts import (
     QZONE_COMMENT_REMINDER_DEFAULT,
@@ -1080,27 +1080,11 @@ class QzoneService:
                 # M11（附录 II §3.3）：空间侧评论提醒**不计入**主动打扰预算——不再查闸门、
                 # 不再发预算记账事件；空间侧约束仍是既有 qzone.daily_max_posts/reply_number，
                 # 预算耗尽也不得拦掉本条提醒。
-                turn_id = None
                 try:
-                    # PR-RELIABILITY（3.17.17 §1A）：登记前置到 trigger 调用前——
-                    # 空间评论提醒直接经宿主 trigger 激活 planner（全仓 grep 核定的
-                    # 第四处宿主调用点）→ 统一登记 other（目标私聊兜底文案）；
-                    # 免预算口径不变，登记不计数；失败/异常 → discard 撤登记。
-                    turn_id = register_turn(self._plugin, self._target_stream_id, "other",
-                                  f"qzone_comment:{tid[:12]}")
-                    reply = await self._ctx.maisaka.proactive.trigger(
-                        stream_id=self._target_stream_id,
-                        intent="qzone_comment",
-                        reason=render(
-                            prompt_of(self._plugin, "qzone_comment_reminder"),
-                            fallback=QZONE_COMMENT_REMINDER_DEFAULT,
-                            excerpt=excerpt, added=added,
-                        ),
-                    )
-                    if not ((isinstance(reply, dict) and reply.get("success") is True) or reply is True):
-                        discard_turn(self._plugin, turn_id)
+                    reply = await self._trigger_comment_notification(tid, added, excerpt, moment)
+                    if reply.get("success") is not True:
+                        continue
                 except Exception as exc:
-                    discard_turn(self._plugin, turn_id)
                     # PR-RELIABILITY（3.17.17 §1E）：异常留痕替代静默吞——节流
                     # warning（同 tid 60s 内不重复），只记 tid 前缀+异常类名，
                     # 不记隐私正文；提醒失败不阻断基线轮询（降级 resilient 不变）。
@@ -1113,9 +1097,22 @@ class QzoneService:
                             self._comment_trigger_warn_at.pop(oldest, None)
                         logger.warning("空间评论提醒触发异常 tid=%s…: %s",
                                        tid[:12], type(exc).__name__)
+                    continue
                 self._log("trigger", trigger_type="qzone_comment",
                           reason=f"说说 {tid[:12]}… 新增 {added} 条评论（共 {total_new}）")
         return new_comments
+
+    async def _trigger_comment_notification(self, tid: str, added: int, excerpt: str,
+                                            moment: dict) -> dict:
+        return await dispatch_proactive(
+            self._plugin, stream_id=self._target_stream_id, kind="qzone_comment",
+            key=f"{tid}:{moment.get('comment_num', 0)}", intent="提醒自己的空间收到新评论",
+            reason=render(
+                prompt_of(self._plugin, "qzone_comment_reminder"),
+                fallback=QZONE_COMMENT_REMINDER_DEFAULT, excerpt=excerpt, added=added,
+            ),
+            trigger=self._ctx.maisaka.proactive.trigger,
+        )
 
     async def _try_auto_reply(self, moment: Dict[str, Any]) -> None:
         """动作通道返回里带评论列表时的向前兼容回评路径（v1.12.10 不会进入）。

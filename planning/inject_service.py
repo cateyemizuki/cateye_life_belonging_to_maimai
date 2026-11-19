@@ -134,7 +134,7 @@ _INJECT_PROACTIVE_SHARE_REPLYER = (
     "（本轮是{bot_name}主动开口的回合：{bot_name}可以自然说出本轮想分享/想说的内容；"
     "上面的『不要主动提及』只约束日程背景，不限制本轮主动动机。）"
 )
-_PROACTIVE_SHARE_KINDS = frozenset({"video_share", "surf_chitchat"})
+_PROACTIVE_SHARE_KINDS = frozenset({"video_share", "video_completion", "surf_chitchat"})
 _EXPERIENCE_SHARE_MARKER = "最近经历参考（可选话题）"
 
 
@@ -206,6 +206,7 @@ class InjectService:
         # 普通 maisaka_chat 模式恒用「请你进行分析…」，passive 模式用「需要信息
         # 或操作时调用工具…」；旧正则只覆盖 focus 模式，致意图分类 100% 误判。
         re.compile(r"^请你进行分析[，,]"),
+        re.compile(r"^请分析后决定下一步[：:]\s*用工具收集或处理信息"),
         re.compile(r"^需要信息或操作时调用工具"),
         # replyer 通道尾指令（cateye_better_post-processing 默认改写文案）
         re.compile(r"^像平常在群里接一句话"),
@@ -927,12 +928,32 @@ class InjectService:
 
     @classmethod
     def _is_structured_system_task(cls, text: str) -> bool:
-        """宿主/插件系统任务块（task 标签）不是真实用户输入。
-
-        只认显式标签；旧正则尾指令过滤属「宿主字段缺失时的回退」，由调用方在
-        :meth:`_structured_self_state` 返回 ``None`` 后才启用。
-        """
+        """Identify host/plugin task wrappers independently of sender flags."""
         return bool(_STRUCTURED_SYSTEM_TASK_PATTERN.match(text or ""))
+
+    @classmethod
+    def _real_user_text(cls, msg: Dict[str, Any], candidates: List[str]) -> str:
+        if not candidates:
+            return ""
+        head = candidates[0].strip()
+        if cls._is_structured_system_task(head) or cls._structured_self_state(msg, head) is True:
+            return ""
+        attrs = cls._parse_message_attrs(head)
+        wrapped = bool(attrs.get("user") and attrs.get("msg_id"))
+        for candidate in candidates:
+            text = candidate.strip()
+            body = cls._strip_planner_prefix(text).strip()
+            if not body:
+                continue
+            # Real wrapped user messages can quote host wording, and the
+            # prefix can live in its own text part before an image or voice.
+            if wrapped:
+                return body
+            if (cls._is_structured_system_task(text) or cls._is_metadata_user_message(text)
+                    or cls._is_metadata_user_message(body) or cls._SELF_MESSAGE_PREFIX_PATTERN.match(text)):
+                continue
+            return body
+        return ""
 
     @staticmethod
     def _message_timestamp_date(msg: Dict[str, Any], text: str) -> Optional[str]:
@@ -988,23 +1009,10 @@ class InjectService:
         for msg in reversed(messages):
             if not isinstance(msg, dict) or cls._message_role(msg) != "user":
                 continue
-            for candidate in cls._message_text_candidates(msg):
-                text = candidate.strip()
-                if not text or cls._is_structured_system_task(text):
-                    continue
-                self_state = cls._structured_self_state(msg, text)
-                if self_state is True:
-                    continue
-                if self_state is None:
-                    # 宿主字段缺失 → 回退旧正则/自身发言前缀过滤
-                    if cls._is_metadata_user_message(text):
-                        continue
-                    if cls._SELF_MESSAGE_PREFIX_PATTERN.match(text):
-                        continue
+            candidates = cls._message_text_candidates(msg)
+            if cls._real_user_text(msg, candidates):
                 has_real = True
-                latest_date = cls._message_timestamp_date(msg, text)
-                break
-            if has_real:
+                latest_date = cls._message_timestamp_date(msg, candidates[0])
                 break
         if latest_date is not None:
             return latest_date >= today
@@ -1014,44 +1022,17 @@ class InjectService:
 
     @classmethod
     def _extract_last_user_text(cls, messages: List[Dict[str, Any]]) -> str:
-        """提取最新一条**含真实文本**的 user 消息。
-
-        结构化优先（2026-11-11 Gemini 批 §2.2）：先看消息元数据
-        （``is_self_message`` / ``source`` / ``meta`` / ``<message ...>`` 属性 /
-        系统 task 标签）判定真实用户输入；只有宿主字段缺失时才回退旧正则滤镜
-        （跳过元数据消息、剥除 planner 前缀）。
-        """
+        """Find the latest actual user text, ignoring host instruction items."""
         for msg in reversed(messages):
-            if not isinstance(msg, dict):
+            if not isinstance(msg, dict) or cls._message_role(msg) != "user":
                 continue
-            if cls._message_role(msg) != "user":
-                continue
-            for candidate in cls._message_text_candidates(msg):
-                text = candidate.strip()
-                if not text:
-                    continue  # 空文本 → 找上一条 user
-                if cls._is_structured_system_task(text):
-                    continue  # 宿主系统 task / 尾指令块（结构化标签）
-                self_state = cls._structured_self_state(msg, text)
-                if self_state is True:
-                    continue  # 宿主明确标注 Bot 自身发言
-                if self_state is False:
-                    # 宿主字段齐全且明确是真实用户：不再用字符串正则猜测
-                    stripped = cls._strip_planner_prefix(text)
-                    if stripped.strip():
-                        return stripped
-                    continue
-                # 宿主字段缺失 → 回退旧逻辑（逐字保留 2026-10-10 N6-3 口径）
-                if cls._is_metadata_user_message(text):
-                    continue  # 元数据消息/part → 跳过
-                if cls._SELF_MESSAGE_PREFIX_PATTERN.match(text):
-                    continue  # 复核 P0-1：Bot 自身历史发言（宿主包装为 user）→ 跳过
-                stripped = cls._strip_planner_prefix(text)
-                if cls._is_metadata_user_message(stripped.strip()):
-                    continue
-                if not stripped.strip():
-                    continue
-                return stripped
+            candidates = cls._message_text_candidates(msg)
+            if (candidates and candidates[0].lstrip().lower().startswith("<plugin_proactive_task")
+                    and cls._is_structured_system_task(candidates[0])):
+                return ""  # The preceding conversation belongs to another turn.
+            body = cls._real_user_text(msg, candidates)
+            if body:
+                return body
         return ""
 
     @staticmethod
@@ -1325,7 +1306,7 @@ class InjectService:
             # 3.9.3 热修：此处无 now 局部变量（原写法 NameError 致日程注入整体失败）；
             # dynamic_status() 缺省由引擎按自身时区取当前时间。
             band = engine.dynamic_status().get("band")
-            cue = {"drowsy": "有点困", "winding_down": "困了，准备休息",
+            cue = {"drowsy": "有点困", "winding_down": "困意较明显",
                    "waking": "刚醒，还在缓神"}.get(band)
             if cue:
                 current_line += f"（{cue}）"
@@ -1683,7 +1664,10 @@ class InjectService:
         效果：用户明确问当前/未来状态时不再被 50% 硬币挡掉；冷却只对「同活动 +
         同意图」生效，replyer 不再被自己写死的同一种意图反复盖冷却章。
         """
+        match_text = kwargs.get("match_text")
         if self._intent_classifier is not None:
+            if isinstance(match_text, str) and match_text.strip():
+                return self._intent_classifier.classify(match_text.strip())
             payload = kwargs.get("items")
             if not isinstance(payload, list):
                 payload = kwargs.get("messages")
@@ -1691,6 +1675,9 @@ class InjectService:
                 text = self._extract_last_user_text(payload)
                 if text:
                     return self._intent_classifier.classify(text)
+                return UserIntent.CASUAL_CHAT, 0.5
+        if isinstance(match_text, str):
+            return UserIntent.CASUAL_CHAT, 0.5  # The current host explicitly found no reply target text.
         if self._context_cache is not None:
             try:
                 turns = self._context_cache.get_recent_turns(session_id or "unknown", count=1)
@@ -1792,7 +1779,15 @@ class InjectService:
             now = self._tz_manager.get_now()
             # P1（2026-11-09 睡眠注入修复）：仅注入调用处显式包含睡眠，不全局改读模型
             # 默认（其他消费者有意排除睡眠的行为保留）。过滤后的空值不再被误当真实空闲。
-            current = model.current(now, include_sleep=True) or None
+            row = model.current(now, include_sleep=True)
+            # The read model can supply planned/paused rows for other callers.
+            # Only the actually running row can be described as current here.
+            current = (row if isinstance(row, dict) and not row.get("paused")
+                       and row.get("status") in (None, "", "active") else None)
+            sleep = self._sleep_presentation(now, current)
+            if current is not None and (sleep.get("source") == "engine_episode_conflict"
+                    or (sleep.get("state") == "asleep" and current.get("goal_type") != "sleep")):
+                current = None
             nxt = list(model.next(now, limit=2) or [])
             try:
                 state_line = str(model.state_line(now, max_items=2) or "").strip()
@@ -1806,7 +1801,7 @@ class InjectService:
                          if isinstance(row, dict)][-2:]
             return {"current": current, "next": nxt, "state_line": state_line,
                     "completed": completed, "now": now,
-                    "sleep": self._sleep_presentation(now)}
+                    "sleep": sleep}
         except Exception as exc:
             logger.debug("life runtime 注入视图读取失败（回退旧路径）：%s", exc)
             return None
@@ -1854,7 +1849,7 @@ class InjectService:
                 logger.debug("主动分享轮判定：定制文案探测失败（降级 False）", exc_info=True)
         return False
 
-    def _sleep_presentation(self, now) -> Dict[str, Any]:
+    def _sleep_presentation(self, now, current: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """P1 权威睡眠表现态：SleepEngine 会话优先，episode 仅名称/时间佐证。
 
         区分 asleep/awake/drowsy/winding_down/waking/unknown；引擎确认已睡即使 episode
@@ -1874,13 +1869,7 @@ class InjectService:
                 started = (getattr(sess, "metadata", None) or {}).get("sleep_started_at")
         except Exception:
             started = None
-        ep_sleep = False
-        try:
-            model = self._life_read_model()
-            cur = model.current(now, include_sleep=True) if model is not None else None
-            ep_sleep = bool(cur) and str(cur.get("goal_type") or "") == "sleep"
-        except Exception:
-            ep_sleep = False
+        ep_sleep = bool(current and current.get("goal_type") == "sleep")
         if asleep is True:
             out.update(state="asleep", started_at=started, source="engine")
             return out
