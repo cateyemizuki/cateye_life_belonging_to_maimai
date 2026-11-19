@@ -11,9 +11,16 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Iterator
-from urllib.parse import urlsplit
 
-from integrations.video_web_card import build_bili_miniapp_request
+from integrations.snowluma_bili_miniapp import (
+    BILI_APP_ID,
+    MiniAppProtocolError,
+    lookup_packet,
+    sign_packet,
+    signed_card_json,
+    verify_video_route,
+)
+from integrations.video_web_card import build_bili_miniapp_request, normalized_qq_launch_url
 
 PASSTHROUGH_API = "adapter.napcat.action.call"
 _CALL_TIMEOUT_SECONDS = 30.0
@@ -24,8 +31,20 @@ _HISTORY_COUNT = 16
 _QQ_RE = re.compile(r"^[0-9]{5,12}$")
 _MESSAGE_ID_RE = re.compile(r"-?[0-9]{1,20}\Z")
 _MINIAPP_CARD = "com.tencent.miniapp_01"
-_BILI_MINIAPP_ID = "1109937557"
 _QQ_PLACEHOLDER = "发送者版本过低，无法展示内容"
+_GENERATION_ERRORS = {
+    "invalid_bvid": "无效的 BV 号",
+    "adapter_identity_unavailable": "QQ 适配器未返回可核验的版本信息",
+    "card_generation_timeout": "等待 QQ 签发或校验卡片超时",
+    "qq_sign_rejected": "QQ 拒绝签发哔哩哔哩小程序卡片",
+    "qq_sign_unverified": "无法确认 QQ 签发结果",
+    "qq_card_invalid": "QQ 未返回可用的哔哩哔哩原生小程序卡片",
+    "qq_web_fallback_mismatch": "QQ 卡片未包含该 BV 对应的网页回退地址",
+    "qq_launch_internal_test": "QQ 返回了小程序内测提示",
+    "qq_launch_rejected": "QQ 拒绝校验小程序启动链接",
+    "qq_launch_unverified": "无法核验 QQ 小程序启动链接",
+    "qq_launch_mismatch": "QQ 小程序启动链接未指向请求的 BV",
+}
 
 ApiCaller = Callable[..., Awaitable[Any]]
 
@@ -48,6 +67,26 @@ def _response_layers(response: Any) -> Iterator[Dict[str, Any]]:
 def _onebot_failed(reply: Dict[str, Any]) -> bool:
     retcode = reply.get("retcode")
     return reply.get("status") == "failed" or (type(retcode) is int and retcode != 0)
+
+
+def _adapter_app_name(response: Any) -> str:
+    for layer in _response_layers(response):
+        if layer.get("success") is False or _onebot_failed(layer):
+            return ""
+        name = layer.get("app_name")
+        if isinstance(name, str) and name.strip():
+            return name.strip().casefold()
+    return ""
+
+
+def _packet_response_hex(response: Any) -> str:
+    for layer in _response_layers(response):
+        if layer.get("success") is False or _onebot_failed(layer):
+            return ""
+        retcode, payload = layer.get("retcode"), layer.get("data")
+        if type(retcode) is int and retcode == 0 and isinstance(payload, str):
+            return payload
+    return ""
 
 
 def _receipt_error(response: Any) -> str:
@@ -76,26 +115,13 @@ def _native_card_identity(card: Any) -> tuple[str, str] | None:
         return None
     meta, config = card.get("meta"), card.get("config")
     detail = meta.get("detail_1") if isinstance(meta, dict) else None
-    if not isinstance(detail, dict) or str(detail.get("appid")) != _BILI_MINIAPP_ID:
+    if not isinstance(detail, dict) or str(detail.get("appid")) != BILI_APP_ID:
         return None
-    launch = detail.get("url")
+    launch = normalized_qq_launch_url(detail.get("url"))
     token = config.get("token") if isinstance(config, dict) else None
-    if (not isinstance(launch, str) or any(ch.isspace() for ch in launch)
-            or not isinstance(token, str) or not token.strip()):
+    if not launch or not isinstance(token, str) or not token.strip():
         return None
-    # A provider may omit the scheme. Normalize only for verification; the
-    # card sent to QQ retains the original launch string unchanged.
-    candidate = "https:" + launch if launch.startswith("//") else (
-        "https://" + launch if launch.casefold().startswith("m.q.qq.com/") else launch)
-    try:
-        url = urlsplit(candidate)
-        if (url.scheme != "https" or url.hostname != "m.q.qq.com" or url.port not in (None, 443)
-                or url.username is not None or url.password is not None
-                or not url.path.startswith("/a/s/") or len(url.path) <= len("/a/s/")):
-            return None
-    except ValueError:
-        return None
-    return url.geturl(), token
+    return launch, token
 
 
 def _parse_native_card(raw: Any) -> dict | None:
@@ -124,6 +150,26 @@ def _original_provider_card(response: Any) -> str:
             if isinstance(raw, str) and _parse_native_card(raw) is not None:
                 return raw
     return ""
+
+
+def _snowluma_ark(provider_json: str) -> dict[str, Any]:
+    try:
+        provider = json.loads(provider_json)
+        if not isinstance(provider, dict) or not isinstance(provider.get("appView"), str) or not provider["appView"]:
+            raise ValueError("invalid provider card")
+    except (ValueError, RecursionError):
+        raise MiniAppProtocolError("qq_card_invalid") from None
+    # Match SnowLuma's OneBot Ark envelope, keeping QQ's config and metadata intact.
+    return {
+        "ver": provider.get("ver"),
+        "prompt": provider.get("prompt"),
+        "config": provider.get("config"),
+        "app": provider.get("appName"),
+        "view": provider["appView"],
+        "meta": provider.get("metaData"),
+        "miniappShareOrigin": 3,
+        "miniappOpenRefer": "10002",
+    }
 
 
 def _read_segment(message: Any) -> tuple[str, Any]:
@@ -202,20 +248,61 @@ class VideoCardService:
         try:
             params = build_bili_miniapp_request(bvid=bvid, title=title, desc=desc, pic_url=pic_url)
         except (TypeError, ValueError):
-            return {"success": False, "error_class": "card_generation_failed", "error": "无效的 BV 号"}
+            return self._generation_failure("invalid_bvid")
         try:
-            response = await asyncio.wait_for(self._api(
-                PASSTHROUGH_API, action_name="get_mini_app_ark", params=params,
-            ), timeout=self._timeout)
-            raw = _original_provider_card(response)
+            raw = await asyncio.wait_for(self._generate(params), timeout=self._timeout)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            return self._generation_failure("card_generation_timeout")
+        except MiniAppProtocolError as exc:
+            return self._generation_failure(str(exc))
         except Exception:
-            raw = ""
+            return self._generation_failure("qq_card_invalid")
         if not raw:
-            return {"success": False, "error_class": "card_generation_failed",
-                    "error": "QQ 未返回可用的哔哩哔哩原生小程序卡片"}
+            return self._generation_failure("qq_card_invalid")
         return {"success": True, "card": {"ark_json": raw}}
+
+    async def _generate(self, params: dict[str, str]) -> str:
+        version = await self._api(PASSTHROUGH_API, action_name="get_version_info", params={})
+        app_name = _adapter_app_name(version)
+        if not app_name:
+            raise MiniAppProtocolError("adapter_identity_unavailable")
+        if app_name != "snowluma":
+            response = await self._api(
+                PASSTHROUGH_API, action_name="get_mini_app_ark", params={"picUrl": "", **params},
+            )
+            return _original_provider_card(response)
+
+        web_url = params["webUrl"]
+        bvid = web_url.rsplit("/", 1)[-1]
+        sign = await self._api(
+            PASSTHROUGH_API, action_name="send_packet",
+            params=sign_packet(bvid=bvid, title=params["title"], desc=params["desc"], pic_url=params.get("picUrl", "")),
+        )
+        ark = _snowluma_ark(signed_card_json(_packet_response_hex(sign)))
+        if not _native_card_identity(ark):
+            raise MiniAppProtocolError("qq_card_invalid")
+        detail = ark["meta"]["detail_1"]
+        if detail.get("qqdocurl") != web_url:
+            raise MiniAppProtocolError("qq_web_fallback_mismatch")
+        lookup = await self._api(
+            PASSTHROUGH_API, action_name="send_packet", params=lookup_packet(detail["url"]),
+        )
+        verify_video_route(_packet_response_hex(lookup), bvid)
+        raw = json.dumps(ark, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        if len(raw.encode("utf-8")) > 65536:
+            raise MiniAppProtocolError("qq_card_invalid")
+        return raw
+
+    def _generation_failure(self, reason: str) -> dict[str, Any]:
+        if reason not in _GENERATION_ERRORS:
+            reason = "qq_card_invalid"
+        logger = getattr(self._log, "debug", None)
+        if callable(logger):
+            logger(f"视频小程序卡片签发结果：{reason}")
+        return {"success": False, "error_class": "card_generation_failed",
+                "reason": reason, "error": _GENERATION_ERRORS[reason]}
 
     async def send_video_card(self, *, user_id: Any, bvid: str, title: str,
                               desc: str = "", pic_url: str = "") -> Dict[str, Any]:

@@ -13,6 +13,7 @@ from integrations.video_web_card import build_bili_miniapp_request
 
 VIDEO = "BV0000000001"
 URL = f"https://www.bilibili.com/video/{VIDEO}"
+JUMP = f"/pages/video/video?bvid={VIDEO}"
 COVER = "https://i0.hdslb.com/bfs/archive/fixture.png"
 
 
@@ -20,7 +21,8 @@ class BiliMiniAppRequestTests(unittest.TestCase):
     def test_documented_miniapp_request_fields(self):
         card = build_bili_miniapp_request(bvid=VIDEO, title="实际标题", desc="视频介绍", pic_url=COVER)
         self.assertEqual(card, {
-            "type": "bili", "title": "实际标题", "desc": "视频介绍", "jumpUrl": URL, "picUrl": COVER,
+            "type": "bili", "title": "实际标题", "desc": "视频介绍", "jumpUrl": JUMP,
+            "webUrl": URL, "picUrl": COVER,
         })
 
     def test_destination_is_derived_from_bv_only(self):
@@ -30,7 +32,8 @@ class BiliMiniAppRequestTests(unittest.TestCase):
                     build_bili_miniapp_request(bvid=value, title="title")
         card = build_bili_miniapp_request(bvid=VIDEO, title=" ", pic_url="//i0.hdslb.com/bfs/archive/fixture.png")
         self.assertEqual(card["title"], VIDEO)
-        self.assertEqual(card["jumpUrl"], URL)
+        self.assertEqual(card["jumpUrl"], JUMP)
+        self.assertEqual(card["webUrl"], URL)
         self.assertEqual(card["picUrl"], COVER)
 
     def test_invalid_preview_is_omitted_without_altering_destination(self):
@@ -43,7 +46,8 @@ class BiliMiniAppRequestTests(unittest.TestCase):
         ):
             with self.subTest(pic_url=pic_url):
                 card = build_bili_miniapp_request(bvid=VIDEO, title="title", pic_url=pic_url)
-                self.assertEqual(card["jumpUrl"], URL)
+                self.assertEqual(card["jumpUrl"], JUMP)
+                self.assertEqual(card["webUrl"], URL)
                 self.assertNotIn("picUrl", card)
 
 
