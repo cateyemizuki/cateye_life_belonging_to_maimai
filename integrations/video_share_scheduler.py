@@ -111,7 +111,7 @@ def attempt_result(attempt: dict, *, duplicate: bool = False) -> dict:
 class VideoSocialService:
     def __init__(self, ledger, profiles, evaluator, *, config_provider, clock, day,
                  prepare_card, send_card, preflight, reserve, commit, release, append_context,
-                 probability_provider=None, roll=None, stage_provider=None, after_deliver=None):
+                 probability_provider=None, roll=None, after_deliver=None):
         self.ledger = ledger
         self.profiles = profiles
         self.evaluator = evaluator
@@ -129,13 +129,7 @@ class VideoSocialService:
         # None / 不可调用 → 不额外过滤（旧行为）；1.0 也等价于不过滤。
         self._probability = probability_provider
         self._roll = roll or random.random
-        # 2026-11-11 阶段 4 视频通道（设计方案 §3.3）：业务端口由装配根注入，
-        # integrations 不反向依赖 plugin——
-        # ``stage_provider`` 只读返回目标当前想念阶段（0..4）；
-        # ``after_deliver`` 在卡片 accepted 且事实同步成功后、仅阶段 4 调用一次。
-        self._stage = stage_provider
         self._after_deliver = after_deliver
-        self._after_delivered = set()
         self._lock = asyncio.Lock()
         self._mode = ''
         self._settled = set()
@@ -155,7 +149,7 @@ class VideoSocialService:
     async def synchronize_fact(self, attempt: str):
         """把已受理卡片写入聊天上下文；返回最终 history 状态（未领取 → None）。
 
-        阶段 4 说话轮只在 ``'synced'`` 后触发（事实先于说话进入上下文）。
+        自动分享仅在本次事实同步成功后提供一次跟评机会。
         """
         item = await asyncio.to_thread(self.ledger.claim_history, attempt)
         if item is None:
@@ -268,7 +262,16 @@ class VideoSocialService:
                 if decision.get('action') != 'share':
                     return {'status': decision.get('action')}
                 candidate = {**candidate, 'status': 'queued', 'decision': decision}
-            return await self._deliver(candidate, audiences)
+            delivery = await self._deliver(candidate, audiences)
+        comment_from = delivery.pop('comment_from', None)
+        if comment_from is not None and callable(self._after_deliver):
+            try:
+                await self._after_deliver(attempt_id=delivery['attempt_id'], route=delivery['route'],
+                                          facts=delivery['facts'], sent_from=comment_from)
+            except Exception:
+                # A failed Planner enqueue cannot change the accepted card or cause a retry.
+                pass
+        return delivery
 
     def _is_companion_route(self, route: dict) -> bool:
         """该路由是否为陪伴目标私聊（只对目标私聊应用额外概率闸）。"""
@@ -411,6 +414,7 @@ class VideoSocialService:
         except BaseException:
             self._release(token)
             raise  # No network send occurred; the persisted intent stays conservative.
+        sent_from = self._now()
         try:
             receipt = await self._send(route, card)
         except asyncio.CancelledError:
@@ -420,18 +424,19 @@ class VideoSocialService:
             receipt = {'uncertain': True, 'error_class': 'unknown'}
         if _verified_card(receipt):
             await asyncio.to_thread(self.ledger.finish, attempt, 'accepted', receipt)
-            self._commit(token)
-            self._settled.add(attempt)
+            committed = self._commit(token)
+            if committed:
+                self._settled.add(attempt)
             cfg = self._config()
             await asyncio.to_thread(
                 self.ledger.reopen_for_other_targets, bvid, self._now(),
                 cfg.max_targets_per_video, cfg.min_interval_hours * 3600)
             history = await self.synchronize_fact(attempt)
-            # 阶段 4 视频通道：事实写入成功后，陪伴目标私聊额外触发一次说话轮。
-            # 回调异常/失败绝不改变已 accepted 的卡片回执；非目标路由/非阶段 4 不调用。
-            await self._after_deliver_once(attempt, route, facts, history)
-            return {'status': 'accepted', 'attempt_id': attempt,
-                    'route': dict(route), 'facts': dict(facts)}
+            delivery = {'status': 'accepted', 'attempt_id': attempt,
+                        'route': dict(route), 'facts': dict(facts)}
+            if committed and history == 'synced':
+                delivery['comment_from'] = sent_from
+            return delivery
         if isinstance(receipt, dict) and receipt.get('not_sent') is True:
             await asyncio.to_thread(self.ledger.finish, attempt, 'rejected', receipt)
             self._release(token)
@@ -441,38 +446,6 @@ class VideoSocialService:
             return {'status': 'rejected'}
         await asyncio.to_thread(self.ledger.finish, attempt, 'uncertain', receipt if isinstance(receipt, dict) else {})
         return {'status': 'uncertain'}
-
-    async def _after_deliver_once(self, attempt: str, route: dict, facts: dict,
-                                  history: str | None) -> None:
-        """阶段 4 说话轮的唯一投递后钩子（at-most-once，进程内幂等）。
-
-        只在「卡片 accepted + 陪伴目标私聊 + 事实已写入上下文」后调用；
-        失败/异常只留痕，不改变卡片已受理的语义。装配根注入的回调必须快速返回
-        （插件侧用 ``create_task`` 承接长耗时 planner 触发，避免占用分享调度锁）。
-        """
-        if self._after_deliver is None or not callable(self._after_deliver):
-            return
-        if history != 'synced' or not self._is_companion_route(route):
-            return
-        if attempt in self._after_delivered:
-            return
-        stage = 0
-        if self._stage is not None:
-            try:
-                stage = int(self._stage() or 0)
-            except Exception:
-                stage = 0
-        if stage != 4:
-            return
-        self._after_delivered.add(attempt)
-        try:
-            await self._after_deliver(attempt_id=attempt, route=dict(route),
-                                      facts=dict(facts or {}), stage=4)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # 说话轮失败不影响卡片事实与预算回执（调用方仍需拿到 accepted）。
-            pass
 
     def snapshot(self) -> dict:
         return {'mode': self._config().mode, **self.ledger.snapshot()}

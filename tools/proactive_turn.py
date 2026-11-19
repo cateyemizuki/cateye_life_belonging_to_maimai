@@ -36,6 +36,7 @@ from typing import Any, Callable, Optional
 from core.storage import save_json_atomic
 from integrations.proactive_reply_target import PROACTIVE_REPLY_NOTICE
 from integrations.planner_proactive import proactive_category
+from integrations.video_share_policy import COMMENT_PLANNER_KIND
 # 阶段 4 文案/清洗规则单一 owner = suite_prompts（提示词集中模块；companion
 # .miss_trigger / planning.proactive_service / integrations.optional_action 也转发
 # 同一份实现）。避免 tools 依赖 companion 包造成的循环导入，也避免两份表漂移
@@ -101,6 +102,12 @@ REWRITE_MATRIX: dict[tuple[str, str], str] = {
         "顺着你已经定下的方向自然说，不必刻意强调想念",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_VIDEO_SHARE):
         PRIVATE_TARGET_FALLBACK_NOTICE + "。刚看完视频想分享，自然地聊聊视频里的内容",
+    **{
+        (chat_type, COMMENT_PLANNER_KIND): (
+            "刚才的视频卡片已送达本会话。按 Planner 确定的方向随口说一句感想，"
+            "不引用或点名，不复述卡片，不贴链接，也不追问。")
+        for chat_type in CHAT_TYPES
+    },
     (CHAT_TYPE_PRIVATE_TARGET, KIND_VIDEO_COMPLETION):
         PRIVATE_TARGET_FALLBACK_NOTICE + "。按本轮点播的结果自然交流",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_SURF_CHITCHAT):
@@ -413,6 +420,18 @@ class ProactiveTurnRegistry:
                        and (not host_task_id or row.get("host_task_id") == host_task_id)
                        and 0 <= now - float(row.get("created_at", 0)) <= self.TTL_SECONDS]
             return dict(matches[0]) if len(matches) == 1 else None
+
+    def begin_video_comment(self, stream_id: str, turn_id: str, window_seconds: float) -> bool:
+        """Claim a comment Planner turn once, independently of Replyer correlation."""
+        now = self._clock()
+        with self._lock:
+            for turn in self._turns:
+                if (turn.get("stream_id") == stream_id and turn.get("turn_id") == turn_id
+                        and turn.get("kind") == COMMENT_PLANNER_KIND and not turn.get("planner_started")
+                        and 0 <= now - turn["created_at"] <= window_seconds):
+                    turn["planner_started"] = True
+                    return self._save()
+        return False
 
     def active_for(self, stream_id: Any, window_seconds: float = 120.0) -> Optional[dict[str, Any]]:
         """最新未消费且窗内的登记（返回副本）；无则 None。"""

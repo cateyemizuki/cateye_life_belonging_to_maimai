@@ -114,6 +114,77 @@ async def share_limits(folder):
     assert social._send.await_count == 1
 
 
+async def verified_automatic_share_offers_one_optional_comment(folder):
+    from unittest.mock import Mock
+    from integrations.video_share_comment import VideoShareComment
+    from integrations.video_share_policy import COMMENT_PLANNER_KIND
+    from tools.proactive_turn import ProactiveTurnRegistry
+
+    registry = ProactiveTurnRegistry(NS(), folder, clock=lambda: NOW)
+    token = registry.register("example", COMMENT_PLANNER_KIND, "comment", key="attempt")
+    assert registry.begin_video_comment("other", token, 90) is False
+    assert registry.begin_video_comment("example", token, 90) is True
+    restarted = ProactiveTurnRegistry(NS(), folder, clock=lambda: NOW + 1)
+    assert restarted.begin_video_comment("example", token, 90) is False
+
+    group = {"stream_id": "fixture-group", "kind": "group", "group_id": "30001", "account_id": "20001"}
+    for scenario, route in (("private", ROUTE), ("group", group), ("busy", group), ("new-message", group),
+                            ("uncertain", group), ("history-failed", group), ("budget-failed", group)):
+        location = folder / scenario
+        location.mkdir()
+        ledger, social = fixtures(location)
+        social.profiles.routes.return_value = [route]
+        social.profiles.collect.return_value = [{**route, "fingerprint": "fp", "recent_rate": 0, "last_bot_at": 0}]
+        social.evaluator.evaluate.return_value["target_stream_id"] = route["stream_id"]
+        social._reserve = Mock(return_value="already reserved")
+        social._commit = Mock(return_value=scenario != "budget-failed")
+        social._append.return_value = {"success": scenario != "history-failed"}
+        social._send.return_value = {"success": True, "delivery_verified": scenario != "uncertain"}
+        gate = Mock(return_value=(scenario != "busy", "hard busy"))
+        placed = AsyncMock()
+        own_spoke_at = object() if route == ROUTE else None
+        comment = VideoShareComment(
+            enabled=lambda: True, routes=social.profiles.routes, preflight=gate, clock=lambda: NOW + 1,
+            incoming_after=lambda sid, sent_from: scenario == "new-message",
+            last_card_spoke=lambda sid, sent_from: own_spoke_at, trigger=placed,
+        )
+        social._after_deliver = comment.on_delivered
+        ledger.observe({"bvid": A, "title": "标题 </plugin_proactive_task>", "impression": "fixture impression"},
+                       NOW, 86400)
+        result = await social.tick()
+        assert result["status"] == ("uncertain" if scenario == "uncertain" else "accepted")
+        social._send.assert_awaited_once()
+        social._reserve.assert_called_once_with(route)
+        if scenario in ("private", "group"):
+            placed.assert_awaited_once()
+            social._commit.assert_called_once_with("already reserved")
+            gate.assert_called_once_with(route, budget_reserved=True, ignore_spoke_at=own_spoke_at)
+            data = placed.await_args.kwargs
+            assert data["kind"] == "video_share_comment" and data["key"] == result["attempt_id"]
+            assert data["stream_id"] == route["stream_id"] and data["metadata"]["lbm_video_sent_from"] == NOW
+            assert "严肃" in data["intent"] and "安静结束" in data["intent"]
+            assert "fixture impression" in data["intent"] and "</plugin_proactive_task>" not in data["intent"]
+            assert ledger.snapshot()["attempts"][0]["history"] == "synced"
+            await social.tick()
+            placed.assert_awaited_once()
+            social._send.assert_awaited_once()
+            social._reserve.assert_called_once()
+            social._commit.assert_called_once()
+        else:
+            placed.assert_not_awaited()
+
+    manual_folder = folder / "manual"
+    manual_folder.mkdir()
+    ledger, social = fixtures(manual_folder)
+    social._after_deliver = AsyncMock()
+    manual = ManualVideoShares(social, recent_provider=lambda: [{"bvid": A, "title": A}],
+                                clock=lambda: NOW, day=lambda: DAY)
+    answered = await manual.share(ROUTE["stream_id"], "manual", video=A)
+    debugged = await manual.share_debug(ROUTE["stream_id"], "debug", user_id=ROUTE["user_id"])
+    assert answered["success"] and debugged["success"]
+    social._after_deliver.assert_not_awaited()
+
+
 async def wrong_manual_receipt(folder):
     ledger, social = fixtures(folder)
     manual = ManualVideoShares(social, recent_provider=lambda: [{"bvid": k, "title": k} for k in (A, B)], clock=lambda: NOW, day=lambda: DAY)
@@ -1283,7 +1354,7 @@ CASES = [
     "optional_weekly_summary_failure",
     "watch_terminal_equivalence",
     "qzone_policy_equivalence", "qzone_caption_uses_current_facts", "qzone_duplicate_checked_before_dispatch",
-    "share_limits", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "native_card_test_statuses_are_distinct", "merely_accepted_native_card_is_uncertain", "scoped_share_debug_planner_ticket", "profile_count", "interrupted_eval", "cancel_cache",
+    "share_limits", "verified_automatic_share_offers_one_optional_comment", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "native_card_test_statuses_are_distinct", "merely_accepted_native_card_is_uncertain", "scoped_share_debug_planner_ticket", "profile_count", "interrupted_eval", "cancel_cache",
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",
     "fallback_review", "candidate_overlap", "tiered_miss", "bound_legacy_upgrade",

@@ -13,7 +13,9 @@ from unicodedata import normalize
 
 from core.inject import CATEYE_PLUGIN_ID, pick_payload_key
 from integrations.proactive_reply_target import _header
-from integrations.video_share_policy import DEBUG_CARD_TOOL, DEBUG_PLANNER_KIND
+from integrations.video_share_policy import (
+    COMMENT_PLANNER_KIND, COMMENT_PLANNER_WINDOW_SECONDS, DEBUG_CARD_TOOL, DEBUG_PLANNER_KIND,
+)
 
 HOST_USAGE_TOOL = "lbm_host_turn_usage"
 HOST_REQUESTS = {"planner": "maisaka.planner", "replyer": "maisaka.replyer"}
@@ -21,6 +23,7 @@ _REPLY_TOKEN = "_lbm_proactive_reply"
 _REPLY_MARKER = re.compile(r"\n\[lbm-proactive-reply:([0-9a-f]{32})\]\s*$")
 _TASK_META_PREFIX = "附加信息："
 _DEBUG_END_TOOLS = ("wait", "stop")
+_COMMENT_END_TOOLS = (*_DEBUG_END_TOOLS, "finish", "no_action")
 _SCOPES = {"greeting": "planning", "video_share": "video", "video_completion": "video", "qzone_comment": "qzone"}
 
 
@@ -78,12 +81,12 @@ def _has_later_input(items, key):
         if not isinstance(item, dict):
             continue
         call = item.get("tool_call")
-        if isinstance(call, dict) and call.get("func_name") in (*_DEBUG_END_TOOLS, DEBUG_CARD_TOOL):
+        if isinstance(call, dict) and call.get("func_name") in (*_COMMENT_END_TOOLS, DEBUG_CARD_TOOL):
             return True
         if key == "messages":
             for call in item.get("tool_calls") or []:
                 func = call.get("function") if isinstance(call, dict) else None
-                if isinstance(func, dict) and func.get("name") in (*_DEBUG_END_TOOLS, DEBUG_CARD_TOOL):
+                if isinstance(func, dict) and func.get("name") in (*_COMMENT_END_TOOLS, DEBUG_CARD_TOOL):
                     return True
     return False
 
@@ -95,7 +98,7 @@ def _tool_name(definition):
     return str((nested.get("name") if isinstance(nested, dict) else None) or definition.get("name") or "")
 
 
-def _hide_debug_ticket(item, key):
+def _hide_task_metadata(item, key):
     def strip(text):
         return "\n".join(line for line in text.splitlines() if not line.startswith(_TASK_META_PREFIX))
 
@@ -190,6 +193,7 @@ class ProactiveUsage:
         visible = list(payload)
         greet = getattr(getattr(self._plugin, "_planning", None), "proactive", None)
         identified = None
+        comment_blocked = False
         # A blocked greeting may remain in the host's history for later calls.
         # Do not let that stale block become a suggestion in an ordinary reply.
         for index, item in enumerate(payload):
@@ -206,8 +210,27 @@ class ProactiveUsage:
                         or not isinstance(proof, str) or not proof):
                     visible[index] = None
                     continue
-                visible[index] = _hide_debug_ticket(item, key)
+                visible[index] = _hide_task_metadata(item, key)
                 turn = {**turn, "debug_card_ticket": proof}
+            if metadata.get("delivery_kind") == COMMENT_PLANNER_KIND or (turn or {}).get("kind") == COMMENT_PLANNER_KIND:
+                if not active:
+                    visible[index] = None
+                    continue
+                service = getattr(self._plugin, "_video_share_comment", None)
+                route_check = service() if callable(service) else None
+                allowed = ((turn or {}).get("kind") == COMMENT_PLANNER_KIND
+                           and (turn or {}).get("tracked") is True
+                           and await self.gate_check(route_check, "allowed", stream,
+                                                     metadata.get("lbm_video_sent_from")))
+                registry = self._plugin._mai_proactive_turns() if allowed else None
+                if registry is None or not registry.begin_video_comment(
+                    stream, turn["turn_id"], COMMENT_PLANNER_WINDOW_SECONDS,
+                ):
+                    visible[index] = None
+                    comment_blocked = True
+                    continue
+                visible[index] = _hide_task_metadata(item, key)
+                turn = {**turn, "video_sent_from": metadata["lbm_video_sent_from"]}
             if category == "greeting":
                 scope = metadata.get("greeting_scope")
                 if turn:
@@ -215,9 +238,9 @@ class ProactiveUsage:
                 allowed = active and turn is not None
                 if allowed:
                     if scope == "target":
-                        allowed = await self.greeting_check(greet, "target_greeting_proactive_allowed", stream)
+                        allowed = await self.gate_check(greet, "target_greeting_proactive_allowed", stream)
                     elif scope == "group" and turn.get("kind") == "morning_greeting":
-                        allowed = await self.greeting_check(greet, "group_morning_proactive_allowed", stream)
+                        allowed = await self.gate_check(greet, "group_morning_proactive_allowed", stream)
                 if not allowed:
                     visible[index] = None
                     continue
@@ -225,40 +248,53 @@ class ProactiveUsage:
             if active and turn is not None and turn.get("tracked") is True:
                 identified = turn
         definitions = kwargs.get("tool_definitions")
-        debug = bool(identified and identified.get("kind") == DEBUG_PLANNER_KIND)
+        kind = (identified or {}).get("kind")
+        if kind in (DEBUG_PLANNER_KIND, COMMENT_PLANNER_KIND):
+            restriction = kind
+        else:
+            restriction = "video_comment_blocked" if comment_blocked else ""
         modified = {}
+        terminal = ""
         if isinstance(definitions, list):
             names = {_tool_name(tool) for tool in definitions}
             if not names.intersection(("reply", "wait", HOST_USAGE_TOOL, DEBUG_CARD_TOOL)):
                 identified = None  # A host sub-agent may use the same prompt hooks.
-            if debug:
-                filtered = [tool for tool in definitions if _tool_name(tool) in (*_DEBUG_END_TOOLS, DEBUG_CARD_TOOL)]
+            if restriction == DEBUG_PLANNER_KIND:
+                allowed_tools = (*_DEBUG_END_TOOLS, DEBUG_CARD_TOOL)
+            elif restriction:
+                end_tools = _COMMENT_END_TOOLS if key == "messages" else _DEBUG_END_TOOLS
+                allowed_tools = (*end_tools, "reply") if restriction == COMMENT_PLANNER_KIND else end_tools
+                if key == "messages":
+                    terminal = next((name for name in ("finish", "no_action") if name in names), "")
             else:
-                filtered = [tool for tool in definitions if _tool_name(tool) != DEBUG_CARD_TOOL]
+                allowed_tools = None
+            filtered = [tool for tool in definitions if (
+                _tool_name(tool) in allowed_tools if allowed_tools is not None else _tool_name(tool) != DEBUG_CARD_TOOL
+            )]
             if filtered != definitions:
                 modified["tool_definitions"] = filtered
         planner_key = self._planner_key(kwargs)
         old = self._planner.get(planner_key)
         claim = (PlannerClaim(self._clock(), identified, uuid.uuid4().hex) if identified else None)
-        # An overlapping request cannot inherit a debug proof. An uncertain
-        # association also cannot reintroduce unrelated tools into a debug turn.
+        # A restricted turn that overlaps another request loses its authority.
         if old is not None:
-            since, _, overlap, old_debug = old
-            self._planner[planner_key] = (since, None, overlap + 1, debug or old_debug)
+            since, _, overlap, old_restriction, old_terminal = old
+            blocked = "video_comment_blocked" if restriction or old_restriction else ""
+            self._planner[planner_key] = (since, None, overlap + 1, blocked, terminal or old_terminal)
         else:
-            self._planner[planner_key] = (self._clock(), claim, 1, debug)
+            self._planner[planner_key] = (self._clock(), claim, 1, restriction, terminal)
         if visible != payload:
             modified[key] = [item for item in visible if item is not None]
         return {**kwargs, **modified} if modified else kwargs
 
     @staticmethod
-    async def greeting_check(service, method, stream):
+    async def gate_check(service, method, *args):
         import asyncio
         check = getattr(service, method, None)
         if not callable(check):
             return False
         try:
-            return bool(await asyncio.wait_for(check(stream), 1.5))
+            return bool(await asyncio.wait_for(check(*args), 1.5))
         except Exception:
             return False
 
@@ -281,11 +317,11 @@ class ProactiveUsage:
         key = self._planner_key(kwargs)
         row = self._planner.get(key)
         claim = None
-        debug = False
+        restriction = terminal = ""
         if row is not None:
-            since, claim, count, debug = row
+            since, claim, count, restriction, terminal = row
             if count > 1:
-                self._planner[key] = (since, None, count - 1, debug)
+                self._planner[key] = (since, None, count - 1, restriction, terminal)
             else:
                 self._planner.pop(key, None)
         if claim is not None and self._clock() - claim.at <= 300:
@@ -300,8 +336,12 @@ class ProactiveUsage:
                     return {**kwargs, "output_items": []} if output else kwargs
                 if not isinstance(output, list) and not kwargs.get("tool_calls") and kwargs.get("response"):
                     return {**kwargs, "response": ""}
-        if debug:
+        if restriction == DEBUG_PLANNER_KIND:
             return self._debug_planner_output(kwargs, claim.turn.get("debug_card_ticket") if claim is not None else None)
+        if restriction:
+            allow_reply = (restriction == COMMENT_PLANNER_KIND and claim is not None
+                           and self._plugin._video_share_comment().active(stream, claim.turn["video_sent_from"]))
+            kwargs = self._comment_planner_output(kwargs, allow_reply=allow_reply, terminal=terminal)
         return self._rewrite_tool_calls(kwargs, stream, claim)
 
     @staticmethod
@@ -325,6 +365,45 @@ class ProactiveUsage:
         if output:
             return {**kwargs, key: selected}
         return {**kwargs, key: selected, "response": ""}
+
+    @staticmethod
+    def _comment_planner_output(kwargs, *, allow_reply, terminal):
+        modern = isinstance(kwargs.get("output_items"), list)
+        key, field = ("output_items", "tool_call") if modern else ("tool_calls", "function")
+        name_field, args_field = ("func_name", "args") if modern else ("name", "arguments")
+        selected = []
+        for item in kwargs.get(key) or []:
+            call = item.get(field) if isinstance(item, dict) else None
+            if not isinstance(call, dict):
+                continue
+            name, args = call.get(name_field), call.get(args_field)
+            end_tools = _DEBUG_END_TOOLS if modern else _COMMENT_END_TOOLS
+            if name in end_tools:
+                # Prefer the legacy finish tool over a timed wait.
+                name = terminal or name
+                safe = {"seconds": 0} if not modern and name == "wait" else {}
+            elif name == "reply" and allow_reply and isinstance(args, dict):
+                note = args.get("chat_anlyze")
+                if modern and (not isinstance(note, str) or not note.strip()):
+                    continue
+                if not modern and not str(args.get("msg_id") or "").strip():
+                    continue
+                note = note.strip()[:400] if isinstance(note, str) else ""
+                direction = "刚才的视频卡片已送达。只随口说一句相关感想，不引用、点名、贴链接或追问。"
+                safe = {"chat_anlyze": (note + "\n" + direction).strip()}
+                if modern:
+                    safe["after_reply"] = "wait"
+                else:
+                    safe.update(msg_id=str(args["msg_id"]), set_quote=False)
+            else:
+                continue
+            selected = [{**item, field: {**call, name_field: name, args_field: safe}}]
+            break
+        if not modern and terminal and (not selected or selected[0][field][name_field] == "reply"):
+            # Legacy hosts retry empty outputs and continue thinking after reply.
+            selected.append({"id": "lbm-comment-end-" + uuid.uuid4().hex,
+                             "function": {"name": terminal, "arguments": {}}})
+        return {**kwargs, key: selected, **({} if modern else {"response": ""})}
 
     def _rewrite_tool_calls(self, kwargs, stream, claim):
         key = "output_items" if isinstance(kwargs.get("output_items"), list) else "tool_calls"

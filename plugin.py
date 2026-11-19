@@ -89,10 +89,7 @@ from planning.services import PlanningServices
 from integrations.video_schedule import SurfQuotaLedger, VideoWatchCoordinator
 from integrations.video_card import VideoCardService
 from integrations.video_completion import CompletionOutbox
-# R2（结构审计批，2026-11-12）：阶段 4 说话轮编排与拼接助手归 integrations；
-# 组合根只注入依赖与回调（模块纯 stdlib，零业务包 import，不新增 integrations↔tools 边）。
-from integrations.video_share_stage4_turn import (
-    VideoShareStage4Turn, stage4_context_fields)
+from integrations.video_share_comment import VideoShareComment
 from suite_offline_settlement import OfflineSettlementService
 from qzone.cgi import QzoneCookieManager
 from qzone.components import QzoneComponentsMixin
@@ -1911,9 +1908,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 preflight=self._social_preflight,reserve=self._social_reserve,
                 commit=self._social_commit,release=self._social_release,append_context=self._append_social_fact,
                 probability_provider=_share_probability,
-                # 2026-11-11 阶段 4 视频通道（设计方案 §3.3）：scheduler 只持有两个业务
-                # 端口，不 import plugin。阶段只读解析 + 卡片事实写入后的说话轮回调。
-                stage_provider=self._target_miss_stage,
                 after_deliver=self._on_video_share_delivered)
         except Exception as exc:
             self.ctx.logger.warning('独立视频分享初始化失败，保守停用发送：%s',type(exc).__name__)
@@ -2334,13 +2328,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             return {}
         return context if isinstance(context, dict) else {}
 
-    def _target_miss_stage(self) -> int:
-        """scheduler 注入的只读阶段端口：陪伴目标当前想念阶段（0..4）。"""
-        try:
-            return int(self._stage4_context().get('stage') or 0)
-        except (TypeError, ValueError):
-            return 0
-
     def _target_miss_stage_context(self) -> dict:
         """薄委托：companion/patrol 阶段 4 单一只读出口（R2 结构审计批）。
 
@@ -2359,18 +2346,6 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             patrol=getattr(companion, 'patrol', None),
             affection=getattr(companion, 'affection', None))
 
-    def _is_companion_private_route(self, route: Any) -> bool:
-        """scheduler 路由是否仍是当前陪伴目标私聊（装配根同口径二次核验）。"""
-        try:
-            target = str(target_qq_of(self.config) or '')
-            stream = str(getattr(self, '_stream_id', '') or '')
-            return (isinstance(route, dict) and bool(target) and bool(stream)
-                    and str(route.get('kind') or '') == 'private'
-                    and str(route.get('stream_id') or '') == stream
-                    and str(route.get('user_id') or '') == target)
-        except Exception:
-            return False
-
     def _social_preflight(self, route: dict | None, *, budget_reserved: bool = False,
                           own_holder: str = '', ignore_spoke_at: Any = None) -> tuple[bool,str]:
         allowed,reason=self._autonomous_context()
@@ -2383,15 +2358,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             if not budget_reserved and self._proactive_budget.remaining()<=0:return False,'目标私聊主动预算不足'
             last=self._companion.affection.last_speak_time()
             if last is not None and 0<=self._surf_now().timestamp()-last.timestamp()<300:
-                # 阶段 4 说话轮与刚受理的卡片属于同一次主动接触：只放行**卡片自身**
-                # 写入的开口时间（2s 容差），其它更晚的主动开口仍按 300s 冷却拦截。
-                own_ok = False
-                if ignore_spoke_at is not None:
-                    try:
-                        own_ok = abs(last.timestamp()-ignore_spoke_at.timestamp())<=2.0
-                    except Exception:
-                        own_ok = False
-                if not own_ok:
+                # Only the cooldown written by this card belongs to the same contact.
+                if ignore_spoke_at is None or last.timestamp() != ignore_spoke_at.timestamp():
                     return False,'刚刚主动开口'
         return True,''
 
@@ -2425,8 +2393,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 spoke_at=self._surf_now()
                 try:
                     self._companion.affection.note_optional_spoke(spoke_at)
-                    # 阶段 4 说话轮据此识别「这 300s 冷却由本卡片自己写入」。
-                    self._last_social_card_spoke_at=spoke_at
+                    if not manual:
+                        self._last_social_card_spoke=(route['stream_id'], spoke_at)
                 except Exception:self.ctx.logger.warning('视频卡片已受理，但共享开口时间更新失败')
             return receipt
         finally:
@@ -2438,47 +2406,32 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             source_kind='plugin:cateye.life_belonging_to_maimai:video_share_fact',
             message_id='video_share_fact:'+attempt,replyable=False)
 
-    def _video_stage4_turn(self) -> Any:
-        """装配：阶段 4 说话轮编排惰性单例（R2 结构审计批；组合根只注入依赖与回调）。
-
-        编排本体在 :class:`integrations.video_share_stage4_turn.VideoShareStage4Turn`；
-        该场景使用公共 Planner 调度入口，分享台账负责卡片的幂等。
-        """
-        turn = getattr(self, '_video_stage4_turn_obj', None)
+    def _video_share_comment(self) -> VideoShareComment:
+        turn = getattr(self, '_video_share_comment_obj', None)
         if turn is None:
-            turn = VideoShareStage4Turn(
-                is_unloading=lambda: bool(getattr(self, '_is_unloading', False)),
-                is_target_route=self._is_companion_private_route,
+            turn = VideoShareComment(
+                enabled=lambda: (not getattr(self, '_is_unloading', False)
+                                 and self.config.video_share.mode == '自动分享'),
+                routes=lambda: self._video_social.profiles.routes(),
                 preflight=self._social_preflight,
-                stage4_context=self._stage4_context,
-                last_card_spoke_at=lambda: getattr(self, '_last_social_card_spoke_at', None),
+                clock=lambda: self._surf_now().timestamp(),
+                incoming_after=self._attention_tracker.incoming_after,
+                last_card_spoke=self._video_comment_card_spoke,
                 trigger=lambda **kwargs: dispatch_proactive(self, **kwargs),
-                append_prompt=lambda *a, **kw: append_stage4_miss_prompt(*a, **kw),
-                logger=lambda: self.ctx.logger)
-            self._video_stage4_turn_obj = turn
+            )
+            self._video_share_comment_obj = turn
         return turn
 
+    def _video_comment_card_spoke(self, stream_id: str, sent_from: float):
+        sid, stamp = getattr(self, '_last_social_card_spoke', ('', None))
+        if sid == stream_id and stamp is not None and stamp.timestamp() >= sent_from:
+            return stamp
+        return None
+
     async def _on_video_share_delivered(self, *, attempt_id: str, route: dict,
-                                        facts: dict, stage: int = 0) -> None:
-        """薄委托：integrations/video_share_stage4_turn 卡片送达回调（R2 结构审计批）。
-
-        设计方案 §3.3：卡片 + 事实写入后，阶段 4 追加一次说话轮。编排侧只做快速
-        校验与 ``create_task`` 调度——``_deliver`` 持有分享调度锁，绝不能在回调里
-        await 完整 planner 触发。回调异常不影响已 accepted 的卡片回执（scheduler 隔离）。
-        """
-        await self._video_stage4_turn().on_delivered(
-            attempt_id=attempt_id, route=route, facts=facts, stage=stage)
-
-    async def _run_video_share_stage4_turn(self, *, attempt_id: str, route: dict,
-                                           facts: dict) -> None:
-        """薄委托：integrations/video_share_stage4_turn 说话轮编排（R2 结构审计批）。
-
-        登记 → 宿主 trigger，失败撤登记；不 reserve/commit（卡片已占本次主动接触
-        的槽位），夜间/睡眠/忙闲与 300s 冷却经 ``_social_preflight(budget_reserved=True)``
-        复检，复检不过一次性跳过（不重试，避免醒来补发旧话）——旧口径逐字不变。
-        """
-        await self._video_stage4_turn().run_turn(
-            attempt_id=attempt_id, route=route, facts=facts)
+                                        facts: dict, sent_from: float) -> None:
+        await self._video_share_comment().on_delivered(
+            attempt_id=attempt_id, route=route, facts=facts, sent_from=sent_from)
 
     def _bind_video_candidate_provider(self) -> None:
         """把候选源同步 pick 面绑到观看 manager（幂等；未启用不绑）。"""
@@ -2679,10 +2632,11 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         stage, stage_hours, stage_relation = 0, 0.0, '恋人'
         try:
             if str(stream_id) == str(getattr(self, '_stream_id', '') or ''):
-                # R2（结构审计批）：阶段解析经 integrations 助手（异常 → stage 0，
-                # 与旧内联口径逐字一致）；拼接仍在 try 外（旧行为不变）。
-                stage, stage_hours, stage_relation = stage4_context_fields(
-                    self._target_miss_stage_context())
+                context = self._target_miss_stage_context()
+                if isinstance(context, dict) and int(context.get('stage') or 0) == 4:
+                    stage = 4
+                    stage_hours = float(context.get('hours') or 0.0)
+                    stage_relation = str(context.get('relation') or '恋人')
         except Exception:
             stage = 0
         if stage == 4:

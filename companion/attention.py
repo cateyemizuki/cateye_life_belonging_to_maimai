@@ -89,6 +89,10 @@ class ConversationActivityTracker:
             pass
 
     # ---- 只读快照 ----
+    def incoming_after(self, stream_id: str, stamp: float) -> bool:
+        with self._lock:
+            return self._last_incoming.get(stream_id, 0.0) > stamp
+
     def snapshot(self, ts: Any = None) -> Dict[str, Any]:
         """忙闲快照（只读；不确定/暖机期 coverage=partial，消费方不得启动自动观看）。"""
         now = _now(self._clock) if ts is None else float(ts)

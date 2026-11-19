@@ -83,7 +83,7 @@ from .rolling_diag import render_rolling
 from integrations.video_share_diag import render_share
 from integrations.proactive_usage import HOST_USAGE_TOOL, ProactiveUsage, read_host_turn_usage
 from integrations.planner_proactive import dispatch_proactive
-from integrations.video_share_policy import DEBUG_CARD_TOOL
+from integrations.video_share_policy import COMMENT_PLANNER_KIND, DEBUG_CARD_TOOL
 from integrations.qzone_video_diag import render_qzone_video, qzone_video_diag_payload
 from .streams_diag import build_streams_records
 from core.diag import DecisionLogger
@@ -540,13 +540,21 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         tracking = self._mai_proactive_usage()
         prepared = tracking.reply_before(kwargs)
         turn = tracking.reply_turn(prepared)
+        if turn and turn.get("kind") == COMMENT_PLANNER_KIND:
+            stream = str(prepared.get("session_id") or prepared.get("stream_id") or "")
+            if not self._video_share_comment().active(stream, turn["video_sent_from"]):
+                return {"action": "abort", "custom_result": {"reason": "这次视频卡片已不适合跟评"}}
+            extra_prompt = str(prepared.get("extra_prompt") or "")
+            direction = prepared["reply_tool_args"]["chat_anlyze"]
+            # The earliest supported Replyer uses extra_prompt but does not read chat_anlyze.
+            prepared = {**prepared, "extra_prompt": "\n".join(part for part in (extra_prompt, direction) if part)}
         if turn and turn.get("category") == "greeting":
             service = getattr(getattr(self, "_planning", None), "proactive", None)
             scope = turn.get("greeting_scope")
             sid = str(prepared.get("session_id") or "")
             method = ("group_morning_proactive_allowed" if scope == "group" and turn.get("kind") == "morning_greeting"
                       else "target_greeting_proactive_allowed" if scope == "target" else "")
-            if method and not await tracking.greeting_check(service, method, sid):
+            if method and not await tracking.gate_check(service, method, sid):
                 return {"action": "abort", "custom_result": {"reason": "本次例行问候已不符合发起条件"}}
         return {"action": "continue", **({"modified_kwargs": prepared} if prepared is not kwargs else {})}
 
@@ -645,7 +653,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             tracker = getattr(self, "_attention_tracker", None)
             if tracker is not None and isinstance(message, dict):
                 sid, grp = extract_session_info_from_message(message)
-                if sid:
+                account = str(message.get("account_id") or "")
+                sender = extract_user_id_from_message(message)
+                if sid and not (account and sender == account):
                     text = str(message.get("raw_message") or message.get("plain_message") or "")
                     lover = str(getattr(self, "_lover_name", "") or "")
                     # 复核 P0-5：群聊仅当 Bot 自身被 @/点名才算直接消息。
@@ -1192,6 +1202,18 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             self.ctx.logger.warning("可选主动回合预算确认失败（忽略）", exc_info=True)
             return {"status": "error"}
 
+    def _expired_video_comment(self, kwargs: dict, turn: dict | None) -> bool:
+        if not turn or turn.get("kind") != COMMENT_PLANNER_KIND:
+            return False
+        stream = str(kwargs.get("session_id") or kwargs.get("stream_id") or "")
+        return not self._video_share_comment().active(stream, turn["video_sent_from"])
+
+    @staticmethod
+    def _discard_video_comment_output(kwargs: dict) -> dict:
+        # The legacy Replyer ignores abort here but accepts a rewritten empty response.
+        output = {"output_items": []} if isinstance(kwargs.get("output_items"), list) else {}
+        return {"action": "continue", "modified_kwargs": {**kwargs, "response": "", **output}}
+
     @HookHandler(
         "maisaka.replyer.after_response",
         name="mai_lover_replyer_speak_confirm",
@@ -1201,7 +1223,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         timeout_ms=12000,
         error_policy=ErrorPolicy.SKIP,
     )
-    async def mai_hook_replyer_after_response(self, **kwargs: Any) -> None:
+    async def mai_hook_replyer_after_response(self, **kwargs: Any) -> dict | None:
         """replyer 实际生成回复时确认可选回合并补计 1.0 发言数。
 
         P1-8（2026-11-10）：入队不再预扣预算/计数。目标流出现真实回复时先调用
@@ -1233,11 +1255,15 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             # 复核 P0-6：与 note_reply_start 同口径传真实流 id，保证配对清计数。
             _sid = str(kwargs.get("session_id") or kwargs.get("stream_id") or "")
             _tracker.note_reply_end(_sid)
+        if self._expired_video_comment(kwargs, typed_turn):
+            return self._discard_video_comment_output(kwargs)
         # P2-DEL-1：真实回复发送前的拟人打字时延（开关/上限见 [patrol]）。
         # B4（v2 §6.3/§6.4）：先向 bpp 认领本轮，再按对方返回的 typing_owner 决定
         # 谁负责打字——只要 bpp 后处理接管生效（无论接受/拒绝认领），它都会分段并
         # 模拟打字，life 一律让位；bpp 不可达/未激活/超时 → life 照常施加。
         await self._mai_apply_typing_delay_with_bridge(kwargs)
+        if self._expired_video_comment(kwargs, typed_turn):
+            return self._discard_video_comment_output(kwargs)
         companion = self._mai_companion()
         if companion is None:
             return

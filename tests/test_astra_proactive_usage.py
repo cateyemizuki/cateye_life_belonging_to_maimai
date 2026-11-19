@@ -177,6 +177,127 @@ class ProactiveUsageTests(unittest.IsolatedAsyncioTestCase):
         assert legacy_response["response"] == ""
         assert legacy_response["tool_calls"] == [{"function": {"name": DEBUG_CARD_TOOL, "arguments": {"ticket": "actual-proof"}}}]
 
+    async def test_video_comment_once_decline_and_usage_on_both_host_formats(self):
+        from integrations.video_share_policy import COMMENT_PLANNER_KIND
+
+        definitions = [{"type": "function", "function": {"name": name}}
+                       for name in ("reply", "wait", "lbm_share_recent_video", "lbm_debug_share_confirm")]
+        plugin = self.subject._plugin
+        service = NS(allowed=AsyncMock(return_value=True), active=Mock(return_value=True))
+        plugin._video_share_comment = lambda: service
+        turns = {}
+
+        def begin(stream, token, window):
+            assert stream == "s" and window == 90
+            if turns[token].get("planner_started"):
+                return False
+            turns[token]["planner_started"] = True
+            return True
+
+        plugin._mai_proactive_turns = lambda: NS(
+            identified=lambda stream, turn_id="", **kwargs: turns.get(turn_id) if stream == "s" else None,
+            begin_video_comment=begin,
+        )
+
+        def queued(key, *, payload_key):
+            token = key
+            turns[token] = {"turn_id": token, "kind": COMMENT_PLANNER_KIND,
+                            "category": "video_share", "tracked": True}
+            item = block(token, "video_share")
+            item["parts"][0]["text"] = item["parts"][0]["text"].replace(
+                '"greeting_scope":"target"', '"delivery_kind":"video_share_comment","lbm_video_sent_from":99.0')
+            if payload_key == "messages":
+                item = {"role": "user", "content": item["parts"][0]["text"]}
+            return token, item
+
+        tick = {**self.planner, "tool_definitions": definitions}
+        token, item = queued("reply", payload_key="items")
+        before = await self.subject.planner_before({**tick, "items": [item]})
+        assert [entry["function"]["name"] for entry in before["tool_definitions"]] == ["reply", "wait"]
+        assert token not in str(before["items"])
+        after = self.subject.planner_after({**self.planner, **self.usage, "output_items": [
+            call("lbm_share_recent_video", to_companion=True),
+            call("reply", chat_anlyze="a thought", msg_id="other", attach_at="123",
+                 after_reply="continue", wait_seconds=2, session_id="other"),
+            call("reply", chat_anlyze="second reply"),
+        ]})
+        assert len(after["output_items"]) == 1
+        reply = after["output_items"][0]["tool_call"]
+        assert reply["func_name"] == "reply" and set(reply["args"]) == {"chat_anlyze", "after_reply"}
+        assert reply["args"]["after_reply"] == "wait"
+        prepared = self.subject.reply_before({"session_id": "s", "reply_tool_args": reply["args"]})
+        assert "只随口说一句" in prepared["reply_tool_args"]["chat_anlyze"]
+        self.subject.reply_after({**prepared, **self.usage})
+        assert [entry.kwargs["event"] for entry in self.record.call_args_list] == [
+            "proactive_video_share_planner", "proactive_video_share_replyer",
+        ]
+        assert all(entry.kwargs["module"] == "video" for entry in self.record.call_args_list)
+
+        reloaded = ProactiveUsage(plugin, clock=lambda: self.now)
+        assert turns[token]["planner_started"] is True
+        before = await reloaded.planner_before({**tick, "items": [item]})
+        assert before["items"] == []
+        assert reloaded.planner_after({**self.planner, "output_items": [
+            call("reply", chat_anlyze="should not run"),
+        ]})["output_items"] == []
+
+        legacy_tick = {**tick, "tool_definitions": definitions + [
+            {"type": "function", "function": {"name": name}} for name in ("finish", "no_action")]}
+        _, item = queued("decline", payload_key="messages")
+        before = await reloaded.planner_before({**legacy_tick, "messages": [item]})
+        assert [entry["function"]["name"] for entry in before["tool_definitions"]] == [
+            "reply", "wait", "finish", "no_action"]
+        complete = reloaded.planner_after({**self.planner, **self.usage, "response": "别打扰他们",
+            "tool_calls": [{"function": {"name": "wait", "arguments": {"seconds": 90}}},
+                           {"function": {"name": "reply", "arguments": {"msg_id": "m"}}}],
+        })
+        assert complete["response"] == "" and complete["tool_calls"] == [
+            {"function": {"name": "finish", "arguments": {}}}]
+        assert self.record.call_args.kwargs["event"] == "proactive_video_share_planner"
+
+        _, item = queued("legacy empty", payload_key="messages")
+        await reloaded.planner_before({**legacy_tick, "messages": [item]})
+        complete = reloaded.planner_after({**self.planner, "response": "", "tool_calls": []})
+        tool = complete["tool_calls"][0]
+        assert len(complete["tool_calls"]) == 1 and tool["id"]
+        assert tool["function"] == {"name": "finish", "arguments": {}}
+
+        _, item = queued("legacy reply", payload_key="messages")
+        await reloaded.planner_before({**legacy_tick, "messages": [item]})
+        complete = reloaded.planner_after({**self.planner, **self.usage, "response": "unused",
+            "tool_calls": [{"function": {"name": "reply", "arguments": {"msg_id": "same-chat",
+                                                                       "set_quote": True}}}],
+        })
+        legacy = complete["tool_calls"][0]["function"]["arguments"]
+        assert legacy["msg_id"] == "same-chat" and legacy["set_quote"] is False
+        assert "lbm-proactive-reply" in legacy["chat_anlyze"]
+        assert len(complete["tool_calls"]) == 2 and complete["tool_calls"][1]["function"]["name"] == "finish"
+
+        _, item = queued("ordinary", payload_key="items")
+        message = {"item_type": "UserMessageItem", "parts": [{"type": "text", "text": "<message>new</message>"}]}
+        before = await reloaded.planner_before({**tick, "items": [item, message]})
+        assert before["items"] == [message] and before["tool_definitions"] == definitions[:-1]
+        ordinary = call("reply", chat_anlyze="answer the new message")
+        assert reloaded.planner_after({**self.planner, "output_items": [ordinary]})["output_items"] == [ordinary]
+
+        _, item = queued("expired", payload_key="items")
+        await reloaded.planner_before({**tick, "items": [item]})
+        service.active.return_value = False
+        expired = reloaded.planner_after({**self.planner, "output_items": [call("reply", chat_anlyze="too late")]})
+        assert expired["output_items"] == []
+        service.active.return_value = True
+
+        service.allowed.return_value = False
+        _, item = queued("busy", payload_key="items")
+        before = await reloaded.planner_before({**tick, "items": [item]})
+        assert before["items"] == [] and before["tool_definitions"] == [definitions[1]]
+        after = reloaded.planner_after({**self.planner, "output_items": [
+            {"item_type": "AssistantMessageItem", "parts": [{"type": "text", "text": "stray prose"}]},
+            call("reply", chat_anlyze="busy"),
+        ]})
+        assert after["output_items"] == []
+
+
     async def test_host_query_scope_and_subtotals(self):
         calls=self.subject.planner_after({"session_id":"s","output_items":[call(HOST_USAGE_TOOL,scope_proof="forged")]})
         proof=calls["output_items"][0]["tool_call"]["args"]["scope_proof"]
