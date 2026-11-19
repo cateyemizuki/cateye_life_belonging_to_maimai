@@ -1,8 +1,7 @@
-"""Send a server-generated QQ link card and independently confirm the chat event.
+"""Request the provider's native Bilibili mini-app card and transmit it as-is.
 
-The dedicated SnowLuma Tuwen action supplies no message ID and does not create
-a synthetic local send row. An action acknowledgment alone is not a confirmed
-card delivery and never triggers a retry through another format.
+No local card format is substituted. Acknowledgment alone never proves a card
+was delivered. QQ history must contain the same message and provider identity.
 """
 from __future__ import annotations
 
@@ -12,8 +11,9 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Iterator
+from urllib.parse import urlsplit
 
-from integrations.video_web_card import build_bili_web_card
+from integrations.video_web_card import build_bili_miniapp_request
 
 PASSTHROUGH_API = "adapter.napcat.action.call"
 _CALL_TIMEOUT_SECONDS = 30.0
@@ -23,7 +23,8 @@ _HISTORY_COUNT = 16
 
 _QQ_RE = re.compile(r"^[0-9]{5,12}$")
 _MESSAGE_ID_RE = re.compile(r"-?[0-9]{1,20}\Z")
-_VIDEO_URL_RE = re.compile(r"https://www\.bilibili\.com/video/(BV[0-9A-Za-z]{10})\Z")
+_MINIAPP_CARD = "com.tencent.miniapp_01"
+_BILI_MINIAPP_ID = "1109937557"
 _QQ_PLACEHOLDER = "发送者版本过低，无法展示内容"
 
 ApiCaller = Callable[..., Awaitable[Any]]
@@ -70,18 +71,59 @@ def _qq_message_id(value: Any) -> int:
     return int(text) if _MESSAGE_ID_RE.fullmatch(text) else 0
 
 
-def _validated_descriptor(card: Any) -> dict | None:
-    if not isinstance(card, dict) or not isinstance(card.get("jump_url"), str):
+def _native_card_identity(card: Any) -> tuple[str, str] | None:
+    if not isinstance(card, dict) or card.get("app") != _MINIAPP_CARD:
         return None
-    match = _VIDEO_URL_RE.fullmatch(card["jump_url"])
-    if match is None:
+    meta, config = card.get("meta"), card.get("config")
+    detail = meta.get("detail_1") if isinstance(meta, dict) else None
+    if not isinstance(detail, dict) or str(detail.get("appid")) != _BILI_MINIAPP_ID:
         return None
+    launch = detail.get("url")
+    token = config.get("token") if isinstance(config, dict) else None
+    if (not isinstance(launch, str) or any(ch.isspace() for ch in launch)
+            or not isinstance(token, str) or not token.strip()):
+        return None
+    # A provider may omit the scheme. Normalize only for verification; the
+    # card sent to QQ retains the original launch string unchanged.
+    candidate = "https:" + launch if launch.startswith("//") else (
+        "https://" + launch if launch.casefold().startswith("m.q.qq.com/") else launch)
     try:
-        canonical = build_bili_web_card(bvid=match[1], title=card.get("title", ""),
-                                        desc=card.get("desc", ""), pic_url=card.get("preview_url", ""))
-    except (TypeError, ValueError):
+        url = urlsplit(candidate)
+        if (url.scheme != "https" or url.hostname != "m.q.qq.com" or url.port not in (None, 443)
+                or url.username is not None or url.password is not None
+                or not url.path.startswith("/a/s/") or len(url.path) <= len("/a/s/")):
+            return None
+    except ValueError:
         return None
-    return canonical if canonical == card else None
+    return url.geturl(), token
+
+
+def _parse_native_card(raw: Any) -> dict | None:
+    if isinstance(raw, str):
+        if not raw or len(raw) > 65536:
+            return None
+        try:
+            raw = json.loads(raw)
+        except (ValueError, RecursionError):
+            return None
+    return raw if _native_card_identity(raw) else None
+
+
+def _original_provider_card(response: Any) -> str:
+    """Preserve returned JSON text; serialize a provider object without field changes."""
+    if isinstance(response, str):
+        return response if _parse_native_card(response) is not None else ""
+    for row in _response_layers(response):
+        if row.get("success") is False or _onebot_failed(row):
+            return ""
+        if _native_card_identity(row):
+            raw = json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            return raw if len(raw) <= 65536 else ""
+        for field in ("data", "result"):
+            raw = row.get(field)
+            if isinstance(raw, str) and _parse_native_card(raw) is not None:
+                return raw
+    return ""
 
 
 def _read_segment(message: Any) -> tuple[str, Any]:
@@ -103,27 +145,10 @@ def _read_segment(message: Any) -> tuple[str, Any]:
     return "json", body if isinstance(body, dict) else None
 
 
-def _matches_card(body: Any, descriptor: dict) -> bool:
-    """QQ may add signature/preview fields. Compare title and URL in one card object."""
-    if not isinstance(body, dict):
-        return False
-    queue: list[tuple[Any, int]] = [(body, 0)]
-    for _ in range(60):
-        if not queue:
-            return False
-        node, level = queue.pop()
-        if isinstance(node, dict):
-            if (node.get("title") == descriptor["title"] and
-                    any(node.get(key) == descriptor["jump_url"] for key in ("jumpUrl", "jump_url", "url"))):
-                return True
-            values = node.values()
-        elif isinstance(node, list):
-            values = node
-        else:
-            continue
-        if level < 5:
-            queue.extend((val, level + 1) for val in list(values)[:24] if isinstance(val, (dict, list)))
-    return False
+def _matches_card(body: Any, expected: dict) -> bool:
+    """Match the opaque native launch and token; the server can add display metadata."""
+    identity = _native_card_identity(body)
+    return identity is not None and identity == _native_card_identity(expected)
 
 
 @dataclass(frozen=True)
@@ -146,7 +171,12 @@ def _scoped_history_message(row: Any, kind: str, peer: str, account: str) -> _Hi
     if kind == "private" and ((own and str(row.get("target_id")) != peer) or (not own and user != peer)):
         return None
     sender = row.get("sender")
-    if isinstance(sender, dict) and str(sender.get("user_id")) != user:
+    if not isinstance(sender, dict) or str(sender.get("user_id")) != user:
+        return None
+    if kind == "group" and (sender.get("role") not in ("member", "admin", "owner")
+                            or "anonymous" not in row):
+        # SnowLuma's raw send also stores a local self echo, but that
+        # synthetic row has neither a group role nor the anonymous field.
         return None
     message_id = _qq_message_id(row.get("message_id"))
     if row.get("real_id") is not None and _qq_message_id(row["real_id"]) != message_id:
@@ -168,13 +198,24 @@ class VideoCardService:
 
     async def generate_card(self, *, bvid: str, title: str, desc: str = "",
                             pic_url: str = "") -> Dict[str, Any]:
-        """Prepare data for SnowLuma's dedicated QQ Tuwen action."""
+        """Request a fresh genuine Bilibili mini-app card without sending it."""
         try:
-            card = build_bili_web_card(bvid=bvid, title=title, desc=desc, pic_url=pic_url)
-        except (TypeError, ValueError) as exc:
+            params = build_bili_miniapp_request(bvid=bvid, title=title, desc=desc, pic_url=pic_url)
+        except (TypeError, ValueError):
+            return {"success": False, "error_class": "card_generation_failed", "error": "无效的 BV 号"}
+        try:
+            response = await asyncio.wait_for(self._api(
+                PASSTHROUGH_API, action_name="get_mini_app_ark", params=params,
+            ), timeout=self._timeout)
+            raw = _original_provider_card(response)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raw = ""
+        if not raw:
             return {"success": False, "error_class": "card_generation_failed",
-                    "error": f"卡片生成失败：{exc}"}
-        return {"success": True, "card": card}
+                    "error": "QQ 未返回可用的哔哩哔哩原生小程序卡片"}
+        return {"success": True, "card": {"ark_json": raw}}
 
     async def send_video_card(self, *, user_id: Any, bvid: str, title: str,
                               desc: str = "", pic_url: str = "") -> Dict[str, Any]:
@@ -210,8 +251,8 @@ class VideoCardService:
         field = "group_id" if kind == "group" else "user_id"
         params = {field: int(peer), "count": _HISTORY_COUNT}
         if kind == "group" and anchor:
-            # Group history otherwise walks back from its local authoritative
-            # anchor. Private roaming is only server-backed when unanchored.
+            # Anchor to the exact send receipt. A fallback-only self echo is
+            # rejected by the group event shape check.
             params.update(message_id=anchor, reverse_order=False)
         try:
             response = await asyncio.wait_for(self._api(PASSTHROUGH_API, action_name=action, params=params),
@@ -232,35 +273,26 @@ class VideoCardService:
         return None
 
     async def _confirm(
-        self, kind: str, peer: str, account: str, before: list[_HistoryMessage] | None,
-        descriptor: Dict[str, Any], started: int,
+        self, kind: str, peer: str, account: str, receipt_id: int, expected: Dict[str, Any], started: int,
     ) -> Dict[str, Any]:
-        if before is None:
-            return self._uncertain("card_history_unavailable")
-        known_ids = {row.message_id for row in before}
-        anchor = max(before, key=lambda row: row.sequence, default=None) if kind == "group" else None
+        if not receipt_id:
+            return self._uncertain("adapter_delivery_unconfirmed")
         history_read = False
-        observed_own: dict[int, _HistoryMessage] = {}
         for delay in _HISTORY_DELAYS:
             await asyncio.sleep(delay)
-            after = await self._read_history(kind, peer, account, anchor.message_id if anchor else 0)
+            after = await self._read_history(kind, peer, account, receipt_id if kind == "group" else 0)
             if after is None:
                 continue
             history_read = True
             upper = int(time.time()) + 5
-            for row in after:
-                if (row.own and row.message_id not in known_ids and started - 2 <= row.time <= upper
-                        and (anchor is None or row.sequence > anchor.sequence)):
-                    observed_own[row.message_id] = row
-            matches = [row for row in observed_own.values()
-                       if row.kind == "json" and _matches_card(row.body, descriptor)]
-            if len(matches) == 1:
+            rows = [row for row in after if row.own and row.message_id == receipt_id
+                    and started - 2 <= row.time <= upper]
+            if len(rows) != 1:
+                continue
+            row = rows[0]
+            if row.kind == "json" and _matches_card(row.body, expected):
                 return {"success": True, "channel": "video_card", "delivery_state": "accepted",
-                        "delivery_verified": True, "message_id": matches[0].message_id}
-            if len(matches) > 1:
-                return self._uncertain("card_not_confirmed")
-        if len(observed_own) == 1:
-            row = next(iter(observed_own.values()))
+                        "delivery_verified": True, "message_id": receipt_id}
             if row.kind == "text" and row.body == _QQ_PLACEHOLDER:
                 return self._uncertain("qq_card_replaced")
         return self._uncertain("card_not_confirmed" if history_read else "card_history_unavailable")
@@ -285,33 +317,34 @@ class VideoCardService:
         peer = str(route.get(field) or "")
         if kind not in ("group", "private") or not _QQ_RE.fullmatch(peer):
             return {"success": False, "not_sent": True, "error_class": "invalid_target"}
-        descriptor = _validated_descriptor(card)
-        if descriptor is None:
+        raw = card.get("ark_json") if isinstance(card, dict) else None
+        expected = _parse_native_card(raw) if isinstance(raw, str) else None
+        if expected is None:
             return {"success": False, "not_sent": True, "error_class": "invalid_card"}
         scope = (kind, peer)
         if scope in self._active:
             return {"success": False, "not_sent": True, "error_class": "card_send_in_progress"}
         self._active.add(scope)
         try:
-            return await self._send_and_confirm(route, kind, field, peer, descriptor, before_send)
+            return await self._send_and_confirm(route, kind, field, peer, raw, expected, before_send)
         finally:
             self._active.discard(scope)
 
-    async def _send_and_confirm(self, route, kind, field, peer, descriptor, before_send):
+    async def _send_and_confirm(self, route, kind, field, peer, raw, expected, before_send):
         account = await self._logged_in_account()
-        expected = str(route.get("account_id") or "")
-        if not account or (expected and account != expected):
+        expected_account = str(route.get("account_id") or "")
+        if not account or (expected_account and account != expected_account):
             return {"success": False, "not_sent": True, "error_class": "route_account_unverified"}
-        before = await self._read_history(kind, peer, account)
         if before_send is not None:
             allowed, _reason = before_send()
             if not allowed:
                 return {"success": False, "not_sent": True, "error_class": "gate_changed"}
-        params = {field: int(peer), **descriptor}
+        action = "send_group_msg" if kind == "group" else "send_private_msg"
+        params = {field: int(peer), "message": [{"type": "json", "data": {"data": raw}}]}
         started = int(time.time())
         try:
             response = await asyncio.wait_for(self._api(
-                PASSTHROUGH_API, action_name="send_tuwen_ark", params=params,
+                PASSTHROUGH_API, action_name=action, params=params,
             ), timeout=self._timeout)
         except asyncio.CancelledError:
             raise
@@ -326,13 +359,16 @@ class VideoCardService:
         if error:
             return self._uncertain(error)
         accepted = False
+        receipt_id = 0
         for layer in _response_layers(response):
             if _onebot_failed(layer):
                 return {"success": False, "not_sent": True, "error_class": "send_rejected"}
             if layer.get("success") is False:
                 return self._uncertain("adapter_delivery_unconfirmed")
             retcode = layer.get("retcode")
-            accepted = accepted or layer.get("status") == "ok" or (type(retcode) is int and retcode == 0)
+            accepted = (accepted or layer.get("status") == "ok" or (type(retcode) is int and retcode == 0)
+                        or layer.get("success") is True or layer.get("sent") is True)
+            receipt_id = _qq_message_id(layer.get("message_id")) or receipt_id
         if not accepted:
             return self._uncertain("adapter_delivery_unconfirmed")
-        return await self._confirm(kind, peer, account, before, descriptor, started)
+        return await self._confirm(kind, peer, account, receipt_id, expected, started)

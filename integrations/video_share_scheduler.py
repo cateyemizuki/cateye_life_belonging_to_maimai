@@ -77,7 +77,7 @@ def attempt_result(attempt: dict, *, duplicate: bool = False) -> dict:
     verified = state == 'accepted' and receipt.get('delivery_verified') is True
     reason = receipt.get('error_class')
     if verified:
-        content = (f'QQ 会话记录已确认视频卡片：《{title}》 {bvid}。'
+        content = (f'QQ 会话记录已确认出现 B 站小程序卡片《{title}》 {bvid}。'
                    '可以用 lbm_watch_bili_video 读取已保存的观看内容。')
     elif state == 'accepted':
         content = '旧回执缺少可核验的 QQ 卡片记录，不重复发送。'
@@ -85,7 +85,8 @@ def attempt_result(attempt: dict, *, duplicate: bool = False) -> dict:
         content = {
             'route_account_unverified': '未核验到当前会话的 QQ 登录账号，测试卡片未发送。',
             'send_rejected': 'QQ 拒绝了这张测试卡片。',
-            'card_action_unsupported': '当前 QQ 适配器不支持原生图文卡片发送动作，未发送。',
+            'card_action_unsupported': '当前 QQ 适配器不支持发送 B 站小程序卡片。',
+            'card_generation_failed': 'QQ 适配器未能生成 B 站小程序卡片，未发送。',
         }.get(reason, '测试卡片未发送。')
     elif attempt.get('kind') == 'debug':
         content = {
@@ -718,8 +719,11 @@ class ManualVideoShares:
                 generated = {}
             card = generated.get('card') if isinstance(generated, dict) and generated.get('success') is True else None
             if not isinstance(card, dict) or not card:
-                await asyncio.to_thread(ledger.finish, attempt, 'rejected', reason='card_generation_failed')
-                return {'success': False, 'error_class': 'card_generation_failed', 'content': '卡片生成失败，未发送。'}
+                failure = {'error_class': 'card_generation_failed'}
+                await asyncio.to_thread(ledger.finish, attempt, 'rejected', failure, 'card_generation_failed')
+                if debug:
+                    return attempt_result({'status': 'rejected', 'facts': selected, 'receipt': failure, 'kind': kind})
+                return {'success': False, **failure, 'content': 'B 站小程序卡片生成失败，未发送。'}
             try:
                 refreshed = await self.social.profiles.routes(manual_stream=send_stream)
             except BaseException:

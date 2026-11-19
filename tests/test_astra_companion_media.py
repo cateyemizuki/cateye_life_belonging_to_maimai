@@ -178,7 +178,7 @@ async def native_card_test_statuses_are_distinct(folder):
     fixture = {"kind": "debug", "facts": {"bvid": A, "title": "Fixture"}}
     confirmed = attempt_result({**fixture, "status": "accepted", "receipt": {"delivery_verified": True}})
     legacy = attempt_result({**fixture, "status": "accepted", "receipt": {"message_id": "-22"}}, duplicate=True)
-    assert "会话记录已确认" in confirmed["content"] and confirmed["success"]
+    assert "会话记录已确认出现 B 站小程序卡片" in confirmed["content"] and confirmed["success"]
     assert "旧回执缺少" in legacy["content"] and not legacy["success"] and legacy["duplicate"]
     for code, wording in (
         ("qq_card_replaced", "版本过低的占位提示"),
@@ -189,7 +189,10 @@ async def native_card_test_statuses_are_distinct(folder):
         assert wording in result["content"] and not result["success"] and result["delivery_state"] == "uncertain"
     unsupported = attempt_result({**fixture, "status": "rejected",
                                   "receipt": {"error_class": "card_action_unsupported"}})
-    assert "不支持原生图文卡片发送动作" in unsupported["content"] and not unsupported["success"]
+    assert "不支持发送 B 站小程序卡片" in unsupported["content"] and not unsupported["success"]
+    rejected = attempt_result({**fixture, "status": "rejected",
+                               "receipt": {"error_class": "card_generation_failed"}})
+    assert "未能生成 B 站小程序卡片" in rejected["content"] and not rejected["success"]
 
 
 async def merely_accepted_native_card_is_uncertain(folder):
