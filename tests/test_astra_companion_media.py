@@ -434,6 +434,154 @@ async def candidate_overlap(folder):
     assert only["pool_size"] == both["pool_size"] == 1, both
 
 
+async def video_companion_preferences_by_identity(folder):
+    from datetime import timedelta
+    from integrations.video_preferences import CompanionVideoPreferences
+
+    day = [datetime(2026, 11, 19, 12)]
+    binding = [("10001", "private-a")]
+    a, b = binding[0], ("10002", "private-b")
+    waits = []
+    captured = []
+
+    async def messages(stream, start, end, **kwargs):
+        owner = {"private-a": "10001", "private-b": "10002"}[stream]
+        stamp = day[0].timestamp() - 10
+        return {"messages": [
+            {"time": stamp, "text": "可以多看一些猫咪视频", "user_id": owner},
+            {"time": stamp, "text": "错误账号的题材", "user_id": "99999"},
+            {"time": stamp, "text": "机器人发的话", "user_id": owner, "is_mai": True},
+        ]}
+
+    async def generate(prompt, **kwargs):
+        captured.append(prompt)
+        assert "猫咪视频" in prompt and "既有话题" in prompt and "徒步" in prompt
+        assert "错误账号的题材" not in prompt and "机器人发的话" not in prompt
+        assert kwargs["max_attempts"] == 1
+        if waits:
+            await waits[0].wait()
+        term = "猫咪" if binding[0] == a else "宠物护理"
+        return NS(ok=True, text=json.dumps({"preferences": {term: 99, "99999999": 1}}))
+
+    def service():
+        return CompanionVideoPreferences(folder, target=lambda: binding[0], clock=lambda: day[0],
+            read_messages=messages, read_topics=lambda _: ["徒步"], generate=generate,
+            logger=logging.getLogger(__name__))
+
+    first = service()
+    await asyncio.gather(first.refresh(), first.refresh())
+    assert len(captured) == 1 and first.snapshot() == (a[0], {"猫咪": 0.45})
+    await service().refresh()
+    assert len(captured) == 1
+
+    binding[0] = b
+    assert first.snapshot() == (b[0], {})
+    await first.refresh()
+    assert first.snapshot() == (b[0], {"宠物护理": 0.45})
+    binding[0] = a
+    await first.refresh()
+    assert first.snapshot() == (a[0], {"猫咪": 0.45}) and len(captured) == 2
+
+    day[0] += timedelta(days=1)
+    waits.append(asyncio.Event())
+    task = asyncio.create_task(first.refresh())
+    while len(captured) < 3:
+        await asyncio.sleep(0)
+    binding[0] = b
+    waits[0].set()
+    await task
+    binding[0] = a
+    assert first.snapshot() == (a[0], {"猫咪": 0.45})
+    body = json.loads((folder / "companion_preferences/10001.json").read_text(encoding="utf-8"))
+    assert body["attempt_day"] == "2026-11-20" and "messages" not in body
+
+
+async def video_weighted_companion_mix(folder):
+    from integrations.video_interest import VideoInterestService, BiliCandidateSource
+    from integrations.video_selection import TopicSampler
+
+    active = [("10001", {"猫咪": .45, "美食": .45, "风光": .30, "弹琴": .35, "徒步": .40})]
+    now = [NOW]
+    doc = {"version": 2, "keywords": ["宠物", "风光", "悬疑"], "topics": [], "obtained_at": NOW-5*86400,
+           "generation": "original", "evidence_weights": {"terms": {
+             "风光":{"persona_base":1.0,"watch_score":.5,"updated_at":NOW}}},
+           }
+    (folder / "video_interest.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    llm = AsyncMock(return_value=NS(ok=True, text=json.dumps({
+        "keywords":["宠物", "风光", "悬疑"], "weights":{"风光":100,"悬疑":.01},
+        "companion_weights":{"美食":.28,"徒步":.99},
+        "shared":{"宠物":"猫咪", "无依据关键词":"弹琴", "风光":"不存在"},
+    })))
+    interest = VideoInterestService(folder,llm_generate_detailed=llm,now_provider=lambda:now[0],
+                                    companion_preferences_provider=lambda:active[0])
+    refreshed=await interest.ensure_interest()
+    assert "对方独有" in llm.await_args.args[0] and "徒步" in llm.await_args.args[0]
+    assert refreshed["weights"] == {"风光":1.15, "悬疑":.85}
+    assert refreshed["companion_mix"]["shared"] == {"宠物":"猫咪"}
+    own = interest.effective_weights()
+    signature, mix = interest.selection_context(interest.load())
+    assert mix["宠物"]>own["宠物"] and mix["风光"]>own["风光"]
+    assert mix["徒步"]==.40 and mix["弹琴"]==.35 and "猫咪" not in mix
+    assert len(set(mix)-set(own))==2 and max(mix.values())<=1.8
+    assert all(mix[k]<min(own.values()) for k in set(mix)-set(own))
+
+    calls=[]
+    async def fetch(url):
+        from urllib.parse import parse_qs, urlsplit
+        if "search/type" not in url:
+            return {"code":0,"data":{"list":[]}}
+        key=parse_qs(urlsplit(url).query)["keyword"][0]
+        calls.append(key)
+        return {"code":0,"data":{"result":[{"bvid":f"BV{len(calls):010d}","title":key+"影片",
+            "duration":"2:00","typename":"短片","play":90000}]}}
+    source=BiliCandidateSource(interest,fetch_json=fetch,selection_path=folder/"picks.json")
+    await source.prepare()
+    assert set(calls)==set(mix)
+    active[0] = ("10002", {"编织": .45})
+    assert source.pick()["reason"] == "interest_changed"
+    _, other_mix = interest.selection_context(interest.load())
+    assert "编织" in other_mix and "徒步" not in other_mix
+    assert other_mix["宠物"]==own["宠物"] and "猫咪" not in other_mix
+    active[0] = ("10001", {"猫咪": .45, "美食": .45, "风光": .30, "弹琴": .35, "徒步": .40})
+    assert interest.selection_context(interest.load()) == (signature, mix)
+
+    pool=[{"selection_topic":term, "selection_weight":weight, "selection_lane":"interest", "bvid":term}
+          for term,weight in mix.items()]
+    rng=Mock()
+    rng.choices.side_effect=lambda topics,weights,k:[topics[-1]]
+    rng.choice.side_effect=lambda values:values[0]
+    sampler=TopicSampler(rng=rng)
+    selected=sampler.choose(pool)
+    assert selected["selection_topic"]==list(mix)[-1]
+    assert rng.choices.call_args.kwargs["weights"] == list(mix.values())
+
+
+async def video_share_checks_latest_exchange(folder):
+    ledger=ShareLedger(folder/"latest.sqlite")
+    items=[{"message_id":"m1","time":NOW-300,"text":"午饭吃了面","user_id":ROUTE["user_id"]}]
+    async def read(sid,start,end,limit,limit_mode,**opts):
+        return items[-limit:]
+    routes=AsyncMock(return_value=[{**ROUTE,"platform":"qq"}])
+    profiles=AudienceProfiles(ledger,stream_reader=routes,message_reader=read,config_provider=lambda:CFG,
+                              target_provider=lambda:ROUTE)
+    first=await profiles.collect(NOW)
+    items.append({"message_id":"m2","time":NOW-10,"text":"正在处理紧急的家事","user_id":ROUTE["user_id"]})
+    second=await profiles.collect(NOW)
+    assert first[0]["recent"][-1]["text"]=="午饭吃了面"
+    assert second[0]["recent"][-1]["text"]=="正在处理紧急的家事"
+    assert first[0]["fingerprint"]!=second[0]["fingerprint"]
+    _, social = fixtures(folder)
+    social.profiles=profiles
+    observed(social.ledger,A,NOW)
+    async def judge(facts,audiences):
+        items.append({"message_id":"m3","time":NOW,"text":"请等我一下","user_id":ROUTE["user_id"]})
+        return {"action":"share", "target_stream_id":ROUTE["stream_id"], "profile_topics":{}}
+    social.evaluator=NS(evaluate=judge)
+    result=await social.tick()
+    assert result=={"status":"deferred","reason":"latest_conversation_changed"}
+    social._send.assert_not_awaited()
+
+
 async def tiered_miss(folder):
     from companion.initiative_profile import InitiativeMemory
     from integrations.optional_action import OptionalActionCoordinator
@@ -863,6 +1011,7 @@ CASES = [
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",
     "fallback_review", "candidate_overlap", "tiered_miss", "bound_legacy_upgrade",
+    "video_companion_preferences_by_identity", "video_weighted_companion_mix", "video_share_checks_latest_exchange",
     "contested_legacy_preserved", "late_review_ownership", "fallback_recovery_once",
     "previous_successful_cache", "detached_and_cross_midnight", "quota_reconciliation",
     "retired_watch_guards", "write_fallback_only_when_unsent",

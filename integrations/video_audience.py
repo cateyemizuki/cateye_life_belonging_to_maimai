@@ -35,6 +35,20 @@ def message_epoch(value:Any)->float:
         except (TypeError,ValueError):return 0.0
 
 
+def message_sender_id(row: dict) -> str:
+    info = row.get("message_info")
+    user = info.get("user_info") if isinstance(info, dict) else None
+    if not isinstance(user, dict):
+        user = row.get("user_info")
+    return str(row.get("user_id") or (user.get("user_id") if isinstance(user, dict) else "") or "")
+
+
+def _is_bot(row: dict, route: dict) -> bool:
+    sender = message_sender_id(row)
+    return (row.get("is_mai") is True or row.get("is_self") is True
+            or bool(sender and sender == route.get("account_id")))
+
+
 def route_of(raw:dict)->dict|None:
     stream=str(raw.get('stream_id') or raw.get('session_id') or '').strip()
     platform=str(raw.get('platform') or 'qq')
@@ -119,15 +133,42 @@ class AudienceProfiles:
                        day_count_is_lower_bound=len(page) >= limit)
         return count
 
+    async def latest_context(self, route: dict, now: float) -> dict | None:
+        """Read the latest exchange on demand, including when the topic profile is cached."""
+        try:
+            items = rows(await self._messages(
+                route["stream_id"], str(now - 7 * 86400), str(now),
+                limit=12, limit_mode="latest", filter_mai=False), "messages")
+        except Exception:
+            return None
+        latest = []
+        for row in items:
+            stamp = message_epoch(row.get("time", row.get("timestamp")))
+            if not now - 7 * 86400 <= stamp <= now:
+                continue
+            mid = str(row.get("message_id") or row.get("id") or "")
+            text = clean(row.get("processed_plain_text") or row.get("plain_text") or row.get("text"), 240)
+            latest.append((stamp, mid, text, _is_bot(row, route)))
+        latest.sort(key=lambda item: (item[0], item[1]))
+        fingerprint = hashlib.sha256(json.dumps(latest, ensure_ascii=False).encode()).hexdigest()
+        return {
+            "fingerprint": fingerprint,
+            "recent": [{"text": text, "is_bot": own, "at": stamp}
+                       for stamp, _, text, own in latest if text][-8:],
+            "last_bot_at": max((stamp for stamp, _, _, own in latest if own), default=0.0),
+            "recent_rate": sum(1 for stamp, _, _, _ in latest if now - stamp < 120),
+        }
+
     async def collect(self,now:float)->list[dict]:
-        routes=await self.routes();out=[]
+        routes = await self.routes()
+        routes.sort(key=lambda route: route["kind"] != "private")
+        out=[]
         cfg=self._config();interval=max(300,float(getattr(cfg,'profile_refresh_minutes',30))*60)
         threshold=max(0,int(getattr(cfg,'min_group_daily_messages',0)))
         day_start,day_key=_day_window(now)
         # No implicit fallback to a companion route if another allowed stream fails.
         for route in routes:
             sid=route['stream_id'];old=await asyncio.to_thread(self.ledger.profile, sid);profile=dict(old)
-            recent=[]
             refresh_after=min(interval,300) if old.get('coverage')!='ok' else interval
             needs_day_count = route['kind'] == 'group' and threshold > 0
             if not old or now-number(old.get('checked_at'))>=refresh_after or (needs_day_count and old.get('activity_day') != day_key):
@@ -142,13 +183,7 @@ class AudienceProfiles:
                         if not mid or not start<=stamp<=now+5:continue
                         text=clean(row.get('processed_plain_text') or row.get('plain_text') or row.get('text'),240)
                         if not text:continue
-                        info=row.get('message_info') if isinstance(row.get('message_info'),dict) else {}
-                        user=(info.get('user_info') if isinstance(info.get('user_info'),dict)
-                              else row.get('user_info') if isinstance(row.get('user_info'),dict) else {})
-                        sender=str(row.get('user_id') or user.get('user_id') or '')
-                        own=(row.get('is_mai') is True or row.get('is_self') is True
-                             or bool(sender and route.get('account_id') and sender==route['account_id']))
-                        normalized.append((stamp,mid,text,own))
+                        normalized.append((stamp,mid,text,_is_bot(row, route)))
                     normalized.sort(key=lambda x:(x[0],x[1]))
                     new=[x for x in normalized if x[1] not in seen]
                     cursor=max([number(old.get('cursor')),*(x[0] for x in normalized)])
@@ -168,7 +203,6 @@ class AudienceProfiles:
                         recent_rate=sum(1 for x in normalized if now-x[0]<120),
                         has_user_history=bool(old.get('has_user_history') or any(not x[3] for x in normalized)),
                         day_key=day_key,day_non_bot_count=day_count)
-                    recent=[{'text':x[2],'is_bot':x[3]} for x in new[-8:]]
                     # 不达标群不建立/更新话题画像（仅留轻量活动计数），省token并防误发小群。
                     if route['kind']=='group' and threshold>0 and day_count<threshold:
                         profile.pop('topics',None)
@@ -181,14 +215,13 @@ class AudienceProfiles:
             if route['kind']=='group' and threshold>0 and stored_count<threshold:continue
             if (profile.get('coverage')!='ok' or not profile.get('has_user_history')
                     or now-number(profile.get('last_message_at'))>7*86400):continue
-            digest=hashlib.sha256(json.dumps({k:profile.get(k) for k in ('cursor','last_message_at')},sort_keys=True).encode()).hexdigest()
-            out.append({**route,'topics':profile.get('topics') or [],'recent':recent,
+            out.append({**route,'topics':profile.get('topics') or [],
                 'as_of':profile.get('checked_at'),'last_message_at':profile.get('last_message_at'),
-                'message_count':profile.get('message_count',0),'recent_rate':profile.get('recent_rate',0),
-                'last_bot_at':profile.get('last_bot_at',0),'day_non_bot_count':stored_count,
-                'day_count_is_lower_bound':bool(profile.get('day_count_is_lower_bound')), 'fingerprint':digest})
-            if len(out)>=12:break
-        return out
+                'message_count':profile.get('message_count',0),'day_non_bot_count':stored_count,
+                'day_count_is_lower_bound':bool(profile.get('day_count_is_lower_bound'))})
+            if len(out)>=8:break
+        latest = await asyncio.gather(*(self.latest_context(route, now) for route in out))
+        return [{**route, **context} for route, context in zip(out, latest) if context is not None]
 
     def update_topics(self,updates:dict,allowed:list[dict]):
         valid={r['stream_id'] for r in allowed}

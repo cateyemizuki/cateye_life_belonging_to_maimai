@@ -692,6 +692,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 tick_task.cancel()
             except Exception:
                 pass
+        preference_task = getattr(self, "_companion_video_preferences_task", None)
+        if preference_task is not None:
+            preference_task.cancel()
         auto_init_task = getattr(self, "_auto_init_task", None)
         if auto_init_task is not None:
             try:
@@ -719,7 +722,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     async def _shutdown_chain(self) -> None:
         """串行停机链（F2：每步独立防御；总超时预算由 on_unload 的 wait_for 控制）。"""
         # Stop single-flight integration work before any service/database teardown.
-        for task_name in ("_video_watch_sync_task", "_video_watch_poll_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task", "_auto_init_task", "_preference_refresh_task"):
+        for task_name in ("_video_watch_sync_task", "_video_watch_poll_task", "_share_delivery_task", "_surf_frequency_task", "_video_completion_task", "_qzone_video_task", "_auto_init_task", "_preference_refresh_task",
+                          "_companion_video_preferences_task"):
             task = getattr(self, task_name, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -806,6 +810,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             # 热启动可能重建 manager：候选提供器随启动重绑（幂等）
             self._bind_video_candidate_provider()
         else:
+            await self._cancel_owned_task("_companion_video_preferences_task")
             await self._video_watch.stop()
         self._llm.update_task(llm_task_name_of(cfg))
         self._companion.sync_from_config()
@@ -892,6 +897,9 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
     def _apply_target(self, target_qq: str, stream_id: str) -> None:
         self._companion.set_target(target_qq, stream_id)
         self._qzone.set_target(stream_id)
+        self._video_preference_binding = (target_qq, stream_id)
+        if getattr(self, "_bg_started", False):
+            self._wake_companion_video_preferences()
         from companion.screen_tools import remember_screen_target
         saved = remember_screen_target(self, target_qq, stream_id)
         self._screen_scope_ready = bool(target_qq and stream_id)
@@ -1738,6 +1746,53 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         except Exception:
             return False  # 配置不可核验：保守不可 roll
 
+    def _active_video_preference_target(self) -> tuple[str, str]:
+        owner, stream = getattr(self, "_video_preference_binding", ("", ""))
+        if not owner or not stream or getattr(self, "_is_unloading", False):
+            return "", ""
+        cfg = self.config
+        if (not cfg.plugin.enabled or not cfg.video_watch.enabled or not cfg.patrol.enabled
+                or owner != target_qq_of(cfg)):
+            return "", ""
+        return owner, stream
+
+    def _companion_video_preference_service(self):
+        service = getattr(self, "_companion_video_preferences", None)
+        if service is None:
+            from integrations.video_preferences import CompanionVideoPreferences
+
+            def topics(stream_id: str) -> list[str]:
+                owner, current = self._active_video_preference_target()
+                if current != stream_id:
+                    return []
+                social = getattr(self, "_video_social", None)
+                profile = social.ledger.profile(stream_id) if social is not None else {}
+                remembered = profile.get("topics")
+                result = list(remembered[:12]) if isinstance(remembered, list) else []
+                affection = getattr(self, "_affection", None)
+                if affection is not None and affection.matches_target(owner):
+                    habits = affection.habits()
+                    if isinstance(habits, dict):
+                        result.extend(str(value) for value in habits.values())
+                return result[:12]
+
+            service = CompanionVideoPreferences(
+                self._data_dir / "video_watch", target=self._active_video_preference_target,
+                read_messages=self.ctx.message.get_by_time_in_chat, read_topics=topics,
+                generate=lambda *args, **kwargs: self._llm.generate_detailed(*args, module="video", **kwargs),
+                clock=self._surf_now, logger=self.ctx.logger,
+            )
+            self._companion_video_preferences = service
+        return service
+
+    def _wake_companion_video_preferences(self) -> None:
+        task = getattr(self, "_companion_video_preferences_task", None)
+        if task is not None and not task.done():
+            self._companion_video_preference_service().wake()
+        elif self._active_video_preference_target()[0]:
+            self._companion_video_preferences_task = asyncio.create_task(
+                self._companion_video_preference_service().run())
+
     def _video_candidate_source(self) -> Any:
         """惰性单例：兴趣服务（3天缓存）+ 公开排行榜候选源（不持任务/预算状态）。"""
         source = getattr(self, "_video_candidate_source_obj", None)
@@ -1756,6 +1811,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 # 动态读 [video_watch]（热重载即时生效；读失败服务侧保守降级）
                 watch_evidence_provider=self._interest_watch_evidence_rows,
                 half_life_days_provider=self._interest_watch_half_life_days,
+                companion_preferences_provider=self._companion_video_preference_service().snapshot,
                 logger=self.ctx.logger)
             # 3.3：分享质量门槛只读兴趣权重（不触发刷新/LLM）；保存引用供 provider
             # 惰性读取，避免每次判分都重建服务。
@@ -2471,6 +2527,8 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             return
         async def refresh() -> None:
             try:
+                if self._active_video_preference_target()[0]:
+                    await self._companion_video_preference_service().refresh()
                 await self._video_candidate_source().refresh_interest()
             except asyncio.CancelledError:
                 raise
@@ -3158,6 +3216,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
         self._ensure_stream_retry()
         self._ensure_life_tick_task()
         self._bg_started = True
+        self._wake_companion_video_preferences()
 
     async def _refresh_persona(self) -> None:
         try:

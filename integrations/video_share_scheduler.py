@@ -316,7 +316,14 @@ class VideoSocialService:
             await asyncio.to_thread(
                 self.ledger.decide, bvid, {'action': 'do_not_share', 'reason': 'card_generation_failed'}, self._now())
             return {'status': 'rejected', 'reason': 'card_generation_failed'}
-        # All awaited work is behind us; re-read consent/routes and business
+        latest = getattr(self.profiles, "latest_context", None)
+        if callable(latest):
+            context = await latest(selected, self._now())
+            if context is None or context["fingerprint"] != selected["fingerprint"]:
+                reason = "latest_conversation_changed"
+                await asyncio.to_thread(self.ledger.postpone, bvid, reason, self._now(), 300, reevaluate=True)
+                return {"status": "deferred", "reason": reason}
+        # Re-read consent/routes and business
         # gates before reserving a budget or persisting the send intent.
         try:
             current = await self.profiles.routes()

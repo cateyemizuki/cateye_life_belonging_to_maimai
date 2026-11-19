@@ -15,7 +15,7 @@ class VideoShareSectionConfig(PluginConfigBase):
         default="自动分享", description="关闭时停止自动评估；影子模式只记录决定不发送；自动分享按授权、活跃门槛、静默和额度投递卡片。默认自动分享，评估器可自主选择不分享。手动分享工具独立可用。",
         json_schema_extra={"label": "运行模式"})
     include_companion: bool = Field(
-        default=True, description="允许将已配置的陪伴目标私聊作为自动分享候选，仍需判断内容相关性与是否适合打扰。陪伴私聊不受群活跃门槛限制。",
+        default=True, description="允许将已配置的陪伴目标私聊作为自动分享候选，按日常朋友分享的口径判断，近期严肃或紧急话题暂缓。陪伴私聊不受群活跃门槛限制。",
         json_schema_extra={"label": "允许陪伴目标私聊"})
     allow_all_groups: bool = Field(
         default=True, description="允许所有已注册且可路由的QQ群作为自动分享候选，仍受群活跃门槛、静默与额度约束，评估器自主决定是否分享。关闭后仅陪伴私聊与额外允许的聊天可候选。",
