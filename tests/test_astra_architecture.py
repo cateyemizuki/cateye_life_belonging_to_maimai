@@ -176,8 +176,9 @@ async def case_gateway_imports_share_patches(root):
 async def case_trusted_command_policy(root):
     from tools.command_components import CommandRootComponentsMixin
     from core.command_dispatcher import DISPATCHER
+    from companion.components import CompanionComponentsMixin
 
-    class Fake(CommandRootComponentsMixin):
+    class Fake(CommandRootComponentsMixin, CompanionComponentsMixin):
         async def cmd_status_dashboard(self, *_args, **kwargs):
             calls.append(kwargs)
             return True, "verified", True
@@ -222,6 +223,24 @@ async def case_trusted_command_policy(root):
     )
     assert len(calls) == before
     assert DISPATCHER.parse("en", "help").kind == "help"
+
+    p.config.plugin = NS(enabled=True)
+    p.config.video_watch = NS(enabled=True)
+    test_share = AsyncMock(return_value={"success": True})
+    p._recent_video_share_service = lambda: NS(share_debug=test_share)
+    kwargs = {
+        "matched_groups": {"root_args": "运维 分享 调试"},
+        "platform": "qq", "user_id": "10203", "stream_id": "s-one",
+        "message_id": "incorrect-top-level-id", "message": {"message_id": "actual-ingress-id"},
+    }
+    await p._cmd_root_entry("cn", {**kwargs, "user_id": "10456"})
+    await p._cmd_root_entry("cn", {**kwargs, "group_id": "198765"})
+    test_share.assert_not_awaited()
+    await p._cmd_root_entry("cn", kwargs)
+    test_share.assert_awaited_once_with("s-one", "actual-ingress-id", group_id="", user_id="10203")
+    await p._cmd_root_entry("en", {**kwargs, "matched_groups": {"root_args": "ops share debug 198765"}})
+    assert test_share.await_count == 1
+
 
 
 async def case_offline_failure_replay_and_dst(root):

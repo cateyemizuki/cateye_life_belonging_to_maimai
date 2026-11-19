@@ -503,7 +503,7 @@ class VideoWatchService:
         """Read-only completion-port result, without model calls."""
         return self._require_manager().result(task_id)
 
-    def recent_videos(self, limit: int = 20) -> list[dict]:
+    def recent_videos(self, limit: Optional[int] = 20) -> list[dict]:
         """真实完成且文字记忆仍有效的近期视频，只读、零模型调用。"""
         import time
         manager = self._require_manager()
@@ -540,7 +540,7 @@ class VideoWatchService:
                 "source": str(row.get("source") or ""),
                 "source_kind": str(row.get("source_kind") or ""),
             })
-            if len(out) >= max(1, min(50, limit)):
+            if limit is not None and len(out) >= max(1, min(50, limit)):
                 break
         return out
 

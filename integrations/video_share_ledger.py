@@ -96,10 +96,22 @@ class ShareLedger:
             row=db.execute('SELECT * FROM attempts WHERE request_key=?',(key,)).fetchone()
             return self._attempt(db,row) if row else None
 
-    def recent_stream_receipt(self,stream:str,now:float)->dict|None:
+    def recent_stream_receipt(self,stream:str,now:float,*,include_accepted:bool=True)->dict|None:
         with self._connection() as db:
-            row=db.execute("SELECT * FROM attempts WHERE stream=? AND created>? AND status IN ('preparing','sending','accepted','uncertain') ORDER BY created DESC LIMIT 1",(stream,now-120)).fetchone()
+            row=db.execute("SELECT * FROM attempts WHERE stream=? AND created>? AND "
+                           "(status IN ('preparing','sending','uncertain') OR (status='accepted' AND ?)) "
+                           "ORDER BY created DESC LIMIT 1",(stream,now-120,include_accepted)).fetchone()
             return self._attempt(db,row) if row else None
+
+    def unresolved_videos(self, stream: str) -> set[str]:
+        """Pairs a deliberate resend must still leave untouched."""
+        scope = hashlib.sha256(stream.encode()).hexdigest()
+        with self._connection() as db:
+            rows = db.execute("SELECT bvid FROM attempts WHERE stream IN (?,'*') "
+                              "AND status IN ('preparing','sending','uncertain') "
+                              "UNION SELECT bvid FROM legacy_manual WHERE scope=? AND status='uncertain'",
+                              (stream, scope))
+            return {row['bvid'] for row in rows}
 
     def pair_receipt(self,bvid:str,stream:str,now:float,*,manual=False)->dict|None:
         with self._connection() as db:
@@ -198,10 +210,13 @@ class ShareLedger:
 
 
     def claim(self, bvid: str, stream: str, kind: str, request_key: str, now: float,
-              day: str, limits: dict, *, budget_token: str = '', preparing: bool = False) -> dict:
+              day: str, limits: dict, *, budget_token: str = '', preparing: bool = False,
+              debug: bool = False) -> dict:
         """Atomic attempt + quota claim, shared by manual and automatic paths."""
         if kind not in ('auto', 'manual') or not stream or not BV.fullmatch(bvid):
             return {'status': 'blocked', 'reason': 'invalid_identity'}
+        if debug and (kind != 'manual' or not request_key):
+            return {'status': 'blocked', 'reason': 'invalid_debug_claim'}
         with self._transaction() as db:
             if not self._clock(db, now):
                 return {'status': 'blocked', 'reason': 'clock_regressed'}
@@ -222,15 +237,17 @@ class ShareLedger:
                 "ORDER BY created DESC", (bvid, stream, stream, now - 120)).fetchall()
             window = KEEP_SECONDS if kind == 'auto' else 21600
             for row in rows:
-                is_active = row['status'] in ACTIVE_ATTEMPTS
+                status = row['status']
+                if status not in ACTIVE_ATTEMPTS or (debug and status == 'accepted'):
+                    continue
                 pair = row['bvid'] == bvid and row['stream'] in (stream, '*')
-                if is_active and pair and (row['status'] != 'accepted' or now - row['created'] < window):
+                if pair and (status != 'accepted' or now - row['created'] < window):
                     return {'status': 'duplicate', 'attempt': self._attempt(db, row)}
-                if is_active and row['stream'] == stream and now - row['created'] < 120:
+                if row['stream'] == stream and now - row['created'] < 120:
                     return {'status': 'blocked', 'reason': 'stream_cooldown'}
             scope = hashlib.sha256(stream.encode()).hexdigest()
             for old in db.execute("SELECT * FROM legacy_manual WHERE scope=? AND bvid=?", (scope, bvid)):
-                if old['status'] == 'uncertain' or now - old['created'] < window:
+                if old['status'] == 'uncertain' or (not debug and now - old['created'] < window):
                     return {'status': 'blocked', 'reason': 'legacy_pair_receipt'}
             if kind == 'auto':
                 reason = self._auto_limit_reason(db, bvid, stream, now, day, limits)

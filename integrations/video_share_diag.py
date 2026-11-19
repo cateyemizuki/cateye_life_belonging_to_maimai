@@ -21,7 +21,8 @@ def _fmt_epoch(value: Any) -> str:
 
 def render_share(host: Any, args: str) -> str:
     usage = (
-        "用法: /lbm ops share <status|clear>（管理员）\n"
+        "用法: /lbm ops share <debug|status|clear>（管理员）\n"
+        "  debug                      — 向当前 QQ 聊天随机发送近期观看的视频测试卡片\n"
         "  status                     — 只读：运行模式/候选状态/uncertain 明细\n"
         "  clear <attempt_id> confirm — 核验确未送达后清除该 uncertain 回执（保留审计）"
     )

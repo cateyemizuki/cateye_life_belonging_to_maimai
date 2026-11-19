@@ -14,7 +14,8 @@ import math
 import random
 import uuid
 
-from integrations.video_share_policy import BV, clean, number, watched_facts
+from core.media_urls import media_cdn_url
+from integrations.video_share_policy import BV, QQ, clean, number, watched_facts
 
 #: 陪伴目标分享机会倍率上限（配置 >1 时生效；1.0 = 现状）
 TARGET_SHARE_BOOST_MAX = 3.0
@@ -442,9 +443,11 @@ class VideoSocialService:
 class ManualVideoShares:
     """A user/natural tool's current-stream action, sharing the same receipts."""
 
-    def __init__(self, social: VideoSocialService, *, recent_provider, clock, day, chooser=random.choice):
+    def __init__(self, social: VideoSocialService, *, recent_provider, clock, day,
+                 chooser=random.choice, debug_recent_provider=None):
         self.social = social
         self._recent = recent_provider
+        self._debug_recent = debug_recent_provider or recent_provider
         self._now = clock
         self._day = day
         self._choose = chooser
@@ -452,20 +455,28 @@ class ManualVideoShares:
 
     async def share(self, stream_id: str, request_id: str = '', *, video: str = '',
                     to_companion: bool = False) -> dict:
-        """两参数手动分享：①video=BV号或视频链接（解析真实BV）；②to_companion。
+        """Share the explicitly requested watched video to the current or companion chat."""
+        bvid = str(video or '').strip()
+        if not BV.fullmatch(bvid):
+            return {'success': False, 'error_class': 'invalid_video',
+                    'content': '未解析到真实BV号（仅支持B站视频BV/页面链接/b23.tv短链/分享文字），不搜索、不编造、不发送。'}
+        return await self._share(stream_id, request_id, bvid=bvid, to_companion=to_companion)
 
-        to_companion=true → 转发陪伴目标私聊（配置取流并核验身份）；false/不传 →
-        发送到当前聊天（工具调用所在流）。目标不由 bot 指定任意 stream_id。防重/
-        回执/账号核验/未知不补发等安全边界与自动分享共用同一台账，保持不变。
-        """
+    async def share_debug(self, stream_id: str, request_id: str, *,
+                          group_id: str = "", user_id: str = "") -> dict:
+        """Force a random card for a distinct command in its verified QQ conversation."""
+        target = group_id or user_id
+        if not stream_id or not request_id or not QQ.fullmatch(target):
+            return {'success': False, 'error_class': 'invalid_debug_context',
+                    'content': '无法核验当前 QQ 会话或调试命令消息 ID，未发送。'}
+        route = ("group", "group_id", group_id) if group_id else ("private", "user_id", user_id)
+        return await self._share(stream_id, 'ops-share-debug:' + request_id, debug_route=route)
+
+    async def _share(self, stream_id: str, request_id: str, *, bvid: str = '',
+                     to_companion: bool = False, debug_route: tuple[str, str, str] | None = None) -> dict:
+        debug = debug_route is not None
         async with self._lock:
             ledger = self.social.ledger
-            # 参数①：工具层已把 BV/链接/短链解析为真实BV（复用 video_watch.bv）；
-            # 此处只接受形态合法的BV，非法/未解析诚实不发送（integrations 不反向依赖 video_watch）。
-            bvid = str(video or '').strip()
-            if not BV.fullmatch(bvid):
-                return {'success': False, 'error_class': 'invalid_video',
-                        'content': '未解析到真实BV号（仅支持B站视频BV/页面链接/b23.tv短链/分享文字），不搜索、不编造、不发送。'}
             # 参数②：陪伴目标私聊或当前聊天；去掉任意指定聊天流参数。
             target = self.social.profiles.companion_target() if to_companion else {}
             send_stream = (target.get('stream_id') or '') if to_companion else str(stream_id or '')
@@ -480,39 +491,62 @@ class ManualVideoShares:
                                  or routes[0].get('user_id') != target.get('user_id')):
                 return {'success': False, 'error_class': 'companion_route_mismatch',
                         'content': '陪伴目标私聊路由已变化，不发送。'}
+            if debug_route is not None:
+                kind, field, expected = debug_route
+                route = routes[0]
+                if (route.get('stream_id') != send_stream or route.get('kind') != kind
+                        or route.get(field) != expected):
+                    return {'success': False, 'error_class': 'debug_route_mismatch',
+                            'content': '当前 QQ 聊天路由与操作来源不一致，未发送。'}
             key = hashlib.sha256((send_stream + '|' + request_id).encode()).hexdigest() if request_id else ''
             now = self._now()
             prior = await asyncio.to_thread(ledger.request_receipt, key)
-            if prior and prior.get('bvid') != bvid:
+            if prior and not debug and prior.get('bvid') != bvid:
                 return {'success': False, 'bvid': bvid, 'error_class': 'request_conflict',
                         'content': '这次请求已用于另一个视频，本次视频未提交。'}
             if prior is None:
-                prior = await asyncio.to_thread(ledger.recent_stream_receipt, send_stream, now)
+                prior = await asyncio.to_thread(
+                    ledger.recent_stream_receipt, send_stream, now, include_accepted=not debug)
+                if prior and debug:
+                    return {'success': False, 'error_class': 'pending_delivery',
+                            'content': '当前聊天刚有一条视频交付待确认，本次调试未发送。'}
                 if prior and prior.get('bvid') != bvid:
                     return {'success': False, 'bvid': bvid, 'error_class': 'stream_cooldown',
                             'content': '当前聊天刚有一次视频分享，本次视频未提交。'}
             if prior:
                 return attempt_result(prior, duplicate=True)
             recent = {}
-            for raw in self._recent() or []:
+            provider = self._debug_recent if debug else self._recent
+            history = await asyncio.to_thread(provider)
+            for raw in history or []:
                 if not isinstance(raw, dict):
                     continue
                 row_bvid = str(raw.get('bvid') or '')
                 title = clean(raw.get('title'), 200)
                 if BV.fullmatch(row_bvid) and title and row_bvid not in recent:
-                    recent[row_bvid] = {'bvid': row_bvid, 'title': title}
-            selected = recent.get(bvid)
-            if selected is None:
-                return {'success': False, 'error_class': 'no_recent_video',
-                        'content': '近期观看记忆中没有这个可分享视频，不搜索、不编造。'}
-            prior = await asyncio.to_thread(ledger.pair_receipt, bvid, send_stream, now, manual=True)
-            if prior:
-                return attempt_result(prior, duplicate=True)
+                    recent[row_bvid] = {'bvid': row_bvid, 'title': title,
+                                        'cover_url': media_cdn_url(raw.get('cover'))}
+            if debug:
+                unsafe = await asyncio.to_thread(ledger.unresolved_videos, send_stream)
+                pool = [row for row in recent.values() if row['bvid'] not in unsafe]
+                if not pool:
+                    return {'success': False, 'error_class': 'no_recent_video',
+                            'content': '近期没有可分享且投递状态明确的观看记录。'}
+                selected = self._choose(pool)
+                bvid = selected['bvid']
+            else:
+                selected = recent.get(bvid)
+                if selected is None:
+                    return {'success': False, 'error_class': 'no_recent_video',
+                            'content': '近期观看记忆中没有这个可分享视频，不搜索、不编造。'}
+                prior = await asyncio.to_thread(ledger.pair_receipt, bvid, send_stream, now, manual=True)
+                if prior:
+                    return attempt_result(prior, duplicate=True)
             await asyncio.to_thread(ledger.ensure_manual, selected, now)
             claim = await asyncio.to_thread(
-                ledger.claim, selected['bvid'], send_stream, 'manual', key, now, self._day(), {}, preparing=True)
+                ledger.claim, bvid, send_stream, 'manual', key, now, self._day(), {}, preparing=True, debug=debug)
             if claim['status'] == 'duplicate':
-                if claim['attempt'].get('bvid') != bvid:
+                if not debug and claim['attempt'].get('bvid') != bvid:
                     return {'success': False, 'bvid': bvid, 'error_class': 'request_conflict',
                             'content': '该请求对应另一个视频，本次视频未提交。'}
                 return attempt_result(claim['attempt'], duplicate=True)
@@ -521,7 +555,8 @@ class ManualVideoShares:
                         'content': '分享防重或状态检查未放行，本次不发送。'}
             attempt = claim['attempt_id']
             try:
-                generated = await self.social._prepare(**selected)
+                generated = await self.social._prepare(
+                    bvid=bvid, title=selected['title'], pic_url=selected['cover_url'])
             except asyncio.CancelledError:
                 await asyncio.to_thread(ledger.finish, attempt, 'rejected', reason='preparation_cancelled_no_send')
                 raise

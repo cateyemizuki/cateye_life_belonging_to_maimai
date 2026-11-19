@@ -123,6 +123,52 @@ async def wrong_manual_receipt(folder):
     assert social._send.await_count == 1
 
 
+async def forced_share_debug_replay_and_unknown(folder):
+    ledger, social = fixtures(folder)
+    stamp = [NOW]
+    rows = [
+        {"bvid": A, "title": "已观看 A", "cover": "http://i0.hdslb.com/cover-a.jpg"},
+        {"bvid": B, "title": "已观看 B", "cover": "http://i0.hdslb.com/cover-b.jpg"},
+    ]
+    recent = Mock(return_value=rows)
+    pick = Mock(side_effect=lambda pool: pool[0])
+    manual = ManualVideoShares(social, recent_provider=lambda: rows, debug_recent_provider=recent,
+                               clock=lambda: stamp[0], day=lambda: DAY, chooser=pick)
+    stream, user = ROUTE["stream_id"], ROUTE["user_id"]
+    wrong = await manual.share_debug(stream, "a", group_id="30005")
+    assert wrong["error_class"] == "debug_route_mismatch"
+    missing = await manual.share_debug(stream, "", user_id=user)
+    assert missing["error_class"] == "invalid_debug_context"
+    social._send.assert_not_awaited()
+
+    first = await manual.share_debug(stream, "one", user_id=user)
+    replay = await manual.share_debug(stream, "one", user_id=user)
+    second = await manual.share_debug(stream, "two", user_id=user)
+    assert first["success"] and replay["success"] and replay["duplicate"] and second["success"]
+    assert first["bvid"] == second["bvid"] == A
+    assert pick.call_count == recent.call_count == social._send.await_count == 2
+    assert social._prepare.await_args.kwargs["pic_url"] == "https://i0.hdslb.com/cover-a.jpg"
+
+    regular = await manual.share(stream, "ordinary", video=B)
+    assert regular["error_class"] == "stream_cooldown"
+    pick.side_effect = lambda pool: pool[-1]
+    social._send.return_value = {"uncertain": True}
+    unknown = await manual.share_debug(stream, "three", user_id=user)
+    assert unknown["bvid"] == B and unknown["delivery_state"] == "uncertain"
+    unknown_replay = await manual.share_debug(stream, "three", user_id=user)
+    assert unknown_replay["duplicate"] and unknown_replay["delivery_state"] == "uncertain"
+    assert (await manual.share_debug(stream, "four", user_id=user))["error_class"] == "pending_delivery"
+    assert social._send.await_count == 3
+
+    stamp[0] += 121
+    social._send.return_value = {"success": True}
+    opt = await manual.share_debug(stream, "five", user_id=user)
+    assert opt["success"] and opt["bvid"] == A
+    assert [row["bvid"] for row in pick.call_args.args[0]] == [A]
+    assert ledger.unresolved_videos(stream) == {B}
+    social.evaluator.evaluate.assert_not_called()
+
+
 async def profile_count(folder):
     ledger = ShareLedger(folder / "profile.sqlite")
     cfg = NS(allowed_chats=[], allow_all_groups=True, min_group_daily_messages=100, profile_refresh_minutes=5)
@@ -1145,7 +1191,7 @@ CASES = [
     "optional_weekly_summary_failure",
     "watch_terminal_equivalence",
     "qzone_policy_equivalence", "qzone_caption_uses_current_facts", "qzone_duplicate_checked_before_dispatch",
-    "share_limits", "wrong_manual_receipt", "profile_count", "interrupted_eval", "cancel_cache",
+    "share_limits", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "profile_count", "interrupted_eval", "cancel_cache",
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",
     "fallback_review", "candidate_overlap", "tiered_miss", "bound_legacy_upgrade",

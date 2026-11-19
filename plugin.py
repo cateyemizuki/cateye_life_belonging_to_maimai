@@ -1870,6 +1870,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
             from integrations.video_share_scheduler import ManualVideoShares
             if self._video_social is None:raise RuntimeError('独立分享回执不可用')
             service = ManualVideoShares(self._video_social,recent_provider=self._video_watch.recent_videos,
+                debug_recent_provider=lambda: self._video_watch.recent_videos(limit=None),
                 clock=lambda:self._surf_now().timestamp(),day=self._surf_day)
             self._recent_video_share = service
         return service

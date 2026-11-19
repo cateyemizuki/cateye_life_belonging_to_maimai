@@ -45,6 +45,8 @@ _CALL_TIMEOUT_SECONDS = 30.0
 
 _BV_FULL_RE = re.compile(r"^BV[0-9A-Za-z]{10}$")
 _QQ_RE = re.compile(r"^[0-9]{5,12}$")
+_MINIAPP_CARD = "com.tencent.miniapp_01"
+_BILI_MINIAPP_ID = "1109937557"
 
 ApiCaller = Callable[..., Awaitable[Any]]
 
@@ -77,6 +79,22 @@ def _extract_ark(data: Any) -> Optional[Dict[str, Any]]:
     if isinstance(card, dict) and card and ("meta" in card or "app" in card):
         return card
     return None
+
+
+def _complete_bili_ark(card: Dict[str, Any], document_url: str) -> Dict[str, Any]:
+    """Supply missing document fields without changing the provider's launch data."""
+    meta = card.get("meta")
+    detail = meta.get("detail_1") if isinstance(meta, dict) else None
+    if (card.get("app") != _MINIAPP_CARD or not isinstance(detail, dict)
+            or str(detail.get("appid")) != _BILI_MINIAPP_ID):
+        return card
+
+    completed = dict(card)
+    document = detail.get("qqdocurl")
+    if document is None or (isinstance(document, str) and not document.strip()):
+        completed["meta"] = {**meta, "detail_1": {**detail, "qqdocurl": document_url}}
+    completed.setdefault("needShareCallBack", False)
+    return completed
 
 
 class VideoCardService:
@@ -135,7 +153,8 @@ class VideoCardService:
             return {"success": False, "error_class": "card_generation_failed",
                     "error": "get_mini_app_ark 未返回可用卡片结构"}
         try:
-            ark_json = json.dumps(card, ensure_ascii=False, separators=(",", ":"))
+            completed = _complete_bili_ark(card, params["jumpUrl"])
+            ark_json = json.dumps(completed, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
             return {"success": False, "error_class": "card_generation_failed",
                     "error": f"卡片 JSON 序列化失败：{exc}"}

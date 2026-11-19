@@ -2194,12 +2194,38 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             matched_groups={"diag_args": diag_args}, **kwargs)
 
     async def cmd_ops_share(self, cmd: Any, args: list[str], **kwargs: Any) -> tuple:
-        """ops/share → 既有视频分享运维（status 只读 / clear 需确认）。"""
+        """Inspect share receipts or deliberately test a retained video in this chat."""
         del cmd
-        stream_id = str(kwargs.get("stream_id", "") or "")
+        stream_id = str(kwargs.get("stream_id", "") or "").strip()
+        if args and args[0].lower() == "debug":
+            return await self._share_video_debug(stream_id, args, **{
+                k: kwargs.get(k) for k in ("platform", "group_id", "user_id", "message_id")
+            })
         reply = self._lbm_life_share(" ".join(str(item) for item in args))
         await self.ctx.send.text(reply, stream_id)
         return True, "视频分享运维已发送", True
+
+    async def _share_video_debug(self, stream_id: str, args: list[str], *,
+                                 platform: Any, group_id: Any, user_id: Any, message_id: Any) -> tuple:
+        if not stream_id or str(platform or "").strip().lower() != "qq":
+            return True, "视频分享调试仅可在已核验的当前 QQ 会话运行。", True
+        if len(args) != 1:
+            await self.ctx.send.text("用法：/lbm ops share debug", stream_id)
+            return True, "参数错误", True
+        if not (self.config.plugin.enabled and self.config.video_watch.enabled):
+            await self.ctx.send.text("视频观看模块尚未启用。", stream_id)
+            return True, "模块未启用", True
+        try:
+            result = await self._recent_video_share_service().share_debug(
+                stream_id, str(message_id or "").strip(),
+                group_id=str(group_id or "").strip(), user_id=str(user_id or "").strip())
+        except Exception:
+            result = {"success": False, "content": "视频分享调试未取得确定回执。"}
+        if result.get("success"):
+            return True, "视频卡片调试已提交", True
+        if not result.get("duplicate"):
+            await self.ctx.send.text(result.get("content") or "视频分享调试未发送。", stream_id)
+        return True, "视频卡片调试未取得新发送回执", True
 
     async def mai_cmd_affection(self, **kwargs: Any) -> tuple[bool, str, bool]:
         companion = self._mai_companion()
