@@ -24,7 +24,8 @@ from integrations.video_web_card import build_bili_miniapp_request, normalized_q
 
 PASSTHROUGH_API = "adapter.napcat.action.call"
 _CALL_TIMEOUT_SECONDS = 30.0
-_HISTORY_TIMEOUT_SECONDS = 3.0
+_GROUP_HISTORY_TIMEOUT_SECONDS = 8.0
+_PRIVATE_HISTORY_TIMEOUT_SECONDS = 3.0
 _HISTORY_DELAYS = (0.5, 1.0)
 _HISTORY_COUNT = 16
 
@@ -334,16 +335,18 @@ class VideoCardService:
 
     async def _read_history(self, kind: str, peer: str, account: str,
                             anchor: int = 0) -> list[_HistoryMessage] | None:
-        action = "get_group_msg_history" if kind == "group" else "get_friend_msg_history"
-        field = "group_id" if kind == "group" else "user_id"
+        is_group = kind == "group"
+        action = "get_group_msg_history" if is_group else "get_friend_msg_history"
+        field = "group_id" if is_group else "user_id"
+        timeout = _GROUP_HISTORY_TIMEOUT_SECONDS if is_group else _PRIVATE_HISTORY_TIMEOUT_SECONDS
         params = {field: int(peer), "count": _HISTORY_COUNT}
-        if kind == "group" and anchor:
+        if is_group and anchor:
             # Anchor to the exact send receipt. A fallback-only self echo is
             # rejected by the group event shape check.
             params.update(message_id=anchor, reverse_order=False)
         try:
             response = await asyncio.wait_for(self._api(PASSTHROUGH_API, action_name=action, params=params),
-                                              timeout=min(self._timeout, _HISTORY_TIMEOUT_SECONDS))
+                                              timeout=min(self._timeout, timeout))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -382,7 +385,8 @@ class VideoCardService:
                         "delivery_verified": True, "message_id": receipt_id}
             if row.kind == "text" and row.body == _QQ_PLACEHOLDER:
                 return self._uncertain("qq_card_replaced")
-        return self._uncertain("card_not_confirmed" if history_read else "card_history_unavailable")
+        reason = "card_not_confirmed" if history_read else "card_history_unavailable"
+        return {**self._uncertain(reason), "message_id": receipt_id}
 
     def _uncertain(self, code: str) -> Dict[str, Any]:
         details = {

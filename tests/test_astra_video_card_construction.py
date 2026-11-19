@@ -253,6 +253,7 @@ class VideoCardConstructionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["success"])
         self.assertTrue(result["uncertain"])
         self.assertEqual(result["error_class"], "card_history_unavailable")
+        self.assertEqual(result["message_id"], MID)
         self.assertEqual(api.await_args.kwargs["params"], {"group_id": int(GROUP), "count": 16,
                                                           "message_id": MID, "reverse_order": False})
         self.assertEqual(actions(api).count("send_group_msg"), 1)
@@ -267,6 +268,51 @@ class VideoCardConstructionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actions(api), ["get_login_info", "send_group_msg", "get_group_msg_history"])
         self.assertEqual(api.await_args_list[1].kwargs["params"]["message"], [
             {"type": "json", "data": {"data": card()["ark_json"]}}])
+
+    async def test_history_wait_allows_late_group_reply_and_keeps_the_private_budget(self):
+        for kind, latency, budget, verified in (
+            ("group", 5.188, 8.0, True),
+            ("group", 8.1, 8.0, False),
+            ("private", 5.188, 3.0, False),
+        ):
+            with self.subTest(kind=kind, latency=latency):
+                history_result = history(event(kind))
+                api = AsyncMock(side_effect=[okay({"user_id": BOT}), okay({"message_id": MID}),
+                                             history_result, history_result])
+                observed_budgets = []
+
+                async def wait_for(awaitable, *, timeout):
+                    result = await awaitable
+                    if result is history_result:
+                        observed_budgets.append(timeout)
+                        if latency > timeout:
+                            raise asyncio.TimeoutError
+                    return result
+
+                with patch("integrations.video_card.asyncio.wait_for", new=wait_for):
+                    result = await VideoCardService(api).send_card(route(kind), card())
+
+                history_action = "get_group_msg_history" if kind == "group" else "get_friend_msg_history"
+                reads = 1 if verified else 2
+                self.assertEqual(observed_budgets, [budget] * reads)
+                self.assertEqual(actions(api), ["get_login_info", f"send_{kind}_msg"] + [history_action] * reads)
+                self.assertEqual(result["message_id"], MID)
+                self.assertEqual(result["success"], verified)
+                if verified:
+                    self.assertTrue(result["delivery_verified"])
+                else:
+                    self.assertTrue(result["uncertain"])
+                    self.assertEqual(result["error_class"], "card_history_unavailable")
+
+    async def test_empty_group_history_keeps_the_send_receipt_without_confirming(self):
+        api = AsyncMock(side_effect=[okay({"user_id": BOT}), okay({"message_id": MID}), history(), history()])
+        result = await VideoCardService(api).send_card(route("group"), card())
+        self.assertFalse(result["success"])
+        self.assertTrue(result["uncertain"])
+        self.assertEqual(result["error_class"], "card_not_confirmed")
+        self.assertEqual(result["message_id"], MID)
+        self.assertEqual(actions(api), ["get_login_info", "send_group_msg",
+                                        "get_group_msg_history", "get_group_msg_history"])
 
     async def test_exact_qq_placeholder_is_seen_but_never_confirms_delivery(self):
         for kind in ("group", "private"):
@@ -299,6 +345,7 @@ class VideoCardConstructionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(result["success"])
                 self.assertTrue(result["uncertain"])
                 self.assertEqual(result["error_class"], "card_not_confirmed")
+                self.assertEqual(result["message_id"], MID)
                 self.assertEqual(actions(api).count("send_private_msg"), 1)
 
     async def test_missing_adapter_id_and_opaque_gate_failure_do_not_start_retries(self):
@@ -306,6 +353,7 @@ class VideoCardConstructionTests(unittest.IsolatedAsyncioTestCase):
         result = await VideoCardService(api).send_card(route(), card())
         self.assertTrue(result["uncertain"])
         self.assertEqual(result["error_class"], "adapter_delivery_unconfirmed")
+        self.assertNotIn("message_id", result)
         self.assertEqual(actions(api), ["get_login_info", "send_private_msg"])
         api = AsyncMock(side_effect=[okay({"user_id": BOT})])
         result = await VideoCardService(api).send_card(route(), card(), before_send=lambda: (False, "changed"))
