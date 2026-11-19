@@ -74,6 +74,10 @@
             }
           }
         },
+        "interests": {
+          "api": "life_dashboard_interests",
+          "version": "1"
+        },
         "thumbnail": {
           "api": "life_dashboard_thumbnail",
           "version": "1",
@@ -83,6 +87,18 @@
               "required": true,
               "max_length": 64
             }
+          }
+        }
+      },
+      "actions": {
+        "save_interests": {
+          "api": "life_dashboard_save_interests",
+          "version": "1",
+          "parameters": {
+            "profile": {"type": "string", "required": true, "choices": ["bot", "companion"]},
+            "revision": {"type": "string", "required": true, "max_length": 64},
+            "mode": {"type": "string", "required": true, "choices": ["manual", "automatic"]},
+            "entries_json": {"type": "string", "required": true, "max_length": 4096}
           }
         }
       }

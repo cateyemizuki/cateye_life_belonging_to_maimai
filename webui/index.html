@@ -747,6 +747,21 @@ html[data-embedded=true] .mast-side{padding-right:10px}
 #media-detail-dialog{background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),#fff}
 [data-theme=dark] #media-detail-dialog{background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),#132019}
 
+.video-card-tools{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+#interest-editor{width:min(560px,calc(100vw - 28px));max-height:88dvh;padding:0;border:1px solid var(--maibot-border);border-radius:16px;color:var(--maibot-foreground);background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),#fff;box-shadow:0 20px 70px #0004}
+[data-theme=dark] #interest-editor{background:linear-gradient(var(--maibot-surface),var(--maibot-surface)),#132019}
+#interest-editor::backdrop{background:#0007}
+.interest-editor-body{padding:14px 18px 18px}
+.interest-editor-body p{margin:10px 0}
+#interest-editor-message:empty{display:none}
+#interest-editor-message[data-error=true]{color:var(--maibot-foreground);border-inline-start:2px solid var(--stress);padding-inline-start:8px}
+.interest-editor-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(75px,86px) auto;gap:8px;align-items:center}
+.interest-editor-columns[aria-hidden=true]{font-size:12px;color:var(--maibot-muted);margin:12px 0 4px}
+.interest-editor-row{margin-bottom:8px}
+.interest-editor-row input{min-width:0;width:100%;box-sizing:border-box;padding:8px;border:1px solid var(--maibot-border);border-radius:9px;background:var(--maibot-background);color:var(--maibot-foreground);font:inherit}
+.interest-editor-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;border-top:1px solid var(--maibot-border);padding-top:12px;margin-top:14px}
+#interest-save{background:var(--maibot-soft);border-color:var(--maibot-primary);color:var(--maibot-primary)}
+
 /* Fullscreen detail layer (2026-11-01 U plan): entries stay in place and lift above the
    backdrop; the backdrop keeps a light blur (2–4px) with a low-strength veil, and a curved
    tail ties the bubble to its entry. Only the panel and its entry stay clear. */
@@ -1550,7 +1565,7 @@ html[data-lbm-pill] .toolbar{margin-right:var(--lbm-pill-lane,0px)}
    <section aria-labelledby="schedule-one_shot-origin"><h3 id="schedule-one_shot-origin">一次性生成事件来源</h3><ul id="schedule-one_shot-sources" class="schedule-pool-list"></ul><section id="schedule-consumed-details"><h3>本周期消耗记录</h3><ul id="schedule-consumed-items" class="schedule-pool-list"></ul></section></section>
  </div>
 </section>
-<section role="tabpanel" id="panel-mood" aria-labelledby="tab-mood" tabindex="0" hidden><section id="entertainment-video"><article class="card maibot-card media-collection" id="video-recent-card"><div class="cardtop"><h2>最近观看</h2><span class="pill" id="video-recent-count">—</span></div><div id="video-recent" class="media-grid" aria-label="视频观看记录网格"></div></article></section><section id="entertainment-posts" hidden><article class="card maibot-card media-collection qzone-card"><div class="cardtop"><h2>空间动态</h2><span class="pill" id="qzone-enabled">—</span></div><div id="qzone-summary"></div><div id="qzone-recent-posts" class="media-grid" aria-label="空间动态记录网格"></div></article></section><div id="video-interests-detail" hidden><div id="video-interests"></div></div></section>
+<section role="tabpanel" id="panel-mood" aria-labelledby="tab-mood" tabindex="0" hidden><section id="entertainment-video"><article class="card maibot-card media-collection" id="video-recent-card"><div class="cardtop"><h2>最近观看</h2><div class="video-card-tools"><span class="pill" id="video-recent-count">—</span><button type="button" id="edit-video-interests" aria-haspopup="dialog" hidden>编辑视频兴趣</button></div></div><div id="video-recent" class="media-grid" aria-label="视频观看记录网格"></div></article></section><section id="entertainment-posts" hidden><article class="card maibot-card media-collection qzone-card"><div class="cardtop"><h2>空间动态</h2><span class="pill" id="qzone-enabled">—</span></div><div id="qzone-summary"></div><div id="qzone-recent-posts" class="media-grid" aria-label="空间动态记录网格"></div></article></section><div id="video-interests-detail" hidden><div id="video-interests"></div></div></section>
 <section role="tabpanel" id="panel-system" aria-labelledby="tab-system" tabindex="0" hidden><section class="card maibot-card wide usage-scene"><div class="cardtop usage-card-head"><div><h2>模型调用与 Token</h2><span class="note" id="usage-window">—</span></div><div class="range usage-card-range" id="usage-range" role="group" aria-label="用量统计范围"><button type="button" data-usage-hours="24" aria-pressed="false">24 小时</button><button type="button" data-usage-hours="168" aria-pressed="false">7 天</button><button type="button" data-usage-hours="720" aria-pressed="true">30 天</button></div></div><div id="usage-metrics" class="usage-card-metrics"></div><div class="note" id="usage-split"></div><div class="summarychips" id="usage-top" hidden aria-label="各模块 Token 用量"></div><section id="usage-detail" class="usage-detail" aria-label="模型调用详情内容">
  <div class="usage-toolbar">
   <div><h3 id="usage-period">等待用量记录</h3><p class="note usage-provenance"><span id="usage-source"></span><time id="usage-updated"></time></p></div>
@@ -1604,7 +1619,31 @@ html[data-lbm-pill] .toolbar{margin-right:var(--lbm-pill-lane,0px)}
     </g>
   </svg>
 </svg>
-</template><script>
+</template><dialog id="interest-editor" aria-labelledby="interest-editor-title">
+ <header class="media-dialog-head">
+  <h2 id="interest-editor-title">编辑视频兴趣</h2>
+  <button type="button" id="interest-close">关闭</button>
+ </header>
+ <div class="interest-editor-body">
+  <div class="range" id="interest-profiles" role="group" aria-label="兴趣档案">
+   <button type="button" data-profile="companion" aria-pressed="false">我的兴趣</button>
+   <button type="button" data-profile="bot" aria-pressed="true">Bot 的兴趣</button>
+  </div>
+  <p id="interest-editor-message" class="note" role="status"></p>
+  <button type="button" id="interest-reload" hidden>重新读取档案</button>
+  <form id="interest-editor-form" hidden>
+   <p id="interest-editor-hint" class="note"></p>
+   <div class="interest-editor-columns" aria-hidden="true"><span>视频题材</span><span>权重</span><span></span></div>
+   <div id="interest-editor-rows"></div>
+   <button type="button" id="interest-add">添加题材</button>
+   <div class="interest-editor-actions">
+    <button type="button" id="interest-automatic" hidden>恢复自动维护</button>
+    <button type="button" id="interest-save">保存为手动兴趣</button>
+   </div>
+  </form>
+ </div>
+</dialog>
+<script>
 (()=>{'use strict';
 // W-04 嵌入态标记：存在宿主桥（window.maibot）即视为嵌入宿主 iframe，给 <html> 加
 // data-embedded——隐藏插件自身品牌区并收纳导出入口；离线独立打开 index.html 时不标记，
@@ -2467,7 +2506,7 @@ async function loadVisibleThumbnails(){
  if(!window.maibot?.query||loadingThumbnails)return;
  loadingThumbnails=true;
  try{
-  for(;;){
+  while(!$('interest-editor').open){
    const frame=[...document.querySelectorAll('[data-thumbnail-id]')].find(node=>node.getClientRects().length);
    if(!frame)break;
    const id=frame.dataset.thumbnailId;
@@ -2519,6 +2558,7 @@ $('media-detail-dialog').addEventListener('click',event=>{if(event.target!==even
 function renderEntertainmentPages(){const video=entertainmentPage===0;$('entertainment-video').hidden=!video;$('entertainment-posts').hidden=video;$('entertainment-prev').setAttribute('aria-pressed',String(video));$('entertainment-next').setAttribute('aria-pressed',String(!video));text('entertainment-page-label',video?'1 / 2':'2 / 2')}
 function renderMood(){const v=data.video||{};
  renderEntertainmentPages();
+ $('edit-video-interests').hidden=!(live&&!imported&&typeof window.maibot?.action==='function');
  const videoRecentBox=$('video-recent'),recent=Array.isArray(v.recent)?v.recent.slice(0,mediaRecordLimit()):[];
  text('video-recent-count',v.available?recent.length+' 条':'—');
  if(videoRecentBox){if(recent.length)videoRecentBox.replaceChildren(...recent.map(row=>renderVideoRecord(row)));else empty(videoRecentBox,v.available?'最近没有看完的视频':'视频信息暂不可用',v.available?'看完的视频会在这里留下记录。':'视频观看模块就绪后展示。')}
@@ -2539,6 +2579,124 @@ $('entertainment-prev').onclick=()=>selectEntertainmentPage(0);
 $('entertainment-next').onclick=()=>selectEntertainmentPage(1);
 window.addEventListener('resize',syncMediaGrid);
 if(typeof ResizeObserver!=='undefined'){const observer=new ResizeObserver(syncMediaGrid);observer.observe($('video-recent'));observer.observe($('qzone-recent-posts'))}
+const interestEditor=$('interest-editor'), interestForm=$('interest-editor-form');
+const interestRows=$('interest-editor-rows');
+let preferenceProfiles=null, preferenceTab='bot', preferenceDrafts={}, preferencePending=false, preferenceReload=false;
+
+function currentPreference(){return preferenceProfiles?.[preferenceTab]}
+function preferenceMessage(message,error=false){
+ const note=$('interest-editor-message');
+ note.textContent=message;
+ note.dataset.error=String(error);
+}
+function updatePreferenceControls(){
+ const profile=currentPreference();
+ for(const tab of $('interest-profiles').querySelectorAll('button')){
+  tab.setAttribute('aria-pressed',String(tab.dataset.profile===preferenceTab));
+  tab.disabled=preferencePending;
+ }
+ const fieldsDisabled=preferencePending||preferenceReload;
+ for(const control of interestRows.querySelectorAll('input,button'))control.disabled=fieldsDisabled;
+ $('interest-close').disabled=preferencePending;
+ $('interest-reload').hidden=!preferenceReload;
+ $('interest-reload').disabled=preferencePending;
+ $('interest-add').disabled=fieldsDisabled||interestRows.children.length>=profile?.maximum_count;
+ $('interest-save').disabled=fieldsDisabled||!profile?.available||interestRows.children.length<profile.minimum_count;
+ $('interest-automatic').hidden=profile?.mode!=='manual';
+ $('interest-automatic').disabled=fieldsDisabled;
+}
+function preferenceInputRow(entry){
+ const profile=currentPreference(),row=el('div','interest-editor-columns interest-editor-row');
+ const topic=el('input'),weight=el('input'),remove=el('button','','移除');
+ topic.type='text';topic.required=true;topic.maxLength=40;topic.value=entry.topic;
+ topic.placeholder='例如：猫咪纪录片';topic.setAttribute('aria-label','视频题材');
+ weight.type='number';weight.required=true;weight.min=profile.minimum;weight.max=profile.maximum;
+ weight.step='0.001';weight.value=entry.weight;weight.setAttribute('aria-label','题材权重');
+ remove.type='button';remove.setAttribute('aria-label','移除此题材');
+ remove.onclick=()=>{row.remove();updatePreferenceControls();$('interest-add').focus()};
+ row.append(topic,weight,remove);
+ return row;
+}
+function preferenceValues(){
+ return [...interestRows.children].map(row=>{
+  const [topic,weight]=row.querySelectorAll('input');
+  return {topic:topic.value,weight:weight.value};
+ });
+}
+function renderPreferenceTab(){
+ const profile=currentPreference();
+ interestForm.hidden=!profile?.available;
+ interestRows.replaceChildren();
+ if(profile?.available){
+  const mode=profile.mode==='manual'?'手动兴趣正在生效':'当前由系统自动维护';
+  $('interest-editor-hint').textContent=mode+'。基本权重 '+profile.minimum+'–'+profile.maximum+'，最多 '+profile.maximum_count+' 个题材。';
+  interestRows.append(...(preferenceDrafts[preferenceTab]||profile.entries).map(preferenceInputRow));
+  preferenceMessage('');
+ }else if(preferenceProfiles){
+  preferenceMessage(preferenceTab==='companion'?'绑定并核验陪伴目标的私聊后可编辑。':'Bot 的兴趣档案暂不可用。');
+ }
+ updatePreferenceControls();
+}
+async function readPreferenceProfiles(){
+ preferencePending=true;preferenceReload=false;preferenceProfiles=null;preferenceDrafts={};
+ renderPreferenceTab();
+ preferenceMessage('正在读取兴趣档案');
+ try{
+  preferenceProfiles=await deadline(window.maibot.query('interests'),11000);
+  renderPreferenceTab();
+ }catch{
+  preferenceReload=true;preferenceMessage('读取失败，请重新读取档案。',true);
+ }finally{
+  preferencePending=false;updatePreferenceControls();
+ }
+}
+async function savePreferenceProfile(mode){
+ if(preferencePending||preferenceReload||!currentPreference()?.available)return;
+ const profile=currentPreference(), entries=mode==='manual'?preferenceValues().map(row=>({topic:row.topic.trim(),weight:Number(row.weight)})):[];
+ if(entries.some(row=>!row.topic)){preferenceMessage('请填写视频题材。',true);return}
+ preferencePending=true;updatePreferenceControls();preferenceMessage('正在保存');
+ try{
+  const result=await deadline(window.maibot.action('save_interests',{
+   profile:preferenceTab,revision:profile.revision,mode,entries_json:JSON.stringify(entries),
+  }),12000);
+  if(!result?.ok){
+   preferenceReload=Boolean(result?.conflict);
+   preferenceMessage(result?.message||'保存失败，请稍后重试。',true);
+   return;
+  }
+  preferenceProfiles[preferenceTab]=result.profile;delete preferenceDrafts[preferenceTab];
+  renderPreferenceTab();preferenceMessage(mode==='manual'?'已保存，选片会使用新兴趣。':'已恢复自动维护。');
+  if(live&&!imported)void refresh();
+ }catch{
+  preferenceReload=true;preferenceMessage('尚未收到保存结果，请重新读取档案确认。',true);
+ }finally{
+  preferencePending=false;updatePreferenceControls();
+ }
+}
+
+$('edit-video-interests').onclick=()=>{preferenceTab='bot';interestEditor.showModal();void readPreferenceProfiles()};
+$('interest-close').onclick=()=>interestEditor.close();
+$('interest-reload').onclick=()=>void readPreferenceProfiles();
+interestEditor.addEventListener('cancel',event=>{if(preferencePending)event.preventDefault()});
+interestEditor.addEventListener('close',()=>{if(!$('edit-video-interests').hidden)$('edit-video-interests').focus();void loadVisibleThumbnails()});
+$('interest-profiles').onclick=event=>{
+ const tab=event.target.closest('button[data-profile]');
+ if(!tab||preferencePending||preferenceReload||tab.dataset.profile===preferenceTab)return;
+ if(currentPreference()?.available)preferenceDrafts[preferenceTab]=preferenceValues();
+ preferenceTab=tab.dataset.profile;renderPreferenceTab();
+};
+$('interest-add').onclick=()=>{
+ const profile=currentPreference();if(!profile||interestRows.children.length>=profile.maximum_count)return;
+ const row=preferenceInputRow({topic:'',weight:Number(((profile.minimum+profile.maximum)/2).toFixed(3))});
+ interestRows.append(row);updatePreferenceControls();row.querySelector('input').focus();
+};
+$('interest-automatic').onclick=()=>void savePreferenceProfile('automatic');
+$('interest-save').onclick=()=>{if(interestForm.reportValidity())void savePreferenceProfile('manual')};
+interestForm.addEventListener('keydown',event=>{
+ if(event.key!=='Enter'||event.isComposing||!event.target.matches('input'))return;
+ event.preventDefault();$('interest-save').click();
+});
+
 const usageCount=value=>group(count(value));
 const usageTokenLabel=(value,reported)=>num(reported)===0?'未回传':usageCount(value)+' Token';
 const usageModuleLabels=new Map(Object.entries({planning:'日程',emotion:'情绪',companion:'陪伴',qzone:'空间',video:'视频',unknown:'未标注模块'}));

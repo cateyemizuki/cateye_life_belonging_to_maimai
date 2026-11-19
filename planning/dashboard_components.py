@@ -1,10 +1,19 @@
-"""Only declared read APIs are reachable from the sandboxed dashboard."""
+"""Only declared APIs are reachable from the sandboxed dashboard."""
 from maibot_sdk import API
 from .dashboard import build_life_dashboard
 from .dashboard_media import dashboard_thumbnail
+from .dashboard_preferences import preference_editor_snapshot, save_preference_edit
 
 
 class LifeDashboardComponentsMixin:
+    @API('life_dashboard_interests', description='读取生活面板的可编辑视频兴趣', version='1', public=False)
+    async def life_dashboard_interests(self) -> dict:
+        return preference_editor_snapshot(self)
+
+    @API('life_dashboard_save_interests', description='保存生活面板的视频兴趣', version='1', public=False)
+    async def life_dashboard_save_interests(self, profile: str, revision: str, mode: str, entries_json: str = "[]") -> dict:
+        return save_preference_edit(self, profile=profile, revision=revision, mode=mode, entries_json=entries_json)
+
     @API('life_dashboard_thumbnail', description='只读加载近期观看封面和动态配图', version='1')
     async def life_dashboard_thumbnail(self, image_id: str) -> dict:
         return {'src': await dashboard_thumbnail(image_id)}

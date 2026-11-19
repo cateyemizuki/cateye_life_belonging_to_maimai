@@ -556,6 +556,71 @@ async def video_weighted_companion_mix(folder):
     assert rng.choices.call_args.kwargs["weights"] == list(mix.values())
 
 
+async def dashboard_manual_video_interests(folder):
+    from integrations.video_preferences import CompanionVideoPreferences
+    from integrations.video_interest import VideoInterestService
+    from planning.dashboard_components import LifeDashboardComponentsMixin
+
+    binding = [("10001", "private-a")]
+    store = folder / "video_watch"
+    store.mkdir()
+    llm = AsyncMock(return_value=NS(ok=True, text='{"keywords":["自动纪录片"],"weights":{"自动纪录片":1}}'))
+    target = CompanionVideoPreferences(store, target=lambda:binding[0], clock=datetime.now,
+        read_messages=AsyncMock(), read_topics=lambda _:[], generate=AsyncMock(), logger=logging.getLogger(__name__))
+    interest = VideoInterestService(store, llm_generate_detailed=llm,
+                                    companion_preferences_provider=target.selection_snapshot)
+    class Dashboard(LifeDashboardComponentsMixin):
+        _data_dir = folder
+
+        def _active_video_preference_target(self):
+            return binding[0]
+
+        def _companion_video_preference_service(self):
+            return target
+
+    dashboard = Dashboard()
+    async def save(name, profile, entries, mode="manual"):
+        return await dashboard.life_dashboard_save_interests(name, profile["revision"], mode, json.dumps(entries))
+
+    view = await dashboard.life_dashboard_interests()
+    assert view["bot"]["mode"] == "automatic" and view["bot"]["entries"] == []
+    assert "10001" not in json.dumps(view)
+    invalid = [{"topic":"猫咪","weight":2}]
+    assert not (await save("bot", view["bot"], invalid))["ok"]
+    duplicates = [{"topic":"Ａ","weight":1},{"topic":"a","weight":1}]
+    assert not (await save("bot", view["bot"], duplicates))["ok"]
+    assert not (await save("bot", view["bot"], []))["ok"]
+
+    bot = await save("bot", view["bot"], [{"topic":"猫咪","weight":1.15}])
+    assert bot["ok"] and bot["profile"]["mode"] == "manual"
+    doc = await interest.interest_for_selection()
+    assert doc["status"] == "manual" and not llm.called
+    old_signature, _ = interest.selection_context(doc)
+    assert interest.current_self_weights() == {"猫咪":1.15}
+    previous_a = view["companion"]
+    mine = await save("companion", previous_a, [{"topic":"猫咪","weight":.45}])
+    assert mine["ok"]
+    assert interest.selection_context(doc)[0] != old_signature
+    assert interest.selection_context(doc)[1]["猫咪"] > 1.15
+
+    binding[0] = ("10002", "private-b")
+    assert (await save("companion", mine["profile"], [{"topic":"剪纸","weight":.4}]))["conflict"]
+    assert target.snapshot() == ("10002", {})
+    binding[0] = ("10001", "private-a")
+    assert target.snapshot() == ("10001", {"猫咪":.45})
+
+    await interest.ensure_interest(force=True)
+    assert interest.current_self_weights() == {"猫咪":1.15}
+    restored = await save("bot", bot["profile"], [], mode="automatic")
+    assert restored["ok"] and restored["profile"]["entries"] == [{"topic":"自动纪录片","weight":1.0}]
+    assert interest.current_self_weights() == {"自动纪录片": 1.0}
+
+    empty = await save("companion", mine["profile"], [])
+    assert empty["ok"] and target.selection_snapshot() == ("10001", {}, True)
+    assert (await save("companion", empty["profile"], [], mode="automatic"))["ok"]
+    assert target.selection_snapshot() == ("10001", {}, False)
+
+
 async def video_share_checks_latest_exchange(folder):
     ledger=ShareLedger(folder/"latest.sqlite")
     items=[{"message_id":"m1","time":NOW-300,"text":"午饭吃了面","user_id":ROUTE["user_id"]}]
@@ -1012,6 +1077,7 @@ CASES = [
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",
     "fallback_review", "candidate_overlap", "tiered_miss", "bound_legacy_upgrade",
     "video_companion_preferences_by_identity", "video_weighted_companion_mix", "video_share_checks_latest_exchange",
+    "dashboard_manual_video_interests",
     "contested_legacy_preserved", "late_review_ownership", "fallback_recovery_once",
     "previous_successful_cache", "detached_and_cross_midnight", "quota_reconciliation",
     "retired_watch_guards", "write_fallback_only_when_unsent",

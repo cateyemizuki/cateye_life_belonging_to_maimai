@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from integrations.video_preferences import (
-    COMPANION_WEIGHT_MAX, COMPANION_WEIGHT_MIN, SHARED_BONUS_MAX, term_key, topic_weights,
+    COMPANION_WEIGHT_MAX, COMPANION_WEIGHT_MIN, SHARED_BONUS_MAX, ManualVideoInterests, term_key, topic_weights,
 )
 from integrations.video_selection import MAX_TOPIC_WEIGHT
 
@@ -346,9 +346,11 @@ class VideoInterestService:
                  now_provider: Optional[Callable[[], float]] = None,
                  watch_evidence_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None,
                  half_life_days_provider: Optional[Callable[[], int]] = None,
-                 companion_preferences_provider: Optional[Callable[[], tuple[str, Dict[str, float]]]] = None) -> None:
+                 companion_preferences_provider: Optional[Callable[[], tuple[str, Dict[str, float]] | tuple[str, Dict[str, float], bool]]] = None) -> None:
         self._path = Path(store_dir) / INTEREST_FILE_NAME
         self._attempt_path = Path(store_dir) / "video_interest_attempt.json"
+        self.manual_interests = ManualVideoInterests(Path(store_dir) / "video_interest_manual.json",
+                                                    MIN_SELF_BASE_WEIGHT, MAX_SELF_BASE_WEIGHT, minimum_count=1)
         self._llm = llm_generate_detailed
         self._persona_provider = persona_provider
         self._name_provider = name_provider
@@ -559,24 +561,37 @@ class VideoInterestService:
             out[term] = max(0.5, min(1.5, own_base + score))
         return out
 
-    def _companion_snapshot(self) -> tuple[str, dict[str, float]]:
+    def _companion_snapshot(self) -> tuple[str, dict[str, float], bool]:
         if self._companion_preferences is None:
-            return "", {}
+            return "", {}, False
         try:
-            return self._companion_preferences()
+            value = self._companion_preferences()
+            return (value[0], value[1], bool(value[2])) if len(value) == 3 else (value[0], value[1], False)
         except Exception:
-            return "", {}
+            return "", {}, False
+
+
+    def current_self_weights(self, *, document: Optional[dict] = None) -> dict[str, float]:
+        manual = self.manual_interests.load()
+        return self.effective_weights(document=document) if manual is None else manual
+
+    async def interest_for_selection(self) -> dict:
+        if self.manual_interests.load() is not None:
+            return {**(self.load() or {}), "status": "manual"}
+        return await self.ensure_interest()
 
     def selection_context(self, doc: dict) -> tuple[tuple, dict[str, float]]:
         """Keep the active QQ contribution separate from personal preference and feedback."""
-        owner, companion = self._companion_snapshot()
-        signature = (str(doc.get("generation") or ""), owner, tuple(sorted(companion.items())))
-        weights = self.effective_weights(document=doc)
+        owner, companion, companion_manual = self._companion_snapshot()
+        manual = self.manual_interests.load()
+        manual_signature = tuple(manual.items()) if manual is not None else None
+        signature = (str(doc.get("generation") or ""), manual_signature, owner, companion_manual, tuple(companion.items()))
+        weights = self.effective_weights(document=doc) if manual is None else manual
         if not weights or not companion:
             return signature, weights
         mix = doc.get("companion_mix", {})
         mix = mix if mix.get("owner") == owner else {}
-        suggested = topic_weights(mix.get("weights"), COMPANION_WEIGHT_MIN, COMPANION_WEIGHT_MAX)
+        suggested = {} if companion_manual else topic_weights(mix.get("weights"), COMPANION_WEIGHT_MIN, COMPANION_WEIGHT_MAX)
         aliases = mix.get("shared", {})
         aliases = aliases if isinstance(aliases, dict) else {}
         used = set()
@@ -639,7 +654,7 @@ class VideoInterestService:
                         "status": "stale_fallback" if cached else "unavailable", "retry_at": retry_at}
             initial = cached is None
             _atomic_write(self._attempt_path, {"retry_at": now + INTEREST_RETRY_SECONDS})
-            owner, companion = ("", {}) if initial else self._companion_snapshot()
+            owner, companion, _ = ("", {}, False) if initial else self._companion_snapshot()
             parsed = await self._ask_once(initial=initial, companion_preferences=companion)
             if companion and self._companion_snapshot()[0] != owner:
                 parsed = None  # The old companion context must not rewrite the new target's mix.
@@ -781,7 +796,7 @@ class BiliCandidateSource:
         兴趣服务缺失 → ``None``（与旧组合根 getattr 兜底口径一致）。
         """
         interest = self._interest
-        return interest.effective_weights() if interest is not None else None
+        return interest.current_self_weights() if interest is not None else None
 
     # ---- 3.17.37 视频自主观看批：主动侧候选数据门槛 ----
     def _passes_stat_gate(self, item: Dict[str, Any]) -> bool:
@@ -1002,7 +1017,8 @@ class BiliCandidateSource:
         """兴趣检查（TTL 内 0 LLM）+ 抓取 + 匹配 + 去重 → 候选池。"""
         self._pool = []
         self._prepared_at = self._now()
-        doc = await self._interest.ensure_interest()
+        read_interest = getattr(self._interest, "interest_for_selection", self._interest.ensure_interest)
+        doc = await read_interest()
         self._selection_signature, weights = self._selection_context(doc)
         self._last_interest_status = str(doc.get("status") or "")
         keywords = list(weights) or [term_key(k) for k in doc.get("keywords") or []]

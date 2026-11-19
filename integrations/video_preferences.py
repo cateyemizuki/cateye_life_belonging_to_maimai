@@ -46,6 +46,33 @@ def topic_weights(value: object, lower: float, upper: float) -> dict[str, float]
     return result
 
 
+class ManualVideoInterests:
+    """A small override file, independent of the automatically maintained profile."""
+
+    def __init__(self, path: Path, lower: float, upper: float, minimum_count: int = 0):
+        self.path = path
+        self.lower = lower
+        self.upper = upper
+        self.minimum_count = minimum_count
+
+    def load(self) -> dict[str, float] | None:
+        doc = load_json(self.path, None)
+        if not isinstance(doc, dict) or doc.get("version") != 1 or doc.get("mode") != "manual":
+            return None
+        raw = doc.get("weights")
+        if not isinstance(raw, dict):
+            return None
+        weights = topic_weights(raw, self.lower, self.upper)
+        return weights if len(weights) == len(raw) and len(weights) >= self.minimum_count else None
+
+    def save(self, weights: dict[str, float] | None) -> bool:
+        return save_json_atomic(self.path, {
+            "version": 1,
+            "mode": "automatic" if weights is None else "manual",
+            "weights": weights or {},
+        })
+
+
 def _parse_profile(text: str) -> dict[str, float] | None:
     data = strict_json(text)
     raw = data.get("preferences") if isinstance(data, dict) else None
@@ -74,12 +101,26 @@ class CompanionVideoPreferences:
         doc = load_json(self._directory / f"{owner}.json", {})
         return doc if isinstance(doc, dict) and doc.get("version") == 1 else {}
 
-    def snapshot(self) -> tuple[str, dict[str, float]]:
+    def editable_profile(self):
         owner, stream = self._target()
         if not qq_id(owner) or qq_id(owner) != owner or not stream:
-            return "", {}
-        doc = self._load(owner)
-        return owner, topic_weights(doc.get("preferences"), COMPANION_WEIGHT_MIN, COMPANION_WEIGHT_MAX)
+            return None
+        automatic = topic_weights(self._load(owner).get("preferences"), COMPANION_WEIGHT_MIN, COMPANION_WEIGHT_MAX)
+        override = ManualVideoInterests(self._directory / f"{owner}.manual.json",
+                                        COMPANION_WEIGHT_MIN, COMPANION_WEIGHT_MAX)
+        return (owner, stream), automatic, override
+
+    def selection_snapshot(self) -> tuple[str, dict[str, float], bool]:
+        profile = self.editable_profile()
+        if profile is None:
+            return "", {}, False
+        (owner, _), automatic, override = profile
+        manual = override.load()
+        return owner, automatic if manual is None else manual, manual is not None
+
+    def snapshot(self) -> tuple[str, dict[str, float]]:
+        owner, weights, _ = self.selection_snapshot()
+        return owner, weights
 
     async def run(self) -> None:
         """Check daily maintenance independently of the schedule and share switches."""

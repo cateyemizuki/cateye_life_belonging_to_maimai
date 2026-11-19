@@ -1463,10 +1463,10 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
             from pathlib import Path
             from integrations.video_interest import VideoInterestService
             service = VideoInterestService(Path(data_dir) / 'video_watch')
-            doc = service.load()
-            if doc is not None:
+            weights = service.current_self_weights()
+            if weights:
                 scored = [{'topic': topic[:40], 'weight': _number(round(weight, 3))}
-                          for topic, weight in service.effective_weights(document=doc).items()]
+                          for topic, weight in weights.items()]
                 scored.sort(key=lambda row: (-row['weight'], row['topic']))
                 video['interests'] = scored[:8]
                 interests_ok = True

@@ -861,7 +861,7 @@ async function loadVisibleThumbnails(){
  if(!window.maibot?.query||loadingThumbnails)return;
  loadingThumbnails=true;
  try{
-  for(;;){
+  while(!$('interest-editor').open){
    const frame=[...document.querySelectorAll('[data-thumbnail-id]')].find(node=>node.getClientRects().length);
    if(!frame)break;
    const id=frame.dataset.thumbnailId;
@@ -913,6 +913,7 @@ $('media-detail-dialog').addEventListener('click',event=>{if(event.target!==even
 function renderEntertainmentPages(){const video=entertainmentPage===0;$('entertainment-video').hidden=!video;$('entertainment-posts').hidden=video;$('entertainment-prev').setAttribute('aria-pressed',String(video));$('entertainment-next').setAttribute('aria-pressed',String(!video));text('entertainment-page-label',video?'1 / 2':'2 / 2')}
 function renderMood(){const v=data.video||{};
  renderEntertainmentPages();
+ $('edit-video-interests').hidden=!(live&&!imported&&typeof window.maibot?.action==='function');
  const videoRecentBox=$('video-recent'),recent=Array.isArray(v.recent)?v.recent.slice(0,mediaRecordLimit()):[];
  text('video-recent-count',v.available?recent.length+' 条':'—');
  if(videoRecentBox){if(recent.length)videoRecentBox.replaceChildren(...recent.map(row=>renderVideoRecord(row)));else empty(videoRecentBox,v.available?'最近没有看完的视频':'视频信息暂不可用',v.available?'看完的视频会在这里留下记录。':'视频观看模块就绪后展示。')}
@@ -933,6 +934,124 @@ $('entertainment-prev').onclick=()=>selectEntertainmentPage(0);
 $('entertainment-next').onclick=()=>selectEntertainmentPage(1);
 window.addEventListener('resize',syncMediaGrid);
 if(typeof ResizeObserver!=='undefined'){const observer=new ResizeObserver(syncMediaGrid);observer.observe($('video-recent'));observer.observe($('qzone-recent-posts'))}
+const interestEditor=$('interest-editor'), interestForm=$('interest-editor-form');
+const interestRows=$('interest-editor-rows');
+let preferenceProfiles=null, preferenceTab='bot', preferenceDrafts={}, preferencePending=false, preferenceReload=false;
+
+function currentPreference(){return preferenceProfiles?.[preferenceTab]}
+function preferenceMessage(message,error=false){
+ const note=$('interest-editor-message');
+ note.textContent=message;
+ note.dataset.error=String(error);
+}
+function updatePreferenceControls(){
+ const profile=currentPreference();
+ for(const tab of $('interest-profiles').querySelectorAll('button')){
+  tab.setAttribute('aria-pressed',String(tab.dataset.profile===preferenceTab));
+  tab.disabled=preferencePending;
+ }
+ const fieldsDisabled=preferencePending||preferenceReload;
+ for(const control of interestRows.querySelectorAll('input,button'))control.disabled=fieldsDisabled;
+ $('interest-close').disabled=preferencePending;
+ $('interest-reload').hidden=!preferenceReload;
+ $('interest-reload').disabled=preferencePending;
+ $('interest-add').disabled=fieldsDisabled||interestRows.children.length>=profile?.maximum_count;
+ $('interest-save').disabled=fieldsDisabled||!profile?.available||interestRows.children.length<profile.minimum_count;
+ $('interest-automatic').hidden=profile?.mode!=='manual';
+ $('interest-automatic').disabled=fieldsDisabled;
+}
+function preferenceInputRow(entry){
+ const profile=currentPreference(),row=el('div','interest-editor-columns interest-editor-row');
+ const topic=el('input'),weight=el('input'),remove=el('button','','移除');
+ topic.type='text';topic.required=true;topic.maxLength=40;topic.value=entry.topic;
+ topic.placeholder='例如：猫咪纪录片';topic.setAttribute('aria-label','视频题材');
+ weight.type='number';weight.required=true;weight.min=profile.minimum;weight.max=profile.maximum;
+ weight.step='0.001';weight.value=entry.weight;weight.setAttribute('aria-label','题材权重');
+ remove.type='button';remove.setAttribute('aria-label','移除此题材');
+ remove.onclick=()=>{row.remove();updatePreferenceControls();$('interest-add').focus()};
+ row.append(topic,weight,remove);
+ return row;
+}
+function preferenceValues(){
+ return [...interestRows.children].map(row=>{
+  const [topic,weight]=row.querySelectorAll('input');
+  return {topic:topic.value,weight:weight.value};
+ });
+}
+function renderPreferenceTab(){
+ const profile=currentPreference();
+ interestForm.hidden=!profile?.available;
+ interestRows.replaceChildren();
+ if(profile?.available){
+  const mode=profile.mode==='manual'?'手动兴趣正在生效':'当前由系统自动维护';
+  $('interest-editor-hint').textContent=mode+'。基本权重 '+profile.minimum+'–'+profile.maximum+'，最多 '+profile.maximum_count+' 个题材。';
+  interestRows.append(...(preferenceDrafts[preferenceTab]||profile.entries).map(preferenceInputRow));
+  preferenceMessage('');
+ }else if(preferenceProfiles){
+  preferenceMessage(preferenceTab==='companion'?'绑定并核验陪伴目标的私聊后可编辑。':'Bot 的兴趣档案暂不可用。');
+ }
+ updatePreferenceControls();
+}
+async function readPreferenceProfiles(){
+ preferencePending=true;preferenceReload=false;preferenceProfiles=null;preferenceDrafts={};
+ renderPreferenceTab();
+ preferenceMessage('正在读取兴趣档案');
+ try{
+  preferenceProfiles=await deadline(window.maibot.query('interests'),11000);
+  renderPreferenceTab();
+ }catch{
+  preferenceReload=true;preferenceMessage('读取失败，请重新读取档案。',true);
+ }finally{
+  preferencePending=false;updatePreferenceControls();
+ }
+}
+async function savePreferenceProfile(mode){
+ if(preferencePending||preferenceReload||!currentPreference()?.available)return;
+ const profile=currentPreference(), entries=mode==='manual'?preferenceValues().map(row=>({topic:row.topic.trim(),weight:Number(row.weight)})):[];
+ if(entries.some(row=>!row.topic)){preferenceMessage('请填写视频题材。',true);return}
+ preferencePending=true;updatePreferenceControls();preferenceMessage('正在保存');
+ try{
+  const result=await deadline(window.maibot.action('save_interests',{
+   profile:preferenceTab,revision:profile.revision,mode,entries_json:JSON.stringify(entries),
+  }),12000);
+  if(!result?.ok){
+   preferenceReload=Boolean(result?.conflict);
+   preferenceMessage(result?.message||'保存失败，请稍后重试。',true);
+   return;
+  }
+  preferenceProfiles[preferenceTab]=result.profile;delete preferenceDrafts[preferenceTab];
+  renderPreferenceTab();preferenceMessage(mode==='manual'?'已保存，选片会使用新兴趣。':'已恢复自动维护。');
+  if(live&&!imported)void refresh();
+ }catch{
+  preferenceReload=true;preferenceMessage('尚未收到保存结果，请重新读取档案确认。',true);
+ }finally{
+  preferencePending=false;updatePreferenceControls();
+ }
+}
+
+$('edit-video-interests').onclick=()=>{preferenceTab='bot';interestEditor.showModal();void readPreferenceProfiles()};
+$('interest-close').onclick=()=>interestEditor.close();
+$('interest-reload').onclick=()=>void readPreferenceProfiles();
+interestEditor.addEventListener('cancel',event=>{if(preferencePending)event.preventDefault()});
+interestEditor.addEventListener('close',()=>{if(!$('edit-video-interests').hidden)$('edit-video-interests').focus();void loadVisibleThumbnails()});
+$('interest-profiles').onclick=event=>{
+ const tab=event.target.closest('button[data-profile]');
+ if(!tab||preferencePending||preferenceReload||tab.dataset.profile===preferenceTab)return;
+ if(currentPreference()?.available)preferenceDrafts[preferenceTab]=preferenceValues();
+ preferenceTab=tab.dataset.profile;renderPreferenceTab();
+};
+$('interest-add').onclick=()=>{
+ const profile=currentPreference();if(!profile||interestRows.children.length>=profile.maximum_count)return;
+ const row=preferenceInputRow({topic:'',weight:Number(((profile.minimum+profile.maximum)/2).toFixed(3))});
+ interestRows.append(row);updatePreferenceControls();row.querySelector('input').focus();
+};
+$('interest-automatic').onclick=()=>void savePreferenceProfile('automatic');
+$('interest-save').onclick=()=>{if(interestForm.reportValidity())void savePreferenceProfile('manual')};
+interestForm.addEventListener('keydown',event=>{
+ if(event.key!=='Enter'||event.isComposing||!event.target.matches('input'))return;
+ event.preventDefault();$('interest-save').click();
+});
+
 const usageCount=value=>group(count(value));
 const usageTokenLabel=(value,reported)=>num(reported)===0?'未回传':usageCount(value)+' Token';
 const usageModuleLabels=new Map(Object.entries({planning:'日程',emotion:'情绪',companion:'陪伴',qzone:'空间',video:'视频',unknown:'未标注模块'}));

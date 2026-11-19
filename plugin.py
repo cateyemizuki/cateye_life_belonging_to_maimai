@@ -1811,7 +1811,7 @@ class CateyeSuitePlugin(LifeDashboardComponentsMixin, PlanningComponentsMixin, C
                 # 动态读 [video_watch]（热重载即时生效；读失败服务侧保守降级）
                 watch_evidence_provider=self._interest_watch_evidence_rows,
                 half_life_days_provider=self._interest_watch_half_life_days,
-                companion_preferences_provider=self._companion_video_preference_service().snapshot,
+                companion_preferences_provider=self._companion_video_preference_service().selection_snapshot,
                 logger=self.ctx.logger)
             # 3.3：分享质量门槛只读兴趣权重（不触发刷新/LLM）；保存引用供 provider
             # 惰性读取，避免每次判分都重建服务。
