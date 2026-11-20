@@ -309,7 +309,7 @@ class PlanningComponentsMixin:
         name="schedule_inject",
         description="在 Maisaka 向 LLM 发起规划请求前注入当前日程信息",
         mode=HookMode.BLOCKING,
-        order=HookOrder.NORMAL,
+        order=HookOrder.LATE,
         timeout_ms=3000,
         error_policy=ErrorPolicy.SKIP,
     )

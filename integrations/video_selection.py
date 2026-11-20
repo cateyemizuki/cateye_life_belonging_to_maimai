@@ -8,6 +8,14 @@ import random
 import uuid
 
 
+MIN_TOPIC_WEIGHT = 0.25
+MAX_TOPIC_WEIGHT = 1.80
+
+
+def _bounded_weight(value):
+    return max(MIN_TOPIC_WEIGHT, min(MAX_TOPIC_WEIGHT, float(value)))
+
+
 class TopicSampler:
     def __init__(self, path=None, *, rng=None):
         self.path=Path(path) if path else None
@@ -45,7 +53,7 @@ class TopicSampler:
         topics=[key for key in keywords if key in hits or key==retrieval]
         topic=(max(topics,key=lambda key:weights.get(key,1.0)) if topics
                else str(candidate.get('tname') or '公开热门探索'))
-        return {**candidate,'selection_topic':topic,'selection_weight':max(.5,min(1.5,float(weights.get(topic,1.0)))),
+        return {**candidate,'selection_topic':topic,'selection_weight':_bounded_weight(weights.get(topic,1.0)),
                 'selection_lane':'explore' if explore else 'interest'}
 
     def balanced_pool(self,candidates,limit=10):
@@ -75,7 +83,7 @@ class TopicSampler:
         topics=list(buckets)
         last=recent[-1].get('topic') if recent else ''
         if len(topics)>1 and last in topics:topics.remove(last)
-        weights=[max(.5,min(1.5,float(buckets[topic][0].get('selection_weight') or 1)))/(1+counts[topic]) for topic in topics]
+        weights=[_bounded_weight(buckets[topic][0].get('selection_weight', 1.0))/(1+counts[topic]) for topic in topics]
         topic=self.rng.choices(topics,weights=weights,k=1)[0]
         candidate=self.rng.choice(buckets[topic][:3])
         state={**self.state,'picks':self.state['picks']+1,

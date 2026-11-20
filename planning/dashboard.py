@@ -10,6 +10,7 @@ from core.plugin_context import PluginContext
 from core.activity_attributes import normalize_activity_attributes
 from core.media_urls import public_image_url
 
+from .dashboard_media import register_dashboard_image
 from .time_utils import TimezoneManager, format_day_minute
 from .life_history import FIELDS, MAX_POINTS, SAMPLE_SECONDS
 
@@ -56,12 +57,14 @@ def _video_recent_row(row: dict) -> dict:
     captured = _media_capture_time(row.get('metrics_captured_at'))
     sources = row.get('metrics_field_provenance') if isinstance(row.get('metrics_field_provenance'), dict) else {}
     times = row.get('metrics_field_captured_at') if isinstance(row.get('metrics_field_captured_at'), dict) else {}
+    cover = public_image_url(row.get('cover'))
     return {'bvid': str(row.get('bvid') or '')[:20],
             'title': str(row.get('title') or '')[:500],
             'watched_at': _number(row.get('watched_at')),
             'source': str(row.get('source') or '')[:32],
             'first_watched_at': _number(row.get('first_watched_at')),
-            'cover': public_image_url(row.get('cover')),
+            'cover': cover,
+            'cover_id': register_dashboard_image(cover),
             'impression': str(row.get('impression') or '')[:5000],
             'impression_provenance': str(row.get('impression_provenance') or '')[:40],
             'understanding_status': str(row.get('understanding_status') or '')[:40],
@@ -1140,10 +1143,11 @@ def _qzone_recent_posts(service: Any, ctx: PluginContext, limit: int = 5) -> lis
             continue
         tid = str(row.get('tid') or '')
         images = row.get('images') if isinstance(row.get('images'), list) else []
+        urls = [url for raw in images[:4] if (url := public_image_url(raw))]
         out.append({'content': str(row.get('content') or ''),
                     'text': str(row.get('content') or ''),
-                    'images': [url for raw in images[:4]
-                               if (url := public_image_url(raw))],
+                    'images': urls,
+                    'image_ids': [register_dashboard_image(url) for url in urls],
                     'images_captured_at': _number(row.get('images_captured_at')),
                     'created_at': row.get('created_at'),
                     'tid': tid,
@@ -1457,29 +1461,12 @@ def _extension_summary(plugin: Any, now: datetime, hours: int,
         data_dir = ctx.data_dir
         if data_dir:
             from pathlib import Path
-            from integrations.video_interest import (
-                PERSONA_BASE_WEIGHT, WATCH_SCORE_CAP_RATIO, VideoInterestService)
-            doc = VideoInterestService(Path(data_dir) / 'video_watch').load()
-            if doc is not None:
-                terms = (doc.get('evidence_weights') or {}).get('terms') or {}
-                scored = []
-                for keyword in doc.get('keywords') or []:
-                    entry = terms.get(str(keyword).lower())
-                    entry = entry if isinstance(entry, dict) else None
-                    base = entry['persona_base'] if entry else PERSONA_BASE_WEIGHT
-                    score = entry['watch_score'] if entry else 0.0
-                    # 评审修复（3.17.13）：损坏文档可能含 Infinity/溢出巨值（json.loads
-                    # 默认接受 Infinity 字面量），非有限值退默认，避免 inf 权重穿过
-                    # json.dumps(allow_nan=False) 炸掉整个 dashboard。
-                    if not isinstance(base, (int, float)) or not math.isfinite(base) or base <= 0:
-                        base = PERSONA_BASE_WEIGHT
-                    if not isinstance(score, (int, float)) or not math.isfinite(score):
-                        score = 0.0
-                    cap = base * WATCH_SCORE_CAP_RATIO
-                    weight = _number(round(base + max(-cap, min(cap, score)), 3))
-                    if weight is None:
-                        continue
-                    scored.append({'topic': str(keyword)[:40], 'weight': weight})
+            from integrations.video_interest import VideoInterestService
+            service = VideoInterestService(Path(data_dir) / 'video_watch')
+            weights = service.current_self_weights()
+            if weights:
+                scored = [{'topic': topic[:40], 'weight': _number(round(weight, 3))}
+                          for topic, weight in weights.items()]
                 scored.sort(key=lambda row: (-row['weight'], row['topic']))
                 video['interests'] = scored[:8]
                 interests_ok = True

@@ -6,6 +6,10 @@ from typing import Any
 BV = re.compile(r"^BV[A-Za-z0-9]{10}$")
 QQ = re.compile(r"^[0-9]{5,12}$")
 KEEP_SECONDS = 15 * 86400
+DEBUG_PLANNER_KIND = "video_share_debug"
+COMMENT_PLANNER_KIND = "video_share_comment"
+COMMENT_PLANNER_WINDOW_SECONDS = 90
+DEBUG_CARD_TOOL = "lbm_debug_share_confirm"
 ACTIVE_ATTEMPTS = ("preparing", "sending", "accepted", "uncertain")
 
 

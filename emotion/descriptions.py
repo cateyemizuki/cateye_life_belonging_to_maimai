@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from core.mapping_dir import read_json_text
-from core.mapping_table import MappingTableSpec, plugin_root, resolve_table_path
+from core.mapping_table import MappingTableSpec, migrate_default_text_table, plugin_root, resolve_table_path
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,36 @@ GENERIC_LABEL = "复杂难名"
 #: 内置默认描述（键 = ``emotion/vad.py`` 的 25 个原型标签 + 复杂难名兜底；代码为唯一真源，
 #: 新增原型时同步补一条，否则该情绪渲染时走 :func:`generic_description`）
 DEFAULT_EMOTION_DESCRIPTIONS: Dict[str, str] = {
+    "狂喜": "特别开心、挺兴奋的，说话比平时更有精神。",
+    "平静": "心里很稳，不急不躁，按平时最自然的状态聊就行。",
+    "期待": "心里惦记着点好事，带点轻快和盼头。",
+    "愤怒": "有点上火、心里堵着气，说话比平时更直接干脆些。",
+    "恐惧": "心里有点发紧、偏谨慎，回复收着点。",
+    "悲伤": "心情有点闷、提不起劲，话可以少一点、慢一点。",
+    "焦虑": "心里有点毛躁、惦记着事，说话略显紧绷简短。",
+    "疲惫": "挺累的、犯懒，回话简短随性些就行。",
+    "厌恶": "心里有点膈应、不太想搭理，保持点距离感。",
+    "无奈": "有点哭笑不得、懒得计较，带着点随它去的感觉。",
+    "骄傲": "心里挺得意、挺有底气，语气自然舒展。",
+    "嫉妒": "心里略微有点酸、有点小别扭，嘴上不一定直说。",
+    "羞耻": "有点不好意思、略局促，话偏短、想快点翻篇。",
+    "无聊": "闲得发慌、没啥精神，说话比较随性漫不经心。",
+    "好奇": "挺感兴趣、有点想多听两句，顺着聊就行。",
+    "感激": "心里暖暖的、领对方的情，态度真诚自然。",
+    "挫败": "有点泄气和不甘心，情绪偏沉但仍保持清醒。",
+    "释然": "心里松快下来了，之前惦记的事放下了些。",
+    "轻蔑": "不太认同、兴致不高，回复偏淡、懒得纠缠。",
+    "忧郁": "情绪淡淡地往下沉，偏安静、话不想太多。",
+    "敬畏": "心里挺触动、带点认真和佩服。",
+    "惊喜": "挺意外也挺开心的，语气比平时亮一点。",
+    "内疚": "心里有点过意不去，语气比平时放轻一点。",
+    "冷漠": "没什么情绪起伏，平平淡淡按事实说就行。",
+    "怀旧": "心里有点念旧，情绪偏柔和安静。",
+    "复杂难名": "心里几种情绪掺在一起，说不太清，按平时状态自然聊就行。"
+}
+
+# 仅迁移与 3.18.20 出厂逐项相同的内容，用户定制原样保留。
+LEGACY_EMOTION_DESCRIPTIONS: Dict[str, str] = {
     "狂喜": "心潮澎湃，明朗热烈，语调上扬且饱满，节奏轻快生动，字里行间透着明亮纯粹的欢愉与雀跃。",
     "平静": "心里安稳从容，像晚风拂过水面，不急不躁，语速平稳而温和，对话节奏松弛，对周遭保持着亲切与随和。",
     "期待": "心绪灵动，带着轻快明朗的探询与跃跃欲试感，语气温和微扬，交流节奏积极而富有生气。",
@@ -59,7 +89,7 @@ DEFAULT_EMOTION_DESCRIPTIONS: Dict[str, str] = {
     "内疚": "心怀歉意与自省，语调放低且温和柔顺，态度体贴顾及，沟通更显细致周全与诚恳。",
     "冷漠": "内心波澜极小，情感投入度低，语气平稳客观，陈述事实直接了当，不带多余的情感修饰。",
     "怀旧": "心境温润而微带感触，像被黄昏的余晖拂过；语调柔软、徐缓沉静，用词细腻温和，自然沉浸在当下的交流氛围中，散发着含蓄与柔情。",
-    GENERIC_LABEL: "此刻的心绪层次丰富而微妙，多种微澜交织，神态沉静温和，表达自然流淌，随对话节奏从容展开。",
+    "复杂难名": "此刻的心绪层次丰富而微妙，多种微澜交织，神态沉静温和，表达自然流淌，随对话节奏从容展开。"
 }
 
 
@@ -104,6 +134,10 @@ def load_descriptions(*, root_dir: Any = None, known_labels: Optional[Iterable[s
         logger.warning("情绪描述 json 顶层不是对象 → 整体回退内置默认")
         _log_decision(decision_logger, "rejected", "top_level_not_object")
         return dict(DEFAULT_EMOTION_DESCRIPTIONS)
+
+    raw = migrate_default_text_table(
+        path, raw, LEGACY_EMOTION_DESCRIPTIONS, DEFAULT_EMOTION_DESCRIPTIONS,
+    )
 
     merged: Dict[str, str] = {}
     dropped: list = []

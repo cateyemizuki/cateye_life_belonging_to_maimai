@@ -7,8 +7,8 @@ Hook 入口：``maisaka.planner.before_request`` / ``maisaka.replyer.before_requ
 情绪系统的 ``mood_text()``（M4，§4.2 行 8，两处「精神状态」同源）。
 
 注入协议（照抄源插件）：
-- 向 items 注入 SystemMessageItem 快照：meta 三件套（item_id=uuid4().hex、
-  logical_turn_id=None（或继承首条）、timestamp=ISO）；
+- 在 Planner 历史之后、宿主本轮即时提示之前注入 UserMessageItem；
+  旧版或无法识别的载荷沿用原系统注入。
 - Hook 返回 ``{"action": "continue"}`` 或
   ``{"action": "continue", "modified_kwargs": {**kwargs, <payload_key>: new, ...}}``
   全量回传（宿主对 modified_kwargs 整体替换，单键返回会丢字段）；
@@ -29,7 +29,7 @@ D:/deepseek-harness_workspace/maibot-plugins/2026-10-25-日程系统滚动化改
 - runtime 视图就绪时（``LifeScheduleReadModel.enabled`` = ``[schedule].enabled``，
   PR8 3.0.0 起唯一总开关）注入块追加 runtime 实况（经
   :class:`~planning.life_schedule.LifeScheduleReadModel`）：current（当前 episode
-  名称/已进行多久/进度/attention_mode/剩余分钟）+ next ≤2 条 + 状态行
+  名称/attention_mode/是否快结束）+ next ≤2 条 + 状态行
   （``LifeStateService.describe`` 最显著 1~2 项）+ recent 1~2 条（completed_today
   尾部实际发生，用于连续性）；当前活动改读 episode（红线 3：不从时间窗编造），
   provider 关闭/缺失/异常一律旁路；
@@ -68,8 +68,7 @@ import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from uuid import uuid4
-
+from core.inject import LBM_CONTEXT_PREFIX, project_planner_injection
 from core.time_utils import minutes_of_now
 
 from .config import ScheduleAdvancedSectionConfig, ScheduleSectionConfig, section_or_default
@@ -102,11 +101,11 @@ from suite_prompts import (
     INJECT_SCHEDULE_FUTURE_LINE_DEFAULT,
     INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT,
     INJECT_SCHEDULE_HEADER_DEFAULT,
-    SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
     SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT,
     SUBCONSCIOUS_TONE_HAPPY_DEFAULT,
     TRANSITION_CONFESSION_LINE_DEFAULT,
-    SUBCONSCIOUS_TONE_HUNGRY_DEFAULT,
+    SUBCONSCIOUS_TONE_LOW_ENERGY_DEFAULT,
+    SUBCONSCIOUS_TONE_LOW_SOCIAL_DEFAULT,
     SUBCONSCIOUS_TONE_STEADY_DEFAULT,
     SUBCONSCIOUS_TONE_TIRED_DEFAULT,
     prompt,
@@ -124,15 +123,9 @@ _ATTENTION_MODE_TEXT = {
 
 #: 复核 P1-9：主动分享回合的运行时豁免——只追加在本次注入文本末尾，不新增
 #: ``[prompts]`` 可配键（schema 不变）。占位符：{bot_name}。
-_INJECT_PROACTIVE_SHARE_HINT = (
-    "（本轮是{bot_name}主动分享近况/视频的回合：{bot_name}可以自然说出要分享的内容；"
-    "上面『不主动提日程 / 刚完成的事』只约束背景信息，不限制本轮分享动机。）"
-)
-_INJECT_PROACTIVE_SHARE_REPLYER = (
-    "（本轮是{bot_name}主动开口的回合：{bot_name}可以自然说出本轮想分享/想说的内容；"
-    "上面的『不要主动提及』只约束日程背景，不限制本轮主动动机。）"
-)
-_PROACTIVE_SHARE_KINDS = frozenset({"video_share", "surf_chitchat"})
+_INJECT_PROACTIVE_SHARE_HINT = "（本轮是你主动想聊起刚看的东西或近况，直接按平时口吻自然说就行。）"
+_INJECT_PROACTIVE_SHARE_REPLYER = "（本轮是你主动找对方说这件事，顺着想说的内容自然聊就好。）"
+_PROACTIVE_SHARE_KINDS = frozenset({"video_share", "video_completion", "surf_chitchat"})
 _EXPERIENCE_SHARE_MARKER = "最近经历参考（可选话题）"
 
 
@@ -196,6 +189,7 @@ class InjectService:
         re.compile(r"^【人物画像-内部参考】"),
         re.compile(r"^【启发式记忆-内部参考】"),
         re.compile(r"^<system-reminder>"),
+        re.compile("^" + re.escape(LBM_CONTEXT_PREFIX)),
         # replyer 篇幅要求（宿主原文：请简短的回复，允许句子残缺…）
         re.compile(r"^请简短的回复[，,]"),
         # planner 尾部的最终提醒（宿主模板：你需要输出对{bot_name}发言的分析…）
@@ -204,6 +198,7 @@ class InjectService:
         # 普通 maisaka_chat 模式恒用「请你进行分析…」，passive 模式用「需要信息
         # 或操作时调用工具…」；旧正则只覆盖 focus 模式，致意图分类 100% 误判。
         re.compile(r"^请你进行分析[，,]"),
+        re.compile(r"^请分析后决定下一步[：:]\s*用工具收集或处理信息"),
         re.compile(r"^需要信息或操作时调用工具"),
         # replyer 通道尾指令（cateye_better_post-processing 默认改写文案）
         re.compile(r"^像平常在群里接一句话"),
@@ -494,6 +489,11 @@ class InjectService:
             # N6-1：不再写死闲聊意图——优先复用本轮 planner 已判定的真实意图
             # （拿不到时才回落 CASUAL_CHAT/0.5，与修复前逐字一致）。
             intent, confidence = self._resolve_replyer_intent(user_id, kwargs)
+            latest_text = kwargs.get("match_text")
+            if not isinstance(latest_text, str) and isinstance(_payload, list):
+                latest_text = self._extract_last_user_text(_payload)
+            show_hunger = intent == UserIntent.QUERY_CURRENT or (
+                isinstance(latest_text, str) and "饿" in latest_text)
 
             # 2026-11-04 双通道门控（replyer 通道）：非目标私聊且非询问意图 →
             # 状态块不携带「接下来 X 要 Y」（排查 E4/E5 逐字泄漏口：该行位于生成前
@@ -548,13 +548,15 @@ class InjectService:
                     future_activities=future_activities if allow_next_line else [],
                     remaining_minutes=remaining_minutes,
                     session_id=session_id,
+                    show_hunger=show_hunger,
                 )
                 logger.info(f"replyer 注入: {current_activity}")
             else:
                 # N1-2：无当前活动不静默早退——空活动变体（兜底文案见 [prompts].inject_no_activity）
                 # 门控同口径：非询问意图不携带接下来条目（兜底行本身不受门控影响）
                 activity_prompt = self._build_replyer_no_activity_prompt(
-                    future_activities if allow_next_line else [], session_id=session_id)
+                    future_activities if allow_next_line else [], session_id=session_id,
+                    show_hunger=show_hunger)
                 if not activity_prompt:
                     # 防御守卫：内部键 inject_no_activity 恒返非空默认，本分支正常
                     # 不可达（2026-11-04 评估问题8：原「文案被显式关空」口径已订正）
@@ -682,7 +684,7 @@ class InjectService:
 
             # R7 runtime 覆盖与实况块（runtime 视图就绪时；未就绪 → 全部旁路）：
             # 当前活动/未来活动改读 episode 口径，另把
-            # 「活动实况（已进行/进度/注意力/剩余）+ next ≤2 + 状态行 + recent ≤2」
+            # 「活动实况（名称/注意力/是否快结束）+ next ≤2 + 状态行 + recent ≤2」
             # 作为追加行注入（主设计 §3.3 注入只读清单）。
             life_view = self._life_runtime_view()
             life_lines: List[str] = []
@@ -702,14 +704,12 @@ class InjectService:
                 remaining_override = life_ov["remaining"]
                 life_lines = self._life_block_lines(
                     life_view, life_ov, subconscious=True,
-                    bot_name=self._bot_name(),
-                    suppress_hunger_mention=True)
+                    bot_name=self._bot_name())
                 if live_gate_enabled:
                     life_lines_slim = self._life_block_lines(
                         life_view, life_ov, slim=True,
                         subconscious=True,
-                        bot_name=self._bot_name(),
-                        suppress_hunger_mention=True)
+                        bot_name=self._bot_name())
 
             # 无当前活动不再静默早退（N1-2）：照常走「分类 → 决策 → 模板路由」，
             # 模板侧自动切到空活动变体（兜底文案 = suite_prompts 内部键 inject_no_activity）。
@@ -780,8 +780,8 @@ class InjectService:
             if header:
                 inject_content = header + "\n" + inject_content
 
-            # 把注入文本作为 system 条目插入消息列表
-            modified_payload = self._inject_system_message(payload, inject_content)
+            # 保留历史前缀，仅在宿主本轮尾部前追加动态上下文。
+            modified_payload = project_planner_injection(payload_key, payload, inject_content)
             modified_kwargs: Dict[str, Any] = {
                 **kwargs,
                 "session_id": session_id,
@@ -925,12 +925,32 @@ class InjectService:
 
     @classmethod
     def _is_structured_system_task(cls, text: str) -> bool:
-        """宿主/插件系统任务块（task 标签）不是真实用户输入。
-
-        只认显式标签；旧正则尾指令过滤属「宿主字段缺失时的回退」，由调用方在
-        :meth:`_structured_self_state` 返回 ``None`` 后才启用。
-        """
+        """Identify host/plugin task wrappers independently of sender flags."""
         return bool(_STRUCTURED_SYSTEM_TASK_PATTERN.match(text or ""))
+
+    @classmethod
+    def _real_user_text(cls, msg: Dict[str, Any], candidates: List[str]) -> str:
+        if not candidates:
+            return ""
+        head = candidates[0].strip()
+        if cls._is_structured_system_task(head) or cls._structured_self_state(msg, head) is True:
+            return ""
+        attrs = cls._parse_message_attrs(head)
+        wrapped = bool(attrs.get("user") and attrs.get("msg_id"))
+        for candidate in candidates:
+            text = candidate.strip()
+            body = cls._strip_planner_prefix(text).strip()
+            if not body:
+                continue
+            # Real wrapped user messages can quote host wording, and the
+            # prefix can live in its own text part before an image or voice.
+            if wrapped:
+                return body
+            if (cls._is_structured_system_task(text) or cls._is_metadata_user_message(text)
+                    or cls._is_metadata_user_message(body) or cls._SELF_MESSAGE_PREFIX_PATTERN.match(text)):
+                continue
+            return body
+        return ""
 
     @staticmethod
     def _message_timestamp_date(msg: Dict[str, Any], text: str) -> Optional[str]:
@@ -986,23 +1006,10 @@ class InjectService:
         for msg in reversed(messages):
             if not isinstance(msg, dict) or cls._message_role(msg) != "user":
                 continue
-            for candidate in cls._message_text_candidates(msg):
-                text = candidate.strip()
-                if not text or cls._is_structured_system_task(text):
-                    continue
-                self_state = cls._structured_self_state(msg, text)
-                if self_state is True:
-                    continue
-                if self_state is None:
-                    # 宿主字段缺失 → 回退旧正则/自身发言前缀过滤
-                    if cls._is_metadata_user_message(text):
-                        continue
-                    if cls._SELF_MESSAGE_PREFIX_PATTERN.match(text):
-                        continue
+            candidates = cls._message_text_candidates(msg)
+            if cls._real_user_text(msg, candidates):
                 has_real = True
-                latest_date = cls._message_timestamp_date(msg, text)
-                break
-            if has_real:
+                latest_date = cls._message_timestamp_date(msg, candidates[0])
                 break
         if latest_date is not None:
             return latest_date >= today
@@ -1012,105 +1019,18 @@ class InjectService:
 
     @classmethod
     def _extract_last_user_text(cls, messages: List[Dict[str, Any]]) -> str:
-        """提取最新一条**含真实文本**的 user 消息。
-
-        结构化优先（2026-11-11 Gemini 批 §2.2）：先看消息元数据
-        （``is_self_message`` / ``source`` / ``meta`` / ``<message ...>`` 属性 /
-        系统 task 标签）判定真实用户输入；只有宿主字段缺失时才回退旧正则滤镜
-        （跳过元数据消息、剥除 planner 前缀）。
-        """
+        """Find the latest actual user text, ignoring host instruction items."""
         for msg in reversed(messages):
-            if not isinstance(msg, dict):
+            if not isinstance(msg, dict) or cls._message_role(msg) != "user":
                 continue
-            if cls._message_role(msg) != "user":
-                continue
-            for candidate in cls._message_text_candidates(msg):
-                text = candidate.strip()
-                if not text:
-                    continue  # 空文本 → 找上一条 user
-                if cls._is_structured_system_task(text):
-                    continue  # 宿主系统 task / 尾指令块（结构化标签）
-                self_state = cls._structured_self_state(msg, text)
-                if self_state is True:
-                    continue  # 宿主明确标注 Bot 自身发言
-                if self_state is False:
-                    # 宿主字段齐全且明确是真实用户：不再用字符串正则猜测
-                    stripped = cls._strip_planner_prefix(text)
-                    if stripped.strip():
-                        return stripped
-                    continue
-                # 宿主字段缺失 → 回退旧逻辑（逐字保留 2026-10-10 N6-3 口径）
-                if cls._is_metadata_user_message(text):
-                    continue  # 元数据消息/part → 跳过
-                if cls._SELF_MESSAGE_PREFIX_PATTERN.match(text):
-                    continue  # 复核 P0-1：Bot 自身历史发言（宿主包装为 user）→ 跳过
-                stripped = cls._strip_planner_prefix(text)
-                if cls._is_metadata_user_message(stripped.strip()):
-                    continue
-                if not stripped.strip():
-                    continue
-                return stripped
+            candidates = cls._message_text_candidates(msg)
+            if (candidates and candidates[0].lstrip().lower().startswith("<plugin_proactive_task")
+                    and cls._is_structured_system_task(candidates[0])):
+                return ""  # The preceding conversation belongs to another turn.
+            body = cls._real_user_text(msg, candidates)
+            if body:
+                return body
         return ""
-
-    @staticmethod
-    def _is_snapshot_payload(messages: List[Dict[str, Any]]) -> bool:
-        """判断 payload 是否为宿主 1.2.x 的 ContextItem 快照投影。"""
-        return any(
-            isinstance(msg, dict) and isinstance(msg.get("item_type"), str) and msg.get("item_type")
-            for msg in messages
-        )
-
-    @staticmethod
-    def _build_snapshot_system_item(
-        inject_content: str,
-        messages: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """构造可被宿主反序列化的 SystemMessageItem 快照（1.2.x payload 契约）。
-
-        - ``item_id`` 必须全局唯一（宿主 validate_context_items 硬性要求）；
-        - ``logical_turn_id`` 可为 null（键必须存在）；
-        - ``timestamp`` 必须是合法 ISO 时间。
-        """
-        logical_turn_id: Optional[str] = None
-        for msg in messages:
-            meta = msg.get("meta") if isinstance(msg, dict) else None
-            if isinstance(meta, dict):
-                candidate = meta.get("logical_turn_id")
-                if isinstance(candidate, str) and candidate.strip():
-                    logical_turn_id = candidate
-                    break
-        return {
-            "item_type": "SystemMessageItem",
-            "meta": {
-                "item_id": f"app-schedule-{uuid4().hex}",
-                "logical_turn_id": logical_turn_id,
-                "timestamp": datetime.now().astimezone().isoformat(),
-            },
-            "parts": [{"type": "text", "text": inject_content}],
-        }
-
-    @classmethod
-    def _inject_system_message(
-        cls,
-        messages: List[Dict[str, Any]],
-        inject_content: str,
-    ) -> List[Dict[str, Any]]:
-        """把注入文本作为 system 条目插入消息列表（紧跟第一条 system 之后）。"""
-        if cls._is_snapshot_payload(messages):
-            injection: Dict[str, Any] = cls._build_snapshot_system_item(inject_content, messages)
-        else:
-            injection = {"role": "system", "content": inject_content}
-
-        first_system_idx: Optional[int] = None
-        for idx, msg in enumerate(messages):
-            if isinstance(msg, dict) and cls._message_role(msg) == "system":
-                first_system_idx = idx
-                break
-
-        new_messages = list(messages)  # 浅拷贝列表，避免污染调用方
-        insert_at = (first_system_idx + 1) if first_system_idx is not None else 0
-        new_messages.insert(insert_at, injection)
-        return new_messages
 
     # ------------------------------------------------------------
     # 注入文本构建（统一管道：IntentClassifier + InjectOptimizer + 模板路由）
@@ -1274,9 +1194,7 @@ class InjectService:
             "max_future_activities", 3)
 
         # 当前活动 + 时间衰减
-        remaining_hint = ""
-        if remaining_minutes is not None and 0 < remaining_minutes <= 15:
-            remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
+        remaining_hint = "（快结束了）" if remaining_minutes is not None and 0 < remaining_minutes <= 10 else ""
 
         bot_name = self._bot_name()
         if not current_activity:
@@ -1287,28 +1205,24 @@ class InjectService:
             except Exception:
                 asleep0 = None
             if asleep0 is True:
-                current_line = (f"{bot_name}现在已经入睡（睡眠中）；收到消息可自然短回复，"
-                                "不要声称正在活动、待机或正准备睡。")
+                current_line = (f"{bot_name}这会儿已经睡着了；如果被吵醒要回一句，"
+                                "就迷糊简短点，别说自己还在忙别的。")
             else:
                 # 空活动变体：兜底文案（内部键恒返非空默认，无「显式关空」路径）
                 current_line = self._no_activity_text()
-        elif enable_detailed and current_description:
-            current_line = render(
-                prompt(self._plugin, "inject_schedule_current_line"),
-                fallback=INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
-                bot_name=bot_name,
-                activity=current_activity, description=current_description,
-                remaining_hint=remaining_hint,
-            )
         else:
-            # 无描述：同一模板渲染后把空的「（…）」括注收干净（自定义模板里没有括注时无副作用）
+            description = current_description if (
+                enable_detailed and current_description
+                and current_description.strip() != current_activity.strip()
+            ) else ""
             current_line = render(
                 prompt(self._plugin, "inject_schedule_current_line"),
                 fallback=INJECT_SCHEDULE_CURRENT_LINE_DEFAULT,
                 bot_name=bot_name,
-                activity=current_activity, description="", remaining_hint=remaining_hint,
+                activity=current_activity, description=description, remaining_hint=remaining_hint,
             )
-            current_line = current_line.replace("（）", "").replace("()", "").strip()
+            if not description:
+                current_line = current_line.replace("（）", "").replace("()", "").strip()
 
         engine = getattr(self._plugin, "_sleep_engine", None)
         try:
@@ -1323,7 +1237,7 @@ class InjectService:
             # 3.9.3 热修：此处无 now 局部变量（原写法 NameError 致日程注入整体失败）；
             # dynamic_status() 缺省由引擎按自身时区取当前时间。
             band = engine.dynamic_status().get("band")
-            cue = {"drowsy": "有点困", "winding_down": "困了，准备休息",
+            cue = {"drowsy": "有点困", "winding_down": "困意较明显",
                    "waking": "刚醒，还在缓神"}.get(band)
             if cue:
                 current_line += f"（{cue}）"
@@ -1512,27 +1426,20 @@ class InjectService:
             return []
 
     def _subconscious_tone_rule(self, session_id: str = "") -> str:
-        """按当前状态选语气分支（极端状态 > 疲惫 > 饥饿 > 开心 > 平稳）。
-
-        F4（B3）：极端状态（stress>0.80 / energy<0.25 / mental_state<0.15）且为
-        目标私聊时，优先返回「拒绝/脆弱」分支（含人设底线）；其他会话继续走原
-        四分支，默认关时逐字不变。疲惫：精力 < 0.40 或社交电量 < 0.20；饥饿：
-        饥饿 >= 0.60；开心：精力 >= 0.72 或社交电量 >= 0.85 或情绪效价 >= 0.30。
-        数据缺失时落到平稳分支。
-        """
+        """优先使用目标私聊的极端状态边界，再按精力、社交和心情调整语气。"""
         extreme = self._boundary_extreme_tone(session_id)
         if extreme:
             return extreme
         snapshot = self._life_state_snapshot()
         energy = snapshot.get("energy")
-        hunger = snapshot.get("hunger")
         social = snapshot.get("social_battery")
-        valence = self._emotion_valence()
-        if (energy is not None and energy < 0.40) or (
-                social is not None and social < 0.20):
+        if energy is not None and energy < 0.25:
             return SUBCONSCIOUS_TONE_TIRED_DEFAULT
-        if hunger is not None and hunger >= 0.60:
-            return SUBCONSCIOUS_TONE_HUNGRY_DEFAULT
+        if energy is not None and energy < 0.40:
+            return SUBCONSCIOUS_TONE_LOW_ENERGY_DEFAULT
+        if social is not None and social < 0.20:
+            return SUBCONSCIOUS_TONE_LOW_SOCIAL_DEFAULT
+        valence = self._emotion_valence()
         if (energy is not None and energy >= 0.72) or (
                 social is not None and social >= 0.85) or (
                 valence is not None and valence >= 0.30):
@@ -1546,32 +1453,36 @@ class InjectService:
         future_activities: List[Tuple[str, str]],
         remaining_minutes: Optional[int],
         session_id: str = "",
+        *,
+        show_hunger: bool = True,
     ) -> str:
         """构建 replyer 极简 extra_prompt（~30 token + 能量基线；模板可在 [prompts] 段定制）。"""
         cfg = self._schedule_cfg()
         enable_detailed = cfg.enable_detailed_description
 
-        remaining_hint = ""
-        if remaining_minutes is not None and 0 < remaining_minutes <= 15:
-            remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
+        remaining_hint = "（快结束了）" if remaining_minutes is not None and 0 < remaining_minutes <= 10 else ""
 
+        if not (enable_detailed and description) or description.strip() == current_activity.strip():
+            description = ""
         state_line = render(
             prompt(self._plugin, "inject_replyer_state_line"),
             fallback=INJECT_REPLYER_STATE_LINE_DEFAULT,
             bot_name=self._bot_name(),
             activity=current_activity,
-            description=description if (enable_detailed and description) else "",
+            description=description,
             remaining_hint=remaining_hint,
         )
-        if not (enable_detailed and description):
+        if not description:
             state_line = state_line.replace("（）", "").replace("()", "").strip()
         return self._render_replyer_status_block(
-            state_line, future_activities, session_id=session_id)
+            state_line, future_activities, session_id=session_id, show_hunger=show_hunger)
 
     def _build_replyer_no_activity_prompt(
         self,
         future_activities: List[Tuple[str, str]],
         session_id: str = "",
+        *,
+        show_hunger: bool = True,
     ) -> str:
         """replyer extra_prompt 的空活动变体（2026-10-10 N1-2）。
 
@@ -1582,7 +1493,7 @@ class InjectService:
         """
         state_line = self._no_activity_text()
         return self._render_replyer_status_block(
-            state_line, future_activities, session_id=session_id)
+            state_line, future_activities, session_id=session_id, show_hunger=show_hunger)
 
     def _replyer_energy_desc(self) -> str:
         """replyer「精神」能量行取值（R7 滚动化改造 §6.6：LifeState 优先）。
@@ -1618,21 +1529,26 @@ class InjectService:
         state_line: str,
         future_activities: List[Tuple[str, str]],
         session_id: str = "",
+        *,
+        show_hunger: bool = True,
     ) -> str:
         """按 ``inject_replyer_status`` 模板拼 replyer 状态块（能量 + 下一条活动）。
 
         R7：能量行改经 :meth:`_replyer_energy_desc`（LifeState 优先，缺失/关闭
         回退静态 ``describe_energy``——关闭路径取值逐字不变）。
 
-        2026-11-11（Gemini 批 P2-EXP-1 / §5.2）：``state_subconscious_style``
-        开（默认）→ 走潜意识模板：状态数据原样保留，但明确禁止直接复述状态词，
-        改由 ``{tone_rule}`` 约束语气/句长（疲惫→短句/省略号、开心→轻快多句、
-        饥饿→纯语感：略慵懒/注意力略散、不主动提饿）；关 → 旧模板逐字不变。
+        通过 ``{tone_rule}`` 提供语气参考。本轮未询问当前状态且无相关话题时，
+        仅从背景省略饥饿描述，保留其他已知状态和实际状态数据。
 
         F4（B3）：默认关时下方两处均短路，返回值与加入前逐字一致；开启且为目标
         私聊时，``{tone_rule}`` 可切极端状态分支，并按概率追加节奏提示行。
         """
         energy_desc = self._replyer_energy_desc()
+        if not show_hunger:
+            energy_desc = "，".join(
+                item for item in energy_desc.split("，")
+                if item.partition("（")[0].strip() not in {"有点饿", "很饿"}
+            )
         bot_name = self._bot_name()
 
         next_line = ""
@@ -1648,14 +1564,6 @@ class InjectService:
         if tone_rule:
             # 语气分支带 {bot_name} 占位（极端分支已在 boundary 内渲染，重复渲染无副作用）
             tone_rule = render(tone_rule, fallback=tone_rule, bot_name=bot_name)
-        # F5（用户裁决 2-A）：无论命中哪个语气分支（含极端/平稳），开关开时
-        # 都追加一条广义抑饿禁令——状态数据里的「有点饿」本身可能诱发主动提饿。
-        hunger_ban = render(
-            SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
-            fallback=SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
-            bot_name=bot_name,
-        )
-        tone_rule = f"{tone_rule}\n{hunger_ban}" if tone_rule else hunger_ban
         text = render(
             INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
             fallback=INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT,
@@ -1685,7 +1593,10 @@ class InjectService:
         效果：用户明确问当前/未来状态时不再被 50% 硬币挡掉；冷却只对「同活动 +
         同意图」生效，replyer 不再被自己写死的同一种意图反复盖冷却章。
         """
+        match_text = kwargs.get("match_text")
         if self._intent_classifier is not None:
+            if isinstance(match_text, str) and match_text.strip():
+                return self._intent_classifier.classify(match_text.strip())
             payload = kwargs.get("items")
             if not isinstance(payload, list):
                 payload = kwargs.get("messages")
@@ -1693,6 +1604,9 @@ class InjectService:
                 text = self._extract_last_user_text(payload)
                 if text:
                     return self._intent_classifier.classify(text)
+                return UserIntent.CASUAL_CHAT, 0.5
+        if isinstance(match_text, str):
+            return UserIntent.CASUAL_CHAT, 0.5  # The current host explicitly found no reply target text.
         if self._context_cache is not None:
             try:
                 turns = self._context_cache.get_recent_turns(session_id or "unknown", count=1)
@@ -1794,7 +1708,15 @@ class InjectService:
             now = self._tz_manager.get_now()
             # P1（2026-11-09 睡眠注入修复）：仅注入调用处显式包含睡眠，不全局改读模型
             # 默认（其他消费者有意排除睡眠的行为保留）。过滤后的空值不再被误当真实空闲。
-            current = model.current(now, include_sleep=True) or None
+            row = model.current(now, include_sleep=True)
+            # The read model can supply planned/paused rows for other callers.
+            # Only the actually running row can be described as current here.
+            current = (row if isinstance(row, dict) and not row.get("paused")
+                       and row.get("status") in (None, "", "active") else None)
+            sleep = self._sleep_presentation(now, current)
+            if current is not None and (sleep.get("source") == "engine_episode_conflict"
+                    or (sleep.get("state") == "asleep" and current.get("goal_type") != "sleep")):
+                current = None
             nxt = list(model.next(now, limit=2) or [])
             try:
                 state_line = str(model.state_line(now, max_items=2) or "").strip()
@@ -1808,7 +1730,7 @@ class InjectService:
                          if isinstance(row, dict)][-2:]
             return {"current": current, "next": nxt, "state_line": state_line,
                     "completed": completed, "now": now,
-                    "sleep": self._sleep_presentation(now)}
+                    "sleep": sleep}
         except Exception as exc:
             logger.debug("life runtime 注入视图读取失败（回退旧路径）：%s", exc)
             return None
@@ -1856,7 +1778,7 @@ class InjectService:
                 logger.debug("主动分享轮判定：定制文案探测失败（降级 False）", exc_info=True)
         return False
 
-    def _sleep_presentation(self, now) -> Dict[str, Any]:
+    def _sleep_presentation(self, now, current: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """P1 权威睡眠表现态：SleepEngine 会话优先，episode 仅名称/时间佐证。
 
         区分 asleep/awake/drowsy/winding_down/waking/unknown；引擎确认已睡即使 episode
@@ -1876,13 +1798,7 @@ class InjectService:
                 started = (getattr(sess, "metadata", None) or {}).get("sleep_started_at")
         except Exception:
             started = None
-        ep_sleep = False
-        try:
-            model = self._life_read_model()
-            cur = model.current(now, include_sleep=True) if model is not None else None
-            ep_sleep = bool(cur) and str(cur.get("goal_type") or "") == "sleep"
-        except Exception:
-            ep_sleep = False
+        ep_sleep = bool(current and current.get("goal_type") == "sleep")
         if asleep is True:
             out.update(state="asleep", started_at=started, source="engine")
             return out
@@ -1955,11 +1871,10 @@ class InjectService:
                           override: Optional[Dict[str, Any]],
                           slim: bool = False,
                           subconscious: bool = False,
-                          bot_name: str = "麦麦",
-                          suppress_hunger_mention: bool = False) -> List[str]:
+                          bot_name: str = "麦麦") -> List[str]:
         """runtime 实况追加行（主设计 §3.3 注入清单；零 emoji）。
 
-        current（名称/已进行/进度/注意力/剩余）+ next ≤2 + 状态行 + recent ≤2
+        current（名称/注意力/是否快结束）+ next ≤2 + 状态行 + recent ≤2
         （completed_today 尾部实际发生）。视图为空 → 空列表（不追加任何行）。
 
         2026-11-04 实况瘦身：``slim=True`` 仅输出「当前活动实况」一行（不含
@@ -1970,32 +1885,13 @@ class InjectService:
         2026-11-11（Gemini 批 P2-EXP-1 / §5.2）：``subconscious=True`` 时在状态
         行尾追加「只用于调整语气 / 不要直接复述」注记，状态数据本身不改；
         缺省 False = 旧文案逐字（开关关闭路径）。
-
-        2026-11-12（用户裁决 2-A / F5）：``subconscious=True`` 且
-        ``suppress_hunger_mention=True`` 时，同一状态行尾再追加广义抑饿禁令
-        （与语气分支是否命中饥饿无关）；缺省 False = 不追加，旧文本逐字不变。
         """
         if not isinstance(view, dict):
             return []
         lines: List[str] = []
         current = view.get("current")
-        now = view.get("now")
-        cur_min = minutes_of_now(now)
         if isinstance(current, dict):
             segs: List[str] = []
-            try:
-                start = int(current.get("start_minute") or 0)
-            except (TypeError, ValueError):
-                start = 0
-            if start > 0:
-                # 已进行 = cur 相对 start 的环距（「经过」方向）：ring_minutes_ahead(cur, start)
-                # ——2026-10-25 门禁员修新代码 bug（R7 依据 = 用户 2026-10-25 直派【滚动化改造】）：
-                # 原写法 ring_minutes_ahead(start, cur) 是「还剩」方向，start<cur 时会渲染
-                # 「已进行 1430 分钟」这类环回大数；换参后同帧 10:00→10:10 = 10、
-                # 跨午夜 23:00→00:30 = 90，两态皆对。
-                elapsed = ring_minutes_ahead(cur_min, start)
-                if elapsed > 0:
-                    segs.append(f"已进行 {elapsed} 分钟")
             # 复核 P1-10：进度百分比不进 planner 文本；注意力档位换自然中文，
             # 未知值直接略过（不再把 now/brief/later 英文枚举直出给模型）。
             attention = _ATTENTION_MODE_TEXT.get(
@@ -2003,11 +1899,10 @@ class InjectService:
             if attention:
                 segs.append(attention)
             remaining = (override or {}).get("remaining")
-            if isinstance(remaining, int) and remaining > 0:
-                segs.append(f"约还剩 {remaining} 分钟")
+            if isinstance(remaining, int) and 0 < remaining <= 10:
+                segs.append("快结束了")
             head = str(current.get("name") or "").strip() or "当前活动"
-            if segs:
-                lines.append(f"当前活动实况：{head}，" + "，".join(segs))
+            lines.append("当前活动实况：" + "，".join([head, *segs]))
         if slim:
             # 瘦身口径：仅当前活动实况一行；接下来/状态/刚完成不输出
             # （无当前活动时 lines 为空 → 不追加任何行，空活动兜底走现在行）
@@ -2045,13 +1940,6 @@ class InjectService:
                     fallback=SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT,
                     bot_name=bot_name,
                 )
-                if suppress_hunger_mention:
-                    # F5（用户裁决 2-A）：同一状态行尾追加广义抑饿禁令
-                    state_line += render(
-                        SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
-                        fallback=SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT,
-                        bot_name=bot_name,
-                    )
             lines.append(state_line)
         for row in (view.get("completed") or [])[-2:]:
             if not isinstance(row, dict):

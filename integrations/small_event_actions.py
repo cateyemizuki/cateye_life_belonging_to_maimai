@@ -32,8 +32,8 @@ class SmallEventActions:
         if not chosen:
             return {'status': status}
         result = await self._dispatch('browse_qq:' + eid, 'optional_contact',
-            '【可选动机·刷QQ】当前活动允许你顺便看看QQ，也可能想随口联系一下陪伴目标。'
-            '没有新消息、没有指定话题，也不要求问候、询问、汇报日程或表达想念。'
-            '结合已有上下文自行决定；没什么想说就不调用任何工具，直接结束。')
+            "你正顺手翻着手机，想起可以给对方随口发句话。"
+            "没有必须说的内容，也没必要报备日程；真有想聊的就按平时口吻说一句，"
+            "没什么想说就直接安静结束。")
         self._mark(eid, {'browse_contact_attempt': str(result.get('status') or 'unknown')})
         return result

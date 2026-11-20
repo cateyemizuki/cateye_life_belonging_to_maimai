@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from .mapping_dir import MappingReadError, ensure_user_table, mappings_path, read_json_text
+from .storage import save_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -94,3 +95,37 @@ def check_top_level_keys(raw: dict, allowed: Sequence[str],
         if key not in allowed:
             raise rejected(str(key), "unknown_key",
                            f"顶层键 {key!r}：未知键（允许的键集 {text}）")
+
+
+def _migrate_exact_defaults(table: dict, legacy: dict, current: dict) -> dict:
+    updates = {}
+    for key, old in legacy.items():
+        if key not in table or key not in current:
+            continue
+        actual, new = table[key], current[key]
+        if isinstance(old, dict) and isinstance(actual, dict) and isinstance(new, dict):
+            next_value = _migrate_exact_defaults(actual, old, new)
+            if next_value is not actual:
+                updates[key] = next_value
+        elif isinstance(actual, str) and isinstance(new, str) and actual == old and actual != new:
+            updates[key] = new
+    return {**table, **updates} if updates else table
+
+
+def migrate_default_text_table(path: Path, document: dict, legacy: dict, current: dict,
+                               *, section: str | None = None) -> dict:
+    """Upgrade exact former defaults; preserve unrecognized keys and edited text."""
+    table = document.get(section) if section is not None else document
+    if not isinstance(table, dict):
+        return document
+    updated = _migrate_exact_defaults(table, legacy, current)
+    if updated is table:
+        return document
+    result = {**document, section: updated} if section is not None else updated
+    try:
+        if not path.is_symlink() and read_json_text(path) == document and save_json_atomic(path, result):
+            return result
+    except MappingReadError:
+        logger.debug("描述表升级前读取失败：%s", path.name, exc_info=True)
+    logger.info("描述表未写入升级值，保留磁盘原文：%s", path.name)
+    return document

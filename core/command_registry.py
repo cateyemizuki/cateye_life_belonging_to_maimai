@@ -261,11 +261,11 @@ COMMANDS: Tuple[Command, ...] = (
                     "companion_disposition|activity_preferences|all|status]",
             args_cn="[情绪|事件|生活状态|频率|视频兴趣|联系倾向|日程偏好|全部|状态]"),
     Command("ops", "运维", "share", "分享", "admin",
-            "Video-share ops: status / clear <id> confirm",
-            "视频分享运维：状态 / 清空 <id> 确认",
+            "Video-share ops: debug a random watched video, inspect status or clear a receipt",
+            "视频分享运维：随机发送近期看过的视频 / 查看状态 / 清空回执",
             "cmd_ops_share",
-            args_en="[status|clear <id> confirm]",
-            args_cn="[状态|清空 <id> 确认]"),
+            args_en="[debug [planner]|status|clear <id> confirm]",
+            args_cn="[调试 [规划]|状态|清空 <id> 确认]"),
 )
 
 HELP_COMMAND = Command(
@@ -283,6 +283,8 @@ ARG_ALIASES: Dict[str, str] = {
     "确认": "confirm",
     "状态": "status",
     "清空": "clear",
+    "调试": "debug",
+    "规划": "planner",
     "重置": "reset",
     "情绪": "emotion",
     "事件": "events",

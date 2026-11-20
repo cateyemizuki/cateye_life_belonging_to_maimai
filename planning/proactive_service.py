@@ -13,7 +13,7 @@
    - **其他私聊**：早安阈值 = 判定窗内对方发送 ≥ ``greeting_other_private_min_messages``；
      晚安 = OR（连锁桶 ∨ 判定窗 ``[本轮日程开始, 晚安结束)`` 对方发送 ≥
      ``greeting_private_night_min_messages``）；窗内任意 tick 达标即通过、到点发；
-   - **目标私聊**：**无条件**（原激活强制随 §31.1 解除，用户 2026-10-23 裁定），只看
+   - **目标私聊**：上次实际问候后须有对方真实来信。另按
      ``[patrol].enabled`` + 名单 + 既有掷点/到点/去重流程。
 
    通则（§31.1）：①「不得界后道早安/晚安」——需判定分支补 ``now > observe_until →
@@ -98,11 +98,9 @@ from .config import (
     section_or_default,
 )
 from core.storage import load_json, save_json_atomic
-from tools.proactive_turn import (
-    append_stage4_miss_prompt,
-    discard_turn,
-    register_turn,
-    stage4_intent_for_kind,
+from integrations.planner_proactive import dispatch_proactive
+from .greeting_guard import (
+    TargetGreetingReceipts, is_target_reply, message_account, message_epoch, own_message,
 )
 
 from .activity_properties import resolve_property
@@ -150,6 +148,7 @@ GREETING_MORNING = "morning"
 GREETING_NIGHT = "night"
 #: 中午问好（2026-11-04 主动行为重写）：仅目标陪伴私聊、无掷点、marks v2 每周期去重
 GREETING_NOON = "noon"
+_NOON_UNANSWERED_MARK = "noon_unanswered"
 #: 中午问好时间窗（本地分钟；内部调参常量——新功能参数，单一真源在本模块，
 #: 不进 internal_tuning.json：其默认值/校验器所有者 core/internal_tuning.py 不在
 #: 本任务文件边界内，新增 JSON 键会被校验器丢弃）
@@ -191,19 +190,8 @@ def noon_fire_offset_minutes(date_str: Any, stream_id: Any,
 MORNING_AFTER_WAKE_HOURS = 2.0
 #: 早安上限时刻出厂默认（HH:MM）；配置为空/非法时回退本值（fail-safe 不放宽）
 DEFAULT_MORNING_LATEST = "10:00"
-#: 中午问好文案（模块内常量；不改 suite_prompts.py——他人负责边界）
-PROACTIVE_INTENT_NOON_DEFAULT = (
-    "现在是中午，请自然地向陪伴对象道一声午安/问问TA吃没吃午饭；"
-    "语气符合人设，简短随意、轻松关心，不要提日程或今天的安排，不要追问不休"
-)
-PROACTIVE_REASON_NOON_DEFAULT = "陪伴：中午问好（目标私聊，每日一次，免预算）"
-#: 阶段 4 清醒沉默阈值（小时；设计 §1.1 “>120h”）。
-#: D5 结构守卫禁止 planning 模块 import companion（含懒导入），故此处只读镜像
-#: ``companion.initiative_profile.MISS_STAGE_END_HOURS``；若 patrol 暴露
-#: ``current_target_miss_stage`` 则优先采用 patrol 口径，避免两处漂移。
-STAGE4_SILENCE_HOURS = 120.0
-#: 覆盖类别（§3.4/B7；2026-10-22 §二十七 分支闸门分离）：目标私聊（激活强制）/
-#: 群聊（必要性配置 + 今日非 bot 消息硬门槛）/ 其他私聊（「对方发送」条数阈值恒开口）
+PROACTIVE_REASON_NOON_DEFAULT = "陪伴：日程问候（中午时段）"
+#: 覆盖类别：陪伴私聊、其他私聊、群聊。
 GREETING_CATEGORY_TARGET = "target"
 GREETING_CATEGORY_GROUP = "group"
 GREETING_CATEGORY_OTHER = "other"
@@ -216,6 +204,9 @@ _GREETING_ABANDON_REASON_CN = {
     "deadline": "观测窗结束仍无人说话",
     "window_closed": "掷点时观测窗已关闭",
     "morning_cap": "已过早安上限（配置时刻与醒后2小时取早）",
+    "recent_bot_speech": "该群近期已发言",
+    "silence_unverified": "未确认该群近期沉默",
+    "previous_greeting_unanswered": "上次问候后尚未收到新消息",
 }
 #: 早安无「非睡眠日程条目」时的放弃期限兜底：基准 + 120 分钟（§3.2 期限列的实现裁量）
 _MORNING_FALLBACK_DEADLINE_MINUTES = 120
@@ -1008,27 +999,28 @@ class ProactiveService:
         getter = getattr(getattr(ctx_obj, "message", None), "get_by_time_in_chat", None)
         if not callable(getter):
             return None
+        fallback = False
         try:
+            args = (str(stream_id), str(float(start_ts)), str(float(end_ts)))
             if keep_bot:
-                # 补发冷静期：找 bot 自己的消息（is_mai=真），不能让 filter_mai 把它们滤掉
-                # （§31.1 通则②；R7 = 用户 2026-10-23 第二轮直派）
-                msgs = await getter(str(stream_id), str(float(start_ts)),
-                                    str(float(end_ts)), limit=int(limit))
+                msgs = await getter(*args, limit=int(limit))
             else:
                 try:
-                    msgs = await getter(str(stream_id), str(float(start_ts)), str(float(end_ts)),
-                                        limit=int(limit), filter_mai=True)
-                except Exception as exc:
-                    logger.debug(f"带 filter_mai 查询失败，改为不带重试: {exc}")
-                    msgs = await getter(str(stream_id), str(float(start_ts)),
-                                        str(float(end_ts)), limit=int(limit))
-        except Exception as exc:
-            logger.debug(f"消息窗查询失败（按取不到处理）: stream={stream_id}, {exc}")
+                    msgs = await getter(*args, limit=int(limit), filter_mai=True)
+                except TypeError:
+                    fallback = True
+                    msgs = await getter(*args, limit=int(limit))
+        except Exception:
+            logger.debug("问候消息窗读取失败", exc_info=True)
             return None
         if isinstance(msgs, dict):
-            msgs = msgs.get("messages") or msgs.get("data") or []
+            if msgs.get("success") is False:
+                return None
+            msgs = msgs.get("messages", msgs.get("data"))
         if not isinstance(msgs, list):
             return None
+        if fallback:
+            msgs = [msg for msg in msgs if own_message(msg) is False]
         if slash_filter:
             kept: List[Any] = []
             for msg in msgs:
@@ -1136,8 +1128,7 @@ class ProactiveService:
                          now_ts: float, cycle: CycleState,
                          from_ts: Optional[float] = None
                          ) -> Tuple[bool, float, Optional[float]]:
-        """补发冷静期判定（§31.1 通则②）：bot 本会话最近一条消息（``is_mai=真``）距今
-        是否 ≥ ``schedule_advanced.greeting_min_silence_minutes``。
+        """补发冷静期按本会话最近一条 bot 实际发言计算。
 
         查询窗 = ``(now − N 分钟, now]``（``from_ts`` 供诊断指定更早窗底）；窗内存在
         ``is_mai=真`` 消息 → 距今 < N → 不满足（余量 = N − 实际沉默分钟）。查询异常 →
@@ -1151,31 +1142,62 @@ class ProactiveService:
         window_start = now - silence * 60.0
         if from_ts is not None:
             window_start = min(window_start, float(from_ts))
-        msgs = await self._messages_in_window(stream_id, window_start, now,
-                                              limit=50, slash_filter=False,
-                                              keep_bot=True)
-        if msgs is None:
-            return False, 0.0, None
-        latest_own: Optional[float] = None
-        for msg in msgs:
-            if isinstance(msg, dict):
-                if not msg.get("is_mai"):
-                    continue
-                raw = msg.get("timestamp")
-            else:
-                if not getattr(msg, "is_mai", None):
-                    continue
-                raw = getattr(msg, "timestamp", None)
-            try:
-                ts = float(raw)
-            except (TypeError, ValueError):
-                continue
-            if ts > window_start and (latest_own is None or ts > latest_own):
-                latest_own = ts
-        if latest_own is None:
-            return True, silence, None
-        quiet = max(0.0, (now - latest_own) / 60.0)
-        return (quiet >= silence), quiet, latest_own
+        covered, latest = await self._latest_bot_message(stream_id, window_start, now)
+        if latest is not None:
+            quiet = max(0.0, (now - latest) / 60.0)
+            return quiet >= silence, quiet, latest
+        return (True, float(silence), None) if covered else (False, 0.0, None)
+
+    async def _latest_bot_message(self, stream_id: str, start: float, end: float
+                                  ) -> tuple[bool, float | None]:
+        """Return confirmed own speech or whether the window was fully checked."""
+        limit = 64
+        rows = await self._messages_in_window(stream_id, start, end, limit=limit,
+                                              slash_filter=False, keep_bot=True)
+        if rows is None:
+            return False, None
+        latest = None
+        unknown = False
+        for row in rows:
+            own = own_message(row)
+            stamp = message_epoch(row)
+            if own is True and stamp is not None and start <= stamp <= end:
+                latest = max(latest or 0.0, stamp)
+            elif own is None or (own and stamp is None):
+                unknown = True
+        if latest is not None or len(rows) < limit:
+            return (not unknown or latest is not None), latest
+        # A dense room can hide the bot's last send behind an entire page of
+        # incoming traffic. Query only the known route account in that stream.
+        accounts = {message_account(row) for row in rows} - {""}
+        db = getattr(getattr(self._plugin, "ctx", None), "database", None)
+        getter = getattr(db, "get", None)
+        if len(accounts) != 1 or not callable(getter):
+            return False, None
+        account = accounts.pop()
+        try:
+            own_rows = await getter("Messages", filters={"session_id": stream_id, "user_id": account},
+                                     limit=limit, order_by=["-timestamp", "-id"])
+        except Exception:
+            logger.debug("密集问候窗口的宿主自发消息读取失败", exc_info=True)
+            return False, None
+        confirmed_success = isinstance(own_rows, dict) and own_rows.get("success") is True
+        if isinstance(own_rows, dict):
+            if own_rows.get("success") is False:
+                return False, None
+            own_rows = own_rows.get("data")
+        # Current db_get can turn internal failures into a bare empty list.
+        # For a partial window, that shape alone cannot prove silence.
+        if not isinstance(own_rows, list) or (not own_rows and not confirmed_success):
+            return False, None
+        stamps = [message_epoch(row) for row in own_rows]
+        if any(stamp is None for stamp in stamps):
+            return False, None
+        known = [stamp for stamp in stamps if stamp is not None]
+        latest = max((stamp for stamp in known if start <= stamp <= end), default=None)
+        if latest is not None:
+            return True, latest
+        return len(known) < limit or min(known, default=end) <= start, None
 
     # 注（2026-10-10 第二轮）：原 ``_in_silence_window`` 已删除——问候不再被静默时段拦截。
     # 注（§31.1，R7 = 用户 2026-10-23 第二轮直派）：早晨晚安的静默拦截同样维持不引入——
@@ -1387,7 +1409,7 @@ class ProactiveService:
         读 ``[planning_proactive].greeting_require_activation``（bool，默认 True）；
         读不到/取值异常 → **True**（fail-closed，宁不发不错发）。**只对群聊早安**生效：
         开 = 在底层硬闸之上额外判定「今天日程第一个条目时段内非 bot 消息 ≥1」（AND）；
-        关 = 不判（硬闸仍无条件生效）。目标私聊**无条件**、其他私聊走阈值判定，均不经
+        关 = 不判（硬闸仍无条件生效）。目标私聊另查历史问候回复、其他私聊走阈值判定，均不经
         本开关。
 
         沿革：2026-10-10 第二轮回正时本闸由配置控制、且所有会话一视同仁；2026-10-20
@@ -1686,7 +1708,7 @@ class ProactiveService:
                                  cfg_p: Any, cycle: Optional[CycleState] = None) -> None:
         """单个候选的状态机（§31.1 闸门矩阵）：**掷点前闸门 → 掷点/复用 → 推进**。
 
-        - **目标私聊**：无条件（原激活强制随 §31.1 解除，用户 2026-10-23 裁定），只看
+        - **目标私聊**：掷点前沿用既有时段条件，到点另查上次已发问候后的真实来信，另看
           ``[patrol].enabled`` + 统一名单 + 既有掷点/到点/去重流程；
         - **群聊早安**：底层硬闸（``[prev.start, cur.start)`` 窗内非 bot ≥1，无条件）不过 =
           直接跳过、**不掷点、不创建条目**（决策日志留痕，每周期每流每 kind 一条）；
@@ -1743,7 +1765,8 @@ class ProactiveService:
             # 早安沉默闸（R7 = 用户 2026-10-24 直派）：第一个检查、三流分派之前——
             # bot 在今日第一日程（= 周期起点）前 N 小时内发过消息 → 该流本周期跳过早安
             # （durable = 不掷点不建条目，对齐群聊硬闸语义；查询异常 fail-closed）
-            silenced = await self._morning_silence_gate(stream_id, now_ts, cycle, cfg_p)
+            silenced = await self._morning_silence_gate(
+                stream_id, now_ts, cycle, cfg_p, group=category == GREETING_CATEGORY_GROUP)
             if silenced is None:
                 self._log_gate_skip(stream_id, kind, cycle,
                                     "早安沉默闸查询失败（morning_silence，fail-closed，宁不发）")
@@ -1752,9 +1775,7 @@ class ProactiveService:
                 hours = self._morning_silence_hours(cfg_p)
                 self._log_gate_skip(
                     stream_id, kind, cycle,
-                    f"早安沉默闸未过（morning_silence：第一日程前 {hours:g} 小时内 bot 发过消息，"
-                    f"窗={self._fmt_span(cur_start - hours * 3600.0)} → {self._fmt_span(cur_start)}，"
-                    f"该流跳过早安）")
+                    f"早安沉默闸未过（morning_silence：检查窗口内 bot 已发言，阈值 {hours:g} 小时）")
                 return "skip", True
             if category == GREETING_CATEGORY_GROUP:
                 hard = await self._group_morning_hard_gate(stream_id, _prev, cur_start)
@@ -1781,9 +1802,9 @@ class ProactiveService:
                     # 阈值未达标：预掷点静默跳过；掷点过后（调用方建条目）由 advance 复查
                     # 到期钳制弃——「窗内一直不满足则到期仍弃」（§31.1）
                     return "skip", False
-            return "pass", False  # TARGET = 无条件（判定窗/阈值均不设）
+            return "pass", False  # TARGET 到点后另查问候回应
         # 晚安：群聊 = 硬性连锁（``greeting_night_require_morning_chain`` 默认 True；
-        # 关 = 解耦直通，其余闸门/频率/预算不变）；其他私聊 = OR（连锁 ∨ 阈值）；目标 = 无条件
+        # 关 = 解耦直通，其余闸门/频率/预算不变）；其他私聊 = OR（连锁 ∨ 阈值）；目标在提交前复核问候回应
         if category == GREETING_CATEGORY_GROUP:
             if not self._greeting_night_requires_chain(cfg_p):
                 return "pass", False
@@ -1798,7 +1819,7 @@ class ProactiveService:
             if self._greeting_chain_pass(stream_id, cycle) or threshold[1]:
                 return "pass", False
             return "skip", False
-        return "pass", False  # TARGET = 无条件
+        return "pass", False  # TARGET 到点后另查问候回应
 
     def _log_gate_skip(self, stream_id: str, kind: str, cycle: CycleState, reason: str) -> None:
         """闸门拒绝的决策日志留痕（每周期每流每 kind 至多一条）。"""
@@ -1840,35 +1861,80 @@ class ProactiveService:
             return 2.0
         return max(0.0, value)
 
-    async def _morning_silence_gate(self, stream_id: str, now_ts: float, cycle: CycleState,
-                                    cfg_p: Any) -> Optional[bool]:
-        """早安沉默闸（R7 = 用户 2026-10-24 直派）：bot 至少在今日第一日程（= 周期起点
-        ``cur_start``）前沉默 N 小时，否则该流跳过早安。
+    def _morning_silence_windows(self, now: float, cycle: CycleState, cfg_p: Any,
+                                 *, group: bool = False) -> list[tuple[float, float]]:
+        seconds = self._morning_silence_hours(cfg_p) * 3600.0
+        if seconds <= 0:
+            return []
+        _prev, anchor, _end = self._cycle_pivots(cycle)
+        if not group:
+            return [(anchor - seconds, anchor)] if 0 < anchor <= now else []
+        sliding = (now - seconds, now)
+        if not 0 < anchor <= now:
+            return [sliding]
+        if anchor >= sliding[0]:
+            return [(anchor - seconds, now)]
+        return [(anchor - seconds, anchor), sliding]
 
-        判定：``N > 0`` 且 ``now >= cur_start`` 时，查窗 ``[cur_start − N×3600, cur_start]``
-        内该流 bot 自身消息（``keep_bot=True`` 不带 filter_mai，逐条按 ``is_mai`` 过滤，
-        写法对齐 :meth:`_calm_gate`）——存在 ≥1 条 → 不过。三流统一受此闸（含目标私聊）。
-        返回 ``None`` = 查询异常（调用方 fail-closed 宁不发）；``N ≤ 0`` 或周期起点不可得
-        或 ``now < cur_start``（尚未进入本周期）→ 恒通过。
-        """
-        hours = self._morning_silence_hours(cfg_p)
-        if hours <= 0:
-            return True
-        _prev, cur_start, _cur_end = self._cycle_pivots(cycle)
-        if cur_start <= 0 or float(now_ts) < cur_start:
-            return True
-        msgs = await self._messages_in_window(
-            stream_id, cur_start - hours * 3600.0, cur_start,
-            limit=20, slash_filter=False, keep_bot=True)
-        if msgs is None:
-            return None
-        for msg in msgs:
-            if isinstance(msg, dict):
-                if msg.get("is_mai"):
-                    return False
-            elif getattr(msg, "is_mai", None):
+    async def _morning_silence_gate(self, stream_id: str, now_ts: float, cycle: CycleState,
+                                    cfg_p: Any, *, group: bool = False) -> Optional[bool]:
+        """Check the wake-anchored window and, for groups, the current sliding window."""
+        for start, end in self._morning_silence_windows(now_ts, cycle, cfg_p, group=group):
+            covered, latest = await self._latest_bot_message(stream_id, start, end)
+            if latest is not None:
                 return False
+            if not covered:
+                return None
         return True
+
+    async def group_morning_proactive_allowed(self, stream_id: str) -> bool:
+        """Refresh the group-silence decision immediately before planner injection."""
+        if not self._greeting_kind_enabled(GREETING_MORNING):
+            return False
+        now = self._tz_manager.get_now()
+        now_ts = _epoch_ts(now)
+        cycle = self._cycle_ctx(now)
+        cap = self._morning_cap_ts(cycle)
+        if cap is not None and now_ts > cap:
+            return False
+        return (await self._morning_silence_gate(
+            stream_id, now_ts, cycle, self._proactive_cfg(), group=True)) is True
+
+    def _target_greeting_receipt_store(self) -> TargetGreetingReceipts:
+        store = getattr(self, "_target_greeting_receipts", None)
+        if store is None:
+            store = TargetGreetingReceipts(getattr(self._plugin, "_data_dir", None))
+            self._target_greeting_receipts = store
+        return store
+
+    def record_target_greeting_sent(self, stream_id: str, at_epoch: float) -> bool:
+        """Accept only send receipts for the currently bound private companion."""
+        owner = self._target_qq()
+        if not owner or stream_id != self._target_stream_id_readonly():
+            return False
+        saved = self._target_greeting_receipt_store().record(owner, at_epoch)
+        if not saved:
+            logger.warning("陪伴问候发送回执保存失败")
+        return saved
+
+    async def target_greeting_proactive_allowed(self, stream_id: str, *, now_ts: float | None = None) -> bool:
+        """After the first confirmed greeting, require a newer real target message."""
+        owner = self._target_qq()
+        if not owner or stream_id != self._target_stream_id_readonly():
+            return False
+        valid, last_sent = self._target_greeting_receipt_store().last_sent(owner)
+        if not valid:
+            return False
+        if not last_sent:
+            return True
+        now = now_ts if now_ts is not None else _epoch_ts(self._tz_manager.get_now())
+        if last_sent >= now:
+            return False
+        rows = await self._messages_in_window(stream_id, last_sent, now, limit=40, slash_filter=False)
+        if rows is None or owner != self._target_qq() or stream_id != self._target_stream_id_readonly():
+            return False
+        return any(is_target_reply(row, owner) and last_sent < (message_epoch(row, inbound=True) or 0) <= now
+                   for row in rows)
 
     async def _advance_greeting(self, entry: Dict[str, Any], now_ts: float,
                                 date_str: str, cfg_p: Any,
@@ -1936,6 +2002,15 @@ class ProactiveService:
             ok = (await self._calm_gate(entry["stream_id"], silence, now_ts, cycle))[0]
             if not ok:
                 return  # 冷静期不足 → 下一 tick 复查；窗尾仍未满足 → 钳制放弃
+        if entry["kind"] == GREETING_MORNING and entry["category"] == GREETING_CATEGORY_GROUP:
+            silence = await self._morning_silence_gate(entry["stream_id"], now_ts, cycle, cfg_p, group=True)
+            if silence is not True:
+                self._abandon_greeting(entry, "recent_bot_speech" if silence is False else "silence_unverified")
+                return
+        if entry["category"] == GREETING_CATEGORY_TARGET and not await self.target_greeting_proactive_allowed(
+                entry["stream_id"], now_ts=now_ts):
+            self._abandon_greeting(entry, "previous_greeting_unanswered")
+            return
         await self._fire_greeting(entry, date_str, now_ts)
 
     async def _greeting_fire_gate(self, entry: Dict[str, Any], cfg_p: Any,
@@ -1945,7 +2020,7 @@ class ProactiveService:
         预掷点被闸的条目不会创建（§31.1「不掷点」）；已掷点条目在到点推进时回到同闸重查
         （判据 = 最新判定；与参考插件 G9「双阶段复核」同形）：
 
-        - 目标私聊：无条件（恒通过、无冷静期）；
+        - 目标私聊：此分支无需群聊门槛，到点另查问候回应；
         - 群聊早安：硬闸 +（necessity 开）必要性——necessity 窗（今天日程第一个条目时段）
           可能越过掷点 → 过点才达标判据以**数据窗段**为准（``[窗底, fire_at)`` 段已有人
           开口 = 到点前已满足 → 正常触发；否则 = 过点才满足 → 补发冷静期）；
@@ -2119,7 +2194,8 @@ class ProactiveService:
     async def _fire_greeting(self, entry: Dict[str, Any], date_str: str, now_ts: float) -> None:
         """触发一次问候（一律走同一条主动链；例行问候始终免预算）。"""
         stream_id, kind = entry["stream_id"], entry["kind"]
-        ok = await self._trigger_greeting(stream_id, kind, date_str)
+        ok = await self._trigger_greeting(stream_id, kind, date_str, category=entry["category"],
+                                         cycle_key=entry.get("cycle"))
         if not ok:
             # 宿主触发失败：状态保持 pending，下一 tick 重试——越过观测窗上界后由
             # _advance_greeting 的越界钳制 abandon(deadline)（§31.1 通则①「不得界后」
@@ -2272,8 +2348,9 @@ class ProactiveService:
             # 抖动时刻未到：静默等待（不标记、不写日志、下一 tick 再看）。
             return
         cycle_key = float(cycle.current_cycle_start or 0.0)
-        if self._stream_greeting_marked(target, GREETING_NOON, cycle_key) \
-                or self._noon_sent_on_affection():
+        if (self._stream_greeting_marked(target, GREETING_NOON, cycle_key)
+                or self._stream_greeting_marked(target, _NOON_UNANSWERED_MARK, cycle_key)
+                or self._noon_sent_on_affection()):
             return
         if self._sleep_engine_asleep(now) is True:
             key = (target, GREETING_NOON, cycle_key)
@@ -2284,13 +2361,14 @@ class ProactiveService:
                     reason="睡眠引擎判定仍在睡（中午问好暂缓，窗内醒来才发）",
                     stream_id=target, category=GREETING_CATEGORY_TARGET)
             return
+        if not await self.target_greeting_proactive_allowed(target, now_ts=_epoch_ts(now)):
+            self._mark_stream_greeting(target, _NOON_UNANSWERED_MARK, cycle_key)
+            self._log_gate_skip(target, GREETING_NOON, cycle, "上次问候后尚未收到陪伴目标的新消息")
+            return
         ok = await self._call_proactive_trigger(
-            stream_id=target,
-            intent_prompt=PROACTIVE_INTENT_NOON_DEFAULT,
-            reason=PROACTIVE_REASON_NOON_DEFAULT,
-            priority="normal",
-            exempt_budget=True,
-            kind="noon_greeting",
+            stream_id=target, intent_prompt=self._target_greeting_prompt(now), reason="日程问候",
+            priority="normal", exempt_budget=True, kind="noon_greeting",
+            key=f"{cycle_key}:{GREETING_NOON}", category=GREETING_CATEGORY_TARGET,
         )
         if not ok:
             return
@@ -2306,34 +2384,31 @@ class ProactiveService:
             fire_at=(f"{fire_minute // 60:02d}:{fire_minute % 60:02d}"),
         )
 
-    async def _trigger_greeting(self, stream_id: str, kind: str, date_str: str) -> bool:
-        """走统一主动链触发一次早晚安问候（intent 提示词按 kind 分派）。
+    @staticmethod
+    def _target_greeting_prompt(now: datetime) -> str:
+        return (f"现在是 {now.strftime('%Y-%m-%d %H:%M')}。"
+                "你可以顺手跟对方打个招呼，按这个时间点和你们平时的相处方式自然开口；"
+                "要是觉得现在不合适，直接静默结束就行。")
 
-        **例行问候始终免预算**（2026-10-10：原 ``greeting_exempt_budget`` 开关删除、恒为
-        免预算）——闸门与计数一起跳；陪伴侧的巡检/想念才走预算。``date_str`` = 周期
-        档案日期（marks v2/决策日志外字段；早安 intent 的首个活动名经同周期日期帧取条目）。
-        """
-        if kind == GREETING_MORNING:
+    async def _trigger_greeting(self, stream_id: str, kind: str, date_str: str, *,
+                                category: str, cycle_key: Any = None) -> bool:
+        """Compose a scheduled greeting and use the shared planner dispatcher."""
+        if category == GREETING_CATEGORY_TARGET:
+            intent_prompt = self._target_greeting_prompt(self._tz_manager.get_now())
+            reason = "日程问候"
+        elif kind == GREETING_MORNING:
             first = self._first_awake_item(date_str)
-            if first is not None:
-                intent_prompt = render(
-                    prompt(self._plugin, "proactive_intent_morning"),
-                    fallback=PROACTIVE_INTENT_MORNING_DEFAULT,
-                    activity_name=first[0],
-                )
-            else:
-                intent_prompt = prompt(self._plugin, "proactive_intent_morning_no_activity")
+            intent_prompt = (render(prompt(self._plugin, "proactive_intent_morning"),
+                                    fallback=PROACTIVE_INTENT_MORNING_DEFAULT, activity_name=first[0])
+                             if first is not None else prompt(self._plugin, "proactive_intent_morning_no_activity"))
             reason = self._greeting_reason(GREETING_MORNING)
         else:
             intent_prompt = prompt(self._plugin, "proactive_intent_night")
             reason = self._greeting_reason(GREETING_NIGHT)
         return await self._call_proactive_trigger(
-            stream_id=stream_id,
-            intent_prompt=intent_prompt,
-            reason=reason,
-            priority="normal",
-            exempt_budget=True,
-            kind=("morning_greeting" if kind == GREETING_MORNING else "night_greeting"),
+            stream_id=stream_id, intent_prompt=intent_prompt, reason=reason, priority="normal",
+            exempt_budget=True, kind=f"{kind}_greeting", key=f"{cycle_key or date_str}:{kind}",
+            category=category,
         )
 
     # ------------------------------------------------------------
@@ -2515,9 +2590,9 @@ class ProactiveService:
         """诊断用问候名单**全集**枚举（§29.1 基底 + §31.3 三流分族，R7 = 用户 2026-10-23
         第二轮直派）。
 
-        顺序 = **群聊（枚举序）→ 其他私聊（枚举序）→ 目标私聊（无条件族）**——群/他族
+        顺序 = **群聊（枚举序）→ 其他私聊（枚举序）→ 目标私聊**——群/他族
         序号语义与 §29.1 不变（同序号恒指向同一流、跨帧稳定），目标流**新增**进全集
-        （「目标流=无条件」 GH diag 显示面需要；殿后附号保证既有序号零漂移）。
+        （目标流的诊断展示需要；殿后附号保证既有序号零漂移）。
         """
         pairs = self._dedup_category_streams(
             (await self._resolve_group_streams_readonly()),
@@ -2547,7 +2622,7 @@ class ProactiveService:
 
         §29.1 名单语义 + §31.3 三流分族（R7 = 用户 2026-10-23 第二轮直派）：在只读全集
         枚举（:meth:`_resolve_greeting_streams_universe_readonly`）内判类别——群聊 ``group``、
-        其他私聊 ``other``、目标流 ``target``（无条件族入集后回归诊断可见）；不在全集 →
+        其他私聊 ``other``、目标流 ``target``（诊断可见）；不在全集 →
         ``(None, True)``（调用方再判「仅频率调控」与否）；解析抛异常 → ``(None, False)``。
         ``cfg_p``/``now`` 仅为调用点兼容保留。
         """
@@ -2603,7 +2678,7 @@ class ProactiveService:
           分钟）``（旧「差激活」语义承自 §27.1 necessity，R7 重新锚定窗） / ``取不到…``；
         - **四类新文案**（§31.3「用户 Q8 可写」）：``早安未开始（连锁待定）`` /
           ``因早安未开口→晚安连锁硬性忽略`` / ``连锁已通过``（后接时点档） /
-          ``数量闸达标 M/N``（后接时点档）；目标流新增「``无条件``」前承；
+          ``数量闸达标 M/N``（后接时点档）；目标流显示上次问候的回复闸；
         - 判定窗/阈值窗/期限全部经周期四变量（:meth:`_greeting_frames` 等），不再看日历
           0 点；``threshold`` 结构（§26.2 契约）保留（``cached`` 恒 None——§31.1 废止
           端点冻结缓存，夜窗逐 tick 重查）。
@@ -2648,10 +2723,8 @@ class ProactiveService:
         if not enabled:
             conclusion = "不适用（早安总开关关闭）" if kind == GREETING_MORNING \
                 else "不适用（晚安总开关关闭）"
-        elif marked:
-            conclusion = "今日已发"
-        elif entry is not None and entry.get("status") == GREETING_STATUS_FIRED:
-            conclusion = "今日已发"
+        elif marked or (entry is not None and entry.get("status") == GREETING_STATUS_FIRED):
+            conclusion = "今日已请求问候" if category == GREETING_CATEGORY_TARGET else "今日已发"
         elif entry is not None and entry.get("status") == GREETING_STATUS_ABANDONED:
             reason = str(entry.get("reason") or "unknown")
             conclusion = (f"已放弃（{_GREETING_ABANDON_REASON_CN.get(reason, reason)}，"
@@ -2689,13 +2762,17 @@ class ProactiveService:
             # 短路其余档位（闸在 _pre_gate 是 durable 拒绝，不会有条目/掷点可报）
             silence_gate = None
             if kind == GREETING_MORNING and silence_hours > 0 and self._message_query_available():
-                silence_gate = await self._morning_silence_gate(stream_id, now_ts, cycle, cfg_p)
+                silence_gate = await self._morning_silence_gate(
+                    stream_id, now_ts, cycle, cfg_p, group=category == GREETING_CATEGORY_GROUP)
                 silence_gate_evaluated = True
 
             if silence_gate is None and kind == GREETING_MORNING and silence_hours > 0:
                 conclusion = "取不到（沉默闸查询失败，宁不发）"
             elif silence_gate is False:
-                conclusion = f"沉默闸未过（第一日程前 {silence_hours:g} 小时内 bot 发过消息）"
+                conclusion = f"沉默闸未过（检查窗口内 bot 已发言，阈值 {silence_hours:g} 小时）"
+            elif category == GREETING_CATEGORY_TARGET and not await self.target_greeting_proactive_allowed(
+                    stream_id, now_ts=now_ts):
+                conclusion = "上次问候后尚未确认收到陪伴目标的新消息"
             elif category == GREETING_CATEGORY_GROUP:
                 if kind == GREETING_MORNING:
                     hard = await self._group_morning_hard_gate(stream_id, win_start, cur_start)
@@ -2733,8 +2810,8 @@ class ProactiveService:
                 else:
                     conclusion = (f"未满足（差门槛 {count}/{need}，"
                                   f"窗内剩 {remaining_minutes} 分钟）")
-            else:  # TARGET：无条件（§31.1 激活强制解除）
-                conclusion = f"无条件，{timing}"
+            else:
+                conclusion = f"陪伴问候已通过回复闸，{timing}"
 
         if category is not None:
             if activated is not None:
@@ -2744,7 +2821,7 @@ class ProactiveService:
                 detail_parts.append(
                     f"阈值={count}/{need}（对方发送，{query_text}，{win_text}）")
             elif category == GREETING_CATEGORY_TARGET:
-                detail_parts.append("门槛=不适用（目标流无门槛/无条件）")
+                detail_parts.append("门槛=上次问候后有真实来信")
                 detail_parts.append(win_text)
             else:
                 detail_parts.append(f"硬闸窗={self._fmt_span(win_start)} → "
@@ -2794,9 +2871,9 @@ class ProactiveService:
                     gate_text = "通过"
                 else:
                     gate_text = "未过"
-                detail_parts.append(
-                    f"沉默闸={gate_text}（窗={self._fmt_span(cur_start - silence_hours * 3600.0)}"
-                    f" → {self._fmt_span(cur_start)}，N={silence_hours:g}h）")
+                windows = self._morning_silence_windows(now_ts, cycle, cfg_p, group=category == GREETING_CATEGORY_GROUP)
+                shown = "、".join(f"{self._fmt_span(start)} → {self._fmt_span(end)}" for start, end in windows)
+                detail_parts.append(f"沉默闸={gate_text}（窗={shown or '未到检查窗口'}，N={silence_hours:g}h）")
             if kind == GREETING_MORNING:
                 cap = self._morning_cap_ts(cycle)
                 if cap is not None:
@@ -2833,7 +2910,7 @@ class ProactiveService:
         except (TypeError, ValueError, OSError, OverflowError):
             return ""
 
-    def _noon_kind_status(self, stream_id: str, category: Optional[str],
+    async def _noon_kind_status(self, stream_id: str, category: Optional[str],
                           now: datetime, cycle: CycleState) -> Dict[str, Any]:
         """中午问好状态快照（2026-11-04；纯读，与主链 :meth:`_process_noon_greeting` 同口径）。"""
         enabled = self._noon_enabled()
@@ -2857,14 +2934,18 @@ class ProactiveService:
         elif not enabled:
             conclusion = "不适用（中午问好开关关闭）"
         elif marked:
-            conclusion = "今日已发"
+            conclusion = "今日已请求问候"
+        elif self._peek_stream_greeting_mark(stream_id, _NOON_UNANSWERED_MARK, cycle_key):
+            conclusion = "本次已取消（上次问候后尚未收到新消息）"
         elif in_window:
             if self._sleep_engine_asleep(now) is True:
                 conclusion = "暂缓（睡眠引擎判定仍在睡，窗内醒来才发）"
             elif now_minute < fire_minute:
                 conclusion = f"等待抖动时刻 {fire_text}（窗 {window_text}）"
             else:
-                conclusion = "已满足（抖动时刻已到，窗内下一 tick 将发送）"
+                conclusion = ("已满足（抖动时刻已到，窗内下一 tick 可请求问候）"
+                              if await self.target_greeting_proactive_allowed(stream_id, now_ts=_epoch_ts(now))
+                              else "上次问候后尚未确认收到陪伴目标的新消息")
         elif cur_minute < NOON_WINDOW_START_MINUTE:
             conclusion = f"未满足（未到中午窗口 {window_text}）"
         else:
@@ -2898,11 +2979,11 @@ class ProactiveService:
         语义（R7 = 用户 2026-10-23 第二轮直派，计划书 §31.1/§31.3）：
 
         - **类别**：只读全集枚举内判类别（§29.1 名单语义 + §31.3 三流分族）——
-          ``group`` / ``other`` / ``target``（**目标流回归诊断可见，「无条件」结论**）；
+          ``group`` / ``other`` / ``target``（目标流带回复闸诊断）；
         - **两类结论** = 既有档（今日已发 / 已放弃 / 已满足 / 将发送 / 未满足差门槛 /
           未满足差必要性激活 / 不适用 / 取不到）+ 四类新文案（早安未开始（连锁待定）/
           因早安未开口→晚安连锁硬性忽略 / 连锁已通过 / 数量闸达标 M/N）+ 无条件前承；
-        - **判定窗/阈值窗/期限/连锁桶/marks v2** 全部经周期四变量（``target`` 类无判定窗）；
+        - **判定窗/阈值窗/期限/连锁桶/marks v2** 全部经周期四变量（``target`` 的回复窗从上次实际问候起算）；
         - **只读纪律**：不调用掷点/标记写入/Affection 写入路径；只做消息查询与内存读取。
 
         返回 ``{"stream_id", "date", "category", "resolved", "frequency_only", "note",
@@ -2965,7 +3046,7 @@ class ProactiveService:
                 "roll": {}, "fire_at": None, "observe_until": None,
             }
         else:
-            kinds[GREETING_NOON] = self._noon_kind_status(stream_id, category, now_dt, cycle)
+            kinds[GREETING_NOON] = await self._noon_kind_status(stream_id, category, now_dt, cycle)
 
         return {
             "stream_id": stream_id,
@@ -3404,53 +3485,12 @@ class ProactiveService:
         exempt_budget: bool = False,
         *,
         kind: str = "other",
+        key: str = "",
+        category: str = "",
     ) -> bool:
-        """调用宿主 maisaka.proactive.trigger（带 priority 时失败则降级不带重试）。
-
-        ``exempt_budget=True``（M11 附录 II §2.3：例行问候专用）→ **闸门与计数一起跳**：
-        既不查询主动打扰预算，也不发布 ``proactive.used``（只跳闸门会让计数仍被悄悄消耗）。
-        默认 ``False``：非问候主动行为照旧「查预算 → 记用量 → 触发」，计数身份按 stream
-        维度判定（M11 §3.3）——目标流已解析时只有发往目标陪伴私聊的主动打扰才查计数/入账，
-        群聊与其他私聊开口不计入、不受限；**目标流不可得/未解析时**预算退回全量口径：
-        任何流的开口都会查计数与被拦截（沿用旧语义，判据见 ``core/event_bus._is_target_stream``）。
-        2026-11-04 修复（评估问题4/P1-04）：非豁免路径 bus=None 时 **fail-closed**
-        （跳过并告警），不再无预算直接触发；问候豁免策略不变。
-
-        PR-PROACTIVE-GATE（3.17.14）：kw-only ``kind`` = 发起原因（问候调用点传
-        morning/noon/night_greeting），经 tools.proactive_turn 统一登记；
-        登记只做事实记录与文案分类，不触碰预算/计数/豁免口径。
-        PR-RELIABILITY（3.17.17 §1A）：登记前置到 trigger 调用前，失败 discard。
-        四阶段渗透（2026-11-11 §3.2）：仅目标陪伴私聊、且只读阶段查询 == 4 时，
-        早/午/晚安 intent 换成无互斥指令的轻量骨架并强制拼接
-        :data:`MISS_REASON_STAGE4_SUFFIX`；登记 ``miss_stage=4`` 供 replyer 强覆盖。
-        非目标流 / 阶段 0~3 的 intent、reason 与登记逐字不变（阶段 1~3 由 patrol
-        独立想念链承担，问候不做额外染色）。
-        """
-        ctx_obj = getattr(self._plugin, "ctx", None)
-        if ctx_obj is None or not hasattr(ctx_obj, "maisaka"):
+        """Publish optional context and route the turn through the typed dispatcher."""
+        if category == GREETING_CATEGORY_TARGET and stream_id != self._target_stream_id_readonly():
             return False
-        trigger = getattr(ctx_obj.maisaka, "proactive", None)
-        trigger = getattr(trigger, "trigger", None) if trigger is not None else None
-        if trigger is None:
-            # 兼容旧形态 ctx.maisaka.trigger_proactive
-            trigger = getattr(ctx_obj.maisaka, "trigger_proactive", None)
-        if trigger is None:
-            logger.warning("宿主未提供 maisaka.proactive.trigger 能力，主动发起跳过")
-            return False
-
-        # 四阶段渗透（设计 §3.2）：目标私聊 + 阶段 4 → 替换 intent 骨架 + 两端拼尾缀。
-        # 只读查询（不调 InitiativeMemory.cycle，不推进/清空周期）；任何异常回 0。
-        stage = 0
-        stage_hours = 0.0
-        if self._is_companion_target_stream(stream_id):
-            stage, stage_hours = self._current_target_miss_stage_readonly()
-        if stage == 4:
-            relation = self._stage4_relation_word()
-            intent_prompt = append_stage4_miss_prompt(
-                stage4_intent_for_kind(kind, intent_prompt),
-                hours=stage_hours, relation=relation)
-            reason = append_stage4_miss_prompt(
-                reason, hours=stage_hours, relation=relation)
 
         # PR-LINKAGE-SCREEN（3.17.16）：问候主动轮触发前看一眼陪伴对象电脑屏幕。
         # 根因修复——旧路径直接 trigger 无 before/无屏幕旁白，问候轮 planner/replyer
@@ -3506,30 +3546,22 @@ class ProactiveService:
                 logger.debug("proactive.used 发布失败 stream_id=%s", stream_id,
                              exc_info=True)
 
-        # 3.17.17 登记前置，失败 discard。阶段 4 额外把阶段号写进 turn（供 replyer
-        # 强覆盖）；其余路径保持既有 4 参调用逐字不变（源码子串契约）。
-        if stage == 4:
-            turn_id = register_turn(self._plugin, stream_id, kind, reason, miss_stage=4)
-        else:
-            turn_id = register_turn(self._plugin, stream_id, kind, reason)
-        result = None
-        if priority and priority != "normal":
-            try:
-                result = await trigger(stream_id=stream_id, intent=intent_prompt, reason=reason, priority=priority)
-            except Exception:
-                result = None  # 不支持 priority 参数时降级
-        if result is None:
-            try:
-                result = await trigger(stream_id=stream_id, intent=intent_prompt, reason=reason)
-            except Exception as exc:
-                logger.warning(f"主动触发异常: stream={stream_id}, {exc}")
-                discard_turn(self._plugin, turn_id)
-                _discard_screen_narration()
-                return False
-
-        if isinstance(result, dict) and not result.get("success", False):
-            logger.warning(f"主动发起被拒: stream={stream_id}, reason={result.get('error')}")
-            discard_turn(self._plugin, turn_id)
+        if category == GREETING_CATEGORY_TARGET and stream_id != self._target_stream_id_readonly():
+            _discard_screen_narration()
+            return False
+        try:
+            result = await dispatch_proactive(
+                self._plugin, stream_id=stream_id, kind=kind, intent=intent_prompt, reason=reason,
+                key=key, priority=priority, metadata={"greeting_scope": category},
+            )
+        except asyncio.CancelledError:
+            _discard_screen_narration()
+            raise
+        except Exception:
+            _discard_screen_narration()
+            logger.warning("问候的宿主接单状态未知", exc_info=True)
+            return False
+        if not result.get("success"):
             _discard_screen_narration()
             return False
         return True
@@ -3545,130 +3577,6 @@ class ProactiveService:
         sid = str(stream_id or "").strip()
         return bool(target) and sid == target
 
-    def _stage4_relation_word(self) -> str:
-        """阶段 4 尾缀里的关系称谓（patrol 关系档案就绪时用其称谓，否则「恋人」）。"""
-        patrol = getattr(getattr(self._plugin, "_companion", None), "patrol", None)
-        getter = getattr(patrol, "_relation_word", None)
-        if callable(getter):
-            try:
-                return str(getter() or "恋人")
-            except Exception:
-                logger.debug("关系称谓读取失败（回退「恋人」）", exc_info=True)
-        return "恋人"
-
-    def _current_target_miss_stage_readonly(
-        self, now: Optional[datetime] = None,
-    ) -> Tuple[int, float]:
-        """只读查询目标私聊当前清醒沉默阶段 → ``(stage, effective_hours)``。
-
-        数据源优先级：
-        1. ``patrol.current_target_miss_stage``（其他模块提供的单一只读出口，若已落地）；
-        2. 本地只读镜像：``patrol._affection.last_user_msg_time()`` +
-           ``patrol._initiative_memory.doc['cycles'][target]``（生效起点含短回复顺延）
-           + ``patrol._sleep_hours_between``（睡眠扣除，开关关 → 不扣）。
-        **绝不调用** ``InitiativeMemory.cycle()``（它会写 defer/新周期并落盘）；
-        阶段 1~3 的精确分档不在此消费，>120h 判定为阶段 4。
-        任何异常/装配缺失 → ``(0, 0.0)``（fail-open：按非阶段 4 原样派发）。
-        """
-        try:
-            patrol = getattr(getattr(self._plugin, "_companion", None), "patrol", None)
-            if patrol is None:
-                return 0, 0.0
-            probe = getattr(patrol, "current_target_miss_stage", None)
-            if callable(probe):
-                try:
-                    raw = probe(now)
-                except TypeError:
-                    raw = probe()
-                if not isinstance(raw, (tuple, list)) or len(raw) < 2:
-                    return 0, 0.0
-                try:
-                    stage = int(raw[0])
-                    hours = float(raw[1])
-                except (TypeError, ValueError):
-                    return 0, 0.0
-                return (stage if 0 <= stage <= 4 else 0), max(0.0, hours)
-
-            affection = getattr(patrol, "_affection", None)
-            memory = getattr(patrol, "_initiative_memory", None)
-            target_qq = str(getattr(patrol, "_target_qq", "") or "").strip()
-            if affection is None or memory is None or not target_qq:
-                return 0, 0.0
-            last = affection.last_user_msg_time()
-            if last is None:
-                return 0, 0.0
-            now_dt = now or datetime.now()
-            # 服务循环与 patrol 的时钟可能一个 aware 一个 naive；统一到本地 naive。
-            if now_dt.tzinfo is not None:
-                now_dt = now_dt.astimezone().replace(tzinfo=None)
-            if getattr(last, "tzinfo", None) is not None:
-                last = last.astimezone().replace(tzinfo=None)
-            anchor = None
-            hours = 0.0
-            # 复核 finding：优先复用 patrol 的只读投影口（公开出口缺失时的兜底），
-            # 它会把最新短回复的 1.5h 顺延即时算进来，与 _tick/current_target_miss_stage
-            # 同口径；本地周期行镜像只含已落盘 defer，可能少一个顺延档。
-            projector = getattr(patrol, "_readonly_cycle_anchor", None)
-            if callable(projector):
-                try:
-
-                    anchor, projected = projector(now_dt, last)
-                    if anchor is not None:
-                        hours = max(0.0, float(projected or 0.0))
-                except Exception:
-                    anchor = None
-            if anchor is None:
-                doc = getattr(memory, "doc", None)
-                cycles = doc.get("cycles") if isinstance(doc, dict) else None
-                row = cycles.get(target_qq) if isinstance(cycles, dict) else None
-                if not isinstance(row, dict):
-                    return 0, 0.0
-                anchor = self._stage4_anchor_datetime(patrol, row)
-                if anchor is None:
-                    return 0, 0.0
-                if (now_dt.tzinfo is None) != (anchor.tzinfo is None):
-                    # 旧装配路径：按调用方时钟对齐后计算自然时长。
-                    if now_dt.tzinfo is not None:
-                        anchor = anchor.replace(tzinfo=now_dt.tzinfo)
-                    else:
-                        now_dt = now_dt.replace(tzinfo=anchor.tzinfo)
-                hours = max(0.0, (now_dt - anchor).total_seconds() / 3600.0)
-            if hours > STAGE4_SILENCE_HOURS:
-
-                sleeper = getattr(patrol, "_sleep_hours_between", None)
-                if callable(sleeper):
-                    try:
-                        hours = max(0.0, hours - float(sleeper(anchor, now_dt) or 0.0))
-                    except Exception:
-                        logger.debug("阶段查询睡眠扣除失败（按自然时长）", exc_info=True)
-            return (4 if hours > STAGE4_SILENCE_HOURS else 0), hours
-        except Exception:
-            logger.debug("目标沉默阶段只读查询失败（按非阶段 4 处理）", exc_info=True)
-            return 0, 0.0
-
-    @staticmethod
-    def _stage4_anchor_datetime(patrol: Any, row: dict) -> Optional[datetime]:
-        """周期行 → 生效起点 datetime（优先 patrol 的既有只读换算，绝不写盘）。"""
-        converter = getattr(patrol, "_cycle_anchor_time", None)
-        if callable(converter):
-            try:
-                value = converter(row)
-                if isinstance(value, datetime):
-                    return value
-            except Exception:
-                logger.debug("周期生效起点换算失败（回退本地镜像）", exc_info=True)
-        try:
-            anchor = float(row.get("anchor"))
-            defer = max(0.0, float(row.get("defer") or 0.0))
-            raw = row.get("raw_anchor")
-            limit = float(raw) if raw is not None else anchor + defer
-            return datetime.fromtimestamp(max(anchor, min(anchor + defer, limit)))
-        except (TypeError, ValueError, OSError, OverflowError):
-            return None
-
-    # 注（2026-10-20 用户指示）：原 _trigger_proactive（活动切换/约定主动开口的指令模板组装
-    # 与触发，'commitment_due' / 'activity_switch' 两类 trigger_type）已删除；
-    # 问候链仍经 _call_proactive_trigger，PROACTIVE_REASON_* 中活动/约定文案随键移除。
     # ------------------------------------------------------------
     # 事件总线（M0）：活动切换事件（无总线时静默跳过）
     # ------------------------------------------------------------

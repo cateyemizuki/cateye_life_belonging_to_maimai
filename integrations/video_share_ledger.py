@@ -30,6 +30,7 @@ class ShareLedger:
               CREATE UNIQUE INDEX IF NOT EXISTS attempt_request ON attempts(request_key) WHERE request_key<>'';
               CREATE INDEX IF NOT EXISTS attempt_pair ON attempts(bvid,stream,created);
               CREATE TABLE IF NOT EXISTS profiles(stream TEXT PRIMARY KEY,doc TEXT NOT NULL);
+              CREATE TABLE IF NOT EXISTS debug_planner_requests(request_key TEXT PRIMARY KEY,created REAL NOT NULL);
               CREATE TABLE IF NOT EXISTS legacy_manual(scope TEXT,bvid TEXT,status TEXT,created REAL);
             ''')
             version=self._meta(db,'version','1')
@@ -96,14 +97,28 @@ class ShareLedger:
             row=db.execute('SELECT * FROM attempts WHERE request_key=?',(key,)).fetchone()
             return self._attempt(db,row) if row else None
 
-    def recent_stream_receipt(self,stream:str,now:float)->dict|None:
+    def recent_stream_receipt(self,stream:str,now:float,*,include_accepted:bool=True)->dict|None:
         with self._connection() as db:
-            row=db.execute("SELECT * FROM attempts WHERE stream=? AND created>? AND status IN ('preparing','sending','accepted','uncertain') ORDER BY created DESC LIMIT 1",(stream,now-120)).fetchone()
+            row=db.execute("SELECT * FROM attempts WHERE stream=? AND created>? AND "
+                           "(status IN ('preparing','sending','uncertain') OR (status='accepted' AND kind<>'debug' AND ?)) "
+                           "ORDER BY created DESC LIMIT 1",(stream,now-120,include_accepted)).fetchone()
             return self._attempt(db,row) if row else None
+
+    def unresolved_videos(self, stream: str) -> set[str]:
+        """Pairs a deliberate resend must still leave untouched."""
+        scope = hashlib.sha256(stream.encode()).hexdigest()
+        with self._connection() as db:
+            rows = db.execute("SELECT bvid FROM attempts WHERE stream IN (?,'*') "
+                              "AND status IN ('preparing','sending','uncertain') "
+                              "UNION SELECT bvid FROM legacy_manual WHERE scope=? AND status='uncertain'",
+                              (stream, scope))
+            return {row['bvid'] for row in rows}
 
     def pair_receipt(self,bvid:str,stream:str,now:float,*,manual=False)->dict|None:
         with self._connection() as db:
-            row=db.execute("SELECT * FROM attempts WHERE bvid=? AND stream IN (?,'*') AND status IN ('preparing','sending','accepted','uncertain') ORDER BY created DESC LIMIT 1",(bvid,stream)).fetchone()
+            row=db.execute("SELECT * FROM attempts WHERE bvid=? AND stream IN (?,'*') "
+                           "AND (status IN ('preparing','sending','uncertain') OR (status='accepted' AND kind<>'debug')) "
+                           "ORDER BY created DESC LIMIT 1",(bvid,stream)).fetchone()
             if row and (row['status']!='accepted' or now-row['created']<(21600 if manual else KEEP_SECONDS)):
                 return self._attempt(db,row)
             return None
@@ -200,8 +215,11 @@ class ShareLedger:
     def claim(self, bvid: str, stream: str, kind: str, request_key: str, now: float,
               day: str, limits: dict, *, budget_token: str = '', preparing: bool = False) -> dict:
         """Atomic attempt + quota claim, shared by manual and automatic paths."""
-        if kind not in ('auto', 'manual') or not stream or not BV.fullmatch(bvid):
+        if kind not in ('auto', 'manual', 'debug') or not stream or not BV.fullmatch(bvid):
             return {'status': 'blocked', 'reason': 'invalid_identity'}
+        debug = kind == 'debug'
+        if debug and not request_key:
+            return {'status': 'blocked', 'reason': 'invalid_debug_claim'}
         with self._transaction() as db:
             if not self._clock(db, now):
                 return {'status': 'blocked', 'reason': 'clock_regressed'}
@@ -222,15 +240,17 @@ class ShareLedger:
                 "ORDER BY created DESC", (bvid, stream, stream, now - 120)).fetchall()
             window = KEEP_SECONDS if kind == 'auto' else 21600
             for row in rows:
-                is_active = row['status'] in ACTIVE_ATTEMPTS
+                status = row['status']
+                if status not in ACTIVE_ATTEMPTS or (status == 'accepted' and (debug or row['kind'] == 'debug')):
+                    continue
                 pair = row['bvid'] == bvid and row['stream'] in (stream, '*')
-                if is_active and pair and (row['status'] != 'accepted' or now - row['created'] < window):
+                if pair and (status != 'accepted' or now - row['created'] < window):
                     return {'status': 'duplicate', 'attempt': self._attempt(db, row)}
-                if is_active and row['stream'] == stream and now - row['created'] < 120:
+                if row['stream'] == stream and now - row['created'] < 120:
                     return {'status': 'blocked', 'reason': 'stream_cooldown'}
             scope = hashlib.sha256(stream.encode()).hexdigest()
             for old in db.execute("SELECT * FROM legacy_manual WHERE scope=? AND bvid=?", (scope, bvid)):
-                if old['status'] == 'uncertain' or now - old['created'] < window:
+                if old['status'] == 'uncertain' or (not debug and now - old['created'] < window):
                     return {'status': 'blocked', 'reason': 'legacy_pair_receipt'}
             if kind == 'auto':
                 reason = self._auto_limit_reason(db, bvid, stream, now, day, limits)
@@ -273,6 +293,7 @@ class ShareLedger:
         safe = {
             'message_id': str((receipt or {}).get('message_id') or '')[:160],
             'error_class': clean((receipt or {}).get('error_class'), 100),
+            'delivery_verified': status == 'accepted' and (receipt or {}).get('delivery_verified') is True,
         }
         with self._transaction() as db:
             old = db.execute("SELECT bvid,kind,status FROM attempts WHERE id=?", (attempt,)).fetchone()
@@ -280,7 +301,7 @@ class ShareLedger:
                 raise ValueError('不存在的发送尝试')
             if old['status'] not in ('preparing', 'sending', 'uncertain'):
                 return
-            history = 'pending' if status == 'accepted' else 'none'
+            history = 'pending' if status == 'accepted' and old['kind'] != 'debug' else 'none'
             db.execute(
                 "UPDATE attempts SET status=?,receipt=?,reason=?,history=? WHERE id=?",
                 (status, json.dumps(safe, ensure_ascii=False), clean(reason, 300), history, attempt))
@@ -333,7 +354,7 @@ class ShareLedger:
 
     def context_facts(self,stream:str,now:float)->list[dict]:
         with self._connection() as db:
-            rows=db.execute("SELECT a.id,a.created,a.receipt,v.facts FROM attempts a JOIN videos v USING(bvid) WHERE a.stream=? AND a.status='accepted' AND a.created>? ORDER BY a.created DESC LIMIT 3",(stream,now-KEEP_SECONDS)).fetchall()
+            rows=db.execute("SELECT a.id,a.created,a.receipt,v.facts FROM attempts a JOIN videos v USING(bvid) WHERE a.stream=? AND a.status='accepted' AND a.kind<>'debug' AND a.created>? ORDER BY a.created DESC LIMIT 3",(stream,now-KEEP_SECONDS)).fetchall()
             return [{'id':r['id'],'at':r['created'],**{k:v for k,v in json.loads(r['facts']).items() if k in ('bvid','title')}} for r in rows]
 
     def profile(self,stream:str)->dict:
@@ -405,6 +426,19 @@ class ShareLedger:
             db.execute("DELETE FROM attempts WHERE status IN ('accepted','rejected') AND created<?",(now-KEEP_SECONDS,))
             db.execute('DELETE FROM videos WHERE created<? AND bvid NOT IN (SELECT bvid FROM attempts)',(now-KEEP_SECONDS,))
             db.execute("DELETE FROM legacy_manual WHERE status='accepted' AND created<?",(now-KEEP_SECONDS,))
+
+    def reserve_debug_planner(self, request_key: str, now: float) -> str:
+        """Reserve a hashed ingress request once, even if no card is sent."""
+        with self._transaction() as db:
+            if not request_key or not self._clock(db, now):
+                return 'blocked'
+            db.execute("DELETE FROM debug_planner_requests WHERE created<?", (now-KEEP_SECONDS,))
+            if db.execute("SELECT 1 FROM debug_planner_requests WHERE request_key=?", (request_key,)).fetchone():
+                return 'duplicate'
+            if db.execute("SELECT count(*) FROM debug_planner_requests").fetchone()[0] >= 2048:
+                return 'blocked'
+            db.execute("INSERT INTO debug_planner_requests VALUES(?,?)", (request_key,now))
+            return 'reserved'
 
     def snapshot(self)->dict:
         with self._connection() as db:

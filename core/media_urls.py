@@ -34,3 +34,17 @@ def public_image_url(value: object, *, limit: int = 3000) -> str:
     except ValueError:
         return ""
     return url
+
+
+def media_cdn_url(value: object) -> str:
+    """Canonical HTTPS address for the known image CDNs used by the dashboard."""
+    url = public_image_url(value)
+    if not url or '\\' in url:
+        return ""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").rstrip(".").lower()
+    if parts.scheme != "https" or parts.port not in (None, 443) or parts.username is not None:
+        return ""
+    if not any(host == domain or host.endswith("." + domain) for domain in IMAGE_HTTPS_CDNS):
+        return ""
+    return urlunsplit(("https", host, parts.path, parts.query, ""))

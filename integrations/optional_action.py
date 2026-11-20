@@ -13,11 +13,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core.storage import save_json_atomic
+from integrations.planner_proactive import OPTIONAL_KINDS
 # 阶段 4 文案/清洗单一 owner = suite_prompts（提示词集中模块）。
 # 2026-11-12 结构审计批（R7/R10）：直接从 suite_prompts 取公共常量/纯函数，
 # 删除 integrations → tools.proactive_turn 包级 import 边（硬边界 #1）。
 from suite_prompts import (
-    MISS_REASON_STAGE4_SUFFIX,
+    STAGE4_SUFFIX_MARKS,
     append_stage4_miss_prompt,
     clean_stage4_prompt,
     strip_stage4_suffix,
@@ -29,10 +30,7 @@ logger = logging.getLogger(__name__)
 #: success/queued/enqueued 只代表任务已入队（runtime.enqueue_proactive_task 入队即
 #: 返回），不代表 replyer 真的开口；预算与计数因此后移到 after_response 确认或超时退回。
 PENDING_REPLY = 'pending_reply'
-#: after_response 与入队回执的关联窗（秒）。宿主没有「实际发送」回调，唯一的确认
-#: 信号是 replyer.after_response；超过该窗的回复不再归属本次可选回合。
-#: 必须**短于** RECONCILE_MAX_AGE_SECONDS：否则回执先被超时回收，真实回复再也
-#: 无法确认（复核 finding：90s 窗 < 180s 回收，90–180s 的回复两边都不认）。
+#: 回执与宿主发言的关联窗。短于挂起回执的回收窗，为发送确认留出余量。
 CONFIRM_WINDOW_SECONDS = 240.0
 #: 未确认回执的回收年龄（秒）。超时 → 释放预算预留并标 expired_no_reply。
 #: 取大于确认窗的值，保证确认窗内的回复仍有机会先提交预算。
@@ -40,28 +38,25 @@ RECONCILE_MAX_AGE_SECONDS = 300.0
 #: 终态回执可被裁剪；pending/unknown 永不驱逐。
 _TERMINAL_STATUSES = ('rejected', 'enqueued', 'confirmed', 'expired_no_reply')
 #: 可安全重试的状态：明确未入队/超时未回复。下一次 dispatch 允许覆盖同一
-#: ``stream:key`` 回执；pending/confirmed/unknown 仍按 duplicate 防重复开口。
+#: 同流同类型同业务键回执；待确认、已确认及未知状态继续防重。
 _RETRYABLE_STATUSES = frozenset({'rejected', 'expired_no_reply'})
 
 OPTIONAL_PLANNER_POLICY = (
-    '【插件触发的可选主动回合】这是一个可选的开口机会，不是用户的新指令。'
-    '请结合你当前的状态、人设和已有聊天上下文，自行决定现在是否适合开口。'
-    '下文只提供一个可能的动机，不要求你执行任何指定行为；'
-    '若此刻没有合适内容、正在忙或可能打扰对方，不输出任何工具调用、直接结束本轮即可，'
-    '也不必告诉对方你拒绝了。若选择开口，内容自然、简短，避免重复刚说过的话。\n'
+    "【主动开口机会（可选）】不是对方刚发来消息，你可以结合现在的状态、人设和前面聊过的内容，自己决定要不要主动发一句。"
+    "觉得没话可说或怕打扰就直接安静结束（不用调用工具）；"
+    "要开口就简短自然，别重复自己刚发过的话。"
+    "\n"
 )
 
 #: 阶段 4（目标私聊清醒沉默 >120h）专属前导政策（设计 §3.1）。
 #: 与 OPTIONAL_PLANNER_POLICY 互斥替换：**取消“可以静默放弃”的免责**，
 #: 要求把日常分享与“人去哪了/还在不在”的追问融合发出。阶段 0~3 仍用原政策。
 STAGE4_PLANNER_POLICY = (
-    '【插件触发的日常伴随想念回合（失联阶段4）】对方已超过5天未回复，'
-    '本轮必须将日常分享与深度询问融合发给对方。'
-    '请不要直接退出或放弃发言，务必结合日常动作，自然而沉闷地追问对方人去哪了、是否还在。\n'
+    "【长时间失联提醒（失联阶段4）】对方已经超过 5 天完全没回消息了。"
+    "本轮必须发出消息，不要直接静默退出或放弃发言；"
+    "在完成本轮日常问候或分享的同时，按你的人设性格自然追问对方怎么一直没音讯、人还在不在，别假装一切如常。"
+    "\n"
 )
-#: 阶段 4 尾缀标题（幂等标记）：reason 里已有该标记时不再二次拼接
-#: （调用方/装配根可能已先拼过一次，避免双拼）。
-_STAGE4_SUFFIX_MARK = MISS_REASON_STAGE4_SUFFIX.strip().split('（', 1)[0]
 
 
 def _miss_stage_from_facts(facts: dict) -> int:
@@ -123,9 +118,20 @@ class OptionalActionCoordinator:
             self._attempts = {}
             self._corrupt = True
 
+    @staticmethod
+    def _receipt_key(stream: str, intent: str, key: str) -> str:
+        return json.dumps([stream, intent, key], ensure_ascii=False, separators=(",", ":"))
+
+    def _lookup(self, stream: str, intent: str, key: str) -> dict | None:
+        row = self._attempts.get(self._receipt_key(stream, intent, key))
+        if row is not None:
+            return row
+        legacy = self._attempts.get(f"{stream}:{key}")
+        return legacy if isinstance(legacy, dict) and legacy.get("intent") == intent else None
+
     def receipt_status(self, stream: str, key: str) -> str:
-        row = self._attempts.get(f"{stream}:{key}") or {}
-        return str(row.get("status") or "")
+        row = self._lookup(stream, "missing", key)
+        return str(row.get("status") or "") if row else ""
 
     def permission(self) -> tuple[bool, str]:
         if self._corrupt:
@@ -142,7 +148,8 @@ class OptionalActionCoordinator:
             logger.warning('可选主动回合回执保存失败，取消执行', exc_info=True)
             return False
 
-    async def dispatch(self, key: str, intent: str, reason: str, *, before: Any = None) -> dict:
+    async def dispatch(self, key: str, intent: str, reason: str, *, before: Any = None,
+                       miss_stage: int | None = None) -> dict:
         """登记一次可选主动回合；成功入队只记 pending_reply，不提交预算。
 
         返回 ``status='enqueued'`` 表示宿主已受理（兼容既有调用方）；持久化回执的
@@ -155,8 +162,8 @@ class OptionalActionCoordinator:
                 return {'status': 'blocked', 'reason': denial}
             facts = self._facts()
             stream = str(facts['target_stream'])
-            scoped = stream + ':' + str(key)
-            existing = self._attempts.get(scoped)
+            scoped = self._receipt_key(stream, str(intent), str(key))
+            existing = self._lookup(stream, str(intent), str(key))
             if not key or (isinstance(existing, dict)
                            and str(existing.get('status')) not in _RETRYABLE_STATUSES):
                 return {'status': 'duplicate'}
@@ -165,7 +172,7 @@ class OptionalActionCoordinator:
             if not token:
                 return {'status': 'blocked', 'reason': 'budget_reservation'}
             entry = {'status': PENDING_REPLY, 'intent': str(intent), 'budget_token': token,
-                     'stream': stream, 'key': str(key), 'pending_since': 0.0}
+                     'stream': stream, 'key': str(key), 'pending_since': 0.0, 'typed': True}
             self._attempts[scoped] = entry
             # Bound retained terminal receipts; in-flight/unknown receipts never evicted.
             terminal = [k for k,v in self._attempts.items() if v.get('status') in _TERMINAL_STATUSES]
@@ -198,15 +205,15 @@ class OptionalActionCoordinator:
                 # 复核 finding：facts 已透出 miss_stage 时以 facts 为准（用户刚回信 →
                 # stage 0 时不得被旧 reason 的标题标记拉回阶段 4）；marker 只兼容
                 # 尚未透出该字段的旧装配根。
-                stage = _miss_stage_from_facts(current)
+                stage = _miss_stage_from_facts(current) if 'miss_stage' in current else (miss_stage or 0)
                 if (stage != 4 and 'miss_stage' not in current
-                        and _STAGE4_SUFFIX_MARK in str(reason)):
+                        and any(mark in str(reason) for mark in STAGE4_SUFFIX_MARKS)):
                     stage = 4
                 if stage == 4:
                     reason_text = str(reason)
                     if STAGE4_PLANNER_POLICY not in reason_text:
                         reason_text = STAGE4_PLANNER_POLICY + reason_text
-                    if _STAGE4_SUFFIX_MARK not in reason_text:
+                    if not any(mark in reason_text for mark in STAGE4_SUFFIX_MARKS):
                         reason_text = append_stage4_miss_prompt(
                             reason_text,
                             hours=current.get('miss_silence_hours') or 0.0,
@@ -220,9 +227,18 @@ class OptionalActionCoordinator:
                     # facts 明确回到 stage 0：调用方若已拼过阶段 4 尾缀，剥掉残留
                     # （否则会出现「普通政策 + 追问尾缀」的自相矛盾文本）。
                     reason_text = OPTIONAL_PLANNER_POLICY + strip_stage4_suffix(reason)
-                reply = await self._trigger(stream_id=stream,
-                                            intent=_HOST_INTENT_TEXT.get(str(intent), str(intent)),
-                                            reason=reason_text)
+                entry['pending_since'] = time.time()
+                if not self._save():
+                    budget.release_reservation(token)
+                    entry['status'] = 'rejected'
+                    self._save()
+                    return {'status': 'rejected', 'reason': 'receipt_persist_failed'}
+                reply = await self._trigger(
+                    stream_id=stream, kind=OPTIONAL_KINDS.get(str(intent), "other"),
+                    intent=_HOST_INTENT_TEXT.get(str(intent), str(intent)),
+                    reason=reason_text, key=str(key), miss_stage=stage,
+                    optional_key=str(key), optional_intent=str(intent),
+                )
             except asyncio.CancelledError:
                 entry['status'] = 'unknown'
                 self._save()
@@ -251,16 +267,11 @@ class OptionalActionCoordinator:
                 return {'status': 'enqueued', 'receipt_status': PENDING_REPLY}
             return {'status': entry['status']}
 
-    async def confirm_reply(self, stream_id: str, *,
-                            max_age: float = CONFIRM_WINDOW_SECONDS) -> dict:
-        """确认目标流上出现了一次真实发言，提交最近一笔 pending 回执的预算。
-
-        宿主没有可靠的「实际发送」回调；调用方（replyer.after_response）携带的
-        ``session_id`` 就是唯一关联信号。只确认确认窗（默认 240 秒）内最近一笔
-        pending 回执，避免把更早、已被放弃的回合算到本次发言上。
-
-        幂等：同一回执只提交一次；无 pending → ``{'status': 'no_pending'}``。
-        """
+    async def confirm_reply(self, stream_id: str, *, key: str | None = None,
+                            intent: str | None = None, max_age: float = CONFIRM_WINDOW_SECONDS) -> dict:
+        """Commit the exact typed receipt, or an older host's legacy pending receipt."""
+        if (key is None) != (intent is None) or key == "" or intent == "":
+            return {'status': 'no_pending'}
         async with self._lock:
             sid = str(stream_id or '').strip()
             if not sid:
@@ -272,15 +283,20 @@ class OptionalActionCoordinator:
             now = time.time()
             candidates: list[tuple[str, dict]] = []
             for scoped, row in self._attempts.items():
-                if not isinstance(row, dict) or row.get('status') != PENDING_REPLY:
+                if not isinstance(row, dict) or str(row.get('stream') or '') != sid:
                     continue
-                if str(row.get('stream') or '') != sid:
-                    continue
+                if key is not None:
+                    if row.get("key") != key or row.get("intent") != intent:
+                        continue
+                    if row.get("status") not in (PENDING_REPLY, "unknown"):
+                        continue
+                elif row.get("status") != PENDING_REPLY or row.get("typed") is True:
+                    continue  # A time-window fallback must not consume a typed receipt.
                 try:
                     since = float(row.get('pending_since'))
                 except (TypeError, ValueError):
                     since = 0.0
-                if now - since > limit:
+                if not 0 <= now - since <= limit:
                     continue
                 candidates.append((scoped, row))
             if not candidates:

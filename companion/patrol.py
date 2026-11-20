@@ -84,7 +84,6 @@ from planning.schedule_items import is_night_sleep_item
 from planning.schedule_query import ScheduleQuery
 from planning.time_utils import is_in_day_frame, is_in_time_window
 from suite_prompts import render
-from tools.proactive_turn import discard_turn, register_turn
 
 from .config import target_qq_of
 from .initiative_profile import (DEFAULT_ANCHOR_HOURS, MISS_STAGE_END_HOURS,
@@ -1343,34 +1342,22 @@ class PatrolService:
         if not callable(action) or not self._stream_id:
             self._last_trigger_status = 'not_assembled'
             return False
-        # PR-RELIABILITY（3.17.17 §1A）：登记前置到触发调用前——dispatch 内含
-        # before 屏幕旁白与宿主 trigger 的 await，宿主可能先构建 replyer；
-        # 非 enqueued（blocked/duplicate/rejected/unknown）→ discard 撤登记。
-        # P1-8：入队不再预扣发言计数；预算/计数后移到 after_response 的实际发言确认。
-        # 2026-11-11 四阶段渗透：阶段号随 turn 落盘，replyer 钩子据此注入阶段 1~3
-        # 的追问强度（此前只用于 reason 文案，turn.miss_stage 恒 0 → 文案永不生效）。
         binding = (self._target_qq, self._stream_id, getattr(self._affection, "binding_generation", 0))
-        turn_id = register_turn(self._config, self._stream_id,
-                      'miss' if intent == 'missing' else 'patrol_chat', reason,
-                      miss_stage=stage)
         try:
-            result = await action(key, intent, self._append_intent_hint(reason), before=self._publish_screen_narration)
+            result = await action(key, intent, self._append_intent_hint(reason),
+                                  before=self._publish_screen_narration, miss_stage=stage)
         except asyncio.CancelledError:
             raise
         except Exception:
-            # 交付态不明：保留登记与周期占用，等待超时回收/用户来信重置。
             self._last_trigger_status = 'unknown'
-            discard_turn(self._config, turn_id)
             self._discard_screen_narration()
             logger.warning('主动回合触发异常（按未知交付处理）', exc_info=True)
             return False
         if binding != (self._target_qq, self._stream_id, getattr(self._affection, "binding_generation", 0)):
-            discard_turn(self._config, turn_id)
             return False
         status = str(result.get('status') or '') if isinstance(result, dict) else ''
         self._last_trigger_status = status
         if status != 'enqueued':
-            discard_turn(self._config, turn_id)
             self._discard_screen_narration()
             return False
         self._last_trigger_time = datetime.now()

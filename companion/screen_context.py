@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional, Tuple
 from uuid import uuid4
 
+from core.inject import LBM_CONTEXT_PREFIX
 from suite_prompts import SCREEN_NARRATION_DEFAULT as SCREEN_NARRATION_TEMPLATE_DEFAULT
 from .sender_identity import first_text_part, message_id_from_item
 
@@ -158,7 +159,7 @@ def _is_real_chat_item(item: Any) -> bool:
     text = first_text_part(item).lstrip()
     if not text:
         return False
-    if text.startswith(HOST_PROACTIVE_BLOCK_PREFIX):
+    if text.startswith((HOST_PROACTIVE_BLOCK_PREFIX, LBM_CONTEXT_PREFIX)):
         return False
     if is_user and not message_id_from_item(item):
         return False

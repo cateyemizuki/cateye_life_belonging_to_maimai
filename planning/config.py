@@ -558,14 +558,13 @@ class PlanningProactiveSectionConfig(PluginConfigBase):
     greeting_morning_silence_hours: float = Field(
         default=2.0,
         ge=0,
-        description="早安沉默闸（小时）：今日第一日程（= 周期起点）前 N 小时内该会话 bot 自己发过消息"
-                    "→ 该会话本周期跳过早安（不掷点、不建条目）。0 = 禁用该闸门；查询异常按不过处理（宁不发）",
+        description="早安沉默闸（小时）。查询周期起点前 N 小时的本会话 bot 发言，群聊还查当前前 N 小时。"
+                    "检查窗内已发言则取消早安。填 0 可关闭。",
         json_schema_extra={
             "label": "早安沉默闸(小时)",
-            "hint": "第一日程前 N 小时内 bot 发过消息就不发早安；0 = 关闭；默认 2",
+            "hint": "群聊额外检查发起和注入前的最近 N 小时。默认 2 小时，0 关闭。",
             **_ui_i18n("Morning silence gate (h)",
-                       "Skip the morning greeting if the bot spoke within N hours before "
-                       "the first schedule item; 0 disables."),
+                       "Check the wake-anchored N-hour window, plus the current N-hour window for groups. 0 disables."),
         },
     )
     greeting_morning_latest: str = Field(

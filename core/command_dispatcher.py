@@ -87,6 +87,7 @@ class DispatchContext:
     platform: str = ""
     group_id: str = ""
     stream_allowed: bool = True
+    message_id: str = ""
 
 
 class CommandDispatcher:
@@ -233,6 +234,7 @@ class CommandDispatcher:
             platform=ctx.platform,
             group_id=ctx.group_id,
             lang=parsed.lang,
+            **({"message_id": ctx.message_id} if ctx.message_id else {}),
         )
         if isinstance(result, tuple) and len(result) == 3:
             return result

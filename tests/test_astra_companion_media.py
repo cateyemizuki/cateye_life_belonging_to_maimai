@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace as NS
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, Mock
 
 ROOT = Path(os.environ.get('CATEYE_TEST_DIR') or Path(__file__).resolve().parents[1]).resolve()
 
@@ -90,8 +90,8 @@ def fixtures(folder, now=NOW, cfg=CFG):
     social = VideoSocialService(ledger, profiles, NS(evaluate=AsyncMock(return_value={
             "action": "share", "target_stream_id": ROUTE["stream_id"], "profile_topics": {}})),
         config_provider=lambda: cfg, clock=lambda: now, day=lambda: DAY,
-        prepare_card=AsyncMock(return_value={"success": True, "ark_json": "{}"}),
-        send_card=AsyncMock(return_value={"success": True}),
+        prepare_card=AsyncMock(return_value={"success": True, "card": {"title": "prepared fixture"}}),
+        send_card=AsyncMock(return_value={"success": True, "delivery_verified": True}),
         preflight=lambda *a: (True, ""), reserve=lambda *a: "", commit=lambda *a: True,
         release=lambda *a: True, append_context=AsyncMock(return_value={"success": True}),
         probability_provider=lambda: 2, roll=lambda: 0)
@@ -114,6 +114,101 @@ async def share_limits(folder):
     assert social._send.await_count == 1
 
 
+async def verified_automatic_share_offers_one_optional_comment(folder):
+    from unittest.mock import Mock
+    from companion.components import CompanionComponentsMixin
+    from integrations.video_share_comment import VIDEO_SHARE_REPLY_GUIDANCE, VIDEO_SHARE_REPLY_NOTICE, VideoShareComment
+    from integrations.video_share_policy import COMMENT_PLANNER_KIND
+    from tools.proactive_turn import ProactiveTurnRegistry, rewrite_notice_for
+
+    registry = ProactiveTurnRegistry(NS(), folder, clock=lambda: NOW)
+    token = registry.register("example", COMMENT_PLANNER_KIND, "comment", key="attempt")
+    assert registry.begin_video_comment("other", token, 90) is False
+    assert registry.begin_video_comment("example", token, 90) is True
+    restarted = ProactiveTurnRegistry(NS(), folder, clock=lambda: NOW + 1)
+    assert restarted.begin_video_comment("example", token, 90) is False
+    for chat_type in ("group", "private_other", "private_target"):
+        assert rewrite_notice_for(chat_type, COMMENT_PLANNER_KIND, miss_stage=4) == VIDEO_SHARE_REPLY_NOTICE
+
+    turn = {"kind": COMMENT_PLANNER_KIND, "video_sent_from": NOW}
+    tracking = NS(reply_turn=lambda kwargs: turn, reply_before=lambda kwargs: kwargs)
+    plugin = NS(_mai_proactive_usage=lambda: tracking, _video_share_comment=lambda: NS(active=lambda *_: True))
+    replyer = await CompanionComponentsMixin.mai_hook_proactive_replyer_request(
+        plugin, session_id="example", reply_tool_args={"reply_reference": "接刚才聊的话"}, extra_prompt="既有约束",
+    )
+    assert replyer["modified_kwargs"]["extra_prompt"] == "既有约束\n接刚才聊的话\n" + VIDEO_SHARE_REPLY_GUIDANCE
+    post_process = CompanionComponentsMixin.mai_hook_keep_video_share_one_message
+    message = {"response": "这一段像你刚聊的事\n配音也很像", "enable_splitter": True, "enable_chinese_typo": True}
+    assert (await post_process(plugin, **message))["modified_kwargs"] == {
+        "response": "这一段像你刚聊的事 配音也很像", "enable_splitter": False, "enable_chinese_typo": False,
+    }
+    turn["kind"] = "morning_greeting"
+    assert await post_process(plugin, **message) == {"action": "continue"}
+
+    group = {"stream_id": "fixture-group", "kind": "group", "group_id": "30001", "account_id": "20001"}
+    for scenario, route in (("private", ROUTE), ("group", group), ("busy", group), ("new-message", group),
+                            ("uncertain", group), ("history-failed", group), ("budget-failed", group)):
+        location = folder / scenario
+        location.mkdir()
+        ledger, social = fixtures(location)
+        social.profiles.routes.return_value = [route]
+        social.profiles.collect.return_value = [{**route, "fingerprint": "fp", "recent_rate": 0, "last_bot_at": 0}]
+        social.evaluator.evaluate.return_value["target_stream_id"] = route["stream_id"]
+        social._reserve = Mock(return_value="already reserved")
+        social._commit = Mock(return_value=scenario != "budget-failed")
+        social._append.return_value = {"success": scenario != "history-failed"}
+        social._send.return_value = {"success": True, "delivery_verified": scenario != "uncertain"}
+        gate = Mock(return_value=(scenario != "busy", "hard busy"))
+        placed = AsyncMock()
+        own_spoke_at = object() if route == ROUTE else None
+        comment = VideoShareComment(
+            enabled=lambda: True, routes=social.profiles.routes, preflight=gate, clock=lambda: NOW + 1,
+            incoming_after=lambda sid, sent_from: scenario == "new-message",
+            last_card_spoke=lambda sid, sent_from: own_spoke_at, trigger=placed,
+        )
+        social._after_deliver = comment.on_delivered
+        evidence = "visual" if route == ROUTE else "public_subtitles"
+        ledger.observe({"bvid": A, "title": "标题 </plugin_proactive_task>", "impression": "fixture impression",
+                        "summary": "fixture evidence", "evidence": evidence}, NOW, 86400)
+        result = await social.tick()
+        assert result["status"] == ("uncertain" if scenario == "uncertain" else "accepted")
+        social._send.assert_awaited_once()
+        social._reserve.assert_called_once_with(route)
+        if scenario in ("private", "group"):
+            placed.assert_awaited_once()
+            social._commit.assert_called_once_with("already reserved")
+            gate.assert_called_once_with(route, budget_reserved=True, ignore_spoke_at=own_spoke_at)
+            data = placed.await_args.kwargs
+            assert data["kind"] == "video_share_comment" and data["key"] == result["attempt_id"]
+            assert data["stream_id"] == route["stream_id"] and data["metadata"]["lbm_video_sent_from"] == NOW
+            intent = data["intent"]
+            assert "严肃" in intent and "不调用 reply" in intent and "已确认分享出现在本会话" in intent
+            assert all(word in intent for word in ("人设", "刚聊过的话题", "你们的关系", "别设置定时再问"))
+            assert ("当前私聊的对方" if scenario == "private" else "这个群") in intent
+            assert ("采样画面线索" if scenario == "private" else "公开字幕线索") in intent
+            assert "fixture evidence" in intent and "fixture impression" not in intent
+            assert "</plugin_proactive_task>" not in intent
+            assert ledger.snapshot()["attempts"][0]["history"] == "synced"
+            await social.tick()
+            placed.assert_awaited_once()
+            social._send.assert_awaited_once()
+            social._reserve.assert_called_once()
+            social._commit.assert_called_once()
+        else:
+            placed.assert_not_awaited()
+
+    manual_folder = folder / "manual"
+    manual_folder.mkdir()
+    ledger, social = fixtures(manual_folder)
+    social._after_deliver = AsyncMock()
+    manual = ManualVideoShares(social, recent_provider=lambda: [{"bvid": A, "title": A}],
+                                clock=lambda: NOW, day=lambda: DAY)
+    answered = await manual.share(ROUTE["stream_id"], "manual", video=A)
+    debugged = await manual.share_debug(ROUTE["stream_id"], "debug", user_id=ROUTE["user_id"])
+    assert answered["success"] and debugged["success"]
+    social._after_deliver.assert_not_awaited()
+
+
 async def wrong_manual_receipt(folder):
     ledger, social = fixtures(folder)
     manual = ManualVideoShares(social, recent_provider=lambda: [{"bvid": k, "title": k} for k in (A, B)], clock=lambda: NOW, day=lambda: DAY)
@@ -121,6 +216,144 @@ async def wrong_manual_receipt(folder):
     b = await manual.share(ROUTE["stream_id"], "user-request-B", video=B)
     assert a["success"] and not b["success"] and b.get("error_class") == "stream_cooldown" and b.get("bvid") == B, b
     assert social._send.await_count == 1
+
+
+async def forced_share_debug_replay_and_unknown(folder):
+    ledger, social = fixtures(folder)
+    stamp = [NOW]
+    rows = [
+        {"bvid": A, "title": "已观看 A", "cover": "http://i0.hdslb.com/cover-a.jpg"},
+        {"bvid": B, "title": "已观看 B", "cover": "http://i0.hdslb.com/cover-b.jpg"},
+    ]
+    recent = Mock(return_value=rows)
+    pick = Mock(side_effect=lambda pool: pool[0])
+    manual = ManualVideoShares(social, recent_provider=lambda: rows, debug_recent_provider=recent,
+                               clock=lambda: stamp[0], day=lambda: DAY, chooser=pick)
+    stream, user = ROUTE["stream_id"], ROUTE["user_id"]
+    wrong = await manual.share_debug(stream, "a", group_id="30005")
+    assert wrong["error_class"] == "debug_route_mismatch"
+    missing = await manual.share_debug(stream, "", user_id=user)
+    assert missing["error_class"] == "invalid_debug_context"
+    social._send.assert_not_awaited()
+
+    first = await manual.share_debug(stream, "one", user_id=user)
+    replay = await manual.share_debug(stream, "one", user_id=user)
+    second = await manual.share_debug(stream, "two", user_id=user)
+    assert first["success"] and replay["success"] and replay["duplicate"] and second["success"]
+    assert first["bvid"] == second["bvid"] == A
+    assert pick.call_count == recent.call_count == social._send.await_count == 2
+    assert social._prepare.await_args.kwargs["pic_url"] == "https://i0.hdslb.com/cover-a.jpg"
+
+    # A direct test acknowledgment is not a social sharing fact or cooldown.
+    assert ledger.recent_stream_receipt(stream, stamp[0]) is None
+    assert ledger.pair_receipt(A, stream, stamp[0], manual=True) is None
+    assert not ledger.context_facts(stream, stamp[0])
+    social._append.assert_not_awaited()
+    pick.side_effect = lambda pool: pool[-1]
+    social._send.return_value = {"uncertain": True, "error_class": "adapter_delivery_unconfirmed"}
+    unknown = await manual.share_debug(stream, "three", user_id=user)
+    assert unknown["bvid"] == B and unknown["delivery_state"] == "uncertain"
+    assert "QQ 未返回送达回执" in unknown["content"]
+    unknown_replay = await manual.share_debug(stream, "three", user_id=user)
+    assert unknown_replay["duplicate"] and unknown_replay["delivery_state"] == "uncertain"
+    assert (await manual.share_debug(stream, "four", user_id=user))["error_class"] == "pending_delivery"
+    assert social._send.await_count == 3
+
+    stamp[0] += 121
+    social._send.return_value = {"success": True, "delivery_verified": True}
+    opt = await manual.share_debug(stream, "five", user_id=user)
+    assert opt["success"] and opt["bvid"] == A
+    assert [row["bvid"] for row in pick.call_args.args[0]] == [A]
+    assert ledger.unresolved_videos(stream) == {B}
+    social.evaluator.evaluate.assert_not_called()
+
+
+async def native_card_test_statuses_are_distinct(folder):
+    from integrations.video_share_scheduler import attempt_result
+    fixture = {"kind": "debug", "facts": {"bvid": A, "title": "Fixture"}}
+    confirmed = attempt_result({**fixture, "status": "accepted", "receipt": {"delivery_verified": True}})
+    legacy = attempt_result({**fixture, "status": "accepted", "receipt": {"message_id": "-22"}}, duplicate=True)
+    assert "会话记录已确认 B 站视频分享" in confirmed["content"] and confirmed["success"]
+    assert "旧回执缺少" in legacy["content"] and not legacy["success"] and legacy["duplicate"]
+    for code, wording in (
+        ("qq_card_replaced", "版本过低的占位提示"),
+        ("card_history_unavailable", "暂时无法核对"),
+        ("card_not_confirmed", "暂未查到"),
+    ):
+        result = attempt_result({**fixture, "status": "uncertain", "receipt": {"error_class": code}})
+        assert wording in result["content"] and not result["success"] and result["delivery_state"] == "uncertain"
+    unsupported = attempt_result({**fixture, "status": "rejected",
+                                  "receipt": {"error_class": "card_action_unsupported"}})
+    assert "不支持 QQ 图文卡" in unsupported["content"] and not unsupported["success"]
+    rejected = attempt_result({**fixture, "status": "rejected",
+                               "receipt": {"error_class": "card_generation_failed"}})
+    assert "未能准备 B 站视频分享" in rejected["content"] and not rejected["success"]
+
+
+async def merely_accepted_native_card_is_uncertain(folder):
+    ledger, social = fixtures(folder)
+    service = ManualVideoShares(social, recent_provider=lambda: [{"bvid": A, "title": A}],
+                                clock=lambda: NOW, day=lambda: DAY)
+    social._send.return_value = {"success": True, "message_id": "-145"}
+    result = await service.share_debug(ROUTE["stream_id"], "one", user_id=ROUTE["user_id"])
+    assert not result["success"] and result["delivery_state"] == "uncertain"
+    replay = await service.share_debug(ROUTE["stream_id"], "one", user_id=ROUTE["user_id"])
+    assert replay["duplicate"] and replay["delivery_state"] == "uncertain"
+    social._send.assert_awaited_once()
+    social._append.assert_not_awaited()
+    assert ledger.unresolved_videos(ROUTE["stream_id"]) == {A}
+
+
+async def scoped_share_debug_planner_ticket(folder):
+    from integrations.video_share_evaluator import SHARE_JUDGMENT_RULES
+    from integrations.video_share_policy import DEBUG_PLANNER_KIND
+
+    ledger, social = fixtures(folder)
+    stamp = [NOW]
+    recent = [{"bvid": A, "title": "真实候选", "impression": "片段摘要",
+               "impression_provenance": "understood_content"}]
+    context = {"user_id": ROUTE["user_id"]}
+    stream = ROUTE["stream_id"]
+    trigger = AsyncMock(return_value={"success": True, "task_id": "host-plan-task"})
+    manual = ManualVideoShares(social, recent_provider=lambda: recent, clock=lambda: stamp[0],
+                               day=lambda: DAY, chooser=lambda rows: rows[0])
+
+    result = await manual.share_debug_planner(stream, "cmd-1", **context, trigger=trigger)
+    assert result["success"] and "已提交" in result["content"]
+    native = trigger.await_args.kwargs
+    assert native["kind"] == DEBUG_PLANNER_KIND and native["stream_id"] == stream
+    assert SHARE_JUDGMENT_RULES in native["intent"] and "片段摘要" in native["intent"]
+    proof = native["metadata"]["lbm_card_ticket"]
+    assert native["metadata"]["lbm_card_debug"] is True and proof not in result["content"]
+    assert (await manual.share_debug_planner(stream, "cmd-1", **context, trigger=trigger))["duplicate"]
+    trigger.assert_awaited_once()
+    social._send.assert_not_awaited()
+    assert not (await manual.share_debug_ticket("wrong-session", proof))["success"]
+
+    confirmation = await manual.share_debug_ticket(stream, proof)
+    assert confirmation["success"] and confirmation["debug_executed"] and confirmation["bvid"] == A
+    assert not (await manual.share_debug_ticket(stream, proof))["success"]
+    social._send.assert_awaited_once()
+    social._append.assert_not_awaited()
+    assert not ledger.context_facts(stream, stamp[0])
+
+    await manual.share_debug_planner(stream, "cmd-account", **context, trigger=trigger)
+    changed = trigger.await_args.kwargs["metadata"]["lbm_card_ticket"]
+    social.profiles.routes.return_value = [{**ROUTE, "account_id": "changed"}]
+    assert (await manual.share_debug_ticket(stream, changed))["error_class"] == "debug_route_mismatch"
+    social.profiles.routes.return_value = [ROUTE]
+    await manual.share_debug_planner(stream, "cmd-expire", **context, trigger=trigger)
+    expired = trigger.await_args.kwargs["metadata"]["lbm_card_ticket"]
+    stamp[0] += 181
+    assert not (await manual.share_debug_ticket(stream, expired))["success"]
+    assert social._send.await_count == 1
+
+    # A replay after reopening the ledger cannot recreate a declined/expired test.
+    social.ledger = ShareLedger(folder / "shares.sqlite")
+    reopened = ManualVideoShares(social, recent_provider=lambda: recent,
+                                 clock=lambda: stamp[0], day=lambda: DAY, chooser=lambda rows: rows[0])
+    assert (await reopened.share_debug_planner(stream, "cmd-expire", **context, trigger=trigger))["duplicate"]
+    assert trigger.await_count == 3
 
 
 async def profile_count(folder):
@@ -322,6 +555,66 @@ async def qzone_activity_toggle(folder):
     assert sent and svc.generate_moment_text.await_count == 1, hist
 
 
+async def qzone_caption_uses_current_facts(folder):
+    from qzone.publish_guard import preview_post
+
+    history = "明天试菜排第一个，今天散步已经开始想菜单"
+    similar = "沿着小路慢慢散步，走到拐角时风刚好停了一阵。"
+    new_waiting = "玩明日方舟时总想把关卡路线再琢磨一遍"
+    now = datetime.now()
+    schedule = NS(find_current_activity=Mock(return_value={"name": "预定去试菜", "status": "planned"}))
+    config = NS(qzone=NS(), schedule=NS(enabled=True),
+                prompts=NS(qzone_post="正在：{activity}，请写一条动态"))
+    llm = NS(generate=AsyncMock(side_effect=[history, new_waiting]))
+    q = QzoneService(NS(), config, schedule, llm)
+    q.list_my_moments = AsyncMock(side_effect=AssertionError("history reached generation"))
+    for text in (history, similar):
+        preview = preview_post(text)
+        q._publish_ledger.rows[preview["key"]] = {
+            **preview, "created_at": now.timestamp()-10, "status": "sent",
+        }
+    assert await q.generate_moment_text(now.date().isoformat(), now) == new_waiting
+    assert llm.generate.await_count == 2
+    for call in llm.generate.await_args_list:
+        prompt = call.args[0]
+        assert "此刻没有进行中的活动记录" in prompt and "预定去试菜" not in prompt
+        assert history not in prompt and similar not in prompt
+
+    schedule.find_current_activity.return_value = {"name": "散步", "status": "active"}
+    llm.generate.reset_mock(side_effect=True)
+    llm.generate.side_effect = [similar.rstrip("。") + "呀", "明日轮到我先试吃"]
+    assert await q.generate_moment_text(now.date().isoformat(), now) == ""
+    assert llm.generate.await_count == 2
+    assert "正在：散步" in llm.generate.await_args.args[0]
+    assert q._decision_history.last()["gate"] == "future_claim"
+
+
+async def qzone_duplicate_checked_before_dispatch(folder):
+    from qzone.publish_guard import preview_post
+
+    now = datetime.now().timestamp()
+    post = "沿着小路慢慢散步，走到拐角时风刚好停了一阵。"
+    duplicate = "沿着小路慢慢散步，走到拐角时风刚好停了一阵呀！"
+    q = QzoneService(NS(), NS(qzone=NS()), NS(), NS())
+    q._dispatch_gate = Mock(return_value=True)
+    q._post_moment_once = AsyncMock(return_value={"tid": "fresh"})
+    q._kick_post_media_refresh = Mock()
+    previous = preview_post(post)
+    q._publish_ledger.rows[previous["key"]] = {
+        **previous, "created_at": now-20, "updated_at": now-20, "status": "sent",
+    }
+    waiting = preview_post(duplicate)
+    q._publish_ledger.rows[waiting["key"]] = {
+        **waiting, "created_at": now-5, "updated_at": now-5, "status": "retry_wait",
+    }
+    assert await q.post_moment(duplicate, enforce_daily_limit=True) is None
+    q._post_moment_once.assert_not_awaited()
+    assert q._publish_ledger.rows[waiting["key"]]["status"] == "failed"
+    assert q._decision_history.last()["gate"] == "duplicate"
+    assert await q.post_moment("沿河散步，转弯遇到一排刚开花的木棉。", enforce_daily_limit=True) == {"tid": "fresh"}
+    q._post_moment_once.assert_awaited_once()
+
+
 async def watch_debit_atomicity(folder):
     from integrations import video_schedule
     quota = SurfQuotaLedger(folder, day_provider=lambda:DAY, clock=lambda:NOW)
@@ -374,6 +667,292 @@ async def candidate_overlap(folder):
     assert only["pool_size"] == both["pool_size"] == 1, both
 
 
+async def video_companion_preferences_by_identity(folder):
+    from datetime import timedelta
+    from integrations.video_preferences import CompanionVideoPreferences
+
+    day = [datetime(2026, 11, 19, 12)]
+    binding = [("10001", "private-a")]
+    a, b = binding[0], ("10002", "private-b")
+    waits = []
+    captured = []
+
+    async def messages(stream, start, end, **kwargs):
+        owner = {"private-a": "10001", "private-b": "10002"}[stream]
+        stamp = day[0].timestamp() - 10
+        return {"messages": [
+            {"time": stamp, "text": "可以多看一些猫咪视频", "user_id": owner},
+            {"time": stamp, "text": "错误账号的题材", "user_id": "99999"},
+            {"time": stamp, "text": "机器人发的话", "user_id": owner, "is_mai": True},
+        ]}
+
+    async def generate(prompt, **kwargs):
+        captured.append(prompt)
+        assert "猫咪视频" in prompt and "既有话题" in prompt and "徒步" in prompt
+        assert "错误账号的题材" not in prompt and "机器人发的话" not in prompt
+        assert kwargs["max_attempts"] == 1
+        if waits:
+            await waits[0].wait()
+        term = "猫咪" if binding[0] == a else "宠物护理"
+        return NS(ok=True, text=json.dumps({"preferences": {term: 99, "99999999": 1}}))
+
+    def service():
+        return CompanionVideoPreferences(folder, target=lambda: binding[0], clock=lambda: day[0],
+            read_messages=messages, read_topics=lambda _: ["徒步"], generate=generate,
+            logger=logging.getLogger(__name__))
+
+    first = service()
+    await asyncio.gather(first.refresh(), first.refresh())
+    assert len(captured) == 1 and first.snapshot() == (a[0], {"猫咪": 0.45})
+    await service().refresh()
+    assert len(captured) == 1
+
+    binding[0] = b
+    assert first.snapshot() == (b[0], {})
+    await first.refresh()
+    assert first.snapshot() == (b[0], {"宠物护理": 0.45})
+    binding[0] = a
+    await first.refresh()
+    assert first.snapshot() == (a[0], {"猫咪": 0.45}) and len(captured) == 2
+
+    day[0] += timedelta(days=1)
+    waits.append(asyncio.Event())
+    task = asyncio.create_task(first.refresh())
+    while len(captured) < 3:
+        await asyncio.sleep(0)
+    binding[0] = b
+    waits[0].set()
+    await task
+    binding[0] = a
+    assert first.snapshot() == (a[0], {"猫咪": 0.45})
+    body = json.loads((folder / "companion_preferences/10001.json").read_text(encoding="utf-8"))
+    assert body["attempt_day"] == "2026-11-20" and "messages" not in body
+
+
+async def video_weighted_companion_mix(folder):
+    from integrations.video_interest import VideoInterestService, BiliCandidateSource
+    from integrations.video_selection import TopicSampler
+
+    active = [("10001", {"猫咪": .45, "美食": .45, "风光": .30, "弹琴": .35, "徒步": .40})]
+    now = [NOW]
+    doc = {"version": 2, "keywords": ["宠物", "风光", "悬疑"], "topics": [], "obtained_at": NOW-5*86400,
+           "generation": "original", "evidence_weights": {"terms": {
+             "风光":{"persona_base":1.0,"watch_score":.5,"updated_at":NOW}}},
+           }
+    (folder / "video_interest.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    llm = AsyncMock(return_value=NS(ok=True, text=json.dumps({
+        "keywords":["宠物", "风光", "悬疑"], "weights":{"风光":100,"悬疑":.01},
+        "companion_weights":{"美食":.28,"徒步":.99},
+        "shared":{"宠物":"猫咪", "无依据关键词":"弹琴", "风光":"不存在"},
+    })))
+    interest = VideoInterestService(folder,llm_generate_detailed=llm,now_provider=lambda:now[0],
+                                    companion_preferences_provider=lambda:active[0])
+    refreshed=await interest.ensure_interest()
+    assert "对方独有" in llm.await_args.args[0] and "徒步" in llm.await_args.args[0]
+    assert refreshed["weights"] == {"风光":1.15, "悬疑":.85}
+    assert refreshed["companion_mix"]["shared"] == {"宠物":"猫咪"}
+    own = interest.effective_weights()
+    signature, mix = interest.selection_context(interest.load())
+    assert mix["宠物"]>own["宠物"] and mix["风光"]>own["风光"]
+    assert mix["徒步"]==.40 and mix["弹琴"]==.35 and "猫咪" not in mix
+    assert len(set(mix)-set(own))==2 and max(mix.values())<=1.8
+    assert all(mix[k]<min(own.values()) for k in set(mix)-set(own))
+
+    calls=[]
+    async def fetch(url):
+        from urllib.parse import parse_qs, urlsplit
+        if "search/type" not in url:
+            return {"code":0,"data":{"list":[]}}
+        key=parse_qs(urlsplit(url).query)["keyword"][0]
+        calls.append(key)
+        return {"code":0,"data":{"result":[{"bvid":f"BV{len(calls):010d}","title":key+"影片",
+            "duration":"2:00","typename":"短片","play":90000}]}}
+    source=BiliCandidateSource(interest,fetch_json=fetch,selection_path=folder/"picks.json")
+    await source.prepare()
+    assert set(calls)==set(mix)
+    active[0] = ("10002", {"编织": .45})
+    assert source.pick()["reason"] == "interest_changed"
+    _, other_mix = interest.selection_context(interest.load())
+    assert "编织" in other_mix and "徒步" not in other_mix
+    assert other_mix["宠物"]==own["宠物"] and "猫咪" not in other_mix
+    active[0] = ("10001", {"猫咪": .45, "美食": .45, "风光": .30, "弹琴": .35, "徒步": .40})
+    assert interest.selection_context(interest.load()) == (signature, mix)
+
+    pool=[{"selection_topic":term, "selection_weight":weight, "selection_lane":"interest", "bvid":term}
+          for term,weight in mix.items()]
+    rng=Mock()
+    rng.choices.side_effect=lambda topics,weights,k:[topics[-1]]
+    rng.choice.side_effect=lambda values:values[0]
+    sampler=TopicSampler(rng=rng)
+    selected=sampler.choose(pool)
+    assert selected["selection_topic"]==list(mix)[-1]
+    assert rng.choices.call_args.kwargs["weights"] == list(mix.values())
+
+
+async def dashboard_manual_video_interests(folder):
+    from integrations.video_preferences import CompanionVideoPreferences
+    from integrations.video_interest import VideoInterestService
+    from planning.dashboard_components import LifeDashboardComponentsMixin
+
+    binding = [("10001", "private-a")]
+    store = folder / "video_watch"
+    store.mkdir()
+    llm = AsyncMock(return_value=NS(ok=True, text='{"keywords":["自动纪录片"],"weights":{"自动纪录片":1}}'))
+    target = CompanionVideoPreferences(store, target=lambda:binding[0], clock=datetime.now,
+        read_messages=AsyncMock(), read_topics=lambda _:[], generate=AsyncMock(), logger=logging.getLogger(__name__))
+    interest = VideoInterestService(store, llm_generate_detailed=llm,
+                                    companion_preferences_provider=target.selection_snapshot)
+    class Dashboard(LifeDashboardComponentsMixin):
+        _data_dir = folder
+
+        def _active_video_preference_target(self):
+            return binding[0]
+
+        def _companion_video_preference_service(self):
+            return target
+
+    dashboard = Dashboard()
+    async def save(name, profile, entries, mode="manual"):
+        return await dashboard.life_dashboard_save_interests(name, profile["revision"], mode, json.dumps(entries))
+
+    view = await dashboard.life_dashboard_interests()
+    assert view["bot"]["mode"] == "automatic" and view["bot"]["entries"] == []
+    assert "10001" not in json.dumps(view)
+    invalid = [{"topic":"猫咪","weight":2}]
+    assert not (await save("bot", view["bot"], invalid))["ok"]
+    duplicates = [{"topic":"Ａ","weight":1},{"topic":"a","weight":1}]
+    assert not (await save("bot", view["bot"], duplicates))["ok"]
+    assert not (await save("bot", view["bot"], []))["ok"]
+
+    bot = await save("bot", view["bot"], [{"topic":"猫咪","weight":1.15}])
+    assert bot["ok"] and bot["profile"]["mode"] == "manual"
+    doc = await interest.interest_for_selection()
+    assert doc["status"] == "manual" and not llm.called
+    old_signature, _ = interest.selection_context(doc)
+    assert interest.current_self_weights() == {"猫咪":1.15}
+    previous_a = view["companion"]
+    mine = await save("companion", previous_a, [{"topic":"猫咪","weight":.45}])
+    assert mine["ok"]
+    assert interest.selection_context(doc)[0] != old_signature
+    assert interest.selection_context(doc)[1]["猫咪"] > 1.15
+
+    binding[0] = ("10002", "private-b")
+    assert (await save("companion", mine["profile"], [{"topic":"剪纸","weight":.4}]))["conflict"]
+    assert target.snapshot() == ("10002", {})
+    binding[0] = ("10001", "private-a")
+    assert target.snapshot() == ("10001", {"猫咪":.45})
+
+    await interest.ensure_interest(force=True)
+    assert interest.current_self_weights() == {"猫咪":1.15}
+    restored = await save("bot", bot["profile"], [], mode="automatic")
+    assert restored["ok"] and restored["profile"]["entries"] == [{"topic":"自动纪录片","weight":1.0}]
+    assert interest.current_self_weights() == {"自动纪录片": 1.0}
+
+    empty = await save("companion", mine["profile"], [])
+    assert empty["ok"] and target.selection_snapshot() == ("10001", {}, True)
+    assert (await save("companion", empty["profile"], [], mode="automatic"))["ok"]
+    assert target.selection_snapshot() == ("10001", {}, False)
+
+
+async def video_share_checks_latest_exchange(folder):
+    ledger=ShareLedger(folder/"latest.sqlite")
+    items=[{"message_id":"m1","time":NOW-300,"text":"午饭吃了面","user_id":ROUTE["user_id"]}]
+    async def read(sid,start,end,limit,limit_mode,**opts):
+        return items[-limit:]
+    routes=AsyncMock(return_value=[{**ROUTE,"platform":"qq"}])
+    profiles=AudienceProfiles(ledger,stream_reader=routes,message_reader=read,config_provider=lambda:CFG,
+                              target_provider=lambda:ROUTE)
+    first=await profiles.collect(NOW)
+    items.append({"message_id":"m2","time":NOW-10,"text":"正在处理紧急的家事","user_id":ROUTE["user_id"]})
+    second=await profiles.collect(NOW)
+    assert first[0]["recent"][-1]["text"]=="午饭吃了面"
+    assert second[0]["recent"][-1]["text"]=="正在处理紧急的家事"
+    assert first[0]["fingerprint"]!=second[0]["fingerprint"]
+    _, social = fixtures(folder)
+    social.profiles=profiles
+    observed(social.ledger,A,NOW)
+    async def judge(facts,audiences):
+        items.append({"message_id":"m3","time":NOW,"text":"请等我一下","user_id":ROUTE["user_id"]})
+        return {"action":"share", "target_stream_id":ROUTE["stream_id"], "profile_topics":{}}
+    social.evaluator=NS(evaluate=judge)
+    result=await social.tick()
+    assert result=={"status":"deferred","reason":"latest_conversation_changed"}
+    social._send.assert_not_awaited()
+
+
+async def typed_proactive_dispatch(folder):
+    from tools.proactive_turn import ProactiveTurnRegistry, rewrite_notice_for
+    from integrations.planner_proactive import dispatch_proactive
+
+    plugin = NS(_stream_id="private-a")
+    registry = ProactiveTurnRegistry(plugin, folder)
+    plugin._mai_proactive_turns = lambda: registry
+    seen = []
+
+    async def host(**kwargs):
+        meta = kwargs["metadata"]
+        entry = registry.identified(kwargs["stream_id"], turn_id=meta["lbm_turn_id"])
+        assert entry["category"] == meta["lbm_proactive_kind"]
+        assert registry.identified("different-chat", turn_id=meta["lbm_turn_id"]) is None
+        assert registry.claim(kwargs["stream_id"]) is None
+        seen.append(entry)
+        return {"success": True, "queued": True, "task_id": f"host-{len(seen)}"}
+
+    async def enqueue(kind, stream="private-a", key="same-business-key", trigger=host):
+        return await dispatch_proactive(plugin, stream_id=stream, kind=kind, key=key,
+                                        intent="test", reason="test", trigger=trigger, miss_stage=4)
+
+    result = await enqueue("morning_greeting")
+    assert result["success"] and registry.identified("private-a", host_task_id="host-1") == {
+        **seen[0], "host_task_id": "host-1"
+    }
+    assert (await enqueue("noon_greeting"))["duplicate"]
+    assert (await enqueue("noon_greeting", key="different-period"))["success"]
+    assert (await enqueue("morning_greeting", stream="another-chat"))["success"]
+    assert (await enqueue("miss"))["success"]
+    assert (await enqueue("video_share"))["success"]
+    assert (await enqueue("surf_chitchat"))["success"]
+    assert len(seen) == 6
+    assert [row["category"] for row in seen] == ["greeting", "greeting", "greeting", "missing", "video_share", "browse_qq"]
+    assert registry.claim("private-a", turn_id=result["lbm_turn_id"])["kind"] == "morning_greeting"
+    assert registry.claim("private-a", turn_id=result["lbm_turn_id"]) is None
+    assert "当前时间点" in rewrite_notice_for("private_target", "morning_greeting", miss_stage=4)
+
+    rejected = AsyncMock(return_value={"success": False})
+    assert not (await enqueue("video_completion", trigger=rejected))["success"]
+    assert (await enqueue("video_completion"))["success"]
+
+    failed = AsyncMock(side_effect=TimeoutError("lost acknowledgement"))
+    try:
+        await enqueue("qzone_comment", trigger=failed)
+        raise AssertionError("ambiguous transport result must not report acceptance")
+    except TimeoutError:
+        pass
+    # A restart does not forget a potentially accepted enqueue.
+    registry = ProactiveTurnRegistry(plugin, folder)
+    assert (await enqueue("qzone_comment"))["duplicate"]
+    assert len(seen) == 7
+
+
+async def optional_actions_confirm_only_own_category(folder):
+    from integrations.optional_action import OptionalActionCoordinator
+
+    facts = lambda: {"enabled": True, "target_stream": "private-a", "coverage": "ok", "budget_remaining": 3}
+    reserved = iter(("miss-budget", "browse-budget"))
+    budget = NS(reserve=lambda *_: next(reserved),
+                release_reservation=Mock(return_value=True), commit_reservation=Mock(return_value=True))
+    trigger = AsyncMock(return_value={"success": True})
+    coordinator = OptionalActionCoordinator(folder, facts, lambda: budget, trigger)
+    assert (await coordinator.dispatch("same-key", "missing", "test"))["status"] == "enqueued"
+    assert (await coordinator.dispatch("same-key", "optional_contact", "test"))["status"] == "enqueued"
+    assert (await coordinator.confirm_reply("private-a"))["status"] == "no_pending"
+    assert (await coordinator.confirm_reply("private-a", key="same-key", intent="optional_contact"))["intent"] == "optional_contact"
+    budget.commit_reservation.assert_called_once_with("browse-budget")
+    assert (await coordinator.confirm_reply("private-a", key="same-key", intent="optional_contact"))["status"] == "no_pending"
+    assert (await coordinator.confirm_reply("private-a", key="same-key", intent="missing"))["intent"] == "missing"
+    assert [row.kwargs["kind"] for row in trigger.await_args_list] == ["miss", "surf_chitchat"]
+
+
 async def tiered_miss(folder):
     from companion.initiative_profile import InitiativeMemory
     from integrations.optional_action import OptionalActionCoordinator
@@ -410,11 +989,11 @@ async def tiered_miss(folder):
     patrol._discard_screen_narration=lambda:None
     patrol._log_decision=lambda **kw:None
     with patch("companion.patrol.datetime",Clock),patch("companion.patrol.random.random",return_value=0),\
-         patch("companion.patrol.register_turn",return_value="turn"),patch("companion.patrol.discard_turn"),\
          patch("integrations.optional_action.time.time",side_effect=lambda:epoch[0]):
         await patrol._tick()
         assert patrol._last_trigger_status == "enqueued"
-        await coordinator.confirm_reply("private-test")
+        turn_key = trigger.call_args.kwargs["optional_key"]
+        await coordinator.confirm_reply("private-test", key=turn_key, intent="missing")
         assert patrol.mark_miss_spoken()
         epoch[0]=anchor+30*3600
         await patrol._tick()
@@ -798,11 +1377,14 @@ async def optional_weekly_summary_failure(folder):
 CASES = [
     "optional_weekly_summary_failure",
     "watch_terminal_equivalence",
-    "qzone_policy_equivalence",
-    "share_limits", "wrong_manual_receipt", "profile_count", "interrupted_eval", "cancel_cache",
+    "qzone_policy_equivalence", "qzone_caption_uses_current_facts", "qzone_duplicate_checked_before_dispatch",
+    "share_limits", "verified_automatic_share_offers_one_optional_comment", "wrong_manual_receipt", "forced_share_debug_replay_and_unknown", "native_card_test_statuses_are_distinct", "merely_accepted_native_card_is_uncertain", "scoped_share_debug_planner_ticket", "profile_count", "interrupted_eval", "cancel_cache",
     "gap_quota", "identity_binding", "review_concurrency", "qzone_capacity",
     "qzone_write_timeout", "qzone_limit_race", "qzone_activity_toggle", "watch_debit_atomicity",
     "fallback_review", "candidate_overlap", "tiered_miss", "bound_legacy_upgrade",
+    "video_companion_preferences_by_identity", "video_weighted_companion_mix", "video_share_checks_latest_exchange",
+    "dashboard_manual_video_interests",
+    "typed_proactive_dispatch", "optional_actions_confirm_only_own_category",
     "contested_legacy_preserved", "late_review_ownership", "fallback_recovery_once",
     "previous_successful_cache", "detached_and_cross_midnight", "quota_reconciliation",
     "retired_watch_guards", "write_fallback_only_when_unsent",

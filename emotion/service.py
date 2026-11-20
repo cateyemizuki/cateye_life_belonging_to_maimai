@@ -19,6 +19,7 @@ from planning.schedule_query import ScheduleQuery
 from planning.schedule_anchors import SOURCE_REAL_SCHEDULE
 from suite_prompts import (
     EMOTION_INJECTION_DEFAULT,
+    EMOTION_NIGHT_HINT_DEFAULT,
     prompt as prompt_of,
     render,
 )
@@ -42,8 +43,8 @@ logger = logging.getLogger(__name__)
 EVENT_DELTA_CLAMP = 0.5
 #: PR-C1 H4：原因注入行的稳定模板（前缀/后缀逐字固定；summary ≤120 字夹在中间）。
 #: 无原因/开关关闭 → 不附行，injection_text 与加入前逐字一致。
-REASON_INJECTION_PREFIX = "（心情原因参考：因为"
-REASON_INJECTION_SUFFIX = "，心情受了些影响。这份影响会随时间慢慢淡去，不必反复提起。）"
+REASON_INJECTION_PREFIX = "（心里还留着点刚才那事的余温："
+REASON_INJECTION_SUFFIX = "；只是背景心境，没必要主动提起。）"
 #: 用户侧最后一条消息的反查窗口（分钟）与拉取条数（§4.2 评估上下文增强）
 USER_MESSAGE_LOOKBACK_MINUTES = 20.0
 USER_MESSAGE_LOOKBACK_LIMIT = 10
@@ -117,8 +118,7 @@ SLEEP_NAME_KEYWORDS = ("睡觉", "睡眠", "安睡", "午休", "午睡", "小憩
 DEFAULT_SLEEP_MINUTES = 23 * 60
 DEFAULT_WAKE_MINUTES = 7 * 60
 #: 冻结态注入的深夜引导行（附录 §2.5.5，逐字定稿）：非冻结态绝不出现，冻结态追加在既有文本后
-NIGHT_INJECTION_HINT = ("（现在是深夜，你本该在睡觉。回复尽量短、慢、软一些；"
-                        "不要主动开启新话题；不要提及本提示。）")
+NIGHT_INJECTION_HINT = EMOTION_NIGHT_HINT_DEFAULT
 #: 夜间事件摘要的单条描述截断 / 落 decision_logs 的条数上限（§2.5.3：超限只留最近 N 条，
 #: ``drained_events_count`` 仍报真实条数——摘要只作可追溯留痕，不参与任何结算）
 DRAINED_SUMMARY_DESC_CHARS = 60
@@ -584,8 +584,7 @@ class EmotionService:
                 # P1（2026-11-09）：引擎确认已睡时表达「已经入睡」事实，而非仅「本该在睡觉」；
                 # 引擎不表态/未睡仍走配置夜窗引导（白天字节不变）。
                 if self._engine_asleep(datetime.now()) is True:
-                    text = (f"{text}\n（你已于本夜入睡、现在仍在睡眠中。回复尽量短、慢、软一些；"
-                            "不要主动开启新话题；不要提及本提示。）")
+                    text = f"{text}\n（你这会儿已经睡下了，按你人设简短回一句就行，别展开聊。）"
                 else:
                     text = f"{text}\n{prompt_of(self._plugin, 'emotion_night_hint')}"
         return text
@@ -645,9 +644,9 @@ class EmotionService:
         # 低分辨成语义行：只给语气方向、不含任何数值；中性为空串
         # （V<−0.3 的文案为规格给定；V>0.3 为对称补充——中性/正向不再是空白）
         if valence < -0.3:
-            intent_hint = "你今天有点低落，语气可以软一点"
+            intent_hint = "这会儿心情稍微有点闷，按你平时的性子自然说就行"
         elif valence > 0.3:
-            intent_hint = "你今天心情不错，语气可以轻快一点"
+            intent_hint = "这会儿心情挺顺，按你平时开心的状态随口聊就行"
         else:
             intent_hint = ""
 

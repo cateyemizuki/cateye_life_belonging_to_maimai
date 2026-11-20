@@ -81,6 +81,9 @@ class CommandRootComponentsMixin:
         group_id = str(kwargs.get("group_id") or "").strip()
         user_id = str(kwargs.get("user_id") or "").strip()
         local = kwargs.get("is_local_operator") is True
+        message = kwargs.get("message")
+        # The supported hosts put the actual ingress message ID in this envelope.
+        message_id = str(message.get("message_id") or "").strip() if isinstance(message, dict) else ""
         parsed: ParsedCommand = DISPATCHER.parse(lang, extract_root_args(lang, kwargs))
 
         async def _send_text(text: str) -> None:
@@ -90,7 +93,7 @@ class CommandRootComponentsMixin:
             await self._cmd_send_help(overview_lang, stream_id)
 
         ctx = DispatchContext(
-            stream_id=stream_id,
+            stream_id=stream_id, message_id=message_id,
             user_id=user_id, platform=platform, group_id=group_id, is_local_operator=local,
             is_admin=lambda uid, trusted: command_admin(
                 self.config, platform=platform, user_id=uid, is_local_operator=trusted),

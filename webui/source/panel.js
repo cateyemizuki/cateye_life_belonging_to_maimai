@@ -24,12 +24,23 @@ function minute(v){if(num(v)===null)return '—';const t=Math.floor(v),d=Math.fl
 // 数据侧 planning/time_utils.format_day_minute 已对 >=1440 的分钟能标「次日」；
 // 这里只兜住数据里仍用 0 点环表示跨午夜段的情形，不改业务值。
 function spanEnd(start,end){const s=num(start),e=num(end);return e===null?null:(s!==null&&e<s?e+1440:e)}
+function offlineSleepName(row){
+ const start=num(row.actual_start_minute),end=spanEnd(start,row.actual_end_minute);
+ if(start===null||end===null||end<start)return '离线休息';
+ const elapsed=end-start;
+ if(elapsed<30)return '小憩一会';
+ if(elapsed<120)return '休息了一阵';
+ if(elapsed<360)return '补了一觉';
+ return '睡了个长觉';
+}
 // 纯显示名称：不修改活动原名、记录或模型输入。
 function displayActivityName(row,context={}){
  const original=String(row?.name||context.fallback||'未命名活动'),kind=String(row?.goal_type||''),meta=row?.metadata||{};
  const nap=(kind==='sleep'||kind==='rest'||kind==='daily_routine')&&(/午睡|午休|小憩|打盹|小睡/.test(original)||meta.kind==='nap');
+ const sleep=kind==='sleep'||(['daily_routine','rest',''].includes(kind)&&/睡觉|睡眠|安睡/.test(original));
+ if((sleep||nap)&&(row?.source==='offline'||row?.wake_reason==='offline_reconnect'))return offlineSleepName(row);
  if(nap)return '午休';
- if(kind==='sleep'||(['daily_routine','rest',''].includes(kind)&&/睡觉|睡眠|安睡/.test(original)))return '晚安，世界';
+ if(sleep)return '晚安，世界';
  if(kind!=='meal')return original;
  let at=Number.isFinite(row?.actual_start_minute)?row.actual_start_minute:null;
  if(at===null&&row?.started_at){
@@ -419,8 +430,8 @@ function renderSleep(){const s=data.state||{},sleep=data.sleep||{},cur=sleep.cur
  const forecast=$('sleep-forecast');if(forecast){const wakeAt=cur?.asleep&&cur.wake_at?clock(cur.wake_at):'';forecast.hidden=!wakeAt;if(wakeAt)text('sleep-forecast','预计最早醒来 '+wakeAt)}
  chart($('debt-chart'),visiblePoints(),['sleep_debt'],12,160);text('sleep-anchors',`配置参考 ${sleep.configured_sleep||'—'} → ${sleep.configured_wake||'—'}${(sleep.dynamic?.window_start&&sleep.dynamic?.window_end)?' · 动态入睡窗口 '+clock(sleep.dynamic.window_start)+' → '+clock(sleep.dynamic.window_end):''}${cur?.asleep&&s.sleep_started_at?' · 实际入睡 '+clock(s.sleep_started_at):''}${cur?.wake_at?' · 最早醒沿 '+clock(cur.wake_at):''}${cur?.lie_in_cap?' · 赖床上限 '+clock(cur.lie_in_cap):''} · 醒睡以引擎会话为准`);const list=$('sleep-list'),rows=Array.isArray(sleep.sessions)?sleep.sessions:[];if(!rows.length){empty(list,'还没有近期睡眠会话','完整睡眠发生后会留下恢复与睡眠债记录。');return}list.replaceChildren();for(const row of rows){const box=el('div','sleeprow'),left=el('div'),right=el('div','rowend');
   // W-08：睡眠会话跨午夜（醒来分钟早于入睡分钟）时结束侧补「次日」。
-  const endShown=spanEnd(row.actual_start_minute,row.actual_end_minute);
-  left.append(el('strong','',`${row.schedule_date||'—'} · ${minute(row.actual_start_minute)} → ${minute(endShown)}`),el('div','note',row.actual_end_minute===null?'会话尚未结束':`醒来：${({energy_threshold:'精力达标',lie_in_cap:'赖床上限',hard_commitment:'硬约定唤醒',interrupted_awake:'被暂时打断',manual:'手动唤醒',no_sleep_mode:'免睡模式',offline_reconnect:'离线补眠估算'}[row.wake_reason]||row.wake_reason||'未记录')}`));right.append(el('strong','',num(row.energy_start)!==null&&num(row.energy_end)!==null?`精力 ${pct(row.energy_start)} → ${pct(row.energy_end)}`:row.actual_end_minute==null?'恢复待结算':'历史恢复数据缺失'),el('div','note',`睡眠债 ${fix(row.sleep_debt_before)} → ${fix(row.sleep_debt_after)}h`));box.append(left,right);list.append(box)}}
+  const endShown=spanEnd(row.actual_start_minute,row.actual_end_minute),offlineLabel=row.wake_reason==='offline_reconnect'?offlineSleepName(row)+' · ':'';
+  left.append(el('strong','',offlineLabel+`${row.schedule_date||'—'} · ${minute(row.actual_start_minute)} → ${minute(endShown)}`),el('div','note',row.actual_end_minute===null?'会话尚未结束':`醒来：${({energy_threshold:'精力达标',lie_in_cap:'赖床上限',hard_commitment:'硬约定唤醒',interrupted_awake:'被暂时打断',manual:'手动唤醒',no_sleep_mode:'免睡模式',offline_reconnect:'离线补眠估算'}[row.wake_reason]||row.wake_reason||'未记录')}`));right.append(el('strong','',num(row.energy_start)!==null&&num(row.energy_end)!==null?`精力 ${pct(row.energy_start)} → ${pct(row.energy_end)}`:row.actual_end_minute==null?'恢复待结算':'历史恢复数据缺失'),el('div','note',`睡眠债 ${fix(row.sleep_debt_before)} → ${fix(row.sleep_debt_after)}h`));box.append(left,right);list.append(box)}}
 function source(v){return({spine:'日意图',random:'生活插曲',resume:'恢复活动',anchor:'生活锚点',idle:'自由活动',hard_commitment:'硬约定',rolling:'滚动安排',commitment:'硬约定'}[v]||v||'运行记录')}
 function scheduleFootprint(rows, day){
  const sorted=[...rows].sort((a,b)=>(num(a.actual_start_minute)??num(a.planned_start_minute)??Infinity)-(num(b.actual_start_minute)??num(b.planned_start_minute)??Infinity));
@@ -815,7 +826,62 @@ function mediaRecordLimit(){return Math.max(3,Math.min(18,mediaColumns*3))}
 function queueMediaGridRefresh(){clearTimeout(mediaResizeTimer);mediaResizeTimer=setTimeout(()=>{if(imported||!live||mediaRecordLimit()===lastRequestedMediaLimit){mediaRefreshPending=false;return}if(busy){mediaRefreshPending=true;return}refresh(true)},150)}
 function syncMediaGrid(){const grid=entertainmentPage===0?$('video-recent'):$('qzone-recent-posts');let columns=estimateMediaColumns();if(activeTab==='mood'&&grid?.getBoundingClientRect().width>0){const tracks=getComputedStyle(grid).gridTemplateColumns;if(tracks&&tracks!=='none'&&!tracks.includes('repeat('))columns=tracks.trim().split(/\s+/).length}columns=Math.max(1,Math.min(6,columns));if(columns===mediaColumns)return;mediaColumns=columns;if(data&&activeTab==='mood')renderMood();if(!imported)queueMediaGridRefresh()}
 function safeMediaUrl(value){if(typeof value!=='string')return null;let input=value.trim();if(input.startsWith('//'))input='https:'+input;if(!/^https?:\/\//i.test(input))return null;try{const url=new URL(input),host=url.hostname.toLowerCase(),allowed=host==='qpic.cn'||['.hdslb.com','.biliimg.com','.qpic.cn','.photo.store.qq.com','.gtimg.cn','.gtimg.com'].some(suffix=>host.endsWith(suffix));if(!allowed||url.username||url.password)return null;if(url.protocol==='http:')url.protocol='https:';return url.protocol==='https:'?url.href:null}catch{return null}}
-function mediaImage(value,alt,cls=''){const frame=el('div','media-image '+cls),url=safeMediaUrl(value);if(!url){frame.append(el('span','note','图片未记录'));return frame}const image=el('img');image.src=url;image.alt=alt;image.loading='lazy';image.decoding='async';image.referrerPolicy='no-referrer';image.onerror=()=>frame.replaceChildren(el('span','note','图片暂时无法加载'));frame.append(image);return frame}
+const thumbnailCache=new Map();
+let loadingThumbnails=false;
+function setMediaImage(frame,src){
+ const placeholder=frame.querySelector('.media-image-status');
+ if(!src){placeholder.textContent='图片暂时无法加载';return}
+ const image=el('img');
+ image.alt=frame.dataset.imageAlt;
+ image.loading='lazy';
+ image.decoding='async';
+ image.referrerPolicy='no-referrer';
+ image.onerror=()=>image.replaceWith(el('span','note','图片暂时无法加载'));
+ placeholder.replaceWith(image);
+ image.src=src;
+}
+function mediaImage(value,alt,cls='',imageId=''){
+ const frame=el('div','media-image '+cls);
+ if(!value){frame.append(el('span','note','图片未记录'));return frame}
+ frame.dataset.imageAlt=alt;
+ frame.append(el('span','note media-image-status','正在加载图片'));
+ if(!window.maibot){
+  setMediaImage(frame,safeMediaUrl(value));
+ }else if(/^[a-f0-9]{64}$/.test(imageId)){
+  const cached=thumbnailCache.get(imageId);
+  if(cached?.src||cached?.retryAt>Date.now())setMediaImage(frame,cached.src);
+  else frame.dataset.thumbnailId=imageId;
+ }else{
+  setMediaImage(frame,'');
+ }
+ return frame;
+}
+// The host allows two in-flight calls. Use one slot for images and leave one for the panel.
+async function loadVisibleThumbnails(){
+ if(!window.maibot?.query||loadingThumbnails)return;
+ loadingThumbnails=true;
+ try{
+  while(!$('interest-editor').open){
+   const frame=[...document.querySelectorAll('[data-thumbnail-id]')].find(node=>node.getClientRects().length);
+   if(!frame)break;
+   const id=frame.dataset.thumbnailId;
+   let src='';
+   try{
+    const result=await window.maibot.query('thumbnail',{image_id:id});
+    if(typeof result?.src==='string'&&result.src.length<=150000&&/^data:image\/jpeg;base64,[A-Za-z0-9+/]+=*$/.test(result.src))src=result.src;
+   }catch{}
+   thumbnailCache.delete(id);
+   thumbnailCache.set(id,{src,retryAt:Date.now()+15000});
+   if(thumbnailCache.size>80)thumbnailCache.delete(thumbnailCache.keys().next().value);
+   for(const target of document.querySelectorAll('[data-thumbnail-id="'+id+'"]')){
+    delete target.dataset.thumbnailId;
+    setMediaImage(target,src);
+   }
+  }
+ }finally{
+  loadingThumbnails=false;
+ }
+}
 function mediaTime(value){const input=typeof value==='number'&&Math.abs(value)<1e11?value*1000:value;return date(input)?clock(input,true):'未记录'}
 const MEDIA_METRICS=[['views','播放量'],['likes','点赞'],['coins','投币'],['favorites','收藏']];
 function mediaMetricInfo(row,key){const sources=row.metrics_field_provenance,times=row.metrics_field_captured_at,has=(object,name)=>object&&typeof object==='object'&&Object.prototype.hasOwnProperty.call(object,name),provenance=(has(sources,key)?sources[key]:row.metrics_provenance)||'unrecorded',captured=has(times,key)?times[key]:row.metrics_captured_at;const input=typeof captured==='number'&&Math.abs(captured)<1e11?captured*1000:captured;return{provenance,captured,epoch:date(input)?Number(date(input)):null,label:provenance==='watch_snapshot'?'观看时记录':provenance==='backfilled_current'?'历史补录 · 当前数据':'来源未记录'}}
@@ -826,7 +892,7 @@ function bindMediaCard(card,kind,row,key){card.classList.add('media-card');card.
 function renderVideoRecord(row,full=false){
  const key=mediaVideoKey(row),card=el('article',full?'media-detail-video':'video-record');if(!full)bindMediaCard(card,'video',row,key);
  const title=el('h3','media-title',row.title||'标题未记录');title.title=row.title||'标题未记录';const meta=el('div','note videometa',videoRecentMeta(row));meta.title=meta.textContent;
- card.append(mediaImage(row.cover,row.title||'视频封面','video-cover'),title,meta);
+ card.append(mediaImage(row.cover,row.title||'视频封面','video-cover',row.cover_id),title,meta);
  const impression=el('div','video-impression'),impressionText=['template_unavailable','unavailable'].includes(row.impression_provenance)?null:row.impression;
  impression.append(el('h3','',row.impression_provenance==='metadata_only'?'感想 · 基于元信息':impressionText&&row.impression_provenance!=='understood_content'?'感想 · 来源未记录':'观后感'),el('p','impression-text',impressionText||'观后感未记录'));card.append(impression);
  const metrics=el('div','video-metrics'+(full?' detail-metrics':'')),origins=[];
@@ -834,11 +900,11 @@ function renderVideoRecord(row,full=false){
  const split=new Set(origins.map(info=>JSON.stringify([info.provenance,info.epoch]))).size>1;
  card.append(el('p','note media-provenance',split?'统计分次采集，详情查看':origins[0].label+' · 采集时间 '+mediaTime(origins[0].captured)),el('p','note media-watched-at','最近观看 '+mediaTime(row.watched_at)));return card;
 }
-function renderPostRecord(row,full=false){const key=mediaPostKey(row),item=el('article',full?'media-detail-post':'qzone-post-record'),images=Array.isArray(row.images)?row.images:[];if(!full)bindMediaCard(item,'post',row,key);item.append(el('p','post-text',row.text||row.content||'（文案未记录）'));
- if(full){if(images.length){const gallery=el('div','post-images');for(const [index,url]of images.entries())gallery.append(mediaImage(url,`动态配图 ${index+1}`));item.append(gallery)}else item.append(el('p','note',num(row.image_count)>0?'原记录有配图，图片地址未记录':'无配图记录'))}
- else{const preview=mediaImage(images[0],images.length?'动态首张配图':'无配图记录','post-cover');if(!images.length)preview.replaceChildren(el('span','note',num(row.image_count)>0?'原记录有配图，图片地址未记录':'无配图记录'));if(images.length>1)preview.append(el('span','post-image-count',images.length+' 张图片 · 详情查看'));item.append(preview)}
+function renderPostRecord(row,full=false){const key=mediaPostKey(row),item=el('article',full?'media-detail-post':'qzone-post-record'),images=Array.isArray(row.images)?row.images:[],imageIds=Array.isArray(row.image_ids)?row.image_ids:[];if(!full)bindMediaCard(item,'post',row,key);item.append(el('p','post-text',row.text||row.content||'（文案未记录）'));
+ if(full){if(images.length){const gallery=el('div','post-images');for(const [index,url]of images.entries())gallery.append(mediaImage(url,`动态配图 ${index+1}`,'',imageIds[index]));item.append(gallery)}else item.append(el('p','note',num(row.image_count)>0?'原记录有配图，图片地址未记录':'无配图记录'))}
+ else{const preview=mediaImage(images[0],images.length?'动态首张配图':'无配图记录','post-cover',imageIds[0]);if(!images.length)preview.replaceChildren(el('span','note',num(row.image_count)>0?'原记录有配图，图片地址未记录':'无配图记录'));if(images.length>1)preview.append(el('span','post-image-count',images.length+' 张图片 · 详情查看'));item.append(preview)}
  item.append(el('p','note post-meta',mediaTime(row.created_at)+(row.source?' · '+row.source:'')));return item}
-function openMediaDetail(kind,row,key){const dialog=$('media-detail-dialog');mediaReturnFocusKey=key;text('media-detail-title',kind==='video'?'视频详情':'动态详情');$('media-detail-body').replaceChildren(kind==='video'?renderVideoRecord(row,true):renderPostRecord(row,true));if(!dialog.open)dialog.showModal()}
+function openMediaDetail(kind,row,key){const dialog=$('media-detail-dialog');mediaReturnFocusKey=key;text('media-detail-title',kind==='video'?'视频详情':'动态详情');$('media-detail-body').replaceChildren(kind==='video'?renderVideoRecord(row,true):renderPostRecord(row,true));if(!dialog.open)dialog.showModal();void loadVisibleThumbnails()}
 function closeMediaDetail(){if($('media-detail-dialog').open)$('media-detail-dialog').close()}
 $('media-detail-close').onclick=closeMediaDetail;
 $('media-detail-dialog').addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeMediaDetail()}});
@@ -847,6 +913,7 @@ $('media-detail-dialog').addEventListener('click',event=>{if(event.target!==even
 function renderEntertainmentPages(){const video=entertainmentPage===0;$('entertainment-video').hidden=!video;$('entertainment-posts').hidden=video;$('entertainment-prev').setAttribute('aria-pressed',String(video));$('entertainment-next').setAttribute('aria-pressed',String(!video));text('entertainment-page-label',video?'1 / 2':'2 / 2')}
 function renderMood(){const v=data.video||{};
  renderEntertainmentPages();
+ $('edit-video-interests').hidden=!(live&&!imported&&typeof window.maibot?.action==='function');
  const videoRecentBox=$('video-recent'),recent=Array.isArray(v.recent)?v.recent.slice(0,mediaRecordLimit()):[];
  text('video-recent-count',v.available?recent.length+' 条':'—');
  if(videoRecentBox){if(recent.length)videoRecentBox.replaceChildren(...recent.map(row=>renderVideoRecord(row)));else empty(videoRecentBox,v.available?'最近没有看完的视频':'视频信息暂不可用',v.available?'看完的视频会在这里留下记录。':'视频观看模块就绪后展示。')}
@@ -856,15 +923,135 @@ function renderMood(){const v=data.video||{};
  // PR-FIXED-CHROME（3.17.15）：头部只保留 enabled/posts_today 额度芯片与登录状态；
  // 发送回执/草稿预览类展示已移除，右列改显最近动态（内容摘录+时间+来源+配图数）。
  $('qzone-summary').replaceChildren(...[q.available?`今日说说 ${q.posts_today??0} / ${q.daily_max_posts??0}`:'空间状态暂不可用',cookieLabels[cookie.status]||'登录状态尚未检查'].map(s=>el('div','sleeprow',s)));
- renderRecentPosts(q)}
+ renderRecentPosts(q);void loadVisibleThumbnails()}
 // 空间最近动态（3.17.15）：data.qzone.recent_posts（dashboard 只读投影，≤5 条已确认
 // 发送）。纯文本 el() 构造，来源 badge（日程说说/视频分享）；旧快照无 recent_posts →
 // 空态降级，不造假。created_at 为 epoch 秒（clock 按毫秒解析故 ×1000）。
 function renderRecentPosts(q){const box=$('qzone-recent-posts');if(!box)return;const source=Array.isArray(q.posts)?q.posts:q.recent_posts,rows=Array.isArray(source)?source.slice(0,mediaRecordLimit()):[];
  if(!rows.length){empty(box,q.available?'最近没有已确认的说说':'空间状态暂不可用',q.available?'发送成功的说说会在这里留下记录。':'空间模块就绪后展示。');return}box.replaceChildren(...rows.map(row=>renderPostRecord(row)))}
-$('entertainment-prev').onclick=()=>{entertainmentPage=0;renderEntertainmentPages();syncMediaGrid()};$('entertainment-next').onclick=()=>{entertainmentPage=1;renderEntertainmentPages();syncMediaGrid()};
+function selectEntertainmentPage(page){entertainmentPage=page;renderEntertainmentPages();syncMediaGrid();void loadVisibleThumbnails()}
+$('entertainment-prev').onclick=()=>selectEntertainmentPage(0);
+$('entertainment-next').onclick=()=>selectEntertainmentPage(1);
 window.addEventListener('resize',syncMediaGrid);
 if(typeof ResizeObserver!=='undefined'){const observer=new ResizeObserver(syncMediaGrid);observer.observe($('video-recent'));observer.observe($('qzone-recent-posts'))}
+const interestEditor=$('interest-editor'), interestForm=$('interest-editor-form');
+const interestRows=$('interest-editor-rows');
+let preferenceProfiles=null, preferenceTab='bot', preferenceDrafts={}, preferencePending=false, preferenceReload=false;
+
+function currentPreference(){return preferenceProfiles?.[preferenceTab]}
+function preferenceMessage(message,error=false){
+ const note=$('interest-editor-message');
+ note.textContent=message;
+ note.dataset.error=String(error);
+}
+function updatePreferenceControls(){
+ const profile=currentPreference();
+ for(const tab of $('interest-profiles').querySelectorAll('button')){
+  tab.setAttribute('aria-pressed',String(tab.dataset.profile===preferenceTab));
+  tab.disabled=preferencePending;
+ }
+ const fieldsDisabled=preferencePending||preferenceReload;
+ for(const control of interestRows.querySelectorAll('input,button'))control.disabled=fieldsDisabled;
+ $('interest-close').disabled=preferencePending;
+ $('interest-reload').hidden=!preferenceReload;
+ $('interest-reload').disabled=preferencePending;
+ $('interest-add').disabled=fieldsDisabled||interestRows.children.length>=profile?.maximum_count;
+ $('interest-save').disabled=fieldsDisabled||!profile?.available||interestRows.children.length<profile.minimum_count;
+ $('interest-automatic').hidden=profile?.mode!=='manual';
+ $('interest-automatic').disabled=fieldsDisabled;
+}
+function preferenceInputRow(entry){
+ const profile=currentPreference(),row=el('div','interest-editor-columns interest-editor-row');
+ const topic=el('input'),weight=el('input'),remove=el('button','','移除');
+ topic.type='text';topic.required=true;topic.maxLength=40;topic.value=entry.topic;
+ topic.placeholder='例如：猫咪纪录片';topic.setAttribute('aria-label','视频题材');
+ weight.type='number';weight.required=true;weight.min=profile.minimum;weight.max=profile.maximum;
+ weight.step='0.001';weight.value=entry.weight;weight.setAttribute('aria-label','题材权重');
+ remove.type='button';remove.setAttribute('aria-label','移除此题材');
+ remove.onclick=()=>{row.remove();updatePreferenceControls();$('interest-add').focus()};
+ row.append(topic,weight,remove);
+ return row;
+}
+function preferenceValues(){
+ return [...interestRows.children].map(row=>{
+  const [topic,weight]=row.querySelectorAll('input');
+  return {topic:topic.value,weight:weight.value};
+ });
+}
+function renderPreferenceTab(){
+ const profile=currentPreference();
+ interestForm.hidden=!profile?.available;
+ interestRows.replaceChildren();
+ if(profile?.available){
+  const mode=profile.mode==='manual'?'手动兴趣正在生效':'当前由系统自动维护';
+  $('interest-editor-hint').textContent=mode+'。基本权重 '+profile.minimum+'–'+profile.maximum+'，最多 '+profile.maximum_count+' 个题材。';
+  interestRows.append(...(preferenceDrafts[preferenceTab]||profile.entries).map(preferenceInputRow));
+  preferenceMessage('');
+ }else if(preferenceProfiles){
+  preferenceMessage(preferenceTab==='companion'?'绑定并核验陪伴目标的私聊后可编辑。':'Bot 的兴趣档案暂不可用。');
+ }
+ updatePreferenceControls();
+}
+async function readPreferenceProfiles(){
+ preferencePending=true;preferenceReload=false;preferenceProfiles=null;preferenceDrafts={};
+ renderPreferenceTab();
+ preferenceMessage('正在读取兴趣档案');
+ try{
+  preferenceProfiles=await deadline(window.maibot.query('interests'),11000);
+  renderPreferenceTab();
+ }catch{
+  preferenceReload=true;preferenceMessage('读取失败，请重新读取档案。',true);
+ }finally{
+  preferencePending=false;updatePreferenceControls();
+ }
+}
+async function savePreferenceProfile(mode){
+ if(preferencePending||preferenceReload||!currentPreference()?.available)return;
+ const profile=currentPreference(), entries=mode==='manual'?preferenceValues().map(row=>({topic:row.topic.trim(),weight:Number(row.weight)})):[];
+ if(entries.some(row=>!row.topic)){preferenceMessage('请填写视频题材。',true);return}
+ preferencePending=true;updatePreferenceControls();preferenceMessage('正在保存');
+ try{
+  const result=await deadline(window.maibot.action('save_interests',{
+   profile:preferenceTab,revision:profile.revision,mode,entries_json:JSON.stringify(entries),
+  }),12000);
+  if(!result?.ok){
+   preferenceReload=Boolean(result?.conflict);
+   preferenceMessage(result?.message||'保存失败，请稍后重试。',true);
+   return;
+  }
+  preferenceProfiles[preferenceTab]=result.profile;delete preferenceDrafts[preferenceTab];
+  renderPreferenceTab();preferenceMessage(mode==='manual'?'已保存，选片会使用新兴趣。':'已恢复自动维护。');
+  if(live&&!imported)void refresh();
+ }catch{
+  preferenceReload=true;preferenceMessage('尚未收到保存结果，请重新读取档案确认。',true);
+ }finally{
+  preferencePending=false;updatePreferenceControls();
+ }
+}
+
+$('edit-video-interests').onclick=()=>{preferenceTab='bot';interestEditor.showModal();void readPreferenceProfiles()};
+$('interest-close').onclick=()=>interestEditor.close();
+$('interest-reload').onclick=()=>void readPreferenceProfiles();
+interestEditor.addEventListener('cancel',event=>{if(preferencePending)event.preventDefault()});
+interestEditor.addEventListener('close',()=>{if(!$('edit-video-interests').hidden)$('edit-video-interests').focus();void loadVisibleThumbnails()});
+$('interest-profiles').onclick=event=>{
+ const tab=event.target.closest('button[data-profile]');
+ if(!tab||preferencePending||preferenceReload||tab.dataset.profile===preferenceTab)return;
+ if(currentPreference()?.available)preferenceDrafts[preferenceTab]=preferenceValues();
+ preferenceTab=tab.dataset.profile;renderPreferenceTab();
+};
+$('interest-add').onclick=()=>{
+ const profile=currentPreference();if(!profile||interestRows.children.length>=profile.maximum_count)return;
+ const row=preferenceInputRow({topic:'',weight:Number(((profile.minimum+profile.maximum)/2).toFixed(3))});
+ interestRows.append(row);updatePreferenceControls();row.querySelector('input').focus();
+};
+$('interest-automatic').onclick=()=>void savePreferenceProfile('automatic');
+$('interest-save').onclick=()=>{if(interestForm.reportValidity())void savePreferenceProfile('manual')};
+interestForm.addEventListener('keydown',event=>{
+ if(event.key!=='Enter'||event.isComposing||!event.target.matches('input'))return;
+ event.preventDefault();$('interest-save').click();
+});
+
 const usageCount=value=>group(count(value));
 const usageTokenLabel=(value,reported)=>num(reported)===0?'未回传':usageCount(value)+' Token';
 const usageModuleLabels=new Map(Object.entries({planning:'日程',emotion:'情绪',companion:'陪伴',qzone:'空间',video:'视频',unknown:'未标注模块'}));
@@ -1243,7 +1430,7 @@ function renderExtras(){
  updateDateLabel();
  $('date-today').setAttribute('aria-pressed',String(selectedDay===today));$('date-yesterday').setAttribute('aria-pressed',String(selectedDay===shiftDay(today,-1)));$('date-range').setAttribute('aria-pressed',String(!selectedDay));
  $('hero-scene').classList.toggle('sleeping',!!data.sleep?.current?.asleep);$('emotion-card').classList.toggle('empty-mood',!data.emotion?.available);
- const dayInfo=$('history-day-summary');dayInfo.replaceChildren();const view=dayView();if(view){for(const [key,label]of [['episode_count','活动记录'],['completed_count','完成'],['interrupted_count','中断'],['sleep_session_count','睡眠会话']])dayInfo.append(el('span','',`${label} ${view.summary?.[key]??'—'}`));for(const row of view.sleep?.sessions||[])dayInfo.append(el('span','',`睡眠 ${minute(row.actual_start_minute)} → ${minute(spanEnd(row.actual_start_minute,row.actual_end_minute))}${row.wake_reason==='offline_reconnect'?' · 离线补全':''}`))}
+ const dayInfo=$('history-day-summary');dayInfo.replaceChildren();const view=dayView();if(view){for(const [key,label]of [['episode_count','活动记录'],['completed_count','完成'],['interrupted_count','中断'],['sleep_session_count','睡眠会话']])dayInfo.append(el('span','',`${label} ${view.summary?.[key]??'—'}`));for(const row of view.sleep?.sessions||[])dayInfo.append(el('span','',`${row.wake_reason==='offline_reconnect'?offlineSleepName(row):'睡眠'} ${minute(row.actual_start_minute)} → ${minute(spanEnd(row.actual_start_minute,row.actual_end_minute))}${row.wake_reason==='offline_reconnect'?' · 离线补全':''}`))}
  text('plan-note',dayView()?.intent?.note||'计划是意图，实际足迹记录发生的活动；它们可以不同。');
  // W-13：睡眠接线喂两个形象——旧鱼（萨卡班麦麦，闭眼探头）与新熊（Bear，Zzz+降饱和），
  // 日程睡眠投影同步；预设切换由 applyConfig 管，两个模块都做缺失兜底。

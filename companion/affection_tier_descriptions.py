@@ -35,7 +35,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from core.mapping_table import MappingTableSpec, resolve_table_path
+from core.mapping_table import MappingTableSpec, migrate_default_text_table, resolve_table_path
 
 logger = logging.getLogger(__name__)
 
@@ -55,30 +55,47 @@ BUILTIN_TIER_DESCRIPTIONS: Dict[str, Dict[str, str]] = {
         "生疏": "初识阶段，语气温柔但有分寸感，保持适当距离",
         "熟悉": "熟悉阶段，语气亲昵自然，像好朋友一样聊天",
         "亲密": "亲密阶段，语气甜蜜亲近，会主动分享日常与心情",
-        "热恋": "热恋阶段，语气甜蜜亲密，可以肉麻撒娇",
-        "挚爱": "挚爱阶段，语气完全放松、坦率依赖，把TA当作最重要的人",
+        "热恋": "热恋阶段，彼此非常亲密，可以按人设自然流露偏爱和亲昵",
+        "挚爱": "挚爱阶段，语气完全放松、坦率依赖，把TA当作最重要的人"
     },
     "挚友": {
         "点头之交": "刚认识，语气客气自然，先做个点头之交",
         "熟识": "熟识阶段，语气轻松随意，偶尔互相打趣",
         "投缘": "很聊得来，语气直来直去，什么都能聊",
         "铁哥们": "铁哥们，语气毫无顾忌，能一起扛事",
-        "过命的交情": "过命的交情，语气完全交底，损TA也护TA",
+        "过命的交情": "过命的交情，彼此完全交底，按人设怎么熟怎么聊，既坦率又护短"
     },
     "维护者": {
         "路人": "还没怎么打过交道，语气礼貌克制",
         "认识": "初步接触，语气礼貌友善，带一点好奇",
         "信任": "开始信赖，语气放松，愿意分享自己的状态",
-        "依靠": "深深依靠，语气坦诚依赖，会主动汇报自己的近况",
-        "生命线": "生命线般的存在，语气完全信赖、事无巨细都想让TA知道",
+        "依靠": "深深信赖对方，聊天坦诚放松，愿意分享真实想法",
+        "生命线": "极为信赖的重要之人，说话毫无防备、自然坦率"
     },
     "家人": {
         "相识": "刚相处，语气客气中带亲近",
         "亲近": "日常相处，语气随性自然，像家人一样不用客气",
         "家人": "彼此当作家人，语气放松、随口唠家常",
-        "至亲": "至亲，语气完全放松，撒娇耍赖都可以",
-        "血浓于水": "血浓于水，语气毫无保留，什么都愿意说",
+        "至亲": "至亲般的熟稔，语气完全放松、不必见外，怎么自在怎么说",
+        "血浓于水": "血浓于水，语气毫无保留，什么都愿意说"
+    }
+}
+
+# 仅迁移与 3.18.20 出厂逐项相同的内容，用户定制原样保留。
+LEGACY_TIER_DESCRIPTIONS: Dict[str, Dict[str, str]] = {
+    "恋人": {
+        "热恋": "热恋阶段，语气甜蜜亲密，可以肉麻撒娇"
     },
+    "挚友": {
+        "过命的交情": "过命的交情，语气完全交底，损TA也护TA"
+    },
+    "维护者": {
+        "依靠": "深深依靠，语气坦诚依赖，会主动汇报自己的近况",
+        "生命线": "生命线般的存在，语气完全信赖、事无巨细都想让TA知道"
+    },
+    "家人": {
+        "至亲": "至亲，语气完全放松，撒娇耍赖都可以"
+    }
 }
 
 
@@ -131,6 +148,12 @@ def load_tier_descriptions(*, root_dir: Any = None,
         logger.warning("档位描述 json 格式错误（%s）→ 整体回退内置默认", result.error)
         _log_decision(decision_logger, ACTION_REJECTED, result.error)
         return _builtin_by_labels(presets)
+
+    migrated = migrate_default_text_table(
+        path, raw, LEGACY_TIER_DESCRIPTIONS, BUILTIN_TIER_DESCRIPTIONS, section="descriptions",
+    )
+    if migrated is not raw:
+        result = _validate(migrated, presets)
 
     # 已知档位 = 该预设**完整标签集**（json 预设改了标签 → 内置文案按名命中不到，
     # 用户描述按新标签生效；未知档位键丢弃）
