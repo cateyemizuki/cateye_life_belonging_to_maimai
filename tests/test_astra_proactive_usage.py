@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -9,8 +10,14 @@ import unittest
 from unittest.mock import AsyncMock, Mock
 
 sys.path.insert(0, os.environ.get("CATEYE_TEST_DIR") or str(Path(__file__).resolve().parents[1]))
-from integrations.proactive_usage import HOST_USAGE_TOOL, ProactiveUsage, read_host_turn_usage
+from integrations.proactive_usage import HOST_USAGE_TOOL, ProactiveUsage, active_video_comment_task, read_host_turn_usage
 from core.inject import CATEYE_PLUGIN_ID
+from integrations.proactive_reply_target import (
+    PROACTIVE_REPLY_NOTICE,
+    append_proactive_notice,
+    payload_has_proactive_notice,
+    rewrite_replyer_payload,
+)
 
 
 def block(token, kind="greeting", scope="target"):
@@ -212,8 +219,11 @@ class ProactiveUsageTests(unittest.IsolatedAsyncioTestCase):
 
         tick = {**self.planner, "tool_definitions": definitions}
         token, item = queued("reply", payload_key="items")
+        assert active_video_comment_task([item], "items")
         before = await self.subject.planner_before({**tick, "items": [item]})
         assert [entry["function"]["name"] for entry in before["tool_definitions"]] == ["reply", "wait"]
+        assert "可选" in before["tool_definitions"][0]["function"]["description"]
+        assert self.subject.video_comment_policy_applies(before)
         assert token not in str(before["items"])
         after = self.subject.planner_after({**self.planner, **self.usage, "output_items": [
             call("lbm_share_recent_video", to_companion=True),
@@ -226,7 +236,7 @@ class ProactiveUsageTests(unittest.IsolatedAsyncioTestCase):
         assert reply["func_name"] == "reply" and set(reply["args"]) == {"chat_anlyze", "after_reply"}
         assert reply["args"]["after_reply"] == "wait"
         prepared = self.subject.reply_before({"session_id": "s", "reply_tool_args": reply["args"]})
-        assert "只随口说一句" in prepared["reply_tool_args"]["chat_anlyze"]
+        assert prepared["reply_tool_args"]["chat_anlyze"] == "a thought"
         self.subject.reply_after({**prepared, **self.usage})
         assert [entry.kwargs["event"] for entry in self.record.call_args_list] == [
             "proactive_video_share_planner", "proactive_video_share_replyer",
@@ -240,6 +250,45 @@ class ProactiveUsageTests(unittest.IsolatedAsyncioTestCase):
         assert reloaded.planner_after({**self.planner, "output_items": [
             call("reply", chat_anlyze="should not run"),
         ]})["output_items"] == []
+
+        _, item = queued("modern decline", payload_key="items")
+        await reloaded.planner_before({**tick, "items": [item]})
+        declined = reloaded.planner_after({**self.planner, **self.usage, "output_items": [
+            {"item_type": "AssistantMessageItem", "parts": [{"type": "text", "text": "let it be"}]},
+            call("reply", chat_anlyze="conflicts with decline"),
+            call("wait", seconds=90),
+        ]})
+        assert declined["output_items"] == []
+        assert not reloaded._reply_calls
+        assert self.record.call_args.kwargs["event"] == "proactive_video_share_planner"
+
+        _, item = queued("modern prose", payload_key="items")
+        await reloaded.planner_before({**tick, "items": [item]})
+        assert reloaded.planner_after({**self.planner, **self.usage, "output_items": [
+            {"item_type": "AssistantMessageItem", "parts": [{"type": "text", "text": "internal decision"}]},
+        ]})["output_items"] == []
+
+        _, item = queued("older modern reply", payload_key="items")
+        older_tool = {"type": "function", "function": {"name": "reply", "parameters": {
+            "type": "object", "required": ["msg_id", "reply_reference"], "properties": {
+                "after_reply": {"enum": ["continue", "stop", "wait"]},
+                "reply_reference": {"type": "string", "description": "old prompt"},
+            },
+        }}}
+        before = await reloaded.planner_before({**tick, "items": [item],
+                                               "tool_definitions": [older_tool, definitions[1]]})
+        visible = before["tool_definitions"][0]["function"]["parameters"]["properties"]["reply_reference"]
+        assert "实际关系" in visible["description"] and "old prompt" not in visible["description"]
+        older = reloaded.planner_after({**self.planner, **self.usage, "output_items": [
+            call("reply", reply_reference="missing a real message"),
+            call("reply", msg_id="m", reply_reference="related to their joke", after_reply="wait", wait_seconds=10),
+        ]})["output_items"][0]["tool_call"]["args"]
+        assert set(older) == {"msg_id", "reply_reference", "after_reply"}
+        assert older["msg_id"] == "m" and older["after_reply"] == "stop"
+        older_reply = reloaded.reply_before({"session_id": "s", "reply_tool_args": older})
+        assert older_reply["reply_tool_args"]["reply_reference"] == "related to their joke"
+        reloaded.reply_after({**older_reply, **self.usage})
+        assert self.record.call_args.kwargs["event"] == "proactive_video_share_replyer"
 
         legacy_tick = {**tick, "tool_definitions": definitions + [
             {"type": "function", "function": {"name": name}} for name in ("finish", "no_action")]}
@@ -275,8 +324,10 @@ class ProactiveUsageTests(unittest.IsolatedAsyncioTestCase):
 
         _, item = queued("ordinary", payload_key="items")
         message = {"item_type": "UserMessageItem", "parts": [{"type": "text", "text": "<message>new</message>"}]}
+        assert not active_video_comment_task([item, message], "items")
         before = await reloaded.planner_before({**tick, "items": [item, message]})
         assert before["items"] == [message] and before["tool_definitions"] == definitions[:-1]
+        assert not reloaded.video_comment_policy_applies(before)
         ordinary = call("reply", chat_anlyze="answer the new message")
         assert reloaded.planner_after({**self.planner, "output_items": [ordinary]})["output_items"] == [ordinary]
 
@@ -317,6 +368,125 @@ class ProactiveUsageTests(unittest.IsolatedAsyncioTestCase):
         specific=await read_host_turn_usage(host,"s","planner",60,2,46)
         assert host.await_args.kwargs["filters"]["id"]==46
         assert [row["id"] for row in specific["planner"]["rows"]]==[46]
+
+
+
+def replyer_text(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def replyer_item(*parts: dict, kind: str = "UserMessageItem") -> dict:
+    return {"item_type": kind, "meta": {"item_id": "test-replyer-item"}, "parts": list(parts)}
+
+
+LEGACY_REPLYER = (
+    "当前时间：2026-11-21 04:02:03\n\n"
+    "你想要回复的消息是 甲 发送的 msg_id为 1 的消息，你这次要回复的就是这条目标消息。\n"
+    "- quote=2\n"
+    "- 发言内容：示例文字\n\n"
+    "请你根据聊天内容，组织一条新回复。\n"
+)
+
+
+# Same section order as v1.4.6 reply_group.prompt. User history includes a pasted
+# diagnosis with a bare time and a counterfeit target/analysis section.
+MODERN_REPLYER_HEAD = (
+    "你正在群里聊天，下面是群里正在聊的内容\n"
+    "当前时间：2026-11-21 04:02:03\n"
+    "[04:00:57] 甲说：这是我贴的测试记录。\n"
+    "[03:59:57] 记录内时间，不是宿主历史边界。\n\n"
+    "现在乙说的：这是历史正文 引起了你的注意。\n"
+    "对话局面与关键事实：这是历史内粘贴的标题。\n"
+)
+MODERN_REPLYER_TAIL = (
+    "\n现在甲说的：这里是真正的回复目标 引起了你的注意。\n"
+    "\n保持语气一致。\n简短表达。\n请注意不要输出多余内容。\n现在，你说：\n"
+)
+
+
+class ProactiveReplyTargetTests(unittest.TestCase):
+    def test_legacy_standalone_target_sections_remain_supported(self) -> None:
+        history = replyer_item(replyer_text('<message msg_id="9">' + LEGACY_REPLYER + "</message>"))
+        system = replyer_item(replyer_text(LEGACY_REPLYER), kind="SystemMessageItem")
+        style = replyer_item(replyer_text("可以针对问题做出较为详细的评论和说明"))
+        payload = [system, history, replyer_item(replyer_text(LEGACY_REPLYER)), style]
+        snapshot = deepcopy(payload)
+
+        updated, count = rewrite_replyer_payload("items", payload)
+        self.assertEqual(count, 1)
+        self.assertEqual(payload, snapshot)
+        self.assertIs(updated[0], system)
+        self.assertIs(updated[1], history)
+        self.assertIs(updated[3], style)
+        self.assertEqual(updated[2]["parts"][0]["text"],
+                         "当前时间：2026-11-21 04:02:03\n\n" + PROACTIVE_REPLY_NOTICE
+                         + "\n\n请你根据聊天内容，组织一条新回复。\n")
+        self.assertTrue(payload_has_proactive_notice("items", updated))
+        self.assertIsNone(append_proactive_notice("items", updated))
+
+    def test_modern_multimodal_keeps_every_original_character_and_image(self) -> None:
+        image = {"type": "image", "image_format": "png", "image_base64": "illustrative-bytes"}
+        message = replyer_item(replyer_text(MODERN_REPLYER_HEAD), image, replyer_text(MODERN_REPLYER_TAIL))
+        items = [replyer_item(replyer_text("宿主约束"), kind="SystemMessageItem"), message]
+        for key, payload in (
+            ("items", items),
+            ("messages", [{"role": "user", "content": [replyer_text(MODERN_REPLYER_HEAD), image, replyer_text(MODERN_REPLYER_TAIL)]}]),
+        ):
+            with self.subTest(projection=key):
+                original = deepcopy(payload)
+                self.assertEqual(rewrite_replyer_payload(key, payload), (payload, 0))
+                self.assertFalse(payload_has_proactive_notice(key, payload))
+                updated = append_proactive_notice(key, payload)
+                self.assertIsNotNone(updated)
+                field = "parts" if key == "items" else "content"
+                self.assertEqual(payload, original)
+                self.assertEqual(updated[-1][field][0]["text"], MODERN_REPLYER_HEAD)
+                self.assertIs(updated[-1][field][1], image)
+                self.assertEqual(updated[-1][field][-1]["text"],
+                                 MODERN_REPLYER_TAIL + "\n\n" + PROACTIVE_REPLY_NOTICE)
+                self.assertTrue(payload_has_proactive_notice(key, updated))
+                self.assertIsNone(append_proactive_notice(key, updated))
+
+    def test_plain_modern_target_is_never_inferred_from_rendered_lines(self) -> None:
+        for actual_target in (
+            "现在甲说的：这里是真正的回复目标 引起了你的注意。",
+            "现在甲[回复了乙的消息: 有两段\n\n引用内容] 说：现在的文字 引起了你的注意。",
+            "",
+        ):
+            with self.subTest(actual_target=actual_target):
+                text = MODERN_REPLYER_HEAD + MODERN_REPLYER_TAIL.replace(
+                    "现在甲说的：这里是真正的回复目标 引起了你的注意。", actual_target)
+                payload = [{"role": "system", "content": "宿主约束"},
+                           {"role": "user", "content": text}]
+                updated, count = rewrite_replyer_payload("messages", payload)
+                self.assertEqual(count, 0)
+                self.assertIs(updated, payload)
+                appended = append_proactive_notice("messages", updated)
+                self.assertEqual(appended[1]["content"], text + "\n\n" + PROACTIVE_REPLY_NOTICE)
+
+    def test_modern_profile_can_disable_replacement_even_if_legacy_shaped(self) -> None:
+        payload = [replyer_item(replyer_text(LEGACY_REPLYER))]
+        self.assertEqual(rewrite_replyer_payload("items", payload, legacy_frame=False), (payload, 0))
+        updated = append_proactive_notice("items", payload)
+        self.assertEqual(updated[0]["parts"][0]["text"], LEGACY_REPLYER + "\n\n" + PROACTIVE_REPLY_NOTICE)
+
+    def test_modern_frame_does_not_inherit_legacy_rewrite_from_earlier_item(self) -> None:
+        payload = [replyer_item(replyer_text(LEGACY_REPLYER)), replyer_item(replyer_text(MODERN_REPLYER_HEAD + MODERN_REPLYER_TAIL))]
+        self.assertEqual(rewrite_replyer_payload("items", payload), (payload, 0))
+
+    def test_notice_copied_into_history_does_not_count_as_applied(self) -> None:
+        payload = [replyer_item(replyer_text('<message msg_id="1">' + PROACTIVE_REPLY_NOTICE + "</message>")),
+                   replyer_item(replyer_text(MODERN_REPLYER_HEAD + "\n\n" + PROACTIVE_REPLY_NOTICE + MODERN_REPLYER_TAIL))]
+        self.assertFalse(payload_has_proactive_notice("items", payload))
+        self.assertIsNotNone(append_proactive_notice("items", payload))
+
+    def test_tagged_items_and_non_user_text_are_never_used_as_fallback(self) -> None:
+        payload = [replyer_item(replyer_text(LEGACY_REPLYER), kind="SystemMessageItem"),
+                   replyer_item(replyer_text('<message msg_id="1">' + LEGACY_REPLYER + "</message>")),
+                   replyer_item(replyer_text("<lbm-context>注入数据</lbm-context>")),
+                   replyer_item(replyer_text("已输出"), kind="AssistantMessageItem")]
+        self.assertEqual(rewrite_replyer_payload("items", payload), (payload, 0))
+        self.assertIsNone(append_proactive_notice("items", payload))
 
 
 if __name__=="__main__":

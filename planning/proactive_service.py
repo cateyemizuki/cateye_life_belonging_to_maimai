@@ -2386,9 +2386,9 @@ class ProactiveService:
 
     @staticmethod
     def _target_greeting_prompt(now: datetime) -> str:
-        return (f"当前是本地时间 {now.strftime('%Y-%m-%d %H:%M')}。"
-                "这是一次主动打招呼的机会。结合时间和当前对话自行决定是否开口、如何问候；"
-                "觉得此时不合适，可以直接结束。")
+        return (f"现在是 {now.strftime('%Y-%m-%d %H:%M')}。"
+                "你可以顺手跟对方打个招呼，按这个时间点和你们平时的相处方式自然开口；"
+                "要是觉得现在不合适，直接静默结束就行。")
 
     async def _trigger_greeting(self, stream_id: str, kind: str, date_str: str, *,
                                 category: str, cycle_key: Any = None) -> bool:

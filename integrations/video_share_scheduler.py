@@ -77,28 +77,28 @@ def attempt_result(attempt: dict, *, duplicate: bool = False) -> dict:
     verified = state == 'accepted' and receipt.get('delivery_verified') is True
     reason = receipt.get('error_class')
     if verified:
-        content = (f'QQ 会话记录已确认出现 B 站小程序卡片《{title}》 {bvid}。'
+        content = (f'QQ 会话记录已确认 B 站视频分享《{title}》 {bvid}。'
                    '可以用 lbm_watch_bili_video 读取已保存的观看内容。')
     elif state == 'accepted':
-        content = '旧回执缺少可核验的 QQ 卡片记录，不重复发送。'
+        content = '旧回执缺少可核验的 QQ 分享记录，不重复发送。'
     elif attempt.get('kind') == 'debug' and state == 'rejected':
         content = {
-            'route_account_unverified': '未核验到当前会话的 QQ 登录账号，测试卡片未发送。',
-            'send_rejected': 'QQ 拒绝了这张测试卡片。',
-            'card_action_unsupported': '当前 QQ 适配器不支持发送 B 站小程序卡片。',
-            'card_generation_failed': 'QQ 适配器未能生成 B 站小程序卡片，未发送。',
-        }.get(reason, '测试卡片未发送。')
+            'route_account_unverified': '未核验到当前会话的 QQ 登录账号，测试分享未发送。',
+            'send_rejected': 'QQ 拒绝了这次测试分享。',
+            'card_action_unsupported': '当前 QQ 适配器不支持 QQ 图文卡。',
+            'card_generation_failed': '未能准备 B 站视频分享。',
+        }.get(reason, '测试分享未发送。')
     elif attempt.get('kind') == 'debug':
         content = {
             'qq_card_replaced': 'QQ 会话里出现了版本过低的占位提示，未查到本次测试卡片。',
             'card_history_unavailable': '暂时无法核对当前 QQ 会话的记录。',
-            'card_not_confirmed': 'QQ 会话记录里暂未查到这张测试卡片。',
-            'adapter_delivery_unconfirmed': 'QQ 未返回送达回执。请查看当前会话确认卡片是否出现。',
-            'private_card_not_confirmed': 'QQ 私聊的服务器历史里暂未查到这张测试卡片。',
+            'card_not_confirmed': 'QQ 会话记录里暂未查到这次测试分享。',
+            'adapter_delivery_unconfirmed': 'QQ 未返回送达回执。请查看当前会话确认分享是否出现。',
+            'private_card_not_confirmed': 'QQ 私聊的服务器历史里暂未查到这次测试分享。',
             'private_card_readback_failed': '暂时无法核对 QQ 私聊的发送结果。',
-        }.get(reason, '测试卡片的发送结果待确认，请查看当前会话。')
+        }.get(reason, '测试分享的发送结果待确认，请查看当前会话。')
     else:
-        content = '当前回执缺少 QQ 会话记录对视频卡片的确认，请勿重复发送。'
+        content = '当前回执缺少 QQ 会话记录对视频分享的确认，请勿重复发送。'
     return {
         'success': verified, 'bvid': bvid, 'title': title, 'delivery_state': state,
         'delivery_verified': verified, 'duplicate': duplicate, 'message_id': receipt.get('message_id'),
@@ -147,7 +147,7 @@ class VideoSocialService:
                 ('daily_limit', 'stream_daily_limit', 'min_interval_hours', 'max_targets_per_video')}
 
     async def synchronize_fact(self, attempt: str):
-        """把已受理卡片写入聊天上下文；返回最终 history 状态（未领取 → None）。
+        """把已确认的视频分享写入聊天上下文；返回最终 history 状态（未领取 → None）。
 
         自动分享仅在本次事实同步成功后提供一次跟评机会。
         """
@@ -162,8 +162,9 @@ class VideoSocialService:
             await asyncio.to_thread(self.ledger.finish_history, attempt, 'rejected')
             return 'rejected'
         facts = item['facts']
-        text = (f"[视频分享事实:{attempt}] QQ 会话记录已确认本聊天的视频卡片：{facts['bvid']}《{facts['title']}》。"
-                "这是已发生行为的记录，消息是否已读未确认。勿再次分享同一卡片。")
+        share_type = "B 站复制链接" if proof.get("channel") == "video_link" else "视频卡片"
+        text = (f"[视频分享事实:{attempt}] 我已在本聊天分享《{facts['title']}》（{facts['bvid']}），"
+                f"形式为{share_type}，QQ 会话记录已确认。无需再次发送，暂不清楚对方是否已读。")
         try:
             reply = await self._append(item['stream'], text, attempt)
             state = 'synced' if isinstance(reply, dict) and reply.get('success') is True else 'rejected'
@@ -338,7 +339,7 @@ class VideoSocialService:
         if reason:
             await asyncio.to_thread(self.ledger.postpone, bvid, reason, now, 1800)
             return {'status': 'deferred', 'reason': reason}
-        # F2（3.17.33 复核修复）：既有授权/夜间/冷却/预算闸之后、卡片生成之前，再对
+        # F2（3.17.33 复核修复）：既有授权/夜间/冷却/预算闸之后、准备分享之前，再对
         # 陪伴目标私聊掷一次额外概率；未命中按终态跳过，后续候选仍可正常评估。
         if self._probability_rejects(selected):
             await asyncio.to_thread(
@@ -348,7 +349,7 @@ class VideoSocialService:
         facts = candidate['facts']
         try:
             generated = await self._prepare(bvid=bvid, title=facts['title'],
-                                            desc='哔哩哔哩视频分享', pic_url=facts.get('cover_url', ''))
+                                            desc='打开 B 站视频网页', pic_url=facts.get('cover_url', ''))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -565,7 +566,7 @@ class ManualVideoShares:
         payload = json.dumps({key: candidate[key] for key in ('bvid', 'title', 'watch_note')
                               if key in candidate}, ensure_ascii=False)
         intent = (
-            "管理员正在测试卡片分享判断。根据当前这个聊天的最新语境与已观看候选，"
+            "管理员正在测试视频分享判断。根据当前这个聊天的最新语境与已观看候选，"
             "判断现在是否适合分享。你可以选择分享、暂缓或不分享。\n"
             + SHARE_JUDGMENT_RULES
             + f"唯一允许的对象是当前聊天，没有其他候选聊天。"
@@ -608,7 +609,7 @@ class ManualVideoShares:
             )
         except Exception:
             result = {'success': False, 'delivery_state': 'uncertain',
-                      'content': '测试卡片的发送结果待确认。'}
+                      'content': '测试分享的发送结果待确认。'}
         return {**result, 'debug_executed': True}
 
     async def _share(self, stream_id: str, request_id: str, *, bvid: str = '',
@@ -696,7 +697,7 @@ class ManualVideoShares:
                 await asyncio.to_thread(ledger.finish, attempt, 'rejected', failure, 'card_generation_failed')
                 if debug:
                     return attempt_result({'status': 'rejected', 'facts': selected, 'receipt': failure, 'kind': kind})
-                return {'success': False, **failure, 'content': 'B 站小程序卡片生成失败，未发送。'}
+                return {'success': False, **failure, 'content': '未能准备 B 站视频分享。'}
             try:
                 refreshed = await self.social.profiles.routes(manual_stream=send_stream)
             except BaseException:

@@ -88,6 +88,15 @@ class ArchitectureCases(unittest.TestCase):
     def test_changed_target_rejects_old_route(self):
         self.run_case("case_changed_target_rejects_old_route")
 
+    def test_prompt_upgrades_preserve_customized_tables(self):
+        self.run_case("case_prompt_upgrades_preserve_customized_tables")
+
+    def test_video_completion_outcomes_survive_proactive_registry(self):
+        self.run_case("case_video_completion_outcomes_survive_proactive_registry")
+
+    def test_impression_uses_identity_and_only_supplied_evidence(self):
+        self.run_case("case_impression_uses_identity_and_only_supplied_evidence")
+
     def run_case(self, name):
         proc = subprocess.run(
             [sys.executable, "-I", "-B", str(Path(__file__).resolve()), name],
@@ -769,16 +778,19 @@ assert.equal(display(750, 780, { name:'散步', goal_type:'exercise' }), '散步
 
 async def case_separate_energy_and_social_tones(root):
     from planning.inject_service import InjectService
+    from suite_prompts import (SUBCONSCIOUS_TONE_LOW_ENERGY_DEFAULT,
+                               SUBCONSCIOUS_TONE_LOW_SOCIAL_DEFAULT,
+                               SUBCONSCIOUS_TONE_TIRED_DEFAULT)
 
     snapshot = {"energy": 0.6896, "social_battery": 0.0592}
     service = NS(_life_state_snapshot=lambda: snapshot, _emotion_valence=lambda: 0.31,
                  _boundary_extreme_tone=lambda _: "")
     rule = InjectService._subconscious_tone_rule
-    assert "想少聊" in rule(service)
+    assert rule(service) == SUBCONSCIOUS_TONE_LOW_SOCIAL_DEFAULT
     snapshot["energy"] = 0.30
-    assert "精力偏低" in rule(service) and "很疲惫" not in rule(service)
+    assert rule(service) == SUBCONSCIOUS_TONE_LOW_ENERGY_DEFAULT
     snapshot["energy"] = 0.24
-    assert "很疲惫" in rule(service)
+    assert rule(service) == SUBCONSCIOUS_TONE_TIRED_DEFAULT
     service._boundary_extreme_tone = lambda _: "目标私聊边界"
     assert rule(service, "target") == "目标私聊边界"
 
@@ -947,6 +959,7 @@ async def case_component_metadata_before_context(root):
             with patch.dict(os.environ, {"MAIBOT_HOST_VERSION": version}):
                 registered = names(plugin)
                 assert ("mai_prepare_proactive_delivery" in registered) is supports_preprocess
+                assert ("mai_keep_video_share_one_message" in registered) is supports_preprocess
                 assert ("mai_prepare_proactive_segments" in registered) is supports_split
                 assert "mai_acknowledge_proactive_send" in registered
         plugin.config = CateyeSuiteConfig()
@@ -981,6 +994,107 @@ async def case_component_metadata_before_context(root):
         for _ in range(5):
             await asyncio.sleep(0)
         ctx.component.reload_plugin.assert_awaited_once()
+
+
+async def case_prompt_upgrades_preserve_customized_tables(root):
+    from companion.affection_tier_descriptions import (BUILTIN_TIER_DESCRIPTIONS, LEGACY_TIER_DESCRIPTIONS,
+                                                      load_tier_descriptions)
+    from emotion.descriptions import DEFAULT_EMOTION_DESCRIPTIONS, LEGACY_EMOTION_DESCRIPTIONS, load_descriptions
+    from plugin import CateyeSuitePlugin
+    from suite_config import CURRENT_LAYOUT_VERSION, CateyeSuiteConfig
+    from suite_prompts import LEGACY_FACTORY_PROMPTS_BY_FIELD, QZONE_POST_DEFAULT, QZONE_REPLY_DEFAULT
+
+    old_post = next(iter(LEGACY_FACTORY_PROMPTS_BY_FIELD["qzone_post"]))
+    old_reply = next(iter(LEGACY_FACTORY_PROMPTS_BY_FIELD["qzone_reply"]))
+    raw = {"plugin": {"layout_version": CURRENT_LAYOUT_VERSION, "config_version": "3.18.20"},
+           "prompts": {"qzone_post": old_post, "qzone_reply": old_reply + "。",
+                       "screen_describe": old_post}}
+    config, changed = CateyeSuitePlugin().normalize_plugin_config(raw)
+    assert changed
+    assert config["prompts"]["qzone_post"] == QZONE_POST_DEFAULT
+    assert config["prompts"]["qzone_reply"] == old_reply + "。"
+    assert config["prompts"]["screen_describe"] == old_post
+    assert raw["prompts"]["qzone_post"] == old_post
+    direct = CateyeSuiteConfig.model_validate({**raw, "prompts": {"qzone_reply": old_reply}})
+    assert direct.prompts.qzone_reply == QZONE_REPLY_DEFAULT
+
+    layer = root / "mappings"
+    layer.mkdir()
+    custom = LEGACY_EMOTION_DESCRIPTIONS["好奇"] + "（用户自定）"
+    emotions = layer / "emotion_descriptions.json"
+    emotions.write_text(json.dumps({"平静": LEGACY_EMOTION_DESCRIPTIONS["平静"], "好奇": custom,
+                                   "额外内容": "自定保留"}, ensure_ascii=False), encoding="utf-8")
+    result = load_descriptions(root_dir=root, known_labels=("平静", "好奇"))
+    assert result["平静"] == DEFAULT_EMOTION_DESCRIPTIONS["平静"] and result["好奇"] == custom
+    disk = json.loads(emotions.read_text(encoding="utf-8"))
+    assert disk == {"平静": DEFAULT_EMOTION_DESCRIPTIONS["平静"], "好奇": custom, "额外内容": "自定保留"}
+    saved = emotions.read_bytes()
+    load_descriptions(root_dir=root, known_labels=("平静", "好奇"))
+    assert emotions.read_bytes() == saved
+
+    affection = layer / "affection_tier_descriptions.json"
+    affection.write_text(json.dumps({"version": 1, "descriptions": {
+        "恋人": {"热恋": LEGACY_TIER_DESCRIPTIONS["恋人"]["热恋"]},
+        "家人": {"至亲": "自定亲近描述"},
+    }}, ensure_ascii=False), encoding="utf-8")
+    tiers = load_tier_descriptions(root_dir=root)
+    assert tiers["恋人"]["热恋"] == BUILTIN_TIER_DESCRIPTIONS["恋人"]["热恋"]
+    assert tiers["家人"]["至亲"] == "自定亲近描述"
+    disk_tiers = json.loads(affection.read_text(encoding="utf-8"))["descriptions"]
+    assert disk_tiers["家人"]["至亲"] == "自定亲近描述"
+    assert disk_tiers["恋人"]["热恋"] == BUILTIN_TIER_DESCRIPTIONS["恋人"]["热恋"]
+
+
+async def case_video_completion_outcomes_survive_proactive_registry(root):
+    from plugin import CateyeSuitePlugin
+    from tools.proactive_turn import ProactiveTurnRegistry, rewrite_notice_for
+
+    plugin = CateyeSuitePlugin()
+    plugin._stream_id = "target-stream"
+    trigger = AsyncMock(return_value={"success": True})
+    plugin.ctx = NS(maisaka=NS(proactive=NS(trigger=trigger)))
+    plugin._video_completion_sleep_gate = Mock(return_value=False)
+    plugin._target_miss_stage_context = Mock(return_value={"stage": 4, "hours": 121, "relation": "恋人"})
+    registry = ProactiveTurnRegistry(plugin, root)
+    plugin._mai_proactive_turns = lambda: registry
+
+    for status in ("failed", "cancelled", "completed"):
+        receipt = {"result": {"status": status, "error": "fixture", "video": {"title": "测试视频"}}}
+        response = await plugin._notify_video_completion(status, plugin._stream_id, receipt)
+        assert response["success"] is True
+        sent = trigger.await_args.kwargs
+        intent = sent["intent"]
+        assert sent["stream_id"] == plugin._stream_id
+        failed = status != "completed"
+        assert sent["metadata"]["video_failed"] is failed
+        assert "不要转发给其他聊天" in intent and "status/result" in intent
+        restored = ProactiveTurnRegistry(plugin, root)
+        turn = restored.identified(plugin._stream_id, turn_id=response["lbm_turn_id"])
+        assert turn["video_failed"] is failed and turn["miss_stage"] == 4
+        notice = rewrite_notice_for("private_target", "video_completion", miss_stage=4,
+                                    video_failed=turn["video_failed"])
+        if failed:
+            assert "没看成" in intent and "刚看的视频" not in intent
+            assert "没看成" in notice and "感想" not in notice
+        else:
+            assert "已处理完" in intent and "测试视频" in intent
+    legacy_notice = rewrite_notice_for("private_target", "video_completion", miss_stage=4)
+    assert "感想" not in legacy_notice and "没看成" not in legacy_notice
+
+
+async def case_impression_uses_identity_and_only_supplied_evidence(root):
+    from video_watch.service import VideoWatchService
+    generate = AsyncMock(return_value=NS(ok=True, text="第一反应"))
+    service = VideoWatchService(root, config_provider=lambda: NS(summary_impression=True, impression_task_name="utils"),
+                                llm_generate_detailed=generate)
+    for visual in ({}, {"summary": "测试画面"}):
+        result = {"subtitle_text": "测试字幕", "visual": visual, "observations": ["测试来源"]}
+        answer = await service._maybe_impression(result)
+        assert answer["impression"] == "第一反应"
+        call = generate.await_args
+        assert call.kwargs["with_identity"] is True
+        assert "测试字幕" in call.args[0] and "不假定看过未取得的部分" in call.args[0]
+        assert ("测试画面" in call.args[0]) is bool(visual)
 
 
 def run_isolated(name):

@@ -2,7 +2,7 @@
 
 items 注入遵循**宿主的真实校验**（MaiBot ``ContextItemMeta`` 与
 ``validate_context_items``，payload_content/context_item.py、context_protocol.py）：
-- item_type ∈ 受支持集合（这里用 SystemMessageItem）；
+- item_type 使用宿主支持的 UserMessageItem 或旧版 SystemMessageItem；
 - meta：item_id **非空**且全局唯一（重复 item_id 宿主抛错；无「纯 hex」要求——
   本插件旁白条目用 ``companion-screen-`` 前缀 hex 是有意设计，便于识别与排查，
   见 companion/screen_context.build_narration_item）；timestamp 需可解析；
@@ -30,6 +30,7 @@ PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清�
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from datetime import datetime
@@ -46,6 +47,13 @@ PROACTIVE_BLOCK_STALE_MS = 30 * 60 * 1000
 _PROACTIVE_ID_MARKER = 'id="proactive:'
 #: 本插件在宿主侧的标识（_manifest.json 的 id）：块 id 里的 plugin_id 段据此比对。
 CATEYE_PLUGIN_ID = "cateye.life_belonging_to_maimai"
+LBM_CONTEXT_PREFIX = "<lbm-context>"
+_CONTEXT_ITEM_ID_PREFIX = "lbm-ctx-"
+_PLANNER_TIME = re.compile(r"时间：\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?")
+_PLANNER_INTERNAL_REFERENCE = re.compile(r"^【[^】\n]+-内部参考】")
+_FOCUS_ROSTER = re.compile(r"^在 .+?\([^()\n]+\) 中的注意信息：")
+_REPLYER_TIME = re.compile(r"(?m)^当前时间[：:]\s*\d{4}-\d{2}-\d{2}\b")
+_REPLYER_HISTORY_PREFIXES = ("<message", PROACTIVE_BLOCK_PREFIX, LBM_CONTEXT_PREFIX)
 # PR8 3.0.0：NAP_BLOCK_KIND / NAP_BLOCK_LINGER_SECONDS（M9 赖床提醒块剥离判据）随链删除。
 
 
@@ -189,12 +197,130 @@ def inject_into_messages(messages: List[Dict[str, Any]], text: str) -> List[Dict
     return [messages[0], system_msg, *messages[1:]]
 
 
+def _plain_user_item_text(item: Any) -> str:
+    """取宿主用 add_text_content 构造的单段纯文本 User 快照。"""
+    if not isinstance(item, dict) or item.get("item_type") != "UserMessageItem":
+        return ""
+    parts = item.get("parts")
+    if not isinstance(parts, list) or len(parts) != 1:
+        return ""
+    return _first_text(item).strip()
+
+
+def _is_planner_reference(text: str) -> bool:
+    # Focus roster 是一个条目。之后的行可能只是群自定义提示的续行。
+    return bool(
+        _PLANNER_INTERNAL_REFERENCE.match(text)
+        or _FOCUS_ROSTER.match(text)
+        or (text.startswith("<focus_reference ") and text.endswith("</focus_reference>"))
+    )
+
+
+def _context_block(text: str) -> str:
+    return f"{LBM_CONTEXT_PREFIX}\n{text.strip()}\n</lbm-context>"
+
+
+def inject_into_items_before_tail(items: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
+    """将动态上下文放在既有历史之后、宿主本轮参考与时间之前。"""
+    if not text.strip():
+        return items
+    block = _context_block(text)
+    if any(_first_text(item).strip() == block for item in items):
+        return items
+    # 跨日历史也用相同时间格式。1.4.6 的本轮独立时间项是最后一个。
+    time_index = next((index for index in range(len(items) - 1, -1, -1)
+                       if _PLANNER_TIME.fullmatch(_plain_user_item_text(items[index]))), None)
+    if time_index is None:
+        # 旧版/未知投影无法确认历史边界，保留既有系统注入。
+        if any(item.get("item_type") == "SystemMessageItem" and _first_text(item).strip() == text.strip()
+               for item in items if isinstance(item, dict)):
+            return items
+        return inject_into_items_after_system(items, text)
+    tail_start = time_index
+    while tail_start > 0 and _is_planner_reference(_plain_user_item_text(items[tail_start - 1])):
+        tail_start -= 1
+    new_item = {
+        "item_type": "UserMessageItem",
+        "meta": {
+            "item_id": f"{_CONTEXT_ITEM_ID_PREFIX}{uuid.uuid4().hex}",
+            "logical_turn_id": None,
+            "timestamp": datetime.now().astimezone().isoformat(),
+        },
+        "parts": [{"type": "text", "text": block}],
+    }
+    return [*items[:tail_start], new_item, *items[tail_start:]]
+
+
+def project_planner_injection(payload_key: str, payload: Any, text: str) -> Any:
+    """向 Planner 的当前载荷投影动态上下文。"""
+    if payload_key == "items" and isinstance(payload, list):
+        return inject_into_items_before_tail(payload, text)
+    return project_injection(payload_key, payload, text) if text.strip() else payload
+
+
+def _append_replyer_context(text: str, block: str) -> str:
+    if block in text:
+        return text
+    lines = text.splitlines(keepends=True)
+    # 收束语留在末尾，避免动态背景被误接成回复正文。
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index].strip()
+        if line == "现在，你说：" or line.startswith("请注意不要输出多余内容"):
+            return "".join([*lines[:index], "\n", block, "\n\n", *lines[index:]])
+    return f"{text}\n\n{block}"
+
+
+def project_replyer_injection(payload_key: str, payload: Any, text: str) -> Any:
+    """只向宿主的最后一条 Replyer 用户模板追加文本，保留所有图片和历史。"""
+    if payload_key not in ("items", "messages") or not isinstance(payload, list) or not text.strip():
+        return payload
+    block = _context_block(text)
+    list_field = "parts" if payload_key == "items" else "content"
+    for index in range(len(payload) - 1, -1, -1):
+        item = payload[index]
+        if not isinstance(item, dict):
+            continue
+        is_user = (item.get("item_type") == "UserMessageItem" if payload_key == "items"
+                   else item.get("role") == "user")
+        if not is_user:
+            continue
+        content = item.get(list_field)
+        if payload_key == "messages" and isinstance(content, str):
+            if (content.lstrip().startswith(_REPLYER_HISTORY_PREFIXES)
+                    or not _REPLYER_TIME.search(content)):
+                continue
+            updated = _append_replyer_context(content, block)
+            if updated == content:
+                return payload
+            return [*payload[:index], {**item, list_field: updated}, *payload[index + 1:]]
+        if not isinstance(content, list):
+            continue
+        text_indices = [part_index for part_index, part in enumerate(content)
+                        if isinstance(part, dict) and part.get("type") == "text"
+                        and isinstance(part.get("text"), str)]
+        if not text_indices:
+            continue
+        first = content[text_indices[0]]["text"]
+        if first.lstrip().startswith(_REPLYER_HISTORY_PREFIXES) or not _REPLYER_TIME.search(first):
+            continue
+        part_index = text_indices[-1]
+        part = content[part_index]
+        updated = _append_replyer_context(part["text"], block)
+        if updated == part["text"]:
+            return payload
+        parts = [*content[:part_index], {**part, "text": updated}, *content[part_index + 1:]]
+        return [*payload[:index], {**item, list_field: parts}, *payload[index + 1:]]
+    # 早期 role/content 接口不保证有可识别的整条宿主模板。
+    return inject_into_messages(payload, text) if payload_key == "messages" else payload
+
+
 def extract_last_user_text(items: Optional[List[Dict[str, Any]]], messages: Optional[List[Dict[str, Any]]]) -> str:
     """从 payload 中提取最后一条真实用户文本（跳过系统元数据），供注入决策。"""
 
     def _clean(text: str) -> str:
         text = text or ""
-        import re
+        if text.lstrip().startswith(LBM_CONTEXT_PREFIX):
+            return ""
 
         text = re.sub(r"^<message\s+[^>]*>\s*", "", text)
         stripped = text.strip()

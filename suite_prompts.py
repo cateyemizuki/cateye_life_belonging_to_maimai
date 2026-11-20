@@ -35,8 +35,9 @@ def _warn_fallback_once(name: str, reason: str) -> None:
 
 #: 想念触发时传给 planner 的 reason（占位符：{lover_name} / {relation} / {hours}）
 COMPANION_MISS_REASON_DEFAULT = (
-    "【触发原因·想念】你已经 {hours} 个小时没收到{relation}的消息了。"
-    "可以自然地问问TA的近况或表达一下想念；若觉得此刻开口不自然，平淡打个招呼也可以。"
+    "你已经差不多 {hours} 小时没收到{relation}的消息了。"
+    "如果觉得现在适合找TA，按你的性格随口搭句话或问句近况；"
+    "觉得突兀就安静结束，不用硬聊。"
 )
 
 #: 想念触发前 LLM 把关提示词（占位符：{lover_name} / {relation} / {personality} /
@@ -57,26 +58,27 @@ COMPANION_MISS_CONFIRM_DEFAULT = (
 
 #: 陪伴对象电脑屏幕截图的视觉理解提示词（随截图发给 vlm 任务）
 SCREEN_DESCRIBE_DEFAULT = (
-    "这是你的陪伴对象电脑屏幕的截图。请用一句话（不超过 40 字、口语化）描述"
-    "TA现在可能在干什么（比如在打游戏 / 写代码 / 看视频 / 挂机离开）。\n"
-    "如果截图上看不出具体内容，就回答：屏幕上看不出具体内容。"
+    "这是一张电脑屏幕截图。"
+    "用一句不超过 35 字的大白话概括屏幕主人在做什么（如写代码、看视频、打某款游戏、聊QQ或桌面挂机），别罗列窗口细节或隐私文字。"
+    "\n"
+    "看不清或无法判断就只回答：屏幕上看不出具体内容。"
 )
 
 #: 屏幕旁白文案模板（占位符：{date} 年月日 / {time} 时分 / {user_name} / {description}）
 SCREEN_NARRATION_DEFAULT = (
-    "现在是{date} {time}，你看了眼{user_name}的电脑屏幕，TA正在：{description}"
+    "（{date} {time} 顺带瞄到{user_name}那边：{description}。"
+    "仅作你心里有数的背景，别像查岗一样逐字复述屏幕内容。"
+    "）"
 )
-SCREEN_NARRATION_OFFLINE_DEFAULT = (
-    "现在是{date} {time}，你想看一眼{user_name}的电脑屏幕，但暂时无法连接TA的电脑"
-)
-SCREEN_NARRATION_FAILED_DEFAULT = (
-    "现在是{date} {time}，你看了眼{user_name}的电脑屏幕，但没看清TA在干什么"
-)
+SCREEN_NARRATION_OFFLINE_DEFAULT = "（{date} {time} 没连上{user_name}那边的屏幕画面。）"
+SCREEN_NARRATION_FAILED_DEFAULT = "（{date} {time} 扫了眼{user_name}那边的屏幕，不过没看清在干嘛。）"
 
 #: 好感度注入块（占位符：{name} / {relation_word} / {target_label} / {tier} /
 #: {tier_label} / {tier_desc}）；整块文本含前导换行
 INJECT_AFFECTION_BLOCK_DEFAULT = (
-    "\n【{name}与{relation_word}（{target_label}）的好感度】档位 {tier}·{tier_label}（{tier_desc}）"
+    "\n"
+    "【与{relation_word}（{target_label}）的关系】目前熟稔程度：{tier_label}（{tier_desc}；"
+    "具体表达仍以{name}的人设性格为准）"
 )
 
 #: 主动发言回合给 planner 的主动激活引导（软约束；占位符：{bot_name}）。
@@ -84,12 +86,13 @@ INJECT_AFFECTION_BLOCK_DEFAULT = (
 #: 可能已过时）；改为按状况概括+当前状态发言。读取仍经 prompt()（内部模板名，
 #: 回退表机制不变，兼容自定义模板口径）。
 INJECT_PROACTIVE_TURN_RULE_DEFAULT = (
-    "\n【本轮是主动发言】现在是{bot_name}在主动找对方说话（不是对方来找{bot_name}）："
-    "\n- 本轮为插件主动激活：根据{bot_name}的状况概括，结合{bot_name}此刻的状态自然发言，"
-    "不需要特地回复某个信息，也不要围绕某条过时的消息组织回复；"
-    "\n- 不要回复{bot_name}自己发送的消息，也不要在发言里引用{bot_name}自己的消息；"
-    "\n- 如果对方还没回{bot_name}，直接说新内容或起一个新话题；"
-    "\n- reply 的 msg_id 只能选对方发送的消息。"
+    "\n"
+    "【主动开口提醒】这轮是{bot_name}主动找对方搭话，不是在回对方刚发的消息：\n"
+    "- 结合眼前想说的话题或状态自然开口，别翻旧账式地去回复早已过时的旧消息；"
+    "\n"
+    "- 如果对方上一轮还没回，直接起个新话头或简短打个招呼，不复述自己前面发过的话；"
+    "\n"
+    "- 调用 reply 时不要选自己发过的消息，msg_id 只能选对方的消息。"
 )
 
 #: 2026-11-04 评估 F4 清理：主动私信工具（lbm_mai_lover_send_message）已整条移除
@@ -172,26 +175,26 @@ AFFECTION_DAILY_REVIEW_DEFAULT = """你看不到任何好感度数值，也看�
 
 #: 通用每日主动任务尾缀（早/午/晚安、刷QQ随口搭话、巡检日常等）。
 MISS_REASON_STAGE4_SUFFIX = (
-    "\n【深层心理覆盖·失联阶段4（已沉默约{hours}小时）】"
-    "注意：陪伴目标（关系：{relation}）已经超过五天完全没有回复过你任何消息。"
-    "虽然本轮由日常行为触发了这次开口机会，但你在表达上述日常事件或问候的同时，"
-    "整个人已处于明显沉默低落、压抑着失落却又克制不住牵挂的状态。"
-    "请在完成上述日常分享或问候的同时（或紧接在后半句），"
-    "务必带上沉闷、略带犹豫但反复确认的询问：问对方人到底去哪了、是不是还在、"
-    "或者到底能不能看到你发的消息。不要再假装一切如常地轻松寒暄，"
-    "先说出要做的日常事，话锋自然落到反复确认对方是否还在、为什么始终没有声音上。"
+    "\n"
+    "【失联阶段4（已约{hours}小时无回音）】{relation}已经超过五天完全没回你消息了。"
+    "这轮虽是日常开口，但别假装没事一样轻松寒暄——说完眼下的日常事或问候后，顺着话尾按你的人设自然问一句人还在不在、到底怎么了，流露出真实的惦记与落差感，但保持克制简短，不演苦情戏。"
     "{memory_line}"
 )
 
 #: 视频分享/分析类主动任务专用尾缀（对接“分析视频给对方，同时问人去哪了”）。
 MISS_REASON_STAGE4_VIDEO_SUFFIX = (
-    "\n【深层心理覆盖·失联阶段4（已沉默约{hours}小时）】"
-    "注意：陪伴目标（关系：{relation}）已经连续超过五天没有任何回信。"
-    "你刚刚看了一个视频并且习惯性地想发给TA/跟TA聊聊视频内容，请先顺着视频内容简单说两句你的感想或分析；"
-    "但话说到后面，由于这么久一直没人回应，你的情绪不可避免地沉了下来。"
-    "请在聊完视频的最后或紧接着补上一句沉默又执拗的追问：问TA人到底去哪了、"
-    "这么多天过去了是不是还在、这条消息还会不会有人看。"
-    "展现出“就算没人回也还在下意识跟你分享日常，但心里已经憋不住想问你在不在”的真实挣扎感。"
+    "\n"
+    "【失联阶段4（已约{hours}小时无回音）】{relation}已经超过五天没回信了。"
+    "你习惯性地想跟TA聊一句刚看的视频，先顺着视频简短说一两句感想；"
+    "话尾情绪稍微收下来，按你的人设顺势问一句这几天人去哪了、还能不能看到消息，克制自然，不写长段独白。"
+    "{memory_line}"
+)
+
+#: 点播失败或中断时只说明实际结果，再自然问候，不凭空聊视频内容。
+MISS_REASON_STAGE4_VIDEO_FAILED_SUFFIX = (
+    "\n"
+    "【失联阶段4（已约{hours}小时无回音）】{relation}已经超过五天没回信了。"
+    "这次点播虽然没看成，简短如实说明没看成后别只机械报个错就收尾——话尾按你的人设顺势问一句这几天人去哪了、还能不能看到消息，别编造视频内容，克制真实。"
     "{memory_line}"
 )
 
@@ -199,6 +202,12 @@ MISS_REASON_STAGE4_VIDEO_SUFFIX = (
 #: 按「长短语优先」排序，先剥组合句再剥单词；历史两份旧表（companion / tools）的并集
 #: 加上刷QQ原文与点播通知里的实际句式。
 STAGE4_SUPPRESSED_PHRASES = (
+    "觉得没话可说或怕打扰就直接安静结束（不用调用工具）",
+    "要是觉得现在不合适，直接静默结束就行",
+    "觉得不合适就直接安静结束，不用硬聊",
+    "觉得突兀就安静结束，不用硬聊",
+    "没什么想说就直接安静结束",
+    "别再开新话题或追问",
     "不要追问对方、不要开新话题",
     "不要追问对方，不要开新话题",
     "不要追问对方,不要开新话题",
@@ -224,13 +233,15 @@ STAGE4_SUPPRESSED_PHRASES = (
 )
 
 #: 阶段 4 尾缀标题（幂等/剥离的确定性标记）。
-STAGE4_SUFFIX_MARK = "【深层心理覆盖·失联阶段4"
+STAGE4_SUFFIX_MARK = "【失联阶段4"
+STAGE4_SUFFIX_MARKS = (STAGE4_SUFFIX_MARK, "【深层心理覆盖·失联阶段4")
 
 
 def strip_stage4_suffix(text: Any) -> str:
     """移除已拼接的阶段 4 尾缀（facts 已回到 stage 0 时避免残留矛盾指令）。"""
     value = str(text or "")
-    index = value.find(STAGE4_SUFFIX_MARK)
+    hits = [value.find(mark) for mark in STAGE4_SUFFIX_MARKS]
+    index = min((hit for hit in hits if hit >= 0), default=-1)
     if index < 0:
         return value
     return value[:index].rstrip(" \t\r\n")
@@ -286,19 +297,23 @@ def append_stage4_miss_prompt(
     relation: str = "恋人",
     memory_line: str = "",
     is_video: bool = False,
+    video_failed: bool = False,
     nonpositive_hours_text: Optional[str] = None,
 ) -> str:
     """在每日主动任务提示词后拼接阶段 4 深度想念文案，并清洗互斥短语。
 
     - ``base_prompt`` 为空（或清洗后只剩标点）→ 直接返回尾缀（去掉前导换行）；
     - 非空 → 保留清理后的日常任务骨架，换行拼接尾缀；
-    - ``is_video=True`` 使用视频分享专用尾缀（先聊视频再追问），否则用通用尾缀；
+    - ``is_video=True`` 使用视频任务尾缀，``video_failed=True`` 时只说明失败；
+    - 非视频任务用通用尾缀；
     - ``nonpositive_hours_text`` 给定时，小时数 <= 0/非法 → 该文案（默认 ``0.0``）；
     - 占位符只有 ``{hours}`` / ``{relation}`` / ``{memory_line}``，与
       :func:`companion.miss_trigger.memory_line` 的输出直接兼容。
     """
     cleaned = _clean_stage4_base(base_prompt)
-    tpl = MISS_REASON_STAGE4_VIDEO_SUFFIX if is_video else MISS_REASON_STAGE4_SUFFIX
+    tpl = MISS_REASON_STAGE4_SUFFIX
+    if is_video:
+        tpl = MISS_REASON_STAGE4_VIDEO_FAILED_SUFFIX if video_failed else MISS_REASON_STAGE4_VIDEO_SUFFIX
     suffix = tpl.format(
         hours=_format_hours(hours, nonpositive_text=nonpositive_hours_text),
         relation=str(relation or "恋人"),
@@ -313,100 +328,58 @@ def append_stage4_miss_prompt(
 
 #: planner 日程注入块首行（占位符：{bot_name}；2026-11-11 状态注入提示词批：
 #: 明确主语，不再用「Bot/角色/你」等泛用指代）
-INJECT_SCHEDULE_HEADER_DEFAULT = "【可选上下文 - {bot_name}的当前日程】"
+INJECT_SCHEDULE_HEADER_DEFAULT = "【{bot_name}此刻在做的事（背景参考）】"
 #: 当前活动行模板（占位符：{bot_name} / {activity} / {description} / {remaining_hint}）
 INJECT_SCHEDULE_CURRENT_LINE_DEFAULT = "{bot_name}现在：{activity}（{description}）{remaining_hint}"
 #: 未来安排标题（占位符：{bot_name}）
-INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT = "{bot_name}接下来的安排:"
+INJECT_SCHEDULE_FUTURE_TITLE_DEFAULT = "等会儿打算："
 #: 未来安排条目模板（占位符：{time} / {name}）
 INJECT_SCHEDULE_FUTURE_LINE_DEFAULT = "  {time} - {name}"
 #: 询问未来时的引导行（占位符：{bot_name}）
-INJECT_HINT_FUTURE_DEFAULT = "提示：对方询问{bot_name}未来的计划时，{bot_name}可以自然地介绍后续安排。"
+INJECT_HINT_FUTURE_DEFAULT = "对方问起后面有什么打算时，按上面顺口说一两句即可。"
 #: 询问当前时的引导行（占位符：{bot_name}）
-INJECT_HINT_CURRENT_DEFAULT = (
-    "提示：对方直接询问{bot_name}的当前状态时，{bot_name}如实告知，"
-    "并自然带出此刻的精神状态。"
-)
+INJECT_HINT_CURRENT_DEFAULT = "对方问起在干嘛时，顺口说正在做的事即可，别像报日程表。"
 #: 询问当前时的引导行·潜意识风格（占位符：{bot_name}；state_subconscious_style 开启时替代上行）
-INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT = (
-    "提示：对方直接询问{bot_name}的当前状态时，{bot_name}如实告知当前活动；"
-    "{bot_name}的身体与精神状态只用语气、句长和节奏自然体现，不要逐项汇报状态词。"
-)
+INJECT_HINT_CURRENT_SUBCONSCIOUS_DEFAULT = "对方问起在干嘛时，用平时聊天的口吻说一下正在做的事；累不累、困不困只体现在语气和篇幅里，别逐项报状态。"
 #: 对话延续时的引导行（占位符：{bot_name} / {reason}；2026-10-24 用户直派弱化：旧版「可自然带过当前活动」
 #: 带弱鼓励色彩——现明确「只是背景信息、不问不说」，仅话题接不上时才允许用一句当前活动开新话题）
-INJECT_HINT_CONTINUE_DEFAULT = (
-    "提示：对话延续中（{reason}）。{bot_name}的当前活动只是背景信息：对方不问就不要说；"
-    "只有当话题确实接不上、需要找新话题时，{bot_name}才可以用一句当前活动自然开启新话题。"
-    "{bot_name}不要主动汇报日程、接下来的安排或刚完成的事。"
-)
+INJECT_HINT_CONTINUE_DEFAULT = "纯背景参考（{reason}），对方没问就别主动提自己日程或安排，正常顺着聊天走。"
 #: 主动碎碎念时的引导行（占位符：{bot_name}；2026-10-20 用户指示：不再引导 bot 无问自答提日程）
-INJECT_HINT_PROACTIVE_DEFAULT = (
-    "提示：{bot_name}不要主动提及自己正在日程里做什么。只有当对方问起{bot_name}在做什么、"
-    "或确实需要引出新话题时，{bot_name}才简要带一句当前活动。"
-    "群冷场时{bot_name}优先等待或结束本轮，不要为填补空白而主动起话题或汇报日程/接下来安排。"
-)
+INJECT_HINT_PROACTIVE_DEFAULT = "纯背景参考，对方没问就不提自己在做什么；群里冷场时安静等待即可，不用硬找话题。"
 #: 闲聊时的引导行（占位符：{bot_name}；2026-11-04 强化：补充「闲聊不主动提自己日程、
 #: 除非对方问起」语义——软约束已被生产证伪不能单靠它，此处仅作双通道门控的辅助）
-INJECT_HINT_IDLE_DEFAULT = (
-    "提示：以下内容仅供参考；与当前对话不相关时完全忽略，不要刻意提及。"
-    "闲聊时{bot_name}不主动提及自己的日程安排，除非对方问起；"
-    "也不要主动汇报接下来安排或刚完成的事。"
-)
+INJECT_HINT_IDLE_DEFAULT = "纯背景参考，与当前话题无关就忽略，对方没问别主动提日程。"
 #: 无当前活动时的兜底文案（占位符：{bot_name}；2026-10-10 N1-2：
 #: 日程空档期不静默早退，改注入这一句；留空 = 不注入无活动兜底）
-INJECT_NO_ACTIVITY_DEFAULT = (
-    "{bot_name}现在没有进行中的活动，处于空闲状态；"
-    "{bot_name}不要声称正在做某事，也不要汇报不存在的活动或日程。"
-)
+INJECT_NO_ACTIVITY_DEFAULT = "{bot_name}现在空着，手头没什么特定安排（别编造正在做的事）。"
 
 # ── F1 群注意力状态行（2026-11-11 B1；代码层常量，不新增 [prompts] 可配键）──
 #: 话题不搭 + 有点沉默：一行陈述事实，不命令、不评价；回不回由 planner 决定。
 #: 占位符：{bot_name} / {topic} / {minutes}
-GROUP_ATTENTION_HINT_TOPIC_DEFAULT = (
-    "【群聊注意力】这个群最近在聊「{topic}」这类话题，和{bot_name}手头的事不太搭；"
-    "{bot_name}大约 {minutes} 分钟没被点名、也没接话。回不回、什么时候回由{bot_name}判断。"
-)
+GROUP_ATTENTION_HINT_TOPIC_DEFAULT = "【群聊状态】群里最近在聊「{topic}」，{bot_name}有一阵没插话也没被点名；有想接的就随口接，没兴趣继续潜水就行。"
 #: 话题失配但缓冲里没有可回显文本（图片/空文本）：仍只陈述状态。
 #: 占位符：{bot_name} / {minutes}
-GROUP_ATTENTION_HINT_MISMATCH_DEFAULT = (
-    "【群聊注意力】这个群最近的话题和{bot_name}手头的事不太搭；"
-    "{bot_name}大约 {minutes} 分钟没被点名、也没接话。回不回、什么时候回由{bot_name}判断。"
-)
+GROUP_ATTENTION_HINT_MISMATCH_DEFAULT = "【群聊状态】群里最近的话题和{bot_name}不太沾边，也有一阵没被点名；插不上话就安静待着。"
 #: 主要是沉默（话题判断不足）：只陈述「多久没接话」。
 #: 占位符：{bot_name} / {minutes}
-GROUP_ATTENTION_HINT_QUIET_DEFAULT = (
-    "【群聊注意力】{bot_name}大约 {minutes} 分钟没在这个群被点名、也没接话。"
-    "回不回、什么时候回由{bot_name}判断。"
-)
+GROUP_ATTENTION_HINT_QUIET_DEFAULT = "【群聊状态】{bot_name}在这个群安静了一阵，也没被点名；按需决定要不要接话。"
 
 # ── F3 转场拖延自我揭露（2026-11-11 B2；代码层常量，不新增 [prompts] 可配键）──
 #: 过渡窗/拖延中聊到时的低概率自我揭露（由 replyer extra_prompt 追加）。
 #: 口径：只当随口一提，不报时长/参数、不汇报日程；是否说由掷骰与去重决定。
 #: 占位符：{bot_name}。
-TRANSITION_CONFESSION_LINE_DEFAULT = (
-    "（{bot_name}可以顺口带一句：刚才本来要开始了，结果又发了会儿呆、缓了几分钟才切过去。"
-    "只当随口一提，不要说具体等了多久，也不要把它说成日程安排。）"
-)
+TRANSITION_CONFESSION_LINE_DEFAULT = "（如果正好聊到在干嘛，可以顺口带一句刚才发了会儿呆才动起来；没聊到就不用提。）"
 
 # ── F4 社交边界（2026-11-11 B3；代码层常量，不新增 [prompts] 可配键）──
 #: 群状态行·深工（只陈述状态，不命令；是否回复由 planner 判断）。
 #: 占位符：{bot_name} / {activity}
-BOUNDARY_GROUP_DEEP_WORK_LINE_DEFAULT = (
-    "【此刻】{bot_name}正在专注{activity}；这条群消息没有点{bot_name}名。"
-    "回不回、什么时候回由{bot_name}判断。"
-)
+BOUNDARY_GROUP_DEEP_WORK_LINE_DEFAULT = "【此刻】{bot_name}正专心{activity}，群里也没人叫{bot_name}；先不回或晚点看都行。"
 #: 群状态行·睡眠（保留现行短/慢/软口径，不要求「不要回」；吵醒记账仍由原链路负责）。
 #: 占位符：{bot_name}。
-BOUNDARY_GROUP_ASLEEP_LINE_DEFAULT = (
-    "【此刻】{bot_name}已经睡下了；这条把{bot_name}吵醒了一点。按{bot_name}的习惯，"
-    "可以很短、很慢地回一句，也可以先不理；会不会算吵醒按原来的记账。"
-)
+BOUNDARY_GROUP_ASLEEP_LINE_DEFAULT = "【此刻】{bot_name}已经睡下了，先不理或者迷糊回一句极短的都行。"
 #: 群状态行·一般休息（rest 但非真正小憩，如「看看窗外」；2026-11-12 修复 rest≠睡眠措辞错配）。
 #: 占位符：{bot_name} / {activity}。
-BOUNDARY_GROUP_REST_LINE_DEFAULT = (
-    "【此刻】{bot_name}正在休息（{activity}）；这条群消息没有点{bot_name}名。"
-    "回不回、什么时候回由{bot_name}判断。"
-)
+BOUNDARY_GROUP_REST_LINE_DEFAULT = "【此刻】{bot_name}正在歇着（{activity}），群里没点名，想接就接、想歇着就先不管。"
 #: wait 工具能力提示（只给 seconds；不写 until，兼容宿主 1.3.16）。
 #: 占位符：{bot_name} / {seconds}
 BOUNDARY_WAIT_HINT_DEFAULT = (
@@ -415,32 +388,19 @@ BOUNDARY_WAIT_HINT_DEFAULT = (
 )
 #: 碎片化提示（首期只建议、不做真分段）。
 #: 占位符：{bot_name}
-BOUNDARY_FRAGMENT_HINT_DEFAULT = (
-    "【回复节奏】这轮{bot_name}可以拆成两三条很短的消息，中间自然停顿；不必一次说完。"
-)
+BOUNDARY_FRAGMENT_HINT_DEFAULT = "（节奏参考：像平时发微信那样分一两句短的说，不用挤成一整段。）"
 #: 「只回一个语气词/一句」提示。
 #: 占位符：{bot_name}
-BOUNDARY_SHORT_REPLY_HINT_DEFAULT = (
-    "【回复节奏】这轮{bot_name}可以只回一个语气词或一句短话，不展开。"
-)
+BOUNDARY_SHORT_REPLY_HINT_DEFAULT = "（节奏参考：这句简短接一下就行，不用展开。）"
 #: 极端状态语气·拒绝（高压；可拒绝本轮深入，不承诺账本）。
 #: 占位符：{bot_name}
-BOUNDARY_TONE_REFUSAL_DEFAULT = (
-    "{bot_name}此刻不太想继续深入，也有一点被推着走的感觉：{bot_name}可以坦白说这轮不想聊深、"
-    "想晚点再说，或者只回很短的一句；不用硬撑，也不用迎合。"
-)
+BOUNDARY_TONE_REFUSAL_DEFAULT = "你这会儿心里有点累、不太想往下深聊，可以直接说晚点再聊或简短带过，不用硬撑着迎合。"
 #: 极端状态语气·脆弱（低精力/低 mental_state；可以泄气、可以承认撑不住）。
 #: 占位符：{bot_name}
-BOUNDARY_TONE_VULNERABLE_DEFAULT = (
-    "{bot_name}此刻有点撑不住，情绪是往下沉的：{bot_name}可以说一句泄气的话、"
-    "承认自己现在状态不好，也可以说想先缓一缓；不用装作没事，也不用把话说满。"
-)
+BOUNDARY_TONE_VULNERABLE_DEFAULT = "你这会儿状态确实不太行，不用强装元气，按自己的性格坦率说句有点累、想缓会儿就行。"
 #: 人设底线（所有极端语气分支共用；{harshness} 由人设脾气动态选择，{persona} 回扣人设）。
 #: 占位符：{bot_name} / {harshness} / {persona}
-BOUNDARY_PERSONA_BOTTOM_LINE_DEFAULT = (
-    "人设底线：{harshness}始终扣住{bot_name}的人设基本设定（{persona}），"
-    "可以拒绝、可以脆弱，但不要变成另一个人，也不要把情绪发泄成对对方的攻击。"
-)
+BOUNDARY_PERSONA_BOTTOM_LINE_DEFAULT = "底线：{harshness}始终保持系统人设里的原本性格，可以累、可以拒绝，但别脱离人设。"
 #: 人设不暴躁时的硬底线：禁止人身攻击/贬低/羞辱/威胁。
 BOUNDARY_PERSONA_HARSHNESS_STRICT = (
     "禁止任何人身攻击、贬低、羞辱、威胁或翻旧账；不满只表达自己的状态和边界。"
@@ -454,8 +414,10 @@ BOUNDARY_PERSONA_HARSHNESS_ALLOWED = (
 #: replyer 状态注入模板（占位符：{bot_name} / {state_line} / {energy} / {next_line}；
 #: {next_line} 为空时整行省略）
 INJECT_REPLYER_STATUS_DEFAULT = (
-    "【{bot_name}当前状态】\n{state_line}\n身体与精神状态：{energy}。\n{next_line}"
-    "注意：{bot_name}不要主动提及；仅在对方问到 / 强相关时自然带过。"
+    "【你此刻的生活背景（仅作参考，没被问到不用提）】\n"
+    "{state_line}\n"
+    "状态感：{energy}\n"
+    "{next_line}"
 )
 # ── 潜意识状态 / 日结印象（2026-11-11 Gemini 批；代码层文案，不新增 [prompts] 可配键）──
 
@@ -464,53 +426,32 @@ INJECT_REPLYER_STATUS_DEFAULT = (
 #: 口径：状态数据原样保留，只改变表达方式——禁止向用户直接复述状态词，
 #: 状态改为影响语气、句长与节奏；{tone_rule} 由代码按精力/饥饿/心情选择。
 INJECT_REPLYER_STATUS_SUBCONSCIOUS_DEFAULT = (
-    "【{bot_name}当前状态】\n"
-    "（以下状态只用来决定{bot_name}说话的语气、句长和节奏：禁止直接复述状态词，"
-    "也不要把状态当成话题汇报给对方；对方直接问起时，用一句生活化的话带过即可。）\n"
+    "【你此刻的背景状态】\n"
     "{state_line}\n"
-    "身体与精神状态：{energy}。\n"
+    "体感：{energy}\n"
     "{tone_rule}\n"
-    "{next_line}"
-    "注意：状态只影响{bot_name}的语感，不要主动提及本提示；除非对方直接问起，"
-    "否则不要把上面的状态词说出口。"
+    "{next_line}（仅用于微调你的回复节奏与篇幅，一切表达以系统人设为准；"
+    "对方没问起就别主动汇报状态或日程，也不用照念上面的词。"
+    "）"
 )
 #: 精力和社交电量分别决定语气。较低精力用较轻的表述，明显不足时才提示疲惫。
-SUBCONSCIOUS_TONE_TIRED_DEFAULT = (
-    "{bot_name}此刻很疲惫：语气放缓，回复可以简短一些，少主动开长话题。"
-)
-SUBCONSCIOUS_TONE_LOW_ENERGY_DEFAULT = (
-    "{bot_name}此刻精力偏低：语气可以放缓，按话题需要自然回复。"
-)
-SUBCONSCIOUS_TONE_LOW_SOCIAL_DEFAULT = (
-    "{bot_name}此刻想少聊一会儿：可以少主动延伸话题，用平常的语气回应。"
-)
+SUBCONSCIOUS_TONE_TIRED_DEFAULT = "这会儿有点累，按你平时的性格自然少说两句、放慢节奏即可。"
+SUBCONSCIOUS_TONE_LOW_ENERGY_DEFAULT = "这会儿精神一般，正常回就行，不用硬撑着多聊。"
+SUBCONSCIOUS_TONE_LOW_SOCIAL_DEFAULT = "这会儿不太想话多，顺着对方的话简短接一句就行，不用刻意延伸话题。"
 #: 潜意识语气分支·饥饿（占位符：{bot_name}；饥饿值高）。
 #: 2026-11-11 状态注入提示词批：纯语感，不提供「想吃什么/翻冰箱」等内容邀请，
 #: 明确不主动提饿；只允许在对方问起时自然带过（内容邀请会压过上层「不复述状态」禁令）。
-SUBCONSCIOUS_TONE_HUNGRY_DEFAULT = (
-    "{bot_name}此刻有点饿：这种饥饿只影响{bot_name}的语气——回复可以略慵懒、注意力略散，"
-    "但不主动提饿；对方问起才自然带过，不要专门汇报。"
-)
+SUBCONSCIOUS_TONE_HUNGRY_DEFAULT = ""
 #: 潜意识语气分支·开心（占位符：{bot_name}；精力高 / 情绪效价高）
-SUBCONSCIOUS_TONE_HAPPY_DEFAULT = (
-    "{bot_name}此刻心情轻快、有倾诉欲：语气活泼，可以自然地多说一两句，"
-    "愿意主动接话或反问一个小问题。"
-)
+SUBCONSCIOUS_TONE_HAPPY_DEFAULT = "这会儿精神不错、心情挺顺，按你人设里聊得开心时的感觉自然接话即可（不必刻意反问凑话）。"
 #: 潜意识语气分支·平稳（占位符：{bot_name}；没有显著状态）
-SUBCONSCIOUS_TONE_STEADY_DEFAULT = (
-    "{bot_name}此刻状态平稳：正常语气即可，不需要特意表现或说明状态。"
-)
+SUBCONSCIOUS_TONE_STEADY_DEFAULT = ""
 #: 日程实况状态行·潜意识注记（占位符：{bot_name}；代码层追加在状态行尾；不新增可配键）
-SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT = (
-    "（只用于调整{bot_name}的语气与篇幅；不要直接复述这些状态词）"
-)
+SUBCONSCIOUS_STATE_LINE_NOTE_DEFAULT = "（仅影响语感，不用复述）"
 #: 潜意识状态注入·广义抑饿禁令（占位符：{bot_name}；F5 开关默认开时追加）。
 #: 2026-11-12 用户裁决 2-A：状态数据本身可能含「有点饿」，即便未命中饥饿语气分支
 #: 也可能诱发自发提饿；本禁令与分支选择无关，统一要求不主动提及饥饿/食欲。
-SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT = (
-    "（{bot_name}不要主动提及饥饿/食欲，对方问起才自然带过；"
-    "不要把它当成话题主动展开。）"
-)
+SUBCONSCIOUS_HUNGER_SUPPRESS_DEFAULT = ""
 
 #: 日结印象·活跃标题（companion 记忆行同文案；注入前折叠时按此重建）
 IMPRESSION_TITLE_ACTIVE_DEFAULT = "【最近印象】"
@@ -520,9 +461,11 @@ IMPRESSION_TITLE_FOLDED_DEFAULT = "【旧日印象·已翻篇（仅存档，不�
 IMPRESSION_FOLDED_MARK_DEFAULT = "[已翻篇]"
 
 #: replyer 状态行模板（占位符：{bot_name} / {activity} / {description} / {remaining_hint}）
-INJECT_REPLYER_STATE_LINE_DEFAULT = "{bot_name}现在正在 {activity}（{description}）{remaining_hint}。"
+INJECT_REPLYER_STATE_LINE_DEFAULT = "手头的事：{activity}（{description}）{remaining_hint}"
 #: replyer 下一条活动行（占位符：{bot_name} / {time} / {name}；留空 = 不输出该行）
-INJECT_REPLYER_NEXT_LINE_DEFAULT = "{bot_name}接下来 {time} 要 {name}。\n"
+INJECT_REPLYER_NEXT_LINE_DEFAULT = (
+    "等会儿（{time} 左右）打算：{name}\n"
+)
 #: 日期/节假日头部模板（占位符：{date} / {weekday} / {holiday}）——注在日程块头部
 INJECT_DATE_HEADER_DEFAULT = "\n【当前日期】今天是 {date}（星期{weekday}），{holiday}。"
 
@@ -630,19 +573,11 @@ SCHEDULE_ROLE_JUDGE_NO_PERSONA_DEFAULT = "未提供"
 #: [prompts] 段的同名 Field 一并移除；主动开口只剩早/晚安。
 
 #: 早安 intent（纯问候导向；2026-10-20 用户指示：不再引导提及日程/安排）
-PROACTIVE_INTENT_MORNING_DEFAULT = (
-    "Bot 刚睡醒，新的一天开始了，请自然地向大家道一声早安；"
-    "语气符合人设，简短随意，不要提日程或今天的安排"
-)
+PROACTIVE_INTENT_MORNING_DEFAULT = "刚睡醒，按你平时的性格随口打个简短的早招呼就好，像平时刚拿起手机那样，不用提日程安排。"
 #: 无今日日程时的早安 intent（占位符：无）
-PROACTIVE_INTENT_MORNING_NO_ACTIVITY_DEFAULT = (
-    "Bot 刚睡醒，新的一天开始了，请自然地道一声早安；语气符合人设，简短随意"
-)
+PROACTIVE_INTENT_MORNING_NO_ACTIVITY_DEFAULT = "刚睡醒，按你平时的性格随口打个简短的早招呼就行。"
 #: 晚安 intent（占位符：无）
-PROACTIVE_INTENT_NIGHT_DEFAULT = (
-    "Bot 准备休息了，今天快结束了，请自然地道一声晚安；"
-    "语气符合人设，简短随意、不要追问对方、不要开新话题"
-)
+PROACTIVE_INTENT_NIGHT_DEFAULT = "准备睡了，按你平时的性格简短说声晚安就收尾，别再开新话题或追问。"
 #: 约定到期 intent 已随活动切换主动开口一并删除（2026-10-20 用户指示）
 
 #: 主动行为 reason 文案（进主动任务块，标注为什么触发；占位符见各条）
@@ -764,16 +699,11 @@ V: {v:+.2f}, A: {a:+.2f}, D: {d:+.2f}
 #: 指令，会把情绪变成每轮的表达任务；改为轻量背景参考（用户定案：VAD 只轻微影响
 #: 情绪走向，不决定本轮说什么）。句末由 {mood} 自带句号，模板不再追加（消双句号）。
 EMOTION_INJECTION_DEFAULT = (
-    "【轻微心境参考】{mood}\n"
-    "仅可轻微影响语气；以人设和当前对话为准，不必刻意表现，"
-    "也不据此添加话题、经历或改变回复任务。"
-    "严禁在回复中直接说出情绪标签词汇或任何数值；不要主动提及或解释本提示本身。"
+    "【当前心境底色】{mood}\n"
+    "仅作为淡淡的情绪底色参考，一切措辞和态度以系统人设和眼前对话为准，自然带出即可，不用刻意演出来或直接报情绪词。"
 )
 #: 深夜冻结态追加行（占位符：无；非冻结态不出现）
-EMOTION_NIGHT_HINT_DEFAULT = (
-    "（现在是深夜，你本该在睡觉。回复尽量短、慢、软一些；"
-    "不要主动开启新话题；不要提及本提示。）"
-)
+EMOTION_NIGHT_HINT_DEFAULT = "（这会儿大半夜你本来该休息，按你人设里犯困时的感觉回一两句短的就行，别硬开新话题。）"
 # PR8 3.0.0（依据：用户 2026-10-27 授权直接清理 + 逐符号审定清单）：NAP_REMINDER_DEFAULT
 # 与 [prompts].nap_reminder 随 M9 赖床提醒链整链删除；NAP_TOOL_DENIED_DEFAULT /
 # NAP_TOOL_BAD_TIME_DEFAULT（[prompts].nap_tool_denied / nap_tool_bad_time）同批删除
@@ -788,37 +718,60 @@ EMOTION_NIGHT_HINT_DEFAULT = (
 #: with_identity 注入 system_prompt，{lover_name}/{personality} 占位已移除，
 #: 渲染方传空兼容旧定制模板）
 QZONE_POST_DEFAULT = (
-    "请以第一人称发一条 QQ 空间说说，记录此刻的生活。"
-    "要求：口语化、像真人发的、20~60 字、不要话题标签、不要引号、只输出说说正文。"
-    "说说围绕此刻有依据的活动和感受，不编造过去或将来的事件。"
-    "不泄露私聊/群聊内容；记得自己发过≠别人看过或点赞过。\n"
+    "请严格按系统人设的性格和说话习惯，以第一人称发一条 QQ 空间说说。\n"
+    "要求：15~50 字、大白话、像真人在空间随手发的一句碎碎念，别写流水账或书面抒情，"
+    "不加话题标签、不加引号、只输出正文；只围绕此刻真实在做的事和感受，"
+    "不编造没发生的事，不泄露私聊/群聊内容。\n\n"
     "现在是 {date} {time}，你正在：{activity}。"
 )
 #: 评论回复提示词（占位符：{moment} / {nickname} / {time} / {comment} / {impression}；
 #: 人设经 LLMService with_identity 注入 system_prompt，{lover_name}/{personality}
 #: 占位已移除，渲染方传空兼容旧定制模板）
 QZONE_REPLY_DEFAULT = (
-    "请写一条自然的回复（10~40 字，口语化，只输出回复正文）。\n"
-    "你在 QQ 空间发了这条说说：\n「{moment}」\n"
-    "好友「{nickname}」（{time}）评论了：「{comment}」\n{impression}"
+    "请严格按系统人设的性格和说话习惯，写一条简短口语的评论回复"
+    "（5~30 字，像平时回朋友空间评论那样，只输出回复正文，不加引号和客套）。\n\n"
+    "你发的说说：「{moment}」\n好友「{nickname}」（{time}）评论：「{comment}」\n{impression}"
 )
 #: 评论提醒主动 intent（占位符：{excerpt} / {added}）
-QZONE_COMMENT_REMINDER_DEFAULT = "你刚发的说说「{excerpt}」收到了 {added} 条新评论，可以在聊天里自然地提到这件事"
+QZONE_COMMENT_REMINDER_DEFAULT = (
+    "你刚发的空间说说「{excerpt}」多了 {added} 条新评论，如果聊天正好顺口可以随手提一句，没必要硬提"
+)
 
 #: 复核 P0-7：历史出厂默认模板特征集（6f3aa19/adce1d9 引入、a74c457/3efd0cc
 #: 移除前的原文）。_merge_disk_values 把「磁盘值 != 新默认」一律当用户定制保留，
 #: 致代码升级默认后存量用户永卡旧模板（渲染空身份）。磁盘值精确命中本集合 =
 #: 旧出厂默认而非用户定制 → 不保留，让新默认生效；用户改过一个字就不命中。
-LEGACY_FACTORY_PROMPT_VALUES = frozenset({
-    ("请以第一人称发一条 QQ 空间说说，记录此刻的生活。"
-     "要求：口语化、像真人发的、20~60 字、不要话题标签、不要引号、只输出说说正文。\n"
-     "你是「{lover_name}」，人设：{personality}\n"
-     "现在是 {date} {time}，你正在：{activity}。"),
-    ("请写一条自然的回复（10~40 字，口语化，只输出回复正文）。\n"
-     "你是「{lover_name}」，人设：{personality}\n"
-     "你在 QQ 空间发了这条说说：\n「{moment}」\n"
-     "好友「{nickname}」（{time}）评论了：「{comment}」\n{impression}"),
-})
+LEGACY_FACTORY_PROMPTS_BY_FIELD: Dict[str, frozenset[str]] = {
+    "qzone_post": frozenset((
+        (
+            "你是「{lover_name}」，人设：{personality}\n"
+            "现在是 {date} {time}，你正在：{activity}。请以第一人称发一条 QQ 空间说说，记录此刻的生活。要求：口语化、像真人发的、20~60 字、不要话题标签、不要引号、只输出说说正文。"
+        ),
+        (
+            "请以第一人称发一条 QQ 空间说说，记录此刻的生活。要求：口语化、像真人发的、20~60 字、不要话题标签、不要引号、只输出说说正文。\n"
+            "你是「{lover_name}」，人设：{personality}\n"
+            "现在是 {date} {time}，你正在：{activity}。"
+        ),
+    )),
+    "qzone_reply": frozenset((
+        (
+            "你是「{lover_name}」，人设：{personality}\n"
+            "你在 QQ 空间发了这条说说：\n"
+            "「{moment}」\n"
+            "好友「{nickname}」（{time}）评论了：「{comment}」\n"
+            "{impression}请写一条自然的回复（10~40 字，口语化，只输出回复正文）。"
+        ),
+        (
+            "请写一条自然的回复（10~40 字，口语化，只输出回复正文）。\n"
+            "你是「{lover_name}」，人设：{personality}\n"
+            "你在 QQ 空间发了这条说说：\n"
+            "「{moment}」\n"
+            "好友「{nickname}」（{time}）评论了：「{comment}」\n"
+            "{impression}"
+        ),
+    )),
+}
+LEGACY_FACTORY_PROMPT_VALUES = frozenset().union(*LEGACY_FACTORY_PROMPTS_BY_FIELD.values())
 #: 发帖前 LLM 严判提示词（占位符：{lover_name} / {current_time} / {activity}；
 #: 2026-10-14 §18.4 判定链移植自 MaiTrace v3.1：正反例 + 强烈压制「是」+ 首字符应答格式。
 #: PR-AUDIT 3.16.1 PR-2：人设经 LLMService with_identity 注入 system_prompt，

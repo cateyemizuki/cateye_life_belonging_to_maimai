@@ -215,13 +215,13 @@ def persona_is_hot_tempered(text: Any) -> bool:
 
 
 def compose_persona_bottom_line(persona: Any, bot_name: Any = "麦麦") -> str:
-    """拼人设底线：{harshness} 按人设脾气动态选择，{persona} 回扣人设基本设定。"""
+    """按人设脾气选择底线约束，角色设定仍由系统提示提供。"""
     body = str(persona or "")
     harshness = (BOUNDARY_PERSONA_HARSHNESS_ALLOWED if persona_is_hot_tempered(body)
                  else BOUNDARY_PERSONA_HARSHNESS_STRICT)
     return BOUNDARY_PERSONA_BOTTOM_LINE_DEFAULT.format(
         bot_name=str(bot_name or "").strip() or "麦麦",
-        harshness=harshness, persona=persona_anchor(body))
+        harshness=harshness)
 
 
 def _walk_addressed(payload: Any, names: Tuple[str, ...], depth: int = 0) -> bool:

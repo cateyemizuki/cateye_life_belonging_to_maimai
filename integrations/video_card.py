@@ -1,8 +1,4 @@
-"""Request the provider's native Bilibili mini-app card and transmit it as-is.
-
-No local card format is substituted. Acknowledgment alone never proves a card
-was delivered. QQ history must contain the same message and provider identity.
-"""
+"""Send Bilibili copy links or official QQ illustrated cards with a scoped receipt."""
 from __future__ import annotations
 
 import asyncio
@@ -12,15 +8,17 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Iterator
 
-from integrations.snowluma_bili_miniapp import (
-    BILI_APP_ID,
-    MiniAppProtocolError,
-    lookup_packet,
-    sign_packet,
-    signed_card_json,
-    verify_video_route,
+import httpx
+
+from integrations.video_web_card import (
+    COPY_LINK,
+    WEB_CARD,
+    bili_copy_short_link,
+    bili_video_metadata,
+    build_bili_web_card,
+    format_bili_copy_share,
+    valid_bili_copy_url,
 )
-from integrations.video_web_card import build_bili_miniapp_request, normalized_qq_launch_url
 
 PASSTHROUGH_API = "adapter.napcat.action.call"
 _CALL_TIMEOUT_SECONDS = 30.0
@@ -31,21 +29,8 @@ _HISTORY_COUNT = 16
 
 _QQ_RE = re.compile(r"^[0-9]{5,12}$")
 _MESSAGE_ID_RE = re.compile(r"-?[0-9]{1,20}\Z")
-_MINIAPP_CARD = "com.tencent.miniapp_01"
+_QQ_WEB_CARD = "com.tencent.tuwen.lua"
 _QQ_PLACEHOLDER = "发送者版本过低，无法展示内容"
-_GENERATION_ERRORS = {
-    "invalid_bvid": "无效的 BV 号",
-    "adapter_identity_unavailable": "QQ 适配器未返回可核验的版本信息",
-    "card_generation_timeout": "等待 QQ 签发或校验卡片超时",
-    "qq_sign_rejected": "QQ 拒绝签发哔哩哔哩小程序卡片",
-    "qq_sign_unverified": "无法确认 QQ 签发结果",
-    "qq_card_invalid": "QQ 未返回可用的哔哩哔哩原生小程序卡片",
-    "qq_web_fallback_mismatch": "QQ 卡片未包含该 BV 对应的网页回退地址",
-    "qq_launch_internal_test": "QQ 返回了小程序内测提示",
-    "qq_launch_rejected": "QQ 拒绝校验小程序启动链接",
-    "qq_launch_unverified": "无法核验 QQ 小程序启动链接",
-    "qq_launch_mismatch": "QQ 小程序启动链接未指向请求的 BV",
-}
 
 ApiCaller = Callable[..., Awaitable[Any]]
 
@@ -70,26 +55,6 @@ def _onebot_failed(reply: Dict[str, Any]) -> bool:
     return reply.get("status") == "failed" or (type(retcode) is int and retcode != 0)
 
 
-def _adapter_app_name(response: Any) -> str:
-    for layer in _response_layers(response):
-        if layer.get("success") is False or _onebot_failed(layer):
-            return ""
-        name = layer.get("app_name")
-        if isinstance(name, str) and name.strip():
-            return name.strip().casefold()
-    return ""
-
-
-def _packet_response_hex(response: Any) -> str:
-    for layer in _response_layers(response):
-        if layer.get("success") is False or _onebot_failed(layer):
-            return ""
-        retcode, payload = layer.get("retcode"), layer.get("data")
-        if type(retcode) is int and retcode == 0 and isinstance(payload, str):
-            return payload
-    return ""
-
-
 def _receipt_error(response: Any) -> str:
     messages = " ".join(
         value.casefold() for row in _response_layers(response)
@@ -111,66 +76,26 @@ def _qq_message_id(value: Any) -> int:
     return int(text) if _MESSAGE_ID_RE.fullmatch(text) else 0
 
 
-def _native_card_identity(card: Any) -> tuple[str, str] | None:
-    if not isinstance(card, dict) or card.get("app") != _MINIAPP_CARD:
+def _validated_descriptor(card: Any) -> dict | None:
+    if not isinstance(card, dict):
         return None
-    meta, config = card.get("meta"), card.get("config")
-    detail = meta.get("detail_1") if isinstance(meta, dict) else None
-    if not isinstance(detail, dict) or str(detail.get("appid")) != BILI_APP_ID:
+    mode = card.get("format")
+    bvid, title = card.get("bvid"), card.get("title")
+    if not isinstance(bvid, str) or not isinstance(title, str):
         return None
-    launch = normalized_qq_launch_url(detail.get("url"))
-    token = config.get("token") if isinstance(config, dict) else None
-    if not launch or not isinstance(token, str) or not token.strip():
-        return None
-    return launch, token
-
-
-def _parse_native_card(raw: Any) -> dict | None:
-    if isinstance(raw, str):
-        if not raw or len(raw) > 65536:
-            return None
-        try:
-            raw = json.loads(raw)
-        except (ValueError, RecursionError):
-            return None
-    return raw if _native_card_identity(raw) else None
-
-
-def _original_provider_card(response: Any) -> str:
-    """Preserve returned JSON text; serialize a provider object without field changes."""
-    if isinstance(response, str):
-        return response if _parse_native_card(response) is not None else ""
-    for row in _response_layers(response):
-        if row.get("success") is False or _onebot_failed(row):
-            return ""
-        if _native_card_identity(row):
-            raw = json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            return raw if len(raw) <= 65536 else ""
-        for field in ("data", "result"):
-            raw = row.get(field)
-            if isinstance(raw, str) and _parse_native_card(raw) is not None:
-                return raw
-    return ""
-
-
-def _snowluma_ark(provider_json: str) -> dict[str, Any]:
     try:
-        provider = json.loads(provider_json)
-        if not isinstance(provider, dict) or not isinstance(provider.get("appView"), str) or not provider["appView"]:
-            raise ValueError("invalid provider card")
-    except (ValueError, RecursionError):
-        raise MiniAppProtocolError("qq_card_invalid") from None
-    # Match SnowLuma's OneBot Ark envelope, keeping QQ's config and metadata intact.
-    return {
-        "ver": provider.get("ver"),
-        "prompt": provider.get("prompt"),
-        "config": provider.get("config"),
-        "app": provider.get("appName"),
-        "view": provider["appView"],
-        "meta": provider.get("metaData"),
-        "miniappShareOrigin": 3,
-        "miniappOpenRefer": "10002",
-    }
+        bvid, title = bili_video_metadata(bvid, title)
+    except ValueError:
+        return None
+    if mode == COPY_LINK:
+        url = card.get("url")
+        if not isinstance(url, str) or not valid_bili_copy_url(url, bvid):
+            return None
+        return {"format": mode, "text": format_bili_copy_share(title, url)}
+    if mode == WEB_CARD:
+        return {"format": mode, **build_bili_web_card(
+            bvid=bvid, title=title, desc=card.get("desc", ""), pic_url=card.get("preview_url", ""))}
+    return None
 
 
 def _read_segment(message: Any) -> tuple[str, Any]:
@@ -193,9 +118,13 @@ def _read_segment(message: Any) -> tuple[str, Any]:
 
 
 def _matches_card(body: Any, expected: dict) -> bool:
-    """Match the opaque native launch and token; the server can add display metadata."""
-    identity = _native_card_identity(body)
-    return identity is not None and identity == _native_card_identity(expected)
+    if not isinstance(body, dict) or body.get("app") != _QQ_WEB_CARD:
+        return False
+    meta = body.get("meta")
+    news = meta.get("news") if isinstance(meta, dict) else None
+    # QQ can shorten the title in the recorded card. The exact mobile destination
+    # identifies the requested video within the scoped, newly observed message.
+    return isinstance(news, dict) and news.get("jumpUrl") == expected["jump_url"]
 
 
 @dataclass(frozen=True)
@@ -237,73 +166,32 @@ def _scoped_history_message(row: Any, kind: str, peer: str, account: str) -> _Hi
 
 class VideoCardService:
     def __init__(self, api_caller: ApiCaller, logger: Any = None,
-                 call_timeout_seconds: float = _CALL_TIMEOUT_SECONDS) -> None:
+                 call_timeout_seconds: float = _CALL_TIMEOUT_SECONDS, *,
+                 format_provider: Callable[[], str] | None = None) -> None:
         self._api = api_caller
         self._log = logger
         self._timeout = max(1.0, float(call_timeout_seconds))
+        self._format = format_provider or (lambda: COPY_LINK)
         self._active: set[tuple[str, str]] = set()
 
     async def generate_card(self, *, bvid: str, title: str, desc: str = "",
                             pic_url: str = "") -> Dict[str, Any]:
-        """Request a fresh genuine Bilibili mini-app card without sending it."""
+        """Prepare the current share format without sending a message."""
         try:
-            params = build_bili_miniapp_request(bvid=bvid, title=title, desc=desc, pic_url=pic_url)
-        except (TypeError, ValueError):
-            return self._generation_failure("invalid_bvid")
+            bvid, title = bili_video_metadata(bvid, title)
+        except ValueError:
+            return {"success": False, "error_class": "card_generation_failed", "reason": "invalid_bvid"}
+        if self._format() == WEB_CARD:
+            card = build_bili_web_card(bvid=bvid, title=title, desc=desc, pic_url=pic_url)
+            return {"success": True, "card": {"format": WEB_CARD, "bvid": bvid, **card}}
+        url = f"https://www.bilibili.com/video/{bvid}"
         try:
-            raw = await asyncio.wait_for(self._generate(params), timeout=self._timeout)
-        except asyncio.CancelledError:
-            raise
-        except asyncio.TimeoutError:
-            return self._generation_failure("card_generation_timeout")
-        except MiniAppProtocolError as exc:
-            return self._generation_failure(str(exc))
-        except Exception:
-            return self._generation_failure("qq_card_invalid")
-        if not raw:
-            return self._generation_failure("qq_card_invalid")
-        return {"success": True, "card": {"ark_json": raw}}
-
-    async def _generate(self, params: dict[str, str]) -> str:
-        version = await self._api(PASSTHROUGH_API, action_name="get_version_info", params={})
-        app_name = _adapter_app_name(version)
-        if not app_name:
-            raise MiniAppProtocolError("adapter_identity_unavailable")
-        if app_name != "snowluma":
-            response = await self._api(
-                PASSTHROUGH_API, action_name="get_mini_app_ark", params={"picUrl": "", **params},
-            )
-            return _original_provider_card(response)
-
-        web_url = params["webUrl"]
-        bvid = web_url.rsplit("/", 1)[-1]
-        sign = await self._api(
-            PASSTHROUGH_API, action_name="send_packet",
-            params=sign_packet(bvid=bvid, title=params["title"], desc=params["desc"], pic_url=params.get("picUrl", "")),
-        )
-        ark = _snowluma_ark(signed_card_json(_packet_response_hex(sign)))
-        if not _native_card_identity(ark):
-            raise MiniAppProtocolError("qq_card_invalid")
-        detail = ark["meta"]["detail_1"]
-        if detail.get("qqdocurl") != web_url:
-            raise MiniAppProtocolError("qq_web_fallback_mismatch")
-        lookup = await self._api(
-            PASSTHROUGH_API, action_name="send_packet", params=lookup_packet(detail["url"]),
-        )
-        verify_video_route(_packet_response_hex(lookup), bvid)
-        raw = json.dumps(ark, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        if len(raw.encode("utf-8")) > 65536:
-            raise MiniAppProtocolError("qq_card_invalid")
-        return raw
-
-    def _generation_failure(self, reason: str) -> dict[str, Any]:
-        if reason not in _GENERATION_ERRORS:
-            reason = "qq_card_invalid"
-        logger = getattr(self._log, "debug", None)
-        if callable(logger):
-            logger(f"视频小程序卡片签发结果：{reason}")
-        return {"success": False, "error_class": "card_generation_failed",
-                "reason": reason, "error": _GENERATION_ERRORS[reason]}
+            url = await asyncio.wait_for(bili_copy_short_link(bvid), timeout=min(self._timeout, 12.0))
+        except (httpx.HTTPError, ValueError, OSError, asyncio.TimeoutError) as exc:
+            logger = getattr(self._log, "debug", None)
+            if callable(logger):
+                logger("B 站短链暂不可用，使用同一视频的长链：%s", type(exc).__name__)
+        return {"success": True, "card": {"format": COPY_LINK, "bvid": bvid, "title": title, "url": url}}
 
     async def send_video_card(self, *, user_id: Any, bvid: str, title: str,
                               desc: str = "", pic_url: str = "") -> Dict[str, Any]:
@@ -340,9 +228,9 @@ class VideoCardService:
         field = "group_id" if is_group else "user_id"
         timeout = _GROUP_HISTORY_TIMEOUT_SECONDS if is_group else _PRIVATE_HISTORY_TIMEOUT_SECONDS
         params = {field: int(peer), "count": _HISTORY_COUNT}
-        if is_group and anchor:
-            # Anchor to the exact send receipt. A fallback-only self echo is
-            # rejected by the group event shape check.
+        if anchor:
+            # SnowLuma's unanchored private roaming can omit illustrated cards.
+            # An authoritative pre-send anchor uses QQ's conversation history.
             params.update(message_id=anchor, reverse_order=False)
         try:
             response = await asyncio.wait_for(self._api(PASSTHROUGH_API, action_name=action, params=params),
@@ -363,75 +251,105 @@ class VideoCardService:
         return None
 
     async def _confirm(
-        self, kind: str, peer: str, account: str, receipt_id: int, expected: Dict[str, Any], started: int,
+        self, kind: str, peer: str, account: str, descriptor: dict, started: int,
+        *, receipt_id: int, before: list[_HistoryMessage] | None,
     ) -> Dict[str, Any]:
-        if not receipt_id:
+        link = descriptor["format"] == COPY_LINK
+        if link and not receipt_id:
             return self._uncertain("adapter_delivery_unconfirmed")
+        if not link and before is None:
+            return self._uncertain("card_history_unavailable")
+        known_ids = {row.message_id for row in before or ()}
+        anchor = max(before or (), key=lambda row: (row.time, row.sequence), default=None)
+        anchor_id = (receipt_id if kind == "group" else 0) if link else (anchor.message_id if anchor else 0)
         history_read = False
+        observed_own: dict[int, _HistoryMessage] = {}
         for delay in _HISTORY_DELAYS:
             await asyncio.sleep(delay)
-            after = await self._read_history(kind, peer, account, receipt_id if kind == "group" else 0)
-            if after is None:
+            rows = await self._read_history(kind, peer, account, anchor_id)
+            if rows is None:
                 continue
             history_read = True
             upper = int(time.time()) + 5
-            rows = [row for row in after if row.own and row.message_id == receipt_id
-                    and started - 2 <= row.time <= upper]
-            if len(rows) != 1:
-                continue
-            row = rows[0]
-            if row.kind == "json" and _matches_card(row.body, expected):
-                return {"success": True, "channel": "video_card", "delivery_state": "accepted",
-                        "delivery_verified": True, "message_id": receipt_id}
+            for row in rows:
+                if not row.own or not started - 2 <= row.time <= upper:
+                    continue
+                if link:
+                    if row.message_id == receipt_id:
+                        observed_own[row.message_id] = row
+                elif (row.message_id not in known_ids
+                      and (kind != "group" or anchor is None or row.sequence > anchor.sequence)):
+                    observed_own[row.message_id] = row
+            if link:
+                matches = [row for row in observed_own.values()
+                           if row.kind == "text" and row.body == descriptor["text"]]
+            else:
+                matches = [row for row in observed_own.values()
+                           if row.kind == "json" and _matches_card(row.body, descriptor)]
+            if len(matches) == 1:
+                return {"success": True, "channel": "video_link" if link else "video_card",
+                        "delivery_state": "accepted", "delivery_verified": True,
+                        "message_id": matches[0].message_id}
+            if len(matches) > 1:
+                break
+        if not link and len(observed_own) == 1:
+            row = next(iter(observed_own.values()))
             if row.kind == "text" and row.body == _QQ_PLACEHOLDER:
                 return self._uncertain("qq_card_replaced")
         reason = "card_not_confirmed" if history_read else "card_history_unavailable"
-        return {**self._uncertain(reason), "message_id": receipt_id}
+        result = self._uncertain(reason)
+        return {**result, "message_id": receipt_id} if receipt_id else result
 
     def _uncertain(self, code: str) -> Dict[str, Any]:
         details = {
-            "card_not_confirmed": "QQ 历史中未能核验这张视频卡片",
+            "card_not_confirmed": "QQ 历史中未能核验这张视频分享",
             "card_history_unavailable": "暂时无法读取 QQ 会话历史确认卡片",
-            "qq_card_replaced": "QQ 历史中出现了版本不支持的占位提示，原卡未获确认",
-            "adapter_delivery_unconfirmed": "QQ 未返回可核验的视频卡片回执",
+            "qq_card_replaced": "QQ 历史中出现了版本不支持的占位提示，分享未获确认",
+            "adapter_delivery_unconfirmed": "QQ 未返回可核验的视频分享回执",
         }
         logger = getattr(self._log, "debug", None)
         if callable(logger):
-            logger(f"视频卡片确认结果：{code}")
+            logger(f"视频分享确认结果：{code}")
         return {"success": False, "uncertain": True, "error_class": code,
-                "error": details.get(code, "视频卡片状态待确认")}
+                "error": details.get(code, "视频分享状态待确认")}
 
     async def send_card(self, route: Dict[str, Any], card: Dict[str, Any], *, before_send: Any = None) -> Dict[str, Any]:
-        """Send one native card only, then correlate a new independent QQ chat event."""
+        """Send once, then correlate a new independent QQ chat event."""
         kind = route.get("kind")
         field = "group_id" if kind == "group" else "user_id"
         peer = str(route.get(field) or "")
         if kind not in ("group", "private") or not _QQ_RE.fullmatch(peer):
             return {"success": False, "not_sent": True, "error_class": "invalid_target"}
-        raw = card.get("ark_json") if isinstance(card, dict) else None
-        expected = _parse_native_card(raw) if isinstance(raw, str) else None
-        if expected is None:
+        descriptor = _validated_descriptor(card)
+        if descriptor is None:
             return {"success": False, "not_sent": True, "error_class": "invalid_card"}
         scope = (kind, peer)
         if scope in self._active:
             return {"success": False, "not_sent": True, "error_class": "card_send_in_progress"}
         self._active.add(scope)
         try:
-            return await self._send_and_confirm(route, kind, field, peer, raw, expected, before_send)
+            return await self._send_and_confirm(route, kind, field, peer, descriptor, before_send)
         finally:
             self._active.discard(scope)
 
-    async def _send_and_confirm(self, route, kind, field, peer, raw, expected, before_send):
+    async def _send_and_confirm(self, route, kind, field, peer, descriptor, before_send):
         account = await self._logged_in_account()
         expected_account = str(route.get("account_id") or "")
         if not account or (expected_account and account != expected_account):
             return {"success": False, "not_sent": True, "error_class": "route_account_unverified"}
+        link = descriptor["format"] == COPY_LINK
+        if link:
+            before = None
+            action = "send_group_msg" if kind == "group" else "send_private_msg"
+            params = {field: int(peer), "message": [{"type": "text", "data": {"text": descriptor["text"]}}]}
+        else:
+            before = await self._read_history(kind, peer, account)
+            action = "send_tuwen_ark"
+            params = {field: int(peer), **{key: value for key, value in descriptor.items() if key != "format"}}
         if before_send is not None:
             allowed, _reason = before_send()
             if not allowed:
                 return {"success": False, "not_sent": True, "error_class": "gate_changed"}
-        action = "send_group_msg" if kind == "group" else "send_private_msg"
-        params = {field: int(peer), "message": [{"type": "json", "data": {"data": raw}}]}
         started = int(time.time())
         try:
             response = await asyncio.wait_for(self._api(
@@ -462,4 +380,4 @@ class VideoCardService:
             receipt_id = _qq_message_id(layer.get("message_id")) or receipt_id
         if not accepted:
             return self._uncertain("adapter_delivery_unconfirmed")
-        return await self._confirm(kind, peer, account, receipt_id, expected, started)
+        return await self._confirm(kind, peer, account, descriptor, started, receipt_id=receipt_id, before=before)

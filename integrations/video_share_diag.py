@@ -22,7 +22,7 @@ def _fmt_epoch(value: Any) -> str:
 def render_share(host: Any, args: str) -> str:
     usage = (
         "用法: /lbm ops share <debug|status|clear>（管理员）\n"
-        "  debug                      — 直接向当前 QQ 聊天发送一张随机测试卡片\n"
+        "  debug                      — 按当前分享形式向当前 QQ 聊天发送一个随机视频\n"
         "  debug planner              — 让 Planner 判断当前聊天适不适合分享该候选\n"
         "  status                     — 只读：运行模式/候选状态/uncertain 明细\n"
         "  clear <attempt_id> confirm — 核验确未送达后清除该 uncertain 回执（保留审计）"
@@ -56,7 +56,7 @@ def render_share(host: Any, args: str) -> str:
     if sub == 'clear':
         if len(parts) < 3 or parts[2].lower() != 'confirm':
             return ("清除需显式确认：/lbm ops share clear <attempt_id> confirm\n"
-                    "务必先核实该卡片确未送达，否则可能重复发送。")
+                    "务必先核实该分享确未送达，否则可能重复发送。")
         attempt_id = parts[1]
         result = ledger.resolve_uncertain(attempt_id)
         if result.get('success'):

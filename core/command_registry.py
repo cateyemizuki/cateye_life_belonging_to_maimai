@@ -262,7 +262,7 @@ COMMANDS: Tuple[Command, ...] = (
             args_cn="[情绪|事件|生活状态|频率|视频兴趣|联系倾向|日程偏好|全部|状态]"),
     Command("ops", "运维", "share", "分享", "admin",
             "Video-share ops: debug a random watched video, inspect status or clear a receipt",
-            "视频分享运维：随机发送近期观看的视频测试卡片 / 查看状态 / 清空回执",
+            "视频分享运维：随机发送近期看过的视频 / 查看状态 / 清空回执",
             "cmd_ops_share",
             args_en="[debug [planner]|status|clear <id> confirm]",
             args_cn="[调试 [规划]|状态|清空 <id> 确认]"),

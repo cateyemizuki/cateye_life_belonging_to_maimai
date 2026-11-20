@@ -21,6 +21,8 @@ import re
 import time
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
+from core.inject import LBM_CONTEXT_PREFIX
+
 #: 平台前缀（``qq:123456`` → ``123456``）
 _PLATFORM_PREFIXES = ("qq:", "wx:", "wechat:", "telegram:", "tg:", "discord:", "kook:")
 
@@ -255,7 +257,8 @@ def sender_ids_in_window(
     """
     sender_ids: List[str] = []
     for item in items or ():
-        if not is_user_message_item(item):
+        if (not is_user_message_item(item)
+                or first_text_part(item).lstrip().startswith(LBM_CONTEXT_PREFIX)):
             continue
         sender_ids.append(cache.get_user_id(message_id_from_item(item)))
     limit = int(window or 0)

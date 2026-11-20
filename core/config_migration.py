@@ -194,6 +194,24 @@ def migrate_event_catalog_cycle(value: Any) -> Any:
     return out
 
 
+def migrate_legacy_factory_prompts(value: Any) -> Any:
+    """Replace only exact shipped prompts for the same setting."""
+    if not isinstance(value, dict) or not isinstance(value.get("prompts"), dict):
+        return value
+    from suite_prompts import LEGACY_FACTORY_PROMPTS_BY_FIELD, PROMPT_FALLBACKS
+
+    prompts = value["prompts"]
+    replacement = {}
+    for field, legacy in LEGACY_FACTORY_PROMPTS_BY_FIELD.items():
+        current = prompts.get(field)
+        default = PROMPT_FALLBACKS[field]
+        if isinstance(current, str) and current in legacy and current != default:
+            replacement[field] = default
+    if not replacement:
+        return value
+    return {**value, "prompts": {**prompts, **replacement}}
+
+
 def migrate_release_config(value: Any) -> Any:
     """Pure, idempotent migration; explicit canonical values win, including false/0."""
     if not isinstance(value, dict):
@@ -238,7 +256,7 @@ def migrate_release_config(value: Any) -> Any:
         if mascot["preset"] not in ("fish", "human"):
             mascot["preset"] = "human"
         out["maimai_interaction"] = mascot
-    return out
+    return migrate_legacy_factory_prompts(out)
 
 
 def _disk_cycle_source(disk: Dict[str, Any]) -> Any:

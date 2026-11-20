@@ -2,13 +2,14 @@
 
 No message lookup, generation or sending happens here. Since PR-PROACTIVE-REPLY
 (3.17.2) proactive turns no longer bind reply to a possibly stale context msg_id:
-the planner prompt carries proactive-activation semantics, the deep rewrite is
-skipped on proactive turns, and the replyer hook replaces the host-rendered
-target instruction («你想要回复的消息是…» / «你想要补充说明你自己…») with the
-proactive-activation notice. Non-proactive turns are never touched.
+the planner prompt carries proactive-activation semantics. The replyer hook
+can replace the target in a standalone legacy instruction frame. Newer host
+frames combine dialogue and reply instructions in the same item, so we keep the
+whole frame intact and attach the proactive notice at its end.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,19 +24,22 @@ _TARGET_MARKER = "【本轮主动回复目标】"
 _HEADER = re.compile(r"^\s*(<([a-z_]+)\b[^>]*>)", re.IGNORECASE)
 _END_TOOLS = frozenset(("stop", "wait"))
 
-#: PR-PROACTIVE-REPLY（3.17.2）：主动激活轮 replyer 目标指令的替换文案（规格逐字）。
+#: 主动激活轮的回复目标提示。
 PROACTIVE_REPLY_NOTICE = (
-    "本轮回复为插件主动激活，你需要根据上方planner传回的状况概括，"
-    "结合你此刻的状态进行回复，不需要特地回复某个信息"
+    "这轮是你主动找对方发消息，结合下面的局面说明和你此刻的状态自然开口，"
+    "不用硬去回复前面已经过时的旧消息"
 )
 
-#: 宿主目标指令段的前缀（maisaka_generator_base._build_target_message_block；
-#: 前缀匹配容忍宿主措辞微调，段边界 = 后续「- 」明细行，遇空行/非明细行即止）。
+#: MaiBot 旧版 `_build_final_user_message` 将时钟与目标分段，并将历史放在独立项中。
 _HOST_TARGET_PREFIXES = ("你想要回复的消息是", "你想要补充说明你自己")
-
-#: 宿主 replyer 最终用户消息的起始标记（_build_final_user_message 首节「当前时间：」）。
-#: 只改写以此开头的文本 part，绝不碰历史消息（带 <message> 头）或旁白/参考文本。
-_FINAL_USER_PREFIX = "当前时间："
+_LEGACY_TIME_LINE = re.compile(r"当前时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+_LEGACY_TRAILING_STYLES = frozenset({
+    "请简短的回复，允许句子残缺，奇怪表达，倒装，省略，符合口语习惯，符合省力随意回复习惯",
+    "可以针对问题做出较为详细的评论和说明",
+})
+_NON_FINAL_USER_PREFIXES = (
+    "<message", "<plugin_proactive_task", "<lbm-context", "<focus_reference", "[参考消息]",
+)
 
 
 class _Attributes(HTMLParser):
@@ -140,10 +144,9 @@ def _target_prompt(target: ReplyTarget | None) -> str:
                 "不要编造msg_id，不要选自己发送的消息；你可以不调用reply，直接结束。")
     # PR-PROACTIVE-REPLY（3.17.2）：主动激活轮不再指认具体 msg_id（上下文里的最后
     # 一条来信可能已过时）；改为主动激活语义。target 仍回传供绑定签名使用。
-    return (_TARGET_MARKER + "本轮由插件主动激活。"
-            "请结合你此刻的状态自然开口，不需要特地回复某个信息，"
-            "也不要围绕某条过时的消息组织回复。如果决定调用reply，msg_id 只能选对方发送的消息；"
-            "不要选择自己发送的消息，不要复述自己先前的发言。若这轮确实不合适，直接结束即可。")
+    return (_TARGET_MARKER + "这轮是你主动找对方说话，不用硬接前面过时的旧消息。"
+            "结合当前状态自然决定要不要发；调用 reply 时 msg_id 只能选对方发过的消息，"
+            "不复述自己之前的话；不合适就直接结束。")
 
 
 def prepare_request(items: list[Any], stream_id: str, target_user: str, *,
@@ -215,142 +218,124 @@ def latest_incoming_timestamp(items: list[Any]) -> tuple[bool, datetime | None]:
     return False, None
 
 
+def _split_legacy_final_text(text: str) -> list[str]:
+    """Split a recognized standalone legacy frame, leaving unknown layouts intact."""
+    sections = text.split("\n\n", 2)
+    if len(sections) == 3 and _LEGACY_TIME_LINE.fullmatch(sections[0].strip()):
+        return sections
+    return []
+
+
 def rewrite_host_target_text(text: str, notice: str = PROACTIVE_REPLY_NOTICE) -> tuple[str, int]:
-    """把宿主目标指令整段（前缀行 + 后续「- 」明细行）替换为主动激活文案。
+    """Only replace the target section immediately after a legacy standalone clock.
 
-    段边界：明细行以「-」起始（quote=/发言内容/你之前的发言内容等），遇空行或
-    非明细行即止——不吞并后续 section。前缀匹配容忍宿主措辞微调。无命中时
-    原样返回 (text, 0)。``notice`` 缺省 = 3.17.2 原文；PR-PROACTIVE-GATE
-    （3.17.14）起 replyer 钩子按 chat_type×kind 传入定制文案。
+    Modern host templates combine free-form dialogue, analysis and the actual
+    target in one text body. User messages can reproduce every visible anchor.
+    Their target slot must not be inferred from rendered text.
     """
-    lines = text.split("\n")
-    out: list[str] = []
-    count = 0
-    index = 0
-    while index < len(lines):
-        stripped = lines[index].lstrip()
-        if any(stripped.startswith(prefix) for prefix in _HOST_TARGET_PREFIXES):
-            end = index + 1
-            while end < len(lines) and lines[end].lstrip().startswith("-"):
-                end += 1
-            out.append(notice)
-            count += 1
-            index = end
-        else:
-            out.append(lines[index])
-            index += 1
-    return ("\n".join(out), count) if count else (text, 0)
+    sections = _split_legacy_final_text(text)
+    if not sections:
+        return text, 0
+    heading, _, details = sections[1].partition("\n")
+    if not heading.startswith(_HOST_TARGET_PREFIXES):
+        return text, 0
+    if any(not line.startswith("- ") for line in details.splitlines()):
+        return text, 0
+    return "\n\n".join((sections[0], notice, sections[2])), 1
 
 
-def _is_final_user_text(text: Any) -> bool:
-    return isinstance(text, str) and text.lstrip().startswith(_FINAL_USER_PREFIX)
+@dataclass(frozen=True)
+class _UserText:
+    entry_index: int
+    field: str
+    text: str
+    part_index: int | None = None
+    single_text: bool = True
+
+    def replace(self, payload: list[Any], value: str) -> list[Any]:
+        entry = payload[self.entry_index]
+        content: Any = value
+        if self.part_index is not None:
+            parts = list(entry[self.field])
+            parts[self.part_index] = {**parts[self.part_index], "text": value}
+            content = parts
+        result = list(payload)
+        result[self.entry_index] = {**entry, self.field: content}
+        return result
+
+
+def _user_texts(payload_key: str, payload: list[Any]) -> Iterator[_UserText]:
+    """Find user text without touching a system, tool, image or tagged history item."""
+    if payload_key == "items":
+        role_field, user_role, field = "item_type", "UserMessageItem", "parts"
+    elif payload_key == "messages":
+        role_field, user_role, field = "role", "user", "content"
+    else:
+        return
+
+    for index in range(len(payload) - 1, -1, -1):
+        entry = payload[index]
+        if not isinstance(entry, dict) or entry.get(role_field) != user_role:
+            continue
+        content = entry.get(field)
+        if payload_key == "messages" and isinstance(content, str):
+            if not content.lstrip().startswith(_NON_FINAL_USER_PREFIXES):
+                yield _UserText(index, field, content)
+        elif isinstance(content, list):
+            texts = [(i, part["text"]) for i, part in enumerate(content)
+                     if isinstance(part, dict) and part.get("type") == "text"
+                     and isinstance(part.get("text"), str)]
+            first_text = next((value for _, value in texts if value.strip()), "")
+            if not texts or first_text.lstrip().startswith(_NON_FINAL_USER_PREFIXES):
+                continue
+            last_index, last_text = texts[-1]
+            yield _UserText(index, field, last_text, last_index, len(content) == 1)
+
+
+def _legacy_user_text(payload_key: str, payload: list[Any]) -> _UserText | None:
+    entries = _user_texts(payload_key, payload)
+    entry = next(entries, None)
+    # Older hosts optionally emit a separate final user item for requested style.
+    if entry is not None and entry.single_text and entry.text in _LEGACY_TRAILING_STYLES:
+        entry = next(entries, None)
+    return entry if entry is not None and entry.single_text else None
 
 
 def payload_has_proactive_notice(payload_key: str, payload: list[Any],
                                  notice: str = PROACTIVE_REPLY_NOTICE) -> bool:
-    """载荷里是否已含主动激活文案（幂等守卫：避免重试/重复钩子二次追加）。
-
-    ``notice`` 缺省 = 3.17.2 原文；定制文案轮由调用方逐个已知文案检查。
-    """
-    for entry in payload:
-        if not isinstance(entry, dict):
-            continue
-        if payload_key == "items":
-            parts = entry.get("parts")
-            if not isinstance(parts, list):
-                continue
-            texts = [part.get("text") for part in parts
-                     if isinstance(part, dict) and part.get("type") == "text"]
-        else:
-            texts = [entry.get("content")]
-        if any(isinstance(text, str) and notice in text for text in texts):
-            return True
-    return False
+    """Identify our notice in its final placement, without searching pasted history."""
+    final = next(_user_texts(payload_key, payload), None)
+    if final is None:
+        return False
+    if final.text == notice or final.text.rstrip().endswith("\n\n" + notice):
+        return True
+    legacy = _legacy_user_text(payload_key, payload)
+    sections = _split_legacy_final_text(legacy.text) if legacy is not None else []
+    return bool(sections and sections[1] == notice)
 
 
 def rewrite_replyer_payload(payload_key: str, payload: list[Any],
-                            notice: str = PROACTIVE_REPLY_NOTICE) -> tuple[list[Any], int]:
-    """Copy-on-write 改写 replyer 载荷里的宿主目标指令段。
-
-    只触碰宿主最终用户消息（「当前时间：」起始的文本）；历史消息（<message> 头）、
-    旁白、planner 参考文本一律不碰。返回 (新载荷, 替换段数)；无命中原样返回。
-    ``notice`` 缺省 = 3.17.2 原文（3.17.14 起可按 chat_type×kind 定制）。
-    """
-    updated = list(payload)
-    total = 0
-    for index, entry in enumerate(payload):
-        if not isinstance(entry, dict):
-            continue
-        if payload_key == "items":
-            parts = entry.get("parts")
-            if not isinstance(parts, list):
-                continue
-            new_parts = None
-            for part_index, part in enumerate(parts):
-                if not isinstance(part, dict) or part.get("type") != "text":
-                    continue
-                if not _is_final_user_text(part.get("text")):
-                    continue
-                new_text, count = rewrite_host_target_text(part["text"], notice)
-                if count:
-                    if new_parts is None:
-                        new_parts = list(parts)
-                    new_parts[part_index] = {**part, "text": new_text}
-                    total += count
-            if new_parts is not None:
-                updated[index] = {**entry, "parts": new_parts}
-        elif payload_key == "messages":
-            content = entry.get("content")
-            if not _is_final_user_text(content):
-                continue
-            new_text, count = rewrite_host_target_text(content, notice)
-            if count:
-                updated[index] = {**entry, "content": new_text}
-                total += count
-    return (updated, total) if total else (payload, 0)
+                            notice: str = PROACTIVE_REPLY_NOTICE, *,
+                            legacy_frame: bool = True) -> tuple[list[Any], int]:
+    """Replace a proven legacy target section, preserving all other parts."""
+    if not legacy_frame:
+        return payload, 0
+    entry = _legacy_user_text(payload_key, payload)
+    if entry is None:
+        return payload, 0
+    text, count = rewrite_host_target_text(entry.text, notice)
+    return (entry.replace(payload, text), count) if count else (payload, 0)
 
 
 def append_proactive_notice(payload_key: str, payload: list[Any],
                             notice: str = PROACTIVE_REPLY_NOTICE) -> list[Any] | None:
-    """替换失败/未找到时的保守尾随锚点：把主动激活文案追加到最后一条用户文本末尾。
-
-    PR-RELIABILITY（3.17.17 §1B）：限定角色——messages 形态仅 ``role=="user"``
-    条目、items 形态仅 ``item_type=="UserMessageItem"`` 条目可追加；末条是
-    assistant/历史/系统文本时不再误关联污染。不破坏原 prompt（copy-on-write）；
-    载荷没有符合条件的文本条目时返回 None（载荷原样，hook 侧 warning+消费）。
-    ``notice`` 缺省 = 3.17.2 原文（3.17.14 起可按 chat_type×kind 定制）。
-    """
-    for index in range(len(payload) - 1, -1, -1):
-        entry = payload[index]
-        if not isinstance(entry, dict):
-            continue
-        if payload_key == "items":
-            if entry.get("item_type") != "UserMessageItem":
-                continue
-            parts = entry.get("parts")
-            if not isinstance(parts, list):
-                continue
-            for part_index in range(len(parts) - 1, -1, -1):
-                part = parts[part_index]
-                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
-                    new_parts = list(parts)
-                    new_parts[part_index] = {
-                        **part, "text": part["text"].rstrip() + "\n\n" + notice,
-                    }
-                    updated = list(payload)
-                    updated[index] = {**entry, "parts": new_parts}
-                    return updated
-        elif payload_key == "messages":
-            if entry.get("role") != "user":
-                continue
-            content = entry.get("content")
-            if isinstance(content, str):
-                updated = list(payload)
-                updated[index] = {**entry, "content": content.rstrip() + "\n\n" + notice}
-                return updated
-    return None
-
-
+    """Use the non-destructive fallback for current Replyer frames."""
+    if payload_has_proactive_notice(payload_key, payload, notice):
+        return None
+    entry = next(_user_texts(payload_key, payload), None)
+    if entry is None:
+        return None
+    return entry.replace(payload, entry.text + "\n\n" + notice)
 
 
 class ProactiveReplyTargets:

@@ -33,6 +33,7 @@ async def dispatch_proactive(
     priority: str = "", key: str = "", metadata: dict | None = None,
     miss_stage: int = 0, trigger: Any = None,
     optional_key: str = "", optional_intent: str = "",
+    video_failed: bool | None = None,
 ) -> dict:
     """Register once before enqueue, with an exact marker the host carries in context.
 
@@ -53,14 +54,16 @@ async def dispatch_proactive(
     getter = getattr(plugin, "_mai_proactive_turns", None)
     registry = getter() if callable(getter) else None
     turn_id = ""
+    outcome = {"video_failed": video_failed} if kind == "video_completion" and isinstance(video_failed, bool) else {}
     if registry is not None:
         turn_id = registry.register(sid, kind, reason, miss_stage=miss_stage, key=key,
-                                    optional_key=optional_key, optional_intent=optional_intent)
+                                    optional_key=optional_key, optional_intent=optional_intent, **outcome)
         if not turn_id:
             return {"success": False, "duplicate": True, "error": "proactive_category_duplicate"}
 
     payload = {k: v for k, v in (metadata or {}).items()
-               if k not in ("lbm_turn_id", "lbm_proactive_kind", "lbm_optional_key")}
+               if k not in ("lbm_turn_id", "lbm_proactive_kind", "lbm_optional_key", "video_failed")}
+    payload.update(outcome)
     payload["lbm_proactive_kind"] = proactive_category(kind)
     if turn_id:
         payload["lbm_turn_id"] = turn_id

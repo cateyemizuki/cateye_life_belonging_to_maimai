@@ -81,14 +81,15 @@ from companion.harass_report import (
 from companion.patrol import resolve_silence_window
 from .rolling_diag import render_rolling
 from integrations.video_share_diag import render_share
-from integrations.proactive_usage import HOST_USAGE_TOOL, ProactiveUsage, read_host_turn_usage
+from integrations.proactive_usage import HOST_USAGE_TOOL, ProactiveUsage, active_video_comment_task, read_host_turn_usage
 from integrations.planner_proactive import dispatch_proactive
+from integrations.video_share_comment import VIDEO_SHARE_REPLY_GUIDANCE
 from integrations.video_share_policy import COMMENT_PLANNER_KIND, DEBUG_CARD_TOOL
 from integrations.qzone_video_diag import render_qzone_video, qzone_video_diag_payload
 from .streams_diag import build_streams_records
 from core.diag import DecisionLogger
 from core.storage import load_json, save_json_atomic
-from core.inject import pick_payload_key, project_injection, without_stale_proactive_blocks
+from core.inject import pick_payload_key, project_planner_injection, without_stale_proactive_blocks
 # R1（结构审计批）：跨插件联动只经 linkage 注册表查询（get_adapter），不直接 import
 # 具体适配器实现（DEV_GUIDE 结构守则 §2 硬边界；linkage 注册表纯 stdlib，无环）。
 from linkage import get_adapter
@@ -506,10 +507,13 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def mai_hook_proactive_reply_target(self, **kwargs: Any) -> dict[str, Any]:
-        prepared = await self._mai_proactive_usage().planner_before(kwargs)
-        modified = self._mai_reply_target_guard().before(
-            prepared, stream_id=self._mai_reply_target_stream(),
-            target_user=target_qq_of(self.config))
+        tracking = self._mai_proactive_usage()
+        prepared = await tracking.planner_before(kwargs)
+        modified = None
+        if not tracking.video_comment_policy_applies(prepared):
+            modified = self._mai_reply_target_guard().before(
+                prepared, stream_id=self._mai_reply_target_stream(),
+                target_user=target_qq_of(self.config))
         if modified is None and prepared is not kwargs:
             modified = prepared
         return {"action": "continue", **({"modified_kwargs": modified} if modified is not None else {})}
@@ -543,11 +547,13 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         if turn and turn.get("kind") == COMMENT_PLANNER_KIND:
             stream = str(prepared.get("session_id") or prepared.get("stream_id") or "")
             if not self._video_share_comment().active(stream, turn["video_sent_from"]):
-                return {"action": "abort", "custom_result": {"reason": "这次视频卡片已不适合跟评"}}
+                return {"action": "abort", "custom_result": {"reason": "这次视频分享已不适合再带一句"}}
             extra_prompt = str(prepared.get("extra_prompt") or "")
-            direction = prepared["reply_tool_args"]["chat_anlyze"]
-            # The earliest supported Replyer uses extra_prompt but does not read chat_anlyze.
-            prepared = {**prepared, "extra_prompt": "\n".join(part for part in (extra_prompt, direction) if part)}
+            note = prepared["reply_tool_args"]
+            direction = note.get("chat_anlyze") or note.get("reply_reference") or ""
+            # Some Replyer profiles only expose extra_prompt to the model.
+            parts = (extra_prompt, direction, VIDEO_SHARE_REPLY_GUIDANCE)
+            prepared = {**prepared, "extra_prompt": "\n".join(part for part in parts if part)}
         if turn and turn.get("category") == "greeting":
             service = getattr(getattr(self, "_planning", None), "proactive", None)
             scope = turn.get("greeting_scope")
@@ -557,6 +563,26 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             if method and not await tracking.gate_check(service, method, sid):
                 return {"action": "abort", "custom_result": {"reason": "本次例行问候已不符合发起条件"}}
         return {"action": "continue", **({"modified_kwargs": prepared} if prepared is not kwargs else {})}
+
+    @HookHandler(
+        "maisaka.reply.before_post_process",
+        name="mai_keep_video_share_one_message",
+        description="视频分享附言按一条消息发送",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def mai_hook_keep_video_share_one_message(self, **kwargs: Any) -> dict[str, Any]:
+        turn = self._mai_proactive_usage().reply_turn(kwargs)
+        if (turn or {}).get("kind") != COMMENT_PLANNER_KIND:
+            return {"action": "continue"}
+        options = {key: False for key in ("enable_splitter", "enable_chinese_typo") if key in kwargs}
+        response = kwargs.get("response")
+        if isinstance(response, str):
+            # Better Post Processing can still split at newlines with its sentence splitter disabled.
+            options["response"] = " ".join(line.strip() for line in response.splitlines() if line.strip())
+        return {"action": "continue", "modified_kwargs": {**kwargs, **options}}
 
     @HookHandler(
         "maisaka.reply.before_post_process",
@@ -582,6 +608,19 @@ class CompanionComponentsMixin(ScreenToolsMixin):
     )
     async def mai_hook_prepare_proactive_segments(self, **kwargs: Any) -> dict[str, Any]:
         self._mai_proactive_usage().after_split(kwargs)
+        return {"action": "continue"}
+
+    @HookHandler(
+        "send_service.after_build_message",
+        name="mai_identify_greeting_send",
+        description="在分段插件改写消息前记录陪伴问候的出站时间",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def mai_hook_identify_greeting_send(self, **kwargs: Any) -> dict[str, Any]:
+        self._mai_proactive_usage().after_build_message(kwargs)
         return {"action": "continue"}
 
     @HookHandler(
@@ -906,7 +945,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         name="mai_lover_planner_inject",
         description="在 planner 请求前注入屏幕旁白、当前活动、好感度与主动回合回复目标约束",
         mode=HookMode.BLOCKING,
-        order=HookOrder.NORMAL,
+        order=HookOrder.EARLY,
         timeout_ms=3000,
         error_policy=ErrorPolicy.SKIP,
     )
@@ -981,13 +1020,15 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 pass
 
         suffix = self._mai_build_affection_suffix(scope)
-        if scope == _SCOPE_PRIVATE:
+        if scope == _SCOPE_PRIVATE and not active_video_comment_task(payload, payload_key):
             suffix += self._mai_build_proactive_target_rule()
         if not suffix.strip():
             # 没有可注入文本：不回传收缩后的载荷（避免白丢图片）
             return {"action": "continue", "modified_kwargs": {**kwargs, "session_id": session_id}}
 
-        modified_payload = project_injection(payload_key, shrunk, suffix)
+        modified_payload = project_planner_injection(payload_key, shrunk, suffix)
+        if modified_payload is shrunk:
+            return {"action": "continue", "modified_kwargs": {**kwargs, "session_id": session_id}}
         return {
             "action": "continue",
             "modified_kwargs": {**kwargs, "session_id": session_id, payload_key: modified_payload},
@@ -1098,6 +1139,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         payload_key, payload = pick_payload_key(kwargs)
         if not payload_key or not isinstance(payload, list):
             return None
+        reply_tool_args = kwargs.get("reply_tool_args")
+        legacy_frame = not (isinstance(reply_tool_args, dict) and "_replyer_prompt_profile" in reply_tool_args)
         registry = self._mai_proactive_turns()
         tagged = self._mai_proactive_usage().reply_turn(kwargs)
         turn = tagged
@@ -1129,8 +1172,8 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             except (TypeError, ValueError):
                 miss_stage = 0
             notice = rewrite_notice_for(turn.get("chat_type"), turn.get("kind"),
-                                        miss_stage=miss_stage)
-            updated, replaced = rewrite_replyer_payload(payload_key, payload, notice)
+                                        miss_stage=miss_stage, video_failed=turn.get("video_failed"))
+            updated, replaced = rewrite_replyer_payload(payload_key, payload, notice, legacy_frame=legacy_frame)
             if replaced:
                 # claim 已原子消费，无需再 consume。
                 self.ctx.logger.info(
@@ -1148,9 +1191,9 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                     f"主动激活轮（kind={turn.get('kind')} chat_type={turn.get('chat_type')}）："
                     "replyer 载荷无可追加文本条目，定制文案未注入（登记已消费）")
                 return None
-            self.ctx.logger.warning(
+            self.ctx.logger.debug(
                 f"主动激活轮（kind={turn.get('kind')} chat_type={turn.get('chat_type')}）："
-                "未匹配到宿主目标指令段，已保守追加定制文案作为尾随锚点")
+                "保留宿主目标与历史文本，追加本轮主动提示")
             return {**kwargs, payload_key: appended}
         # 已登记的新任务没有精确回复凭证时不借用旧时间窗。
         if registry is not None and session_id:
@@ -1168,7 +1211,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
         # P1-8：旧路径（registry 未命中）同样标记为主动轮，供 after_response 确认。
         self._mai_proactive_reply_marker = {"stream": session_id,
                                             "at": time.time()}
-        updated, replaced = rewrite_replyer_payload(payload_key, payload)
+        updated, replaced = rewrite_replyer_payload(payload_key, payload, legacy_frame=legacy_frame)
         if replaced:
             self.ctx.logger.info(
                 f"陪伴主动激活轮：已把 replyer 宿主目标指令替换为主动激活文案（{replaced} 段）")
@@ -1180,8 +1223,7 @@ class CompanionComponentsMixin(ScreenToolsMixin):
             self.ctx.logger.warning(
                 "陪伴主动激活轮：replyer 载荷无可追加文本条目，主动激活文案未注入")
             return None
-        self.ctx.logger.warning(
-            "陪伴主动激活轮：未匹配到宿主目标指令段，已保守追加主动激活文案作为尾随锚点")
+        self.ctx.logger.debug("陪伴主动激活轮：保留宿主目标与历史文本，追加本轮主动提示")
         return {**kwargs, payload_key: appended}
 
     async def _mai_confirm_optional_reply(self, reply_stream: str, *, key=None, intent=None) -> dict[str, Any]:
@@ -2260,11 +2302,11 @@ class CompanionComponentsMixin(ScreenToolsMixin):
                 result.get("content") or "视频分享调试未发送。", stream_id,
                 storage_message=False, sync_to_maisaka_history=False,
             )
-        return True, result.get("content") or "视频卡片调试已处理", True
+        return True, result.get("content") or "视频分享调试已处理", True
 
     @Tool(
         DEBUG_CARD_TOOL, platforms="qq", visibility="visible",
-        description="只用于当前由管理员发起的 Planner 视频测试。选择分享时调用一次，宿主钩子自动绑定测试卡片及当前会话。",
+        description="只用于当前由管理员发起的 Planner 视频测试。选择分享时调用一次，宿主钩子自动绑定候选视频及当前会话。",
         parameters={"ticket": {"type": "string", "description": "由宿主在调试轮自动填写"}},
     )
     async def mai_tool_confirm_debug_share(self, ticket: str = "", **kwargs: Any) -> dict:

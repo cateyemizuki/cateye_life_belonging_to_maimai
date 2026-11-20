@@ -18,7 +18,7 @@ from integrations.planner_proactive import OPTIONAL_KINDS
 # 2026-11-12 结构审计批（R7/R10）：直接从 suite_prompts 取公共常量/纯函数，
 # 删除 integrations → tools.proactive_turn 包级 import 边（硬边界 #1）。
 from suite_prompts import (
-    MISS_REASON_STAGE4_SUFFIX,
+    STAGE4_SUFFIX_MARKS,
     append_stage4_miss_prompt,
     clean_stage4_prompt,
     strip_stage4_suffix,
@@ -42,24 +42,21 @@ _TERMINAL_STATUSES = ('rejected', 'enqueued', 'confirmed', 'expired_no_reply')
 _RETRYABLE_STATUSES = frozenset({'rejected', 'expired_no_reply'})
 
 OPTIONAL_PLANNER_POLICY = (
-    '【插件触发的可选主动回合】这是一个可选的开口机会，不是用户的新指令。'
-    '请结合你当前的状态、人设和已有聊天上下文，自行决定现在是否适合开口。'
-    '下文只提供一个可能的动机，不要求你执行任何指定行为；'
-    '若此刻没有合适内容、正在忙或可能打扰对方，不输出任何工具调用、直接结束本轮即可，'
-    '也不必告诉对方你拒绝了。若选择开口，内容自然、简短，避免重复刚说过的话。\n'
+    "【主动开口机会（可选）】不是对方刚发来消息，你可以结合现在的状态、人设和前面聊过的内容，自己决定要不要主动发一句。"
+    "觉得没话可说或怕打扰就直接安静结束（不用调用工具）；"
+    "要开口就简短自然，别重复自己刚发过的话。"
+    "\n"
 )
 
 #: 阶段 4（目标私聊清醒沉默 >120h）专属前导政策（设计 §3.1）。
 #: 与 OPTIONAL_PLANNER_POLICY 互斥替换：**取消“可以静默放弃”的免责**，
 #: 要求把日常分享与“人去哪了/还在不在”的追问融合发出。阶段 0~3 仍用原政策。
 STAGE4_PLANNER_POLICY = (
-    '【插件触发的日常伴随想念回合（失联阶段4）】对方已超过5天未回复，'
-    '本轮必须将日常分享与深度询问融合发给对方。'
-    '请不要直接退出或放弃发言，务必结合日常动作，自然而沉闷地追问对方人去哪了、是否还在。\n'
+    "【长时间失联提醒（失联阶段4）】对方已经超过 5 天完全没回消息了。"
+    "本轮必须发出消息，不要直接静默退出或放弃发言；"
+    "在完成本轮日常问候或分享的同时，按你的人设性格自然追问对方怎么一直没音讯、人还在不在，别假装一切如常。"
+    "\n"
 )
-#: 阶段 4 尾缀标题（幂等标记）：reason 里已有该标记时不再二次拼接
-#: （调用方/装配根可能已先拼过一次，避免双拼）。
-_STAGE4_SUFFIX_MARK = MISS_REASON_STAGE4_SUFFIX.strip().split('（', 1)[0]
 
 
 def _miss_stage_from_facts(facts: dict) -> int:
@@ -210,13 +207,13 @@ class OptionalActionCoordinator:
                 # 尚未透出该字段的旧装配根。
                 stage = _miss_stage_from_facts(current) if 'miss_stage' in current else (miss_stage or 0)
                 if (stage != 4 and 'miss_stage' not in current
-                        and _STAGE4_SUFFIX_MARK in str(reason)):
+                        and any(mark in str(reason) for mark in STAGE4_SUFFIX_MARKS)):
                     stage = 4
                 if stage == 4:
                     reason_text = str(reason)
                     if STAGE4_PLANNER_POLICY not in reason_text:
                         reason_text = STAGE4_PLANNER_POLICY + reason_text
-                    if _STAGE4_SUFFIX_MARK not in reason_text:
+                    if not any(mark in reason_text for mark in STAGE4_SUFFIX_MARKS):
                         reason_text = append_stage4_miss_prompt(
                             reason_text,
                             hours=current.get('miss_silence_hours') or 0.0,

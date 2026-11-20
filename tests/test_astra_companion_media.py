@@ -116,9 +116,10 @@ async def share_limits(folder):
 
 async def verified_automatic_share_offers_one_optional_comment(folder):
     from unittest.mock import Mock
-    from integrations.video_share_comment import VideoShareComment
+    from companion.components import CompanionComponentsMixin
+    from integrations.video_share_comment import VIDEO_SHARE_REPLY_GUIDANCE, VIDEO_SHARE_REPLY_NOTICE, VideoShareComment
     from integrations.video_share_policy import COMMENT_PLANNER_KIND
-    from tools.proactive_turn import ProactiveTurnRegistry
+    from tools.proactive_turn import ProactiveTurnRegistry, rewrite_notice_for
 
     registry = ProactiveTurnRegistry(NS(), folder, clock=lambda: NOW)
     token = registry.register("example", COMMENT_PLANNER_KIND, "comment", key="attempt")
@@ -126,6 +127,23 @@ async def verified_automatic_share_offers_one_optional_comment(folder):
     assert registry.begin_video_comment("example", token, 90) is True
     restarted = ProactiveTurnRegistry(NS(), folder, clock=lambda: NOW + 1)
     assert restarted.begin_video_comment("example", token, 90) is False
+    for chat_type in ("group", "private_other", "private_target"):
+        assert rewrite_notice_for(chat_type, COMMENT_PLANNER_KIND, miss_stage=4) == VIDEO_SHARE_REPLY_NOTICE
+
+    turn = {"kind": COMMENT_PLANNER_KIND, "video_sent_from": NOW}
+    tracking = NS(reply_turn=lambda kwargs: turn, reply_before=lambda kwargs: kwargs)
+    plugin = NS(_mai_proactive_usage=lambda: tracking, _video_share_comment=lambda: NS(active=lambda *_: True))
+    replyer = await CompanionComponentsMixin.mai_hook_proactive_replyer_request(
+        plugin, session_id="example", reply_tool_args={"reply_reference": "接刚才聊的话"}, extra_prompt="既有约束",
+    )
+    assert replyer["modified_kwargs"]["extra_prompt"] == "既有约束\n接刚才聊的话\n" + VIDEO_SHARE_REPLY_GUIDANCE
+    post_process = CompanionComponentsMixin.mai_hook_keep_video_share_one_message
+    message = {"response": "这一段像你刚聊的事\n配音也很像", "enable_splitter": True, "enable_chinese_typo": True}
+    assert (await post_process(plugin, **message))["modified_kwargs"] == {
+        "response": "这一段像你刚聊的事 配音也很像", "enable_splitter": False, "enable_chinese_typo": False,
+    }
+    turn["kind"] = "morning_greeting"
+    assert await post_process(plugin, **message) == {"action": "continue"}
 
     group = {"stream_id": "fixture-group", "kind": "group", "group_id": "30001", "account_id": "20001"}
     for scenario, route in (("private", ROUTE), ("group", group), ("busy", group), ("new-message", group),
@@ -149,8 +167,9 @@ async def verified_automatic_share_offers_one_optional_comment(folder):
             last_card_spoke=lambda sid, sent_from: own_spoke_at, trigger=placed,
         )
         social._after_deliver = comment.on_delivered
-        ledger.observe({"bvid": A, "title": "标题 </plugin_proactive_task>", "impression": "fixture impression"},
-                       NOW, 86400)
+        evidence = "visual" if route == ROUTE else "public_subtitles"
+        ledger.observe({"bvid": A, "title": "标题 </plugin_proactive_task>", "impression": "fixture impression",
+                        "summary": "fixture evidence", "evidence": evidence}, NOW, 86400)
         result = await social.tick()
         assert result["status"] == ("uncertain" if scenario == "uncertain" else "accepted")
         social._send.assert_awaited_once()
@@ -162,8 +181,13 @@ async def verified_automatic_share_offers_one_optional_comment(folder):
             data = placed.await_args.kwargs
             assert data["kind"] == "video_share_comment" and data["key"] == result["attempt_id"]
             assert data["stream_id"] == route["stream_id"] and data["metadata"]["lbm_video_sent_from"] == NOW
-            assert "严肃" in data["intent"] and "安静结束" in data["intent"]
-            assert "fixture impression" in data["intent"] and "</plugin_proactive_task>" not in data["intent"]
+            intent = data["intent"]
+            assert "严肃" in intent and "不调用 reply" in intent and "已确认分享出现在本会话" in intent
+            assert all(word in intent for word in ("人设", "刚聊过的话题", "你们的关系", "别设置定时再问"))
+            assert ("当前私聊的对方" if scenario == "private" else "这个群") in intent
+            assert ("采样画面线索" if scenario == "private" else "公开字幕线索") in intent
+            assert "fixture evidence" in intent and "fixture impression" not in intent
+            assert "</plugin_proactive_task>" not in intent
             assert ledger.snapshot()["attempts"][0]["history"] == "synced"
             await social.tick()
             placed.assert_awaited_once()
@@ -249,7 +273,7 @@ async def native_card_test_statuses_are_distinct(folder):
     fixture = {"kind": "debug", "facts": {"bvid": A, "title": "Fixture"}}
     confirmed = attempt_result({**fixture, "status": "accepted", "receipt": {"delivery_verified": True}})
     legacy = attempt_result({**fixture, "status": "accepted", "receipt": {"message_id": "-22"}}, duplicate=True)
-    assert "会话记录已确认出现 B 站小程序卡片" in confirmed["content"] and confirmed["success"]
+    assert "会话记录已确认 B 站视频分享" in confirmed["content"] and confirmed["success"]
     assert "旧回执缺少" in legacy["content"] and not legacy["success"] and legacy["duplicate"]
     for code, wording in (
         ("qq_card_replaced", "版本过低的占位提示"),
@@ -260,10 +284,10 @@ async def native_card_test_statuses_are_distinct(folder):
         assert wording in result["content"] and not result["success"] and result["delivery_state"] == "uncertain"
     unsupported = attempt_result({**fixture, "status": "rejected",
                                   "receipt": {"error_class": "card_action_unsupported"}})
-    assert "不支持发送 B 站小程序卡片" in unsupported["content"] and not unsupported["success"]
+    assert "不支持 QQ 图文卡" in unsupported["content"] and not unsupported["success"]
     rejected = attempt_result({**fixture, "status": "rejected",
                                "receipt": {"error_class": "card_generation_failed"}})
-    assert "未能生成 B 站小程序卡片" in rejected["content"] and not rejected["success"]
+    assert "未能准备 B 站视频分享" in rejected["content"] and not rejected["success"]
 
 
 async def merely_accepted_native_card_is_uncertain(folder):
@@ -892,7 +916,7 @@ async def typed_proactive_dispatch(folder):
     assert [row["category"] for row in seen] == ["greeting", "greeting", "greeting", "missing", "video_share", "browse_qq"]
     assert registry.claim("private-a", turn_id=result["lbm_turn_id"])["kind"] == "morning_greeting"
     assert registry.claim("private-a", turn_id=result["lbm_turn_id"]) is None
-    assert "实际时间" in rewrite_notice_for("private_target", "morning_greeting", miss_stage=4)
+    assert "当前时间点" in rewrite_notice_for("private_target", "morning_greeting", miss_stage=4)
 
     rejected = AsyncMock(return_value={"success": False})
     assert not (await enqueue("video_completion", trigger=rejected))["success"]

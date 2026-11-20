@@ -36,6 +36,7 @@ from typing import Any, Callable, Optional
 from core.storage import save_json_atomic
 from integrations.proactive_reply_target import PROACTIVE_REPLY_NOTICE
 from integrations.planner_proactive import proactive_category
+from integrations.video_share_comment import VIDEO_SHARE_REPLY_NOTICE
 from integrations.video_share_policy import COMMENT_PLANNER_KIND
 # 阶段 4 文案/清洗规则单一 owner = suite_prompts（提示词集中模块；companion
 # .miss_trigger / planning.proactive_service / integrations.optional_action 也转发
@@ -78,40 +79,29 @@ TRIGGER_KINDS = (
 
 # ---- 提示词矩阵（确定性常量表；缺省按 chat_type 兜底） ----
 #: 群聊兜底（规格 §1A 口径）。
-GROUP_FALLBACK_NOTICE = (
-    "本轮为插件主动激活的群聊发言，根据planner状况概括自然开口，不需要特地回复某条消息"
-)
+GROUP_FALLBACK_NOTICE = "这轮是你主动在群里说句话，按下面的局面说明自然开口，不用特地回复某条旧消息"
 #: 其他私聊兜底（同群聊口径换「私聊」）。
-PRIVATE_OTHER_FALLBACK_NOTICE = (
-    "本轮为插件主动激活的私聊发言，根据planner状况概括自然开口，不需要特地回复某条消息"
-)
-#: 陪伴目标私聊兜底 = 3.17.2 原文（逐字，不得改写）。
+PRIVATE_OTHER_FALLBACK_NOTICE = "这轮是你主动给对方发消息，按下面的局面说明自然开口，不用特地回复某条旧消息"
+#: 陪伴目标私聊共用主动回复文案。
 PRIVATE_TARGET_FALLBACK_NOTICE = PROACTIVE_REPLY_NOTICE
 
 #: (chat_type, kind) → 定制文案。private_target 各 flavor = 兜底原文 + 自然补充；
 #: group / private_other 不细分 kind，统一走各自兜底。
 REWRITE_MATRIX: dict[tuple[str, str], str] = {
     (CHAT_TYPE_PRIVATE_TARGET, KIND_MORNING_GREETING):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。参考本轮提供的实际时间，自然表达问候",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。结合当前时间点，按平时熟人聊天的口吻简短打个招呼",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_NOON_GREETING):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。参考本轮提供的实际时间，自然表达问候",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。结合当前时间点，按平时熟人聊天的口吻简短打个招呼",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_NIGHT_GREETING):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。参考本轮提供的实际时间，自然表达问候",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。结合当前时间点，按平时熟人聊天的口吻简短打个招呼",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_MISS):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。这次是因为你想对方了主动开口；"
-        "顺着你已经定下的方向自然说，不必刻意强调想念",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。顺着想说的话自然开口，简短随性",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_VIDEO_SHARE):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。刚看完视频想分享，自然地聊聊视频里的内容",
-    **{
-        (chat_type, COMMENT_PLANNER_KIND): (
-            "刚才的视频卡片已送达本会话。按 Planner 确定的方向随口说一句感想，"
-            "不引用或点名，不复述卡片，不贴链接，也不追问。")
-        for chat_type in CHAT_TYPES
-    },
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。刚看到个有意思的视频想顺手聊一句，口吻随意",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_VIDEO_COMPLETION):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。按本轮点播的结果自然交流",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。按本轮点播的实际结果随口跟对方说两句（没看成就如实说明，别编内容）",
     (CHAT_TYPE_PRIVATE_TARGET, KIND_SURF_CHITCHAT):
-        PRIVATE_TARGET_FALLBACK_NOTICE + "。刷QQ看到有意思的想闲聊，轻松地搭句话",
+        PRIVATE_TARGET_FALLBACK_NOTICE + "。顺手刷手机时想找对方闲聊一句，轻松自然",
 }
 
 _CHAT_TYPE_FALLBACKS = {
@@ -126,27 +116,29 @@ _CHAT_TYPE_FALLBACKS = {
 #: （known_notice_texts）与既有 startswith 断言不破。
 STAGE1_MISS_NOTICE = (
     PRIVATE_TARGET_FALLBACK_NOTICE
-    + "。这次是你主动想找对方搭话；不要直接说“想你了”，结合你们的关系随口问问TA在干嘛"
-      "或怎么没理你，简短自然"
+    + "。按你的人设随手问一嘴对方在干嘛，简短口语化"
 )
 STAGE2_MISS_NOTICE = (
     PRIVATE_TARGET_FALLBACK_NOTICE
-    + "。对方已经一整天没回你了，语气里带出一点等待和在意，顺便找个话题试探TA是不是"
-      "在忙或没看到消息"
+    + "。对方一天多没回，带点熟人间的在意随口问问是不是在忙"
 )
 STAGE3_MISS_NOTICE = (
     PRIVATE_TARGET_FALLBACK_NOTICE
-    + "。对方已经两三天没音讯了，这次直接表达失落或焦急，明确追问对方人去哪了、"
-      "怎么一直不回消息，不要客气敷衍"
+    + "。对方两三天没动静了，按你的性格直接问一句人去哪了，别打圆场"
 )
 #: 阶段 4（>120h 失联）每日主动任务强覆盖：明确剥离原问候/晚安里的
 #: “不要追问/轻松寒暄”限制，先完成日常动作、再转入沉默追问。
 STAGE4_DAILY_OVERLAY_NOTICE = (
     PRIVATE_TARGET_FALLBACK_NOTICE
-    + "。本轮为失联第4阶段下的日常主动交互。虽然原本的任务是完成上方planner里的日常动作"
-      "（如问候或分享/分析视频），但对方已失联超过5天。请先简短带出你的日常事/视频感想，"
-      "随后语气转入沉默低落，反复确认对方到底去哪了、人是否还在。忽略任何“不要追问”或"
-      "“轻松寒暄”的限制，语气真实克制又带着执拗的等待感"
+    + "。对方已失联超过 5 天。先简短说完眼下的日常或视频感想，话尾按你的人设自然问一句人还在不在，克制真实"
+)
+STAGE4_VIDEO_FAILED_OVERLAY_NOTICE = (
+    PRIVATE_TARGET_FALLBACK_NOTICE
+    + "。对方已失联超过 5 天。先简短如实说明这次视频没看成（别编造视频内容），话尾按你的人设自然问一句人还在不在，克制真实"
+)
+STAGE4_VIDEO_RESULT_OVERLAY_NOTICE = (
+    PRIVATE_TARGET_FALLBACK_NOTICE
+    + "。对方已失联超过 5 天。先按本轮点播的实际结果说明情况，话尾自然问一句人还在不在，克制真实"
 )
 _STAGE_MISS_NOTICES: dict[int, str] = {
     1: STAGE1_MISS_NOTICE,
@@ -161,9 +153,9 @@ _STAGE4_SUPPRESSED_PHRASES = STAGE4_SUPPRESSED_PHRASES
 #: 阶段 4 早/午/晚安轻量任务骨架：绕开 [prompts] 自定义模板与默认文案里
 #: “不要追问 / 轻松关心 / 不要开新话题”等互斥指令（设计 §3.2 推荐骨架替换）。
 STAGE4_GREETING_INTENT_SKELETONS: dict[str, str] = {
-    KIND_MORNING_GREETING: "Bot 刚睡醒，新的一天开始了，准备像往常一样发消息",
-    KIND_NOON_GREETING: "现在是中午，习惯性想发条消息",
-    KIND_NIGHT_GREETING: "夜深了，准备睡觉前习惯性发条消息",
+    KIND_MORNING_GREETING: "刚睡醒，习惯性想给对方发条消息",
+    KIND_NOON_GREETING: "到中午了，习惯性想给对方发条消息",
+    KIND_NIGHT_GREETING: "夜深准备睡了，习惯性想给对方发条消息",
 }
 
 
@@ -196,6 +188,7 @@ def append_stage4_miss_prompt(
     relation: str = "恋人",
     memory_line: str = "",
     is_video: bool = False,
+    video_failed: bool = False,
 ) -> str:
     """在每日主动任务提示词后拼接 Stage 4 深度想念文案（转发单一 owner）。
 
@@ -207,29 +200,38 @@ def append_stage4_miss_prompt(
     """
     return _append_stage4_miss_prompt(
         base_prompt, hours=hours, relation=relation,
-        memory_line=memory_line, is_video=is_video,
+        memory_line=memory_line, is_video=is_video, video_failed=video_failed,
         nonpositive_hours_text="120+",
     )
 
 
-def rewrite_notice_for(chat_type: Any, kind: Any, *, miss_stage: int = 0) -> str:
+def rewrite_notice_for(chat_type: Any, kind: Any, *, miss_stage: int = 0,
+                       video_failed: bool | None = None) -> str:
     """(chat_type, kind, miss_stage) → 改写文案；未登记组合按 chat_type 兜底。
 
     - ``CHAT_TYPE_PRIVATE_TARGET`` + ``KIND_MISS``：阶段 1/2/3 各注入对应追问强度；
-    - 目标私聊的阶段 4 提示用于想念或其他非问候回合；问候保留自然表达；
+    - 目标私聊的阶段 4 提示不改变问候或已送达的视频分享附言；
     - 阶段 0 / 其他 chat_type：逐字沿用 :data:`REWRITE_MATRIX` 与三态兜底
       （群聊/其他私聊绝不因阶段号被染色）。
 
     未知 chat_type 保守按其他私聊兜底（绝不把非目标流当陪伴目标私聊）。
     """
     ct = str(chat_type or "")
+    turn_kind = str(kind or "")
+    if turn_kind == COMMENT_PLANNER_KIND:
+        return VIDEO_SHARE_REPLY_NOTICE
     stage = _normalize_miss_stage(miss_stage)
     if ct == CHAT_TYPE_PRIVATE_TARGET:
         if stage == 4 and proactive_category(kind) != "greeting":
+            if turn_kind == KIND_VIDEO_COMPLETION:
+                if video_failed is True:
+                    return STAGE4_VIDEO_FAILED_OVERLAY_NOTICE
+                if video_failed is None:
+                    return STAGE4_VIDEO_RESULT_OVERLAY_NOTICE
             return STAGE4_DAILY_OVERLAY_NOTICE
-        if stage in _STAGE_MISS_NOTICES and str(kind or "") == KIND_MISS:
+        if stage in _STAGE_MISS_NOTICES and turn_kind == KIND_MISS:
             return _STAGE_MISS_NOTICES[stage]
-    text = REWRITE_MATRIX.get((ct, str(kind or "")))
+    text = REWRITE_MATRIX.get((ct, turn_kind))
     if text is not None:
         return text
     return _CHAT_TYPE_FALLBACKS.get(ct, PRIVATE_OTHER_FALLBACK_NOTICE)
@@ -239,8 +241,11 @@ def known_notice_texts() -> tuple[str, ...]:
     """全部可能注入的文案（矩阵 + 阶段 1~4 变体 + 三态兜底），供幂等守卫去重。"""
     return tuple(dict.fromkeys((
         *REWRITE_MATRIX.values(),
+        VIDEO_SHARE_REPLY_NOTICE,
         *_STAGE_MISS_NOTICES.values(),
         STAGE4_DAILY_OVERLAY_NOTICE,
+        STAGE4_VIDEO_FAILED_OVERLAY_NOTICE,
+        STAGE4_VIDEO_RESULT_OVERLAY_NOTICE,
         *_CHAT_TYPE_FALLBACKS.values(),
     )))
 
@@ -353,7 +358,8 @@ class ProactiveTurnRegistry:
     # ---- 登记 / 查询 / 消费 ----
     def register(self, stream_id: Any, kind: Any, reason: Any, summary: str = "", *,
                  miss_stage: int = 0, key: str | None = None,
-                 optional_key: str = "", optional_intent: str = "") -> str | None:
+                 optional_key: str = "", optional_intent: str = "",
+                 video_failed: bool | None = None) -> str | None:
         """登记一次主动激活；返回 turn_id。分类失败保守按 private_other。
 
         ``miss_stage``（kw-only，默认 0）：阶梯想念/四阶段渗透的阶段号（0~4），
@@ -378,6 +384,8 @@ class ProactiveTurnRegistry:
             "created_at": float(self._clock()),
             "consumed": False,
         }
+        if turn["kind"] == KIND_VIDEO_COMPLETION and isinstance(video_failed, bool):
+            turn["video_failed"] = video_failed
         if key is not None:
             turn.update(key=str(key)[:240], optional_key=str(optional_key)[:240],
                         optional_intent=str(optional_intent), tracked=True)

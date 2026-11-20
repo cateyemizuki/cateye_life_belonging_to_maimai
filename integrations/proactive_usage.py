@@ -13,6 +13,7 @@ from unicodedata import normalize
 
 from core.inject import CATEYE_PLUGIN_ID, pick_payload_key
 from integrations.proactive_reply_target import _header
+from integrations.video_share_comment import VIDEO_SHARE_REPLY_ANALYSIS
 from integrations.video_share_policy import (
     COMMENT_PLANNER_KIND, COMMENT_PLANNER_WINDOW_SECONDS, DEBUG_CARD_TOOL, DEBUG_PLANNER_KIND,
 )
@@ -24,6 +25,8 @@ _REPLY_MARKER = re.compile(r"\n\[lbm-proactive-reply:([0-9a-f]{32})\]\s*$")
 _TASK_META_PREFIX = "附加信息："
 _DEBUG_END_TOOLS = ("wait", "stop")
 _COMMENT_END_TOOLS = (*_DEBUG_END_TOOLS, "finish", "no_action")
+_BLOCKED_VIDEO_COMMENT = "video_comment_blocked"
+_REPLY_NOTE_FIELDS = ("chat_anlyze", "reply_reference")
 _SCOPES = {"greeting": "planning", "video_share": "video", "video_completion": "video", "qzone_comment": "qzone"}
 
 
@@ -91,11 +94,42 @@ def _has_later_input(items, key):
     return False
 
 
+def active_video_comment_task(items, key):
+    """Check the current host task before the generic reply-target prompt runs."""
+    for index, item in enumerate(items):
+        task = _task(_text(item, key))
+        if task and task[1].get("delivery_kind") == COMMENT_PLANNER_KIND and not _has_later_input(items[index + 1:], key):
+            return True
+    return False
+
+
 def _tool_name(definition):
     if not isinstance(definition, dict):
         return ""
     nested = definition.get("function")
     return str((nested.get("name") if isinstance(nested, dict) else None) or definition.get("name") or "")
+
+
+def _comment_reply_definition(definition, *, legacy):
+    nested = definition.get("function")
+    tool = nested if isinstance(nested, dict) else definition
+    parameters = tool.get("parameters") or {}
+    properties = parameters.get("properties") or {}
+    note_key = next((key for key in _REPLY_NOTE_FIELDS if key in properties), "chat_anlyze")
+    needs_id = legacy or "msg_id" in (parameters.get("required") or ())
+    reply_end_options = (properties.get("after_reply") or {}).get("enum") or ()
+    after_reply = "stop" if "stop" in reply_end_options else "wait"
+    options = {"video_reply_note_key": note_key, "video_reply_needs_id": needs_id, "video_reply_end": after_reply}
+    visible = {**tool, "description": "可选。只有想对当前会话的人顺手带一句时才调用一次。"}
+    if note_key in properties:
+        note = {**properties[note_key], "description": VIDEO_SHARE_REPLY_ANALYSIS}
+        visible["parameters"] = {**parameters, "properties": {**properties, note_key: note}}
+    return ({**definition, "function": visible} if isinstance(nested, dict) else visible), options
+
+
+def _reply_note_key(arguments):
+    return next((key for key in _REPLY_NOTE_FIELDS if isinstance(arguments.get(key), str)
+                 and arguments[key].strip()), "")
 
 
 def _hide_task_metadata(item, key):
@@ -155,12 +189,13 @@ class ProactiveUsage:
         self._reply_attempts = {}
         self._grants = {}
         self._pending_sends = {}
+        self._built_sends = {}
         self._sent_turns = {}
 
     def _prune(self):
         now = self._clock()
         for bucket in (self._planner, self._reply_calls, self._reply_attempts, self._grants,
-                       self._pending_sends, self._sent_turns):
+                       self._pending_sends, self._built_sends, self._sent_turns):
             for key, row in list(bucket.items()):
                 if now - row[0] > 300:
                     bucket.pop(key, None)
@@ -182,6 +217,10 @@ class ProactiveUsage:
     @staticmethod
     def _planner_key(kwargs):
         return _stream(kwargs), kwargs.get("selected_history_count"), str(kwargs.get("selection_reason") or "")
+
+    def video_comment_policy_applies(self, kwargs):
+        row = self._planner.get(self._planner_key(kwargs))
+        return row is not None and row[3] in (COMMENT_PLANNER_KIND, _BLOCKED_VIDEO_COMMENT)
 
     async def planner_before(self, kwargs):
         """Veto identified old/busy greetings and capture the task before model invocation."""
@@ -252,12 +291,12 @@ class ProactiveUsage:
         if kind in (DEBUG_PLANNER_KIND, COMMENT_PLANNER_KIND):
             restriction = kind
         else:
-            restriction = "video_comment_blocked" if comment_blocked else ""
+            restriction = _BLOCKED_VIDEO_COMMENT if comment_blocked else ""
         modified = {}
         terminal = ""
         if isinstance(definitions, list):
             names = {_tool_name(tool) for tool in definitions}
-            if not names.intersection(("reply", "wait", HOST_USAGE_TOOL, DEBUG_CARD_TOOL)):
+            if not names.intersection(("reply", HOST_USAGE_TOOL, DEBUG_CARD_TOOL, *_COMMENT_END_TOOLS)):
                 identified = None  # A host sub-agent may use the same prompt hooks.
             if restriction == DEBUG_PLANNER_KIND:
                 allowed_tools = (*_DEBUG_END_TOOLS, DEBUG_CARD_TOOL)
@@ -265,12 +304,18 @@ class ProactiveUsage:
                 end_tools = _COMMENT_END_TOOLS if key == "messages" else _DEBUG_END_TOOLS
                 allowed_tools = (*end_tools, "reply") if restriction == COMMENT_PLANNER_KIND else end_tools
                 if key == "messages":
-                    terminal = next((name for name in ("finish", "no_action") if name in names), "")
+                    terminal = next((name for name in ("finish", "no_action", "stop") if name in names), "")
             else:
                 allowed_tools = None
             filtered = [tool for tool in definitions if (
                 _tool_name(tool) in allowed_tools if allowed_tools is not None else _tool_name(tool) != DEBUG_CARD_TOOL
             )]
+            if restriction == COMMENT_PLANNER_KIND and identified is not None:
+                for index, tool in enumerate(filtered):
+                    if _tool_name(tool) == "reply":
+                        filtered[index], options = _comment_reply_definition(tool, legacy=key == "messages")
+                        identified = {**identified, **options}
+                        break
             if filtered != definitions:
                 modified["tool_definitions"] = filtered
         planner_key = self._planner_key(kwargs)
@@ -279,7 +324,7 @@ class ProactiveUsage:
         # A restricted turn that overlaps another request loses its authority.
         if old is not None:
             since, _, overlap, old_restriction, old_terminal = old
-            blocked = "video_comment_blocked" if restriction or old_restriction else ""
+            blocked = _BLOCKED_VIDEO_COMMENT if restriction or old_restriction else ""
             self._planner[planner_key] = (since, None, overlap + 1, blocked, terminal or old_terminal)
         else:
             self._planner[planner_key] = (self._clock(), claim, 1, restriction, terminal)
@@ -340,8 +385,10 @@ class ProactiveUsage:
             return self._debug_planner_output(kwargs, claim.turn.get("debug_card_ticket") if claim is not None else None)
         if restriction:
             allow_reply = (restriction == COMMENT_PLANNER_KIND and claim is not None
+                           and "video_reply_note_key" in claim.turn
                            and self._plugin._video_share_comment().active(stream, claim.turn["video_sent_from"]))
-            kwargs = self._comment_planner_output(kwargs, allow_reply=allow_reply, terminal=terminal)
+            kwargs = self._comment_planner_output(kwargs, reply_turn=claim.turn if allow_reply else None,
+                                                  terminal=terminal)
         return self._rewrite_tool_calls(kwargs, stream, claim)
 
     @staticmethod
@@ -367,38 +414,44 @@ class ProactiveUsage:
         return {**kwargs, key: selected, "response": ""}
 
     @staticmethod
-    def _comment_planner_output(kwargs, *, allow_reply, terminal):
+    def _comment_planner_output(kwargs, *, reply_turn, terminal):
         modern = isinstance(kwargs.get("output_items"), list)
         key, field = ("output_items", "tool_call") if modern else ("tool_calls", "function")
         name_field, args_field = ("func_name", "args") if modern else ("name", "arguments")
+        end_tools = _DEBUG_END_TOOLS if modern else _COMMENT_END_TOOLS
         selected = []
+        note_key = (reply_turn or {}).get("video_reply_note_key", "chat_anlyze")
         for item in kwargs.get(key) or []:
             call = item.get(field) if isinstance(item, dict) else None
             if not isinstance(call, dict):
                 continue
             name, args = call.get(name_field), call.get(args_field)
-            end_tools = _DEBUG_END_TOOLS if modern else _COMMENT_END_TOOLS
             if name in end_tools:
-                # Prefer the legacy finish tool over a timed wait.
-                name = terminal or name
-                safe = {"seconds": 0} if not modern and name == "wait" else {}
-            elif name == "reply" and allow_reply and isinstance(args, dict):
-                note = args.get("chat_anlyze")
-                if modern and (not isinstance(note, str) or not note.strip()):
-                    continue
-                if not modern and not str(args.get("msg_id") or "").strip():
-                    continue
-                note = note.strip()[:400] if isinstance(note, str) else ""
-                direction = "刚才的视频卡片已送达。只随口说一句相关感想，不引用、点名、贴链接或追问。"
-                safe = {"chat_anlyze": (note + "\n" + direction).strip()}
+                # A decline wins even when the model also supplied reply or prose.
+                # An empty modern output ends silently across both wait contracts.
                 if modern:
-                    safe["after_reply"] = "wait"
-                else:
-                    safe.update(msg_id=str(args["msg_id"]), set_quote=False)
-            else:
+                    return {**kwargs, key: []}
+                name = terminal or name
+                safe = {"seconds": 0} if name == "wait" else {}
+                selected = [{**item, field: {**call, name_field: name, args_field: safe}}]
+                break
+            if name != "reply" or reply_turn is None or selected or not isinstance(args, dict):
                 continue
-            selected = [{**item, field: {**call, name_field: name, args_field: safe}}]
-            break
+            note = args.get(note_key)
+            note = note.strip()[:400] if isinstance(note, str) else ""
+            if modern and not note:
+                continue
+            safe = {note_key: note or "当前会话刚完成一次视频分享。"}
+            if reply_turn.get("video_reply_needs_id", not modern):
+                message_id = args.get("msg_id")
+                if type(message_id) not in (str, int) or not str(message_id).strip():
+                    continue
+                safe["msg_id"] = str(message_id).strip()
+            if modern:
+                safe["after_reply"] = reply_turn.get("video_reply_end", "wait")
+            else:
+                safe["set_quote"] = False
+            selected = [{**item, field: {**call, args_field: safe}}]
         if not modern and terminal and (not selected or selected[0][field][name_field] == "reply"):
             # Legacy hosts retry empty outputs and continue thinking after reply.
             selected.append({"id": "lbm-comment-end-" + uuid.uuid4().hex,
@@ -428,11 +481,11 @@ class ProactiveUsage:
                 self._grants[nonce] = (self._clock(), stream)
                 arguments = {**arguments, "scope_proof": nonce}
             elif name == "reply" and claim is not None:
-                analysis = arguments.get("chat_anlyze")
-                if not isinstance(analysis, str) or not analysis.strip():
+                note_key = _reply_note_key(arguments)
+                if not note_key:
                     continue
                 self._reply_calls[nonce] = (self._clock(), stream, claim.turn)
-                arguments = {**arguments, "chat_anlyze": _REPLY_MARKER.sub("", analysis).rstrip()
+                arguments = {**arguments, note_key: _REPLY_MARKER.sub("", arguments[note_key]).rstrip()
                               + f"\n[lbm-proactive-reply:{nonce}]"}
             else:
                 continue
@@ -443,14 +496,15 @@ class ProactiveUsage:
         args = kwargs.get("reply_tool_args")
         if not isinstance(args, dict):
             return kwargs
-        text = args.get("chat_anlyze")
-        match = _REPLY_MARKER.search(text) if isinstance(text, str) else None
+        note_key = _reply_note_key(args)
+        text = args.get(note_key, "")
+        match = _REPLY_MARKER.search(text)
         if match is None:
             return kwargs
         self._prune()
         nonce = match[1]
         row = self._reply_calls.get(nonce)
-        cleaned = {**args, "chat_anlyze": text[:match.start()].rstrip()}
+        cleaned = {**args, note_key: text[:match.start()].rstrip()}
         cleaned.pop(_REPLY_TOKEN, None)
         if row is not None and row[1] == _stream(kwargs):
             cleaned[_REPLY_TOKEN] = nonce
@@ -462,8 +516,7 @@ class ProactiveUsage:
             return None
         nonce = args.get(_REPLY_TOKEN)
         if not isinstance(nonce, str) or not nonce:
-            text = args.get("chat_anlyze")
-            match = _REPLY_MARKER.search(text) if isinstance(text, str) else None
+            match = _REPLY_MARKER.search(args.get(_reply_note_key(args), ""))
             nonce = match[1] if match is not None else ""
         row = self._reply_calls.get(nonce)
         if row is not None and row[1] == _stream(kwargs) and self._clock() - row[0] <= 300:
@@ -524,22 +577,63 @@ class ProactiveUsage:
                 if combined:
                     marks.add(_digest(combined))
 
+    def _matching_send(self, stream, message, now):
+        body = _canonical_text(_outbound_text(message))
+        if not stream or not body:
+            return None
+        mark = _digest(body)
+        matches = [(key, row) for key, row in self._pending_sends.items()
+                   if key[0] == stream and 0 <= now - row[0] <= 120 and mark in row[3]]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _outbound_timestamp(message):
+        try:
+            stamp = float(message.get("timestamp"))
+        except (ValueError, TypeError, OverflowError):
+            return None
+        return stamp if 0 < stamp < float("inf") else None
+
+    def after_build_message(self, kwargs):
+        """Identify a greeting while the outgoing message still carries the full text."""
+        message = kwargs.get("message")
+        if not isinstance(message, dict):
+            return
+        self._prune()
+        now = self._clock()
+        stream = _stream(message)
+        stamp = self._outbound_timestamp(message)
+        if stamp is None:
+            return
+        matched = self._matching_send(stream, message, now)
+        if matched is None:
+            return
+        key, pending = matched
+        turn = pending[1] or {}
+        if turn.get("category") == "greeting" and turn.get("greeting_scope") == "target":
+            # Post-process plugins can replace the body during this hook and QQ
+            # may replace message_id on success. The host keeps the build time.
+            self._built_sends[stream, stamp] = now, key
+
     def confirm_sent(self, kwargs):
         self._prune()
         message = kwargs.get("message")
         if kwargs.get("sent") is not True or not isinstance(message, dict):
             return None
         stream = _stream(message)
-        body = _canonical_text(_outbound_text(message))
-        if not stream or not body:
-            return None
+        stamp = self._outbound_timestamp(message)
         now = self._clock()
-        mark = _digest(body)
-        matches = [(key, row) for key, row in self._pending_sends.items()
-                   if key[0] == stream and 0 <= now - row[0] <= 120 and mark in row[3]]
-        if len(matches) != 1:
-            return None
-        key, pending = matches[0]
+        built = self._built_sends.pop((stream, stamp), None)
+        if built is not None:
+            key = built[1]
+            pending = self._pending_sends.get(key)
+            if pending is None or not 0 <= now - pending[0] <= 120:
+                return None
+        else:
+            matched = self._matching_send(stream, message, now)
+            if matched is None:
+                return None
+            key, pending = matched
         self._pending_sends.pop(key, None)
         turn = pending[1]
         if turn is None:
@@ -548,11 +642,7 @@ class ProactiveUsage:
         if turn_id in self._sent_turns:
             return None
         self._sent_turns[turn_id] = (now,)
-        try:
-            stamp = float(message.get("timestamp"))
-        except (ValueError, TypeError):
-            stamp = now
-        return turn, stamp if -5 <= now - stamp <= 120 else now
+        return turn, stamp if stamp is not None and -5 <= now - stamp <= 120 else now
 
     def tool_stream(self, proof):
         self._prune()

@@ -27,11 +27,7 @@ from typing import Any, ClassVar, Dict, Optional
 from maibot_sdk import HookHandler, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
-from core.inject import (
-    inject_into_items_after_system,
-    inject_into_messages,
-    pick_payload_key,
-)
+from core.inject import pick_payload_key, project_planner_injection, project_replyer_injection
 
 
 class EmotionComponentsMixin:
@@ -40,8 +36,8 @@ class EmotionComponentsMixin:
     emotion_components_info: ClassVar[Dict[str, str]] = {
         "lbm_command_root": "Command：双语双根 /lbm 与 /麦麦生活（情绪组 emotion/config）",
         "lbm_emotion_report": "Tool：上报一件影响心情的事件；is_target 声明是否由重要的人引发（M3）",
-        "emotion_planner_inject": "HookHandler：maisaka.planner.before_request 情绪底色注入（系统提示词后）",
-        "emotion_replyer_model_inject": "HookHandler：maisaka.replyer.before_model_request 情绪底色注入（系统提示词后）",
+        "emotion_planner_inject": "HookHandler：maisaka.planner.before_request 情绪底色注入（历史之后）",
+        "emotion_replyer_model_inject": "HookHandler：maisaka.replyer.before_model_request 情绪底色注入（用户模板尾部）",
         "emotion_reply_evaluate": "HookHandler：maisaka.replyer.after_response 会话片段登记/增量评估（OBSERVE，按 evaluate_mode）",
     }
 
@@ -156,11 +152,11 @@ class EmotionComponentsMixin:
         return "已记下这件事给心情带来的变化。"
 
     # ============================================================
-    # Hooks（planner + replyer 双通道：均插到第一条系统提示词之后）
+    # Hooks（planner + replyer 分别按宿主载荷结构注入）
     # ============================================================
     def _emo_inject(self, kwargs: Dict[str, Any], channel: str = "replyer",
                     **writeback: Any) -> Optional[Dict[str, Any]]:
-        """按 payload 形态把情绪底色系统条目插到第一条系统提示词之后。
+        """把情绪底色送入对应通道的当前上下文。
 
         ``writeback``：随 ``modified_kwargs`` 一并**原样回传**的键。宿主对 blocking
         处理器返回的 modified_kwargs 做整份替换，被具名参数接住的键（session_id /
@@ -172,22 +168,22 @@ class EmotionComponentsMixin:
         """
         svc = self._emo_service()
         payload_key, payload = pick_payload_key(kwargs)
-        if payload_key is None or svc is None:
+        if not payload_key or svc is None:
             return None
         text = svc.injection_text(channel)
-        if payload_key == "items":
-            modified = inject_into_items_after_system(payload, text)
-        else:
-            modified = inject_into_messages(payload, text)
+        project = project_planner_injection if channel == "planner" else project_replyer_injection
+        modified = project(payload_key, payload, text)
+        if modified is payload:
+            return None
         return {"action": "continue", "modified_kwargs": {**kwargs, **writeback, payload_key: modified}}
 
     @HookHandler("maisaka.planner.before_request",
                  name="emotion_planner_inject",
-                 description="把当前情绪底色（模糊化）以系统条目插入 planner 上下文的第一条系统提示词之后",
+                 description="把当前情绪底色放到 planner 历史之后、宿主本轮参考之前",
                  mode=HookMode.BLOCKING, order=HookOrder.NORMAL,
                  timeout_ms=2000, error_policy=ErrorPolicy.SKIP)
     async def emo_hook_planner_inject(self, **kwargs: Any) -> dict[str, Any]:
-        """planner 通道情绪底色注入（本 Hook 是 planner 链上排序最靠前的一个，见 N6 审计）。
+        """planner 通道情绪底色注入。
 
         ``session_id``（replyer 通道路径另含 ``attempt``）一律走 ``**kwargs`` 并在
         回传里原样写回：本 Hook 一旦返回 modified_kwargs，宿主会整份替换请求参数，
@@ -210,7 +206,7 @@ class EmotionComponentsMixin:
 
     @HookHandler("maisaka.replyer.before_model_request",
                  name="emotion_replyer_model_inject",
-                 description="把当前情绪底色（模糊化）以系统条目插入 replyer 模型请求的第一条系统提示词之后",
+                 description="把当前情绪底色追加到 replyer 的宿主用户模板尾部",
                  mode=HookMode.BLOCKING, order=HookOrder.NORMAL,
                  timeout_ms=2000, error_policy=ErrorPolicy.SKIP)
     async def emo_hook_replyer_model_inject(self, **kwargs: Any) -> dict[str, Any]:

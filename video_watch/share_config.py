@@ -12,8 +12,12 @@ class VideoShareSectionConfig(PluginConfigBase):
     __ui_i18n__: ClassVar[dict] = {"en": {"title": "Video social sharing"}}
 
     mode: Literal["关闭", "影子模式", "自动分享"] = Field(
-        default="自动分享", description="关闭时停止自动评估；影子模式只记录决定不发送；自动分享按授权、活跃门槛、静默和额度投递卡片。默认自动分享，评估器可自主选择不分享。手动分享工具独立可用。",
+        default="自动分享", description="关闭时停止自动评估；影子模式只记录决定不发送；自动分享按授权、活跃门槛、静默和额度投递视频分享。默认自动分享，评估器可自主选择不分享。手动分享工具独立可用。",
         json_schema_extra={"label": "运行模式"})
+    share_format: Literal["复制链接", "QQ 图文卡"] = Field(
+        default="复制链接",
+        description="聊天视频分享默认发送 B 站复制链接格式。选 QQ 图文卡时，点击打开 B 站移动视频网页。",
+        json_schema_extra={"label": "聊天分享形式"})
     include_companion: bool = Field(
         default=True, description="允许将已配置的陪伴目标私聊作为自动分享候选，按日常朋友分享的口径判断，近期严肃或紧急话题暂缓。陪伴私聊不受群活跃门槛限制。",
         json_schema_extra={"label": "允许陪伴目标私聊"})
@@ -50,7 +54,7 @@ class VideoShareSectionConfig(PluginConfigBase):
     # 2026-11-11 Gemini 批：分享质量门槛（默认关，避免压低现有分享量）。
     video_share_quality_gate: bool = Field(default=False,
         description="QQ 空间视频候选的质量门槛；开启后由空间视频评估与发布链检查质量分。",
-        json_schema_extra={"label": "空间视频质量门槛", "hint": "默认关闭。聊天视频卡片使用独立的相关性判断。"})
+        json_schema_extra={"label": "空间视频质量门槛", "hint": "默认关闭。聊天视频分享使用独立的相关性判断。"})
     video_share_quality_threshold: float = Field(default=0.55, ge=0.0, le=1.0,
         description="QQ 空间视频候选达到该质量分才可通过空间质量门槛（0~1）。",
         json_schema_extra={"label": "空间视频质量阈值", "step": 0.05})
