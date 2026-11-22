@@ -139,6 +139,33 @@ class GreetingAndInjectionCases(unittest.IsolatedAsyncioTestCase):
             service._target_qq.return_value = "730001"
             self.assertTrue(await service.target_greeting_proactive_allowed("target"))
 
+    async def test_greeting_gate_skip_records_the_actual_chat_category(self):
+        service = self.greeting_service()
+        service._greeting_gate_logged = {}
+        service._decision_log = Mock()
+        service._sleep_engine_asleep = Mock(return_value=True)
+        cycle = service._cycle_ctx(NOW)
+        for category in ("target", "other", "group"):
+            verdict = await service._pre_gate(category, category, "morning", cycle, NOW,
+                                              NOW.timestamp(), service._proactive_cfg())
+            self.assertEqual(verdict, ("pending", False))
+            self.assertEqual(service._decision_log.call_args.kwargs["category"], category)
+
+        service._noon_enabled = Mock(return_value=True)
+        service._noon_jitter_minutes = Mock(return_value=0)
+        service._target_stream_id_readonly = Mock(return_value="target")
+        service._stream_greeting_marked = Mock(return_value=False)
+        service._noon_sent_on_affection = Mock(return_value=False)
+        service._sleep_engine_asleep.return_value = False
+        service.target_greeting_proactive_allowed = AsyncMock(return_value=False)
+        service._mark_stream_greeting = Mock()
+        service._call_proactive_trigger = AsyncMock()
+        await service._process_noon_greeting(NOW.replace(hour=12), cycle)
+        self.assertEqual(service._decision_log.call_args.kwargs["trigger_type"], "noon_greeting")
+        self.assertEqual(service._decision_log.call_args.kwargs["category"], "target")
+        service._mark_stream_greeting.assert_called_once_with("target", "noon_unanswered", cycle.current_cycle_start)
+        service._call_proactive_trigger.assert_not_awaited()
+
     async def test_receipt_retries_same_timestamp_after_atomic_write_failure(self):
         from planning import greeting_guard
         with tempfile.TemporaryDirectory() as directory:

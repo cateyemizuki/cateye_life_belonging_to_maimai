@@ -1760,7 +1760,8 @@ class ProactiveService:
             if asleep is True:
                 self._log_gate_skip(
                     stream_id, kind, cycle,
-                    "睡眠引擎判定仍未醒（实际 wake 晚于旧锚点；早安待定，不落 durable 标记）")
+                    "睡眠引擎判定仍未醒（实际 wake 晚于旧锚点；早安待定，不落 durable 标记）",
+                    category=category)
                 return "pending", False
             # 早安沉默闸（R7 = 用户 2026-10-24 直派）：第一个检查、三流分派之前——
             # bot 在今日第一日程（= 周期起点）前 N 小时内发过消息 → 该流本周期跳过早安
@@ -1769,30 +1770,32 @@ class ProactiveService:
                 stream_id, now_ts, cycle, cfg_p, group=category == GREETING_CATEGORY_GROUP)
             if silenced is None:
                 self._log_gate_skip(stream_id, kind, cycle,
-                                    "早安沉默闸查询失败（morning_silence，fail-closed，宁不发）")
+                                    "早安沉默闸查询失败（morning_silence，fail-closed，宁不发）",
+                                    category=category)
                 return "skip", True
             if not silenced:
                 hours = self._morning_silence_hours(cfg_p)
                 self._log_gate_skip(
                     stream_id, kind, cycle,
-                    f"早安沉默闸未过（morning_silence：检查窗口内 bot 已发言，阈值 {hours:g} 小时）")
+                    f"早安沉默闸未过（morning_silence：检查窗口内 bot 已发言，阈值 {hours:g} 小时）",
+                    category=category)
                 return "skip", True
             if category == GREETING_CATEGORY_GROUP:
                 hard = await self._group_morning_hard_gate(stream_id, _prev, cur_start)
                 if hard is None:
                     self._log_gate_skip(stream_id, kind, cycle,
-                                        "群聊早安硬闸查询失败（fail-closed，宁不发）")
+                                        "群聊早安硬闸查询失败（fail-closed，宁不发）", category=category)
                     return "skip", True
                 if not hard:
                     self._log_gate_skip(stream_id, kind, cycle,
-                                        "群聊早安硬闸不过（判定窗内无非 bot 消息，跳过）")
+                                        "群聊早安硬闸不过（判定窗内无非 bot 消息，跳过）", category=category)
                     return "skip", True
                 if self._greeting_requires_activation(cfg_p):
                     necessity = await self._group_necessity_gate(stream_id, cycle)
                     if necessity is None or not necessity:
                         self._log_gate_skip(
                             stream_id, kind, cycle,
-                            "群聊早安必要性不过（今天日程第一个条目时段内无人开口）")
+                            "群聊早安必要性不过（今天日程第一个条目时段内无人开口）", category=category)
                         return "skip", True
                 return "pass", False
             if category == GREETING_CATEGORY_OTHER:
@@ -1821,7 +1824,7 @@ class ProactiveService:
             return "skip", False
         return "pass", False  # TARGET 到点后另查问候回应
 
-    def _log_gate_skip(self, stream_id: str, kind: str, cycle: CycleState, reason: str) -> None:
+    def _log_gate_skip(self, stream_id: str, kind: str, cycle: CycleState, reason: str, *, category: str) -> None:
         """闸门拒绝的决策日志留痕（每周期每流每 kind 至多一条）。"""
         key = (str(stream_id), str(kind), float(cycle.current_cycle_start or 0.0))
         if self._greeting_gate_logged.get(key):
@@ -1829,7 +1832,7 @@ class ProactiveService:
         self._greeting_gate_logged[key] = True
         self._decision_log("skip", trigger_type=f"{kind}_greeting",
                            reason=reason, stream_id=str(stream_id),
-                           category=GREETING_CATEGORY_GROUP)
+                           category=category)
         logger.info(f"问候闸门拒绝: stream={stream_id}, kind={kind}: {reason}")
 
     def _threshold_need(self, cfg_p: Any, kind: str) -> int:
@@ -2363,7 +2366,8 @@ class ProactiveService:
             return
         if not await self.target_greeting_proactive_allowed(target, now_ts=_epoch_ts(now)):
             self._mark_stream_greeting(target, _NOON_UNANSWERED_MARK, cycle_key)
-            self._log_gate_skip(target, GREETING_NOON, cycle, "上次问候后尚未收到陪伴目标的新消息")
+            self._log_gate_skip(target, GREETING_NOON, cycle, "上次问候后尚未收到陪伴目标的新消息",
+                                category=GREETING_CATEGORY_TARGET)
             return
         ok = await self._call_proactive_trigger(
             stream_id=target, intent_prompt=self._target_greeting_prompt(now), reason="日程问候",
